@@ -755,6 +755,40 @@ mod tests {
     }
 
     #[test]
+    fn signed_div_min_is_a_branch() {
+        let path = std::env::temp_dir().join(format!(
+            "j3c_signed_div_min_{}.j3",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            // Plan wrote `-9223372036854775808`; parser rejects that literal
+            // (unary-minus of an out-of-range positive). Equivalent MIN:
+            r#"module t;
+fn main() {
+    let a = -9223372036854775807 - 1;
+    let b = -1;
+    let q = a / b;
+    let _ = q;
+}
+"#,
+        )
+        .expect("write temp");
+        let prog = compile_path(&path).expect("compile");
+        let _ = std::fs::remove_file(&path);
+        let ll = emit::emit_llvm(&prog.cx, &prog.modules, &emit::EmitOpts::default())
+            .expect("emit llvm");
+        assert!(ll.contains("sdiv "), "{ll}");
+        assert!(ll.contains("phi "), "{ll}");
+        for line in ll.lines() {
+            assert!(
+                !(line.contains("select i1") && line.contains("-9223372036854775808")),
+                "select+min on one line:\n{line}\n{ll}"
+            );
+        }
+    }
+
+    #[test]
     fn defer_is_block_scoped() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/defer_scope.j3");
         let prog = compile_path(&path).expect("compile defer_scope");

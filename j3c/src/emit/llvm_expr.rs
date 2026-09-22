@@ -1064,14 +1064,26 @@ impl<'a> LlvmFn<'a> {
                     self.inst(&format!("{ismin} = icmp eq {ll} {l}, {min}"));
                     self.inst(&format!("{ism1} = icmp eq {ll} {r}, -1"));
                     self.inst(&format!("{ov} = and i1 {ismin}, {ism1}"));
+                    let ov_bb = self.label();
+                    let norm_bb = self.label();
+                    let join = self.label();
+                    self.term(&format!("br i1 {ov}, label %{ov_bb}, label %{norm_bb}"));
+                    self.block(&ov_bb);
+                    let wrapped = if op == BinOp::Div { min } else { "0" };
+                    self.term(&format!("br label %{join}"));
+                    self.block(&norm_bb);
                     let norm = self.fresh();
                     if op == BinOp::Div {
                         self.inst(&format!("{norm} = sdiv {ll} {l}, {r}"));
                     } else {
                         self.inst(&format!("{norm} = srem {ll} {l}, {r}"));
                     }
+                    self.term(&format!("br label %{join}"));
+                    self.block(&join);
                     let v = self.fresh();
-                    self.inst(&format!("{v} = select i1 {ov}, {ll} {min}, {ll} {norm}"));
+                    self.inst(&format!(
+                        "{v} = phi {ll} [ {wrapped}, %{ov_bb} ], [ {norm}, %{norm_bb} ]"
+                    ));
                     Ok(v)
                 } else {
                     let inst = if op == BinOp::Div { "udiv" } else { "urem" };
