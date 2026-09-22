@@ -10,18 +10,19 @@ Execute in the order below. Each executor: read the plan fully before starting, 
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
-| 001 | Run acceptance programs on LLVM and C | P1 | M | — | TODO |
-| 002 | Branch around signed MIN/-1 before sdiv | P1 | S | 001 | TODO |
-| 003 | Abort on inverted slices, not syscall 60 | P1 | S | 001 | TODO |
-| 004 | Keep div-by-zero abort under --fast | P1 | S | 001 | TODO |
-| 005 | Declare _exit in every C program | P1 | S | 001 | TODO |
-| 006 | Stop citing missing speculation.md | P2 | S | — | TODO |
-| 007 | Sync roadmap and AGENTS to shipped language | P2 | S | 006 | TODO |
-| 008 | Reuse one LSP check per buffer version | P2 | M | — | TODO |
-| 009 | Darwin linker flag instead of --gc-sections | P3 | S | — | TODO |
-| 010 | Clone check maps only for method origins | P3 | S | — | TODO |
-| 011 | Delete hand-built hello IR | P3 | S | — | TODO |
-| 012 | Default fields on Hit, Texture, and Mesh | P2 | S | — | TODO |
+| 001 | Run acceptance programs on LLVM and C | P1 | M | 013 | DONE |
+| 013 | C array fields and static floats | P1 | M | — | DONE |
+| 002 | Branch around signed MIN/-1 before sdiv | P1 | S | 001 | DONE |
+| 003 | Abort on inverted slices, not syscall 60 | P1 | S | 001 | DONE |
+| 004 | Keep div-by-zero abort under --fast | P1 | S | 001 | DONE |
+| 005 | Declare _exit in every C program | P1 | S | 001 | DONE |
+| 006 | Stop citing missing speculation.md | P2 | S | — | DONE |
+| 007 | Sync roadmap and AGENTS to shipped language | P2 | S | 006 | DONE |
+| 008 | Reuse one LSP check per buffer version | P2 | M | — | DONE |
+| 009 | Darwin linker flag instead of --gc-sections | P3 | S | — | DONE |
+| 010 | Clone check maps only for method origins | P3 | S | — | DONE |
+| 011 | Delete hand-built hello IR | P3 | S | — | DONE |
+| 012 | Default fields on Hit, Texture, and Mesh | P2 | S | — | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
@@ -43,3 +44,26 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
 - Merging the C and LLVM printers, CFG-ifying check, splitting `lower.rs` because it is long, adding crates.io deps.
 - Left-hand numeric literals (`2 * far` as `f32`). `roadmap.md` says the games compile and to hold language changes until something forces them. `math.j3` casts stay.
 - LSP rename. Roadmap lists it under work nothing in the examples is blocked on.
+
+## Execute log
+
+- 001 BLOCKED 2026-09-22. Worktree `/home/jacoby/.cursor/worktrees/plan001-438e79c6/j3-663927497ebe`, branch `plan001-dual-backend-acceptance`, commit `23eb345`. The new test is in scope and correct. `cargo test both_backends_run_01_through_08` exits 101. LLVM stdout for `02_data.j3` matches the plan. C compile fails: `incompatible types when initializing type 'float' using type 'float *'` in `math.j3` Mat4 (`identity` / `perspective` / `ortho`). `08_game_loop.j3` C also fails (`HUD_QUAD` non-constant initializer). Do not weaken the assert. 002–005 stay queued until this backend gap is fixed; they do not repair Mat4 init.
+
+- 006 APPROVE `12c2072` branch `plan-006-retarget-language-contract` worktree `/home/jacoby/.cursor/worktrees/retarget-lang-02421a9f/j3-663927497ebe`. Two remaining `speculation.md` strings are the replacement wording the plan required.
+- 009 APPROVE `eaf54b6` branch `plan009-darwin-link-flag` worktree `/home/jacoby/.cursor/worktrees/darwin-link-fb9787b2/j3-663927497ebe`.
+- 010 APPROVE `7026ffe` branch `plan010-lower-fn-clone-maps` worktree `/home/jacoby/.cursor/worktrees/lower-fn-clone-6be98987/j3-663927497ebe`.
+- 012 APPROVE `05e54a6` branch `plan-012-struct-field-defaults` worktree `/home/jacoby/.cursor/worktrees/struct-defaults-53a2f642/j3-663927497ebe`. Temp test uses `use j3.io.printLn` (the plan snippet called `j3.io.printLn` as a path).
+
+- 008 APPROVE `960aebe` branch `plan008-lsp-analyze-cache` worktree `/home/jacoby/.cursor/worktrees/lsp-cache-1e113ea6/j3-663927497ebe`. Revision routed `documentSymbol` through the cache.
+- 007 APPROVE `ffcc99b` branch `plan-007-sync-roadmap-agents` worktree `/home/jacoby/.cursor/worktrees/plan007-11fee262/j3-663927497ebe`. Includes 006. The `@j3ui` design sample was removed from `roadmap.md` as the plan allowed.
+- 011 APPROVE `1b4c399` branch `plan-011-delete-hello-ir` worktree `/home/jacoby/.cursor/worktrees/delete-hello-ir-658a9090/j3-663927497ebe`. Includes 006. `stdlib/mod.rs` is `stdlib_dir` only.
+- 002, 003, 004, 005 not started: they depend on 001, which is BLOCKED.
+
+- 013 APPROVE `67999e4` branch `plan013-c-array-field-and-static-float` worktree `/home/jacoby/.cursor/worktrees/plan013-5d444e13/j3-663927497ebe`. Struct array fields are assigned with memcpy. Static f32/f64 inits are decimal constants. Runtime union form unchanged.
+
+- 001 APPROVE `471e4ec` branch `plan001-rerun-both-backends` worktree `/home/jacoby/.cursor/worktrees/plan001-rerun-a89099ad/j3-663927497ebe`. Merges 013 and the dual-backend test. `both_backends_run_01_through_08` and `cargo test` (132) passed.
+
+- 002 APPROVE `4260bfd` branch `plan002-llvm-signed-div-branch`. Includes 001+013. INT_MIN in the test is written `-9223372036854775807 - 1` because the decimal literal does not parse. LLVM text still asserts a phi and no select of the min constant.
+- 003 APPROVE `8a713d9` branch `plan003-slice-invert-abort`. Includes 002. `@syscall(60, 1)` remains only in `samples.ir`.
+- 004 APPROVE `960194c` branch `plan004-fast-keeps-div0`. Includes 003. New statement dumps as `abort div0;` and is not stripped.
+- 005 APPROVE `26476d5` branch `plan005-c-declare-exit` worktree `/home/jacoby/.cursor/worktrees/plan005-a7c8d1e7/j3-663927497ebe`. Includes 013 and 001–004. This is the compiler-fix stack.
