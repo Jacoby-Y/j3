@@ -2196,15 +2196,11 @@ impl<'a> Lower<'a> {
             Rvalue::binary(span, bool_ty, BinOp::Lt, end.clone(), start.clone()),
         );
         let saved = self.b.begin_block();
-        self.b.expr(
+        self.b.push(crate::ir::stmt::Stmt {
+            ty: self.cx.common.void,
             span,
-            Rvalue::syscall(
-                span,
-                self.cx.common.int,
-                Operand::int(span, self.cx.common.int, 60),
-                vec![Operand::int(span, self.cx.common.int, 1)],
-            ),
-        );
+            kind: crate::ir::stmt::StmtKind::Abort,
+        });
         let then_block = self.b.end_block(saved);
         self.b.push(crate::ir::stmt::Stmt {
             ty: self.cx.common.void,
