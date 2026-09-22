@@ -1,0 +1,344 @@
+/// Bevy-shaped runner. Stages: startup (once) / always / first+update+last @ 60 Hz / draw.
+
+module j3.app;
+
+use j3.game;
+use j3.memory.{ Arena, rewindScratch, scratch };
+
+/// Process heap. Created the first time `heap` runs.
+#[singleton]
+let HEAP: Arena = Arena { ptr: 0, used: 0, cap: 0, head: 0 };
+
+/// Default process-heap size, in bytes.
+const DEFAULT_CAP: int = 2 * 1024 * 1024;
+/// Scratch arena size, in bytes.
+const SCRATCH_CAP: int = 256 * 1024;
+/// Fixed step length in seconds (60 Hz).
+const TICK: f32 = 0.016666668;
+/// Frame delta is clamped to this many seconds.
+const MAX_FRAME: f32 = 0.25;
+/// Most fixed steps one frame may run.
+const MAX_STEPS: int = 8;
+
+/// Lazily creates the process heap and scratch arena, then returns a pointer to HEAP.
+fn heap(cap: int): &Arena {
+    if HEAP.ptr == 0 {
+        HEAP = Arena.create(cap);
+        scratch(SCRATCH_CAP);
+    }
+    return &HEAP;
+}
+
+/// Fixed-timestep app runner over a user world `W`, with staged system lists.
+pub struct App<W> {
+    /// Process arena used for world boot and growing system tables.
+    mem: &Arena;
+    /// User world value passed by reference to every registered system.
+    world: W;
+    /// Startup systems run once before the main loop.
+    startups: []fn(&W);
+    /// Number of entries in `startups`.
+    n_start: int;
+    /// Fixed-tick systems that run before `updates` each step.
+    firsts: []fn(&W, f32);
+    /// Number of entries in `firsts`.
+    n_first: int;
+    /// Fixed-tick update systems (main simulation stage).
+    updates: []fn(&W, f32);
+    /// Number of entries in `updates`.
+    n_update: int;
+    /// Fixed-tick systems that run after `updates` each step.
+    lasts: []fn(&W, f32);
+    /// Number of entries in `lasts`.
+    n_last: int;
+    /// Variable-dt systems run every frame before fixed steps.
+    alwayses: []fn(&W, f32);
+    /// Number of entries in `alwayses`.
+    n_always: int;
+    /// Draw systems run once per frame after fixed steps.
+    draws: []fn(&W);
+    /// Number of entries in `draws`.
+    n_draw: int;
+    /// Window title passed to `game.init` / `game.initGl`.
+    title: string;
+    /// Initial window width in pixels.
+    width: int;
+    /// Initial window height in pixels.
+    height: int;
+    /// Minimum window width for `game.setMinSize`.
+    min_w: int;
+    /// Minimum window height for `game.setMinSize`.
+    min_h: int;
+    /// Whether the window may be resized.
+    resizable: bool;
+    /// When true, `run` calls `game.initGl` instead of `game.init`.
+    gl: bool;
+
+    /// Boots `W` on the default heap and returns an empty system schedule.
+    fn create(title: string, width: int, height: int, boot: fn(&Arena): W): App<W> {
+        let mem = heap(DEFAULT_CAP);
+        let world = boot(mem);
+        return App<W> {
+            mem: mem,
+            world: world,
+            startups: mem.alloc::<fn(&W)>(4),
+            n_start: 0,
+            firsts: mem.alloc::<fn(&W, f32)>(4),
+            n_first: 0,
+            updates: mem.alloc::<fn(&W, f32)>(8),
+            n_update: 0,
+            lasts: mem.alloc::<fn(&W, f32)>(4),
+            n_last: 0,
+            alwayses: mem.alloc::<fn(&W, f32)>(8),
+            n_always: 0,
+            draws: mem.alloc::<fn(&W)>(8),
+            n_draw: 0,
+            title: title,
+            width: width,
+            height: height,
+            min_w: 320,
+            min_h: 180,
+            resizable: true,
+            gl: false,
+        };
+    }
+
+    /// Like `create`, but uses `cap` bytes for the process heap.
+    fn createSized(
+        title: string,
+        width: int,
+        height: int,
+        cap: int,
+        boot: fn(&Arena): W,
+    ): App<W> {
+        let mem = heap(cap);
+        let world = boot(mem);
+        return App<W> {
+            mem: mem,
+            world: world,
+            startups: mem.alloc::<fn(&W)>(4),
+            n_start: 0,
+            firsts: mem.alloc::<fn(&W, f32)>(4),
+            n_first: 0,
+            updates: mem.alloc::<fn(&W, f32)>(8),
+            n_update: 0,
+            lasts: mem.alloc::<fn(&W, f32)>(4),
+            n_last: 0,
+            alwayses: mem.alloc::<fn(&W, f32)>(8),
+            n_always: 0,
+            draws: mem.alloc::<fn(&W)>(8),
+            n_draw: 0,
+            title: title,
+            width: width,
+            height: height,
+            min_w: 320,
+            min_h: 180,
+            resizable: true,
+            gl: false,
+        };
+    }
+
+    /// Enables OpenGL window init on the next `run`.
+    fn useGl(this: &App<W>): &App<W> {
+        this.gl = true;
+        return this;
+    }
+
+    /// Appends a one-shot startup system.
+    fn startup(this: &App<W>, sys: fn(&W)): &App<W> {
+        if this.n_start >= this.startups.len {
+            let cap = this.startups.len;
+            let next = 4;
+            if cap != 0 {
+                next = cap * 2;
+            }
+            let fresh = this.mem.alloc::<fn(&W)>(next);
+            let i = 0;
+            while i < this.n_start {
+                fresh[i] = this.startups[i];
+                i += 1;
+            }
+            this.startups = fresh;
+        }
+        this.startups[this.n_start] = sys;
+        this.n_start = this.n_start + 1;
+        return this;
+    }
+
+    /// Appends a fixed-tick system that runs before updates.
+    fn first(this: &App<W>, sys: fn(&W, f32)): &App<W> {
+        if this.n_first >= this.firsts.len {
+            let cap = this.firsts.len;
+            let next = 4;
+            if cap != 0 {
+                next = cap * 2;
+            }
+            let fresh = this.mem.alloc::<fn(&W, f32)>(next);
+            let i = 0;
+            while i < this.n_first {
+                fresh[i] = this.firsts[i];
+                i += 1;
+            }
+            this.firsts = fresh;
+        }
+        this.firsts[this.n_first] = sys;
+        this.n_first = this.n_first + 1;
+        return this;
+    }
+
+    /// Appends a fixed-tick update system.
+    fn add(this: &App<W>, sys: fn(&W, f32)): &App<W> {
+        if this.n_update >= this.updates.len {
+            let cap = this.updates.len;
+            let next = 8;
+            if cap != 0 {
+                next = cap * 2;
+            }
+            let fresh = this.mem.alloc::<fn(&W, f32)>(next);
+            let i = 0;
+            while i < this.n_update {
+                fresh[i] = this.updates[i];
+                i += 1;
+            }
+            this.updates = fresh;
+        }
+        this.updates[this.n_update] = sys;
+        this.n_update = this.n_update + 1;
+        return this;
+    }
+
+    /// Appends a fixed-tick system that runs after updates.
+    fn last(this: &App<W>, sys: fn(&W, f32)): &App<W> {
+        if this.n_last >= this.lasts.len {
+            let cap = this.lasts.len;
+            let next = 4;
+            if cap != 0 {
+                next = cap * 2;
+            }
+            let fresh = this.mem.alloc::<fn(&W, f32)>(next);
+            let i = 0;
+            while i < this.n_last {
+                fresh[i] = this.lasts[i];
+                i += 1;
+            }
+            this.lasts = fresh;
+        }
+        this.lasts[this.n_last] = sys;
+        this.n_last = this.n_last + 1;
+        return this;
+    }
+
+    /// Appends a variable-dt system run every frame before fixed steps.
+    fn always(this: &App<W>, sys: fn(&W, f32)): &App<W> {
+        if this.n_always >= this.alwayses.len {
+            let cap = this.alwayses.len;
+            let next = 8;
+            if cap != 0 {
+                next = cap * 2;
+            }
+            let fresh = this.mem.alloc::<fn(&W, f32)>(next);
+            let i = 0;
+            while i < this.n_always {
+                fresh[i] = this.alwayses[i];
+                i += 1;
+            }
+            this.alwayses = fresh;
+        }
+        this.alwayses[this.n_always] = sys;
+        this.n_always = this.n_always + 1;
+        return this;
+    }
+
+    /// Appends a per-frame draw system.
+    fn draw(this: &App<W>, sys: fn(&W)): &App<W> {
+        if this.n_draw >= this.draws.len {
+            let cap = this.draws.len;
+            let next = 8;
+            if cap != 0 {
+                next = cap * 2;
+            }
+            let fresh = this.mem.alloc::<fn(&W)>(next);
+            let i = 0;
+            while i < this.n_draw {
+                fresh[i] = this.draws[i];
+                i += 1;
+            }
+            this.draws = fresh;
+        }
+        this.draws[this.n_draw] = sys;
+        this.n_draw = this.n_draw + 1;
+        return this;
+    }
+
+    /// Opens the window, runs startups, then loops always/fixed/draw until quit.
+    fn run(this: &App<W>) {
+        if this.gl {
+            game.initGl(this.title, this.width, this.height);
+        } else {
+            game.init(this.title, this.width, this.height);
+        }
+        game.setResizable(this.resizable);
+        game.setMinSize(this.min_w, this.min_h);
+        let i = 0;
+        while i < this.n_start {
+            let cb_start = this.startups[i];
+            cb_start(&this.world);
+            i += 1;
+        }
+        let acc: f32 = 0;
+        while true {
+            rewindScratch();
+            let dt = game.poll();
+            if dt > MAX_FRAME {
+                dt = MAX_FRAME;
+            }
+            if game.quitRequested() {
+                break;
+            }
+            i = 0;
+            while i < this.n_always {
+                let cb_always = this.alwayses[i];
+                cb_always(&this.world, dt);
+                i += 1;
+            }
+            if game.quitRequested() {
+                break;
+            }
+            acc = acc + dt;
+            let steps = 0;
+            while acc >= TICK && steps < MAX_STEPS {
+                i = 0;
+                while i < this.n_first {
+                    let cb_first = this.firsts[i];
+                    cb_first(&this.world, TICK);
+                    i += 1;
+                }
+                i = 0;
+                while i < this.n_update {
+                    let cb_upd = this.updates[i];
+                    cb_upd(&this.world, TICK);
+                    i += 1;
+                }
+                i = 0;
+                while i < this.n_last {
+                    let cb_last = this.lasts[i];
+                    cb_last(&this.world, TICK);
+                    i += 1;
+                }
+                acc = acc - TICK;
+                steps += 1;
+            }
+            i = 0;
+            while i < this.n_draw {
+                let cb_draw = this.draws[i];
+                cb_draw(&this.world);
+                i += 1;
+            }
+            game.present();
+        }
+        game.destroy();
+        rewindScratch();
+        scratch(SCRATCH_CAP).destroy();
+        this.mem.destroy();
+    }
+}
