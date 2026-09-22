@@ -334,6 +334,13 @@ impl<'a> CWriter<'a> {
                 if def.fields.len() != fields.len() {
                     return Err("aggregate field count != struct".to_string());
                 }
+                if def
+                    .fields
+                    .iter()
+                    .any(|f| c_ty::array_parts(self.cx, f.ty).is_some())
+                {
+                    return Err("array field in struct aggregate".into());
+                }
                 let mut s = String::new();
                 s.push('(');
                 s.push_str(&c_type(self.cx, ty)?);
@@ -421,14 +428,79 @@ impl<'a> CWriter<'a> {
         let dir = self.line_dir(stmt.span, indent);
         let body = match &stmt.kind {
             StmtKind::Assign { place, rvalue } => {
-                let p = self.place(place)?;
-                let v = self.rvalue(rvalue)?;
-                let line = if c_ty::array_parts(self.cx, place.ty).is_some() {
-                    format!("{pad}memcpy({p}, {v}, sizeof({p}));\n")
+                if let RvalueKind::Aggregate { fields } = &rvalue.kind {
+                    if let TyKind::Struct(id) = self.cx.ty_kind(rvalue.ty) {
+                        let def = self.cx.struct_def(*id);
+                        if def.fields.len() != fields.len() {
+                            return Err("aggregate field count != struct".to_string());
+                        }
+                        if def
+                            .fields
+                            .iter()
+                            .any(|f| c_ty::array_parts(self.cx, f.ty).is_some())
+                        {
+                            let p = self.place(place)?;
+                            let ty_name = c_type(self.cx, rvalue.ty)?;
+                            let mut parts = Vec::new();
+                            for (i, field) in def.fields.iter().enumerate() {
+                                if c_ty::array_parts(self.cx, field.ty).is_some() {
+                                    continue;
+                                }
+                                let fname = self.cx.name_str(field.name);
+                                let v = self.operand(&fields[i])?;
+                                parts.push(format!(".{fname} = {v}"));
+                            }
+                            let mut s = String::new();
+                            if parts.is_empty() {
+                                s.push_str(&format!("{pad}{p} = ({ty_name}){{0}};\n"));
+                            } else {
+                                s.push_str(&format!(
+                                    "{pad}{p} = ({ty_name}){{ {} }};\n",
+                                    parts.join(", ")
+                                ));
+                            }
+                            for (i, field) in def.fields.iter().enumerate() {
+                                if c_ty::array_parts(self.cx, field.ty).is_none() {
+                                    continue;
+                                }
+                                let fname = self.cx.name_str(field.name);
+                                let src = self.operand(&fields[i])?;
+                                let dest = format!("({p}).{fname}");
+                                s.push_str(&format!(
+                                    "{pad}memcpy({dest}, {src}, sizeof({dest}));\n"
+                                ));
+                            }
+                            Ok::<String, String>(s)
+                        } else {
+                            let p = self.place(place)?;
+                            let v = self.rvalue(rvalue)?;
+                            let line = if c_ty::array_parts(self.cx, place.ty).is_some() {
+                                format!("{pad}memcpy({p}, {v}, sizeof({p}));\n")
+                            } else {
+                                format!("{pad}{p} = {v};\n")
+                            };
+                            Ok(line)
+                        }
+                    } else {
+                        let p = self.place(place)?;
+                        let v = self.rvalue(rvalue)?;
+                        let line = if c_ty::array_parts(self.cx, place.ty).is_some() {
+                            format!("{pad}memcpy({p}, {v}, sizeof({p}));\n")
+                        } else {
+                            format!("{pad}{p} = {v};\n")
+                        };
+                        Ok(line)
+                    }
                 } else {
-                    format!("{pad}{p} = {v};\n")
-                };
-                Ok::<String, String>(line)
+                    let p = self.place(place)?;
+                    let v = self.rvalue(rvalue)?;
+                    let line = if c_ty::array_parts(self.cx, place.ty).is_some() {
+                        format!("{pad}memcpy({p}, {v}, sizeof({p}));\n")
+                    } else {
+                        format!("{pad}{p} = {v};\n")
+                    };
+                    Ok(line)
+                }
             }
             StmtKind::AssignOp { place, op, rhs } => {
                 let p = self.place(place)?;

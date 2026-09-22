@@ -465,6 +465,53 @@ mod tests {
     }
 
     #[test]
+    fn c_backend_runs_02_data() {
+        let prog = compile_path(&speculative("02_data.j3")).expect("compile 02");
+        let mut opts = emit::EmitOpts::default();
+        opts.backend = emit::Backend::C;
+        let run = emit::run_program(&prog.cx, &prog.modules, &opts).expect("c run 02");
+        assert_eq!(
+            run.status,
+            0,
+            "stderr {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            "len=4.47214 player.pos=Vec2 { x: 12, y: 9 }\n"
+        );
+    }
+
+    #[test]
+    fn c_backend_runs_08_headless() {
+        let prog = compile_path_headless(&speculative("08_game_loop.j3")).expect("compile 08");
+        let mut opts = emit::EmitOpts::default();
+        opts.backend = emit::Backend::C;
+        let run = emit::run_program(&prog.cx, &prog.modules, &opts).expect("c run 08");
+        assert_eq!(
+            run.status,
+            0,
+            "stderr {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "bye\n");
+    }
+
+    #[test]
+    fn hud_quad_static_init_has_no_union() {
+        let prog = compile_path(&speculative("08_game_loop.j3")).expect("compile 08 sdl");
+        let c = emit::emit_program(&prog.cx, &prog.modules).expect("emit");
+        let line = c
+            .lines()
+            .find(|l| l.contains("HUD_QUAD"))
+            .expect("HUD_QUAD line missing");
+        assert!(
+            !line.contains("union"),
+            "HUD_QUAD static init used union:\n{line}"
+        );
+    }
+
+    #[test]
     fn analyze_hello_and_overlay() {
         let path = default_hello_path();
         let prog = analyze_path(&path, &[]).expect("analyze");
