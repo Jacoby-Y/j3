@@ -44,6 +44,8 @@ Larger games live in the compiler repo, not in the new project:
     examples/island         GL mesh and a shadow map
     examples/minecraft      first person, break and place
     examples/leaves         3D yard, click, upgrades
+    examples/defense        tower defense, waves and HUD
+    examples/gallery        UI tabs, layout, widgets
 
 `j3c lsp` is the language server. The editor extension spawns it.
 Set j3.j3cPath when `j3c` is not on PATH.

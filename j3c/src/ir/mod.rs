@@ -3,7 +3,7 @@
 //! After typecheck, every node has a concrete [`ty::Ty`]. There is no
 //! `Option<Ty>`. If a pass cannot name a type, that is a compiler bug.
 //!
-//! **Places** are first-class (speculation.md §2). Field and index of `&T`
+//! **Places** are first-class. Field and index of `&T`
 //! name a slot; they do not memcpy. `+=` binds a place once. Local `use`
 //! aliases are places. Auto-deref is extra [`place::Proj::Deref`] entries,
 //! not a load into a temporary.

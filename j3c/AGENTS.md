@@ -1,6 +1,6 @@
 # j3c — agent map
 
-J3 compiler crate. **Language law is `../speculation.md`.** If this crate and that doc disagree, the doc wins — then fix the crate (or the examples in `../speculative/`).
+J3 compiler crate. The contract is this file, `../roadmap.md`'s non-goals, and `../speculative/` (01–08 run, 09 typechecks, `10_j3ui.j3` typechecks). If this file and those disagree with an example, the example's test in `compile.rs` is what `cargo test` locks.
 
 Host: Rust, no crates.io deps. **Emit is LLVM by default** (text `.ll` + host `clang`). C is optional (`--emit c` or `[emit] backend = c`). No libLLVM, no crates.io. `--fast` strips OOB `Abort`. The IR with places is the backend contract; C and LLVM are printers.
 
@@ -44,7 +44,7 @@ parse  →  check  →  ir  →  emit LLVM (default) or C
 LIVE      LIVE      LIVE    LIVE
 ```
 
-Hello + `01`–`08` compile and run. `09` typechecks shipped `j3.game`. `stdlib/j3/game.j3` wraps SDL2 + image/mixer/ttf (color, src/dest draw, bakeText, gamepad, `quitRequested`, window min/max/resize, one-shot `play` / `playLoops`, looping `Music`, channel and music volume) plus `initGl` (GL 3.3 core) / `SDL_GL_SwapWindow` when `App.useGl`; `08` runs against `game_headless.j3` (same pub names). `j3.math` is f32 trig/clamp/lerp + `Vec2` / `Vec3` / `Quat` / `Mat4` (identity/mul/translate/rotate/scale/perspective/lookAt/ortho/transformPoint). `j3.mesh` is `# j3mesh 1` (10 floats per vertex) or `# j3mesh 2` (those plus `u v`). `gfx.upload` takes either length; a length divisible by both stays 10 floats, and `uploadUv` forces the 12-float layout. `j3.voxel` is a solid grid (`0` is air): get/set, exposed-face count, DDA `ray`, AABB `overlaps`, corner occlusion (`corners`, `shade`). `gfx.emitFaceAo` bakes that shade into the vertex color and keeps the darker diagonal. `j3.gfx` is a GL 3.3 forward renderer (`Mesh`, `Orbit`, `Look`, directional shadow map, `use lib "GL"`). `j3.game` can capture the mouse (`captureMouse`, `mouseDelta`). `j3.rand` is a seedable LCG. `j3.ecs` is generational entities + `Column<T>` + deferred `Commands` + `Events<T>`. `j3.app` is `App<W>` (arena + window + loop; user `main` only `create`/`startup`/`first`/`add`/`last`/`always`/`draw`/`useGl`/`run`). `j3.collide` is AABB / tile slide. Framework modules: `res` `scene` `assets` `tile` `ui` `save` `fx` `debug` `gfx` `mesh`. `--fast` strips `Abort` (OOB). Import cycles, occur-check, `pub` exports, and non-zero singleton init are check-time. `j3.sys` is `sys.j3` on Linux, `sys_windows.j3` or `sys_macos.j3` when `[emit] target` says so.
+Hello + `01`–`08` compile and run. `09` typechecks shipped `j3.game`. `speculative/10_j3ui.j3` typechecks (`@j3ui`); defense and gallery projects typecheck. `stdlib/j3/game.j3` wraps SDL2 + image/mixer/ttf (color, src/dest draw, bakeText, gamepad, `quitRequested`, window min/max/resize, one-shot `play` / `playLoops`, looping `Music`, channel and music volume) plus `initGl` (GL 3.3 core) / `SDL_GL_SwapWindow` when `App.useGl`; `08` runs against `game_headless.j3` (same pub names). `j3.math` is f32 trig/clamp/lerp + `Vec2` / `Vec3` / `Quat` / `Mat4` (identity/mul/translate/rotate/scale/perspective/lookAt/ortho/transformPoint). `j3.mesh` is `# j3mesh 1` (10 floats per vertex) or `# j3mesh 2` (those plus `u v`). `gfx.upload` takes either length; a length divisible by both stays 10 floats, and `uploadUv` forces the 12-float layout. `j3.voxel` is a solid grid (`0` is air): get/set, exposed-face count, DDA `ray`, AABB `overlaps`, corner occlusion (`corners`, `shade`). `gfx.emitFaceAo` bakes that shade into the vertex color and keeps the darker diagonal. `j3.gfx` is a GL 3.3 forward renderer (`Mesh`, `Orbit`, `Look`, directional shadow map, `use lib "GL"`). `j3.game` can capture the mouse (`captureMouse`, `mouseDelta`). `j3.rand` is a seedable LCG. `j3.ecs` is generational entities + `Column<T>` + deferred `Commands` + `Events<T>`. `j3.app` is `App<W>` (arena + window + loop; user `main` only `create`/`startup`/`first`/`add`/`last`/`always`/`draw`/`useGl`/`run`). `j3.collide` is AABB / tile slide. Framework modules: `res` `scene` `assets` `tile` `ui` `save` `fx` `debug` `gfx` `mesh`. `--fast` strips `Abort` (OOB). Import cycles, occur-check, `pub` exports, and non-zero singleton init are check-time. `j3.sys` is `sys.j3` on Linux, `sys_windows.j3` or `sys_macos.j3` when `[emit] target` says so.
 
 Do not start a second parser. The LSP lives in `src/lsp/` and calls `compile::analyze_checked`. Cranelift is not a required middle step. New printers plug into `emit::Backend` and consume the same typed IR.
 
@@ -150,7 +150,7 @@ C / LLVM names: structs/funcs are `j3_<module>_<name>` (funcs also `_<id>`). Sli
 
 - Small files. No macros. Explicit matches. Named fields.
 - Verbose is fine if a human can tweak it.
-- Comments point at `speculation.md` sections, not at novels.
+- Comments name the rule. Do not cite speculation.md.
 - Do not introduce `Option<Ty>` “until check fills it in.” Check produces IR; IR is already typed.
 
 ## Do not build
@@ -161,4 +161,4 @@ Unknown `#[foo]` / `@foo()` will be compile errors in the parser. `@ident(...)` 
 
 ## Language examples
 
-Acceptance programs: `../speculative/01`–`08` compile and run (`08` via headless `j3.game`). `09` typechecks shipped SDL `j3.game`. `06` uses `j3.option` / `j3.result`.
+Acceptance programs: `../speculative/01`–`08` compile and run (`08` via headless `j3.game`). `09` typechecks shipped SDL `j3.game`. `10_j3ui.j3` typechecks (`@j3ui`); defense and gallery projects typecheck. `06` uses `j3.option` / `j3.result`.

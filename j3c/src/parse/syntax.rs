@@ -24,7 +24,7 @@ pub const INTRINSICS: &[&str] = &[
     INTRINSIC_J3UI,
 ];
 
-/// Builtin type spellings (speculation.md §4.1). Checker must accept every name.
+/// Builtin type spellings. Checker must accept every name.
 pub const BUILTIN_TYPES: &[&str] = &[
     "void", "bool", "int", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64",
     "float", "ptr", "cstr", "string",

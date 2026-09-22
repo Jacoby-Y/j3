@@ -1,6 +1,6 @@
 //! J3 compiler library.
 //!
-//! Pipeline (speculation.md §16): parse → typecheck → typed IR → emit (LLVM default, C optional).
+//! Pipeline: parse → typecheck → typed IR → emit (LLVM default, C optional).
 
 pub mod check;
 pub mod cli;
