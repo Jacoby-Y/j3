@@ -1,6 +1,6 @@
 # j3c — agent map
 
-J3 compiler crate. **Language law is `../speculation.md`.** If this crate and that doc disagree, the doc wins — then fix the crate (or the examples in `../speculative/`).
+J3 compiler crate. The contract is this file, `../roadmap.md`'s non-goals, and `../speculative/` (01–08 run, 09 typechecks). If this file and those disagree with an example, the example's test in `compile.rs` is what `cargo test` locks.
 
 Host: Rust, no crates.io deps. **Emit is LLVM by default** (text `.ll` + host `clang`). C is optional (`--emit c` or `[emit] backend = c`). No libLLVM, no crates.io. `--fast` strips OOB `Abort`. The IR with places is the backend contract; C and LLVM are printers.
 
@@ -150,7 +150,7 @@ C / LLVM names: structs/funcs are `j3_<module>_<name>` (funcs also `_<id>`). Sli
 
 - Small files. No macros. Explicit matches. Named fields.
 - Verbose is fine if a human can tweak it.
-- Comments point at `speculation.md` sections, not at novels.
+- Comments name the rule. Do not cite speculation.md.
 - Do not introduce `Option<Ty>` “until check fills it in.” Check produces IR; IR is already typed.
 
 ## Do not build

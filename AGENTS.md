@@ -4,7 +4,7 @@ AOT game language. Spec wins over examples; examples win over compiler comments.
 
 | Path | What |
 |------|------|
-| `speculation.md` | Language + compiler contract |
+| `j3c/AGENTS.md` | Language + compiler contract (there is no `speculation.md`) |
 | `roadmap.md` | Path to a language/framework that can ship full games |
 | `speculative/` | `01`–`09` example programs (acceptance tests; `01`–`08` compile, `09` typechecks shipped `j3.game`) |
 | `j3c/` | Compiler crate — **map: `j3c/AGENTS.md`**. Fresh project: `j3c new`, `j3c guide`, `j3c doc`, `j3c check` |

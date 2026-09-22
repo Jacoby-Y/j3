@@ -1,6 +1,6 @@
 # J3 roadmap
 
-Spec (`speculation.md`) wins. No GC, no borrow checker, no traits, no drop, no capturing closures, no comptime interpreter in v1. Do not CFG-ify check. Do not start a second parser. Do not grow `j3c/src/stdlib/mod.rs`. Do not add libLLVM / crates.io.
+Non-goals (no separate spec file in this tree): No GC, no borrow checker, no traits, no drop, no capturing closures, no comptime interpreter in v1. Do not CFG-ify check. Do not start a second parser. Do not grow `j3c/src/stdlib/mod.rs`. Do not add libLLVM / crates.io.
 
 2D (bounce, dungeon) and a GL voxel island ship on Linux. `[emit] target` is one triple or an array (`sys.j3` / `sys_windows.j3` / `sys_macos.j3`). `build` writes one binary per triple; `run` uses the host triple.
 
