@@ -297,11 +297,20 @@ pub fn serve() -> i32 {
             "textDocument/documentSymbol" => {
                 let items = match doc_cursor(&msg, &docs) {
                     Some(cur) => {
+                        let key = docs_key(&docs);
+                        let path = cur.path.clone();
                         let overlays = overlays_from(&docs);
-                        let syms = query::analyze(&cur.path, &overlays)
-                            .ok()
-                            .map(|prog| complete::symbols(&prog, &cur.path_str))
-                            .unwrap_or_default();
+                        let syms = match cache.get(key, || query::analyze(&path, &overlays).ok()) {
+                            Some(prog) => complete::symbols(prog, &cur.path_str),
+                            None if !has_doc_overlay(&docs, &cur.path) => {
+                                // Disk-only analyze must not write into cache.
+                                query::analyze(&cur.path, &[])
+                                    .ok()
+                                    .map(|prog| complete::symbols(&prog, &cur.path_str))
+                                    .unwrap_or_default()
+                            }
+                            None => Vec::new(),
+                        };
                         syms.into_iter()
                             .map(|s| {
                                 let ((sl, sc), (el, ec)) = query::range_of(&cur.src, s.span);
