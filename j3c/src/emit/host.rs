@@ -106,7 +106,7 @@ pub fn compile_llvm(
         .arg(format!("-O{opt}"))
         .arg("-ffunction-sections")
         .arg("-fdata-sections")
-        .arg("-Wl,--gc-sections");
+        .arg(link_gc_flag(target));
     if cc.debug {
         cmd.arg("-g");
     }
@@ -176,7 +176,7 @@ pub fn compile_c(c_source: &str, opts: &CcOpts, target: &str, clang: &str) -> Re
         .arg(format!("-O{opt}"))
         .arg("-ffunction-sections")
         .arg("-fdata-sections")
-        .arg("-Wl,--gc-sections");
+        .arg(link_gc_flag(target));
     if opts.debug {
         cmd.arg("-g");
     }
@@ -212,6 +212,15 @@ pub fn run_exe_in(exe: &Path, cwd: Option<&Path>) -> Result<RunResult, String> {
         stdout: run.stdout,
         stderr: run.stderr,
     })
+}
+
+fn link_gc_flag(target: &str) -> &'static str {
+    let t = target.to_ascii_lowercase();
+    if t.contains("apple") || t.contains("darwin") {
+        "-Wl,-dead_strip"
+    } else {
+        "-Wl,--gc-sections"
+    }
 }
 
 fn foreign_target(target: &str) -> bool {
@@ -341,4 +350,16 @@ fn libs_from_c(source: &str) -> Vec<String> {
         }
     }
     libs
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn link_gc_flag_matches_target() {
+        assert_eq!(super::link_gc_flag(""), "-Wl,--gc-sections");
+        assert_eq!(super::link_gc_flag("x86_64-pc-linux-gnu"), "-Wl,--gc-sections");
+        assert_eq!(super::link_gc_flag("x86_64-pc-windows-gnu"), "-Wl,--gc-sections");
+        assert_eq!(super::link_gc_flag("arm64-apple-darwin"), "-Wl,-dead_strip");
+        assert_eq!(super::link_gc_flag("x86_64-apple-darwin"), "-Wl,-dead_strip");
+    }
 }
