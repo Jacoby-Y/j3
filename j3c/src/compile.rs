@@ -925,6 +925,48 @@ fn main() {
     }
 
     #[test]
+    fn omitted_hit_texture_mesh_use_zeros() {
+        let path = std::env::temp_dir().join(format!(
+            "j3c_omitted_hit_texture_mesh_{}.j3",
+            std::process::id()
+        ));
+        let src = "\
+module t;
+use j3.voxel.Hit;
+use j3.game.Texture;
+use j3.gfx.Mesh;
+use j3.io.printLn;
+fn main() {
+    let h = Hit {};
+    let tex = Texture {};
+    let mesh = Mesh {};
+    if h.ok || h.x != 0 || h.face != 0 {
+        printLn(\"hit\");
+    }
+    if tex.w != 0 || tex.h != 0 {
+        printLn(\"tex\");
+    }
+    if mesh.count != 0 || mesh.vao != 0 {
+        printLn(\"mesh\");
+    }
+}
+";
+        std::fs::write(&path, src).expect("write temp");
+        let result = compile_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let prog = result.expect("compile");
+        let run = exec(&prog);
+        assert_eq!(
+            run.status,
+            0,
+            "stderr {}\nstdout {}",
+            String::from_utf8_lossy(&run.stderr),
+            String::from_utf8_lossy(&run.stdout)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "");
+    }
+
+    #[test]
     fn missing_field_without_default_is_error() {
         let src = "\
 module t;
