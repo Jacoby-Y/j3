@@ -70,7 +70,7 @@ The **library** (`src/lib.rs`) is what the LSP depends on. The **bin** (`src/mai
 | `src/fmt.rs` | Token reprint; comments copied from source gaps |
 | `src/lsp/` | Stdio LSP. `json.rs` is a tiny parser (no serde). Hover, goto, completion, signature, symbols, import edits |
 | `src/check/` | AST → typed IR. |
-| `src/stdlib/mod.rs` | Old IR bootstrap of sys/io/hello. Do not grow; parse is the path. |
+| `src/stdlib/mod.rs` | `stdlib_dir()` only. Source of truth is `stdlib/j3/*.j3`. |
 | `src/diag.rs` | rustc-shaped errors (snippet, notes, help, suggestions) |
 | `src/span.rs` | `FileId`, `Span`. Parser fills these in. |
 | `src/intern.rs` | Interned `Name` strings. |
@@ -125,7 +125,7 @@ If a change makes those strings go away, the IR is wrong.
 
 ## Stdlib
 
-Source of truth: `stdlib/j3/*.j3`. `j3c run` parses `sys` + `io` + the entry file. `j3.sys.start` calls user `main` then `exit(0)`. mmap/Arena IR is later. `src/stdlib/mod.rs` is leftover hand-built IR — do not add to it.
+Source of truth: `stdlib/j3/*.j3`. `j3c run` parses `sys` + `io` + the entry file. `j3.sys.start` calls user `main` then `exit(0)`. mmap/Arena IR is later. `src/stdlib/mod.rs` is `stdlib_dir()` only.
 
 ## How data is owned
 
