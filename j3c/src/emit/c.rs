@@ -29,6 +29,7 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
     out.push_str("#include <stddef.h>\n");
     out.push_str("#include <stdio.h>\n");
     out.push_str("#include <string.h>\n");
+    out.push_str("void _exit(int);\n");
     if syscall {
         out.push_str("#include <unistd.h>\n\n");
         out.push_str("static int64_t j3_syscall(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a3, int64_t a4, int64_t a5) {\n");

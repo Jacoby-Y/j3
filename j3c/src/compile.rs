@@ -1593,6 +1593,18 @@ fn main() {
     }
 
     #[test]
+    fn c_declares_exit_without_syscall() {
+        let prog = compile_path_target(
+            &speculative("01_basics.j3"),
+            "x86_64-pc-windows-gnu",
+        )
+        .expect("windows 01");
+        let c = emit::emit_program(&prog.cx, &prog.modules).expect("c");
+        assert!(!c.contains("j3_syscall"), "{c}");
+        assert!(c.contains("void _exit(int);"), "{c}");
+    }
+
+    #[test]
     fn target_list_picks_a_sys_file_per_triple() {
         let toml = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
