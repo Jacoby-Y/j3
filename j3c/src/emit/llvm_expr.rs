@@ -408,7 +408,7 @@ impl<'a> LlvmFn<'a> {
                 let lab = self.loop_target(true)?;
                 self.term(&format!("br label %{lab}"));
             }
-            StmtKind::Abort => {
+            StmtKind::Abort | StmtKind::Div0 => {
                 self.exit_abort();
             }
             StmtKind::Block(inner) => {

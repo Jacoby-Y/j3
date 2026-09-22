@@ -1253,6 +1253,25 @@ fn main() {
     }
 
     #[test]
+    fn fast_keeps_div0() {
+        let src = r#"
+module t;
+fn main() {
+    let n = 1;
+    let d = 0;
+    let q = n / d;
+    let _ = q;
+}
+"#;
+        let mut prog = check::check_files(vec![parse_file(1, "t.j3", src)]).expect("check");
+        let slow_ir = dump_program(&prog.cx, &prog.modules);
+        assert!(slow_ir.contains("abort div0;"), "{slow_ir}");
+        apply_fast(&mut prog);
+        let fast_ir = dump_program(&prog.cx, &prog.modules);
+        assert!(fast_ir.contains("abort div0;"), "{fast_ir}");
+    }
+
+    #[test]
     fn read_file_j3_runs() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/read_file.j3");
         let prog = compile_path(&path).expect("compile read_file");

@@ -1641,7 +1641,7 @@ impl<'a> Lower<'a> {
         self.b.push(crate::ir::stmt::Stmt {
             ty: self.cx.common.void,
             span,
-            kind: crate::ir::stmt::StmtKind::Abort,
+            kind: crate::ir::stmt::StmtKind::Div0,
         });
         let then_block = self.b.end_block(saved);
         self.b.push(crate::ir::stmt::Stmt {

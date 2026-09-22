@@ -191,6 +191,7 @@ fn dump_stmt(cx: &IrCx, body: &Body, stmt: &Stmt, indent: usize, out: &mut Strin
         StmtKind::Break => out.push_str("break;\n"),
         StmtKind::Continue => out.push_str("continue;\n"),
         StmtKind::Abort => out.push_str("abort;\n"),
+        StmtKind::Div0 => out.push_str("abort div0;\n"),
         StmtKind::Block(inner) => {
             out.push_str("{\n");
             for s in &inner.stmts {

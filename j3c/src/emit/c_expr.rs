@@ -555,7 +555,7 @@ impl<'a> CWriter<'a> {
                 s.push_str(&format!("{pad}continue;\n"));
                 Ok(s)
             }
-            StmtKind::Abort => Ok(format!("{pad}_exit(1);\n")),
+            StmtKind::Abort | StmtKind::Div0 => Ok(format!("{pad}_exit(1);\n")),
             StmtKind::Block(inner) => {
                 let mut s = format!("{pad}{{\n");
                 s.push_str(&self.emit_block(inner, false, indent + 1)?);

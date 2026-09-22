@@ -158,7 +158,7 @@ fn validate_stmt(
                 }
             }
         },
-        StmtKind::Abort => {}
+        StmtKind::Abort | StmtKind::Div0 => {}
         StmtKind::Break | StmtKind::Continue => {
             if !in_loop {
                 return Err(ValidateError::new(

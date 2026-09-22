@@ -58,6 +58,8 @@ pub enum StmtKind {
     },
     /// Bounds-check / panic abort. `--fast` strips these. Not a Linux syscall.
     Abort,
+    /// Integer division by zero. `--fast` does not strip this.
+    Div0,
     /// Nested `{}`. Defers in `body` run at the end of this block.
     Block(Block),
     /// Fill `buf` (`[N]u8`) from interpolate parts; write byte count to `used`.
