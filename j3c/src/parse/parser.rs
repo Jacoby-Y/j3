@@ -527,7 +527,7 @@ impl<'a> Parser<'a> {
     ) -> Result<Stmt, ParseError> {
         let call = self.method_call(recv, name.clone(), args, name.span);
         match name.name.as_str() {
-            "panel" | "row" | "scroll" => {
+            "panel" | "row" | "scroll" | "card" => {
                 let end = self.method_call(recv, ident_at("end", name.span), Vec::new(), name.span);
                 let mut stmts = vec![Stmt::Expr(call)];
                 stmts.extend(body.stmts);
@@ -1860,10 +1860,20 @@ fn j3ui_widget(name: &str) -> bool {
             | "labelBold"
             | "gap"
             | "button"
+            | "buttonOff"
             | "bar"
             | "image"
             | "slider"
+            | "range"
+            | "toggle"
+            | "check"
+            | "stepper"
+            | "chip"
+            | "rule"
+            | "wash"
+            | "drop"
             | "panel"
+            | "card"
             | "row"
             | "scroll"
             | "pushId"

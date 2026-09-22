@@ -79,7 +79,7 @@ fn draw(w: &World) {
 
 A bare widget name gets the receiver (`label` becomes `ui.label`). Closers:
 
-- `panel`, `row`, `scroll` — the call, the body, then `end`
+- `panel`, `row`, `scroll`, `card` — the call, the body, then `end`
 - `pushId` — the call, the body, then `popId`
 - `button` — `if ui.button(...) { body }`
 
