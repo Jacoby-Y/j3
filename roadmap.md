@@ -8,7 +8,7 @@ Non-goals (no separate spec file in this tree): No GC, no borrow checker, no tra
 
 Language v1, typed IR, C and LLVM printers, `--fast`. Short-circuit, if-expr arms, `return`/`defer`, `+=`, interpolate, wrapping ints, string lvalues, `Arena` by value. Inclusive `..=`, default fields, `for` index ends with the loop. `@j3ui` in the parser (defense, gallery). Errors, C `#line`, LLVM `DILocation` and named locals (`DILocalVariable`, `dbg.declare`). `j3c lsp` hover, goto, scoped completion, signature help, outline, import quick-fix, format; diagnostics follow the error into another open buffer. `j3.toml` keys complete in the editor. `j3c fmt`, package-rooted assets.
 
-`App` stages, ECS, collide, assets, `# j3tile 1`, UI, save, particles. `j3.gfx` GL 3.3 mesh + one shadow map, `Orbit` and first-person `Look`. `j3.voxel` is a solid grid with a ray and an AABB test. `Vec3` / `Quat` / `Mat4` (translate, rotate, scale), `# j3mesh 1`. Island draws a second mesh (a bobbing lantern). `examples/minecraft` walks that grid: break, place, jump, optional corner shadows (F3). `Music` loops via `playMusic` / `stopMusic`; `play` stays one-shot and `playLoops` takes the repeat count. Channel and music volume are 0..128. Dungeon loops `theme.wav`. Title continues the saved floor; a new run starts at 0. Death still retries the current floor in memory.
+`App` stages (`pause`, `timeScale`, `frameAlpha`), ECS (`join`, `Signal`), collide, `j3.space`, `j3.physics`, `j3.path`, `j3.anim`, `j3.input`, assets, `# j3tile 1`, UI (`field`, keyboard focus, `drag`, world labels), save (int, float, string, hex blob), particles, camera `Rig`. `j3.physics` is intentionally lightweight: 2D AABB separation and a 3D voxel-stopping body, not a contact solver. `j3.gfx` GL 3.3 mesh + one shadow map, up to 4 point lights, `drawAlpha`, `drawInstanced`, `drawLine`, `Orbit` and first-person `Look`. `j3.voxel` is a solid grid with a ray and an AABB test. `Vec3` / `Quat` / `Mat4` (translate, rotate, scale), `# j3mesh 1`. Island draws a second mesh (a bobbing lantern). `examples/minecraft` walks that grid: break, place, jump, optional corner shadows (F3). SDL_mixer supports sfx and voice groups, group volume, channel and music fades, and positional channels. `Music` loops via `playMusic` / `stopMusic`; `play` stays one-shot and `playLoops` takes the repeat count. Channel and music volume are 0..128. Dungeon loops `theme.wav`. Title continues the saved floor; a new run starts at 0. Death still retries the current floor in memory.
 
 ## Left
 
@@ -17,7 +17,7 @@ Language v1, typed IR, C and LLVM printers, `--fast`. Short-circuit, if-expr arm
 - **Tooling** — rename.
 - **Packages** — `j3.toml` deps. Language-level tests stay `cargo test` plus a playable example until then.
 - **Ship a Windows binary** — mingw `clang` and the SDL import libs. A missing lib stays a link error. Distribution is one binary plus an assets folder.
-- **3D game** — audio buses still later. Physics is 2D, then 3D, a J3 module over `use lib`. Editor and hot reload only after scenes are data. Bar: a small 3D or 2.5D game with art, audio, save, and two desktops.
+- **3D game bar** — a small 3D or 2.5D game with art, audio, save, and two desktops. A mixer graph is future work. Editor and hot reload wait until scenes are data.
 
 Later, not this list: Wasm, consoles, threads, a J3 shader language, SIMD.
 
@@ -26,9 +26,7 @@ Later, not this list: Wasm, consoles, threads, a J3 shader language, SIMD.
 Nothing in the examples is waiting on a language change. Hold these until something forces them:
 
 - **One translation unit.** Still one `.ll` and one `clang`, and generics re-lower into one IR context. Measure dungeon check vs emit vs clang first. Stop if check is cheap. Do not CFG-ify check to get there.
-- **Physics.** `j3.collide` overlap and tile slide cover dungeon. A `j3.physics` module waits until a 2D game outgrows that.
 - **`j3.toml` deps, LSP rename, Wasm, threads, shaders.** Nothing in the examples is blocked on them.
-- **Draw interpolation.** `App.run` keeps leftover `acc` and draw callbacks take `&W` only. Every `draw` signature would grow an alpha. Do it when something on screen stutters.
 - **Pack / install.** Dungeon rpath is `$ORIGIN/../lib`, and assets try three roots (`assets/`, `examples/dungeon/assets/`, `../examples/dungeon/assets/`). Matters when there is a build to hand someone.
 
 ## Language features
@@ -48,4 +46,16 @@ Not a language change:
 
 ## `@j3ui`
 
-`@j3ui` is in the parser; defense and gallery call it; `button` still has no disabled/refuse API (`j3c/stdlib/j3/ui.j3` `button`, around lines 512–552).
+`@j3ui` is in the parser. Defense and gallery call it. `j3c doc j3ui` is the syntax, and it is generated from the same widget names the parser accepts. `j3c doc j3.ui` lists each widget. `button` runs its body on a click. `buttonOff` draws that shape and never clicks. `panel`, `row`, `scroll`, and `card` close with `end`. `pushId` closes with `popId`. A body on any other widget is an error.
+
+
+create a new plan to make a raytracing demo. the demo is simple:
+- 3D scene in a white box room
+- a simple white light at the top of the room
+- 3 spheres: glass, metal, plastic
+- glass tests raytracing light refraction
+- metal tests raytracing reflections
+- plastic tests simple materials, defaulting to a dull plastic
+- add a toggleable HUD to change settings such as: glass/metal/plastic sphere material properties and radius, light brightness, light RGB color values, etc.
+
+obviously, a lot of these things aren't very possible, so first give me a concise list of features that'd need to be added for this to be possible

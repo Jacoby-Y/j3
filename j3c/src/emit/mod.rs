@@ -11,7 +11,8 @@ mod opts;
 
 pub use c::{emit_c, emit_program};
 pub use host::{
-    compile_and_run, compile_and_run_with, compile_c, run_exe, run_exe_in, CcOpts, RunResult,
+    compile_and_run, compile_and_run_with, compile_c, failure_hint, host_lib_present, run_exe,
+    run_exe_in, CcOpts, RunResult,
 };
 pub use llvm::emit_llvm;
 pub use opts::{Backend, EmitOpts};

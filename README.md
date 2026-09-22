@@ -17,7 +17,7 @@ cargo build --release
 cargo test
 ```
 
-The binary is `j3c/target/release/j3c`. Put it on `PATH`, or call it by that path. The standard library ships next to the compiler in `j3c/stdlib/j3/`. Override it with `J3_STDLIB` (the parent of the `j3/` modules).
+The binary is `j3c/target/release/j3c`. Put it on `PATH`, or call it by that path. The standard library is compiled into that binary. `J3_STDLIB` (the parent of the `j3/` modules) replaces the embedded copy.
 
 ## Examples
 
@@ -33,7 +33,7 @@ j3c build examples/island
 |---------|------------|
 | `examples/bounce` | Paddle and ball |
 | `examples/dungeon` | Tile crawler: scenes, UI, save, particles, looping music |
-| `examples/gallery` | UI gallery |
+| `examples/gallery` | UI gallery: widgets, controls, layout, style, inventory |
 | `examples/defense` | Tower defense. Drag the map, scroll to zoom |
 | `examples/island` | Voxel island: GL mesh, shadow map, orbit camera |
 | `examples/minecraft` | First person. Break, place, jump, corner shadows |
@@ -48,7 +48,7 @@ j3c check
 j3c run
 ```
 
-`j3c new mygame --app` scaffolds an SDL window. `j3c guide` and `j3c doc` describe the layout and the standard library. `j3c help manifest` lists `j3.toml` keys.
+`j3c new mygame --app` scaffolds an SDL window. `j3c guide` starts a project. `j3c doc lang` is the language, `j3c doc` is the standard library, and `j3c doc j3ui` is UI component syntax. `j3c help manifest` lists `j3.toml` keys.
 
 ## Editor
 
@@ -60,7 +60,7 @@ j3c run
 |------|------|
 | `j3c/` | Compiler. Map in `j3c/AGENTS.md` |
 | `j3c/stdlib/j3/` | Standard library, written in J3 |
-| `speculative/` | Acceptance programs (`01`–`08` compile; `09` typechecks `j3.game`) |
+| `speculative/` | Acceptance programs (`01`–`08` compile and run; `09` typechecks `j3.game`; `10_j3ui.j3` typechecks `@j3ui`) |
 | `examples/` | Playable games |
 | `editors/vscode/` | Editor extension |
 | `tools/j3mesh_import.py` | Mesh importer |

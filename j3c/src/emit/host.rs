@@ -120,7 +120,7 @@ pub fn compile_llvm(
         cmd.arg(flag);
     }
     cmd.arg("-o").arg(&exe_path).arg(&src_path);
-    append_link_args(&mut cmd, cc, ll_source, target);
+    append_link_args(&mut cmd, cc, ll_source, target)?;
     let out = cmd.output().map_err(|e| format!("spawn {clang}: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -181,7 +181,7 @@ pub fn compile_c(c_source: &str, opts: &CcOpts, target: &str, clang: &str) -> Re
         cmd.arg("-g");
     }
     cmd.arg("-o").arg(&exe_path).arg(&src_path);
-    append_link_args(&mut cmd, opts, c_source, target);
+    append_link_args(&mut cmd, opts, c_source, target)?;
     let cc = cmd.output().map_err(|e| format!("spawn {compiler}: {e}"))?;
 
     if !cc.status.success() {
@@ -240,7 +240,7 @@ fn keep_flag(flag: &str, target: &str) -> bool {
     !f.contains("rpath") && !f.contains("--disable-new-dtags")
 }
 
-fn append_link_args(cmd: &mut Command, opts: &CcOpts, source: &str, target: &str) {
+fn append_link_args(cmd: &mut Command, opts: &CcOpts, source: &str, target: &str) -> Result<(), String> {
     for file in &opts.files {
         cmd.arg(file);
     }
@@ -257,26 +257,30 @@ fn append_link_args(cmd: &mut Command, opts: &CcOpts, source: &str, target: &str
         }
     }
     for lib in &libs {
-        if let Some(flag) = link_lib(lib, &opts.search, target) {
-            cmd.arg(flag);
-        }
+        cmd.arg(link_lib(lib, &opts.search, target)?);
     }
     for flag in &opts.flags {
         if keep_flag(flag, target) {
             cmd.arg(flag);
         }
     }
+    Ok(())
+}
+
+/// True when the host linker can see `lib{name}`.
+pub fn host_lib_present(name: &str, search: &[String]) -> bool {
+    link_lib(name, search, "").is_ok()
 }
 
 /// `-lNAME` when the linker can see `libNAME.so`; otherwise a found `libNAME*.so*`.
 /// Debian often ships `libSDL2-2.0.so.0` without the `-dev` symlink.
 /// Windows and macOS pass `-lNAME` through so a missing library is the linker's error.
-fn link_lib(name: &str, search: &[String], target: &str) -> Option<String> {
+fn link_lib(name: &str, search: &[String], target: &str) -> Result<String, String> {
     if foreign_target(target) {
-        return Some(format!("-l{name}"));
+        return Ok(format!("-l{name}"));
     }
     if name == "m" {
-        return Some("-lm".to_string());
+        return Ok("-lm".to_string());
     }
     let mut dirs: Vec<PathBuf> = search.iter().map(PathBuf::from).collect();
     for extra in [
@@ -292,15 +296,78 @@ fn link_lib(name: &str, search: &[String], target: &str) -> Option<String> {
     }
     for dir in &dirs {
         if dir.join(format!("lib{name}.so")).is_file() {
-            return Some(format!("-l{name}"));
+            return Ok(format!("-l{name}"));
         }
     }
     for dir in &dirs {
         if let Some(found) = find_soname(dir, name) {
-            return Some(found);
+            return Ok(found);
         }
     }
-    None
+    let msg = format!("cannot find library `{name}`");
+    Err(match failure_hint(&msg) {
+        Some(hint) => format!("{msg}\n  = help: {hint}"),
+        None => format!("{msg}\n  = help: install it, or take it out of [link] libs"),
+    })
+}
+
+/// Extra line for a failed `run`/`build` that is not a J3 diagnostic.
+/// Names a package when the log mentions a known library or a missing compiler.
+pub fn failure_hint(text: &str) -> Option<String> {
+    if text.contains("-->") {
+        return None;
+    }
+    let mut pkgs: Vec<&str> = Vec::new();
+    let mut push = |pkg: &'static str| {
+        if !pkgs.contains(&pkg) {
+            pkgs.push(pkg);
+        }
+    };
+    if text.contains("SDL2_image") || text.contains("libSDL2_image") || text.contains("IMG_") {
+        push("libsdl2-image-2.0-0");
+    }
+    if text.contains("SDL2_mixer") || text.contains("libSDL2_mixer") || text.contains("Mix_") {
+        push("libsdl2-mixer-2.0-0");
+    }
+    if text.contains("SDL2_ttf") || text.contains("libSDL2_ttf") || text.contains("TTF_") {
+        push("libsdl2-ttf-2.0-0");
+    }
+    if sdl2_core(text) {
+        push("libsdl2-2.0-0");
+    }
+    if text.contains("library `GL`") || text.contains("-lGL") || text.contains("libGL") {
+        push("libgl1");
+    }
+    let mut lines: Vec<String> = Vec::new();
+    if !pkgs.is_empty() {
+        let list = pkgs.join(" ");
+        lines.push(format!("install {list}\n         `sudo apt install {list}`"));
+    }
+    if text.contains("spawn clang")
+        || text.contains("spawn cc")
+        || text.contains("clang: not found")
+        || text.contains("cc: not found")
+    {
+        lines.push("install clang\n         `sudo apt install clang`".to_string());
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n  = help: "))
+    }
+}
+
+/// `SDL2` itself, not `SDL2_image` / `SDL2_mixer` / `SDL2_ttf`.
+fn sdl2_core(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(i) = rest.find("SDL2") {
+        let after = rest[i + 4..].chars().next();
+        if after != Some('_') {
+            return true;
+        }
+        rest = &rest[i + 4..];
+    }
+    false
 }
 
 fn find_soname(dir: &Path, name: &str) -> Option<String> {
@@ -361,5 +428,30 @@ mod tests {
         assert_eq!(super::link_gc_flag("x86_64-pc-windows-gnu"), "-Wl,--gc-sections");
         assert_eq!(super::link_gc_flag("arm64-apple-darwin"), "-Wl,-dead_strip");
         assert_eq!(super::link_gc_flag("x86_64-apple-darwin"), "-Wl,-dead_strip");
+    }
+
+    #[test]
+    fn missing_library_names_itself() {
+        let err = super::link_lib("not-a-real-lib", &[], "").unwrap_err();
+        assert!(err.contains("not-a-real-lib"), "{err}");
+        assert!(err.contains("take it out of [link] libs"), "{err}");
+    }
+
+    #[test]
+    fn missing_sdl_names_the_package() {
+        let err = super::failure_hint("cannot find library `SDL2_mixer`").unwrap();
+        assert!(err.contains("libsdl2-mixer-2.0-0"), "{err}");
+        assert!(!err.contains("libsdl2-2.0-0"), "{err}");
+        let image = super::failure_hint("libSDL2_image-2.0.so.0\n").unwrap();
+        assert!(image.contains("libsdl2-image-2.0-0"), "{image}");
+        let both = super::failure_hint(
+            "undefined reference to `IMG_Quit'\nundefined reference to `TTF_Quit'",
+        )
+        .unwrap();
+        assert!(both.contains("libsdl2-image-2.0-0"), "{both}");
+        assert!(both.contains("libsdl2-ttf-2.0-0"), "{both}");
+        assert!(super::failure_hint("error: expected `;`\n --> src/main.j3:1:1\n").is_none());
+        let cc = super::failure_hint("spawn clang: No such file or directory (os error 2)").unwrap();
+        assert!(cc.contains("sudo apt install clang"), "{cc}");
     }
 }

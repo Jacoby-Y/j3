@@ -13,7 +13,7 @@ pub fn cmd(rest: &[String]) -> i32 {
         } else if a == "--help" || a == "-h" {
             println!("usage: j3c new [name] [--app]");
             println!("    j3c new mygame        printLn hello in ./mygame");
-            println!("    j3c new mygame --app  SDL window (links SDL2, image, mixer, ttf)");
+            println!("    j3c new mygame --app  SDL window (links SDL2)");
             println!("    j3c new               write into the current directory");
             println!("    j3c new --app         window template in the current directory");
             return 0;
@@ -29,13 +29,20 @@ pub fn cmd(rest: &[String]) -> i32 {
         }
     }
     match create(name, app) {
-        Ok(root) => {
+        Ok((root, module)) => {
             println!("{}", root.display());
             println!("  j3.toml");
             println!("  src/main.j3");
             println!("  AGENTS.md");
+            let dir = root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if dir != module {
+                println!("  module {module}");
+            }
             if app {
-                println!("next: j3c check   (run needs SDL2, SDL2_image, SDL2_mixer, SDL2_ttf)");
+                println!("next: j3c check   (run needs SDL2)");
             } else {
                 println!("next: j3c check");
             }
@@ -48,13 +55,9 @@ pub fn cmd(rest: &[String]) -> i32 {
     }
 }
 
-pub fn create(name: Option<&str>, app: bool) -> Result<PathBuf, String> {
+pub fn create(name: Option<&str>, app: bool) -> Result<(PathBuf, String), String> {
     let (root, package) = locate(name)?;
-    if !is_ident(&package) {
-        return Err(format!(
-            "package name `{package}` is not a J3 identifier\n  = help: `j3c new mygame`"
-        ));
-    }
+    let module = module_name(&package);
     if root.join("j3.toml").is_file()
         || root.join("src/main.j3").is_file()
         || root.join("AGENTS.md").is_file()
@@ -66,15 +69,15 @@ pub fn create(name: Option<&str>, app: bool) -> Result<PathBuf, String> {
     }
     std::fs::create_dir_all(root.join("src")).map_err(|e| format!("mkdir: {e}"))?;
     let (toml, main) = if app {
-        (app_toml(&package), app_main(&package))
+        (app_toml(&module), app_main(&module))
     } else {
-        (hello_toml(&package), hello_main(&package))
+        (hello_toml(&module), hello_main(&module))
     };
     let main = fmt::format_src(&main).map_err(|e| format!("fmt template: {e}"))?;
     std::fs::write(root.join("j3.toml"), toml).map_err(|e| format!("write j3.toml: {e}"))?;
     std::fs::write(root.join("src/main.j3"), main).map_err(|e| format!("write src/main.j3: {e}"))?;
     std::fs::write(root.join("AGENTS.md"), AGENTS).map_err(|e| format!("write AGENTS.md: {e}"))?;
-    Ok(root)
+    Ok((root, module))
 }
 
 const AGENTS: &str = r#"# This project
@@ -100,7 +103,7 @@ Do not lock drawing to the size passed to `App.create` and ignore later resizes.
 
 ## UI
 
-Write each screen as its own `@j3ui` component so `draw` stays a short list of calls. Syntax: `j3c doc j3ui`. Widgets under that (`scroll`, `slider`, theme): `j3c doc j3.ui`.
+Write each screen as its own `@j3ui` component so `draw` stays a short list of calls. Which names take a body: `j3c doc j3ui`. Each widget (`label`, `button`, `buttonOff`, `toggle`, `check`, `slider`, `range`, `stepper`, `scroll`, `card`, and the rest): `j3c doc j3.ui`.
 
     @j3ui title(ui: &Ui) {
         panel(280, 120) {
@@ -117,7 +120,15 @@ Write each screen as its own `@j3ui` component so `draw` stays a short list of c
         title(&ui);
     }
 
-`begin` opens a downward column (width 220, row height 28). Inside `@j3ui`, a bare widget name is a method on the first parameter. `panel`, `row`, `scroll`, and `card` close themselves. `button` runs its body on the click. Set `ui.theme` after `begin` (`Theme.dusk`, `Theme.yard`, or a few colors of your own). Place `x` and `y` from `windowSize` so a panel stays put when the window changes. Two widgets with the same caption need `pushId` / `popId`.
+`begin` opens a downward column (width 220, row height 28). Inside `@j3ui`, a bare widget name is a method on the first parameter. `panel`, `row`, `scroll`, and `card` close themselves. `button` runs its body on the click. `buttonOff` never clicks. Set `ui.theme` after `begin` (`Theme.dusk`, `Theme.yard`, or a few colors of your own). Place `x` and `y` from `windowSize` so a panel stays put when the window changes. Two widgets with the same caption need `pushId` / `popId`.
+
+## Fonts
+
+`Ui.begin` takes a font. Load a `.ttf` that lives in the project (`assets/font.ttf`).
+
+`tryLoadFont` returns an empty font when the file is missing or SDL_ttf is not installed. Labels still draw. `loadFont` panics. The same split holds for images (`tryLoadTexture` / `loadTexture`) and sounds (`tryLoadSound` / `loadSound`).
+
+`j3c check` does not run the game. It fails when a library or a file the program loads is missing on this machine. `j3c run` uses that check and does not launch when it fails. `j3c: program exited` is a failed run, even when a window appeared. Read stderr.
 "#;
 
 fn locate(name: Option<&str>) -> Result<(PathBuf, String), String> {
@@ -145,13 +156,36 @@ fn locate(name: Option<&str>) -> Result<(PathBuf, String), String> {
     }
 }
 
-fn is_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
+/// Directory label → module name. `my-game` and `My Game` become `my_game`.
+fn module_name(raw: &str) -> String {
+    let mut out = String::new();
+    let mut gap = false;
+    for c in raw.chars() {
+        if c.is_alphanumeric() {
+            if gap && !out.is_empty() {
+                out.push('_');
+            }
+            gap = false;
+            for lower in c.to_lowercase() {
+                out.push(lower);
+            }
+        } else {
+            gap = true;
+        }
     }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.chars().next().is_some_and(|c| !c.is_alphabetic() && c != '_') {
+        out.insert(0, '_');
+    }
+    if out.is_empty() || out.chars().all(|c| c == '_') {
+        return "game".to_string();
+    }
+    if crate::parse::keyword(&out).is_some() {
+        out.push('_');
+    }
+    out
 }
 
 fn hello_toml(name: &str) -> String {
@@ -186,7 +220,9 @@ fn main() {{
 
 fn app_toml(name: &str) -> String {
     format!(
-        r#"# SDL window. Needs SDL2, SDL2_image, SDL2_mixer, and SDL2_ttf.
+        r#"# SDL window. Needs SDL2.
+# Image, mixer, and font libraries load the first time you use them.
+# A missing library leaves the handle empty and does not close the window.
 # From this directory: j3c check / j3c run
 # Left and Right move the bar. Escape quits.
 
@@ -200,7 +236,7 @@ opt = 0
 debug = true
 
 [link]
-libs = ["SDL2", "SDL2_image", "SDL2_mixer", "SDL2_ttf"]
+libs = ["SDL2"]
 "#
     )
 }
@@ -269,7 +305,8 @@ mod tests {
     fn hello_project_typechecks() {
         let dir = scratch();
         let root = dir.join("hello");
-        let err = create(Some(root.to_str().unwrap()), false).expect("create");
+        let (err, module) = create(Some(root.to_str().unwrap()), false).expect("create");
+        assert_eq!(module, "hello");
         assert!(err.join("j3.toml").is_file());
         let src = std::fs::read_to_string(err.join("src/main.j3")).unwrap();
         assert!(src.contains("module hello;"), "{src}");
@@ -278,6 +315,9 @@ mod tests {
         assert!(agents.contains("Learn J3 from `j3c` only"), "{agents}");
         assert!(agents.contains("@j3ui"), "{agents}");
         assert!(agents.contains("j3c doc j3ui"), "{agents}");
+        assert!(agents.contains("buttonOff"), "{agents}");
+        assert!(agents.contains("tryLoadFont"), "{agents}");
+        assert!(agents.contains("program exited"), "{agents}");
         let code = crate::cli::run(["check".into(), err.display().to_string()]);
         assert_eq!(code, 0);
         let again = create(Some(root.to_str().unwrap()), false).unwrap_err();
@@ -289,17 +329,33 @@ mod tests {
     fn app_project_typechecks() {
         let dir = scratch();
         let root = dir.join("window");
-        let made = create(Some(root.to_str().unwrap()), true).expect("create");
+        let (made, _) = create(Some(root.to_str().unwrap()), true).expect("create");
         let toml = std::fs::read_to_string(made.join("j3.toml")).unwrap();
-        assert!(toml.contains("SDL2_ttf"), "{toml}");
+        assert!(toml.contains("libs = [\"SDL2\"]"), "{toml}");
+        assert!(toml.contains("does not close the window"), "{toml}");
         let code = crate::cli::run(["check".into(), made.display().to_string()]);
         assert_eq!(code, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn hyphenated_name_is_rejected() {
-        let err = create(Some("my-game"), false).unwrap_err();
-        assert!(err.contains("identifier"), "{err}");
+    fn directory_name_becomes_a_module() {
+        assert_eq!(module_name("my-game"), "my_game");
+        assert_eq!(module_name("My Game"), "my_game");
+        assert_eq!(module_name("bounce"), "bounce");
+        assert_eq!(module_name("123go"), "_123go");
+        assert_eq!(module_name("fn"), "fn_");
+        assert_eq!(module_name("!!!"), "game");
+        let dir = scratch();
+        let root = dir.join("my-game");
+        let (made, module) = create(Some(root.to_str().unwrap()), false).expect("create");
+        assert_eq!(module, "my_game");
+        let src = std::fs::read_to_string(made.join("src/main.j3")).unwrap();
+        assert!(src.contains("module my_game;"), "{src}");
+        let toml = std::fs::read_to_string(made.join("j3.toml")).unwrap();
+        assert!(toml.contains("name = \"my_game\""), "{toml}");
+        let code = crate::cli::run(["check".into(), made.display().to_string()]);
+        assert_eq!(code, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

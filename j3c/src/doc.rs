@@ -2,6 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::parse::syntax::{
+    keyword_names, ATTRIBUTES, BUILTIN_TYPES, INTRINSICS, J3UI_CALL, J3UI_END, J3UI_IF, J3UI_POP,
+};
 use crate::parse::{self, EnumItem, FieldItem, File, FnItem, Ident, Item, StructItem, Type, TypeKind};
 use crate::span::FileId;
 use crate::stdlib::stdlib_dir;
@@ -17,6 +20,7 @@ pub fn cmd(rest: &[String]) -> i32 {
             println!("    j3c doc j3.app          public items and /// comments");
             println!("    j3c doc j3.app create   one item");
             println!("    j3c doc app             same as j3.app");
+            println!("    j3c doc lang           language");
             println!("    j3c doc j3ui           `@j3ui` component syntax");
             return 0;
         }
@@ -28,6 +32,7 @@ pub fn cmd(rest: &[String]) -> i32 {
     }
     let text = match args.as_slice() {
         [] => index(),
+        ["lang"] => Ok(lang_page()),
         ["j3ui"] | ["@j3ui"] => Ok(j3ui_page()),
         [query] => module(query, None),
         [query, item] => module(query, Some(item)),
@@ -48,45 +53,108 @@ pub fn cmd(rest: &[String]) -> i32 {
     }
 }
 
+fn names(list: &[&str]) -> String {
+    list.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
+}
+
+fn lang_page() -> String {
+    let keywords: Vec<&str> = keyword_names().collect();
+    format!(
+        "`j3c doc lang` — the language
+
+`int` is i64. `float` is f64. Gameplay math uses `f32`. A number with no context is `int`, or `f64` when it has a dot. `let` is mutable. A local's type is inferred when you omit it.
+
+One file is one module. `use j3.io.printLn` brings in one name. `use j3.memory.{{ Arena, List }}` brings in several. `pub` is what another module can name.
+
+`if` and `while` take no parentheses. Braces are required. An `if` used as a value needs `else`. `&&` and `||` stop at the first decisive operand.
+
+`for i in 0..n` stops before `n`. `for i in 0..=n` includes `n`. `for n in xs` walks a slice or an array. The index name ends when the loop ends.
+
+`match` lists every variant. Write `Enum.Name`, not a bare name. `_` is the rest. `defer` runs at the end of its block, including on `return`. `break` and `continue` stay in the loop.
+
+A backtick string `hello {{name}}` fills the hole. A struct in a hole needs `#[Debug]`.
+
+`+=` `-=` `*=` `/=` write the place once. Integer overflow wraps. Divide by zero aborts. `--fast` strips that abort and the bounds-check aborts.
+
+`operator+` is a method. `this` is the receiver. `.` follows a pointer. A method `this: &T` takes the address at the call. A field may end with `= value`. A struct literal that omits the field uses that value.
+
+`?` unwraps a `#[TryCatch(Ok, Err)]` enum: the failure variant returns from the function, the success variant continues. `j3.option.Option` and `j3.result.Result` are that attribute. The compiler does not special-case the names.
+
+`#[singleton]` is one process value. Its initializer is a constant, and it cannot be a call.
+
+`[N]T` is a stack array. `[]T` is a pointer and a length. `xs[i]` checks the bound. `xs[1..3]` and `xs[:]` are views. `string` is a read-only byte view. Mutate bytes with `j3c doc j3.text`.
+
+`use position: Vec2` on a struct embeds those fields. A statement `use transform` names them in this block, and assigning one writes the field.
+
+`use lib \"SDL2\" as sdl {{ fn SDL_Init(flags: u32): i32; }}` declares C functions. `@syscall`, `@sizeof`, and `@slice` are compiler calls. `@j3ui` is `j3c doc j3ui`.
+
+No traits, capturing closures, GC, or borrow checker.
+
+Types
+    {types}
+
+Keywords
+    {keywords}
+
+Attributes
+    {attrs}
+
+Intrinsics
+    {intrinsics}
+
+The standard library is `j3c doc`. The window loop is `j3c doc j3.app`. Draw, input, and audio are `j3c doc j3.game`.
+",
+        types = names(BUILTIN_TYPES),
+        keywords = names(&keywords),
+        attrs = names(ATTRIBUTES),
+        intrinsics = names(INTRINSICS),
+    )
+}
+
 fn j3ui_page() -> String {
-    String::from(
+    format!(
         r#"`@j3ui` — UI components
 
-`@j3ui name(ui: &Ui, ...) { }` is a function. The first parameter is the `Ui` from `Ui.begin`. The body cannot see locals from another function. Call it like a function. A component inside another is that call. Learn the widgets with `j3c doc j3.ui`.
+`@j3ui name(ui: &Ui, ...) {{ }}` is a function. The first parameter is the `Ui` from `Ui.begin`. The body cannot see locals from another function. Call it like a function. A component inside another is that call. Each widget's arguments are `j3c doc j3.ui`.
 
 ```
-@j3ui shopRow(ui: &Ui, w: &World, kind: int, name: string, cost: int, maxed: bool) {
-    row() {
-        label(`{name}   {cost} leaves`);
-        button("buy") {
+@j3ui shopRow(ui: &Ui, w: &World, kind: int, name: string, cost: int, maxed: bool) {{
+    row() {{
+        label(`{{name}}   {{cost}} leaves`);
+        button("buy") {{
             buy(w, kind);
-        }
-    }
-}
+        }}
+    }}
+}}
 
-@j3ui shop(ui: &Ui, w: &World) {
-    panel(280, 248) {
+@j3ui shop(ui: &Ui, w: &World) {{
+    panel(280, 248) {{
         label("shop");
         shopRow(ui, w, 0, "grab speed", costSpeed(w.speed), w.speed >= 5);
-    }
-}
+    }}
+}}
 
-fn draw(w: &World) {
+fn draw(w: &World) {{
     let ui = Ui.begin(w.font, 16, 188);
     shop(ui, w);
-}
+}}
 ```
 
-A bare widget name gets the receiver (`label` becomes `ui.label`). Closers:
+A bare widget name gets the receiver (`label` becomes `ui.label`). These names are the ones the parser accepts:
 
-- `panel`, `row`, `scroll`, `card` — the call, the body, then `end`
-- `pushId` — the call, the body, then `popId`
-- `button` — `if ui.button(...) { body }`
+- {end_names} — the call, the body, then `end`
+- {pop_names} — the call, the body, then `popId`
+- {if_names} — `if ui.button(...) {{ body }}`. The body runs on the click
+- {call_names} — the call, then `;`. A `{{ }}` on these is an error
 
-`if`, `for`, `let`, and other calls stay J3. A `{ }` on any other widget is an error.
+`buttonOff` draws a button that never clicks. `toggle`, `check`, `slider`, `range`, and `stepper` write through a pointer and return true when the value changes. `field` edits a `Text` buffer. Tab and shift-tab move focus across `button` and `field`. Focused buttons use the theme's hot color and activate on Enter or Space. `drag` stays true while the pointer holds it; `dragDelta()` is the motion since the press. `worldLabel` and `worldLabel3` draw at a world point and do not advance the cursor. `if`, `for`, `let`, and other calls stay J3.
 
 ASCII text is drawn from a glyph atlas, so a changing digit does not allocate a new string texture. `scroll(id, height)` skips rows that sit fully outside the window. `j3c doc j3.game drawText` describes the cache.
 "#,
+        end_names = names(J3UI_END),
+        pop_names = names(J3UI_POP),
+        if_names = names(J3UI_IF),
+        call_names = names(J3UI_CALL),
     )
 }
 
@@ -100,13 +168,16 @@ pub fn index() -> Result<String, String> {
         if HIDDEN.iter().any(|h| *h == name) {
             continue;
         }
-        let src = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let src = read_source(&path)?;
         let file = parse_file(&path, &src)?;
         out.push_str(&file.module_key());
         out.push('\n');
         push_doc(&mut out, &file.doc, "    ");
         out.push('\n');
     }
+    out.push_str("also:\n\n");
+    out.push_str("    j3c doc lang     language\n");
+    out.push_str("    j3c doc j3ui     UI components\n");
     Ok(out)
 }
 
@@ -115,7 +186,7 @@ pub fn module(query: &str, item: Option<&str>) -> Result<String, String> {
     let item_owned = item.map(|s| s.to_string()).or(from_path);
     let item = item_owned.as_deref();
     let path = find_module(&module)?;
-    let src = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let src = read_source(&path)?;
     let file = parse_file(&path, &src)?;
     let (text, hits) = render(&file, &file.doc, item);
     if item.is_some() && hits == 0 {
@@ -153,13 +224,25 @@ fn find_module(module: &str) -> Result<PathBuf, String> {
         return Err(format!("no stdlib module `{module}`\n  = help: `j3c doc`"));
     }
     let path = stdlib_dir().join("j3").join(format!("{}.j3", parts[1]));
-    if path.is_file() {
+    if crate::stdlib::embedded(&path).is_some() || path.is_file() {
         return Ok(path);
     }
     Err(format!("no stdlib module `{module}`\n  = help: `j3c doc`"))
 }
 
+fn read_source(path: &Path) -> Result<String, String> {
+    if let Some(src) = crate::stdlib::embedded(path) {
+        return Ok(src.to_string());
+    }
+    std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
+}
+
 fn read_dir_j3(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    if !crate::stdlib::using_override() {
+        let mut out: Vec<PathBuf> = crate::stdlib::files().map(|(name, _)| dir.join(name)).collect();
+        out.sort();
+        return Ok(out);
+    }
     let ents = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
     let mut out = Vec::new();
     for ent in ents.flatten() {
@@ -379,6 +462,8 @@ mod tests {
     fn index_lists_app_and_gfx() {
         let text = index().expect("index");
         assert!(text.contains("j3.app\n"), "{text}");
+        assert!(text.contains("j3c doc lang"), "{text}");
+        assert!(text.contains("j3c doc j3ui"), "{text}");
         assert!(text.contains("Bevy-shaped runner"), "{text}");
         assert!(text.contains("j3.gfx\n"), "{text}");
         assert!(text.contains("j3.mesh\n"), "{text}");
@@ -407,7 +492,24 @@ mod tests {
         let text = j3ui_page();
         assert!(text.contains("@j3ui shopRow"), "{text}");
         assert!(text.contains("cannot see locals"), "{text}");
-        assert!(text.contains("scroll"), "{text}");
+        for name in J3UI_END.iter().chain(J3UI_POP).chain(J3UI_IF).chain(J3UI_CALL) {
+            assert!(
+                crate::parse::syntax::is_j3ui_widget(name),
+                "{name} is not a widget"
+            );
+            assert!(text.contains(&format!("`{name}`")), "page missing {name}\n{text}");
+        }
+    }
+
+    #[test]
+    fn lang_page_lists_shipped_forms() {
+        let text = lang_page();
+        assert!(text.contains("0..n"), "{text}");
+        assert!(text.contains("0..=n"), "{text}");
+        assert!(text.contains("TryCatch"), "{text}");
+        assert!(text.contains("`j3ui`"), "{text}");
+        assert!(text.contains("j3c doc j3.app"), "{text}");
+        assert!(text.contains("`match`"), "{text}");
     }
 
     #[test]

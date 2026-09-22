@@ -24,6 +24,48 @@ pub const INTRINSICS: &[&str] = &[
     INTRINSIC_J3UI,
 ];
 
+/// `@j3ui` widgets whose body is the call, then `end`.
+pub const J3UI_END: &[&str] = &["panel", "row", "scroll", "card"];
+/// `@j3ui` widgets whose body is the call, then `popId`.
+pub const J3UI_POP: &[&str] = &["pushId"];
+/// `@j3ui` widgets whose body runs when the call returns true.
+pub const J3UI_IF: &[&str] = &["button"];
+/// `@j3ui` widgets that are one call. A `{ }` on these is an error.
+pub const J3UI_CALL: &[&str] = &[
+    "label",
+    "labelBold",
+    "gap",
+    "buttonOff",
+    "bar",
+    "image",
+    "slider",
+    "range",
+    "toggle",
+    "check",
+    "stepper",
+    "chip",
+    "rule",
+    "wash",
+    "drop",
+    "field",
+    "drag",
+    "worldLabel",
+    "worldLabel3",
+    "popId",
+    "end",
+];
+
+pub fn keyword_names() -> impl Iterator<Item = &'static str> {
+    KEYWORDS.iter().map(|(name, _)| *name)
+}
+
+pub fn is_j3ui_widget(name: &str) -> bool {
+    J3UI_END.contains(&name)
+        || J3UI_POP.contains(&name)
+        || J3UI_IF.contains(&name)
+        || J3UI_CALL.contains(&name)
+}
+
 /// Builtin type spellings. Checker must accept every name.
 pub const BUILTIN_TYPES: &[&str] = &[
     "void", "bool", "int", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64",

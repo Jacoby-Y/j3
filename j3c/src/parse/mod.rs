@@ -1,9 +1,10 @@
 //! Concrete syntax. Compiler and LSP both depend on this module.
 //!
 //! Live: modules, use, `use lib`, const, fn, struct, methods, `operator`,
-//! `#[Debug]`, let, assign/`+=`, `&`/`*`, calls, `@syscall`, `as`, fields,
-//! arrays/slices, arithmetic, comparisons, `if`/`while`/`for`/`defer`,
-//! interpolate, floats, enum, match, `?`, generics, turbofish, `@sizeof` / `@slice`.
+//! `#[Debug]` / `#[singleton]` / `#[TryCatch]`, field defaults, let, assign/`+=`,
+//! `&`/`*`, calls, `@syscall`, `as`, fields, arrays/slices, arithmetic,
+//! comparisons, `if`/`while`/`for` (`..` and `..=`)/`defer`, interpolate, floats,
+//! enum, match, `?`, generics, turbofish, `@sizeof` / `@slice` / `@j3ui`.
 
 mod ast;
 mod error;
@@ -19,7 +20,7 @@ pub use ast::{
     UseLibItem, UseLocalStmt, VariantItem,
 };
 pub use error::ParseError;
-pub use token::{Token, TokenKind};
+pub use token::{keyword, Token, TokenKind};
 
 use crate::span::FileId;
 

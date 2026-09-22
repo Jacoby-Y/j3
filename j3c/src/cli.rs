@@ -150,11 +150,13 @@ fn print_help() {
     println!();
     println!("commands:");
     println!("    new [name]       write j3.toml, src/main.j3, and AGENTS.md (hello)");
-    println!("    new [name] --app SDL window (links SDL2, image, mixer, ttf)");
+    println!("    new [name] --app SDL window (links SDL2)");
     println!("    guide            how to start a project");
     println!("    check [path]     typecheck; no emit or link");
     println!("    check --json     one JSON object on stdout");
     println!("    doc [module]     list stdlib modules, or one module's public items");
+    println!("    doc lang         language");
+    println!("    doc j3ui         UI component syntax");
     println!("    build [path]     emit, compile, write `target/<name>`");
     println!("    run [path]       emit, compile, execute");
     println!("    fmt [path]       pretty-print `.j3` (same lexer; keeps comments)");
@@ -395,6 +397,17 @@ fn print_fail(e: &str) {
     } else {
         eprintln!("j3c: {e}");
     }
+    print_hint(e);
+}
+
+fn print_hint(text: &str) {
+    let Some(hint) = crate::emit::failure_hint(text) else {
+        return;
+    };
+    if text.contains(&hint) {
+        return;
+    }
+    eprintln!("  = help: {hint}");
 }
 
 fn dump_opts(manifest: &Option<Manifest>) -> emit::EmitOpts {
@@ -431,6 +444,10 @@ fn run_loaded(
     match prog {
         Ok((prog, manifest)) => match emit_opts(&manifest) {
             Ok(mut opts) => {
+                if let Err(e) = crate::preflight::check(&prog, manifest.as_ref()) {
+                    print_fail(&e);
+                    return 1;
+                }
                 if opts.cwd.is_none() {
                     opts.cwd = extra_cwd;
                 }
@@ -443,6 +460,7 @@ fn run_loaded(
                             if !err.is_empty() {
                                 eprintln!("{err}");
                             }
+                            print_hint(&err);
                         }
                         result.status
                     }
@@ -594,7 +612,15 @@ fn check_cmd(rest: &[String]) -> i32 {
         }
     }
     match compile_user(path) {
-        Ok((_, manifest)) => {
+        Ok((prog, manifest)) => {
+            if let Err(e) = crate::preflight::check(&prog, manifest.as_ref()) {
+                if json {
+                    println!("{}", json_err(&e));
+                } else {
+                    print_fail(&e);
+                }
+                return 1;
+            }
             let entry = match &manifest {
                 Some(m) => m.entry.display().to_string(),
                 None => path.unwrap_or(".").to_string(),
@@ -832,6 +858,27 @@ mod tests {
         assert!(json.contains("\"ok\":false"), "{json}");
         assert!(json.contains("\"line\":2"), "{json}");
         assert!(json.contains("noSuch") || json.contains("unknown"), "{json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_stops_when_check_fails() {
+        let dir = std::env::temp_dir().join(format!("j3-run-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("j3.toml"),
+            "[package]\nname = \"gate\"\nentry = \"src/main.j3\"\n\n[link]\nlibs = [\"SDL2\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/main.j3"),
+            "module gate;\n\nuse j3.game.tryLoadFont;\n\nfn main() {\n    let font = tryLoadFont(\"nope.ttf\", 12);\n    if font.raw == 0 {\n        return;\n    }\n}\n",
+        )
+        .unwrap();
+        let path = dir.display().to_string();
+        assert_eq!(run(["check".into(), path.clone()]), 1);
+        assert_eq!(run(["run".into(), path]), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

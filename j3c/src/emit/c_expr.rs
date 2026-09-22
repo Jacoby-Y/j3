@@ -231,6 +231,9 @@ impl<'a> CWriter<'a> {
             RvalueKind::Cast { from } => {
                 let t = c_type(self.cx, rvalue.ty)?;
                 let v = self.operand(from)?;
+                if byte_view(self.cx, from.ty()) && byte_view(self.cx, rvalue.ty) {
+                    return Ok(format!("({t}){{ .ptr = ({v}).ptr, .len = ({v}).len }}"));
+                }
                 Ok(format!("({t})({v})"))
             }
             RvalueKind::Interpolate { .. } => {
@@ -853,4 +856,13 @@ pub(crate) fn proto(cx: &IrCx, func: &crate::ir::entity::Func) -> Result<String,
     }
     s.push(')');
     Ok(s)
+}
+
+/// `string` and `[]u8` are both `{ptr, len}` and may be cast either way.
+fn byte_view(cx: &IrCx, ty: Ty) -> bool {
+    match cx.ty_kind(ty) {
+        TyKind::String => true,
+        TyKind::Slice { elem } => *elem == cx.common.u8,
+        _ => false,
+    }
 }

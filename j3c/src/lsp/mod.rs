@@ -464,7 +464,7 @@ fn doc_parts(msg: &Json, docs: &HashMap<String, String>) -> Option<(String, Path
     let src = docs
         .get(&uri)
         .cloned()
-        .or_else(|| std::fs::read_to_string(&path).ok())?;
+        .or_else(|| crate::stdlib::read(&path))?;
     Some((uri, path, src))
 }
 
@@ -600,7 +600,7 @@ where
     let text = docs
         .get(uri)
         .cloned()
-        .or_else(|| std::fs::read_to_string(&path).ok())?;
+        .or_else(|| crate::stdlib::read(&path))?;
     let off = query::offset_at(&text, line, col);
     let key = docs_key(docs);
     let path_buf = path.clone();
@@ -646,7 +646,7 @@ fn publish_diags(
                 } else if let Some(buf) = docs.get(&target) {
                     buf.clone()
                 } else {
-                    std::fs::read_to_string(&e.path).unwrap_or_default()
+                    crate::stdlib::read(Path::new(&e.path)).unwrap_or_default()
                 };
                 diags.push(diag_json(&src, e.span, &diag_text(&e)));
             }

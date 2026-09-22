@@ -160,8 +160,14 @@ pub fn analyze_checked(
     check::check_files_lib(loader.files)
 }
 
+const HELLO_SRC: &str = include_str!("../examples/hello.j3");
+
 pub fn default_hello_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/hello.j3")
+}
+
+fn builtin_hello(path: &Path) -> bool {
+    path == default_hello_path()
 }
 
 struct Loader {
@@ -186,6 +192,12 @@ impl Loader {
             if same_path(p, path) {
                 return Ok(src.clone());
             }
+        }
+        if let Some(src) = crate::stdlib::embedded(path) {
+            return Ok(src.to_string());
+        }
+        if builtin_hello(path) {
+            return Ok(HELLO_SRC.to_string());
         }
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
     }
@@ -216,7 +228,7 @@ impl Loader {
             return Ok(());
         }
         let path = self.module_path(parts);
-        if !path.is_file() {
+        if !source_exists(&path) {
             return Err(format!(
                 "cannot find module `{}` (looked for {})",
                 key,
@@ -289,7 +301,7 @@ impl Loader {
             for (path, names) in uses {
                 if names.is_some() {
                     self.load_module(&path)?;
-                } else if self.module_path(&path).is_file() {
+                } else if source_exists(&self.module_path(&path)) {
                     self.load_module(&path)?;
                 } else if path.len() >= 2 {
                     self.load_module(&path[..path.len() - 1])?;
@@ -378,6 +390,10 @@ fn cycle_from(graph: &HashMap<String, Vec<String>>, start: &str) -> Option<Vec<S
         None
     }
     dfs(graph, start, &mut Vec::new(), &mut HashSet::new())
+}
+
+fn source_exists(path: &Path) -> bool {
+    crate::stdlib::embedded(path).is_some() || builtin_hello(path) || path.is_file()
 }
 
 fn module_file(parts: &[String]) -> PathBuf {

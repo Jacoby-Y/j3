@@ -12,8 +12,8 @@ struct ItemAttrs {
 }
 use crate::parse::error::ParseError;
 use crate::parse::syntax::{
-    ATTR_DEBUG, ATTR_SINGLETON, ATTR_TRY_CATCH, INTRINSIC_SIZEOF, INTRINSIC_SLICE,
-    INTRINSIC_SYSCALL,
+    is_j3ui_widget, ATTR_DEBUG, ATTR_SINGLETON, ATTR_TRY_CATCH, INTRINSIC_SIZEOF, INTRINSIC_SLICE,
+    INTRINSIC_SYSCALL, J3UI_END, J3UI_IF, J3UI_POP,
 };
 use crate::parse::token::{Token, TokenKind};
 use crate::span::Span;
@@ -526,32 +526,33 @@ impl<'a> Parser<'a> {
         span: Span,
     ) -> Result<Stmt, ParseError> {
         let call = self.method_call(recv, name.clone(), args, name.span);
-        match name.name.as_str() {
-            "panel" | "row" | "scroll" | "card" => {
-                let end = self.method_call(recv, ident_at("end", name.span), Vec::new(), name.span);
-                let mut stmts = vec![Stmt::Expr(call)];
-                stmts.extend(body.stmts);
-                stmts.push(Stmt::Expr(end));
-                Ok(Stmt::Block(Block { span, stmts }))
-            }
-            "pushId" => {
-                let pop = self.method_call(recv, ident_at("popId", name.span), Vec::new(), name.span);
-                let mut stmts = vec![Stmt::Expr(call)];
-                stmts.extend(body.stmts);
-                stmts.push(Stmt::Expr(pop));
-                Ok(Stmt::Block(Block { span, stmts }))
-            }
-            "button" => Ok(Stmt::If(IfStmt {
+        let widget = name.name.as_str();
+        if J3UI_END.contains(&widget) {
+            let end = self.method_call(recv, ident_at("end", name.span), Vec::new(), name.span);
+            let mut stmts = vec![Stmt::Expr(call)];
+            stmts.extend(body.stmts);
+            stmts.push(Stmt::Expr(end));
+            return Ok(Stmt::Block(Block { span, stmts }));
+        }
+        if J3UI_POP.contains(&widget) {
+            let pop = self.method_call(recv, ident_at("popId", name.span), Vec::new(), name.span);
+            let mut stmts = vec![Stmt::Expr(call)];
+            stmts.extend(body.stmts);
+            stmts.push(Stmt::Expr(pop));
+            return Ok(Stmt::Block(Block { span, stmts }));
+        }
+        if J3UI_IF.contains(&widget) {
+            return Ok(Stmt::If(IfStmt {
                 span,
                 cond: call,
                 then_block: body,
                 else_block: None,
-            })),
-            _ => Err(ParseError::new(
-                name.span,
-                format!("`{}` does not take a body", name.name),
-            )),
+            }));
         }
+        Err(ParseError::new(
+            name.span,
+            format!("`{}` does not take a body", name.name),
+        ))
     }
 
     fn method_call(&self, recv: &str, name: Ident, args: Vec<Expr>, span: Span) -> Expr {
@@ -719,7 +720,7 @@ impl<'a> Parser<'a> {
         if self.j3ui_recv.is_some()
             && self.cur().kind == TokenKind::Ident
             && self.look(1).kind == TokenKind::LParen
-            && j3ui_widget(&self.cur().text)
+            && is_j3ui_widget(&self.cur().text)
         {
             return self.j3ui_widget_stmt();
         }
@@ -1851,35 +1852,6 @@ fn ident_at(name: &str, span: Span) -> Ident {
         name: name.to_string(),
         span,
     }
-}
-
-fn j3ui_widget(name: &str) -> bool {
-    matches!(
-        name,
-        "label"
-            | "labelBold"
-            | "gap"
-            | "button"
-            | "buttonOff"
-            | "bar"
-            | "image"
-            | "slider"
-            | "range"
-            | "toggle"
-            | "check"
-            | "stepper"
-            | "chip"
-            | "rule"
-            | "wash"
-            | "drop"
-            | "panel"
-            | "card"
-            | "row"
-            | "scroll"
-            | "pushId"
-            | "popId"
-            | "end"
-    )
 }
 
 fn parse_hole_expr(src: &str, span: Span) -> Result<Expr, ParseError> {

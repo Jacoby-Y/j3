@@ -460,6 +460,7 @@ fn collect_struct_names(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Result
             packed: s.packed,
             debug: s.debug,
             span: s.span,
+            ty_args: Vec::new(),
         });
         let ty = cx.ty_struct(id);
         mods[i].structs.insert(s.name.name.clone(), id);
@@ -2175,6 +2176,12 @@ pub(crate) fn instantiate_struct(
         packed: temp.packed,
         debug: temp.debug,
         span: temp.span,
+        ty_args: temp
+            .type_params
+            .iter()
+            .zip(args.iter())
+            .map(|(p, a)| (p.name.clone(), *a))
+            .collect(),
     });
     env.struct_insts.insert(key, id);
     env.ir_structs.push(id);

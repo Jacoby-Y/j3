@@ -15,5 +15,5 @@ AOT game language. Spec wins over examples; examples win over compiler comments.
 | `examples/minecraft/` | Block world: first person, break/place, jump, corner shadows (`j3.toml` + `src/`). Needs SDL2 + libGL. |
 | `examples/leaves/` | Leaf cleaning: first person, walk the yard, click leaves, spend them on grab speed and reach, clear the lot for a time (`j3.toml` + `src/` + `assets/`). Needs SDL2 + image/mixer/ttf + libGL. |
 | `examples/defense/` | Tiny tower defense: drag/zoom map, waves, towers (`j3.toml` + `src/` with `world.j3` and `hud.j3`). Needs SDL2 + image/mixer/ttf. |
-| `examples/gallery/` | UI gallery: tabs, layout, widgets, controls (`j3.toml` + `src/`). Needs SDL2 + image/mixer/ttf. |
-| `j3c/stdlib/j3/` | Stdlib in J3 (`sys`, `io`, `math`, `rand`, `memory`, `option`, `result`, `text`, `game`, `ecs`, `app`, `collide`, `res`, `scene`, `assets`, `tile`, `ui`, `save`, `fx`, `debug`, `gfx`, `mesh`, `voxel`). `j3.sys` is `sys.j3` / `sys_windows.j3` / `sys_macos.j3` by `[emit] target`. SSOT; `j3c` parses `sys`+`io` for hello |
+| `examples/gallery/` | UI gallery: widgets, controls, layout, style, inventory (`j3.toml` + `src/`). Needs SDL2 + image/mixer/ttf. |
+| `j3c/stdlib/j3/` | Stdlib in J3 (`sys`, `io`, `math`, `rand`, `memory`, `option`, `result`, `text`, `game`, `ecs`, `app`, `collide`, `space`, `physics`, `path`, `anim`, `input`, `res`, `scene`, `assets`, `tile`, `ui`, `save`, `fx`, `debug`, `gfx`, `mesh`, `voxel`). `j3.sys` is `sys.j3` / `sys_windows.j3` / `sys_macos.j3` by `[emit] target`. SSOT; `j3c` parses `sys`+`io` for hello |

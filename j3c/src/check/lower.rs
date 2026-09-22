@@ -96,9 +96,22 @@ pub(crate) fn lower_module(
     let globals = mods[i].globals.clone();
     let enum_temps = mods[i].enum_temps.clone();
     let mut enum_insts = mods[i].insts.clone();
-    let struct_temps = mods[i].struct_temps.clone();
-    let struct_temp_env = mods[i].struct_temp_env.clone();
-    let mut struct_insts = mods[i].struct_insts.clone();
+    let mut struct_temps = HashMap::new();
+    let mut struct_temp_env = HashMap::new();
+    for m in mods.iter() {
+        for (k, v) in &m.struct_temps {
+            struct_temps.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        for (k, v) in &m.struct_temp_env {
+            struct_temp_env.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    let mut struct_insts = HashMap::new();
+    for m in mods.iter() {
+        for (k, v) in &m.struct_insts {
+            struct_insts.entry(k.clone()).or_insert(*v);
+        }
+    }
     let mut method_temps = mods[i].method_temps.clone();
     let mut method_insts = mods[i].method_insts.clone();
     let mut fn_substs = mods[i].fn_substs.clone();
@@ -2555,12 +2568,22 @@ impl<'a> Lower<'a> {
             ));
         }
         let mut subst = HashMap::new();
+        for (pname, ty) in &self.cx.struct_def(sid).ty_args {
+            subst.insert(pname.clone(), *ty);
+        }
         for (p, a) in temp.type_params.iter().zip(type_args.iter()) {
             subst.insert(p.name.clone(), *a);
         }
         let id = {
+            let mut types = self.types.clone();
+            let struct_name = self.cx.name_str(self.cx.struct_def(sid).name).to_string();
+            if let Some(env) = self.struct_temp_env.get(&struct_name) {
+                for (k, v) in env {
+                    types.entry(k.clone()).or_insert(*v);
+                }
+            }
             let mut env = GenEnv {
-                types: self.types,
+                types: &types,
                 subst: &subst,
                 enum_temps: self.enum_temps,
                 enum_insts: self.enum_insts,

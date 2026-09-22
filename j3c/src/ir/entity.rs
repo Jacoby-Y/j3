@@ -33,6 +33,8 @@ pub struct StructDef {
     pub packed: bool,
     pub debug: bool,
     pub span: Span,
+    /// Type arguments this instance was built with. Empty for non-generic structs.
+    pub ty_args: Vec<(String, crate::ir::ty::Ty)>,
 }
 
 impl StructDef {

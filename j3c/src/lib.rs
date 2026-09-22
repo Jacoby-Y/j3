@@ -4,6 +4,7 @@
 
 pub mod check;
 pub mod cli;
+pub mod preflight;
 pub mod compile;
 pub mod diag;
 pub mod doc;
