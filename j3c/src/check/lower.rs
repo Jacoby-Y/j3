@@ -210,6 +210,18 @@ struct Lower<'a> {
     tmp: u32,
 }
 
+struct MergedEnv {
+    funcs: HashMap<String, FuncId>,
+    consts: HashMap<String, ConstVal>,
+    types: HashMap<String, Ty>,
+    lib_ns: HashMap<String, HashMap<String, FuncId>>,
+    mod_ns: HashMap<String, HashMap<String, FuncId>>,
+    mod_types: HashMap<String, HashMap<String, Ty>>,
+    globals: HashMap<String, crate::ir::ids::GlobalId>,
+    struct_temps: HashMap<String, parse::StructItem>,
+    struct_temp_env: HashMap<String, HashMap<String, Ty>>,
+}
+
 fn lower_fn(
     cx: &mut IrCx,
     path: &str,
@@ -239,35 +251,47 @@ fn lower_fn(
     ir_funcs: &mut Vec<FuncId>,
     type_subst: HashMap<String, Ty>,
 ) -> Result<crate::ir::body::Body, CheckError> {
-    let mut use_funcs = funcs.clone();
-    let mut use_consts = consts.clone();
-    let mut use_types = types.clone();
-    let mut use_lib_ns = lib_ns.clone();
-    let mut use_mod_ns = mod_ns.clone();
-    let mut use_mod_types = mod_types.clone();
-    let mut use_globals = globals.clone();
-    let mut use_struct_temps = struct_temps.clone();
-    let mut use_struct_temp_env = struct_temp_env.clone();
     let mut body_path = path.to_string();
     let mut inst_note: Option<String> = None;
-    if let Some(sid) = cx.func(id).method_of {
+    let merged: Option<MergedEnv> = if let Some(sid) = cx.func(id).method_of {
         let sname = cx.name_str(cx.struct_def(sid).name).to_string();
         if let Some(o) = origins.get(&sname) {
-            use_funcs = merge_map(&o.funcs, funcs);
-            use_consts = merge_map(&o.consts, consts);
-            use_types = merge_map(&o.types, types);
-            use_lib_ns = merge_map(&o.lib_ns, lib_ns);
-            use_mod_ns = merge_map(&o.mod_ns, mod_ns);
-            use_mod_types = merge_map(&o.mod_types, mod_types);
-            use_globals = merge_map(&o.globals, globals);
-            use_struct_temps = merge_map(&o.struct_temps, struct_temps);
-            use_struct_temp_env = merge_map(&o.struct_temp_env, struct_temp_env);
             if o.path != path {
                 inst_note = Some(format!("while instantiating `{sname}` (from {path})"));
                 body_path = o.path.clone();
             }
+            Some(MergedEnv {
+                funcs: merge_map(&o.funcs, funcs),
+                consts: merge_map(&o.consts, consts),
+                types: merge_map(&o.types, types),
+                lib_ns: merge_map(&o.lib_ns, lib_ns),
+                mod_ns: merge_map(&o.mod_ns, mod_ns),
+                mod_types: merge_map(&o.mod_types, mod_types),
+                globals: merge_map(&o.globals, globals),
+                struct_temps: merge_map(&o.struct_temps, struct_temps),
+                struct_temp_env: merge_map(&o.struct_temp_env, struct_temp_env),
+            })
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
+    let use_funcs = merged.as_ref().map(|m| &m.funcs).unwrap_or(funcs);
+    let use_consts = merged.as_ref().map(|m| &m.consts).unwrap_or(consts);
+    let use_types = merged.as_ref().map(|m| &m.types).unwrap_or(types);
+    let use_lib_ns = merged.as_ref().map(|m| &m.lib_ns).unwrap_or(lib_ns);
+    let use_mod_ns = merged.as_ref().map(|m| &m.mod_ns).unwrap_or(mod_ns);
+    let use_mod_types = merged.as_ref().map(|m| &m.mod_types).unwrap_or(mod_types);
+    let use_globals = merged.as_ref().map(|m| &m.globals).unwrap_or(globals);
+    let use_struct_temps = merged
+        .as_ref()
+        .map(|m| &m.struct_temps)
+        .unwrap_or(struct_temps);
+    let use_struct_temp_env = merged
+        .as_ref()
+        .map(|m| &m.struct_temp_env)
+        .unwrap_or(struct_temp_env);
     let (param_tys, ret) = match cx.fn_sig(cx.func(id).ty) {
         Some((ps, r)) => (ps.clone(), r),
         None => (Vec::new(), cx.common.void),
@@ -292,18 +316,18 @@ fn lower_fn(
         b,
         locals,
         aliases: HashMap::new(),
-        funcs: &use_funcs,
-        consts: &use_consts,
-        types: &use_types,
+        funcs: use_funcs,
+        consts: use_consts,
+        types: use_types,
         methods,
-        lib_ns: &use_lib_ns,
-        mod_ns: &use_mod_ns,
-        mod_types: &use_mod_types,
-        globals: &use_globals,
+        lib_ns: use_lib_ns,
+        mod_ns: use_mod_ns,
+        mod_types: use_mod_types,
+        globals: use_globals,
         enum_temps,
         enum_insts,
-        struct_temps: &use_struct_temps,
-        struct_temp_env: &use_struct_temp_env,
+        struct_temps: use_struct_temps,
+        struct_temp_env: use_struct_temp_env,
         struct_insts,
         method_temps,
         method_insts,
