@@ -682,6 +682,79 @@ mod tests {
     }
 
     #[test]
+    fn both_backends_run_01_through_08() {
+        let cases: &[(&str, bool, &str)] = &[
+            (
+                "01_basics.j3",
+                false,
+                "Hello, world!\nHello, Coby, how are you?\n",
+            ),
+            (
+                "02_data.j3",
+                false,
+                "len=4.47214 player.pos=Vec2 { x: 12, y: 9 }\n",
+            ),
+            ("03_embedding.j3", false, "x=10, width=1\nx=10, width=1\n"),
+            (
+                "04_control.j3",
+                false,
+                "hp=3\nn=3\nn=2\nn=1\nabs=4\ni=0\ni=1\ni=3\nhello player\nleaving main\n",
+            ),
+            (
+                "05_arrays.j3",
+                false,
+                "sum=102 mid0=21\nxs[0]=11\nxs[1]=21\nxs[2]=30\nxs[3]=40\nhi Coby bytes=4\n",
+            ),
+            ("06_enums_errors.j3", false, "north\nhit 2\nmissing\n"),
+            ("07_memory.j3", false, "entities=1 hits=1\n"),
+            ("08_game_loop.j3", true, "bye\n"),
+        ];
+
+        for &(name, headless, expected) in cases {
+            let prog = if headless {
+                compile_path_headless(&speculative(name)).expect(name)
+            } else {
+                compile_path(&speculative(name)).expect(name)
+            };
+
+            let mut llvm_opts = emit::EmitOpts::default();
+            llvm_opts.backend = emit::Backend::Llvm;
+            if !emit::clang_available(&llvm_opts.clang) {
+                panic!("clang required for dual-backend test");
+            }
+            let llvm_run =
+                emit::run_program(&prog.cx, &prog.modules, &llvm_opts).expect("llvm run");
+
+            let mut c_opts = emit::EmitOpts::default();
+            c_opts.backend = emit::Backend::C;
+            let c_run = emit::run_program(&prog.cx, &prog.modules, &c_opts).expect("c run");
+
+            assert_eq!(
+                llvm_run.status,
+                0,
+                "{name} llvm stderr {}",
+                String::from_utf8_lossy(&llvm_run.stderr)
+            );
+            assert_eq!(
+                c_run.status,
+                0,
+                "{name} c stderr {}",
+                String::from_utf8_lossy(&c_run.stderr)
+            );
+            let llvm_out = String::from_utf8_lossy(&llvm_run.stdout);
+            let c_out = String::from_utf8_lossy(&c_run.stdout);
+            assert_eq!(llvm_out.as_ref(), expected, "{name} llvm stdout");
+            assert_eq!(c_out.as_ref(), expected, "{name} c stdout");
+            assert_eq!(
+                llvm_out, c_out,
+                "{name} llvm vs c\nllvm stderr {}\nc stderr {}",
+                String::from_utf8_lossy(&llvm_run.stderr),
+                String::from_utf8_lossy(&c_run.stderr)
+            );
+        }
+    }
+
+    #[test]
     fn defer_is_block_scoped() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/defer_scope.j3");
         let prog = compile_path(&path).expect("compile defer_scope");
