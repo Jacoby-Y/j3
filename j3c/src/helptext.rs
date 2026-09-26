@@ -30,8 +30,12 @@ One file is one module. `use j3.io.printLn` brings in one name.
     j3c doc                  list stdlib modules
     j3c doc j3.app           public items and their /// comments
     j3c doc j3.app create    one item
+    j3c doc j3.gfx.canvas        headless sprite and texture drawing
+    j3c doc j3.gfx.urp.raytrace  fullscreen room and sphere renderer
+    j3c doc j3.gfx.urp.forest    mesh-aware light and glass composite
     j3c doc lang             language
     j3c doc j3ui             UI components
+    j3c doc editor           3D scene editor, scene files, behaviors
     j3c help manifest        j3.toml keys
     j3c fmt --write          rewrite src/
     j3c check --json         one JSON object (ok, or message/path/line)
@@ -54,9 +58,29 @@ Larger games live in the compiler repo, not in the new project:
     examples/leaves         3D yard, click, upgrades
     examples/defense        tower defense, waves and HUD
     examples/gallery        UI: widgets, controls, layout, style, inventory
+    examples/canvas         procedural sprite and tile PNGs
+    examples/canvas_preview SDL preview of generated PNGs and live pixels
+    examples/raytrace       OpenGL room raytracer
+    examples/ocean          custom-shader wave scene
+    examples/forest         mesh, canopy shadows, and volumetric light
+
+Programmatic art: `j3.gfx.canvas.Canvas.create(arena, w, h, Mode.Pixel)`
+or `Mode.Smooth`, then draw shapes, gradients, or noise. `savePng` exports
+without SDL. In a game, `j3.game.textureFromCanvas` uploads once;
+`updateTextureFromCanvas` updates a changed rectangle. Keep the arena
+alive while drawing; destroy uploaded textures when done.
 
 `j3c lsp` is the language server. The editor extension spawns it.
 Set j3.j3cPath when `j3c` is not on PATH.
+
+3D scenes without the editor window (for agents and scripts):
+    j3c -e scene list        objects by name path; add/set/delete/check too
+    j3c -e scene ground Box  place objects: ground, ontop, scatter
+    j3c -e render --view iso the scene as the game draws it, to a PNG
+    j3c run --frames 120 --screenshot shot.png --headless
+    j3c -e gen               run assets/gen/*.j3 mesh generators (j3.gfx.meshgen)
+    j3c -e mcp               the same as MCP tools for an agent; with the
+                             editor open, edits land there as undo steps
 ";
 
 pub const MANIFEST: &str = "\
@@ -93,6 +117,8 @@ No [emit] section inherits [cc] opt.
 
 Environment
     J3_STDLIB   stdlib directory (the parent of j3/). Unset means the
+                copy compiled into this j3c binary
+    J3_EDITOR_SRC  editor frontend `src/` directory for `j3c editor`, instead of the
                 copy compiled into this j3c binary
     J3_ROOT     set by `run` to the package root. The process cwd is
                 that directory too

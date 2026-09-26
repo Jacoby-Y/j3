@@ -189,6 +189,10 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
     out.push_str(&format!("    {entry}();\n"));
     out.push_str("    return 0;\n");
     out.push_str("}\n");
+    // ponytail: text scan for fmod; flag it in the printer if this grows
+    if out.contains("__builtin_fmod") {
+        out.push_str("/* use lib \"m\" */\n");
+    }
 
     Ok(out)
 }

@@ -53,7 +53,13 @@ fn collect(prog: &Program, manifest: Option<&Manifest>) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let mut seen = Vec::new();
     let search: Vec<String> = manifest
-        .map(|m| m.link.search.clone())
+        .map(|m| {
+            m.link.search.iter().map(|dir| {
+                let path = PathBuf::from(dir);
+                if path.is_absolute() { dir.clone() }
+                else { m.root.join(dir).display().to_string() }
+            }).collect()
+        })
         .unwrap_or_default();
     let root = asset_root(prog, manifest);
     let probe_libs = manifest
@@ -106,7 +112,8 @@ fn collect(prog: &Program, manifest: Option<&Manifest>) -> Vec<Diagnostic> {
             let Some(api) = api(&module, name) else {
                 return;
             };
-            if probe_libs && !host_lib_present(api.link_name, &search) {
+            // Image loads fall back to the J3 PNG decoder, so SDL2_image is optional.
+            if probe_libs && api.link_name != "SDL2_image" && !host_lib_present(api.link_name, &search) {
                 push_once(
                     &mut diags,
                     &mut seen,

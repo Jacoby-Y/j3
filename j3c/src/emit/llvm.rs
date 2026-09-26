@@ -44,10 +44,14 @@ pub fn emit_llvm(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<Strin
     out.push_str("@.j3_true = private unnamed_addr constant [5 x i8] c\"true\\00\"\n");
     out.push_str("@.j3_false = private unnamed_addr constant [6 x i8] c\"false\\00\"\n\n");
 
+    // Several modules may bind the same C function (`getenv` in two `use lib "c"` blocks);
+    // LLVM takes one declaration per symbol.
+    let mut declared = std::collections::HashSet::new();
     for module in modules {
         for id in &module.funcs {
             let func = cx.func(*id);
             if let FuncKind::Lib { lib, symbol } = &func.kind {
+                if !declared.insert(*symbol) { continue; }
                 out.push_str(&format!("; use lib \"{}\"\n", cx.name_str(*lib)));
                 out.push_str(&format!(
                     "declare {} @{}({})\n",
@@ -115,6 +119,11 @@ pub fn emit_llvm(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<Strin
     if !meta.is_empty() {
         out.push('\n');
         out.push_str(&meta);
+    }
+    // `frem` lowers to a libm call.
+    // ponytail: text scan for frem; flag it in the printer if this grows
+    if out.contains(" frem ") {
+        out.push_str("; use lib \"m\"\n");
     }
     Ok(out)
 }

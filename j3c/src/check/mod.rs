@@ -574,11 +574,12 @@ fn fold_const_bin(
         parse::BinOp::Sub => crate::ir::op::BinOp::Sub,
         parse::BinOp::Mul => crate::ir::op::BinOp::Mul,
         parse::BinOp::Div => crate::ir::op::BinOp::Div,
+        parse::BinOp::Rem => crate::ir::op::BinOp::Rem,
         _ => return Ok(None),
     };
     match crate::ir::wrap::fold_bin(ir_op, a, b) {
         Some(v) => Ok(Some(v)),
-        None if matches!(op, parse::BinOp::Div) && b == 0 => Err(CheckError::new(
+        None if matches!(op, parse::BinOp::Div | parse::BinOp::Rem) && b == 0 => Err(CheckError::new(
             path,
             span,
             "division by zero in const initializer",
@@ -676,6 +677,11 @@ fn embed_names(cx: &IrCx, sid: StructId) -> Vec<String> {
         }
     }
     out
+}
+
+/// Key for const `name` of the module `use`d as `alias`. Idents never hold `.`, so it can't collide.
+pub(crate) fn qual_key(alias: &str, name: &str) -> String {
+    format!("{alias}.{name}")
 }
 
 pub(crate) fn field_path(
@@ -1283,6 +1289,13 @@ fn peek_ty(
             )),
         },
         ExprKind::Field { base, field } => {
+            if let ExprKind::Name(n) = &base.kind {
+                if !locals.contains_key(&n.name) {
+                    if let Some(c) = consts.get(&qual_key(&n.name, &field.name)) {
+                        return Ok(c.ty);
+                    }
+                }
+            }
             let mut base_ty = peek_ty(
                 cx, base, locals, types, funcs, methods, lib_ns, consts, path,
             )?;
@@ -1344,7 +1357,11 @@ fn peek_ty(
                 | parse::BinOp::Le
                 | parse::BinOp::Gt
                 | parse::BinOp::Ge => Ok(cx.common.bool),
-                parse::BinOp::Add | parse::BinOp::Sub | parse::BinOp::Mul | parse::BinOp::Div => {
+                parse::BinOp::Add
+                | parse::BinOp::Sub
+                | parse::BinOp::Mul
+                | parse::BinOp::Div
+                | parse::BinOp::Rem => {
                     if let Some(id) = find_operator(cx, lt, *op, methods) {
                         return match cx.fn_sig(cx.func(id).ty) {
                             Some((_, ret)) => Ok(ret),
@@ -1752,6 +1769,15 @@ fn resolve_all_uses(mods: &mut [ModData], phase: UsePhase) -> Result<(), CheckEr
                         if mods[src_i].exports.contains(k) {
                             exported.insert(k.clone(), *v);
                         }
+                    }
+                    let consts: Vec<(String, ConstVal)> = mods[src_i]
+                        .consts
+                        .iter()
+                        .filter(|(k, _)| mods[src_i].exports.contains(*k))
+                        .map(|(k, v)| (qual_key(&alias, k), v.clone()))
+                        .collect();
+                    for (k, v) in consts {
+                        mods[i].consts.insert(k, v);
                     }
                     mods[i].mod_ns.insert(alias.clone(), exported.clone());
                     mods[i].lib_ns.insert(alias, exported);

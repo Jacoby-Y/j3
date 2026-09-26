@@ -23,6 +23,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
         *g = None;
     }
     FAST.store(false, std::sync::atomic::Ordering::Relaxed);
+    crate::project::FILE_ONLY.store(false, std::sync::atomic::Ordering::Relaxed);
 
     let cmd = args[0].as_str();
     let rest = &args[1..];
@@ -37,19 +38,47 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
         "dump-llvm" => dispatch(rest, dump_ll_hello, dump_ll_samples, dump_ll_path, false),
         "dump-syntax" => dump_syntax(rest),
         "new" => crate::scaffold::cmd(rest),
+        "editor" => crate::editor::cmd(rest),
+        "-e" | "--editor" => editor_tool(rest),
         "check" => check_cmd(rest),
         "doc" => crate::doc::cmd(rest),
         "guide" => {
             print!("{}", crate::helptext::GUIDE);
             0
         }
-        "run" => dispatch(rest, run_cwd, run_samples, run_path, true),
+        "run" => match take_run_flags(rest) {
+            Ok(rest) => dispatch(&rest, run_cwd, run_samples, run_path, true),
+            Err(e) => {
+                eprintln!("j3c run: {e}");
+                1
+            }
+        },
         "build" => dispatch(rest, build_cwd, build_samples_err, build_path, true),
         "fmt" => fmt_cmd(rest),
         "lsp" => crate::lsp::serve(),
         other => {
             eprintln!("j3c: unknown command `{other}`");
-            eprintln!("run `j3c help`");
+            if matches!(other, "scene" | "render" | "gen" | "mcp") {
+                eprintln!("editor tools take -e: `j3c -e {other}`");
+            } else {
+                eprintln!("run `j3c help`");
+            }
+            1
+        }
+    }
+}
+
+/// `j3c -e <tool>`: the scene editor's tools, which work without its window.
+fn editor_tool(args: &[String]) -> i32 {
+    let rest = args.get(1..).unwrap_or(&[]);
+    match args.first().map(String::as_str) {
+        Some("scene") => crate::scene::cmd(rest),
+        Some("render") => crate::scene::render_cmd(rest),
+        Some("gen") => crate::gen::cmd(rest),
+        Some("mcp") => crate::mcp::cmd(rest),
+        other => {
+            if let Some(o) = other { eprintln!("j3c -e: unknown editor tool `{o}`"); }
+            eprintln!("usage: j3c -e scene|render|gen|mcp ...  (or --editor)");
             1
         }
     }
@@ -142,6 +171,42 @@ fn help_cmd(rest: &[String]) -> i32 {
     }
 }
 
+/// Strip `--frames N`, `--screenshot FILE`, and `--headless` from `run`'s arguments and pass
+/// them to the program: `j3.app` stops after N frames and saves the last one as a PNG, and
+/// headless runs use SDL's offscreen video and silent audio, so no window or sound appears.
+fn take_run_flags(rest: &[String]) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--frames" => {
+                let n = it.next().ok_or("--frames needs a count")?;
+                if n.parse::<u32>().map_or(true, |n| n == 0) {
+                    return Err(format!("--frames wants a positive whole number, not `{n}`"));
+                }
+                std::env::set_var("J3_FRAMES", n);
+            }
+            "--screenshot" => {
+                let path = PathBuf::from(it.next().ok_or("--screenshot needs a file")?);
+                // The program runs in its project root; keep the path the user meant.
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir().map_err(|e| e.to_string())?.join(path)
+                };
+                std::env::set_var("J3_SCREENSHOT", path);
+            }
+            "--file" => crate::project::FILE_ONLY.store(true, std::sync::atomic::Ordering::Relaxed),
+            "--headless" => {
+                std::env::set_var("SDL_VIDEODRIVER", "offscreen");
+                std::env::set_var("SDL_AUDIODRIVER", "dummy");
+            }
+            _ => out.push(arg.clone()),
+        }
+    }
+    Ok(out)
+}
+
 fn print_help() {
     println!("j3c {VERSION} — J3 compiler");
     println!();
@@ -151,6 +216,12 @@ fn print_help() {
     println!("commands:");
     println!("    new [name]       write j3.toml, src/main.j3, and AGENTS.md (hello)");
     println!("    new [name] --app SDL window (links SDL2)");
+    println!("    editor [--new] [project]  open the 3D scene editor");
+    println!("    -e scene <op> ... list/get/add/set/delete/check scene objects by name (`-e scene --help`)");
+    println!("    -e render [opts] draw a scene to a PNG without a window (`-e render --help`)");
+    println!("    -e gen [--force] run assets/gen/*.j3 mesh generators that changed");
+    println!("    -e mcp [--project D] MCP server for agents: edit, render, check, play scenes");
+    println!("                     (-e is short for --editor)");
     println!("    guide            how to start a project");
     println!("    check [path]     typecheck; no emit or link");
     println!("    check --json     one JSON object on stdout");
@@ -159,6 +230,7 @@ fn print_help() {
     println!("    doc j3ui         UI component syntax");
     println!("    build [path]     emit, compile, write `target/<name>`");
     println!("    run [path]       emit, compile, execute");
+    println!("    run --frames N [--screenshot F.png] [--headless]  stop an App after N frames");
     println!("    fmt [path]       pretty-print `.j3` (same lexer; keeps comments)");
     println!("    fmt --write      rewrite files");
     println!("    fmt --check      exit 1 if formatting would change a file");
@@ -220,7 +292,15 @@ fn compile_input(input: &Input) -> Result<(compile::Program, Option<Manifest>), 
     match input {
         Input::Hello => Ok((compile::compile_path(&compile::default_hello_path())?, None)),
         Input::File(p) => Ok((compile::compile_path(p)?, None)),
-        Input::Project(m) => Ok((compile::compile_manifest(m)?, Some(m.clone()))),
+        Input::Project(m) => {
+            // The editor's generated dispatch follows j3.editor.toml (main scene, behaviors).
+            if m.root.join("j3.editor.toml").is_file() {
+                if let Err(e) = crate::editor::generate_dispatch(&m.root, &m.name) {
+                    eprintln!("warning: src/behaviors.j3: {e}");
+                }
+            }
+            Ok((compile::compile_manifest(m)?, Some(m.clone())))
+        }
     }
 }
 
@@ -444,6 +524,7 @@ fn run_loaded(
     match prog {
         Ok((prog, manifest)) => match emit_opts(&manifest) {
             Ok(mut opts) => {
+                if let Some(m) = &manifest { crate::gen::before_build(&m.root); }
                 if let Err(e) = crate::preflight::check(&prog, manifest.as_ref()) {
                     print_fail(&e);
                     return 1;
@@ -515,7 +596,52 @@ fn build_cwd() -> i32 {
 }
 
 fn build_path(path: &str) -> i32 {
-    build_loaded(compile_user(Some(path)))
+    let started = std::time::Instant::now();
+    let prog = compile_user(Some(path));
+    timing("parse + check", started);
+    build_loaded(prog)
+}
+
+/// Hash of everything a single-target build's output depends on: every checked source
+/// file, the emit options, fast mode, and this j3c binary.
+fn source_key(prog: &compile::Program, opts: &emit::EmitOpts, fast: bool) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in &prog.cx.files {
+        f.path.hash(&mut h);
+        f.src.hash(&mut h);
+    }
+    format!("{opts:?}").hash(&mut h);
+    (fast || FAST.load(std::sync::atomic::Ordering::Relaxed)).hash(&mut h);
+    if let Some(meta) = crate::editor::host_exe().ok().and_then(|p| std::fs::metadata(p).ok()) {
+        meta.len().hash(&mut h);
+        meta.modified().ok().hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
+}
+
+fn source_stamp(opts: &emit::EmitOpts) -> Option<PathBuf> {
+    opts.cc.out.as_ref().map(|p| p.with_extension("j3c-src"))
+}
+
+/// The output exists and was built from exactly these sources and options, so emit and
+/// clang can be skipped. Scene-only edits in the editor land here.
+fn up_to_date(prog: &compile::Program, opts: &emit::EmitOpts, fast: bool) -> bool {
+    let (Some(out), Some(stamp)) = (opts.cc.out.as_ref(), source_stamp(opts)) else { return false };
+    out.exists() && std::fs::read_to_string(stamp).map(|k| k == source_key(prog, opts, fast)).unwrap_or(false)
+}
+
+fn mark_built(prog: &compile::Program, opts: &emit::EmitOpts, fast: bool) {
+    if let Some(stamp) = source_stamp(opts) {
+        let _ = std::fs::write(stamp, source_key(prog, opts, fast));
+    }
+}
+
+/// With `J3C_TIMINGS` set, print how long a build phase took to stderr.
+pub(crate) fn timing(phase: &str, since: std::time::Instant) {
+    if std::env::var_os("J3C_TIMINGS").is_some() {
+        eprintln!("j3c: {phase}: {:.3}s", since.elapsed().as_secs_f64());
+    }
 }
 
 fn build_samples_err() -> i32 {
@@ -527,6 +653,7 @@ fn build_loaded(prog: Result<(compile::Program, Option<Manifest>), String>) -> i
     match prog {
         Ok((prog, manifest)) => match emit_opts(&manifest) {
             Ok(mut opts) => {
+                if let Some(m) = &manifest { crate::gen::before_build(&m.root); }
                 let targets = manifest
                     .as_ref()
                     .map(|m| m.emit.targets.clone())
@@ -535,7 +662,14 @@ fn build_loaded(prog: Result<(compile::Program, Option<Manifest>), String>) -> i
                     if opts.cc.out.is_none() {
                         opts.cc.out = Some(PathBuf::from("target").join("a.out"));
                     }
-                    return link_built(&prog, &opts);
+                    let fast = manifest.as_ref().map(|m| m.cc.fast || m.emit.fast).unwrap_or(false);
+                    if up_to_date(&prog, &opts, fast) {
+                        println!("{}", opts.cc.out.as_ref().expect("out path").display());
+                        return 0;
+                    }
+                    let built = link_built(&prog, &opts);
+                    if built == 0 { mark_built(&prog, &opts, fast); }
+                    return built;
                 }
                 let m = manifest.as_ref().expect("target list");
                 for triple in &targets {
@@ -572,7 +706,10 @@ fn build_loaded(prog: Result<(compile::Program, Option<Manifest>), String>) -> i
 }
 
 fn link_built(prog: &compile::Program, opts: &emit::EmitOpts) -> i32 {
-    match emit::emit_text(&prog.cx, &prog.modules, opts) {
+    let started = std::time::Instant::now();
+    let emitted = emit::emit_text(&prog.cx, &prog.modules, opts);
+    timing("emit", started);
+    match emitted {
         Ok(text) => match emit::compile_text(&text, opts) {
             Ok(exe) => {
                 println!("{}", exe.display());
@@ -879,6 +1016,27 @@ mod tests {
         let path = dir.display().to_string();
         assert_eq!(run(["check".into(), path.clone()]), 1);
         assert_eq!(run(["run".into(), path]), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_skips_unchanged_sources() {
+        let dir = std::env::temp_dir().join(format!("j3-build-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("j3.toml"), "[package]\nname = \"skip\"\nentry = \"src/main.j3\"\n").unwrap();
+        let main = dir.join("src/main.j3");
+        std::fs::write(&main, "module skip;\n\nfn main() {\n}\n").unwrap();
+        let path = dir.display().to_string();
+        let exe = dir.join("target/skip");
+        assert_eq!(build_path(&path), 0);
+        let first = std::fs::metadata(&exe).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(build_path(&path), 0);
+        assert_eq!(std::fs::metadata(&exe).unwrap().modified().unwrap(), first, "unchanged build relinked");
+        std::fs::write(&main, "module skip;\n\nfn main() {\n    let x = 1;\n}\n").unwrap();
+        assert_eq!(build_path(&path), 0);
+        assert_ne!(std::fs::metadata(&exe).unwrap().modified().unwrap(), first, "edit didn't rebuild");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

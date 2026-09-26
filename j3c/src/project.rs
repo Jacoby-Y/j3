@@ -138,7 +138,13 @@ fn target_slug(target: &str) -> String {
 }
 
 /// File, directory, or `j3.toml`. Walks up from a `.j3` file to find a project.
+/// `j3c run --file`: a `.j3` path is that one file, even inside a project.
+pub static FILE_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn resolve(path: &Path) -> Result<Input, String> {
+    if FILE_ONLY.load(std::sync::atomic::Ordering::Relaxed) && path.extension().and_then(|e| e.to_str()) == Some("j3") {
+        return Ok(Input::File(path.to_path_buf()));
+    }
     if path.is_dir() {
         let toml = path.join("j3.toml");
         if toml.is_file() {

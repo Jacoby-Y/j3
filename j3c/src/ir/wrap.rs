@@ -56,6 +56,7 @@ mod tests {
         assert_eq!(fold_bin(BinOp::Div, 1, 0), None);
         assert_eq!(fold_bin(BinOp::Rem, 1, 0), None);
         assert_eq!(fold_bin(BinOp::Div, i64::MIN, -1), Some(i64::MIN));
+        assert_eq!(fold_bin(BinOp::Rem, i64::MIN, -1), Some(0));
         assert_eq!(fold_neg(i64::MIN), i64::MIN);
     }
 }

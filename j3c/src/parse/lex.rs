@@ -132,6 +132,7 @@ impl<'a> Lexer<'a> {
                 '-' => self.assign_op(start, TokenKind::Minus, TokenKind::MinusEq),
                 '*' => self.assign_op(start, TokenKind::Star, TokenKind::StarEq),
                 '/' => self.assign_op(start, TokenKind::Slash, TokenKind::SlashEq),
+                '%' => self.one(TokenKind::Percent, start),
                 '"' => self.string(start)?,
                 '`' => self.interpolate(start)?,
                 c if is_ident_start(c) => self.ident(start),

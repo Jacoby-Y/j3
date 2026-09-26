@@ -1,0 +1,230 @@
+/// Bounding volume hierarchy over triangles, for ray tracing on the GPU (see `gfx.traceUpload`).
+/// Splits the longest centroid axis where the surface area heuristic says rays test the
+/// fewest triangles (12 bins), falling back to halving the list.
+
+module j3.gfx.bvh;
+
+use j3.memory.Arena;
+
+/// Triangles in a leaf, at most.
+pub const LEAF: int = 4;
+/// Floats per node: `lo.xyz`, first triangle (leaf) or left child (inner), `hi.xyz`,
+/// triangle count (0 for an inner node, whose right child is left + 1).
+pub const NODE_FLOATS: int = 8;
+
+pub struct Bvh {
+    nodes: []f32;
+    count: int;
+    /// Triangle indices in leaf order; a leaf covers `order[first..first + count]`.
+    order: []int;
+    /// Levels below the root; the GPU tracer skips subtrees deeper than 45.
+    depth: int;
+}
+
+/// Build over `n` triangles whose corners are `corners[t * 9 .. t * 9 + 9]`.
+pub fn build(corners: []f32, n: int, arena: &Arena): Bvh {
+    let most = if n > 0 { n * 2 } else { 1 };
+    let b = Bvh { nodes: arena.alloc::<f32>(most * NODE_FLOATS), count: 1, order: arena.alloc::<int>(n), depth: 0 };
+    let centers = arena.alloc::<f32>(n * 3);
+    let t = 0;
+    while t < n {
+        b.order[t] = t;
+        let k = 0;
+        while k < 3 {
+            centers[t * 3 + k] = (corners[t * 9 + k] + corners[t * 9 + 3 + k] + corners[t * 9 + 6 + k]) / 3;
+            k += 1;
+        }
+        t += 1;
+    }
+    // Work list of (node, first, count, depth).
+    let work = arena.alloc::<int>(most * 4);
+    let bins = arena.alloc::<f32>(BINS * 7);
+    let top = 0;
+    work[0] = 0;
+    work[1] = 0;
+    work[2] = n;
+    work[3] = 0;
+    top = 1;
+    while top > 0 {
+        top -= 1;
+        let node = work[top * 4];
+        let first = work[top * 4 + 1];
+        let count = work[top * 4 + 2];
+        let level = work[top * 4 + 3];
+        if level > b.depth { b.depth = level; }
+        let at = node * NODE_FLOATS;
+        bounds(corners, b.order, first, count, b.nodes, at);
+        if count <= LEAF {
+            b.nodes[at + 3] = f32(first);
+            b.nodes[at + 7] = f32(count);
+            continue;
+        }
+        let mid = split(corners, centers, b.order, first, count, bins);
+        let left = b.count;
+        b.count += 2;
+        b.nodes[at + 3] = f32(left);
+        b.nodes[at + 7] = 0;
+        work[top * 4] = left;
+        work[top * 4 + 1] = first;
+        work[top * 4 + 2] = mid - first;
+        work[top * 4 + 3] = level + 1;
+        top += 1;
+        work[top * 4] = left + 1;
+        work[top * 4 + 1] = mid;
+        work[top * 4 + 2] = first + count - mid;
+        work[top * 4 + 3] = level + 1;
+        top += 1;
+    }
+    return b;
+}
+
+/// Box around triangles `order[first..first + count]`, written to `out[at..]` as lo, hi.
+fn bounds(corners: []f32, order: []int, first: int, count: int, out: []f32, at: int) {
+    let k = 0;
+    while k < 3 {
+        out[at + k] = 1000000000;
+        out[at + 4 + k] = -1000000000;
+        k += 1;
+    }
+    let i = first;
+    while i < first + count {
+        let c = 0;
+        while c < 9 {
+            let axis = c - (c / 3) * 3;
+            let v = corners[order[i] * 9 + c];
+            if v < out[at + axis] { out[at + axis] = v; }
+            if v > out[at + 4 + axis] { out[at + 4 + axis] = v; }
+            c += 1;
+        }
+        i += 1;
+    }
+}
+
+/// SAH bins per split.
+const BINS: int = 12;
+
+/// Surface area of a box, half of it; only comparisons matter.
+fn area(lo: []f32, hi: []f32, at: int): f32 {
+    let x = hi[at] - lo[at];
+    let y = hi[at + 1] - lo[at + 1];
+    let z = hi[at + 2] - lo[at + 2];
+    if x < 0 { return 0; }
+    return x * y + y * z + z * x;
+}
+
+/// Which of `BINS` bins centroid value `v` falls in between `lo` and `hi`.
+fn binOf(v: f32, lo: f32, hi: f32): int {
+    let k = int((v - lo) / (hi - lo) * f32(BINS));
+    if k < 0 { return 0; }
+    if k >= BINS { return BINS - 1; }
+    return k;
+}
+
+/// Reorder `order[first..first + count]` around the cheapest SAH cut on the longest
+/// centroid axis and return where the second half starts. Never returns an empty side.
+/// `bins` is scratch for `BINS * 7` floats.
+fn split(corners: []f32, centers: []f32, order: []int, first: int, count: int, bins: []f32): int {
+    let lo = [f32(1000000000), 1000000000, 1000000000];
+    let hi = [f32(-1000000000), -1000000000, -1000000000];
+    let i = first;
+    let k = 0;
+    while i < first + count {
+        k = 0;
+        while k < 3 {
+            let v = centers[order[i] * 3 + k];
+            if v < lo[k] { lo[k] = v; }
+            if v > hi[k] { hi[k] = v; }
+            k += 1;
+        }
+        i += 1;
+    }
+    let axis = 0;
+    if hi[1] - lo[1] > hi[axis] - lo[axis] { axis = 1; }
+    if hi[2] - lo[2] > hi[axis] - lo[axis] { axis = 2; }
+    // All centroids on one spot: halve the list.
+    if hi[axis] - lo[axis] < 0.000001 { return first + count / 2; }
+    // Per bin: count, then box lo (3), box hi (3).
+    let b = 0;
+    while b < BINS {
+        bins[b * 7] = 0;
+        k = 0;
+        while k < 3 {
+            bins[b * 7 + 1 + k] = 1000000000;
+            bins[b * 7 + 4 + k] = -1000000000;
+            k += 1;
+        }
+        b += 1;
+    }
+    i = first;
+    while i < first + count {
+        let t = order[i];
+        let at = binOf(centers[t * 3 + axis], lo[axis], hi[axis]) * 7;
+        bins[at] += 1;
+        let c = 0;
+        while c < 9 {
+            k = c - (c / 3) * 3;
+            let w = corners[t * 9 + c];
+            if w < bins[at + 1 + k] { bins[at + 1 + k] = w; }
+            if w > bins[at + 4 + k] { bins[at + 4 + k] = w; }
+            c += 1;
+        }
+        i += 1;
+    }
+    // Sweep from the right for each cut's right side cost, then from the left.
+    let rightCost: [12]f32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let box = [f32(1000000000), 1000000000, 1000000000, -1000000000, -1000000000, -1000000000];
+    let boxLo = []f32 { ptr: &box[0], len: 3 };
+    let boxHi = []f32 { ptr: &box[3], len: 3 };
+    let n: f32 = 0;
+    b = BINS - 1;
+    while b > 0 {
+        n += bins[b * 7];
+        k = 0;
+        while k < 3 {
+            if bins[b * 7 + 1 + k] < box[k] { box[k] = bins[b * 7 + 1 + k]; }
+            if bins[b * 7 + 4 + k] > box[3 + k] { box[3 + k] = bins[b * 7 + 4 + k]; }
+            k += 1;
+        }
+        rightCost[b] = n * area(boxLo, boxHi, 0);
+        b -= 1;
+    }
+    k = 0;
+    while k < 3 {
+        box[k] = 1000000000;
+        box[3 + k] = -1000000000;
+        k += 1;
+    }
+    n = 0;
+    let best: f32 = 1000000000000000000000000000000.0;
+    let cut = 1;
+    b = 0;
+    while b < BINS - 1 {
+        n += bins[b * 7];
+        k = 0;
+        while k < 3 {
+            if bins[b * 7 + 1 + k] < box[k] { box[k] = bins[b * 7 + 1 + k]; }
+            if bins[b * 7 + 4 + k] > box[3 + k] { box[3 + k] = bins[b * 7 + 4 + k]; }
+            k += 1;
+        }
+        let cost = n * area(boxLo, boxHi, 0) + rightCost[b + 1];
+        if n > 0 && n < f32(count) && cost < best {
+            best = cost;
+            cut = b + 1;
+        }
+        b += 1;
+    }
+    let a = first;
+    let z = first + count - 1;
+    while a <= z {
+        if binOf(centers[order[a] * 3 + axis], lo[axis], hi[axis]) < cut {
+            a += 1;
+        } else {
+            let keep = order[a];
+            order[a] = order[z];
+            order[z] = keep;
+            z -= 1;
+        }
+    }
+    if a == first || a == first + count { return first + count / 2; }
+    return a;
+}

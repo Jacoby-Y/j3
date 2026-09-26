@@ -1,0 +1,339 @@
+// Hot reload: scene, material, and effect files changed on disk by someone else (an agent, `j3c -e scene`,
+// a text editor, git) show up in the editor. A tab without unsaved edits takes the new file;
+// one with unsaved edits merges it object by object, keeping yours where both changed the same
+// object. Either way it is one undo step. Files are compared with the text the editor last
+// read or wrote, so its own saves never count as changes.
+
+module j3_editor.watch;
+
+use j3.io;
+use j3.memory.{ Arena, scratch };
+use j3.result.Result;
+use j3.data.save.Save;
+use j3.scene3d;
+use j3.scene3d.{ Node, Scene };
+use j3.math.Vec3;
+use j3.text.{ Text, same };
+use j3_editor.console.{ conAdd, say };
+use j3_editor.shared.shared;
+use j3_editor.files.refreshFor;
+use j3_editor.history.{ modified, restore, snapshot };
+use j3_editor.tabs.switchTab;
+use j3_editor.types.{ CON_ERROR, Snap, Watched, World };
+use j3_editor.util.{ cut, endsWith, fileStamp, readNow, remember, watchSlot };
+
+/// Frames between looks at the files (about once a second). A look stats each file and
+/// reads only the ones whose modification time moved.
+const EVERY: int = 60;
+
+pub fn pollWatch(w: &World) {
+    // Effect compile errors, from loading a material or an effect edit, go to the console.
+    let errs = scene3d.takeEffectErrors(scratch(0));
+    let at = 0;
+    while at < errs.len {
+        let end = at;
+        while end < errs.len && errs[end] != 10 { end += 1; }
+        if end > at {
+            conAdd(w, CON_ERROR, cut(errs, at, end));
+            let g = shared();
+            g.consoleOpen = true;
+        }
+        at = end + 1;
+    }
+    w.watchTicks += 1;
+    if w.watchTicks < EVERY { return; }
+    w.watchTicks = 0;
+    // Never swap the scene out from under a drag or a field being typed in.
+    if w.editGesture || w.dragging { return; }
+    let i = 0;
+    while i < w.tabCount {
+        if i == w.active { look(w, w.path); } else { look(w, w.tabs[i].path); }
+        i += 1;
+    }
+    let k = 0;
+    while k < w.assetCount {
+        let p = w.assetPaths[k];
+        if endsWith(p, ".j3scene") || endsWith(p, ".j3mat") || endsWith(p, ".j3fx") { look(w, p); }
+        k += 1;
+    }
+}
+
+fn look(w: &World, path: string) {
+    let slot = watchSlot(w, path);
+    if slot < 0 {
+        remember(w, path);
+        return;
+    }
+    let fresh = false;
+    let stamp = fileStamp(path, &fresh);
+    if stamp != 0 && stamp == w.watched[slot].stamp { return; }
+    w.watched[slot].stamp = if fresh { 0 } else { stamp };
+    let found = false;
+    let now = readNow(path, scratch(0), &found);
+    // A missing file is a delete or a rename in progress; the asset menu handles those.
+    if !found || same(now as string, w.watched[slot].text as string) { return; }
+    let before = w.watched[slot].text;
+    let kept = w.mem.alloc::<u8>(now.len);
+    let i = 0;
+    while i < now.len { kept[i] = now[i]; i += 1; }
+    w.watched[slot].text = kept;
+    changedOnDisk(w, w.watched[slot].path, kept, before);
+}
+
+fn changedOnDisk(w: &World, path: string, now: []u8, before: []u8) {
+    let i = 0;
+    while i < w.tabCount {
+        let tabPath = w.tabs[i].path;
+        if i == w.active { tabPath = w.path; }
+        if same(tabPath, path) {
+            let material = w.tabs[i].mat as ptr != 0;
+            if i == w.active { material = w.matTab; }
+            if material { reloadMaterialTab(w, i, now); } else { reloadTab(w, i, now, before); }
+        }
+        i += 1;
+    }
+    // Scenes that place this one, in any tab, rebuild their copies of it.
+    if endsWith(path, ".j3scene") { refreshFor(w, path); }
+    if endsWith(path, ".j3mat") { scene3d.refreshMaterial(path); }
+    if endsWith(path, ".j3fx") { scene3d.refreshEffect(path); }
+}
+
+fn reloadMaterialTab(w: &World, i: int, now: []u8) {
+    let dirty = w.tabs[i].dirty;
+    if i == w.active { dirty = w.dirty; }
+    let t = Text.new(scratch(0));
+    t.pushStr(w.tabs[i].path);
+    if dirty {
+        t.pushStr(" changed on disk; kept your unsaved material (save to overwrite, or close without saving)");
+    } else {
+        w.tabs[i].mat.file.bytes = now;
+        t.pushStr(" reloaded from disk");
+    }
+    say(w, t.str());
+}
+
+/// Take the file's new text into tab `i`: as is when the tab has no unsaved edits, else
+/// merged with them. One undo step; the shown tab stays in front.
+fn reloadTab(w: &World, i: int, now: []u8, before: []u8) {
+    let back = w.active;
+    switchTab(w, i);
+    if w.pendingUndo || w.stale { snapshot(w); }
+    scene3d.flushParams(&w.scene);
+    let wasDirty = w.dirty;
+    let theirs = scene3d.parse(now, true, w.scene.arena);
+    let conflicts = 0;
+    let snap = Snap { nodes: theirs.nodes, len: theirs.len, next: theirs.nextId, data: theirs.data, selected: w.selected, picked: w.picked, pickedCount: w.pickedCount };
+    if wasDirty {
+        let base = scene3d.parse(before, true, scratch(0));
+        snap = merged(w, &base, &theirs, &conflicts);
+    }
+    modified(w);
+    restore(w, &snap);
+    w.dirty = wasDirty;
+    let t = Text.new(scratch(0));
+    t.pushStr(w.path);
+    if !wasDirty {
+        t.pushStr(" changed on disk and was reloaded (Ctrl+Z to undo)");
+    } else {
+        t.pushStr(" changed on disk; merged into your unsaved edits");
+        if conflicts > 0 {
+            t.pushStr(", keeping yours for ");
+            t.pushInt(conflicts);
+            if conflicts == 1 { t.pushStr(" object both changed"); } else { t.pushStr(" objects both changed"); }
+        }
+    }
+    say(w, t.str());
+    switchTab(w, back);
+}
+
+fn near(a: f32, b: f32): bool {
+    let d = a - b;
+    return d < 0.0001 && d > -0.0001;
+}
+
+fn nearVec(a: Vec3, b: Vec3): bool { return near(a.x, b.x) && near(a.y, b.y) && near(a.z, b.z); }
+
+/// Whether two objects would be saved the same. Floats compare loosely: a value read,
+/// written, and read again can move in its last bit.
+fn sameNode(a: Node, b: Node): bool {
+    return a.id == b.id && a.parent == b.parent && a.kind == b.kind && same(a.name, b.name)
+        && same(a.asset, b.asset) && same(a.texture, b.texture) && same(a.behavior, b.behavior)
+        && a.doubleSided == b.doubleSided && nearVec(a.position, b.position) && nearVec(a.rotation, b.rotation)
+        && nearVec(a.scale, b.scale) && near(a.fov, b.fov) && near(a.near, b.near) && near(a.far, b.far)
+        && same(a.scene, b.scene) && nearVec(a.color, b.color) && near(a.range, b.range) && a.alpha == b.alpha
+        && near(a.opacity, b.opacity) && same(a.material, b.material) && same(a.effects, b.effects);
+}
+
+/// Slot of `id` among a scene's own objects, or -1.
+// ponytail: linear scans make a merge O(objects squared); fine for hand-sized scenes.
+fn find(s: &Scene, id: int): int {
+    let i = 0;
+    while i < s.len {
+        if s.nodes[i].id == id && s.nodes[i].owner == 0 { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+/// Three-way merge of the active tab's objects (ours) with `theirs`, both changed from `base`.
+/// Objects only one side changed take that side; objects both changed keep ours (counted in
+/// `conflicts`). Objects both sides added with the same id: theirs gets a new id.
+fn merged(w: &World, base: &Scene, theirs: &Scene, conflicts: &int): Snap {
+    let ours = &w.scene;
+    let out = ours.arena.alloc::<Node>(ours.len + theirs.len + 1);
+    let count = 0;
+    let next = ours.nextId;
+    if theirs.nextId > next { next = theirs.nextId; }
+    let i = 0;
+    while i < ours.len {
+        let o = ours.nodes[i];
+        i += 1;
+        if o.owner != 0 { continue; }
+        let b = find(base, o.id);
+        let t = find(theirs, o.id);
+        if b < 0 {
+            out[count] = o;
+            count += 1;
+        } else if t < 0 {
+            // They deleted it; keep it only if we changed it.
+            if !sameNode(o, base.nodes[b]) {
+                out[count] = o;
+                count += 1;
+                *conflicts += 1;
+            }
+        } else if sameNode(o, base.nodes[b]) {
+            out[count] = theirs.nodes[t];
+            count += 1;
+        } else {
+            if !sameNode(theirs.nodes[t], base.nodes[b]) && !sameNode(o, theirs.nodes[t]) { *conflicts += 1; }
+            out[count] = o;
+            count += 1;
+        }
+    }
+    // Their new objects. `from`/`to` renumber ones whose id we also used.
+    let from = scratch(0).alloc::<int>(theirs.len);
+    let to = scratch(0).alloc::<int>(theirs.len);
+    let moved = 0;
+    let firstNew = count;
+    let k = 0;
+    while k < theirs.len {
+        let n = theirs.nodes[k];
+        k += 1;
+        let inBase = find(base, n.id) >= 0;
+        let inOurs = find(ours, n.id) >= 0;
+        if inBase {
+            // We deleted it; if they changed it, that's a conflict and it stays deleted.
+            if !inOurs && !sameNode(n, base.nodes[find(base, n.id)]) { *conflicts += 1; }
+            continue;
+        }
+        if inOurs {
+            from[moved] = n.id;
+            to[moved] = next;
+            moved += 1;
+            n.id = next;
+            next += 1;
+        }
+        out[count] = n;
+        count += 1;
+    }
+    let j = firstNew;
+    while j < count {
+        let m = 0;
+        while m < moved {
+            if out[j].parent == from[m] { out[j].parent = to[m]; }
+            m += 1;
+        }
+        j += 1;
+    }
+    let data = mergeLines(base.data.bytes, ours.data.bytes, theirs.data.bytes, ours.arena, conflicts);
+    return Snap { nodes: out, len: count, next: next, data: Save { bytes: data, arena: ours.arena }, selected: w.selected, picked: w.picked, pickedCount: w.pickedCount };
+}
+
+/// Lines of `text`.
+fn linesOf(text: []u8, mem: &Arena): []string {
+    let count = 0;
+    let i = 0;
+    while i < text.len {
+        if text[i] == 10 { count += 1; }
+        i += 1;
+    }
+    let out = mem.alloc::<string>(count + 1);
+    let n = 0;
+    let start = 0;
+    i = 0;
+    while i <= text.len {
+        if i == text.len || text[i] == 10 {
+            if i > start {
+                out[n] = cut(text as string, start, i);
+                n += 1;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    return []string { ptr: out.ptr, len: n };
+}
+
+/// A `key[ tag]=value` line's key.
+fn keyOf(line: string): string {
+    let i = 0;
+    while i < line.len && line[i] != 32 && line[i] != 61 { i += 1; }
+    return cut(line, 0, i);
+}
+
+/// The line in `lines` with `key`, or "" (with `found` false).
+fn lineFor(lines: []string, key: string, found: &bool): string {
+    let i = 0;
+    while i < lines.len {
+        if same(keyOf(lines[i]), key) {
+            *found = true;
+            return lines[i];
+        }
+        i += 1;
+    }
+    *found = false;
+    return "";
+}
+
+/// Merge the non-object lines (field values, overrides, lighting) key by key, like objects.
+fn mergeLines(base: []u8, ours: []u8, theirs: []u8, mem: &Arena, conflicts: &int): []u8 {
+    let b = linesOf(base, scratch(0));
+    let o = linesOf(ours, scratch(0));
+    let t = linesOf(theirs, scratch(0));
+    let out = Text.new(mem);
+    let i = 0;
+    while i < o.len {
+        let key = keyOf(o[i]);
+        let inBase = false;
+        let inTheirs = false;
+        let bl = lineFor(b, key, &inBase);
+        let tl = lineFor(t, key, &inTheirs);
+        let keep = o[i];
+        let drop = false;
+        if inBase && same(o[i], bl) {
+            if inTheirs { keep = tl; } else { drop = true; }
+        } else if inBase && inTheirs && !same(tl, bl) && !same(tl, o[i]) {
+            *conflicts += 1;
+        }
+        if !drop {
+            out.pushStr(keep);
+            out.push(10);
+        }
+        i += 1;
+    }
+    let k = 0;
+    while k < t.len {
+        let key2 = keyOf(t[k]);
+        let inOurs = false;
+        let inBase2 = false;
+        lineFor(o, key2, &inOurs);
+        lineFor(b, key2, &inBase2);
+        // New on their side; one only in the base and theirs was deleted by us.
+        if !inOurs && !inBase2 {
+            out.pushStr(t[k]);
+            out.push(10);
+        }
+        k += 1;
+    }
+    return out.bytes;
+}

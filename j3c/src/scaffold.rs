@@ -6,14 +6,26 @@ use crate::fmt;
 
 pub fn cmd(rest: &[String]) -> i32 {
     let mut app = false;
+    let mut template: Option<&str> = None;
     let mut name: Option<&str> = None;
-    for a in rest {
-        if a == "--app" {
+    let mut args = rest.iter();
+    while let Some(a) = args.next() {
+        if a == "--template" {
+            match args.next().map(String::as_str) {
+                Some("fps") => template = Some("fps"),
+                other => {
+                    eprintln!("j3c: unknown template `{}`", other.unwrap_or(""));
+                    eprintln!("  = help: templates: fps");
+                    return 1;
+                }
+            }
+        } else if a == "--app" {
             app = true;
         } else if a == "--help" || a == "-h" {
-            println!("usage: j3c new [name] [--app]");
+            println!("usage: j3c new [name] [--app | --template fps]");
             println!("    j3c new mygame        printLn hello in ./mygame");
             println!("    j3c new mygame --app  SDL window (links SDL2)");
+            println!("    j3c new mygame --template fps   first-person 3D game with a scene (SDL2 + GL)");
             println!("    j3c new               write into the current directory");
             println!("    j3c new --app         window template in the current directory");
             return 0;
@@ -27,6 +39,23 @@ pub fn cmd(rest: &[String]) -> i32 {
             eprintln!("j3c: unexpected argument `{a}`");
             return 1;
         }
+    }
+    if template.is_some() {
+        if app {
+            eprintln!("j3c: `--app` and `--template` don't go together");
+            return 1;
+        }
+        return match create_fps(name) {
+            Ok(root) => {
+                println!("{}", root.display());
+                println!("next: j3c check; j3c editor to edit scenes/main.j3scene");
+                0
+            }
+            Err(e) => {
+                eprintln!("j3c: {e}");
+                1
+            }
+        };
     }
     match create(name, app) {
         Ok((root, module)) => {
@@ -80,6 +109,23 @@ pub fn create(name: Option<&str>, app: bool) -> Result<(PathBuf, String), String
     Ok((root, module))
 }
 
+/// The editor's project files with a first-person main (`--template fps`), plus AGENTS.md.
+pub fn create_fps(name: Option<&str>) -> Result<PathBuf, String> {
+    let (root, _) = locate(name)?;
+    let root = if root.is_absolute() {
+        root
+    } else {
+        std::env::current_dir().map_err(|e| format!("cwd: {e}"))?.join(root)
+    };
+    if root.join("AGENTS.md").is_file() {
+        return Err(format!("AGENTS.md already exists in {}", root.display()));
+    }
+    std::fs::create_dir_all(&root).map_err(|e| format!("mkdir: {e}"))?;
+    crate::editor::create_fps_project(&root)?;
+    std::fs::write(root.join("AGENTS.md"), AGENTS).map_err(|e| format!("write AGENTS.md: {e}"))?;
+    Ok(root)
+}
+
 const AGENTS: &str = r#"# This project
 
 Learn J3 from `j3c` only: `j3c guide`, `j3c doc`, `j3c help`. Do not search the machine, home directory, or other projects to figure out the language.
@@ -100,6 +146,29 @@ The window can resize, including fullscreen. Pick one and keep it:
 - Fluid: place things from the current size so windowed and fullscreen both read well.
 
 Do not lock drawing to the size passed to `App.create` and ignore later resizes.
+
+## Programmatic art
+
+Use `j3c doc j3.gfx.canvas` for `Canvas`. Generate sprites, tiles, icons, and textures in J3 without a window. `Mode.Pixel` keeps exact pixel edges; `Mode.Smooth` antialiases circles, lines, and triangles. Build once during startup, call `game.textureFromCanvas`, draw the resulting texture each frame, and destroy it at shutdown. For changing art, call `game.updateTextureFromCanvas` with only the changed rectangle. `Canvas.savePng` writes a PNG from a headless J3 program into an existing directory.
+
+    use j3.gfx.canvas;
+    use j3.gfx.canvas.{ Canvas, Mode };
+    use j3.game;
+    use j3.game.Texture;
+    use j3.memory.Arena;
+
+    fn makeSprite(arena: &Arena): Texture {
+        let sprite = Canvas.create(arena, 64, 64, Mode.Pixel);
+        sprite.clear(canvas.rgba(0, 0, 0, 0));
+        sprite.fillCircle(32, 32, 20, canvas.rgb(235, 176, 75));
+        return game.textureFromCanvas(sprite);
+    }
+
+`j3.gfx.canvas` colors are for image pixels; `j3.game` colors are for screen drawing. The texture keeps its uploaded pixels after the canvas arena is released.
+
+Make graphics readable at the size they appear in game. Start with a clear silhouette and a small color palette. Pick one light direction; add a darker side, a lit side, and a few highlights. Separate the subject from the background with value and contrast. Add noise sparingly after the main shapes read well. Use a fixed seed so regeneration is repeatable. Preview at native size and at the size used in game. Avoid rebuilding or uploading a static texture every frame.
+
+For large generated images, build with `[emit] opt = 2` and measure the drawing work before using `--fast`. Normal builds keep pixel bounds checks.
 
 ## UI
 
@@ -315,6 +384,8 @@ mod tests {
         assert!(agents.contains("Learn J3 from `j3c` only"), "{agents}");
         assert!(agents.contains("@j3ui"), "{agents}");
         assert!(agents.contains("j3c doc j3ui"), "{agents}");
+        assert!(agents.contains("j3c doc j3.gfx.canvas"), "{agents}");
+        assert!(agents.contains("textureFromCanvas"), "{agents}");
         assert!(agents.contains("buttonOff"), "{agents}");
         assert!(agents.contains("tryLoadFont"), "{agents}");
         assert!(agents.contains("program exited"), "{agents}");
@@ -333,6 +404,20 @@ mod tests {
         let toml = std::fs::read_to_string(made.join("j3.toml")).unwrap();
         assert!(toml.contains("libs = [\"SDL2\"]"), "{toml}");
         assert!(toml.contains("does not close the window"), "{toml}");
+        let code = crate::cli::run(["check".into(), made.display().to_string()]);
+        assert_eq!(code, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fpwalk_template_typechecks() {
+        let dir = scratch();
+        let made = create_fps(Some(dir.join("walk").to_str().unwrap())).expect("create");
+        for file in ["src/behaviors.j3", "scenes/main.j3scene", "j3.editor.toml", "AGENTS.md"] {
+            assert!(made.join(file).is_file(), "{file}");
+        }
+        let main = std::fs::read_to_string(made.join("src/main.j3")).unwrap();
+        assert!(main.contains("drawFrame"), "{main}");
         let code = crate::cli::run(["check".into(), made.display().to_string()]);
         assert_eq!(code, 0);
         let _ = std::fs::remove_dir_all(&dir);

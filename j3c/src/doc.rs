@@ -22,6 +22,7 @@ pub fn cmd(rest: &[String]) -> i32 {
             println!("    j3c doc app             same as j3.app");
             println!("    j3c doc lang           language");
             println!("    j3c doc j3ui           `@j3ui` component syntax");
+            println!("    j3c doc editor         3D scene editor, scene files, behaviors");
             return 0;
         }
         if a.starts_with('-') {
@@ -34,6 +35,7 @@ pub fn cmd(rest: &[String]) -> i32 {
         [] => index(),
         ["lang"] => Ok(lang_page()),
         ["j3ui"] | ["@j3ui"] => Ok(j3ui_page()),
+        ["editor"] => Ok(editor_page()),
         [query] => module(query, None),
         [query, item] => module(query, Some(item)),
         _ => Err("usage: j3c doc [module] [item]".to_string()),
@@ -74,7 +76,7 @@ One file is one module. `use j3.io.printLn` brings in one name. `use j3.memory.{
 
 A backtick string `hello {{name}}` fills the hole. A struct in a hole needs `#[Debug]`.
 
-`+=` `-=` `*=` `/=` write the place once. Integer overflow wraps. Divide by zero aborts. `--fast` strips that abort and the bounds-check aborts.
+`+=` `-=` `*=` write the place once (no `/=` or `%=` yet). `%` is the remainder and truncates like C: `-7 % 3 == -1`; `math.wrapi(-7, 3) == 2` wraps an index. Integer overflow wraps. Divide or `%` by zero aborts. `--fast` strips that abort and the bounds-check aborts.
 
 `operator+` is a method. `this` is the receiver. `.` follows a pointer. A method `this: &T` takes the address at the call. A field may end with `= value`. A struct literal that omits the field uses that value.
 
@@ -102,7 +104,7 @@ Attributes
 Intrinsics
     {intrinsics}
 
-The standard library is `j3c doc`. The window loop is `j3c doc j3.app`. Draw, input, and audio are `j3c doc j3.game`.
+The standard library is `j3c doc`. The window loop is `j3c doc j3.app`. Draw, input, and audio are `j3c doc j3.game`. Generate RGBA assets without a window with `j3c doc j3.gfx.canvas`.
 ",
         types = names(BUILTIN_TYPES),
         keywords = names(&keywords),
@@ -158,10 +160,37 @@ ASCII text is drawn from a glyph atlas, so a changing digit does not allocate a 
     )
 }
 
+/// The editor's user guide, embedded so it matches this j3c build.
+fn editor_page() -> String {
+    format!(
+        "`j3c doc editor` — 3D scene editor
+
+For agents editing an editor project (not the editor itself):
+- Project-owned: `j3.editor.toml` (main scene, behavior fields), `scenes/*.j3scene`, `assets/`, `src/behaviors/*.j3`.
+- Generated, don't hand-edit: `src/behaviors.j3` (dispatcher; F5/Rescan regenerates it), everything under `target/j3-editor/`.
+- Edit scenes with `j3c -e scene` (by object name, `Parent/Child` path, or `#id`), not by hand: `j3c -e scene --help`.
+- Look at what you built: `j3c -e render [--view iso|top|front] [--focus NAME] [--out F.png]`, and
+  `j3c run --frames 120 --screenshot F.png --headless` for the running game.
+- Place without guessing heights: `j3c -e scene ground|ontop|scatter`.
+- Meshes from code: `assets/gen/<name>.j3` with `j3.gfx.meshgen`, made by `j3c -e gen` (`j3c doc j3.gfx.meshgen`).
+- Reusable scenes can declare props: `j3c -e scene set @scene prop.speed=float:1`, then
+  `set <copy> prop.speed=2`; code reads `scene3d.propNumber(&scene, scene3d.copyOf(&scene, id), \"speed\", 1)`.
+- `j3c -e mcp` serves all of this as MCP tools; with the editor open, edits go to it live.
+- Scene files are line-based `key=value` saves. The editor picks up outside edits within a second (merging them into unsaved work), but `j3c -e mcp` edits it directly and is safer while it's open.
+- Runtime API for scenes, fields, lights, and materials: `j3c doc j3.scene3d`. Build/run: `j3c check`, `j3c run`.
+- Build errors from Play land in `target/j3-editor/build.log`.
+- Changing the editor itself: `j3c/editor/src/` (window, one module per file; `main.j3` is the entry), `j3c/src/editor.rs` (host, project setup), `j3c/stdlib/j3/scene3d.j3` (format); `J3_EDITOR_SRC=path/to/editor/src` builds from disk.
+
+{}",
+        include_str!("../editor/README.md")
+    )
+}
+
 pub fn index() -> Result<String, String> {
     let dir = stdlib_dir().join("j3");
     let mut files = read_dir_j3(&dir)?;
-    files.sort();
+    // Without the extension, `j3/game` sorts before `j3/game/anim`.
+    files.sort_by_key(|p| p.with_extension(""));
     let mut out = String::from("stdlib modules (`j3c doc <module>`):\n\n");
     for path in files {
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -178,6 +207,7 @@ pub fn index() -> Result<String, String> {
     out.push_str("also:\n\n");
     out.push_str("    j3c doc lang     language\n");
     out.push_str("    j3c doc j3ui     UI components\n");
+    out.push_str("    j3c doc editor   3D scene editor\n");
     Ok(out)
 }
 
@@ -210,20 +240,28 @@ fn split_query(query: &str) -> Result<(String, Option<String>), String> {
     if parts.len() < 2 {
         return Err(format!("no stdlib module `{query}`\n  = help: `j3c doc`"));
     }
-    if parts.len() == 2 {
-        return Ok((format!("{}.{}", parts[0], parts[1]), None));
+    for end in (2..=parts.len()).rev() {
+        let candidate = parts[..end].join(".");
+        if find_module(&candidate).is_ok() {
+            let item = if end < parts.len() {
+                Some(parts[end..].join("."))
+            } else {
+                None
+            };
+            return Ok((candidate, item));
+        }
     }
-    let module = format!("{}.{}", parts[0], parts[1]);
-    let item = parts[2..].join(".");
-    Ok((module, Some(item)))
+    Err(format!("no stdlib module `{query}`\n  = help: `j3c doc`"))
 }
 
 fn find_module(module: &str) -> Result<PathBuf, String> {
     let parts: Vec<&str> = module.split('.').collect();
-    if parts.len() != 2 || parts[0] != "j3" || parts[1].is_empty() {
+    if parts.len() < 2 || parts[0] != "j3" || parts[1..].iter().any(|p| p.is_empty()) {
         return Err(format!("no stdlib module `{module}`\n  = help: `j3c doc`"));
     }
-    let path = stdlib_dir().join("j3").join(format!("{}.j3", parts[1]));
+    let path = stdlib_dir()
+        .join("j3")
+        .join(format!("{}.j3", parts[1..].join("/")));
     if crate::stdlib::embedded(&path).is_some() || path.is_file() {
         return Ok(path);
     }
@@ -243,15 +281,22 @@ fn read_dir_j3(dir: &Path) -> Result<Vec<PathBuf>, String> {
         out.sort();
         return Ok(out);
     }
-    let ents = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
     let mut out = Vec::new();
+    collect_j3(dir, &mut out)?;
+    Ok(out)
+}
+
+fn collect_j3(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let ents = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
     for ent in ents.flatten() {
-        let p = ent.path();
-        if p.extension().and_then(|e| e.to_str()) == Some("j3") {
-            out.push(p);
+        let path = ent.path();
+        if path.is_dir() {
+            collect_j3(&path, out)?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("j3") {
+            out.push(path);
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn parse_file(path: &Path, src: &str) -> Result<File, String> {
@@ -466,7 +511,7 @@ mod tests {
         assert!(text.contains("j3c doc j3ui"), "{text}");
         assert!(text.contains("Bevy-shaped runner"), "{text}");
         assert!(text.contains("j3.gfx\n"), "{text}");
-        assert!(text.contains("j3.mesh\n"), "{text}");
+        assert!(text.contains("j3.gfx.mesh\n"), "{text}");
         assert_eq!(text.matches("j3.game\n").count(), 1, "{text}");
         assert!(text.contains("game_headless.j3 is the test stand-in"), "{text}");
     }

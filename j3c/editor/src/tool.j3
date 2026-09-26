@@ -1,0 +1,1618 @@
+// Scene edits by name for `j3c -e scene`, `j3c -e mcp`, and live commands sent to the editor.
+// A request is tab-separated: `op`, then its arguments. Replies are tab-separated lines:
+//   node  id  path  kind  parent  asset  position  rotation  scale  behavior  material  scene
+//   field key value          (from get)
+//   added id path            (from add)
+//   issue severity id message (from check; severity is error or warning, id 0 for the scene)
+//   ok message | err message
+// The same functions run headless (cli mode, on `scene3d.read`) and inside the editor.
+
+module j3_editor.tool;
+
+use j3.scene3d.editor.props;
+use j3.scene3d.editor.props.PropDecl;
+use j3.scene3d.editor.uses;
+use j3.gfx.{ Ray, FX_INT, FX_BOOL, FX_COLOR };
+use j3.math.{ Mat4, Vec3, PI };
+use j3.rand.Rng;
+use j3.io.printLn;
+use j3.memory.{ Arena, scratch };
+use j3.data.save;
+use j3.data.save.Save;
+use j3.scene3d;
+use j3.scene3d.{ Env, Node, Scene, GROUP, MESH, CAMERA, INSTANCE, LIGHT, OPAQUE, CUTOUT, BLEND, SKY_CLOUDS };
+use j3.text.{ Text, same };
+use j3_editor.util.{ cut, fileExists, own };
+
+/// What a request did to the scene.
+pub struct Outcome {
+    /// The scene changed, so save it (cli) or record an undo step (editor).
+    changed: bool;
+    /// Node whose mesh, texture, or material changed and needs reloading on the GPU; 0 for none.
+    reload: int;
+    /// Node to select in the editor; 0 for none.
+    focus: int;
+    /// Every other reply line is only data; this is false when the request failed.
+    ok: bool;
+}
+
+/// Split `s` on tabs.
+pub fn fields(s: string, mem: &Arena): []string {
+    let count = 1;
+    let i = 0;
+    while i < s.len {
+        if s[i] == 9 { count += 1; }
+        i += 1;
+    }
+    let out = mem.alloc::<string>(count);
+    let start = 0;
+    let k = 0;
+    i = 0;
+    while i <= s.len {
+        if i == s.len || s[i] == 9 {
+            out[k] = cut(s, start, i);
+            k += 1;
+            start = i + 1;
+        }
+        i += 1;
+    }
+    return out;
+}
+
+/// Run a request on `scene`, which was read from `path`. Replies go to `out`. A batch is
+/// several requests joined by byte 30; it stops at the first failure (`changed` still says
+/// whether earlier parts touched the scene, so the caller can roll back).
+pub fn apply(scene: &Scene, catalog: &Save, path: string, request: string, out: &Text): Outcome {
+    let result = Outcome { changed: false, reload: 0, focus: 0, ok: true };
+    let start = 0;
+    let i = 0;
+    while i <= request.len {
+        if i == request.len || request[i] == 30 {
+            let part = applyOne(scene, catalog, path, cut(request, start, i), out);
+            if part.changed { result.changed = true; }
+            if part.reload != 0 { result.reload = part.reload; }
+            if part.focus != 0 { result.focus = part.focus; }
+            if !part.ok { result.ok = false; return result; }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    return result;
+}
+
+fn applyOne(scene: &Scene, catalog: &Save, path: string, request: string, out: &Text): Outcome {
+    let args = fields(request, scratch(0));
+    let result = Outcome { changed: false, reload: 0, focus: 0, ok: true };
+    let op = args[0];
+    if same(op, "list") { list(scene, out); }
+    else if same(op, "get") { result = get(scene, catalog, args, out); }
+    else if same(op, "add") { result = addOp(scene, catalog, args, out); }
+    else if same(op, "set") { result = setOp(scene, catalog, args, out); }
+    else if same(op, "delete") { result = deleteOp(scene, args, out); }
+    else if same(op, "check") { check(scene, catalog, path, args.len > 1 && same(args[1], "part"), out); }
+    else if same(op, "ground") { result = groundOp(scene, args, out); }
+    else if same(op, "ontop") { result = ontopOp(scene, args, out); }
+    else if same(op, "scatter") { result = scatterOp(scene, args, out); }
+    else {
+        fail(out, "unknown op; expected list, get, add, set, delete, check, ground, ontop, or scatter");
+        result.ok = false;
+    }
+    return result;
+}
+
+fn line2(out: &Text, a: string, b: string) {
+    out.pushStr(a);
+    out.push(9);
+    out.pushStr(b);
+    out.push(10);
+}
+
+fn fail(out: &Text, message: string) { line2(out, "err", message); }
+
+fn failed(out: &Text, message: string): Outcome {
+    fail(out, message);
+    return Outcome { changed: false, reload: 0, focus: 0, ok: false };
+}
+
+fn done(out: &Text, message: string, id: int): Outcome {
+    line2(out, "ok", message);
+    return Outcome { changed: true, reload: 0, focus: id, ok: true };
+}
+
+pub fn kindName(kind: int): string {
+    if kind == MESH { return "mesh"; }
+    if kind == CAMERA { return "camera"; }
+    if kind == INSTANCE { return "instance"; }
+    if kind == LIGHT { return "light"; }
+    return "group";
+}
+
+/// `Parent/Child` names from the top level down to `id`.
+pub fn pathOf(scene: &Scene, id: int, mem: &Arena): string {
+    let chain = mem.alloc::<int>(64);
+    let used = 0;
+    let at = scene3d.index(scene, id);
+    while at >= 0 && used < chain.len {
+        chain[used] = at;
+        used += 1;
+        at = scene3d.index(scene, scene.nodes[at].parent);
+    }
+    let t = Text.new(mem);
+    while used > 0 {
+        used -= 1;
+        t.pushStr(scene.nodes[chain[used]].name);
+        if used > 0 { t.push(47); }
+    }
+    return t.str();
+}
+
+fn pushVec(t: &Text, v: Vec3) {
+    t.pushFloat(v.x);
+    t.push(44);
+    t.pushFloat(v.y);
+    t.push(44);
+    t.pushFloat(v.z);
+}
+
+/// Radians to degrees, rounded to a thousandth so 45 prints as 45.0, not 44.999985.
+fn degrees(v: Vec3): Vec3 {
+    let d = v * (180 / PI);
+    return Vec3.xyz(thousandths(d.x), thousandths(d.y), thousandths(d.z));
+}
+
+fn thousandths(x: f32): f32 {
+    if x < 0 { return 0 - thousandths(0 - x); }
+    return f32(int(x * 1000 + 0.5)) / 1000;
+}
+
+/// Objects added from placed scenes are not the file's own; requests never touch them.
+fn isOwn(n: Node): bool { return n.owner == 0; }
+
+// ---- node references ----
+
+/// Slot of the node `ref` names: `#<id>`, a `Parent/Child` path, or a name. Writes an `err`
+/// line listing the candidates and returns -1 when it names none or several.
+pub fn resolve(scene: &Scene, ref: string, out: &Text): int {
+    if ref.len == 0 {
+        fail(out, "no object named; pass a name, a Parent/Child path, or #id");
+        return -1;
+    }
+    if ref[0] == 35 {
+        let id = save.parseInt(ref as []u8, 1, -1);
+        let at = scene3d.index(scene, id);
+        if at < 0 || !isOwn(scene.nodes[at]) {
+            let msg = Text.new(scratch(0));
+            msg.pushStr("no object with id ");
+            msg.pushStr(ref);
+            fail(out, msg.str());
+            return -1;
+        }
+        return at;
+    }
+    let found = -1;
+    let count = 0;
+    let i = 0;
+    while i < scene.len {
+        let n = scene.nodes[i];
+        if isOwn(n) && (same(n.name, ref) || same(pathOf(scene, n.id, scratch(0)), ref)) {
+            if found < 0 { found = i; }
+            count += 1;
+        }
+        i += 1;
+    }
+    if count == 1 { return found; }
+    let t = Text.new(scratch(0));
+    if count == 0 {
+        t.pushStr("no object named ");
+        t.pushStr(ref);
+        // Near misses: names containing the reference.
+        let near = 0;
+        i = 0;
+        while i < scene.len && near < 8 {
+            if isOwn(scene.nodes[i]) && contains(scene.nodes[i].name, ref) {
+                if near == 0 { t.pushStr("; did you mean "); } else { t.pushStr(", "); }
+                t.pushStr(pathOf(scene, scene.nodes[i].id, scratch(0)));
+                near += 1;
+            }
+            i += 1;
+        }
+    } else {
+        t.pushStr(ref);
+        t.pushStr(" names several objects; use one of");
+        i = 0;
+        while i < scene.len {
+            let other = scene.nodes[i];
+            if isOwn(other) && same(other.name, ref) {
+                t.pushStr(" #");
+                t.pushInt(other.id);
+                t.pushStr(" (");
+                t.pushStr(pathOf(scene, other.id, scratch(0)));
+                t.pushStr(")");
+            }
+            i += 1;
+        }
+    }
+    fail(out, t.str());
+    return -1;
+}
+
+/// Case-insensitive: `text` contains `part`.
+fn contains(text: string, part: string): bool {
+    let i = 0;
+    while i + part.len <= text.len {
+        let j = 0;
+        while j < part.len && lowerByte(text[i + j]) == lowerByte(part[j]) { j += 1; }
+        if j == part.len { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+fn lowerByte(b: u8): u8 {
+    if b >= 65 && b <= 90 { return b + 32; }
+    return b;
+}
+
+// ---- list / get ----
+
+fn nodeLine(scene: &Scene, n: Node, out: &Text) {
+    let t = out;
+    let m = scene3d.world(scene, n.id);
+    t.pushStr("node\t");
+    t.pushInt(n.id);
+    t.push(9);
+    t.pushStr(pathOf(scene, n.id, scratch(0)));
+    t.push(9);
+    t.pushStr(kindName(n.kind));
+    t.push(9);
+    t.pushInt(n.parent);
+    t.push(9);
+    t.pushStr(n.asset);
+    t.push(9);
+    pushVec(t, Vec3.xyz(m.m[12], m.m[13], m.m[14]));
+    t.push(9);
+    pushVec(t, degrees(n.rotation));
+    t.push(9);
+    pushVec(t, n.scale);
+    t.push(9);
+    t.pushStr(n.behavior);
+    t.push(9);
+    t.pushStr(n.material);
+    t.push(9);
+    t.pushStr(n.scene);
+    t.push(10);
+}
+
+fn list(scene: &Scene, out: &Text) {
+    let i = 0;
+    while i < scene.len {
+        if isOwn(scene.nodes[i]) { nodeLine(scene, scene.nodes[i], out); }
+        i += 1;
+    }
+}
+
+fn fieldLine(out: &Text, key: string, value: string) {
+    out.pushStr("field\t");
+    out.pushStr(key);
+    out.push(9);
+    out.pushStr(value);
+    out.push(10);
+}
+
+fn fieldVec(out: &Text, key: string, v: Vec3) {
+    let t = Text.new(scratch(0));
+    pushVec(&t, v);
+    fieldLine(out, key, t.str());
+}
+
+fn fieldFloat(out: &Text, key: string, v: f32) {
+    let t = Text.new(scratch(0));
+    t.pushFloat(v);
+    fieldLine(out, key, t.str());
+}
+
+fn get(scene: &Scene, catalog: &Save, args: []string, out: &Text): Outcome {
+    if args.len < 2 { return failed(out, "get needs an object"); }
+    if same(args[1], "@scene") {
+        envFields(scene, out);
+        let decls = props.propsIn(&scene.data, scratch(0));
+        let d = 0;
+        while d < decls.len {
+            let key = Text.new(scratch(0));
+            key.pushStr("prop.");
+            key.pushStr(decls[d].name);
+            let v = Text.new(scratch(0));
+            v.pushStr(decls[d].kind);
+            v.push(58);
+            v.pushStr(decls[d].value);
+            fieldLine(out, key.str(), v.str());
+            d += 1;
+        }
+        return Outcome { changed: false, reload: 0, focus: 0, ok: true };
+    }
+    let at = resolve(scene, args[1], out);
+    if at < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+    let n = scene.nodes[at];
+    nodeLine(scene, n, out);
+    let idText = Text.new(scratch(0));
+    idText.pushInt(n.id);
+    fieldLine(out, "id", idText.str());
+    fieldLine(out, "name", n.name);
+    fieldLine(out, "kind", kindName(n.kind));
+    fieldLine(out, "parent", if n.parent == 0 { "" } else { pathOf(scene, n.parent, scratch(0)) });
+    fieldVec(out, "pos", n.position);
+    fieldVec(out, "rot", degrees(n.rotation));
+    fieldVec(out, "scale", n.scale);
+    if n.kind == MESH {
+        fieldLine(out, "asset", n.asset);
+        fieldLine(out, "material", n.material);
+        fieldLine(out, "texture", n.texture);
+        let alpha = "opaque";
+        if n.alpha == CUTOUT { alpha = "cutout"; }
+        if n.alpha == BLEND { alpha = "blend"; }
+        fieldLine(out, "alpha", alpha);
+        fieldFloat(out, "opacity", n.opacity);
+        fieldLine(out, "doubleSided", if n.doubleSided { "true" } else { "false" });
+    }
+    if n.kind == CAMERA {
+        fieldFloat(out, "fov", n.fov);
+        fieldFloat(out, "near", n.near);
+        fieldFloat(out, "far", n.far);
+        fieldLine(out, "effects", n.effects);
+        let keys = []string { ptr: 0 as &string, len: 0 };
+        let params = scene3d.cameraFxParams(scene, n.id, &keys, scratch(0));
+        let k = 0;
+        while k < keys.len {
+            let dv = params[k].def;
+            let val = Text.new(scratch(0));
+            if params[k].kind == FX_COLOR { pushVec(&val, scene3d.vector(scene, n.id, keys[k], Vec3.xyz(dv[0], dv[1], dv[2]))); }
+            else if params[k].kind == FX_BOOL { val.pushStr(if scene3d.flag(scene, n.id, keys[k], dv[0] != 0) { "true" } else { "false" }); }
+            else if params[k].kind == FX_INT { val.pushInt(scene3d.integer(scene, n.id, keys[k], int(dv[0]))); }
+            else { val.pushFloat(scene3d.number(scene, n.id, keys[k], dv[0])); }
+            fieldLine(out, keys[k], val.str());
+            k += 1;
+        }
+    }
+    if n.kind == MESH || n.kind == INSTANCE { fieldVec(out, "tint", n.tint); }
+    if n.kind == LIGHT {
+        fieldVec(out, "color", n.color);
+        fieldFloat(out, "range", n.range);
+    }
+    if n.kind == INSTANCE { fieldLine(out, "scene", n.scene); }
+    fieldLine(out, "behavior", n.behavior);
+    paramFields(scene, catalog, n, out);
+    if n.kind == INSTANCE { propFields(scene, n, out); }
+    return Outcome { changed: false, reload: 0, focus: n.id, ok: true };
+}
+
+/// `param.<field>` lines for `id`'s behavior, as declared in the catalog.
+pub fn paramFields(scene: &Scene, catalog: &Save, n: Node, out: &Text) {
+    let b = behaviorAt(catalog, n.behavior);
+    if b < 0 { return; }
+    let count = save.getInt(catalog, catKey(b, -1, "count"), 0);
+    let j = 0;
+    while j < count {
+        let field = save.getStr(catalog, catKey(b, j, "name"), "");
+        let kind = save.getStr(catalog, catKey(b, j, "type"), "");
+        let key = Text.new(scratch(0));
+        key.pushStr("param.");
+        key.pushStr(field);
+        let v = Text.new(scratch(0));
+        if same(kind, "f32") {
+            v.pushFloat(scene3d.number(scene, n.id, field, save.getFloat(catalog, catKey(b, j, "value"), 0)));
+        } else if same(kind, "bool") {
+            let on = scene3d.flag(scene, n.id, field, save.getInt(catalog, catKey(b, j, "value"), 0) != 0);
+            v.pushStr(if on { "true" } else { "false" });
+        } else if same(kind, "int") {
+            v.pushInt(scene3d.integer(scene, n.id, field, save.getInt(catalog, catKey(b, j, "value"), 0)));
+        } else if same(kind, "vec3") || same(kind, "color") {
+            let fallback = Vec3.xyz(save.getFloat(catalog, catKey(b, j, "x"), 0),
+                save.getFloat(catalog, catKey(b, j, "y"), 0), save.getFloat(catalog, catKey(b, j, "z"), 0));
+            pushVec(&v, scene3d.vector(scene, n.id, field, fallback));
+        } else if same(kind, "object") {
+            let target = scene3d.object(scene, n.id, field);
+            if target != 0 { v.pushStr(pathOf(scene, target, scratch(0))); }
+        } else {
+            v.pushStr(scene3d.label(scene, n.id, field, save.getStr(catalog, catKey(b, j, "default"), "")));
+        }
+        fieldLine(out, key.str(), v.str());
+        j += 1;
+    }
+}
+
+/// `prop.<name>` lines for placed copy `n`: its value, or its scene's default.
+fn propFields(scene: &Scene, n: Node, out: &Text) {
+    let decls = props.declaredProps(n.scene, scratch(0));
+    let d = 0;
+    while d < decls.len {
+        let key = Text.new(scratch(0));
+        key.pushStr("prop.");
+        key.pushStr(decls[d].name);
+        let value = decls[d].value;
+        if scene3d.propSet(scene, n.id, decls[d].name) { value = scene3d.prop(scene, n.id, decls[d].name, value); }
+        fieldLine(out, key.str(), value);
+        d += 1;
+    }
+}
+
+/// The declaration of prop `name` in scene file `file`; `found` false when it has none.
+fn declOf(file: string, name: string, found: &bool): PropDecl {
+    let decls = props.declaredProps(file, scratch(0));
+    let d = 0;
+    while d < decls.len {
+        if same(decls[d].name, name) {
+            *found = true;
+            return decls[d];
+        }
+        d += 1;
+    }
+    *found = false;
+    return PropDecl { name: name, kind: "", value: "" };
+}
+
+/// Whether `value` suits a prop of type `kind`.
+fn propValueOk(kind: string, value: string): bool {
+    let f = false;
+    if same(kind, "float") { return isNumber(value); }
+    if same(kind, "int") { return isNumber(value) && !containsByte(value, 46); }
+    if same(kind, "bool") { return parseBool(value, &f); }
+    return true;
+}
+
+fn containsByte(s: string, b: u8): bool {
+    let i = 0;
+    while i < s.len {
+        if s[i] == b { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+fn propKind(kind: string): bool {
+    return same(kind, "int") || same(kind, "float") || same(kind, "text") || same(kind, "bool")
+        || same(kind, "material") || same(kind, "mesh") || same(kind, "scene");
+}
+
+fn envFields(scene: &Scene, out: &Text) {
+    let e = scene3d.environment(scene);
+    fieldVec(out, "sun", e.sunDir);
+    fieldVec(out, "sunColor", e.sunColor);
+    fieldVec(out, "sky", e.sky);
+    fieldFloat(out, "fogStart", e.fogStart);
+    fieldFloat(out, "fogEnd", e.fogEnd);
+    fieldLine(out, "shadows", if e.shadows { "true" } else { "false" });
+    fieldFloat(out, "shadowSize", e.shadowSize);
+    fieldLine(out, "urp", if e.urp { "true" } else { "false" });
+    let t = Text.new(scratch(0));
+    t.pushInt(e.bounces);
+    fieldLine(out, "urpBounces", t.str());
+    let s = Text.new(scratch(0));
+    s.pushInt(e.samples);
+    fieldLine(out, "urpSamples", s.str());
+    fieldLine(out, "urpShadows", if e.tracedShadows { "true" } else { "false" });
+    fieldFloat(out, "urpShadowNear", e.traceNear);
+}
+
+// ---- catalog ----
+
+fn catKey(i: int, j: int, suffix: string): string {
+    let t = Text.new(scratch(0));
+    t.pushStr("catalog.");
+    t.pushInt(i);
+    if j >= 0 { t.push(46); t.pushInt(j); }
+    t.push(46);
+    t.pushStr(suffix);
+    return t.str();
+}
+
+fn behaviorAt(catalog: &Save, name: string): int {
+    if name.len == 0 { return -1; }
+    let count = save.getInt(catalog, "catalog.count", 0);
+    let i = 0;
+    while i < count {
+        if same(save.getStr(catalog, catKey(i, -1, "name"), ""), name) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+/// Declared type of `field` on behavior `b`, or "".
+fn fieldType(catalog: &Save, b: int, field: string): string {
+    let count = save.getInt(catalog, catKey(b, -1, "count"), 0);
+    let j = 0;
+    while j < count {
+        if same(save.getStr(catalog, catKey(b, j, "name"), ""), field) {
+            return save.getStr(catalog, catKey(b, j, "type"), "");
+        }
+        j += 1;
+    }
+    return "";
+}
+
+fn fieldNames(catalog: &Save, b: int): string {
+    let t = Text.new(scratch(0));
+    let count = save.getInt(catalog, catKey(b, -1, "count"), 0);
+    let j = 0;
+    while j < count {
+        if j > 0 { t.pushStr(", "); }
+        t.pushStr(save.getStr(catalog, catKey(b, j, "name"), ""));
+        j += 1;
+    }
+    return t.str();
+}
+
+fn behaviorNames(catalog: &Save): string {
+    let t = Text.new(scratch(0));
+    let count = save.getInt(catalog, "catalog.count", 0);
+    let i = 0;
+    while i < count {
+        if i > 0 { t.pushStr(", "); }
+        t.pushStr(save.getStr(catalog, catKey(i, -1, "name"), ""));
+        i += 1;
+    }
+    if count == 0 { t.pushStr("none declared in j3.editor.toml"); }
+    return t.str();
+}
+
+// ---- values ----
+
+/// Whether `s` is a plain decimal number (`-1`, `2.5`, `.5`).
+fn isNumber(s: string): bool {
+    let i = 0;
+    if i < s.len && s[i] == 45 { i += 1; }
+    let digits = 0;
+    let dot = false;
+    while i < s.len {
+        if s[i] >= 48 && s[i] <= 57 { digits += 1; }
+        else if s[i] == 46 && !dot { dot = true; }
+        else { return false; }
+        i += 1;
+    }
+    return digits > 0;
+}
+
+fn number(s: string): f32 { return save.parseFloat(s as []u8, 0); }
+
+/// `x,y,z` into `v`; one number sets all three when `uniform`. False when malformed.
+fn parseVec(s: string, v: &Vec3, uniform: bool): bool {
+    let parts = scratch(0).alloc::<string>(3);
+    let count = 0;
+    let start = 0;
+    let i = 0;
+    while i <= s.len {
+        if i == s.len || s[i] == 44 || s[i] == 32 {
+            if i > start {
+                if count >= 3 { return false; }
+                parts[count] = cut(s, start, i);
+                count += 1;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if count == 1 && uniform && isNumber(parts[0]) {
+        let k = number(parts[0]);
+        *v = Vec3.xyz(k, k, k);
+        return true;
+    }
+    if count != 3 || !isNumber(parts[0]) || !isNumber(parts[1]) || !isNumber(parts[2]) { return false; }
+    *v = Vec3.xyz(number(parts[0]), number(parts[1]), number(parts[2]));
+    return true;
+}
+
+fn parseBool(s: string, v: &bool): bool {
+    if same(s, "true") || same(s, "1") || same(s, "on") || same(s, "yes") { *v = true; return true; }
+    if same(s, "false") || same(s, "0") || same(s, "off") || same(s, "no") { *v = false; return true; }
+    return false;
+}
+
+fn bad(out: &Text, key: string, want: string): Outcome {
+    let t = Text.new(scratch(0));
+    t.pushStr(key);
+    t.pushStr(" wants ");
+    t.pushStr(want);
+    return failed(out, t.str());
+}
+
+/// Kind for an `add` word, and the mesh it shows for shape words (`cube`, `sphere`, ...).
+fn kindOf(word: string, mesh: &string): int {
+    *mesh = "";
+    if same(word, "group") { return GROUP; }
+    if same(word, "mesh") { return MESH; }
+    if same(word, "camera") { return CAMERA; }
+    if same(word, "instance") || same(word, "scene") { return INSTANCE; }
+    if same(word, "light") { return LIGHT; }
+    if same(word, "cube") || same(word, "sphere") || same(word, "quad") || same(word, "plane") || same(word, "sky")
+        || same(word, "cylinder") || same(word, "cone") || same(word, "capsule") || same(word, "torus") {
+        let t = Text.new(scratch(0));
+        t.pushStr("builtin:");
+        t.pushStr(word);
+        *mesh = t.str();
+        return MESH;
+    }
+    return -1;
+}
+
+fn nameTaken(scene: &Scene, name: string): bool {
+    let i = 0;
+    while i < scene.len {
+        if same(scene.nodes[i].name, name) { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+/// `base`, or `base2`, `base3`, ... whichever is free, in the scene's memory.
+pub fn uniqueIn(scene: &Scene, base: string): string {
+    let t = Text.new(scratch(0));
+    t.pushStr(base);
+    let n = 2;
+    while nameTaken(scene, t.str()) {
+        t.clear();
+        t.pushStr(base);
+        t.pushInt(n);
+        n += 1;
+    }
+    return own(scene.arena, t.str());
+}
+
+fn capitalized(word: string): string {
+    let t = Text.new(scratch(0));
+    t.pushStr(word);
+    if t.bytes.len > 0 && t.bytes[0] >= 97 && t.bytes[0] <= 122 { t.bytes[0] = t.bytes[0] - 32; }
+    return t.str();
+}
+
+// ---- add / set / delete ----
+
+/// `add <kind> [key=value ...]`: kind is group, mesh, camera, light, instance, or a shape
+/// (cube, sphere, cylinder, cone, capsule, torus, quad, plane, sky). Keys are the same as `set`.
+fn addOp(scene: &Scene, catalog: &Save, args: []string, out: &Text): Outcome {
+    if args.len < 2 { return failed(out, "add needs a kind: group, mesh, camera, light, instance, cube, sphere, cylinder, cone, capsule, torus, quad, plane, or sky"); }
+    let mesh = "";
+    let kind = kindOf(args[1], &mesh);
+    if kind < 0 {
+        return bad(out, "kind", "group, mesh, camera, light, instance, cube, sphere, cylinder, cone, capsule, torus, quad, plane, or sky");
+    }
+    let name = "";
+    let parent = 0;
+    let k = 2;
+    while k < args.len {
+        let eq = keyEnd(args[k]);
+        let key = cut(args[k], 0, eq);
+        let value = cut(args[k], eq + 1, args[k].len);
+        if eq < args[k].len && same(key, "name") { name = value; }
+        if eq < args[k].len && same(key, "parent") && value.len > 0 {
+            let p = resolve(scene, value, out);
+            if p < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+            parent = scene.nodes[p].id;
+        }
+        k += 1;
+    }
+    if name.len == 0 {
+        let base = capitalized(args[1]);
+        if same(args[1], "mesh") && mesh.len == 0 { base = "Mesh"; }
+        name = uniqueIn(scene, base);
+    } else if nameTaken(scene, name) {
+        name = uniqueIn(scene, name);
+    } else {
+        name = own(scene.arena, name);
+    }
+    let id = scene3d.add(scene, kind, name, parent);
+    let at = scene3d.index(scene, id);
+    if mesh.len > 0 { scene.nodes[at].asset = own(scene.arena, mesh); }
+    if same(mesh, "builtin:plane") { scene.nodes[at].scale = Vec3.xyz(4, 1, 4); }
+    if same(mesh, "builtin:sky") { scene.nodes[at].texture = SKY_CLOUDS; }
+    // Meshes rest on the ground and lights hang above it unless a position is given.
+    if kind == MESH && parent == 0 { scene.nodes[at].position.y = 0.5 * scene.nodes[at].scale.y; }
+    if same(mesh, "builtin:plane") || same(mesh, "builtin:quad") || same(mesh, "builtin:sky") { scene.nodes[at].position.y = 0; }
+    if kind == LIGHT { scene.nodes[at].position.y = 2; }
+    k = 2;
+    while k < args.len {
+        let later = cut(args[k], 0, keyEnd(args[k]));
+        if !same(later, "name") && !same(later, "parent") {
+            let r = setKey(scene, catalog, id, args[k], out);
+            if !r.ok {
+                scene3d.remove(scene, id);
+                return r;
+            }
+        }
+        k += 1;
+    }
+    at = scene3d.index(scene, id);
+    let t = out;
+    t.pushStr("added\t");
+    t.pushInt(id);
+    t.push(9);
+    t.pushStr(pathOf(scene, id, scratch(0)));
+    t.push(10);
+    return Outcome { changed: true, reload: if kind == MESH { id } else { 0 }, focus: id, ok: true };
+}
+
+fn keyEnd(arg: string): int {
+    let i = 0;
+    while i < arg.len && arg[i] != 61 { i += 1; }
+    return i;
+}
+
+/// `set <object> key=value ...`, or `set @scene key=value ...` for scene lighting.
+fn setOp(scene: &Scene, catalog: &Save, args: []string, out: &Text): Outcome {
+    if args.len < 3 { return failed(out, "set needs an object and key=value pairs"); }
+    if same(args[1], "@scene") {
+        let e = scene3d.environment(scene);
+        let k = 2;
+        while k < args.len {
+            let pk = keyEnd(args[k]);
+            if pk > 5 && same(cut(args[k], 0, 5), "prop.") {
+                // `prop.<name>=<type>:<default>` declares; `prop.<name>=` removes.
+                let name = cut(args[k], 5, pk);
+                let spec = cut(args[k], pk + 1, args[k].len);
+                if spec.len == 0 {
+                    props.dropProp(scene, name);
+                } else {
+                    let colon = 0;
+                    while colon < spec.len && spec[colon] != 58 { colon += 1; }
+                    let kind = cut(spec, 0, colon);
+                    let value = "";
+                    if colon < spec.len { value = cut(spec, colon + 1, spec.len); }
+                    if !propKind(kind) { return bad(out, args[k], "type:default, type one of int, float, text, bool, material, mesh, scene"); }
+                    if value.len > 0 && !propValueOk(kind, value) { return bad(out, args[k], "a default of its type"); }
+                    props.declareProp(scene, name, kind, value);
+                }
+            } else if !setEnv(&e, args[k], out) {
+                return Outcome { changed: false, reload: 0, focus: 0, ok: false };
+            }
+            k += 1;
+        }
+        scene3d.setEnvironment(scene, e);
+        return done(out, "scene updated", 0);
+    }
+    let at = resolve(scene, args[1], out);
+    if at < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+    let id = scene.nodes[at].id;
+    let reload = 0;
+    let a = 2;
+    while a < args.len {
+        let r = setKey(scene, catalog, id, args[a], out);
+        if !r.ok {
+            // Earlier keys already changed the scene; the caller discards it.
+            r.changed = a > 2;
+            return r;
+        }
+        if r.reload != 0 { reload = id; }
+        a += 1;
+    }
+    let result = done(out, pathOf(scene, id, scratch(0)), id);
+    result.reload = reload;
+    return result;
+}
+
+/// Apply one `key=value` to node `id`. `ok` is false (with an `err` line) when it's invalid;
+/// `reload` is set when the mesh, texture, or material changed.
+fn setKey(scene: &Scene, catalog: &Save, id: int, arg: string, out: &Text): Outcome {
+    let eq = keyEnd(arg);
+    if eq == arg.len { return bad(out, arg, "key=value"); }
+    let key = cut(arg, 0, eq);
+    let value = cut(arg, eq + 1, arg.len);
+    let at = scene3d.index(scene, id);
+    let n = &scene.nodes[at];
+    let ok = Outcome { changed: true, reload: 0, focus: id, ok: true };
+    let v = Vec3.zero();
+    let f = false;
+    if same(key, "name") {
+        if value.len == 0 { return bad(out, key, "a non-empty name"); }
+        if !same(value, n.name) && nameTaken(scene, value) {
+            let t = Text.new(scratch(0));
+            t.pushStr("another object is already named ");
+            t.pushStr(value);
+            return failed(out, t.str());
+        }
+        n.name = own(scene.arena, value);
+    } else if same(key, "pos") || same(key, "position") {
+        if !parseVec(value, &v, false) { return bad(out, key, "x,y,z"); }
+        n.position = v;
+    } else if same(key, "x") || same(key, "y") || same(key, "z") {
+        if !isNumber(value) { return bad(out, key, "a number"); }
+        if same(key, "x") { n.position.x = number(value); }
+        if same(key, "y") { n.position.y = number(value); }
+        if same(key, "z") { n.position.z = number(value); }
+    } else if same(key, "rot") || same(key, "rotation") {
+        if !parseVec(value, &v, false) { return bad(out, key, "x,y,z in degrees"); }
+        n.rotation = v * (PI / 180);
+    } else if same(key, "scale") {
+        if !parseVec(value, &v, true) { return bad(out, key, "x,y,z or one number"); }
+        n.scale = v;
+    } else if same(key, "parent") {
+        let parent = 0;
+        if value.len > 0 {
+            let p = resolve(scene, value, out);
+            if p < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+            parent = scene.nodes[p].id;
+        }
+        if !scene3d.reparent(scene, id, parent) { return failed(out, "can't put an object inside itself or its child"); }
+    } else if same(key, "asset") || same(key, "mesh") {
+        if n.kind != MESH { return failed(out, "asset is only for mesh objects"); }
+        n.asset = own(scene.arena, value);
+        ok.reload = id;
+    } else if same(key, "texture") {
+        n.texture = own(scene.arena, value);
+        ok.reload = id;
+    } else if same(key, "material") {
+        n.material = own(scene.arena, value);
+        ok.reload = id;
+    } else if same(key, "effects") {
+        if n.kind != CAMERA { return failed(out, "effects is only for cameras"); }
+        let a = 0;
+        while a < value.len {
+            let b = a;
+            while b < value.len && value[b] != 124 { b += 1; }
+            if !endsWithFx(cut(value, a, b)) { return failed(out, "effects is a |-separated list of .j3fx files"); }
+            a = b + 1;
+        }
+        n.effects = own(scene.arena, value);
+    } else if same(key, "scene") {
+        if n.kind != INSTANCE { return failed(out, "scene is only for instance objects"); }
+        n.scene = own(scene.arena, value);
+    } else if same(key, "behavior") {
+        if value.len > 0 && behaviorAt(catalog, value) < 0 {
+            let t2 = Text.new(scratch(0));
+            t2.pushStr("unknown behavior ");
+            t2.pushStr(value);
+            t2.pushStr("; declared: ");
+            t2.pushStr(behaviorNames(catalog));
+            return failed(out, t2.str());
+        }
+        n.behavior = own(scene.arena, value);
+    } else if same(key, "color") {
+        if !parseVec(value, &v, false) { return bad(out, key, "r,g,b (1 is full)"); }
+        n.color = v;
+    } else if same(key, "tint") {
+        if n.kind != MESH && n.kind != INSTANCE { return failed(out, "tint is for meshes and placed scenes"); }
+        if !parseVec(value, &v, true) { return bad(out, key, "r,g,b or one number (1 is unchanged)"); }
+        n.tint = v;
+    } else if same(key, "range") || same(key, "fov") || same(key, "near") || same(key, "far") || same(key, "opacity") {
+        if !isNumber(value) { return bad(out, key, "a number"); }
+        let x = number(value);
+        if same(key, "range") { n.range = x; }
+        if same(key, "fov") { n.fov = x; }
+        if same(key, "near") { n.near = x; }
+        if same(key, "far") { n.far = x; }
+        if same(key, "opacity") { n.opacity = x; }
+    } else if same(key, "alpha") {
+        if same(value, "opaque") { n.alpha = OPAQUE; }
+        else if same(value, "cutout") { n.alpha = CUTOUT; }
+        else if same(value, "blend") { n.alpha = BLEND; }
+        else { return bad(out, key, "opaque, cutout, or blend"); }
+    } else if same(key, "doubleSided") {
+        if !parseBool(value, &f) { return bad(out, key, "true or false"); }
+        n.doubleSided = f;
+    } else if key.len > 5 && same(cut(key, 0, 5), "prop.") {
+        if n.kind != INSTANCE { return failed(out, "props are set on placed scenes (instance objects)"); }
+        let name = cut(key, 5, key.len);
+        let has = false;
+        let decl = declOf(n.scene, name, &has);
+        if !has {
+            let tp = Text.new(scratch(0));
+            tp.pushStr(n.scene);
+            tp.pushStr(" declares no prop ");
+            tp.pushStr(name);
+            tp.pushStr("; declare it there with set @scene prop.");
+            tp.pushStr(name);
+            tp.pushStr("=<type>:<default>");
+            return failed(out, tp.str());
+        }
+        if value.len == 0 {
+            props.clearProp(scene, id, name);
+        } else {
+            if !propValueOk(decl.kind, value) { return bad(out, key, decl.kind); }
+            props.setProp(scene, id, name, value);
+        }
+    } else if key.len > 6 && same(cut(key, 0, 6), "param.") {
+        return setParam(scene, catalog, id, cut(key, 6, key.len), value, out);
+    } else if key.len > 3 && same(cut(key, 0, 3), "fx.") {
+        return setFxParam(scene, id, key, value, out);
+    } else {
+        let t3 = Text.new(scratch(0));
+        t3.pushStr("unknown key ");
+        t3.pushStr(key);
+        t3.pushStr("; expected name, pos, x, y, z, rot, scale, parent, asset, texture, material, scene, behavior, ");
+        t3.pushStr("tint, color, range, fov, near, far, effects, alpha, opacity, doubleSided, param.<field>, fx.<effect>.<param>, or prop.<name>");
+        return failed(out, t3.str());
+    }
+    return ok;
+}
+
+/// `fx.<effect stem>.<param>=value` on a camera: a param of one of its effects.
+fn setFxParam(scene: &Scene, id: int, key: string, value: string, out: &Text): Outcome {
+    let keys = []string { ptr: 0 as &string, len: 0 };
+    let params = scene3d.cameraFxParams(scene, id, &keys, scratch(0));
+    let k = 0;
+    while k < keys.len && !same(keys[k], key) { k += 1; }
+    if k == keys.len {
+        let t = Text.new(scratch(0));
+        t.pushStr("no effect of this camera has ");
+        t.pushStr(key);
+        t.pushStr("; it has:");
+        let j = 0;
+        while j < keys.len {
+            t.pushStr(" ");
+            t.pushStr(keys[j]);
+            j += 1;
+        }
+        if keys.len == 0 { t.pushStr(" none (set effects= first)"); }
+        return failed(out, t.str());
+    }
+    let kind = params[k].kind;
+    let v = Vec3.zero();
+    let f = false;
+    if kind == FX_COLOR {
+        if !parseVec(value, &v, false) { return bad(out, key, "r,g,b"); }
+        scene3d.setVector(scene, id, key, v);
+    } else if kind == FX_BOOL {
+        if !parseBool(value, &f) { return bad(out, key, "true or false"); }
+        scene3d.setFlag(scene, id, key, f);
+    } else if kind == FX_INT {
+        if !isNumber(value) { return bad(out, key, "a whole number"); }
+        scene3d.setInteger(scene, id, key, save.parseInt(value as []u8, 0, 0));
+    } else {
+        if !isNumber(value) { return bad(out, key, "a number"); }
+        scene3d.setNumber(scene, id, key, number(value));
+    }
+    return Outcome { changed: true, reload: 0, focus: id, ok: true };
+}
+
+fn setParam(scene: &Scene, catalog: &Save, id: int, field: string, value: string, out: &Text): Outcome {
+    let at = scene3d.index(scene, id);
+    let b = behaviorAt(catalog, scene.nodes[at].behavior);
+    if b < 0 { return failed(out, "the object has no declared behavior; set behavior=<name> first"); }
+    let kind = fieldType(catalog, b, field);
+    let ok = Outcome { changed: true, reload: 0, focus: id, ok: true };
+    let v = Vec3.zero();
+    let f = false;
+    if kind.len == 0 {
+        let t = Text.new(scratch(0));
+        t.pushStr("behavior ");
+        t.pushStr(scene.nodes[at].behavior);
+        t.pushStr(" has no field ");
+        t.pushStr(field);
+        t.pushStr("; fields: ");
+        t.pushStr(fieldNames(catalog, b));
+        return failed(out, t.str());
+    }
+    if same(kind, "f32") {
+        if !isNumber(value) { return bad(out, field, "a number"); }
+        scene3d.setNumber(scene, id, field, number(value));
+    } else if same(kind, "int") {
+        if !isNumber(value) { return bad(out, field, "a whole number"); }
+        scene3d.setInteger(scene, id, field, save.parseInt(value as []u8, 0, 0));
+    } else if same(kind, "bool") {
+        if !parseBool(value, &f) { return bad(out, field, "true or false"); }
+        scene3d.setFlag(scene, id, field, f);
+    } else if same(kind, "vec3") || same(kind, "color") {
+        if !parseVec(value, &v, false) { return bad(out, field, "x,y,z"); }
+        scene3d.setVector(scene, id, field, v);
+    } else if same(kind, "object") {
+        let target = 0;
+        if value.len > 0 {
+            let slot = resolve(scene, value, out);
+            if slot < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+            target = scene.nodes[slot].id;
+        }
+        scene3d.setObject(scene, id, field, target);
+    } else {
+        scene3d.setLabel(scene, id, field, value);
+    }
+    return ok;
+}
+
+fn setEnv(e: &Env, arg: string, out: &Text): bool {
+    let eq = keyEnd(arg);
+    let key = cut(arg, 0, eq);
+    let value = cut(arg, eq + 1, arg.len);
+    let v = Vec3.zero();
+    let f = false;
+    if eq == arg.len { bad(out, arg, "key=value"); return false; }
+    if same(key, "sun") || same(key, "sunColor") || same(key, "sky") {
+        if !parseVec(value, &v, false) { bad(out, key, "x,y,z"); return false; }
+        if same(key, "sun") { e.sunDir = v; }
+        if same(key, "sunColor") { e.sunColor = v; }
+        if same(key, "sky") { e.sky = v; }
+    } else if same(key, "fogStart") || same(key, "fogEnd") || same(key, "shadowSize") || same(key, "urpShadowNear") {
+        if !isNumber(value) { bad(out, key, "a number"); return false; }
+        if same(key, "urpShadowNear") { e.traceNear = number(value); }
+        if same(key, "fogStart") { e.fogStart = number(value); }
+        if same(key, "fogEnd") { e.fogEnd = number(value); }
+        if same(key, "shadowSize") { e.shadowSize = number(value); }
+    } else if same(key, "shadows") || same(key, "urp") || same(key, "urpShadows") {
+        if !parseBool(value, &f) { bad(out, key, "true or false"); return false; }
+        if same(key, "shadows") { e.shadows = f; }
+        if same(key, "urp") { e.urp = f; }
+        if same(key, "urpShadows") { e.tracedShadows = f; }
+    } else if same(key, "urpBounces") || same(key, "urpSamples") {
+        if !isNumber(value) { bad(out, key, "a whole number"); return false; }
+        if same(key, "urpBounces") { e.bounces = save.parseInt(value as []u8, 0, 1); }
+        if same(key, "urpSamples") { e.samples = save.parseInt(value as []u8, 0, 1); }
+    } else {
+        fail(out, "unknown scene key; expected sun, sunColor, sky, fogStart, fogEnd, shadows, shadowSize, urp, urpBounces, urpSamples, urpShadows, or urpShadowNear");
+        return false;
+    }
+    return true;
+}
+
+fn deleteOp(scene: &Scene, args: []string, out: &Text): Outcome {
+    if args.len < 2 { return failed(out, "delete needs an object"); }
+    let k = 1;
+    let t = Text.new(scratch(0));
+    t.pushStr("deleted");
+    while k < args.len {
+        let at = resolve(scene, args[k], out);
+        if at < 0 { return Outcome { changed: k > 1, reload: 0, focus: 0, ok: false }; }
+        t.push(32);
+        t.pushStr(pathOf(scene, scene.nodes[at].id, scratch(0)));
+        scene3d.remove(scene, scene.nodes[at].id);
+        k += 1;
+    }
+    return done(out, t.str(), 0);
+}
+
+// ---- check ----
+
+fn issue(out: &Text, error: bool, id: int, message: string) {
+    out.pushStr("issue\t");
+    out.pushStr(if error { "error" } else { "warning" });
+    out.push(9);
+    out.pushInt(id);
+    out.push(9);
+    out.pushStr(message);
+    out.push(10);
+}
+
+fn missing(what: string, n: Node, file: string, scene: &Scene, out: &Text) {
+    let t = Text.new(scratch(0));
+    t.pushStr(pathOf(scene, n.id, scratch(0)));
+    t.pushStr(": ");
+    t.pushStr(what);
+    t.pushStr(" file ");
+    t.pushStr(file);
+    t.pushStr(" does not exist");
+    issue(out, true, n.id, t.str());
+}
+
+/// Problems an agent (or a person) would want fixed before playing: broken links between
+/// objects, missing files, placement cycles, and fields no behavior declares.
+/// `part`: other scenes place this one and the game never starts in it, so no camera is fine.
+fn check(scene: &Scene, catalog: &Save, path: string, part: bool, out: &Text) {
+    let cameras = 0;
+    let i = 0;
+    while i < scene.len {
+        let n = scene.nodes[i];
+        i += 1;
+        if !isOwn(n) { continue; }
+        let where = pathOf(scene, n.id, scratch(0));
+        if n.kind == CAMERA { cameras += 1; }
+        if n.parent != 0 && scene3d.index(scene, n.parent) < 0 {
+            let t = Text.new(scratch(0));
+            t.pushStr(where);
+            t.pushStr(": parent #");
+            t.pushInt(n.parent);
+            t.pushStr(" does not exist");
+            issue(out, true, n.id, t.str());
+        }
+        if n.kind == MESH {
+            if n.asset.len == 0 {
+                let t2 = Text.new(scratch(0));
+                t2.pushStr(where);
+                t2.pushStr(": mesh has no asset");
+                issue(out, false, n.id, t2.str());
+            } else if !scene3d.isBuiltin(n.asset) && !fileExists(n.asset) {
+                missing("mesh", n, n.asset, scene, out);
+            }
+            if n.texture.len > 0 && !scene3d.isBuiltin(n.texture) && !fileExists(n.texture) {
+                missing("texture", n, n.texture, scene, out);
+            }
+            if n.material.len > 0 && !fileExists(n.material) { missing("material", n, n.material, scene, out); }
+        }
+        if n.kind == CAMERA && n.effects.len > 0 {
+            let from = 0;
+            while from < n.effects.len {
+                let to = from;
+                while to < n.effects.len && n.effects[to] != 124 { to += 1; }
+                let one = cut(n.effects, from, to);
+                if one.len > 0 && !fileExists(one) { missing("effect", n, one, scene, out); }
+                from = to + 1;
+            }
+        }
+        if n.kind == INSTANCE {
+            if n.scene.len == 0 {
+                let t3 = Text.new(scratch(0));
+                t3.pushStr(where);
+                t3.pushStr(": instance places no scene");
+                issue(out, true, n.id, t3.str());
+            } else if !fileExists(n.scene) {
+                missing("scene", n, n.scene, scene, out);
+            } else if same(n.scene, path) || uses.uses(n.scene, path) {
+                let t4 = Text.new(scratch(0));
+                t4.pushStr(where);
+                t4.pushStr(": placing ");
+                t4.pushStr(n.scene);
+                t4.pushStr(" makes a cycle back to this scene");
+                issue(out, true, n.id, t4.str());
+            }
+        }
+        if n.behavior.len > 0 {
+            let b = behaviorAt(catalog, n.behavior);
+            if b < 0 {
+                let t5 = Text.new(scratch(0));
+                t5.pushStr(where);
+                t5.pushStr(": behavior ");
+                t5.pushStr(n.behavior);
+                t5.pushStr(" is not declared in j3.editor.toml");
+                issue(out, true, n.id, t5.str());
+            } else {
+                checkObjects(scene, catalog, b, n, where, out);
+            }
+        }
+        if siblingsNamed(scene, n.parent, n.name) > 1 {
+            let t6 = Text.new(scratch(0));
+            t6.pushStr(where);
+            t6.pushStr(": a sibling has the same name, so only #id reaches it; this is #");
+            t6.pushInt(n.id);
+            issue(out, false, n.id, t6.str());
+        }
+    }
+    if cameras == 0 && !part { issue(out, false, 0, "the scene has no camera; the game falls back to a default view"); }
+}
+
+fn checkObjects(scene: &Scene, catalog: &Save, b: int, n: Node, where: string, out: &Text) {
+    let count = save.getInt(catalog, catKey(b, -1, "count"), 0);
+    let j = 0;
+    while j < count {
+        if same(save.getStr(catalog, catKey(b, j, "type"), ""), "object") {
+            let field = save.getStr(catalog, catKey(b, j, "name"), "");
+            let target = scene3d.object(scene, n.id, field);
+            if target != 0 && scene3d.index(scene, target) < 0 {
+                let t = Text.new(scratch(0));
+                t.pushStr(where);
+                t.pushStr(": field ");
+                t.pushStr(field);
+                t.pushStr(" points at #");
+                t.pushInt(target);
+                t.pushStr(", which does not exist");
+                issue(out, true, n.id, t.str());
+            }
+        }
+        j += 1;
+    }
+}
+
+fn siblingsNamed(scene: &Scene, parent: int, name: string): int {
+    let count = 0;
+    let i = 0;
+    while i < scene.len {
+        if isOwn(scene.nodes[i]) && scene.nodes[i].parent == parent && same(scene.nodes[i].name, name) { count += 1; }
+        i += 1;
+    }
+    return count;
+}
+
+// ---- placement: ground, ontop, scatter ----
+
+/// Mesh vertices read for this request, by asset, so each file loads once.
+struct Geo {
+    assets: []string;
+    verts: [][]f32;
+    count: int;
+}
+
+fn newGeo(): Geo {
+    return Geo { assets: scratch(0).alloc::<string>(64), verts: scratch(0).alloc::<[]f32>(64), count: 0 };
+}
+
+fn geoVerts(g: &Geo, asset: string): []f32 {
+    let i = 0;
+    while i < g.count {
+        if same(g.assets[i], asset) { return g.verts[i]; }
+        i += 1;
+    }
+    let v = scene3d.assetVerts(asset, scratch(0));
+    if g.count < g.assets.len {
+        g.assets[g.count] = asset;
+        g.verts[g.count] = v;
+        g.count += 1;
+    }
+    return v;
+}
+
+/// Whether `id` is `root` or inside it.
+fn inside(scene: &Scene, id: int, root: int): bool {
+    let at = id;
+    let steps = 0;
+    while at != 0 && steps <= scene.len {
+        if at == root { return true; }
+        let slot = scene3d.index(scene, at);
+        if slot < 0 { return false; }
+        at = scene.nodes[slot].parent;
+        steps += 1;
+    }
+    return false;
+}
+
+fn solid(n: Node): bool { return n.kind == MESH && n.asset.len > 0 && !scene3d.isSky(n); }
+
+/// World box of the meshes in `root`'s subtree. With none (a group, an instance), a point at
+/// its origin. False when the box is only that point.
+fn worldBox(scene: &Scene, g: &Geo, root: int, lo: &Vec3, hi: &Vec3): bool {
+    let any = false;
+    let i = 0;
+    while i < scene.len {
+        let n = scene.nodes[i];
+        i += 1;
+        if !solid(n) || !inside(scene, n.id, root) { continue; }
+        let verts = geoVerts(g, n.asset);
+        if verts.len < 36 { continue; }
+        let m = scene3d.world(scene, n.id);
+        let v = 0;
+        while v + 2 < verts.len {
+            let q = m.transformPoint(Vec3.xyz(verts[v], verts[v + 1], verts[v + 2]));
+            if !any {
+                *lo = q;
+                *hi = q;
+                any = true;
+            }
+            if q.x < lo.x { lo.x = q.x; }
+            if q.y < lo.y { lo.y = q.y; }
+            if q.z < lo.z { lo.z = q.z; }
+            if q.x > hi.x { hi.x = q.x; }
+            if q.y > hi.y { hi.y = q.y; }
+            if q.z > hi.z { hi.z = q.z; }
+            v += 12;
+        }
+    }
+    if !any {
+        let o = scene3d.world(scene, root).transformPoint(Vec3.zero());
+        *lo = o;
+        *hi = o;
+    }
+    return any;
+}
+
+/// Highest mesh surface straight below `(x, fromY, z)`, leaving out `skip`'s subtree and,
+/// when `only` isn't 0, anything outside `only`'s. `found` is false when nothing is there.
+// ponytail: tests every triangle of every mesh; a scene BVH (j3.gfx.bvh) if scenes get big.
+fn surfaceBelow(scene: &Scene, g: &Geo, x: f32, fromY: f32, z: f32, skip: int, only: int, found: &bool): f32 {
+    let ray = Ray { origin: Vec3.xyz(x, fromY, z), dir: Vec3.xyz(0, -1, 0) };
+    let best: f32 = 0;
+    *found = false;
+    let i = 0;
+    while i < scene.len {
+        let n = scene.nodes[i];
+        i += 1;
+        if !solid(n) || inside(scene, n.id, skip) { continue; }
+        if only != 0 && !inside(scene, n.id, only) { continue; }
+        let verts = geoVerts(g, n.asset);
+        let hit = scene3d.hitTriangles(verts, scene3d.world(scene, n.id), ray, 10000);
+        if hit.ok && (!*found || fromY - hit.t > best) {
+            best = fromY - hit.t;
+            *found = true;
+        }
+    }
+    return best;
+}
+
+/// Move `id` by `delta` in world space, whatever its parent's transform.
+fn moveWorld(scene: &Scene, id: int, delta: Vec3) {
+    let at = scene3d.index(scene, id);
+    let parent = scene.nodes[at].parent;
+    if parent == 0 {
+        scene.nodes[at].position = scene.nodes[at].position + delta;
+        return;
+    }
+    let inv = scene3d.world(scene, parent).affineInverse();
+    scene.nodes[at].position = scene.nodes[at].position + (inv.transformPoint(delta) - inv.transformPoint(Vec3.zero()));
+}
+
+/// Drop (or lift) `id` so its lowest point rests on what is under it: the highest surface
+/// under its middle and four points around it, or y 0 when there's nothing. `only` limits
+/// the surfaces to one object's subtree. False (with an `err`) when `only` isn't under it.
+fn settle(scene: &Scene, g: &Geo, id: int, skip: int, only: int, out: &Text): bool {
+    let lo = Vec3.zero();
+    let hi = Vec3.zero();
+    worldBox(scene, g, id, &lo, &hi);
+    let c = (lo + hi) * 0.5;
+    let rx = (hi.x - lo.x) * 0.3;
+    let rz = (hi.z - lo.z) * 0.3;
+    let top: f32 = 0;
+    let any = false;
+    let k = 0;
+    while k < 5 {
+        let x = c.x;
+        let z = c.z;
+        if k == 1 { x = c.x - rx; z = c.z - rz; }
+        if k == 2 { x = c.x + rx; z = c.z - rz; }
+        if k == 3 { x = c.x - rx; z = c.z + rz; }
+        if k == 4 { x = c.x + rx; z = c.z + rz; }
+        let hit = false;
+        let y = surfaceBelow(scene, g, x, c.y + 0.001, z, skip, only, &hit);
+        if hit && (!any || y > top) {
+            top = y;
+            any = true;
+        }
+        k += 1;
+    }
+    if !any {
+        if only != 0 {
+            fail(out, "nothing of that object is under this one");
+            return false;
+        }
+        top = 0;
+    }
+    moveWorld(scene, id, Vec3.xyz(0, top - lo.y, 0));
+    return true;
+}
+
+/// `ground <object> [on=<object>]`: rest it on whatever is below (or on one object).
+fn groundOp(scene: &Scene, args: []string, out: &Text): Outcome {
+    if args.len < 2 { return failed(out, "ground needs an object"); }
+    let at = resolve(scene, args[1], out);
+    if at < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+    let id = scene.nodes[at].id;
+    let only = 0;
+    let k = 2;
+    while k < args.len {
+        let eq = keyEnd(args[k]);
+        if same(cut(args[k], 0, eq), "on") {
+            let t = resolve(scene, cut(args[k], eq + 1, args[k].len), out);
+            if t < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+            only = scene.nodes[t].id;
+        } else {
+            return bad(out, args[k], "on=<object>");
+        }
+        k += 1;
+    }
+    let g = newGeo();
+    if !settle(scene, &g, id, id, only, out) { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+    return done(out, pathOf(scene, id, scratch(0)), id);
+}
+
+/// `ontop <object> <target>`: center it over the target and rest it on the target's top.
+fn ontopOp(scene: &Scene, args: []string, out: &Text): Outcome {
+    if args.len < 3 { return failed(out, "ontop needs an object and the object to put it on"); }
+    let at = resolve(scene, args[1], out);
+    if at < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+    let tat = resolve(scene, args[2], out);
+    if tat < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+    let id = scene.nodes[at].id;
+    let target = scene.nodes[tat].id;
+    if inside(scene, target, id) { return failed(out, "can't put an object on top of itself or its child"); }
+    let g = newGeo();
+    let lo = Vec3.zero();
+    let hi = Vec3.zero();
+    let tlo = Vec3.zero();
+    let thi = Vec3.zero();
+    worldBox(scene, &g, id, &lo, &hi);
+    worldBox(scene, &g, target, &tlo, &thi);
+    let c = (lo + hi) * 0.5;
+    let tc = (tlo + thi) * 0.5;
+    // Over the target's middle, just above its top; then down onto its surface.
+    moveWorld(scene, id, Vec3.xyz(tc.x - c.x, thi.y + 0.001 - lo.y, tc.z - c.z));
+    if !settle(scene, &g, id, id, target, out) {
+        // No surface under the middle (a ring, say): rest on its box.
+        out.clear();
+    }
+    let t = Text.new(scratch(0));
+    t.pushStr(pathOf(scene, id, scratch(0)));
+    t.pushStr(" on ");
+    t.pushStr(pathOf(scene, target, scratch(0)));
+    return done(out, t.str(), id);
+}
+
+/// `scatter <what> area=x0,z0,x1,z1 [count=10] [seed=1] [scale=lo,hi] [yaw=true]
+/// [spacing=0] [parent=P] [name=Base] [ground=true]`: copies of a shape (cube, sphere, ...),
+/// a mesh asset, or a scene file (placed as instances) at random spots in the area (in the
+/// parent's space), under a new group. The same seed gives the same layout.
+fn scatterOp(scene: &Scene, args: []string, out: &Text): Outcome {
+    if args.len < 2 { return failed(out, "scatter needs what to place: a shape, a mesh file, or a .j3scene"); }
+    let what = args[1];
+    let mesh = "";
+    let kind = kindOf(what, &mesh);
+    let file = "";
+    if kind != MESH || mesh.len == 0 {
+        if endsWithText(what, ".j3scene") { kind = INSTANCE; file = what; }
+        else if endsWithText(what, ".j3mesh") || scene3d.isBuiltin(what) { kind = MESH; mesh = what; }
+        else { return bad(out, "what", "a shape (cube, sphere, cylinder, ...), a .j3mesh or builtin: asset, or a .j3scene"); }
+    }
+    if kind == INSTANCE && !fileExists(file) { return failed(out, "that scene file does not exist"); }
+    if kind == MESH && !scene3d.isBuiltin(mesh) && !fileExists(mesh) { return failed(out, "that mesh file does not exist"); }
+    let count = 10;
+    let seed = 1;
+    let area = Vec3.zero();
+    let areaHi = Vec3.zero();
+    let haveArea = false;
+    let scaleLo: f32 = 1;
+    let scaleHi: f32 = 1;
+    let yaw = true;
+    let spacing: f32 = 0;
+    let parent = 0;
+    let base = "";
+    let onGround = true;
+    let k = 2;
+    while k < args.len {
+        let eq = keyEnd(args[k]);
+        let key = cut(args[k], 0, eq);
+        let value = cut(args[k], eq + 1, args[k].len);
+        let nums = scratch(0).alloc::<f32>(4);
+        let got = numbers(value, nums);
+        if eq == args[k].len { return bad(out, args[k], "key=value"); }
+        if same(key, "count") {
+            if got != 1 || nums[0] < 1 || nums[0] > 2000 { return bad(out, key, "a whole number from 1 to 2000"); }
+            count = int(nums[0]);
+        } else if same(key, "seed") {
+            if got != 1 { return bad(out, key, "a whole number"); }
+            seed = int(nums[0]);
+        } else if same(key, "area") {
+            if got != 4 { return bad(out, key, "x0,z0,x1,z1"); }
+            area = Vec3.xyz(nums[0], 0, nums[1]);
+            areaHi = Vec3.xyz(nums[2], 0, nums[3]);
+            haveArea = true;
+        } else if same(key, "scale") {
+            if got == 1 { scaleLo = nums[0]; scaleHi = nums[0]; }
+            else if got == 2 { scaleLo = nums[0]; scaleHi = nums[1]; }
+            else { return bad(out, key, "a number or lo,hi"); }
+        } else if same(key, "spacing") {
+            if got != 1 { return bad(out, key, "a distance"); }
+            spacing = nums[0];
+        } else if same(key, "yaw") || same(key, "ground") {
+            let f = false;
+            if !parseBool(value, &f) { return bad(out, key, "true or false"); }
+            if same(key, "yaw") { yaw = f; } else { onGround = f; }
+        } else if same(key, "parent") {
+            if value.len > 0 {
+                let ps = resolve(scene, value, out);
+                if ps < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+                parent = scene.nodes[ps].id;
+            }
+        } else if same(key, "name") {
+            base = value;
+        } else {
+            return bad(out, key, "one of count, area, seed, scale, yaw, spacing, parent, name, ground");
+        }
+        k += 1;
+    }
+    if !haveArea { return failed(out, "scatter needs area=x0,z0,x1,z1 (in the parent's space)"); }
+    if base.len == 0 {
+        if kind == INSTANCE { base = capitalized(stemOf(file)); } else { base = capitalized(stemOf(mesh)); }
+    }
+    let group = scene3d.add(scene, GROUP, uniqueIn(scene, "Scatter"), parent);
+    let rng = Rng.new(seed);
+    let spots = scratch(0).alloc::<Vec3>(count);
+    let made = 0;
+    while made < count {
+        // Up to 30 tries for a spot `spacing` clear of the others; then take the last one.
+        let p = Vec3.zero();
+        let tries = 0;
+        let clear = false;
+        while tries < 30 && !clear {
+            p = Vec3.xyz(rng.floatRange(min(area.x, areaHi.x), max(area.x, areaHi.x)), 0,
+                rng.floatRange(min(area.z, areaHi.z), max(area.z, areaHi.z)));
+            clear = true;
+            let j = 0;
+            while j < made && spacing > 0 {
+                let d = spots[j] - p;
+                if d.x * d.x + d.z * d.z < spacing * spacing { clear = false; }
+                j += 1;
+            }
+            tries += 1;
+        }
+        spots[made] = p;
+        let id = scene3d.add(scene, kind, uniqueIn(scene, base), group);
+        let at = scene3d.index(scene, id);
+        if kind == MESH { scene.nodes[at].asset = own(scene.arena, mesh); }
+        if kind == INSTANCE { scene.nodes[at].scene = own(scene.arena, file); }
+        let s = rng.floatRange(scaleLo, scaleHi);
+        scene.nodes[at].scale = Vec3.xyz(s, s, s);
+        if yaw { scene.nodes[at].rotation = Vec3.xyz(0, rng.floatRange(0, PI * 2), 0); }
+        scene.nodes[at].position = p;
+        made += 1;
+    }
+    if onGround {
+        let g = newGeo();
+        let i = 0;
+        while i < scene.len {
+            let n = scene.nodes[i];
+            i += 1;
+            if n.parent == group { settle(scene, &g, n.id, group, 0, out); }
+        }
+    }
+    let t = out;
+    t.pushStr("added\t");
+    t.pushInt(group);
+    t.push(9);
+    t.pushStr(pathOf(scene, group, scratch(0)));
+    t.push(10);
+    let msg = Text.new(scratch(0));
+    msg.pushStr("scattered ");
+    msg.pushInt(count);
+    msg.push(32);
+    msg.pushStr(base);
+    msg.pushStr(" under ");
+    msg.pushStr(pathOf(scene, group, scratch(0)));
+    return done(out, msg.str(), group);
+}
+
+/// Numbers in `s` separated by commas or spaces, into `out`; how many, or -1 if one is bad.
+fn numbers(s: string, out: []f32): int {
+    let count = 0;
+    let start = 0;
+    let i = 0;
+    while i <= s.len {
+        if i == s.len || s[i] == 44 || s[i] == 32 {
+            if i > start {
+                let part = cut(s, start, i);
+                if !isNumber(part) || count >= out.len { return -1; }
+                out[count] = number(part);
+                count += 1;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    return count;
+}
+
+fn min(a: f32, b: f32): f32 { if a < b { return a; } return b; }
+fn max(a: f32, b: f32): f32 { if a > b { return a; } return b; }
+
+fn endsWithText(value: string, suffix: string): bool {
+    if value.len < suffix.len { return false; }
+    return same(cut(value, value.len - suffix.len, value.len), suffix);
+}
+
+/// "assets/gen/tree.j3mesh" or "builtin:cube" -> "tree" or "cube".
+fn stemOf(path: string): string {
+    let start = 0;
+    let end = path.len;
+    let i = 0;
+    while i < path.len {
+        if path[i] == 47 || path[i] == 58 { start = i + 1; end = path.len; }
+        if path[i] == 46 && i > start { end = i; }
+        i += 1;
+    }
+    return cut(path, start, end);
+}
+
+/// `J3_EDITOR_MODE=cli`: run `J3_TOOL` (a tab-separated request) on `J3_EDITOR_SCENE`, save
+/// when it changed the scene, and print the reply. Exit status 1 when it failed.
+pub fn cli(request: string, path: string): int {
+    let mem = Arena.create(4 * 1024 * 1024);
+    let scene = scene3d.read(path, &mem);
+    let catalog = save.load("target/j3-editor/catalog", &mem);
+    let out = Text.new(&mem);
+    if !scene.found && !(request.len >= 5 && same(cut(request, 0, 5), "check")) && !(request.len > 3 && same(cut(request, 0, 4), "add\t")) {
+        let t = Text.new(scratch(0));
+        t.pushStr("scene file ");
+        t.pushStr(path);
+        t.pushStr(" does not exist");
+        fail(&out, t.str());
+        printOut(out.str());
+        return 1;
+    }
+    let result = apply(&scene, &catalog, path, request, &out);
+    // A failed request may have changed the scene partway; the file keeps its old contents.
+    if result.ok && result.changed && !scene3d.store(&scene, path) {
+        fail(&out, "could not write the scene file");
+        result.ok = false;
+    }
+    printOut(out.str());
+    return if result.ok { 0 } else { 1 };
+}
+
+fn printOut(s: string) {
+    if s.len > 0 && s[s.len - 1] == 10 { s = cut(s, 0, s.len - 1); }
+    if s.len > 0 { printLn(s); }
+}
+
+fn endsWithFx(path: string): bool {
+    let ext = ".j3fx";
+    if path.len <= ext.len { return false; }
+    return same(cut(path, path.len - ext.len, path.len), ext);
+}

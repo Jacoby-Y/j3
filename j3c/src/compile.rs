@@ -848,21 +848,21 @@ fn main() {
         check_path_lib(&dir.join("result.j3")).expect("check j3.result");
         check_path_lib(&dir.join("rand.j3")).expect("check j3.rand");
         check_path_lib(&dir.join("math.j3")).expect("check j3.math");
-        check_path_lib(&dir.join("ecs.j3")).expect("check j3.ecs");
+        check_path_lib(&dir.join("game/ecs.j3")).expect("check j3.game.ecs");
         check_path_lib(&dir.join("app.j3")).expect("check j3.app");
-        check_path_lib(&dir.join("collide.j3")).expect("check j3.collide");
-        check_path_lib(&dir.join("res.j3")).expect("check j3.res");
-        check_path_lib(&dir.join("scene.j3")).expect("check j3.scene");
-        check_path_lib(&dir.join("save.j3")).expect("check j3.save");
-        check_path_lib(&dir.join("tile.j3")).expect("check j3.tile");
-        check_path_lib(&dir.join("fx.j3")).expect("check j3.fx");
-        check_path_lib(&dir.join("debug.j3")).expect("check j3.debug");
+        check_path_lib(&dir.join("game/collide.j3")).expect("check j3.game.collide");
+        check_path_lib(&dir.join("data/res.j3")).expect("check j3.data.res");
+        check_path_lib(&dir.join("data/scene.j3")).expect("check j3.data.scene");
+        check_path_lib(&dir.join("data/save.j3")).expect("check j3.data.save");
+        check_path_lib(&dir.join("game/tile.j3")).expect("check j3.game.tile");
+        check_path_lib(&dir.join("game/fx.j3")).expect("check j3.game.fx");
+        check_path_lib(&dir.join("data/debug.j3")).expect("check j3.data.debug");
         check_path_lib(&dir.join("ui.j3")).expect("check j3.ui");
         check_path_lib(&speculative("10_j3ui.j3")).expect("check 10 j3ui");
-        check_path_lib(&dir.join("assets.j3")).expect("check j3.assets");
+        check_path_lib(&dir.join("data/assets.j3")).expect("check j3.data.assets");
         check_path_lib(&dir.join("gfx.j3")).expect("check j3.gfx");
-        check_path_lib(&dir.join("mesh.j3")).expect("check j3.mesh");
-        check_path_lib(&dir.join("voxel.j3")).expect("check j3.voxel");
+        check_path_lib(&dir.join("gfx/mesh.j3")).expect("check j3.gfx.mesh");
+        check_path_lib(&dir.join("gfx/voxel.j3")).expect("check j3.gfx.voxel");
     }
 
     #[test]
@@ -885,6 +885,69 @@ fn main() {
     fn mesh_fmt_j3_runs() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/mesh.j3");
         let prog = compile_path(&path).expect("compile mesh");
+        let run = exec(&prog);
+        assert_eq!(
+            run.status,
+            0,
+            "stderr {}\nstdout {}",
+            String::from_utf8_lossy(&run.stderr),
+            String::from_utf8_lossy(&run.stdout)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "ok\n");
+    }
+
+    #[test]
+    fn scene3d_check_j3_runs() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/scene3d_check.j3");
+        let prog = compile_path(&path).expect("compile scene3d_check");
+        let run = exec(&prog);
+        assert_eq!(
+            run.status,
+            0,
+            "stderr {}\nstdout {}",
+            String::from_utf8_lossy(&run.stderr),
+            String::from_utf8_lossy(&run.stdout)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "ok\n");
+    }
+
+    #[test]
+    fn fpwalk_check_j3_runs() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/fpwalk_check.j3");
+        let prog = compile_path(&path).expect("compile fpwalk_check");
+        let run = exec(&prog);
+        assert_eq!(
+            run.status,
+            0,
+            "stderr {}\nstdout {}",
+            String::from_utf8_lossy(&run.stderr),
+            String::from_utf8_lossy(&run.stdout)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "ok\n");
+    }
+
+    #[test]
+    fn cull_check_j3_runs() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/cull_check.j3");
+        let prog = compile_path(&path).expect("compile cull_check");
+        let run = exec(&prog);
+        assert_eq!(run.status, 0, "stderr {}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "ok\n");
+    }
+
+    #[test]
+    fn bvh_check_j3_runs() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/bvh_check.j3");
+        let prog = compile_path(&path).expect("compile bvh_check");
+        let run = exec(&prog);
+        assert_eq!(run.status, 0, "stderr {}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "ok\n");
+    }
+
+    #[test]
+    fn png_check_j3_runs() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/png_check.j3");
+        let prog = compile_path(&path).expect("compile png_check");
         let run = exec(&prog);
         assert_eq!(
             run.status,
@@ -950,6 +1013,19 @@ fn main() {
         let m = crate::project::Manifest::load(&toml).expect("j3.toml");
         assert_eq!(m.name, "minecraft");
         compile_manifest(&m).expect("compile minecraft");
+    }
+
+    #[test]
+    fn raytrace_project_typechecks_with_nested_stdlib() {
+        let toml = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("examples/raytrace/j3.toml");
+        let m = crate::project::Manifest::load(&toml).expect("j3.toml");
+        let prog = compile_manifest(&m).expect("compile raytrace");
+        let ll = emit::emit_llvm(&prog.cx, &prog.modules, &emit::EmitOpts::default())
+            .expect("emit llvm");
+        assert!(ll.contains("; use lib \"GL\""));
     }
 
     #[test]
@@ -1102,7 +1178,7 @@ fn main() {
         ));
         let src = "\
 module t;
-use j3.voxel.Hit;
+use j3.gfx.voxel.Hit;
 use j3.game.Texture;
 use j3.gfx.Mesh;
 use j3.io.printLn;
@@ -1472,10 +1548,11 @@ fn main() {
         assert!(
             prog.modules.iter().any(|mod_| {
                 prog.cx.name_str(mod_.name[0]) == "j3"
-                    && mod_.name.len() > 1
-                    && prog.cx.name_str(mod_.name[1]) == "ecs"
+                    && mod_.name.len() > 2
+                    && prog.cx.name_str(mod_.name[1]) == "game"
+                    && prog.cx.name_str(mod_.name[2]) == "ecs"
             }),
-            "expected j3.ecs"
+            "expected j3.game.ecs"
         );
         assert!(
             prog.modules.iter().any(|mod_| {
@@ -1506,6 +1583,74 @@ fn main() {
             String::from_utf8_lossy(&run.stdout)
         );
         assert_eq!(String::from_utf8_lossy(&run.stdout), stdout);
+    }
+
+    fn run_both_ok(path: &Path, stdout: &str) {
+        let prog = compile_path(path).expect("compile");
+        for backend in [emit::Backend::Llvm, emit::Backend::C] {
+            let mut o = emit::EmitOpts::default();
+            o.backend = backend;
+            if backend == emit::Backend::Llvm && !emit::clang_available(&o.clang) {
+                continue;
+            }
+            let run = emit::run_program(&prog.cx, &prog.modules, &o).expect("run");
+            assert_eq!(run.status, 0, "{backend:?} stderr {}", String::from_utf8_lossy(&run.stderr));
+            assert_eq!(String::from_utf8_lossy(&run.stdout), stdout, "{backend:?}");
+        }
+    }
+
+    /// Compile `src` from a temp file (so the stdlib loads).
+    fn compile_src(tag: &str, src: &str) -> Result<Program, String> {
+        let path = std::env::temp_dir().join(format!("j3c_{tag}_{}.j3", std::process::id()));
+        std::fs::write(&path, src).expect("write temp");
+        let prog = compile_path(&path).map_err(|e| format!("{e:?}"));
+        let _ = std::fs::remove_file(&path);
+        prog
+    }
+
+    #[test]
+    fn gaps_rem_runs_on_both_backends() {
+        run_both_ok(&honesty("rem.j3"), "ok\n");
+    }
+
+    #[test]
+    fn gaps_rem_by_zero_aborts() {
+        let prog = compile_src(
+            "rem0",
+            "module t;\nfn main() {\n    let a = 1;\n    let b = 0;\n    let _ = a % b;\n}\n",
+        )
+        .expect("compile");
+        let run = exec(&prog);
+        assert_ne!(run.status, 0, "% 0 should abort");
+    }
+
+    #[test]
+    fn gaps_const_rem_by_zero_is_error() {
+        let files = vec![parse_file(1, "t.j3", "module t;\nconst X = 1 % 0;\nfn main() {}\n")];
+        let err = match check::check_files(files) {
+            Ok(_) => panic!("expected %0 error"),
+            Err(e) => e,
+        };
+        assert!(err.message.contains("division by zero"), "{}", err.message);
+    }
+
+    #[test]
+    fn gaps_text_find_runs() {
+        run_both_ok(&honesty("text_find.j3"), "ok\n");
+    }
+
+    #[test]
+    fn gaps_module_const_runs() {
+        run_both_ok(&honesty("module_const.j3"), "ok\n");
+    }
+
+    #[test]
+    fn gaps_module_const_missing_is_named() {
+        let err = match compile_src("mcnope", "module t;\nuse j3.gfx.mesh;\nfn main() {\n    let k = mesh.NOPE;\n}\n") {
+            Ok(_) => panic!("expected missing const error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("has no pub const"), "{err}");
     }
 
     #[test]

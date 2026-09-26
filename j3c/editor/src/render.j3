@@ -1,0 +1,344 @@
+// Scene renders to PNG files: `j3c -e render`, the MCP `render` tool, and live `render` commands.
+// A request is tab-separated `key=value` options:
+//   camera=<object>   look through that camera (default: the main camera, else view=iso)
+//   view=iso|front|side|top|back   frame the whole scene from that side instead
+//   size=<w>x<h>      image size (default 640x360)
+//   focus=<object>    frame that object and its children (with view, default iso)
+//   select=<object>   outline that object in orange
+//   out=<path>        PNG to write (default target/j3-editor/render.png)
+
+module j3_editor.render;
+
+use j3.gfx.canvas.{ Canvas, Mode };
+use j3.game;
+use j3.gfx;
+use j3.gfx.{ Orbit, Target };
+use j3.io.printLn;
+use j3.math.{ Mat4, Vec3, PI, asin, atan2, sin, sqrt };
+use j3.memory.{ Arena, scratch };
+use j3.result.Result;
+use j3.data.save;
+use j3.scene3d;
+use j3.scene3d.{ Env, Node, Scene, CAMERA, MESH };
+use j3.text.{ Text, same };
+use j3_editor.tool.{ fields, pathOf, resolve };
+use j3_editor.util.cut;
+use j3_editor.viewport.drawBox;
+
+/// A parsed render request.
+pub struct Shot {
+    camera: string;
+    view: string;
+    w: int;
+    h: int;
+    select: string;
+    focus: string;
+    out: string;
+}
+
+pub fn parseShot(request: string): Shot {
+    let shot = Shot { camera: "", view: "", w: 640, h: 360, select: "", focus: "", out: "target/j3-editor/render.png" };
+    let args = fields(request, scratch(0));
+    let i = 0;
+    while i < args.len {
+        let a = args[i];
+        let eq = 0;
+        while eq < a.len && a[eq] != 61 { eq += 1; }
+        let key = cut(a, 0, eq);
+        let value = "";
+        if eq < a.len { value = cut(a, eq + 1, a.len); }
+        if same(key, "camera") { shot.camera = value; }
+        if same(key, "view") { shot.view = value; }
+        if same(key, "select") { shot.select = value; }
+        if same(key, "focus") { shot.focus = value; }
+        if same(key, "out") && value.len > 0 { shot.out = value; }
+        if same(key, "size") {
+            let x = 0;
+            while x < value.len && value[x] != 120 { x += 1; }
+            let w = save.parseInt(value as []u8, 0, 640);
+            let h = save.parseInt(value as []u8, x + 1, 360);
+            if w >= 16 && w <= 4096 { shot.w = w; }
+            if h >= 16 && h <= 4096 { shot.h = h; }
+        }
+        i += 1;
+    }
+    return shot;
+}
+
+/// Where a shot looks from, and with what lens.
+pub struct Lens {
+    cam: Orbit;
+    fov: f32;
+    near: f32;
+    far: f32;
+    /// What the reply says was used.
+    label: string;
+    /// False for framed views: fog would hide a scene framed from far out.
+    fog: bool;
+    /// The camera object it looks through (its effects run), or 0.
+    camera: int;
+}
+
+/// An orbit that sees what camera object `id` sees.
+pub fn throughCamera(scene: &Scene, id: int): Orbit {
+    let model = scene3d.world(scene, id);
+    let eye = model.transformPoint(Vec3.xyz(0, 0, 0));
+    let forward = (model.transformPoint(Vec3.xyz(0, 0, -1)) - eye).normalize();
+    return Orbit.create(eye + forward * 5, atan2(0 - forward.x, 0 - forward.z), asin(0 - forward.y), 5);
+}
+
+/// Whether `id` is `root` or under it.
+fn under(scene: &Scene, id: int, root: int): bool {
+    let at = id;
+    let steps = 0;
+    while at != 0 && steps <= scene.len {
+        if at == root { return true; }
+        let slot = scene3d.index(scene, at);
+        if slot < 0 { return false; }
+        at = scene.nodes[slot].parent;
+        steps += 1;
+    }
+    return false;
+}
+
+/// Whether a mesh counts toward framing: never the sky, and ground planes only when `planes`.
+fn frames(scene: &Scene, n: Node, root: int, planes: bool): bool {
+    if n.kind != MESH || scene3d.isSky(n) || n.gpu.vao == 0 { return false; }
+    if root != 0 { return under(scene, n.id, root); }
+    return planes || !same(n.asset, "builtin:plane");
+}
+
+/// World bounds of the meshes under `root` (0 for all, leaving out the sky, and ground
+/// planes unless nothing else is drawn); false when there are none.
+fn sceneBounds(scene: &Scene, root: int, lo: &Vec3, hi: &Vec3): bool {
+    let planes = false;
+    let any = false;
+    let pass = 0;
+    while pass < 2 && !any {
+        let i = 0;
+        while i < scene.len {
+            let n = scene.nodes[i];
+            i += 1;
+            if !frames(scene, n, root, planes) { continue; }
+            let m = scene3d.world(scene, n.id);
+            let c = 0;
+            while c < 8 {
+                let p = Vec3.xyz(if (c / 2) * 2 == c { n.boundLo.x } else { n.boundHi.x },
+                    if ((c / 2) / 2) * 2 == c / 2 { n.boundLo.y } else { n.boundHi.y },
+                    if c / 4 == 0 { n.boundLo.z } else { n.boundHi.z });
+                let q = m.transformPoint(p);
+                if !any {
+                    *lo = q;
+                    *hi = q;
+                    any = true;
+                }
+                if q.x < lo.x { lo.x = q.x; }
+                if q.y < lo.y { lo.y = q.y; }
+                if q.z < lo.z { lo.z = q.z; }
+                if q.x > hi.x { hi.x = q.x; }
+                if q.y > hi.y { hi.y = q.y; }
+                if q.z > hi.z { hi.z = q.z; }
+                c += 1;
+            }
+        }
+        planes = true;
+        pass += 1;
+    }
+    if !any && root != 0 {
+        // A group or camera with no meshes: frame a small box around it.
+        let o = scene3d.world(scene, root).transformPoint(Vec3.zero());
+        *lo = o - Vec3.xyz(1, 1, 1);
+        *hi = o + Vec3.xyz(1, 1, 1);
+        any = true;
+    }
+    return any;
+}
+
+/// The whole scene framed from `view`'s side, filling a 60 degree lens.
+fn framed(scene: &Scene, root: int, view: string): Orbit {
+    let lo = Vec3.xyz(-1, -1, -1);
+    let hi = Vec3.xyz(1, 1, 1);
+    sceneBounds(scene, root, &lo, &hi);
+    let center = (lo + hi) * 0.5;
+    let half = (hi - lo) * 0.5;
+    let radius = sqrt(half.x * half.x + half.y * half.y + half.z * half.z);
+    if radius < 0.5 { radius = 0.5; }
+    let yaw: f32 = 0.7;
+    let pitch: f32 = 0.5;
+    if same(view, "front") { yaw = 0; pitch = 0.05; }
+    if same(view, "back") { yaw = PI; pitch = 0.05; }
+    if same(view, "side") { yaw = PI / 2; pitch = 0.05; }
+    if same(view, "top") { yaw = 0; pitch = 1.55; }
+    // Distance at which a sphere of `radius` fits a 60 degree view (sin 30 = 0.5), plus room around it.
+    return Orbit.create(center, yaw, pitch, radius / sin(PI / 6) * 1.1);
+}
+
+/// Pick the camera for `shot`. Writes an `err` line and returns false for a bad camera name.
+pub fn lensFor(scene: &Scene, shot: Shot, lens: &Lens, out: &Text): bool {
+    lens.fov = 60;
+    lens.fog = true;
+    lens.near = 0.05;
+    lens.far = 1000;
+    lens.camera = 0;
+    let id = 0;
+    if shot.camera.len > 0 {
+        let at = resolve(scene, shot.camera, out);
+        if at < 0 { return false; }
+        if scene.nodes[at].kind != CAMERA {
+            out.pushStr("err\t");
+            out.pushStr(shot.camera);
+            out.pushStr(" is not a camera\n");
+            return false;
+        }
+        id = scene.nodes[at].id;
+    } else if shot.view.len == 0 && shot.focus.len == 0 {
+        let i = 0;
+        while i < scene.len && id == 0 {
+            if scene.nodes[i].kind == CAMERA && scene.nodes[i].owner == 0 { id = scene.nodes[i].id; }
+            i += 1;
+        }
+    }
+    if id != 0 {
+        let n = scene.nodes[scene3d.index(scene, id)];
+        lens.cam = throughCamera(scene, id);
+        lens.fov = n.fov;
+        lens.near = n.near;
+        lens.far = n.far;
+        lens.camera = id;
+        let t = Text.new(scratch(0));
+        t.pushStr("camera ");
+        t.pushStr(pathOf(scene, id, scratch(0)));
+        lens.label = t.str();
+        return true;
+    }
+    let view = shot.view;
+    if view.len == 0 { view = "iso"; }
+    if !same(view, "iso") && !same(view, "front") && !same(view, "back") && !same(view, "side") && !same(view, "top") {
+        out.pushStr("err\tview wants iso, front, back, side, or top\n");
+        return false;
+    }
+    let root = 0;
+    if shot.focus.len > 0 {
+        let f = resolve(scene, shot.focus, out);
+        if f < 0 { return false; }
+        root = scene.nodes[f].id;
+    }
+    lens.fog = false;
+    lens.cam = framed(scene, root, view);
+    let t2 = Text.new(scratch(0));
+    t2.pushStr("view ");
+    t2.pushStr(view);
+    if root != 0 {
+        t2.pushStr(" of ");
+        t2.pushStr(pathOf(scene, root, scratch(0)));
+    }
+    lens.label = t2.str();
+    return true;
+}
+
+/// Draw `scene` as the game would (lights, shadows, sky, URP) into `target`, outlining
+/// the object `select` names (0 for none).
+pub fn drawShot(scene: &Scene, matrices: []Mat4, lens: Lens, target: Target, select: int) {
+    let main = gfx.viewState();
+    let win = game.windowSize();
+    gfx.setOutputFbo(target.fbo);
+    // The camera pass flips the rect's y against the window height; this puts it at 0,0.
+    gfx.setViewRect(0, win.y - f32(target.h), f32(target.w), f32(target.h));
+    let env = scene3d.environment(scene);
+    if lens.fog { gfx.setFog(env.fogStart, env.fogEnd); } else { gfx.setFog(100000, 100001); }
+    gfx.setOrtho(0);
+    gfx.setFov(lens.fov);
+    gfx.setClip(lens.near, lens.far);
+    let r = env.shadowSize;
+    gfx.shadowPass(env.sunDir, Vec3.xyz(0 - r, 0 - r, 0 - r), Vec3.xyz(r, r, r));
+    if env.shadows { scene3d.drawWith(scene, matrices); }
+    scene3d.lights(scene);
+    let fx = lens.camera != 0 && scene3d.beginEffects(scene, lens.camera);
+    gfx.cameraPass(lens.cam, env.sunDir, env.sky, env.sunColor);
+    scene3d.drawSky(scene);
+    scene3d.drawWith(scene, matrices);
+    if fx { scene3d.endEffects(scene, lens.camera); }
+    let at = scene3d.index(scene, select);
+    if at >= 0 {
+        let n = scene.nodes[at];
+        drawBox(matrices[at], n.boundLo, n.boundHi, Vec3.xyz(1, 0.65, 0.15));
+    }
+    gfx.setViewState(main);
+}
+
+/// Read `target` back and write it to `path` as a PNG.
+pub fn savePng(target: Target, path: string): bool {
+    let mem = Arena.create(target.w * target.h * 4 * 3 + 4096);
+    let canvas = Canvas.create(&mem, i32(target.w), i32(target.h), Mode.Pixel);
+    gfx.setOutputFbo(target.fbo);
+    gfx.readPixels(target.w, target.h, canvas.pixels);
+    gfx.setOutputFbo(0);
+    // Opaque: the sky clear leaves alpha 0 in some drivers.
+    let i = 3;
+    while i < canvas.pixels.len {
+        canvas.pixels[i] = 255;
+        i += 4;
+    }
+    let ok = false;
+    match canvas.savePng(path, &mem) {
+        Result.Ok(_) { ok = true; }
+        Result.Err(_) {}
+    }
+    mem.destroy();
+    return ok;
+}
+
+/// `J3_EDITOR_MODE=render`: draw `J3_EDITOR_SCENE` per the request to a PNG in a hidden
+/// window, print `ok  <out>  <camera used>` or `err  <message>`, and exit.
+pub fn cli(request: string, path: string): int {
+    let shot = parseShot(request);
+    let mem = Arena.create(8 * 1024 * 1024);
+    let out = Text.new(&mem);
+    let scene = scene3d.load(path, &mem);
+    if !scene.found {
+        out.pushStr("err\tscene file ");
+        out.pushStr(path);
+        out.pushStr(" does not exist");
+        printLn(out.str());
+        return 1;
+    }
+    game.initGlHidden("J3 render", shot.w, shot.h);
+    gfx.init();
+    scene3d.upload(&scene);
+    let lens = Lens { cam: Orbit.create(Vec3.zero(), 0, 0, 5), fov: 60, near: 0.05, far: 1000, label: "", fog: true, camera: 0 };
+    let code = 1;
+    if lensFor(&scene, shot, &lens, &out) {
+        let select = 0;
+        if shot.select.len > 0 {
+            let at = resolve(&scene, shot.select, &out);
+            if at >= 0 { select = scene.nodes[at].id; }
+        }
+        let matrices = mem.alloc::<Mat4>(scene.len);
+        scene3d.worlds(&scene, matrices);
+        let target = gfx.makeTarget(shot.w, shot.h);
+        // A few frames, so anything built on first draw (the URP trace, shadow maps) is ready.
+        let frame = 0;
+        while frame < 3 {
+            game.poll();
+            drawShot(&scene, matrices, lens, target, select);
+            frame += 1;
+        }
+        if savePng(target, shot.out) {
+            out.pushStr("ok\t");
+            out.pushStr(shot.out);
+            out.push(9);
+            out.pushStr(lens.label);
+            code = 0;
+        } else {
+            out.pushStr("err\tcould not write ");
+            out.pushStr(shot.out);
+        }
+        gfx.freeTarget(&target);
+    }
+    scene3d.release(&scene);
+    game.destroy();
+    let text = out.str();
+    if text.len > 0 && text[text.len - 1] == 10 { text = cut(text, 0, text.len - 1); }
+    printLn(text);
+    return code;
+}

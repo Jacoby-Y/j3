@@ -1,0 +1,243 @@
+/// Mesh-aware URP pass: composite rasterized scene depth, canopy shadow map,
+/// volumetric sunlight and analytic glass/metal spheres.
+module j3.gfx.urp.forest;
+
+use j3.game;
+use j3.gfx;
+use j3.gfx.{ Orbit, Tex };
+use j3.math.{ Mat4, Vec3 };
+use j3.sys.panic;
+use j3.text.cstr;
+
+const FRAMEBUFFER: u32 = 0x8D40;
+const COLOR_ATTACHMENT: u32 = 0x8CE0;
+const DEPTH_ATTACHMENT: u32 = 0x8D00;
+const TEXTURE_2D: u32 = 0x0DE1;
+const RGBA8: i32 = 0x8058;
+const RGBA: u32 = 0x1908;
+const DEPTH24: i32 = 0x81A6;
+const DEPTH: u32 = 0x1902;
+const UNSIGNED_BYTE: u32 = 0x1401;
+const UNSIGNED_INT: u32 = 0x1405;
+const LINEAR: i32 = 0x2601;
+const NEAREST: i32 = 0x2600;
+const MIN_FILTER: u32 = 0x2801;
+const MAG_FILTER: u32 = 0x2800;
+const WRAP_S: u32 = 0x2802;
+const WRAP_T: u32 = 0x2803;
+const CLAMP_EDGE: i32 = 0x812F;
+const VERTEX_SHADER: u32 = 0x8B31;
+const FRAGMENT_SHADER: u32 = 0x8B30;
+const COMPILE_STATUS: u32 = 0x8B81;
+const LINK_STATUS: u32 = 0x8B82;
+const FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+const DEPTH_TEST: u32 = 0x0B71;
+
+struct State {
+    program: u32;
+    vao: u32;
+    fbo: u32;
+    color: u32;
+    depth: u32;
+    width: i32;
+    height: i32;
+}
+#[singleton]
+let R: State;
+#[singleton]
+let LOG: [2048]u8;
+
+fn proc(name: string): ptr {
+    let p = game.glProc(name);
+    if p == 0 { panic(name); }
+    return p;
+}
+fn location(name: string): i32 {
+    let f = proc("glGetUniformLocation") as fn(u32, cstr): i32;
+    return f(R.program, cstr(name));
+}
+fn intUniform(name: string, value: i32) {
+    let f = proc("glUniform1i") as fn(i32, i32);
+    f(location(name), value);
+}
+fn floatUniform(name: string, value: f32) {
+    let f = proc("glUniform1f") as fn(i32, f32);
+    f(location(name), value);
+}
+fn vec2Uniform(name: string, x: f32, y: f32) {
+    let f = proc("glUniform2f") as fn(i32, f32, f32);
+    f(location(name), x, y);
+}
+fn vec3Uniform(name: string, v: Vec3) {
+    let f = proc("glUniform3f") as fn(i32, f32, f32, f32);
+    f(location(name), v.x, v.y, v.z);
+}
+fn vec4Uniform(name: string, v: Vec3, w: f32) {
+    let f = proc("glUniform4f") as fn(i32, f32, f32, f32, f32);
+    f(location(name), v.x, v.y, v.z, w);
+}
+fn matrixUniform(name: string, m: Mat4) {
+    let f = proc("glUniformMatrix4fv") as fn(i32, i32, u8, ptr);
+    f(location(name), 1, 0, &m.m[0] as ptr);
+}
+fn bindFramebuffer(id: u32) {
+    let f = proc("glBindFramebuffer") as fn(u32, u32);
+    f(FRAMEBUFFER, id);
+}
+fn bindTexture(id: u32) {
+    let f = proc("glBindTexture") as fn(u32, u32);
+    f(TEXTURE_2D, id);
+}
+fn failShader(id: u32, program: bool) {
+    let written: i32 = 0;
+    if program {
+        let programLog = proc("glGetProgramInfoLog") as fn(u32, i32, ptr, ptr);
+        programLog(id, 2047, &written as ptr, &LOG[0] as ptr);
+    } else {
+        let shaderLog = proc("glGetShaderInfoLog") as fn(u32, i32, ptr, ptr);
+        shaderLog(id, 2047, &written as ptr, &LOG[0] as ptr);
+    }
+    if written < 1 { panic("forest shader"); }
+    panic([]u8 { ptr: &LOG[0], len: int(written) } as string);
+}
+fn compile(kind: u32, source: string): u32 {
+    let create = proc("glCreateShader") as fn(u32): u32;
+    let id = create(kind);
+    let ptrSource: ptr = source.ptr as ptr;
+    let length: i32 = i32(source.len);
+    let set = proc("glShaderSource") as fn(u32, i32, ptr, ptr);
+    set(id, 1, &ptrSource as ptr, &length as ptr);
+    let run = proc("glCompileShader") as fn(u32);
+    run(id);
+    let ok: i32 = 0;
+    let get = proc("glGetShaderiv") as fn(u32, u32, ptr);
+    get(id, COMPILE_STATUS, &ok as ptr);
+    if ok == 0 { failShader(id, false); }
+    return id;
+}
+
+/// Compile the forest post shader. Call after gfx.init.
+pub fn init(fragment: string) {
+    if R.program != 0 { return; }
+    let vertex = "#version 330 core\nout vec2 vUv;\nvoid main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);vUv=p;gl_Position=vec4(p*2.0-1.0,0,1);}";
+    let vs = compile(VERTEX_SHADER, vertex);
+    let fs = compile(FRAGMENT_SHADER, fragment);
+    let create = proc("glCreateProgram") as fn(): u32;
+    R.program = create();
+    let attach = proc("glAttachShader") as fn(u32, u32);
+    attach(R.program, vs);
+    attach(R.program, fs);
+    let link = proc("glLinkProgram") as fn(u32);
+    link(R.program);
+    let ok: i32 = 0;
+    let get = proc("glGetProgramiv") as fn(u32, u32, ptr);
+    get(R.program, LINK_STATUS, &ok as ptr);
+    if ok == 0 { failShader(R.program, true); }
+    let del = proc("glDeleteShader") as fn(u32);
+    del(vs); del(fs);
+    let gen = proc("glGenVertexArrays") as fn(i32, ptr);
+    gen(1, &R.vao as ptr);
+    game.setGlShutdown(shutdown);
+}
+
+fn freeTarget() {
+    let delTex = proc("glDeleteTextures") as fn(i32, ptr);
+    if R.color != 0 { let colorId = R.color; delTex(1, &colorId as ptr); R.color = 0; }
+    if R.depth != 0 { let depthId = R.depth; delTex(1, &depthId as ptr); R.depth = 0; }
+    if R.fbo != 0 {
+        let del = proc("glDeleteFramebuffers") as fn(i32, ptr);
+        let frameId = R.fbo; del(1, &frameId as ptr); R.fbo = 0;
+    }
+}
+fn setup(w: i32, h: i32) {
+    if R.fbo != 0 && R.width == w && R.height == h { return; }
+    freeTarget();
+    R.width = w; R.height = h;
+    let gen = proc("glGenTextures") as fn(i32, ptr);
+    let image = proc("glTexImage2D") as fn(u32, i32, i32, i32, i32, i32, u32, u32, ptr);
+    let param = proc("glTexParameteri") as fn(u32, u32, i32);
+    gen(1, &R.color as ptr); bindTexture(R.color);
+    image(TEXTURE_2D, 0, RGBA8, w, h, 0, RGBA, UNSIGNED_BYTE, 0 as ptr);
+    param(TEXTURE_2D, MIN_FILTER, LINEAR); param(TEXTURE_2D, MAG_FILTER, LINEAR);
+    param(TEXTURE_2D, WRAP_S, CLAMP_EDGE); param(TEXTURE_2D, WRAP_T, CLAMP_EDGE);
+    gen(1, &R.depth as ptr); bindTexture(R.depth);
+    image(TEXTURE_2D, 0, DEPTH24, w, h, 0, DEPTH, UNSIGNED_INT, 0 as ptr);
+    param(TEXTURE_2D, MIN_FILTER, NEAREST); param(TEXTURE_2D, MAG_FILTER, NEAREST);
+    param(TEXTURE_2D, WRAP_S, CLAMP_EDGE); param(TEXTURE_2D, WRAP_T, CLAMP_EDGE);
+    let genFbo = proc("glGenFramebuffers") as fn(i32, ptr);
+    genFbo(1, &R.fbo as ptr);
+    bindFramebuffer(R.fbo);
+    let attach = proc("glFramebufferTexture2D") as fn(u32, u32, u32, u32, i32);
+    attach(FRAMEBUFFER, COLOR_ATTACHMENT, TEXTURE_2D, R.color, 0);
+    attach(FRAMEBUFFER, DEPTH_ATTACHMENT, TEXTURE_2D, R.depth, 0);
+    let status = proc("glCheckFramebufferStatus") as fn(u32): u32;
+    if status(FRAMEBUFFER) != FRAMEBUFFER_COMPLETE { panic("forest framebuffer"); }
+    bindFramebuffer(0);
+}
+
+/// Set the mesh renderer's camera pass target. Run its shadow pass first.
+pub fn begin() {
+    let size = game.windowSize();
+    let w = i32(size.x); let h = i32(size.y);
+    if w < 1 { w = 1; }
+    if h < 1 { h = 1; }
+    setup(w, h);
+    gfx.setOutputFbo(R.fbo);
+}
+
+fn sampler(slot: u32, id: u32) {
+    let active = proc("glActiveTexture") as fn(u32);
+    active(0x84C0 + slot);
+    bindTexture(id);
+}
+
+/// Composite mesh color/depth, shadowed atmosphere, and two spheres.
+pub fn present(camera: Orbit, sun: Vec3, glass: Vec3, metal: Vec3,
+               radius: f32, ior: f32, roughness: f32, shaftStrength: f32,
+               exposure: f32, time: f32, environment: Tex) {
+    gfx.setOutputFbo(0);
+    bindFramebuffer(0);
+    let viewport = proc("glViewport") as fn(i32, i32, i32, i32);
+    viewport(0, 0, R.width, R.height);
+    let disable = proc("glDisable") as fn(u32);
+    let enable = proc("glEnable") as fn(u32);
+    disable(DEPTH_TEST);
+    let useProgram = proc("glUseProgram") as fn(u32);
+    useProgram(R.program);
+    sampler(0, R.color); sampler(1, R.depth);
+    sampler(2, gfx.shadowTexture()); sampler(3, environment.id);
+    intUniform("uColor", 0); intUniform("uDepth", 1);
+    intUniform("uShadow", 2); intUniform("uEnv", 3);
+    let eye = camera.eye();
+    let forward = (camera.target - eye).normalize();
+    let right = forward.cross(Vec3.up()).normalize();
+    let up = right.cross(forward).normalize();
+    vec3Uniform("uEye", eye); vec3Uniform("uForward", forward);
+    vec3Uniform("uRight", right); vec3Uniform("uUp", up);
+    vec3Uniform("uSun", sun.normalize());
+    vec4Uniform("uGlass", glass, radius);
+    vec4Uniform("uMetal", metal, radius);
+    vec2Uniform("uResolution", f32(R.width), f32(R.height));
+    floatUniform("uIor", ior); floatUniform("uRoughness", roughness);
+    floatUniform("uShaftStrength", shaftStrength);
+    floatUniform("uExposure", exposure); floatUniform("uTime", time);
+    matrixUniform("uLight", gfx.shadowMatrix());
+    let bindVao = proc("glBindVertexArray") as fn(u32);
+    let draw = proc("glDrawArrays") as fn(u32, i32, i32);
+    bindVao(R.vao); draw(0x0004, 0, 3); bindVao(0);
+    enable(DEPTH_TEST);
+}
+
+pub fn shutdown() {
+    gfx.setOutputFbo(0);
+    freeTarget();
+    if R.program != 0 {
+        let delProgram = proc("glDeleteProgram") as fn(u32);
+        delProgram(R.program); R.program = 0;
+    }
+    if R.vao != 0 {
+        let delVao = proc("glDeleteVertexArrays") as fn(i32, ptr);
+        let id = R.vao; delVao(1, &id as ptr); R.vao = 0;
+    }
+    gfx.shutdown();
+}

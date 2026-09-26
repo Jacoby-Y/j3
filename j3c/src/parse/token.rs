@@ -64,6 +64,7 @@ pub enum TokenKind {
     StarEq,
     Slash,
     SlashEq,
+    Percent,
     Interpolate,
     /// `///` line. `text` is the body, without the slashes or one leading space.
     Doc,
@@ -172,7 +173,11 @@ impl TokenKind {
             TokenKind::AndAnd | TokenKind::OrOr | TokenKind::Not => {
                 Some("keyword.operator.logical.j3")
             }
-            TokenKind::Plus | TokenKind::Minus | TokenKind::Star | TokenKind::Slash => {
+            TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::Percent => {
                 Some("keyword.operator.arithmetic.j3")
             }
             TokenKind::ColonColon
@@ -211,6 +216,7 @@ impl TokenKind {
             TokenKind::StarEq => Some("*="),
             TokenKind::Slash => Some("/"),
             TokenKind::SlashEq => Some("/="),
+            TokenKind::Percent => Some("%"),
             _ => None,
         }
     }

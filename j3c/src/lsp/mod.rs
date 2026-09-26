@@ -1,7 +1,7 @@
 //! Language server. Same parse + check as `j3c`. Stdio JSON-RPC, no crates.io.
 
 mod complete;
-mod json;
+pub(crate) mod json;
 mod query;
 
 use std::collections::hash_map::DefaultHasher;

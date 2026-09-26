@@ -121,14 +121,46 @@ pub fn compile_llvm(
     }
     cmd.arg("-o").arg(&exe_path).arg(&src_path);
     append_link_args(&mut cmd, cc, ll_source, target)?;
+    // A named output rebuilt from the same IR and command is already up to date. Most
+    // editor Plays change only scene files, which the program reads at run time.
+    let stamp_path = cc.out.as_ref().map(|p| p.with_extension("j3c-stamp"));
+    let key = build_key(&src_path, ll_source, &cmd);
+    if let Some(stamp) = &stamp_path {
+        if exe_path.exists() && fs::read_to_string(stamp).map(|k| k == key).unwrap_or(false) {
+            let _ = fs::remove_file(&src_path);
+            return Ok(exe_path);
+        }
+        let _ = fs::remove_file(stamp);
+    }
+    let started = std::time::Instant::now();
     let out = cmd.output().map_err(|e| format!("spawn {clang}: {e}"))?;
+    if std::env::var_os("J3C_TIMINGS").is_some() {
+        eprintln!("j3c: clang: {:.3}s", started.elapsed().as_secs_f64());
+    }
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let _ = fs::remove_file(&src_path);
         return Err(format!("{clang} failed:\n{err}"));
     }
     let _ = fs::remove_file(&src_path);
+    if let Some(stamp) = &stamp_path {
+        let _ = fs::write(stamp, &key);
+    }
     Ok(exe_path)
+}
+
+/// Build-cache key for `cmd` compiling `source`, leaving out the per-run temp file name.
+fn build_key(temp: &std::path::Path, source: &str, cmd: &Command) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut h);
+    cmd.get_program().hash(&mut h);
+    for arg in cmd.get_args() {
+        if arg != temp.as_os_str() {
+            arg.hash(&mut h);
+        }
+    }
+    format!("{:016x}", h.finish())
 }
 
 pub fn compile_c(c_source: &str, opts: &CcOpts, target: &str, clang: &str) -> Result<PathBuf, String> {
@@ -199,10 +231,16 @@ pub fn run_exe(exe: &Path) -> Result<RunResult, String> {
 }
 
 pub fn run_exe_in(exe: &Path, cwd: Option<&Path>) -> Result<RunResult, String> {
-    let mut cmd = Command::new(exe);
+    let absolute = exe
+        .canonicalize()
+        .map_err(|e| format!("run {}: {e}", exe.display()))?;
+    let mut cmd = Command::new(&absolute);
     if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-        cmd.env("J3_ROOT", dir);
+        let root = dir
+            .canonicalize()
+            .map_err(|e| format!("project root {}: {e}", dir.display()))?;
+        cmd.current_dir(&root);
+        cmd.env("J3_ROOT", root);
     }
     let run = cmd
         .output()

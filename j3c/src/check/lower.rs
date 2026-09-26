@@ -387,7 +387,7 @@ impl<'a> Lower<'a> {
         cands.extend(self.aliases.keys().cloned());
         cands.extend(self.funcs.keys().cloned());
         cands.extend(self.types.keys().cloned());
-        cands.extend(self.consts.keys().cloned());
+        cands.extend(self.consts.keys().filter(|k| !k.contains('.')).cloned());
         cands.extend(self.globals.keys().cloned());
         cands.extend(extra.iter().cloned());
         let mut e = CheckError::new(self.path, span, format!("unknown {kind} `{name}`"));
@@ -841,6 +841,18 @@ impl<'a> Lower<'a> {
                 Operand::bytes(expr.span, self.cx.common.string, bytes),
             )),
             ExprKind::Field { base, field } => {
+                if let Some(c) = self.qualified_const(expr) {
+                    return Ok(self.const_rvalue(expr.span, &c));
+                }
+                if let ExprKind::Name(n) = &base.kind {
+                    if self.mod_ns.contains_key(&n.name) && !self.shadows(&n.name) {
+                        return Err(CheckError::new(
+                            self.path,
+                            field.span,
+                            format!("`{}` has no pub const `{}`", n.name, field.name),
+                        ));
+                    }
+                }
                 if let Some(ename) = self.enum_ctor_name(base) {
                     return self.construct_variant(expr.span, &ename, &field.name, None, expected);
                 }
@@ -1573,7 +1585,11 @@ impl<'a> Lower<'a> {
                 }
                 Ok(Rvalue::binary(span, self.cx.common.bool, ir_op, l, r))
             }
-            parse::BinOp::Add | parse::BinOp::Sub | parse::BinOp::Mul | parse::BinOp::Div => {
+            parse::BinOp::Add
+            | parse::BinOp::Sub
+            | parse::BinOp::Mul
+            | parse::BinOp::Div
+            | parse::BinOp::Rem => {
                 if bare_num(lhs) && !bare_num(rhs) {
                     let right_expect = match expected {
                         Some(t) if is_numeric(self.cx, t) => Some(t),
@@ -1595,7 +1611,7 @@ impl<'a> Lower<'a> {
                             "arithmetic type mismatch",
                         ));
                     }
-                    if matches!(op, parse::BinOp::Div) && is_int(self.cx, r.ty()) {
+                    if matches!(op, parse::BinOp::Div | parse::BinOp::Rem) && is_int(self.cx, r.ty()) {
                         self.abort_if_zero(span, &r)?;
                     }
                     return Ok(Rvalue::binary(span, r.ty(), ir_op, l, r));
@@ -1649,7 +1665,7 @@ impl<'a> Lower<'a> {
                 if r.ty() != ty {
                     return Err(CheckError::new(self.path, span, "arithmetic type mismatch"));
                 }
-                if matches!(op, parse::BinOp::Div) && is_int(self.cx, ty) {
+                if matches!(op, parse::BinOp::Div | parse::BinOp::Rem) && is_int(self.cx, ty) {
                     self.abort_if_zero(span, &r)?;
                 }
                 let _ = expected;
@@ -1693,9 +1709,30 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// `alias.NAME` for a const exported by a `use`d module. Locals, aliases, and globals win.
+    fn qualified_const(&self, expr: &Expr) -> Option<ConstVal> {
+        let ExprKind::Field { base, field } = &expr.kind else { return None };
+        let ExprKind::Name(n) = &base.kind else { return None };
+        if self.shadows(&n.name) {
+            return None;
+        }
+        self.consts.get(&super::qual_key(&n.name, &field.name)).cloned()
+    }
+
+    fn shadows(&self, name: &str) -> bool {
+        self.locals.contains_key(name) || self.aliases.contains_key(name) || self.globals.contains_key(name)
+    }
+
     fn fold_int(&self, expr: &Expr) -> Option<i64> {
         match &expr.kind {
             ExprKind::Int(v) => Some(*v),
+            ExprKind::Field { .. } => match self.qualified_const(expr) {
+                Some(ConstVal {
+                    kind: ConstPayload::Int(v),
+                    ..
+                }) => Some(v),
+                _ => None,
+            },
             ExprKind::Name(n) => match self.consts.get(&n.name) {
                 Some(ConstVal {
                     kind: ConstPayload::Int(v),
@@ -3176,6 +3213,7 @@ fn ast_binop(op: parse::BinOp) -> BinOp {
         parse::BinOp::Sub => BinOp::Sub,
         parse::BinOp::Mul => BinOp::Mul,
         parse::BinOp::Div => BinOp::Div,
+        parse::BinOp::Rem => BinOp::Rem,
         parse::BinOp::Eq => BinOp::Eq,
         parse::BinOp::Ne => BinOp::Ne,
         parse::BinOp::Lt => BinOp::Lt,

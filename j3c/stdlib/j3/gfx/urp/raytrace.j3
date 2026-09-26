@@ -1,0 +1,385 @@
+/// Optional OpenGL 3.3 raytracing pipeline. Importing this module has no effect until init.
+module j3.gfx.urp.raytrace;
+
+use j3.game;
+use j3.gfx.Orbit;
+use j3.math.{ Vec2, Vec3, clamp };
+use j3.memory.{ Arena, scratch };
+use j3.sys.panic;
+use j3.text.cstr;
+use j3.gfx.urp.shaders;
+
+const GL_VERTEX_SHADER: u32 = 0x8B31;
+const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+const GL_COMPILE_STATUS: u32 = 0x8B81;
+const GL_LINK_STATUS: u32 = 0x8B82;
+const GL_INFO_LOG_LENGTH: u32 = 0x8B84;
+const GL_FRAMEBUFFER: u32 = 0x8D40;
+const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_RGBA8: i32 = 0x8058;
+const GL_RGBA: u32 = 0x1908;
+const GL_UNSIGNED_BYTE: u32 = 0x1401;
+const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
+const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
+const GL_LINEAR: i32 = 0x2601;
+const GL_TRIANGLES: u32 = 0x0004;
+const GL_DEPTH_TEST: u32 = 0x0B71;
+const GL_CULL_FACE: u32 = 0x0B44;
+const GL_BLEND: u32 = 0x0BE2;
+
+/// Plastic, metal, or glass surface data. Values are linear RGB in 0..1.
+pub struct Material {
+    /// 1 plastic, 2 metal, 3 glass.
+    kind: i32;
+    color: Vec3;
+    roughness: f32;
+    ior: f32;
+
+    fn plastic(color: Vec3, roughness: f32): Material {
+        return Material { kind: 1, color: color, roughness: roughness, ior: 1 };
+    }
+    fn metal(color: Vec3, roughness: f32): Material {
+        return Material { kind: 2, color: color, roughness: roughness, ior: 1 };
+    }
+    fn glass(tint: Vec3, ior: f32): Material {
+        return Material { kind: 3, color: tint, roughness: 0, ior: ior };
+    }
+}
+
+pub struct Sphere {
+    center: Vec3;
+    radius: f32;
+    material: Material;
+}
+
+pub struct AreaLight {
+    /// Center of a square ceiling emitter.
+    center: Vec3;
+    halfSize: f32;
+    color: Vec3;
+    brightness: f32;
+}
+
+/// The room is open on +Z; room.x and room.z are half extents, room.y is height.
+pub struct Scene {
+    room: Vec3;
+    spheres: []Sphere;
+    lights: []AreaLight;
+}
+
+/// Independent quality controls. Presets can be copied and then adjusted.
+pub struct Quality {
+    scale: f32;
+    bounces: int;
+    lightSamples: int;
+    aaSamples: int;
+
+    fn low(): Quality {
+        return Quality { scale: 0.5, bounces: 2, lightSamples: 1, aaSamples: 1 };
+    }
+    fn medium(): Quality {
+        return Quality { scale: 0.75, bounces: 4, lightSamples: 4, aaSamples: 1 };
+    }
+    fn high(): Quality {
+        return Quality { scale: 1, bounces: 6, lightSamples: 8, aaSamples: 2 };
+    }
+}
+
+/// Settings for the procedural ocean shader. Time is in seconds.
+pub struct Ocean {
+    time: f32;
+    wind: f32;
+    swell: f32;
+    choppiness: f32;
+    sunHeight: f32;
+    waterColor: Vec3;
+}
+
+struct State {
+    ready: bool;
+    trace: u32;
+    ocean: u32;
+    active: u32;
+    present: u32;
+    vao: u32;
+    target: u32;
+    image: u32;
+    width: i32;
+    height: i32;
+}
+#[singleton]
+let R: State;
+#[singleton]
+let LOG: [2048]u8;
+
+fn proc(name: string): ptr {
+    let p = game.glProc(name);
+    if p == 0 { panic(name); }
+    return p;
+}
+fn viewport(x: i32, y: i32, w: i32, h: i32) { let f = proc("glViewport") as fn(i32, i32, i32, i32); f(x, y, w, h); }
+fn bindFramebuffer(target: u32, id: u32) { let f = proc("glBindFramebuffer") as fn(u32, u32); f(target, id); }
+fn bindTexture(target: u32, id: u32) { let f = proc("glBindTexture") as fn(u32, u32); f(target, id); }
+fn useProgram(id: u32) { let f = proc("glUseProgram") as fn(u32); f(id); }
+fn bindVertexArray(id: u32) { let f = proc("glBindVertexArray") as fn(u32); f(id); }
+fn drawArrays(mode: u32, first: i32, count: i32) { let f = proc("glDrawArrays") as fn(u32, i32, i32); f(mode, first, count); }
+fn uniform1i(loc: i32, value: i32) { let f = proc("glUniform1i") as fn(i32, i32); f(loc, value); }
+fn uniform1f(loc: i32, value: f32) { let f = proc("glUniform1f") as fn(i32, f32); f(loc, value); }
+fn uniform2f(loc: i32, x: f32, y: f32) { let f = proc("glUniform2f") as fn(i32, f32, f32); f(loc, x, y); }
+fn uniform3f(loc: i32, x: f32, y: f32, z: f32) { let f = proc("glUniform3f") as fn(i32, f32, f32, f32); f(loc, x, y, z); }
+fn uniform4fv(loc: i32, count: i32, data: ptr) { let f = proc("glUniform4fv") as fn(i32, i32, ptr); f(loc, count, data); }
+fn loc(prog: u32, name: string): i32 {
+    let f = proc("glGetUniformLocation") as fn(u32, cstr): i32;
+    return f(prog, cstr(name));
+}
+fn logError(program: bool, id: u32) {
+    let n: i32 = 0;
+    let written: i32 = 0;
+    if program {
+        let get = proc("glGetProgramiv") as fn(u32, u32, ptr);
+        let info = proc("glGetProgramInfoLog") as fn(u32, i32, ptr, ptr);
+        get(id, GL_INFO_LOG_LENGTH, &n as ptr);
+        info(id, 2048, &written as ptr, &LOG[0] as ptr);
+    } else {
+        let getShader = proc("glGetShaderiv") as fn(u32, u32, ptr);
+        let shaderInfo = proc("glGetShaderInfoLog") as fn(u32, i32, ptr, ptr);
+        getShader(id, GL_INFO_LOG_LENGTH, &n as ptr);
+        shaderInfo(id, 2048, &written as ptr, &LOG[0] as ptr);
+    }
+    if written < 1 { panic("URP shader"); }
+    if written > 2047 { written = 2047; }
+    panic([]u8 { ptr: &LOG[0], len: int(written) } as string);
+}
+fn compile(kind: u32, source: string): u32 {
+    let make = proc("glCreateShader") as fn(u32): u32;
+    let sh = make(kind);
+    if sh == 0 { panic("URP glCreateShader"); }
+    let p: ptr = source.ptr as ptr;
+    let n: i32 = i32(source.len);
+    let set = proc("glShaderSource") as fn(u32, i32, ptr, ptr);
+    set(sh, 1, &p as ptr, &n as ptr);
+    let run = proc("glCompileShader") as fn(u32);
+    run(sh);
+    let ok: i32 = 0;
+    let get = proc("glGetShaderiv") as fn(u32, u32, ptr);
+    get(sh, GL_COMPILE_STATUS, &ok as ptr);
+    if ok == 0 { logError(false, sh); }
+    return sh;
+}
+fn link(vs: u32, fs: u32): u32 {
+    let make = proc("glCreateProgram") as fn(): u32;
+    let program = make();
+    if program == 0 { panic("URP glCreateProgram"); }
+    let attach = proc("glAttachShader") as fn(u32, u32);
+    attach(program, vs);
+    attach(program, fs);
+    let doLink = proc("glLinkProgram") as fn(u32);
+    doLink(program);
+    let ok: i32 = 0;
+    let get = proc("glGetProgramiv") as fn(u32, u32, ptr);
+    get(program, GL_LINK_STATUS, &ok as ptr);
+    if ok == 0 { logError(true, program); }
+    let del = proc("glDeleteShader") as fn(u32);
+    del(vs);
+    del(fs);
+    return program;
+}
+fn freeTarget() {
+    if R.image != 0 {
+        let del = proc("glDeleteTextures") as fn(i32, ptr);
+        let id = R.image;
+        del(1, &id as ptr);
+        R.image = 0;
+    }
+    if R.target != 0 {
+        let delFrame = proc("glDeleteFramebuffers") as fn(i32, ptr);
+        let frameId = R.target;
+        delFrame(1, &frameId as ptr);
+        R.target = 0;
+    }
+}
+fn target(w: i32, h: i32) {
+    if R.width == w && R.height == h && R.target != 0 { return; }
+    freeTarget();
+    let genTex = proc("glGenTextures") as fn(i32, ptr);
+    let genFbo = proc("glGenFramebuffers") as fn(i32, ptr);
+    genTex(1, &R.image as ptr);
+    if R.image == 0 { panic("URP color target"); }
+    bindTexture(GL_TEXTURE_2D, R.image);
+    let texImage = proc("glTexImage2D") as fn(u32, i32, i32, i32, i32, i32, u32, u32, ptr);
+    texImage(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0 as ptr);
+    let param = proc("glTexParameteri") as fn(u32, u32, i32);
+    param(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    param(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    genFbo(1, &R.target as ptr);
+    if R.target == 0 { panic("URP framebuffer"); }
+    bindFramebuffer(GL_FRAMEBUFFER, R.target);
+    let attach = proc("glFramebufferTexture2D") as fn(u32, u32, u32, u32, i32);
+    attach(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, R.image, 0);
+    let status = proc("glCheckFramebufferStatus") as fn(u32): u32;
+    if status(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE { panic("URP framebuffer incomplete"); }
+    bindFramebuffer(GL_FRAMEBUFFER, 0);
+    R.width = w;
+    R.height = h;
+}
+
+/// Initialize after game.initGl or App.useGl startup.
+pub fn init() {
+    if R.ready { return; }
+    if !game.usingGl() { panic("URP needs OpenGL 3.3"); }
+    let vertex = shaders.vertex();
+    R.trace = link(compile(GL_VERTEX_SHADER, vertex), compile(GL_FRAGMENT_SHADER, shaders.trace()));
+    R.present = link(compile(GL_VERTEX_SHADER, vertex), compile(GL_FRAGMENT_SHADER, shaders.present()));
+    let gen = proc("glGenVertexArrays") as fn(i32, ptr);
+    gen(1, &R.vao as ptr);
+    if R.vao == 0 { panic("URP vertex array"); }
+    R.ready = true;
+    game.addGlShutdown(shutdown);
+}
+
+/// Compile an ocean fragment shader after init. Its source can live with the example.
+pub fn initOcean(source: string) {
+    if !R.ready { panic("URP init first"); }
+    if R.ocean != 0 { return; }
+    R.ocean = link(compile(GL_VERTEX_SHADER, shaders.vertex()), compile(GL_FRAGMENT_SHADER, source));
+}
+
+/// Release URP resources while the GL context still exists.
+pub fn shutdown() {
+    if !R.ready { return; }
+    freeTarget();
+    let delProgram = proc("glDeleteProgram") as fn(u32);
+    delProgram(R.trace);
+    if R.ocean != 0 { delProgram(R.ocean); }
+    delProgram(R.present);
+    let delVao = proc("glDeleteVertexArrays") as fn(i32, ptr);
+    let id = R.vao;
+    delVao(1, &id as ptr);
+    R.trace = 0;
+    R.ocean = 0;
+    R.active = 0;
+    R.present = 0;
+    R.vao = 0;
+    R.width = 0;
+    R.height = 0;
+    R.ready = false;
+}
+fn set3(name: string, value: Vec3) {
+    uniform3f(loc(R.active, name), value.x, value.y, value.z);
+}
+fn uploadScene(scene: &Scene) {
+    if scene.spheres.len > 16 { panic("URP supports at most 16 spheres"); }
+    if scene.lights.len > 4 { panic("URP supports at most 4 area lights"); }
+    let s = scratch(1).alloc::<f32>(64);
+    let a = scratch(1).alloc::<f32>(64);
+    let b = scratch(1).alloc::<f32>(64);
+    let i = 0;
+    while i < scene.spheres.len {
+        let sphere = scene.spheres[i];
+        if sphere.radius <= 0 { panic("URP sphere radius must be positive"); }
+        s[i*4] = sphere.center.x;
+        s[i*4+1] = sphere.center.y;
+        s[i*4+2] = sphere.center.z;
+        s[i*4+3] = sphere.radius;
+        a[i*4] = sphere.material.color.x;
+        a[i*4+1] = sphere.material.color.y;
+        a[i*4+2] = sphere.material.color.z;
+        a[i*4+3] = sphere.material.roughness;
+        b[i*4] = f32(sphere.material.kind);
+        b[i*4+1] = sphere.material.ior;
+        i += 1;
+    }
+    uniform1i(loc(R.active, "uSphereCount"), i32(scene.spheres.len));
+    uniform4fv(loc(R.active, "uSphere[0]"), i32(scene.spheres.len), s.ptr as ptr);
+    uniform4fv(loc(R.active, "uMatA[0]"), i32(scene.spheres.len), a.ptr as ptr);
+    uniform4fv(loc(R.active, "uMatB[0]"), i32(scene.spheres.len), b.ptr as ptr);
+    let lp = scratch(1).alloc::<f32>(16);
+    let lc = scratch(1).alloc::<f32>(16);
+    i = 0;
+    while i < scene.lights.len {
+        let light = scene.lights[i];
+        lp[i*4] = light.center.x;
+        lp[i*4+1] = light.center.y;
+        lp[i*4+2] = light.center.z;
+        lp[i*4+3] = light.halfSize;
+        lc[i*4] = light.color.x;
+        lc[i*4+1] = light.color.y;
+        lc[i*4+2] = light.color.z;
+        lc[i*4+3] = light.brightness;
+        i += 1;
+    }
+    uniform1i(loc(R.active, "uLightCount"), i32(scene.lights.len));
+    uniform4fv(loc(R.active, "uLightPR[0]"), i32(scene.lights.len), lp.ptr as ptr);
+    uniform4fv(loc(R.active, "uLightCI[0]"), i32(scene.lights.len), lc.ptr as ptr);
+    set3("uRoom", scene.room);
+}
+
+/// Trace the scene to a scaled target, then present it. Draw the HUD afterward.
+pub fn render(scene: &Scene, camera: Orbit, quality: Quality) {
+    R.active = R.trace;
+    renderScene(scene, camera, quality, false, Ocean {
+        time: 0, wind: 0, swell: 0, choppiness: 0,
+        sunHeight: 0, waterColor: Vec3.xyz(0, 0, 0),
+    });
+}
+
+/// Trace animated waves and spheres with the ocean shader installed by initOcean.
+pub fn renderOcean(scene: &Scene, camera: Orbit, quality: Quality, ocean: Ocean) {
+    if R.ocean == 0 { panic("URP initOcean first"); }
+    R.active = R.ocean;
+    renderScene(scene, camera, quality, true, ocean);
+}
+
+fn renderScene(scene: &Scene, camera: Orbit, quality: Quality, isOcean: bool, ocean: Ocean) {
+    if !R.ready { panic("URP init first"); }
+    if quality.bounces < 1 || quality.bounces > 6 { panic("URP bounces must be 1..6"); }
+    if quality.lightSamples < 1 || quality.lightSamples > 8 { panic("URP light samples must be 1..8"); }
+    if quality.aaSamples < 1 || quality.aaSamples > 4 { panic("URP AA samples must be 1..4"); }
+    let size = game.windowSize();
+    let windowW = i32(size.x);
+    let windowH = i32(size.y);
+    if windowW < 1 || windowH < 1 { return; }
+    let scale = clamp(quality.scale, 0.25, 1);
+    let w = i32(size.x*scale);
+    let h = i32(size.y*scale);
+    target(w, h);
+    let disable = proc("glDisable") as fn(u32);
+    disable(GL_DEPTH_TEST);
+    disable(GL_CULL_FACE);
+    disable(GL_BLEND);
+    bindFramebuffer(GL_FRAMEBUFFER, R.target);
+    viewport(0, 0, w, h);
+    useProgram(R.active);
+    bindVertexArray(R.vao);
+    uniform2f(loc(R.active, "uResolution"), f32(w), f32(h));
+    let eye = camera.eye();
+    let forward = (camera.target-eye).normalize();
+    let right = forward.cross(Vec3.up()).normalize();
+    let up = right.cross(forward).normalize();
+    set3("uEye", eye);
+    set3("uForward", forward);
+    set3("uRight", right);
+    set3("uUp", up);
+    uniform1i(loc(R.active, "uBounces"), i32(quality.bounces));
+    uniform1i(loc(R.active, "uLightSamples"), i32(quality.lightSamples));
+    uniform1i(loc(R.active, "uAaSamples"), i32(quality.aaSamples));
+    uploadScene(scene);
+    if isOcean {
+        uniform1f(loc(R.active, "uTime"), ocean.time);
+        uniform1f(loc(R.active, "uWind"), ocean.wind);
+        uniform1f(loc(R.active, "uSwell"), ocean.swell);
+        uniform1f(loc(R.active, "uChoppiness"), ocean.choppiness);
+        uniform1f(loc(R.active, "uSunHeight"), ocean.sunHeight);
+        set3("uWaterColor", ocean.waterColor);
+    }
+    drawArrays(GL_TRIANGLES, 0, 3);
+    bindFramebuffer(GL_FRAMEBUFFER, 0);
+    viewport(0, 0, windowW, windowH);
+    useProgram(R.present);
+    bindTexture(GL_TEXTURE_2D, R.image);
+    uniform1i(loc(R.present, "uImage"), 0);
+    drawArrays(GL_TRIANGLES, 0, 3);
+    bindVertexArray(0);
+}

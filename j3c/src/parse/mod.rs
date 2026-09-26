@@ -155,9 +155,9 @@ fn main() {
 
     #[test]
     fn parse_ecs_file() {
-        let src = include_str!("../../stdlib/j3/ecs.j3");
+        let src = include_str!("../../stdlib/j3/game/ecs.j3");
         let f = parse_ok(src);
-        assert_eq!(f.module_key(), "j3.ecs");
+        assert_eq!(f.module_key(), "j3.game.ecs");
         let structs: Vec<&str> = f
             .items
             .iter()
@@ -175,25 +175,25 @@ fn main() {
 
     #[test]
     fn parse_collide_file() {
-        let src = include_str!("../../stdlib/j3/collide.j3");
+        let src = include_str!("../../stdlib/j3/game/collide.j3");
         let f = parse_ok(src);
-        assert_eq!(f.module_key(), "j3.collide");
+        assert_eq!(f.module_key(), "j3.game.collide");
     }
 
     #[test]
     fn parse_framework_files() {
         for (src, key) in [
-            (include_str!("../../stdlib/j3/res.j3"), "j3.res"),
-            (include_str!("../../stdlib/j3/scene.j3"), "j3.scene"),
-            (include_str!("../../stdlib/j3/assets.j3"), "j3.assets"),
-            (include_str!("../../stdlib/j3/tile.j3"), "j3.tile"),
+            (include_str!("../../stdlib/j3/data/res.j3"), "j3.data.res"),
+            (include_str!("../../stdlib/j3/data/scene.j3"), "j3.data.scene"),
+            (include_str!("../../stdlib/j3/data/assets.j3"), "j3.data.assets"),
+            (include_str!("../../stdlib/j3/game/tile.j3"), "j3.game.tile"),
             (include_str!("../../stdlib/j3/ui.j3"), "j3.ui"),
-            (include_str!("../../stdlib/j3/save.j3"), "j3.save"),
-            (include_str!("../../stdlib/j3/fx.j3"), "j3.fx"),
-            (include_str!("../../stdlib/j3/debug.j3"), "j3.debug"),
+            (include_str!("../../stdlib/j3/data/save.j3"), "j3.data.save"),
+            (include_str!("../../stdlib/j3/game/fx.j3"), "j3.game.fx"),
+            (include_str!("../../stdlib/j3/data/debug.j3"), "j3.data.debug"),
             (include_str!("../../stdlib/j3/gfx.j3"), "j3.gfx"),
-            (include_str!("../../stdlib/j3/mesh.j3"), "j3.mesh"),
-            (include_str!("../../stdlib/j3/voxel.j3"), "j3.voxel"),
+            (include_str!("../../stdlib/j3/gfx/mesh.j3"), "j3.gfx.mesh"),
+            (include_str!("../../stdlib/j3/gfx/voxel.j3"), "j3.gfx.voxel"),
         ] {
             let f = parse_ok(src);
             assert_eq!(f.module_key(), key);

@@ -1,0 +1,537 @@
+/// Scene file round trips, load speed, float rounding, and value injection. No GL.
+module scene3d_check;
+
+use lib "c" as libc {
+    fn clock(): i64;
+}
+
+use j3.scene3d.editor.overrides;
+use j3.scene3d.editor.paste;
+use j3.scene3d.editor.props;
+use j3.scene3d.editor.uses;
+use j3.scene3d.fx;
+use j3.gfx.FX_COLOR;
+use j3.gfx.Ray;
+use j3.io;
+use j3.io.printLn;
+use j3.result.Result;
+use j3.math.{ Mat4, Vec3 };
+use j3.memory.Arena;
+use j3.data.save;
+use j3.gfx.meshgen;
+use j3.scene3d;
+use j3.scene3d.{ Scene, MESH, INSTANCE, GRAFT, LIGHT };
+use j3.sys.panic;
+use j3.text.{ Text, same };
+
+const PATH: string = "/tmp/j3_scene3d_check.j3scene";
+const SUB: string = "/tmp/j3_scene3d_check_sub.j3scene";
+const FAN_B: string = "/tmp/j3_scene3d_check_b.j3scene";
+const FAN_C: string = "/tmp/j3_scene3d_check_c.j3scene";
+const NEST_B: string = "/tmp/j3_scene3d_check_nest_b.j3scene";
+const NEST_C: string = "/tmp/j3_scene3d_check_nest_c.j3scene";
+
+/// How many times `pat` appears in `bytes`.
+fn countOf(bytes: []u8, pat: string): int {
+    let n = 0;
+    let i = 0;
+    while i + pat.len <= bytes.len {
+        let k = 0;
+        while k < pat.len && bytes[i + k] == pat[k] { k += 1; }
+        if k == pat.len { n += 1; }
+        i += 1;
+    }
+    return n;
+}
+
+fn names(s: &Scene): string {
+    let t = Text.new(s.arena);
+    let i = 0;
+    while i < s.len {
+        t.pushStr(s.nodes[i].name);
+        i += 1;
+    }
+    return t.str();
+}
+
+fn noSpeed(_ctx: ptr, _id: int, field: string): bool {
+    return !same(field, "speed");
+}
+
+fn build(arena: &Arena, count: int, nested: bool): Scene {
+    let scene = scene3d.read("/nonexistent.j3scene", arena);
+    let i = 0;
+    while i < count {
+        let parent = 0;
+        if nested && i > 0 { parent = scene.nodes[(i - 1) / 2].id; }
+        scene3d.add(&scene, MESH, "Cube", parent);
+        let at = scene.len - 1;
+        scene.nodes[at].position = Vec3.xyz(f32(i) * 0.25, 0.9999, -1.5);
+        scene.nodes[at].asset = "assets/cube.j3mesh";
+        i += 1;
+    }
+    return scene;
+}
+
+/// The object placed under instance `owner` from source id `source`, or 0.
+fn placedFrom(s: &Scene, owner: int, source: int): int {
+    let i = 0;
+    while i < s.len {
+        // Straight from the copy's own file: its path is just its id there.
+        let key = Text.new(s.arena);
+        key.pushInt(source);
+        if s.nodes[i].owner == owner && same(s.nodes[i].sourcePath, key.str()) { return s.nodes[i].id; }
+        i += 1;
+    }
+    return 0;
+}
+
+/// Picking tests triangles, not boxes: a diamond (a square turned 45 degrees) misses in
+/// its box's corners, hits in its middle at the right distance, and scaling carries over.
+fn checkPicking(arena: &Arena) {
+    let quad = arena.alloc::<f32>(6 * 12);
+    let corners: [12]f32 = [-0.5, -0.5, 0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, 0.5];
+    let k = 0;
+    while k < 6 {
+        quad[k * 12] = corners[k * 2];
+        quad[k * 12 + 1] = corners[k * 2 + 1];
+        quad[k * 12 + 2] = 0;
+        k += 1;
+    }
+    let turned = Mat4.rotate(Vec3.xyz(0, 0, 1), 0.7853982);
+    let down = Vec3.xyz(0, 0, -1);
+    let corner = scene3d.hitTriangles(quad, turned, Ray { origin: Vec3.xyz(0.6, 0.6, 5), dir: down }, 100);
+    if corner.ok { panic("pick hit the empty corner of a turned square's box"); }
+    let middle = scene3d.hitTriangles(quad, turned, Ray { origin: Vec3.xyz(0.1, 0.05, 5), dir: down }, 100);
+    if !middle.ok || middle.t < 4.999 || middle.t > 5.001 { panic("pick missed the middle of a turned square"); }
+    let big = Mat4.translate(0, 0, 1).mul(Mat4.scale(4, 4, 4));
+    let far = scene3d.hitTriangles(quad, big, Ray { origin: Vec3.xyz(1.5, 1.5, 5), dir: down }, 100);
+    if !far.ok || far.t < 3.999 || far.t > 4.001 { panic("pick ignored the object's scale"); }
+    let short = scene3d.hitTriangles(quad, big, Ray { origin: Vec3.xyz(1.5, 1.5, 5), dir: down }, 3);
+    if short.ok { panic("pick went past its reach"); }
+
+    // A mesh past 256 triangles is searched through its BVH; it must find what a scan finds.
+    let torus = meshgen.unitShape("torus", arena);
+    let model = Mat4.rotate(Vec3.xyz(1, 0, 0), 0.6).mul(Mat4.scale(3, 3, 3));
+    let hits = 0;
+    let r = 0;
+    while r < 200 {
+        let ray = Ray { origin: Vec3.xyz(f32(r % 20) * 0.25 - 2.5, f32(r / 20) * 0.5 - 2.5, 6), dir: Vec3.xyz(0.02, 0.01, -1).normalize() };
+        let fast = scene3d.hitTriangles(torus, model, ray, 100);
+        let best: f32 = 100;
+        let t = 0;
+        while t < torus.len / 36 {
+            let one = scene3d.hitTriangles([]f32 { ptr: &torus[t * 36], len: 36 }, model, ray, best);
+            if one.ok { best = one.t; }
+            t += 1;
+        }
+        if fast.ok != (best < 100) || (fast.ok && fast.t != best) { panic("BVH pick disagrees with a scan"); }
+        if fast.ok { hits += 1; }
+        r += 1;
+    }
+    if hits < 20 || hits > 180 { panic("BVH pick rays should both hit and miss the torus"); }
+}
+
+/// Slot of the mesh named "leaf" placed under copy `copy`, or -1.
+fn nestedLeaf(s: &Scene, copy: int): int {
+    let i = 0;
+    while i < s.len {
+        if s.nodes[i].owner == copy && same(s.nodes[i].name, "leaf") { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+fn main() {
+    let arena = Arena.create(1024 * 1024);
+    checkPicking(&arena);
+
+    // Cached transforms agree with parent-chain transforms on a varied tree.
+    let transforms = scene3d.read("/nonexistent.j3scene", &arena);
+    let seed: int = 29;
+    let slot = 0;
+    while slot < 1000 {
+        let parent = 0;
+        if slot > 0 {
+            seed = seed * 17 + 13;
+            seed = seed - (seed / 1000000) * 1000000;
+            parent = transforms.nodes[seed - (seed / slot) * slot].id;
+        }
+        let id = scene3d.add(&transforms, MESH, "node", parent);
+        transforms.nodes[scene3d.index(&transforms, id)].position = Vec3.xyz(f32(slot) * 0.01, 0.2, -0.1);
+        slot += 1;
+    }
+    let cached = arena.alloc::<Mat4>(transforms.len);
+    scene3d.worlds(&transforms, cached);
+    slot = 0;
+    while slot < transforms.len {
+        let direct = scene3d.world(&transforms, transforms.nodes[slot].id);
+        let axis = 0;
+        while axis < 16 {
+            let difference = cached[slot].m[axis] - direct.m[axis];
+            if difference > 0.0001 || difference < -0.0001 { panic("cached world differs"); }
+            axis += 1;
+        }
+        slot += 1;
+    }
+
+    // Field reads are indexed; dragging one number reuses its value buffer.
+    let fieldArena = Arena.create(8 * 1024 * 1024);
+    let fields = scene3d.read("/nonexistent.j3scene", &fieldArena);
+    let fieldIndex = 0;
+    while fieldIndex < 10000 {
+        let fieldId = scene3d.add(&fields, MESH, "field", 0);
+        scene3d.setNumber(&fields, fieldId, "speed", 1.25);
+        scene3d.setNumber(&fields, fieldId, "size", 2.5);
+        scene3d.setLabel(&fields, fieldId, "name", "value");
+        fieldIndex += 1;
+    }
+    let readStart = libc.clock();
+    fieldIndex = 0;
+    while fieldIndex < 10000 {
+        if scene3d.number(&fields, fields.nodes[fieldIndex].id, "speed", 0) != 1.25 { panic("field index"); }
+        fieldIndex += 1;
+    }
+    if (libc.clock() - readStart) / 1000 > 5 { panic("10k field reads took over 5 ms"); }
+    let usedBefore = fieldArena.used;
+    fieldIndex = 0;
+    while fieldIndex < 1000 {
+        scene3d.setNumber(&fields, fields.nodes[0].id, "speed", f32(fieldIndex) * 0.01);
+        fieldIndex += 1;
+    }
+    if fieldArena.used - usedBefore > 4096 { panic("field drag grew scene memory"); }
+    fieldArena.destroy();
+
+    let deep = scene3d.read("/nonexistent.j3scene", &arena);
+    let parentId = 0;
+    let level = 0;
+    while level < 40 {
+        parentId = scene3d.add(&deep, MESH, "depth", parentId);
+        level += 1;
+    }
+    if !scene3d.store(&deep, PATH) { panic("store deep"); }
+    let deepBack = scene3d.read(PATH, &arena);
+    if deepBack.len != 40 || deepBack.nodes[39].parent != deepBack.nodes[38].id { panic("deep hierarchy"); }
+
+    // Round trip and load time for 2,000 objects.
+    let big = build(&arena, 2000, true);
+    scene3d.setNumber(&big, big.nodes[7].id, "speed", 2.5);
+    if !scene3d.store(&big, PATH) { panic("store"); }
+    let t0 = libc.clock();
+    let back = scene3d.load(PATH, &arena);
+    let ms = (libc.clock() - t0) / 1000;
+    if back.len != 2000 || back.nextId != big.nextId { panic("count or nextId"); }
+    let i = 0;
+    while i < back.len {
+        let a = big.nodes[i];
+        let b = back.nodes[i];
+        if a.id != b.id || a.parent != b.parent || a.kind != b.kind || !same(a.name, b.name) || !same(a.asset, b.asset) {
+            panic("node fields");
+        }
+        if a.position.x != b.position.x || b.position.y != 0.9999 || b.position.z != -1.5 || b.scale.x != 1 {
+            panic("node transform");
+        }
+        i += 1;
+    }
+    if scene3d.number(&back, back.nodes[7].id, "speed", 0) != 2.5 { panic("param"); }
+    if ms > 50 { panic("2,000 objects took over 50 ms to load"); }
+
+    // A name that looks like another object's line stays a name.
+    let small = build(&arena, 2, true);
+    small.nodes[0].name = "evil node.1.px f=9";
+    if !scene3d.store(&small, PATH) { panic("store small"); }
+    let s2 = scene3d.load(PATH, &arena);
+    if s2.nodes[1].position.x != 0.25 || !same(s2.nodes[0].name, "evil node.1.px f=9") { panic("injection"); }
+    let data = save.empty(&arena);
+    save.putStr(&data, "a", "b=1 c f=2");
+    save.putInt(&data, "b", 7);
+    if save.getInt(&data, "b", 0) != 7 || save.getFloat(&data, "c", 0) != 0 { panic("save injection"); }
+
+    // Rounding.
+    let t = Text.new(&arena);
+    t.pushFloat(0.9999);
+    t.push(32);
+    t.pushFloat(-2);
+    t.push(32);
+    t.pushFloat(0.1234567);
+    if !same(t.str(), "0.9999 -2.0 0.123457") { panic(t.str()); }
+
+    // More than the old 100,000-object cap.
+    let huge = Arena.create(64 * 1024 * 1024);
+    let lots = build(&huge, 150000, true);
+    if !scene3d.store(&lots, PATH) { panic("store huge"); }
+    let many = scene3d.load(PATH, &huge);
+    if many.len != 150000 { panic("150,000 objects"); }
+    huge.destroy();
+
+    // Delete keeps sibling order and takes descendants along.
+    let tree = scene3d.read("/nonexistent.j3scene", &arena);
+    let na = scene3d.add(&tree, MESH, "a", 0);
+    let nb = scene3d.add(&tree, MESH, "b", 0);
+    scene3d.add(&tree, MESH, "c", 0);
+    scene3d.add(&tree, MESH, "d", 0);
+    scene3d.add(&tree, MESH, "b1", nb);
+    scene3d.add(&tree, MESH, "a1", na);
+    scene3d.remove(&tree, nb);
+    if !same(names(&tree), "acda1") { panic(names(&tree)); }
+
+    // Placed scenes: stable ids, nextId untouched, field values carried over.
+    let sub = scene3d.read("/nonexistent.j3scene", &arena);
+    let s1 = scene3d.add(&sub, MESH, "inner", 0);
+    scene3d.add(&sub, MESH, "inner2", s1);
+    scene3d.setNumber(&sub, s1, "speed", 4);
+    if !scene3d.store(&sub, SUB) { panic("store sub"); }
+    let top = scene3d.read("/nonexistent.j3scene", &arena);
+    let place = scene3d.add(&top, INSTANCE, "placed", 0);
+    top.nodes[scene3d.index(&top, place)].scene = SUB;
+    let gone = scene3d.add(&top, INSTANCE, "gone", 0);
+    top.nodes[scene3d.index(&top, gone)].scene = "/nonexistent.j3scene";
+    if !scene3d.store(&top, PATH) { panic("store top"); }
+    let one = scene3d.load(PATH, &arena);
+    let two = scene3d.load(PATH, &arena);
+    if one.len != 4 || one.nodes[2].id != GRAFT || one.nodes[3].parent != GRAFT || one.nodes[2].parent != place { panic("graft ids"); }
+    if two.nodes[3].id != one.nodes[3].id || one.nextId != top.nextId { panic("graft ids differ"); }
+    if scene3d.number(&one, GRAFT, "speed", 0) != 4 { panic("graft params"); }
+    if one.nodes[0].missing || !one.nodes[1].missing { panic("missing flag"); }
+    if !scene3d.store(&one, PATH) { panic("store one"); }
+    let three = scene3d.load(PATH, &arena);
+    if three.nextId != top.nextId || three.len != 4 { panic("nextId grew"); }
+
+    // Refresh brings in a placed scene's new field values instead of keeping stale copies.
+    scene3d.setNumber(&sub, s1, "speed", 6);
+    if !scene3d.store(&sub, SUB) { panic("store sub again"); }
+    scene3d.refresh(&one, PATH);
+    if one.len != 4 || scene3d.number(&one, GRAFT, "speed", 0) != 6 { panic("refresh params"); }
+
+    // Clearing and pruning field values.
+    scene3d.setNumber(&three, place, "speed", 1);
+    scene3d.setNumber(&three, place, "size", 2);
+    scene3d.setNumber(&three, gone, "speed", 3);
+    scene3d.retainParams(&three, 0 as ptr, noSpeed);
+    if scene3d.number(&three, place, "speed", 0) != 0 || scene3d.number(&three, place, "size", 0) != 2 { panic("retain"); }
+    scene3d.clearParams(&three, place);
+    if scene3d.number(&three, place, "size", 0) != 0 { panic("clear"); }
+
+    // Repeated placements share one parsed source per expansion; refresh replaces their arena.
+    let placeArena = Arena.create(4 * 1024 * 1024);
+    let repeated = scene3d.read("/nonexistent.j3scene", &placeArena);
+    let repeat = 0;
+    while repeat < 200 {
+        let placedId = scene3d.add(&repeated, INSTANCE, "copy", 0);
+        repeated.nodes[scene3d.index(&repeated, placedId)].scene = SUB;
+        repeat += 1;
+    }
+    if !scene3d.store(&repeated, PATH) { panic("store repeated"); }
+    let expanded = scene3d.load(PATH, &placeArena);
+    if expanded.len != 600 { panic("200 placements"); }
+    let beforeRefresh = placeArena.used;
+    repeat = 0;
+    while repeat < 20 {
+        scene3d.refresh(&expanded, PATH);
+        if expanded.len != 600 { panic("refresh placements"); }
+        repeat += 1;
+    }
+    if placeArena.used - beforeRefresh > 8192 { panic("refresh grew scene arena"); }
+    scene3d.release(&expanded);
+    placeArena.destroy();
+
+    let leaf = scene3d.read("/nonexistent.j3scene", &arena);
+    scene3d.add(&leaf, MESH, "leaf", 0);
+    if !scene3d.store(&leaf, FAN_C) { panic("store fan leaf"); }
+    let middle = scene3d.read("/nonexistent.j3scene", &arena);
+    let fan = 0;
+    while fan < 10 {
+        let middleId = scene3d.add(&middle, INSTANCE, "middle", 0);
+        middle.nodes[scene3d.index(&middle, middleId)].scene = FAN_C;
+        fan += 1;
+    }
+    if !scene3d.store(&middle, FAN_B) { panic("store fan middle"); }
+    let topFan = scene3d.read("/nonexistent.j3scene", &arena);
+    fan = 0;
+    while fan < 10 {
+        let topId = scene3d.add(&topFan, INSTANCE, "top", 0);
+        topFan.nodes[scene3d.index(&topFan, topId)].scene = FAN_B;
+        fan += 1;
+    }
+    if !scene3d.store(&topFan, PATH) { panic("store fan top"); }
+    if !uses.uses(PATH, FAN_C) { panic("nested uses"); }
+    let useStart = libc.clock();
+    if uses.uses(PATH, "/tmp/j3_scene3d_check_absent.j3scene") { panic("false uses"); }
+    if (libc.clock() - useStart) / 1000 > 20 { panic("nested uses too slow"); }
+
+    // Lights and scene lighting survive a save, and setting lighting keeps unsaved field values.
+    let lit = scene3d.read("/nonexistent.j3scene", &arena);
+    let lamp = scene3d.add(&lit, LIGHT, "lamp", 0);
+    lit.nodes[scene3d.index(&lit, lamp)].color = Vec3.xyz(1, 0.5, 0.25);
+    lit.nodes[scene3d.index(&lit, lamp)].range = 3.5;
+    scene3d.setNumber(&lit, lamp, "speed", 7);
+    let env = scene3d.environment(&lit);
+    env.fogEnd = 55;
+    env.shadows = false;
+    scene3d.setEnvironment(&lit, env);
+    if scene3d.number(&lit, lamp, "speed", 0) != 7 { panic("setEnvironment lost a field value"); }
+    if !scene3d.store(&lit, PATH) { panic("store lit"); }
+    let litBack = scene3d.read(PATH, &arena);
+    let lampBack = litBack.nodes[scene3d.index(&litBack, lamp)];
+    if lampBack.kind != LIGHT || lampBack.range != 3.5 || lampBack.color.y != 0.5 { panic("light round trip"); }
+    let envBack = scene3d.environment(&litBack);
+    if envBack.fogEnd != 55 || envBack.shadows { panic("lighting round trip"); }
+    if scene3d.number(&litBack, lamp, "speed", 0) != 7 { panic("field value round trip"); }
+
+    // Object fields follow srcA copy of the object they point at; others keep pointing out.
+    let refs = scene3d.read("/nonexistent.j3scene", &arena);
+    let srcA = scene3d.add(&refs, MESH, "a", 0);
+    let srcB = scene3d.add(&refs, MESH, "b", 0);
+    scene3d.setObject(&refs, srcA, "target", srcB);
+    scene3d.setInteger(&refs, srcA, "count", -3);
+    scene3d.setVector(&refs, srcA, "tint", Vec3.xyz(0.5, 1, 0.25));
+    scene3d.flushParams(&refs);
+    let pair = arena.alloc::<int>(4);
+    pair[0] = srcA;
+    pair[1] = srcB;
+    pair[2] = scene3d.add(&refs, MESH, "a2", 0);
+    pair[3] = scene3d.add(&refs, MESH, "b2", 0);
+    paste.copyParamsMany(&refs, &refs.data, []int { ptr: pair.ptr, len: 2 }, []int { ptr: &pair[2], len: 2 });
+    if scene3d.object(&refs, pair[2], "target") != pair[3] { panic("object field not remapped"); }
+    if scene3d.integer(&refs, pair[2], "count", 0) != -3 { panic("int field copy"); }
+    let tint = scene3d.vector(&refs, pair[2], "tint", Vec3.zero());
+    if tint.z != 0.25 { panic("vec3 field copy"); }
+    let alone = arena.alloc::<int>(2);
+    alone[0] = srcA;
+    alone[1] = scene3d.add(&refs, MESH, "a3", 0);
+    paste.copyParamsMany(&refs, &refs.data, []int { ptr: alone.ptr, len: 1 }, []int { ptr: &alone[1], len: 1 });
+    if scene3d.object(&refs, alone[1], "target") != srcB { panic("object field outside the copy moved"); }
+
+    // Overrides change one placement of a scene and survive a save; clearing them reverts.
+    let part = scene3d.read("/nonexistent.j3scene", &arena);
+    let piece = scene3d.add(&part, MESH, "piece", 0);
+    scene3d.setNumber(&part, piece, "speed", 1);
+    if !scene3d.store(&part, FAN_C) { panic("store override part"); }
+    let host = scene3d.read("/nonexistent.j3scene", &arena);
+    let first = scene3d.add(&host, INSTANCE, "first", 0);
+    host.nodes[scene3d.index(&host, first)].scene = FAN_C;
+    let second = scene3d.add(&host, INSTANCE, "second", 0);
+    host.nodes[scene3d.index(&host, second)].scene = FAN_C;
+    scene3d.expand(&host, PATH);
+    let copy = placedFrom(&host, first, piece);
+    if copy == 0 { panic("placed copy has no source"); }
+    overrides.override(&host, copy, "px", " f", "4.5");
+    scene3d.setNumber(&host, copy, "speed", 9);
+    overrides.overrideParam(&host, copy, "speed");
+    if !scene3d.store(&host, PATH) { panic("store overrides"); }
+    let again = scene3d.load(PATH, &arena);
+    let moved = again.nodes[scene3d.index(&again, placedFrom(&again, first, piece))];
+    let still = again.nodes[scene3d.index(&again, placedFrom(&again, second, piece))];
+    if moved.position.x != 4.5 || still.position.x != 0 { panic("override position"); }
+    if scene3d.number(&again, moved.id, "speed", 0) != 9 { panic("override field"); }
+    if scene3d.number(&again, still.id, "speed", 0) != 1 { panic("override leaked to another copy"); }
+    overrides.clearOverrides(&again, moved.id);
+    scene3d.refresh(&again, PATH);
+    let reverted = again.nodes[scene3d.index(&again, placedFrom(&again, first, piece))];
+    if reverted.position.x != 0 || overrides.hasOverrides(&again, reverted.id) { panic("clear overrides"); }
+
+    // Tint multiplies down through placements, and 1,1,1 isn't written.
+    let tpart = scene3d.read("/nonexistent.j3scene", &arena);
+    let tmesh = scene3d.add(&tpart, MESH, "tinted", 0);
+    tpart.nodes[scene3d.index(&tpart, tmesh)].tint = Vec3.xyz(0.5, 1, 1);
+    let plain = scene3d.add(&tpart, MESH, "plain", 0);
+    if !scene3d.store(&tpart, SUB) { panic("store tint part"); }
+    let thost = scene3d.read("/nonexistent.j3scene", &arena);
+    let tplace = scene3d.add(&thost, INSTANCE, "placedTint", 0);
+    thost.nodes[scene3d.index(&thost, tplace)].scene = SUB;
+    thost.nodes[scene3d.index(&thost, tplace)].tint = Vec3.xyz(1, 2, 1);
+    if !scene3d.store(&thost, PATH) { panic("store tint host"); }
+    let tback = scene3d.load(PATH, &arena);
+    let got = tback.nodes[scene3d.index(&tback, placedFrom(&tback, tplace, tmesh))].tint;
+    if got.x != 0.5 || got.y != 2 || got.z != 1 { panic("tint through placement"); }
+    let plainLine = io.readFile(SUB, &arena);
+    match plainLine {
+        Result.Ok(bytes) {
+            if countOf(bytes, ".tr ") != 1 { panic("tint lines"); }
+        }
+        Result.Err(e) { panic("read tint part"); }
+    }
+    if plain == 0 { panic("plain"); }
+
+    // Renaming a prop moves its declaration and the values copies set, and nothing else.
+    let decl = scene3d.read("/nonexistent.j3scene", &arena);
+    props.declareProp(&decl, "speed", "float", "1");
+    if props.renameProp(&decl, "", "speed", "rate") != 1 { panic("rename declaration"); }
+    let decls = props.propsIn(&decl.data, &arena);
+    if decls.len != 1 || !same(decls[0].name, "rate") || !same(decls[0].value, "1") { panic("renamed declaration"); }
+    let outer = scene3d.read("/nonexistent.j3scene", &arena);
+    let mine = scene3d.add(&outer, INSTANCE, "mine", 0);
+    outer.nodes[scene3d.index(&outer, mine)].scene = FAN_B;
+    let other = scene3d.add(&outer, INSTANCE, "other", 0);
+    outer.nodes[scene3d.index(&outer, other)].scene = FAN_C;
+    props.setProp(&outer, mine, "speed", "2");
+    props.setProp(&outer, other, "speed", "3");
+    if props.renameProp(&outer, FAN_B, "speed", "rate") != 1 { panic("rename copies"); }
+    if !same(scene3d.prop(&outer, mine, "rate", ""), "2") || scene3d.propSet(&outer, mine, "speed") { panic("renamed copy value"); }
+    if !same(scene3d.prop(&outer, other, "speed", ""), "3") { panic("rename touched another scene's copy"); }
+
+    // Pasting a placed copy (copyParamsMany) carries its overrides to the new copy.
+    let dhost = scene3d.read("/nonexistent.j3scene", &arena);
+    let orig = scene3d.add(&dhost, INSTANCE, "orig", 0);
+    dhost.nodes[scene3d.index(&dhost, orig)].scene = FAN_C;
+    props.setProp(&dhost, orig, "speed", "7");
+    let twin = scene3d.add(&dhost, INSTANCE, "twin", 0);
+    dhost.nodes[scene3d.index(&dhost, twin)].scene = FAN_C;
+    let pasteFrom = arena.alloc::<int>(1);
+    let pasteTo = arena.alloc::<int>(1);
+    pasteFrom[0] = orig;
+    pasteTo[0] = twin;
+    paste.copyParamsMany(&dhost, &dhost.data, pasteFrom, pasteTo);
+    if !same(scene3d.prop(&dhost, twin, "speed", ""), "7") { panic("paste dropped overrides"); }
+
+    // Objects nested two scenes deep: the middle file's overrides reach them, and the outer
+    // scene can override them per copy, keyed by the path of ids down to them.
+    let leafFile = scene3d.read("/nonexistent.j3scene", &arena);
+    let leafId = scene3d.add(&leafFile, MESH, "leaf", 0);
+    if !scene3d.store(&leafFile, NEST_C) { panic("store nest c"); }
+    let mid = scene3d.read("/nonexistent.j3scene", &arena);
+    let midCopy = scene3d.add(&mid, INSTANCE, "inner", 0);
+    mid.nodes[scene3d.index(&mid, midCopy)].scene = NEST_C;
+    scene3d.expand(&mid, NEST_B);
+    overrides.override(&mid, placedFrom(&mid, midCopy, leafId), "px", " f", "2");
+    if !scene3d.store(&mid, NEST_B) { panic("store nest b"); }
+    let top2 = scene3d.read("/nonexistent.j3scene", &arena);
+    let copyOne = scene3d.add(&top2, INSTANCE, "one", 0);
+    top2.nodes[scene3d.index(&top2, copyOne)].scene = NEST_B;
+    let copyTwo = scene3d.add(&top2, INSTANCE, "two", 0);
+    top2.nodes[scene3d.index(&top2, copyTwo)].scene = NEST_B;
+    scene3d.expand(&top2, PATH);
+    let deepOne = nestedLeaf(&top2, copyOne);
+    if deepOne < 0 || top2.nodes[deepOne].position.x != 2 { panic("middle file's override lost when nested"); }
+    overrides.override(&top2, top2.nodes[deepOne].id, "px", " f", "5");
+    if !scene3d.store(&top2, PATH) { panic("store nest top"); }
+    let top3 = scene3d.load(PATH, &arena);
+    let a1 = nestedLeaf(&top3, copyOne);
+    let a2 = nestedLeaf(&top3, copyTwo);
+    if top3.nodes[a1].position.x != 5 || top3.nodes[a2].position.x != 2 { panic("nested override"); }
+    overrides.clearOverrides(&top3, top3.nodes[a1].id);
+    scene3d.refresh(&top3, PATH);
+    if top3.nodes[nestedLeaf(&top3, copyOne)].position.x != 2 { panic("clear nested override"); }
+
+    // .j3fx effect files: header, params, body line, and GL log lines mapped back to the file.
+    let toon = fx.parseEffect("kind=material\nparam.bands=int:3\nparam.rim=color:1,0.8,0.4\nparam.strength=float:0.5\nparam.on=bool:true\n---\nvec3 effect(Surface s, vec3 lit) {\n  return lit;\n}\n" as []u8, &arena);
+    if !toon.ok || toon.camera || toon.params.len != 4 || toon.bodyLine != 7 { panic("fx parse"); }
+    let rim = toon.params[1];
+    if rim.kind != FX_COLOR || rim.def[0] != 1 || rim.def[1] < 0.79 || rim.def[1] > 0.81 || rim.def[2] < 0.39 || rim.def[2] > 0.41 { panic("fx color default"); }
+    if toon.params[0].def[0] != 3 || toon.params[3].def[0] != 1 || !same(toon.params[2].name, "strength") { panic("fx defaults"); }
+    if !same(toon.glsl, "vec3 effect(Surface s, vec3 lit) {\n  return lit;\n}\n") { panic("fx body"); }
+    let noBody = fx.parseEffect("kind=material\nvec3 x;\n" as []u8, &arena);
+    if noBody.ok { panic("fx without ---"); }
+    let badType = fx.parseEffect("param.x=vec9:1\n---\n" as []u8, &arena);
+    if badType.ok { panic("fx bad type"); }
+    let cam = fx.parseEffect("kind=camera\n---\n" as []u8, &arena);
+    if !cam.camera { panic("fx camera"); }
+    let mapped = Text.new(&arena);
+    fx.mapGlslLog("0:103(5): error: foo\n", "a.j3fx", 100, 7, &mapped);
+    fx.mapGlslLog("0(103) : error C1: foo\n", "a.j3fx", 100, 7, &mapped);
+    fx.mapGlslLog("warning: nothing\n", "a.j3fx", 100, 7, &mapped);
+    fx.mapGlslLog("ERROR: 0:103: 'foo' : undeclared identifier\n", "a.j3fx", 100, 7, &mapped);
+    if !same(mapped.str(), "a.j3fx:10: error: foo\na.j3fx:10: error C1: foo\nwarning: nothing\na.j3fx:10: error: 'foo' : undeclared identifier\n") { panic("fx log map"); }
+
+    printLn("ok");
+}

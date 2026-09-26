@@ -1206,6 +1206,7 @@ impl<'a> Parser<'a> {
             let op = match self.cur().kind {
                 TokenKind::Star => BinOp::Mul,
                 TokenKind::Slash => BinOp::Div,
+                TokenKind::Percent => BinOp::Rem,
                 _ => break,
             };
             let _ = self.bump();

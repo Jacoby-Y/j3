@@ -1,0 +1,427 @@
+// Move/rotate/scale gizmo math, hit tests, and dragging, plus viewport picking.
+
+module j3_editor.gizmo;
+
+use j3.game;
+use j3.gfx;
+use j3.gfx.Ray;
+use j3.math.{ Mat4, Vec2, Vec3, cos, sin, PI };
+use j3.memory.{ Arena, scratch };
+use j3.scene3d;
+use j3.scene3d.{ Node, GROUP, MESH, CAMERA, INSTANCE, LIGHT };
+use j3.text.same;
+use j3_editor.history.modified;
+use j3_editor.nodes.{ setLocal, toParent };
+use j3_editor.selection.pickedRoots;
+use j3_editor.types.{ EDGE_HANDLE, GRAB, MOVE, RING, ROTATE, SCALE, World };
+
+pub fn axisDir(axis: int): Vec3 {
+    if axis == 0 { return Vec3.xyz(1, 0, 0); }
+    if axis == 1 { return Vec3.xyz(0, 1, 0); }
+    return Vec3.xyz(0, 0, 1);
+}
+
+pub fn comp(v: Vec3, axis: int): f32 {
+    if axis == 0 { return v.x; }
+    if axis == 1 { return v.y; }
+    return v.z;
+}
+
+pub fn setComp(v: &Vec3, axis: int, value: f32) {
+    if axis == 0 { v.x = value; }
+    if axis == 1 { v.y = value; }
+    if axis == 2 { v.z = value; }
+}
+
+/// `v` rounded to the nearest multiple of `step`.
+pub fn snapTo(v: f32, step: f32): f32 {
+    let k = v / step;
+    let n = int(k + 0.5);
+    if k < 0 { n = int(k - 0.5); }
+    return f32(n) * step;
+}
+
+/// Two unit vectors spanning the plane a rotate ring lies in; `u x v` is the axis.
+pub fn ringU(w: &World, axis: int): Vec3 { return handleAxis(w, nextAxis(axis)); }
+pub fn ringV(w: &World, axis: int): Vec3 { return handleAxis(w, nextAxis(nextAxis(axis))); }
+pub fn nextAxis(axis: int): int { if axis >= 2 { return 0; } return axis + 1; }
+
+/// Direction of a move or scale arm.
+pub fn armDir(w: &World, axis: int): Vec3 { return handleAxis(w, axis); }
+
+/// World axes for move and rotate, or the object's own axes for scale and in local mode.
+pub fn handleAxis(w: &World, axis: int): Vec3 {
+    if w.gizmoMode != SCALE && !w.localSpace { return axisDir(axis); }
+    let m = scene3d.world(&w.scene, w.selected);
+    let d = m.transformPoint(axisDir(axis)) - m.transformPoint(Vec3.zero());
+    if d.length() < 0.0001 { return axisDir(axis); }
+    return d.normalize();
+}
+
+pub fn gizmoOrigin(w: &World): Vec3 {
+    return scene3d.world(&w.scene, w.selected).transformPoint(Vec3.xyz(0, 0, 0));
+}
+
+/// World length of a gizmo arm, so it keeps a steady size on screen.
+pub fn gizmoLength(w: &World): f32 {
+    // Orthographic views are as big on screen at any depth, so size by the zoom instead.
+    if w.ortho { return w.cam.radius * 0.16; }
+    return (w.cam.eye() - gizmoOrigin(w)).length() * 0.16;
+}
+
+pub fn flat(p: Vec3): Vec2 { return Vec2 { x: p.x, y: p.y }; }
+
+/// Distance from `p` to the segment `a`-`b`, all in screen pixels.
+pub fn segmentDistance(p: Vec2, a: Vec2, b: Vec2): f32 {
+    let ab = b - a;
+    let len2 = ab.dot(ab);
+    let t: f32 = 0;
+    if len2 > 0.0001 { t = (p - a).dot(ab) / len2; }
+    if t < 0 { t = 0; }
+    if t > 1 { t = 1; }
+    let near = a + ab * t;
+    return (p - near).length();
+}
+
+pub fn ringPoint(w: &World, o: Vec3, axis: int, radius: f32, k: int): Vec3 {
+    let angle = f32(k) * PI * 2 / f32(RING);
+    return o + ringU(w, axis) * (cos(angle) * radius) + ringV(w, axis) * (sin(angle) * radius);
+}
+
+/// The two local axes whose edges a selected built-in plane (X, Z) or quad (X, Y) can be
+/// dragged by, as a bit pair: 5 is X and Z, 3 is X and Y, 0 is none.
+pub fn edgeAxes(w: &World): int {
+    if w.pickedCount > 1 { return 0; }
+    let at = scene3d.index(&w.scene, w.selected);
+    if at < 0 || w.scene.nodes[at].kind != MESH || w.matTab { return 0; }
+    if same(w.scene.nodes[at].asset, "builtin:plane") { return 5; }
+    if same(w.scene.nodes[at].asset, "builtin:quad") { return 3; }
+    return 0;
+}
+
+pub fn hasEdge(axes: int, axis: int): bool {
+    if axis == 0 { return axes > 0; }
+    if axis == 1 { return axes == 3; }
+    return axes == 5;
+}
+
+/// World position of edge handle `handle` (`EDGE_HANDLE` + ...).
+pub fn edgePoint(w: &World, handle: int): Vec3 {
+    let axis = (handle - EDGE_HANDLE) / 2;
+    let side: f32 = if handle - EDGE_HANDLE - axis * 2 == 1 { 0.5 } else { -0.5 };
+    return scene3d.world(&w.scene, w.selected).transformPoint(axisDir(axis) * side);
+}
+
+/// Edge handle under the mouse, or -1.
+pub fn pickEdge(w: &World, mouse: Vec2): int {
+    let axes = edgeAxes(w);
+    if axes == 0 { return -1; }
+    let found = -1;
+    let best = GRAB + 2;
+    let handle = EDGE_HANDLE;
+    while handle < EDGE_HANDLE + 6 {
+        if hasEdge(axes, (handle - EDGE_HANDLE) / 2) {
+            let p = gfx.toScreen(edgePoint(w, handle));
+            let gap = (flat(p) - mouse).length();
+            if p.z > 0 && gap < best {
+                best = gap;
+                found = handle;
+            }
+        }
+        handle += 1;
+    }
+    return found;
+}
+
+/// Axis handle under the mouse, or -1. Also records the ring tangent for rotate drags.
+pub fn pickAxis(w: &World, mouse: Vec2): int {
+    if scene3d.index(&w.scene, w.selected) < 0 { return -1; }
+    let edge = pickEdge(w, mouse);
+    if edge >= 0 { return edge; }
+    let o = gizmoOrigin(w);
+    let len = gizmoLength(w);
+    let center = gfx.toScreen(o);
+    if center.z <= 0 { return -1; }
+    let best = GRAB;
+    let found = -1;
+    let axis = 0;
+    while axis < 3 {
+        if w.gizmoMode == ROTATE {
+            let k = 0;
+            while k < RING {
+                let a = gfx.toScreen(ringPoint(w, o, axis, len, k));
+                let b = gfx.toScreen(ringPoint(w, o, axis, len, k + 1));
+                if a.z > 0 && b.z > 0 {
+                    let gap = segmentDistance(mouse, flat(a), flat(b));
+                    if gap < best {
+                        best = gap;
+                        found = axis;
+                        // Pixels moved along the ring per radian at this point.
+                        w.grabTangent = (flat(b) - flat(a)) * (f32(RING) / (PI * 2));
+                    }
+                }
+                k += 1;
+            }
+        } else {
+            let tip = gfx.toScreen(o + armDir(w, axis) * len);
+            if tip.z > 0 {
+                let armGap = segmentDistance(mouse, flat(center), flat(tip));
+                if armGap < best {
+                    best = armGap;
+                    found = axis;
+                }
+            }
+        }
+        axis += 1;
+    }
+    return found;
+}
+
+/// Reuse the scene's transforms throughout this frame, including picking and both GL passes.
+pub fn cachedWorlds(w: &World): []Mat4 {
+    if !w.worldsReady || w.worlds.len != w.scene.len {
+        w.worlds = scratch(0).alloc::<Mat4>(w.scene.len);
+        scene3d.worlds(&w.scene, w.worlds);
+        w.worldsReady = true;
+    }
+    return w.worlds;
+}
+
+/// Nearest object under the mouse, or 0.
+pub fn pickNode(w: &World): int {
+    return pickPast(w, -1);
+}
+
+/// Nearest object under the mouse that is farther along the pointer's ray than `past`, or 0;
+/// `w.pickDepth` gets how far it is. Meshes are hit by their triangles, and a camera, light,
+/// group, or placed scene by its marker only when that is in front of the mesh.
+pub fn pickPast(w: &World, past: f32): int {
+    let ray = gfx.mouseRay(w.cam);
+    let matrices = cachedWorlds(w);
+    let best: f32 = 100000;
+    let hitId = 0;
+    let i = 0;
+    while i < w.scene.len {
+        let n = w.scene.nodes[i];
+        if n.kind == MESH {
+            // Start a hair past `past`, so the next hit behind it is found.
+            let from = Ray { origin: ray.origin + ray.dir * (past + 0.001), dir: ray.dir };
+            if past < 0 { from = ray; }
+            let hit = scene3d.hitWith(&w.scene, matrices, i, from, best);
+            let t = hit.t;
+            if past >= 0 { t = hit.t + past + 0.001; }
+            if hit.ok && t < best {
+                best = t;
+                hitId = n.id;
+                // Objects from an instanced scene pick their instance; with Alt, the object itself.
+                if n.owner != 0 { hitId = n.owner; }
+                if n.owner != 0 && game.keyDown(game.Key.Alt) { hitId = placedRoot(w, n.id); }
+            }
+        }
+        i += 1;
+    }
+    let marker = pickMarker(w);
+    if marker != 0 {
+        let at = scene3d.index(&w.scene, marker);
+        let far = (matrices[at].transformPoint(Vec3.zero()) - ray.origin).length();
+        if far < best && far > past {
+            best = far;
+            hitId = marker;
+        }
+    }
+    w.pickDepth = best;
+    return hitId;
+}
+
+/// Placed object `id`, listed in the hierarchy so it shows where it was picked.
+pub fn placedRoot(w: &World, id: int): int {
+    let at = scene3d.index(&w.scene, id);
+    if at < 0 { return 0; }
+    if w.scene.nodes[at].owner == 0 { return w.scene.nodes[at].id; }
+    // Show it in the hierarchy.
+    let host = scene3d.index(&w.scene, w.scene.nodes[at].owner);
+    if host >= 0 { w.scene.nodes[host].editable = true; }
+    return w.scene.nodes[at].id;
+}
+
+/// The camera, group, or placed scene whose origin is nearest the cursor, within 12 pixels.
+// ponytail: origin point only; pick along the frustum lines if cameras prove hard to hit.
+pub fn pickMarker(w: &World): int {
+    let matrices = cachedWorlds(w);
+    let mouse = game.mousePos();
+    let best: f32 = 12;
+    let hitId = 0;
+    let i = 0;
+    while i < w.scene.len {
+        let n = w.scene.nodes[i];
+        if hasMarker(n) && n.id != w.viewCam {
+            let p = gfx.toScreen(matrices[i].transformPoint(Vec3.xyz(0, 0, 0)));
+            let d = (flat(p) - mouse).length();
+            if p.z > 0 && d < best {
+                best = d;
+                hitId = n.id;
+            }
+        }
+        i += 1;
+    }
+    return hitId;
+}
+
+/// Objects drawn as a frustum or cross instead of a mesh.
+pub fn hasMarker(n: Node): bool {
+    return n.owner == 0 && (n.kind == CAMERA || n.kind == GROUP || n.kind == INSTANCE || n.kind == LIGHT);
+}
+
+pub fn startGizmoDrag(w: &World) {
+    let at = scene3d.index(&w.scene, w.selected);
+    if at < 0 { return; }
+    let n = w.scene.nodes[at];
+    w.gizmoAxis = w.hoverAxis;
+    w.dragging = true;
+    w.dragTotal = 0;
+    if w.gizmoAxis >= EDGE_HANDLE {
+        // Outward from the middle through the dragged edge.
+        w.grabAxis = (edgePoint(w, w.gizmoAxis) - gizmoOrigin(w)).normalize();
+        w.grabStart = n.scale;
+        w.edgeFrom = gizmoOrigin(w);
+        w.edgeLength = (edgePoint(w, w.gizmoAxis) - w.edgeFrom).length() * 2;
+        return;
+    }
+    w.grabAxis = handleAxis(w, w.gizmoAxis);
+    w.grabStart = gizmoOrigin(w);
+    if w.gizmoMode == SCALE { w.grabStart = n.scale; }
+    let roots = pickedRoots(w);
+    if w.grabIds.len < roots.len {
+        w.grabIds = w.mem.alloc::<int>(roots.len * 2);
+        w.grabPos = w.mem.alloc::<Vec3>(roots.len * 2);
+        w.grabRot = w.mem.alloc::<Vec3>(roots.len * 2);
+        w.grabScale = w.mem.alloc::<Vec3>(roots.len * 2);
+    }
+    w.grabCount = roots.len;
+    let k = 0;
+    while k < roots.len {
+        let r = w.scene.nodes[scene3d.index(&w.scene, roots[k])];
+        w.grabIds[k] = r.id;
+        w.grabPos[k] = scene3d.world(&w.scene, r.id).transformPoint(Vec3.zero());
+        w.grabRot[k] = r.rotation;
+        w.grabScale[k] = r.scale;
+        k += 1;
+    }
+}
+
+/// Apply a mouse drag of `delta` pixels along `w.gizmoAxis` to every selected object.
+/// Holding Ctrl snaps to the steps set under Snap.
+pub fn dragGizmo(w: &World, delta: Vec2) {
+    if scene3d.index(&w.scene, w.selected) < 0 { return; }
+    let axis = w.gizmoAxis;
+    let snap = game.keyDown(game.Key.Ctrl);
+    if w.gizmoMode == ROTATE {
+        let t2 = w.grabTangent.dot(w.grabTangent);
+        if t2 < 0.0001 { return; }
+        w.dragTotal += delta.dot(w.grabTangent) / t2;
+        let angle = w.dragTotal;
+        if snap { angle = snapTo(angle, w.snapAngle * PI / 180); }
+        let turned = 0;
+        while turned < w.grabCount {
+            spinNode(w, w.grabIds[turned], w.grabRot[turned], angle);
+            turned += 1;
+        }
+        modified(w);
+        return;
+    }
+    if axis >= EDGE_HANDLE {
+        dragEdge(w, delta, snap);
+        return;
+    }
+    let o = gizmoOrigin(w);
+    let len = gizmoLength(w);
+    let a = flat(gfx.toScreen(o));
+    let b = flat(gfx.toScreen(o + w.grabAxis * len));
+    let arm = b - a;
+    let arm2 = arm.dot(arm);
+    if arm2 < 4 { return; }
+    // World units moved along the axis for this mouse motion.
+    w.dragTotal += delta.dot(arm) / arm2 * len;
+    if w.gizmoMode == MOVE {
+        let along = w.dragTotal;
+        if snap && w.localSpace {
+            along = snapTo(along, w.snapMove);
+        } else if snap {
+            // Snap the handle's object onto the world grid; the others keep their offsets.
+            along = snapTo(comp(w.grabStart, axis) + along, w.snapMove) - comp(w.grabStart, axis);
+        }
+        let shift = w.grabAxis * along;
+        let moved = 0;
+        while moved < w.grabCount {
+            let slot = scene3d.index(&w.scene, w.grabIds[moved]);
+            let node = &w.scene.nodes[slot];
+            node.position = toParent(w, node.parent).transformPoint(w.grabPos[moved] + shift);
+            moved += 1;
+        }
+    } else {
+        let size = comp(w.grabStart, axis) + w.dragTotal / len;
+        if snap { size = snapTo(size, w.snapScale); }
+        // Everything else scales by the same factor along its own axis.
+        let base = comp(w.grabStart, axis);
+        let factor: f32 = 1;
+        if base > 0.0001 || base < -0.0001 { factor = clampScale(size) / base; }
+        let k = 0;
+        while k < w.grabCount {
+            let at = scene3d.index(&w.scene, w.grabIds[k]);
+            let scaled = clampScale(comp(w.grabScale[k], axis) * factor);
+            if w.grabIds[k] == w.selected { scaled = clampScale(size); }
+            setComp(&w.scene.nodes[at].scale, axis, scaled);
+            k += 1;
+        }
+    }
+    modified(w);
+}
+
+/// Drag one edge of a plane or quad: it grows or shrinks along that axis while the
+/// opposite edge stays put. Ctrl snaps the size to the move step.
+pub fn dragEdge(w: &World, delta: Vec2, snap: bool) {
+    let at = scene3d.index(&w.scene, w.selected);
+    let n = &w.scene.nodes[at];
+    let axis = (w.gizmoAxis - EDGE_HANDLE) / 2;
+    let len = gizmoLength(w);
+    let tip = w.edgeFrom + w.grabAxis * (w.edgeLength * 0.5);
+    let a = flat(gfx.toScreen(tip));
+    let b = flat(gfx.toScreen(tip + w.grabAxis * len));
+    let arm = b - a;
+    let arm2 = arm.dot(arm);
+    if arm2 < 4 { return; }
+    w.dragTotal += delta.dot(arm) / arm2 * len;
+    // World size of one unit of scale along the axis.
+    let start = comp(w.grabStart, axis);
+    let unit = w.edgeLength / start;
+    let size = w.edgeLength + w.dragTotal;
+    if snap { size = snapTo(size, w.snapMove); }
+    if size < 0.01 { size = 0.01; }
+    setComp(&n.scale, axis, size / unit);
+    let moved = (size - w.edgeLength) * 0.5;
+    n.position = toParent(w, n.parent).transformPoint(w.edgeFrom + w.grabAxis * moved);
+    modified(w);
+}
+
+/// Turn object `id` by `angle` about the dragged handle's world axis, from rotation `start`.
+pub fn spinNode(w: &World, id: int, start: Vec3, angle: f32) {
+    let at = scene3d.index(&w.scene, id);
+    let node = &w.scene.nodes[at];
+    // R = rot(axis in parent space, angle) * R_start.
+    let inv = toParent(w, node.parent);
+    let spin = inv.transformPoint(w.grabAxis) - inv.transformPoint(Vec3.zero());
+    let bare = w.scene.nodes[at];
+    bare.position = Vec3.zero();
+    bare.scale = Vec3.xyz(1, 1, 1);
+    bare.rotation = start;
+    setLocal(&bare, Mat4.rotate(spin.normalize(), angle).mul(scene3d.local(bare)));
+    node.rotation = bare.rotation;
+}
+
+pub fn clampScale(v: f32): f32 {
+    if v > -0.01 && v < 0.01 {
+        if v < 0 { return -0.01; }
+        return 0.01;
+    }
+    return v;
+}

@@ -52,12 +52,20 @@ pub fn parse(src: &str) -> Result<Json, String> {
         b: src.as_bytes(),
         i: 0,
     };
-    let v = p.value()?;
-    p.skip_ws();
-    if p.i != p.b.len() {
-        return Err("trailing JSON".to_string());
-    }
-    Ok(v)
+    let r = p.value().and_then(|v| {
+        p.skip_ws();
+        if p.i != p.b.len() {
+            Err("trailing JSON".to_string())
+        } else {
+            Ok(v)
+        }
+    });
+    r.map_err(|e| format!("{e} at byte {} near `{}`", p.i, near(p.b, p.i)))
+}
+
+fn near(b: &[u8], i: usize) -> String {
+    let s = &b[i.saturating_sub(20)..(i + 20).min(b.len())];
+    String::from_utf8_lossy(s).replace(['\n', '\r', '\t'], " ")
 }
 
 struct Parser<'a> {
@@ -158,6 +166,13 @@ impl<'a> Parser<'a> {
         }
         if self.peek() == Some(b'.') {
             self.i += 1;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.i += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.i += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) { self.i += 1; }
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.i += 1;
             }
@@ -269,7 +284,21 @@ fn write_str(s: &str, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_exponents() {
+        let v = super::parse("[1E-07, -2.5e+3, 4e2]").unwrap();
+        let super::Json::Arr(xs) = v else { panic!() };
+        let n: Vec<f64> = xs.iter().map(|x| if let super::Json::Num(n) = x { *n } else { f64::NAN }).collect();
+        assert_eq!(n, vec![1e-7, -2500.0, 400.0]);
+    }
+
     use super::*;
+
+    #[test]
+    fn error_has_position() {
+        let e = parse("[1, 2,, 3]").unwrap_err();
+        assert!(e.contains("at byte 6") && e.contains("near `"), "{e}");
+    }
 
     #[test]
     fn roundtrip_object() {

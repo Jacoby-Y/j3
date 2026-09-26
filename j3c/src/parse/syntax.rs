@@ -97,6 +97,7 @@ const OPERATOR_KINDS: &[TokenKind] = &[
     TokenKind::Minus,
     TokenKind::Star,
     TokenKind::Slash,
+    TokenKind::Percent,
 ];
 
 /// ASCII ident. Lexer also allows Unicode letters (`is_alphabetic`).

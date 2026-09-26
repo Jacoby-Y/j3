@@ -10,7 +10,7 @@ use crate::ir::operand::{ConstKind, Operand};
 use crate::ir::place::{Place, PlaceRoot, Proj};
 use crate::ir::rvalue::{Rvalue, RvalueKind};
 use crate::ir::stmt::{Stmt, StmtKind};
-use crate::ir::ty::{Ty, TyKind};
+use crate::ir::ty::{FloatTy, Ty, TyKind};
 
 struct DeferFrame {
     blocks: Vec<crate::ir::body::Block>,
@@ -178,6 +178,12 @@ impl<'a> CWriter<'a> {
                 let r = self.operand(rhs)?;
                 if c_ty::is_int(self.cx, rvalue.ty) && crate::ir::wrap::wrapping_bin(*op) {
                     wrap_int(self.cx, rvalue.ty, *op, &l, &r)
+                } else if *op == BinOp::Rem {
+                    match self.cx.ty_kind(rvalue.ty) {
+                        TyKind::Float(FloatTy::F32) => Ok(format!("__builtin_fmodf({l}, {r})")),
+                        TyKind::Float(FloatTy::F64) => Ok(format!("__builtin_fmod({l}, {r})")),
+                        _ => Ok(format!("({l} % {r})")),
+                    }
                 } else {
                     Ok(format!("({l} {} {r})", op.as_str()))
                 }
@@ -747,8 +753,10 @@ fn wrap_int(cx: &IrCx, ty: Ty, op: BinOp, lhs: &str, rhs: &str) -> Result<String
                         64 => "INT64_MIN",
                         _ => return Err("bad int width".to_string()),
                     };
+                    // `MIN / -1` wraps to MIN; `MIN % -1` is 0.
+                    let wrapped = if op == BinOp::Div { format!("({c}){min}") } else { format!("({c})0") };
                     Ok(format!(
-                        "((({lhs}) == ({c}){min} && ({rhs}) == ({c})-1) ? ({c}){min} : ({c})(({lhs}) {sop} ({rhs})))"
+                        "((({lhs}) == ({c}){min} && ({rhs}) == ({c})-1) ? {wrapped} : ({c})(({lhs}) {sop} ({rhs})))"
                     ))
                 }
                 _ => Ok(format!("(({c})(({u})({lhs}) {sop} ({u})({rhs})))")),
