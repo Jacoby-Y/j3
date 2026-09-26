@@ -11,7 +11,7 @@ use j3.game;
 use j3.game.Rgba;
 use j3.io;
 use j3.result.Result;
-use j3.math.{ Mat4, Vec3, PI, TAU, cos, sin, sqrt };
+use j3.math.{ Mat4, Vec3, PI, TAU, cos, max, min, sin, sqrt };
 use j3.memory.{ Arena, scratch };
 use j3.gfx.mesh;
 use j3.gfx.meshgen;
@@ -25,6 +25,7 @@ use j3.gfx.noise.{ Noise, Ramp, PERLIN, FBM, NEAREST };
 use j3.data.save;
 use j3.data.save.Save;
 use j3.text.{ Text, same };
+use j3.sys.panic;
 
 pub const GROUP: int = 0;
 pub const MESH: int = 1;
@@ -47,7 +48,7 @@ pub const NEST: int = 8;
 /// load, so the same files always give the same ids and the saved `nextId` never moves.
 pub const GRAFT: int = 1099511627776;
 
-/// Stable id, local transform, asset paths, and optional behavior name.
+/// Stable id, local transform, asset paths, and the script attached to it (if any).
 pub struct Node {
     id: int;
     parent: int;
@@ -55,7 +56,9 @@ pub struct Node {
     name: string;
     asset: string;
     texture: string;
-    behavior: string;
+    /// Script attached in the editor (`scripts/door.j3s`), or "". `j3.scene3d.scripts`
+    /// makes its instances.
+    script: string;
     doubleSided: bool;
     position: Vec3;
     rotation: Vec3;
@@ -103,6 +106,12 @@ pub struct Node {
     effects: string;
 }
 
+/// A handle to one object: its stable id. A script prop of this type is set in the editor
+/// by picking an object (`param.<id>.<prop> r=<target id>`); `scene.node(handle)` reads it.
+pub struct NodeId {
+    id: int;
+}
+
 /// Scene-wide lighting, stored as `scene.env.*` lines so undo and the file keep it.
 pub struct Env {
     /// Direction toward the sun.
@@ -126,7 +135,7 @@ pub struct Env {
     traceNear: f32 = 40;
 }
 
-/// One behavior field value in a scene's parameter table (`Scene.params`).
+/// One script prop (or effect param) value in a scene's parameter table (`Scene.params`).
 pub struct ParamEntry {
     id: int;
     field: string;
@@ -175,6 +184,44 @@ pub struct Scene {
     /// strongest URP settings among placed scenes.
     urpChild: string;
     childUrp: Env;
+
+    /// The object `handle` names. Panics when it isn't in the scene.
+    fn node(this: &Scene, handle: NodeId): &Node {
+        let at = index(this, handle.id);
+        if at < 0 { panic("scene3d: no object with that id"); }
+        return &this.nodes[at];
+    }
+
+    /// The object at `path`: a name (`"Door"`, the first object with it) or a
+    /// `Parent/Child` path from the top. `NodeId { id: 0 }` when nothing matches.
+    fn find(this: &Scene, path: string): NodeId {
+        let slash = false;
+        for i in 0..path.len { if path[i] == 47 { slash = true; } }
+        if !slash {
+            for i in 0..this.len {
+                if same(this.nodes[i].name, path) { return NodeId { id: this.nodes[i].id }; }
+            }
+            return NodeId { id: 0 };
+        }
+        let parent = 0;
+        let start = 0;
+        while start <= path.len {
+            let end = start;
+            while end < path.len && path[end] != 47 { end += 1; }
+            let part = path[start..end];
+            let next = 0;
+            for i in 0..this.len {
+                if this.nodes[i].parent == parent && same(this.nodes[i].name, part) {
+                    next = this.nodes[i].id;
+                    break;
+                }
+            }
+            if next == 0 { return NodeId { id: 0 }; }
+            parent = next;
+            start = end + 1;
+        }
+        return NodeId { id: parent };
+    }
 }
 
 fn key(i: int, field: string, arena: &Arena): string {
@@ -195,7 +242,7 @@ fn blank(id: int): Node {
         name: "Object",
         asset: "",
         texture: "",
-        behavior: "",
+        script: "",
         doubleSided: false,
         position: Vec3.xyz(0, 0, 0),
         rotation: Vec3.xyz(0, 0, 0),
@@ -246,7 +293,7 @@ fn setField(n: &Node, bytes: []u8, f: int, fe: int, v: int, end: int) {
     else if fieldIs(bytes, f, fe, "name") { n.name = text; }
     else if fieldIs(bytes, f, fe, "asset") { n.asset = text; }
     else if fieldIs(bytes, f, fe, "texture") { n.texture = text; }
-    else if fieldIs(bytes, f, fe, "behavior") { n.behavior = text; }
+    else if fieldIs(bytes, f, fe, "script") { n.script = text; }
     else if fieldIs(bytes, f, fe, "scene") { n.scene = text; }
     else if fieldIs(bytes, f, fe, "px") { n.position.x = save.parseFloat(bytes, v); }
     else if fieldIs(bytes, f, fe, "py") { n.position.y = save.parseFloat(bytes, v); }
@@ -1202,7 +1249,7 @@ fn write(scene: &Scene, path: string, mem: &Arena): bool {
         lineStr(&t, key(i, "name", &keymem), n.name);
         lineStr(&t, key(i, "asset", &keymem), n.asset);
         lineStr(&t, key(i, "texture", &keymem), n.texture);
-        lineStr(&t, key(i, "behavior", &keymem), n.behavior);
+        lineStr(&t, key(i, "script", &keymem), n.script);
         let sided = 0;
         if n.doubleSided { sided = 1; }
         lineInt(&t, key(i, "doubleSided", &keymem), sided);
@@ -3111,18 +3158,37 @@ pub fn urpSettings(scene: &Scene): Env {
     return scene.childUrp;
 }
 
-/// Most triangles URP traces; meshes past it are left out of reflections and shadows.
-// ponytail: 262144 × 9 texels is 2304 texture rows; no GL_MAX_TEXTURE_SIZE check, every GL 3.3 desktop GPU takes 8192+.
+/// Most mesh triangles URP traces, counting each mesh once however many objects use it.
+/// Meshes past it are left out of reflections and shadows.
+// ponytail: 262144 × 7 texels is 1792 texture rows; no GL_MAX_TEXTURE_SIZE check, every GL 3.3 desktop GPU takes 8192+.
 pub const TRACE_MAX: int = 262144;
 
-/// The last clamp or depth `buildTrace` warned about, so each prints once.
+/// The last clamp or depth warned about, so each prints once.
 #[singleton]
 let TRACE_WARNED: int = 0;
 
-/// A scene's triangles uploaded for tracing, and what they were built from.
+/// Every loaded mesh on the GPU for tracing, each with a BVH in its own space.
+struct TraceMeshes {
+    /// `meshSignature` when it was built, and how many builds so far.
+    sig: int;
+    builds: int;
+    /// Root node of each `SHARED` slot's tree, or -1 for none.
+    roots: []int;
+    data: Traced;
+}
+
+#[singleton]
+let TRACE_MESHES: TraceMeshes;
+/// Holds `TRACE_MESHES.roots`.
+#[singleton]
+let TRACE_ROOTS: Arena = Arena { ptr: 0, used: 0, cap: 0, head: 0 };
+
+/// A scene's objects uploaded for tracing, and what they were built from.
 struct TraceSlot {
     key: int;
     sig: f32;
+    /// `TRACE_MESHES.builds` it was built against.
+    meshes: int;
     data: Traced;
     used: int;
 }
@@ -3132,9 +3198,9 @@ let TRACES: [4]TraceSlot;
 #[singleton]
 let TRACE_TICK: int = 0;
 
-/// With URP on, make sure gfx traces this scene's current triangles; otherwise turn
-/// tracing off. Rebuilds only when an object, mesh, or material changed.
-// ponytail: whole rebuild on any change, 4 scenes cached; refit the BVH if big scenes lag while dragging.
+/// With URP on, make sure gfx traces this scene's current objects; otherwise turn tracing
+/// off. Meshes upload once; objects, a small BVH over their boxes, redo when one moves or
+/// changes look.
 fn traceScene(scene: &Scene, transforms: []Mat4) {
     let settings = urpSettings(scene);
     if !settings.urp {
@@ -3150,21 +3216,30 @@ fn traceScene(scene: &Scene, transforms: []Mat4) {
         if TRACES[k].used < TRACES[slot].used { slot = k; }
         k += 1;
     }
+    traceMeshes();
     // Transforms reused from the shadow pass were signed there.
     let sig = if REUSED && TRACES[slot].key == key { TRACES[slot].sig } else { traceSignature(scene, transforms) };
-    if TRACES[slot].key != key || TRACES[slot].sig != sig {
-        TRACES[slot].key = key;
-        TRACES[slot].sig = sig;
-        buildTrace(scene, transforms, &TRACES[slot].data);
+    let s = &TRACES[slot];
+    if s.key != key || s.sig != sig || s.meshes != TRACE_MESHES.builds {
+        s.key = key;
+        s.sig = sig;
+        s.meshes = TRACE_MESHES.builds;
+        traceObjects(scene, transforms, &s.data);
     }
-    TRACES[slot].used = TRACE_TICK;
+    s.data.tris = TRACE_MESHES.data.tris;
+    s.data.nodes = TRACE_MESHES.data.nodes;
+    s.used = TRACE_TICK;
     let bounces = settings.bounces;
     if bounces < 1 { bounces = 1; }
     if bounces > 8 { bounces = 8; }
     let samples = settings.samples;
     if samples < 1 { samples = 1; }
     if samples > 16 { samples = 16; }
-    gfx.traceUse(TRACES[slot].data, bounces, samples, settings.tracedShadows, settings.traceNear);
+    gfx.traceUse(s.data, bounces, samples, settings.tracedShadows, settings.traceNear);
+}
+
+fn traced(n: Node): bool {
+    return n.kind == MESH && n.gpu.vao != 0 && !isSky(n);
 }
 
 /// A number that changes when any traced object moves or its mesh or material changes.
@@ -3173,7 +3248,7 @@ fn traceSignature(scene: &Scene, transforms: []Mat4): f32 {
     let i = 0;
     while i < scene.len {
         let n = scene.nodes[i];
-        if n.kind == MESH && n.gpu.vao != 0 && !isSky(n) {
+        if traced(n) {
             let weight = f32(i - (i / 7) * 7 + 1);
             let k = 0;
             while k < 16 {
@@ -3193,102 +3268,200 @@ fn traceSignature(scene: &Scene, transforms: []Mat4): f32 {
     return sig;
 }
 
-/// Gather the scene's mesh triangles in world space with their surface, build a BVH over
-/// them, and upload both into `out`.
-fn buildTrace(scene: &Scene, transforms: []Mat4, out: &Traced) {
-    let total = 0;
-    let i = 0;
-    while i < scene.len {
-        let counted = traceVerts(scene.nodes[i]);
-        total += counted.len / 36;
-        i += 1;
+/// A number that changes when a mesh loads, unloads, or reloads.
+fn meshSignature(): int {
+    let sig = SHARED_LEN;
+    let k = 0;
+    while k < SHARED_LEN {
+        let v = SHARED[k].verts;
+        sig += ((v.ptr as ptr as int) % 1000003 + v.len) * (k + 1);
+        k += 1;
     }
-    if total > TRACE_MAX && TRACE_WARNED != total {
-        TRACE_WARNED = total;
+    return sig;
+}
+
+/// Upload every loaded mesh's triangles in its own space, each with its own BVH, when the
+/// set of meshes changed.
+// ponytail: rebuilds every mesh when one changes; append new ones if editor imports lag.
+fn traceMeshes() {
+    let sig = meshSignature();
+    let m = &TRACE_MESHES;
+    if m.data.tris != 0 && m.sig == sig && m.roots.len == SHARED_LEN { return; }
+    m.sig = sig;
+    m.builds += 1;
+    TRACE_ROOTS.destroy();
+    TRACE_ROOTS = Arena.create(SHARED_LEN * 8 + 64);
+    m.roots = TRACE_ROOTS.alloc::<int>(SHARED_LEN);
+    let total = 0;
+    let wanted = 0;
+    let k = 0;
+    while k < SHARED_LEN {
+        let size = SHARED[k].verts.len / 36;
+        wanted += size;
+        if total + size <= TRACE_MAX { total += size; }
+        k += 1;
+    }
+    if wanted > TRACE_MAX && TRACE_WARNED != wanted {
+        TRACE_WARNED = wanted;
         let say = Text.new(scratch(0));
         say.pushStr("scene3d: URP traces ");
-        say.pushInt(TRACE_MAX);
-        say.pushStr(" of ");
         say.pushInt(total);
-        say.pushStr(" triangles; raise TRACE_MAX or split the scene");
+        say.pushStr(" of ");
+        say.pushInt(wanted);
+        say.pushStr(" mesh triangles; raise TRACE_MAX or use fewer meshes");
         io.printLn(say.str());
     }
-    if total > TRACE_MAX { total = TRACE_MAX; }
     let mem = Arena.create((total * 60 + 1024) * 8 + 4 * 1024 * 1024);
-    let corners = mem.alloc::<f32>(total * 9);
-    let surf = mem.alloc::<f32>(total * 36);
-    let count = 0;
-    i = 0;
-    while i < scene.len && count < total {
-        let n = scene.nodes[i];
-        let verts = traceVerts(n);
-        if verts.len > 0 {
-            let model = transforms[i];
-            let look = gfx.plainSurface();
-            let opacity: f32 = 1;
-            if n.mat > 0 {
-                look = MATS[n.mat - 1].look;
-                opacity = MATS[n.mat - 1].opacity;
-            }
-            look = tinted(look, n);
+    let tris = mem.alloc::<f32>(total * 28 + 4);
+    let nodes = mem.alloc::<f32>((total * 2 + SHARED_LEN + 1) * bvh.NODE_FLOATS);
+    let triBase = 0;
+    let nodeBase = 0;
+    k = 0;
+    while k < SHARED_LEN {
+        m.roots[k] = -1;
+        let verts = SHARED[k].verts;
+        let n = verts.len / 36;
+        if n > 0 && triBase + n <= TRACE_MAX {
+            let corners = mem.alloc::<f32>(n * 9);
             let t = 0;
-            while t + 36 <= verts.len && count < total {
+            while t < n * 3 {
+                corners[t * 3] = verts[t * 12];
+                corners[t * 3 + 1] = verts[t * 12 + 1];
+                corners[t * 3 + 2] = verts[t * 12 + 2];
+                t += 1;
+            }
+            let tree = bvh.build(corners, n, &mem);
+            if tree.depth > 45 && TRACE_WARNED != 0 - tree.depth {
+                TRACE_WARNED = 0 - tree.depth;
+                let deep = Text.new(scratch(0));
+                deep.pushStr("scene3d: a URP mesh tree is ");
+                deep.pushInt(tree.depth);
+                deep.pushStr(" deep; traced rays may skip geometry");
+                io.printLn(deep.str());
+            }
+            // Triangles in leaf order: corner, two edges, three corner normals, color.
+            let j = 0;
+            while j < n {
+                let v = tree.order[j] * 36;
+                let at = (triBase + j) * 28;
+                let p0 = Vec3.xyz(verts[v], verts[v + 1], verts[v + 2]);
+                put3(tris, at, p0);
+                put3(tris, at + 4, Vec3.xyz(verts[v + 12], verts[v + 13], verts[v + 14]) - p0);
+                put3(tris, at + 8, Vec3.xyz(verts[v + 24], verts[v + 25], verts[v + 26]) - p0);
                 let c = 0;
                 while c < 3 {
-                    let v = t + c * 12;
-                    let p = model.transformPoint(Vec3.xyz(verts[v], verts[v + 1], verts[v + 2]));
-                    let tip = model.transformPoint(Vec3.xyz(verts[v] + verts[v + 3], verts[v + 1] + verts[v + 4], verts[v + 2] + verts[v + 5]));
-                    let nrm = (tip - p).normalize();
-                    corners[count * 9 + c * 3] = p.x;
-                    corners[count * 9 + c * 3 + 1] = p.y;
-                    corners[count * 9 + c * 3 + 2] = p.z;
-                    put3(surf, count * 36 + 12 + c * 4, nrm);
+                    put3(tris, at + 12 + c * 4, Vec3.xyz(verts[v + c * 12 + 3], verts[v + c * 12 + 4], verts[v + c * 12 + 5]));
                     c += 1;
                 }
-                let color = Vec3.xyz(verts[t + 6] * look.tint.x, verts[t + 7] * look.tint.y, verts[t + 8] * look.tint.z);
-                put3(surf, count * 36 + 24, color);
-                surf[count * 36 + 27] = look.reflect;
-                put3(surf, count * 36 + 28, look.glow);
-                surf[count * 36 + 31] = look.ior;
-                surf[count * 36 + 32] = look.rough;
-                surf[count * 36 + 34] = look.cloud;
-                surf[count * 36 + 33] = opacity;
-                count += 1;
-                t += 36;
+                put3(tris, at + 24, Vec3.xyz(verts[v + 6], verts[v + 7], verts[v + 8]));
+                j += 1;
             }
-        }
-        i += 1;
-    }
-    let tree = bvh.build(corners, count, &mem);
-    if tree.depth > 45 && TRACE_WARNED != 0 - tree.depth {
-        TRACE_WARNED = 0 - tree.depth;
-        let deep = Text.new(scratch(0));
-        deep.pushStr("scene3d: URP tree is ");
-        deep.pushInt(tree.depth);
-        deep.pushStr(" deep; traced rays may skip geometry");
-        io.printLn(deep.str());
-    }
-    // Triangles go to the GPU in leaf order: corner, two edges, then the surface.
-    let texels = count * 9;
-    let rows = (texels + 1023) / 1024;
-    let tris = mem.alloc::<f32>((rows + 1) * 1024 * 4);
-    let k = 0;
-    while k < count {
-        let from = tree.order[k];
-        let p0 = Vec3.xyz(corners[from * 9], corners[from * 9 + 1], corners[from * 9 + 2]);
-        let p1 = Vec3.xyz(corners[from * 9 + 3], corners[from * 9 + 4], corners[from * 9 + 5]);
-        let p2 = Vec3.xyz(corners[from * 9 + 6], corners[from * 9 + 7], corners[from * 9 + 8]);
-        put3(tris, k * 36, p0);
-        put3(tris, k * 36 + 4, p1 - p0);
-        put3(tris, k * 36 + 8, p2 - p0);
-        let f = 12;
-        while f < 36 {
-            tris[k * 36 + f] = surf[from * 36 + f];
-            f += 1;
+            // Nodes point at triangles (leaves) and children (inner) in the shared textures.
+            let q = 0;
+            while q < tree.count {
+                let from = q * bvh.NODE_FLOATS;
+                let to = (nodeBase + q) * bvh.NODE_FLOATS;
+                let f = 0;
+                while f < bvh.NODE_FLOATS {
+                    nodes[to + f] = tree.nodes[from + f];
+                    f += 1;
+                }
+                nodes[to + 3] += f32(if tree.nodes[from + 7] > 0 { triBase } else { nodeBase });
+                q += 1;
+            }
+            m.roots[k] = nodeBase;
+            triBase += n;
+            nodeBase += tree.count;
         }
         k += 1;
     }
-    gfx.traceUpload(out, tris, count, tree.nodes, tree.count);
+    gfx.traceMeshes(&m.data, tris, triBase, nodes, nodeBase);
+    mem.destroy();
+}
+
+/// Upload the scene's traced objects (where each mesh is, and its look) and a BVH over
+/// their world boxes into `out`.
+fn traceObjects(scene: &Scene, transforms: []Mat4, out: &Traced) {
+    let mem = Arena.create(scene.len * 512 + 64 * 1024);
+    let boxes = mem.alloc::<f32>(scene.len * 9 + 9);
+    let which = mem.alloc::<int>(scene.len + 1);
+    let roots = mem.alloc::<int>(scene.len + 1);
+    let count = 0;
+    let i = 0;
+    while i < scene.len {
+        let n = scene.nodes[i];
+        let k = if traced(n) { sharedSlot(n.asset, n.texture) } else { -1 };
+        if k >= 0 && k < TRACE_MESHES.roots.len && TRACE_MESHES.roots[k] >= 0 {
+            let lo = SHARED[k].lo;
+            let hi = SHARED[k].hi;
+            let model = transforms[i];
+            let wlo = model.transformPoint(lo);
+            let whi = wlo;
+            let c = 1;
+            while c < 8 {
+                let x = if c % 2 == 1 { hi.x } else { lo.x };
+                let y = if (c / 2) % 2 == 1 { hi.y } else { lo.y };
+                let z = if c / 4 == 1 { hi.z } else { lo.z };
+                let p = model.transformPoint(Vec3.xyz(x, y, z));
+                wlo = Vec3.xyz(min(wlo.x, p.x), min(wlo.y, p.y), min(wlo.z, p.z));
+                whi = Vec3.xyz(max(whi.x, p.x), max(whi.y, p.y), max(whi.z, p.z));
+                c += 1;
+            }
+            // ponytail: each box goes to `bvh.build` as the triangle (lo, hi, center), whose
+            // bounds are the box and whose centroid is its center.
+            put3(boxes, count * 9, wlo);
+            put3(boxes, count * 9 + 3, whi);
+            put3(boxes, count * 9 + 6, (wlo + whi) * 0.5);
+            which[count] = i;
+            roots[count] = TRACE_MESHES.roots[k];
+            count += 1;
+        }
+        i += 1;
+    }
+    let tree = bvh.build(boxes, count, &mem);
+    // The shader's object stack holds 32.
+    if tree.depth > 29 && TRACE_WARNED != 0 - 1000 - tree.depth {
+        TRACE_WARNED = 0 - 1000 - tree.depth;
+        let deep = Text.new(scratch(0));
+        deep.pushStr("scene3d: the URP object tree is ");
+        deep.pushInt(tree.depth);
+        deep.pushStr(" deep; traced rays may skip objects");
+        io.printLn(deep.str());
+    }
+    // Objects in leaf order: world-to-object rows, then the look.
+    let inst = mem.alloc::<f32>(count * 24 + 4);
+    let j = 0;
+    while j < count {
+        let from = tree.order[j];
+        let obj = scene.nodes[which[from]];
+        let inv = transforms[which[from]].inverseAffine();
+        let at = j * 24;
+        let r = 0;
+        while r < 3 {
+            inst[at + r * 4] = inv.m[r];
+            inst[at + r * 4 + 1] = inv.m[4 + r];
+            inst[at + r * 4 + 2] = inv.m[8 + r];
+            inst[at + r * 4 + 3] = inv.m[12 + r];
+            r += 1;
+        }
+        let look = gfx.plainSurface();
+        let opacity: f32 = 1;
+        if obj.mat > 0 {
+            look = MATS[obj.mat - 1].look;
+            opacity = MATS[obj.mat - 1].opacity;
+        }
+        look = tinted(look, obj);
+        put3(inst, at + 12, look.tint);
+        inst[at + 15] = look.reflect;
+        put3(inst, at + 16, look.glow);
+        inst[at + 19] = look.ior;
+        inst[at + 20] = look.rough;
+        inst[at + 21] = opacity;
+        inst[at + 22] = look.cloud;
+        inst[at + 23] = f32(roots[from]);
+        j += 1;
+    }
+    gfx.traceInstances(out, inst, count, tree.nodes, tree.count);
     mem.destroy();
 }
 

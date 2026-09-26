@@ -259,6 +259,7 @@ fn alloc_struct(cx: &mut IrCx, module: &[Name], name: &str, debug: bool) -> Stru
         debug,
         span: Span::dummy(),
         ty_args: Vec::new(),
+        script: None,
     })
 }
 

@@ -17,11 +17,15 @@ pub const INTRINSIC_SYSCALL: &str = "syscall";
 pub const INTRINSIC_SIZEOF: &str = "sizeof";
 pub const INTRINSIC_SLICE: &str = "slice";
 pub const INTRINSIC_J3UI: &str = "j3ui";
+pub const INTRINSIC_SCRIPT: &str = "script";
+pub const SCRIPT_PROPS: &str = "props";
+pub const SCRIPT_SHARED: &str = "shared";
 pub const INTRINSICS: &[&str] = &[
     INTRINSIC_SYSCALL,
     INTRINSIC_SIZEOF,
     INTRINSIC_SLICE,
     INTRINSIC_J3UI,
+    INTRINSIC_SCRIPT,
 ];
 
 /// `@j3ui` widgets whose body is the call, then `end`.
@@ -119,6 +123,7 @@ const TOP_INCLUDES: &[&str] = &[
     "type-decl",
     "const-decl",
     "let-decl",
+    "script-block",
     "keywords",
     "types",
     "constants-bool",
@@ -169,6 +174,8 @@ pub fn tm_grammar() -> String {
     repo_const_decl(&mut out);
     sep(&mut out);
     repo_let_decl(&mut out);
+    sep(&mut out);
+    repo_script_block(&mut out);
     sep(&mut out);
     repo_keywords(&mut out);
     sep(&mut out);
@@ -634,6 +641,15 @@ fn repo_let_decl(out: &mut String) {
         &[("1", "storage.type.j3"), ("2", "variable.other.j3")],
         false,
     );
+    out.push_str("      ]\n");
+    out.push_str("    }");
+}
+
+fn repo_script_block(out: &mut String) {
+    out.push_str("    \"script-block\": {\n");
+    out.push_str("      \"patterns\": [\n");
+    let pat = format!("\\b({}|{})\\b(?=\\s*\\{{)", SCRIPT_PROPS, SCRIPT_SHARED);
+    match_captures(out, 4, &pat, &[("1", "keyword.other.j3")], false);
     out.push_str("      ]\n");
     out.push_str("    }");
 }

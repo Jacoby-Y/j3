@@ -8,13 +8,13 @@ use super::{
 use crate::intern::Name;
 use crate::ir::build::BodyBuilder;
 use crate::ir::cx::IrCx;
+use crate::ir::dump::dump_ty;
 use crate::ir::entity::FuncKind;
-use crate::ir::ids::{EnumId, FuncId, GlobalId, LocalId, StructId, VariantId};
+use crate::ir::ids::{EnumId, FieldId, FuncId, GlobalId, LocalId, StructId, VariantId};
 use crate::ir::op::{BinOp, UnaryOp};
 use crate::ir::operand::Operand;
 use crate::ir::place::Place;
 use crate::ir::rvalue::{Rvalue, RvalueKind};
-use crate::ir::dump::dump_ty;
 use crate::ir::ty::{Ty, TyKind};
 use crate::parse::{self, Expr, ExprKind, FnItem, Ident, InterpPart, Item, MatchArm, Pat, Stmt};
 use crate::span::Span;
@@ -197,6 +197,8 @@ struct Lower<'a> {
     b: BodyBuilder,
     locals: HashMap<String, LocalId>,
     aliases: HashMap<String, Place>,
+    script_sid: Option<StructId>,
+    script_props: HashSet<String>,
     funcs: &'a HashMap<String, FuncId>,
     consts: &'a HashMap<String, ConstVal>,
     types: &'a HashMap<String, Ty>,
@@ -329,6 +331,8 @@ fn lower_fn(
         b,
         locals,
         aliases: HashMap::new(),
+        script_sid: None,
+        script_props: HashSet::new(),
         funcs: use_funcs,
         consts: use_consts,
         types: use_types,
@@ -354,6 +358,37 @@ fn lower_fn(
         ret,
         tmp: 0,
     };
+    if let Some(sid) = l.cx.func(id).method_of {
+        if let Some(meta) = l.cx.struct_def(sid).script.clone() {
+            l.script_sid = Some(sid);
+            let this = l.locals["this"];
+            let base =
+                l.b.deref(l.cx, l.b.local_place(this, f.name.span), f.name.span);
+            let fields: Vec<(String, usize)> =
+                l.cx.struct_def(sid)
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| (l.cx.name_str(field.name).to_string(), i))
+                    .collect();
+            for (name, index) in fields {
+                let mut place = l.b.field(
+                    l.cx,
+                    base.clone(),
+                    FieldId {
+                        struct_id: sid,
+                        index: index as u32,
+                    },
+                    f.name.span,
+                );
+                if index < meta.prop_spans.len() {
+                    place.access.assign = false;
+                    l.script_props.insert(name.clone());
+                }
+                l.aliases.insert(name, place);
+            }
+        }
+    }
     for stmt in &f.body.stmts {
         l.stmt(stmt).map_err(|e| match &inst_note {
             Some(n) => e.note(n.clone()),
@@ -364,6 +399,91 @@ fn lower_fn(
 }
 
 impl<'a> Lower<'a> {
+    /// A script instance used by value. Generic code (`List<Door>` growing) may move one;
+    /// user code may not copy one.
+    fn is_script_value(&self, ty: Ty) -> bool {
+        if !self.type_subst.is_empty() {
+            return false;
+        }
+        match self.cx.ty_kind(ty) {
+            TyKind::Struct(sid) => self.cx.struct_def(*sid).script.is_some(),
+            _ => false,
+        }
+    }
+
+    /// `j3.scene3d.Scene`.
+    fn is_scene(&self, sid: StructId) -> bool {
+        let def = self.cx.struct_def(sid);
+        self.cx.name_str(def.name) == "Scene"
+            && def.module.len() == 2
+            && self.cx.name_str(def.module[0]) == "j3"
+            && self.cx.name_str(def.module[1]) == "scene3d"
+    }
+
+    /// `scene.script<Door>(node)`: the registry's `find` for that script type.
+    fn scene_script_find(&self, ty: Ty, span: Span) -> Result<FuncId, CheckError> {
+        let script = match self.cx.ty_kind(ty) {
+            TyKind::Struct(sid) if self.cx.struct_def(*sid).script.is_some() => *sid,
+            _ => {
+                return Err(CheckError::new(
+                    self.path,
+                    span,
+                    "`scene.script<T>` takes a script type",
+                )
+                .help("bind one with `const Door = @script(\"scripts/door.j3s\");`"));
+            }
+        };
+        let path = crate::emit::bc::script_path(self.cx, &self.cx.struct_def(script).module);
+        let want = format!("find__{}", crate::compile::scene_scripts::ident(&path));
+        let registry = |f: &crate::ir::entity::Func| {
+            f.module.len() == 3
+                && self.cx.name_str(f.module[0]) == "j3"
+                && self.cx.name_str(f.module[1]) == "scene3d"
+                && self.cx.name_str(f.module[2]) == "scripts"
+        };
+        self.cx
+            .funcs()
+            .iter()
+            .find(|f| registry(f) && self.cx.name_str(f.name) == want)
+            .map(|f| f.id)
+            .ok_or_else(|| {
+                CheckError::new(
+                    self.path,
+                    span,
+                    format!("no scene attaches {path}, so no object has one"),
+                )
+                .help(format!(
+                    "attach it to an object in the editor (a `node.<i>.script s={path}` line)"
+                ))
+            })
+    }
+
+    fn script_copy(&self, span: Span, ty: Ty) -> CheckError {
+        let name = match self.cx.ty_kind(ty) {
+            TyKind::Struct(sid) => self.cx.name_str(self.cx.struct_def(*sid).name).to_string(),
+            _ => "the script".to_string(),
+        };
+        CheckError::new(self.path, span, "script instances can't be copied")
+            .help(format!("pass `&{name}` instead"))
+    }
+
+    fn script_prop_name<'b>(&self, expr: &'b Expr) -> Option<&'b str> {
+        match &expr.kind {
+            ExprKind::Name(n) if self.script_props.contains(&n.name) => Some(&n.name),
+            ExprKind::Field { base, field } => {
+                if matches!(&base.kind, ExprKind::Name(n) if n.name == "this")
+                    && self.script_props.contains(&field.name)
+                {
+                    Some(&field.name)
+                } else {
+                    self.script_prop_name(base)
+                }
+            }
+            ExprKind::Index { base, .. } => self.script_prop_name(base),
+            _ => None,
+        }
+    }
+
     fn ty_str(&self, ty: Ty) -> String {
         let mut s = String::new();
         dump_ty(self.cx, ty, &mut s);
@@ -483,6 +603,14 @@ impl<'a> Lower<'a> {
             Stmt::Assign(s) => {
                 let place = self.place(&s.place)?;
                 if !place.access.assign {
+                    if let Some(prop) = self.script_prop_name(&s.place) {
+                        return Err(CheckError::new(
+                            self.path,
+                            s.place.span,
+                            format!("prop `{prop}` is read-only in the script"),
+                        )
+                        .help("props are read-only in the script; copy it into a `let`"));
+                    }
                     return Err(CheckError::new(
                         self.path,
                         s.span,
@@ -499,6 +627,14 @@ impl<'a> Lower<'a> {
             Stmt::AssignOp(s) => {
                 let place = self.place(&s.place)?;
                 if !place.access.assign {
+                    if let Some(prop) = self.script_prop_name(&s.place) {
+                        return Err(CheckError::new(
+                            self.path,
+                            s.place.span,
+                            format!("prop `{prop}` is read-only in the script"),
+                        )
+                        .help("props are read-only in the script; copy it into a `let`"));
+                    }
                     return Err(CheckError::new(
                         self.path,
                         s.span,
@@ -711,6 +847,9 @@ impl<'a> Lower<'a> {
             return Ok(self.num_from_float(expr.span, v, expected));
         }
         if let Ok(place) = self.try_place(expr) {
+            if self.is_script_value(place.ty) {
+                return Err(self.script_copy(expr.span, place.ty));
+            }
             if let Some(want) = expected {
                 if place.ty == want {
                     return Ok(Operand::Copy(place));
@@ -744,6 +883,13 @@ impl<'a> Lower<'a> {
     }
 
     fn rvalue(&mut self, expr: &Expr, expected: Option<Ty>) -> Result<Rvalue, CheckError> {
+        if matches!(expr.kind, ExprKind::Name(_)) {
+            if let Ok(place) = self.try_place(expr) {
+                if self.is_script_value(place.ty) {
+                    return Err(self.script_copy(expr.span, place.ty));
+                }
+            }
+        }
         if let Some(v) = self.fold_int(expr) {
             if v == 0 {
                 if let Some(want) = expected {
@@ -979,6 +1125,12 @@ impl<'a> Lower<'a> {
             },
             ExprKind::Interpolate { parts } => self.interpolate(expr.span, parts),
             ExprKind::Question { expr: inner } => self.question(expr.span, inner),
+            ExprKind::ScriptType(_) => Err(CheckError::new(
+                self.path,
+                expr.span,
+                "a script type is not a value",
+            )),
+            ExprKind::ScriptLit { path, fields } => self.script_lit(expr.span, path, fields),
         }
     }
 
@@ -1128,6 +1280,13 @@ impl<'a> Lower<'a> {
         }
         match &func.kind {
             ExprKind::Name(n) => {
+                if let Some(sid) = self.script_sid {
+                    if let Some(id) = self.methods.get(&(sid.0, n.name.clone())).copied() {
+                        let this = self.locals["this"];
+                        let recv = self.b.local_place(this, n.span);
+                        return self.call_id(span, id, Some(recv), args);
+                    }
+                }
                 if args.len() == 1 {
                     if let Some(to) = self.conv_ty(&n.name) {
                         let from = self.operand(&args[0], None)?;
@@ -1193,6 +1352,10 @@ impl<'a> Lower<'a> {
                     }
                 };
                 let targs = self.resolve_type_args(type_args)?;
+                if field.name == "script" && targs.len() == 1 && self.is_scene(sid) {
+                    let id = self.scene_script_find(targs[0], field.span)?;
+                    return self.call_id(span, id, Some(recv), args);
+                }
                 let id = self.lookup_method(sid, &field.name, targs, field.span)?;
                 self.call_id(span, id, Some(recv), args)
             }
@@ -1402,11 +1565,30 @@ impl<'a> Lower<'a> {
                 match self.cx.ty_kind(place.ty) {
                     TyKind::Struct(sid) => {
                         let sid = *sid;
+                        if self.cx.struct_def(sid).script.is_some() && self.script_sid != Some(sid)
+                        {
+                            return Err(CheckError::new(
+                                self.path,
+                                field.span,
+                                "script fields are private",
+                            )
+                            .help("add a `pub fn` to expose this value"));
+                        }
                         match field_path(self.cx, sid, &field.name) {
                             Some(path) => {
                                 let mut place = place;
+                                let prop_field = path.first().map(|f| f.index as usize);
                                 for fid in path {
                                     place = self.b.field(self.cx, place, fid, field.span);
+                                }
+                                if self.script_sid == Some(sid) {
+                                    if let (Some(meta), Some(index)) =
+                                        (&self.cx.struct_def(sid).script, prop_field)
+                                    {
+                                        if index < meta.prop_spans.len() {
+                                            place.access.assign = false;
+                                        }
+                                    }
                                 }
                                 Ok(place)
                             }
@@ -1816,6 +1998,43 @@ impl<'a> Lower<'a> {
                 ));
             }
         };
+        self.struct_lit_sid(span, &name.name, ty, sid, fields)
+    }
+
+    fn script_lit(
+        &mut self,
+        span: Span,
+        path: &str,
+        fields: &[(parse::Ident, Expr)],
+    ) -> Result<Rvalue, CheckError> {
+        let key = format!("script.{}", path.trim_end_matches(".j3s").replace('/', "."));
+        let sid = self
+            .cx
+            .structs()
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| {
+                let module = s.module.iter().map(|n| self.cx.name_str(*n)).collect::<Vec<_>>();
+                if s.script.is_some() && module.join(".") == key {
+                    Some(StructId(i as u32))
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| CheckError::new(self.path, span, format!("no script at {path}")))?;
+        let ty = self.cx.ty_struct(sid);
+        let name = self.cx.name_str(self.cx.struct_def(sid).name).to_string();
+        self.struct_lit_sid(span, &name, ty, sid, fields)
+    }
+
+    fn struct_lit_sid(
+        &mut self,
+        span: Span,
+        name: &str,
+        ty: Ty,
+        sid: StructId,
+        fields: &[(parse::Ident, Expr)],
+    ) -> Result<Rvalue, CheckError> {
         let nfields = self.cx.struct_def(sid).fields.len();
         let mut ops: Vec<Option<Operand>> = vec![None; nfields];
         for (fname, value) in fields {
@@ -1832,10 +2051,20 @@ impl<'a> Lower<'a> {
                     return Err(CheckError::new(
                         self.path,
                         fname.span,
-                        format!("`{}` has no field `{}`", name.name, fname.name),
+                        format!("`{name}` has no field `{}`", fname.name),
                     ));
                 }
             };
+            if let Some(meta) = &self.cx.struct_def(sid).script {
+                if i >= meta.prop_spans.len() {
+                    return Err(CheckError::new(
+                        self.path,
+                        fname.span,
+                        format!("`{}` is script state, not a prop", fname.name),
+                    )
+                    .help("move it into `props` if callers should set it"));
+                }
+            }
             if ops[i].is_some() {
                 return Err(CheckError::new(
                     self.path,
@@ -1855,6 +2084,28 @@ impl<'a> Lower<'a> {
                         continue;
                     }
                     let fname = self.cx.name_str(self.cx.struct_def(sid).fields[i].name);
+                    if let Some(meta) = &self.cx.struct_def(sid).script {
+                        if let Some(prop_span) = meta.prop_spans.get(i) {
+                            let note = self
+                                .cx
+                                .file(prop_span.file)
+                                .map(|file| {
+                                    format!(
+                                        "prop declared at {}:{}",
+                                        file.path,
+                                        parse::line_of(&file.src, prop_span.start)
+                                    )
+                                })
+                                .unwrap_or_else(|| "required prop declared in script".to_string());
+                            return Err(CheckError::new(
+                                self.path,
+                                span,
+                                format!("missing required prop `{fname}`"),
+                            )
+                            .note(note)
+                            .help(format!("add `{fname}: ...` to the script literal")));
+                        }
+                    }
                     return Err(CheckError::new(
                         self.path,
                         span,
@@ -2575,13 +2826,13 @@ impl<'a> Lower<'a> {
     ) -> Result<FuncId, CheckError> {
         if type_args.is_empty() {
             return match self.methods.get(&(sid.0, name.to_string())).copied() {
-                Some(id) => Ok(id),
+                Some(id) => self.script_method_visible(sid, id, name, span),
                 None => Err(self.no_method(span, sid, name)),
             };
         }
         let key = (sid.0, name.to_string(), type_args.clone());
         if let Some(&id) = self.method_insts.get(&key) {
-            return Ok(id);
+            return self.script_method_visible(sid, id, name, span);
         }
         let temp = match self.method_temps.get(&(sid.0, name.to_string())).cloned() {
             Some(f) => f,
@@ -2593,6 +2844,15 @@ impl<'a> Lower<'a> {
                 ));
             }
         };
+        if self.cx.struct_def(sid).script.is_some() && self.script_sid != Some(sid) && !temp.vis_pub
+        {
+            return Err(CheckError::new(
+                self.path,
+                span,
+                format!("`{name}` is private to this script"),
+            )
+            .help("add `pub` to expose this function"));
+        }
         if temp.type_params.len() != type_args.len() {
             return Err(CheckError::new(
                 self.path,
@@ -2651,6 +2911,26 @@ impl<'a> Lower<'a> {
         self.ir_funcs.push(id);
         self.fn_substs.insert(id, subst.clone());
         self.pending_mono.push((id, temp, subst));
+        self.script_method_visible(sid, id, name, span)
+    }
+
+    fn script_method_visible(
+        &self,
+        sid: StructId,
+        id: FuncId,
+        name: &str,
+        span: Span,
+    ) -> Result<FuncId, CheckError> {
+        if let Some(meta) = &self.cx.struct_def(sid).script {
+            if self.script_sid != Some(sid) && self.cx.func(id).vis != crate::ir::entity::Vis::Pub {
+                return Err(CheckError::new(
+                    self.path,
+                    span,
+                    format!("`{name}` is private to {}", meta.path),
+                )
+                .help("add `pub` to expose this function"));
+            }
+        }
         Ok(id)
     }
 

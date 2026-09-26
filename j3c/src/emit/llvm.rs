@@ -11,11 +11,45 @@ use crate::emit::opts::EmitOpts;
 use crate::ir::abi;
 use crate::ir::cx::IrCx;
 use crate::ir::entity::{ConstInit, FuncKind};
-use crate::ir::ids::StructId;
+use crate::ir::ids::{FuncId, StructId};
 use crate::ir::module::Module;
 use crate::ir::ty::{Ty, TyKind};
 
+/// Which functions one LLVM text defines. A split build compiles the script VM at `-O2`
+/// as its own object while the rest of a dev build stays at the project's `opt`.
+#[derive(Clone, Copy)]
+pub enum Part<'a> {
+    Whole,
+    /// Define only these; declare everything else, and reference globals as external.
+    Only(&'a HashSet<FuncId>),
+    /// Define everything except these, plus `main` and every global.
+    Except(&'a HashSet<FuncId>),
+}
+
+impl Part<'_> {
+    fn defines(&self, id: FuncId) -> bool {
+        match self {
+            Part::Whole => true,
+            Part::Only(set) => set.contains(&id),
+            Part::Except(set) => !set.contains(&id),
+        }
+    }
+
+    fn split(&self) -> bool {
+        !matches!(self, Part::Whole)
+    }
+}
+
 pub fn emit_llvm(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<String, String> {
+    emit_llvm_part(cx, modules, opts, Part::Whole)
+}
+
+pub fn emit_llvm_part(
+    cx: &IrCx,
+    modules: &[Module],
+    opts: &EmitOpts,
+    part: Part,
+) -> Result<String, String> {
     let triple = if opts.target.is_empty() {
         "x86_64-pc-linux-gnu"
     } else {
@@ -69,12 +103,20 @@ pub fn emit_llvm(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<Strin
             let g = cx.global(*id);
             let name = c_expr::global_c_name(cx, g);
             let ty = ll_type(cx, g.ty)?;
+            if matches!(part, Part::Only(_)) {
+                out.push_str(&format!(
+                    "@{name} = external global {ty}, align {}\n",
+                    llvm_ty::align(cx, g.ty)
+                ));
+                continue;
+            }
             let init = match &g.init {
                 Some(v) => ll_const_init(cx, g.ty, v)?,
                 None => "zeroinitializer".to_string(),
             };
+            let linkage = if part.split() { "" } else { "internal " };
             out.push_str(&format!(
-                "@{name} = internal global {ty} {init}, align {}\n",
+                "@{name} = {linkage}global {ty} {init}, align {}\n",
                 llvm_ty::align(cx, g.ty)
             ));
         }
@@ -83,7 +125,7 @@ pub fn emit_llvm(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<Strin
         out.push('\n');
     }
 
-    let mut dbg = if opts.cc.debug {
+    let mut dbg = if opts.cc.debug && !matches!(part, Part::Only(_)) {
         DebugOut::prepare(cx, modules)
     } else {
         DebugOut::off()
@@ -95,6 +137,14 @@ pub fn emit_llvm(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<Strin
         for id in &module.funcs {
             let func = cx.func(*id);
             match &func.kind {
+                FuncKind::J3 { .. } if !part.defines(*id) => {
+                    out.push_str(&format!(
+                        "declare {} @{}({})\n",
+                        ll_ret(cx, func.ty)?,
+                        c_expr::func_c_name(cx, func),
+                        ll_params(cx, func.ty)?
+                    ));
+                }
                 FuncKind::J3 { body } => {
                     let slot = if dbg.enabled() {
                         Some(&mut dbg)
@@ -102,6 +152,7 @@ pub fn emit_llvm(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<Strin
                         None
                     };
                     let mut f = LlvmFn::new(cx, body, slot);
+                    f.external = part.split();
                     out.push_str(&f.emit_func(func)?);
                     out.push('\n');
                 }
@@ -110,11 +161,13 @@ pub fn emit_llvm(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<Strin
         }
     }
 
-    let entry = host_entry(cx, modules)?;
-    out.push_str("define i32 @main() {\n");
-    out.push_str(&format!("  call void @{entry}()\n"));
-    out.push_str("  ret i32 0\n");
-    out.push_str("}\n");
+    if !matches!(part, Part::Only(_)) {
+        let entry = host_entry(cx, modules)?;
+        out.push_str("define i32 @main() {\n");
+        out.push_str(&format!("  call void @{entry}()\n"));
+        out.push_str("  ret i32 0\n");
+        out.push_str("}\n");
+    }
     let meta = dbg.finish();
     if !meta.is_empty() {
         out.push('\n');

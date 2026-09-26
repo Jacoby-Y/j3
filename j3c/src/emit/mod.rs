@@ -1,6 +1,7 @@
 //! Codegen printers. C and LLVM consume the same typed IR. Never parse J3 here.
 
 mod c;
+pub mod bc;
 mod c_expr;
 mod c_ty;
 mod host;
@@ -11,10 +12,10 @@ mod opts;
 
 pub use c::{emit_c, emit_program};
 pub use host::{
-    compile_and_run, compile_and_run_with, compile_c, failure_hint, host_lib_present, run_exe,
+    compile_and_run, compile_and_run_with, compile_c, compile_llvm_split, failure_hint, host_lib_present, run_exe,
     run_exe_in, CcOpts, RunResult,
 };
-pub use llvm::emit_llvm;
+pub use llvm::{emit_llvm, emit_llvm_part, Part};
 pub use opts::{Backend, EmitOpts};
 
 use crate::ir::body::Block;

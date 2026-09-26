@@ -16,8 +16,8 @@ mod token;
 pub use ast::{
     AssignOpStmt, AssignStmt, BinOp, Block, ConstItem, EnumItem, Expr, ExprKind, FieldItem, File,
     FnItem, ForEachStmt, Ident, InterpPart, Item, LetStmt, LibFnDecl, MatchArm, MatchStmt,
-    ModLetItem, Param, Pat, ReturnStmt, Stmt, StructItem, Type, TypeKind, UnaryOp, UseItem,
-    UseLibItem, UseLocalStmt, VariantItem,
+    ModLetItem, Param, Pat, ReturnStmt, ScriptBlockItem, ScriptLetItem, Stmt, StructItem, Type,
+    TypeKind, UnaryOp, UseItem, UseLibItem, UseLocalStmt, VariantItem,
 };
 pub use error::ParseError;
 pub use token::{keyword, Token, TokenKind};
@@ -27,6 +27,11 @@ use crate::span::FileId;
 pub fn parse(src: &str, file: FileId) -> Result<File, ParseError> {
     let tokens = lex::lex(src, file)?;
     parser::parse_tokens(&tokens)
+}
+
+pub fn parse_script(src: &str, file: FileId, module: &[String]) -> Result<File, ParseError> {
+    let tokens = lex::lex(src, file)?;
+    parser::parse_script_tokens(&tokens, module)
 }
 
 pub fn format_error(path: &str, src: &str, err: &ParseError) -> String {
@@ -268,6 +273,47 @@ fn main() {
         match parse(src, FileId(1)) {
             Ok(_) => panic!("expected error"),
             Err(e) => assert!(e.message.contains("@foo"), "{}", e.message),
+        }
+    }
+
+    #[test]
+    fn script_file_and_script_type_parse() {
+        let script = include_str!("../../../speculative/11_script/scripts/door.j3s");
+        let module = vec![
+            "script".to_string(),
+            "scripts".to_string(),
+            "door".to_string(),
+        ];
+        let f = parse_script(script, FileId(1), &module).expect("script parses");
+        assert!(f.is_script);
+        assert_eq!(f.module_key(), "script.scripts.door");
+        assert!(f.items.iter().any(|i| matches!(i, Item::Props(_))));
+        assert!(f.items.iter().any(|i| matches!(i, Item::Shared(_))));
+        assert!(f.items.iter().any(|i| matches!(i, Item::State(_))));
+        let main = include_str!("../../../speculative/11_script/main.j3");
+        let f = parse(main, FileId(2)).expect("main parses");
+        assert!(f.items.iter().any(
+            |i| matches!(i, Item::Const(c) if matches!(c.value.kind, ExprKind::ScriptType(_)))
+        ));
+    }
+
+    #[test]
+    fn script_top_level_rules_are_named() {
+        let module = vec!["script".to_string(), "bad".to_string()];
+        for (src, rule) in [
+            ("module bad;", "can't have a `module` line"),
+            ("use lib \"c\" as c {}", "can't use `use lib`"),
+            ("while true {}", "scripts allow only"),
+        ] {
+            let err = parse_script(src, FileId(1), &module).unwrap_err();
+            assert!(err.message.contains(rule), "{}", err.message);
+        }
+        for (src, rule) in [
+            ("module m; const X = @script(path);", "string literal"),
+            ("module m; const X = @script(\"foo.j3\");", "end in `.j3s`"),
+        ] {
+            let err = parse(src, FileId(1)).unwrap_err();
+            assert!(err.message.contains(rule), "{}", err.message);
         }
     }
 }

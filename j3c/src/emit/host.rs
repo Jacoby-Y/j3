@@ -149,6 +149,115 @@ pub fn compile_llvm(
     Ok(exe_path)
 }
 
+/// Dev builds of script programs: compile `vm_ll` (the script VM) to an object at `-O2`,
+/// cached by its text, while `main_ll` compiles at the project's level; then link both.
+/// The VM runs every script instruction, so it must not be `-O0` even when the game is.
+pub fn compile_llvm_split(
+    main_ll: &str,
+    vm_ll: &str,
+    cc: &CcOpts,
+    clang: &str,
+    target: &str,
+    cpu: &str,
+    extra: &[String],
+) -> Result<PathBuf, String> {
+    let exe_path = cc.out.clone().ok_or("split build needs an output path")?;
+    if let Some(parent) = exe_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let clang = if clang.is_empty() { "clang" } else { clang };
+    let base = exe_path.display().to_string();
+    let vm_src = PathBuf::from(format!("{base}.vm.ll"));
+    let vm_obj = PathBuf::from(format!("{base}.vm.o"));
+    let vm_stamp = PathBuf::from(format!("{base}.vm.key"));
+    let main_src = PathBuf::from(format!("{base}.main.ll"));
+    let main_obj = PathBuf::from(format!("{base}.main.o"));
+    let compile = |src: &Path, obj: &Path, opt: &str, debug: bool| {
+        let mut cmd = Command::new(clang);
+        cmd.arg("-c")
+            .arg("-Wno-override-module")
+            .arg(format!("-O{opt}"))
+            .arg("-ffunction-sections")
+            .arg("-fdata-sections");
+        if debug {
+            cmd.arg("-g");
+        }
+        if !target.is_empty() {
+            cmd.arg(format!("--target={target}"));
+        }
+        if !cpu.is_empty() {
+            cmd.arg(format!("-mcpu={cpu}"));
+        }
+        for flag in extra {
+            cmd.arg(flag);
+        }
+        cmd.arg("-o").arg(obj).arg(src);
+        cmd
+    };
+    let started = std::time::Instant::now();
+    let vm_key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        vm_ll.hash(&mut h);
+        format!("{:?}", compile(&vm_src, &vm_obj, "2", false)).hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let vm_cached =
+        vm_obj.exists() && fs::read_to_string(&vm_stamp).map(|k| k == vm_key).unwrap_or(false);
+    let mut vm_child = None;
+    if !vm_cached {
+        let _ = fs::remove_file(&vm_stamp);
+        fs::write(&vm_src, vm_ll).map_err(|e| format!("write {}: {e}", vm_src.display()))?;
+        let child = compile(&vm_src, &vm_obj, "2", false)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn {clang}: {e}"))?;
+        vm_child = Some(child);
+    }
+    fs::write(&main_src, main_ll).map_err(|e| format!("write {}: {e}", main_src.display()))?;
+    let out = compile(&main_src, &main_obj, clang_opt(&cc.opt), cc.debug)
+        .output()
+        .map_err(|e| format!("spawn {clang}: {e}"))?;
+    let _ = fs::remove_file(&main_src);
+    if !out.status.success() {
+        return Err(format!("{clang} failed:\n{}", String::from_utf8_lossy(&out.stderr)));
+    }
+    if let Some(child) = vm_child {
+        let vm_out = child.wait_with_output().map_err(|e| format!("wait {clang}: {e}"))?;
+        let _ = fs::remove_file(&vm_src);
+        if !vm_out.status.success() {
+            return Err(format!(
+                "{clang} failed on the script VM:\n{}",
+                String::from_utf8_lossy(&vm_out.stderr)
+            ));
+        }
+        let _ = fs::write(&vm_stamp, &vm_key);
+    }
+    let mut link = Command::new(clang);
+    link.arg(link_gc_flag(target));
+    if !target.is_empty() {
+        link.arg(format!("--target={target}"));
+    }
+    for flag in extra {
+        link.arg(flag);
+    }
+    link.arg("-o").arg(&exe_path).arg(&main_obj).arg(&vm_obj);
+    append_link_args(&mut link, cc, main_ll, target)?;
+    let linked = link.output().map_err(|e| format!("spawn {clang}: {e}"))?;
+    let _ = fs::remove_file(&main_obj);
+    if std::env::var_os("J3C_TIMINGS").is_some() {
+        eprintln!(
+            "j3c: clang (split{}): {:.3}s",
+            if vm_cached { ", VM cached" } else { "" },
+            started.elapsed().as_secs_f64()
+        );
+    }
+    if !linked.status.success() {
+        return Err(format!("{clang} link failed:\n{}", String::from_utf8_lossy(&linked.stderr)));
+    }
+    Ok(exe_path)
+}
+
 /// Build-cache key for `cmd` compiling `source`, leaving out the per-run temp file name.
 fn build_key(temp: &std::path::Path, source: &str, cmd: &Command) -> String {
     use std::hash::{Hash, Hasher};

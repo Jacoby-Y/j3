@@ -207,6 +207,7 @@ fn needs_space(prev: Option<TokenKind>, next: TokenKind) -> bool {
             | TokenKind::LBracket
             | TokenKind::RBracket
             | TokenKind::RBrace
+            | TokenKind::Colon
             | TokenKind::Dot
             | TokenKind::DotDot
             | TokenKind::DotDotEq
@@ -267,5 +268,14 @@ mod tests {
         assert!(out.contains("0..=3"), "{out}");
         let again = format_src(&out).expect("fmt2");
         assert_eq!(out, again);
+    }
+
+    #[test]
+    fn script_blocks_format_and_stay_stable() {
+        let src = "props{hinge:int;angle:f32=90.0;}\nshared{count:int=0;}\nlet open=false;\n";
+        let out = format_src(src).expect("fmt script");
+        assert!(out.contains("props {\n    hinge: int;"), "{out}");
+        assert!(out.contains("shared {\n    count: int = 0;"), "{out}");
+        assert_eq!(out, format_src(&out).expect("fmt script twice"));
     }
 }

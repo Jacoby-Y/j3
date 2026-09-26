@@ -42,6 +42,55 @@ pub fn hover(prog: &Program, path: &str, offset: u32) -> Option<Hover> {
             span: local.span,
         });
     }
+    if file.path.ends_with(".j3s") {
+        if let Some(script) = prog
+            .cx
+            .structs()
+            .iter()
+            .find(|s| s.span.file == file.id && s.script.is_some())
+        {
+            for (index, field) in script.fields.iter().enumerate() {
+                if prog.cx.name_str(field.name) == name {
+                    let kind = if index < script.script.as_ref().unwrap().prop_spans.len() {
+                        "prop"
+                    } else {
+                        "state"
+                    };
+                    return Some(Hover {
+                        text: format!(
+                            "```j3\n{kind} {name}: {}\n```",
+                            dump::ty_string(&prog.cx, field.ty)
+                        ),
+                        span,
+                    });
+                }
+            }
+            if let Some(global) = prog
+                .cx
+                .globals()
+                .iter()
+                .find(|g| g.span.file == file.id && prog.cx.name_str(g.name) == name)
+            {
+                return Some(Hover {
+                    text: format!(
+                        "```j3\nshared {name}: {}\n```",
+                        dump::ty_string(&prog.cx, global.ty)
+                    ),
+                    span,
+                });
+            }
+        }
+    }
+    if let Some(alias) = prog
+        .script_aliases
+        .iter()
+        .find(|a| a.file == file.id && a.name == name)
+    {
+        return Some(Hover {
+            text: script_hover(prog, alias.struct_id),
+            span,
+        });
+    }
     if let Some(func) = find_func(&prog.cx, &name, file.id) {
         let mut sig = String::from("```j3\n");
         dump::dump_ty(&prog.cx, func.ty, &mut sig);
@@ -56,6 +105,17 @@ pub fn hover(prog: &Program, path: &str, offset: u32) -> Option<Hover> {
         });
     }
     if let Some(s) = find_struct(&prog.cx, &name) {
+        if s.script.is_some() {
+            let sid = prog
+                .cx
+                .structs()
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, s))?;
+            return Some(Hover {
+                text: script_hover(prog, crate::ir::ids::StructId(sid as u32)),
+                span,
+            });
+        }
         let mut text = format!("```j3\nstruct {}\n```\n", prog.cx.name_str(s.name));
         text.push_str(&module_path(&prog.cx, &s.module));
         return Some(Hover {
@@ -106,7 +166,31 @@ pub fn hover(prog: &Program, path: &str, offset: u32) -> Option<Hover> {
 
 pub fn definition(prog: &Program, path: &str, offset: u32) -> Option<Location> {
     let file = file_by_path(&prog.cx, path)?;
+    if let Some(rel) = script_path_at(&file.src, offset) {
+        if let Some(target) = prog
+            .cx
+            .files
+            .iter()
+            .find(|f| Path::new(&f.path).ends_with(Path::new(&rel)))
+        {
+            return Some(Location {
+                path: target.path.clone(),
+                span: Span {
+                    file: target.id,
+                    start: 0,
+                    end: 0,
+                },
+            });
+        }
+    }
     let (name, _) = ident_at(&file.src, file.id, offset)?;
+    if let Some(alias) = prog
+        .script_aliases
+        .iter()
+        .find(|a| a.file == file.id && a.name == name)
+    {
+        return loc_of(&prog.cx, prog.cx.struct_def(alias.struct_id).span);
+    }
     if let Some(local) = find_local(&prog.cx, file.id, offset, &name) {
         return loc_of(&prog.cx, local.span);
     }
@@ -125,6 +209,60 @@ pub fn definition(prog: &Program, path: &str, offset: u32) -> Option<Location> {
     None
 }
 
+fn script_hover(prog: &Program, sid: crate::ir::ids::StructId) -> String {
+    let cx = &prog.cx;
+    let s = cx.struct_def(sid);
+    let mut out = format!("```j3\nscript {}\n", cx.name_str(s.name));
+    let prop_count = s.script.as_ref().map(|m| m.prop_spans.len()).unwrap_or(0);
+    for field in s.fields.iter().take(prop_count) {
+        let required = if field.default.is_none() {
+            "required"
+        } else {
+            "default"
+        };
+        out.push_str(&format!(
+            "  prop {}: {} ({required})\n",
+            cx.name_str(field.name),
+            dump::ty_string(cx, field.ty)
+        ));
+    }
+    for func in cx
+        .funcs()
+        .iter()
+        .filter(|f| f.method_of == Some(sid) && f.vis == crate::ir::entity::Vis::Pub)
+    {
+        let name = cx.name_str(func.name);
+        if let Some((params, ret)) = cx.fn_sig(func.ty) {
+            let params: Vec<String> = params
+                .iter()
+                .skip(1)
+                .map(|t| dump::ty_string(cx, *t))
+                .collect();
+            out.push_str(&format!("  pub fn {name}({})", params.join(", ")));
+            if ret != cx.common.void {
+                out.push_str(&format!(": {}", dump::ty_string(cx, ret)));
+            }
+            out.push('\n');
+        }
+    }
+    out.push_str("```");
+    out
+}
+
+fn script_path_at(src: &str, offset: u32) -> Option<String> {
+    for (at, _) in src.match_indices("@script") {
+        let rest = src.get(at + "@script".len()..)?;
+        let quote = rest.find('"')?;
+        let start = at + "@script".len() + quote + 1;
+        let end = start + src.get(start..)?.find('"')?;
+        if (offset as usize) >= start && (offset as usize) <= end {
+            return Some(src[start..end].to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
 pub use super::complete::complete;
 
 pub fn format_file(src: &str) -> Result<String, String> {
@@ -328,6 +466,40 @@ mod tests {
     use super::*;
     use crate::compile::default_hello_path;
     use std::path::PathBuf;
+
+    #[test]
+    fn script_type_hover_and_path_goto() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../speculative/11_script/main.j3");
+        let prog = analyze(&path, &[]).expect("analyze script");
+        let src = std::fs::read_to_string(&path).unwrap();
+        let shown = path.display().to_string();
+        let type_at = src.find("const Door").unwrap() + "const ".len();
+        let type_hover = hover(&prog, &shown, type_at as u32).expect("hover script type");
+        assert!(
+            type_hover.text.contains("script Door"),
+            "{}",
+            type_hover.text
+        );
+        assert!(
+            type_hover.text.contains("prop hinge"),
+            "{}",
+            type_hover.text
+        );
+        assert!(
+            type_hover.text.contains("pub fn toggle"),
+            "{}",
+            type_hover.text
+        );
+        let path_at = src.find("scripts/door.j3s").unwrap() + 4;
+        let target = definition(&prog, &shown, path_at as u32).expect("script path goto");
+        assert!(target.path.ends_with("scripts/door.j3s"), "{}", target.path);
+        let script = target.path.clone();
+        let script_src = std::fs::read_to_string(&script).unwrap();
+        let prop_at = script_src.find("if open").unwrap() + 3;
+        let hover = hover(&prog, &script, prop_at as u32).expect("state hover");
+        assert!(hover.text.contains("state open: bool"), "{}", hover.text);
+    }
 
     #[test]
     fn hover_print_ln_on_hello() {

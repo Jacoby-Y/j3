@@ -788,7 +788,7 @@ fn write_scene(out: &Path, parts: &[Part]) -> Result<(), String> {
         let id = p + 1;
         let parent = if part.parent < 0 { 0 } else { part.parent as usize + 1 };
         let prefix = format!("node.{p}.");
-        text.push_str(&format!("{prefix}id={id}\n{prefix}parent={parent}\n{prefix}kind={}\n{prefix}name s={}\n{prefix}asset s={}\n{prefix}texture s={}\n{prefix}behavior s=\n{prefix}doubleSided={}\n", part.kind, safe_line(&part.name), part.asset, part.texture, if part.double_sided { 1 } else { 0 }));
+        text.push_str(&format!("{prefix}id={id}\n{prefix}parent={parent}\n{prefix}kind={}\n{prefix}name s={}\n{prefix}asset s={}\n{prefix}texture s={}\n{prefix}script s=\n{prefix}doubleSided={}\n", part.kind, safe_line(&part.name), part.asset, part.texture, if part.double_sided { 1 } else { 0 }));
         for (axis, value) in ["px", "py", "pz"].iter().zip(part.position) {
             text.push_str(&format!("{prefix}{axis} f={value:.6}\n"));
         }

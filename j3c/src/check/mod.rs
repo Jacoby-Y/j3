@@ -6,6 +6,7 @@
 
 mod error;
 mod lower;
+mod script;
 
 pub use error::CheckError;
 
@@ -14,7 +15,8 @@ use std::collections::{HashMap, HashSet};
 use crate::intern::Name;
 use crate::ir::cx::IrCx;
 use crate::ir::entity::{
-    ConstInit, EnumDef, FieldDef, Func, FuncKind, GlobalDef, StructDef, TryCatch, VariantDef, Vis,
+    ConstInit, EnumDef, FieldDef, Func, FuncKind, GlobalDef, ScriptMeta, StructDef, TryCatch,
+    VariantDef, Vis,
 };
 use crate::ir::ids::{EnumId, FuncId, GlobalId, StructId, VariantId};
 use crate::ir::module::Module;
@@ -41,6 +43,14 @@ pub struct Program {
     pub exports: Vec<Export>,
     /// Every `const`, including private ones, so hover can show `///`.
     pub const_docs: Vec<Export>,
+    pub script_aliases: Vec<ScriptAlias>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScriptAlias {
+    pub file: FileId,
+    pub name: String,
+    pub struct_id: StructId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,7 +139,8 @@ pub fn check_files_lib(files: Vec<ParsedFile>) -> Result<Program, CheckError> {
     check_files_cfg(files, false)
 }
 
-fn check_files_cfg(files: Vec<ParsedFile>, require_main: bool) -> Result<Program, CheckError> {
+fn check_files_cfg(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Program, CheckError> {
+    script::prepare(&mut files)?;
     let mut cx = IrCx::new();
     let _ = cx.ty_ref(cx.common.u8);
 
@@ -176,6 +187,7 @@ fn check_files_cfg(files: Vec<ParsedFile>, require_main: bool) -> Result<Program
     for i in 0..mods.len() {
         collect_struct_names(&mut cx, &mut mods, i)?;
     }
+    script::resolve_aliases(&mut mods)?;
     for i in 0..mods.len() {
         collect_enums(&mut cx, &mut mods, i)?;
     }
@@ -232,6 +244,26 @@ fn check_files_cfg(files: Vec<ParsedFile>, require_main: bool) -> Result<Program
 
     let exports = program_exports(&cx, &mods);
     let const_docs = const_docs(&cx, &mods);
+    let script_aliases = mods
+        .iter()
+        .flat_map(|m| {
+            m.ast.items.iter().filter_map(|item| {
+                let Item::Const(c) = item else { return None };
+                if !matches!(c.value.kind, ExprKind::ScriptType(_)) {
+                    return None;
+                }
+                let ty = m.types.get(&c.name.name)?;
+                let TyKind::Struct(sid) = cx.ty_kind(*ty) else {
+                    return None;
+                };
+                Some(ScriptAlias {
+                    file: m.ast.span.file,
+                    name: c.name.name.clone(),
+                    struct_id: *sid,
+                })
+            })
+        })
+        .collect();
 
     let mut modules = Vec::new();
     for m in mods {
@@ -249,6 +281,7 @@ fn check_files_cfg(files: Vec<ParsedFile>, require_main: bool) -> Result<Program
         modules,
         exports,
         const_docs,
+        script_aliases,
     })
 }
 
@@ -388,6 +421,9 @@ fn collect_consts(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Result<(), C
         .collect();
 
     for c in items {
+        if matches!(c.value.kind, ExprKind::ScriptType(_)) {
+            continue;
+        }
         if mods[i].consts.contains_key(&c.name.name) {
             return Err(CheckError::new(
                 path.clone(),
@@ -461,6 +497,25 @@ fn collect_struct_names(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Result
             debug: s.debug,
             span: s.span,
             ty_args: Vec::new(),
+            script: if mods[i].ast.is_script {
+                Some(ScriptMeta {
+                    path: path.clone(),
+                    prop_spans: mods[i]
+                        .ast
+                        .items
+                        .iter()
+                        .filter_map(|it| match it {
+                            Item::Props(b) => {
+                                Some(b.fields.iter().map(|f| f.span).collect::<Vec<_>>())
+                            }
+                            _ => None,
+                        })
+                        .flatten()
+                        .collect(),
+                })
+            } else {
+                None
+            },
         });
         let ty = cx.ty_struct(id);
         mods[i].structs.insert(s.name.name.clone(), id);
@@ -1263,6 +1318,11 @@ fn peek_ty(
     path: &str,
 ) -> Result<Ty, CheckError> {
     match &expr.kind {
+        ExprKind::ScriptType(_) | ExprKind::ScriptLit { .. } => Err(CheckError::new(
+            path,
+            expr.span,
+            "script type is not available here",
+        )),
         ExprKind::Int(_) => Ok(cx.common.int),
         ExprKind::Float(_) => Ok(cx.common.float),
         ExprKind::Bool(_) => Ok(cx.common.bool),
@@ -2208,6 +2268,7 @@ pub(crate) fn instantiate_struct(
             .zip(args.iter())
             .map(|(p, a)| (p.name.clone(), *a))
             .collect(),
+        script: None,
     });
     env.struct_insts.insert(key, id);
     env.ir_structs.push(id);
@@ -2402,6 +2463,8 @@ fn mentions_type_param(ty: &Type, params: &[crate::parse::Ident]) -> bool {
 
 fn literal_default(cx: &IrCx, path: &str, ty: Ty, expr: &Expr) -> Result<Operand, CheckError> {
     let mismatch = |span| CheckError::new(path, span, "field default type mismatch");
+    let folded = expr.folded_literal();
+    let expr = &folded;
     match &expr.kind {
         ExprKind::Bool(v) => {
             if ty != cx.common.bool {
@@ -2432,6 +2495,9 @@ fn literal_default(cx: &IrCx, path: &str, ty: Ty, expr: &Expr) -> Result<Operand
                 return Ok(Operand::f64_const(expr.span, ty, *v));
             }
             Err(mismatch(expr.span))
+        }
+        ExprKind::String(bytes) if ty == cx.common.string => {
+            Ok(Operand::bytes(expr.span, ty, bytes))
         }
         _ => Err(CheckError::new(
             path,

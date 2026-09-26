@@ -41,6 +41,8 @@ pub(crate) struct LlvmFn<'a> {
     dbg: Option<&'a mut DebugOut>,
     scope: u32,
     line: u32,
+    /// Split builds link two objects, so every definition is visible to the other one.
+    pub(crate) external: bool,
 }
 
 impl<'a> LlvmFn<'a> {
@@ -56,6 +58,7 @@ impl<'a> LlvmFn<'a> {
             dbg,
             scope: 0,
             line: 1,
+            external: false,
         }
     }
 
@@ -71,6 +74,7 @@ impl<'a> LlvmFn<'a> {
             dbg: None,
             scope: 0,
             line: 1,
+            external: false,
         }
     }
 
@@ -161,6 +165,7 @@ impl<'a> LlvmFn<'a> {
         };
         let name = c_expr::func_c_name(self.cx, func);
         let linkage = match func.vis {
+            _ if self.external => "",
             Vis::Private => "internal ",
             Vis::Pub => "",
         };

@@ -113,7 +113,7 @@ fn execute(rest: &[String]) -> Result<(), String> {
     validate_scene(&scene)?;
     let _project_lock = project_lock(&root)?;
     note_open(&root);
-    generate_dispatch(&root, &manifest.name)?;
+    let _ = &manifest;
     generate_catalog(&root)?;
     for line in crate::gen::run_all(&root, false).failed {
         eprintln!("warning: mesh generator failed: {line}");
@@ -122,29 +122,14 @@ fn execute(rest: &[String]) -> Result<(), String> {
     launch(&root, &scene)
 }
 
-/// `j3c new NAME --template fps`: the editor project with a walkable scene, plus the
-/// behavior dispatch so it compiles before the editor has ever opened it.
+/// `j3c new NAME --template fps`: the editor project with a walkable scene.
 pub(crate) fn create_fps_project(root: &Path) -> Result<(), String> {
-    create_project(root, true)?;
-    let manifest = Manifest::load(&root.join("j3.toml"))?;
-    generate_dispatch(root, &manifest.name)
+    create_project(root, true)
 }
 
 /// A new editor project. `fps` picks the first-person main and scene.
 // ponytail: a bool for two templates; make it an enum when a third arrives.
 fn create_project(root: &Path, fps: bool) -> Result<(), String> {
-    for relative in [
-        "j3.toml",
-        "j3.editor.toml",
-        "src/main.j3",
-        "src/behaviors.j3",
-        "src/behaviors/spin.j3",
-        "scenes/main.j3scene",
-    ] {
-        if root.join(relative).exists() {
-            return Err(format!("{} already exists", root.join(relative).display()));
-        }
-    }
     let raw_name = root
         .file_name()
         .and_then(|s| s.to_str())
@@ -156,57 +141,63 @@ fn create_project(root: &Path, fps: bool) -> Result<(), String> {
                 .and_then(|p| p.file_name().and_then(|s| s.to_str()).map(str::to_string))
         })
         .unwrap_or_else(|| "game".into());
-    let name = module_name(&raw_name);
-    fs::create_dir_all(root.join("src")).map_err(|e| e.to_string())?;
-    fs::create_dir_all(root.join("scenes")).map_err(|e| e.to_string())?;
+    let files = project_files(&module_name(&raw_name), fps);
+    for (relative, _) in &files {
+        if root.join(relative).exists() {
+            return Err(format!("{} already exists", root.join(relative).display()));
+        }
+    }
     fs::create_dir_all(root.join("assets")).map_err(|e| e.to_string())?;
-    fs::write(
-        root.join("j3.toml"),
-        format!("[package]\nname = \"{name}\"\nentry = \"src/main.j3\"\n\n[emit]\nbackend = llvm\nopt = 0\ndebug = true\n\n[link]\nlibs = [\"SDL2\", \"GL\"]\n"),
-    ).map_err(|e| e.to_string())?;
-    let main = if fps { fps_template(&name) } else { game_template(&name) };
-    fs::write(root.join("src/main.j3"), main).map_err(|e| e.to_string())?;
-    add_editor_files(root)?;
-    fs::create_dir_all(root.join("src/behaviors")).map_err(|e| e.to_string())?;
-    fs::write(root.join("src/behaviors/spin.j3"), spin_template(&name))
-        .map_err(|e| e.to_string())?;
-    fs::write(root.join("j3.editor.toml"),
-        "[editor]\nscene = \"scenes/main.j3scene\"\n\n[behavior.spin]\nfields = [\"speed:f32=1.0\"]\n")
-        .map_err(|e| e.to_string())?;
-    fs::write(root.join("scenes/main.j3scene"), if fps { FPS_SCENE } else { START_SCENE }).map_err(|e| e.to_string())?;
-    fs::create_dir_all(root.join("assets/gen")).map_err(|e| e.to_string())?;
-    fs::write(root.join("assets/gen/tree.j3"), TREE_GEN).map_err(|e| e.to_string())?;
+    for (relative, text) in files {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::write(path, text).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
+/// Every file of a new editor project (`j3c doc recipes scene3d` prints them too).
+pub(crate) fn project_files(name: &str, fps: bool) -> Vec<(&'static str, String)> {
+    vec![
+        ("j3.toml", format!("[package]\nname = \"{name}\"\nentry = \"src/main.j3\"\n\n[emit]\nbackend = llvm\nopt = 0\ndebug = true\n\n[link]\nlibs = [\"SDL2\", \"GL\"]\n")),
+        ("j3.editor.toml", "[editor]\nscene = \"scenes/main.j3scene\"\n".to_string()),
+        ("src/main.j3", if fps { fps_template(name) } else { game_template(name) }),
+        ("scripts/spin.j3s", SPIN_SCRIPT.to_string()),
+        ("scenes/main.j3scene", (if fps { FPS_SCENE } else { START_SCENE }).to_string()),
+        ("assets/gen/tree.j3", TREE_GEN.to_string()),
+    ]
+}
+
 const START_SCENE: &str = "scene.version=1\nscene.count=2\nscene.nextId=3\n\
-node.0.id=1\nnode.0.parent=0\nnode.0.kind=2\nnode.0.name s=Camera\nnode.0.asset s=\nnode.0.texture s=\nnode.0.behavior s=\n\
+node.0.id=1\nnode.0.parent=0\nnode.0.kind=2\nnode.0.name s=Camera\nnode.0.asset s=\nnode.0.texture s=\nnode.0.script s=\n\
 node.0.px f=0\nnode.0.py f=2\nnode.0.pz f=7\nnode.0.rx f=-0.2\nnode.0.ry f=0\nnode.0.rz f=0\n\
 node.0.sx f=1\nnode.0.sy f=1\nnode.0.sz f=1\nnode.0.fov f=60\nnode.0.near f=0.15\nnode.0.far f=200\n\
-node.1.id=2\nnode.1.parent=0\nnode.1.kind=1\nnode.1.name s=Cube\nnode.1.asset s=builtin:cube\nnode.1.texture s=\nnode.1.behavior s=spin\n\
+node.1.id=2\nnode.1.parent=0\nnode.1.kind=1\nnode.1.name s=Cube\nnode.1.asset s=builtin:cube\nnode.1.texture s=\nnode.1.script s=scripts/spin.j3s\n\
 node.1.px f=0\nnode.1.py f=0\nnode.1.pz f=0\nnode.1.rx f=0\nnode.1.ry f=0\nnode.1.rz f=0\n\
 node.1.sx f=1\nnode.1.sy f=1\nnode.1.sz f=1\n";
 
 /// The `--template fps` scene: a camera (where the walker starts), a floor, and things to bump into.
 const FPS_SCENE: &str = "scene.version=1\nscene.count=5\nscene.nextId=6\n\
-node.0.id=1\nnode.0.parent=0\nnode.0.kind=2\nnode.0.name s=Camera\nnode.0.asset s=\nnode.0.texture s=\nnode.0.behavior s=\n\
+node.0.id=1\nnode.0.parent=0\nnode.0.kind=2\nnode.0.name s=Camera\nnode.0.asset s=\nnode.0.texture s=\nnode.0.script s=\n\
 node.0.px f=0\nnode.0.py f=0\nnode.0.pz f=8\nnode.0.rx f=0\nnode.0.ry f=0\nnode.0.rz f=0\n\
 node.0.sx f=1\nnode.0.sy f=1\nnode.0.sz f=1\nnode.0.fov f=70\nnode.0.near f=0.1\nnode.0.far f=200\n\
-node.1.id=2\nnode.1.parent=0\nnode.1.kind=1\nnode.1.name s=Ground\nnode.1.asset s=builtin:plane\nnode.1.texture s=\nnode.1.behavior s=\n\
+node.1.id=2\nnode.1.parent=0\nnode.1.kind=1\nnode.1.name s=Ground\nnode.1.asset s=builtin:plane\nnode.1.texture s=\nnode.1.script s=\n\
 node.1.px f=0\nnode.1.py f=0\nnode.1.pz f=0\nnode.1.rx f=0\nnode.1.ry f=0\nnode.1.rz f=0\n\
 node.1.sx f=40\nnode.1.sy f=1\nnode.1.sz f=40\n\
-node.2.id=3\nnode.2.parent=0\nnode.2.kind=1\nnode.2.name s=Crate\nnode.2.asset s=builtin:cube\nnode.2.texture s=\nnode.2.behavior s=\n\
+node.2.id=3\nnode.2.parent=0\nnode.2.kind=1\nnode.2.name s=Crate\nnode.2.asset s=builtin:cube\nnode.2.texture s=\nnode.2.script s=\n\
 node.2.px f=3\nnode.2.py f=0.5\nnode.2.pz f=0\nnode.2.rx f=0\nnode.2.ry f=0\nnode.2.rz f=0\n\
 node.2.sx f=1\nnode.2.sy f=1\nnode.2.sz f=1\n\
-node.3.id=4\nnode.3.parent=0\nnode.3.kind=1\nnode.3.name s=Wall\nnode.3.asset s=builtin:cube\nnode.3.texture s=\nnode.3.behavior s=\n\
+node.3.id=4\nnode.3.parent=0\nnode.3.kind=1\nnode.3.name s=Wall\nnode.3.asset s=builtin:cube\nnode.3.texture s=\nnode.3.script s=\n\
 node.3.px f=0\nnode.3.py f=1\nnode.3.pz f=-6\nnode.3.rx f=0\nnode.3.ry f=0\nnode.3.rz f=0\n\
 node.3.sx f=8\nnode.3.sy f=2\nnode.3.sz f=0.5\n\
-node.4.id=5\nnode.4.parent=0\nnode.4.kind=1\nnode.4.name s=Spinner\nnode.4.asset s=builtin:cube\nnode.4.texture s=\nnode.4.behavior s=spin\n\
+node.4.id=5\nnode.4.parent=0\nnode.4.kind=1\nnode.4.name s=Spinner\nnode.4.asset s=builtin:cube\nnode.4.texture s=\nnode.4.script s=scripts/spin.j3s\n\
 node.4.px f=-3\nnode.4.py f=0.5\nnode.4.pz f=0\nnode.4.rx f=0\nnode.4.ry f=0\nnode.4.rz f=0\n\
 node.4.sx f=1\nnode.4.sy f=1\nnode.4.sz f=1\n";
 
 /// Example mesh generator for new projects; `j3c -e gen` turns it into `assets/gen/tree.j3mesh`.
-const TREE_GEN: &str = "// A low-poly tree built in code: a tapered trunk and three cones of leaves.
+pub(crate) const TREE_GEN: &str = "// A low-poly tree built in code: a tapered trunk and three cones of leaves.
 // `j3c -e gen` (and every build, render, and play) runs it when it changes and writes
 // assets/gen/tree.j3mesh. `j3c doc j3.gfx.meshgen` lists the shapes.
 module gen_tree;
@@ -236,25 +227,25 @@ fn main() {
 }
 ";
 
-fn spin_template(name: &str) -> String {
-    format!(
-        r#"module {name}.behaviors.spin;
+/// The script new editor projects attach to a cube.
+const SPIN_SCRIPT: &str = "// Attached to objects in the scene editor. The scene calls `start` once and `update`
+// every frame; `node` is the object this copy is attached to.
+use j3.scene3d.{ Scene, NodeId };
 
-use j3.scene3d;
-use j3.scene3d.Scene;
-
-pub fn start(_scene: &Scene, _id: int) {{
-}}
-
-pub fn update(scene: &Scene, id: int, dt: f32) {{
-    let at = scene3d.index(scene, id);
-    if at < 0 {{ return; }}
-    let speed = scene3d.number(scene, id, "speed", 1);
-    scene.nodes[at].rotation.y += speed * dt;
-}}
-"#
-    )
+props {
+    node: NodeId;
+    /// Turns per second, in radians.
+    speed: f32 = 1.0;
 }
+
+pub fn start(scene: &Scene) {
+}
+
+pub fn update(scene: &Scene, dt: f32) {
+    let n = scene.node(node);
+    n.rotation.y += speed * dt;
+}
+";
 
 fn add_editor_files(root: &Path) -> Result<(), String> {
     if !root.join("j3.toml").is_file() {
@@ -385,7 +376,7 @@ fn fps_template(name: &str) -> String {
     format!(
         r#"module {name};
 
-use {name}.behaviors;
+use j3.scene3d.scripts;
 use j3.app.App;
 use j3.scene3d.fpwalk;
 use j3.scene3d.fpwalk.Walker;
@@ -403,7 +394,7 @@ struct World {{
 }}
 
 fn boot(mem: &Arena): World {{
-    let scene = scene3d.load(behaviors.scene(), mem);
+    let scene = scene3d.load(scripts.scene(), mem);
     return World {{ scene: scene, walker: fpwalk.spawn(&scene, mem), mem: mem }};
 }}
 
@@ -413,21 +404,13 @@ fn startup(w: &World) {{
     // Colliders need mesh bounds, which upload fills in.
     w.walker = fpwalk.spawn(&w.scene, w.mem);
     game.captureMouse(true);
-    let i = 0;
-    while i < w.scene.len {{
-        behaviors.start(&w.scene, w.scene.nodes[i].id);
-        i += 1;
-    }}
+    scripts.start(&w.scene);
 }}
 
 fn update(w: &World, dt: f32) {{
     if game.keyPressed(Key.Escape) {{ game.requestQuit(); }}
     fpwalk.update(&w.walker, dt, true, 1, 4.5);
-    let i = 0;
-    while i < w.scene.len {{
-        behaviors.update(&w.scene, w.scene.nodes[i].id, dt);
-        i += 1;
-    }}
+    scripts.update(&w.scene, dt);
 }}
 
 fn draw(w: &World) {{
@@ -450,7 +433,7 @@ fn game_template(name: &str) -> String {
     format!(
         r#"module {name};
 
-use {name}.behaviors;
+use j3.scene3d.scripts;
 use j3.app.App;
 use j3.game;
 use j3.gfx;
@@ -465,26 +448,18 @@ struct World {{
 }}
 
 fn boot(mem: &Arena): World {{
-    return World {{ scene: scene3d.load(behaviors.scene(), mem) }};
+    return World {{ scene: scene3d.load(scripts.scene(), mem) }};
 }}
 
 fn startup(w: &World) {{
     gfx.init();
     scene3d.upload(&w.scene);
-    let i = 0;
-    while i < w.scene.len {{
-        behaviors.start(&w.scene, w.scene.nodes[i].id);
-        i += 1;
-    }}
+    scripts.start(&w.scene);
 }}
 
 fn update(w: &World, dt: f32) {{
     if game.keyPressed(game.Key.Escape) {{ game.requestQuit(); }}
-    let i = 0;
-    while i < w.scene.len {{
-        behaviors.update(&w.scene, w.scene.nodes[i].id, dt);
-        i += 1;
-    }}
+    scripts.update(&w.scene, dt);
 }}
 
 fn camera(w: &World): Look {{
@@ -533,196 +508,80 @@ fn main() {{
     )
 }
 
-fn behavior_names(config: &str) -> Vec<String> {
-    config
-        .lines()
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix("[behavior.")
-                .and_then(|s| s.strip_suffix(']'))
-                .filter(|s| {
-                    !s.is_empty()
-                        && !s.as_bytes()[0].is_ascii_digit()
-                        && crate::parse::keyword(s).is_none()
-                        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                })
-                .map(str::to_string)
-        })
-        .collect()
+/// One script prop, as the inspector shows it.
+pub(crate) struct ScriptProp {
+    pub name: String,
+    /// Inspector type: `f32`, `int`, `bool`, `string`, `vec3`, or `object`.
+    pub kind: String,
+    /// The default as written in the script ("" when the prop is required).
+    pub default: String,
+    pub required: bool,
 }
 
-fn table_header(line: &str) -> bool {
-    let line = line.trim();
-    line.strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .is_some_and(|name| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'))
-}
-
-/// Parse the editor's TOML array of quoted field definitions. Comments and trailing commas
-/// are allowed; a comma inside a string is part of that field's default value.
-fn field_array(raw: &str, behavior: &str) -> Result<Vec<String>, String> {
-    let error = || format!("j3.editor.toml: behavior `{behavior}` fields must be an array of strings");
-    let bytes = raw.as_bytes();
-    let mut i = 0;
-    let skip = |i: &mut usize| {
-        loop {
-            while *i < bytes.len() && bytes[*i].is_ascii_whitespace() { *i += 1; }
-            if *i < bytes.len() && bytes[*i] == b'#' {
-                while *i < bytes.len() && bytes[*i] != b'\n' { *i += 1; }
-            } else { break; }
-        }
-    };
-    skip(&mut i);
-    if bytes.get(i) != Some(&b'[') { return Err(error()); }
-    i += 1;
-    let mut fields = Vec::new();
-    loop {
-        skip(&mut i);
-        if bytes.get(i) == Some(&b']') { return Ok(fields); }
-        if bytes.get(i) != Some(&b'"') { return Err(error()); }
-        i += 1;
-        let mut value = Vec::new();
-        loop {
-            let Some(&b) = bytes.get(i) else { return Err(error()); };
-            i += 1;
-            if b == b'"' { break; }
-            if b == b'\n' || b == b'\r' { return Err(error()); }
-            if b == b'\\' {
-                let Some(&escaped) = bytes.get(i) else { return Err(error()); };
-                i += 1;
-                value.push(match escaped {
-                    b'"' => b'"', b'\\' => b'\\', b'n' => b'\n', b'r' => b'\r', b't' => b'\t',
-                    _ => return Err(error()),
-                });
-            } else { value.push(b); }
-        }
-        fields.push(String::from_utf8(value).map_err(|_| error())?);
-        skip(&mut i);
-        match bytes.get(i) {
-            Some(b',') => { i += 1; }
-            Some(b']') => return Ok(fields),
-            _ => return Err(error()),
+/// The props of the script at `rel` (e.g. `scripts/door.j3s`) the editor can set. Props of
+/// other types stay at their defaults.
+pub(crate) fn script_props(root: &Path, rel: &str) -> Result<Vec<ScriptProp>, String> {
+    let text = fs::read_to_string(root.join(rel)).map_err(|e| format!("{rel}: {e}"))?;
+    let parts: Vec<String> = std::iter::once("script".to_string())
+        .chain(rel.trim_end_matches(".j3s").split('/').map(str::to_string))
+        .collect();
+    let file = crate::parse::parse_script(&text, crate::span::FileId(0), &parts)
+        .map_err(|e| crate::parse::format_error(rel, &text, &e))?;
+    let mut out = Vec::new();
+    for item in &file.items {
+        let crate::parse::Item::Props(block) = item else { continue };
+        for field in &block.fields {
+            let crate::parse::TypeKind::Named(ty) = &field.ty.kind else { continue };
+            let kind = match ty.rsplit('.').next().unwrap_or(ty) {
+                "f32" | "f64" | "float" => "f32",
+                "int" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => "int",
+                "bool" => "bool",
+                "string" => "string",
+                "Vec3" => "vec3",
+                "NodeId" => "object",
+                _ => continue,
+            };
+            let folded = field.default.as_ref().map(|e| e.folded_literal());
+            let default = match folded.as_ref().map(|e| &e.kind) {
+                Some(crate::parse::ExprKind::Int(v)) => v.to_string(),
+                Some(crate::parse::ExprKind::Float(v)) => v.to_string(),
+                Some(crate::parse::ExprKind::Bool(v)) => v.to_string(),
+                Some(crate::parse::ExprKind::String(b)) => String::from_utf8_lossy(b).into_owned(),
+                _ => String::new(),
+            };
+            out.push(ScriptProp {
+                name: field.name.name.clone(),
+                kind: kind.to_string(),
+                default,
+                // `node: NodeId` falls back to the object the script is attached to.
+                required: field.default.is_none() && !(kind == "object" && field.name.name == "node"),
+            });
         }
     }
+    Ok(out)
 }
 
-/// Behavior field types `j3.editor.toml` may declare.
-const FIELD_TYPES: [&str; 9] = ["f32", "bool", "string", "int", "vec3", "color", "choice", "asset", "object"];
-
+/// `target/j3-editor/catalog`: every `.j3s` in the project and the props the inspector edits.
+/// A script that doesn't parse is listed with no props (`j3c check` reports it).
 pub(crate) fn generate_catalog(root: &Path) -> Result<(), String> {
-    let config = fs::read_to_string(root.join("j3.editor.toml")).map_err(|e| e.to_string())?;
-    for line in config.lines() {
-        if let Some(raw) = line.trim().strip_prefix("[behavior.") {
-            let name = raw
-                .strip_suffix(']')
-                .ok_or("j3.editor.toml: malformed behavior section")?;
-            if name.is_empty()
-                || name.as_bytes()[0].is_ascii_digit()
-                || crate::parse::keyword(name).is_some()
-                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                return Err(format!("j3.editor.toml: invalid behavior name `{name}`"));
-            }
-        }
-    }
-    let names = behavior_names(&config);
-    let mut unique = HashSet::new();
-    for name in &names {
-        if !unique.insert(name) {
-            return Err(format!("j3.editor.toml: duplicate behavior `{name}`"));
-        }
-    }
-    let mut out = format!("catalog.count={}\n", names.len());
-    for (i, name) in names.iter().enumerate() {
-        let header = format!("[behavior.{name}]");
-        let section = config
-            .split(&header)
-            .nth(1)
-            .unwrap_or("")
-            .split('\n')
-            .skip(1)
-            .take_while(|line| !table_header(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut fields = Vec::new();
-        let mut lines = section.lines();
-        while let Some(line) = lines.next() {
-            let Some((key, value)) = line.split_once('=') else { continue; };
-            if key.trim() != "fields" { continue; }
-            let mut raw = value.to_string();
-            for continuation in lines { raw.push('\n'); raw.push_str(continuation); }
-            for definition in field_array(&raw, name)? {
-                let (field, typed) = definition
-                    .split_once(':')
-                    .ok_or_else(|| format!("j3.editor.toml: invalid field `{definition}`"))?;
-                let (kind, default) = typed.split_once('=').unwrap_or((typed, ""));
-                if field.is_empty()
-                    || !field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    || !FIELD_TYPES.contains(&kind)
-                {
-                    return Err(format!("j3.editor.toml: invalid field `{definition}`"));
-                }
-                fields.push((field.to_string(), kind.to_string(), default.to_string()));
-            }
-            break;
-        }
-        out.push_str(&format!(
-            "catalog.{i}.name s={name}\ncatalog.{i}.count={}\n",
-            fields.len()
-        ));
-        for (j, (field, kind, default)) in fields.iter().enumerate() {
-            // A choice lists its options after `=`; the first one is the default.
-            let shown = if kind == "choice" { default.split('|').next().unwrap_or("") } else { default.as_str() };
-            out.push_str(&format!("catalog.{i}.{j}.name s={field}\ncatalog.{i}.{j}.type s={kind}\ncatalog.{i}.{j}.default s={shown}\n"));
-            let value = match kind.as_str() {
-                "int" => {
-                    let parsed = if default.is_empty() { 0 } else {
-                        default.parse::<i64>().map_err(|_| format!("j3.editor.toml: invalid int default for `{field}`"))?
-                    };
-                    format!("catalog.{i}.{j}.value={parsed}\n")
-                }
-                "vec3" | "color" => {
-                    let fallback = if kind == "color" { "1,1,1" } else { "0,0,0" };
-                    let raw = if default.is_empty() { fallback } else { default.as_str() };
-                    let parts = raw
-                        .split(',')
-                        .map(|p| p.trim().parse::<f32>())
-                        .collect::<Result<Vec<_>, _>>()
-                        .ok()
-                        .filter(|p| p.len() == 3)
-                        .ok_or_else(|| format!("j3.editor.toml: `{field}` needs three numbers like 1,0.5,0"))?;
-                    format!("catalog.{i}.{j}.x f={}\ncatalog.{i}.{j}.y f={}\ncatalog.{i}.{j}.z f={}\n", parts[0], parts[1], parts[2])
-                }
-                "choice" => {
-                    if default.split('|').any(|o| o.trim().is_empty()) {
-                        return Err(format!("j3.editor.toml: `{field}` needs options like choice=walk|run"));
-                    }
-                    format!("catalog.{i}.{j}.options s={default}\n")
-                }
-                "object" if !default.is_empty() => {
-                    return Err(format!("j3.editor.toml: object field `{field}` has no default"));
-                }
-                "f32" => {
-                    let parsed = if default.is_empty() {
-                        0.0
-                    } else {
-                        default.parse::<f32>().map_err(|_| {
-                            format!("j3.editor.toml: invalid f32 default for `{field}`")
-                        })?
-                    };
-                    format!("catalog.{i}.{j}.value f={parsed}\n")
-                }
-                "bool" => {
-                    if !default.is_empty() && default != "true" && default != "false" {
-                        return Err(format!(
-                            "j3.editor.toml: invalid bool default for `{field}`"
-                        ));
-                    }
-                    format!(
-                        "catalog.{i}.{j}.value={}\n",
-                        if default == "true" { 1 } else { 0 }
-                    )
-                }
+    let scripts = crate::compile::script_paths(root);
+    let mut out = format!("catalog.count={}\n", scripts.len());
+    for (i, rel) in scripts.iter().enumerate() {
+        let props = script_props(root, rel).unwrap_or_default();
+        out.push_str(&format!("catalog.{i}.name s={rel}\ncatalog.{i}.count={}\n", props.len()));
+        for (j, prop) in props.iter().enumerate() {
+            out.push_str(&format!(
+                "catalog.{i}.{j}.name s={}\ncatalog.{i}.{j}.type s={}\ncatalog.{i}.{j}.default s={}\ncatalog.{i}.{j}.required={}\n",
+                prop.name,
+                prop.kind,
+                prop.default,
+                u8::from(prop.required)
+            ));
+            let value = match prop.kind.as_str() {
+                "int" => format!("catalog.{i}.{j}.value={}\n", prop.default.parse::<i64>().unwrap_or(0)),
+                "f32" => format!("catalog.{i}.{j}.value f={}\n", prop.default.parse::<f32>().unwrap_or(0.0)),
+                "bool" => format!("catalog.{i}.{j}.value={}\n", u8::from(prop.default == "true")),
+                "vec3" => format!("catalog.{i}.{j}.x f=0\ncatalog.{i}.{j}.y f=0\ncatalog.{i}.{j}.z f=0\n"),
                 _ => String::new(),
             };
             out.push_str(&value);
@@ -731,6 +590,21 @@ pub(crate) fn generate_catalog(root: &Path) -> Result<(), String> {
     let dir = root.join("target/j3-editor");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     fs::write(dir.join("catalog"), out).map_err(|e| e.to_string())
+}
+
+/// `j3c -e script-props <path>`: a script's editable props as JSON.
+pub(crate) fn script_props_json(root: &Path, rel: &str) -> Result<String, String> {
+    let props = script_props(root, rel)?;
+    let rows: Vec<String> = props
+        .iter()
+        .map(|p| {
+            format!(
+                "{{\"name\":{:?},\"type\":{:?},\"default\":{:?},\"required\":{}}}",
+                p.name, p.kind, p.default, p.required
+            )
+        })
+        .collect();
+    Ok(format!("[{}]", rows.join(",")))
 }
 
 fn collect_assets(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), String> {
@@ -863,86 +737,26 @@ pub(crate) fn generate_assets_catalog(root: &Path) -> Result<(), String> {
     fs::write(dir.join("assets-catalog"), out).map_err(|e| e.to_string())
 }
 
-pub(crate) fn generate_dispatch(root: &Path, package: &str) -> Result<(), String> {
-    let path = root.join("src/behaviors.j3");
-    let config = fs::read_to_string(root.join("j3.editor.toml")).map_err(|e| e.to_string())?;
-    let names = behavior_names(&config);
-    let entry = fs::read_to_string(root.join("src/main.j3")).unwrap_or_default();
-    if !path.exists() && names.is_empty() && !entry.contains(&format!("use {package}.behaviors")) {
-        return Ok(());
-    }
-    if let Ok(existing) = fs::read_to_string(&path) {
-        if !existing.starts_with("// Generated by j3c editor") {
-            if names.is_empty() {
-                return Ok(());
-            }
-            return Err(format!(
-                "{} exists and is not generated by j3c editor",
-                path.display()
-            ));
-        }
-    }
-    let mut src = format!("// Generated by j3c editor. Edit behavior modules instead.\nmodule {package}.behaviors;\n\nuse lib \"c\" as libc {{\n    fn getenv(name: cstr): cstr;\n    fn strlen(s: cstr): int;\n}}\n\nuse j3.scene3d;\nuse j3.scene3d.Scene;\nuse j3.text.{{ cstr, same }};\n");
-    for name in &names {
-        src.push_str(&format!("use {package}.behaviors.{name};\n"));
-    }
-    let scene = scene_path(root)?;
-    let rel = scene.strip_prefix(root).map_err(|e| e.to_string())?;
-    src.push_str(&format!(
-        "\n/// The scene set in j3.editor.toml.\npub const MAIN_SCENE: string = {:?};\n",
-        rel.to_string_lossy()
-    ));
-    src.push_str("\n/// The scene to run: the one the editor's Play picked (`J3_SCENE`), else `MAIN_SCENE`.\npub fn scene(): string {\n    let raw = libc.getenv(cstr(\"J3_SCENE\"));\n    if raw == 0 { return MAIN_SCENE; }\n    let len = libc.strlen(raw);\n    if len < 1 { return MAIN_SCENE; }\n    return []u8 { ptr: raw as &u8, len: len } as string;\n}\n");
-    src.push_str("\npub fn start(scene: &Scene, id: int) {\n    let at = scene3d.index(scene, id);\n    if at < 0 { return; }\n    let name = scene.nodes[at].behavior;\n");
-    for name in &names {
-        src.push_str(&format!(
-            "    if same(name, \"{name}\") {{ {name}.start(scene, id); return; }}\n"
-        ));
-    }
-    src.push_str("}\n\npub fn update(scene: &Scene, id: int, dt: f32) {\n    let at = scene3d.index(scene, id);\n    if at < 0 { return; }\n    let name = scene.nodes[at].behavior;\n");
-    for name in &names {
-        src.push_str(&format!(
-            "    if same(name, \"{name}\") {{ {name}.update(scene, id, dt); return; }}\n"
-        ));
-    }
-    src.push_str("}\n");
-    if path.exists() && fs::read_to_string(&path).ok().as_deref() == Some(&src) {
-        return Ok(());
-    }
-    fs::write(path, src).map_err(|e| e.to_string())
-}
-
-fn create_behavior(root: &Path, name: &str) -> Result<(), String> {
+/// Write `scripts/<name>.j3s` with a `props` block and the two hooks the scene calls.
+fn create_script(root: &Path, name: &str) -> Result<String, String> {
     if name.is_empty()
         || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         || name.as_bytes()[0].is_ascii_digit()
         || crate::parse::keyword(name).is_some()
     {
-        return Err("behavior name must be a J3 identifier".into());
+        return Err("script name must be a J3 identifier".into());
     }
-    let manifest = Manifest::load(&root.join("j3.toml"))?;
-    let config_path = root.join("j3.editor.toml");
-    let mut config = fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
-    if behavior_names(&config)
-        .iter()
-        .any(|existing| existing == name)
-    {
-        return Err(format!("behavior `{name}` already exists"));
-    }
-    let dir = root.join("src/behaviors");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!("{name}.j3"));
+    let rel = format!("scripts/{name}.j3s");
+    let path = root.join(&rel);
     if path.exists() {
-        return Err(format!("{} already exists", path.display()));
+        return Err(format!("{rel} already exists"));
     }
-    let stub = format!("module {}.behaviors.{name};\n\nuse j3.scene3d.Scene;\n\npub fn start(_scene: &Scene, _id: int) {{\n}}\n\npub fn update(_scene: &Scene, _id: int, _dt: f32) {{\n}}\n", manifest.name);
+    fs::create_dir_all(root.join("scripts")).map_err(|e| e.to_string())?;
+    let stub = "use j3.scene3d.{ Scene, NodeId };\n\nprops {\n    node: NodeId;\n}\n\n\
+pub fn start(scene: &Scene) {\n}\n\npub fn update(scene: &Scene, dt: f32) {\n}\n";
     fs::write(&path, stub).map_err(|e| e.to_string())?;
-    config.push_str(&format!("\n[behavior.{name}]\nfields = []\n"));
-    fs::write(config_path, config).map_err(|e| e.to_string())?;
-    generate_dispatch(root, &manifest.name)?;
     generate_catalog(root)?;
-    println!("created {}", path.display());
-    Ok(())
+    Ok(rel)
 }
 
 /// Append `kind<TAB>scene<TAB>message` to the log the editor polls.
@@ -1213,8 +1027,97 @@ fn kill_game(running: &mut Option<Child>) -> bool {
     alive
 }
 
+/// Send a failed build's error lines to the console (the full log stays in build.log).
+fn report_build_errors(root: &Path, log: &str) {
+    let _ = fs::write(root.join("target/j3-editor/build.log"), log);
+    let project = format!("{}/", root.display());
+    let errors = log.lines().filter(|s| s.contains("error") || s.trim_start().starts_with("-->"));
+    let mut sent = 0;
+    for line in errors.take(30) {
+        event(root, "build", "", &line.trim().replace(&project, ""));
+        sent += 1;
+    }
+    if sent == 0 {
+        event(root, "build", "", "Build failed; see target/j3-editor/build.log");
+    }
+}
+
+/// A game with scripts builds in dev mode: script edits never rebuild it. Anything else
+/// builds with `j3c build`. Returns the program to launch and, in dev mode, its scripts.
+fn build_for_play(root: &Path, host: &Path) -> Result<(PathBuf, Option<crate::devrun::Built>), ()> {
+    let manifest = match Manifest::load(&root.join("j3.toml")) {
+        Ok(m) => m,
+        Err(e) => {
+            event(root, "msg", "", &e);
+            return Err(());
+        }
+    };
+    let opts = crate::emit::EmitOpts::from_manifest(&manifest).and_then(|mut o| {
+        o.backend = crate::emit::resolve_backend(o.backend, false, &o.clang)?;
+        Ok(o)
+    });
+    let prepared = opts.and_then(|opts| crate::devrun::prepare(&manifest, &opts, false));
+    match prepared {
+        Ok(crate::devrun::Prepared::Dev(built)) => return Ok((built.exe.clone(), Some(built))),
+        Ok(crate::devrun::Prepared::NoScripts(_)) => {}
+        Err(e) => {
+            report_build_errors(root, &e);
+            event(root, "msg", "", "Build failed");
+            return Err(());
+        }
+    }
+    let build = match Command::new(host).arg("build").arg(root).output() {
+        Ok(out) => out,
+        Err(e) => {
+            event(root, "msg", "", &format!("build game: {e}"));
+            return Err(());
+        }
+    };
+    let mut log = String::from_utf8_lossy(&build.stderr).to_string();
+    log.push_str(&String::from_utf8_lossy(&build.stdout));
+    if !build.status.success() {
+        report_build_errors(root, &log);
+        event(root, "msg", "", "Build failed");
+        return Err(());
+    }
+    let _ = fs::write(root.join("target/j3-editor/build.log"), &log);
+    let project = format!("{}/", root.display());
+    for line in log.lines().filter(|s| s.contains("warning")).take(30) {
+        event(root, "out", "", &line.trim().replace(&project, ""));
+    }
+    Ok((manifest.out_path(), None))
+}
+
+fn spawn_game(root: &Path, exe: &Path, scene: &str) -> Result<Child, String> {
+    let mut process = Command::new(exe)
+        .current_dir(root)
+        .env("J3_ROOT", root)
+        .env("J3_SCENE", scene)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    if let Some(out) = process.stdout.take() { forward(root, out, "out"); }
+    if let Some(err) = process.stderr.take() { forward(root, err, "err"); }
+    Ok(process)
+}
+
+fn script_times(built: &Option<crate::devrun::Built>) -> Vec<Option<std::time::SystemTime>> {
+    built
+        .as_ref()
+        .map(|b| {
+            b.scripts
+                .iter()
+                .map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Build the game and (re)launch it on `scene`. The lock is the "Play is busy" flag and holds
 /// the game; after launch it is released between checks so Stop and Play can reach the game.
+/// In dev mode a script edit swaps into the running game, or relaunches it when its layout
+/// changed, without compiling the game again.
 fn play(root: &Path, host: &Path, game: &Mutex<Option<Child>>, scene: &str) {
     let Ok(mut running) = game.try_lock() else {
         event(root, "msg", "", "Already building");
@@ -1226,46 +1129,11 @@ fn play(root: &Path, host: &Path, game: &Mutex<Option<Child>>, scene: &str) {
     event(root, "msg", "", "Building...");
     event(root, "out", "", &format!("--- Play {scene} ---"));
     let started = std::time::Instant::now();
-    let build = match Command::new(host).arg("build").arg(root).output() {
-        Ok(out) => out,
-        Err(e) => return event(root, "msg", "", &format!("build game: {e}")),
-    };
-    let mut log = String::from_utf8_lossy(&build.stderr).to_string();
-    log.push_str(&String::from_utf8_lossy(&build.stdout));
-    let _ = fs::write(root.join("target/j3-editor/build.log"), &log);
-    let project = format!("{}/", root.display());
-    if !build.status.success() {
-        // The console lists these lines; the full log stays in build.log.
-        let errors = log.lines().filter(|s| s.contains("error") || s.trim_start().starts_with("-->"));
-        let mut sent = 0;
-        for line in errors.take(30) {
-            event(root, "build", "", &line.trim().replace(&project, ""));
-            sent += 1;
-        }
-        if sent == 0 {
-            event(root, "build", "", "Build failed; see target/j3-editor/build.log");
-        }
-        return event(root, "msg", "", "Build failed");
-    }
-    for line in log.lines().filter(|s| s.contains("warning")).take(30) {
-        event(root, "out", "", &line.trim().replace(&project, ""));
-    }
+    let Ok((exe, mut built)) = build_for_play(root, host) else { return };
     event(root, "out", "", &format!("Built in {:.1}s", started.elapsed().as_secs_f32()));
-    let launched = Manifest::load(&root.join("j3.toml")).and_then(|m| {
-        Command::new(m.out_path())
-            .current_dir(root)
-            .env("J3_ROOT", root)
-            .env("J3_SCENE", scene)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| e.to_string())
-    });
-    let pid = match launched {
-        Ok(mut process) => {
+    let mut pid = match spawn_game(root, &exe, scene) {
+        Ok(process) => {
             let pid = process.id();
-            if let Some(out) = process.stdout.take() { forward(root, out, "out"); }
-            if let Some(err) = process.stderr.take() { forward(root, err, "err"); }
             *running = Some(process);
             event(root, "run", "", "Game launched");
             pid
@@ -1273,6 +1141,8 @@ fn play(root: &Path, host: &Path, game: &Mutex<Option<Child>>, scene: &str) {
         Err(e) => return event(root, "msg", "", &format!("Could not launch game: {e}")),
     };
     drop(running);
+    let mut seen = script_times(&built);
+    let manifest = Manifest::load(&root.join("j3.toml")).ok();
     // Report the game closing by itself. Stop and restart clear or replace the child, which ends this.
     loop {
         std::thread::sleep(std::time::Duration::from_millis(250));
@@ -1292,6 +1162,44 @@ fn play(root: &Path, host: &Path, game: &Mutex<Option<Child>>, scene: &str) {
             Err(_) => {
                 *running = None;
                 return event(root, "stopped", "", "Game closed");
+            }
+        }
+        let now = script_times(&built);
+        if now == seen {
+            continue;
+        }
+        seen = now;
+        let (Some(m), Some(old)) = (manifest.as_ref(), built.as_ref()) else { continue };
+        let opts = crate::emit::EmitOpts::from_manifest(m).and_then(|mut o| {
+            o.backend = crate::emit::resolve_backend(o.backend, false, &o.clang)?;
+            Ok(o)
+        });
+        match opts.and_then(|opts| crate::devrun::prepare(m, &opts, false)) {
+            Ok(crate::devrun::Prepared::Dev(next)) => {
+                let same_layout = next.layouts.iter().all(|(path, (layout, _))| {
+                    old.layouts.get(path).map(|(was, _)| was == layout).unwrap_or(true)
+                });
+                if next.rebuilt || !same_layout {
+                    kill_game(&mut running);
+                    match spawn_game(root, &next.exe, scene) {
+                        Ok(process) => {
+                            pid = process.id();
+                            *running = Some(process);
+                            event(root, "run", "", "Script layout changed; relaunched the game");
+                        }
+                        Err(e) => return event(root, "msg", "", &format!("Could not relaunch game: {e}")),
+                    }
+                } else {
+                    crate::devrun::bump_reload(root);
+                    event(root, "out", "", "Swapped script code");
+                }
+                seen = next.scripts.iter().map(|p| fs::metadata(p).and_then(|m| m.modified()).ok()).collect();
+                built = Some(next);
+            }
+            Ok(crate::devrun::Prepared::NoScripts(_)) => {}
+            Err(e) => {
+                report_build_errors(root, &e);
+                event(root, "msg", "", "Script error; the game keeps its old code");
             }
         }
     }
@@ -1398,13 +1306,11 @@ fn pick(root: &Path, tab: &str) {
     }
 }
 
-/// Regenerate the behavior dispatcher and both catalogs, as at startup.
+/// Regenerate both catalogs, as at startup.
 fn rescan(root: &Path) -> Result<(), String> {
     for line in crate::gen::run_all(root, false).failed {
         event(root, "build", "", &format!("mesh generator failed: {line}"));
     }
-    let manifest = Manifest::load(&root.join("j3.toml"))?;
-    generate_dispatch(root, &manifest.name)?;
     generate_catalog(root)?;
     generate_assets_catalog(root)
 }
@@ -1452,7 +1358,6 @@ fn launch(root: &Path, scene: &Path) -> Result<(), String> {
         } else if let Some(rest) = line.strip_prefix("J3EDITOR PLAY") {
             let (root, host, game) = (root.to_path_buf(), host.clone(), game.clone());
             let scene = rest.trim().to_string();
-            // ponytail: a behavior created mid-build rewrites src/behaviors.j3 under the build; Play again.
             std::thread::spawn(move || play(&root, &host, &game, &scene));
         } else if line == "J3EDITOR STOP" {
             match game.try_lock() {
@@ -1479,12 +1384,12 @@ fn launch(root: &Path, scene: &Path) -> Result<(), String> {
             }
         } else if line == "J3EDITOR RESCAN" {
             match rescan(root) {
-                Ok(()) => event(root, "refresh", "", "Assets and j3.editor.toml reloaded"),
+                Ok(()) => event(root, "refresh", "", "Assets and scripts reloaded"),
                 Err(e) => event(root, "msg", "", &e),
             }
-        } else if let Some(name) = line.strip_prefix("J3EDITOR BEHAVIOR ") {
-            match create_behavior(root, name) {
-                Ok(()) => event(root, "refresh", "", "Behavior created. Rebuild with Play."),
+        } else if let Some(name) = line.strip_prefix("J3EDITOR SCRIPT ") {
+            match create_script(root, name) {
+                Ok(rel) => event(root, "refresh", "", &format!("Made {rel}")),
                 Err(e) => {
                     eprintln!("j3c editor: {e}");
                     event(root, "msg", "", &e);
@@ -1597,16 +1502,39 @@ mod tests {
     }
 
     #[test]
-    fn config_accepts_multiline_fields_and_comma_defaults() {
-        let root = std::env::temp_dir().join(format!("j3_editor_config_{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("j3.editor.toml"), "[editor]\nscene=\"scenes/demo.j3scene\"\n\n[behavior.caption]\nfields=[\n  \"text:string=hi, there\", # comma belongs to the value\n  \"speed:f32=2.5\",\n]\n").unwrap();
+    fn catalog_lists_script_props() {
+        let root = std::env::temp_dir().join(format!("j3_editor_catalog_{}", std::process::id()));
+        fs::create_dir_all(root.join("scripts/doors")).unwrap();
+        fs::write(root.join("j3.editor.toml"), "[editor]\nscene=\"scenes/demo.j3scene\"\n").unwrap();
+        fs::write(
+            root.join("scripts/doors/door.j3s"),
+            "use j3.scene3d.NodeId;\nprops {\n    node: NodeId;\n    hinge: NodeId;\n    text: string = \"hi, there\";\n    speed: f32 = 2.5;\n    hp: int = -3;\n    open: bool = true;\n}\n",
+        )
+        .unwrap();
         assert_eq!(scene_path(&root).unwrap(), root.join("scenes/demo.j3scene"));
         generate_catalog(&root).unwrap();
         let catalog = fs::read_to_string(root.join("target/j3-editor/catalog")).unwrap();
-        assert!(catalog.contains("catalog.0.count=2"), "{catalog}");
-        assert!(catalog.contains("catalog.0.0.default s=hi, there"), "{catalog}");
-        assert!(catalog.contains("catalog.0.1.value f=2.5"), "{catalog}");
+        for line in [
+            "catalog.0.name s=scripts/doors/door.j3s",
+            "catalog.0.count=6",
+            "catalog.0.0.required=0",
+            "catalog.0.1.type s=object",
+            "catalog.0.1.required=1",
+            "catalog.0.2.default s=hi, there",
+            "catalog.0.3.value f=2.5",
+            "catalog.0.4.value=-3",
+            "catalog.0.5.value=1",
+        ] {
+            assert!(catalog.contains(line), "{line} missing from {catalog}");
+        }
+        let json = script_props_json(&root, "scripts/doors/door.j3s").unwrap();
+        assert!(json.contains("{\"name\":\"hinge\",\"type\":\"object\",\"default\":\"\",\"required\":true}"), "{json}");
+        let made = create_script(&root, "lamp").unwrap();
+        assert_eq!(made, "scripts/lamp.j3s");
+        assert!(create_script(&root, "lamp").is_err());
+        assert!(create_script(&root, "2lamp").is_err());
+        let catalog = fs::read_to_string(root.join("target/j3-editor/catalog")).unwrap();
+        assert!(catalog.contains("catalog.1.name s=scripts/lamp.j3s"), "{catalog}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1628,28 +1556,6 @@ mod tests {
         assert!(delete_asset(&root, "scenes/main.j3scene").is_err());
         assert_eq!(delete_asset(&root, "assets/sub/b.j3mesh").unwrap(), "target/j3-editor/trash/b.j3mesh");
         assert!(!root.join("assets/sub/b.j3mesh").exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn config_field_types() {
-        let root = std::env::temp_dir().join(format!("j3_editor_types_{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let write = |fields: &str| {
-            fs::write(root.join("j3.editor.toml"), format!("[behavior.enemy]\nfields = [{fields}]\n")).unwrap();
-            generate_catalog(&root).map(|_| fs::read_to_string(root.join("target/j3-editor/catalog")).unwrap())
-        };
-        let catalog = write(r#""hp:int=-3", "spot:vec3=1,2,3", "tint:color", "mode:choice=walk|run", "skin:asset=a.png", "chase:object""#).unwrap();
-        for line in [
-            "catalog.0.0.value=-3", "catalog.0.1.z f=3", "catalog.0.2.x f=1", "catalog.0.3.default s=walk",
-            "catalog.0.3.options s=walk|run", "catalog.0.4.default s=a.png", "catalog.0.5.type s=object",
-        ] {
-            assert!(catalog.contains(line), "{line} missing from {catalog}");
-        }
-        assert!(write(r#""spot:vec3=1,2""#).is_err());
-        assert!(write(r#""mode:choice=walk||run""#).is_err());
-        assert!(write(r#""chase:object=3""#).is_err());
-        assert!(write(r#""hp:int=1.5""#).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1682,25 +1588,6 @@ mod tests {
         assert!(!build(4).exists() && !build(5).exists());
         assert!(!old_tmp.exists() && new_tmp.exists());
         fs::remove_dir_all(cache).unwrap();
-    }
-
-    #[test]
-    fn robust_dispatch_follows_editor_toml() {
-        let root = std::env::temp_dir().join(format!("j3_dispatch_test_{}", std::process::id()));
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::create_dir_all(root.join("scenes")).unwrap();
-        fs::write(root.join("scenes/a.j3scene"), "").unwrap();
-        fs::write(root.join("scenes/b.j3scene"), "").unwrap();
-        fs::write(root.join("j3.toml"), "[package]\nname = \"t\"\n").unwrap();
-        fs::write(root.join("src/main.j3"), "use t.behaviors;\n").unwrap();
-        let generated = |scene: &str| {
-            fs::write(root.join("j3.editor.toml"), format!("[editor]\nscene = \"{scene}\"\n")).unwrap();
-            generate_dispatch(&root, "t").unwrap();
-            fs::read_to_string(root.join("src/behaviors.j3")).unwrap()
-        };
-        assert!(generated("scenes/a.j3scene").contains("\"scenes/a.j3scene\""));
-        assert!(generated("scenes/b.j3scene").contains("\"scenes/b.j3scene\""));
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]

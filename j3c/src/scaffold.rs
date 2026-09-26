@@ -130,12 +130,22 @@ const AGENTS: &str = r#"# This project
 
 Learn J3 from `j3c` only: `j3c guide`, `j3c doc`, `j3c help`. Do not search the machine, home directory, or other projects to figure out the language.
 
+- Start from the task: `j3c doc` lists recipes and modules by what you're building; `j3c doc recipes <name>` prints a whole program that checks.
+- Find a name: `j3c doc search <word>`, or `j3c doc <name>`. A module on one screen: `j3c doc <module> --short`.
+- Check your work: `j3c check`, then `j3c run --frames 120 --screenshot shot.png --headless` and look at the picture (`j3c doc recipes check`).
+
 ## Shape
 
 - `src/main.j3` is the entry. `fn main` sets up the app and returns. Game code lives in other files.
 - One file, one job. Split a module when it starts doing two things.
 - One way to do a thing. No copied blocks, no long if/else chains. Name the case and call it.
 - Build the smallest thing that works, and leave a place to add detail later. Do not invent extra systems, settings, or polish.
+
+## Scripts
+
+Per-object logic that you edit while the game runs goes in a `.j3s` script (`j3c doc lang`, Scripts). A script is J3 with a `props` block (read-only, set by whoever makes the instance), per-instance `let` state, `shared` values, and `pub fn`s. Make instances from J3 with `const Door = @script("scripts/door.j3s");` and `Door { hinge: h }`, or attach a script to an object in a scene (`node.<i>.script s=scripts/door.j3s`, props as `param.<id>.<prop>` lines) and run them with `j3.scene3d.scripts` (`start`, `update`, `scene.script::<Door>(node)`).
+
+`j3c run` never recompiles the game for a script edit, and swaps new script code into the running game. Keep engine-level code (drawing, input plumbing, data structures) in `.j3`; keep tunable gameplay in scripts.
 
 ## Screen
 
@@ -287,7 +297,7 @@ fn main() {{
     )
 }
 
-fn app_toml(name: &str) -> String {
+pub(crate) fn app_toml(name: &str) -> String {
     format!(
         r#"# SDL window. Needs SDL2.
 # Image, mixer, and font libraries load the first time you use them.
@@ -310,7 +320,7 @@ libs = ["SDL2"]
     )
 }
 
-fn app_main(name: &str) -> String {
+pub(crate) fn app_main(name: &str) -> String {
     format!(
         r#"module {name};
 
@@ -413,7 +423,7 @@ mod tests {
     fn fpwalk_template_typechecks() {
         let dir = scratch();
         let made = create_fps(Some(dir.join("walk").to_str().unwrap())).expect("create");
-        for file in ["src/behaviors.j3", "scenes/main.j3scene", "j3.editor.toml", "AGENTS.md"] {
+        for file in ["scripts/spin.j3s", "scenes/main.j3scene", "j3.editor.toml", "AGENTS.md"] {
             assert!(made.join(file).is_file(), "{file}");
         }
         let main = std::fs::read_to_string(made.join("src/main.j3")).unwrap();

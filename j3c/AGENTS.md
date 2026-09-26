@@ -2,7 +2,7 @@
 
 J3 compiler crate. The contract is this file, `../roadmap.md`'s non-goals, and `../speculative/` (01–08 run, 09 typechecks, `10_j3ui.j3` typechecks). If this file and those disagree with an example, the example's test in `compile.rs` is what `cargo test` locks.
 
-Host: Rust, no crates.io deps. **Emit is LLVM by default** (text `.ll` + host `clang`). C is optional (`--emit c` or `[emit] backend = c`). No libLLVM, no crates.io. `--fast` strips OOB `Abort`. The IR with places is the backend contract; C and LLVM are printers.
+Host: Rust, no crates.io deps. **Emit is LLVM by default** (text `.ll` + host `clang`). C is optional (`--emit c` or `[emit] backend = c`). Script bytecode is a third printer over the same checked IR. The runtime bytecode VM in J3 is allowed; the comptime interpreter remains out of scope. No libLLVM, no crates.io. `--fast` strips OOB `Abort`. The IR with places is the backend contract.
 
 ## Commands
 
@@ -14,6 +14,9 @@ cargo run -- dump-ir
 cargo run -- dump-ir samples
 cargo run -- dump-c
 cargo run -- dump-llvm
+cargo run -- dump-bc ../speculative/11_script/scripts/door.j3s
+cargo run -- run ../examples/scripted
+cargo run -- -e script-props scripts/door.j3s
 cargo run -- dump-syntax ../editors/vscode/syntaxes/j3.tmLanguage.json
 cargo run -- run examples/hello.j3
 cargo run -- run --emit c examples/hello.j3
@@ -42,7 +45,7 @@ cargo run -- help
 ## Pipeline
 
 ```
-parse  →  check  →  ir  →  emit LLVM (default) or C
+parse  →  check  →  ir  →  emit LLVM (default), C, or script bytecode
 LIVE      LIVE      LIVE    LIVE
 ```
 
@@ -79,7 +82,11 @@ Procedural 2D art lives in `stdlib/j3/gfx/canvas.j3`: RGBA8 `Canvas`, pixel/smoo
 | `src/project.rs` | `j3.toml` + `src/` layout. Tiny TOML subset; `[emit]` backend/opt/debug/fast/target/cpu/clang/flags. |
 | `stdlib/j3/` | Stdlib in J3. SSOT. Shipped with the crate, not mixed into `src/`; optional OpenGL passes are in `urp/`. |
 | `examples/hello.j3` | Built-in hello for `dump-*` and `j3c run examples/hello.j3`. |
-| `src/compile.rs` | Load entry + stdlib modules, parse, check. |
+| `src/compile.rs` | Load entry + stdlib modules, parse, check. `.j3s` files load through `@script` paths (`compile/script_deps.rs`) and scene attachments. |
+| `src/compile/dev.rs` | Dev-mode IR pass: script structs become `{ handle: ptr }`, script literals `j3.script.devNew`, `pub` script fns `devCall` stubs, plus a thunk per native fn a script may call (called now, or `pub` in a module a script `use`s), registered from `main`. |
+| `src/compile/scene_scripts.rs` | Scans `*.j3scene` for `node.<i>.script`, checks props/params/hooks against each script (errors point at the scene line), and makes `j3.scene3d.scripts` in memory (instances, `start`/`update`, `find__*` behind `scene.script::<T>(node)`). |
+| `src/devrun.rs` | `j3c run` with scripts: writes `target/j3s/*.j3sb`, keys the dev binary on `.j3` sources + lowered native IR (so script edits skip clang), compiles the VM as its own `-O2` object below opt 2, and watches `.j3s` (live swap via `target/j3s/reload`, relaunch on a layout change). |
+| `src/check/script.rs` | Script → struct/methods/globals lowering and script-scope rules. |
 | `src/parse/` | Grammar: lex + recursive descent. Shared with `lsp` + `fmt`. `syntax.rs` is keyword/attr/intrinsic/type names + TextMate dump (`dump-syntax`). |
 | `src/fmt.rs` | Token reprint; comments copied from source gaps |
 | `src/lsp/` | Stdio LSP. `json.rs` is a tiny parser (no serde). Hover, goto, completion, signature, symbols, import edits |
@@ -94,6 +101,7 @@ Procedural 2D art lives in `stdlib/j3/gfx/canvas.j3`: RGBA8 `Canvas`, pixel/smoo
 | `src/span.rs` | `FileId`, `Span`. Parser fills these in. |
 | `src/intern.rs` | Interned `Name` strings. |
 | `src/emit/mod.rs` | Printers + `run_program`. Consumes IR only. Never parse J3. |
+| `src/emit/bc.rs` | Versioned `.j3sb` printer over checked script IR: typed opcodes, register 0 is the frame pointer, fused compare-branch, `abi.rs` offsets. The opcode table is shared with `stdlib/j3/script.j3` (the VM, written in J3). |
 | `src/emit/opts.rs` | `Backend` + `EmitOpts` from `[emit]` |
 | `src/emit/c.rs` | Modules → C text (`j3_*` names). Host `int main` calls `j3.sys.start` if present, else user `main`. |
 | `src/emit/c_expr.rs` | Places, operands, rvalues, statements |

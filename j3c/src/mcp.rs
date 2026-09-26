@@ -28,7 +28,13 @@ Without --project it follows the editor: the project `j3c editor` has open, else
 nearest j3.toml at or above the current directory. With --project DIR it stays on the
 nearest j3.toml at or above DIR. Tools: scene_list,
 scene_get, scene_add, scene_add_many, scene_set, scene_delete, place, undo, render, check, play, console, import,
-asset_search, asset_online_search, asset_fetch, gen. With `j3c editor` open on the project, scene edits go to the editor live.
+asset_search, asset_online_search, asset_fetch, gen. `j3c -e mcp --tools` prints each tool's
+arguments and the CLI command that does the same work.
+
+Saving and undo depend on the editor. With `j3c editor` open on the project, scene edits go
+to it live: each is one undo step there (Ctrl+Z), and nothing is saved until the person saves
+or scene_set passes save: true. With it closed, each edit writes the scene file at once and
+the undo tool puts the file back (20 steps). Every edit reply says which one happened.
 
 Claude Code:  claude mcp add -s user j3 -- j3c -e mcp
 .mcp.json:    {\"mcpServers\": {\"j3\": {\"command\": \"j3c\", \"args\": [\"-e\", \"mcp\"]}}}";
@@ -52,6 +58,10 @@ pub fn cmd(rest: &[String]) -> i32 {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!("{USAGE}");
+                return 0;
+            }
+            "--tools" => {
+                print!("{}", tool_reference());
                 return 0;
             }
             "--project" => match it.next() {
@@ -210,6 +220,21 @@ impl Server {
     }
 
     fn call(&mut self, name: &str, args: &Json) -> Result<Answer, String> {
+        let mut answer = self.run_tool(name, args)?;
+        if EDITS.contains(&name) && !answer.error {
+            answer.content.push(text_block(
+                if self.was_live {
+                    "(live in the open editor: one undo step there, unsaved until the person saves or scene_set passes save: true)"
+                } else {
+                    "(written to the scene file; the undo tool puts it back)"
+                }
+                .to_string(),
+            ));
+        }
+        Ok(answer)
+    }
+
+    fn run_tool(&mut self, name: &str, args: &Json) -> Result<Answer, String> {
         let root = self.root()?;
         match name {
             "scene_list" => {
@@ -916,6 +941,7 @@ fn asset_kind(path: &str) -> &'static str {
         "wav" | "ogg" | "mp3" => "sound",
         "ttf" | "otf" => "font",
         "j3" => "code",
+        "j3s" => "script",
         _ => "file",
     }
 }
@@ -942,11 +968,9 @@ fn asset_search(root: &Path, args: &Json) -> Result<Answer, String> {
             found.push((rel, k, note));
         }
     }
-    if let Ok(config) = fs::read_to_string(root.join("j3.editor.toml")) {
-        for line in config.lines() {
-            if let Some(name) = line.trim().strip_prefix("[behavior.").and_then(|r| r.strip_suffix(']')) {
-                found.push((name.to_string(), "behavior", "set behavior=<name> on an object".into()));
-            }
+    for script in crate::compile::script_paths(root) {
+        if !script.starts_with("assets/") && !script.starts_with("scenes/") {
+            found.push((script, "script", "set script=<path> on an object".into()));
         }
     }
     found.retain(|(p, k, n)| {
@@ -970,6 +994,85 @@ fn asset_search(root: &Path, args: &Json) -> Result<Answer, String> {
     })
 }
 
+/// Tools that change a scene; their replies say whether the change went to the editor or the file.
+const EDITS: &[&str] = &["scene_add", "scene_add_many", "scene_set", "scene_delete", "place"];
+
+/// The CLI command doing each tool's work; "" when only MCP has it.
+const CLI_SAME: &[(&str, &str)] = &[
+    ("scene_list", "j3c -e scene list"),
+    ("scene_get", "j3c -e scene get <object>|@scene"),
+    ("scene_add", "j3c -e scene add <kind> key=value ..."),
+    ("scene_add_many", ""),
+    ("scene_set", "j3c -e scene set <object> key=value ..."),
+    ("scene_delete", "j3c -e scene delete <object> ..."),
+    ("place", "j3c -e scene ground|ontop|scatter ... (grid is MCP only)"),
+    ("undo", "j3c -e scene undo"),
+    ("render", "j3c -e render"),
+    ("check", "j3c -e scene check --all, then j3c check"),
+    ("play", "j3c run --frames N --screenshot F.png --headless"),
+    ("console", ""),
+    ("import", ""),
+    ("asset_search", ""),
+    ("asset_online_search", ""),
+    ("asset_fetch", ""),
+    ("gen", "j3c -e gen [--force]"),
+];
+
+/// `j3c -e mcp --tools`: every tool's arguments, from the same definitions as `tools/list`.
+fn tool_reference() -> String {
+    let mut out = String::from("MCP tools (`j3c -e mcp`), from the definitions `tools/list` sends. * marks a required argument.\n");
+    let Json::Arr(list) = tools() else { return out };
+    for tool in &list {
+        let name = tool.get("name").and_then(Json::as_str).unwrap_or("");
+        let title = tool.get("title").and_then(Json::as_str).unwrap_or("");
+        out.push_str(&format!("\n{name} — {title}\n"));
+        let cli = CLI_SAME.iter().find(|(n, _)| *n == name).map(|(_, c)| *c).unwrap_or("");
+        out.push_str(&format!("    CLI: {}\n", if cli.is_empty() { "none; MCP only" } else { cli }));
+        if let Some(d) = tool.get("description").and_then(Json::as_str) {
+            out.push_str(&format!("    {d}\n"));
+        }
+        if let Some(schema) = tool.get("inputSchema") {
+            push_args(&mut out, schema, "    ");
+        }
+    }
+    out
+}
+
+fn push_args(out: &mut String, schema: &Json, indent: &str) {
+    let Some(Json::Obj(props)) = schema.get("properties") else { return };
+    let required: Vec<&str> = match schema.get("required") {
+        Some(Json::Arr(r)) => r.iter().filter_map(Json::as_str).collect(),
+        _ => Vec::new(),
+    };
+    for (key, prop) in props {
+        let mut line = format!("{indent}{key}{}: {}", if required.contains(&key.as_str()) { "*" } else { "" }, type_text(prop));
+        if let Some(Json::Arr(e)) = prop.get("enum") {
+            let names: Vec<&str> = e.iter().filter_map(Json::as_str).collect();
+            line.push_str(&format!(" ({})", names.join("|")));
+        }
+        if let Some(d) = prop.get("default") {
+            line.push_str(&format!(" = {}", d.stringify()));
+        }
+        if let Some(d) = prop.get("description").and_then(Json::as_str) {
+            line.push_str(&format!(" — {d}"));
+        }
+        out.push_str(&line);
+        out.push('\n');
+        let item = prop.get("items").unwrap_or(prop);
+        if item.get("properties").is_some() {
+            push_args(out, item, &format!("{indent}    "));
+        }
+    }
+}
+
+fn type_text(prop: &Json) -> String {
+    let ty = prop.get("type").and_then(Json::as_str).unwrap_or("any");
+    match (ty, prop.get("items").and_then(|i| i.get("type")).and_then(Json::as_str)) {
+        ("array", Some(inner)) => format!("array of {inner}"),
+        _ => ty.to_string(),
+    }
+}
+
 const TOOL_NAMES: &[&str] = &[
     "scene_list", "scene_get", "scene_add", "scene_add_many", "scene_set", "scene_delete", "place", "undo", "render", "check", "play", "console", "import",
     "asset_search", "asset_online_search", "asset_fetch", "gen",
@@ -982,13 +1085,13 @@ fn tools() -> Json {
 
 const TOOLS: &str = r#"[
 {"name":"scene_list","title":"List scene objects",
- "description":"List every object in a scene: #id, Parent/Child path, kind (group, mesh, camera, light, instance), asset, world position, rotation (degrees), scale, behavior. Objects placed by an instance (another scene file) are not listed; edit that scene instead.",
+ "description":"List every object in a scene: #id, Parent/Child path, kind (group, mesh, camera, light, instance), asset, world position, rotation (degrees), scale, script. Objects placed by an instance (another scene file) are not listed; edit that scene instead.",
  "inputSchema":{"type":"object","properties":{
    "scene":{"type":"string","description":"Scene file, e.g. scenes/main.j3scene. Default: the scene in j3.editor.toml."},
    "filter":{"type":"string","description":"Only objects whose id, path, or kind contains this text."}}},
  "annotations":{"readOnlyHint":true}},
 {"name":"scene_get","title":"Get an object",
- "description":"All fields of one object, including its behavior's params (param.<field>). Pass node \"@scene\" for scene lighting (sun, sky, fog, shadows, URP).",
+ "description":"All fields of one object, including its script's props (param.<prop>). Pass node \"@scene\" for scene lighting (sun, sky, fog, shadows, URP).",
  "inputSchema":{"type":"object","required":["node"],"properties":{
    "node":{"type":"string","description":"Name, Parent/Child path, #id, or @scene."},
    "scene":{"type":"string"}}},
@@ -1008,7 +1111,7 @@ const TOOLS: &str = r#"[
      "kind":{"type":"string"},"name":{"type":"string"},"parent":{"type":"string"},"fields":{"type":"object"}}}},
    "scene":{"type":"string"}}}},
 {"name":"scene_set","title":"Change an object",
- "description":"Set fields on an object (all or nothing). Keys: name; pos [x,y,z] (local to parent), x, y, z; rot [x,y,z] degrees; scale [x,y,z] or one number; parent (\"\" for top level; keeps local transform); asset (mesh file or builtin:cube|sphere|cylinder|cone|capsule|torus|quad|plane|sky); texture; material (.j3mat); scene (instance's scene file); behavior; param.<field> (behavior field, typed by j3.editor.toml); tint [r,g,b] or one number (meshes and placed scenes; multiplies color, 1 unchanged, above 1 allowed, e.g. [0.7,1,1.8] turns green teal); color [r,g,b] 0-1 and range (lights); fov, near, far (cameras); effects (cameras: kind=camera .j3fx files run in order, \"a.j3fx|b.j3fx\"; \"\" for none) and fx.<file stem>.<param> (their params); alpha opaque|cutout|blend; opacity; doubleSided; prop.<name> (on an instance: a prop its scene declares; \"\" goes back to the default). With node \"@scene\": prop.<name> = \"<type>:<default>\" declares a prop on this scene (type int, float, text, bool, material, mesh, scene; \"\" removes it), and sun [x,y,z] (direction toward the sun), sunColor, sky, fogStart, fogEnd, shadows, shadowSize, urp, urpBounces, urpSamples, urpShadows, urpShadowNear (meters traced sun shadows reach; the shadow map covers the rest; 0 no limit). save: true also saves the scene in the open editor.",
+ "description":"Set fields on an object (all or nothing). Keys: name; pos [x,y,z] (local to parent), x, y, z; rot [x,y,z] degrees; scale [x,y,z] or one number; parent (\"\" for top level; keeps local transform); asset (mesh file or builtin:cube|sphere|cylinder|cone|capsule|torus|quad|plane|sky); texture; material (.j3mat); scene (instance's scene file); script (a .j3s path, \"\" for none); param.<prop> (a prop of the object's script, typed by its props block); tint [r,g,b] or one number (meshes and placed scenes; multiplies color, 1 unchanged, above 1 allowed, e.g. [0.7,1,1.8] turns green teal); color [r,g,b] 0-1 and range (lights); fov, near, far (cameras); effects (cameras: kind=camera .j3fx files run in order, \"a.j3fx|b.j3fx\"; \"\" for none) and fx.<file stem>.<param> (their params); alpha opaque|cutout|blend; opacity; doubleSided; prop.<name> (on an instance: a prop its scene declares; \"\" goes back to the default). With node \"@scene\": prop.<name> = \"<type>:<default>\" declares a prop on this scene (type int, float, text, bool, material, mesh, scene; \"\" removes it), and sun [x,y,z] (direction toward the sun), sunColor, sky, fogStart, fogEnd, shadows, shadowSize, urp, urpBounces, urpSamples, urpShadows, urpShadowNear (meters traced sun shadows reach; the shadow map covers the rest; 0 no limit). save: true also saves the scene in the open editor.",
  "inputSchema":{"type":"object","required":["node"],"properties":{
    "node":{"type":"string","description":"Name, Parent/Child path, #id, or @scene."},
    "fields":{"type":"object"},
@@ -1059,13 +1162,13 @@ const TOOLS: &str = r#"[
    "height":{"type":"integer","default":360}}},
  "annotations":{"readOnlyHint":true}},
 {"name":"check","title":"Check scenes and code",
- "description":"Find problems before playing: broken parents, missing mesh/material/texture/scene files, placement cycles, undeclared behaviors, object fields pointing at deleted objects, same-named siblings, and J3 compile errors (with file and line).",
+ "description":"Find problems before playing: broken parents, missing mesh/material/texture/scene files, placement cycles, missing scripts, object fields pointing at deleted objects, same-named siblings, and J3 compile errors (with file and line).",
  "inputSchema":{"type":"object","properties":{
    "scene":{"type":"string","description":"One scene; default every scene under scenes/."},
    "code":{"type":"boolean","default":true,"description":"Also typecheck the project's code."}}},
  "annotations":{"readOnlyHint":true}},
 {"name":"play","title":"Play the game",
- "description":"Build the game and run it without a window for some frames (behaviors run), then return the last frame as an image with the game's output. For a 3D game the output ends with a J3STATS line: average fps, draw calls, triangles, and CPU/GPU milliseconds. Build errors come back instead of an image.",
+ "description":"Build the game and run it without a window for some frames (scripts run), then return the last frame as an image with the game's output. For a 3D game the output ends with a J3STATS line: average fps, draw calls, triangles, and CPU/GPU milliseconds. Build errors come back instead of an image.",
  "inputSchema":{"type":"object","properties":{
    "scene":{"type":"string","description":"Scene to start in; default the project's main scene."},
    "frames":{"type":"integer","default":120,"description":"Frames to run (60 per second)."},
@@ -1087,10 +1190,10 @@ const TOOLS: &str = r#"[
    "parent":{"type":"string"},
    "pos":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}}}},
 {"name":"asset_search","title":"Find assets",
- "description":"Find meshes, models, materials, images, scenes, sounds, and behaviors in the project, plus the built-in shapes. Paths are what asset, material, texture, scene, and behavior fields take.",
+ "description":"Find meshes, models, materials, images, scenes, sounds, and scripts in the project, plus the built-in shapes. Paths are what asset, material, texture, scene, and script fields take.",
  "inputSchema":{"type":"object","properties":{
    "query":{"type":"string"},
-   "kind":{"type":"string","enum":["any","mesh","model","material","image","scene","sound","font","behavior","code","file"]}}},
+   "kind":{"type":"string","enum":["any","mesh","model","material","image","scene","sound","font","script","code","file"]}}},
  "annotations":{"readOnlyHint":true}},
 {"name":"asset_online_search","title":"Search online assets",
  "description":"Search free CC0 assets online: Poly Haven models and skies, ambientCG materials, and Kenney model packs (a pack is a zip of many low-poly models). One line per result: source, id, kind, name, author. Then asset_fetch with the source and id.",
@@ -1157,6 +1260,16 @@ mod tests {
         };
         let names: Vec<&str> = tools.iter().filter_map(|t| t.get("name").and_then(Json::as_str)).collect();
         assert_eq!(names, TOOL_NAMES);
+        let cli: Vec<&str> = CLI_SAME.iter().map(|(n, _)| *n).collect();
+        assert_eq!(cli, TOOL_NAMES, "CLI_SAME must name every tool, in order");
+        assert!(EDITS.iter().all(|e| TOOL_NAMES.contains(e)));
+        let text = tool_reference();
+        for name in TOOL_NAMES {
+            assert!(text.contains(&format!("\n{name} — ")), "{name} missing\n{text}");
+        }
+        assert!(text.contains("    adds*: array of object"), "{text}");
+        assert!(text.contains("        kind*: string"), "{text}");
+        assert!(text.contains("op*: string (ground|ontop|scatter|grid)"), "{text}");
         for t in &tools {
             assert!(t.get("inputSchema").and_then(|s| s.get("type")).is_some());
         }

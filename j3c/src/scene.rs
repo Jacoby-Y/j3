@@ -15,11 +15,11 @@ Objects are named by name, by Parent/Child path, or by #id. Positions are in the
 space; rotations are degrees. --scene defaults to the scene in j3.editor.toml.
 
   list                         every object: id, path, kind, asset, world position
-  get <object>|@scene          fields and behavior params (@scene: lighting)
+  get <object>|@scene          fields and script props (@scene: lighting)
   add <kind> [key=value ...]   kind: group mesh camera light instance cube sphere cylinder
                                cone capsule torus quad plane sky
   set <object> key=value ...   name pos x y z rot scale parent asset texture material scene
-                               behavior color range fov near far alpha opacity doubleSided
+                               script color range fov near far alpha opacity doubleSided
                                tint r,g,b (meshes and placed scenes; 1 unchanged)
                                param.<field> prop.<name> (instances; empty = default)
                                effects=a.j3fx|b.j3fx fx.<stem>.<param> (cameras)
@@ -33,9 +33,17 @@ space; rotations are degrees. --scene defaults to the scene in j3.editor.toml.
           [spacing=d] [parent=P] [name=Base] [ground=true]
                                copies of a shape, mesh file, or .j3scene at random spots
   check [--all]                broken parents, missing files, placement cycles, unknown
-                               behaviors, dangling object fields; --all checks scenes/*
+                               scripts, dangling object fields; --all checks scenes/*
   undo                         put back the scene file from before the last change made
-                               here or through MCP (not editor edits; keeps 20)";
+                               here or through MCP (not editor edits; keeps 20)
+
+Saving: every change here writes the scene file at once. If `j3c editor` has the scene open,
+it merges the file change into its unsaved work within a second; `undo` here puts the file
+back. `j3c -e mcp` edits an open editor directly instead: one undo step there, unsaved until
+the person saves. Its replies say which one happened.
+
+Check what you built: `j3c -e scene check --all`, `j3c check`, `j3c -e render --help`, then
+`j3c run --frames 120 --screenshot shot.png --headless` (`j3c doc recipes check`).";
 
 pub fn cmd(rest: &[String]) -> i32 {
     match execute(rest) {
@@ -325,7 +333,7 @@ pub(crate) fn request_text(args: &[String]) -> Result<String, String> {
 
 pub(crate) fn run_tool(root: &Path, rel: &str, args: &[String]) -> Result<Reply, String> {
     let request = request_text(args)?;
-    // Keep the behavior catalog current so params and checks match j3.editor.toml.
+    // Keep the script catalog current so props and checks match the scripts.
     if root.join("j3.editor.toml").is_file() {
         fs::create_dir_all(root.join("target/j3-editor")).map_err(|e| e.to_string())?;
         crate::editor::generate_catalog(root)?;
@@ -416,7 +424,7 @@ fn node_json(l: &[String]) -> Json {
         ("worldPosition", vec3(at(l, 6))),
         ("rotation", vec3(at(l, 7))),
         ("scale", vec3(at(l, 8))),
-        ("behavior", Json::Str(at(l, 9).into())),
+        ("script", Json::Str(at(l, 9).into())),
         ("material", Json::Str(at(l, 10).into())),
         ("scene", Json::Str(at(l, 11).into())),
     ])

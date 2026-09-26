@@ -11,6 +11,10 @@ use crate::project::Manifest;
 use crate::span::FileId;
 use crate::stdlib::stdlib_dir;
 
+mod script_deps;
+pub mod dev;
+pub mod scene_scripts;
+
 #[derive(Clone, Copy)]
 enum GameBackend {
     Sdl,
@@ -61,6 +65,19 @@ pub fn compile_manifest_target(manifest: &Manifest, target: &str) -> Result<Prog
     )
 }
 
+/// Check a project for a dev build: like `compile_manifest`, plus `j3.script` (the VM)
+/// when the program has scripts.
+pub fn compile_manifest_dev(manifest: &Manifest) -> Result<Program, String> {
+    load_and_check_with(
+        &manifest.entry,
+        GameBackend::Sdl,
+        true,
+        Some(manifest),
+        manifest.emit.primary(),
+        true,
+    )
+}
+
 pub fn check_path_lib(entry: &Path) -> Result<Program, String> {
     load_and_check(entry, GameBackend::Sdl, false, None, "")
 }
@@ -72,6 +89,17 @@ fn load_and_check(
     project: Option<&Manifest>,
     target: &str,
 ) -> Result<Program, String> {
+    load_and_check_with(entry, game, require_main, project, target, false)
+}
+
+fn load_and_check_with(
+    entry: &Path,
+    game: GameBackend,
+    require_main: bool,
+    project: Option<&Manifest>,
+    target: &str,
+    dev: bool,
+) -> Result<Program, String> {
     let mut loader = Loader {
         files: Vec::new(),
         loaded: HashSet::new(),
@@ -80,11 +108,22 @@ fn load_and_check(
         os: os_kind(target),
         src_dir: project.map(|m| m.src_dir()),
         package: project.map(|m| m.name.clone()),
+        script_root: project
+            .map(|m| m.root.clone())
+            .unwrap_or_else(|| entry.parent().unwrap_or(Path::new(".")).to_path_buf()),
         overlays: Vec::new(),
+        scene_scan: None,
     };
     loader.load_path(entry)?;
     loader.load_module(&["j3".to_string(), "sys".to_string()])?;
     loader.load_imports()?;
+    if project.is_some() {
+        loader.load_scene_scripts()?;
+    }
+    if dev && loader.files.iter().any(|f| f.ast.is_script) {
+        loader.load_module(&["j3".to_string(), "script".to_string()])?;
+        loader.load_imports()?;
+    }
     check_import_cycles(&loader.files)?;
     let srcs: Vec<(String, String)> = loader
         .files
@@ -140,7 +179,12 @@ pub fn analyze_checked(
         os: os_kind(&target),
         src_dir: project.as_ref().map(|m| m.src_dir()),
         package: project.as_ref().map(|m| m.name.clone()),
+        script_root: project
+            .as_ref()
+            .map(|m| m.root.clone())
+            .unwrap_or_else(|| entry.parent().unwrap_or(Path::new(".")).to_path_buf()),
         overlays: overlays.to_vec(),
+        scene_scan: None,
     };
     loader
         .load_path(&entry)
@@ -154,6 +198,11 @@ pub fn analyze_checked(
     loader
         .load_imports()
         .map_err(|e| crate::check::CheckError::new(path.display().to_string(), crate::span::Span::dummy(), e))?;
+    if project.is_some() {
+        loader
+            .load_scene_scripts()
+            .map_err(|e| crate::check::CheckError::new(path.display().to_string(), crate::span::Span::dummy(), e))?;
+    }
     check_import_cycles(&loader.files).map_err(|e| {
         crate::check::CheckError::new(path.display().to_string(), crate::span::Span::dummy(), e)
     })?;
@@ -178,7 +227,10 @@ struct Loader {
     os: OsKind,
     src_dir: Option<PathBuf>,
     package: Option<String>,
+    script_root: PathBuf,
     overlays: Vec<(PathBuf, String)>,
+    /// Scene files scanned for attached scripts (once, on first need).
+    scene_scan: Option<scene_scripts::Scan>,
 }
 
 impl Loader {
@@ -205,7 +257,21 @@ impl Loader {
     fn parse_text(&mut self, path: String, text: String) -> Result<(), String> {
         let file_id = FileId(self.next_file);
         self.next_file += 1;
-        let ast = match parse::parse(&text, file_id) {
+        let ast = match if path.ends_with(".j3s") {
+            let rel = Path::new(&path)
+                .strip_prefix(&self.script_root)
+                .map_err(|_| {
+                    format!(
+                        "script {} is outside the project root {}",
+                        path,
+                        self.script_root.display()
+                    )
+                })?;
+            let parts = script_module_parts(&rel.to_string_lossy())?;
+            parse::parse_script(&text, file_id, &parts)
+        } else {
+            parse::parse(&text, file_id)
+        } {
             Ok(f) => f,
             Err(e) => return Err(parse::format_error(&path, &text, &e)),
         };
@@ -226,6 +292,9 @@ impl Loader {
         let key = parts.join(".");
         if self.loaded.contains(&key) {
             return Ok(());
+        }
+        if key == scene_scripts::MODULE {
+            return self.load_registry();
         }
         let path = self.module_path(parts);
         if !source_exists(&path) {
@@ -299,7 +368,9 @@ impl Loader {
                 })
                 .collect();
             for (path, names) in uses {
-                if names.is_some() {
+                if path.join(".") == scene_scripts::MODULE {
+                    self.load_registry()?;
+                } else if names.is_some() {
                     self.load_module(&path)?;
                 } else if source_exists(&self.module_path(&path)) {
                     self.load_module(&path)?;
@@ -309,10 +380,126 @@ impl Loader {
                     return Err(format!("cannot resolve `use {}`", path.join(".")));
                 }
             }
+            let scripts = script_deps::find(&self.files[i].ast);
+            for script in scripts {
+                self.load_script(&script.path, i, script.span)?;
+            }
             i += 1;
         }
         Ok(())
     }
+
+    /// `j3.scene3d.scripts`, made from the project's scenes.
+    fn load_registry(&mut self) -> Result<(), String> {
+        if self.loaded.contains(scene_scripts::MODULE) {
+            return Ok(());
+        }
+        let scan = self
+            .scene_scan
+            .get_or_insert_with(|| scene_scripts::scan(&self.script_root));
+        let text = scene_scripts::registry(&self.script_root, scan)?;
+        self.parse_text(scene_scripts::LABEL.to_string(), text)
+    }
+
+    /// When a scene attaches scripts, they and the registry join the program.
+    fn load_scene_scripts(&mut self) -> Result<(), String> {
+        let root = self.script_root.clone();
+        let scan = self.scene_scan.get_or_insert_with(|| scene_scripts::scan(&root));
+        if scan.attachments.is_empty() {
+            return Ok(());
+        }
+        self.load_registry()?;
+        self.load_imports()
+    }
+
+    fn load_script(
+        &mut self,
+        rel: &str,
+        source: usize,
+        span: crate::span::Span,
+    ) -> Result<(), String> {
+        let parts = script_module_parts(rel)?;
+        let key = parts.join(".");
+        if self.loaded.contains(&key) {
+            return Ok(());
+        }
+        let path = self.script_root.join(rel);
+        if !path.is_file() && !self.overlays.iter().any(|(p, _)| same_path(p, &path)) {
+            let source_file = &self.files[source];
+            let mut error = crate::check::CheckError::new(
+                &source_file.path,
+                span,
+                format!("no script at {rel}"),
+            );
+            if let Some(suggested) =
+                crate::diag::did_you_mean(rel, &script_paths(&self.script_root))
+            {
+                error = error.help(format!("did you mean `{suggested}`?"));
+            }
+            return Err(error.render(&[(source_file.path.clone(), source_file.src.clone())]));
+        }
+        self.load_path(&path)
+    }
+}
+
+/// Every `.j3s` under `root` (skipping `target/` and `.git/`), relative, `/`-separated.
+pub fn script_paths(root: &Path) -> Vec<String> {
+    fn visit(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && !path.is_symlink() {
+                let name = entry.file_name();
+                if name != ".git" && name != "target" {
+                    visit(root, &path, out);
+                }
+            } else if path.extension().and_then(|s| s.to_str()) == Some("j3s") {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(
+                        rel.to_string_lossy()
+                            .replace(std::path::MAIN_SEPARATOR, "/"),
+                    );
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(root, root, &mut out);
+    out.sort();
+    out
+}
+
+fn script_module_parts(rel: &str) -> Result<Vec<String>, String> {
+    let path = Path::new(rel);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "script path must be relative to the project root: {rel}"
+        ));
+    }
+    let Some(stem) = rel.strip_suffix(".j3s") else {
+        return Err(format!("script path must end in `.j3s`: {rel}"));
+    };
+    let mut parts = vec!["script".to_string()];
+    for part in stem.split('/') {
+        if part.is_empty()
+            || !part
+                .bytes()
+                .enumerate()
+                .all(|(i, b)| b.is_ascii_alphabetic() || b == b'_' || (i > 0 && b.is_ascii_digit()))
+        {
+            return Err(format!(
+                "script path has an invalid module component: {rel}"
+            ));
+        }
+        parts.push(part.to_string());
+    }
+    Ok(parts)
 }
 
 fn check_import_cycles(files: &[ParsedFile]) -> Result<(), String> {
@@ -327,6 +514,12 @@ fn check_import_cycles(files: &[ParsedFile]) -> Result<(), String> {
                         graph.entry(from.clone()).or_default().push(to);
                     }
                 }
+            }
+        }
+        for script in script_deps::find(&f.ast) {
+            let to = script_module_parts(&script.path)?.join(".");
+            if to != from {
+                graph.entry(from.clone()).or_default().push(to);
             }
         }
     }
@@ -410,7 +603,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn join_mod(root: &Path, parts: &[String]) -> PathBuf {
+pub(crate) fn join_mod(root: &Path, parts: &[String]) -> PathBuf {
     let mut p = root.to_path_buf();
     for (i, part) in parts.iter().enumerate() {
         if i + 1 == parts.len() {
@@ -1932,5 +2125,344 @@ fn main() {
             let stem = name.trim_end_matches(".j3");
             assert_golden(&format!("{stem}.ir"), &user_dump(&prog));
         }
+    }
+
+    const DOOR_OUTPUT: &str = "door 1: open false t 0.8 opened 2\ndoor 2: open true t 0.5 opened 2\n\
+door 3: open true t 0.5 opened 3\nangles 80.64 60 45\n";
+
+    fn script_demo() -> Manifest {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../speculative/11_script");
+        Manifest::load(&root.join("j3.toml")).expect("script manifest")
+    }
+
+    #[test]
+    fn script_aot_ir_golden_and_both_backends() {
+        let prog = compile_manifest(&script_demo()).expect("script checks");
+        assert_golden("11_script.ir", &user_dump(&prog));
+        let bytecode = dev::bytecode(&prog).expect("script bytecode");
+        assert_eq!(bytecode.len(), 1);
+        assert_golden("11_script.bc", &bytecode[0].dump());
+        assert_eq!(&bytecode[0].encode()[..4], b"J3SB");
+        for backend in [emit::Backend::Llvm, emit::Backend::C] {
+            let mut opts = llvm_opts();
+            opts.backend = backend;
+            let result = emit::run_program(&prog.cx, &prog.modules, &opts).expect("script run");
+            assert_eq!(result.status, 0, "{}", String::from_utf8_lossy(&result.stderr));
+            assert_eq!(String::from_utf8_lossy(&result.stdout), DOOR_OUTPUT);
+        }
+    }
+
+    /// Dev mode: every script call goes through the J3 VM, and the output matches AOT.
+    #[test]
+    fn script_dev_mode_matches_aot_on_both_backends() {
+        let manifest = script_demo();
+        let mut prog = compile_manifest_dev(&manifest).expect("dev check");
+        let bytecode = dev::bytecode(&prog).expect("bytecode");
+        for module in &bytecode {
+            module.write_to(&manifest.root).expect("write bytecode");
+        }
+        dev::lower(&mut prog, &bytecode).expect("dev lower");
+        for backend in [emit::Backend::Llvm, emit::Backend::C] {
+            let mut opts = llvm_opts();
+            opts.backend = backend;
+            opts.cwd = Some(manifest.root.clone());
+            let result = emit::run_program(&prog.cx, &prog.modules, &opts).expect("dev run");
+            assert_eq!(result.status, 0, "{}", String::from_utf8_lossy(&result.stderr));
+            assert_eq!(String::from_utf8_lossy(&result.stdout), DOOR_OUTPUT, "{backend:?}");
+        }
+    }
+
+    /// A throwaway project under the temp dir.
+    fn temp_project(name: &str, files: &[(&str, &str)]) -> Manifest {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("j3c_{name}_{}_{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        Manifest::load(&root.join("j3.toml")).expect("temp manifest")
+    }
+
+    const TICK_TOML: &str = "[package]\nname = \"ticker\"\nentry = \"main.j3\"\n\n[emit]\nopt = 0\n";
+    const TICK_MAIN: &str = "module ticker;\n\
+use j3.memory.frameHook;\n\
+const Tick = @script(\"scripts/tick.j3s\");\n\
+fn sleepMs(ms: int) { let ts: [2]int = [0, ms * 1000000]; @syscall(35, &ts[0] as ptr, 0); }\n\
+fn main() {\n    let tick = Tick {};\n    for i in 0..400 {\n        frameHook();\n        tick.say(i);\n        sleepMs(10);\n    }\n}\n";
+    const TICK_SCRIPT: &str = "use j3.io.printLn;\n\nprops {\n    gain: int = 1;\n}\n\n\
+pub fn say(i: int) {\n    if i % 10 == 0 { printLn(`value {gain}`); }\n}\n";
+
+    fn first_line(child: &mut std::process::Child) -> String {
+        use std::io::BufRead;
+        let out = child.stdout.as_mut().expect("piped stdout");
+        let mut line = String::new();
+        std::io::BufReader::new(out).read_line(&mut line).expect("read line");
+        line
+    }
+
+    fn launch(exe: &Path, root: &Path) -> std::process::Child {
+        std::process::Command::new(exe)
+            .current_dir(root)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("launch dev binary")
+    }
+
+    fn dev_built(m: &Manifest) -> crate::devrun::Built {
+        match crate::devrun::prepare(m, &llvm_opts(), false).expect("prepare") {
+            crate::devrun::Prepared::Dev(built) => built,
+            crate::devrun::Prepared::NoScripts(_) => panic!("expected scripts"),
+        }
+    }
+
+    /// Editing a script (a constant, a new prop with a default, new state) never runs clang.
+    #[test]
+    fn script_edits_rerun_without_clang() {
+        let m = temp_project(
+            "script_edits",
+            &[("j3.toml", TICK_TOML), ("main.j3", TICK_MAIN), ("scripts/tick.j3s", TICK_SCRIPT)],
+        );
+        let first = dev_built(&m);
+        assert!(first.rebuilt, "first dev build compiles the program");
+        let edits = [
+            ("value {gain}", "value {gain} b"),
+            ("    gain: int = 1;\n", "    gain: int = 1;\n    extra: int = 7;\n"),
+            ("pub fn say", "let seen = 3;\n\npub fn say"),
+            ("value {gain} b", "value {gain} {extra} {seen}"),
+        ];
+        let path = m.root.join("scripts/tick.j3s");
+        for (from, to) in edits {
+            let text = std::fs::read_to_string(&path).unwrap().replace(from, to);
+            std::fs::write(&path, text).unwrap();
+            let started = std::time::Instant::now();
+            let built = dev_built(&m);
+            assert!(!built.rebuilt, "script edit `{to}` ran clang");
+            let mut child = launch(&built.exe, &m.root);
+            let line = first_line(&mut child);
+            let elapsed = started.elapsed();
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(elapsed.as_millis() < 2000, "edit to first line took {elapsed:?}");
+            if to.contains("{extra} {seen}") {
+                assert_eq!(line, "value 1 7 3\n");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&m.root);
+    }
+
+    /// A script that needs a module the program never loaded rebuilds the program.
+    #[test]
+    fn script_new_native_module_rebuilds() {
+        let m = temp_project(
+            "script_rebuild",
+            &[("j3.toml", TICK_TOML), ("main.j3", TICK_MAIN), ("scripts/tick.j3s", TICK_SCRIPT)],
+        );
+        dev_built(&m);
+        let path = m.root.join("scripts/tick.j3s");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("use j3.io.printLn;", "use j3.io.printLn;\nuse j3.rand.Rng;")
+            .replace("value {gain}", "value {gain} {roll()}");
+        let text = format!("{text}\nfn roll(): int {{\n    let r = Rng.new(5);\n    return r.next() % 1;\n}}\n");
+        std::fs::write(&path, text).unwrap();
+        let built = dev_built(&m);
+        assert!(built.rebuilt, "a new native module needs a program rebuild");
+        let mut child = launch(&built.exe, &m.root);
+        assert_eq!(first_line(&mut child), "value 1 0\n");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&m.root);
+    }
+
+    /// While the program runs, a code edit swaps in at the next `frameHook`.
+    #[test]
+    fn script_code_edit_swaps_live() {
+        use std::io::BufRead;
+        let m = temp_project(
+            "script_swap",
+            &[("j3.toml", TICK_TOML), ("main.j3", TICK_MAIN), ("scripts/tick.j3s", TICK_SCRIPT)],
+        );
+        let built = dev_built(&m);
+        let mut child = launch(&built.exe, &m.root);
+        let out = child.stdout.take().expect("stdout");
+        let mut lines = std::io::BufReader::new(out).lines();
+        assert_eq!(lines.next().unwrap().unwrap(), "value 1");
+        let path = m.root.join("scripts/tick.j3s");
+        let text = std::fs::read_to_string(&path).unwrap().replace("value {gain}", "swapped {gain}");
+        std::fs::write(&path, text).unwrap();
+        let started = std::time::Instant::now();
+        let next = dev_built(&m);
+        assert!(!next.rebuilt);
+        assert_eq!(next.layouts, built.layouts, "a code edit keeps the layout");
+        crate::devrun::bump_reload(&m.root);
+        let mut swapped = false;
+        for line in lines.by_ref() {
+            if line.unwrap() == "swapped 1" {
+                swapped = true;
+                break;
+            }
+        }
+        let elapsed = started.elapsed();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(swapped, "the running program never picked up the edit");
+        assert!(elapsed.as_millis() < 1000, "swap took {elapsed:?}");
+        let _ = std::fs::remove_dir_all(&m.root);
+    }
+
+    /// `examples/scripted`: the same output from the VM (dev) and compiled in (release).
+    #[test]
+    fn scripted_example_same_in_dev_and_release() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/scripted");
+        let manifest = Manifest::load(&root.join("j3.toml")).expect("example manifest");
+        let release = compile_manifest(&manifest).expect("release check");
+        let aot = emit::run_program(&release.cx, &release.modules, &llvm_opts()).expect("release run");
+        assert_eq!(aot.status, 0, "{}", String::from_utf8_lossy(&aot.stderr));
+        let mut prog = compile_manifest_dev(&manifest).expect("dev check");
+        let bytecode = dev::bytecode(&prog).expect("bytecode");
+        assert_eq!(bytecode.len(), 2);
+        for module in &bytecode {
+            module.write_to(&manifest.root).expect("write bytecode");
+        }
+        dev::lower(&mut prog, &bytecode).expect("dev lower");
+        let mut opts = llvm_opts();
+        opts.cwd = Some(manifest.root.clone());
+        let vm = emit::run_program(&prog.cx, &prog.modules, &opts).expect("dev run");
+        assert_eq!(vm.status, 0, "{}", String::from_utf8_lossy(&vm.stderr));
+        let out = String::from_utf8_lossy(&aot.stdout);
+        assert!(out.contains("Bo is down (2 so far)"), "{out}");
+        assert_eq!(out, String::from_utf8_lossy(&vm.stdout));
+    }
+
+    const SCENE_TOML: &str = "[package]\nname = \"sc\"\nentry = \"src/main.j3\"\n";
+    const SCENE_MAIN: &str = "module sc;\nuse j3.memory.Arena;\nuse j3.option.Option;\nuse j3.scene3d;\nuse j3.scene3d.scripts;\n\
+const Spin = @script(\"scripts/spin.j3s\");\n\
+fn main() {\n    let mem = Arena.create(65536);\n    let scene = scene3d.load(scripts.scene(), &mem);\n    scripts.start(&scene);\n    scripts.update(&scene, 0.1);\n\
+    match scene.script::<Spin>(scene.find(\"Cube\")) { Option.Some(s) { s.report(); } Option.None {} }\n}\n";
+    const SPIN: &str = "use j3.scene3d.{ Scene, NodeId };\nuse j3.io.printLn;\n\
+props {\n    node: NodeId;\n    target: NodeId;\n    speed: f32 = 1.0;\n    label: string = \"x\";\n}\n\
+pub fn update(scene: &Scene, dt: f32) {\n    let n = scene.node(node);\n    n.rotation.y += speed * dt;\n}\n\
+pub fn report() { printLn(label); }\n";
+
+    fn scene_file(extra: &str) -> String {
+        format!(
+            "scene.version=1\nscene.count=2\nscene.nextId=3\n\
+node.0.id=1\nnode.0.parent=0\nnode.0.kind=1\nnode.0.name s=Cube\nnode.0.script s=scripts/spin.j3s\n\
+node.1.id=2\nnode.1.parent=0\nnode.1.kind=1\nnode.1.name s=Other\n{extra}"
+        )
+    }
+
+    fn scene_err(scene: &str, spin: &str) -> String {
+        match scene_check(scene, spin) {
+            Ok(_) => panic!("expected a scene error"),
+            Err(e) => e,
+        }
+    }
+
+    fn scene_check(scene: &str, spin: &str) -> Result<Program, String> {
+        let m = temp_project(
+            "scene_scripts",
+            &[
+                ("j3.toml", SCENE_TOML),
+                ("j3.editor.toml", "[editor]\nscene = \"scenes/main.j3scene\"\n"),
+                ("src/main.j3", SCENE_MAIN),
+                ("scripts/spin.j3s", spin),
+                ("scenes/main.j3scene", scene),
+            ],
+        );
+        let out = compile_manifest(&m);
+        let _ = std::fs::remove_dir_all(&m.root);
+        out
+    }
+
+    #[test]
+    fn scene_attached_scripts_check_against_the_scene() {
+        let good = scene_file("param.1.target r=2\nparam.1.speed f=3\nparam.1.label s=cube\n");
+        let prog = scene_check(&good, SPIN).expect("attached script checks");
+        assert!(prog.cx.funcs().iter().any(|f| prog.cx.name_str(f.name) == "find__scripts__spin"));
+
+        let missing = scene_err(&scene_file("param.1.speed f=3\n"), SPIN);
+        assert!(missing.contains("scripts/spin.j3s needs prop `target`"), "{missing}");
+        assert!(missing.contains("--> scenes/main.j3scene:8"), "{missing}");
+
+        let typed = scene_err(&scene_file("param.1.target r=2\nparam.1.speed s=fast\n"), SPIN);
+        assert!(typed.contains("`speed` is `f32` in scripts/spin.j3s"), "{typed}");
+        assert!(typed.contains("--> scenes/main.j3scene:14"), "{typed}");
+        assert!(typed.contains("param.1.speed s=fast"), "{typed}");
+
+        let unknown = scene_err(&scene_file("param.1.target r=2\nparam.1.sped f=3\n"), SPIN);
+        assert!(unknown.contains("`sped` isn't a prop of scripts/spin.j3s"), "{unknown}");
+
+        let hook = SPIN.replace("pub fn update(scene: &Scene, dt: f32)", "pub fn update(dt: f32)");
+        let bad_hook = scene_err(&scene_file("param.1.target r=2\n"), &hook);
+        assert!(bad_hook.contains("must be `pub fn update(scene: &Scene, dt: f32)`"), "{bad_hook}");
+
+        let wrong_path = scene_file("param.1.target r=2\n").replace("s=scripts/spin.j3s", "s=scripts/spn.j3s");
+        let path = scene_err(&wrong_path, SPIN);
+        assert!(path.contains("no script at scripts/spn.j3s"), "{path}");
+        assert!(path.contains("did you mean `scripts/spin.j3s`"), "{path}");
+    }
+
+    #[test]
+    fn scene_script_lookup_needs_an_attachment() {
+        let detached = scene_file("").replace("node.0.script s=scripts/spin.j3s\n", "");
+        let err = scene_err(&detached, SPIN);
+        assert!(err.contains("no scene attaches scripts/spin.j3s"), "{err}");
+    }
+
+    #[test]
+    fn script_path_error_suggests_existing_script() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../speculative/11_script");
+        let manifest = Manifest::load(&root.join("j3.toml")).expect("script manifest");
+        let mut loader = Loader {
+            files: Vec::new(),
+            loaded: HashSet::new(),
+            next_file: 1,
+            game: GameBackend::Sdl,
+            os: OsKind::Linux,
+            src_dir: Some(manifest.src_dir()),
+            package: Some(manifest.name),
+            script_root: root,
+            overlays: vec![(
+                manifest.entry.clone(),
+                "module script_demo; const Door = @script(\"scripts/dor.j3s\"); fn main() {}"
+                    .to_string(),
+            )],
+            scene_scan: None,
+        };
+        loader.load_path(&manifest.entry).expect("load main");
+        let err = loader.load_imports().unwrap_err();
+        assert!(err.contains("no script at scripts/dor.j3s"), "{err}");
+        assert!(err.contains("did you mean `scripts/door.j3s`"), "{err}");
+    }
+
+    #[test]
+    fn script_references_join_import_cycles() {
+        let module_a = ["script".to_string(), "scripts".to_string(), "a".to_string()];
+        let module_b = ["script".to_string(), "scripts".to_string(), "b".to_string()];
+        let a = "const B = @script(\"scripts/b.j3s\");";
+        let b = "const A = @script(\"scripts/a.j3s\");";
+        let files = vec![
+            ParsedFile {
+                path: "scripts/a.j3s".to_string(),
+                src: a.to_string(),
+                ast: parse::parse_script(a, FileId(1), &module_a).unwrap(),
+                file_id: FileId(1),
+            },
+            ParsedFile {
+                path: "scripts/b.j3s".to_string(),
+                src: b.to_string(),
+                ast: parse::parse_script(b, FileId(2), &module_b).unwrap(),
+                file_id: FileId(2),
+            },
+        ];
+        let err = check_import_cycles(&files).unwrap_err();
+        assert!(
+            err.contains("script.scripts.a -> script.scripts.b -> script.scripts.a"),
+            "{err}"
+        );
     }
 }

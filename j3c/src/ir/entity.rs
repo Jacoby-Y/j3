@@ -35,6 +35,14 @@ pub struct StructDef {
     pub span: Span,
     /// Type arguments this instance was built with. Empty for non-generic structs.
     pub ty_args: Vec<(String, crate::ir::ty::Ty)>,
+    /// Script rules without changing the native struct layout.
+    pub script: Option<ScriptMeta>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScriptMeta {
+    pub path: String,
+    pub prop_spans: Vec<Span>,
 }
 
 impl StructDef {

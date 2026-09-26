@@ -37,6 +37,9 @@ long-running MCP servers.
 | TODO | 016 | Move editor and asset logic into J3 | P2 | L | 001, 004 |
 | TODO | 017 | Everyday game framework gaps | P2 | L | 016 JSON reader for phase 4 only |
 | TODO | 009 | glTF animation, skinning, morph targets | P2 | L | — (deferred to last) |
+| DONE | 018 | J3s scripts (typed, per-instance, hot-reload VM) | P2 | XL | 008 helps; supersedes behaviors (016 phase 3) |
+| DONE | 019 | Two-level URP trace (moving objects no longer rebuild the BVH) | P1 | M | 006 |
+| DONE | 020 | Agent-facing docs and discovery (`doc search`, recipes, `--tools`) | P1 | L | — |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 

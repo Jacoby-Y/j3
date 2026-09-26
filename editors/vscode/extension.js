@@ -46,6 +46,8 @@ function completionKind(kind) {
       return k.Keyword;
     case 15:
       return k.Snippet;
+    case 17:
+      return k.File;
     case 20:
       return k.EnumMember;
     case 21:

@@ -8,6 +8,7 @@ use crate::ir::cx::IrCx;
 use crate::ir::dump;
 use crate::ir::entity::{Func, FuncKind, Vis};
 use crate::ir::ids::StructId;
+use crate::ir::operand::{ConstKind, Operand};
 use crate::ir::ty::{Ty, TyKind};
 use crate::parse::syntax::{ATTRIBUTES, BUILTIN_TYPES, INTRINSICS};
 use crate::span::{FileId, Span};
@@ -49,6 +50,7 @@ pub struct ImportEdit {
     pub offset: u32,
 }
 
+#[cfg(test)]
 pub fn complete(prog: &Program, path: &str, offset: u32) -> Vec<Completion> {
     let src = file_src(prog, path);
     complete_at(prog, path, &src, offset)
@@ -68,6 +70,9 @@ pub fn complete_buffer(
     src: &str,
     offset: u32,
 ) -> Vec<Completion> {
+    if let Some(prefix) = script_path_prefix(src, offset as usize) {
+        return script_path_items(path, &prefix);
+    }
     let shown = path.display().to_string();
     if let Ok(prog) = query::analyze(path, overlays) {
         return complete_at(&prog, &shown, src, offset);
@@ -93,6 +98,9 @@ fn complete_with(
     spanned: &str,
     offset: u32,
 ) -> Vec<Completion> {
+    if let Some(prefix) = script_path_prefix(lex, offset as usize) {
+        return script_path_items(std::path::Path::new(path), &prefix);
+    }
     if lexical_mode(lex, offset as usize) != Mode::Code {
         return Vec::new();
     }
@@ -109,6 +117,9 @@ fn complete_with(
         }
         return complete_use(prog, &use_at);
     }
+    if let Some(items) = script_prop_items(prog, path, lex, prefix_at, &prefix) {
+        return items;
+    }
     let file = query::file_by_path(&prog.cx, path);
     let trusted = file
         .map(|f| f.src == spanned && lex.len() == spanned.len())
@@ -123,6 +134,7 @@ fn complete_with(
     if trusted {
         if let Some(file) = file {
             push_locals(&prog.cx, file.id, offset, &prefix, &mut out);
+            push_script_names(&prog.cx, file.id, &prefix, &mut out);
             push_file_items(prog, file.id, &prefix, &mut out);
         }
     }
@@ -130,6 +142,138 @@ fn complete_with(
     push_builtins(&prefix, &mut out);
     push_keywords(&prefix, &mut out);
     finish(&prefix, out)
+}
+
+fn script_path_prefix(src: &str, offset: usize) -> Option<String> {
+    let head = src.get(..offset.min(src.len()))?;
+    let at = head.rfind("@script")?;
+    if lexical_mode(src, at) != Mode::Code {
+        return None;
+    }
+    let mut rest = head.get(at + "@script".len()..)?.trim_start();
+    rest = rest.strip_prefix('(')?.trim_start();
+    rest = rest.strip_prefix('"')?;
+    if rest.contains('"') || rest.contains('\n') {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+fn script_path_items(path: &std::path::Path, prefix: &str) -> Vec<Completion> {
+    let root = match crate::project::resolve(path) {
+        Ok(crate::project::Input::Project(m)) => m.root,
+        _ => path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf(),
+    };
+    let mut out = Vec::new();
+    for candidate in crate::compile::script_paths(&root) {
+        if !candidate.starts_with(prefix) {
+            continue;
+        }
+        let mut entry = item(&candidate, 17, "script path", "", "0", false);
+        entry.insert = if prefix.contains('/') {
+            candidate
+                .rsplit('/')
+                .next()
+                .unwrap_or(&candidate)
+                .to_string()
+        } else {
+            candidate.clone()
+        };
+        out.push(entry);
+    }
+    finish(prefix, out)
+}
+
+fn script_prop_items(
+    prog: &Program,
+    path: &str,
+    src: &str,
+    prefix_at: usize,
+    prefix: &str,
+) -> Option<Vec<Completion>> {
+    let brace = src.get(..prefix_at)?.rfind('{')?;
+    if src[brace + 1..prefix_at].contains('}') {
+        return None;
+    }
+    let head = src[..brace].trim_end();
+    let file = query::file_by_path(&prog.cx, path)?;
+    let sid = if head.ends_with(')') {
+        let at = head.rfind("@script")?;
+        let segment = &head[at..];
+        if segment.find(')')? != segment.len() - 1 {
+            return None;
+        }
+        let quoted = segment.split('"').nth(1)?;
+        prog.cx.structs().iter().enumerate().find_map(|(i, s)| {
+            s.script
+                .as_ref()
+                .filter(|m| m.path.ends_with(quoted))
+                .map(|_| StructId(i as u32))
+        })?
+    } else {
+        let bytes = head.as_bytes();
+        let mut start = bytes.len();
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+            start -= 1;
+        }
+        let name = head.get(start..)?;
+        prog.script_aliases
+            .iter()
+            .find(|a| a.file == file.id && a.name == name)
+            .map(|a| a.struct_id)
+            .or_else(|| {
+                prog.cx.structs().iter().enumerate().find_map(|(i, s)| {
+                    if s.script.is_some() && prog.cx.name_str(s.name) == name {
+                        Some(StructId(i as u32))
+                    } else {
+                        None
+                    }
+                })
+            })?
+    };
+    let s = prog.cx.struct_def(sid);
+    let meta = s.script.as_ref()?;
+    let typed = &src[brace + 1..prefix_at];
+    let mut out = Vec::new();
+    for field in s.fields.iter().take(meta.prop_spans.len()) {
+        let name = prog.cx.name_str(field.name);
+        if !name.starts_with(prefix) || field_written(typed, name) {
+            continue;
+        }
+        let ty = dump::ty_string(&prog.cx, field.ty);
+        let (detail, sort) = match &field.default {
+            None => (format!("required prop: {ty}"), "0"),
+            Some(default) => (format!("prop: {ty} = {}", default_text(default)), "1"),
+        };
+        out.push(item(name, 5, &detail, &field.doc, sort, false));
+    }
+    Some(finish(prefix, out))
+}
+
+fn field_written(body: &str, name: &str) -> bool {
+    body.match_indices(name).any(|(at, _)| {
+        let before = body.as_bytes().get(at.wrapping_sub(1)).copied();
+        let boundary = at == 0 || !before.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_');
+        boundary && body[at + name.len()..].trim_start().starts_with(':')
+    })
+}
+
+fn default_text(op: &Operand) -> String {
+    match op {
+        Operand::Const(c) => match &c.kind {
+            ConstKind::Bool(v) => v.to_string(),
+            ConstKind::Int(v) => (*v as i64).to_string(),
+            ConstKind::F32Bits(v) => f32::from_bits(*v).to_string(),
+            ConstKind::F64Bits(v) => f64::from_bits(*v).to_string(),
+            ConstKind::Bytes(v) => format!("\"{}\"", String::from_utf8_lossy(v)),
+            ConstKind::Null => "0".to_string(),
+            _ => "...".to_string(),
+        },
+        Operand::Copy(_) => "...".to_string(),
+    }
 }
 
 fn blank_line(src: &str, offset: u32) -> String {
@@ -150,9 +294,10 @@ fn blank_line(src: &str, offset: u32) -> String {
 
 fn set_overlay(overlays: &mut Vec<(std::path::PathBuf, String)>, path: &std::path::Path, src: String) {
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if let Some(slot) = overlays.iter_mut().find(|(p, _)| {
-        p == path || p.canonicalize().unwrap_or_else(|_| p.clone()) == canon
-    }) {
+    if let Some(slot) = overlays
+        .iter_mut()
+        .find(|(p, _)| p == path || p.canonicalize().unwrap_or_else(|_| p.clone()) == canon)
+    {
         slot.1 = src;
     } else {
         overlays.push((path.to_path_buf(), src));
@@ -172,13 +317,13 @@ pub fn signature(prog: &Program, path: &str, src: &str, offset: u32) -> Option<S
             if let Some(file) = file {
                 if let Some(local) = query::find_local(&prog.cx, file.id, offset, recv) {
                     if let Some(id) = struct_of(&prog.cx, local.ty) {
-                        push_methods(&prog.cx, id, &call.name, &mut found);
+                        push_methods(&prog.cx, id, &call.name, file.id, &mut found);
                     }
                 }
             }
         }
         if found.is_empty() {
-            push_methods_named(&prog.cx, recv, &call.name, &mut found);
+            push_methods_named(&prog.cx, recv, &call.name, file.map(|f| f.id), &mut found);
         }
         if found.is_empty() {
             push_module_fns(prog, recv, &call.name, &mut found);
@@ -226,6 +371,62 @@ pub fn symbols(prog: &Program, path: &str) -> Vec<Symbol> {
     let Some(file) = query::file_by_path(&prog.cx, path) else {
         return Vec::new();
     };
+    if file.path.ends_with(".j3s") {
+        let module = ["script".to_string(), "outline".to_string()];
+        let Ok(ast) = crate::parse::parse_script(&file.src, file.id, &module) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for item in ast.items {
+            match item {
+                crate::parse::Item::Props(b) | crate::parse::Item::Shared(b) => {
+                    let name = if file
+                        .src
+                        .get(b.span.start as usize..)
+                        .is_some_and(|s| s.starts_with("props"))
+                    {
+                        "props"
+                    } else {
+                        "shared"
+                    };
+                    out.push(Symbol {
+                        name: name.to_string(),
+                        kind: 3,
+                        container: String::new(),
+                        span: b.span,
+                    });
+                    for field in b.fields {
+                        out.push(Symbol {
+                            name: field.name.name,
+                            kind: 8,
+                            container: name.to_string(),
+                            span: field.span,
+                        });
+                    }
+                }
+                crate::parse::Item::State(s) => out.push(Symbol {
+                    name: s.name.name,
+                    kind: 8,
+                    container: "state".to_string(),
+                    span: s.span,
+                }),
+                crate::parse::Item::Fn(f) => out.push(Symbol {
+                    name: f.name.name,
+                    kind: 12,
+                    container: String::new(),
+                    span: f.span,
+                }),
+                crate::parse::Item::Const(c) => out.push(Symbol {
+                    name: c.name.name,
+                    kind: 14,
+                    container: String::new(),
+                    span: c.span,
+                }),
+                _ => {}
+            }
+        }
+        return out;
+    }
     let cx = &prog.cx;
     let mut out = Vec::new();
     for s in cx.structs() {
@@ -314,7 +515,12 @@ pub fn symbols(prog: &Program, path: &str) -> Vec<Symbol> {
         });
     }
     out.sort_by(|a, b| a.span.start.cmp(&b.span.start).then(a.name.cmp(&b.name)));
-    out.dedup_by(|a, b| a.name == b.name && a.kind == b.kind && a.container == b.container && a.span.start == b.span.start);
+    out.dedup_by(|a, b| {
+        a.name == b.name
+            && a.kind == b.kind
+            && a.container == b.container
+            && a.span.start == b.span.start
+    });
     out
 }
 
@@ -384,14 +590,14 @@ fn members(
     if trusted {
         if let Some(local) = query::find_local(cx, file, offset, base) {
             if let Some(id) = struct_of(cx, local.ty) {
-                push_struct_members(cx, id, prefix, &mut out);
+                push_struct_members(cx, id, file, prefix, &mut out);
                 return finish(prefix, out);
             }
         }
     }
     if let Some(s) = query::find_struct(cx, base) {
         if let Some(id) = struct_id(cx, s) {
-            push_struct_members(cx, id, prefix, &mut out);
+            push_struct_members(cx, id, file, prefix, &mut out);
             if !out.is_empty() {
                 return finish(prefix, out);
             }
@@ -460,7 +666,68 @@ fn push_locals(cx: &IrCx, file: FileId, offset: u32, prefix: &str, out: &mut Vec
             continue;
         }
         let kind = if loc.kind == LocalKind::Const { 21 } else { 6 };
-        out.push(item(name, kind, &dump::ty_string(cx, loc.ty), &loc.doc, "0", false));
+        out.push(item(
+            name,
+            kind,
+            &dump::ty_string(cx, loc.ty),
+            &loc.doc,
+            "0",
+            false,
+        ));
+    }
+}
+
+fn push_script_names(cx: &IrCx, file: FileId, prefix: &str, out: &mut Vec<Completion>) {
+    let Some((id, script)) = cx
+        .structs()
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.span.file == file && s.script.is_some())
+    else {
+        return;
+    };
+    let sid = StructId(id as u32);
+    let prop_count = script.script.as_ref().unwrap().prop_spans.len();
+    for (index, field) in script.fields.iter().enumerate() {
+        let name = cx.name_str(field.name);
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let detail = if index < prop_count { "prop" } else { "state" };
+        out.push(item(
+            name,
+            6,
+            &format!("{detail}: {}", dump::ty_string(cx, field.ty)),
+            &field.doc,
+            "1",
+            false,
+        ));
+    }
+    for global in cx.globals().iter().filter(|g| g.span.file == file) {
+        let name = cx.name_str(global.name);
+        if name.starts_with(prefix) {
+            out.push(item(
+                name,
+                6,
+                &format!("shared: {}", dump::ty_string(cx, global.ty)),
+                &global.doc,
+                "1",
+                false,
+            ));
+        }
+    }
+    for func in cx.funcs().iter().filter(|f| f.method_of == Some(sid)) {
+        let name = cx.name_str(func.name);
+        if name.starts_with(prefix) {
+            out.push(item(
+                name,
+                3,
+                &format!("script fn: {}", dump::ty_string(cx, func.ty)),
+                &func.doc,
+                "1",
+                false,
+            ));
+        }
     }
 }
 
@@ -667,8 +934,18 @@ fn func_in_module<'a>(prog: &'a Program, module: &str, name: &str) -> Option<&'a
     })
 }
 
-fn push_struct_members(cx: &IrCx, id: StructId, prefix: &str, out: &mut Vec<Completion>) {
+fn push_struct_members(
+    cx: &IrCx,
+    id: StructId,
+    file: FileId,
+    prefix: &str,
+    out: &mut Vec<Completion>,
+) {
+    let script_outside = cx.struct_def(id).script.is_some() && cx.struct_def(id).span.file != file;
     for field in &cx.struct_def(id).fields {
+        if script_outside {
+            break;
+        }
         let name = cx.name_str(field.name);
         if name.is_empty() || !name.starts_with(prefix) {
             continue;
@@ -679,6 +956,9 @@ fn push_struct_members(cx: &IrCx, id: StructId, prefix: &str, out: &mut Vec<Comp
         if func.method_of != Some(id) {
             continue;
         }
+        if script_outside && func.vis != Vis::Pub {
+            continue;
+        }
         let name = cx.name_str(func.name);
         if !is_ident_name(name) || !name.starts_with(prefix) {
             continue;
@@ -687,15 +967,33 @@ fn push_struct_members(cx: &IrCx, id: StructId, prefix: &str, out: &mut Vec<Comp
     }
 }
 
-fn push_methods<'a>(cx: &'a IrCx, id: StructId, name: &str, out: &mut Vec<(&'a Func, bool)>) {
+fn push_methods<'a>(
+    cx: &'a IrCx,
+    id: StructId,
+    name: &str,
+    file: FileId,
+    out: &mut Vec<(&'a Func, bool)>,
+) {
     for func in cx.funcs() {
         if func.method_of == Some(id) && cx.name_str(func.name) == name {
+            if cx.struct_def(id).script.is_some()
+                && cx.struct_def(id).span.file != file
+                && func.vis != Vis::Pub
+            {
+                continue;
+            }
             out.push((func, true));
         }
     }
 }
 
-fn push_methods_named<'a>(cx: &'a IrCx, struct_name: &str, method: &str, out: &mut Vec<(&'a Func, bool)>) {
+fn push_methods_named<'a>(
+    cx: &'a IrCx,
+    struct_name: &str,
+    method: &str,
+    file: Option<FileId>,
+    out: &mut Vec<(&'a Func, bool)>,
+) {
     for s in cx.structs() {
         if cx.name_str(s.name) != struct_name {
             continue;
@@ -703,7 +1001,7 @@ fn push_methods_named<'a>(cx: &'a IrCx, struct_name: &str, method: &str, out: &m
         let Some(id) = struct_id(cx, s) else {
             continue;
         };
-        push_methods(cx, id, method, out);
+        push_methods(cx, id, method, file.unwrap_or(FileId(0)), out);
     }
 }
 
@@ -803,6 +1101,7 @@ fn finish(prefix: &str, mut out: Vec<Completion>) -> Vec<Completion> {
     out
 }
 
+#[cfg(test)]
 fn file_src(prog: &Program, path: &str) -> String {
     query::file_by_path(&prog.cx, path)
         .map(|f| f.src.clone())
@@ -874,9 +1173,10 @@ fn struct_id(cx: &IrCx, def: &crate::ir::entity::StructDef) -> Option<StructId> 
 }
 
 fn func_at(cx: &IrCx, file: FileId, offset: u32) -> Option<&Func> {
-    cx.funcs().iter().rev().find(|func| {
-        func.span.file == file && offset >= func.span.start && offset <= func.span.end
-    })
+    cx.funcs()
+        .iter()
+        .rev()
+        .find(|func| func.span.file == file && offset >= func.span.start && offset <= func.span.end)
 }
 
 fn unknown_name(msg: &str) -> Option<&str> {
@@ -1561,6 +1861,88 @@ mod tests {
 
     fn labels(items: &[Completion]) -> Vec<&str> {
         items.iter().map(|c| c.label.as_str()).collect()
+    }
+
+    fn script_sample() -> (Program, String, String, String, String) {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../speculative/11_script");
+        let main = root.join("main.j3");
+        let script = root.join("scripts/door.j3s");
+        let prog = query::analyze(&main, &[]).expect("analyze script sample");
+        let main_src = std::fs::read_to_string(&main).unwrap();
+        let script_src = std::fs::read_to_string(&script).unwrap();
+        (
+            prog,
+            main.display().to_string(),
+            main_src,
+            script.display().to_string(),
+            script_src,
+        )
+    }
+
+    #[test]
+    fn script_path_and_props_complete() {
+        let (prog, main, src, _, _) = script_sample();
+        let partial = "module demo; const Door = @script(\"scripts/do";
+        let items = complete_buffer(
+            std::path::Path::new(&main),
+            &[],
+            partial,
+            partial.len() as u32,
+        );
+        assert!(
+            items.iter().any(|c| c.label == "scripts/door.j3s"),
+            "{:?}",
+            labels(&items)
+        );
+        let at = src.find("Door { hinge").unwrap() + "Door { ".len();
+        let items = complete_at(&prog, &main, &src, at as u32);
+        assert_eq!(items.first().map(|c| c.label.as_str()), Some("hinge"));
+        assert!(
+            items[0].detail.contains("required prop: Node"),
+            "{}",
+            items[0].detail
+        );
+        assert!(items
+            .iter()
+            .any(|c| c.label == "openAngle" && c.detail.contains("= 90")));
+        assert!(!items.iter().any(|c| c.label == "open"));
+    }
+
+    #[test]
+    fn script_scope_completion_and_outline() {
+        let (prog, main, src, script, script_src) = script_sample();
+        let at = script_src.find("if open").unwrap() + "if op".len();
+        let items = complete_at(&prog, &script, &script_src, at as u32);
+        assert!(items
+            .iter()
+            .any(|c| c.label == "open" && c.detail.contains("state")));
+        let at = src.find("front.toggle").unwrap() + "front.".len();
+        let members = complete_at(&prog, &main, &src, at as u32);
+        assert!(
+            members.iter().any(|c| c.label == "toggle"),
+            "{:?}",
+            labels(&members)
+        );
+        assert!(!members
+            .iter()
+            .any(|c| c.label == "open" || c.label == "smooth"));
+        let call_at = src.find("front.update(").unwrap() + "front.update(".len();
+        let sig = signature(&prog, &main, &src, call_at as u32).expect("script signature");
+        assert!(
+            sig.signatures[0].label.contains("update("),
+            "{}",
+            sig.signatures[0].label
+        );
+        assert!(
+            !sig.signatures[0].label.contains("this:"),
+            "{}",
+            sig.signatures[0].label
+        );
+        let outline = symbols(&prog, &script);
+        for wanted in ["props", "shared", "open", "t", "toggle"] {
+            assert!(outline.iter().any(|s| s.name == wanted), "missing {wanted}");
+        }
     }
 
     #[test]

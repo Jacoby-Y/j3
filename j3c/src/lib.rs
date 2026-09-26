@@ -6,6 +6,7 @@ pub mod check;
 pub mod cli;
 pub mod preflight;
 pub mod compile;
+pub mod devrun;
 pub mod diag;
 pub mod doc;
 pub mod editor;

@@ -1,8 +1,9 @@
 use crate::parse::ast::{
     AssignOpStmt, AssignStmt, BinOp, Block, ConstItem, DeferStmt, EnumItem, Expr, ExprKind,
     FieldItem, File, FnItem, ForEachStmt, ForStmt, Ident, IfStmt, InterpPart, Item, LetStmt,
-    LibFnDecl, MatchArm, MatchStmt, ModLetItem, Param, Pat, ReturnStmt, Stmt, StructItem, Type,
-    TypeKind, UnaryOp, UseItem, UseLibItem, UseLocalStmt, VariantItem, WhileStmt,
+    LibFnDecl, MatchArm, MatchStmt, ModLetItem, Param, Pat, ReturnStmt, ScriptBlockItem,
+    ScriptLetItem, Stmt, StructItem, Type, TypeKind, UnaryOp, UseItem, UseLibItem, UseLocalStmt,
+    VariantItem, WhileStmt,
 };
 
 struct ItemAttrs {
@@ -12,8 +13,8 @@ struct ItemAttrs {
 }
 use crate::parse::error::ParseError;
 use crate::parse::syntax::{
-    is_j3ui_widget, ATTR_DEBUG, ATTR_SINGLETON, ATTR_TRY_CATCH, INTRINSIC_SIZEOF, INTRINSIC_SLICE,
-    INTRINSIC_SYSCALL, J3UI_END, J3UI_IF, J3UI_POP,
+    is_j3ui_widget, ATTR_DEBUG, ATTR_SINGLETON, ATTR_TRY_CATCH, INTRINSIC_SCRIPT, INTRINSIC_SIZEOF,
+    INTRINSIC_SLICE, INTRINSIC_SYSCALL, J3UI_END, J3UI_IF, J3UI_POP, SCRIPT_PROPS, SCRIPT_SHARED,
 };
 use crate::parse::token::{Token, TokenKind};
 use crate::span::Span;
@@ -23,6 +24,17 @@ pub fn parse_tokens(tokens: &[Token]) -> Result<File, ParseError> {
         tokens,
         i: 0,
         j3ui_recv: None,
+        script_module: None,
+    };
+    p.file()
+}
+
+pub fn parse_script_tokens(tokens: &[Token], module: &[String]) -> Result<File, ParseError> {
+    let mut p = Parser {
+        tokens,
+        i: 0,
+        j3ui_recv: None,
+        script_module: Some(module.to_vec()),
     };
     p.file()
 }
@@ -32,15 +44,30 @@ struct Parser<'a> {
     i: usize,
     /// First parameter name while parsing an `@j3ui` body.
     j3ui_recv: Option<String>,
+    script_module: Option<Vec<String>>,
 }
 
 impl<'a> Parser<'a> {
     fn file(&mut self) -> Result<File, ParseError> {
         let start = self.cur().span;
         let doc = self.take_doc();
-        self.expect(TokenKind::Module, "expected `module`")?;
-        let module = self.path()?;
-        self.expect(TokenKind::Semi, "expected `;` after module path")?;
+        let module = if let Some(parts) = &self.script_module {
+            if self.cur().kind == TokenKind::Module {
+                return Err(self.err("scripts can't have a `module` line; the path names it"));
+            }
+            parts
+                .iter()
+                .map(|name| Ident {
+                    name: name.clone(),
+                    span: start,
+                })
+                .collect()
+        } else {
+            self.expect(TokenKind::Module, "expected `module`")?;
+            let module = self.path()?;
+            self.expect(TokenKind::Semi, "expected `;` after module path")?;
+            module
+        };
         let mut items = Vec::new();
         while self.cur().kind != TokenKind::Eof {
             items.push(self.item()?);
@@ -50,11 +77,15 @@ impl<'a> Parser<'a> {
             span: join(start, end),
             doc,
             module,
+            is_script: self.script_module.is_some(),
             items,
         })
     }
 
     fn item(&mut self) -> Result<Item, ParseError> {
+        if self.script_module.is_some() {
+            return self.script_item();
+        }
         let doc = self.take_doc();
         let attrs = self.attrs()?;
         let vis_pub = if self.cur().kind == TokenKind::Pub {
@@ -121,6 +152,103 @@ impl<'a> Parser<'a> {
                 Err(self.err("expected `use`, `const`, `fn`, `struct`, or `let`"))
             }
         }
+    }
+
+    fn script_item(&mut self) -> Result<Item, ParseError> {
+        let doc = self.take_doc();
+        if self.cur().kind == TokenKind::Module {
+            return Err(self.err("scripts can't have a `module` line; the path names it"));
+        }
+        let vis_pub = if self.cur().kind == TokenKind::Pub {
+            let _ = self.bump();
+            true
+        } else {
+            false
+        };
+        match self.cur().kind {
+            TokenKind::Use if self.look(1).kind == TokenKind::Lib => {
+                Err(self.err("scripts can't use `use lib`; import a J3 wrapper"))
+            }
+            TokenKind::Use if !vis_pub => {
+                self.forbid_doc(&doc)?;
+                Ok(Item::Use(self.use_item()?))
+            }
+            TokenKind::Const if !vis_pub => Ok(Item::Const(self.const_item(false, doc)?)),
+            TokenKind::Fn => Ok(Item::Fn(self.fn_item(vis_pub, doc)?)),
+            TokenKind::Ident if !vis_pub && self.cur().text == SCRIPT_PROPS => {
+                self.forbid_doc(&doc)?;
+                Ok(Item::Props(self.script_block(SCRIPT_PROPS)?))
+            }
+            TokenKind::Ident if !vis_pub && self.cur().text == SCRIPT_SHARED => {
+                self.forbid_doc(&doc)?;
+                Ok(Item::Shared(self.script_block(SCRIPT_SHARED)?))
+            }
+            TokenKind::Let if !vis_pub => {
+                self.forbid_doc(&doc)?;
+                Ok(Item::State(self.script_let()?))
+            }
+            _ => Err(self.err("scripts allow only `use`, `const`, `props`, `shared`, `let`, and `fn` at top level")),
+        }
+    }
+
+    fn script_block(&mut self, label: &str) -> Result<ScriptBlockItem, ParseError> {
+        let start = self.cur().span;
+        let name = self.ident()?;
+        if name.name != label {
+            return Err(ParseError::new(name.span, format!("expected `{label}`")));
+        }
+        self.expect(TokenKind::LBrace, &format!("expected `{{` after `{label}`"))?;
+        let mut fields = Vec::new();
+        while self.cur().kind != TokenKind::RBrace && self.cur().kind != TokenKind::Eof {
+            let doc = self.take_doc();
+            let name = self.ident()?;
+            self.expect(TokenKind::Colon, "expected `:` after script field")?;
+            let ty = self.ty()?;
+            let default = if self.cur().kind == TokenKind::Eq {
+                let _ = self.bump();
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            self.expect(TokenKind::Semi, "expected `;` after script field")?;
+            fields.push(FieldItem {
+                span: join(name.span, self.prev_end(name.span)),
+                doc,
+                name,
+                ty,
+                embedded: false,
+                default,
+            });
+        }
+        self.expect(TokenKind::RBrace, &format!("expected `}}` after `{label}`"))?;
+        Ok(ScriptBlockItem {
+            span: join(start, self.prev_end(start)),
+            fields,
+        })
+    }
+
+    fn script_let(&mut self) -> Result<ScriptLetItem, ParseError> {
+        let start = self.cur().span;
+        self.expect(TokenKind::Let, "expected `let`")?;
+        let name = self.ident()?;
+        let ty = if self.cur().kind == TokenKind::Colon {
+            let _ = self.bump();
+            Some(self.ty()?)
+        } else {
+            None
+        };
+        self.expect(
+            TokenKind::Eq,
+            "script state `let` needs a literal initializer",
+        )?;
+        let value = self.expr()?;
+        self.expect(TokenKind::Semi, "expected `;` after script state")?;
+        Ok(ScriptLetItem {
+            span: join(start, self.prev_end(start)),
+            name,
+            ty,
+            value,
+        })
     }
 
     fn take_doc(&mut self) -> String {
@@ -1326,6 +1454,17 @@ impl<'a> Parser<'a> {
                         },
                     };
                 }
+                TokenKind::LBrace if matches!(expr.kind, ExprKind::ScriptType(_)) => {
+                    let ExprKind::ScriptType(path) = expr.kind else {
+                        unreachable!()
+                    };
+                    let start = expr.span;
+                    let fields = self.script_lit_fields()?;
+                    expr = Expr {
+                        span: join(start, self.prev_end(start)),
+                        kind: ExprKind::ScriptLit { path, fields },
+                    };
+                }
                 TokenKind::Question => {
                     let _ = self.bump();
                     expr = Expr {
@@ -1527,6 +1666,25 @@ impl<'a> Parser<'a> {
                             },
                         })
                     }
+                    INTRINSIC_SCRIPT => {
+                        self.expect(TokenKind::LParen, "expected `(` after `@script`")?;
+                        let path = self.cur().clone();
+                        if path.kind != TokenKind::String {
+                            return Err(self.err("`@script` path must be a string literal"));
+                        }
+                        let _ = self.bump();
+                        if !path.text.ends_with(".j3s") {
+                            return Err(ParseError::new(
+                                path.span,
+                                "`@script` path must end in `.j3s`",
+                            ));
+                        }
+                        self.expect(TokenKind::RParen, "expected `)` after `@script` path")?;
+                        Ok(Expr {
+                            span: join(start, self.prev_end(start)),
+                            kind: ExprKind::ScriptType(path.text),
+                        })
+                    }
                     other => Err(ParseError::new(
                         name.span,
                         format!("unknown intrinsic `@{other}`"),
@@ -1706,6 +1864,29 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn script_lit_fields(&mut self) -> Result<Vec<(Ident, Expr)>, ParseError> {
+        self.expect(TokenKind::LBrace, "expected `{` after `@script` type")?;
+        let mut fields = Vec::new();
+        if self.cur().kind != TokenKind::RBrace {
+            loop {
+                let field = self.ident()?;
+                self.expect(TokenKind::Colon, "expected `:` after prop name")?;
+                let value = self.expr()?;
+                fields.push((field, value));
+                if self.cur().kind == TokenKind::Comma {
+                    let _ = self.bump();
+                    if self.cur().kind == TokenKind::RBrace {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace, "expected `}` after script literal")?;
+        Ok(fields)
+    }
+
     fn ident(&mut self) -> Result<Ident, ParseError> {
         let tok = self.cur().clone();
         if tok.kind != TokenKind::Ident && tok.kind != TokenKind::This {
@@ -1861,6 +2042,7 @@ fn parse_hole_expr(src: &str, span: Span) -> Result<Expr, ParseError> {
         tokens: &tokens,
         i: 0,
         j3ui_recv: None,
+        script_module: None,
     };
     let expr = p.expr()?;
     if p.cur().kind != TokenKind::Eof {

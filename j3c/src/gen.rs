@@ -15,7 +15,7 @@ pub fn cmd(rest: &[String]) -> i32 {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--help" | "-h" => {
-                println!("usage: j3c -e gen [--project DIR] [--force]\n\nRuns each assets/gen/<name>.j3 that changed since its last run; it writes\nassets/gen/<name>.j3mesh through j3.gfx.meshgen. --force runs them all.");
+                println!("usage: j3c -e gen [--project DIR] [--force]\n\nRuns each assets/gen/<name>.j3 that changed since its last run; it writes\nassets/gen/<name>.j3mesh through j3.gfx.meshgen. render, play, and build run it too.\nA script reruns when its own file or j3c changes, not when another project module\nit imports changes: run --force after editing one. --force runs them all.\nExample and API: `j3c doc recipes meshgen`, `j3c doc j3.gfx.meshgen`.");
                 return 0;
             }
             "--force" => force = true,

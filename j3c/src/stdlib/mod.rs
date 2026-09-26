@@ -32,6 +32,7 @@ const FILES: &[(&str, &str)] = &[
     ("data/save.j3", include_str!("../../stdlib/j3/data/save.j3")),
     ("data/scene.j3", include_str!("../../stdlib/j3/data/scene.j3")),
     ("scene3d.j3", include_str!("../../stdlib/j3/scene3d.j3")),
+    ("script.j3", include_str!("../../stdlib/j3/script.j3")),
     ("gfx/noise.j3", include_str!("../../stdlib/j3/gfx/noise.j3")),
     ("gfx/bvh.j3", include_str!("../../stdlib/j3/gfx/bvh.j3")),
     ("game/space.j3", include_str!("../../stdlib/j3/game/space.j3")),
@@ -50,6 +51,39 @@ const FILES: &[(&str, &str)] = &[
     ("scene3d/editor/uses.j3", include_str!("../../stdlib/j3/scene3d/editor/uses.j3")),
     ("gfx/voxel.j3", include_str!("../../stdlib/j3/gfx/voxel.j3")),
 ];
+
+/// A short hash of what `j3c doc`, `guide`, and help print in this build: the embedded stdlib
+/// and the Rust files holding the other pages. Two binaries with the same id print the same docs.
+pub fn docs_id() -> String {
+    const PAGES: &[&str] = &[
+        include_str!("../doc.rs"),
+        include_str!("../helptext.rs"),
+        include_str!("../cli.rs"),
+        include_str!("../editor.rs"),
+        include_str!("../scaffold.rs"),
+        include_str!("../scene.rs"),
+        include_str!("../mcp.rs"),
+        include_str!("../gen.rs"),
+        include_str!("../../editor/README.md"),
+        include_str!("../../stdlib/j3/gfx/urp/README.md"),
+    ];
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for text in FILES.iter().flat_map(|(name, src)| [*name, *src]).chain(PAGES.iter().copied()) {
+        for b in text.bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    format!("{:08x}", h >> 32)
+}
+
+/// Where this build reads the stdlib from, and its docs id.
+pub fn provenance() -> String {
+    if using_override() {
+        format!("stdlib from J3_STDLIB={}, docs {}", stdlib_dir().display(), docs_id())
+    } else {
+        format!("stdlib embedded, docs {}", docs_id())
+    }
+}
 
 /// True when `J3_STDLIB` names a directory that replaces the embedded sources.
 pub fn using_override() -> bool {

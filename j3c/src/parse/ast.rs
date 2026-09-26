@@ -12,6 +12,8 @@ pub struct File {
     /// `///` lines immediately above `module`.
     pub doc: String,
     pub module: Vec<Ident>,
+    /// Scripts get their module name from their path, not a `module` line.
+    pub is_script: bool,
     pub items: Vec<Item>,
 }
 
@@ -24,6 +26,23 @@ pub enum Item {
     Struct(StructItem),
     Enum(EnumItem),
     Let(ModLetItem),
+    Props(ScriptBlockItem),
+    Shared(ScriptBlockItem),
+    State(ScriptLetItem),
+}
+
+#[derive(Clone, Debug)]
+pub struct ScriptBlockItem {
+    pub span: Span,
+    pub fields: Vec<FieldItem>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScriptLetItem {
+    pub span: Span,
+    pub name: Ident,
+    pub ty: Option<Type>,
+    pub value: Expr,
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +354,13 @@ pub enum ExprKind {
     Syscall {
         args: Vec<Expr>,
     },
+    /// The type of a project-local `.j3s` file.
+    ScriptType(String),
+    /// `@script("path.j3s") { prop: value }`.
+    ScriptLit {
+        path: String,
+        fields: Vec<(Ident, Expr)>,
+    },
     SizeOf(Type),
     SliceFrom {
         ptr: Box<Expr>,
@@ -407,5 +433,29 @@ impl File {
             s.push_str(&part.name);
         }
         s
+    }
+}
+
+impl Expr {
+    /// `-3` and `-0.5` as the literals they are (the parser keeps them as negation).
+    pub fn folded_literal(&self) -> Expr {
+        if let ExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } = &self.kind
+        {
+            let kind = match expr.kind {
+                ExprKind::Int(v) => Some(ExprKind::Int(v.wrapping_neg())),
+                ExprKind::Float(v) => Some(ExprKind::Float(-v)),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                return Expr {
+                    span: self.span,
+                    kind,
+                };
+            }
+        }
+        self.clone()
     }
 }

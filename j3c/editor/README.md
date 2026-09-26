@@ -6,12 +6,12 @@ j3c editor ./my-game
 ```
 
 The first command creates a runnable J3 project with a camera and a cube using
-the example `spin` behavior. The
+the example `scripts/spin.j3s` script. The
 second opens an existing project. If that project has no editor scene, the
 command adds `j3.editor.toml` and `scenes/main.j3scene` without changing its
 entry point. To render that scene in an existing game:
 
-- Load it with `j3.scene3d.load` during boot. `behaviors.scene()` names the scene Play picked.
+- Load it with `j3.scene3d.load` during boot. `scripts.scene()` (`use j3.scene3d.scripts;`) names the scene Play picked.
 - Call `scene3d.upload` after `gfx.init`.
 - Each frame:
   - take the lighting with `scene3d.environment`;
@@ -67,7 +67,7 @@ Right-click an object (in the viewport or the hierarchy) for these actions:
 
 Commands act on every selected object. Right-click empty space for Paste and Add;
 objects added from the viewport land where you clicked. Copies include children,
-their behavior field values, and a placed scene's overrides. Paste puts the copy next to the selection.
+their script props, and a placed scene's overrides. Paste puts the copy next to the selection.
 
 | Key | Action |
 |-----|--------|
@@ -154,7 +154,7 @@ scene opens you are asked whether to recover it.
 
 ### Colors
 
-Every color (lights, mesh and placed-scene tints, scene lighting, materials, `color` behavior fields) is a
+Every color (lights, mesh and placed-scene tints, scene lighting, materials) is a
 swatch with its hex code. Click the swatch to open the picker:
 
 - drag in the square for saturation and brightness, and on the bar for hue;
@@ -203,12 +203,12 @@ open scene.
 To change one copy only:
 
 - Turn on **Edit placed objects** in its inspector, which lists its objects in the hierarchy (tagged `placed`). In the viewport, Alt+click selects one of them directly.
-- Edit its transform, name, mesh, texture, material, and behavior fields. The changes are saved in the outer scene as overrides for that copy. This works for objects from scenes nested inside the placed one too, and a placed scene's own overrides of what it places come along.
+- Edit its transform, name, mesh, texture, material, script, and script props. The changes are saved in the outer scene as overrides for that copy. This works for objects from scenes nested inside the placed one too, and a placed scene's own overrides of what it places come along.
 - **Revert to the scene file** drops them.
 - Placed objects can't be deleted or re-parented; do that in their own scene. Objects from scenes nested deeper can't be overridden.
 
 At runtime `scene3d.load` adds each placed scene's objects under its node (they
-have `owner` set to that node's id), with their behaviors, field values, and
+have `owner` set to that node's id), with their scripts, prop values, and
 overrides, so game code needs no changes. `scene3d.store` writes only the scene's
 own objects and their overrides.
 
@@ -373,9 +373,11 @@ is a `uFx_<name>` uniform; 8 params at most. `uTime` (seconds) and `uResolution`
 with the `.j3fx` line, and a broken effect draws as if it weren't there. Agents set
 `effects=a.j3fx|b.j3fx` and `fx.<stem>.<param>=` on cameras with `set`.
 
-Limits: URP traces and shadows ignore material effects (a displaced mesh casts its
-undisplaced shadow), surfaces with an effect skip URP's traced shadows, mirrors, and
-glass, and the corner camera preview shows no camera effects.
+Limits: `displace` also runs in the shadow map pass, so displaced meshes cast displaced
+shadows, but URP traces ignore material effects (reflections show the undisplaced mesh),
+surfaces with an effect skip URP's traced shadows, mirrors, and glass, and the corner
+camera preview shows no camera effects. `examples/editor_village/assets/fx/wind.j3fx`
+bends the crops with `displace`.
 
 ### URP
 
@@ -395,49 +397,62 @@ Settings:
 A scene placing a scene that uses URP uses it too; its inspector shows
 "*Using URP" and which placed scene turned it on. Games need nothing extra: the
 tracer runs whenever the drawn scene uses URP. Traced hits use material colors, not
-textures, and at most 65536 triangles are traced.
+textures. Copies of a mesh share its triangles; at most 262144 triangles across the
+distinct meshes are traced.
 
-### Behaviors
+### Scripts
 
-**Create behavior** makes `src/behaviors/<name>.j3` with `start` and `update`
-callbacks. Type that name in a node's **Behavior** field to attach it. One
-behavior can be attached to several nodes. The callbacks receive the scene and
-the object's stable id. They read that object's data with `scene3d.index`,
-`scene3d.world`, and the field getters below. The editor generates
-`src/behaviors.j3` as the dispatcher. It contains `MAIN_SCENE`, set to the scene
-path from `j3.editor.toml`, and `scene()`, which returns the scene Play chose.
-Keep custom logic in the individual behavior files. For an existing game, call
-its `behaviors.start` and `behaviors.update` functions from the appropriate game
-stages after opting into the scene.
+A script is a `.j3s` file anywhere in the project (`j3c doc lang`, Scripts). Type
+its path (`scripts/spin.j3s`) in an object's **Script** field to attach it; one
+script can be on many objects, and each gets its own instance. **Create script**
+makes `scripts/<name>.j3s` with a `props` block and the two functions the scene
+calls:
 
-Declare inspector fields in `j3.editor.toml`:
+```j3
+use j3.scene3d.{ Scene, NodeId };
 
-```toml
-[editor]
-scene = "scenes/main.j3scene"
+props {
+    node: NodeId;          // the object this copy is on (unless the scene sets it)
+    speed: f32 = 1.0;      // shown in the inspector
+}
 
-[behavior.spin]
-fields = ["speed:f32=1.0", "enabled:bool=true", "caption:string=hello"]
+pub fn start(scene: &Scene) {
+}
+
+pub fn update(scene: &Scene, dt: f32) {
+    let n = scene.node(node);
+    n.rotation.y += speed * dt;
+}
 ```
 
-Press **Rescan (F5)** after changing the behavior list or fields. Field values
-are stored per object in the scene file, and the default is used until an
-object's value is changed.
+The inspector shows the script's props; press **Rescan (F5)** after changing a
+props block. Values are stored per object as `param.<id>.<prop>` lines, and a
+prop keeps its default until an object sets it. A prop with no default must be
+set on every object the script is on; `j3c check` points at the scene line when
+one isn't, or when a value has the wrong type.
 
-| Type | Default after `=` | Inspector | Read with |
-|------|-------------------|-----------|-----------|
-| `f32` | a number | number box | `scene3d.number` |
-| `int` | a whole number | number box, rounded | `scene3d.integer` |
-| `bool` | `true` or `false` | switch | `scene3d.flag` |
-| `string` | text | text field | `scene3d.label` |
-| `vec3` | `x,y,z` | three number boxes | `scene3d.vector` |
-| `color` | `r,g,b` in 0..1 | a swatch that opens the color picker | `scene3d.vector` |
-| `choice` | options, `walk\|run\|fly`; the first is the default | button that cycles | `scene3d.label` |
-| `asset` | a path | text field; **Pick**, then click an asset | `scene3d.label` |
-| `object` | none | button; click it, then an object | `scene3d.object` (an id, or 0) |
+| Prop type | Inspector | Scene line |
+|-----------|-----------|------------|
+| `f32`, `f64` | number box | `param.<id>.<prop> f=1.5` |
+| `int` and sized ints | number box, rounded | `param.<id>.<prop>=3` |
+| `bool` | switch | `param.<id>.<prop>=1` |
+| `string` | text field | `param.<id>.<prop> s=text` |
+| `Vec3` | three number boxes | `.x` / `.y` / `.z` numbers |
+| `NodeId` | button; click it, then an object | `param.<id>.<prop> r=<object id>` |
 
-An `object` field follows copies: when an object and the object it points at are
+A `NodeId` prop follows copies: when an object and the object it points at are
 copied or placed together, the copy points at the other copy.
+
+The game runs attached scripts through `j3.scene3d.scripts`, which `j3c` makes
+from the project's scenes: `scripts.scene()` is the scene Play picked (else the
+one in `j3.editor.toml`), `scripts.start(&scene)` makes every instance and runs
+its `start`, `scripts.update(&scene, dt)` runs every `update`, and
+`scene.script::<Spin>(node)` finds one object's instance
+(`const Spin = @script("scripts/spin.j3s");`). New projects already call these.
+
+**Play** builds the game in dev mode when it has scripts: editing a script while
+the game runs swaps the new code in at the next frame, and a change to a script's
+props or state relaunches the same game binary. Neither compiles the game again.
 
 The editor targets Linux with SDL2, OpenGL 3.3, and SDL2_ttf. It bundles
 a UI font for its panels; projects can supply their own meshes

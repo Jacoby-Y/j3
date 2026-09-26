@@ -522,7 +522,11 @@ fn fold_access(cx: &IrCx, start: Access, projs: &[Proj], start_ty: Ty) -> Access
                 }
                 access = Access::through_ref();
             }
-            Proj::Field { ty: field_ty, .. } => {
+            Proj::Field { field, ty: field_ty } => {
+                if cx.struct_def(field.struct_id).script.as_ref()
+                    .is_some_and(|meta| (field.index as usize) < meta.prop_spans.len()) {
+                    access = Access::read_only_view();
+                }
                 ty = *field_ty;
             }
             Proj::Index { ty: elem_ty, .. } => {

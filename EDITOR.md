@@ -2,7 +2,7 @@
 
 ## Implemented
 
-- `j3c editor --new PATH` creates a runnable project with `j3.toml`, `j3.editor.toml`, a scene, a camera, a cube, and an example behavior. `j3c editor PATH` opens an existing project and adds editor files without changing its game entry point.
+- `j3c editor --new PATH` creates a runnable project with `j3.toml`, `j3.editor.toml`, a scene, a camera, a cube, and an example script (`scripts/spin.j3s`). `j3c editor PATH` opens an existing project and adds editor files without changing its game entry point.
 - The window: a toolbar, the hierarchy and assets on the left, the 3D viewport, the inspector on the right, and a status bar with hints. Both side panels and the hierarchy/assets split are resizable by dragging, and remembered.
 - **Get Asset** (toolbar) opens a tab that searches free CC0 models, materials, and skies online (Poly Haven, ambientCG, Kenney packs, with previews of each pack's models), shows the picked one's details, and adds it to the project; credits go in `assets/CREDITS.txt`.
 - The session (open tabs, split views, per-tab cameras, selections, folds, console) is saved in `target/j3-editor/session` and restored on the next launch.
@@ -27,9 +27,10 @@
 - Lights and scene lighting:
   - Point lights; eight shine at once, including glowing materials set to light other objects.
   - Sun direction and color, sky/ambient color, fog, and sun shadows, stored in the scene and used by the editor and the game template alike.
-- Behaviors:
-  - Named J3 behaviors with per-object `f32`, `bool`, `string`, `int`, `vec3`, `color`, `choice`, `asset`, and `object` fields.
-  - Object fields follow copies of the object they point at.
+- Scripts:
+  - `.j3s` scripts attached to objects, with per-object props (`f32`, `int`, `bool`, `string`, `Vec3`, `NodeId`) from the script's `props` block; `j3c check` reports a missing or mistyped prop at the scene line.
+  - `NodeId` props follow copies of the object they point at.
+  - Play runs scripts on the VM: a script edit swaps into the running game, or relaunches it when the script's layout changed, without compiling the game.
 - Assets:
   - Import `.gltf`/`.glb`/`.j3mesh` by path, file picker, or drag-and-drop onto the window, as pasted objects or as a reusable scene file.
   - glTF alpha-mask and alpha-blend materials import; see-through meshes draw last, farthest first.
@@ -58,7 +59,7 @@
 
 `j3c -e mcp` is an MCP server (stdio). Add it once with `claude mcp add -s user j3 -- j3c -e mcp` (the editor's **Agent** button copies this). It follows the project `j3c editor` has open, else the one around the current directory; `--project PATH` pins one. The Agent panel can turn agent access off and shows recent requests. Tools: `scene_list`, `scene_get`, `scene_add`, `scene_add_many` (one step, all or nothing), `scene_set`, `scene_delete`, `place` (ground, ontop, scatter, grid: modular pieces at cell x,z, floor, quarter turns), `undo` (editor closed: puts back the scene file from before the last tool change; 20 kept in `target/j3-editor/history/`), `render` (returns the image), `check` (scenes and code), `play` (runs N frames headless, returns the last frame and output), `console`, `import`, `asset_search`, `asset_online_search` and `asset_fetch` (Poly Haven, ambientCG, Kenney; see below), `gen`. Objects are named by name, `Parent/Child` path, or `#id`; rotations are degrees.
 
-While `j3c editor` has the project open, scene tools and `render` act on the live editor: each change is one undo step, nothing is saved until you save (or the agent passes `save`), and renders include unsaved edits. Scenes the editor doesn't have open are edited as files. The same operations are on the command line: `j3c -e scene --help`, `j3c -e render --help`.
+While `j3c editor` has the project open, scene tools and `render` act on the live editor: each change is one undo step, nothing is saved until you save (or the agent passes `save`), and renders include unsaved edits. Scenes the editor doesn't have open are edited as files. The same operations are on the command line: `j3c -e scene --help`, `j3c -e render --help`; `j3c -e mcp --tools` lists every tool's arguments next to its CLI command. Every edit reply says whether it went to the open editor or the file.
 
 How it works: the scene operations are `j3c/editor/src/tool.j3` and `render.j3`, run by the editor binary in headless `cli`/`render` modes (`J3_EDITOR_MODE`), so `scene3d` stays the only reader and writer of scene files. `j3c/src/scene.rs` runs them and turns replies into JSON; `j3c/src/mcp.rs` is the server. Live commands go through the events file as `cmd` lines (`live.j3`), and replies come back on the editor's stdout as `J3EDITOR REPLY` lines, which the host appends to `target/j3-editor/replies`. Renders use SDL's offscreen video driver, so no display is needed.
 
@@ -83,13 +84,13 @@ Read [`j3c/AGENTS.md`](j3c/AGENTS.md) for compiler and language constraints befo
 | Area | Source of truth |
 |------|-----------------|
 | CLI entry and help | `j3c/src/cli.rs` dispatches `editor` to `j3c/src/editor.rs`. |
-| Project setup and desktop host | `j3c/src/editor.rs` creates project files, reads `j3.editor.toml`, generates behavior and asset catalogs, builds the editor once per `j3c` version into `~/.cache/j3/scene3d/editor/` (`J3_EDITOR_SRC=path/to/editor/src` builds from disk instead of the embedded copy), launches it, and handles the editor's `J3EDITOR` requests on stdout: PLAY/STOP, IMPORT/PICK, BEHAVIOR, RESCAN, RENAME/DELETE. Messages back to the editor are lines appended to `target/j3-editor/events`. |
+| Project setup and desktop host | `j3c/src/editor.rs` creates project files, reads `j3.editor.toml`, generates the script and asset catalogs, builds the editor once per `j3c` version into `~/.cache/j3/scene3d/editor/` (`J3_EDITOR_SRC=path/to/editor/src` builds from disk instead of the embedded copy), launches it, and handles the editor's `J3EDITOR` requests on stdout: PLAY/STOP, IMPORT/PICK, SCRIPT, RESCAN, RENAME/DELETE. Messages back to the editor are lines appended to `target/j3-editor/events`. |
 | Editor window and interactions | `j3c/editor/src/` (one module per file, entry `main.j3`) owns the viewport, panels, selection, transforms, undo (diff-based `Delta` steps), autosave, overrides of placed objects, the material panel, and commands sent to the host. |
 | Scene format and runtime API | `j3c/stdlib/j3/scene3d.j3` loads/stores scenes, expands placed scenes (`INSTANCE`, `expand`, `refresh`, `uses`), applies per-placement overrides (`over.*` lines), manages nodes, per-object fields, lights, scene lighting (`scene.env.*`), and materials, uploads meshes, and draws them (see-through ones last). It is embedded through `j3c/src/stdlib/mod.rs`. |
 | Asset conversion | `j3c/src/gltf.rs` imports static glTF/GLB and `.j3mesh` into project assets and writes each import to its own `target/j3-editor/import-<n>.j3scene`, which the editor pastes into the scene, or moves it to `assets/imported/<name>.j3scene` to be placed as a scene. |
 | Supporting UI/rendering | `j3c/stdlib/j3/ui.j3`, `gfx.j3` (lit shader, `Surface`, `ViewState` for extra views), `noise.j3` (material noise), `bvh.j3` (the triangle BVH URP traces), `mesh.j3`, and `game.j3`. |
 
-Project-owned files are `j3.editor.toml`, `scenes/*.j3scene`, `assets/`, and `src/behaviors/*.j3`. The host generates `src/behaviors.j3`; change the generator in `editor.rs` when changing its contract. `target/j3-editor/` holds catalogs, the events log, import output, build logs, autosaves, editor prefs, and the asset trash. See [`j3c/editor/README.md`](j3c/editor/README.md) for the user-facing behavior and field format.
+Project-owned files are `j3.editor.toml`, `scenes/*.j3scene`, `assets/`, and `scripts/*.j3s`. `j3c` makes `j3.scene3d.scripts` from the scenes in memory (`j3c/src/compile/scene_scripts.rs`); nothing is generated into `src/`. `target/j3-editor/` holds catalogs, the events log, import output, build logs, autosaves, editor prefs, and the asset trash. See [`j3c/editor/README.md`](j3c/editor/README.md) for the user-facing script and prop format.
 
 ## MCP Fixes
 
@@ -186,7 +187,7 @@ Plan 007 (2026-09-25), headless at the spawn view on an RTX 5060 Ti, from `J3STA
 - Material effects draw with the plain lit variant, so a surface with an effect gets no traced shadows, mirrors, or glass.
 - The corner camera preview doesn't run camera effects; the viewport's camera view (0) and Play do.
 - Outline effects need a normal buffer.
-- Underwater switching (a camera inside a volume) is a behavior's job: it can set the camera's `effects` field.
+- Underwater switching (a camera inside a volume) is a script's job: it can set the camera's `effects` field.
 - The hook runs before fog; an effect that should skip fog needs a flag.
 - Renaming a `.j3fx` doesn't rewrite the `.j3mat` files or camera `effects` fields that use it.
 - `j3c -e scene check` finds missing effect files but can't compile GLSL (no GL); broken effects show in `-e render` output only as a stock-looking render.
@@ -227,4 +228,4 @@ The blockers:
 - Noise has no simplex type, since simplex doesn't tile on a square texture.
 - No normal or roughness maps: there are no tangents in the forward shader, so Poly Haven models look flat. The glTF importer warns when it drops them.
 
-See [the detailed editor guide](j3c/editor/README.md) for controls, behavior definitions, and import limits.
+See [the detailed editor guide](j3c/editor/README.md) for controls, scripts, and import limits.

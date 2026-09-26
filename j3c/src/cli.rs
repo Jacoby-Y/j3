@@ -31,11 +31,18 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
         "help" | "--help" | "-h" => help_cmd(rest),
         "version" | "--version" | "-V" => {
             println!("j3c {VERSION}");
+            if rest.iter().any(|a| a == "--verbose" || a == "-v") {
+                print_provenance();
+            }
             0
         }
         "dump-ir" => dispatch(rest, dump_ir_hello, dump_ir_samples, dump_ir_path, false),
         "dump-c" => dispatch(rest, dump_c_hello, dump_c_samples, dump_c_path, false),
         "dump-llvm" => dispatch(rest, dump_ll_hello, dump_ll_samples, dump_ll_path, false),
+        "dump-bc" => match rest.first() {
+            Some(path) => dump_bc_path(path),
+            None => { eprintln!("usage: j3c dump-bc <file.j3s>"); 1 }
+        },
         "dump-syntax" => dump_syntax(rest),
         "new" => crate::scaffold::cmd(rest),
         "editor" => crate::editor::cmd(rest),
@@ -76,9 +83,33 @@ fn editor_tool(args: &[String]) -> i32 {
         Some("render") => crate::scene::render_cmd(rest),
         Some("gen") => crate::gen::cmd(rest),
         Some("mcp") => crate::mcp::cmd(rest),
+        Some("script-props") => script_props_cmd(rest),
         other => {
             if let Some(o) = other { eprintln!("j3c -e: unknown editor tool `{o}`"); }
-            eprintln!("usage: j3c -e scene|render|gen|mcp ...  (or --editor)");
+            eprintln!("usage: j3c -e scene|render|gen|mcp|script-props ...  (or --editor)");
+            1
+        }
+    }
+}
+
+/// `j3c -e script-props <scripts/door.j3s>`: the props the inspector edits, as JSON
+/// (name, type, default, required). Run from the project root.
+fn script_props_cmd(rest: &[String]) -> i32 {
+    let Some(rel) = rest.first() else {
+        eprintln!("usage: j3c -e script-props <path.j3s>");
+        return 1;
+    };
+    let root = match project::resolve_cwd() {
+        Ok(Input::Project(m)) => m.root,
+        _ => PathBuf::from("."),
+    };
+    match crate::editor::script_props_json(&root, rel) {
+        Ok(json) => {
+            println!("{json}");
+            0
+        }
+        Err(e) => {
+            print_fail(&e);
             1
         }
     }
@@ -216,22 +247,29 @@ fn print_help() {
     println!("commands:");
     println!("    new [name]       write j3.toml, src/main.j3, and AGENTS.md (hello)");
     println!("    new [name] --app SDL window (links SDL2)");
+    println!("    new [name] --template fps  first-person 3D game with a scene (SDL2 + GL)");
     println!("    editor [--new] [project]  open the 3D scene editor");
     println!("    -e scene <op> ... list/get/add/set/delete/check scene objects by name (`-e scene --help`)");
     println!("    -e render [opts] draw a scene to a PNG without a window (`-e render --help`)");
     println!("    -e gen [--force] run assets/gen/*.j3 mesh generators that changed");
     println!("    -e mcp [--project D] MCP server for agents: edit, render, check, play scenes");
+    println!("    -e mcp --tools   every MCP tool's arguments and the CLI command doing the same");
+    println!("    -e script-props <f.j3s>  a script's props as JSON (what the inspector edits)");
     println!("                     (-e is short for --editor)");
     println!("    guide            how to start a project");
     println!("    check [path]     typecheck; no emit or link");
     println!("    check --json     one JSON object on stdout");
-    println!("    doc [module]     list stdlib modules, or one module's public items");
+    println!("    doc [module]     tasks and stdlib modules, or one module's public items (`doc --help`)");
+    println!("    doc search <w>   public names containing a word, in any module");
+    println!("    doc recipes      complete checked programs: 2D app, 3D scene, canvas, script, ...");
     println!("    doc lang         language");
     println!("    doc j3ui         UI component syntax");
     println!("    build [path]     emit, compile, write `target/<name>`");
     println!("    run [path]       emit, compile, execute");
-    println!("    run --frames N [--screenshot F.png] [--headless]  stop an App after N frames");
-    println!("    fmt [path]       pretty-print `.j3` (same lexer; keeps comments)");
+    println!("    run --frames N [--screenshot F.png] [--headless]  stop an App after N frames;");
+    println!("                     F.png is relative to where you run j3c, not the project");
+    println!("    run --file f.j3  run that one file even inside a project");
+    println!("    fmt [path]       pretty-print `.j3` and `.j3s` (same lexer; keeps comments)");
     println!("    fmt --write      rewrite files");
     println!("    fmt --check      exit 1 if formatting would change a file");
     println!("    lsp              language server (stdio JSON-RPC)");
@@ -239,6 +277,7 @@ fn print_help() {
     println!("    dump-ir samples  print hand-built place-IR samples");
     println!("    dump-c [path]    print C from the program");
     println!("    dump-llvm [path] print LLVM IR from the program");
+    println!("    dump-bc <file.j3s> print script bytecode");
     println!("    dump-syntax [f]  print TextMate grammar (lexer/parser names)");
     println!("    --fast           with run/build: strip bounds-check Abort; no `-g`");
     println!("    --emit llvm|c    backend (default llvm; override [emit] backend)");
@@ -246,6 +285,7 @@ fn print_help() {
     println!("    run samples      emit, compile, execute place tests");
     println!("    help manifest    print j3.toml keys");
     println!("    version          print version");
+    println!("    version --verbose  docs id, stdlib source, binary path: spot a stale j3c");
     println!("    help             print this help");
     println!();
     println!("A path may be a `.j3` file, a `j3.toml`, or a directory with `j3.toml`.");
@@ -253,7 +293,23 @@ fn print_help() {
     println!("dump-ir, dump-c, and dump-llvm still fall back to the built-in hello.");
     println!("emit: LLVM by default (clang); C is optional. Options live in [emit] of j3.toml.");
     println!("run/build of a project executes with cwd = package root (`J3_ROOT`).");
+    println!("J3C_TIMINGS=1 prints how long each build phase took to stderr (`j3c help manifest`).");
     println!("`j3c guide` is the short start. `j3c doc` lists the standard library.");
+}
+
+/// `j3c version --verbose`: where this build's docs and sources come from.
+fn print_provenance() {
+    let from = |var: &str| match std::env::var(var) {
+        Ok(v) if !v.is_empty() => format!("{var}={v}"),
+        _ => "embedded in this binary".to_string(),
+    };
+    println!("docs     {} (`j3c doc` prints the same id; another id means other docs)", crate::stdlib::docs_id());
+    println!("stdlib   {}", from("J3_STDLIB"));
+    println!("editor   {}", from("J3_EDITOR_SRC"));
+    match std::env::current_exe() {
+        Ok(p) => println!("binary   {}", p.display()),
+        Err(e) => println!("binary   unknown ({e})"),
+    }
 }
 
 fn dump_syntax(rest: &[String]) -> i32 {
@@ -292,15 +348,7 @@ fn compile_input(input: &Input) -> Result<(compile::Program, Option<Manifest>), 
     match input {
         Input::Hello => Ok((compile::compile_path(&compile::default_hello_path())?, None)),
         Input::File(p) => Ok((compile::compile_path(p)?, None)),
-        Input::Project(m) => {
-            // The editor's generated dispatch follows j3.editor.toml (main scene, behaviors).
-            if m.root.join("j3.editor.toml").is_file() {
-                if let Err(e) = crate::editor::generate_dispatch(&m.root, &m.name) {
-                    eprintln!("warning: src/behaviors.j3: {e}");
-                }
-            }
-            Ok((compile::compile_manifest(m)?, Some(m.clone())))
-        }
+        Input::Project(m) => Ok((compile::compile_manifest(m)?, Some(m.clone()))),
     }
 }
 
@@ -336,6 +384,41 @@ fn dump_ir_hello() -> i32 {
 
 fn dump_ir_path(path: &str) -> i32 {
     dump_ir_prog(compile_entry(Some(path)))
+}
+
+fn dump_bc_path(path: &str) -> i32 {
+    if !path.ends_with(".j3s") {
+        eprintln!("j3c dump-bc: expected a .j3s file");
+        return 1;
+    }
+    match compile::analyze_path(Path::new(path), &[]) {
+        Ok(prog) => {
+            let script = prog.modules.iter().find(|module| {
+                module.structs.iter().any(|id| {
+                    prog.cx.struct_def(*id).script.as_ref().is_some_and(|meta| {
+                        Path::new(&meta.path).ends_with(path)
+                    })
+                })
+            });
+            match script.map(|module| emit::bc::emit_script(&prog.cx, module)) {
+                Some(Ok(bc)) => {
+                    let root = match project::resolve(Path::new(path)) {
+                        Ok(Input::Project(manifest)) => manifest.root,
+                        _ => Path::new(path).parent().unwrap_or(Path::new(".")).to_path_buf(),
+                    };
+                    if let Err(e) = bc.write_to(&root) {
+                        eprintln!("j3c dump-bc: {e}");
+                        return 1;
+                    }
+                    print!("{}", bc.dump());
+                    0
+                }
+                Some(Err(e)) => { eprintln!("j3c dump-bc: {e}"); 1 }
+                None => { eprintln!("j3c dump-bc: no script module for {path}"); 1 }
+            }
+        }
+        Err(e) => { print_fail(&e); 1 }
+    }
 }
 
 fn dump_ir_prog(prog: Result<(compile::Program, Option<Manifest>), String>) -> i32 {
@@ -461,11 +544,53 @@ fn dump_c_samples() -> i32 {
 }
 
 fn run_cwd() -> i32 {
-    run_loaded(compile_user(None), None)
+    run_user(None)
 }
 
 fn run_path(path: &str) -> i32 {
-    run_loaded(compile_user(Some(path)), None)
+    run_user(Some(path))
+}
+
+/// A project with scripts runs in dev mode (`devrun`); everything else runs as before.
+fn run_user(path: Option<&str>) -> i32 {
+    if let Ok(Input::Project(m)) = load_input(path) {
+        let manifest = Some(m.clone());
+        let opts = match emit_opts(&manifest) {
+            Ok(opts) => opts,
+            Err(e) => {
+                print_fail(&e);
+                return 1;
+            }
+        };
+        crate::gen::before_build(&m.root);
+        let fast = FAST.load(std::sync::atomic::Ordering::Relaxed);
+        return match crate::devrun::prepare(&m, &opts, fast) {
+            Ok(crate::devrun::Prepared::NoScripts(prog)) => run_loaded(Ok((*prog, manifest)), None),
+            Ok(crate::devrun::Prepared::Dev(mut built)) => {
+                match crate::devrun::watch(&m, &opts, fast, &mut built) {
+                    Ok(code) => {
+                        if code != 0 {
+                            eprintln!("j3c: program exited {code}");
+                        }
+                        code
+                    }
+                    Err(e) => {
+                        print_fail(&e);
+                        1
+                    }
+                }
+            }
+            Err(e) => {
+                print_fail(&e);
+                1
+            }
+        };
+    }
+    run_loaded(compile_user(path), None)
+}
+
+pub(crate) fn print_error(e: &str) {
+    print_fail(e);
 }
 
 fn print_fail(e: &str) {
@@ -879,7 +1004,7 @@ fn fmt_cmd(rest: &[String]) -> i32 {
         }
     };
     if files.is_empty() {
-        eprintln!("j3c: no `.j3` files to format");
+        eprintln!("j3c: no `.j3` or `.j3s` files to format");
         return 1;
     }
     let mut dirty = 0;
@@ -934,7 +1059,7 @@ fn collect_j3(path: Option<&str>) -> Result<Vec<PathBuf>, String> {
             let here = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
             let src = here.join("src");
             if src.is_dir() {
-                list_j3(&src)
+                list_project_sources(&here)
             } else {
                 list_j3(&here)
             }
@@ -944,7 +1069,7 @@ fn collect_j3(path: Option<&str>) -> Result<Vec<PathBuf>, String> {
             if p.is_dir() {
                 let src = p.join("src");
                 if src.is_dir() {
-                    list_j3(&src)
+                    list_project_sources(&p)
                 } else {
                     list_j3(&p)
                 }
@@ -953,6 +1078,19 @@ fn collect_j3(path: Option<&str>) -> Result<Vec<PathBuf>, String> {
             }
         }
     }
+}
+
+/// `src/**/*.j3` plus every `.j3s` under the project root (scripts can live anywhere).
+fn list_project_sources(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = list_j3(&root.join("src"))?;
+    for rel in crate::compile::script_paths(root) {
+        let path = root.join(rel);
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn list_j3(dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -1054,7 +1192,7 @@ fn walk_j3(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
         let p = ent.path();
         if p.is_dir() {
             walk_j3(&p, out)?;
-        } else if p.extension().and_then(|e| e.to_str()) == Some("j3") {
+        } else if matches!(p.extension().and_then(|e| e.to_str()), Some("j3" | "j3s")) {
             out.push(p);
         }
     }
