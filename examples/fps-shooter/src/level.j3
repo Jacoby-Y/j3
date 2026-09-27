@@ -1,0 +1,494 @@
+// Collision boxes, jump pads and hazards read from the scene once, filed in a grid of cells so a
+// query only looks at boxes nearby, and bullets against the scene's triangles.
+
+module fps_shooter.level;
+
+use j3.gfx.Ray;
+use j3.math.{ Mat4, Vec3, abs, atan2, clamp, max, maxi, min };
+use j3.memory.Arena;
+use j3.scene3d;
+use j3.scene3d.{ Node, Scene, CAMERA, MESH };
+use j3.text;
+
+/// Box kinds, from the top-level object's name: `Lava...`, `Ice...`, `JumpPad...`, or plain.
+pub const SOLID: int = 0;
+pub const PAD: int = 1;
+pub const LAVA: int = 2;
+pub const ICE: int = 3;
+/// A locked border between biomes (see `setGates`).
+pub const BARRIER: int = 4;
+/// The biome grid (tools/arena.j3s): 3 by 3 tiles of TILE from -HALF on x and z.
+const TILE: f32 = 110;
+const HALF: f32 = 165;
+/// Borders between neighbouring tiles.
+pub const EDGES: int = 12;
+const HUB: int = 4;
+/// Grid cell size, in metres.
+const CELL: f32 = 8;
+
+/// A world-space box. `launch` above 0 makes it a jump pad with that upward speed.
+pub struct Box {
+    lo: Vec3;
+    hi: Vec3;
+    launch: f32;
+    kind: int;
+}
+
+/// The grid cells a query covers, and where the walk through them is.
+pub struct Scan {
+    x0: int;
+    x1: int;
+    z0: int;
+    z1: int;
+    cx: int;
+    cz: int;
+    k: int;
+    end: int;
+}
+
+pub struct Level {
+    boxes: []Box;
+    count: int;
+    /// Every object's world matrix; nothing in the arena moves.
+    mats: []Mat4;
+    spawn: Vec3;
+    spawnYaw: f32;
+    /// Everything solid fits in here; invisible walls stand on its sides.
+    lo: Vec3;
+    hi: Vec3;
+    /// The grid: `gw` by `gd` cells from `gridLo` (x/z); cell `c` holds `items[cellStart[c]..]`,
+    /// `cellCount[c]` box indices.
+    gridLo: Vec3;
+    gw: int;
+    gd: int;
+    cellStart: []int;
+    cellCount: []int;
+    items: []int;
+    /// Each mesh's world bounds, for skipping it cheaply in `shoot`; `hasBounds` false for others.
+    nodeLo: []Vec3;
+    nodeHi: []Vec3;
+    hasBounds: []bool;
+    /// Bit per biome tile that's unlocked; the `EDGES` barrier boxes start at `gate0`.
+    open: int;
+    gate0: int;
+}
+
+/// Where a bullet stopped.
+pub struct Shot {
+    hit: bool;
+    point: Vec3;
+}
+
+/// The top-level object `n` belongs to (itself when it is top level).
+fn root(scene: &Scene, n: Node): Node {
+    let at = n;
+    if at.owner != 0 { at = scene.nodes[scene3d.index(scene, at.owner)]; }
+    while at.parent != 0 {
+        at = scene.nodes[scene3d.index(scene, at.parent)];
+    }
+    return at;
+}
+
+fn startsWith(s: string, prefix: string): bool {
+    return text.find(s, prefix) == 0;
+}
+
+/// `JumpPad24` launches at 24; a bare `JumpPad` at 20.
+fn launchOf(name: string): f32 {
+    let v = 0;
+    let i = 7;
+    while i < name.len && name[i] >= 48 && name[i] <= 57 {
+        v = v * 10 + int(name[i]) - 48;
+        i += 1;
+    }
+    if v == 0 { return 20; }
+    return f32(v);
+}
+
+/// Boxes for every mesh except the sky and anything under a top-level `Deco...` object,
+/// and the spawn point from the scene's camera. Call after `scene3d.upload`.
+// ponytail: world AABBs, so a rotated piece collides as its bounding box; oriented boxes if we add ramps.
+/// A level with room for `n` boxes (plus the 4 walls) and `nodes` scene objects, and nothing in it.
+pub fn empty(mem: &Arena, n: int, nodes: int): Level {
+    return Level {
+        boxes: mem.alloc::<Box>(n + 4 + EDGES),
+        count: 0,
+        mats: mem.alloc::<Mat4>(maxi(nodes, 1)),
+        spawn: Vec3.xyz(0, 1, 0),
+        spawnYaw: 0,
+        lo: Vec3.xyz(1000000, 1000000, 1000000),
+        hi: Vec3.xyz(-1000000, -1000000, -1000000),
+        gridLo: Vec3.zero(), gw: 0, gd: 0, cellStart: mem.alloc::<int>(1), cellCount: mem.alloc::<int>(1),
+        items: mem.alloc::<int>(1), nodeLo: mem.alloc::<Vec3>(maxi(nodes, 1)), nodeHi: mem.alloc::<Vec3>(maxi(nodes, 1)),
+        hasBounds: mem.alloc::<bool>(maxi(nodes, 1)), open: bit(HUB), gate0: -1,
+    };
+}
+
+pub fn build(scene: &Scene, mem: &Arena): Level {
+    let lvl = empty(mem, scene.len, scene.len);
+    scene3d.worlds(scene, lvl.mats);
+    let i = 0;
+    while i < scene.len {
+        let n = scene.nodes[i];
+        if n.kind == CAMERA && n.owner == 0 {
+            let eye = lvl.mats[i].transformPoint(Vec3.zero());
+            let ahead = lvl.mats[i].transformPoint(Vec3.xyz(0, 0, -1)) - eye;
+            lvl.spawn = Vec3.xyz(eye.x, eye.y - 1.6, eye.z);
+            lvl.spawnYaw = atan2(ahead.x, 0 - ahead.z);
+        }
+        lvl.hasBounds[i] = false;
+        if n.kind == MESH && n.gpu.vao != 0 && !scene3d.isSky(n) {
+            let lo = Vec3.xyz(1000000, 1000000, 1000000);
+            let hi = Vec3.xyz(-1000000, -1000000, -1000000);
+            let c = 0;
+            while c < 8 {
+                let corner = n.boundLo;
+                if c % 2 == 1 { corner.x = n.boundHi.x; }
+                if (c / 2) % 2 == 1 { corner.y = n.boundHi.y; }
+                if c >= 4 { corner.z = n.boundHi.z; }
+                let q = lvl.mats[i].transformPoint(corner);
+                lo = Vec3.xyz(min(lo.x, q.x), min(lo.y, q.y), min(lo.z, q.z));
+                hi = Vec3.xyz(max(hi.x, q.x), max(hi.y, q.y), max(hi.z, q.z));
+                c += 1;
+            }
+            lvl.nodeLo[i] = lo;
+            lvl.nodeHi[i] = hi;
+            lvl.hasBounds[i] = true;
+            let top = root(scene, n);
+            if !startsWith(top.name, "Deco") {
+                let launch: f32 = 0;
+                let kind = SOLID;
+                if startsWith(top.name, "JumpPad") {
+                    launch = launchOf(top.name);
+                    kind = PAD;
+                }
+                if startsWith(top.name, "Lava") { kind = LAVA; }
+                if startsWith(top.name, "Ice") { kind = ICE; }
+                lvl.boxes[lvl.count] = Box { lo: lo, hi: hi, launch: launch, kind: kind };
+                lvl.count += 1;
+                lvl.lo = Vec3.xyz(min(lvl.lo.x, lo.x), min(lvl.lo.y, lo.y), min(lvl.lo.z, lo.z));
+                lvl.hi = Vec3.xyz(max(lvl.hi.x, hi.x), max(lvl.hi.y, hi.y), max(lvl.hi.z, hi.z));
+            }
+        }
+        i += 1;
+    }
+    // Invisible walls around the edges, far taller than any pad can throw you. (Nothing to wall
+    // in before the meshes are uploaded.)
+    let a = lvl.lo;
+    let b = lvl.hi;
+    if lvl.count > 0 {
+        wall(&lvl, Vec3.xyz(a.x - 5, a.y, a.z - 5), Vec3.xyz(a.x, 500, b.z + 5));
+        wall(&lvl, Vec3.xyz(b.x, a.y, a.z - 5), Vec3.xyz(b.x + 5, 500, b.z + 5));
+        wall(&lvl, Vec3.xyz(a.x, a.y, a.z - 5), Vec3.xyz(b.x, 500, a.z));
+        wall(&lvl, Vec3.xyz(a.x, a.y, b.z), Vec3.xyz(b.x, 500, b.z + 5));
+        // Barriers on every border, filed in the grid now and opened by `setGates`.
+        lvl.gate0 = lvl.count;
+        let e = 0;
+        while e < EDGES {
+            lvl.boxes[lvl.count] = gateBox(e);
+            lvl.count += 1;
+            e += 1;
+        }
+        setGates(&lvl);
+    }
+    index(&lvl, mem);
+    return lvl;
+}
+
+fn wall(lvl: &Level, lo: Vec3, hi: Vec3) {
+    lvl.boxes[lvl.count] = Box { lo: lo, hi: hi, launch: 0, kind: SOLID };
+    lvl.count += 1;
+}
+
+pub fn bit(t: int): int {
+    let b = 1;
+    let i = 0;
+    while i < t {
+        b = b * 2;
+        i += 1;
+    }
+    return b;
+}
+
+/// The biome tile under x/z (row * 3 + column, row 0 north, column 0 west).
+pub fn tileAt(x: f32, z: f32): int {
+    let col = int(clamp((x + HALF) / TILE, 0, 2.999));
+    let row = int(clamp((z + HALF) / TILE, 0, 2.999));
+    return row * 3 + col;
+}
+
+pub fn isOpen(lvl: &Level, t: int): bool {
+    return (lvl.open / bit(t)) % 2 == 1;
+}
+
+pub fn openAt(lvl: &Level, x: f32, z: f32): bool {
+    return isOpen(lvl, tileAt(x, z));
+}
+
+/// Border `e`'s two tiles: 0-5 split west from east (row e/2), 6-11 north from south.
+pub fn edgeA(e: int): int {
+    if e < 6 { return (e / 2) * 3 + e % 2; }
+    return e - 6;
+}
+
+pub fn edgeB(e: int): int {
+    if e < 6 { return edgeA(e) + 1; }
+    return edgeA(e) + 3;
+}
+
+/// The middle of border `e` on the ground, where its main gate and lock are.
+pub fn edgeMid(e: int): Vec3 {
+    let a = edgeA(e);
+    let x = -HALF + f32(a % 3) * TILE + TILE * 0.5;
+    let z = -HALF + f32(a / 3) * TILE + TILE * 0.5;
+    if e < 6 { return Vec3.xyz(x + TILE * 0.5, 0, z); }
+    return Vec3.xyz(x, 0, z + TILE * 0.5);
+}
+
+/// The wall standing on border `e`, far taller than a jetpack gets you.
+pub fn gateBox(e: int): Box {
+    let m = edgeMid(e);
+    let lo = Vec3.xyz(m.x - 0.3, -40, m.z - TILE * 0.5);
+    let hi = Vec3.xyz(m.x + 0.3, 300, m.z + TILE * 0.5);
+    if e >= 6 {
+        lo = Vec3.xyz(m.x - TILE * 0.5, -40, m.z - 0.3);
+        hi = Vec3.xyz(m.x + TILE * 0.5, 300, m.z + 0.3);
+    }
+    return Box { lo: lo, hi: hi, launch: 0, kind: BARRIER };
+}
+
+/// Border `e` is walled while either side is locked.
+pub fn locked(lvl: &Level, e: int): bool {
+    return !isOpen(lvl, edgeA(e)) || !isOpen(lvl, edgeB(e));
+}
+
+/// Walls up on locked borders; open ones sink far below everything, so the grid can stay.
+pub fn setGates(lvl: &Level) {
+    if lvl.gate0 < 0 { return; }
+    let e = 0;
+    while e < EDGES {
+        let b = gateBox(e);
+        if !locked(lvl, e) {
+            b.lo.y = -2000;
+            b.hi.y = -1999;
+        }
+        lvl.boxes[lvl.gate0 + e] = b;
+        e += 1;
+    }
+}
+
+/// Cell column (or row) of `v` along an axis starting at `from`, clamped into `0..n-1`.
+fn cellAt(v: f32, from: f32, n: int): int {
+    let c = int((v - from) / CELL);
+    if v < from { c = 0; }
+    if c >= n { c = n - 1; }
+    return c;
+}
+
+/// File every box in each grid cell it overlaps. Call again after changing the boxes.
+pub fn index(lvl: &Level, mem: &Arena) {
+    let lo = Vec3.xyz(1000000, 0, 1000000);
+    let hi = Vec3.xyz(-1000000, 0, -1000000);
+    let i = 0;
+    while i < lvl.count {
+        lo = Vec3.xyz(min(lo.x, lvl.boxes[i].lo.x), 0, min(lo.z, lvl.boxes[i].lo.z));
+        hi = Vec3.xyz(max(hi.x, lvl.boxes[i].hi.x), 0, max(hi.z, lvl.boxes[i].hi.z));
+        i += 1;
+    }
+    if lvl.count == 0 {
+        lo = Vec3.zero();
+        hi = Vec3.zero();
+    }
+    lvl.gridLo = lo;
+    lvl.gw = int((hi.x - lo.x) / CELL) + 1;
+    lvl.gd = int((hi.z - lo.z) / CELL) + 1;
+    let cells = lvl.gw * lvl.gd;
+    lvl.cellStart = mem.alloc::<int>(cells + 1);
+    lvl.cellCount = mem.alloc::<int>(cells);
+    let pass = 0;
+    let total = 0;
+    // Pass 0 counts; then starts are summed up and pass 1 fills (counts re-grow as the cursor).
+    while pass < 2 {
+        i = 0;
+        while i < lvl.count {
+            let b = lvl.boxes[i];
+            let z = cellAt(b.lo.z, lo.z, lvl.gd);
+            while z <= cellAt(b.hi.z, lo.z, lvl.gd) {
+                let x = cellAt(b.lo.x, lo.x, lvl.gw);
+                while x <= cellAt(b.hi.x, lo.x, lvl.gw) {
+                    let c = z * lvl.gw + x;
+                    if pass == 1 { lvl.items[lvl.cellStart[c] + lvl.cellCount[c]] = i; }
+                    lvl.cellCount[c] += 1;
+                    x += 1;
+                }
+                z += 1;
+            }
+            i += 1;
+        }
+        if pass == 0 {
+            total = 0;
+            let cc = 0;
+            while cc < cells {
+                lvl.cellStart[cc] = total;
+                total += lvl.cellCount[cc];
+                lvl.cellCount[cc] = 0;
+                cc += 1;
+            }
+            lvl.items = mem.alloc::<int>(maxi(total, 1));
+        }
+        pass += 1;
+    }
+}
+
+/// Start walking the boxes filed in the cells under `lo`..`hi` (x/z). A box can come up more
+/// than once when it spans several of those cells.
+pub fn scan(lvl: &Level, lo: Vec3, hi: Vec3): Scan {
+    let s = Scan {
+        x0: cellAt(lo.x, lvl.gridLo.x, lvl.gw), x1: cellAt(hi.x, lvl.gridLo.x, lvl.gw),
+        z0: cellAt(lo.z, lvl.gridLo.z, lvl.gd), z1: cellAt(hi.z, lvl.gridLo.z, lvl.gd), cx: 0, cz: 0, k: 0, end: 0,
+    };
+    s.cx = s.x0;
+    s.cz = s.z0;
+    let c = s.cz * lvl.gw + s.cx;
+    s.k = lvl.cellStart[c];
+    s.end = s.k + lvl.cellCount[c];
+    return s;
+}
+
+/// The next box index in the scan, or -1 when done.
+pub fn next(lvl: &Level, s: &Scan): int {
+    while s.k >= s.end {
+        s.cx += 1;
+        if s.cx > s.x1 {
+            s.cx = s.x0;
+            s.cz += 1;
+            if s.cz > s.z1 { return -1; }
+        }
+        let c = s.cz * lvl.gw + s.cx;
+        s.k = lvl.cellStart[c];
+        s.end = s.k + lvl.cellCount[c];
+    }
+    s.k += 1;
+    return lvl.items[s.k - 1];
+}
+
+/// Whether `r` passes through the box `lo`..`hi` closer than `reach`.
+fn rayBox(r: Ray, lo: Vec3, hi: Vec3, reach: f32): bool {
+    return rayEntry(r, lo, hi, reach) >= 0;
+}
+
+/// Distance to the first contact, including zero when starting inside a box.
+fn rayEntry(r: Ray, lo: Vec3, hi: Vec3, reach: f32): f32 {
+    let t0: f32 = 0;
+    let t1 = reach;
+    let ax = 0;
+    while ax < 3 {
+        let o = r.origin.x;
+        let d = r.dir.x;
+        let a = lo.x;
+        let b = hi.x;
+        if ax == 1 {
+            o = r.origin.y;
+            d = r.dir.y;
+            a = lo.y;
+            b = hi.y;
+        }
+        if ax == 2 {
+            o = r.origin.z;
+            d = r.dir.z;
+            a = lo.z;
+            b = hi.z;
+        }
+        if abs(d) < 0.000001 {
+            if o < a || o > b { return -1; }
+        } else {
+            let ta = (a - o) / d;
+            let tb = (b - o) / d;
+            t0 = max(t0, min(ta, tb));
+            t1 = min(t1, max(ta, tb));
+            if t1 < t0 { return -1; }
+        }
+        ax += 1;
+    }
+    return t0;
+}
+
+/// Sweep a projectile tip through the physical world, including closed gates.
+/// Tests the whole segment so fast arrows cannot skip thin floors or walls.
+pub fn sweep(lvl: &Level, r: Ray, reach: f32): Shot {
+    let end = r.origin + r.dir * reach;
+    let lo = Vec3.xyz(min(r.origin.x, end.x), min(r.origin.y, end.y), min(r.origin.z, end.z));
+    let hi = Vec3.xyz(max(r.origin.x, end.x), max(r.origin.y, end.y), max(r.origin.z, end.z));
+    let s = scan(lvl, lo, hi);
+    let i = next(lvl, &s);
+    let near = reach;
+    let hit = false;
+    while i >= 0 {
+        let t = rayEntry(r, lvl.boxes[i].lo, lvl.boxes[i].hi, near);
+        if t >= 0 { near = t; hit = true; }
+        i = next(lvl, &s);
+    }
+    return Shot { hit: hit, point: r.origin + r.dir * near };
+}
+
+/// Whether the segment `a`..`b` misses every collision box. Boxes only, so much cheaper
+/// than `shoot`; decorations without a box don't block it.
+pub fn clear(lvl: &Level, a: Vec3, b: Vec3): bool {
+    let d = b - a;
+    let far = d.length();
+    if far < 0.001 { return true; }
+    let r = Ray { origin: a, dir: d * (1 / far) };
+    let lo = Vec3.xyz(min(a.x, b.x), min(a.y, b.y), min(a.z, b.z));
+    let hi = Vec3.xyz(max(a.x, b.x), max(a.y, b.y), max(a.z, b.z));
+    let s = scan(lvl, lo, hi);
+    let i = next(lvl, &s);
+    while i >= 0 {
+        if rayBox(r, lvl.boxes[i].lo, lvl.boxes[i].hi, far) { return false; }
+        i = next(lvl, &s);
+    }
+    return true;
+}
+
+/// The nearest mesh triangle along `ray` within `reach`, decorations included.
+pub fn shoot(lvl: &Level, scene: &Scene, ray: Ray, reach: f32): Shot {
+    let best = reach;
+    let hit = false;
+    let i = 0;
+    while i < scene.len {
+        // Only meshes whose bounds the ray crosses get the triangle test.
+        if scene.nodes[i].kind == MESH && (!lvl.hasBounds[i] || rayBox(ray, lvl.nodeLo[i], lvl.nodeHi[i], best)) {
+            let h = scene3d.hitWith(scene, lvl.mats, i, ray, best);
+            if h.ok && h.t < best {
+                best = h.t;
+                hit = true;
+            }
+        }
+        i += 1;
+    }
+    return Shot { hit: hit, point: ray.origin + ray.dir * best };
+}
+
+/// Whether anything stands under x/z between `top` and y -2 (a pit has nothing).
+pub fn floorUnder(lvl: &Level, x: f32, z: f32, top: f32): bool {
+    let y = top;
+    while y > -2 {
+        if solid(lvl, Vec3.xyz(x, y, z), 0.5) >= 0 { return true; }
+        y = y - 1;
+    }
+    return false;
+}
+
+/// The first box overlapping the cube `half` around `p`, or -1.
+pub fn solid(lvl: &Level, p: Vec3, half: f32): int {
+    let s = scan(lvl, p - Vec3.xyz(half, half, half), p + Vec3.xyz(half, half, half));
+    let i = next(lvl, &s);
+    while i >= 0 {
+        let b = lvl.boxes[i];
+        if p.x + half > b.lo.x && p.x - half < b.hi.x && p.y + half > b.lo.y && p.y - half < b.hi.y
+            && p.z + half > b.lo.z && p.z - half < b.hi.z {
+            return i;
+        }
+        i = next(lvl, &s);
+    }
+    return -1;
+}

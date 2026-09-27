@@ -588,7 +588,7 @@ mod tests {
         assert!(c.contains("j3_ir_samples_scale_"), "{c}");
         assert!(c.contains("j3_sl_i64"), "{c}");
         assert!(c.contains("j3_ir_samples_Vec2"), "{c}");
-        assert!(c.contains("int main(void)"), "{c}");
+        assert!(c.contains("int main(int argc, char **argv)"), "{c}");
         let run = crate::emit::compile_and_run(&c).expect("cc");
         assert_eq!(
             run.status,

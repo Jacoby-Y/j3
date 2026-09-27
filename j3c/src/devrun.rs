@@ -194,7 +194,7 @@ fn dev_key(sources: &u64, prog: &Program, opts: &EmitOpts, fast: bool) -> String
     format!("{:016x}", h.finish())
 }
 
-fn launch(exe: &Path, root: &Path) -> Result<Child, String> {
+fn launch(exe: &Path, root: &Path, args: &[String]) -> Result<Child, String> {
     let root = root
         .canonicalize()
         .map_err(|e| format!("project root {}: {e}", root.display()))?;
@@ -202,6 +202,7 @@ fn launch(exe: &Path, root: &Path) -> Result<Child, String> {
         .canonicalize()
         .map_err(|e| format!("run {}: {e}", exe.display()))?;
     Command::new(&exe)
+        .args(args)
         .current_dir(&root)
         .env("J3_ROOT", &root)
         .spawn()
@@ -227,8 +228,14 @@ pub fn bump_reload(root: &Path) {
 }
 
 /// Run the dev binary and watch its scripts until the program exits.
-pub fn watch(m: &Manifest, opts: &EmitOpts, fast: bool, built: &mut Built) -> Result<i32, String> {
-    let mut child = launch(&built.exe, &m.root)?;
+pub fn watch(
+    m: &Manifest,
+    opts: &EmitOpts,
+    fast: bool,
+    built: &mut Built,
+    args: &[String],
+) -> Result<i32, String> {
+    let mut child = launch(&built.exe, &m.root, args)?;
     let mut seen = mtimes(&built.scripts);
     loop {
         if let Some(status) = child.try_wait().map_err(|e| format!("wait: {e}"))? {
@@ -263,7 +270,7 @@ pub fn watch(m: &Manifest, opts: &EmitOpts, fast: bool, built: &mut Built) -> Re
                         "j3c: relaunching ({})",
                         if next.rebuilt { "rebuilt" } else { "script layout changed" }
                     );
-                    child = launch(&next.exe, &m.root)?;
+                    child = launch(&next.exe, &m.root, args)?;
                 } else {
                     bump_reload(&m.root);
                     eprintln!("j3c: swapped script code");

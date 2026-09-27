@@ -1,0 +1,707 @@
+// First-person movement: Quake-style ground acceleration, smooth air steering, double jump,
+// slide, dash, jump pads, and boxes to stand on. All the feel knobs are the consts below.
+
+module fps_shooter.player;
+
+use j3.game;
+use j3.game.Key;
+use j3.sys.panic;
+use j3.memory.Arena;
+use j3.gfx.Look;
+use j3.math.{ Mat4, Vec3, abs, clamp, max, maxi, min, sin, sqrt };
+use fps_shooter.sfx;
+use fps_shooter.level.{ Box, Level, Scan, empty, index, next, scan, ICE, LAVA, SOLID };
+
+const EYE: f32 = 1.6;
+const SLIDE_EYE: f32 = 0.85;
+const RADIUS: f32 = 0.35;
+const HEIGHT: f32 = 1.8;
+const SLIDE_HEIGHT: f32 = 1.1;
+const GRAVITY: f32 = 24;
+/// Top ground speed from input alone, and how fast it gets there.
+pub const RUN: f32 = 9;
+const GROUND_ACCEL: f32 = 12;
+const FRICTION: f32 = 8;
+/// Air steering: how fast (per second) air velocity eases toward the input. Higher is
+/// snappier, lower is floatier.
+const AIR_CONTROL: f32 = 3;
+const AIR_MAX: f32 = 30;
+const JUMP: f32 = 8.5;
+const AIR_JUMP: f32 = 8;
+const COYOTE: f32 = 0.1;
+const BUFFER: f32 = 0.1;
+const SLIDE_TIME: f32 = 0.8;
+const SLIDE_BOOST: f32 = 8;
+const SLIDE_MIN: f32 = 5;
+const SLIDE_FRICTION: f32 = 0.5;
+/// Camera roll while sliding (radians, about 4.5 degrees), leaning toward the slide's side;
+/// a straight-ahead slide still leans half that way, to the right.
+const SLIDE_ROLL: f32 = 0.08;
+/// Holding Shift runs this much faster.
+const SPRINT: f32 = 1.45;
+const DASH: f32 = 14;
+const DASH_COOLDOWN: f32 = 0.9;
+/// A spent air jump or air dash comes back after this long, or on landing.
+const AIR_REFILL: f32 = 1.5;
+const STEP: f32 = 0.45;
+/// Longest move per collision sub-step, so fast knockback can't pass through a thin wall.
+const MAX_MOVE: f32 = 0.2;
+/// Horizontal speed cap right after a knockback.
+const KNOCK_MAX: f32 = 25;
+const RESPAWN_Y: f32 = -30;
+const SENSITIVITY: f32 = 0.0022;
+pub const MAX_HP: f32 = 100;
+/// No damage for this long after a hit.
+const IFRAMES: f32 = 0.35;
+/// Health comes back this fast once you've gone `REGEN_AFTER` seconds unhurt.
+const REGEN: f32 = 20;
+const REGEN_AFTER: f32 = 4;
+/// Jetpack: upward push, top climb speed, fuel refill per second in the air and on the
+/// ground (a full tank is 1), burn per second, and the glide's fall speed with the tank dry.
+const JET_PUSH: f32 = 34;
+const JET_CLIMB: f32 = 8;
+const JET_AIR_REFILL: f32 = 0.15;
+const JET_GROUND_REFILL: f32 = 1;
+const JET_BURN: f32 = 0.85;
+const GLIDE_FALL: f32 = 3;
+/// Skateboard: top speed scale, ground friction, and how hard it pushes up to speed.
+const BOARD_TOP: f32 = 1.7;
+const BOARD_FRICTION: f32 = 0.6;
+const BOARD_ACCEL: f32 = 3;
+/// Ram skill: forced speed along the view.
+pub const RAM_SPEED: f32 = 21;
+
+/// Ice: ground friction and acceleration (vs 8 and 12). Lava: the hit and the hop off it.
+const ICE_FRICTION: f32 = 0.7;
+const ICE_ACCEL: f32 = 3;
+const LAVA_HIT: f32 = 15;
+const LAVA_HOP: f32 = 14;
+/// Falling into a pit: the damage, and how long you must stand somewhere for it to be where
+/// you come back.
+const FALL_HIT: f32 = 15;
+const SAFE_AFTER: f32 = 0.3;
+
+/// Shrine gifts, one bit each in `Stats.gifts`.
+pub const AIR_DMG: int = 1;
+pub const ARROW: int = 2;
+pub const JETPACK: int = 4;
+pub const RPG: int = 8;
+pub const BOW: int = 16;
+pub const KNIFE: int = 32;
+pub const TURRET: int = 64;
+pub const WAND: int = 128;
+pub const BOARD: int = 256;
+pub const SHOTGUN: int = 512;
+pub const GIFTS: int = 10;
+
+/// Bonuses from the between-wave cards. Fractions (0.1 is +10%) plus extra air jumps/dashes.
+pub struct Stats {
+    fireRate: f32;
+    damage: f32;
+    speed: f32;
+    mag: f32;
+    reload: f32;
+    regen: f32;
+    maxHp: f32;
+    luck: f32;
+    airJumps: int;
+    airDashes: int;
+    /// Shrine gifts owned: a sum of the gift bits above.
+    gifts: int;
+}
+
+pub fn noStats(): Stats {
+    return Stats { fireRate: 0, damage: 0, speed: 0, mag: 0, reload: 0, regen: 0, maxHp: 0, luck: 0, airJumps: 0, airDashes: 0, gifts: 0 };
+}
+
+pub struct Player {
+    /// Feet.
+    pos: Vec3;
+    vel: Vec3;
+    yaw: f32;
+    pitch: f32;
+    onGround: bool;
+    airJumps: int;
+    airDashes: int;
+    /// Time until a spent air jump / air dash comes back.
+    jumpBack: f32;
+    dashBack: f32;
+    coyote: f32;
+    jumpBuffer: f32;
+    slideT: f32;
+    dashCd: f32;
+    /// Counts down after a dash, for the fov kick.
+    dashT: f32;
+    eyeH: f32;
+    bobPhase: f32;
+    /// Landing dip, eased back to 0.
+    dip: f32;
+    /// Recoil pitch, eased back to 0.
+    kick: f32;
+    /// View roll, eased toward the slide lean and back to 0 standing.
+    roll: f32;
+    fovBoost: f32;
+    /// Set by the guns: ADS slows walking and mouse look.
+    speedScale: f32;
+    lookScale: f32;
+    /// Pause-menu settings: mouse sensitivity, and its extra scale while aiming.
+    sens: f32;
+    adsSens: f32;
+    /// Pause-menu sound volume, 0..100.
+    volume: f32;
+    spawn: Vec3;
+    spawnYaw: f32;
+    hp: f32;
+    /// Seconds since the last hit.
+    hurtT: f32;
+    stats: Stats;
+    sprinting: bool;
+    /// Jetpack fuel, 0..1.
+    fuel: f32;
+    /// Set by the guns each frame: damage taken scale (knife out), and riding the skateboard.
+    guard: f32;
+    board: bool;
+    /// Kind of box last landed on (level SOLID, PAD, LAVA, ICE).
+    surface: int;
+    /// Where a pit fall puts you back: the last place you stood a moment on solid ground.
+    safe: Vec3;
+    safeT: f32;
+    /// Set by the skills: fire and reload speed scale (Overclock), and ram time left.
+    haste: f32 = 1;
+    ramT: f32 = 0;
+}
+
+/// Whether the shrine gift `gift` (one of the bits above) is owned.
+pub fn has(p: &Player, gift: int): bool {
+    return (p.stats.gifts / gift) % 2 == 1;
+}
+
+pub fn create(lvl: &Level): Player {
+    return Player {
+        pos: lvl.spawn, vel: Vec3.zero(), yaw: lvl.spawnYaw, pitch: 0, onGround: false,
+        airJumps: 1, airDashes: 1, jumpBack: 0, dashBack: 0, coyote: 0, jumpBuffer: 0, slideT: 0, dashCd: 0, dashT: 0,
+        eyeH: EYE, bobPhase: 0, dip: 0, kick: 0, roll: 0, fovBoost: 0, speedScale: 1, lookScale: 1, sens: 1, adsSens: 1, volume: sfx.DEFAULT_VOLUME,
+        spawn: lvl.spawn, spawnYaw: lvl.spawnYaw, hp: MAX_HP, hurtT: 10,
+        stats: noStats(), sprinting: false, fuel: 1, guard: 1, board: false, surface: SOLID, safe: lvl.spawn, safeT: 0,
+    };
+}
+
+pub fn look(p: &Player): Look {
+    let bob: f32 = 0;
+    if p.onGround && p.slideT <= 0 {
+        bob = sin(p.bobPhase) * 0.045 * min(hspeed(p) / RUN, 1);
+    }
+    let eye = p.pos + Vec3.xyz(0, p.eyeH - p.dip + bob, 0);
+    let l = Look.create(eye, p.yaw, clamp(p.pitch + p.kick, -1.55, 1.55));
+    l.roll = p.roll;
+    return l;
+}
+
+pub fn maxHp(p: &Player): f32 {
+    return MAX_HP * (1 + p.stats.maxHp);
+}
+
+/// Top speed from input right now: run, sprint, card bonus, and ADS slowdown.
+fn top(p: &Player): f32 {
+    let s = RUN * (1 + p.stats.speed) * p.speedScale;
+    if p.sprinting { s = s * SPRINT; }
+    if p.board { s = s * BOARD_TOP; }
+    return s;
+}
+
+pub fn hspeed(p: &Player): f32 {
+    return sqrt(p.vel.x * p.vel.x + p.vel.z * p.vel.z);
+}
+
+/// Back to the spawn point, standing still. Health is the caller's call.
+pub fn respawn(p: &Player) {
+    p.pos = p.spawn;
+    p.vel = Vec3.zero();
+    p.yaw = p.spawnYaw;
+    p.pitch = 0;
+    p.slideT = 0;
+    p.roll = 0;
+    p.safe = p.spawn;
+}
+
+/// Fell out of the level: back to the last safe spot, a little hurt.
+fn fell(p: &Player) {
+    p.pos = p.safe;
+    p.vel = Vec3.zero();
+    p.slideT = 0;
+    p.hp = p.hp - FALL_HIT;
+    sfx.play(sfx.HURT);
+    p.hurtT = 0;
+}
+
+/// Take `dmg` and a shove, unless just hit. True when it landed.
+pub fn hurt(p: &Player, dmg: f32, shove: Vec3): bool {
+    if p.hurtT < IFRAMES { return false; }
+    p.hp = p.hp - dmg * p.guard;
+    p.hurtT = 0;
+    push(p, shove);
+    sfx.play(sfx.HURT);
+    return true;
+}
+
+/// A shove from a gun. Upward shoves lift off the ground right away.
+pub fn push(p: &Player, impulse: Vec3) {
+    p.vel = p.vel + impulse;
+    if impulse.y > 0.5 && p.onGround {
+        p.onGround = false;
+        p.coyote = 0;
+    }
+    let h = hspeed(p);
+    if h > KNOCK_MAX {
+        p.vel.x = p.vel.x * (KNOCK_MAX / h);
+        p.vel.z = p.vel.z * (KNOCK_MAX / h);
+    }
+}
+
+fn accelerate(p: &Player, wish: Vec3, wishSpeed: f32, accel: f32, dt: f32) {
+    let current = p.vel.x * wish.x + p.vel.z * wish.z;
+    let add = wishSpeed - current;
+    if add <= 0 { return; }
+    let step = min(accel * wishSpeed * dt, add);
+    p.vel.x = p.vel.x + wish.x * step;
+    p.vel.z = p.vel.z + wish.z * step;
+}
+
+/// Ease horizontal velocity toward `wish` at run speed, or at the speed already going that
+/// way when it's more, so knockback and pads carry on where you point them.
+fn airSteer(p: &Player, wish: Vec3, dt: f32) {
+    let h = hspeed(p);
+    let along: f32 = 0;
+    if h > 0.01 { along = max((p.vel.x * wish.x + p.vel.z * wish.z) / h, 0); }
+    let speed = max(top(p), h * along);
+    let k = min(AIR_CONTROL * dt, 1);
+    p.vel.x = p.vel.x + (wish.x * speed - p.vel.x) * k;
+    p.vel.z = p.vel.z + (wish.z * speed - p.vel.z) * k;
+}
+
+fn friction(p: &Player, amount: f32, dt: f32) {
+    let speed = hspeed(p);
+    if speed < 0.01 {
+        p.vel.x = 0;
+        p.vel.z = 0;
+        return;
+    }
+    let drop = max(speed, 2) * amount * dt;
+    let scale = max(speed - drop, 0) / speed;
+    p.vel.x = p.vel.x * scale;
+    p.vel.z = p.vel.z * scale;
+}
+
+fn height(p: &Player): f32 {
+    if p.slideT > 0 { return SLIDE_HEIGHT; }
+    return HEIGHT;
+}
+
+fn overlaps(pos: Vec3, h: f32, b: Box): bool {
+    return pos.x + RADIUS > b.lo.x && pos.x - RADIUS < b.hi.x
+        && pos.y + h > b.lo.y && pos.y < b.hi.y
+        && pos.z + RADIUS > b.lo.z && pos.z - RADIUS < b.hi.z;
+}
+
+/// Walk the boxes near the player's box at `pos`.
+fn around(lvl: &Level, pos: Vec3, h: f32): Scan {
+    return scan(lvl, pos - Vec3.xyz(RADIUS, 0, RADIUS), pos + Vec3.xyz(RADIUS, h, RADIUS));
+}
+
+fn blocked(lvl: &Level, pos: Vec3, h: f32): bool {
+    let s = around(lvl, pos, h);
+    let i = next(lvl, &s);
+    while i >= 0 {
+        if overlaps(pos, h, lvl.boxes[i]) { return true; }
+        i = next(lvl, &s);
+    }
+    return false;
+}
+
+/// Whether a standing player with feet at `pos` fits there, clear of every box.
+pub fn fits(lvl: &Level, pos: Vec3): bool {
+    return !blocked(lvl, pos, HEIGHT);
+}
+
+/// Move along x (axis 0) or z (axis 2) by `d`, stepping up low ledges, else stopping at walls.
+/// Returns the launch of a jump pad bumped from the side, or -1.
+fn moveFlat(p: &Player, lvl: &Level, axis: int, d: f32): f32 {
+    if axis == 0 { p.pos.x = p.pos.x + d; } else { p.pos.z = p.pos.z + d; }
+    let h = height(p);
+    let pad: f32 = -1;
+    let s = around(lvl, p.pos, h);
+    let i = next(lvl, &s);
+    while i >= 0 {
+        let b = lvl.boxes[i];
+        if overlaps(p.pos, h, b) {
+            let up = Vec3.xyz(p.pos.x, b.hi.y + 0.001, p.pos.z);
+            if p.onGround && b.hi.y - p.pos.y <= STEP && !blocked(lvl, up, h) {
+                p.dip = p.dip + (b.hi.y - p.pos.y);
+                p.pos = up;
+            } else {
+                // A pad's side bounces you too, and keeps your speed so you carry on over it.
+                if b.launch > 0 { pad = max(pad, b.launch); }
+                if axis == 0 {
+                    if d > 0 { p.pos.x = b.lo.x - RADIUS - 0.001; } else { p.pos.x = b.hi.x + RADIUS + 0.001; }
+                    if b.launch <= 0 { p.vel.x = 0; }
+                } else {
+                    if d > 0 { p.pos.z = b.lo.z - RADIUS - 0.001; } else { p.pos.z = b.hi.z + RADIUS + 0.001; }
+                    if b.launch <= 0 { p.vel.z = 0; }
+                }
+            }
+        }
+        i = next(lvl, &s);
+    }
+    return pad;
+}
+
+/// Move along y by `d`. Returns the launch of the pad landed on, 0 for plain ground, or -1
+/// for no landing.
+fn moveUp(p: &Player, lvl: &Level, d: f32): f32 {
+    p.pos.y = p.pos.y + d;
+    let h = height(p);
+    let landed: f32 = -1;
+    let s = around(lvl, p.pos, h);
+    let i = next(lvl, &s);
+    while i >= 0 {
+        let b = lvl.boxes[i];
+        if overlaps(p.pos, h, b) {
+            if d <= 0 {
+                p.pos.y = b.hi.y;
+                landed = max(landed, b.launch);
+                p.surface = b.kind;
+            } else {
+                p.pos.y = b.lo.y - h - 0.001;
+                p.vel.y = 0;
+            }
+        }
+        i = next(lvl, &s);
+    }
+    return landed;
+}
+
+fn land(p: &Player, launch: f32) {
+    if !p.onGround && p.vel.y < -6 { p.dip = p.dip + min((0 - p.vel.y) * 0.015, 0.3); }
+    p.airJumps = 1 + p.stats.airJumps;
+    p.airDashes = 1 + p.stats.airDashes;
+    if launch > 0 {
+        p.vel.y = launch;
+        p.onGround = false;
+        return;
+    }
+    // Lava: a burn and a hop off it.
+    if p.surface == LAVA {
+        hurt(p, LAVA_HIT, Vec3.zero());
+        p.vel.y = LAVA_HOP;
+        p.onGround = false;
+        return;
+    }
+    p.vel.y = 0;
+    p.onGround = true;
+}
+
+/// Jetpack refill. Never while Space is held in the air, so a dry tank stays dry and glides
+/// instead of trickling fuel into a climb every frame.
+fn refuel(p: &Player, held: bool, dt: f32) {
+    if p.onGround {
+        p.fuel = min(p.fuel + JET_GROUND_REFILL * dt, 1);
+    } else if !held {
+        p.fuel = min(p.fuel + JET_AIR_REFILL * dt, 1);
+    }
+}
+
+fn jetpack(p: &Player, dt: f32) {
+    if p.fuel > 0 {
+        p.fuel = max(p.fuel - JET_BURN * dt, 0);
+        if p.vel.y < JET_CLIMB { p.vel.y = min(p.vel.y + JET_PUSH * dt, JET_CLIMB); }
+    } else if p.vel.y < 0 - GLIDE_FALL {
+        p.vel.y = 0 - GLIDE_FALL;
+    }
+}
+
+fn collide(p: &Player, lvl: &Level, dt: f32) {
+    let move = p.vel * dt;
+    let steps = 1 + int(move.length() / MAX_MOVE);
+    if steps > 40 { steps = 40; }
+    let part = move * (1 / f32(steps));
+    let wasGround = p.onGround;
+    // Horizontal collision needs the previous grounded state to step up stairs.
+    // Clearing it before moveFlat made every low riser behave like a wall.
+    let landed: f32 = -1;
+    let s = 0;
+    while s < steps {
+        landed = max(landed, moveFlat(p, lvl, 0, part.x));
+        landed = max(landed, moveFlat(p, lvl, 2, part.z));
+        // Glued to the ground while walking, so walking off a step doesn't count as a fall.
+        let dy = part.y;
+        if wasGround && dy <= 0 { dy = dy - 0.05; }
+        let hit = moveUp(p, lvl, dy);
+        if hit >= 0 {
+            landed = max(landed, hit);
+        } else if wasGround && dy <= 0 {
+            p.pos.y = p.pos.y + 0.05;
+        }
+        s += 1;
+    }
+    p.onGround = false;
+    if landed >= 0 { land(p, landed); }
+}
+
+pub fn update(p: &Player, lvl: &Level, dt: f32) {
+    if game.mouseCaptured() {
+        let m = game.mouseDelta();
+        let turn = SENSITIVITY * p.sens * p.lookScale;
+        p.yaw = p.yaw + m.x * turn;
+        p.pitch = clamp(p.pitch - m.y * turn, -1.55, 1.55);
+    }
+    let look = Look.create(p.pos, p.yaw, 0);
+    let fwd = look.forward();
+    let right = look.right();
+    let wish = Vec3.zero();
+    if game.keyDown(Key.W) { wish = wish + fwd; }
+    if game.keyDown(Key.S) { wish = wish - fwd; }
+    if game.keyDown(Key.D) { wish = wish + right; }
+    if game.keyDown(Key.A) { wish = wish - right; }
+    let moving = wish.length() > 0.01;
+    p.sprinting = moving && game.keyDown(Key.Shift);
+    wish = wish.normalize();
+
+    p.jumpBuffer = p.jumpBuffer - dt;
+    p.coyote = p.coyote - dt;
+    p.dashCd = p.dashCd - dt;
+    p.jumpBack = p.jumpBack - dt;
+    p.dashBack = p.dashBack - dt;
+    if p.jumpBack <= 0 { p.airJumps = maxi(p.airJumps, 1 + p.stats.airJumps); }
+    if p.dashBack <= 0 { p.airDashes = maxi(p.airDashes, 1 + p.stats.airDashes); }
+    p.dashT = p.dashT - dt;
+    if p.onGround { p.coyote = COYOTE; }
+    if game.keyPressed(Key.Space) { p.jumpBuffer = BUFFER; }
+
+    // Slide: a boost along the way you're going, then almost no friction.
+    let slideKey = game.keyPressed(Key.Ctrl) || game.keyPressed(Key.C);
+    if slideKey && p.onGround && p.slideT <= 0 && hspeed(p) > SLIDE_MIN {
+        let dir = Vec3.xyz(p.vel.x, 0, p.vel.z).normalize();
+        p.vel = p.vel + dir * SLIDE_BOOST;
+        p.slideT = SLIDE_TIME;
+    }
+    if p.slideT > 0 {
+        p.slideT = p.slideT - dt;
+        // Stay low until there's room to stand.
+        if p.slideT <= 0 && blocked(lvl, p.pos, HEIGHT) { p.slideT = 0.05; }
+    }
+
+    // Dash: a burst along the input (or the view), once per landing in the air.
+    if game.keyPressed(Key.E) && p.dashCd <= 0 && (p.onGround || p.airDashes > 0) {
+        let dash = wish;
+        if !moving { dash = Vec3.xyz(fwd.x, 0, fwd.z).normalize(); }
+        p.vel.x = p.vel.x + dash.x * DASH;
+        p.vel.z = p.vel.z + dash.z * DASH;
+        p.vel.y = max(p.vel.y, 1.5);
+        if !p.onGround {
+            p.airDashes -= 1;
+            p.dashBack = AIR_REFILL;
+        }
+        p.onGround = false;
+        p.dashCd = DASH_COOLDOWN;
+        p.dashT = 0.25;
+        sfx.play(sfx.DASH);
+    }
+
+    let jumped = false;
+    if p.jumpBuffer > 0 {
+        if p.onGround || p.coyote > 0 {
+            p.vel.y = max(p.vel.y, JUMP);
+            jumped = true;
+        } else if p.airJumps > 0 && !has(p, JETPACK) {
+            p.vel.y = max(p.vel.y, AIR_JUMP);
+            p.airJumps -= 1;
+            p.jumpBack = AIR_REFILL;
+            jumped = true;
+        }
+        if jumped {
+            sfx.play(sfx.JUMP);
+            p.jumpBuffer = 0;
+            p.coyote = 0;
+            p.onGround = false;
+        }
+    }
+
+    let jet = has(p, JETPACK);
+    if jet { refuel(p, game.keyDown(Key.Space), dt); }
+    if p.onGround {
+        if p.slideT > 0 {
+            friction(p, SLIDE_FRICTION, dt);
+        } else if p.board {
+            friction(p, BOARD_FRICTION, dt);
+            if moving { accelerate(p, wish, top(p), BOARD_ACCEL, dt); }
+        } else if p.surface == ICE {
+            friction(p, ICE_FRICTION, dt);
+            if moving { accelerate(p, wish, top(p), ICE_ACCEL, dt); }
+        } else {
+            friction(p, FRICTION, dt);
+            if moving { accelerate(p, wish, top(p), GROUND_ACCEL, dt); }
+        }
+        p.bobPhase = p.bobPhase + hspeed(p) * dt * 1.4;
+    } else {
+        if moving { airSteer(p, wish, dt); }
+        p.vel.y = p.vel.y - GRAVITY * dt;
+        // Jetpack: Space held in the air (not on the jump's own frame) burns fuel to climb,
+        // and glides once the tank is dry.
+        if jet && !jumped && game.keyDown(Key.Space) { jetpack(p, dt); }
+        let h = hspeed(p);
+        if h > AIR_MAX {
+            p.vel.x = p.vel.x * (AIR_MAX / h);
+            p.vel.z = p.vel.z * (AIR_MAX / h);
+        }
+    }
+    // Ramming: driven along the view whatever the keys say; jumping still works.
+    if p.ramT > 0 {
+        p.vel.x = fwd.x * RAM_SPEED;
+        p.vel.z = fwd.z * RAM_SPEED;
+    }
+
+    collide(p, lvl, dt);
+
+    if p.onGround && p.surface != LAVA {
+        p.safeT = p.safeT + dt;
+        if p.safeT >= SAFE_AFTER { p.safe = p.pos; }
+    } else {
+        p.safeT = 0;
+    }
+    if p.pos.y < RESPAWN_Y { fell(p); }
+    p.hurtT = p.hurtT + dt;
+    if p.hurtT > REGEN_AFTER { p.hp = min(p.hp + REGEN * (1 + p.stats.regen) * dt, maxHp(p)); }
+
+    // Feel: eye height, landing dip, recoil recovery, fov kick at speed.
+    let eyeTo = EYE;
+    if p.slideT > 0 { eyeTo = SLIDE_EYE; }
+    p.eyeH = p.eyeH + (eyeTo - p.eyeH) * min(dt * 14, 1);
+    p.dip = p.dip * max(1 - dt * 9, 0);
+    p.kick = p.kick * max(1 - dt * 12, 0);
+    let rollTo: f32 = 0;
+    let speed = hspeed(p);
+    if p.slideT > 0 && speed > 0.5 {
+        let side = (p.vel.x * right.x + p.vel.z * right.z) / speed;
+        let lean = clamp(side * 2, -1, 1);
+        if side < 0 { lean = min(lean, -0.5); } else { lean = max(lean, 0.5); }
+        rollTo = SLIDE_ROLL * lean;
+    }
+    p.roll = p.roll + (rollTo - p.roll) * min(dt * 10, 1);
+    let fast = clamp((hspeed(p) - RUN) / 8, 0, 1);
+    if p.dashT > 0 { fast = 1; }
+    p.fovBoost = p.fovBoost + (fast * 10 - p.fovBoost) * min(dt * 8, 1);
+}
+
+/// Horizontal speed left after half a second coasting at 10 m/s over a floor of `kind`.
+fn coast(p: &Player, lvl: &Level, kind: int): f32 {
+    lvl.boxes[0].kind = kind;
+    p.pos = Vec3.xyz(0, 0, 0);
+    p.vel = Vec3.xyz(10, 0, 0);
+    p.onGround = true;
+    p.surface = kind;
+    p.slideT = 0;
+    let t = 0;
+    while t < 30 {
+        update(p, lvl, 0.0166);
+        t += 1;
+    }
+    return hspeed(p);
+}
+
+/// Asserts the movement rules against a made-up level: a floor with its top at y = 0 and a
+/// wall from x = 3 to 3.5. Runs once at startup.
+pub fn selfCheck(mem: &Arena) {
+    let lvl = empty(mem, 2, 0);
+    lvl.count = 2;
+    lvl.boxes[0] = Box { lo: Vec3.xyz(-50, -1, -50), hi: Vec3.xyz(50, 0, 50), launch: 0, kind: SOLID };
+    lvl.boxes[1] = Box { lo: Vec3.xyz(3, -1, -50), hi: Vec3.xyz(3.5, 10, 50), launch: 0, kind: SOLID };
+    index(&lvl, mem);
+    let p = create(&lvl);
+    // Lands on the floor box (top at y = 0).
+    p.pos = Vec3.xyz(0, 2, 0);
+    let t = 0;
+    while t < 120 {
+        update(&p, &lvl, 0.0166);
+        t += 1;
+    }
+    if !p.onGround || abs(p.pos.y) > 0.01 { panic("selfCheck: didn't land on the floor"); }
+    // A shotgun blast straight down launches off the ground.
+    push(&p, Vec3.xyz(0, 13, 0));
+    if p.onGround || p.vel.y <= 10 { panic("selfCheck: knockback didn't launch"); }
+    // 30 m/s into the wall (x from 3 to 3.5) stops at it.
+    p.pos = Vec3.xyz(0, 0.5, 0);
+    p.vel = Vec3.xyz(30, 0, 0);
+    p.onGround = false;
+    collide(&p, &lvl, 0.1);
+    if p.pos.x > 3 - RADIUS + 0.01 { panic("selfCheck: tunnelled through the wall"); }
+    // Running into a jump pad's side bounces you up.
+    lvl.boxes[1].launch = 20;
+    p.vel = Vec3.xyz(10, 0, 0);
+    collide(&p, &lvl, 0.1);
+    if p.vel.y < 19 { panic("selfCheck: a pad's side didn't bounce"); }
+    // Jetpack: burning climbs, a dry tank glides.
+    p.stats.gifts = JETPACK;
+    if !has(&p, JETPACK) || has(&p, RPG) { panic("selfCheck: gift bits"); }
+    p.vel = Vec3.xyz(0, -5, 0);
+    p.fuel = 1;
+    jetpack(&p, 0.1);
+    if p.vel.y <= -5 { panic("selfCheck: jetpack didn't push up"); }
+    p.fuel = 0;
+    p.vel = Vec3.xyz(0, -20, 0);
+    jetpack(&p, 0.1);
+    if p.vel.y < 0 - GLIDE_FALL - 0.01 { panic("selfCheck: glide didn't slow the fall"); }
+    // Holding Space in the air with a dry tank keeps gliding: no refill, no climb.
+    p.onGround = false;
+    let k = 0;
+    while k < 60 {
+        refuel(&p, true, 0.0166);
+        jetpack(&p, 0.0166);
+        k += 1;
+    }
+    if p.fuel > 0 || p.vel.y > 0 { panic("selfCheck: dry jetpack climbed while held"); }
+    refuel(&p, false, 0.5);
+    if p.fuel <= 0 { panic("selfCheck: jetpack didn't refill with Space up"); }
+    p.stats.gifts = 0;
+    // Ice keeps more of a slide than plain ground.
+    lvl.boxes[1] = Box { lo: Vec3.xyz(3, -1, 60), hi: Vec3.xyz(3.5, 10, 61), launch: 0, kind: SOLID };
+    index(&lvl, mem);
+    let kept = coast(&p, &lvl, SOLID);
+    if coast(&p, &lvl, ICE) <= kept + 2 { panic("selfCheck: ice didn't keep the slide"); }
+    // Lava hurts and throws you up.
+    lvl.boxes[0].kind = LAVA;
+    p.pos = Vec3.xyz(0, 0.3, 0);
+    p.vel = Vec3.xyz(0, -10, 0);
+    p.onGround = false;
+    p.hp = MAX_HP;
+    p.hurtT = 10;
+    collide(&p, &lvl, 0.05);
+    if p.vel.y < LAVA_HOP - 0.01 || p.hp >= MAX_HP { panic("selfCheck: lava didn't burn and bounce"); }
+    // A pit fall comes back to the last safe spot.
+    p.safe = Vec3.xyz(1, 0, 2);
+    p.pos = Vec3.xyz(0, RESPAWN_Y - 1, 0);
+    p.vel = Vec3.zero();
+    update(&p, &lvl, 0.0166);
+    if (p.pos - p.safe).length() > 0.5 { panic("selfCheck: pit fall didn't return to safe ground"); }
+    // The basin stairs are walkable with the starting player, without a jump.
+    lvl.boxes[0].kind = SOLID;
+    lvl.boxes[1] = Box { lo: Vec3.xyz(3, -1, -4), hi: Vec3.xyz(6, 0.4, 4), launch: 0, kind: SOLID };
+    index(&lvl, mem);
+    p = create(&lvl);
+    p.pos = Vec3.xyz(2, 0, 0);
+    p.vel = Vec3.xyz(9, 0, 0);
+    p.onGround = true;
+    collide(&p, &lvl, 0.1);
+    if p.pos.x < 2.8 || abs(p.pos.y - 0.4) > 0.01 || !p.onGround { panic("selfCheck: couldn't walk up a stair"); }
+    // Airborne players and ledges above STEP still use ordinary wall collision.
+    p.pos = Vec3.xyz(2, 0.1, 0);
+    p.vel = Vec3.xyz(9, 0, 0);
+    p.onGround = false;
+    collide(&p, &lvl, 0.1);
+    if p.pos.x > 3 - RADIUS || p.pos.y > 0.11 { panic("selfCheck: stepped up while airborne"); }
+    lvl.boxes[1].hi.y = 0.6;
+    p.pos = Vec3.xyz(2, 0, 0);
+    p.vel = Vec3.xyz(9, 0, 0);
+    p.onGround = true;
+    collide(&p, &lvl, 0.1);
+    if p.pos.x > 3 - RADIUS || p.pos.y > 0.01 { panic("selfCheck: stepped up a tall ledge"); }
+}

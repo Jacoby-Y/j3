@@ -34,7 +34,7 @@ pub fn prepare(files: &mut [ParsedFile]) -> Result<(), CheckError> {
                     }
                     has_props = true;
                     for f in &b.fields {
-                        unique(&mut seen, &file.path, &f.name)?;
+                        take_name(&mut seen, &file.path, &f.name, &name)?;
                         if let Some(value) = &f.default {
                             literal(&file.path, value, "prop default")?;
                         }
@@ -51,7 +51,7 @@ pub fn prepare(files: &mut [ParsedFile]) -> Result<(), CheckError> {
                     }
                     has_shared = true;
                     for f in &b.fields {
-                        unique(&mut seen, &file.path, &f.name)?;
+                        take_name(&mut seen, &file.path, &f.name, &name)?;
                         if let Some(value) = &f.default {
                             literal(&file.path, value, "shared initializer")?;
                         }
@@ -65,7 +65,7 @@ pub fn prepare(files: &mut [ParsedFile]) -> Result<(), CheckError> {
                     }
                 }
                 Item::State(s) => {
-                    unique(&mut seen, &file.path, &s.name)?;
+                    take_name(&mut seen, &file.path, &s.name, &name)?;
                     literal(&file.path, &s.value, "state initializer")?;
                     let ty = match &s.ty {
                         Some(ty) => ty.clone(),
@@ -87,7 +87,7 @@ pub fn prepare(files: &mut [ParsedFile]) -> Result<(), CheckError> {
                     });
                 }
                 Item::Fn(f) => {
-                    unique(&mut seen, &file.path, &f.name)?;
+                    take_name(&mut seen, &file.path, &f.name, &name)?;
                     if f.params.iter().any(|p| p.name.name == "this") {
                         return Err(CheckError::new(
                             &file.path,
@@ -116,10 +116,15 @@ pub fn prepare(files: &mut [ParsedFile]) -> Result<(), CheckError> {
                     methods.push(method);
                 }
                 Item::Const(c) => {
-                    unique(&mut seen, &file.path, &c.name)?;
+                    take_name(&mut seen, &file.path, &c.name, &name)?;
                 }
-                Item::Use(_) | Item::UseLib(_) | Item::Struct(_) | Item::Enum(_) | Item::Let(_) => {
+                Item::Struct(s) => {
+                    take_name(&mut seen, &file.path, &s.name, &name)?;
                 }
+                Item::Enum(e) => {
+                    take_name(&mut seen, &file.path, &e.name, &name)?;
+                }
+                Item::Use(_) | Item::UseLib(_) | Item::Let(_) => {}
             }
         }
         let mut fields = props;
@@ -152,6 +157,24 @@ fn unique(seen: &mut HashSet<String>, path: &str, name: &Ident) -> Result<(), Ch
         ));
     }
     Ok(())
+}
+
+/// Props, functions, consts, and struct/enum names share one namespace. The script type
+/// (`Door` for `door.j3s`) is that struct, so another type cannot take the same name.
+fn take_name(
+    seen: &mut HashSet<String>,
+    path: &str,
+    name: &Ident,
+    script: &str,
+) -> Result<(), CheckError> {
+    if name.name == script {
+        return Err(CheckError::new(
+            path,
+            name.span,
+            format!("`{script}` is the script type; pick another name"),
+        ));
+    }
+    unique(seen, path, name)
 }
 
 fn literal(path: &str, expr: &parse::Expr, what: &str) -> Result<(), CheckError> {
@@ -344,6 +367,25 @@ mod tests {
         let err = check(SCRIPT, main).err().expect("copy error");
         assert!(err.message.contains("can't be copied"), "{err:?}");
         assert!(err.helps.iter().any(|h| h.contains("&Door")));
+    }
+
+    #[test]
+    fn script_type_name_is_reserved() {
+        let err = check("struct Door { n: int; }\n", "module demo; fn main() {}")
+            .err()
+            .expect("script type name");
+        assert!(err.message.contains("is the script type"), "{err:?}");
+    }
+
+    #[test]
+    fn script_struct_shares_the_namespace() {
+        let err = check(
+            "struct Hinge { n: int; }\nfn Hinge(): int { return 1; }\n",
+            "module demo; fn main() {}",
+        )
+        .err()
+        .expect("duplicate name");
+        assert!(err.message.contains("already in script scope"), "{err:?}");
     }
 
     #[test]

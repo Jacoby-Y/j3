@@ -1,0 +1,324 @@
+// Saucer: a raider disc over the sky isles. It circles high over the player, paints impact
+// spots on the island they stand on and fires a staggered volley of missiles at them: keep
+// moving off the rings. Then it boosts low along a marked lane for a strafing run, its armor
+// petals open underneath, and hangs low at the end of it with the reactor exposed. Spots only
+// go on ground at the player's own height, so dodging never means leaving the island.
+// In phase two the volleys are bigger and a small volley follows every strafe.
+
+module fps_shooter.saucer;
+
+use j3.math.{ Mat4, Vec3, TAU, clamp, cos, max, min, sin };
+use fps_shooter.bosskit.{ Boss, Bosses, BODY, WEAK, MISSILE, STRAFE, addPart, armed, beam, box, bit, clearParts, fire, flat,
+    flatDist, footing, glowBox, glowRay, groundTop, paint, projsLive, puff, tilt };
+use fps_shooter.level.Level;
+use fps_shooter.player.Player;
+use fps_shooter.sfx;
+
+const DESCEND: int = 0;
+const ORBIT: int = 1;
+const VOLLEY: int = 2;
+const LINEUP: int = 3;
+const STRAFE_RUN: int = 4;
+const HOVER: int = 5;
+const CLIMB: int = 6;
+const IDLE: int = 7;
+
+const DESCEND_T: f32 = 2.4;
+const ORBIT_R: f32 = 24;
+const ORBIT_UP: f32 = 15;
+const ORBIT_T: f32 = 2.4;
+const ORBIT_T2: f32 = 1.6;
+/// It circles no further than this from its island.
+const REACH: f32 = 40;
+const TOP_SPEED: f32 = 20;
+/// Volleys: spots, seconds between them, and how long a spot shows before its missile lands.
+const SPOTS: int = 6;
+const SPOTS2: int = 9;
+const SPOT_GAP: f32 = 0.2;
+const SPOT_T: f32 = 1.7;
+/// The missile leaves this long before it lands.
+const FLIGHT: f32 = 1.1;
+const SPOT_R: f32 = 2.3;
+const MISSILE_DMG: f32 = 18;
+const VOLLEYS: int = 2;
+/// Strafing: the lane's length and half width, its warning, the speed, how low it flies.
+const LANE: f32 = 52;
+const LANE_HALF: f32 = 2.3;
+const LINEUP_T: f32 = 1.6;
+const STRAFE_SPEED: f32 = 30;
+const STRAFE_UP: f32 = 5;
+const STRAFE_DMG: f32 = 22;
+const HOVER_T: f32 = 3.0;
+const HOVER_T2: f32 = 2.4;
+const CLIMB_T: f32 = 1.2;
+/// The reactor takes this much more while open; the petals take this much less shut.
+const REACTOR: f32 = 3;
+const PETALS: f32 = 0.6;
+
+fn hot(): Vec3 {
+    return Vec3.xyz(3, 0.35, 0.25);
+}
+
+fn cyan(): Vec3 {
+    return Vec3.xyz(0.3, 2.4, 3);
+}
+
+pub fn begin(bs: &Bosses) {
+    let b = &bs.b;
+    b.aim = b.pos;
+    b.from = b.pos + Vec3.xyz(0, 40, 0);
+    b.pos = b.from;
+    b.state = DESCEND;
+    b.t = 0;
+    b.len = DESCEND_T;
+    b.intro = DESCEND_T;
+    b.cycle = 0;
+}
+
+fn to(b: &Boss, state: int, len: f32) {
+    b.state = state;
+    b.t = 0;
+    b.len = len;
+    b.step = 0;
+}
+
+/// Fly toward `goal`, no faster than `speed`.
+fn steer(b: &Boss, goal: Vec3, speed: f32, dt: f32) {
+    let want = (goal - b.pos) * 2.5;
+    let fast = want.length();
+    if fast > speed { want = want * (speed / fast); }
+    b.vel = b.vel + (want - b.vel) * min(dt * 3, 1);
+    b.pos = b.pos + b.vel * dt;
+}
+
+/// A spot on the ground the player stands on near x/z, or false over a drop.
+fn spotAt(lvl: &Level, x: f32, z: f32, floor: f32, out: &Vec3): bool {
+    let g = groundTop(lvl, x, z, 0.6, floor + 1.5);
+    if g < floor - 1.5 { return false; }
+    out.x = x;
+    out.y = g;
+    out.z = z;
+    return true;
+}
+
+/// Paint the next spot of a volley: the first on the player (a little ahead of them), the
+/// rest around them.
+fn spot(bs: &Bosses, p: &Player, lvl: &Level) {
+    let floor = footing(lvl, p);
+    let at = Vec3.zero();
+    let tries = 0;
+    while tries < 6 {
+        let x = p.pos.x + p.vel.x * 0.35;
+        let z = p.pos.z + p.vel.z * 0.35;
+        if bs.b.step > 0 || tries > 0 {
+            let a = bs.rng.unit() * TAU;
+            let r = 2.5 + bs.rng.unit() * 4.5;
+            x = p.pos.x + cos(a) * r;
+            z = p.pos.z + sin(a) * r;
+        }
+        if spotAt(lvl, x, z, floor, &at) {
+            paint(bs, at, SPOT_R, SPOT_T, hot());
+            return;
+        }
+        tries += 1;
+    }
+}
+
+/// Launch at every painted spot whose missile is due, from the rim facing it.
+fn launch(bs: &Bosses) {
+    let i = 0;
+    while i < bs.marks.len {
+        let m = bs.marks[i];
+        if m.live && m.armed && m.len - m.t <= FLIGHT {
+            let side = flat(m.at - bs.b.pos).normalize();
+            fire(bs, MISSILE, bs.b.pos + side * 3.5 - Vec3.xyz(0, 0.3, 0), i, 7, MISSILE_DMG);
+            sfx.at(sfx.ROCKET, bs.b.pos);
+        }
+        i += 1;
+    }
+}
+
+/// Circling over the player, kept over the isles.
+fn orbitGoal(b: &Boss, p: &Player, lvl: &Level): Vec3 {
+    let a = b.anim * (if b.phase2 { 0.5 } else { 0.35 });
+    let c = flat(p.pos - b.home);
+    if c.length() > REACH { c = c.normalize() * REACH; }
+    return Vec3.xyz(b.home.x + c.x + cos(a) * ORBIT_R, footing(lvl, p) + ORBIT_UP, b.home.z + c.z + sin(a) * ORBIT_R);
+}
+
+pub fn update(bs: &Bosses, p: &Player, lvl: &Level, dt: f32) {
+    let b = &bs.b;
+    b.t += dt;
+    b.anim += dt;
+    b.open = b.open + (b.openTo - b.open) * min(dt * 5, 1);
+    launch(bs);
+    if b.state == DESCEND {
+        let k = clamp(b.t / b.len, 0, 1);
+        let ease = 1 - (1 - k) * (1 - k);
+        b.pos = b.from + (b.aim - b.from) * ease;
+        if k >= 1 { to(b, if b.engaged { ORBIT } else { IDLE }, ORBIT_T); }
+    } else if b.state == IDLE {
+        let a = b.anim * 0.3;
+        steer(b, b.home + Vec3.xyz(cos(a) * 6, 14, sin(a) * 6), 8, dt);
+        if b.engaged { to(b, ORBIT, ORBIT_T); }
+    } else if b.state == ORBIT {
+        steer(b, orbitGoal(b, p, lvl), TOP_SPEED, dt);
+        if !b.engaged { to(b, IDLE, 1); }
+        else if b.t >= b.len {
+            if b.cycle >= VOLLEYS {
+                b.cycle = 0;
+                lineup(bs, p, lvl);
+            } else {
+                to(b, VOLLEY, 0);
+                sfx.at(sfx.WARN, b.pos);
+            }
+        }
+    } else if b.state == VOLLEY {
+        steer(b, orbitGoal(b, p, lvl), TOP_SPEED, dt);
+        let spots = if b.phase2 { SPOTS2 } else { SPOTS };
+        if b.step < spots && b.t >= f32(b.step) * SPOT_GAP {
+            spot(bs, p, lvl);
+            b.step += 1;
+        }
+        if b.step >= spots && armed(bs) == 0 && projsLive(bs) == 0 {
+            b.cycle += 1;
+            to(b, ORBIT, if b.phase2 { ORBIT_T2 } else { ORBIT_T });
+        }
+    } else if b.state == LINEUP {
+        // Swings round to the start of the lane, low, petals opening.
+        steer(b, b.from + Vec3.xyz(0, STRAFE_UP, 0), 34, dt);
+        b.openTo = 1;
+        if b.t >= b.len {
+            to(b, STRAFE_RUN, LANE / STRAFE_SPEED);
+            sfx.at(sfx.BEAM, b.pos);
+        }
+    } else if b.state == STRAFE_RUN {
+        let s = min(b.t * STRAFE_SPEED, LANE);
+        let goal = b.from + b.dir * s + Vec3.xyz(0, STRAFE_UP, 0);
+        b.vel = (goal - b.pos) * (1 / max(dt, 0.001));
+        b.pos = goal;
+        if b.t >= b.len {
+            b.vel = b.dir * 6;
+            to(b, HOVER, if b.phase2 { HOVER_T2 } else { HOVER_T });
+            if b.phase2 {
+                let n = 0;
+                while n < 3 { spot(bs, p, lvl); b.step += 1; n += 1; }
+            }
+        }
+    } else if b.state == HOVER {
+        b.cue = true;
+        b.vel = b.vel * max(1 - dt * 2, 0);
+        b.pos = b.pos + b.vel * dt + Vec3.xyz(0, sin(b.anim * 3) * 0.4 * dt, 0);
+        if b.t >= b.len - 0.3 { b.openTo = 0; }
+        if b.t >= b.len {
+            to(b, CLIMB, CLIMB_T);
+            sfx.at(sfx.DASH, b.pos);
+        }
+    } else {
+        steer(b, orbitGoal(b, p, lvl), TOP_SPEED, dt);
+        if b.t >= b.len { to(b, ORBIT, ORBIT_T); }
+    }
+    if b.state == LINEUP || b.state == STRAFE_RUN {
+        if bs.fxRng.unit() < dt * 30 {
+            puff(bs, b.pos - b.dir * 3 - Vec3.xyz(0, 0.4, 0), b.dir * -4, 0.5, 0.4, 1.2, 0, Vec3.zero(), cyan() * 0.5);
+        }
+    }
+    pose(bs);
+    bs.glowAt = b.pos - Vec3.xyz(0, 2, 0);
+    bs.glowColor = Vec3.xyz(0.2, 1.2, 1.5) * (0.15 + b.open * 0.6);
+    bs.glowR = 8 + b.open * 6;
+}
+
+/// The lane runs through the player from the saucer's side, on the ground they stand on.
+fn lineup(bs: &Bosses, p: &Player, lvl: &Level) {
+    let b = &bs.b;
+    let d = flat(p.pos - b.pos);
+    if d.length() < 1 { d = Vec3.xyz(1, 0, 0); }
+    b.dir = d.normalize();
+    let floor = footing(lvl, p);
+    b.from = Vec3.xyz(p.pos.x, floor, p.pos.z) - b.dir * (LANE * 0.5);
+    to(b, LINEUP, LINEUP_T);
+    beam(bs, STRAFE, b.from, b.dir, LANE, LANE_HALF, LINEUP_T, STRAFE_SPEED, 5, STRAFE_DMG, cyan());
+    sfx.at(sfx.WARN, b.pos);
+}
+
+/// The disc's frame: spinning, banked into its motion.
+fn base(b: &Boss): Mat4 {
+    let tiltAxis = Vec3.xyz(b.vel.z, 0, 0 - b.vel.x);
+    let lean = min(tiltAxis.length() * 0.02, 0.35);
+    let m = Mat4.translate(b.pos.x, b.pos.y, b.pos.z);
+    if lean > 0.001 { m = m.mul(Mat4.rotate(tiltAxis.normalize(), lean)); }
+    return m.mul(Mat4.rotate(Vec3.up(), b.anim * 0.6));
+}
+
+fn pose(bs: &Bosses) {
+    let b = &bs.b;
+    clearParts(bs);
+    let r: f32 = if b.open > 0.5 { REACTOR } else { PETALS };
+    addPart(bs, b.pos - Vec3.xyz(0, 0.9, 0), 1.2, r, WEAK);
+    addPart(bs, b.pos, 2.4, 1, BODY);
+    addPart(bs, b.pos + Vec3.xyz(2.7, 0, 0), 1.5, 1, BODY);
+    addPart(bs, b.pos + Vec3.xyz(-2.7, 0, 0), 1.5, 1, BODY);
+    addPart(bs, b.pos + Vec3.xyz(0, 0, 2.7), 1.5, 1, BODY);
+    addPart(bs, b.pos + Vec3.xyz(0, 0, -2.7), 1.5, 1, BODY);
+    addPart(bs, b.pos + Vec3.xyz(0, 1.1, 0), 1.3, 1.2, BODY);
+}
+
+pub fn draw(bs: &Bosses) {
+    let b = &bs.b;
+    let hull = Vec3.xyz(0.72, 0.75, 0.82);
+    let dark = Vec3.xyz(0.24, 0.26, 0.34);
+    let glass = Vec3.xyz(0.55, 0.85, 1);
+    let m = base(b);
+    // Three stacked hexagonal discs, each three crossed slabs.
+    let k = 0;
+    while k < 3 {
+        let r = m.mul(Mat4.rotate(Vec3.up(), f32(k) * 1.0472));
+        box(bs, r, Vec3.zero(), Vec3.xyz(8.4, 0.5, 4.85), hull, Vec3.zero());
+        box(bs, r, Vec3.xyz(0, -0.45, 0), Vec3.xyz(6.2, 0.45, 3.58), dark, Vec3.zero());
+        box(bs, r, Vec3.xyz(0, 0.38, 0), Vec3.xyz(5.4, 0.3, 3.1), hull, Vec3.zero());
+        k += 1;
+    }
+    // Dome, antenna and its blinking tip.
+    box(bs, m.mul(Mat4.rotate(Vec3.up(), 0.785)), Vec3.xyz(0, 1.0, 0), Vec3.xyz(2.6, 1.2, 2.6), glass, Vec3.xyz(0.15, 0.4, 0.55));
+    box(bs, m, Vec3.xyz(0, 1.75, 0), Vec3.xyz(1.8, 0.5, 1.8), glass, Vec3.xyz(0.15, 0.4, 0.55));
+    bit(bs, m, Vec3.xyz(0, 2.5, 0), Vec3.xyz(0.12, 1.0, 0.12), dark, Vec3.zero());
+    let blink: f32 = if sin(b.anim * 8) > 0 { 3 } else { 0.3 };
+    bit(bs, m, Vec3.xyz(0, 3.05, 0), Vec3.xyz(0.3, 0.3, 0.3), Vec3.zero(), Vec3.xyz(3, 0.4, 0.3) * blink);
+    // Rim lights chasing round.
+    let lit = int(b.anim * 10);
+    k = 0;
+    while k < 12 {
+        let a = f32(k) * TAU / 12;
+        let on = (k + lit) % 4 == 0;
+        let g = if on { Vec3.xyz(3, 2.6, 0.6) } else { Vec3.xyz(0.6, 0.4, 0.1) };
+        bit(bs, m, Vec3.xyz(cos(a) * 4.05, 0.05, sin(a) * 4.05), Vec3.xyz(0.35, 0.3, 0.35), Vec3.zero(), g);
+        k += 1;
+    }
+    // Underneath: petals that swing open round the reactor, and three thrusters.
+    let o = b.open;
+    k = 0;
+    while k < 4 {
+        let pet = m.mul(Mat4.rotate(Vec3.up(), f32(k) * 1.5708));
+        tilt(bs, pet, Vec3.xyz(0, -0.85 - o * 0.25, 0.75 + o * 0.8), Vec3.xyz(1.5, 0.22, 1.4), 0 - o * 0.9, 0, dark, Vec3.zero());
+        k += 1;
+    }
+    let core = m.mul(Mat4.rotate(Vec3.up(), b.anim * 3));
+    bit(bs, core, Vec3.xyz(0, -0.95, 0), Vec3.xyz(1.4, 0.6, 1.4), Vec3.zero(), cyan() * (0.3 + o * 1.4));
+    bit(bs, core.mul(Mat4.rotate(Vec3.up(), 0.785)), Vec3.xyz(0, -1.05, 0), Vec3.xyz(1.0, 0.7, 1.0), Vec3.xyz(1, 1, 1), cyan() * (0.5 + o * 1.5));
+    let boost: f32 = if b.state == STRAFE_RUN || b.state == LINEUP { 2.5 } else { 0.8 };
+    k = 0;
+    while k < 3 {
+        let at = f32(k) * TAU / 3 + 0.5;
+        bit(bs, m, Vec3.xyz(cos(at) * 2.6, -0.75, sin(at) * 2.6), Vec3.xyz(0.6, 0.3, 0.6), Vec3.zero(), cyan() * boost);
+        k += 1;
+    }
+    // The strafe's laser down to the lane.
+    if b.state == STRAFE_RUN {
+        let s = min(b.t * STRAFE_SPEED, LANE);
+        let hit = b.from + b.dir * s;
+        glowRay(bs, b.pos - Vec3.xyz(0, 1, 0), hit, 0.35, Vec3.zero(), Vec3.xyz(1, 3, 3.5));
+        glowRay(bs, b.pos - Vec3.xyz(0, 1, 0), hit, 0.12, Vec3.xyz(1, 1, 1), Vec3.xyz(3, 3, 3));
+        glowBox(bs, hit + Vec3.xyz(0, 0.2, 0), Vec3.xyz(1.4, 0.3, 1.4), Vec3.zero(), cyan() * 2);
+    }
+}

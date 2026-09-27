@@ -51,9 +51,18 @@ pub fn run_program(
     modules: &[Module],
     opts: &EmitOpts,
 ) -> Result<RunResult, String> {
+    run_program_with(cx, modules, opts, &[])
+}
+
+pub fn run_program_with(
+    cx: &IrCx,
+    modules: &[Module],
+    opts: &EmitOpts,
+    args: &[String],
+) -> Result<RunResult, String> {
     let text = emit_text(cx, modules, opts)?;
     let exe = compile_text(&text, opts)?;
-    let result = host::run_exe_in(&exe, opts.cwd.as_deref());
+    let result = host::run_exe_in(&exe, opts.cwd.as_deref(), args);
     if opts.cc.out.is_none() {
         let _ = std::fs::remove_file(&exe);
     }

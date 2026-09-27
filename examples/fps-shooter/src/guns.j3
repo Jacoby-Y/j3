@@ -1,0 +1,1440 @@
+// Machine gun and sniper, plus the shrine weapons: shotgun, RPG, bow, wand, knife and
+// skateboard. Scroll or 1-8 (in strip order) to switch, right mouse to aim. Every shot shoves the
+// player back along the aim, so a shotgun blast at the floor is a jump; an RPG blast under your
+// feet throws you from the ground.
+
+module fps_shooter.guns;
+
+use j3.game;
+use j3.game.{ Key, Mouse };
+use j3.gfx;
+use j3.gfx.{ Look, Mesh, Ray };
+use j3.math.{ Mat4, Vec3, PI, TAU, abs, clamp, cos, lerp, max, min, sin, sqrt, tan };
+use j3.memory.Arena;
+use j3.rand.Rng;
+use j3.scene3d;
+use j3.scene3d.Scene;
+use j3.sys.panic;
+use fps_shooter.debug;
+use fps_shooter.level;
+use fps_shooter.player;
+use fps_shooter.boss;
+use fps_shooter.bosskit.Bosses;
+use fps_shooter.enemies;
+use fps_shooter.enemies.{ Enemies, MAX_ENEMIES };
+use fps_shooter.level.{ Box, Level, clear, shoot, solid, sweep };
+use fps_shooter.player.{ Player, has, look, push, AIR_DMG, BOARD, BOW, KNIFE, RPG, SHOTGUN, WAND };
+use fps_shooter.sfx;
+use fps_shooter.shrine;
+use fps_shooter.shrine.Shrines;
+
+pub const HIP_FOV: f32 = 75;
+const SWITCH_TIME: f32 = 0.22;
+const ADS_TIME: f32 = 0.12;
+const REACH: f32 = 400;
+const TRACER_LIFE: f32 = 0.07;
+const MARK_LIFE: f32 = 4;
+const FLASH_LIFE: f32 = 0.05;
+pub const GUNS: int = 8;
+/// What a pull of the trigger does.
+const HITSCAN: int = 0;
+const ROCKET: int = 1;
+const MELEE: int = 2;
+const BOLT: int = 3;
+const RIDE: int = 4;
+const ARROW: int = 5;
+const BOW_DRAW: f32 = 1;
+const ARROW_GRAVITY: f32 = 24;
+const BOW_SPARK: f32 = 0.45;
+const ARROW_HITS: int = 5;
+const TRAIL_LIFE: f32 = 0.16;
+const MAX_TRAIL: int = 512;
+const MAX_SHOTS: int = 32;
+const ROCKET_SPEED: f32 = 35;
+const BLAST: f32 = 5;
+/// Wand bolt burst radius.
+const WAND_BLAST: f32 = 2.5;
+/// Most a rocket blast throws you, standing right on it.
+const ROCKET_JUMP: f32 = 28;
+const BOLT_SPEED: f32 = 22;
+/// Bolts pick an enemy within this cosine of their heading (60 degrees) that they can see,
+/// every `BOLT_SEEK` seconds, and turn toward it this fast; harder with ground just ahead.
+const BOLT_CONE: f32 = 0.5;
+const BOLT_TURN: f32 = 11;
+const BOLT_RANGE: f32 = 40;
+const BOLT_SEEK: f32 = 0.1;
+const BOLT_PULL_UP: f32 = 2.5;
+/// A bolt's target when it's homing on the boss.
+const AT_BOSS: int = -2;
+const KNIFE_REACH: f32 = 4.5;
+/// Knife swing: cosine of the half-angle it hits within (60 degrees).
+const KNIFE_CONE: f32 = 0.5;
+const OLLIE: f32 = 9;
+/// Air damage gift.
+const AIR_BONUS: f32 = 1.3;
+const MAX_PARTS: int = 32;
+
+/// One box of a viewmodel, in the gun's space (x right, y up, -z forward).
+struct Part {
+    at: Vec3;
+    size: Vec3;
+    color: Vec3;
+    /// Radians about x.
+    tilt: f32;
+    glow: Vec3;
+}
+
+pub struct Gun {
+    name: string;
+    /// Seconds between shots.
+    interval: f32;
+    pellets: int;
+    /// Cone half-angle in degrees.
+    hipSpread: f32;
+    adsSpread: f32;
+    adsFov: f32;
+    /// Speed the shot takes off the player, along the aim.
+    knock: f32;
+    /// Per pellet: health off an enemy, and how hard it shoves one.
+    damage: f32;
+    shove: f32;
+    /// Shots per magazine, shots left in it, and seconds to refill it.
+    mag: int;
+    ammo: int;
+    reload: f32;
+    /// View kick (radians) and screen shake.
+    kick: f32;
+    shake: f32;
+    tracer: Vec3;
+    /// Sniper: aiming shows a scope and hides the gun.
+    scope: bool;
+    muzzle: Vec3;
+    parts: []Part;
+    count: int;
+    kind: int;
+    /// The shrine gift that unlocks it; 0 for the starting two.
+    gift: int;
+    /// Hitscan: enemies a shot goes on through after the first.
+    pierce: int;
+}
+
+/// A rocket, wand bolt, or physical arrow. An arrow's position is its tip.
+struct Shot {
+    pos: Vec3;
+    vel: Vec3;
+    t: f32;
+    kind: int;
+    damage: f32;
+    /// Bolts: the enemy it's homing on (-1 none, `AT_BOSS` the boss), and time until it looks again.
+    target: int;
+    seekT: f32;
+    stuck: bool = false;
+    hitCount: int = 0;
+    hits: [5]int;
+}
+
+struct Trail {
+    a: Vec3;
+    b: Vec3;
+    t: f32;
+}
+
+struct Tracer {
+    a: Vec3;
+    b: Vec3;
+    t: f32;
+    color: Vec3;
+}
+
+struct Mark {
+    p: Vec3;
+    t: f32;
+    color: Vec3;
+}
+
+pub struct Guns {
+    list: []Gun;
+    cur: int;
+    cd: f32;
+    /// Length of the last shot's cooldown, for the HUD bar.
+    cdLen: f32;
+    switchT: f32;
+    /// Counts down while reloading the current gun; 0 when not. `reloadLen` is where it started.
+    reloadT: f32;
+    reloadLen: f32;
+    /// 0 at the hip, 1 aimed.
+    ads: f32;
+    flash: f32;
+    /// Viewmodel kick back, 1 right after a shot.
+    recoil: f32;
+    sway: Vec3;
+    shake: f32;
+    tracers: []Tracer;
+    nextTracer: int;
+    marks: []Mark;
+    nextMark: int;
+    shots: []Shot;
+    nextShot: int;
+    trail: []Trail;
+    nextTrail: int = 0;
+    cube: Mesh;
+    arrowhead: Mesh;
+    rng: Rng;
+    /// Set while a menu has the mouse; the trigger stays dead until left is let go, so the
+    /// click that picks a card or presses Resume doesn't also shoot.
+    locked: bool;
+    /// Overclock running: the gun glows hot.
+    hot: f32 = 0;
+    bowDrawing: bool = false;
+    bowCharge: f32 = 0;
+    bowSpark: f32 = 0;
+}
+
+fn add(g: &Gun, at: Vec3, size: Vec3, color: Vec3, tilt: f32, glow: Vec3) {
+    g.parts[g.count] = Part { at: at, size: size, color: color, tilt: tilt, glow: glow };
+    g.count += 1;
+}
+
+fn part(g: &Gun, at: Vec3, size: Vec3, color: Vec3) {
+    add(g, at, size, color, 0, Vec3.zero());
+}
+
+/// Tipped about x: positive leans the top back toward you (and the front end up).
+fn bent(g: &Gun, at: Vec3, size: Vec3, color: Vec3, tilt: f32) {
+    add(g, at, size, color, tilt, Vec3.zero());
+}
+
+/// Lit from inside: lenses, gems, sight dots.
+fn shine(g: &Gun, at: Vec3, size: Vec3, color: Vec3) {
+    add(g, at, size, color, 0, color * 1.6);
+}
+
+fn machineGun(mem: &Arena): Gun {
+    let g = Gun {
+        name: "MACHINE GUN", interval: 0.0833, pellets: 1, hipSpread: 2.5,
+        adsSpread: 0.6, adsFov: 55, knock: 0.6, damage: 14, shove: 1, mag: 30, ammo: 30, reload: 1.4, kick: 0.012, shake: 0.004,
+        tracer: Vec3.xyz(1, 0.85, 0.3), scope: false, muzzle: Vec3.xyz(0, 0.015, -0.52), count: 0, parts: mem.alloc::<Part>(MAX_PARTS),
+        kind: HITSCAN, gift: 0, pierce: 0,
+    };
+    let body = Vec3.xyz(0.2, 0.75, 0.85);
+    let dark = Vec3.xyz(0.18, 0.2, 0.28);
+    let pop = Vec3.xyz(1, 0.6, 0.15);
+    // Receiver, rail, handguard, barrel and brake.
+    part(&g, Vec3.xyz(0, 0, -0.05), Vec3.xyz(0.07, 0.09, 0.3), body);
+    part(&g, Vec3.xyz(0, 0.05, -0.08), Vec3.xyz(0.04, 0.014, 0.4), dark);
+    part(&g, Vec3.xyz(0, 0.008, -0.27), Vec3.xyz(0.075, 0.075, 0.16), dark);
+    part(&g, Vec3.xyz(0.039, 0.008, -0.27), Vec3.xyz(0.004, 0.02, 0.12), pop);
+    part(&g, Vec3.xyz(-0.039, 0.008, -0.27), Vec3.xyz(0.004, 0.02, 0.12), pop);
+    part(&g, Vec3.xyz(0, 0.015, -0.41), Vec3.xyz(0.028, 0.028, 0.14), dark);
+    part(&g, Vec3.xyz(0, 0.015, -0.49), Vec3.xyz(0.045, 0.045, 0.045), dark);
+    // Ejection port, charging handle, side stripe.
+    part(&g, Vec3.xyz(0.036, 0.02, 0.0), Vec3.xyz(0.004, 0.025, 0.06), dark);
+    part(&g, Vec3.xyz(0.045, 0.028, 0.07), Vec3.xyz(0.025, 0.012, 0.012), dark);
+    part(&g, Vec3.xyz(-0.036, -0.02, -0.06), Vec3.xyz(0.004, 0.012, 0.22), pop);
+    // Sights: rear notch and a lit front post.
+    part(&g, Vec3.xyz(0, 0.068, 0.06), Vec3.xyz(0.03, 0.022, 0.02), dark);
+    part(&g, Vec3.xyz(0, 0.062, -0.26), Vec3.xyz(0.012, 0.012, 0.012), dark);
+    shine(&g, Vec3.xyz(0, 0.075, -0.26), Vec3.xyz(0.006, 0.014, 0.006), pop);
+    // Magazine leaning forward, grip leaning back, guard and trigger.
+    bent(&g, Vec3.xyz(0, -0.1, -0.13), Vec3.xyz(0.045, 0.14, 0.07), pop, 0.22);
+    bent(&g, Vec3.xyz(0, -0.085, 0.07), Vec3.xyz(0.05, 0.12, 0.055), dark, -0.3);
+    part(&g, Vec3.xyz(0, -0.075, -0.005), Vec3.xyz(0.014, 0.012, 0.075), dark);
+    part(&g, Vec3.xyz(0, -0.057, 0.0), Vec3.xyz(0.008, 0.03, 0.008), dark);
+    // Stock and butt plate.
+    part(&g, Vec3.xyz(0, -0.005, 0.18), Vec3.xyz(0.045, 0.06, 0.12), body);
+    part(&g, Vec3.xyz(0, -0.02, 0.25), Vec3.xyz(0.05, 0.1, 0.03), dark);
+    return g;
+}
+
+fn sniper(mem: &Arena): Gun {
+    let g = Gun {
+        name: "SNIPER", interval: 1.1, pellets: 1, hipSpread: 4, adsSpread: 0,
+        adsFov: 20, knock: 6, damage: 120, shove: 10, mag: 5, ammo: 5, reload: 2, kick: 0.07, shake: 0.02, tracer: Vec3.xyz(0.6, 0.4, 1),
+        scope: true, muzzle: Vec3.xyz(0, 0.01, -0.78), count: 0, parts: mem.alloc::<Part>(MAX_PARTS),
+        kind: HITSCAN, gift: 0, pierce: 3,
+    };
+    let body = Vec3.xyz(0.6, 0.35, 0.9);
+    let dark = Vec3.xyz(0.15, 0.14, 0.22);
+    let glass = Vec3.xyz(0.5, 1, 0.9);
+    // Receiver, forend, long barrel and brake.
+    part(&g, Vec3.xyz(0, 0, -0.02), Vec3.xyz(0.058, 0.07, 0.3), dark);
+    part(&g, Vec3.xyz(0, -0.01, -0.28), Vec3.xyz(0.065, 0.065, 0.24), body);
+    part(&g, Vec3.xyz(0, 0.01, -0.57), Vec3.xyz(0.026, 0.026, 0.4), dark);
+    part(&g, Vec3.xyz(0, 0.01, -0.76), Vec3.xyz(0.048, 0.036, 0.055), dark);
+    // Folded bipod under the forend.
+    part(&g, Vec3.xyz(0.02, -0.05, -0.32), Vec3.xyz(0.01, 0.01, 0.16), dark);
+    part(&g, Vec3.xyz(-0.02, -0.05, -0.32), Vec3.xyz(0.01, 0.01, 0.16), dark);
+    // Scope: rings, tube, bell, eyepiece, knobs, lens.
+    part(&g, Vec3.xyz(0, 0.052, -0.1), Vec3.xyz(0.03, 0.035, 0.02), dark);
+    part(&g, Vec3.xyz(0, 0.052, 0.05), Vec3.xyz(0.03, 0.035, 0.02), dark);
+    part(&g, Vec3.xyz(0, 0.085, -0.02), Vec3.xyz(0.045, 0.045, 0.24), dark);
+    part(&g, Vec3.xyz(0, 0.085, -0.18), Vec3.xyz(0.064, 0.064, 0.08), dark);
+    part(&g, Vec3.xyz(0, 0.085, 0.12), Vec3.xyz(0.054, 0.054, 0.05), dark);
+    part(&g, Vec3.xyz(0, 0.115, -0.03), Vec3.xyz(0.022, 0.025, 0.022), body);
+    part(&g, Vec3.xyz(0.03, 0.085, -0.03), Vec3.xyz(0.025, 0.022, 0.022), body);
+    shine(&g, Vec3.xyz(0, 0.085, -0.222), Vec3.xyz(0.052, 0.052, 0.006), glass);
+    // Bolt handle and knob, magazine, guard, grip.
+    part(&g, Vec3.xyz(0.045, 0.012, 0.07), Vec3.xyz(0.05, 0.014, 0.014), dark);
+    part(&g, Vec3.xyz(0.072, 0.012, 0.07), Vec3.xyz(0.024, 0.024, 0.024), body);
+    part(&g, Vec3.xyz(0, -0.06, -0.03), Vec3.xyz(0.04, 0.06, 0.07), dark);
+    part(&g, Vec3.xyz(0, -0.06, 0.06), Vec3.xyz(0.012, 0.012, 0.06), dark);
+    bent(&g, Vec3.xyz(0, -0.08, 0.14), Vec3.xyz(0.05, 0.11, 0.05), body, -0.35);
+    // Stock, cheek rest, butt pad.
+    part(&g, Vec3.xyz(0, -0.02, 0.3), Vec3.xyz(0.055, 0.09, 0.22), body);
+    part(&g, Vec3.xyz(0, 0.035, 0.28), Vec3.xyz(0.05, 0.022, 0.13), body);
+    part(&g, Vec3.xyz(0, -0.025, 0.42), Vec3.xyz(0.06, 0.11, 0.025), dark);
+    return g;
+}
+
+fn shotgun(mem: &Arena): Gun {
+    let g = Gun {
+        name: "SHOTGUN", interval: 0.75, pellets: 10, hipSpread: 7, adsSpread: 5,
+        adsFov: 62, knock: 13, damage: 11, shove: 2.5, mag: 4, ammo: 4, reload: 1.6, kick: 0.09, shake: 0.03, tracer: Vec3.xyz(1, 0.45, 0.3),
+        scope: false, muzzle: Vec3.xyz(0, 0.02, -0.5), count: 0, parts: mem.alloc::<Part>(MAX_PARTS),
+        kind: HITSCAN, gift: SHOTGUN, pierce: 0,
+    };
+    let body = Vec3.xyz(0.95, 0.25, 0.3);
+    let dark = Vec3.xyz(0.2, 0.16, 0.16);
+    let wood = Vec3.xyz(1, 0.75, 0.35);
+    let gold = Vec3.xyz(1, 0.8, 0.3);
+    // Receiver with gold side plates.
+    part(&g, Vec3.xyz(0, 0, 0), Vec3.xyz(0.1, 0.09, 0.2), body);
+    part(&g, Vec3.xyz(0.051, 0, 0), Vec3.xyz(0.004, 0.05, 0.13), gold);
+    part(&g, Vec3.xyz(-0.051, 0, 0), Vec3.xyz(0.004, 0.05, 0.13), gold);
+    part(&g, Vec3.xyz(0, -0.01, -0.11), Vec3.xyz(0.106, 0.022, 0.022), dark);
+    // Twin barrels, top rib, muzzle rings, bead.
+    part(&g, Vec3.xyz(-0.025, 0.02, -0.29), Vec3.xyz(0.045, 0.045, 0.4), dark);
+    part(&g, Vec3.xyz(0.025, 0.02, -0.29), Vec3.xyz(0.045, 0.045, 0.4), dark);
+    part(&g, Vec3.xyz(0, 0.045, -0.29), Vec3.xyz(0.016, 0.01, 0.4), dark);
+    part(&g, Vec3.xyz(-0.025, 0.02, -0.48), Vec3.xyz(0.053, 0.053, 0.022), body);
+    part(&g, Vec3.xyz(0.025, 0.02, -0.48), Vec3.xyz(0.053, 0.053, 0.022), body);
+    shine(&g, Vec3.xyz(0, 0.056, -0.47), Vec3.xyz(0.012, 0.012, 0.012), gold);
+    // Wood forend with grooves.
+    part(&g, Vec3.xyz(0, -0.03, -0.24), Vec3.xyz(0.09, 0.045, 0.2), wood);
+    part(&g, Vec3.xyz(0, -0.03, -0.2), Vec3.xyz(0.094, 0.04, 0.008), dark);
+    part(&g, Vec3.xyz(0, -0.03, -0.28), Vec3.xyz(0.094, 0.04, 0.008), dark);
+    // Top lever, guard, trigger.
+    part(&g, Vec3.xyz(0, 0.05, 0.07), Vec3.xyz(0.02, 0.012, 0.05), dark);
+    part(&g, Vec3.xyz(0, -0.065, 0.06), Vec3.xyz(0.014, 0.012, 0.07), dark);
+    part(&g, Vec3.xyz(0, -0.052, 0.05), Vec3.xyz(0.008, 0.028, 0.008), dark);
+    // Grip, short stock, butt, spare shells on the side.
+    bent(&g, Vec3.xyz(0, -0.07, 0.14), Vec3.xyz(0.06, 0.11, 0.06), wood, -0.5);
+    bent(&g, Vec3.xyz(0, -0.06, 0.25), Vec3.xyz(0.06, 0.09, 0.16), wood, -0.15);
+    bent(&g, Vec3.xyz(0, -0.075, 0.33), Vec3.xyz(0.065, 0.12, 0.022), dark, -0.15);
+    let s = 0;
+    while s < 3 {
+        let z = 0.2 + f32(s) * 0.035;
+        part(&g, Vec3.xyz(0.035, -0.055, z), Vec3.xyz(0.012, 0.045, 0.024), body);
+        part(&g, Vec3.xyz(0.035, -0.083, z), Vec3.xyz(0.014, 0.012, 0.026), gold);
+        s += 1;
+    }
+    return g;
+}
+
+/// A gun with no parts yet: everything but the feel knobs zeroed.
+fn blank(mem: &Arena, name: string, kind: int, gift: int, interval: f32, mag: int, reload: f32, tracer: Vec3): Gun {
+    return Gun {
+        name: name, interval: interval, pellets: 1, hipSpread: 0, adsSpread: 0, adsFov: HIP_FOV, knock: 0, damage: 0,
+        shove: 0, mag: mag, ammo: mag, reload: reload, kick: 0.03, shake: 0.01, tracer: tracer, scope: false,
+        muzzle: Vec3.xyz(0, 0.02, -0.5), count: 0, parts: mem.alloc::<Part>(MAX_PARTS), kind: kind, gift: gift, pierce: 0,
+    };
+}
+
+fn rpg(mem: &Arena): Gun {
+    let g = blank(mem, "RPG", ROCKET, RPG, 0.9, 1, 1.1, Vec3.xyz(1, 0.5, 0.2));
+    g.damage = 90;
+    g.adsFov = 60;
+    g.kick = 0.08;
+    g.shake = 0.03;
+    g.muzzle = Vec3.xyz(0, 0.03, -0.62);
+    let tube = Vec3.xyz(0.35, 0.6, 0.3);
+    let dark = Vec3.xyz(0.16, 0.18, 0.16);
+    let tip = Vec3.xyz(1, 0.35, 0.25);
+    let warn = Vec3.xyz(1, 0.85, 0.2);
+    // Tube, bands, warning stripe, flared back end.
+    part(&g, Vec3.xyz(0, 0.03, -0.12), Vec3.xyz(0.1, 0.1, 0.66), tube);
+    part(&g, Vec3.xyz(0, 0.03, -0.42), Vec3.xyz(0.112, 0.112, 0.025), dark);
+    part(&g, Vec3.xyz(0, 0.03, 0.1), Vec3.xyz(0.112, 0.112, 0.025), dark);
+    part(&g, Vec3.xyz(0, 0.03, -0.3), Vec3.xyz(0.105, 0.105, 0.03), warn);
+    part(&g, Vec3.xyz(0, 0.03, 0.23), Vec3.xyz(0.14, 0.14, 0.05), dark);
+    part(&g, Vec3.xyz(0, 0.03, 0.26), Vec3.xyz(0.1, 0.1, 0.01), Vec3.xyz(0.05, 0.05, 0.05));
+    // Loaded warhead poking out the front, stepped to a point.
+    part(&g, Vec3.xyz(0, 0.03, -0.49), Vec3.xyz(0.06, 0.06, 0.06), dark);
+    part(&g, Vec3.xyz(0, 0.03, -0.55), Vec3.xyz(0.13, 0.13, 0.08), tip);
+    part(&g, Vec3.xyz(0, 0.03, -0.61), Vec3.xyz(0.09, 0.09, 0.05), tip);
+    part(&g, Vec3.xyz(0, 0.03, -0.65), Vec3.xyz(0.045, 0.045, 0.04), tip);
+    // Grips, guard, shoulder pad.
+    bent(&g, Vec3.xyz(0, -0.07, -0.22), Vec3.xyz(0.045, 0.1, 0.05), dark, 0.15);
+    bent(&g, Vec3.xyz(0, -0.08, 0), Vec3.xyz(0.05, 0.12, 0.055), dark, -0.3);
+    part(&g, Vec3.xyz(0, -0.035, -0.07), Vec3.xyz(0.012, 0.012, 0.07), dark);
+    part(&g, Vec3.xyz(0, -0.025, 0.14), Vec3.xyz(0.06, 0.03, 0.12), dark);
+    // Sight on the left with a green dot.
+    part(&g, Vec3.xyz(-0.06, 0.1, -0.15), Vec3.xyz(0.02, 0.06, 0.07), dark);
+    shine(&g, Vec3.xyz(-0.06, 0.12, -0.18), Vec3.xyz(0.022, 0.012, 0.004), Vec3.xyz(0.3, 1, 0.4));
+    return g;
+}
+
+fn bow(mem: &Arena): Gun {
+    let g = blank(mem, "BOW", ARROW, BOW, 0.22, 0, 0, Vec3.xyz(0.6, 1, 0.5));
+    g.damage = 120;
+    g.shove = 8;
+    g.hipSpread = 0.4;
+    g.adsFov = 45;
+    g.knock = 1;
+    g.kick = 0.04;
+    let wood = Vec3.xyz(0.8, 0.5, 0.25);
+    let leaf = Vec3.xyz(0.5, 1, 0.45);
+    let wrap = Vec3.xyz(0.35, 0.2, 0.12);
+    // Grip with a leather wrap, then each limb in three pieces curving back to the tips.
+    part(&g, Vec3.xyz(0, 0, -0.1), Vec3.xyz(0.04, 0.16, 0.05), wood);
+    part(&g, Vec3.xyz(0, 0, -0.1), Vec3.xyz(0.046, 0.07, 0.056), wrap);
+    let up = 1;
+    while up >= -1 {
+        let k = f32(up);
+        bent(&g, Vec3.xyz(0, 0.13 * k, -0.1), Vec3.xyz(0.032, 0.14, 0.036), wood, 0.05 * k);
+        bent(&g, Vec3.xyz(0, 0.235 * k, -0.085), Vec3.xyz(0.028, 0.1, 0.03), wood, 0.25 * k);
+        bent(&g, Vec3.xyz(0, 0.31 * k, -0.052), Vec3.xyz(0.024, 0.08, 0.026), leaf, 0.6 * k);
+        up -= 2;
+    }
+    // The string and nocked arrow are animated separately in drawBow.
+    return g;
+}
+
+fn wand(mem: &Arena): Gun {
+    let g = blank(mem, "WAND", BOLT, WAND, 0.22, 15, 1.2, Vec3.xyz(0.7, 0.5, 1));
+    g.damage = 22;
+    g.hipSpread = 1;
+    g.adsFov = 60;
+    g.kick = 0.01;
+    g.shake = 0.003;
+    g.muzzle = Vec3.xyz(0, 0, -0.5);
+    let shaft = Vec3.xyz(0.35, 0.22, 0.5);
+    let gold = Vec3.xyz(0.95, 0.8, 0.3);
+    let gem = Vec3.xyz(0.8, 0.6, 1);
+    // Handle, pommel, bands up the shaft.
+    part(&g, Vec3.xyz(0, 0, 0.06), Vec3.xyz(0.042, 0.042, 0.16), Vec3.xyz(0.25, 0.15, 0.3));
+    part(&g, Vec3.xyz(0, 0, 0.15), Vec3.xyz(0.056, 0.056, 0.03), gold);
+    part(&g, Vec3.xyz(0, 0, -0.22), Vec3.xyz(0.028, 0.028, 0.36), shaft);
+    let b = 0;
+    while b < 4 {
+        part(&g, Vec3.xyz(0, 0, -0.03 - f32(b) * 0.1), Vec3.xyz(0.036, 0.036, 0.014), gold);
+        b += 1;
+    }
+    // Four prongs holding a gem, turned a bit so it reads as a crystal.
+    part(&g, Vec3.xyz(0.028, 0, -0.43), Vec3.xyz(0.01, 0.01, 0.08), gold);
+    part(&g, Vec3.xyz(-0.028, 0, -0.43), Vec3.xyz(0.01, 0.01, 0.08), gold);
+    part(&g, Vec3.xyz(0, 0.028, -0.43), Vec3.xyz(0.01, 0.01, 0.08), gold);
+    part(&g, Vec3.xyz(0, -0.028, -0.43), Vec3.xyz(0.01, 0.01, 0.08), gold);
+    shine(&g, Vec3.xyz(0, 0, -0.47), Vec3.xyz(0.055, 0.055, 0.055), gem);
+    add(&g, Vec3.xyz(0, 0, -0.47), Vec3.xyz(0.04, 0.04, 0.085), gem, 0.785, gem * 2.4);
+    return g;
+}
+
+/// A karambit: finger ring, short handle, and a claw that hooks back toward you.
+fn knife(mem: &Arena): Gun {
+    let g = blank(mem, "KNIFE", MELEE, KNIFE, 0.35, 0, 0, Vec3.xyz(1, 1, 1));
+    g.damage = 55;
+    g.shove = 6;
+    g.kick = 0.02;
+    let grip = Vec3.xyz(0.16, 0.12, 0.14);
+    let wrap = Vec3.xyz(0.08, 0.07, 0.08);
+    let steel = Vec3.xyz(0.82, 0.86, 0.92);
+    let edge = Vec3.xyz(0.95, 0.97, 1);
+    // Finger ring behind the grip.
+    let i = 0;
+    while i < 6 {
+        let a = f32(i) * 1.0472;
+        bent(&g, Vec3.xyz(0, sin(a) * 0.042, 0.145 + cos(a) * 0.042), Vec3.xyz(0.014, 0.012, 0.03), steel, a);
+        i += 1;
+    }
+    part(&g, Vec3.xyz(0, 0, 0.05), Vec3.xyz(0.03, 0.038, 0.11), grip);
+    part(&g, Vec3.xyz(0, 0, 0.02), Vec3.xyz(0.034, 0.02, 0.04), wrap);
+    part(&g, Vec3.xyz(0, 0, 0.07), Vec3.xyz(0.034, 0.02, 0.03), wrap);
+    // Claw: short segments along an arc, forward then hooking down and back.
+    let n = 7;
+    i = 0;
+    while i < n {
+        let t = f32(i) / f32(n - 1);
+        let ang = 3.4 + t * 1.9;
+        let y = 0.02 + sin(ang) * 0.17;
+        let z = -0.04 + cos(ang) * 0.17;
+        let len = 0.07 - t * 0.02;
+        bent(&g, Vec3.xyz(0, y, z), Vec3.xyz(0.014, 0.028 - t * 0.012, len), steel, ang + 1.5708);
+        bent(&g, Vec3.xyz(0, y - 0.01, z), Vec3.xyz(0.006, 0.008, len * 0.85), edge, ang + 1.5708);
+        i += 1;
+    }
+    return g;
+}
+
+fn skateboard(mem: &Arena): Gun {
+    let g = blank(mem, "SKATEBOARD", RIDE, BOARD, 0.5, 0, 0, Vec3.xyz(1, 1, 1));
+    g.kick = 0;
+    g.shake = 0;
+    let deck = Vec3.xyz(1, 0.4, 0.55);
+    let wheel = Vec3.xyz(0.95, 0.95, 0.8);
+    let metal = Vec3.xyz(0.6, 0.62, 0.68);
+    // Deck with grip tape and kicked-up nose and tail.
+    part(&g, Vec3.xyz(0, -0.1, -0.15), Vec3.xyz(0.2, 0.025, 0.6), deck);
+    part(&g, Vec3.xyz(0, -0.086, -0.15), Vec3.xyz(0.19, 0.004, 0.58), Vec3.xyz(0.15, 0.15, 0.18));
+    bent(&g, Vec3.xyz(0, -0.083, -0.49), Vec3.xyz(0.2, 0.025, 0.1), deck, 0.4);
+    bent(&g, Vec3.xyz(0, -0.083, 0.19), Vec3.xyz(0.2, 0.025, 0.1), deck, -0.4);
+    part(&g, Vec3.xyz(0, -0.113, -0.15), Vec3.xyz(0.12, 0.003, 0.3), Vec3.xyz(1, 0.85, 0.3));
+    // Trucks and wheels.
+    let t = 0;
+    while t < 2 {
+        let z = 0.03 - f32(t) * 0.36;
+        part(&g, Vec3.xyz(0, -0.125, z), Vec3.xyz(0.14, 0.02, 0.04), metal);
+        part(&g, Vec3.xyz(0.085, -0.145, z), Vec3.xyz(0.035, 0.045, 0.045), wheel);
+        part(&g, Vec3.xyz(-0.085, -0.145, z), Vec3.xyz(0.035, 0.045, 0.045), wheel);
+        t += 1;
+    }
+    return g;
+}
+
+/// No GL yet: `upload` gives the guns their mesh once the window is up.
+pub fn create(mem: &Arena): Guns {
+    let g = Guns {
+        list: mem.alloc::<Gun>(GUNS), cur: 0, cd: 0, cdLen: 1, switchT: 0, reloadT: 0, reloadLen: 1, ads: 0, flash: 0, recoil: 0,
+        sway: Vec3.zero(), shake: 0, tracers: mem.alloc::<Tracer>(48), nextTracer: 0,
+        marks: mem.alloc::<Mark>(128), nextMark: 0, shots: mem.alloc::<Shot>(MAX_SHOTS), nextShot: 0, cube: Mesh { vao: 0, vbo: 0, count: 0 },
+        trail: mem.alloc::<Trail>(MAX_TRAIL), rng: Rng.new(7), locked: false, arrowhead: Mesh { vao: 0, vbo: 0, count: 0 },
+    };
+    g.list[0] = machineGun(mem);
+    g.list[1] = sniper(mem);
+    g.list[2] = shotgun(mem);
+    g.list[3] = rpg(mem);
+    g.list[4] = bow(mem);
+    g.list[5] = wand(mem);
+    g.list[6] = knife(mem);
+    g.list[7] = skateboard(mem);
+    return g;
+}
+
+pub fn upload(g: &Guns, mem: &Arena) {
+    g.cube = gfx.uploadUv(scene3d.assetVerts("builtin:cube", mem));
+    g.arrowhead = gfx.uploadUv(scene3d.assetVerts("builtin:cone", mem));
+}
+
+pub fn current(g: &Guns): Gun {
+    return g.list[g.cur];
+}
+
+/// Vertical fov right now: eased between hip and aimed.
+pub fn fov(g: &Guns): f32 {
+    return lerp(HIP_FOV, g.list[g.cur].adsFov, g.ads * g.ads * (3 - 2 * g.ads));
+}
+
+/// Cone half-angle in degrees right now, for shots and the crosshair.
+pub fn spread(g: &Guns): f32 {
+    let gun = current(g);
+    return lerp(gun.hipSpread, gun.adsSpread, g.ads);
+}
+
+/// How far through the reload, 0..1, or 0 when not reloading.
+/// Fraction of the shot cooldown still to go: 1 just after a shot, 0 ready.
+pub fn cooldown(g: &Guns): f32 {
+    return clamp(g.cd / g.cdLen, 0, 1);
+}
+
+pub fn reloading(g: &Guns): f32 {
+    if g.reloadT <= 0 { return 0; }
+    return 1 - g.reloadT / g.reloadLen;
+}
+
+fn same(a: string, b: string): bool {
+    if a.len != b.len { return false; }
+    let i = 0;
+    while i < a.len { if a[i] != b[i] { return false; } i += 1; }
+    return true;
+}
+
+fn gunIndex(name: string): int {
+    if same(name, "machine") || same(name, "1") { return 0; }
+    if same(name, "sniper") || same(name, "2") { return 1; }
+    if same(name, "shotgun") || same(name, "3") { return 2; }
+    if same(name, "rpg") || same(name, "4") { return 3; }
+    if same(name, "bow") || same(name, "5") { return 4; }
+    if same(name, "wand") || same(name, "6") { return 5; }
+    if same(name, "knife") || same(name, "7") { return 6; }
+    if same(name, "skateboard") || same(name, "board") || same(name, "8") { return 7; }
+    return -1;
+}
+
+/// Grant every gun named in `list` (comma-separated) and hold the first. Empty does nothing.
+pub fn preview(g: &Guns, p: &Player, mem: &Arena, list: string) {
+    if list.len == 0 { return; }
+    let first = -1;
+    let at = 0;
+    while at < list.len {
+        let bit = debug.piece(mem, list, at);
+        at = bit.next;
+        if bit.name.len == 0 { break; }
+        let i = gunIndex(bit.name);
+        if i < 0 { continue; }
+        let gift = g.list[i].gift;
+        if gift != 0 && !has(p, gift) { p.stats.gifts += gift; }
+        if first < 0 { first = i; }
+    }
+    if first >= 0 { g.cur = first; }
+}
+
+/// Whether gun `i` is in hand: the starting three, or one a shrine gave.
+pub fn owned(g: &Guns, p: &Player, i: int): bool {
+    return g.list[i].gift == 0 || has(p, g.list[i].gift);
+}
+
+/// The `n`th owned gun (0-based, strip order), or -1.
+pub fn nth(g: &Guns, p: &Player, n: int): int {
+    let left = n;
+    let i = 0;
+    while i < GUNS {
+        if owned(g, p, i) {
+            if left == 0 { return i; }
+            left -= 1;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+/// Damage scale from cards, and the air gift while airborne.
+fn dmgScale(p: &Player): f32 {
+    let s = 1 + p.stats.damage;
+    if !p.onGround && has(p, AIR_DMG) { s = s * AIR_BONUS; }
+    return s;
+}
+
+/// Magazine size with the card bonus; any bonus at all rounds up to a shot more. 0 for no magazine.
+pub fn mag(gun: Gun, p: &Player): int {
+    if gun.mag == 0 { return 0; }
+    let m = f32(gun.mag) * (1 + p.stats.mag);
+    let n = int(m);
+    if f32(n) < m - 0.001 { n += 1; }
+    return n;
+}
+
+/// After a death: every gun with a magazine full at its current size, no reload running.
+pub fn refill(g: &Guns, p: &Player) {
+    cancelDraw(g);
+    let i = 0;
+    while i < GUNS {
+        if g.list[i].mag > 0 { g.list[i].ammo = mag(g.list[i], p); }
+        i += 1;
+    }
+    g.reloadT = 0;
+}
+
+/// Menus, switching and death discard the draw; releasing afterwards cannot fire.
+pub fn cancelDraw(g: &Guns) {
+    g.bowDrawing = false;
+    g.bowCharge = 0;
+    g.bowSpark = 0;
+    g.locked = true;
+}
+
+fn arrowSpeed(charge: f32): f32 { return lerp(20, 85, clamp(charge, 0, 1)); }
+fn arrowPower(charge: f32): f32 { return lerp(0.2, 1, clamp(charge, 0, 1)); }
+
+/// Returns the released draw, or -1 while idle/held. Full draw cues only once.
+fn drawTrigger(g: &Guns, down: bool, dt: f32, rate: f32): f32 {
+    if down {
+        g.bowDrawing = true;
+        let before = g.bowCharge;
+        g.bowCharge = min(1, g.bowCharge + dt * rate / BOW_DRAW);
+        if before < 1 && g.bowCharge >= 1 {
+            g.bowSpark = BOW_SPARK;
+            sfx.play(sfx.BOW_READY);
+        }
+        return -1;
+    }
+    if !g.bowDrawing { return -1; }
+    let charge = g.bowCharge;
+    g.bowDrawing = false;
+    // Keep charge until fire has positioned the released arrow at the nock.
+    return charge;
+}
+
+fn startReload(g: &Guns, p: &Player) {
+    let gun = g.list[g.cur];
+    if gun.mag == 0 || g.reloadT > 0 || gun.ammo >= mag(gun, p) || g.switchT > 0 { return; }
+    g.reloadLen = gun.reload / (1 + p.stats.reload);
+    g.reloadT = g.reloadLen;
+    sfx.play(sfx.RELOAD);
+}
+
+/// The sniper's scope covers the screen.
+pub fn scoped(g: &Guns): bool {
+    return g.list[g.cur].scope && g.ads > 0.9;
+}
+
+pub fn update(g: &Guns, p: &Player, lvl: &Level, scene: &Scene, e: &Enemies, sh: &Shrines, bs: &Bosses, dt: f32) {
+    g.cd = g.cd - dt;
+    g.switchT = max(g.switchT - dt, 0);
+    g.flash = g.flash - dt;
+    g.recoil = g.recoil * max(1 - dt * 12, 0);
+    g.shake = g.shake * max(1 - dt * 14, 0);
+
+    // Gone (a death took the shrine weapons): back to the first gun.
+    if !owned(g, p, g.cur) { cancelDraw(g); g.cur = 0; }
+    let want = g.cur;
+    let wheel = game.mouseWheel();
+    if wheel != 0 {
+        let step = 1;
+        if wheel > 0 { step = GUNS - 1; }
+        want = (g.cur + step) % GUNS;
+        while !owned(g, p, want) { want = (want + step) % GUNS; }
+    }
+    let k = 0;
+    while k < GUNS {
+        if game.keyPressed(numKey(k)) && nth(g, p, k) >= 0 { want = nth(g, p, k); }
+        k += 1;
+    }
+    if want != g.cur {
+        if g.list[g.cur].kind == ARROW || g.list[want].kind == ARROW { cancelDraw(g); }
+        g.cur = want;
+        g.reloadT = 0;
+        g.switchT = SWITCH_TIME;
+        g.ads = 0;
+        g.cd = max(g.cd, SWITCH_TIME);
+        g.cdLen = max(g.cd, 0.01);
+    }
+
+    if g.reloadT > 0 {
+        g.reloadT = g.reloadT - dt * p.haste;
+        if g.reloadT <= 0 {
+            g.reloadT = 0;
+            g.list[g.cur].ammo = mag(g.list[g.cur], p);
+        }
+    }
+    if game.keyPressed(Key.R) { startReload(g, p); }
+
+    let held = g.list[g.cur].kind;
+    let aiming = game.mouseDown(Mouse.Right) && g.switchT <= 0 && g.reloadT <= 0 && game.mouseCaptured()
+        && held != MELEE && held != RIDE;
+    if aiming { g.ads = min(g.ads + dt / ADS_TIME, 1); } else { g.ads = max(g.ads - dt / ADS_TIME, 0); }
+    p.speedScale = lerp(1, 0.7, g.ads);
+    // Knife out: quicker and tougher. Skateboard out: riding.
+    p.guard = 1;
+    if held == MELEE {
+        p.speedScale = p.speedScale * 1.15;
+        p.guard = 0.8;
+    }
+    p.board = held == RIDE;
+    p.lookScale = fov(g) / HIP_FOV * lerp(1, p.adsSens, g.ads);
+
+    // The gun lags a little behind the view.
+    let m = game.mouseDelta();
+    let swayTo = Vec3.xyz(clamp(0 - m.x * 0.0005, -0.03, 0.03), clamp(m.y * 0.0005, -0.03, 0.03), 0);
+    g.sway = g.sway + (swayTo - g.sway) * min(dt * 10, 1);
+
+    g.bowSpark = max(0, g.bowSpark - dt);
+    if g.locked || !game.mouseCaptured() { cancelDraw(g); }
+    if g.locked && !game.mouseDown(Mouse.Left) { g.locked = false; }
+    if held == ARROW {
+        if game.mouseCaptured() && !g.locked && g.cd <= 0 && g.switchT <= 0 && g.reloadT <= 0 {
+            let released = drawTrigger(g, game.mouseDown(Mouse.Left), dt, (1 + p.stats.fireRate) * p.haste);
+            if released >= 0 {
+                fire(g, p, lvl, scene, e, sh, bs);
+                g.cd = g.list[g.cur].interval / ((1 + p.stats.fireRate) * p.haste);
+                g.cdLen = g.cd;
+                g.bowCharge = 0;
+                g.bowSpark = 0;
+            }
+        }
+    } else if game.mouseCaptured() && g.cd <= 0 && g.reloadT <= 0 {
+        let gun = current(g);
+        // Other weapons fire while the button is held.
+        let pull = game.mouseDown(Mouse.Left) && !g.locked;
+        // The board only ollies off the ground; holding click isn't a reason to wait.
+        if gun.kind == RIDE && !p.onGround { pull = false; }
+        if pull && gun.mag > 0 && gun.ammo <= 0 {
+            startReload(g, p);
+        } else if pull {
+            fire(g, p, lvl, scene, e, sh, bs);
+            g.cd = gun.interval / ((1 + p.stats.fireRate) * p.haste);
+            g.cdLen = g.cd;
+            if gun.mag > 0 {
+                g.list[g.cur].ammo -= 1;
+                // Empty: straight into the reload.
+                if g.list[g.cur].ammo == 0 { startReload(g, p); }
+            }
+        }
+    }
+
+    flight(g, p, lvl, e, sh, bs, dt);
+    let i = 0;
+    while i < 48 {
+        g.tracers[i].t = g.tracers[i].t - dt;
+        i += 1;
+    }
+    i = 0;
+    while i < 128 {
+        g.marks[i].t = g.marks[i].t - dt;
+        i += 1;
+    }
+}
+
+fn numKey(k: int): Key {
+    if k == 0 { return Key.Num1; }
+    if k == 1 { return Key.Num2; }
+    if k == 2 { return Key.Num3; }
+    if k == 3 { return Key.Num4; }
+    if k == 4 { return Key.Num5; }
+    if k == 5 { return Key.Num6; }
+    if k == 6 { return Key.Num7; }
+    return Key.Num8;
+}
+
+fn mark(g: &Guns, at: Vec3, color: Vec3) {
+    g.marks[g.nextMark] = Mark { p: at, t: MARK_LIFE, color: color };
+    g.nextMark = (g.nextMark + 1) % 128;
+}
+
+/// A bolt's target: the enemy in its cone scoring best on distance and angle, among the two
+/// best, that the level's boxes don't hide; the boss when it beats them. -1 for none.
+fn seek(e: &Enemies, bs: &Bosses, lvl: &Level, at: Vec3, dir: Vec3): int {
+    let best = -1;
+    let second = -1;
+    let bestS: f32 = 1000000;
+    let secondS: f32 = 1000000;
+    if boss.targetable(bs) {
+        let off = boss.aimPoint(bs) - at;
+        let away = off.length();
+        if away < BOLT_RANGE && away > 0.01 && off.dot(dir) / away > BOLT_CONE && clear(lvl, at, boss.aimPoint(bs)) {
+            // A little keener on the boss than on a crowd around it.
+            bestS = away * (2 - off.dot(dir) / away) * 0.8;
+            best = AT_BOSS;
+        }
+    }
+    let i = 0;
+    while i < MAX_ENEMIES {
+        if e.list[i].kind != 0 {
+            let d = e.list[i].pos - at;
+            let far = d.length();
+            if far < BOLT_RANGE && far > 0.01 {
+                let c = d.dot(dir) / far;
+                if c > BOLT_CONE {
+                    let score = far * (2 - c);
+                    if score < bestS {
+                        second = best;
+                        secondS = bestS;
+                        best = i;
+                        bestS = score;
+                    } else if score < secondS {
+                        second = i;
+                        secondS = score;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    if best == AT_BOSS { return best; }
+    if best >= 0 && clear(lvl, at, e.list[best].pos) { return best; }
+    if second == AT_BOSS { return second; }
+    if second >= 0 && clear(lvl, at, e.list[second].pos) { return second; }
+    return -1;
+}
+
+/// Ballistic tip sweep: at most five distinct enemies, stopped by world/shrines/bosses.
+fn arrowFlight(s: &Shot, lvl: &Level, e: &Enemies, sh: &Shrines, bs: &Bosses, dt: f32) {
+    if s.stuck { return; }
+    let left = dt;
+    while left > 0 && s.t > 0 && !s.stuck {
+        let tick = min(left, 0.016666667);
+        left -= tick;
+        let motion = s.vel * tick + Vec3.xyz(0, -0.5 * ARROW_GRAVITY * tick * tick, 0);
+        s.vel.y -= ARROW_GRAVITY * tick;
+        let distance = motion.length();
+        if distance < 0.00001 { continue; }
+        let dir = motion * (1 / distance);
+        let r = Ray { origin: s.pos, dir: dir };
+        let wall = sweep(lvl, r, distance);
+        let near = distance;
+        if wall.hit { near = (wall.point - s.pos).length(); }
+        let who = 0;
+        let index = -1;
+        let stone = shrine.ray(sh, r, near);
+        if stone.index >= 0 && max(0, stone.t) < near {
+            near = max(0, stone.t); who = 2; index = stone.index;
+        }
+        let big = boss.ray(bs, r, near);
+        if big.part >= 0 && max(0, big.t) < near {
+            near = max(0, big.t); who = 3; index = big.part;
+        }
+        // Resolve every enemy before the nearest blocker, including overlapping
+        // bodies in a single step. Remember hits across steps and frames.
+        while s.hitCount < ARROW_HITS {
+            let foe = enemies.rayExcept(e, r, near, s.hits[:]);
+            if foe.index < 0 || max(0, foe.t) >= near { break; }
+            let at = r.origin + dir * max(0, foe.t);
+            s.hits[s.hitCount] = foe.index;
+            s.hitCount += 1;
+            enemies.damage(e, foe.index, s.damage, dir * 8, at);
+            if s.hitCount == ARROW_HITS {
+                s.pos = at;
+                s.t = 0;
+                return;
+            }
+        }
+        s.pos = s.pos + dir * near;
+        if who == 2 { shrine.damage(sh, e, index, s.damage, s.pos); }
+        if who == 3 { boss.damage(bs, e, index, s.damage, s.pos); }
+        if who != 0 {
+            s.t = 0;
+        } else if wall.hit {
+            // Leave the shaft and feathers visible, with the head embedded.
+            s.pos = s.pos + dir * 0.025;
+            s.vel = dir;
+            s.stuck = true;
+            s.t = 8;
+        }
+    }
+}
+
+/// A short, fading wake follows the arrow's feathers and survives an impact.
+fn arrowTrail(g: &Guns, a: Vec3, b: Vec3) {
+    if (b - a).length() < 0.001 { return; }
+    g.trail[g.nextTrail] = Trail { a: a, b: b, t: TRAIL_LIFE };
+    g.nextTrail = (g.nextTrail + 1) % MAX_TRAIL;
+}
+
+/// Rockets, bolts and arrows in flight.
+fn flight(g: &Guns, p: &Player, lvl: &Level, e: &Enemies, sh: &Shrines, bs: &Bosses, dt: f32) {
+    let fade = 0;
+    while fade < MAX_TRAIL {
+        g.trail[fade].t = max(0, g.trail[fade].t - dt);
+        fade += 1;
+    }
+    let i = 0;
+    while i < MAX_SHOTS {
+        let s = &g.shots[i];
+        if s.t > 0 {
+            s.t = s.t - dt;
+            if s.kind == ARROW {
+                let start = s.pos - s.vel.normalize() * 0.8;
+                let moving = !s.stuck && s.t > 0;
+                arrowFlight(s, lvl, e, sh, bs, dt);
+                if moving { arrowTrail(g, start, s.pos - s.vel.normalize() * 0.8); }
+                i += 1;
+                continue;
+            }
+            let dir = s.vel.normalize();
+            if s.kind == BOLT {
+                s.seekT = s.seekT - dt;
+                if s.seekT <= 0 {
+                    s.target = seek(e, bs, lvl, s.pos, dir);
+                    s.seekT = BOLT_SEEK;
+                }
+                let homing = s.target >= 0 && e.list[s.target].kind != 0;
+                let goal = s.pos;
+                if homing { goal = e.list[s.target].pos; }
+                if s.target == AT_BOSS && boss.targetable(bs) {
+                    homing = true;
+                    goal = boss.aimPoint(bs);
+                }
+                if homing {
+                    let to = (goal - s.pos).normalize();
+                    // Ground or a wall right ahead: pull up toward the target instead of hugging it.
+                    let turn = BOLT_TURN;
+                    if solid(lvl, s.pos + dir * 2.5, 0.1) >= 0 { turn = turn * BOLT_PULL_UP; }
+                    dir = (dir + (to - dir) * min(turn * dt, 1)).normalize();
+                }
+                s.vel = dir * BOLT_SPEED;
+            }
+            let step = s.vel.length() * dt;
+            let r = Ray { origin: s.pos, dir: dir };
+            let foe = enemies.ray(e, r, step);
+            let stone = shrine.ray(sh, r, step);
+            let big = boss.ray(bs, r, step);
+            let end = s.pos + s.vel * dt;
+            let wall = solid(lvl, end, 0.1) >= 0;
+            if foe.index >= 0 || stone.index >= 0 || big.part >= 0 || wall || s.t <= 0 {
+                let at = end;
+                let near = step;
+                if foe.index >= 0 { at = s.pos + dir * foe.t; near = foe.t; }
+                if stone.index >= 0 && stone.t < near { at = s.pos + dir * stone.t; near = stone.t; }
+                if big.part >= 0 && big.t < near { at = s.pos + dir * big.t; }
+                if s.kind == ROCKET {
+                    explode(g, p, e, sh, bs, at, s.damage);
+                } else {
+                    // A small magic burst: no rocket jump, a light shove.
+                    enemies.blast(e, at, WAND_BLAST, s.damage, Vec3.xyz(0.7, 0.5, 1), 3);
+                    shrine.blast(sh, e, at, WAND_BLAST, s.damage);
+                    boss.blast(bs, e, at, WAND_BLAST, s.damage);
+                    mark(g, at, Vec3.xyz(0.7, 0.5, 1));
+                }
+                s.t = 0;
+            } else {
+                s.pos = end;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// A rocket going off: enemies and shrines around take the blast, and so does the player's
+/// footing: standing in it throws you (a rocket jump). In the air it doesn't.
+fn explode(g: &Guns, p: &Player, e: &Enemies, sh: &Shrines, bs: &Bosses, at: Vec3, dmg: f32) {
+    sfx.at(sfx.BOOM, at);
+    enemies.blast(e, at, BLAST, dmg, Vec3.xyz(1, 0.6, 0.2), 18);
+    shrine.blast(sh, e, at, BLAST, dmg);
+    boss.blast(bs, e, at, BLAST, dmg);
+    mark(g, at, Vec3.xyz(1, 0.5, 0.2));
+    let mid = p.pos + Vec3.xyz(0, 0.9, 0);
+    let far = (mid - at).length();
+    if far < BLAST {
+        g.shake = max(g.shake, 0.04 * (1 - far / BLAST));
+        if p.onGround {
+            let away = (mid - at).normalize();
+            push(p, away * (ROCKET_JUMP * (1 - far / BLAST * 0.5)));
+        }
+    }
+}
+
+/// Knife: everything close in front takes the slash.
+fn slash(g: &Guns, p: &Player, e: &Enemies, sh: &Shrines, bs: &Bosses, gun: Gun) {
+    let l = look(p);
+    let fwd = l.forward();
+    let hit = false;
+    let i = 0;
+    while i < MAX_ENEMIES {
+        let en = e.list[i];
+        if en.kind != 0 {
+            let to = en.pos - l.eye;
+            if to.length() < KNIFE_REACH && to.normalize().dot(fwd) > KNIFE_CONE {
+                enemies.damage(e, i, gun.damage * dmgScale(p), fwd * gun.shove + Vec3.xyz(0, 3, 0), en.pos);
+                hit = true;
+            }
+        }
+        i += 1;
+    }
+    let stone = shrine.near(sh, l.eye, fwd, KNIFE_REACH);
+    if stone >= 0 { shrine.damage(sh, e, stone, gun.damage * dmgScale(p), l.eye + fwd * KNIFE_REACH * 0.7); }
+    let part = boss.near(bs, l.eye, fwd, KNIFE_REACH);
+    if part >= 0 {
+        boss.damage(bs, e, part, gun.damage * dmgScale(p), l.eye + fwd * KNIFE_REACH * 0.7);
+        hit = true;
+    }
+    // A swipe streak across the view.
+    let right = l.right();
+    let mid = l.eye + fwd * 1.2;
+    g.tracers[g.nextTracer] = Tracer { a: mid + right * 0.5 + Vec3.xyz(0, 0.25, 0), b: mid - right * 0.5 - Vec3.xyz(0, 0.2, 0),
+        t: TRACER_LIFE * 2, color: Vec3.xyz(1, 1, 1) };
+    g.nextTracer = (g.nextTracer + 1) % 48;
+    if hit { g.shake = max(g.shake, 0.01); }
+}
+
+/// The gun's own space in view space: hip or aimed, lowered while switching, kicked back.
+fn gunInView(g: &Guns): Mat4 {
+    let t = g.ads * g.ads * (3 - 2 * g.ads);
+    // Where the gun sits in view space, at the hip and aimed.
+    let hip = Vec3.xyz(0.19, -0.18, -0.5);
+    let aimed = Vec3.xyz(0, -0.068, -0.4);
+    let size: f32 = 0.55;
+    if g.list[g.cur].kind == ARROW {
+        hip = Vec3.xyz(0.24, -0.14, -0.48);
+        aimed = Vec3.xyz(0.07, -0.035, -0.43);
+        size = 0.85;
+    }
+    let at = hip + (aimed - hip) * t + g.sway * (1 - t * 0.7);
+    at.y = at.y - g.switchT / SWITCH_TIME * 0.35;
+    at.z = at.z + g.recoil * 0.05;
+    // The knife stabs forward instead of kicking back.
+    if g.list[g.cur].kind == MELEE { at = at + Vec3.xyz(-0.08, 0.03, -0.3) * g.recoil; }
+    // Reload: tip down and roll in, then come back up.
+    let r = reloading(g);
+    let dip = sin(r * PI);
+    at.y = at.y - dip * 0.12;
+    let tilt = Mat4.rotate(Vec3.xyz(1, 0, 0), g.recoil * 0.12 - dip * 0.6).mul(Mat4.rotate(Vec3.xyz(0, 0, 1), dip * 0.5));
+    return Mat4.translate(at.x, at.y, at.z).mul(tilt).mul(Mat4.scale(size, size, size));
+}
+
+fn bowTip(g: &Guns): Vec3 { return Vec3.xyz(0, 0, -0.78 + g.bowCharge * 0.28); }
+
+/// Local -Z follows the arrow's travel, even for nearly vertical shots.
+fn along(tip: Vec3, dir: Vec3): Mat4 {
+    let up = Vec3.up();
+    if abs(dir.y) > 0.98 { up = Vec3.xyz(1, 0, 0); }
+    return Mat4.lookAt(tip, tip + dir, up).affineInverse();
+}
+
+fn arrowBox(g: &Guns, base: Mat4, at: Vec3, size: Vec3, tint: Vec3) {
+    gfx.material(tint, tint * 0.08);
+    gfx.draw(g.cube, base.mul(Mat4.translate(at.x, at.y, at.z)).mul(Mat4.scale(size.x, size.y, size.z)));
+}
+
+/// The same shaft, pointed steel head and crossed feathers in hand and in flight.
+fn drawArrow(g: &Guns, base: Mat4, glow: f32) {
+    arrowBox(g, base, Vec3.xyz(0, 0, 0.435), Vec3.xyz(0.018, 0.018, 0.69), Vec3.xyz(0.65, 0.39, 0.18));
+    gfx.material(Vec3.xyz(0.7, 0.8, 0.85), Vec3.xyz(0.45, 0.85, 0.65) * glow);
+    gfx.draw(g.arrowhead, base.mul(Mat4.translate(0, 0, 0.06)).mul(Mat4.rotate(Vec3.xyz(1, 0, 0), -PI / 2)).mul(Mat4.scale(0.014, 0.12, 0.08)));
+    arrowBox(g, base, Vec3.xyz(0, 0, 0.71), Vec3.xyz(0.006, 0.08, 0.13), Vec3.xyz(0.9, 0.3, 0.22));
+    arrowBox(g, base, Vec3.xyz(0, 0, 0.71), Vec3.xyz(0.08, 0.006, 0.13), Vec3.xyz(0.95, 0.85, 0.6));
+    arrowBox(g, base, Vec3.xyz(0, 0, 0.79), Vec3.xyz(0.023, 0.023, 0.025), Vec3.xyz(0.85, 0.8, 0.65));
+}
+
+fn drawBow(g: &Guns, base: Mat4) {
+    let tip = bowTip(g);
+    let nock = tip + Vec3.xyz(0, 0, 0.8);
+    let sign: f32 = -1;
+    while sign <= 1 {
+        let end = Vec3.xyz(0, sign * 0.345 * (1 - g.bowCharge * 0.08), -0.028 + g.bowCharge * 0.08);
+        let delta = end - nock;
+        let stringBase = base.mul(along(nock, delta.normalize()));
+        arrowBox(g, stringBase, Vec3.xyz(0, 0, -delta.length() * 0.5), Vec3.xyz(0.004, 0.004, delta.length()), Vec3.xyz(0.95, 0.9, 0.75));
+        sign += 2;
+    }
+    if g.cd > 0 { return; }
+    let ready: f32 = 0;
+    if g.bowCharge >= 1 { ready = 0.35; }
+    drawArrow(g, base.mul(Mat4.translate(tip.x, tip.y, tip.z)), ready);
+    if g.bowSpark > 0 {
+        let age = 1 - g.bowSpark / BOW_SPARK;
+        let i = 0;
+        while i < 8 {
+            let angle = f32(i) * TAU / 8;
+            let radius = 0.02 + age * 0.13;
+            let at = tip + Vec3.xyz(cos(angle) * radius, sin(angle) * radius + age * 0.05, -0.02 - age * 0.03);
+            let size = 0.012 * (1 - age);
+            gfx.material(Vec3.zero(), Vec3.xyz(0.7, 1, 0.8) * ((1 - age) * 1.5));
+            gfx.draw(g.cube, base.mul(Mat4.translate(at.x, at.y, at.z)).mul(Mat4.scale(size, size, size)));
+            i += 1;
+        }
+    }
+}
+
+/// The sound of gun `i` going off, in `create`'s order.
+fn bang(i: int) {
+    let s = sfx.SHOT;
+    if i == 1 { s = sfx.SNIPER; }
+    if i == 2 { s = sfx.SHOTGUN; }
+    if i == 3 { s = sfx.ROCKET; }
+    if i == 4 { s = sfx.BOW; }
+    if i == 5 { s = sfx.WAND; }
+    if i == 6 { s = sfx.SWISH; }
+    if i == 7 { s = sfx.JUMP; }
+    sfx.play(s);
+}
+
+fn fire(g: &Guns, p: &Player, lvl: &Level, scene: &Scene, e: &Enemies, sh: &Shrines, bs: &Bosses) {
+    let gun = current(g);
+    g.recoil = 1;
+    bang(g.cur);
+    if gun.kind == RIDE {
+        p.vel.y = OLLIE;
+        p.onGround = false;
+        return;
+    }
+    if gun.kind == MELEE {
+        slash(g, p, e, sh, bs, gun);
+        return;
+    }
+    let l = look(p);
+    let fwd = l.forward();
+    let right = l.right();
+    let up = right.cross(fwd);
+    let cone = tan(spread(g) * PI / 180);
+    let muzzle = l.view().affineInverse().mul(gunInView(g)).transformPoint(gun.muzzle);
+    if gun.kind == ARROW {
+        let tip = l.view().affineInverse().mul(gunInView(g)).transformPoint(bowTip(g));
+        // Aim the physical arrow toward the crosshair, with gravity taking over in flight.
+        let eyeRay = Ray { origin: l.eye, dir: fwd };
+        let aimWall = sweep(lvl, eyeRay, 60);
+        let aimFar = (aimWall.point - l.eye).length();
+        let aimFoe = enemies.ray(e, eyeRay, aimFar);
+        if aimFoe.index >= 0 { aimFar = max(1, aimFoe.t); }
+        let aimBoss = boss.ray(bs, eyeRay, aimFar);
+        if aimBoss.part >= 0 { aimFar = max(1, aimBoss.t); }
+        let aimShrine = shrine.ray(sh, eyeRay, aimFar);
+        if aimShrine.index >= 0 { aimFar = max(1, aimShrine.t); }
+        // A viewmodel can overlap a wall. Start at the eye in that case so the
+        // first sweep hits the wall instead of creating an arrow behind it.
+        let toTip = tip - l.eye;
+        let muzzleWall = sweep(lvl, Ray { origin: l.eye, dir: toTip.normalize() }, toTip.length());
+        if muzzleWall.hit { tip = l.eye; }
+        let arrowAim = (l.eye + fwd * max(1, aimFar) - tip).normalize();
+        g.shots[g.nextShot] = Shot { hits: [-1, -1, -1, -1, -1], pos: tip, vel: arrowAim * arrowSpeed(g.bowCharge), t: 6, kind: ARROW,
+            damage: gun.damage * arrowPower(g.bowCharge) * dmgScale(p), target: -1, seekT: 0 };
+        g.nextShot = (g.nextShot + 1) % MAX_SHOTS;
+        push(p, fwd * (0 - gun.knock * arrowPower(g.bowCharge)));
+        p.kick += gun.kick * arrowPower(g.bowCharge);
+        return;
+    }
+    if gun.kind == ROCKET || gun.kind == BOLT {
+        let speed = ROCKET_SPEED;
+        if gun.kind == BOLT { speed = BOLT_SPEED; }
+        let aim = (fwd + right * ((g.rng.unit() - 0.5) * cone) + up * ((g.rng.unit() - 0.5) * cone)).normalize();
+        // From the eye, so a shot at your feet can't start inside the floor.
+        g.shots[g.nextShot] = Shot { hits: [-1, -1, -1, -1, -1], pos: l.eye + aim * 0.4, vel: aim * speed, t: 4, kind: gun.kind, damage: gun.damage * dmgScale(p), target: -1, seekT: 0 };
+        g.nextShot = (g.nextShot + 1) % MAX_SHOTS;
+    }
+    let i = 0;
+    if gun.kind != HITSCAN { i = gun.pellets; }
+    while i < gun.pellets {
+        let a = g.rng.unit() * TAU;
+        let r = sqrt(g.rng.unit()) * cone;
+        let dir = (fwd + right * (cos(a) * r) + up * (sin(a) * r)).normalize();
+        let ray = Ray { origin: l.eye, dir: dir };
+        let shot = shoot(lvl, scene, ray, REACH);
+        let far = (shot.point - l.eye).length();
+        let stone = shrine.ray(sh, ray, far);
+        if stone.index >= 0 { far = stone.t; }
+        // Nothing pierces a boss.
+        let big = boss.ray(bs, ray, far);
+        if big.part >= 0 {
+            far = big.t;
+            stone.index = -1;
+        }
+        let end = l.eye + dir * far;
+        // Through the first enemy and `pierce` more, stopped by a wall, a shrine or the boss.
+        let past = f32(0);
+        let left = gun.pierce + 1;
+        while left > 0 {
+            let hit = enemies.ray(e, Ray { origin: l.eye + dir * past, dir: dir }, far - past);
+            if hit.index < 0 { break; }
+            let at = l.eye + dir * (past + hit.t);
+            enemies.damage(e, hit.index, gun.damage * dmgScale(p), dir * gun.shove, at);
+            past = past + hit.exit + 0.01;
+            left -= 1;
+            if left == 0 { end = at; }
+        }
+        if stone.index >= 0 && left > 0 { shrine.damage(sh, e, stone.index, gun.damage * dmgScale(p), end); }
+        if big.part >= 0 && left > 0 { boss.damage(bs, e, big.part, gun.damage * dmgScale(p), end); }
+        g.tracers[g.nextTracer] = Tracer { a: muzzle, b: end, t: TRACER_LIFE, color: gun.tracer };
+        g.nextTracer = (g.nextTracer + 1) % 48;
+        if shot.hit && left == gun.pierce + 1 && stone.index < 0 && big.part < 0 { mark(g, shot.point - dir * 0.03, gun.tracer); }
+        i += 1;
+    }
+    push(p, fwd * (0 - gun.knock));
+    p.kick = p.kick + gun.kick;
+    g.flash = FLASH_LIFE;
+    g.shake = max(g.shake, gun.shake);
+}
+
+/// Before the camera pass: the muzzle flash light (slot 7, after the scene's own).
+pub fn lights(g: &Guns, l: Look) {
+    if g.flash > 0 {
+        gfx.light(7, l.eye + l.forward() * 0.8, Vec3.xyz(4, 2.6, 1.2), 7);
+    } else {
+        gfx.light(7, l.eye, Vec3.zero(), 0);
+    }
+}
+
+/// The view the camera pass uses: the player's, shaken after a big shot.
+pub fn view(g: &Guns, l: Look): Look {
+    if g.shake <= 0.0005 { return l; }
+    let s = l;
+    s.yaw = s.yaw + (g.rng.unit() - 0.5) * g.shake;
+    s.pitch = s.pitch + (g.rng.unit() - 0.5) * g.shake;
+    return s;
+}
+
+/// In the camera pass, after the scene: tracers, impact marks, then the gun on top.
+pub fn draw(g: &Guns, l: Look) {
+    let wake = 0;
+    while wake < MAX_TRAIL {
+        let trail = g.trail[wake];
+        if trail.t > 0 {
+            let fade = trail.t / TRAIL_LIFE;
+            let delta = trail.b - trail.a;
+            let mid = (trail.a + trail.b) * 0.5;
+            let width = 0.006 + fade * 0.022;
+            gfx.material(Vec3.xyz(0.6, 0.85, 0.7), Vec3.xyz(0.45, 0.8, 0.6));
+            gfx.drawAlpha(g.cube, along(mid, delta.normalize()).mul(Mat4.scale(width, width, delta.length())), fade * fade * 0.65);
+        }
+        wake += 1;
+    }
+    let i = 0;
+    while i < 48 {
+        let tr = g.tracers[i];
+        if tr.t > 0 { gfx.drawLine(tr.a, tr.b, tr.color); }
+        i += 1;
+    }
+    i = 0;
+    while i < 128 {
+        let mk = g.marks[i];
+        if mk.t > 0 {
+            let s = 0.12 * min(mk.t, 1);
+            gfx.material(Vec3.xyz(0.2, 0.2, 0.2), mk.color * min(mk.t, 1.5));
+            gfx.draw(g.cube, Mat4.translate(mk.p.x, mk.p.y, mk.p.z).mul(Mat4.scale(s, s, s)));
+        }
+        i += 1;
+    }
+
+    i = 0;
+    while i < MAX_SHOTS {
+        let pr = g.shots[i];
+        if pr.t > 0 {
+            let spin = Mat4.translate(pr.pos.x, pr.pos.y, pr.pos.z).mul(Mat4.rotate(Vec3.xyz(1, 1, 0).normalize(), pr.t * 12));
+            if pr.kind == ARROW {
+                drawArrow(g, along(pr.pos, pr.vel.normalize()), 0);
+            } else if pr.kind == ROCKET {
+                gfx.material(Vec3.xyz(0.9, 0.9, 0.85), Vec3.xyz(0.3, 0.1, 0.05));
+                gfx.draw(g.cube, spin.mul(Mat4.scale(0.22, 0.22, 0.22)));
+                let tail = pr.pos - pr.vel.normalize() * 0.25;
+                gfx.material(Vec3.zero(), Vec3.xyz(3, 1.4, 0.3));
+                gfx.draw(g.cube, Mat4.translate(tail.x, tail.y, tail.z).mul(Mat4.scale(0.16, 0.16, 0.16)));
+            } else {
+                gfx.material(Vec3.xyz(0.8, 0.6, 1), Vec3.xyz(1.6, 1, 3));
+                gfx.draw(g.cube, spin.mul(Mat4.scale(0.16, 0.16, 0.16)));
+            }
+        }
+        i += 1;
+    }
+    if scoped(g) {
+        gfx.surface(gfx.plainSurface());
+        return;
+    }
+    gfx.clearDepth();
+    let gun = current(g);
+    let toWorld = l.view().affineInverse().mul(gunInView(g));
+    i = 0;
+    while i < gun.count {
+        let pt = gun.parts[i];
+        if gun.kind == ARROW && i >= 2 {
+            // Limbs flex toward the drawing hand, strongest at their tips.
+            let bend = g.bowCharge * min(1, abs(pt.at.y) / 0.35);
+            pt.at.z += bend * 0.08;
+            pt.at.y *= 1 - g.bowCharge * 0.08;
+            if pt.at.y > 0 { pt.tilt -= g.bowCharge * 0.12; } else { pt.tilt += g.bowCharge * 0.12; }
+        }
+        let heat = Vec3.xyz(0.55, 0.2, 0.03) * (g.hot * (0.6 + 0.4 * sin(f32(game.ticks()) * 0.015)));
+        gfx.material(pt.color, pt.color * 0.08 + pt.glow + heat);
+        gfx.draw(g.cube, toWorld.mul(Mat4.translate(pt.at.x, pt.at.y, pt.at.z)).mul(Mat4.rotate(Vec3.xyz(1, 0, 0), pt.tilt)).mul(Mat4.scale(pt.size.x, pt.size.y, pt.size.z)));
+        i += 1;
+    }
+    if gun.kind == ARROW { drawBow(g, toWorld); }
+    if g.flash > 0 {
+        let f = g.flash / FLASH_LIFE;
+        let size = 0.09 + 0.05 * f;
+        gfx.material(Vec3.zero(), Vec3.xyz(3, 2.2, 0.9));
+        let at = gun.muzzle;
+        gfx.draw(g.cube, toWorld.mul(Mat4.translate(at.x, at.y, at.z - 0.04)).mul(Mat4.rotate(Vec3.xyz(0, 0, 1), f * 2)).mul(Mat4.scale(size, size, size * 1.6)));
+    }
+    gfx.surface(gfx.plainSurface());
+}
+
+
+/// Bow input, ballistic motion and occlusion checks, using the real weapon code.
+pub fn selfCheck(mem: &Arena, scene: &Scene) {
+    let g = create(mem);
+    g.cur = 4;
+    if drawTrigger(&g, false, 0.1, 1) >= 0 { panic("bow check: idle release fired"); }
+    if drawTrigger(&g, true, 0.25, 1) >= 0 { panic("bow check: fired while drawing"); }
+    let weak = drawTrigger(&g, false, 0, 1);
+    if abs(weak - 0.25) > 0.001 { panic("bow check: early release charge"); }
+    cancelDraw(&g);
+    drawTrigger(&g, true, 1, 1);
+    if g.bowCharge != 1 || g.bowSpark <= 0 { panic("bow check: missing full draw cue"); }
+    g.bowSpark = 0;
+    drawTrigger(&g, true, 2, 1);
+    if g.bowSpark > 0 || g.bowCharge != 1 { panic("bow check: full draw cue repeated"); }
+    let full = drawTrigger(&g, false, 0, 1);
+    if full != 1 || drawTrigger(&g, false, 0, 1) >= 0 { panic("bow check: release repeated"); }
+    if arrowSpeed(weak) >= arrowSpeed(full) || arrowPower(weak) >= arrowPower(full) { panic("bow check: charge did not scale shot"); }
+    drawTrigger(&g, true, 0.5, 1);
+    cancelDraw(&g);
+    if drawTrigger(&g, false, 0, 1) >= 0 || g.bowSpark > 0 { panic("bow check: cancelled draw fired"); }
+    drawTrigger(&g, true, 0.5, 2);
+    if g.bowCharge != 1 { panic("bow check: fire rate did not speed draw"); }
+    cancelDraw(&g);
+
+    let lvl = level.empty(mem, 1, 0);
+    // Floor well below the test flight, and room in the grid for every shot.
+    lvl.count = 1;
+    lvl.boxes[0] = Box { lo: Vec3.xyz(-20, -21, -30), hi: Vec3.xyz(20, -20, 20), launch: 0, kind: level.SOLID };
+    level.index(&lvl, mem);
+    let e = enemies.create(mem);
+    let sh = shrine.create(mem);
+    let bs = boss.create(mem);
+    let p = player.create(&lvl);
+    p.pos = Vec3.zero();
+    p.onGround = true;
+    let slow = Shot { hits: [-1, -1, -1, -1, -1], pos: Vec3.xyz(0, 5, 0), vel: Vec3.xyz(0, 0, -arrowSpeed(weak)), t: 6,
+        kind: ARROW, damage: 120 * arrowPower(weak), target: -1, seekT: 0 };
+    let fast = Shot { hits: [-1, -1, -1, -1, -1], pos: Vec3.xyz(0, 5, 0), vel: Vec3.xyz(0, 0, -arrowSpeed(full)), t: 6,
+        kind: ARROW, damage: 120 * arrowPower(full), target: -1, seekT: 0 };
+    arrowFlight(&slow, &lvl, &e, &sh, &bs, 0.1);
+    arrowFlight(&fast, &lvl, &e, &sh, &bs, 0.1);
+    if fast.pos.z >= slow.pos.z || abs(fast.pos.y - 4.88) > 0.002 || fast.vel.y >= 0 { panic("bow check: ballistic motion"); }
+    // Both early and full releases produce projectiles, not instant damage.
+    enemies.spawnAt(&e, 1, Vec3.xyz(0, 1.6, -5), Vec3.zero(), false);
+    e.list[0].hp = 1000;
+    let k = 0;
+    while k < 2 {
+        let charge = weak;
+        if k == 1 { charge = full; }
+        g.bowCharge = charge;
+        let before = e.list[0].hp;
+        let slot = g.nextShot;
+        fire(&g, &p, &lvl, scene, &e, &sh, &bs);
+        if e.list[0].hp != before || g.shots[slot].kind != ARROW { panic("bow check: release was hitscan"); }
+        if abs(g.shots[slot].vel.length() - arrowSpeed(charge)) > 0.01 { panic("bow check: release speed"); }
+        arrowFlight(&g.shots[slot], &lvl, &e, &sh, &bs, 0.4);
+        if abs(before - e.list[0].hp - 120 * arrowPower(charge)) > 0.01 { panic("bow check: release damage"); }
+        arrowFlight(&g.shots[slot], &lvl, &e, &sh, &bs, 0.4);
+        if abs(before - e.list[0].hp - 120 * arrowPower(charge)) > 0.01 { panic("bow check: arrow hit twice"); }
+        p.kick = 0;
+        p.vel = Vec3.zero();
+        k += 1;
+    }
+    // A thin wall beats the enemy behind it, even across a whole low-FPS step.
+    lvl.boxes[0] = Box { lo: Vec3.xyz(-10, -10, -2.02), hi: Vec3.xyz(10, 10, -2), launch: 0, kind: level.BARRIER };
+    level.index(&lvl, mem);
+    let blocked = Shot { hits: [-1, -1, -1, -1, -1], pos: Vec3.xyz(0, 1.6, 0), vel: Vec3.xyz(0, 0, -85), t: 6,
+        kind: ARROW, damage: 120, target: -1, seekT: 0 };
+    let health = e.list[0].hp;
+    arrowFlight(&blocked, &lvl, &e, &sh, &bs, 0.2);
+    if !blocked.stuck || abs(blocked.pos.z + 2.025) > 0.01 || e.list[0].hp != health { panic("bow check: shot through thin wall"); }
+    let lodged = blocked.pos;
+    arrowFlight(&blocked, &lvl, &e, &sh, &bs, 1);
+    if (blocked.pos - lodged).length() > 0.001 { panic("bow check: embedded arrow moved"); }
+    // Fire with the bowtip on the far side of a nearby wall: it must still hit it.
+    lvl.boxes[0].lo.z = -0.11;
+    lvl.boxes[0].hi.z = -0.1;
+    level.index(&lvl, mem);
+    g.bowCharge = 1;
+    let closeSlot = g.nextShot;
+    fire(&g, &p, &lvl, scene, &e, &sh, &bs);
+    arrowFlight(&g.shots[closeSlot], &lvl, &e, &sh, &bs, 0.05);
+    if !g.shots[closeSlot].stuck || g.shots[closeSlot].pos.z < -0.14 { panic("bow check: muzzle bypassed wall"); }
+    // A dense line: five distinct enemies take full damage, the sixth is untouched.
+    lvl.boxes[0] = Box { lo: Vec3.xyz(-20, -21, -30), hi: Vec3.xyz(20, -20, 20), launch: 0, kind: level.SOLID };
+    level.index(&lvl, mem);
+    let row = 0;
+    while row < 6 {
+        if row > 0 { enemies.spawnAt(&e, 1, Vec3.zero(), Vec3.zero(), false); }
+        e.list[row].pos = Vec3.xyz(0, 1.6, -1 - f32(row) * 0.2);
+        e.list[row].hp = 1000;
+        row += 1;
+    }
+    let clearShot = 0;
+    while clearShot < MAX_SHOTS { g.shots[clearShot].t = 0; clearShot += 1; }
+    g.shots[0] = Shot { hits: [-1, -1, -1, -1, -1], pos: Vec3.xyz(0, 1.6, 0), vel: Vec3.xyz(0, 0, -85),
+        t: 6, kind: ARROW, damage: 120, target: -1, seekT: 0 };
+    flight(&g, &p, &lvl, &e, &sh, &bs, 0.05);
+    if g.shots[0].hitCount != 5 || g.shots[0].t > 0 { panic("bow check: five-enemy limit"); }
+    row = 0;
+    while row < 6 {
+        let expected: f32 = 880;
+        if row == 5 { expected = 1000; }
+        if e.list[row].hp != expected { panic("bow check: piercing damage or duplicate hit"); }
+        row += 1;
+    }
+    if g.nextTrail != 1 || g.trail[0].t <= 0 || (g.trail[0].b - g.trail[0].a).length() < 0.1 { panic("bow check: missing arrow trail"); }
+    flight(&g, &p, &lvl, &e, &sh, &bs, TRAIL_LIFE + 0.01);
+    if g.trail[0].t > 0 || g.nextTrail != 1 { panic("bow check: trail did not expire"); }
+    // Piercing must not carry damage through a wall after the first enemy.
+    row = 2;
+    while row < 6 { e.list[row].kind = 0; row += 1; }
+    e.list[0].pos = Vec3.xyz(0, 1.6, -1);
+    e.list[1].pos = Vec3.xyz(0, 1.6, -3);
+    lvl.boxes[0] = Box { lo: Vec3.xyz(-10, -10, -2.02), hi: Vec3.xyz(10, 10, -2), launch: 0, kind: level.BARRIER };
+    level.index(&lvl, mem);
+    let piercingWall = Shot { hits: [-1, -1, -1, -1, -1], pos: Vec3.xyz(0, 1.6, 0), vel: Vec3.xyz(0, 0, -85),
+        t: 6, kind: ARROW, damage: 120, target: -1, seekT: 0 };
+    arrowFlight(&piercingWall, &lvl, &e, &sh, &bs, 0.1);
+    if !piercingWall.stuck || piercingWall.hitCount != 1 || e.list[0].hp != 760 || e.list[1].hp != 880 { panic("bow check: pierced through wall"); }
+
+}

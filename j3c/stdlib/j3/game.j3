@@ -3553,7 +3553,7 @@ pub const ZONE_CAMERA: int = 1;
 pub const ZONE_UI: int = 2;
 /// Timed GPU spans one frame can hold; later spans go untimed.
 const PROF_SPANS: int = 8;
-/// Frames of spans in flight. Results are read this many frames late, so nothing waits on the GPU.
+/// Query frames in flight. Occupied slots are skipped until their results are ready.
 const PROF_RING: int = 4;
 /// Frame times the F3 graph shows.
 const PROF_HISTORY: int = 120;
@@ -3574,11 +3574,11 @@ pub struct FrameStats {
     cpuMs: f32 = 0;
     /// CPU time inside `scene3d.draw`.
     sceneMs: f32 = 0;
-    /// GPU time of the shadow pass; -1 without timer queries.
+    /// GPU time of the shadow pass; -1 when no fresh GPU sample is available.
     shadowMs: f32 = 0;
-    /// GPU time of the camera passes; -1 without timer queries.
+    /// GPU time of the camera passes; -1 when no fresh GPU sample is available.
     cameraMs: f32 = 0;
-    /// GPU time of the HUD; -1 without timer queries.
+    /// GPU time of the HUD; -1 when no fresh GPU sample is available.
     uiMs: f32 = 0;
 }
 
@@ -3593,6 +3593,7 @@ struct Prof {
     /// Totals after warm-up, for `J3STATS`.
     sum: FrameStats;
     summed: int;
+    gpuSummed: int = 0;
     /// `micros` at the last present and just after the last swap.
     presentAt: int;
     swapped: int;
@@ -3625,9 +3626,15 @@ let PROF_QZONE: [32]int;
 /// Spans used in each ring slot.
 #[singleton]
 let PROF_QN: [4]int;
+/// Frame owning each query slot; unread frames must never be overwritten.
+#[singleton]
+let PROF_QFRAME: [4]int;
 /// Recent frame times for the graph.
 #[singleton]
 let PROF_HIST: [120]f32;
+
+/// Most recently completed frame, without smoothing. GPU timings arrive asynchronously.
+pub fn lastFrameStats(): FrameStats { return PROF.last; }
 
 /// Averages over the last second or so of frames.
 pub fn frameStats(): FrameStats {
@@ -3675,6 +3682,8 @@ pub fn profZone(z: int) {
     PROF.zone = -1;
     let n = PROF_QN[slot];
     if z < 0 || n >= PROF_SPANS { return; }
+    if n > 0 && PROF_QFRAME[slot] != PRESENTED { return; }
+    PROF_QFRAME[slot] = PRESENTED;
     let begin = PROF.beginQuery as fn(u32, u32);
     begin(GL_TIME_ELAPSED, PROF_Q[slot * PROF_SPANS + n]);
     PROF_QZONE[slot * PROF_SPANS + n] = z;
@@ -3682,34 +3691,35 @@ pub fn profZone(z: int) {
     PROF.zone = z;
 }
 
-/// Read the oldest ring slot's GPU spans into the frame being finished, then free the slot.
+/// Read the oldest available frame without waiting or discarding pending queries.
+/// A negative time means no fresh GPU result this frame, never a repeated old sample.
 fn profReadGpu() {
     let n = &PROF.now;
-    if !platform.gl || PROF.gpu < 0 {
-        n.shadowMs = -1;
-        n.cameraMs = -1;
-        n.uiMs = -1;
-        return;
+    n.shadowMs = -1;
+    n.cameraMs = -1;
+    n.uiMs = -1;
+    if !platform.gl || PROF.gpu != 1 { return; }
+    let slot = -1;
+    let scan = 0;
+    while scan < PROF_RING {
+        if PROF_QN[scan] > 0 {
+            if slot < 0 { slot = scan; }
+            else if PROF_QFRAME[scan] < PROF_QFRAME[slot] { slot = scan; }
+        }
+        scan += 1;
     }
-    let slot = (PRESENTED + 1) % PROF_RING;
+    if slot < 0 { return; }
+    // A later query completing also completes the earlier queries in this frame.
+    let ready: [1]i32 = [0];
+    let avail = PROF.queryInt as fn(u32, u32, ptr);
+    avail(PROF_Q[slot * PROF_SPANS + PROF_QN[slot] - 1], GL_QUERY_RESULT_AVAILABLE, &ready[0] as ptr);
+    if ready[0] == 0 { return; }
     let ms: [3]f32 = [0, 0, 0];
     let k = 0;
     while k < PROF_QN[slot] {
-        let q = PROF_Q[slot * PROF_SPANS + k];
-        let ready: [1]i32 = [0];
-        let avail = PROF.queryInt as fn(u32, u32, ptr);
-        avail(q, GL_QUERY_RESULT_AVAILABLE, &ready[0] as ptr);
-        if ready[0] == 0 {
-            // Not back yet: show the previous numbers rather than a dip to zero.
-            n.shadowMs = PROF.last.shadowMs;
-            n.cameraMs = PROF.last.cameraMs;
-            n.uiMs = PROF.last.uiMs;
-            PROF_QN[slot] = 0;
-            return;
-        }
         let ns: [1]int = [0];
         let read = PROF.query64 as fn(u32, u32, ptr);
-        read(q, GL_QUERY_RESULT, &ns[0] as ptr);
+        read(PROF_Q[slot * PROF_SPANS + k], GL_QUERY_RESULT, &ns[0] as ptr);
         ms[PROF_QZONE[slot * PROF_SPANS + k]] += f32(ns[0]) / 1000000;
         k += 1;
     }
@@ -3745,9 +3755,11 @@ fn profEnd() {
         a.frameMs = ease(a.frameMs, n.frameMs);
         a.cpuMs = ease(a.cpuMs, n.cpuMs);
         a.sceneMs = ease(a.sceneMs, n.sceneMs);
-        a.shadowMs = ease(a.shadowMs, n.shadowMs);
-        a.cameraMs = ease(a.cameraMs, n.cameraMs);
-        a.uiMs = ease(a.uiMs, n.uiMs);
+        if n.shadowMs >= 0 {
+            a.shadowMs = if a.shadowMs < 0 { n.shadowMs } else { ease(a.shadowMs, n.shadowMs) };
+            a.cameraMs = if a.cameraMs < 0 { n.cameraMs } else { ease(a.cameraMs, n.cameraMs) };
+            a.uiMs = if a.uiMs < 0 { n.uiMs } else { ease(a.uiMs, n.uiMs) };
+        }
     }
     // `J3STATS` skips the first tenth of a `--frames` run: shader compiles and uploads land there.
     if STOP_AT > 0 && PRESENTED > STOP_AT / 10 {
@@ -3757,9 +3769,12 @@ fn profEnd() {
         s.frameMs += n.frameMs;
         s.cpuMs += n.cpuMs;
         s.sceneMs += n.sceneMs;
-        s.shadowMs += n.shadowMs;
-        s.cameraMs += n.cameraMs;
-        s.uiMs += n.uiMs;
+        if n.shadowMs >= 0 {
+            s.shadowMs += n.shadowMs;
+            s.cameraMs += n.cameraMs;
+            s.uiMs += n.uiMs;
+            PROF.gpuSummed += 1;
+        }
         PROF.summed += 1;
     }
     PROF.last = PROF.now;
@@ -3800,11 +3815,11 @@ fn profReport() {
     t.pushStr(" tris=");
     t.pushInt(s.tris / k);
     t.pushStr(" shadow=");
-    pushMs(&t, s.shadowMs / f);
+    pushMs(&t, if PROF.gpuSummed > 0 { s.shadowMs / f32(PROF.gpuSummed) } else { -1 });
     t.pushStr(" camera=");
-    pushMs(&t, s.cameraMs / f);
+    pushMs(&t, if PROF.gpuSummed > 0 { s.cameraMs / f32(PROF.gpuSummed) } else { -1 });
     t.pushStr(" ui=");
-    pushMs(&t, s.uiMs / f);
+    pushMs(&t, if PROF.gpuSummed > 0 { s.uiMs / f32(PROF.gpuSummed) } else { -1 });
     if platform.gl {
         let get = glProc("glGetString") as fn(u32): cstr;
         let name = get(GL_RENDERER);

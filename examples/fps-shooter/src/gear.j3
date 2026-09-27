@@ -1,0 +1,216 @@
+// Shrine helpers that fight on their own: the magic arrow floating at your shoulder, and the
+// turret you drop with G. Both go for the boss too when it's the nearest thing.
+
+module fps_shooter.gear;
+
+use j3.game;
+use j3.game.Key;
+use j3.gfx;
+use j3.gfx.{ Look, Mesh, Ray };
+use j3.math.{ Mat4, Vec3, atan2, max, min, sin };
+use j3.memory.Arena;
+use j3.scene3d;
+use j3.scene3d.Scene;
+use fps_shooter.boss;
+use fps_shooter.bosskit.Bosses;
+use fps_shooter.enemies;
+use fps_shooter.enemies.Enemies;
+use fps_shooter.level.{ Level, shoot };
+use fps_shooter.player.{ Player, has, look, ARROW, TURRET };
+
+const ARROW_RANGE: f32 = 25;
+const ARROW_SPEED: f32 = 30;
+const ARROW_DAMAGE: f32 = 40;
+const ARROW_REST: f32 = 1.5;
+const TURRET_RANGE: f32 = 30;
+const TURRET_RATE: f32 = 0.15;
+const TURRET_DAMAGE: f32 = 8;
+/// G drops the turret where you look, up to this far, or at your feet.
+const PLACE_REACH: f32 = 6;
+/// Arrow states.
+const RESTING: int = 0;
+const FLYING: int = 1;
+const COMING_BACK: int = 2;
+/// A target that is the boss rather than an enemy slot.
+const AT_BOSS: int = -2;
+
+pub struct Gear {
+    arrow: Vec3;
+    arrowDir: Vec3;
+    state: int;
+    target: int;
+    /// Resting: until the next dart. Flying: time left before it gives up.
+    arrowT: f32;
+    turret: bool;
+    turretAt: Vec3;
+    aim: Vec3;
+    turretCd: f32;
+    /// The last turret shot, for a tracer.
+    shotEnd: Vec3;
+    shotT: f32;
+    cube: Mesh;
+}
+
+pub fn create(): Gear {
+    return Gear {
+        arrow: Vec3.zero(), arrowDir: Vec3.xyz(0, 0, -1), state: RESTING, target: -1, arrowT: 0,
+        turret: false, turretAt: Vec3.zero(), aim: Vec3.xyz(0, 0, -1), turretCd: 0, shotEnd: Vec3.zero(), shotT: 0,
+        cube: Mesh { vao: 0, vbo: 0, count: 0 },
+    };
+}
+
+pub fn upload(gr: &Gear, mem: &Arena) {
+    gr.cube = gfx.uploadUv(scene3d.assetVerts("builtin:cube", mem));
+}
+
+/// Where the arrow floats: over your right shoulder.
+fn shoulder(p: &Player): Vec3 {
+    let l = Look.create(p.pos, p.yaw, 0);
+    return p.pos + l.right() * 0.7 + Vec3.xyz(0, 2.1 + sin(f32(game.ticks()) * 0.003) * 0.08, 0) - l.forward() * 0.2;
+}
+
+fn fly(gr: &Gear, to: Vec3, dt: f32): f32 {
+    let d = to - gr.arrow;
+    let far = d.length();
+    gr.arrowDir = d.normalize();
+    gr.arrow = gr.arrow + gr.arrowDir * min(ARROW_SPEED * dt, far);
+    return far;
+}
+
+/// The nearest enemy within `range` of `at`, or the boss when it's nearer: an enemy index,
+/// AT_BOSS, or -1.
+fn pick(e: &Enemies, bs: &Bosses, at: Vec3, range: f32): int {
+    let t = enemies.nearest(e, at, range);
+    if !boss.targetable(bs) { return t; }
+    let bossFar = (boss.aimPoint(bs) - at).length();
+    if bossFar > range { return t; }
+    if t < 0 || bossFar < (e.list[t].pos - at).length() { return AT_BOSS; }
+    return t;
+}
+
+fn arrow(gr: &Gear, p: &Player, e: &Enemies, bs: &Bosses, dt: f32) {
+    let home = shoulder(p);
+    if gr.state == RESTING {
+        gr.arrow = gr.arrow + (home - gr.arrow) * min(dt * 12, 1);
+        gr.arrowDir = gr.arrowDir + (look(p).forward() - gr.arrowDir) * min(dt * 8, 1);
+        gr.arrowT = gr.arrowT - dt;
+        if gr.arrowT <= 0 {
+            gr.target = pick(e, bs, p.pos, ARROW_RANGE);
+            if gr.target != -1 {
+                gr.state = FLYING;
+                gr.arrowT = 3;
+            } else {
+                gr.arrowT = 0.3;
+            }
+        }
+    } else if gr.state == FLYING {
+        gr.arrowT = gr.arrowT - dt;
+        if gr.target == AT_BOSS {
+            if !boss.targetable(bs) || gr.arrowT <= 0 {
+                gr.state = COMING_BACK;
+            } else if fly(gr, boss.aimPoint(bs), dt) < 0.8 {
+                let part = boss.near(bs, gr.arrow, gr.arrowDir, 1.5);
+                if part >= 0 { boss.damage(bs, e, part, ARROW_DAMAGE, gr.arrow); }
+                gr.state = COMING_BACK;
+            }
+        } else {
+            let en = e.list[gr.target];
+            if en.kind == 0 || gr.arrowT <= 0 {
+                gr.state = COMING_BACK;
+            } else if fly(gr, en.pos, dt) < 0.6 {
+                enemies.damage(e, gr.target, ARROW_DAMAGE, gr.arrowDir * 4, en.pos);
+                gr.state = COMING_BACK;
+            }
+        }
+    } else if fly(gr, home, dt) < 0.3 {
+        gr.state = RESTING;
+        gr.arrowT = ARROW_REST;
+    }
+}
+
+fn turret(gr: &Gear, p: &Player, lvl: &Level, scene: &Scene, e: &Enemies, bs: &Bosses, dt: f32) {
+    if game.keyPressed(Key.G) {
+        let l = look(p);
+        let hit = shoot(lvl, scene, Ray { origin: l.eye, dir: l.forward() }, PLACE_REACH);
+        let at = p.pos;
+        if hit.hit {
+            // Back off the surface, then down onto whatever is below.
+            let off = hit.point - l.forward() * 0.4;
+            let down = shoot(lvl, scene, Ray { origin: off, dir: Vec3.xyz(0, -1, 0) }, 30);
+            if down.hit { at = down.point; }
+        }
+        gr.turret = true;
+        gr.turretAt = at;
+        gr.turretCd = 0.5;
+    }
+    if !gr.turret { return; }
+    gr.shotT = gr.shotT - dt;
+    gr.turretCd = gr.turretCd - dt;
+    let head = gr.turretAt + Vec3.xyz(0, 1.1, 0);
+    let target = pick(e, bs, head, TURRET_RANGE);
+    if target == -1 { return; }
+    let goal = boss.aimPoint(bs);
+    if target >= 0 { goal = e.list[target].pos; }
+    let to = goal - head;
+    let far = to.length();
+    gr.aim = to.normalize();
+    if gr.turretCd > 0 { return; }
+    gr.turretCd = TURRET_RATE;
+    // Only with a clear line.
+    let sight = shoot(lvl, scene, Ray { origin: head, dir: gr.aim }, far);
+    if sight.hit { return; }
+    if target == AT_BOSS {
+        let struck = boss.ray(bs, Ray { origin: head, dir: gr.aim }, far + 3);
+        if struck.part < 0 { return; }
+        gr.shotEnd = head + gr.aim * struck.t;
+        boss.damage(bs, e, struck.part, TURRET_DAMAGE, gr.shotEnd);
+    } else {
+        enemies.damage(e, target, TURRET_DAMAGE, gr.aim * 1.5, goal);
+        gr.shotEnd = goal;
+    }
+    gr.shotT = 0.05;
+}
+
+pub fn update(gr: &Gear, p: &Player, lvl: &Level, scene: &Scene, e: &Enemies, bs: &Bosses, dt: f32) {
+    // Lost on going down, with the rest of the gifts.
+    if !has(p, TURRET) { gr.turret = false; }
+    if has(p, ARROW) {
+        arrow(gr, p, e, bs, dt);
+    } else {
+        gr.state = RESTING;
+        gr.arrow = shoulder(p);
+    }
+    if has(p, TURRET) { turret(gr, p, lvl, scene, e, bs, dt); }
+}
+
+fn box(gr: &Gear, m: Mat4, tint: Vec3, glow: Vec3) {
+    gfx.material(tint, glow);
+    gfx.draw(gr.cube, m);
+}
+
+/// A frame looking along `dir` from `at`: -z points down `dir`.
+fn facing(at: Vec3, dir: Vec3): Mat4 {
+    let yaw = atan2(0 - dir.x, 0 - dir.z);
+    let pitch = atan2(dir.y, max(Vec3.xyz(dir.x, 0, dir.z).length(), 0.0001));
+    return Mat4.translate(at.x, at.y, at.z).mul(Mat4.rotate(Vec3.xyz(0, 1, 0), yaw)).mul(Mat4.rotate(Vec3.xyz(1, 0, 0), pitch));
+}
+
+/// `lit`: the camera pass (the tracer only draws there).
+pub fn draw(gr: &Gear, p: &Player, lit: bool) {
+    if has(p, ARROW) {
+        let m = facing(gr.arrow, gr.arrowDir);
+        box(gr, m.mul(Mat4.scale(0.05, 0.05, 0.7)), Vec3.xyz(0.6, 0.9, 1), Vec3.xyz(0.8, 1.6, 2.4));
+        box(gr, m.mul(Mat4.translate(0, 0, -0.38)).mul(Mat4.scale(0.14, 0.14, 0.14)), Vec3.xyz(1, 1, 1), Vec3.xyz(2, 2.5, 3));
+        box(gr, m.mul(Mat4.translate(0, 0, 0.32)).mul(Mat4.scale(0.2, 0.03, 0.12)), Vec3.xyz(0.6, 0.9, 1), Vec3.xyz(0.4, 0.8, 1.2));
+    }
+    if gr.turret {
+        let t = gr.turretAt;
+        box(gr, Mat4.translate(t.x, t.y + 0.15, t.z).mul(Mat4.scale(0.8, 0.3, 0.8)), Vec3.xyz(0.3, 0.32, 0.4), Vec3.zero());
+        box(gr, Mat4.translate(t.x, t.y + 0.6, t.z).mul(Mat4.scale(0.2, 0.7, 0.2)), Vec3.xyz(0.3, 0.32, 0.4), Vec3.zero());
+        let head = facing(t + Vec3.xyz(0, 1.1, 0), gr.aim);
+        box(gr, head.mul(Mat4.scale(0.5, 0.35, 0.55)), Vec3.xyz(0.35, 0.85, 0.6), Vec3.zero());
+        box(gr, head.mul(Mat4.translate(0, 0, -0.45)).mul(Mat4.scale(0.1, 0.1, 0.5)), Vec3.xyz(0.15, 0.15, 0.2), Vec3.zero());
+        box(gr, head.mul(Mat4.translate(0, 0.05, -0.28)).mul(Mat4.scale(0.3, 0.08, 0.02)), Vec3.zero(), Vec3.xyz(0.3, 2, 1.2));
+        if lit && gr.shotT > 0 { gfx.drawLine(t + Vec3.xyz(0, 1.1, 0) + gr.aim * 0.7, gr.shotEnd, Vec3.xyz(0.4, 1, 0.7)); }
+    }
+}

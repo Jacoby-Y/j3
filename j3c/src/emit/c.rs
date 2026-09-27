@@ -185,7 +185,13 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
     }
 
     let entry = host_entry(cx, modules)?;
-    out.push_str("int main(void) {\n");
+    let set_args = sys_func(cx, modules, "setArgs");
+    out.push_str("int main(int argc, char **argv) {\n");
+    if let Some(set_args) = set_args {
+        out.push_str(&format!("    {set_args}((int64_t)argc, (void *)argv);\n"));
+    } else {
+        out.push_str("    (void)argc;\n    (void)argv;\n");
+    }
     out.push_str(&format!("    {entry}();\n"));
     out.push_str("    return 0;\n");
     out.push_str("}\n");
@@ -195,6 +201,22 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
     }
 
     Ok(out)
+}
+
+fn sys_func(cx: &IrCx, modules: &[Module], name: &str) -> Option<String> {
+    for module in modules {
+        let is_sys = module_is(cx, module, &["j3", "sys"]);
+        if !is_sys {
+            continue;
+        }
+        for id in &module.funcs {
+            let func = cx.func(*id);
+            if cx.name_str(func.name) == name {
+                return Some(c_expr::func_c_name(cx, func));
+            }
+        }
+    }
+    None
 }
 
 fn host_entry(cx: &IrCx, modules: &[Module]) -> Result<String, String> {

@@ -6,7 +6,7 @@
 
 mod error;
 mod lower;
-mod script;
+pub(crate) mod script;
 
 pub use error::CheckError;
 
@@ -497,7 +497,9 @@ fn collect_struct_names(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Result
             debug: s.debug,
             span: s.span,
             ty_args: Vec::new(),
-            script: if mods[i].ast.is_script {
+            // Only the synthesized script struct is a script value. Other structs in the
+            // file are ordinary types the script uses.
+            script: if mods[i].ast.is_script && s.name.name == script::script_name(&path) {
                 Some(ScriptMeta {
                     path: path.clone(),
                     prop_spans: mods[i]
@@ -2245,13 +2247,15 @@ pub(crate) fn instantiate_struct(
     for (p, a) in temp.type_params.iter().zip(args.iter()) {
         subst.insert(p.name.clone(), *a);
     }
+    // The generic's own module wins on a shared name (`Arena` in `arena.j3s`
+    // must not replace `j3.memory.Arena` inside `List`).
     let mut merged_types = env
         .struct_temp_env
         .get(name)
         .cloned()
         .unwrap_or_else(|| env.types.clone());
     for (k, v) in env.types.iter() {
-        merged_types.insert(k.clone(), *v);
+        merged_types.entry(k.clone()).or_insert(*v);
     }
     let sname = cx.intern_name(&temp.name.name);
     let id = cx.alloc_struct(StructDef {

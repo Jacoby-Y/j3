@@ -82,6 +82,45 @@ pub fn check_path_lib(entry: &Path) -> Result<Program, String> {
     load_and_check(entry, GameBackend::Sdl, false, None, "")
 }
 
+/// A `.j3s` entry is a tool: one instance, then `pub fn main()`. Scene scripts are not this.
+fn tool_host(entry: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(entry)
+        .map_err(|e| format!("read {}: {e}", entry.display()))?;
+    let module = vec!["script".to_string(), "tool".to_string()];
+    let ast = match parse::parse_script(&text, FileId(1), &module) {
+        Ok(ast) => ast,
+        Err(e) => return Err(parse::format_error(&entry.display().to_string(), &text, &e)),
+    };
+    let ready = ast.items.iter().any(|item| match item {
+        parse::Item::Fn(f) => {
+            f.vis_pub && f.name.name == "main" && f.params.is_empty() && f.ret.is_none()
+        }
+        _ => false,
+    });
+    if !ready {
+        return Err(format!(
+            "{} has no `pub fn main()`\n  = help: this file is a tool entry; scene scripts are started by the game (`node.<i>.script`)",
+            entry.display()
+        ));
+    }
+    let type_name = check::script::script_name(&entry.display().to_string());
+    let ident = type_name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && type_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !ident {
+        return Err(format!(
+            "{} script type `{type_name}` is not a name the host can bind",
+            entry.display()
+        ));
+    }
+    let file_name = entry
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("script path has no file name: {}", entry.display()))?;
+    Ok(format!(
+        "module tool_host;\nconst {type_name} = @script(\"{file_name}\");\nfn main() {{\n    let tool = {type_name} {{}};\n    tool.main();\n}}\n"
+    ))
+}
+
 fn load_and_check(
     entry: &Path,
     game: GameBackend,
@@ -100,6 +139,26 @@ fn load_and_check_with(
     target: &str,
     dev: bool,
 ) -> Result<Program, String> {
+    let script_entry = entry.extension().and_then(|e| e.to_str()) == Some("j3s");
+    let script_root = if script_entry {
+        match entry.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        }
+    } else {
+        project
+            .map(|m| m.root.clone())
+            .unwrap_or_else(|| entry.parent().unwrap_or(Path::new(".")).to_path_buf())
+    };
+    let mut overlays = Vec::new();
+    let entry_path = if script_entry {
+        let host = tool_host(entry)?;
+        let host_path = script_root.join(".j3c-tool-host.j3");
+        overlays.push((host_path.clone(), host));
+        host_path
+    } else {
+        entry.to_path_buf()
+    };
     let mut loader = Loader {
         files: Vec::new(),
         loaded: HashSet::new(),
@@ -108,13 +167,11 @@ fn load_and_check_with(
         os: os_kind(target),
         src_dir: project.map(|m| m.src_dir()),
         package: project.map(|m| m.name.clone()),
-        script_root: project
-            .map(|m| m.root.clone())
-            .unwrap_or_else(|| entry.parent().unwrap_or(Path::new(".")).to_path_buf()),
-        overlays: Vec::new(),
+        script_root,
+        overlays,
         scene_scan: None,
     };
-    loader.load_path(entry)?;
+    loader.load_path(&entry_path)?;
     loader.load_module(&["j3".to_string(), "sys".to_string()])?;
     loader.load_imports()?;
     if project.is_some() {
@@ -647,7 +704,7 @@ mod tests {
         assert!(c.contains("#line "), "missing #line in C:\n{c}");
         let ll = emit::emit_llvm(&prog.cx, &prog.modules, &emit::EmitOpts::default()).expect("emit llvm");
         assert!(ll.contains("target triple"), "{ll}");
-        assert!(ll.contains("define i32 @main()"), "{ll}");
+        assert!(ll.contains("define i32 @main(i32 %argc, ptr %argv)"), "{ll}");
         let run = exec(&prog);
         assert_eq!(
             run.status,
@@ -2464,5 +2521,62 @@ node.1.id=2\nnode.1.parent=0\nnode.1.kind=1\nnode.1.name s=Other\n{extra}"
             err.contains("script.scripts.a -> script.scripts.b -> script.scripts.a"),
             "{err}"
         );
+    }
+
+    fn tool_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("j3c_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn tool_script_main_prints() {
+        let dir = tool_dir("tool_main");
+        let path = dir.join("greet.j3s");
+        std::fs::write(
+            &path,
+            "struct Note { n: int; }\nuse j3.io.printLn;\npub fn main() {\n    let note = Note { n: 3 };\n    printLn(`note {note.n}`);\n}\n",
+        )
+        .unwrap();
+        let prog = compile_path(&path).expect("tool script");
+        let run = exec(&prog);
+        assert_eq!(run.status, 0, "{}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "note 3\n");
+    }
+
+    #[test]
+    fn tool_script_without_main_errors() {
+        let dir = tool_dir("tool_nomain");
+        let path = dir.join("spin.j3s");
+        std::fs::write(&path, "pub fn update() {}\n").unwrap();
+        let err = match compile_path(&path) {
+            Ok(_) => panic!("expected a missing main"),
+            Err(e) => e,
+        };
+        assert!(err.contains("pub fn main"), "{err}");
+        assert!(err.contains("scene"), "{err}");
+    }
+
+    #[test]
+    fn tool_script_reads_args() {
+        let dir = tool_dir("tool_args");
+        let path = dir.join("echo.j3s");
+        std::fs::write(
+            &path,
+            "use j3.io.printLn;\nuse j3.sys.arg;\npub fn main() { printLn(arg(1)); }\n",
+        )
+        .unwrap();
+        let prog = compile_path(&path).expect("args script");
+        let opts = llvm_opts();
+        let run = emit::run_program_with(
+            &prog.cx,
+            &prog.modules,
+            &opts,
+            &["west".to_string()],
+        )
+        .expect("run");
+        assert_eq!(run.status, 0, "{}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "west\n");
     }
 }

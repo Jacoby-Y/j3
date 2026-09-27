@@ -163,7 +163,11 @@ pub fn emit_llvm_part(
 
     if !matches!(part, Part::Only(_)) {
         let entry = host_entry(cx, modules)?;
-        out.push_str("define i32 @main() {\n");
+        out.push_str("define i32 @main(i32 %argc, ptr %argv) {\n");
+        if let Some(set_args) = sys_func(cx, modules, "setArgs") {
+            out.push_str("  %argc64 = sext i32 %argc to i64\n");
+            out.push_str(&format!("  call void @{set_args}(i64 %argc64, ptr %argv)\n"));
+        }
         out.push_str(&format!("  call void @{entry}()\n"));
         out.push_str("  ret i32 0\n");
         out.push_str("}\n");
@@ -200,6 +204,24 @@ fn ll_params(cx: &IrCx, fn_ty: Ty) -> Result<String, String> {
         s.push_str(&ll_type(cx, *p)?);
     }
     Ok(s)
+}
+
+fn sys_func(cx: &IrCx, modules: &[Module], name: &str) -> Option<String> {
+    for module in modules {
+        let is_sys = module.name.len() == 2
+            && cx.name_str(module.name[0]) == "j3"
+            && cx.name_str(module.name[1]) == "sys";
+        if !is_sys {
+            continue;
+        }
+        for id in &module.funcs {
+            let func = cx.func(*id);
+            if cx.name_str(func.name) == name {
+                return Some(c_expr::func_c_name(cx, func));
+            }
+        }
+    }
+    None
 }
 
 fn host_entry(cx: &IrCx, modules: &[Module]) -> Result<String, String> {

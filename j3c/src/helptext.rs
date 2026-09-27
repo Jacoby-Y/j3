@@ -32,6 +32,7 @@ with `props { ... }`, per-instance `let` state, and `pub fn`s. Bind one
 with `const Door = @script(\"scripts/door.j3s\");` and make instances with
 `Door { hinge: h }`. `j3c run` runs scripts on a VM, so a script edit
 re-runs without compiling the program; `j3c build` compiles them in.
+`j3c run path/to/tool.j3s` runs that file's `pub fn main` once.
 `j3c doc lang` has the rules; `j3c doc recipes script` is a small program.
 
     j3c doc                  tasks, then every stdlib module

@@ -1,0 +1,1356 @@
+// Toy enemies that keep coming. Hoppers are slimes that leap at you and hit on contact; drones
+// circle overhead and lob slow glowing orbs you can dodge; zippers are small and fast and run you
+// down; chargers are big, wind up, then rush; bombers climb, then dive at you and blow up.
+// They inhabit unlocked tiles and sleep outside combat range. Each kill drops XP gems that fly to you when you get close.
+
+module fps_shooter.enemies;
+
+use j3.gfx;
+use j3.gfx.{ Mesh, Ray, Instance };
+use j3.game;
+use j3.sys.panic;
+use j3.math.{ Mat4, Vec3, TAU, abs, atan2, clamp, cos, max, min, mini, sin, sqrt };
+use j3.memory.Arena;
+use j3.rand.Rng;
+use j3.scene3d;
+use j3.scene3d.Scene;
+use fps_shooter.level.{ Level, isOpen, floorUnder, openAt, shoot, solid, tileAt };
+use fps_shooter.sfx;
+use fps_shooter.level;
+use fps_shooter.level.Box;
+use fps_shooter.player;
+use fps_shooter.player.{ Player, MAX_HP, hurt, noStats, respawn };
+
+pub const HOPPER: int = 1;
+pub const DRONE: int = 2;
+pub const ZIPPER: int = 3;
+pub const CHARGER: int = 4;
+pub const BOMBER: int = 5;
+pub const MAX_ENEMIES: int = 192;
+const MAX_ORBS: int = 64;
+const MAX_BITS: int = 160;
+const GRAVITY: f32 = 24;
+const HOPPER_HP: f32 = 50;
+const HOPPER_SIZE: f32 = 1;
+const HOPPER_HOP: f32 = 7;
+const HOPPER_HIT: f32 = 15;
+const DRONE_HP: f32 = 35;
+const DRONE_SIZE: f32 = 0.8;
+const DRONE_ORBIT: f32 = 12;
+const DRONE_HEIGHT: f32 = 5;
+/// Flyers' top speeds: across, and up or down (kept low so they can't chase your jumps).
+const DRONE_SPEED: f32 = 4;
+const DRONE_CLIMB: f32 = 1.2;
+const BOMBER_SPEED: f32 = 5;
+const BOMBER_CLIMB: f32 = 1.5;
+const ZIPPER_HP: f32 = 20;
+const ZIPPER_SIZE: f32 = 0.55;
+const ZIPPER_RUN: f32 = 11;
+const ZIPPER_HIT: f32 = 8;
+const CHARGER_HP: f32 = 160;
+const CHARGER_SIZE: f32 = 1.6;
+const CHARGER_WALK: f32 = 2.5;
+const CHARGER_RUSH: f32 = 19;
+const CHARGER_HIT: f32 = 25;
+const BOMBER_HP: f32 = 30;
+const BOMBER_SIZE: f32 = 0.7;
+const BOMBER_DIVE: f32 = 11;
+const BOMBER_HIT: f32 = 22;
+const BOMBER_BLAST: f32 = 4;
+const ORB_SPEED: f32 = 11;
+const ORB_HIT: f32 = 10;
+const ORB_LIFE: f32 = 5;
+/// Fastest an enemy moves, so a sniper shot can't fling one through a wall.
+const MAX_SPEED: f32 = 22;
+/// Quiet time at the start, and after going down.
+const START_REST: f32 = 2;
+const DOWN_REST: f32 = 4;
+/// The difficulty tier goes up this often (seconds survived).
+const TIER_TIME: f32 = 40;
+/// Combat distance hysteresis; distant inhabitants remain alive.
+const WAKE: f32 = 55;
+const SLEEP: f32 = 65;
+/// Slots kept free for shrine batches.
+const GOLD_ROOM: int = 12;
+const MAX_GEMS: int = 256;
+/// Gems fly to you from this close, and are picked up this close.
+const MAGNET: f32 = 5;
+const PICKUP: f32 = 1.1;
+const GEM_LIFE: f32 = 90;
+/// Outline thickness (metres) and brightness.
+const OUTLINE: f32 = 0.035;
+const OUTLINE_GLOW: f32 = 0.9;
+/// Shrine enemies: health scale, and their thicker gold outline.
+const GOLD_HP: f32 = 1.5;
+const GOLD_OUTLINE: f32 = 0.07;
+/// Shrine enemies move this much faster.
+const GOLD_SPEED: f32 = 1.2;
+/// Walkers pressed against a wall go up it this fast.
+const CLIMB: f32 = 6;
+/// Outside the hub, this share of spawns are the biome's own enemy: tougher, worth more XP.
+const ZONE_CHANCE: f32 = 0.25;
+const ZONE_HP: f32 = 1.3;
+const ZONE_XP: int = 1;
+/// Area kills that complete a biome.
+pub const ZONE_GOAL: int = 100;
+const HUB: int = 4;
+
+pub struct Enemy {
+    /// 0 for a free slot.
+    kind: int;
+    /// Centre.
+    pos: Vec3;
+    vel: Vec3;
+    hp: f32;
+    /// Hoppers: until the next hop. Drones: until the next shot. Chargers: until the next
+    /// rush. Bombers: until the dive.
+    t: f32;
+    /// White flash after a hit.
+    flash: f32;
+    /// Drones and bombers: where on the circle around you. Zippers: zig-zag clock. Chargers:
+    /// rush time left.
+    phase: f32;
+    grounded: bool;
+    squash: f32;
+    /// From a shrine: a gold outline and more health.
+    gold: bool;
+    /// A biome's own enemy: that biome's tile, else -1.
+    zone: int;
+    active: bool = false;
+    wakeT: f32 = 0;
+    detailed: bool = true;
+}
+
+struct Orb {
+    pos: Vec3;
+    vel: Vec3;
+    t: f32;
+}
+
+/// A bit of debris from a hit or a death.
+struct Bit {
+    pos: Vec3;
+    vel: Vec3;
+    t: f32;
+    size: f32;
+    color: Vec3;
+}
+
+/// XP gem with a simulation-clock expiry; `t` caches remaining lifetime for drawing.
+struct Gem {
+    pos: Vec3;
+    vel: Vec3;
+    value: int;
+    t: f32;
+    pulled: bool;
+    expires: f32 = 0;
+    settled: bool = false;
+    pending: f32 = 0;
+    nextTick: f32 = 0;
+}
+
+/// What a ray hit: an enemy index (or -1) and how far along.
+pub struct Hit {
+    index: int;
+    t: f32;
+    /// Where the ray leaves that enemy.
+    exit: f32;
+}
+
+pub struct Enemies {
+    list: []Enemy;
+    orbs: []Orb;
+    nextOrb: int;
+    bits: []Bit;
+    nextBit: int;
+    gems: []Gem;
+    nextGem: int;
+    /// Seconds survived this run, and the difficulty it sets (1 up).
+    time: f32;
+    tier: int;
+    spawnT: f32;
+    /// Quiet time before spawning starts.
+    restT: f32;
+    kills: int;
+    /// Bullets that landed, for the score.
+    hits: int;
+    /// XP picked up and not yet spent on levels (the caller takes it).
+    xp: int;
+    /// HUD: hit marker, kill marker, gem pickup flash, "down" banner.
+    hitT: f32;
+    killT: f32;
+    gemT: f32;
+    downT: f32;
+    /// How long the last run lasted, for the "down" banner.
+    downTime: f32;
+    /// Set the moment the player goes down; the caller clears it.
+    died: bool;
+    /// Area enemies killed per biome tile (kept across runs), and the tile that just hit
+    /// `ZONE_GOAL`, or -1; the caller clears it.
+    zoneKills: []int;
+    cleared: int;
+    cube: Mesh;
+    rng: Rng;
+    /// The outline being drawn: glow and thickness, set per enemy.
+    edge: Vec3;
+    edgeW: f32;
+    cosmetic: Rng;
+    clock: f32 = 0;
+    effectsLeft: int = 48;
+    tokens: f32 = 48;
+    listener: Vec3;
+    aiMs: f32 = 0;
+    gemMs: f32 = 0;
+    effectsMs: f32 = 0;
+    parts: []Instance;
+    owners: []int;
+    casts: []bool;
+    shells: []bool;
+    batch: []Instance;
+    visible: []bool;
+    partCount: int = 0;
+    owner: int = -1;
+    cast: bool = true;
+    detail: bool = true;
+    /// A boss fight is on: half the population, topped up half as fast.
+    calm: bool = false;
+}
+
+pub fn create(mem: &Arena): Enemies {
+    return Enemies {
+        list: mem.alloc::<Enemy>(MAX_ENEMIES), orbs: mem.alloc::<Orb>(MAX_ORBS), nextOrb: 0,
+        bits: mem.alloc::<Bit>(MAX_BITS), nextBit: 0, gems: mem.alloc::<Gem>(MAX_GEMS), nextGem: 0,
+        time: 0, tier: 1, spawnT: 0, restT: START_REST, kills: 0, hits: 0, xp: 0,
+        hitT: 0, killT: 0, gemT: 0, downT: 0, downTime: 0, died: false, zoneKills: mem.alloc::<int>(9), cleared: -1,
+        cube: Mesh { vao: 0, vbo: 0, count: 0 }, rng: Rng.new(99),
+        edge: Vec3.zero(), edgeW: OUTLINE, cosmetic: Rng.new(701), listener: Vec3.zero(),
+        parts: mem.alloc::<Instance>(4096), owners: mem.alloc::<int>(4096), casts: mem.alloc::<bool>(4096),
+        shells: mem.alloc::<bool>(4096), batch: mem.alloc::<Instance>(4096), visible: mem.alloc::<bool>(MAX_ENEMIES),
+    };
+}
+
+pub fn upload(e: &Enemies, mem: &Arena) {
+    e.cube = gfx.uploadUv(scene3d.assetVerts("builtin:cube", mem));
+}
+
+/// Enemies alive, not counting shrine ones.
+pub fn alive(e: &Enemies): int {
+    let n = 0;
+    let i = 0;
+    while i < MAX_ENEMIES {
+        if e.list[i].kind != 0 && !e.list[i].gold { n += 1; }
+        i += 1;
+    }
+    return n;
+}
+
+/// How many to keep around at this tier, and how fast to top them up.
+fn target(e: &Enemies, lvl: &Level): int {
+    let count = 0;
+    let i = 0;
+    while i < 9 { if isOpen(lvl, i) { count += 1; } i += 1; }
+    let n = mini(6 + e.tier * 3, 20) * count;
+    if e.calm { n = n / 2; }
+    return n;
+}
+
+/// Reset before weapons, gear, or enemies can emit effects this update.
+pub fn beginUpdate(e: &Enemies, p: &Player, dt: f32) {
+    e.clock += dt;
+    e.listener = p.pos;
+    e.tokens = min(48, e.tokens + dt * 480);
+    e.effectsLeft = 48;
+}
+
+fn spawnEvery(e: &Enemies): f32 {
+    return max(1 - f32(e.tier) * 0.07, 0.25);
+}
+
+/// XP a kill of `kind` drops.
+fn worth(kind: int): int {
+    if kind == CHARGER { return 5; }
+    if kind == DRONE || kind == BOMBER { return 2; }
+    return 1;
+}
+
+fn drop(e: &Enemies, at: Vec3, value: int) {
+    let a = e.cosmetic.unit() * TAU;
+    e.gems[e.nextGem] = Gem { pos: at, vel: Vec3.xyz(cos(a) * 2.5, 5, sin(a) * 2.5), value: value, t: GEM_LIFE, pulled: false, expires: e.clock + GEM_LIFE, pending: 0, settled: false, nextTick: e.clock + f32(e.nextGem % 10) * 0.01 };
+    e.nextGem = (e.nextGem + 1) % MAX_GEMS;
+}
+
+/// A fallen boss's hoard: `xp` in red gems, scattered from `at`.
+pub fn reward(e: &Enemies, at: Vec3, xp: int) {
+    let left = xp;
+    while left > 0 {
+        let v = mini(left, 5);
+        drop(e, at, v);
+        e.gems[(e.nextGem + MAX_GEMS - 1) % MAX_GEMS].vel = e.gems[(e.nextGem + MAX_GEMS - 1) % MAX_GEMS].vel * 2.2;
+        left -= v;
+    }
+}
+
+/// Gem colour by value: blue, green, red.
+fn gemColor(value: int): Vec3 {
+    if value >= 5 { return Vec3.xyz(1, 0.25, 0.3); }
+    if value >= 2 { return Vec3.xyz(0.3, 1, 0.4); }
+    return Vec3.xyz(0.3, 0.6, 1);
+}
+
+/// Gems fall and settle; near the player they fly in and are picked up.
+fn gems(e: &Enemies, p: &Player, lvl: &Level, dt: f32) {
+    let chest = p.pos + Vec3.xyz(0, 0.9, 0);
+    let i = 0;
+    while i < MAX_GEMS {
+        let g = &e.gems[i];
+        if g.t > 0 {
+            g.t = max(0, g.expires - e.clock);
+            let to = chest - g.pos;
+            let dist2 = to.dot(to);
+            if g.t > 0 && dist2 < MAGNET * MAGNET { g.pulled = true; }
+            if g.t > 0 && g.pulled {
+                let far = sqrt(dist2);
+                g.vel = to.normalize() * (12 + (GEM_LIFE - g.t) * 0.5 + max(MAGNET - far, 0) * 5);
+                g.pos = g.pos + g.vel * dt;
+                if far < PICKUP {
+                    e.xp += g.value;
+                    if e.gemT <= 0.1 { sfx.play(sfx.GEM); }
+                    e.gemT = 0.15;
+                    g.t = 0;
+                }
+            } else if g.t > 0 && !g.settled {
+                g.pending += dt;
+                // Stagger distant falling gems into ten time buckets.
+                let due = e.clock >= g.nextTick;
+                if dist2 < 400 || due || g.pending >= 0.12 {
+                    g.nextTick = e.clock + 0.1;
+                    let remaining = g.pending;
+                    g.pending = 0;
+                    while remaining > 0 && !g.settled {
+                        let step = min(remaining, 0.02);
+                        remaining -= step;
+                        g.vel.y -= GRAVITY * step;
+                        let next = g.pos + g.vel * step;
+                        if solid(lvl, next, 0.15) >= 0 {
+                            g.vel = Vec3.zero();
+                            g.settled = true;
+                        } else { g.pos = next; }
+                    }
+                    if g.pos.y < -30 { g.t = 0; }
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+fn size(kind: int): f32 {
+    if kind == HOPPER { return HOPPER_SIZE; }
+    if kind == ZIPPER { return ZIPPER_SIZE; }
+    if kind == CHARGER { return CHARGER_SIZE; }
+    if kind == BOMBER { return BOMBER_SIZE; }
+    return DRONE_SIZE;
+}
+
+fn health(kind: int): f32 {
+    if kind == HOPPER { return HOPPER_HP; }
+    if kind == ZIPPER { return ZIPPER_HP; }
+    if kind == CHARGER { return CHARGER_HP; }
+    if kind == BOMBER { return BOMBER_HP; }
+    return DRONE_HP;
+}
+
+pub fn color(kind: int): Vec3 {
+    if kind == HOPPER { return Vec3.xyz(1, 0.35, 0.6); }
+    if kind == ZIPPER { return Vec3.xyz(0.2, 0.9, 1); }
+    if kind == CHARGER { return Vec3.xyz(1, 0.3, 0.15); }
+    if kind == BOMBER { return Vec3.xyz(0.65, 0.35, 1); }
+    return Vec3.xyz(1, 0.75, 0.15);
+}
+
+/// Which kind to spawn: new kinds join as the waves go on.
+fn pickKind(e: &Enemies): int {
+    let u = e.rng.unit();
+    if e.tier >= 5 && u < 0.05 { return BOMBER; }
+    if e.tier >= 4 && u >= 0.1 && u < 0.22 { return CHARGER; }
+    if e.tier >= 3 && u >= 0.22 && u < 0.42 { return ZIPPER; }
+    if e.tier >= 2 && u >= 0.88 { return DRONE; }
+    return HOPPER;
+}
+
+fn burst(e: &Enemies, at: Vec3, tint: Vec3, n: int, speed: f32) {
+    let off = at - e.listener;
+    if off.dot(off) > 3600 { return; }
+    let count = mini(n, mini(e.effectsLeft, int(e.tokens)));
+    e.effectsLeft -= count;
+    e.tokens -= f32(count);
+    let i = 0;
+    while i < count {
+        let d = Vec3.xyz(e.cosmetic.unit() - 0.5, e.cosmetic.unit() * 0.8, e.cosmetic.unit() - 0.5).normalize();
+        e.bits[e.nextBit] = Bit {
+            pos: at, vel: d * (speed * (0.4 + e.cosmetic.unit())), t: 0.5 + e.cosmetic.unit() * 0.4,
+            size: 0.08 + e.cosmetic.unit() * 0.12, color: tint,
+        };
+        e.nextBit = (e.nextBit + 1) % MAX_BITS;
+        i += 1;
+    }
+}
+
+/// Clear everything: the player went down.
+fn wipe(e: &Enemies) {
+    let bit = 0;
+    while bit < MAX_BITS { e.bits[bit].t = 0; bit += 1; }
+    let g = 0;
+    while g < MAX_GEMS {
+        e.gems[g].t = 0;
+        g += 1;
+    }
+    let i = 0;
+    while i < MAX_ENEMIES {
+        e.list[i].kind = 0;
+        i += 1;
+    }
+    i = 0;
+    while i < MAX_ORBS {
+        e.orbs[i].t = 0;
+        i += 1;
+    }
+}
+
+/// The farthest ordinary enemy at least 45 m away, or -1. Gold ones stay.
+fn farthest(e: &Enemies, p: &Player): int {
+    let best = -1;
+    let bestD: f32 = 2025;
+    let i = 0;
+    while i < MAX_ENEMIES {
+        let en = e.list[i];
+        if en.kind != 0 && !en.gold {
+            let d = en.pos - p.pos;
+            let dd = d.x * d.x + d.z * d.z;
+            if dd > bestD {
+                best = i;
+                bestD = dd;
+            }
+        }
+        i += 1;
+    }
+    return best;
+}
+
+/// One enemy somewhere clear, away from the player: hoppers drop in from above, drones fly in.
+/// At the ordinary cap, the farthest enemy beyond 45 m is removed and the new one appears
+/// 12–22 m from the player.
+fn spawn(e: &Enemies, p: &Player, lvl: &Level) {
+    let replacing = false;
+    if alive(e) >= MAX_ENEMIES - GOLD_ROOM {
+        let gone = farthest(e, p);
+        if gone < 0 { return; }
+        e.list[gone].kind = 0;
+        replacing = true;
+    }
+    let slot = 0;
+    while slot < MAX_ENEMIES && e.list[slot].kind != 0 { slot += 1; }
+    if slot == MAX_ENEMIES { return; }
+    let kind = pickKind(e);
+    let counts: [9]int = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let near = 0;
+    let j = 0;
+    while j < MAX_ENEMIES {
+        let en = e.list[j];
+        if en.kind != 0 && !en.gold {
+            let inhabitantTile = tileAt(en.pos.x, en.pos.z);
+            if inhabitantTile >= 0 && inhabitantTile < 9 { counts[inhabitantTile] += 1; }
+            let d = en.pos - p.pos;
+            if d.x * d.x + d.z * d.z < 3600 { near += 1; }
+        }
+        j += 1;
+    }
+    let tileChoice = -1;
+    let start = e.rng.intRange(0, 9);
+    j = 0;
+    while j < 9 {
+        let candidate = (start + j) % 9;
+        if isOpen(lvl, candidate) && counts[candidate] < mini(6 + e.tier * 3, 20) {
+            if tileChoice < 0 { tileChoice = candidate; }
+            else if counts[candidate] < counts[tileChoice] { tileChoice = candidate; }
+        }
+        j += 1;
+    }
+    if replacing {
+        tileChoice = tileAt(p.pos.x, p.pos.z);
+        if !isOpen(lvl, tileChoice) { tileChoice = HUB; }
+    }
+    if tileChoice < 0 { return; }
+    let tries = 0;
+    let limit = 12;
+    if replacing { limit = 24; }
+    while tries < limit {
+        let at = Vec3.xyz(-165 + f32(tileChoice % 3) * 110 + 3 + e.rng.unit() * 104, 14,
+            -165 + f32(tileChoice / 3) * 110 + 3 + e.rng.unit() * 104);
+        if replacing {
+            let a = e.rng.unit() * TAU;
+            let r = 12 + e.rng.unit() * 10;
+            at = Vec3.xyz(p.pos.x + cos(a) * r, 14, p.pos.z + sin(a) * r);
+        }
+        let k = kind;
+        let zone = -1;
+        let tile = tileAt(at.x, at.z);
+        if tile != HUB && e.rng.unit() < ZONE_CHANCE {
+            zone = tile;
+            k = zoneKind(tile);
+        }
+        if k == DRONE || k == BOMBER { at.y = 6 + e.rng.unit() * 5; }
+        let dx = at.x - p.pos.x;
+        let dz = at.z - p.pos.z;
+        let d2 = dx * dx + dz * dz;
+        let farEnough = d2 > 400 && (near < 48 || d2 >= 3600);
+        if replacing { farEnough = d2 > 144 && d2 < 484; }
+        if farEnough && openAt(lvl, at.x, at.z) && solid(lvl, at, size(k)) < 0 && floorUnder(lvl, at.x, at.z, at.y) {
+            // spawnAt takes the first free slot too: `slot`.
+            if spawnAt(e, k, at, Vec3.zero(), false) && zone >= 0 {
+                e.list[slot].zone = zone;
+                e.list[slot].hp = health(k) * ZONE_HP;
+            }
+            return;
+        }
+        tries += 1;
+    }
+}
+
+/// One enemy of `kind` at `at` moving at `vel`; `gold` ones come from shrines. False when full.
+pub fn spawnAt(e: &Enemies, kind: int, at: Vec3, vel: Vec3, gold: bool): bool {
+    if !gold && alive(e) >= MAX_ENEMIES - GOLD_ROOM { return false; }
+    let slot = 0;
+    while slot < MAX_ENEMIES && e.list[slot].kind != 0 { slot += 1; }
+    if slot == MAX_ENEMIES { return false; }
+    let hp = health(kind);
+    if gold { hp = hp * GOLD_HP; }
+    e.list[slot] = Enemy {
+        kind: kind, pos: at, vel: vel, hp: hp, t: 1 + e.rng.unit(), flash: 0,
+        phase: e.rng.unit() * TAU, grounded: false, squash: 1, gold: gold, zone: -1,
+    };
+    // Bombers get to circle a while before the first dive.
+    if kind == BOMBER { e.list[slot].t = 3 + e.rng.unit() * 2; }
+    burst(e, at, Vec3.xyz(1, 1, 1), 10, 5);
+    return true;
+}
+
+/// Each biome's own enemy: the body it borrows.
+fn zoneKind(t: int): int {
+    if t == 0 || t == 3 { return ZIPPER; }
+    if t == 1 || t == 6 { return CHARGER; }
+    if t == 5 { return DRONE; }
+    if t == 8 { return BOMBER; }
+    return HOPPER;
+}
+
+/// Its body colour and the glow of its outline and crystal.
+fn zoneTint(t: int): Vec3 {
+    if t == 0 { return Vec3.xyz(0.85, 0.95, 1); }
+    if t == 1 { return Vec3.xyz(0.35, 0.7, 0.3); }
+    if t == 2 { return Vec3.xyz(0.25, 0.2, 0.22); }
+    if t == 3 { return Vec3.xyz(0.95, 0.7, 0.4); }
+    if t == 5 { return Vec3.xyz(1, 0.4, 0.85); }
+    if t == 6 { return Vec3.xyz(0.9, 0.87, 0.78); }
+    if t == 7 { return Vec3.xyz(0.3, 0.5, 0.25); }
+    return Vec3.xyz(0.95, 0.97, 1);
+}
+
+fn zoneGlow(t: int): Vec3 {
+    if t == 0 { return Vec3.xyz(0.6, 1.6, 2.6); }
+    if t == 1 { return Vec3.xyz(0.8, 2.2, 0.5); }
+    if t == 2 { return Vec3.xyz(2.8, 0.9, 0.1); }
+    if t == 3 { return Vec3.xyz(2.4, 1.2, 0.4); }
+    if t == 5 { return Vec3.xyz(2.6, 0.5, 2.4); }
+    if t == 6 { return Vec3.xyz(1.8, 1.7, 1.2); }
+    if t == 7 { return Vec3.xyz(1.2, 2.4, 0.4); }
+    return Vec3.xyz(0.8, 1.2, 2.8);
+}
+
+/// A ground kind for a shrine's gold batch.
+pub fn groundKind(e: &Enemies): int {
+    let u = e.rng.unit();
+    if u < 0.15 { return CHARGER; }
+    if u < 0.5 { return ZIPPER; }
+    return HOPPER;
+}
+
+/// Gold enemies still alive.
+pub fn golds(e: &Enemies): int {
+    let n = 0;
+    let i = 0;
+    while i < MAX_ENEMIES {
+        if e.list[i].kind != 0 && e.list[i].gold { n += 1; }
+        i += 1;
+    }
+    return n;
+}
+
+/// The nearest enemy within `range` of `at`, or -1.
+pub fn nearest(e: &Enemies, at: Vec3, range: f32): int {
+    let best = -1;
+    let bestD = range * range;
+    let i = 0;
+    while i < MAX_ENEMIES {
+        if e.list[i].kind != 0 {
+            let d = e.list[i].pos - at;
+            let dd = d.dot(d);
+            if dd < bestD {
+                best = i;
+                bestD = dd;
+            }
+        }
+        i += 1;
+    }
+    return best;
+}
+
+/// An explosion: every enemy within `radius` takes `dmg`, less toward the edge, and is thrown
+/// out by up to `shove`.
+pub fn blast(e: &Enemies, at: Vec3, radius: f32, dmg: f32, tint: Vec3, shove: f32) {
+    burst(e, at, tint, int(radius * 6), radius * 2.6);
+    burst(e, at, Vec3.xyz(1, 1, 0.8), int(radius * 3), radius * 1.6);
+    let i = 0;
+    while i < MAX_ENEMIES {
+        let en = e.list[i];
+        if en.kind != 0 {
+            let d = en.pos - at;
+            let far = d.length();
+            if far < radius {
+                let k = 1 - far / radius * 0.6;
+                damage(e, i, dmg * k, d.normalize() * (shove * k) + Vec3.xyz(0, shove * 0.4 * k, 0), en.pos);
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Debris for a hit on something that isn't an enemy (a shrine).
+pub fn sparks(e: &Enemies, at: Vec3, tint: Vec3, n: int, speed: f32) {
+    burst(e, at, tint, n, speed);
+}
+
+/// Move with the level's boxes in the way. Returns true on landing on something. Walkers
+/// that run into a wall climb it instead of bouncing off.
+fn moveBody(en: &Enemy, lvl: &Level, dt: f32): bool {
+    let half = size(en.kind) * 0.5;
+    let d = en.vel * dt;
+    if en.gold {
+        d.x = d.x * GOLD_SPEED;
+        d.z = d.z * GOLD_SPEED;
+    }
+    let walker = en.kind != DRONE && en.kind != BOMBER;
+    let steps = 1 + int(d.length() / 0.25);
+    let part = d * (1 / f32(steps));
+    let landed = false;
+    let climb = false;
+    let s = 0;
+    while s < steps {
+        en.pos.x = en.pos.x + part.x;
+        if solid(lvl, en.pos, half) >= 0 {
+            en.pos.x = en.pos.x - part.x;
+            if walker { climb = true; } else { en.vel.x = en.vel.x * -0.3; }
+        }
+        en.pos.z = en.pos.z + part.z;
+        if solid(lvl, en.pos, half) >= 0 {
+            en.pos.z = en.pos.z - part.z;
+            if walker { climb = true; } else { en.vel.z = en.vel.z * -0.3; }
+        }
+        en.pos.y = en.pos.y + part.y;
+        let b = solid(lvl, en.pos, half);
+        if b >= 0 {
+            if part.y < 0 {
+                en.pos.y = lvl.boxes[b].hi.y + half;
+                landed = true;
+            } else {
+                en.pos.y = en.pos.y - part.y;
+            }
+            en.vel.y = 0;
+        }
+        s += 1;
+    }
+    if climb { en.vel.y = max(en.vel.y, CLIMB); }
+    return landed;
+}
+
+fn hopper(e: &Enemies, en: &Enemy, p: &Player, lvl: &Level, dt: f32) {
+    en.vel.y = en.vel.y - GRAVITY * dt;
+    let was = en.grounded;
+    en.grounded = moveBody(en, lvl, dt);
+    if en.grounded && !was { en.squash = 0.6; }
+    if en.grounded {
+        en.vel.x = en.vel.x * max(1 - dt * 10, 0);
+        en.vel.z = en.vel.z * max(1 - dt * 10, 0);
+        en.t = en.t - dt;
+        if en.t <= 0 {
+            // Leap at the player, higher when they're up on something.
+            let to = Vec3.xyz(p.pos.x - en.pos.x, 0, p.pos.z - en.pos.z);
+            let far = to.length();
+            let dir = to.normalize();
+            let reach = min(far * 0.9, HOPPER_HOP + f32(mini(e.tier, 10)) * 0.4);
+            en.vel.x = dir.x * reach;
+            en.vel.z = dir.z * reach;
+            en.vel.y = 7 + clamp(p.pos.y - en.pos.y, 0, 9) * 0.9;
+            en.grounded = false;
+            en.squash = 1.35;
+            en.t = 0.5 + e.rng.unit() * 0.5;
+        }
+    }
+    en.squash = en.squash + (1 - en.squash) * min(dt * 10, 1);
+    touch(en, p, 1.2, HOPPER_HIT, 10);
+}
+
+/// Contact within `reach` of the player's middle: a hit and a shove away. True on a hit.
+fn touch(en: &Enemy, p: &Player, reach: f32, dmg: f32, shove: f32): bool {
+    let off = p.pos + Vec3.xyz(0, 0.9, 0) - en.pos;
+    if off.length() >= reach { return false; }
+    let away = Vec3.xyz(off.x, 0, off.z).normalize();
+    return hurt(p, dmg, away * shove + Vec3.xyz(0, shove * 0.5, 0));
+}
+
+/// Flat direction from `en` to the player.
+fn toward(en: &Enemy, p: &Player): Vec3 {
+    return Vec3.xyz(p.pos.x - en.pos.x, 0, p.pos.z - en.pos.z).normalize();
+}
+
+/// Runs straight at you, weaving, and hops anything that stops it.
+fn zipper(en: &Enemy, p: &Player, lvl: &Level, dt: f32) {
+    en.vel.y = en.vel.y - GRAVITY * dt;
+    en.grounded = moveBody(en, lvl, dt);
+    en.phase = en.phase + dt * 7;
+    let dir = toward(en, p);
+    let side = Vec3.xyz(0 - dir.z, 0, dir.x) * (sin(en.phase) * 0.6);
+    let goal = (dir + side) * ZIPPER_RUN;
+    let k = min(dt * 6, 1);
+    en.vel.x = en.vel.x + (goal.x - en.vel.x) * k;
+    en.vel.z = en.vel.z + (goal.z - en.vel.z) * k;
+    // Stuck on something, or you're above it: hop.
+    let flat = Vec3.xyz(en.vel.x, 0, en.vel.z).length();
+    if en.grounded && (flat < ZIPPER_RUN * 0.4 || p.pos.y > en.pos.y + 2) {
+        en.vel.y = 8 + clamp(p.pos.y - en.pos.y, 0, 8);
+        en.grounded = false;
+    }
+    touch(en, p, 0.9, ZIPPER_HIT, 6);
+}
+
+/// Plods toward you, winds up (glows) and rushes in a straight line.
+fn charger(e: &Enemies, en: &Enemy, p: &Player, lvl: &Level, dt: f32) {
+    en.vel.y = en.vel.y - GRAVITY * dt;
+    en.grounded = moveBody(en, lvl, dt);
+    if en.phase > 0 {
+        en.phase = en.phase - dt;
+        // Stopped dead by a wall: the rush is over.
+        if Vec3.xyz(en.vel.x, 0, en.vel.z).length() < CHARGER_RUSH * 0.3 { en.phase = 0; }
+    } else {
+        let dir = toward(en, p);
+        let walk = CHARGER_WALK;
+        if en.t < 0.6 { walk = 0; }
+        let k = min(dt * 4, 1);
+        en.vel.x = en.vel.x + (dir.x * walk - en.vel.x) * k;
+        en.vel.z = en.vel.z + (dir.z * walk - en.vel.z) * k;
+        if en.grounded { en.t = en.t - dt; }
+        if en.t <= 0 {
+            en.vel.x = dir.x * CHARGER_RUSH;
+            en.vel.z = dir.z * CHARGER_RUSH;
+            en.phase = 1.1;
+            en.t = 2.2 + e.rng.unit() * 1.5;
+        }
+    }
+    touch(en, p, 1.7, CHARGER_HIT, 16);
+}
+
+/// Hovers high above you, then dives and blows up on whatever it hits.
+/// Ease a flyer's velocity toward `goal`, no faster than `speed` across and `climb` up or down.
+fn hover(en: &Enemy, goal: Vec3, speed: f32, climb: f32, dt: f32) {
+    let d = goal - en.pos;
+    let flat = Vec3.xyz(d.x, 0, d.z);
+    let want = flat.normalize() * min(flat.length() * 0.6, speed);
+    want.y = clamp(d.y * 0.6, 0 - climb, climb);
+    en.vel = en.vel + (want - en.vel) * min(dt * 2, 1);
+}
+
+/// Drifts to a spot high over you, then dives at where you were and blows up.
+fn bomber(e: &Enemies, en: &Enemy, p: &Player, lvl: &Level, dt: f32) {
+    en.t = en.t - dt;
+    if en.t > 0 {
+        hover(en, p.pos + Vec3.xyz(cos(en.phase) * 6, 9, sin(en.phase) * 6), BOMBER_SPEED, BOMBER_CLIMB, dt);
+        if en.t < 0.9 { en.vel = en.vel * max(1 - dt * 6, 0); }
+    } else if en.t > -dt {
+        // Lock on once, then commit.
+        en.vel = (p.pos + Vec3.xyz(0, 0.9, 0) - en.pos).normalize() * BOMBER_DIVE;
+    }
+    let hitGround = moveBody(en, lvl, dt);
+    let blocked = en.t <= 0 && en.vel.length() < BOMBER_DIVE * 0.5;
+    let near = (p.pos + Vec3.xyz(0, 0.9, 0) - en.pos).length() < BOMBER_BLAST * 0.4;
+    if en.t < 0 && (hitGround || blocked || near || en.t < -3) { explode(e, en, p); }
+}
+
+fn explode(e: &Enemies, en: &Enemy, p: &Player) {
+    touch(en, p, BOMBER_BLAST, BOMBER_HIT, 14);
+    sfx.at(sfx.BOOM, en.pos);
+    burst(e, en.pos, color(BOMBER), 26, 12);
+    burst(e, en.pos, Vec3.xyz(1, 0.8, 0.4), 14, 9);
+    en.kind = 0;
+}
+
+/// Drifts slowly around a wide ring at a set height over you and lobs an orb now and then.
+fn drone(e: &Enemies, en: &Enemy, p: &Player, lvl: &Level, scene: &Scene, dt: f32) {
+    en.phase = en.phase + dt * 0.15;
+    hover(en, p.pos + Vec3.xyz(cos(en.phase) * DRONE_ORBIT, DRONE_HEIGHT, sin(en.phase) * DRONE_ORBIT), DRONE_SPEED, DRONE_CLIMB, dt);
+    moveBody(en, lvl, dt);
+    en.t = en.t - dt;
+    if en.t <= 0 {
+        en.t = 2.5 + e.rng.unit() * 1.5;
+        let eye = p.pos + Vec3.xyz(0, 1.4, 0);
+        let to = eye - en.pos;
+        let far = to.length();
+        let dir = to.normalize();
+        // Only with a clear line to you.
+        let sight = shoot(lvl, scene, Ray { origin: en.pos, dir: dir }, far);
+        if far < 50 && !sight.hit {
+            e.orbs[e.nextOrb] = Orb { pos: en.pos + dir * 0.6, vel: dir * ORB_SPEED, t: ORB_LIFE };
+            e.nextOrb = (e.nextOrb + 1) % MAX_ORBS;
+            sfx.at(sfx.ZAP, en.pos);
+        }
+    }
+}
+
+pub fn update(e: &Enemies, p: &Player, lvl: &Level, scene: &Scene, dt: f32) {
+    e.hitT = e.hitT - dt;
+    e.killT = e.killT - dt;
+    e.gemT = e.gemT - dt;
+    e.downT = e.downT - dt;
+
+    if p.hp <= 0 {
+        wipe(e);
+        e.downTime = e.time;
+        e.downT = DOWN_REST;
+        e.time = 0;
+        e.tier = 1;
+        e.xp = 0;
+        e.restT = DOWN_REST;
+        e.died = true;
+        respawn(p);
+        // A fresh run: the cards go too.
+        p.stats = noStats();
+        p.hp = MAX_HP;
+    }
+
+    // Spawn all the time, topping up to the tier's count.
+    if e.restT > 0 {
+        e.restT = e.restT - dt;
+    } else {
+        e.time = e.time + dt;
+        e.tier = 1 + int(e.time / TIER_TIME);
+        e.spawnT = e.spawnT - dt;
+        if e.spawnT <= 0 {
+            if alive(e) < target(e, lvl) { spawn(e, p, lvl); }
+            e.spawnT = spawnEvery(e);
+            if e.calm { e.spawnT = e.spawnT * 2; }
+        }
+    }
+    let gemStart = game.micros();
+    gems(e, p, lvl, dt);
+    e.gemMs = f32(game.micros() - gemStart) / 1000;
+    let aiStart = game.micros();
+
+    let i = 0;
+    while i < MAX_ENEMIES {
+        let en = &e.list[i];
+        if en.kind != 0 {
+            en.flash = en.flash - dt;
+            en.wakeT = max(0, en.wakeT - dt);
+            let delta = en.pos - p.pos;
+            let range2 = delta.dot(delta);
+            if en.gold || en.wakeT > 0 || range2 < WAKE * WAKE { en.active = true; }
+            else if range2 > SLEEP * SLEEP { en.active = false; }
+            if en.active {
+                if en.kind == HOPPER { hopper(e, en, p, lvl, dt); }
+                if en.kind == DRONE { drone(e, en, p, lvl, scene, dt); }
+                if en.kind == ZIPPER { zipper(en, p, lvl, dt); }
+                if en.kind == CHARGER { charger(e, en, p, lvl, dt); }
+                if en.kind == BOMBER { bomber(e, en, p, lvl, dt); }
+            } else if en.kind != DRONE && en.kind != BOMBER {
+                if !en.grounded || en.vel.dot(en.vel) > 0.01 {
+                    en.vel.y -= GRAVITY * dt;
+                    en.grounded = moveBody(en, lvl, dt);
+                    if en.grounded { en.vel = Vec3.zero(); }
+                }
+            } else { en.vel = Vec3.zero(); }
+            // Distance never removes an inhabitant.
+            if en.pos.y < -30 {
+                // Shrine ones come back near you, on ground you stood on.
+                if en.gold {
+                    let back = p.safe + toward(en, p) * -4 + Vec3.xyz(0, 3, 0);
+                    if solid(lvl, back, size(en.kind) * 0.5) >= 0 || !floorUnder(lvl, back.x, back.z, back.y) {
+                        back = p.safe + Vec3.xyz(0, 4, 0);
+                    }
+                    en.pos = back;
+                    en.vel = Vec3.zero();
+                } else {
+                    en.kind = 0;
+                }
+            }
+
+        }
+        i += 1;
+    }
+
+    e.aiMs = f32(game.micros() - aiStart) / 1000;
+    let effectsStart = game.micros();
+    i = 0;
+    while i < MAX_ORBS {
+        let o = &e.orbs[i];
+        if o.t > 0 {
+            o.t = o.t - dt;
+            o.pos = o.pos + o.vel * dt;
+            let off = o.pos - p.pos;
+            if off.y > -0.2 && off.y < 2 && off.x * off.x + off.z * off.z < 0.5 {
+                hurt(p, ORB_HIT, o.vel.normalize() * 6 + Vec3.xyz(0, 2, 0));
+                burst(e, o.pos, Vec3.xyz(0.6, 1, 0.3), 8, 4);
+                o.t = 0;
+            } else if solid(lvl, o.pos, 0.1) >= 0 {
+                burst(e, o.pos, Vec3.xyz(0.6, 1, 0.3), 8, 4);
+                o.t = 0;
+            }
+        }
+        i += 1;
+    }
+
+    i = 0;
+    while i < MAX_BITS {
+        let b = &e.bits[i];
+        if b.t > 0 {
+            b.t = b.t - dt;
+            b.vel.y = b.vel.y - GRAVITY * 0.7 * dt;
+            b.pos = b.pos + b.vel * dt;
+        }
+        i += 1;
+    }
+    e.effectsMs = f32(game.micros() - effectsStart) / 1000;
+}
+
+/// The nearest enemy along `ray` closer than `reach`: a sphere test per enemy.
+pub fn ray(e: &Enemies, r: Ray, reach: f32): Hit {
+    let ignored: [1]int = [-1];
+    return rayExcept(e, r, reach, ignored[:]);
+}
+
+/// Piercing projectiles skip enemies they have already damaged on this flight.
+pub fn rayExcept(e: &Enemies, r: Ray, reach: f32, ignored: []int): Hit {
+    let best = Hit { index: -1, t: reach, exit: reach };
+    let i = 0;
+    while i < MAX_ENEMIES {
+        let en = e.list[i];
+        let skip = false;
+        let j = 0;
+        while j < ignored.len {
+            if ignored[j] == i { skip = true; }
+            j += 1;
+        }
+        if en.kind != 0 && !skip {
+            let rad = size(en.kind) * 0.65;
+            let to = en.pos - r.origin;
+            let along = to.dot(r.dir);
+            let miss = to.dot(to) - along * along;
+            if along > 0 && miss < rad * rad {
+                let t = along - sqrt(rad * rad - miss);
+                if t < best.t {
+                    best.index = i;
+                    best.t = t;
+                    best.exit = along + sqrt(rad * rad - miss);
+                }
+            }
+        }
+        i += 1;
+    }
+    return best;
+}
+
+/// A bullet landed: flash, knock back, and pop it when it's out of health.
+pub fn damage(e: &Enemies, index: int, dmg: f32, shove: Vec3, at: Vec3) {
+    let en = &e.list[index];
+    if en.kind == 0 { return; }
+    en.wakeT = 3;
+    en.active = true;
+    en.hp = en.hp - dmg;
+    en.flash = 0.08;
+    en.vel = en.vel + shove;
+    let fast = en.vel.length();
+    if fast > MAX_SPEED { en.vel = en.vel * (MAX_SPEED / fast); }
+    // One tick per burst, not one per shotgun pellet.
+    if e.hitT < 0.08 { sfx.play(sfx.HIT); }
+    e.hitT = 0.12;
+    e.hits += 1;
+    if en.hp > 0 { burst(e, at, color(en.kind), 2, 5); }
+    if en.hp <= 0 {
+        let xp = worth(en.kind);
+        if en.gold { xp = xp * 3; }
+        if en.zone >= 0 {
+            xp += ZONE_XP;
+            e.zoneKills[en.zone] += 1;
+            if e.zoneKills[en.zone] == ZONE_GOAL { e.cleared = en.zone; }
+        }
+        drop(e, en.pos, xp);
+        burst(e, en.pos, color(en.kind), 8, 9);
+        burst(e, en.pos, Vec3.xyz(1, 1, 1), 2, 6);
+        en.kind = 0;
+        e.kills += 1;
+        e.killT = 0.3;
+        sfx.at(sfx.KILL, en.pos);
+    }
+}
+
+fn append(e: &Enemies, model: Mat4, tint: Vec3, glow: Vec3, shell: bool, cast: bool) {
+    if e.partCount >= e.parts.len { panic("enemy render capacity"); }
+    let i = e.partCount;
+    e.parts[i] = Instance { model: model, tint: tint, emission: glow };
+    e.owners[i] = e.owner;
+    e.shells[i] = shell;
+    e.casts[i] = cast;
+    e.partCount += 1;
+}
+
+fn cube(e: &Enemies, base: Mat4, at: Vec3, sz: Vec3, tint: Vec3, glow: Vec3) {
+    let tiny = sz.x < 0.35 && sz.y < 0.35 && sz.z < 0.1;
+    if !e.detail && tiny { return; }
+    append(e, base.mul(Mat4.translate(at.x, at.y, at.z)).mul(Mat4.scale(sz.x, sz.y, sz.z)), tint, glow, false, e.cast && !tiny);
+}
+
+fn hull(e: &Enemies, base: Mat4, at: Vec3, sz: Vec3) {
+    if !e.detail { return; }
+    let w = e.edgeW * 2;
+    append(e, base.mul(Mat4.translate(at.x, at.y, at.z)).mul(Mat4.scale(sz.x + w, sz.y + w, sz.z + w)), Vec3.zero(), e.edge, true, false);
+}
+
+/// Submit the prepared geometry using independent camera/light visibility.
+pub fn draw(e: &Enemies, p: &Player) {
+    let camera = gfx.inCameraPass();
+    let i = 0;
+    while i < MAX_ENEMIES {
+        let en = e.list[i];
+        e.visible[i] = en.kind != 0 && gfx.visible(Mat4.translate(en.pos.x, en.pos.y, en.pos.z), Vec3.xyz(-2, -2, -2), Vec3.xyz(2, 3, 2));
+        i += 1;
+    }
+    let pass = 0;
+    while pass < (if camera { 2 } else { 1 }) {
+        let count = 0;
+        i = 0;
+        while i < e.partCount {
+            let owner = e.owners[i];
+            let visible = false;
+            if owner >= 0 { visible = e.visible[owner]; }
+            else if camera { visible = gfx.visible(e.parts[i].model, Vec3.xyz(-0.5, -0.5, -0.5), Vec3.xyz(0.5, 0.5, 0.5)); }
+            if visible && e.shells[i] == (pass == 1) && (camera || e.casts[i]) {
+                e.batch[count] = e.parts[i]; count += 1;
+            }
+            i += 1;
+        }
+        let batch = []Instance { ptr: e.batch.ptr, len: count };
+        if pass == 1 { gfx.drawHullInstances(e.cube, batch); }
+        else { gfx.drawInstances(e.cube, batch); }
+        pass += 1;
+    }
+}
+
+/// Prepare once before either render pass. No GL calls or per-frame allocations.
+pub fn prepare(e: &Enemies, p: &Player) {
+    e.partCount = 0;
+    e.cast = true;
+    let i = 0;
+    while i < MAX_ENEMIES {
+        let en = e.list[i];
+        if en.kind != 0 {
+            e.owner = i;
+            let distance = en.pos - p.pos;
+            let far2 = distance.dot(distance);
+            if far2 > 2500 { e.list[i].detailed = false; }
+            if far2 < 2025 { e.list[i].detailed = true; }
+            e.detail = e.list[i].detailed;
+            // Face the player: local -z points at them.
+            let yaw = atan2(0 - (p.pos.x - en.pos.x), 0 - (p.pos.z - en.pos.z));
+            let base = Mat4.translate(en.pos.x, en.pos.y, en.pos.z).mul(Mat4.rotate(Vec3.xyz(0, 1, 0), yaw));
+            let tint = color(en.kind);
+            let glow = Vec3.zero();
+            e.edge = Vec3.xyz(OUTLINE_GLOW, OUTLINE_GLOW, OUTLINE_GLOW);
+            e.edgeW = OUTLINE;
+            if en.gold {
+                e.edge = Vec3.xyz(2.6, 1.8, 0.3);
+                e.edgeW = GOLD_OUTLINE;
+                if !e.detail { tint = Vec3.xyz(1, 0.7, 0.15); }
+            }
+            if en.zone >= 0 {
+                tint = zoneTint(en.zone);
+                e.edge = zoneGlow(en.zone);
+                e.edgeW = GOLD_OUTLINE;
+                // A spinning crystal over its head, in the biome's glow.
+                let twirl = e.clock * 4 + en.phase;
+                let top = Mat4.translate(en.pos.x, en.pos.y + size(en.kind) * 0.5 + 0.6 + sin(twirl * 2) * 0.1, en.pos.z)
+                    .mul(Mat4.rotate(Vec3.xyz(0, 1, 0), twirl)).mul(Mat4.rotate(Vec3.xyz(1, 0, 1).normalize(), 0.6155));
+                e.cast = false;
+                cube(e, top, Vec3.zero(), Vec3.xyz(0.3, 0.3, 0.3), zoneTint(en.zone), zoneGlow(en.zone));
+                e.cast = true;
+            }
+            if en.flash > 0 {
+                tint = Vec3.xyz(1, 1, 1);
+                glow = Vec3.xyz(2, 2, 2);
+            }
+            let white = Vec3.xyz(1, 1, 1);
+            let black = Vec3.xyz(0.05, 0.05, 0.08);
+            if en.kind == HOPPER {
+                let sq = en.squash;
+                let wide = 1 / sqrt(sq);
+                let h = HOPPER_SIZE * sq;
+                base = base.mul(Mat4.translate(0, (h - HOPPER_SIZE) * 0.5, 0));
+                hull(e, base, Vec3.zero(), Vec3.xyz(wide, sq * 0.9, wide));
+                cube(e, base, Vec3.zero(), Vec3.xyz(wide, sq * 0.9, wide), tint, glow);
+                cube(e, base, Vec3.xyz(-0.22, 0.12 * sq, -0.5 * wide), Vec3.xyz(0.22, 0.26 * sq, 0.04), white, glow);
+                cube(e, base, Vec3.xyz(0.22, 0.12 * sq, -0.5 * wide), Vec3.xyz(0.22, 0.26 * sq, 0.04), white, glow);
+                cube(e, base, Vec3.xyz(-0.22, 0.08 * sq, -0.52 * wide), Vec3.xyz(0.1, 0.12 * sq, 0.04), black, Vec3.zero());
+                cube(e, base, Vec3.xyz(0.22, 0.08 * sq, -0.52 * wide), Vec3.xyz(0.1, 0.12 * sq, 0.04), black, Vec3.zero());
+            } else if en.kind == ZIPPER {
+                let zs = ZIPPER_SIZE;
+                let skip = abs(sin(en.phase * 2)) * 0.08;
+                base = base.mul(Mat4.translate(0, skip, 0));
+                hull(e, base, Vec3.zero(), Vec3.xyz(zs, zs * 0.7, zs * 1.2));
+                cube(e, base, Vec3.zero(), Vec3.xyz(zs, zs * 0.7, zs * 1.2), tint, glow);
+                cube(e, base, Vec3.xyz(-0.13, 0.08, -0.6 * zs * 1.2), Vec3.xyz(0.12, 0.14, 0.04), white, glow);
+                cube(e, base, Vec3.xyz(0.13, 0.08, -0.6 * zs * 1.2), Vec3.xyz(0.12, 0.14, 0.04), white, glow);
+                cube(e, base, Vec3.xyz(0, 0.3, 0.1), Vec3.xyz(0.05, 0.25, 0.05), black, Vec3.xyz(0.2, 0.9, 1));
+            } else if en.kind == CHARGER {
+                let cs = CHARGER_SIZE;
+                // Glows hot while winding up and rushing.
+                let hot = 1 - clamp(en.t / 0.6, 0, 1);
+                if en.phase > 0 { hot = 1; }
+                if en.flash <= 0 { glow = Vec3.xyz(1.5, 0.2, 0.05) * hot; }
+                hull(e, base, Vec3.zero(), Vec3.xyz(cs, cs * 0.8, cs));
+                cube(e, base, Vec3.zero(), Vec3.xyz(cs, cs * 0.8, cs), tint, glow);
+                hull(e, base, Vec3.xyz(-0.55, 0.75, -0.55), Vec3.xyz(0.2, 0.5, 0.2));
+                hull(e, base, Vec3.xyz(0.55, 0.75, -0.55), Vec3.xyz(0.2, 0.5, 0.2));
+                cube(e, base, Vec3.xyz(-0.55, 0.75, -0.55), Vec3.xyz(0.2, 0.5, 0.2), white, glow);
+                cube(e, base, Vec3.xyz(0.55, 0.75, -0.55), Vec3.xyz(0.2, 0.5, 0.2), white, glow);
+                cube(e, base, Vec3.xyz(-0.35, 0.2, -0.81), Vec3.xyz(0.3, 0.14, 0.04), black, Vec3.xyz(1, 0.1, 0.05) * (1 + hot * 3));
+                cube(e, base, Vec3.xyz(0.35, 0.2, -0.81), Vec3.xyz(0.3, 0.14, 0.04), black, Vec3.xyz(1, 0.1, 0.05) * (1 + hot * 3));
+            } else if en.kind == BOMBER {
+                let bs = BOMBER_SIZE;
+                // The core blinks faster as the dive nears, and burns during it.
+                let rate = 4 + 14 * (1 - clamp(en.t / 2, 0, 1));
+                let blink = 0.5 + 0.5 * sin(en.phase * 10 + (2 - en.t) * rate);
+                if en.t <= 0 { blink = 1; }
+                hull(e, base, Vec3.zero(), Vec3.xyz(bs, bs, bs));
+                hull(e, base, Vec3.xyz(-0.55, 0.1, 0), Vec3.xyz(0.4, 0.05, 0.3));
+                hull(e, base, Vec3.xyz(0.55, 0.1, 0), Vec3.xyz(0.4, 0.05, 0.3));
+                cube(e, base, Vec3.zero(), Vec3.xyz(bs, bs, bs), tint, glow);
+                cube(e, base, Vec3.xyz(-0.55, 0.1, 0), Vec3.xyz(0.4, 0.05, 0.3), black, Vec3.zero());
+                cube(e, base, Vec3.xyz(0.55, 0.1, 0), Vec3.xyz(0.4, 0.05, 0.3), black, Vec3.zero());
+                cube(e, base, Vec3.xyz(0, 0, -0.36), Vec3.xyz(0.34, 0.34, 0.04), black, Vec3.xyz(1.5, 0.6, 3) * (0.3 + blink * 2));
+            } else {
+                let bob = sin(en.phase * 6) * 0.08;
+                base = base.mul(Mat4.translate(0, bob, 0));
+                // The eye glows hotter just before a shot.
+                let charge = 1 - clamp(en.t / 0.5, 0, 1);
+                hull(e, base, Vec3.zero(), Vec3.xyz(0.8, 0.5, 0.8));
+                hull(e, base, Vec3.xyz(-0.6, 0.05, 0), Vec3.xyz(0.45, 0.06, 0.35));
+                hull(e, base, Vec3.xyz(0.6, 0.05, 0), Vec3.xyz(0.45, 0.06, 0.35));
+                cube(e, base, Vec3.zero(), Vec3.xyz(0.8, 0.5, 0.8), tint, glow);
+                cube(e, base, Vec3.xyz(-0.6, 0.05, 0), Vec3.xyz(0.45, 0.06, 0.35), black, Vec3.zero());
+                cube(e, base, Vec3.xyz(0.6, 0.05, 0), Vec3.xyz(0.45, 0.06, 0.35), black, Vec3.zero());
+                cube(e, base, Vec3.xyz(0, 0, -0.41), Vec3.xyz(0.3, 0.2, 0.04), black, Vec3.xyz(1, 0.1, 0.05) * (1 + charge * 4));
+            }
+        }
+        i += 1;
+    }
+    e.owner = -1;
+    e.cast = false;
+    e.detail = true;
+    i = 0;
+    while i < MAX_ORBS {
+        let o = e.orbs[i];
+        if o.t > 0 {
+            let spin = Mat4.translate(o.pos.x, o.pos.y, o.pos.z).mul(Mat4.rotate(Vec3.xyz(1, 1, 0).normalize(), o.t * 9));
+            cube(e, spin, Vec3.zero(), Vec3.xyz(0.35, 0.35, 0.35), Vec3.xyz(0.4, 1, 0.3), Vec3.xyz(1.2, 3, 0.8));
+        }
+        i += 1;
+    }
+    i = 0;
+    while i < MAX_BITS {
+        let b = e.bits[i];
+        if b.t > 0 {
+            let s = b.size * min(b.t * 3, 1);
+            cube(e, Mat4.translate(b.pos.x, b.pos.y, b.pos.z), Vec3.zero(), Vec3.xyz(s, s, s), b.color, b.color * 0.5);
+        }
+        i += 1;
+    }
+    // Gems: spinning diamonds, bigger for more XP, blinking before they fade.
+    let turn = e.clock * 3;
+    e.edge = Vec3.xyz(0.7, 2.4, 0.2);
+    e.edgeW = 0.04;
+    i = 0;
+    while i < MAX_GEMS {
+        let g = e.gems[i];
+        if g.t > 0 && (g.t > 5 || sin(g.t * 20) > 0) {
+            let gs = min(0.2 + f32(g.value) * 0.04, 0.45);
+            let lift = sin(turn * 2 + f32(i)) * 0.08;
+            let m = Mat4.translate(g.pos.x, g.pos.y + 0.25 + lift, g.pos.z).mul(Mat4.rotate(Vec3.xyz(0, 1, 0), turn + f32(i)))
+                .mul(Mat4.rotate(Vec3.xyz(1, 0, 1).normalize(), 0.6155));
+            let gc = gemColor(g.value);
+            hull(e, m, Vec3.zero(), Vec3.xyz(gs, gs, gs));
+            cube(e, m, Vec3.zero(), Vec3.xyz(gs, gs, gs), gc, gc * 1.6);
+        }
+        i += 1;
+    }
+}
+
+/// Deterministic stress fixtures, called only by the opt-in performance harness.
+pub fn benchmarkFill(e: &Enemies, p: &Player, lvl: &Level, pack: bool) {
+    e.rng = Rng.new(99);
+    e.cosmetic = Rng.new(701);
+    let i = 0;
+    while i < MAX_ENEMIES {
+        // 48 locals; remaining inhabitants distributed over all nine tiles.
+        let tile = i % 9;
+        let at = Vec3.xyz(-110 + f32(tile % 3) * 110 + e.rng.floatRange(-35, 35), 14,
+            -110 + f32(tile / 3) * 110 + e.rng.floatRange(-35, 35));
+        if i < 48 {
+            let angle = f32(i) * TAU / 48;
+            let radius: f32 = if pack && i < 24 { 10 } else { 24 + f32(i % 4) * 5 };
+            at = p.pos + Vec3.xyz(cos(angle) * radius, 3, sin(angle) * radius);
+        }
+        // Walk down to a supported, clear position. Retry an unsupported point later.
+        let y: f32 = 50;
+        let found = false;
+        while y > -2 && !found {
+            let box = solid(lvl, Vec3.xyz(at.x, y, at.z), 0.1);
+            if box >= 0 { at.y = lvl.boxes[box].hi.y + 2; found = true; }
+            y -= 1;
+        }
+        let kind = 1 + i % 5;
+        // Flyers keep the synthetic population stable over pits too.
+        if !found { kind = DRONE; at.y = 10; }
+        e.list[i] = Enemy { kind: kind, pos: at, vel: Vec3.zero(), hp: health(kind),
+            t: 1 + f32(i % 7) * 0.2, flash: 0, phase: f32(i), grounded: false,
+            squash: 1, gold: i >= MAX_ENEMIES - GOLD_ROOM, zone: if i % 4 == 0 { tile } else { -1 } };
+        i += 1;
+    }
+    i = 0;
+    while i < MAX_GEMS {
+        let a = f32(i) * 0.71;
+        let gemRadius = 7 + f32(i % 50);
+        let gemAt = p.pos + Vec3.xyz(cos(a) * gemRadius, 2, sin(a) * gemRadius);
+        e.gems[i] = Gem { pos: gemAt, vel: Vec3.zero(), value: 1 + i % 5,
+            t: GEM_LIFE, pulled: false, expires: e.clock + GEM_LIFE, nextTick: e.clock + f32(i % 10) * 0.01 };
+        i += 1;
+    }
+    e.time = 800;
+    e.tier = 21;
+}
+
+pub fn benchmarkOrbs(e: &Enemies, p: &Player) {
+    let i = 0;
+    while i < MAX_ORBS {
+        if e.orbs[i].t <= 0 {
+            let a = f32(i) * TAU / f32(MAX_ORBS);
+            e.orbs[i] = Orb { pos: p.pos + Vec3.xyz(cos(a) * 22, 3 + f32(i % 8), sin(a) * 22),
+                vel: Vec3.xyz(-cos(a) * 11, 0, -sin(a) * 11), t: 5 };
+        }
+        i += 1;
+    }
+}
+
+/// Pack kills use the real damage, reward, sound and debris paths.
+pub fn benchmarkKill(e: &Enemies) {
+    let i = 0;
+    while i < 24 {
+        if e.list[i].kind != 0 { damage(e, i, 10000, Vec3.zero(), e.list[i].pos); }
+        i += 1;
+    }
+}
+
+/// Behavioral regression checks on a simple floor, without a render context dependency.
+pub fn selfCheck(mem: &Arena, scene: &Scene) {
+    let lvl = level.empty(mem, 1, 0);
+    lvl.count = 1;
+    lvl.boxes[0] = Box { lo: Vec3.xyz(-165, -1, -165), hi: Vec3.xyz(165, 0, 165), launch: 0, kind: level.SOLID };
+    level.index(&lvl, mem);
+    let p = player.create(&lvl);
+    p.pos = Vec3.zero();
+    let e = create(mem);
+    let i = 0;
+    while i < 100 { spawn(&e, &p, &lvl); i += 1; }
+    if alive(&e) != 9 { panic("enemy check: hub target"); }
+    i = 0;
+    while i < MAX_ENEMIES {
+        if e.list[i].kind != 0 {
+            let at = e.list[i].pos;
+            if tileAt(at.x, at.z) != HUB || at.x * at.x + at.z * at.z <= 400 { panic("enemy check: spawn exclusion"); }
+        }
+        i += 1;
+    }
+    lvl.open = 511;
+    e.tier = 100;
+    i = 0;
+    while i < 2000 { spawn(&e, &p, &lvl); i += 1; }
+    if alive(&e) != 180 { panic("enemy check: world population"); }
+    if spawnAt(&e, HOPPER, Vec3.zero(), Vec3.zero(), false) { panic("enemy check: shrine reserve"); }
+    i = 0;
+    while i < 12 {
+        if !spawnAt(&e, HOPPER, Vec3.zero(), Vec3.zero(), true) { panic("enemy check: shrine capacity"); }
+        i += 1;
+    }
+    if spawnAt(&e, HOPPER, Vec3.zero(), Vec3.zero(), true) { panic("enemy check: full capacity"); }
+    wipe(&e);
+    e.restT = 10000;
+    spawnAt(&e, HOPPER, Vec3.xyz(54, 0.5, 0), Vec3.zero(), false);
+    e.list[0].grounded = true;
+    e.list[0].t = 10;
+    update(&e, &p, &lvl, scene, 0.01);
+    if !e.list[0].active { panic("enemy check: wake"); }
+    e.list[0].pos.x = 60;
+    update(&e, &p, &lvl, scene, 0.01);
+    if !e.list[0].active { panic("enemy check: hysteresis"); }
+    e.list[0].pos.x = 100;
+    update(&e, &p, &lvl, scene, 0.01);
+    if e.list[0].active || e.list[0].kind == 0 { panic("enemy check: persistence"); }
+    let timer = e.list[0].t;
+    update(&e, &p, &lvl, scene, 0.01);
+    if e.list[0].t != timer { panic("enemy check: sleeping attack clock"); }
+    damage(&e, 0, 1, Vec3.zero(), e.list[0].pos);
+    update(&e, &p, &lvl, scene, 0.01);
+    if !e.list[0].active || e.list[0].wakeT < 2.9 { panic("enemy check: damage wakes"); }
+    wipe(&e);
+    beginUpdate(&e, &p, 0.1);
+    e.nextBit = 0;
+    let seed = e.rng.state;
+    burst(&e, p.pos, Vec3.xyz(1, 0, 0), 500, 9);
+    burst(&e, p.pos, Vec3.xyz(1, 0, 0), 500, 9);
+    if e.nextBit != 48 || e.effectsLeft != 0 || e.rng.state != seed { panic("enemy check: effect budget/RNG"); }
+    beginUpdate(&e, &p, 0.01);
+    if e.tokens > 4.81 { panic("enemy check: effect rate"); }
+    let before = e.nextBit;
+    burst(&e, Vec3.xyz(100, 0, 0), Vec3.xyz(1, 0, 0), 5, 9);
+    if e.nextBit != before { panic("enemy check: far effects"); }
+    e.nextGem = 0;
+    drop(&e, Vec3.xyz(100, 0.2, 0), 3);
+    e.gems[0].settled = true;
+    let gemPos = e.gems[0].pos;
+    beginUpdate(&e, &p, 0.1);
+    gems(&e, &p, &lvl, 0.1);
+    if (e.gems[0].pos - gemPos).length() > 0 { panic("enemy check: settled gem moved"); }
+    e.gems[0].pos = Vec3.xyz(0, 0.9, 0);
+    gems(&e, &p, &lvl, 0.01);
+    if e.xp != 3 || e.gems[0].t != 0 { panic("enemy check: pickup"); }
+    drop(&e, Vec3.xyz(100, 0.2, 0), 2);
+    e.clock += 91;
+    gems(&e, &p, &lvl, 0.01);
+    if e.gems[1].t != 0 { panic("enemy check: expiry"); }
+    p.hp = 0;
+    update(&e, &p, &lvl, scene, 0.01);
+    if alive(&e) != 0 || !e.died || e.xp != 0 { panic("enemy check: death reset"); }
+}
+
+/// Fixed opening population, independent of capture duration or rendering speed.
+pub fn benchmarkOpening(e: &Enemies, p: &Player, lvl: &Level) {
+    let i = 0;
+    while i < 100 && alive(e) < 9 { spawn(e, p, lvl); i += 1; }
+    e.restT = 100000;
+}

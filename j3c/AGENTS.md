@@ -16,6 +16,7 @@ cargo run -- dump-c
 cargo run -- dump-llvm
 cargo run -- dump-bc ../speculative/11_script/scripts/door.j3s
 cargo run -- run ../examples/scripted
+cargo run -- run ../examples/fps-shooter/tools/arena.j3s
 cargo run -- -e script-props scripts/door.j3s
 cargo run -- dump-syntax ../editors/vscode/syntaxes/j3.tmLanguage.json
 cargo run -- run examples/hello.j3

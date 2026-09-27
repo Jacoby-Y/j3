@@ -1,0 +1,374 @@
+// XP from gems fills levels; each level up stops the game and deals three cards; pick one for a
+// bonus. Each card rolls a rarity that scales its value, and some bonuses only show up at a high
+// enough rarity. Several level ups at once deal one hand after another.
+
+module fps_shooter.perks;
+
+use j3.game;
+use j3.game.{ Font, Key, Mouse };
+use j3.math.{ Vec2, clamp, maxi, sin };
+use j3.memory.Arena;
+use j3.sys.panic;
+use j3.rand.Rng;
+use fps_shooter.enemies.Enemies;
+use fps_shooter.sfx;
+use fps_shooter.player.{ Player, maxHp };
+
+const COMMON: int = 0;
+const EPIC: int = 3;
+const LEGENDARY: int = 4;
+const FIRE_RATE: int = 0;
+const DAMAGE: int = 1;
+const SPEED: int = 2;
+const MAG: int = 3;
+const RELOAD: int = 4;
+const REGEN: int = 5;
+const MAX_HP: int = 6;
+const LUCK: int = 7;
+const AIR_JUMP: int = 8;
+const AIR_DASH: int = 9;
+const KINDS: int = 10;
+const CARDS: int = 3;
+const CARD_W: f32 = 220;
+const CARD_H: f32 = 290;
+const CARD_GAP: f32 = 28;
+/// Clicks and keys are ignored this long after the cards come up, so a held trigger can't pick.
+const ARM: f32 = 0.45;
+
+struct Perk {
+    name: string;
+    /// Percent at common; each rarity above adds half again (5, 7.5, 10, 12.5, 15).
+    base: f32;
+    /// The lowest rarity this card can come at.
+    minRarity: int;
+}
+
+pub struct Card {
+    kind: int;
+    rarity: int;
+}
+
+pub struct Perks {
+    list: []Perk;
+    cards: []Card;
+    offering: bool;
+    /// Seconds since the cards came up.
+    t: f32;
+    rng: Rng;
+    /// Level (from 1), XP toward the next one, and level ups still to deal cards for.
+    level: int;
+    xp: int;
+    pending: int;
+    /// This hand is a free legendary one for completing an area: no level spent on it.
+    free: bool;
+    /// A free hand of epic cards from an area shrine.
+    epic: bool = false;
+}
+
+/// XP from `level` to the next.
+pub fn need(level: int): int {
+    return 5 + (level - 1) * 3 + ((level - 1) * (level - 1)) / 6;
+}
+
+/// Take the XP the enemies picked up. True when a hand of cards should be dealt now.
+pub fn earn(ps: &Perks, e: &Enemies): bool {
+    gain(ps, e.xp);
+    e.xp = 0;
+    return ps.pending > 0 && !ps.offering;
+}
+
+fn gain(ps: &Perks, xp: int) {
+    ps.xp += xp;
+    while ps.xp >= need(ps.level) {
+        ps.xp -= need(ps.level);
+        ps.level += 1;
+        ps.pending += 1;
+    }
+}
+
+/// Asserts the level math. Runs once at startup.
+pub fn selfCheck(mem: &Arena) {
+    let ps = create(mem);
+    gain(&ps, 4);
+    if ps.level != 1 || ps.pending != 0 { panic("perks.selfCheck: leveled too early"); }
+    // 4 + 10 = 14: level 2 costs 5, level 3 costs 8, one left over.
+    gain(&ps, 10);
+    if ps.level != 3 || ps.pending != 2 || ps.xp != 1 { panic("perks.selfCheck: level math"); }
+    reset(&ps);
+    if ps.level != 1 || ps.xp != 0 { panic("perks.selfCheck: reset"); }
+}
+
+/// Clock seed. Zero becomes 1, which `Rng.new` would do anyway.
+fn clockSeed(): int {
+    let t = game.micros() + game.ticks() * 1000003;
+    if t < 0 { t = 0 - t; }
+    if t == 0 { t = 1; }
+    return t;
+}
+
+/// A new deal. Called when the window comes up and when a run ends, so two launches
+/// (and two lives) don't share a card sequence.
+pub fn reseed(ps: &Perks) {
+    ps.rng = Rng.new(clockSeed());
+}
+
+/// A fresh run: back to level 1, and a new card sequence.
+pub fn reset(ps: &Perks) {
+    ps.level = 1;
+    ps.xp = 0;
+    ps.pending = 0;
+    reseed(ps);
+}
+
+fn def(ps: &Perks, kind: int, name: string, base: f32, minRarity: int) {
+    ps.list[kind] = Perk { name: name, base: base, minRarity: minRarity };
+}
+
+pub fn create(mem: &Arena): Perks {
+    let ps = Perks { list: mem.alloc::<Perk>(KINDS), cards: mem.alloc::<Card>(CARDS), offering: false, t: 0, rng: Rng.new(1234),
+        level: 1, xp: 0, pending: 0, free: false };
+    def(&ps, FIRE_RATE, "FIRE RATE", 5, COMMON);
+    def(&ps, DAMAGE, "DAMAGE", 5, COMMON);
+    def(&ps, SPEED, "MOVE SPEED", 5, COMMON);
+    def(&ps, MAG, "AMMO CAPACITY", 5, COMMON);
+    def(&ps, RELOAD, "RELOAD SPEED", 5, COMMON);
+    def(&ps, REGEN, "HP REGEN", 5, COMMON);
+    def(&ps, MAX_HP, "MAX HP", 5, COMMON);
+    def(&ps, LUCK, "LUCK", 5, COMMON);
+    def(&ps, AIR_JUMP, "EXTRA AIR JUMP", 1, LEGENDARY);
+    def(&ps, AIR_DASH, "EXTRA AIR DASH", 1, LEGENDARY);
+    return ps;
+}
+
+/// Base odds 50 / 25 / 14 / 8 / 3%, then luck is a chance per step to go up another tier.
+fn roll(ps: &Perks, luck: f32): int {
+    let u = ps.rng.unit();
+    let r = LEGENDARY;
+    if u < 0.5 { r = 0; } else if u < 0.75 { r = 1; } else if u < 0.89 { r = 2; } else if u < 0.97 { r = 3; }
+    while r < LEGENDARY && ps.rng.unit() < luck { r += 1; }
+    return r;
+}
+
+/// A bonus allowed at `rarity` that the cards before `slot` don't already have.
+fn pick(ps: &Perks, rarity: int, slot: int): int {
+    let tries = 0;
+    while tries < 200 {
+        let k = ps.rng.intRange(0, KINDS);
+        // Damage turns up a bit more than the rest.
+        if ps.rng.unit() < 0.06 { k = DAMAGE; }
+        let ok = ps.list[k].minRarity <= rarity;
+        let i = 0;
+        while i < slot {
+            if ps.cards[i].kind == k { ok = false; }
+            i += 1;
+        }
+        if ok { return k; }
+        tries += 1;
+    }
+    return DAMAGE;
+}
+
+pub fn offer(ps: &Perks, p: &Player) {
+    let i = 0;
+    while i < CARDS {
+        let r = roll(ps, p.stats.luck);
+        ps.cards[i] = Card { kind: pick(ps, r, i), rarity: r };
+        i += 1;
+    }
+    ps.offering = true;
+    sfx.play(sfx.LEVEL);
+    ps.free = false;
+    ps.epic = false;
+    ps.t = 0;
+}
+
+/// A free hand of legendary cards, for completing an area.
+pub fn offerLegendary(ps: &Perks) {
+    let i = 0;
+    while i < CARDS {
+        ps.cards[i] = Card { kind: pick(ps, LEGENDARY, i), rarity: LEGENDARY };
+        i += 1;
+    }
+    ps.offering = true;
+    sfx.play(sfx.LEVEL);
+    ps.free = true;
+    ps.epic = false;
+    ps.t = 0;
+}
+
+/// A free hand where every card is epic, for breaking an area shrine.
+pub fn offerEpic(ps: &Perks) {
+    let i = 0;
+    while i < CARDS {
+        ps.cards[i] = Card { kind: pick(ps, EPIC, i), rarity: EPIC };
+        i += 1;
+    }
+    ps.offering = true;
+    sfx.play(sfx.LEVEL);
+    ps.free = true;
+    ps.epic = true;
+    ps.t = 0;
+}
+
+/// Percent for a rate card; 1 for the extra jump or dash.
+fn value(ps: &Perks, c: Card): f32 {
+    let perk = ps.list[c.kind];
+    if perk.minRarity == LEGENDARY { return perk.base; }
+    return perk.base * (1 + f32(c.rarity) * 0.5);
+}
+
+fn apply(ps: &Perks, p: &Player, c: Card) {
+    let v = value(ps, c) / 100;
+    let s = &p.stats;
+    if c.kind == FIRE_RATE { s.fireRate = s.fireRate + v; }
+    if c.kind == DAMAGE { s.damage = s.damage + v; }
+    if c.kind == SPEED { s.speed = s.speed + v; }
+    if c.kind == MAG { s.mag = s.mag + v; }
+    if c.kind == RELOAD { s.reload = s.reload + v; }
+    if c.kind == REGEN { s.regen = s.regen + v; }
+    if c.kind == LUCK { s.luck = s.luck + v; }
+    if c.kind == MAX_HP {
+        // The new health comes filled.
+        let before = maxHp(p);
+        s.maxHp = s.maxHp + v;
+        p.hp = p.hp + maxHp(p) - before;
+    }
+    if c.kind == AIR_JUMP {
+        s.airJumps += 1;
+        p.airJumps += 1;
+    }
+    if c.kind == AIR_DASH {
+        s.airDashes += 1;
+        p.airDashes += 1;
+    }
+}
+
+/// Top-left of card `i`, before the pop-in and hover lift.
+fn cardAt(i: int, sz: Vec2): Vec2 {
+    let total = f32(CARDS) * CARD_W + f32(CARDS - 1) * CARD_GAP;
+    return Vec2 { x: (sz.x - total) * 0.5 + f32(i) * (CARD_W + CARD_GAP), y: (sz.y - CARD_H) * 0.5 + 20 };
+}
+
+fn hovered(sz: Vec2): int {
+    let m = game.mousePos();
+    let i = 0;
+    while i < CARDS {
+        let at = cardAt(i, sz);
+        if m.x >= at.x && m.x < at.x + CARD_W && m.y >= at.y && m.y < at.y + CARD_H { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+/// While offering: click a card or press 1/2/3. True on the frame one is taken.
+pub fn update(ps: &Perks, p: &Player, dt: f32): bool {
+    ps.t = ps.t + dt;
+    if ps.t < ARM { return false; }
+    let choice = -1;
+    if game.keyPressed(Key.Num1) { choice = 0; }
+    if game.keyPressed(Key.Num2) { choice = 1; }
+    if game.keyPressed(Key.Num3) { choice = 2; }
+    if game.mousePressed(Mouse.Left) { choice = hovered(game.windowSize()); }
+    if choice < 0 { return false; }
+    apply(ps, p, ps.cards[choice]);
+    ps.offering = false;
+    ps.epic = false;
+    if !ps.free { ps.pending = maxi(ps.pending - 1, 0); }
+    return true;
+}
+
+fn rarityName(r: int): string {
+    if r == 0 { return "COMMON"; }
+    if r == 1 { return "UNCOMMON"; }
+    if r == 2 { return "RARE"; }
+    if r == 3 { return "EPIC"; }
+    return "LEGENDARY";
+}
+
+fn rarityColor(r: int, alpha: u8) {
+    if r == 0 { game.setColor(game.rgba(200, 205, 215, alpha)); }
+    if r == 1 { game.setColor(game.rgba(110, 230, 110, alpha)); }
+    if r == 2 { game.setColor(game.rgba(80, 160, 255, alpha)); }
+    if r == 3 { game.setColor(game.rgba(190, 100, 255, alpha)); }
+    if r == 4 { game.setColor(game.rgba(255, 170, 40, alpha)); }
+}
+
+/// "+7.5%", or "+1" for a jump or dash, centred on `cx`.
+// ponytail: draws instead of returning the text: an interpolated string lives in its function's stack frame.
+fn drawValue(ps: &Perks, c: Card, big: Font, cx: f32, y: f32) {
+    let v = value(ps, c);
+    let whole = int(v);
+    let tenths = int(v * 10 + 0.5) - whole * 10;
+    if ps.list[c.kind].minRarity == LEGENDARY {
+        centered(big, cx, y, `+{whole}`);
+    } else if tenths == 0 {
+        centered(big, cx, y, `+{whole}%`);
+    } else {
+        centered(big, cx, y, `+{whole}.{tenths}%`);
+    }
+}
+
+fn rect(x: f32, y: f32, w: f32, h: f32) {
+    game.drawRect(Vec2 { x: x, y: y }, Vec2 { x: w, y: h });
+}
+
+fn centered(font: Font, cx: f32, y: f32, msg: string) {
+    let t = game.textSize(font, msg);
+    game.drawText(font, Vec2 { x: cx - t.x * 0.5, y: y }, msg);
+}
+
+pub fn draw(ps: &Perks, font: Font, big: Font) {
+    let sz = game.windowSize();
+    game.setColor(game.rgba(10, 12, 24, 170));
+    rect(0, 0, sz.x, sz.y);
+    let first = cardAt(0, sz);
+    let top = first.y;
+    game.setColor(game.rgb(255, 220, 90));
+    // The level this hand is for (several can queue up), or a shrine's spare card.
+    if ps.epic { centered(big, sz.x * 0.5, top - 96, "EPIC SHRINE"); }
+    else if ps.free { centered(big, sz.x * 0.5, top - 96, "AREA COMPLETE"); }
+    else if ps.pending > 0 { centered(big, sz.x * 0.5, top - 96, `LEVEL {ps.level - ps.pending + 1}`); }
+    else { centered(big, sz.x * 0.5, top - 96, "SHRINE BONUS"); }
+    game.setColor(game.rgb(220, 225, 240));
+    centered(font, sz.x * 0.5, top - 42, "PICK A CARD   (click or 1 / 2 / 3)");
+
+    let hot = hovered(sz);
+    let i = 0;
+    while i < CARDS {
+        let c = ps.cards[i];
+        // Deal in one after another, sliding up.
+        let k = clamp((ps.t - f32(i) * 0.09) / 0.22, 0, 1);
+        if k > 0 {
+            let ease = 1 - (1 - k) * (1 - k);
+            let at = cardAt(i, sz);
+            let x = at.x;
+            let y = at.y + (1 - ease) * 80;
+            if i == hot && ps.t >= ARM { y = y - 10; }
+            let alpha = u8(255 * ease);
+            let cx = x + CARD_W * 0.5;
+            // Epic and legendary glow, pulsing.
+            if c.rarity >= 3 {
+                let pulse = 0.5 + 0.5 * sin(ps.t * 5);
+                rarityColor(c.rarity, u8((40 + 50 * pulse) * ease));
+                rect(x - 8, y - 8, CARD_W + 16, CARD_H + 16);
+            }
+            rarityColor(c.rarity, alpha);
+            rect(x - 3, y - 3, CARD_W + 6, CARD_H + 6);
+            if i == hot { game.setColor(game.rgba(40, 46, 72, alpha)); } else { game.setColor(game.rgba(24, 28, 46, alpha)); }
+            rect(x, y, CARD_W, CARD_H);
+            // Rarity band.
+            rarityColor(c.rarity, alpha);
+            rect(x, y, CARD_W, 34);
+            game.setColor(game.rgba(20, 20, 30, alpha));
+            centered(font, cx, y + 8, rarityName(c.rarity));
+            // Name and value.
+            game.setColor(game.rgba(240, 240, 250, alpha));
+            centered(font, cx, y + 92, ps.list[c.kind].name);
+            rarityColor(c.rarity, alpha);
+            drawValue(ps, c, big, cx, y + 130);
+            game.setColor(game.rgba(150, 155, 180, alpha));
+            centered(font, cx, y + CARD_H - 36, `[{i + 1}]`);
+        }
+        i += 1;
+    }
+}

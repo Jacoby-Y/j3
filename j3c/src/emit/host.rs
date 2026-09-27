@@ -336,14 +336,15 @@ pub fn compile_c(c_source: &str, opts: &CcOpts, target: &str, clang: &str) -> Re
 }
 
 pub fn run_exe(exe: &Path) -> Result<RunResult, String> {
-    run_exe_in(exe, None)
+    run_exe_in(exe, None, &[])
 }
 
-pub fn run_exe_in(exe: &Path, cwd: Option<&Path>) -> Result<RunResult, String> {
+pub fn run_exe_in(exe: &Path, cwd: Option<&Path>, args: &[String]) -> Result<RunResult, String> {
     let absolute = exe
         .canonicalize()
         .map_err(|e| format!("run {}: {e}", exe.display()))?;
     let mut cmd = Command::new(&absolute);
+    cmd.args(args);
     if let Some(dir) = cwd {
         let root = dir
             .canonicalize()

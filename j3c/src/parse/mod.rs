@@ -300,6 +300,14 @@ fn main() {
     #[test]
     fn script_top_level_rules_are_named() {
         let module = vec!["script".to_string(), "bad".to_string()];
+        let types = parse_script(
+            "struct Box { n: int; }\nenum Hue { Red, Blue }\n",
+            FileId(1),
+            &module,
+        )
+        .expect("struct and enum parse");
+        assert!(types.items.iter().any(|i| matches!(i, Item::Struct(_))));
+        assert!(types.items.iter().any(|i| matches!(i, Item::Enum(_))));
         for (src, rule) in [
             ("module bad;", "can't have a `module` line"),
             ("use lib \"c\" as c {}", "can't use `use lib`"),

@@ -139,9 +139,13 @@ fn target_slug(target: &str) -> String {
 
 /// File, directory, or `j3.toml`. Walks up from a `.j3` file to find a project.
 /// `j3c run --file`: a `.j3` path is that one file, even inside a project.
+/// A `.j3s` path is always that script (`pub fn main`), not the project above it.
 pub static FILE_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn resolve(path: &Path) -> Result<Input, String> {
+    if path.extension().and_then(|e| e.to_str()) == Some("j3s") {
+        return Ok(Input::File(path.to_path_buf()));
+    }
     if FILE_ONLY.load(std::sync::atomic::Ordering::Relaxed) && path.extension().and_then(|e| e.to_str()) == Some("j3") {
         return Ok(Input::File(path.to_path_buf()));
     }
@@ -557,6 +561,24 @@ target = "x86_64-pc-windows-gnu"
         assert_eq!(m.emit.targets, vec!["x86_64-pc-windows-gnu".to_string()]);
         assert_eq!(m.emit.primary(), "x86_64-pc-windows-gnu");
         assert!(m.out_path().ends_with("multi"));
+    }
+
+    #[test]
+    fn script_path_is_the_file_not_the_project() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/fps-shooter");
+        match resolve(&root).expect("project") {
+            Input::Project(m) => assert!(
+                m.entry.ends_with("src/main.j3"),
+                "{}",
+                m.entry.display()
+            ),
+            Input::File(_) | Input::Hello => panic!("expected the game project"),
+        }
+        let script = root.join("tools/arena.j3s");
+        match resolve(&script).expect("script") {
+            Input::File(p) => assert_eq!(p, script),
+            Input::Project(_) | Input::Hello => panic!("expected the script file"),
+        }
     }
 
     #[test]

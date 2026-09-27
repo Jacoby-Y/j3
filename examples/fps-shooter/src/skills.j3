@@ -1,0 +1,870 @@
+// Skills: one active on Q, won from bosses. Each fallen boss offers the next in a fixed order
+// (Blink, Missile Pack, Overclock, Detonate, Ram, Storm, then round again) as a card to take or
+// refuse. Taking replaces the skill held and starts it ready; refusing keeps it, and the next
+// boss offers the same one again. Going down loses the skill and starts the order over.
+//
+// tools/debug.j3s `skill` (or J3_FPS_SKILL) starts holding that skill. `skill_auto` 1 uses it
+// whenever it's ready.
+
+module fps_shooter.skills;
+
+use lib "c" as libc {
+    fn getenv(name: cstr): cstr;
+    fn strlen(s: cstr): int;
+}
+use j3.game;
+use j3.game.{ Font, Key, Mouse };
+use j3.gfx;
+use j3.gfx.{ Instance, Mesh, Ray };
+use j3.math.{ Mat4, Vec2, Vec3, TAU, abs, clamp, cos, max, min, sin, sqrt };
+use j3.memory.Arena;
+use j3.rand.Rng;
+use j3.sys.panic;
+use j3.text.cstr;
+use j3.scene3d;
+use fps_shooter.boss;
+use fps_shooter.debug;
+use fps_shooter.bosskit;
+use fps_shooter.bosskit.Bosses;
+use fps_shooter.enemies;
+use fps_shooter.enemies.{ Enemies, MAX_ENEMIES };
+use fps_shooter.guns.Guns;
+use fps_shooter.level;
+use fps_shooter.level.{ Box, Level, solid, SOLID };
+use fps_shooter.player;
+use fps_shooter.player.{ Player, fits, look };
+use fps_shooter.sfx;
+use fps_shooter.shrine;
+use fps_shooter.shrine.Shrines;
+
+pub const BLINK: int = 1;
+pub const MISSILES: int = 2;
+pub const OVERCLOCK: int = 3;
+pub const DETONATE: int = 4;
+pub const RAM: int = 5;
+pub const STORM: int = 6;
+const COUNT: int = 6;
+
+const BLINK_RANGE: f32 = 14;
+/// A blink shorter than this doesn't happen (or cost anything).
+const BLINK_MIN: f32 = 2;
+const MISSILE_EVERY: f32 = 0.16;
+const MISSILE_SPEED: f32 = 28;
+const MISSILE_TURN: f32 = 9;
+const MISSILE_RANGE: f32 = 45;
+const MISSILE_DMG: f32 = 40;
+const MISSILE_BLAST: f32 = 2.8;
+const MAX_MISSILES: int = 48;
+const DETONATE_R: f32 = 16;
+const DETONATE_DMG: f32 = 220;
+const DETONATE_LIFT: f32 = 26;
+/// Ram: damage taken scale, the hit on enemies it runs into, and on a boss (which ends it).
+const RAM_GUARD: f32 = 0.3;
+const RAM_DMG: f32 = 80;
+const RAM_BOSS: f32 = 300;
+const RAM_REACH: f32 = 2.2;
+const MAX_RAMMED: int = 32;
+const STORM_EVERY: f32 = 0.45;
+const STORM_RANGE: f32 = 22;
+const STORM_DMG: f32 = 55;
+const STORM_UP: f32 = 9;
+const MAX_BOLTS: int = 8;
+const BOLT_LIFE: f32 = 0.16;
+const TRAIL: int = 12;
+const CARD_W: f32 = 400;
+const CARD_H: f32 = 320;
+/// Clicks are ignored this long after the card comes up.
+const ARM: f32 = 0.45;
+
+struct Missile {
+    pos: Vec3;
+    vel: Vec3;
+    t: f32;
+    /// An enemy index, -2 for the boss, -1 for nothing yet; and time until it looks again.
+    target: int;
+    seekT: f32;
+}
+
+/// A lightning bolt from the cloud, drawn for a moment.
+struct Bolt {
+    from: Vec3;
+    to: Vec3;
+    t: f32;
+    seed: f32;
+}
+
+pub struct Skills {
+    /// The skill held (0 for none) and the one the next boss offers.
+    skill: int = 0;
+    next: int = 1;
+    /// Cooldown left, and time left on a skill that lasts.
+    cd: f32 = 0;
+    active: f32 = 0;
+    /// Hud flashes: ready again, just used, refused (nothing happened).
+    readyT: f32 = 0;
+    usedT: f32 = 0;
+    denyT: f32 = 0;
+    offering: bool = false;
+    t: f32 = 0;
+    missiles: []Missile;
+    nextMissile: int = 0;
+    fireT: f32 = 0;
+    side: f32 = 1;
+    cloud: Vec3;
+    strikeT: f32 = 0;
+    strikes: int = 0;
+    bolts: []Bolt;
+    nextBolt: int = 0;
+    flashAt: Vec3;
+    flashT: f32 = 0;
+    /// Blink afterimages along the path, fading.
+    trail: []Vec3;
+    trailT: f32 = 0;
+    /// Detonate's shock: where, and how long ago.
+    boomAt: Vec3;
+    boomT: f32 = 10;
+    /// Enemies a ram hit lately, and how long until each can be hit again.
+    rammed: []int;
+    rammedT: []f32;
+    parts: []Instance;
+    nparts: int = 0;
+    cube: Mesh;
+    rng: Rng;
+    /// J3_FPS_SKILL_AUTO: use it whenever it's ready.
+    auto: bool = false;
+}
+
+pub fn create(mem: &Arena): Skills {
+    return Skills {
+        missiles: mem.alloc::<Missile>(MAX_MISSILES), cloud: Vec3.zero(), bolts: mem.alloc::<Bolt>(MAX_BOLTS),
+        flashAt: Vec3.zero(), trail: mem.alloc::<Vec3>(TRAIL), boomAt: Vec3.zero(),
+        rammed: mem.alloc::<int>(MAX_RAMMED), rammedT: mem.alloc::<f32>(MAX_RAMMED),
+        parts: mem.alloc::<Instance>(1024), cube: Mesh { vao: 0, vbo: 0, count: 0 }, rng: Rng.new(606),
+    };
+}
+
+pub fn upload(s: &Skills, mem: &Arena) {
+    s.cube = gfx.uploadUv(scene3d.assetVerts("builtin:cube", mem));
+}
+
+pub fn name(k: int): string {
+    if k == BLINK { return "BLINK"; }
+    if k == MISSILES { return "MISSILE PACK"; }
+    if k == OVERCLOCK { return "OVERCLOCK"; }
+    if k == DETONATE { return "DETONATE"; }
+    if k == RAM { return "RAM"; }
+    return "STORM";
+}
+
+fn line1(k: int): string {
+    if k == BLINK { return "Teleport where you look, up to 14 m."; }
+    if k == MISSILES { return "For 5 seconds, seeking missiles"; }
+    if k == OVERCLOCK { return "For 10 seconds, double fire rate"; }
+    if k == DETONATE { return "Explode where you stand: huge"; }
+    if k == RAM { return "For 4 seconds, charge ahead, taking"; }
+    return "For 15 seconds, a thunder cloud";
+}
+
+fn line2(k: int): string {
+    if k == BLINK { return "Stops at walls; keeps your momentum."; }
+    if k == MISSILES { return "stream off your back."; }
+    if k == OVERCLOCK { return "and reload speed."; }
+    if k == DETONATE { return "damage, and it throws you up."; }
+    if k == RAM { return "70% less damage and bowling foes over."; }
+    return "follows you, striking enemies.";
+}
+
+pub fn cooldown(k: int): f32 {
+    if k == BLINK { return 3; }
+    if k == MISSILES { return 60; }
+    if k == OVERCLOCK { return 40; }
+    if k == DETONATE { return 20; }
+    if k == RAM { return 20; }
+    return 60;
+}
+
+/// How long it lasts once used; 0 for instant ones.
+fn lasts(k: int): f32 {
+    if k == MISSILES { return 5; }
+    if k == OVERCLOCK { return 10; }
+    if k == RAM { return 4; }
+    if k == STORM { return 15; }
+    return 0;
+}
+
+fn tint(k: int): Vec3 {
+    if k == BLINK { return Vec3.xyz(0.55, 0.8, 1); }
+    if k == MISSILES { return Vec3.xyz(1, 0.55, 0.25); }
+    if k == OVERCLOCK { return Vec3.xyz(1, 0.75, 0.2); }
+    if k == DETONATE { return Vec3.xyz(1, 0.35, 0.2); }
+    if k == RAM { return Vec3.xyz(0.35, 0.65, 1); }
+    return Vec3.xyz(0.6, 0.85, 1);
+}
+
+/// A fresh run: no skill, and the order starts over.
+pub fn reset(s: &Skills, p: &Player) {
+    s.skill = 0;
+    s.next = BLINK;
+    s.cd = 0;
+    s.active = 0;
+    s.offering = false;
+    let i = 0;
+    while i < MAX_MISSILES { s.missiles[i].t = 0; i += 1; }
+    p.haste = 1;
+    p.ramT = 0;
+}
+
+fn env(key: string): string {
+    let raw = libc.getenv(cstr(key));
+    if raw == 0 { return ""; }
+    return []u8 { ptr: raw as &u8, len: libc.strlen(raw) } as string;
+}
+
+fn same(a: string, b: string): bool {
+    if a.len != b.len { return false; }
+    let i = 0;
+    while i < a.len { if a[i] != b[i] { return false; } i += 1; }
+    return true;
+}
+
+fn named(v: string): int {
+    if same(v, "blink") || same(v, "1") { return BLINK; }
+    if same(v, "missiles") || same(v, "2") { return MISSILES; }
+    if same(v, "overclock") || same(v, "3") { return OVERCLOCK; }
+    if same(v, "detonate") || same(v, "4") { return DETONATE; }
+    if same(v, "ram") || same(v, "5") { return RAM; }
+    if same(v, "storm") || same(v, "6") { return STORM; }
+    return 0;
+}
+
+/// Start holding `skill` (or `J3_FPS_SKILL` when that string is empty). `auto` "1" fires it when ready.
+pub fn preview(s: &Skills, p: &Player, skill: string, auto: string) {
+    let k = named(debug.pick(skill, env("J3_FPS_SKILL")));
+    if k == 0 { return; }
+    s.next = k;
+    take(s, p);
+    s.auto = same(debug.pick(auto, env("J3_FPS_SKILL_AUTO")), "1");
+}
+
+/// A boss fell: deal the next skill's card.
+pub fn offer(s: &Skills) {
+    s.offering = true;
+    s.t = 0;
+    sfx.play(sfx.LEVEL);
+}
+
+fn rect(x: f32, y: f32, w: f32, h: f32) {
+    game.drawRect(Vec2 { x: x, y: y }, Vec2 { x: w, y: h });
+}
+
+fn centered(font: Font, cx: f32, y: f32, msg: string) {
+    let t = game.textSize(font, msg);
+    game.drawText(font, Vec2 { x: cx - t.x * 0.5, y: y }, msg);
+}
+
+fn over(m: Vec2, x: f32, y: f32, w: f32, h: f32): bool {
+    return m.x >= x && m.x < x + w && m.y >= y && m.y < y + h;
+}
+
+fn buttonAt(i: int, sz: Vec2): Vec2 {
+    let x = (sz.x - CARD_W) * 0.5 + 24 + f32(i) * (CARD_W * 0.5 - 12);
+    return Vec2 { x: x, y: (sz.y - CARD_H) * 0.5 + CARD_H - 70 };
+}
+
+/// While offering: 1 or click TAKE, 2 or click REFUSE. True on the frame it closes.
+pub fn choose(s: &Skills, p: &Player, dt: f32): bool {
+    s.t += dt;
+    if s.t < ARM { return false; }
+    let sz = game.windowSize();
+    let bw = CARD_W * 0.5 - 36;
+    let m = game.mousePos();
+    let click = game.mousePressed(Mouse.Left);
+    let b0 = buttonAt(0, sz);
+    let b1 = buttonAt(1, sz);
+    let yes = game.keyPressed(Key.Num1) || (click && over(m, b0.x, b0.y, bw, 46));
+    let no = game.keyPressed(Key.Num2) || (click && over(m, b1.x, b1.y, bw, 46));
+    if yes {
+        take(s, p);
+        sfx.play(sfx.READY);
+    } else if !no {
+        return false;
+    }
+    s.offering = false;
+    return true;
+}
+
+/// Take the offered skill, ready to use; the next boss offers the one after it.
+fn take(s: &Skills, p: &Player) {
+    s.skill = s.next;
+    s.next = s.next % COUNT + 1;
+    s.cd = 0;
+    s.active = 0;
+    s.readyT = 1;
+    p.haste = 1;
+    p.ramT = 0;
+}
+
+fn dmgScale(p: &Player): f32 {
+    return 1 + p.stats.damage;
+}
+
+/// Blink: along the view as far as there's room, up to BLINK_RANGE. On the ground it won't
+/// dip into the floor. False when there's no room to go.
+fn blink(s: &Skills, p: &Player, lvl: &Level, e: &Enemies): bool {
+    let dir = look(p).forward();
+    if p.onGround && dir.y < 0 { dir = Vec3.xyz(dir.x, 0, dir.z).normalize(); }
+    let start = p.pos;
+    let last = p.pos;
+    let d: f32 = 0;
+    while d < BLINK_RANGE {
+        let q = start + dir * (d + 0.25);
+        if !fits(lvl, q) { break; }
+        last = q;
+        d += 0.25;
+    }
+    if d < BLINK_MIN { return false; }
+    let i = 0;
+    while i < TRAIL {
+        s.trail[i] = start + (last - start) * (f32(i) / f32(TRAIL - 1));
+        i += 1;
+    }
+    s.trailT = 0.35;
+    let tint = Vec3.xyz(0.55, 0.85, 1);
+    enemies.sparks(e, start + Vec3.xyz(0, 0.9, 0), tint, 16, 8);
+    enemies.sparks(e, last + Vec3.xyz(0, 0.9, 0), Vec3.xyz(1, 1, 1), 16, 8);
+    i = 1;
+    while i < 5 {
+        enemies.sparks(e, start + (last - start) * (f32(i) / 5) + Vec3.xyz(0, 0.9, 0), tint, 3, 3);
+        i += 1;
+    }
+    p.pos = last;
+    p.vel.y = max(p.vel.y, 0);
+    p.onGround = false;
+    p.dashT = 0.25;
+    sfx.play(sfx.BLINK);
+    return true;
+}
+
+/// Detonate: a huge blast round the player, who's thrown up by it.
+fn detonate(s: &Skills, p: &Player, e: &Enemies, bs: &Bosses, sh: &Shrines, g: &Guns) {
+    let at = p.pos + Vec3.xyz(0, 1, 0);
+    let dmg = DETONATE_DMG * dmgScale(p);
+    enemies.blast(e, at, DETONATE_R, dmg, Vec3.xyz(1, 0.5, 0.2), 18);
+    shrine.blast(sh, e, at, DETONATE_R, dmg);
+    boss.blast(bs, e, at, DETONATE_R, dmg);
+    enemies.sparks(e, at, Vec3.xyz(1, 0.55, 0.15), 48, 18);
+    enemies.sparks(e, at, Vec3.xyz(1, 0.9, 0.4), 24, 10);
+    p.vel.y = max(p.vel.y, DETONATE_LIFT);
+    p.onGround = false;
+    g.shake = max(g.shake, 0.08);
+    s.boomAt = at;
+    s.boomT = 0;
+    s.flashAt = at;
+    s.flashT = 0.3;
+    sfx.play(sfx.BOOM);
+}
+
+/// Use the held skill. False when it can't go (a blink with no room): no cooldown spent.
+fn trigger(s: &Skills, p: &Player, lvl: &Level, e: &Enemies, bs: &Bosses, sh: &Shrines, g: &Guns): bool {
+    let k = s.skill;
+    if k == BLINK { return blink(s, p, lvl, e); }
+    if k == DETONATE { detonate(s, p, e, bs, sh, g); }
+    if k == STORM { s.cloud = p.pos + Vec3.xyz(0, STORM_UP + 3, 0); s.strikeT = 0.3; s.strikes = 0; }
+    if k == RAM {
+        let i = 0;
+        while i < MAX_RAMMED { s.rammedT[i] = 0; i += 1; }
+    }
+    s.active = lasts(k);
+    sfx.play(sfx.SKILL);
+    return true;
+}
+
+pub fn update(s: &Skills, p: &Player, lvl: &Level, e: &Enemies, bs: &Bosses, sh: &Shrines, g: &Guns, dt: f32) {
+    s.readyT -= dt;
+    s.usedT -= dt;
+    s.denyT -= dt;
+    s.trailT -= dt;
+    s.flashT -= dt;
+    s.boomT += dt;
+    let wasCooling = s.cd > 0;
+    s.cd = max(s.cd - dt, 0);
+    if wasCooling && s.cd <= 0 && s.skill != 0 {
+        s.readyT = 0.6;
+        sfx.play(sfx.READY);
+    }
+    if s.skill != 0 && (game.keyPressed(Key.Q) || (s.auto && s.cd <= 0 && s.active <= 0)) {
+        if s.cd <= 0 && s.active <= 0 && trigger(s, p, lvl, e, bs, sh, g) {
+            s.cd = cooldown(s.skill);
+            s.usedT = 0.4;
+        } else {
+            s.denyT = 0.3;
+            sfx.play(sfx.DENY);
+        }
+    }
+    let k = s.skill;
+    if s.active > 0 {
+        s.active = max(s.active - dt, 0);
+        if k == MISSILES { launch(s, p, dt); }
+        if k == RAM { ram(s, p, e, bs, dt); }
+        if k == STORM { storm(s, p, e, bs, dt); }
+        if s.active <= 0 && k != 0 { sfx.play(sfx.DASH); }
+    }
+    let over = k == OVERCLOCK && s.active > 0;
+    let haste: f32 = if over { 2 } else { 1 };
+    let hot: f32 = if over { 1 } else { 0 };
+    let ramT: f32 = if k == RAM { s.active } else { 0 };
+    p.haste = haste;
+    p.ramT = ramT;
+    g.hot = hot;
+    if k == RAM && s.active > 0 { p.guard = p.guard * RAM_GUARD; }
+    // The cloud drifts after the player and fades away after.
+    if k == STORM {
+        let goal = p.pos + Vec3.xyz(0, STORM_UP, 0);
+        s.cloud = s.cloud + (goal - s.cloud) * min(dt * 3, 1);
+    }
+    fly(s, p, lvl, e, bs, sh, dt);
+    let i = 0;
+    while i < MAX_BOLTS { s.bolts[i].t -= dt; i += 1; }
+}
+
+/// Missile Pack: one off the back every MISSILE_EVERY, alternating shoulders.
+fn launch(s: &Skills, p: &Player, dt: f32) {
+    s.fireT -= dt;
+    if s.fireT > 0 { return; }
+    s.fireT = MISSILE_EVERY;
+    let l = look(p);
+    let fwd = l.forward();
+    let right = l.right();
+    s.side = 0 - s.side;
+    let from = l.eye - fwd * 0.5 + Vec3.xyz(0, 0.3, 0) + right * (s.side * 0.45);
+    let up = Vec3.xyz(0, 1, 0) + right * (s.side * 0.6) - fwd * 0.2 + fwd * (s.rng.unit() * 0.4);
+    s.missiles[s.nextMissile] = Missile { pos: from, vel: up.normalize() * 14, t: 3, target: -1, seekT: 0.15 };
+    s.nextMissile = (s.nextMissile + 1) % MAX_MISSILES;
+    if s.nextMissile % 3 == 0 { sfx.play(sfx.ROCKET); }
+}
+
+/// The nearest enemy to `at` within reach, or the boss (-2) when it's nearer, or -1.
+fn nearestFoe(e: &Enemies, bs: &Bosses, at: Vec3, range: f32): int {
+    let t = enemies.nearest(e, at, range);
+    if !boss.targetable(bs) { return t; }
+    let bossFar = (boss.aimPoint(bs) - at).length();
+    if bossFar > range { return t; }
+    if t < 0 || bossFar < (e.list[t].pos - at).length() + 6 { return -2; }
+    return t;
+}
+
+fn goalOf(e: &Enemies, bs: &Bosses, target: int): Vec3 {
+    if target == -2 { return boss.aimPoint(bs); }
+    return e.list[target].pos;
+}
+
+fn live(e: &Enemies, bs: &Bosses, target: int): bool {
+    if target == -2 { return boss.targetable(bs); }
+    return target >= 0 && e.list[target].kind != 0;
+}
+
+/// Missiles climb off the back, then home and burst on what they hit.
+fn fly(s: &Skills, p: &Player, lvl: &Level, e: &Enemies, bs: &Bosses, sh: &Shrines, dt: f32) {
+    let i = 0;
+    while i < MAX_MISSILES {
+        let m = &s.missiles[i];
+        if m.t > 0 {
+            m.t -= dt;
+            m.seekT -= dt;
+            if m.seekT <= 0 && !live(e, bs, m.target) {
+                m.target = nearestFoe(e, bs, m.pos, MISSILE_RANGE);
+                m.seekT = 0.2;
+            }
+            let dir = m.vel.normalize();
+            let speed = min(m.vel.length() + dt * 40, MISSILE_SPEED);
+            if live(e, bs, m.target) && m.t < 2.8 {
+                let to = (goalOf(e, bs, m.target) - m.pos).normalize();
+                dir = (dir + (to - dir) * min(MISSILE_TURN * dt, 1)).normalize();
+            }
+            m.vel = dir * speed;
+            let step = speed * dt;
+            let r = Ray { origin: m.pos, dir: dir };
+            let foe = enemies.ray(e, r, step);
+            let big = boss.ray(bs, r, step);
+            let end = m.pos + m.vel * dt;
+            if foe.index >= 0 || big.part >= 0 || solid(lvl, end, 0.1) >= 0 || m.t <= 0 {
+                let at = end;
+                if foe.index >= 0 { at = m.pos + dir * foe.t; }
+                if big.part >= 0 && (foe.index < 0 || big.t < foe.t) { at = m.pos + dir * big.t; }
+                let dmg = MISSILE_DMG * dmgScale(p);
+                enemies.blast(e, at, MISSILE_BLAST, dmg, Vec3.xyz(1, 0.55, 0.2), 5);
+                shrine.blast(sh, e, at, MISSILE_BLAST, dmg);
+                boss.blast(bs, e, at, MISSILE_BLAST, dmg);
+                sfx.at(sfx.BOOM, at);
+                m.t = 0;
+            } else {
+                m.pos = end;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Ram: whatever's in front takes a hit and flies; a boss takes a big one and ends it.
+fn ram(s: &Skills, p: &Player, e: &Enemies, bs: &Bosses, dt: f32) {
+    let l = look(p);
+    let fwd = bosskit.flat(l.forward()).normalize();
+    let chest = p.pos + Vec3.xyz(0, 0.9, 0);
+    let j = 0;
+    while j < MAX_RAMMED { s.rammedT[j] -= dt; j += 1; }
+    let i = 0;
+    while i < MAX_ENEMIES {
+        let en = e.list[i];
+        if en.kind != 0 {
+            let off = en.pos - chest;
+            if off.length() < RAM_REACH && off.dot(fwd) > -0.3 && !recent(s, i) {
+                enemies.damage(e, i, RAM_DMG * dmgScale(p), fwd * 16 + Vec3.xyz(0, 7, 0), en.pos);
+                remember(s, i);
+                sfx.at(sfx.SLAM, en.pos);
+            }
+        }
+        i += 1;
+    }
+    let part = bosskit.nearest(bs, chest + fwd * 0.6, 0.9);
+    if part >= 0 {
+        boss.damage(bs, e, part, RAM_BOSS * dmgScale(p), chest + fwd);
+        s.active = 0;
+        p.ramT = 0;
+        p.vel = fwd * -10 + Vec3.xyz(0, 6, 0);
+        p.onGround = false;
+        bs.shake = max(bs.shake, 0.04);
+        sfx.play(sfx.SLAM);
+    }
+}
+
+fn recent(s: &Skills, i: int): bool {
+    let j = 0;
+    while j < MAX_RAMMED {
+        if s.rammed[j] == i && s.rammedT[j] > 0 { return true; }
+        j += 1;
+    }
+    return false;
+}
+
+fn remember(s: &Skills, i: int) {
+    let j = 0;
+    while j < MAX_RAMMED && s.rammedT[j] > 0 { j += 1; }
+    if j == MAX_RAMMED { return; }
+    s.rammed[j] = i;
+    s.rammedT[j] = 0.5;
+}
+
+/// Storm: a strike on the nearest enemy every STORM_EVERY; every other strike goes to the boss
+/// instead when it's in reach.
+fn storm(s: &Skills, p: &Player, e: &Enemies, bs: &Bosses, dt: f32) {
+    s.strikeT -= dt;
+    if s.strikeT > 0 { return; }
+    s.strikeT = STORM_EVERY;
+    let target = enemies.nearest(e, p.pos, STORM_RANGE);
+    let bossNear = boss.targetable(bs) && bosskit.flatDist(boss.middle(bs), p.pos) < STORM_RANGE + 6;
+    let at = Vec3.zero();
+    let dmg = STORM_DMG * dmgScale(p);
+    if bossNear && s.strikes % 2 == 0 {
+        at = boss.aimPoint(bs);
+        boss.blast(bs, e, at, 2.5, dmg);
+    } else if target >= 0 {
+        at = e.list[target].pos;
+        enemies.blast(e, at, 2.5, dmg, Vec3.xyz(0.6, 0.85, 1), 4);
+    } else {
+        // Nothing to hit this time; the next strike may still find the boss.
+        s.strikes += 1;
+        return;
+    }
+    s.strikes += 1;
+    s.bolts[s.nextBolt] = Bolt { from: s.cloud - Vec3.xyz(0, 0.8, 0), to: at, t: BOLT_LIFE, seed: s.rng.unit() * 100 };
+    s.nextBolt = (s.nextBolt + 1) % MAX_BOLTS;
+    s.flashAt = at + Vec3.xyz(0, 1, 0);
+    s.flashT = 0.12;
+    sfx.at(sfx.THUNDER, at);
+}
+
+// ---- Drawing ----
+
+fn put(s: &Skills, m: Mat4, tint: Vec3, glow: Vec3) {
+    if s.nparts >= s.parts.len { return; }
+    s.parts[s.nparts] = Instance { model: m, tint: tint, emission: glow };
+    s.nparts += 1;
+}
+
+fn cubeAt(s: &Skills, at: Vec3, size: f32, tint: Vec3, glow: Vec3) {
+    put(s, Mat4.translate(at.x, at.y, at.z).mul(Mat4.scale(size, size, size)), tint, glow);
+}
+
+/// A thin glowing box from `a` to `b`.
+fn beam(s: &Skills, a: Vec3, b: Vec3, w: f32, glow: Vec3) {
+    let y = b - a;
+    let len = y.length();
+    if len < 0.001 { return; }
+    let up = y * (1 / len);
+    let ref = Vec3.xyz(1, 0, 0);
+    if abs(up.x) > 0.9 { ref = Vec3.xyz(0, 0, 1); }
+    let x = up.cross(ref).normalize() * w;
+    let z = up.cross(x).normalize() * w;
+    put(s, bosskit.basis((a + b) * 0.5, x, y, z), Vec3.zero(), glow);
+}
+
+/// A jagged bolt: the same zigzag for its whole short life.
+fn bolt(s: &Skills, bt: Bolt) {
+    let k = bt.t / BOLT_LIFE;
+    let prev = bt.from;
+    let n = 7;
+    let i = 1;
+    while i <= n {
+        let f = f32(i) / f32(n);
+        let at = bt.from + (bt.to - bt.from) * f;
+        if i < n {
+            let j = bt.seed + f32(i) * 12.9;
+            at = at + Vec3.xyz(sin(j) * 0.9, 0, cos(j * 1.3) * 0.9);
+        }
+        beam(s, prev, at, 0.22 * k + 0.05, Vec3.xyz(1.5, 2.2, 3) * (1 + k * 2));
+        beam(s, prev, at, 0.07, Vec3.xyz(3, 3, 3));
+        prev = at;
+        i += 1;
+    }
+    cubeAt(s, bt.to, 0.8 * k, Vec3.zero(), Vec3.xyz(2, 2.6, 3));
+}
+
+fn drawMissiles(s: &Skills) {
+    let i = 0;
+    while i < MAX_MISSILES {
+        let m = s.missiles[i];
+        if m.t > 0 {
+            let d = m.vel.normalize();
+            beam(s, m.pos - d * 0.35, m.pos + d * 0.35, 0.14, Vec3.xyz(0.6, 0.6, 0.65));
+            cubeAt(s, m.pos + d * 0.35, 0.16, Vec3.zero(), Vec3.xyz(3, 0.5, 0.3));
+            cubeAt(s, m.pos - d * 0.45, 0.2, Vec3.zero(), Vec3.xyz(3, 1.6, 0.4));
+        }
+        i += 1;
+    }
+}
+
+/// The thunder cloud: dark lumps flickering with lightning inside.
+fn drawCloud(s: &Skills) {
+    if s.skill != STORM || s.active <= 0 { return; }
+    let fade = min(s.active, 1);
+    let k = 0;
+    while k < 11 {
+        let a = f32(k) * 2.4;
+        let r = 1.2 + f32(k % 4) * 0.9;
+        let flick: f32 = if sin(f32(game.ticks()) * 0.02 + f32(k) * 3) > 0.8 { 1.6 } else { 0.08 };
+        let at = s.cloud + Vec3.xyz(cos(a) * r, sin(a * 1.7) * 0.4, sin(a) * r);
+        cubeAt(s, at, (1.6 + f32(k % 3) * 0.5) * fade, Vec3.xyz(0.22, 0.24, 0.3), Vec3.xyz(0.5, 0.7, 1) * flick);
+        k += 1;
+    }
+}
+
+/// Blink afterimages: tall slivers along the path, fading.
+fn drawTrail(s: &Skills) {
+    if s.trailT <= 0 { return; }
+    let k = s.trailT / 0.35;
+    let i = 0;
+    while i < TRAIL - 1 {
+        let at = s.trail[i] + Vec3.xyz(0, 0.9, 0);
+        let size = 0.5 * k * (0.4 + 0.6 * f32(i) / f32(TRAIL));
+        put(s, Mat4.translate(at.x, at.y, at.z).mul(Mat4.scale(size * 0.8, size * 2.6, size * 0.8)), Vec3.zero(), Vec3.xyz(0.6, 1.2, 2.4) * k);
+        i += 1;
+    }
+}
+
+/// Detonate: a ring of fire racing out and a fading core.
+fn drawBoom(s: &Skills) {
+    if s.boomT >= 0.45 { return; }
+    let k = s.boomT / 0.45;
+    let r = DETONATE_R * sqrt(k);
+    let n = 40;
+    let j = 0;
+    while j < n {
+        let a = f32(j) * TAU / f32(n);
+        let at = s.boomAt + Vec3.xyz(cos(a) * r, -0.6 + sin(f32(j) * 1.7) * 0.3, sin(a) * r);
+        cubeAt(s, at, 0.9 * (1 - k) + 0.1, Vec3.zero(), Vec3.xyz(3, 1.3, 0.3) * (1 - k));
+        j += 1;
+    }
+    cubeAt(s, s.boomAt, r * 0.9 * (1 - k), Vec3.zero(), Vec3.xyz(3, 2, 0.8) * (1 - k));
+}
+
+/// Missiles, the storm cloud and its bolts, blink afterimages, detonate's shock. Camera pass.
+pub fn draw(s: &Skills) {
+    s.nparts = 0;
+    drawMissiles(s);
+    drawCloud(s);
+    let i = 0;
+    while i < MAX_BOLTS {
+        if s.bolts[i].t > 0 { bolt(s, s.bolts[i]); }
+        i += 1;
+    }
+    drawTrail(s);
+    drawBoom(s);
+    if s.nparts == 0 { return; }
+    gfx.surface(gfx.plainSurface());
+    gfx.drawInstances(s.cube, []Instance { ptr: s.parts.ptr, len: s.nparts });
+}
+
+/// The strike and detonate flash (light slot 5), before the camera pass.
+pub fn lights(s: &Skills) {
+    if s.flashT > 0 {
+        gfx.light(5, s.flashAt, Vec3.xyz(1.5, 2, 3) * (s.flashT * 8), 16);
+    } else {
+        gfx.light(5, Vec3.zero(), Vec3.zero(), 0);
+    }
+}
+
+// ---- Hud ----
+
+fn paint(c: Vec3, a: f32) {
+    game.setColor(game.rgba(u8(clamp(c.x, 0, 1) * 255), u8(clamp(c.y, 0, 1) * 255), u8(clamp(c.z, 0, 1) * 255), u8(clamp(a, 0, 1) * 255)));
+}
+
+/// The skill's box, bottom left above the health: a ring that fills as it cools down (and
+/// empties as a lasting skill runs out), its name, and the Q prompt. Overclock and Ram tint
+/// the screen's edges while they run.
+pub fn hud(s: &Skills, font: Font, big: Font) {
+    let sz = game.windowSize();
+    if s.skill != 0 && s.active > 0 && (s.skill == OVERCLOCK || s.skill == RAM) {
+        let c = tint(s.skill);
+        let pulse = 0.55 + 0.25 * sin(f32(game.ticks()) * 0.012);
+        let edge: f32 = 26;
+        paint(c, 0.22 * pulse);
+        rect(0, 0, sz.x, edge);
+        rect(0, sz.y - edge, sz.x, edge);
+        rect(0, edge, edge, sz.y - edge * 2);
+        rect(sz.x - edge, edge, edge, sz.y - edge * 2);
+    }
+    if s.skill != 0 { widget(s, font, sz); }
+    if s.offering { card(s, font, big, sz); }
+}
+
+fn widget(s: &Skills, font: Font, sz: Vec2) {
+    let x: f32 = 12;
+    let y = sz.y - 172;
+    let c = tint(s.skill);
+    paint(Vec3.xyz(0.08, 0.09, 0.16), 0.6);
+    rect(x, y, 190, 62);
+    let cx = x + 31;
+    let cy = y + 31;
+    let ready = s.cd <= 0 && s.active <= 0;
+    // The ring: cooled share lit, or while it lasts, the time left.
+    let fill: f32 = 1;
+    if s.active > 0 { fill = s.active / max(lasts(s.skill), 0.01); }
+    else if s.cd > 0 { fill = 1 - s.cd / cooldown(s.skill); }
+    let n = 32;
+    let k = 0;
+    while k < n {
+        let a = f32(k) / f32(n) * TAU;
+        let lit = f32(k) + 0.5 < fill * f32(n);
+        if lit {
+            if s.active > 0 { paint(Vec3.xyz(1, 1, 1), 0.95); } else { paint(c, if ready { 1 } else { 0.7 }); }
+        } else {
+            paint(Vec3.xyz(0.25, 0.27, 0.35), 0.8);
+        }
+        rect(cx + sin(a) * 24 - 2.5, cy - cos(a) * 24 - 2.5, 5, 5);
+        k += 1;
+    }
+    // The key in the middle: bright when ready, flashing when it comes back.
+    let flash = max(s.readyT, 0) / 0.6;
+    if ready { paint(c + (Vec3.xyz(1, 1, 1) - c) * flash, 1); } else { paint(Vec3.xyz(0.3, 0.32, 0.42), 1); }
+    rect(cx - 13, cy - 13, 26, 26);
+    if s.denyT > 0 { paint(Vec3.xyz(1, 0.25, 0.2), 0.9); rect(cx - 13, cy - 13, 26, 26); }
+    paint(Vec3.xyz(0.06, 0.06, 0.1), 1);
+    centered(font, cx, cy - 9, "Q");
+    paint(c, 1);
+    game.drawText(font, Vec2 { x: x + 64, y: y + 10 }, name(s.skill));
+    if s.active > 0 {
+        paint(Vec3.xyz(1, 1, 1), 0.9);
+        game.drawText(font, Vec2 { x: x + 64, y: y + 34 }, `ACTIVE  {int(s.active + 0.99)}s`);
+    } else if s.cd > 0 {
+        paint(Vec3.xyz(0.7, 0.72, 0.8), 0.9);
+        game.drawText(font, Vec2 { x: x + 64, y: y + 34 }, `{int(s.cd + 0.99)}s`);
+    } else {
+        paint(Vec3.xyz(0.55, 1, 0.5), 0.9 + 0.1 * sin(f32(game.ticks()) * 0.01));
+        game.drawText(font, Vec2 { x: x + 64, y: y + 34 }, "READY");
+    }
+}
+
+/// The reward card: take or refuse the next skill.
+fn card(s: &Skills, font: Font, big: Font, sz: Vec2) {
+    game.setColor(game.rgba(10, 12, 24, 170));
+    rect(0, 0, sz.x, sz.y);
+    let k = clamp(s.t / 0.25, 0, 1);
+    let ease = 1 - (1 - k) * (1 - k);
+    let x = (sz.x - CARD_W) * 0.5;
+    let y = (sz.y - CARD_H) * 0.5 + (1 - ease) * 60;
+    let alpha = ease;
+    let cx = sz.x * 0.5;
+    let c = tint(s.next);
+    paint(Vec3.xyz(1, 0.5, 0.35), 1);
+    centered(big, cx, y - 70, "BOSS REWARD");
+    let pulse = 0.5 + 0.5 * sin(s.t * 4);
+    paint(c, (0.2 + 0.25 * pulse) * ease);
+    rect(x - 10, y - 10, CARD_W + 20, CARD_H + 20);
+    paint(c, alpha);
+    rect(x - 3, y - 3, CARD_W + 6, CARD_H + 6);
+    paint(Vec3.xyz(0.1, 0.1, 0.17), alpha);
+    rect(x, y, CARD_W, CARD_H);
+    paint(Vec3.xyz(0.75, 0.78, 0.88), alpha);
+    centered(font, cx, y + 16, "NEW SKILL  -  Q");
+    paint(c, alpha);
+    centered(big, cx, y + 44, name(s.next));
+    paint(Vec3.xyz(0.9, 0.9, 0.95), alpha);
+    centered(font, cx, y + 114, line1(s.next));
+    centered(font, cx, y + 138, line2(s.next));
+    paint(Vec3.xyz(0.65, 0.68, 0.78), alpha);
+    centered(font, cx, y + 170, `cooldown {int(cooldown(s.next))} s`);
+    if s.skill != 0 {
+        paint(Vec3.xyz(1, 0.75, 0.4), alpha);
+        centered(font, cx, y + 196, `replaces {name(s.skill)}`);
+    }
+    let bw = CARD_W * 0.5 - 36;
+    let m = game.mousePos();
+    let i = 0;
+    while i < 2 {
+        let b = buttonAt(i, sz);
+        b.y = b.y - (1 - ease) * 60;
+        let hot = over(m, b.x, b.y, bw, 46);
+        if i == 0 {
+            if hot { game.setColor(game.rgba(120, 240, 110, u8(255 * alpha))); } else { game.setColor(game.rgba(80, 190, 80, u8(255 * alpha))); }
+        } else {
+            if hot { game.setColor(game.rgba(255, 100, 90, u8(255 * alpha))); } else { game.setColor(game.rgba(190, 70, 70, u8(255 * alpha))); }
+        }
+        rect(b.x, b.y, bw, 46);
+        game.setColor(game.rgba(20, 20, 30, u8(255 * alpha)));
+        if i == 0 { centered(font, b.x + bw * 0.5, b.y + 14, "[1] TAKE"); } else { centered(font, b.x + bw * 0.5, b.y + 14, "[2] REFUSE"); }
+        i += 1;
+    }
+    paint(Vec3.xyz(0.6, 0.62, 0.72), alpha);
+    centered(font, cx, y + CARD_H + 16, "a refused skill is offered again by the next boss");
+}
+
+// ---- Checks ----
+
+/// Blink stops short of a wall and costs nothing without room; the order runs Blink first and
+/// comes round again; refusing keeps the same offer; going down starts over.
+pub fn selfCheck(mem: &Arena) {
+    let lvl = level.empty(mem, 2, 0);
+    lvl.count = 2;
+    lvl.boxes[0] = Box { lo: Vec3.xyz(-50, -1, -50), hi: Vec3.xyz(50, 0, 50), launch: 0, kind: SOLID };
+    lvl.boxes[1] = Box { lo: Vec3.xyz(-5, -1, -10), hi: Vec3.xyz(5, 10, -9), launch: 0, kind: SOLID };
+    level.index(&lvl, mem);
+    let p = player.create(&lvl);
+    let s = create(mem);
+    let foes = enemies.create(mem);
+    p.pos = Vec3.zero();
+    p.yaw = 0;
+    p.pitch = 0;
+    p.onGround = true;
+    if !blink(&s, &p, &lvl, &foes) { panic("skills check: blink didn't go"); }
+    if p.pos.z < -8.7 || p.pos.z > -6 { panic("skills check: blink didn't stop at the wall"); }
+    if blink(&s, &p, &lvl, &foes) { panic("skills check: blink into a wall went"); }
+    if s.next != BLINK { panic("skills check: order doesn't start at blink"); }
+    take(&s, &p);
+    if s.skill != BLINK || s.next != MISSILES || s.cd > 0 { panic("skills check: take"); }
+    let k = 0;
+    while k < 5 { take(&s, &p); k += 1; }
+    if s.skill != STORM || s.next != BLINK { panic("skills check: order doesn't wrap"); }
+    reset(&s, &p);
+    if s.skill != 0 || s.next != BLINK { panic("skills check: reset"); }
+}

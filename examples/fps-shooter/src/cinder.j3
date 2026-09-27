@@ -1,0 +1,303 @@
+// Cinder: a walking furnace on four legs, at home on the volcano (it wades through lava). Its
+// mortar lobs a barrage of firebombs at the player, each marked where it will land and each
+// leaving a small burning patch (only a few burn at once, so safe ground remains). After every
+// barrage its exhaust vents open on its flanks and back: get round it and shoot them. It also
+// sweeps a flamethrower that turns to follow you, slower than you can circle it. In phase two
+// the mortar keeps firing while it flames, and the vents open after that too.
+
+module fps_shooter.cinder;
+
+use j3.math.{ Mat4, Vec3, TAU, abs, clamp, cos, max, min, sin };
+use fps_shooter.bosskit.{ Boss, Bosses, BODY, WEAK, BOMB, addPart, box, bit, bulk, burst, clearParts, flat, flatDist, forward,
+    frame, groundTop, limb, lob, puff, smoke, tilt, turn, walk, yawTo };
+use fps_shooter.level.Level;
+use fps_shooter.player.{ Player, hurt };
+use fps_shooter.sfx;
+
+const RISE: int = 0;
+const WALK: int = 1;
+const BARRAGE: int = 2;
+const VENT: int = 3;
+const TELL: int = 4;
+const FLAME: int = 5;
+const IDLE: int = 6;
+
+const RISE_T: f32 = 2.0;
+const WALK_T: f32 = 2.4;
+const WALK_T2: f32 = 1.8;
+const WALK_SPEED: f32 = 4.5;
+/// It keeps about this far from the player.
+const KEEP: f32 = 12;
+const BOMBS: int = 5;
+const BOMBS2: int = 7;
+const BOMB_GAP: f32 = 0.42;
+const BOMB_GAP2: f32 = 0.34;
+const BOMB_T: f32 = 1.4;
+const BOMB_R: f32 = 3;
+const BOMB_DMG: f32 = 16;
+const VENT_T: f32 = 3.0;
+const VENT_T2: f32 = 2.5;
+const TELL_T: f32 = 0.8;
+const FLAME_T: f32 = 3.4;
+/// How fast the flame turns after you (radians a second), its reach and half-width.
+const FLAME_TURN: f32 = 0.95;
+const FLAME_TURN2: f32 = 1.3;
+const FLAME_REACH: f32 = 12;
+const FLAME_HALF: f32 = 0.38;
+const FLAME_DMG: f32 = 9;
+const FLAME_TICK: f32 = 0.3;
+/// Phase two lobs a bomb this often while flaming.
+const FLAME_BOMB: f32 = 0.9;
+const VENTS: f32 = 3;
+const SHUTTERS: f32 = 0.7;
+const LEASH: f32 = 45;
+
+fn fire(): Vec3 {
+    return Vec3.xyz(3, 0.9, 0.12);
+}
+
+pub fn begin(bs: &Bosses) {
+    let b = &bs.b;
+    b.aim = b.pos;
+    b.pos = b.aim - Vec3.xyz(0, 6, 0);
+    b.state = RISE;
+    b.t = 0;
+    b.len = RISE_T;
+    b.intro = RISE_T;
+    b.cycle = 0;
+}
+
+fn to(b: &Boss, state: int, len: f32) {
+    b.state = state;
+    b.t = 0;
+    b.len = len;
+    b.step = 0;
+}
+
+/// A firebomb at the player (a little ahead, and scattered after the first).
+fn lobAt(bs: &Bosses, p: &Player, lvl: &Level, first: bool) {
+    let b = &bs.b;
+    let aim = flat(p.pos + p.vel * 0.5);
+    if !first {
+        let a = bs.rng.unit() * TAU;
+        let r = 1.5 + bs.rng.unit() * 3.5;
+        aim = aim + Vec3.xyz(cos(a) * r, 0, sin(a) * r);
+    }
+    let y = groundTop(lvl, aim.x, aim.z, 0.8, p.pos.y + 3);
+    if y < -50 { return; }
+    let muzzle = mortar(b).transformPoint(Vec3.xyz(0, 1.1, 0));
+    lob(bs, BOMB, muzzle, Vec3.xyz(aim.x, y, aim.z), BOMB_T, 9, BOMB_DMG, BOMB_R, true, fire());
+    smoke(bs, muzzle, 3, 0.6, Vec3.xyz(0.3, 0.28, 0.28), Vec3.zero());
+    sfx.at(sfx.ROCKET, b.pos);
+}
+
+fn mortar(b: &Boss): Mat4 {
+    return frame(b.pos, b.yaw).mul(Mat4.translate(0, 5.0, 0.7)).mul(Mat4.rotate(Vec3.xyz(1, 0, 0), 0.35));
+}
+
+fn stalk(bs: &Bosses, p: &Player, lvl: &Level, dt: f32) {
+    let b = &bs.b;
+    let off = flat(p.pos - b.pos);
+    let far = off.length();
+    let want = Vec3.zero();
+    if far > KEEP + 2 { want = off * (WALK_SPEED / far); }
+    if far < KEEP - 3 { want = off * (0 - WALK_SPEED * 0.6 / max(far, 0.1)); }
+    if flatDist(b.pos + want, b.home) > LEASH { want = flat(b.home - b.pos).normalize() * WALK_SPEED; }
+    b.vel = b.vel + (want - b.vel) * min(dt * 3, 1);
+    walk(bs, lvl, b.vel, 2.2, 1.6, dt);
+    b.yaw = turn(b.yaw, yawTo(b.pos, p.pos), dt * 1.5);
+    b.anim += b.vel.length() * dt * 0.5;
+}
+
+/// The flame: a cone ahead that turns after the player, burning them inside it.
+fn flame(bs: &Bosses, p: &Player, dt: f32) {
+    let b = &bs.b;
+    let rate = if b.phase2 { FLAME_TURN2 } else { FLAME_TURN };
+    b.yaw = turn(b.yaw, yawTo(b.pos, p.pos), rate * dt);
+    let nozzle = frame(b.pos, b.yaw).transformPoint(Vec3.xyz(0, 2.3, -2.8));
+    let fwd = forward(b.yaw);
+    let n = int(dt * 90) + 1;
+    let k = 0;
+    while k < n {
+        let spread = (bs.fxRng.unit() - 0.5) * FLAME_HALF * 2;
+        let dir = fwd * cos(spread) + Vec3.xyz(0 - fwd.z, 0, fwd.x) * sin(spread) + Vec3.xyz(0, (bs.fxRng.unit() - 0.4) * 0.3, 0);
+        let hotter = if bs.fxRng.unit() < 0.5 { Vec3.xyz(3, 1.4, 0.2) } else { Vec3.xyz(3, 0.6, 0.08) };
+        puff(bs, nozzle, dir * (14 + bs.fxRng.unit() * 6), 0.75, 0.3, 1.6, 0, Vec3.zero(), hotter);
+        k += 1;
+    }
+    b.cd2 -= dt;
+    let off = flat(p.pos - b.pos);
+    let far = off.length();
+    let a = yawTo(b.pos, p.pos) - b.yaw;
+    while a > 3.1416 { a -= TAU; }
+    while a < -3.1416 { a += TAU; }
+    let up = p.pos.y - b.pos.y;
+    if far < FLAME_REACH && abs(a) < FLAME_HALF && up < 4 && up > -2 && b.cd2 <= 0 {
+        hurt(p, FLAME_DMG, off.normalize() * 3 + Vec3.xyz(0, 1.5, 0));
+        b.cd2 = FLAME_TICK;
+    }
+    b.heat += dt;
+    if b.heat >= 0.5 {
+        b.heat = 0;
+        sfx.at(sfx.FLAME, nozzle);
+    }
+}
+
+pub fn update(bs: &Bosses, p: &Player, lvl: &Level, dt: f32) {
+    let b = &bs.b;
+    b.t += dt;
+    b.open = b.open + (b.openTo - b.open) * min(dt * 6, 1);
+    b.openTo = 0;
+    if b.state == RISE {
+        let k = clamp(b.t / b.len, 0, 1);
+        b.pos = b.aim - Vec3.xyz(0, 6 * (1 - k) * (1 - k), 0);
+        if bs.fxRng.unit() < dt * 30 {
+            burst(bs, b.aim + Vec3.xyz(0, 0.3, 0), 2, 8, Vec3.xyz(1, 0.5, 0.1), fire());
+        }
+        if k >= 1 {
+            b.pos = b.aim;
+            sfx.at(sfx.ROAR, b.pos);
+            to(b, WALK, WALK_T);
+        }
+    } else if b.state == WALK || b.state == IDLE {
+        if b.engaged {
+            stalk(bs, p, lvl, dt);
+            if b.state == IDLE { to(b, WALK, WALK_T); }
+            if b.t >= (if b.phase2 { WALK_T2 } else { WALK_T }) {
+                b.vel = Vec3.zero();
+                if b.cycle % 2 == 0 { to(b, BARRAGE, 0); sfx.at(sfx.WARN, b.pos); }
+                else { to(b, TELL, TELL_T); sfx.at(sfx.WARN, b.pos); }
+            }
+        } else {
+            b.state = IDLE;
+            b.vel = b.vel * max(1 - dt * 3, 0);
+            if flatDist(b.pos, b.home) > 4 {
+                walk(bs, lvl, flat(b.home - b.pos).normalize() * WALK_SPEED, 2.2, 1.6, dt);
+                b.anim += WALK_SPEED * dt * 0.5;
+            }
+        }
+    } else if b.state == BARRAGE {
+        b.yaw = turn(b.yaw, yawTo(b.pos, p.pos), dt * 1.5);
+        let n = if b.phase2 { BOMBS2 } else { BOMBS };
+        let gap = if b.phase2 { BOMB_GAP2 } else { BOMB_GAP };
+        if b.step < n && b.t >= f32(b.step) * gap + 0.3 {
+            lobAt(bs, p, lvl, b.step == 0);
+            b.step += 1;
+        }
+        if b.step >= n && b.t >= f32(n) * gap + 0.6 {
+            b.cycle += 1;
+            to(b, VENT, if b.phase2 { VENT_T2 } else { VENT_T });
+            sfx.at(sfx.SLAM, b.pos);
+        }
+    } else if b.state == VENT {
+        b.openTo = 1;
+        b.cue = true;
+        let back = frame(b.pos, b.yaw);
+        if bs.fxRng.unit() < dt * 24 {
+            let which = bs.fxRng.intRange(0, 3);
+            let local = Vec3.xyz(0, 3.2, 2.3);
+            if which == 0 { local = Vec3.xyz(-2.3, 3.0, 0.4); }
+            if which == 1 { local = Vec3.xyz(2.3, 3.0, 0.4); }
+            smoke(bs, back.transformPoint(local), 1, 0.5, Vec3.xyz(0.85, 0.85, 0.85), Vec3.xyz(0.2, 0.1, 0.05));
+        }
+        if b.t >= b.len { to(b, WALK, WALK_T); }
+    } else if b.state == TELL {
+        b.yaw = turn(b.yaw, yawTo(b.pos, p.pos), dt * 2);
+        if bs.fxRng.unit() < dt * 20 {
+            let nozzle = frame(b.pos, b.yaw).transformPoint(Vec3.xyz(0, 2.3, -2.8));
+            puff(bs, nozzle, forward(b.yaw) * 3, 0.3, 0.25, 0.5, 0, Vec3.zero(), fire());
+        }
+        if b.t >= b.len { to(b, FLAME, FLAME_T); b.cd2 = 0; b.cd = FLAME_BOMB; }
+    } else if b.state == FLAME {
+        flame(bs, p, dt);
+        if b.phase2 {
+            b.cd -= dt;
+            if b.cd <= 0 { b.cd = FLAME_BOMB; lobAt(bs, p, lvl, true); }
+        }
+        if b.t >= b.len {
+            b.cycle += 1;
+            if b.phase2 { to(b, VENT, VENT_T2); sfx.at(sfx.SLAM, b.pos); } else { to(b, WALK, WALK_T); }
+        }
+    }
+    // The chimneys smoke all the time.
+    if bs.fxRng.unit() < dt * 6 {
+        let c = frame(b.pos, b.yaw).transformPoint(Vec3.xyz(1.3, 5.8, 1.3));
+        smoke(bs, c, 1, 0.3, Vec3.xyz(0.25, 0.22, 0.22), Vec3.zero());
+    }
+    pose(bs);
+    bs.glowAt = frame(b.pos, b.yaw).transformPoint(Vec3.xyz(0, 3, -4));
+    let flaming: f32 = if b.state == FLAME { 1 } else { 0 };
+    bs.glowColor = Vec3.xyz(1.6, 0.6, 0.1) * (0.2 + flaming * 0.8 + b.open * 0.3);
+    bs.glowR = 9 + flaming * 6;
+}
+
+fn pose(bs: &Bosses) {
+    let b = &bs.b;
+    clearParts(bs);
+    let f = frame(b.pos, b.yaw);
+    let v = if b.open > 0.5 { VENTS } else { SHUTTERS };
+    addPart(bs, f.transformPoint(Vec3.xyz(-2.25, 3.0, 0.4)), 0.8, v, WEAK);
+    addPart(bs, f.transformPoint(Vec3.xyz(2.25, 3.0, 0.4)), 0.8, v, WEAK);
+    addPart(bs, f.transformPoint(Vec3.xyz(0, 3.2, 2.25)), 0.8, v, WEAK);
+    addPart(bs, f.transformPoint(Vec3.xyz(0, 3.1, 0)), 2.3, 1, BODY);
+    addPart(bs, f.transformPoint(Vec3.xyz(0, 5.2, 0.7)), 0.8, 1, BODY);
+    addPart(bs, f.transformPoint(Vec3.xyz(0, 1.4, 0)), 1.5, 1, BODY);
+    bulk(bs, 2.3, b.pos.y, b.pos.y + 5.5);
+}
+
+pub fn draw(bs: &Bosses) {
+    let b = &bs.b;
+    let iron = Vec3.xyz(0.24, 0.21, 0.2);
+    let brass = Vec3.xyz(0.55, 0.38, 0.18);
+    let black = Vec3.xyz(0.05, 0.04, 0.04);
+    let f = frame(b.pos + Vec3.xyz(0, abs(sin(b.anim * 2)) * 0.15, 0), b.yaw);
+    let heat = fire() * (0.6 + 0.3 * sin(b.t * 7) + (if b.state == FLAME || b.state == TELL { 0.8 } else { 0 }));
+    // Four legs, each lifting in turn as it walks.
+    let k = 0;
+    while k < 4 {
+        let sx: f32 = if k % 2 == 0 { -1 } else { 1 };
+        let sz: f32 = if k < 2 { -1 } else { 1 };
+        let phase = b.anim * 2 + f32(k) * 1.5708;
+        let lift = max(sin(phase), 0) * 0.8;
+        let reach = cos(phase) * 0.6;
+        let hip = f.transformPoint(Vec3.xyz(sx * 1.7, 2.3, sz * 1.5));
+        let knee = f.transformPoint(Vec3.xyz(sx * 3.0, 3.1 + lift * 0.5, sz * 2.2 + reach * sz));
+        let foot = f.transformPoint(Vec3.xyz(sx * 3.1, lift, sz * 2.8 + reach * sz));
+        foot.y = min(foot.y, b.pos.y + lift);
+        limb(bs, hip, knee, 0.6, 0.6, iron, Vec3.zero());
+        limb(bs, knee, foot, 0.5, 0.5, iron, Vec3.zero());
+        box(bs, frame(foot, b.yaw), Vec3.xyz(0, 0.15, 0), Vec3.xyz(0.9, 0.3, 0.9), black, Vec3.zero());
+        k += 1;
+    }
+    // The furnace body with brass bands, the glowing grate and the nozzle under it.
+    box(bs, f, Vec3.xyz(0, 3.1, 0), Vec3.xyz(4.0, 2.6, 4.0), iron, Vec3.zero());
+    box(bs, f, Vec3.xyz(0, 2.0, 0), Vec3.xyz(4.15, 0.3, 4.15), brass, Vec3.zero());
+    box(bs, f, Vec3.xyz(0, 4.3, 0), Vec3.xyz(4.15, 0.3, 4.15), brass, Vec3.zero());
+    bit(bs, f, Vec3.xyz(0, 3.1, -2.02), Vec3.xyz(2.6, 1.3, 0.08), black, heat);
+    k = 0;
+    while k < 5 {
+        bit(bs, f, Vec3.xyz(-1.0 + f32(k) * 0.5, 3.1, -2.07), Vec3.xyz(0.12, 1.35, 0.08), iron, Vec3.zero());
+        k += 1;
+    }
+    box(bs, f, Vec3.xyz(0, 2.3, -2.35), Vec3.xyz(0.9, 0.9, 0.8), black, Vec3.zero());
+    bit(bs, f, Vec3.xyz(0, 2.3, -2.77), Vec3.xyz(0.55, 0.55, 0.06), Vec3.zero(), heat * (if b.state == FLAME { 1.5 } else { 0.5 }));
+    // Mortar on top, and two chimneys.
+    let m = mortar(b);
+    box(bs, m, Vec3.xyz(0, 0.2, 0), Vec3.xyz(1.4, 2.0, 1.4), iron, Vec3.zero());
+    box(bs, m, Vec3.xyz(0, 1.2, 0), Vec3.xyz(1.6, 0.3, 1.6), brass, Vec3.zero());
+    bit(bs, m, Vec3.xyz(0, 1.37, 0), Vec3.xyz(0.9, 0.05, 0.9), black, fire() * 0.8);
+    box(bs, f, Vec3.xyz(1.3, 5.1, 1.3), Vec3.xyz(0.55, 1.5, 0.55), iron, Vec3.zero());
+    box(bs, f, Vec3.xyz(-1.3, 4.9, 1.4), Vec3.xyz(0.5, 1.1, 0.5), iron, Vec3.zero());
+    // Vents: shutters slide open on the flanks and back over glowing cores.
+    let o = b.open;
+    let core = fire() * (0.4 + o * 1.6);
+    bit(bs, f, Vec3.xyz(-2.03, 3.0, 0.4), Vec3.xyz(0.08, 1.0, 1.3), black, core);
+    bit(bs, f, Vec3.xyz(2.03, 3.0, 0.4), Vec3.xyz(0.08, 1.0, 1.3), black, core);
+    bit(bs, f, Vec3.xyz(0, 3.2, 2.03), Vec3.xyz(1.3, 1.0, 0.08), black, core);
+    box(bs, f, Vec3.xyz(-2.1 - o * 0.25, 3.0 + o * 0.9, 0.4), Vec3.xyz(0.12, 1.1, 1.45), brass, Vec3.zero());
+    box(bs, f, Vec3.xyz(2.1 + o * 0.25, 3.0 + o * 0.9, 0.4), Vec3.xyz(0.12, 1.1, 1.45), brass, Vec3.zero());
+    box(bs, f, Vec3.xyz(0, 3.2 + o * 0.9, 2.1 + o * 0.25), Vec3.xyz(1.45, 1.1, 0.12), brass, Vec3.zero());
+    // Eyes above the grate.
+    bit(bs, f, Vec3.xyz(-0.7, 4.0, -2.04), Vec3.xyz(0.5, 0.2, 0.06), black, Vec3.xyz(3, 2, 0.4));
+    bit(bs, f, Vec3.xyz(0.7, 4.0, -2.04), Vec3.xyz(0.5, 0.2, 0.06), black, Vec3.xyz(3, 2, 0.4));
+}

@@ -54,7 +54,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
             0
         }
         "run" => match take_run_flags(rest) {
-            Ok(rest) => dispatch(&rest, run_cwd, run_samples, run_path, true),
+            Ok(rest) => run_dispatch(&rest),
             Err(e) => {
                 eprintln!("j3c run: {e}");
                 1
@@ -269,6 +269,7 @@ fn print_help() {
     println!("    run --frames N [--screenshot F.png] [--headless]  stop an App after N frames;");
     println!("                     F.png is relative to where you run j3c, not the project");
     println!("    run --file f.j3  run that one file even inside a project");
+    println!("    run tool.j3s [args]  run that script's `pub fn main` once; args are `j3.sys.arg`");
     println!("    fmt [path]       pretty-print `.j3` and `.j3s` (same lexer; keeps comments)");
     println!("    fmt --write      rewrite files");
     println!("    fmt --check      exit 1 if formatting would change a file");
@@ -543,16 +544,53 @@ fn dump_c_samples() -> i32 {
     }
 }
 
-fn run_cwd() -> i32 {
-    run_user(None)
+/// `run`'s positionals: flags, then one path, then arguments for the program.
+fn run_dispatch(rest: &[String]) -> i32 {
+    let (fast, path, args) = peel_run(rest);
+    FAST.store(fast, std::sync::atomic::Ordering::Relaxed);
+    match path {
+        Some("samples") => run_samples(),
+        Some(p) => run_user(Some(p), &args),
+        None => run_user(None, &args),
+    }
 }
 
-fn run_path(path: &str) -> i32 {
-    run_user(Some(path))
+fn peel_run(rest: &[String]) -> (bool, Option<&str>, Vec<String>) {
+    let mut fast = false;
+    let mut path = None;
+    let mut args = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        if a == "--fast" {
+            fast = true;
+        } else if a == "--emit" {
+            if let Some(v) = rest.get(i + 1) {
+                EMIT.store(emit_code(v), std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+            }
+        } else if let Some(v) = a.strip_prefix("--emit=") {
+            EMIT.store(emit_code(v), std::sync::atomic::Ordering::Relaxed);
+        } else if a == "--opt" {
+            if let Some(v) = rest.get(i + 1) {
+                set_opt(v);
+                i += 1;
+            }
+        } else if let Some(v) = a.strip_prefix("--opt=") {
+            set_opt(v);
+        } else if path.is_none() && !a.starts_with('-') {
+            path = Some(rest[i].as_str());
+        } else if path.is_some() {
+            args.push(rest[i].clone());
+        }
+        i += 1;
+    }
+    (fast, path, args)
 }
 
 /// A project with scripts runs in dev mode (`devrun`); everything else runs as before.
-fn run_user(path: Option<&str>) -> i32 {
+/// A `.j3s` path is a one-shot tool, not the dev watcher.
+fn run_user(path: Option<&str>, args: &[String]) -> i32 {
     if let Ok(Input::Project(m)) = load_input(path) {
         let manifest = Some(m.clone());
         let opts = match emit_opts(&manifest) {
@@ -565,9 +603,9 @@ fn run_user(path: Option<&str>) -> i32 {
         crate::gen::before_build(&m.root);
         let fast = FAST.load(std::sync::atomic::Ordering::Relaxed);
         return match crate::devrun::prepare(&m, &opts, fast) {
-            Ok(crate::devrun::Prepared::NoScripts(prog)) => run_loaded(Ok((*prog, manifest)), None),
+            Ok(crate::devrun::Prepared::NoScripts(prog)) => run_loaded(Ok((*prog, manifest)), None, args),
             Ok(crate::devrun::Prepared::Dev(mut built)) => {
-                match crate::devrun::watch(&m, &opts, fast, &mut built) {
+                match crate::devrun::watch(&m, &opts, fast, &mut built, args) {
                     Ok(code) => {
                         if code != 0 {
                             eprintln!("j3c: program exited {code}");
@@ -586,7 +624,7 @@ fn run_user(path: Option<&str>) -> i32 {
             }
         };
     }
-    run_loaded(compile_user(path), None)
+    run_loaded(compile_user(path), None, args)
 }
 
 pub(crate) fn print_error(e: &str) {
@@ -645,6 +683,7 @@ fn emit_opts(manifest: &Option<Manifest>) -> Result<emit::EmitOpts, String> {
 fn run_loaded(
     prog: Result<(compile::Program, Option<Manifest>), String>,
     extra_cwd: Option<PathBuf>,
+    args: &[String],
 ) -> i32 {
     match prog {
         Ok((prog, manifest)) => match emit_opts(&manifest) {
@@ -657,7 +696,7 @@ fn run_loaded(
                 if opts.cwd.is_none() {
                     opts.cwd = extra_cwd;
                 }
-                match emit::run_program(&prog.cx, &prog.modules, &opts) {
+                match emit::run_program_with(&prog.cx, &prog.modules, &opts, args) {
                     Ok(result) => {
                         print!("{}", String::from_utf8_lossy(&result.stdout));
                         if result.status != 0 {

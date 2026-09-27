@@ -1,0 +1,1021 @@
+// Runs boss fights. Every four minutes of a run one boss comes, in the unlocked biome that
+// suits it best: the player's own when it has a boss, then the nearest, preferring kinds not
+// beaten yet this run. One at a time; a late one waits for the last to fall. Bosses never
+// leave for distance: away from the player they wait at their arena, marked on the map and
+// the hud. Going down ends the fight with the run. A fallen boss drops a hoard of XP and
+// offers the next skill (skills.j3).
+//
+// tools/debug.j3s (and J3_FPS_BOSS / J3_FPS_BOSS_WATCH) starts a boss, or several at once.
+// One name stands you at its arena. Several spawn in a ring around you.
+
+module fps_shooter.boss;
+
+use lib "c" as libc {
+    fn getenv(name: cstr): cstr;
+    fn strlen(s: cstr): int;
+}
+use j3.game;
+use j3.game.Font;
+use j3.gfx;
+use j3.gfx.{ Look, Ray };
+use j3.math.{ Vec2, Vec3, TAU, atan2, clamp, cos, max, min, sin };
+use j3.memory.Arena;
+use j3.sys.panic;
+use j3.text.cstr;
+use fps_shooter.biome;
+use fps_shooter.debug;
+use fps_shooter.bosskit;
+use fps_shooter.bosskit.{ Boss, Bosses, Hit, COLOSSUS, SAUCER, RIME, CINDER, HEARTWOOD, MARQUEE, accent, flat, flatDist, groundTop, yawTo };
+use fps_shooter.cinder;
+use fps_shooter.colossus;
+use fps_shooter.enemies;
+use fps_shooter.enemies.Enemies;
+use fps_shooter.heartwood;
+use fps_shooter.level;
+use fps_shooter.marquee;
+use fps_shooter.level.{ Box, Level, next, scan, isOpen, tileAt, LAVA };
+use fps_shooter.player;
+use fps_shooter.player.Player;
+use fps_shooter.rime;
+use fps_shooter.saucer;
+use fps_shooter.sfx;
+
+const EVERY: f32 = 240;
+/// After a boss falls, the next one waits at least this long.
+const BREATHER: f32 = 45;
+/// With the player within this of its arena it fights; beyond `DISENGAGE` it waits at home.
+const ENGAGE: f32 = 70;
+const DISENGAGE: f32 = 95;
+const DEATH_T: f32 = 2.4;
+const BANNER_T: f32 = 4.5;
+/// Health grows with the run's tier and with each boss already fought.
+const TIER_HP: f32 = 0.12;
+const FIGHT_HP: f32 = 0.25;
+/// XP in the hoard.
+const HOARD: int = 60;
+const HUB: int = 4;
+
+pub fn create(mem: &Arena): Bosses {
+    let bs = bosskit.create(mem);
+    let i = 0;
+    while i < 6 {
+        bs.squad[i].kind = 0;
+        i += 1;
+    }
+    return bs;
+}
+
+pub fn upload(bs: &Bosses, mem: &Arena) {
+    bosskit.upload(bs, mem);
+}
+
+/// A boss is up (alive or going down).
+pub fn up(bs: &Bosses): bool {
+    return bs.b.kind != 0;
+}
+
+/// The player is in a fight with it.
+pub fn fighting(bs: &Bosses): bool {
+    return bs.b.kind != 0 && bs.b.engaged && bs.b.dying <= 0;
+}
+
+/// A fresh run: no boss, the schedule from the start.
+pub fn reset(bs: &Bosses) {
+    bs.b.kind = 0;
+    bs.squadN = 0;
+    bs.keepParts = false;
+    bosskit.clearHazards(bs);
+    bs.nparts = 0;
+    bs.nextAt = EVERY;
+    bs.beaten = 0;
+    bs.fights = 0;
+    bs.bannerT = 0;
+    bs.enrageT = 0;
+    bs.glowR = 0;
+}
+
+fn baseHp(kind: int): f32 {
+    if kind == COLOSSUS { return 3600; }
+    if kind == SAUCER { return 3000; }
+    if kind == RIME { return 3800; }
+    if kind == CINDER { return 4200; }
+    if kind == HEARTWOOD { return 4000; }
+    return 3600;
+}
+
+/// The boss a biome has, or 0 (the canyon and the ruins have none).
+fn kindAt(tile: int): int {
+    if tile == HUB || tile == 1 { return COLOSSUS; }
+    if tile == 8 { return SAUCER; }
+    if tile == 0 { return RIME; }
+    if tile == 2 { return CINDER; }
+    if tile == 7 { return HEARTWOOD; }
+    if tile == 5 { return MARQUEE; }
+    return 0;
+}
+
+/// The biome whose boss is `kind`, preferring the hub for Colossus.
+fn tileOf(kind: int): int {
+    if kind == COLOSSUS { return HUB; }
+    if kind == SAUCER { return 8; }
+    if kind == RIME { return 0; }
+    if kind == CINDER { return 2; }
+    if kind == HEARTWOOD { return 7; }
+    return 5;
+}
+
+fn bitOf(kind: int): int {
+    return level.bit(kind);
+}
+
+/// Fixed order, repeating. `fights` is how many have already been brought this run.
+fn nextKind(bs: &Bosses): int {
+    let i = bs.fights % 6;
+    if i == 0 { return COLOSSUS; }
+    if i == 1 { return SAUCER; }
+    if i == 2 { return RIME; }
+    if i == 3 { return CINDER; }
+    if i == 4 { return HEARTWOOD; }
+    return MARQUEE;
+}
+
+/// Where the next boss stands: the player's open tile, or the hub when that tile is locked.
+fn hereTile(p: &Player, lvl: &Level): int {
+    let t = tileAt(p.pos.x, p.pos.z);
+    if isOpen(lvl, t) { return t; }
+    return HUB;
+}
+
+/// Standing room at x/z: a floor near y 0 that isn't lava, and nothing in the way above it.
+fn roomAt(lvl: &Level, x: f32, z: f32): bool {
+    let floor = false;
+    let s = scan(lvl, Vec3.xyz(x - 0.8, 0, z - 0.8), Vec3.xyz(x + 0.8, 0, z + 0.8));
+    let i = next(lvl, &s);
+    while i >= 0 {
+        let b = lvl.boxes[i];
+        if x + 0.8 > b.lo.x && x - 0.8 < b.hi.x && z + 0.8 > b.lo.z && z - 0.8 < b.hi.z {
+            if b.hi.y > 0.7 && b.lo.y < 5 { return false; }
+            if b.hi.y > -0.4 && b.hi.y <= 0.7 {
+                if b.kind == LAVA { return false; }
+                floor = true;
+            }
+        }
+        i = next(lvl, &s);
+    }
+    return floor;
+}
+
+/// How much standing room is within 16 m of x/z, on a 4 m lattice.
+fn room(lvl: &Level, x: f32, z: f32): int {
+    let n = 0;
+    let i = -4;
+    while i <= 4 {
+        let j = -4;
+        while j <= 4 {
+            if i * i + j * j <= 16 && roomAt(lvl, x + f32(i) * 4, z + f32(j) * 4) { n += 1; }
+            j += 1;
+        }
+        i += 1;
+    }
+    return n;
+}
+
+/// The arena for a boss in `tile`: the roomiest spot on a 12 m grid over the tile. The sky
+/// isles have no ground, so the saucer's is the crown island.
+fn arena(lvl: &Level, tile: int): Vec3 {
+    let cx = -110 + f32(tile % 3) * 110;
+    let cz = -110 + f32(tile / 3) * 110;
+    if tile == 8 { return Vec3.xyz(cx + 8, 21.5, cz + 26); }
+    let best = Vec3.xyz(cx, 0, cz);
+    let bestN = -1;
+    let i = -3;
+    while i <= 3 {
+        let j = -3;
+        while j <= 3 {
+            let x = cx + f32(i) * 12;
+            let z = cz + f32(j) * 12;
+            // Nearer the middle wins a tie.
+            let n = room(lvl, x, z) * 10 - (if i < 0 { 0 - i } else { i }) - (if j < 0 { 0 - j } else { j });
+            if n > bestN {
+                bestN = n;
+                best = Vec3.xyz(x, 0, z);
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    best.y = max(groundTop(lvl, best.x, best.z, 0.8, 1.2), 0);
+    return best;
+}
+
+/// Where it first stands: 22 m from the player toward home when the player is at the arena,
+/// else at home.
+fn entry(lvl: &Level, home: Vec3, p: &Player, kind: int): Vec3 {
+    if kind == SAUCER { return home + Vec3.xyz(0, 14, 0); }
+    if flatDist(p.pos, home) < 45 {
+        let d = flat(home - p.pos);
+        if d.length() < 1 { d = Vec3.xyz(0, 0, -1); }
+        let at = flat(p.pos) + d.normalize() * 22;
+        if roomAt(lvl, at.x, at.z) { return Vec3.xyz(at.x, max(groundTop(lvl, at.x, at.z, 0.8, 1.2), 0), at.z); }
+    }
+    return home;
+}
+
+fn beginKind(bs: &Bosses) {
+    let k = bs.b.kind;
+    if k == COLOSSUS { colossus.begin(bs); }
+    if k == SAUCER { saucer.begin(bs); }
+    if k == RIME { rime.begin(bs); }
+    if k == CINDER { cinder.begin(bs); }
+    if k == HEARTWOOD { heartwood.begin(bs); }
+    if k == MARQUEE { marquee.begin(bs); }
+}
+
+fn updateKind(bs: &Bosses, p: &Player, lvl: &Level, dt: f32) {
+    let k = bs.b.kind;
+    if k == COLOSSUS { colossus.update(bs, p, lvl, dt); }
+    if k == SAUCER { saucer.update(bs, p, lvl, dt); }
+    if k == RIME { rime.update(bs, p, lvl, dt); }
+    if k == CINDER { cinder.update(bs, p, lvl, dt); }
+    if k == HEARTWOOD { heartwood.update(bs, p, lvl, dt); }
+    if k == MARQUEE { marquee.update(bs, p, lvl, dt); }
+}
+
+fn drawKind(bs: &Bosses) {
+    let k = bs.b.kind;
+    if k == COLOSSUS { colossus.draw(bs); }
+    if k == SAUCER { saucer.draw(bs); }
+    if k == RIME { rime.draw(bs); }
+    if k == CINDER { cinder.draw(bs); }
+    if k == HEARTWOOD { heartwood.draw(bs); }
+    if k == MARQUEE { marquee.draw(bs); }
+}
+
+/// Bring a boss of `kind` in `tile`.
+fn spawn(bs: &Bosses, p: &Player, lvl: &Level, e: &Enemies, kind: int, tile: int) {
+    let home = arena(lvl, tile);
+    let hp = baseHp(kind) * (1 + TIER_HP * f32(e.tier - 1) + FIGHT_HP * f32(bs.fights));
+    let at = entry(lvl, home, p, kind);
+    bs.b = Boss { kind: kind, tile: tile, home: home, pos: at, vel: Vec3.zero(), yaw: yawTo(at, p.pos), hp: hp, maxHp: hp,
+        from: at, aim: at, dir: Vec3.xyz(0, 0, -1), engaged: flatDist(p.pos, home) < ENGAGE };
+    let i = 0;
+    while i < bosskit.MAX_SUBS {
+        bs.sub[i] = 0;
+        bs.subOn[i] = false;
+        i += 1;
+    }
+    bs.fights += 1;
+    bs.chip = 1;
+    bs.bannerT = BANNER_T;
+    beginKind(bs);
+    sfx.play(sfx.HORN);
+}
+
+fn stash(bs: &Bosses, slot: int) {
+    bs.squad[slot] = bs.b;
+    let s = 0;
+    while s < bosskit.MAX_SUBS {
+        bs.subSave[slot * bosskit.MAX_SUBS + s] = bs.sub[s];
+        bs.subOnSave[slot * bosskit.MAX_SUBS + s] = bs.subOn[s];
+        s += 1;
+    }
+}
+
+fn recall(bs: &Bosses, slot: int) {
+    bs.b = bs.squad[slot];
+    bs.active = slot;
+    let s = 0;
+    while s < bosskit.MAX_SUBS {
+        bs.sub[s] = bs.subSave[slot * bosskit.MAX_SUBS + s];
+        bs.subOn[s] = bs.subOnSave[slot * bosskit.MAX_SUBS + s];
+        s += 1;
+    }
+}
+
+/// `kinds` bosses in a ring around the player. Debug only.
+fn spawnPack(bs: &Bosses, p: &Player, lvl: &Level, e: &Enemies, kinds: []int, n: int) {
+    lvl.open = 511;
+    level.setGates(lvl);
+    let tile = hereTile(p, lvl);
+    let i = 0;
+    while i < n {
+        spawn(bs, p, lvl, e, kinds[i], tile);
+        let ang = f32(i) * TAU / f32(n);
+        let home = Vec3.xyz(p.pos.x + cos(ang) * 22, 0, p.pos.z + sin(ang) * 22);
+        let y = groundTop(lvl, home.x, home.z, 1.6, 40);
+        if y < -50 { y = p.pos.y; }
+        home.y = y;
+        bs.b.home = home;
+        bs.b.pos = home;
+        bs.b.aim = home;
+        bs.b.yaw = yawTo(home, p.pos);
+        bs.b.engaged = true;
+        beginKind(bs);
+        stash(bs, i);
+        i += 1;
+    }
+    bs.squadN = n;
+    bs.preview = 0;
+    recall(bs, 0);
+}
+
+fn updatePack(bs: &Bosses, p: &Player, lvl: &Level, e: &Enemies, dt: f32): bool {
+    bs.keepParts = false;
+    let i = 0;
+    let living = 0;
+    let first = -1;
+    let lastKind = COLOSSUS;
+    let lastPos = p.pos;
+    while i < bs.squadN {
+        if bs.squad[i].kind == 0 { i += 1; continue; }
+        recall(bs, i);
+        let b = &bs.b;
+        b.flash -= dt;
+        b.cue = false;
+        b.engaged = true;
+        b.intro = max(b.intro - dt, 0);
+        if b.dying > 0 {
+            b.dying -= dt;
+            if b.dying <= 0 {
+                lastKind = b.kind;
+                lastPos = b.pos;
+                b.kind = 0;
+            } else { dyingFx(bs); }
+        } else if b.hp <= 0 {
+            b.hp = 0;
+            b.dying = DEATH_T;
+            b.open = 0;
+            sfx.at(sfx.ROAR, b.pos);
+        } else {
+            if !b.phase2 && b.hp < b.maxHp * 0.5 {
+                b.phase2 = true;
+                sfx.at(sfx.ROAR, b.pos);
+            }
+            updateKind(bs, p, lvl, dt);
+            if b.pos.y < -40 { b.pos = b.home; }
+        }
+        if b.kind != 0 {
+            living += 1;
+            if first < 0 { first = i; }
+        }
+        stash(bs, i);
+        bs.keepParts = true;
+        i += 1;
+    }
+    bosskit.hazards(bs, p, lvl, dt);
+    e.calm = living > 0;
+    if living == 0 {
+        bs.squadN = 0;
+        bs.keepParts = false;
+        bosskit.clearHazards(bs);
+        bs.b.kind = lastKind;
+        bs.b.pos = lastPos;
+        finale(bs, p, e);
+        return true;
+    }
+    recall(bs, first);
+    let frac = bs.b.hp / bs.b.maxHp;
+    bs.chipT -= dt;
+    if bs.chip < frac { bs.chip = frac; }
+    if bs.chipT <= 0 { bs.chip = max(frac, bs.chip - dt * 0.5); }
+    if bs.watch { watch(bs, p); }
+    return false;
+}
+
+/// The fight's frame: the schedule, the boss's own update, its hazards. True once a boss has
+/// fallen and its reward should be offered.
+pub fn update(bs: &Bosses, p: &Player, lvl: &Level, e: &Enemies, dt: f32): bool {
+    bs.bannerT -= dt;
+    bs.enrageT -= dt;
+    if bs.squadN > 1 { return updatePack(bs, p, lvl, e, dt); }
+    let b = &bs.b;
+    if b.kind == 0 {
+        let due = e.time >= bs.nextAt && e.restT <= 0;
+        if bs.preview > 0 && bs.fights == 0 { due = true; }
+        if due {
+            let tile = hereTile(p, lvl);
+            let kind = nextKind(bs);
+            if bs.preview > 0 && bs.fights == 0 {
+                kind = bs.preview;
+                tile = tileOf(kind);
+            }
+            spawn(bs, p, lvl, e, kind, tile);
+            bs.nextAt += EVERY;
+        }
+        bosskit.hazards(bs, p, lvl, dt);
+        e.calm = false;
+        return false;
+    }
+    let away = flatDist(p.pos, b.home);
+    if away < ENGAGE { b.engaged = true; }
+    if away > DISENGAGE { b.engaged = false; }
+    e.calm = fighting(bs);
+    b.intro = max(b.intro - dt, 0);
+    b.flash -= dt;
+    b.cue = false;
+    if b.dying > 0 {
+        b.dying -= dt;
+        dyingFx(bs);
+        bosskit.hazards(bs, p, lvl, dt);
+        if b.dying <= 0 {
+            finale(bs, p, e);
+            return true;
+        }
+        return false;
+    }
+    if b.hp <= 0 {
+        b.hp = 0;
+        b.dying = DEATH_T;
+        b.open = 0;
+        bosskit.clearHazards(bs);
+        sfx.at(sfx.ROAR, b.pos);
+        return false;
+    }
+    if !b.phase2 && b.hp < b.maxHp * 0.5 {
+        b.phase2 = true;
+        bs.enrageT = 2.5;
+        sfx.at(sfx.ROAR, b.pos);
+    }
+    updateKind(bs, p, lvl, dt);
+    bosskit.hazards(bs, p, lvl, dt);
+    let frac = b.hp / b.maxHp;
+    bs.chipT -= dt;
+    if bs.chip < frac { bs.chip = frac; }
+    if bs.chipT <= 0 { bs.chip = max(frac, bs.chip - dt * 0.5); }
+    // Lost in a pit: back home.
+    if b.pos.y < -40 { b.pos = b.home; }
+    if bs.watch { watch(bs, p); }
+    return false;
+}
+
+/// Screenshot mode: look at the boss, and don't die.
+fn watch(bs: &Bosses, p: &Player) {
+    let eye = p.pos + Vec3.xyz(0, 1.6, 0);
+    let d = middle(bs) - eye;
+    p.yaw = atan2(d.x, 0 - d.z);
+    p.pitch = atan2(d.y, flat(d).length());
+    p.hp = 100;
+}
+
+/// Going down: shaking, smoking, bursting.
+fn dyingFx(bs: &Bosses) {
+    let b = &bs.b;
+    b.flash = if sin(b.dying * 30) > 0.3 { 0.05 } else { 0 };
+    if bs.fxRng.unit() < 0.35 && bs.nparts > 0 {
+        let q = bs.parts[bs.fxRng.intRange(0, bs.nparts)];
+        let at = q.at + Vec3.xyz(bs.fxRng.unit() - 0.5, bs.fxRng.unit() - 0.5, bs.fxRng.unit() - 0.5) * (q.r * 1.5);
+        bosskit.burst(bs, at, 8, 7, accent(b.kind), accent(b.kind) * 1.5);
+        bosskit.smoke(bs, at, 2, 1, Vec3.xyz(0.3, 0.3, 0.32), Vec3.zero());
+        if bs.fxRng.unit() < 0.4 { sfx.at(sfx.BOOM, at); }
+    }
+    bs.shake = max(bs.shake, 0.012);
+}
+
+/// The last blast, the hoard, and the run's record of it.
+fn finale(bs: &Bosses, p: &Player, e: &Enemies) {
+    let b = &bs.b;
+    let mid = b.pos + Vec3.xyz(0, 2.5, 0);
+    if b.kind == SAUCER { mid = b.pos; }
+    bosskit.burst(bs, mid, 60, 16, accent(b.kind), accent(b.kind) * 2);
+    bosskit.burst(bs, mid, 30, 10, Vec3.xyz(1, 1, 0.8), Vec3.xyz(2, 2, 1.5));
+    bosskit.smoke(bs, mid, 14, 5, Vec3.xyz(0.35, 0.35, 0.38), Vec3.zero());
+    sfx.at(sfx.BOOM, mid);
+    sfx.play(sfx.UNLOCK);
+    bs.shake = max(bs.shake, 0.06);
+    // The saucer's over the void as often as not: its hoard rains down on the player instead.
+    let drop = mid;
+    if b.kind == MARQUEE { drop = Vec3.xyz(b.pos.x, b.home.y + 2, b.pos.z); }
+    if b.kind == SAUCER { drop = p.pos + Vec3.xyz(0, 3, 0); }
+    enemies.reward(e, drop, HOARD);
+    bs.beaten += bitOf(b.kind);
+    bs.nextAt = max(bs.nextAt, e.time + BREATHER);
+    b.kind = 0;
+    bs.nparts = 0;
+    bs.glowR = 0;
+}
+
+// ---- What the weapons use ----
+
+/// The boss part along `r` closer than `reach`, if any.
+pub fn ray(bs: &Bosses, r: Ray, reach: f32): Hit {
+    return bosskit.ray(bs, r, reach);
+}
+
+/// Part `part` takes `dmg` at `at`. Counts as a hit for the combo.
+pub fn damage(bs: &Bosses, e: &Enemies, part: int, dmg: f32, at: Vec3) {
+    if bs.squadN > 1 && part >= 0 && part < bs.nparts {
+        let who = bs.partBoss[part];
+        let back = bs.active;
+        if who != back && who >= 0 && who < bs.squadN {
+            stash(bs, back);
+            recall(bs, who);
+            let struck = bosskit.wound(bs, part, dmg, at);
+            stash(bs, who);
+            recall(bs, back);
+            if struck > 0 {
+                e.hits += 1;
+                e.hitT = 0.12;
+            }
+            return;
+        }
+    }
+    let dealt = bosskit.wound(bs, part, dmg, at);
+    if dealt > 0 {
+        e.hits += 1;
+        e.hitT = 0.12;
+    }
+}
+
+/// An explosion at `at`: the part nearest it takes `dmg`, less toward the edge of `radius`.
+pub fn blast(bs: &Bosses, e: &Enemies, at: Vec3, radius: f32, dmg: f32) {
+    let i = bosskit.nearest(bs, at, radius);
+    if i < 0 { return; }
+    let q = bs.parts[i];
+    let far = max((q.at - at).length() - q.r, 0);
+    damage(bs, e, i, dmg * (1 - far / radius * 0.6), q.at + (at - q.at).normalize() * q.r);
+}
+
+/// A part within `reach` of `at` in front of `dir` (a knife swing), or -1.
+pub fn near(bs: &Bosses, at: Vec3, dir: Vec3, reach: f32): int {
+    let i = bosskit.nearest(bs, at, reach);
+    if i < 0 { return -1; }
+    let to = bs.parts[i].at - at;
+    if to.length() > bs.parts[i].r && to.normalize().dot(dir) < 0.2 { return -1; }
+    return i;
+}
+
+/// Whether homing shots and helpers can go for it, and where to.
+pub fn targetable(bs: &Bosses): bool {
+    return bs.b.kind != 0 && bs.b.dying <= 0 && bs.nparts > 0;
+}
+
+pub fn aimPoint(bs: &Bosses): Vec3 {
+    return bosskit.aimPoint(bs);
+}
+
+/// The middle of the boss, for distance checks.
+pub fn middle(bs: &Bosses): Vec3 {
+    if bs.nparts > 0 { return bs.parts[0].at; }
+    return bs.b.pos;
+}
+
+// ---- Drawing ----
+
+/// Before either pass: the boss's boxes and every hazard.
+fn drawOne(bs: &Bosses) {
+    if bs.b.kind == 0 { return; }
+    bosskit.refreshEdge(bs);
+    let b = &bs.b;
+    let sink: f32 = 0;
+    if b.dying > 0 && b.kind != SAUCER { sink = (1 - b.dying / DEATH_T) * 1.2; }
+    b.pos.y -= sink;
+    drawKind(bs);
+    b.pos.y += sink;
+}
+
+pub fn prepare(bs: &Bosses) {
+    bosskit.begin(bs);
+    if bs.squadN > 1 {
+        let focus = bs.active;
+        bs.keepParts = false;
+        let i = 0;
+        while i < bs.squadN {
+            recall(bs, i);
+            drawOne(bs);
+            stash(bs, i);
+            bs.keepParts = true;
+            i += 1;
+        }
+        recall(bs, focus);
+    } else { drawOne(bs); }
+    bosskit.drawHazards(bs);
+}
+
+pub fn draw(bs: &Bosses) {
+    bosskit.draw(bs);
+}
+
+pub fn drawBlended(bs: &Bosses) {
+    bosskit.drawBlended(bs);
+}
+
+/// Its light (slot 6), before the camera pass.
+pub fn lights(bs: &Bosses) {
+    if bs.b.kind == 0 || bs.glowR <= 0 {
+        gfx.light(6, Vec3.zero(), Vec3.zero(), 0);
+        return;
+    }
+    gfx.light(6, bs.glowAt, bs.glowColor, bs.glowR);
+}
+
+// ---- Hud ----
+
+fn rect(x: f32, y: f32, w: f32, h: f32) {
+    game.drawRect(Vec2 { x: x, y: y }, Vec2 { x: w, y: h });
+}
+
+fn tone(c: Vec3, a: f32) {
+    game.setColor(game.rgba(u8(clamp(c.x, 0, 1) * 255), u8(clamp(c.y, 0, 1) * 255), u8(clamp(c.z, 0, 1) * 255), u8(clamp(a, 0, 1) * 255)));
+}
+
+fn centered(font: Font, cx: f32, y: f32, msg: string) {
+    let t = game.textSize(font, msg);
+    game.drawText(font, Vec2 { x: cx - t.x * 0.5, y: y }, msg);
+}
+
+/// Shadowed text centred on `cx`.
+fn shout(font: Font, cx: f32, y: f32, msg: string, c: Vec3, a: f32) {
+    let t = game.textSize(font, msg);
+    tone(Vec3.xyz(0.04, 0.04, 0.08), a * 0.7);
+    game.drawText(font, Vec2 { x: cx - t.x * 0.5 + 2, y: y + 2 }, msg);
+    tone(c, a);
+    game.drawText(font, Vec2 { x: cx - t.x * 0.5, y: y }, msg);
+}
+
+fn weakHint(kind: int): string {
+    if kind == COLOSSUS { return "SHOOT THE FURNACE MOUTH"; }
+    if kind == SAUCER { return "REACTOR EXPOSED"; }
+    if kind == RIME { return "CORE EXPOSED"; }
+    if kind == CINDER { return "VENTS OPEN"; }
+    if kind == HEARTWOOD { return "HEART EXPOSED"; }
+    return "HEAD LOWERED";
+}
+
+/// The boss bar across the top, its entrance and phase banners, a weak-point marker at the
+/// crosshair, and a pointer to it when it's away.
+pub fn hud(bs: &Bosses, p: &Player, font: Font, big: Font) {
+    let b = bs.b;
+    let sz = game.windowSize();
+    let cx = sz.x * 0.5;
+    if b.kind == 0 { return; }
+    let c = accent(b.kind);
+    if bs.bannerT > 0 {
+        let a = clamp(bs.bannerT / 0.8, 0, 1) * clamp((BANNER_T - bs.bannerT) / 0.3, 0, 1);
+        let y = sz.y * 0.3;
+        shout(font, cx, y - 26, "A BOSS APPROACHES", Vec3.xyz(0.9, 0.9, 0.95), a);
+        shout(big, cx, y, bosskit.name(b.kind), c, a);
+        shout(font, cx, y + 50, bosskit.title(b.kind), Vec3.xyz(0.85, 0.85, 0.9), a);
+        if !b.engaged { shout(font, cx, y + 74, `IN {biome.name(b.tile)}`, Vec3.xyz(1, 0.85, 0.4), a); }
+    }
+    if bs.enrageT > 0 && b.dying <= 0 {
+        let fade = clamp(bs.enrageT / 0.6, 0, 1);
+        shout(big, cx, sz.y * 0.36, "ENRAGED", Vec3.xyz(1, 0.25, 0.2), fade);
+    }
+    // The bar, with a notch at the phase-two half and the recent damage trailing in white.
+    let w = min(sz.x * 0.5, 640);
+    let x = cx - w * 0.5;
+    let top: f32 = 40;
+    let frac = clamp(b.hp / b.maxHp, 0, 1);
+    tone(Vec3.xyz(0.08, 0.09, 0.14), 0.75);
+    rect(x - 4, top - 4, w + 8, 22);
+    tone(Vec3.xyz(1, 1, 1), 0.85);
+    rect(x, top, w * bs.chip, 14);
+    let fill = c;
+    if b.phase2 { fill = Vec3.xyz(1, 0.25 + 0.1 * sin(bs.clock * 6), 0.2); }
+    tone(fill, 1);
+    rect(x, top, w * frac, 14);
+    tone(Vec3.xyz(0.05, 0.05, 0.08), 0.9);
+    rect(x + w * 0.5 - 1, top - 2, 2, 18);
+    shout(font, cx, top - 26, bosskit.name(b.kind), c, 1);
+    if b.cue {
+        let pulse = 0.65 + 0.35 * sin(bs.clock * 10);
+        shout(font, cx, top + 22, weakHint(b.kind), Vec3.xyz(1, 0.85, 0.3), pulse);
+    }
+    // Away from it: a pointer on a ring round the crosshair, and how far.
+    let far = flatDist(p.pos, b.pos);
+    if far > 30 {
+        let view = Look.create(p.pos, p.yaw, 0);
+        let d = b.pos - p.pos;
+        let fwd = view.forward();
+        let side = view.right();
+        let ang = atan2(d.x * side.x + d.z * side.z, d.x * fwd.x + d.z * fwd.z);
+        let ring: f32 = 118;
+        let px = cx + sin(ang) * ring;
+        let py = sz.y * 0.5 - cos(ang) * ring;
+        let k = 0;
+        while k < 4 {
+            let rr = ring + f32(k) * 6;
+            let half = 7 - f32(k) * 1.5;
+            tone(Vec3.xyz(0.04, 0.04, 0.08), 0.6);
+            rect(cx + sin(ang) * rr - half - 1.5, sz.y * 0.5 - cos(ang) * rr - half - 1.5, half * 2 + 3, half * 2 + 3);
+            tone(c, 0.95);
+            rect(cx + sin(ang) * rr - half, sz.y * 0.5 - cos(ang) * rr - half, half * 2, half * 2);
+            k += 1;
+        }
+        tone(c, 0.95);
+        centered(font, px, py + 14, `{int(far)} m`);
+        shout(font, cx + w * 0.5 + 60, top - 3, `{int(far)} m`, c, 0.9);
+    }
+    // A weak-point hit: a bigger gold marker.
+    if bs.critT > 0 {
+        tone(Vec3.xyz(1, 0.7, 0.15), clamp(bs.critT / 0.15, 0, 1));
+        let n = 0;
+        while n < 5 {
+            let dd = 10 + f32(k) * 2.5;
+            let my = sz.y * 0.5;
+            rect(cx - dd - 2, my - dd - 2, 4, 4);
+            rect(cx + dd - 2, my - dd - 2, 4, 4);
+            rect(cx - dd - 2, my + dd - 2, 4, 4);
+            rect(cx + dd - 2, my + dd - 2, 4, 4);
+            n += 1;
+        }
+    }
+}
+
+/// The performance harness: the boss of the tile the route is in (Colossus where there's none),
+/// fighting the player there. A new tile brings its own, entrance and all.
+pub fn benchmark(bs: &Bosses, p: &Player, lvl: &Level, e: &Enemies, dt: f32) {
+    let tile = tileAt(p.pos.x, p.pos.z);
+    let kind = kindAt(tile);
+    if kind == 0 { kind = COLOSSUS; }
+    if bs.b.kind != kind || bs.b.tile != tile {
+        bosskit.clearHazards(bs);
+        bs.b.kind = 0;
+        spawn(bs, p, lvl, e, kind, tile);
+    }
+    // Health never runs out, and it never waits at home.
+    bs.b.hp = bs.b.maxHp * 0.6;
+    bs.b.engaged = true;
+    updateKind(bs, p, lvl, dt);
+    bosskit.hazards(bs, p, lvl, dt);
+    if bs.b.phase2 == false { bs.b.phase2 = true; }
+}
+
+// ---- Preview ----
+
+fn env(name: string): string {
+    let raw = libc.getenv(cstr(name));
+    if raw == 0 { return ""; }
+    return []u8 { ptr: raw as &u8, len: libc.strlen(raw) } as string;
+}
+
+fn same(a: string, b: string): bool {
+    if a.len != b.len { return false; }
+    let i = 0;
+    while i < a.len { if a[i] != b[i] { return false; } i += 1; }
+    return true;
+}
+
+/// A boss kind named by `s` (its name in lower case, or 1-6), or 0.
+pub fn kindNamed(s: string): int {
+    if same(s, "colossus") || same(s, "1") { return COLOSSUS; }
+    if same(s, "saucer") || same(s, "2") { return SAUCER; }
+    if same(s, "rime") || same(s, "3") { return RIME; }
+    if same(s, "cinder") || same(s, "4") { return CINDER; }
+    if same(s, "heartwood") || same(s, "5") { return HEARTWOOD; }
+    if same(s, "marquee") || same(s, "6") { return MARQUEE; }
+    return 0;
+}
+
+fn placeSingle(bs: &Bosses, p: &Player, lvl: &Level, kind: int) {
+    bs.preview = kind;
+    lvl.open = 511;
+    level.setGates(lvl);
+    let home = arena(lvl, tileOf(kind));
+    let at = home + Vec3.xyz(3, 0, 3);
+    if kind != SAUCER {
+        // The roomiest of eight spots 22 m out.
+        let bestN = -1;
+        let k = 0;
+        while k < 8 {
+            let a = f32(k) * 0.785;
+            let x = home.x + sin(a) * 22;
+            let z = home.z + cos(a) * 22;
+            let n = room(lvl, x, z);
+            if roomAt(lvl, x, z) && n > bestN {
+                bestN = n;
+                at = Vec3.xyz(x, max(groundTop(lvl, x, z, 0.3, 1.2), 0), z);
+            }
+            k += 1;
+        }
+    }
+    p.pos = at;
+    p.spawn = at;
+    p.safe = at;
+    p.yaw = atan2(home.x - at.x, 0 - (home.z - at.z));
+    p.spawnYaw = p.yaw;
+}
+
+/// `bosses` (several names) spawns that pack around the player. One name, or `boss`, stands
+/// the player at that arena the way `J3_FPS_BOSS` does. A set string wins over the env var.
+pub fn preview(bs: &Bosses, p: &Player, lvl: &Level, e: &Enemies, mem: &Arena, bosses: string, bossName: string, watch: string) {
+    bs.watch = same(debug.pick(watch, env("J3_FPS_BOSS_WATCH")), "1");
+    if bosses.len > 0 {
+        let kinds = mem.alloc::<int>(6);
+        let n = 0;
+        let at = 0;
+        while n < 6 && at < bosses.len {
+            let bit = debug.piece(mem, bosses, at);
+            at = bit.next;
+            if bit.name.len == 0 { break; }
+            let k = kindNamed(bit.name);
+            if k != 0 {
+                kinds[n] = k;
+                n += 1;
+            }
+        }
+        if n > 1 {
+            spawnPack(bs, p, lvl, e, kinds, n);
+            return;
+        }
+        if n == 1 {
+            placeSingle(bs, p, lvl, kinds[0]);
+            return;
+        }
+    }
+    let kind = kindNamed(debug.pick(bossName, env("J3_FPS_BOSS")));
+    if kind == 0 { return; }
+    placeSingle(bs, p, lvl, kind);
+}
+
+// ---- Checks ----
+
+/// A flat test floor: Colossus comes on schedule, its landing marks and hurts, its wave can be
+/// jumped, its mouth is the weak point only while open, and its death clears the hazards and
+/// asks for the reward.
+pub fn selfCheck(mem: &Arena) {
+    let lvl = level.empty(mem, 1, 0);
+    lvl.count = 1;
+    lvl.boxes[0] = Box { lo: Vec3.xyz(-165, -1, -165), hi: Vec3.xyz(165, 0, 165), launch: 0, kind: level.SOLID };
+    level.index(&lvl, mem);
+    let p = player.create(&lvl);
+    p.pos = Vec3.xyz(0, 0, 20);
+    p.onGround = true;
+    let e = enemies.create(mem);
+    let bs = create(mem);
+    e.time = EVERY - 0.01;
+    e.restT = 0;
+    update(&bs, &p, &lvl, &e, 0.016);
+    if up(&bs) { panic("boss check: came early"); }
+    e.time = EVERY;
+    update(&bs, &p, &lvl, &e, 0.016);
+    if bs.b.kind != COLOSSUS { panic("boss check: no colossus in the hub"); }
+    if bs.nextAt != EVERY * 2 { panic("boss check: schedule"); }
+    let marked = false;
+    let m = 0;
+    while m < bs.marks.len { if bs.marks[m].live { marked = true; } m += 1; }
+    if !marked { panic("boss check: entrance landing unmarked"); }
+    // Stand on the landing spot: the drop hurts.
+    p.pos = bs.b.aim;
+    p.hp = 100;
+    p.hurtT = 10;
+    let t = 0;
+    while t < 200 && bs.b.intro > 0 {
+        update(&bs, &p, &lvl, &e, 0.016);
+        p.pos = bs.b.aim;
+        t += 1;
+    }
+    update(&bs, &p, &lvl, &e, 0.016);
+    if p.hp >= 100 { panic("boss check: landing didn't hurt"); }
+    // The wave: jumping over it is safe, standing in it is not.
+    let w = 0;
+    while w < bs.waves.len && !bs.waves[w].live { w += 1; }
+    if w == bs.waves.len { panic("boss check: no shockwave"); }
+    let mid = bs.waves[w].at;
+    p.pos = mid + Vec3.xyz(0, 1.5, 12);
+    p.hp = 100;
+    p.hurtT = 10;
+    t = 0;
+    while t < 80 { bosskit.hazards(&bs, &p, &lvl, 0.016); p.pos = mid + Vec3.xyz(0, 1.5, 12); t += 1; }
+    if p.hp < 100 { panic("boss check: jumped wave still hit"); }
+    bosskit.wave(&bs, mid, 17, 38, 0.9, 22, Vec3.xyz(1, 0, 0));
+    p.pos = mid + Vec3.xyz(0, 0, 12);
+    t = 0;
+    while t < 80 { bosskit.hazards(&bs, &p, &lvl, 0.016); p.pos = mid + Vec3.xyz(0, 0, 12); t += 1; }
+    if p.hp >= 100 { panic("boss check: standing in the wave was safe"); }
+    // The mouth: plain while shut, heavy while open.
+    bs.b.intro = 0;
+    bs.b.open = 0;
+    bs.b.openTo = 0;
+    colossus.update(&bs, &p, &lvl, 0.001);
+    if bs.parts[0].mult > 1.01 { panic("boss check: closed mouth is weak"); }
+    bs.b.openTo = 1;
+    bs.b.open = 1;
+    colossus.update(&bs, &p, &lvl, 0.001);
+    let before = bs.b.hp;
+    damage(&bs, &e, 0, 10, bs.parts[0].at);
+    if before - bs.b.hp < 30 { panic("boss check: open mouth isn't weak"); }
+    // Standing on it: the next hop goes sideways, not straight up and down.
+    bs.b.engaged = true;
+    bs.b.state = colossus.CROUCH;
+    bs.b.len = 0.01;
+    bs.b.t = 0.02;
+    bs.b.step = 0;
+    p.pos = bs.b.pos + Vec3.xyz(1, 0, 0);
+    let feet = bs.b.pos;
+    colossus.update(&bs, &p, &lvl, 0.02);
+    if flatDist(bs.b.aim, feet) < 2 { panic("boss check: hop in place"); }
+    // Shots at it from in front hit it.
+    let front = bs.parts[1].at + bosskit.forward(bs.b.yaw) * 20;
+    let hit = ray(&bs, Ray { origin: front, dir: (bs.parts[1].at - front).normalize() }, 100);
+    if hit.part < 0 { panic("boss check: ray missed"); }
+    // Death: hazards gone, reward asked for once the fall is over.
+    bosskit.wave(&bs, mid, 17, 38, 0.9, 22, Vec3.xyz(1, 0, 0));
+    bs.b.hp = 1;
+    damage(&bs, &e, 1, 1000, bs.parts[1].at);
+    update(&bs, &p, &lvl, &e, 0.016);
+    let any = false;
+    w = 0;
+    while w < bs.waves.len { if bs.waves[w].live { any = true; } w += 1; }
+    if any || bs.b.dying <= 0 { panic("boss check: death didn't clear hazards"); }
+    let rewarded = false;
+    t = 0;
+    while t < 400 && !rewarded { rewarded = update(&bs, &p, &lvl, &e, 0.016); t += 1; }
+    if !rewarded || up(&bs) { panic("boss check: no reward"); }
+    if (bs.beaten / bitOf(COLOSSUS)) % 2 != 1 { panic("boss check: not marked beaten"); }
+    // Only the hub is open, and Colossus just fell: the next is still the Saucer.
+    lvl.open = 16;
+    if nextKind(&bs) != SAUCER { panic("boss check: order skipped the saucer"); }
+    let kind = COLOSSUS;
+    while kind <= MARQUEE {
+        soak(mem, &lvl, kind);
+        kind += 1;
+    }
+}
+
+/// Rime charging with one of its ice blocks between it and the player: the block breaks, a
+/// shard goes, and it's down with its core open.
+fn bait(bs: &Bosses, p: &Player, lvl: &Level, e: &Enemies) {
+    let b = &bs.b;
+    let shards = b.armor;
+    p.pos = Vec3.xyz(b.pos.x + 20, b.pos.y, b.pos.z);
+    p.vel = Vec3.zero();
+    bosskit.clearHazards(bs);
+    bosskit.chunk(bs, Vec3.xyz(b.pos.x + 10, b.pos.y, b.pos.z), 1.1, 2.4, 11);
+    // Skating, its time up, with a charge next.
+    b.state = rime.SKATING;
+    b.t = 100;
+    b.cycle = 1;
+    let down = false;
+    let t = 0;
+    while t < 400 && !down {
+        p.hp = 100;
+        update(bs, p, lvl, e, 0.016);
+        p.pos = Vec3.xyz(b.pos.x + 20, b.pos.y, b.pos.z);
+        if b.cue { down = true; }
+        t += 1;
+    }
+    if !down { panic("boss check: rime baited into its ice didn't fall"); }
+    if b.armor != shards - 1 { panic("boss check: rime's shard didn't break"); }
+}
+
+/// A minute against each boss with the player circling its arena, then the same at half
+/// health: it must attack, open its weak point, stay by its arena, and fall to enough damage.
+fn soak(mem: &Arena, lvl: &Level, kind: int) {
+    let p = player.create(lvl);
+    let e = enemies.create(mem);
+    let bs = create(mem);
+    lvl.open = 511;
+    bs.preview = kind;
+    e.restT = 0;
+    update(&bs, &p, lvl, &e, 0.016);
+    if bs.b.kind != kind { panic("boss check: preview kind"); }
+    let home = bs.b.home;
+    let hazards = 0;
+    let cues = 0;
+    let t = 0;
+    while t < 7200 {
+        let a = f32(t) * 0.016 * 0.55;
+        p.pos = Vec3.xyz(home.x + cos(a) * 14, 0, home.z + sin(a) * 14);
+        p.vel = Vec3.xyz(0 - sin(a), 0, cos(a)) * 7.7;
+        p.onGround = true;
+        p.hp = 100;
+        p.hurtT += 0.016;
+        if t == 3600 { bs.b.hp = bs.b.maxHp * 0.45; }
+        // Chip at a random part now and then, as a player shooting would: growths and knee
+        // lights break, which some weak points need.
+        if t % 20 == 0 && bs.nparts > 0 && bs.b.intro <= 0 {
+            let q = bs.rng.intRange(0, bs.nparts);
+            damage(&bs, &e, q, 5, bs.parts[q].at);
+        }
+        update(&bs, &p, lvl, &e, 0.016);
+        if bs.b.cue { cues += 1; }
+        let i = 0;
+        while i < bs.marks.len { if bs.marks[i].live { hazards += 1; } i += 1; }
+        i = 0;
+        while i < bs.waves.len { if bs.waves[i].live { hazards += 1; } i += 1; }
+        i = 0;
+        while i < bs.projs.len { if bs.projs[i].live { hazards += 1; } i += 1; }
+        i = 0;
+        while i < bs.beams.len { if bs.beams[i].live { hazards += 1; } i += 1; }
+        i = 0;
+        while i < bs.roots.len { if bs.roots[i].live { hazards += 1; } i += 1; }
+        let at = bs.b.pos;
+        if !(at.x == at.x) || !(at.y == at.y) || flatDist(at, home) > 70 || at.y < -45 || at.y > 80 {
+            panic(`boss check: {bosskit.name(kind)} wandered off`);
+        }
+        t += 1;
+    }
+    if hazards == 0 { panic(`boss check: {bosskit.name(kind)} never attacked`); }
+    if kind == RIME { bait(&bs, &p, lvl, &e); }
+    else if cues == 0 { panic(`boss check: {bosskit.name(kind)} never opened up`); }
+    if !bs.b.phase2 { panic(`boss check: {bosskit.name(kind)} no phase two`); }
+    let done = false;
+    t = 0;
+    while t < 600 && !done {
+        if bs.nparts > 0 { damage(&bs, &e, 0, 500, bs.parts[0].at); }
+        done = update(&bs, &p, lvl, &e, 0.016);
+        t += 1;
+    }
+    if !done { panic(`boss check: {bosskit.name(kind)} wouldn't fall`); }
+}

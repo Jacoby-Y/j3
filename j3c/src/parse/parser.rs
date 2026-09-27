@@ -175,6 +175,12 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Const if !vis_pub => Ok(Item::Const(self.const_item(false, doc)?)),
             TokenKind::Fn => Ok(Item::Fn(self.fn_item(vis_pub, doc)?)),
+            TokenKind::Struct => Ok(Item::Struct(self.struct_item(vis_pub, false, doc)?)),
+            TokenKind::Enum => Ok(Item::Enum(self.enum_item(
+                vis_pub,
+                ItemAttrs { debug: false, try_catch: None, singleton: false },
+                doc,
+            )?)),
             TokenKind::Ident if !vis_pub && self.cur().text == SCRIPT_PROPS => {
                 self.forbid_doc(&doc)?;
                 Ok(Item::Props(self.script_block(SCRIPT_PROPS)?))
@@ -187,7 +193,9 @@ impl<'a> Parser<'a> {
                 self.forbid_doc(&doc)?;
                 Ok(Item::State(self.script_let()?))
             }
-            _ => Err(self.err("scripts allow only `use`, `const`, `props`, `shared`, `let`, and `fn` at top level")),
+            _ => Err(self.err(
+                "scripts allow only `use`, `const`, `props`, `shared`, `let`, `fn`, `struct`, and `enum` at top level",
+            )),
         }
     }
 
