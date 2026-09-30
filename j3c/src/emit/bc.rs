@@ -1489,7 +1489,7 @@ impl<'a> Codegen<'a> {
                     self.aggregate_into(dst, rvalue)?;
                 }
             }
-            StmtKind::Abort => {
+            StmtKind::Abort(_) => {
                 self.push(Instr::new(Op::Abort, NO_REG, NO_REG, NO_REG, 0));
             }
             StmtKind::Div0 => {
@@ -1947,7 +1947,7 @@ fn walk_block(block: &Block, f: &mut dyn FnMut(&Place, bool)) {
                     }
                 }
             }
-            StmtKind::Break | StmtKind::Continue | StmtKind::Abort | StmtKind::Div0 => {}
+            StmtKind::Break | StmtKind::Continue | StmtKind::Abort(_) | StmtKind::Div0 => {}
         }
     }
 }

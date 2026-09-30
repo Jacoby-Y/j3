@@ -79,6 +79,7 @@ pub(crate) struct ConstVal {
 pub(crate) enum ConstPayload {
     Int(i64),
     Float(f64),
+    Bool(bool),
     String(Vec<u8>),
 }
 
@@ -140,6 +141,7 @@ pub fn check_files_lib(files: Vec<ParsedFile>) -> Result<Program, CheckError> {
 }
 
 fn check_files_cfg(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Program, CheckError> {
+    let t_all = std::time::Instant::now();
     script::prepare(&mut files)?;
     let mut cx = IrCx::new();
     let _ = cx.ty_ref(cx.common.u8);
@@ -181,6 +183,8 @@ fn check_files_cfg(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Pro
         });
     }
 
+    crate::cli::timing("  check: setup", t_all);
+    let t = std::time::Instant::now();
     for i in 0..mods.len() {
         collect_exports(&mut mods, i);
     }
@@ -224,6 +228,7 @@ fn check_files_cfg(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Pro
         collect_funcs(&mut cx, &mut mods, i)?;
     }
 
+    crate::cli::timing("  check: collect", t);
     let main_id = match find_main(&mods) {
         Ok(id) => id,
         Err(_) if !require_main => dummy_main(&mut cx),
@@ -234,13 +239,17 @@ fn check_files_cfg(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Pro
     for i in 0..mods.len() {
         collect_globals(&mut cx, &mut mods, i)?;
     }
+    let t = std::time::Instant::now();
     for i in 0..mods.len() {
         infer_omitted_rets(&mut cx, &mut mods, i)?;
     }
+    crate::cli::timing("  check: infer rets", t);
 
+    let t = std::time::Instant::now();
     for i in 0..mods.len() {
         lower::lower_module(&mut cx, &mut mods, i, main_id)?;
     }
+    crate::cli::timing("  check: lower", t);
 
     let exports = program_exports(&cx, &mods);
     let const_docs = const_docs(&cx, &mods);
@@ -265,6 +274,7 @@ fn check_files_cfg(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Pro
         })
         .collect();
 
+    let t = std::time::Instant::now();
     let mut modules = Vec::new();
     for m in mods {
         match validate_module(&cx, &m.ir) {
@@ -275,6 +285,7 @@ fn check_files_cfg(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Pro
         }
         modules.push(m.ir);
     }
+    crate::cli::timing("  check: validate", t);
 
     Ok(Program {
         cx,
@@ -2746,7 +2757,8 @@ fn eval_const(
     cx: &IrCx,
     path: &str,
 ) -> Result<ConstVal, CheckError> {
-    match &expr.kind {
+    let folded = expr.folded_literal();
+    match &folded.kind {
         parse::ExprKind::String(b) => Ok(ConstVal {
             ty: cx.common.string,
             kind: ConstPayload::String(b.clone()),
@@ -2758,6 +2770,10 @@ fn eval_const(
         parse::ExprKind::Float(v) => Ok(ConstVal {
             ty: cx.common.float,
             kind: ConstPayload::Float(*v),
+        }),
+        parse::ExprKind::Bool(v) => Ok(ConstVal {
+            ty: cx.common.bool,
+            kind: ConstPayload::Bool(*v),
         }),
         parse::ExprKind::Name(n) => match consts.get(&n.name) {
             Some(c) => Ok(c.clone()),
@@ -2787,15 +2803,46 @@ fn eval_const(
         }
         parse::ExprKind::Unary {
             op: parse::UnaryOp::Neg,
-            expr,
-        } => Ok(ConstVal {
-            ty: cx.common.int,
-            kind: ConstPayload::Int(eval_int(expr, consts, path)?.wrapping_neg()),
-        }),
+            expr: inner,
+        } => {
+            let v = eval_const(inner, consts, cx, path)?;
+            match v.kind {
+                ConstPayload::Int(n) => Ok(ConstVal {
+                    ty: cx.common.int,
+                    kind: ConstPayload::Int(n.wrapping_neg()),
+                }),
+                ConstPayload::Float(n) => Ok(ConstVal {
+                    ty: v.ty,
+                    kind: ConstPayload::Float(-n),
+                }),
+                _ => Err(CheckError::new(
+                    path,
+                    expr.span,
+                    "const initializer must be a number",
+                )),
+            }
+        }
+        parse::ExprKind::Unary {
+            op: parse::UnaryOp::Not,
+            expr: inner,
+        } => {
+            let v = eval_const(inner, consts, cx, path)?;
+            match v.kind {
+                ConstPayload::Bool(b) => Ok(ConstVal {
+                    ty: cx.common.bool,
+                    kind: ConstPayload::Bool(!b),
+                }),
+                _ => Err(CheckError::new(
+                    path,
+                    expr.span,
+                    "const initializer must be a bool",
+                )),
+            }
+        }
         _ => Err(CheckError::new(
             path,
             expr.span,
-            "const initializer must be an integer or string",
+            "const initializer must be an int, float, bool, or string",
         )),
     }
 }

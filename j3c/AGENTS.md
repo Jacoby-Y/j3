@@ -23,23 +23,21 @@ cargo run -- run examples/hello.j3
 cargo run -- run --emit c examples/hello.j3
 cargo run -- run --opt 2 examples/hello.j3
 cargo run -- run samples
-cargo run -- check ../examples/bounce
+cargo run -- check ../examples/gallery
 cargo run -- new /tmp/mygame
 cargo run -- doc j3.app
 cargo run -- doc lang
 cargo run -- doc j3ui
 cargo run -- guide
 cargo run -- help manifest
-cargo run -- run ../examples/bounce
-cargo run -- run ../examples/dungeon
-cargo run -- run ../examples/island
-cargo run -- build --fast ../examples/bounce
+cargo run -- run ../examples/gallery
+cargo run -- build --fast ../examples/gallery
 cargo run -- fmt examples/hello.j3
 cargo run -- lsp
 cargo run -- help
 ```
 
-`run` / `build` / `check` with no path use `./j3.toml` and stop if it is missing (`j3c new`, `j3c guide`). `check` typechecks, then reports a missing host library and a missing file passed to `loadFont` / `tryLoadFont` / `loadTexture` / `tryLoadTexture` / `loadRgba` / `loadSound` / `tryLoadSound` / `loadMusic` / `tryLoadMusic` / `setVolume` / `setMusicVolume` / `stop` / `stopMusic`. It does not run the program. `run` uses that same check and does not launch when it fails. A cross-compile target skips the library probe. `dump-ir` with no path still parses `examples/hello.j3` + `stdlib/j3` and prints typed IR. `dump-ir samples` prints `ir/samples.rs` after `validate` (place picture). `dump-c` / `dump-llvm` with no path emit that hello; `run examples/hello.j3` executes it (`printLn("Hello, world!")`). `dump-syntax` writes the editor TextMate grammar from lexer/parser tables (shipped at `../editors/vscode/syntaxes/j3.tmLanguage.json`). `run samples` is the place tests. `run foo.j3` compiles a real file. `run` / `build` also take a directory with `j3.toml` (`../examples/bounce`, `../examples/dungeon`, `../examples/island`). A project run executes the binary with **cwd = package root** (`J3_ROOT`). `fmt` pretty-prints from the same lexer (comments stay). `lsp` is stdio JSON-RPC: hover, goto-def, scoped completion (including `use`), signature help, document symbols, import quick-fix, diagnostics, format — same parse + check, no second frontend. Diagnostics for an error in another open buffer are published on that buffer.
+`run` / `build` / `check` with no path use `./j3.toml` and stop if it is missing (`j3c new`, `j3c guide`). `check` typechecks, then reports a missing host library and a missing file passed to `loadFont` / `tryLoadFont` / `loadTexture` / `tryLoadTexture` / `loadRgba` / `loadSound` / `tryLoadSound` / `loadMusic` / `tryLoadMusic` / `setVolume` / `setMusicVolume` / `stop` / `stopMusic`. It does not run the program. `run` uses that same check and does not launch when it fails. A cross-compile target skips the library probe. `dump-ir` with no path still parses `examples/hello.j3` + `stdlib/j3` and prints typed IR. `dump-ir samples` prints `ir/samples.rs` after `validate` (place picture). `dump-c` / `dump-llvm` with no path emit that hello; `run examples/hello.j3` executes it (`printLn("Hello, world!")`). `dump-syntax` writes the editor TextMate grammar from lexer/parser tables (shipped at `../editors/vscode/syntaxes/j3.tmLanguage.json`). `run samples` is the place tests. `run foo.j3` compiles a real file. `run` / `build` also take a directory with `j3.toml` (`../examples/gallery`, `../examples/fps-shooter`). A project run executes the binary with **cwd = package root** (`J3_ROOT`). `fmt` pretty-prints from the same lexer (comments stay). `lsp` is stdio JSON-RPC: hover, goto-def, scoped completion (including `use`), signature help, document symbols, import quick-fix, diagnostics, format — same parse + check, no second frontend. Diagnostics for an error in another open buffer are published on that buffer.
 
 `/target` must stay small: no incremental, no extra crates. Host `clang -g` / `cc -g` is on unless `--fast`. Flags live in `Cargo.toml` and `.cargo/config.toml`. Do not add clap, serde, inkwell, llvm-sys, or anyhow.
 
@@ -50,7 +48,7 @@ parse  →  check  →  ir  →  emit LLVM (default), C, or script bytecode
 LIVE      LIVE      LIVE    LIVE
 ```
 
-Hello + `01`–`08` compile and run. `09` typechecks shipped `j3.game`. `speculative/10_j3ui.j3` typechecks (`@j3ui`); defense and gallery projects typecheck. `stdlib/j3/game.j3` wraps SDL2 + image/mixer/ttf (color, src/dest draw, bakeText, gamepad, `quitRequested`, `holdClose` / `closeRequested` (window close asks instead of quitting), window min/max/resize, one-shot `play` / `playLoops` (return a channel), sfx and voice groups, fade, `setPosition`, looping `Music`, channel and music volume, `drawTextureEx`, `drawLine`, `frameAlpha`, `textInput` / `textTyped`) plus `initGl` (GL 3.3 core) / `SDL_GL_SwapWindow` when `App.useGl`; `08` runs against `game_headless.j3` (same pub names). `tryLoadFont`, `tryLoadTexture`, `tryLoadSound`, and `tryLoadMusic` return an empty handle when that shared library is missing; `loadFont`, `loadTexture`, `loadSound`, and `loadMusic` panic with the soname (`j3c run` then prints the apt package). `j3.math` is f32 trig/clamp/lerp + `Vec2` / `Vec3` / `Quat` / `Mat4` (identity/mul/translate/rotate/scale/perspective/lookAt/ortho/transformPoint). `j3.gfx.mesh` is `# j3mesh 1` (10 floats per vertex) or `# j3mesh 2` (those plus `u v`). `gfx.upload` takes either length; a length divisible by both stays 10 floats, and `uploadUv` forces the 12-float layout. `j3.gfx.voxel` is a solid grid (`0` is air): get/set, exposed-face count, DDA `ray`, AABB `overlaps`, corner occlusion (`corners`, `shade`). `gfx.emitFaceAo` bakes that shade into the vertex color and keeps the darker diagonal. `j3.gfx` is a GL 3.3 forward renderer (`Mesh`, `Orbit`, `Look`, directional shadow map, up to 4 point lights, `drawAlpha`, `drawInstanced`, `drawLine`, `use lib "GL"`). `j3.game` can capture the mouse (`captureMouse`, `mouseDelta`). `j3.rand` is a seedable LCG. `j3.game.ecs` is generational entities + `Column<T>` (`join`) + deferred `Commands` + `Events<T>` + `Signal<T>`. `j3.app` is `App<W>` (arena + window + loop; user `main` only `create`/`startup`/`first`/`add`/`last`/`always`/`draw`/`useGl`/`pause`/`timeScale`/`run`; `run` stores `frameAlpha` before draw). `j3.game.collide` is AABB / tile slide. `j3.game.space` is a hash grid. `j3.game.physics` is 2D bodies plus a 3D body that stops on voxels. `j3.game.path` is grid A*. `j3.game.anim` is sprite clips and a rigid transform track. `j3.game.input` is action bindings. `j3.scene3d.fpwalk` is a first-person walker with box colliders from scene objects; `scene3d.drawFrame` draws a scene from a `Look`. `j3.scene3d.fx` parses `.j3fx` shader effects (header, params, GL log line mapping); `scene3d` caches and compiles them (`effectSlot`, material `fx`, camera `beginEffects`/`endEffects`), and `gfx` builds them (`effectProgram`, `postProgram`, `postPass`). Any new lit uniform goes in `LitLocs`, or effect programs miss it. `j3.gfx` also has up to 4 point lights, `drawAlpha`, `drawInstanced` (64), `drawLine`, `setViewRect` (camera pass and `mouseRay` in a window sub-rect), and `toScreen` (world point to window pixel). Framework modules: `ui` `gfx`, and the `game/` (`anim` `input` `path` `physics` `space` `tile` `fx` `collide` `ecs`), `gfx/` (`mesh` `voxel` ...), and `data/` (`res` `scene` `assets` `save` `debug`) folders; a folder is part of the module name (`j3.game.ecs`). `--fast` strips `Abort` (OOB). Import cycles, occur-check, `pub` exports, and non-zero singleton init are check-time. `j3.sys` is `sys.j3` on Linux, `sys_windows.j3` or `sys_macos.j3` when `[emit] target` says so.
+Hello + `01`–`08` compile and run. `09` typechecks shipped `j3.game`. `speculative/10_j3ui.j3` typechecks (`@j3ui`); defense and gallery projects typecheck. `stdlib/j3/game.j3` wraps SDL2 + image/mixer/ttf (color, src/dest draw, bakeText, gamepad, `quitRequested`, `holdClose` / `closeRequested` (window close asks instead of quitting), window min/max/resize, one-shot `play` / `playLoops` (return a channel), sfx and voice groups, fade, `setPosition`, looping `Music`, channel and music volume, `drawTextureEx`, `drawLine`, `frameAlpha`, `textInput` / `textTyped`) plus `initGl` (GL 3.3 core) / `SDL_GL_SwapWindow` when `App.useGl`; `08` runs against `game_headless.j3` (same pub names). `tryLoadFont`, `tryLoadTexture`, `tryLoadSound`, and `tryLoadMusic` return an empty handle when that shared library is missing; `loadFont`, `loadTexture`, `loadSound`, and `loadMusic` panic with the soname (`j3c run` then prints the apt package). `j3.math` is f32 trig/clamp/lerp + `Vec2` / `Vec3` / `Quat` / `Mat4` (identity/mul/translate/rotate/scale/perspective/lookAt/ortho/transformPoint). `j3.gfx.mesh` is `# j3mesh 1` (10 floats per vertex) or `# j3mesh 2` (those plus `u v`). `gfx.upload` takes either length; a length divisible by both stays 10 floats, and `uploadUv` forces the 12-float layout. `j3.gfx.voxel` is a solid grid (`0` is air): get/set, exposed-face count, DDA `ray`, AABB `overlaps`, corner occlusion (`corners`, `shade`). `gfx.emitFaceAo` bakes that shade into the vertex color and keeps the darker diagonal. `j3.gfx` is a GL 3.3 forward renderer (`Mesh`, `Orbit`, `Look`, directional shadow map, up to 4 point lights, `drawAlpha`, `drawInstanced`, `drawLine`, `use lib "GL"`). `j3.game` can capture the mouse (`captureMouse`, `mouseDelta`). `j3.rand` is a seedable LCG. `j3.game.ecs` is generational entities + `Column<T>` (`join`) + deferred `Commands` + `Events<T>` + `Signal<T>`. `j3.app` is `App<W>` (arena + window + loop; user `main` only `create`/`startup`/`first`/`add`/`last`/`always`/`draw`/`useGl`/`pause`/`timeScale`/`run`; `run` stores `frameAlpha` before draw). `j3.game.collide` is AABB / tile slide. `j3.game.space` is a hash grid. `j3.game.physics` is 2D bodies plus a 3D body that stops on voxels. `j3.game.path` is grid A*. `j3.game.anim` is sprite clips and a rigid transform track. `j3.game.input` is action bindings. `j3.scene3d.fpwalk` is a first-person walker with box colliders from scene objects; `scene3d.drawFrame` draws a scene from a `Look`. `j3.scene3d.fx` parses `.j3fx` shader effects (header, params, GL log line mapping); `scene3d` caches and compiles them (`effectSlot`, material `fx`, camera `beginEffects`/`endEffects`), and `gfx` builds them (`effectProgram`, `postProgram`, `postPass`). Any new lit uniform goes in `LitLocs`, or effect programs miss it. `j3.gfx` also has up to 4 point lights, `drawAlpha`, `drawInstanced` (64), `drawLine`, `setViewRect` (camera pass and `mouseRay` in a window sub-rect), and `toScreen` (world point to window pixel). Framework modules: `ui` `gfx`, and the `game/` (`anim` `input` `path` `physics` `space` `tile` `fx` `collide` `ecs`), `gfx/` (`mesh` `voxel` ...), and `data/` (`res` `scene` `assets` `save` `debug`) folders; a folder is part of the module name (`j3.game.ecs`). `--fast` strips `Abort` (OOB). Exit codes: `panic` 101, failed runtime check 102 (`Abort(AbortKind)` prints `file:line: reason`), signal 128+n; debug builds on x86-64 Linux add a crash handler (`emit/llvm_crash.rs`) that `emit::host::symbolize` turns into a trace. Import cycles, occur-check, `pub` exports, and non-zero singleton init are check-time. `j3.sys` is `sys.j3` on Linux, `sys_windows.j3` or `sys_macos.j3` when `[emit] target` says so.
 
 Do not start a second parser. The LSP lives in `src/lsp/` and calls `compile::analyze_checked`. Cranelift is not a required middle step. New printers plug into `emit::Backend` and consume the same typed IR.
 
@@ -59,16 +57,16 @@ The **library** (`src/lib.rs`) is what the LSP depends on. The **bin** (`src/mai
 ## Crate root
 
 Optional `j3.gfx.urp.raytrace` is a fullscreen sphere/room path tracer with a
-custom-shader hook (`../examples/raytrace/` and `../examples/ocean/`). Optional
+custom-shader hook (its README has a sample). Optional
 `j3.gfx.urp.forest` routes `j3.gfx` camera color and depth through an external
 framebuffer, samples the same alpha-cutout canopy shadow map for volumetric
-light, and composites analytic glass and metal spheres (`../examples/forest/`).
+light, and composites analytic glass and metal spheres.
 Both need a GL context from `App.useGl()` and release GL resources before that
 context closes. The URP entry points are in `stdlib/j3/gfx/urp/README.md`.
 
 Scene editing that only the editor does lives in `stdlib/j3/scene3d/editor/` (`j3.scene3d.editor.overrides`, `props`, `paste`, `uses`): per-copy overrides, declaring and renaming props, pasting placed objects, and the placement loop check. Games load, draw, and read props with `j3.scene3d` alone.
 
-Procedural 2D art lives in `stdlib/j3/gfx/canvas.j3`: RGBA8 `Canvas`, pixel/smooth modes, clipped primitives, seeded noise, and PNG export. `j3.game.textureFromCanvas` uploads it for SDL or GL; `updateTextureFromCanvas` updates a rectangle. `examples/canvas` generates assets without SDL. Keep its hot drawing loops allocation-free and clip before iterating. The scaffolded `AGENTS.md` teaches agents to use the API and compose more readable game art.
+Procedural 2D art lives in `stdlib/j3/gfx/canvas.j3`: RGBA8 `Canvas`, pixel/smooth modes, clipped primitives, seeded noise, and PNG export. `j3.game.textureFromCanvas` uploads it for SDL or GL; `updateTextureFromCanvas` updates a rectangle. `j3c doc recipes canvas` generates assets without SDL. Keep its hot drawing loops allocation-free and clip before iterating. The scaffolded `AGENTS.md` teaches agents to use the API and compose more readable game art.
 
 | Path | What it is |
 |------|------------|
@@ -107,10 +105,10 @@ Procedural 2D art lives in `stdlib/j3/gfx/canvas.j3`: RGBA8 `Canvas`, pixel/smoo
 | `src/emit/c.rs` | Modules → C text (`j3_*` names). Host `int main` calls `j3.sys.start` if present, else user `main`. |
 | `src/emit/c_expr.rs` | Places, operands, rvalues, statements |
 | `src/emit/c_ty.rs` | IR `Ty` → C type names / slice typedefs |
-| `src/emit/llvm.rs` | Modules → LLVM IR text. Host `@main` calls `j3.sys.start` if present, else user `main`. |
+| `src/emit/llvm.rs` | Modules → LLVM IR text. At opt 0, one object per module under `target/j3c-obj`, cached by an IR hash (`src/emit/incr.rs`); opt 1 and above stay one clang invocation. `[emit] incremental = false` forces that. Host `@main` calls `j3.sys.start` if present, else user `main`. |
 | `src/emit/llvm_expr.rs` | Alloca locals; clang `-O` mem2reg’s |
 | `src/emit/llvm_ty.rs` | IR `Ty` → LLVM type names (`ptr`, `%j3_string`) |
-| `src/emit/host.rs` | `clang` / `cc` + extras from `j3.toml` (`-l`, `-L`, files, flags). Run cwd / `J3_ROOT` |
+| `src/emit/host.rs` | `clang` / `cc` + extras from `j3.toml` (`-l`, `-L`, files, flags). Opt 0 links cached per-module objects. Run cwd / `J3_ROOT` |
 
 ## IR (`src/ir/`)
 
@@ -155,6 +153,8 @@ If a change makes those strings go away, the IR is wrong.
 
 Source of truth: `stdlib/j3/*.j3`, compiled into the binary with `include_str`. A copied `j3c` does not need that directory. `J3_STDLIB` replaces the embedded copy. `j3c run` parses `sys` + `io` + the entry file. `j3.sys.start` calls user `main` then `exit(0)`. mmap/Arena IR is later.
 
+Scenes: rotation in `.j3scene` files is radians, in the tools (`j3c -e scene`, MCP, inspector) degrees. Code that writes scene text directly converts.
+
 ## How data is owned
 
 ```
@@ -170,9 +170,9 @@ Place
 
 Need a new interned type? `cx.intern_ty(TyKind::…)`. Need a builtin? add it in `IrCx::new` / `CommonTys`. Need a new statement? `stmt.rs` + dump arm + validate arm + a sample if it touches places.
 
-C / LLVM names: structs/funcs are `j3_<module>_<name>` (funcs also `_<id>`). Slices are `j3_sl_<elem>` (`[]int` → `j3_sl_i64`), `string` → `j3_string`. Store `module` on the IR entity so names stay stable if another module is in the same `IrCx`. Do **not** intern places or switch to CFG. Parser exists for the hello subset; grow the grammar there, not a second frontend.
+C / LLVM names: structs are `j3_<module>_<name>_<id>` (that id is local to one compile). Function symbols are `j3_<module>_<name>_<sig>`, where the suffix hashes the signature and, for a method, its type arguments — not the allocation order, so an object cache can reuse them. Slices are `j3_sl_<elem>` (`[]int` → `j3_sl_i64`), `string` → `j3_string`. Store `module` on the IR entity so names stay stable if another module is in the same `IrCx`. Do **not** intern places or switch to CFG. Parser exists for the hello subset; grow the grammar there, not a second frontend.
 
-`[emit]` in `j3.toml`: `backend` (`llvm` default, or `c`), `opt` (`0`/`1`/`2`/`3`/`s`/`z` — `0` compile speed, `2` runtime), `debug`, `fast`, `target` (one triple or an array; `build` emits each, `run` uses the host triple), `cpu`, `clang`, `flags`. No `[emit]` inherits `[cc] opt`. CLI `--emit` / `--opt` override. If clang is missing and LLVM was not forced, fall back to C.
+`[emit]` in `j3.toml`: `backend` (`llvm` default, or `c`), `opt` (`0`/`1`/`2`/`3`/`s`/`z` — `0` compile speed, `2` runtime), `incremental` (default true: opt 0 keeps one object per module), `debug`, `fast`, `target` (one triple or an array; `build` emits each, `run` uses the host triple), `cpu`, `clang`, `flags`. No `[emit]` inherits `[cc] opt`. CLI `--emit` / `--opt` override. If clang is missing and LLVM was not forced, fall back to C.
 
 ## Style
 

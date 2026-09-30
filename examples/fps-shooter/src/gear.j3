@@ -1,4 +1,4 @@
-// Shrine helpers that fight on their own: the magic arrow floating at your shoulder, and the
+// Shrine helpers that fight on their own: the battle drone hovering at your shoulder, and the
 // turret you drop with G. Both go for the boss too when it's the nearest thing.
 
 module fps_shooter.gear;
@@ -7,7 +7,7 @@ use j3.game;
 use j3.game.Key;
 use j3.gfx;
 use j3.gfx.{ Look, Mesh, Ray };
-use j3.math.{ Mat4, Vec3, atan2, max, min, sin };
+use j3.math.{ Mat4, Vec3, atan2, clamp, cos, max, min, sin };
 use j3.memory.Arena;
 use j3.scene3d;
 use j3.scene3d.Scene;
@@ -16,31 +16,41 @@ use fps_shooter.bosskit.Bosses;
 use fps_shooter.enemies;
 use fps_shooter.enemies.Enemies;
 use fps_shooter.level.{ Level, shoot };
-use fps_shooter.player.{ Player, has, look, ARROW, TURRET };
+use fps_shooter.player.{ Player, has, look, DRONE, TURRET };
+use fps_shooter.sfx;
 
-const ARROW_RANGE: f32 = 25;
-const ARROW_SPEED: f32 = 30;
-const ARROW_DAMAGE: f32 = 40;
-const ARROW_REST: f32 = 1.5;
+/// Battle drone: how far it sees, its fire rate and damage, how snappily it follows, and how far
+/// it may fall behind before it catches up at once. Follow is a loose spring (pull and drag), so it
+/// swings out behind when you run and drifts back when you stop.
+const DRONE_RANGE: f32 = 28;
+const DRONE_RATE: f32 = 0.22;
+const DRONE_DAMAGE: f32 = 12;
+const DRONE_FOLLOW: f32 = 9;
+const DRONE_DRAG: f32 = 3.2;
+const DRONE_SCALE: f32 = 1;
+/// The distance it keeps from you, measured from this height above your feet.
+const DRONE_DIST: f32 = 6;
+const DRONE_HEIGHT: f32 = 1.7;
+const DRONE_LEASH: f32 = 25;
 const TURRET_RANGE: f32 = 30;
 const TURRET_RATE: f32 = 0.15;
 const TURRET_DAMAGE: f32 = 8;
 /// G drops the turret where you look, up to this far, or at your feet.
 const PLACE_REACH: f32 = 6;
-/// Arrow states.
-const RESTING: int = 0;
-const FLYING: int = 1;
-const COMING_BACK: int = 2;
 /// A target that is the boss rather than an enemy slot.
 const AT_BOSS: int = -2;
 
 pub struct Gear {
-    arrow: Vec3;
-    arrowDir: Vec3;
-    state: int;
+    dronePos: Vec3;
+    droneDir: Vec3;
     target: int;
-    /// Resting: until the next dart. Flying: time left before it gives up.
-    arrowT: f32;
+    /// Time left swooping away after a hit.
+    droneCd: f32;
+    seekT: f32;
+    /// The drone's last shot, for a tracer.
+    droneEnd: Vec3;
+    droneVel: Vec3;
+    droneShot: f32;
     turret: bool;
     turretAt: Vec3;
     aim: Vec3;
@@ -53,7 +63,7 @@ pub struct Gear {
 
 pub fn create(): Gear {
     return Gear {
-        arrow: Vec3.zero(), arrowDir: Vec3.xyz(0, 0, -1), state: RESTING, target: -1, arrowT: 0,
+        dronePos: Vec3.zero(), droneDir: Vec3.xyz(0, 0, -1), target: -1, droneCd: 0, seekT: 0, droneEnd: Vec3.zero(), droneVel: Vec3.zero(), droneShot: 0,
         turret: false, turretAt: Vec3.zero(), aim: Vec3.xyz(0, 0, -1), turretCd: 0, shotEnd: Vec3.zero(), shotT: 0,
         cube: Mesh { vao: 0, vbo: 0, count: 0 },
     };
@@ -63,18 +73,10 @@ pub fn upload(gr: &Gear, mem: &Arena) {
     gr.cube = gfx.uploadUv(scene3d.assetVerts("builtin:cube", mem));
 }
 
-/// Where the arrow floats: over your right shoulder.
+/// Where the drone hovers: over your right shoulder.
 fn shoulder(p: &Player): Vec3 {
     let l = Look.create(p.pos, p.yaw, 0);
-    return p.pos + l.right() * 0.7 + Vec3.xyz(0, 2.1 + sin(f32(game.ticks()) * 0.003) * 0.08, 0) - l.forward() * 0.2;
-}
-
-fn fly(gr: &Gear, to: Vec3, dt: f32): f32 {
-    let d = to - gr.arrow;
-    let far = d.length();
-    gr.arrowDir = d.normalize();
-    gr.arrow = gr.arrow + gr.arrowDir * min(ARROW_SPEED * dt, far);
-    return far;
+    return p.pos + l.right() * 1.6 - l.forward() * 0.3 + Vec3.xyz(0, 1.7 + sin(f32(game.ticks()) * 0.003) * 0.08, 0);
 }
 
 /// The nearest enemy within `range` of `at`, or the boss when it's nearer: an enemy index,
@@ -88,44 +90,59 @@ fn pick(e: &Enemies, bs: &Bosses, at: Vec3, range: f32): int {
     return t;
 }
 
-fn arrow(gr: &Gear, p: &Player, e: &Enemies, bs: &Bosses, dt: f32) {
-    let home = shoulder(p);
-    if gr.state == RESTING {
-        gr.arrow = gr.arrow + (home - gr.arrow) * min(dt * 12, 1);
-        gr.arrowDir = gr.arrowDir + (look(p).forward() - gr.arrowDir) * min(dt * 8, 1);
-        gr.arrowT = gr.arrowT - dt;
-        if gr.arrowT <= 0 {
-            gr.target = pick(e, bs, p.pos, ARROW_RANGE);
-            if gr.target != -1 {
-                gr.state = FLYING;
-                gr.arrowT = 3;
-            } else {
-                gr.arrowT = 0.3;
-            }
-        }
-    } else if gr.state == FLYING {
-        gr.arrowT = gr.arrowT - dt;
-        if gr.target == AT_BOSS {
-            if !boss.targetable(bs) || gr.arrowT <= 0 {
-                gr.state = COMING_BACK;
-            } else if fly(gr, boss.aimPoint(bs), dt) < 0.8 {
-                let part = boss.near(bs, gr.arrow, gr.arrowDir, 1.5);
-                if part >= 0 { boss.damage(bs, e, part, ARROW_DAMAGE, gr.arrow); }
-                gr.state = COMING_BACK;
-            }
-        } else {
-            let en = e.list[gr.target];
-            if en.kind == 0 || gr.arrowT <= 0 {
-                gr.state = COMING_BACK;
-            } else if fly(gr, en.pos, dt) < 0.6 {
-                enemies.damage(e, gr.target, ARROW_DAMAGE, gr.arrowDir * 4, en.pos);
-                gr.state = COMING_BACK;
-            }
-        }
-    } else if fly(gr, home, dt) < 0.3 {
-        gr.state = RESTING;
-        gr.arrowT = ARROW_REST;
+/// Hovers at your shoulder, turns to face the nearest thing it can see and shoots it.
+fn drone(gr: &Gear, p: &Player, lvl: &Level, scene: &Scene, e: &Enemies, bs: &Bosses, dt: f32) {
+    gr.droneCd = gr.droneCd - dt;
+    gr.droneShot = gr.droneShot - dt;
+    gr.seekT = gr.seekT - dt;
+    if gr.seekT <= 0 {
+        gr.target = pick(e, bs, gr.dronePos, DRONE_RANGE);
+        gr.seekT = 0.2;
     }
+    let goal = gr.dronePos;
+    let live = false;
+    if gr.target == AT_BOSS && boss.targetable(bs) {
+        goal = boss.aimPoint(bs);
+        live = true;
+    } else if gr.target >= 0 && e.list[gr.target].kind != 0 {
+        goal = e.list[gr.target].pos;
+        live = true;
+    }
+    // Follow: ease to the shoulder, or snap back when left far behind.
+    // No fixed side: it just keeps DRONE_DIST from you, wherever it already is around you.
+    let center = p.pos + Vec3.xyz(0, DRONE_HEIGHT, 0);
+    let off = gr.dronePos - center;
+    if off.length() < 0.2 { off = Vec3.xyz(1, 0, 0); }
+    off.y = clamp(off.y, -0.5, 0.5);
+    let home = center + off.normalize() * DRONE_DIST;
+    if (home - gr.dronePos).length() > DRONE_LEASH { gr.dronePos = center + Look.create(p.pos, p.yaw, 0).right() * DRONE_DIST; gr.droneVel = Vec3.zero(); }
+    gr.droneVel = gr.droneVel + ((home - gr.dronePos) * DRONE_FOLLOW - gr.droneVel * DRONE_DRAG) * dt;
+    gr.dronePos = gr.dronePos + gr.droneVel * dt;
+    let face = look(p).forward();
+    if live { face = (goal - gr.dronePos).normalize(); }
+    gr.droneDir = (gr.droneDir + (face - gr.droneDir) * min(dt * 10, 1)).normalize();
+    if !live || gr.droneCd > 0 { return; }
+    gr.droneCd = DRONE_RATE;
+    // Only with a clear line.
+    let to = goal - gr.dronePos;
+    let far = to.length();
+    let dir = to.normalize();
+    let sight = shoot(lvl, scene, Ray { origin: gr.dronePos, dir: dir }, far);
+    if sight.hit { gr.seekT = 0; return; }
+    // Its hits are half as loud as yours.
+    sfx.hush(true);
+    if gr.target == AT_BOSS {
+        let struck = boss.ray(bs, Ray { origin: gr.dronePos, dir: dir }, far + 3);
+        if struck.part >= 0 {
+            gr.droneEnd = gr.dronePos + dir * struck.t;
+            boss.damage(bs, e, struck.part, DRONE_DAMAGE, gr.droneEnd);
+        }
+    } else {
+        enemies.damage(e, gr.target, DRONE_DAMAGE, dir * 1.5, goal);
+        gr.droneEnd = goal;
+    }
+    sfx.hush(false);
+    gr.droneShot = 0.06;
 }
 
 fn turret(gr: &Gear, p: &Player, lvl: &Level, scene: &Scene, e: &Enemies, bs: &Bosses, dt: f32) {
@@ -174,18 +191,19 @@ fn turret(gr: &Gear, p: &Player, lvl: &Level, scene: &Scene, e: &Enemies, bs: &B
 pub fn update(gr: &Gear, p: &Player, lvl: &Level, scene: &Scene, e: &Enemies, bs: &Bosses, dt: f32) {
     // Lost on going down, with the rest of the gifts.
     if !has(p, TURRET) { gr.turret = false; }
-    if has(p, ARROW) {
-        arrow(gr, p, e, bs, dt);
+    if has(p, DRONE) {
+        drone(gr, p, lvl, scene, e, bs, dt);
     } else {
-        gr.state = RESTING;
-        gr.arrow = shoulder(p);
+        gr.dronePos = shoulder(p);
+        gr.droneVel = Vec3.zero();
+        gr.droneCd = 0;
     }
     if has(p, TURRET) { turret(gr, p, lvl, scene, e, bs, dt); }
 }
 
 fn box(gr: &Gear, m: Mat4, tint: Vec3, glow: Vec3) {
     gfx.material(tint, glow);
-    gfx.draw(gr.cube, m);
+    gfx.drawDoubleSided(gr.cube, m);
 }
 
 /// A frame looking along `dir` from `at`: -z points down `dir`.
@@ -197,11 +215,31 @@ fn facing(at: Vec3, dir: Vec3): Mat4 {
 
 /// `lit`: the camera pass (the tracer only draws there).
 pub fn draw(gr: &Gear, p: &Player, lit: bool) {
-    if has(p, ARROW) {
-        let m = facing(gr.arrow, gr.arrowDir);
-        box(gr, m.mul(Mat4.scale(0.05, 0.05, 0.7)), Vec3.xyz(0.6, 0.9, 1), Vec3.xyz(0.8, 1.6, 2.4));
-        box(gr, m.mul(Mat4.translate(0, 0, -0.38)).mul(Mat4.scale(0.14, 0.14, 0.14)), Vec3.xyz(1, 1, 1), Vec3.xyz(2, 2.5, 3));
-        box(gr, m.mul(Mat4.translate(0, 0, 0.32)).mul(Mat4.scale(0.2, 0.03, 0.12)), Vec3.xyz(0.6, 0.9, 1), Vec3.xyz(0.4, 0.8, 1.2));
+    if has(p, DRONE) {
+        let m = facing(gr.dronePos, gr.droneDir).mul(Mat4.scale(DRONE_SCALE, DRONE_SCALE, DRONE_SCALE));
+        let steel = Vec3.xyz(0.3, 0.31, 0.33);
+        let dark = Vec3.xyz(0.14, 0.15, 0.17);
+        // Chunky dark-gray hull with a red eye, a gun barrel, and
+        // four arms carrying hubs and spinning blades.
+        box(gr, m.mul(Mat4.scale(0.34, 0.16, 0.4)), steel, Vec3.zero());
+        box(gr, m.mul(Mat4.translate(0, 0.1, 0)).mul(Mat4.scale(0.16, 0.05, 0.2)), dark, Vec3.zero());
+        box(gr, m.mul(Mat4.translate(0, -0.1, 0)).mul(Mat4.scale(0.16, 0.05, 0.2)), dark, Vec3.zero());
+        box(gr, m.mul(Mat4.translate(0, 0.01, -0.21)).mul(Mat4.scale(0.14, 0.08, 0.04)), Vec3.zero(), Vec3.xyz(2.6, 0.4, 0.3));
+        box(gr, m.mul(Mat4.translate(0, -0.06, -0.3)).mul(Mat4.scale(0.05, 0.05, 0.26)), dark, Vec3.zero());
+        let spin = f32(game.ticks()) * 0.06;
+        let k = 0;
+        while k < 4 {
+            let sx: f32 = 1;
+            if k % 2 == 0 { sx = 0 - 1; }
+            let sz: f32 = 1;
+            if k < 2 { sz = 0 - 1; }
+            let at = Vec3.xyz(sx * 0.3, 0.08, sz * 0.28);
+            box(gr, m.mul(Mat4.translate(at.x * 0.5, 0.04, at.z * 0.5)).mul(Mat4.rotate(Vec3.xyz(0, 1, 0), sx * sz * 0.785)).mul(Mat4.scale(0.06, 0.06, 0.42)), steel, Vec3.zero());
+            box(gr, m.mul(Mat4.translate(at.x, at.y, at.z)).mul(Mat4.scale(0.1, 0.1, 0.1)), dark, Vec3.zero());
+            box(gr, m.mul(Mat4.translate(at.x, at.y + 0.08, at.z)).mul(Mat4.rotate(Vec3.xyz(0, 1, 0), spin + f32(k))).mul(Mat4.scale(0.5, 0.03, 0.07)), Vec3.xyz(0.2, 0.21, 0.23), Vec3.zero());
+            k += 1;
+        }
+        if lit && gr.droneShot > 0 { gfx.drawLine(gr.dronePos + gr.droneDir * 0.3, gr.droneEnd, Vec3.xyz(1, 0.4, 0.3)); }
     }
     if gr.turret {
         let t = gr.turretAt;

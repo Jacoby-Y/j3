@@ -16,7 +16,7 @@ use crate::ir::op::{BinOp, UnaryOp};
 use crate::ir::operand::{ConstKind, Operand};
 use crate::ir::place::{Place, PlaceRoot, Proj};
 use crate::ir::rvalue::{InterpPart, Rvalue, RvalueKind};
-use crate::ir::stmt::{Stmt, StmtKind};
+use crate::ir::stmt::{AbortKind, Stmt, StmtKind};
 use crate::ir::ty::{FloatTy, IntTy, Ty, TyKind};
 use crate::span::FileId;
 use crate::ir::wrap;
@@ -41,6 +41,7 @@ pub(crate) struct LlvmFn<'a> {
     dbg: Option<&'a mut DebugOut>,
     scope: u32,
     line: u32,
+    file: String,
     /// Split builds link two objects, so every definition is visible to the other one.
     pub(crate) external: bool,
 }
@@ -58,6 +59,7 @@ impl<'a> LlvmFn<'a> {
             dbg,
             scope: 0,
             line: 1,
+            file: String::new(),
             external: false,
         }
     }
@@ -74,6 +76,7 @@ impl<'a> LlvmFn<'a> {
             dbg: None,
             scope: 0,
             line: 1,
+            file: String::new(),
             external: false,
         }
     }
@@ -119,17 +122,22 @@ impl<'a> LlvmFn<'a> {
             Some(f) => f,
             None => return,
         };
+        self.file = file.path.clone();
         let line = crate::parse::line_of(&file.src, span.start);
         if line > 0 {
             self.line = line as u32;
         }
     }
 
-    fn exit_abort(&mut self) {
+    fn exit_abort(&mut self, kind: AbortKind) {
         if self.terminated {
             return;
         }
-        self.inst("call void @_exit(i32 1)");
+        let msg = format!("{}:{}: {}\n", self.file, self.line, kind.message());
+        let p = self.bytes_global(msg.as_bytes());
+        let w = self.fresh();
+        self.inst(&format!("{w} = call i64 @write(i32 2, ptr {p}, i64 {})", msg.len()));
+        self.inst("call void @_exit(i32 102)");
         self.inst("unreachable");
         self.terminated = true;
     }
@@ -176,7 +184,7 @@ impl<'a> LlvmFn<'a> {
             .unwrap_or(0);
         self.note_span(func.span);
         let dbg_attr = if self.scope != 0 {
-            format!(" !dbg !{}", self.scope)
+            format!(" #0 !dbg !{}", self.scope)
         } else {
             String::new()
         };
@@ -213,7 +221,7 @@ impl<'a> LlvmFn<'a> {
             if ret == self.cx.common.void {
                 self.term("ret void");
             } else {
-                self.exit_abort();
+                self.exit_abort(AbortKind::NoReturn);
             }
         }
         self.text.push_str("}\n");
@@ -413,8 +421,11 @@ impl<'a> LlvmFn<'a> {
                 let lab = self.loop_target(true)?;
                 self.term(&format!("br label %{lab}"));
             }
-            StmtKind::Abort | StmtKind::Div0 => {
-                self.exit_abort();
+            StmtKind::Abort(k) => {
+                self.exit_abort(*k);
+            }
+            StmtKind::Div0 => {
+                self.exit_abort(AbortKind::Div0);
             }
             StmtKind::Block(inner) => {
                 self.emit_block(inner, false)?;
@@ -1141,7 +1152,7 @@ impl<'a> LlvmFn<'a> {
         let e = self.label();
         self.term(&format!("br i1 {ok}, label %{t}, label %{e}"));
         self.block(&e);
-        self.exit_abort();
+        self.exit_abort(AbortKind::Fmt);
         self.block(&t);
         let dst = self.fresh();
         self.inst(&format!("{dst} = getelementptr i8, ptr {buf}, i64 {u}"));
@@ -1178,7 +1189,7 @@ impl<'a> LlvmFn<'a> {
             let bad = self.label();
             self.term(&format!("br i1 {ok}, label %{t}, label %{bad}"));
             self.block(&bad);
-            self.exit_abort();
+            self.exit_abort(AbortKind::Fmt);
             self.block(&t);
             let dst = self.fresh();
             self.inst(&format!("{dst} = getelementptr i8, ptr {buf}, i64 {u}"));
@@ -1271,7 +1282,7 @@ impl<'a> LlvmFn<'a> {
         let bad = self.label();
         self.term(&format!("br i1 {ok}, label %{t}, label %{bad}"));
         self.block(&bad);
-        self.exit_abort();
+        self.exit_abort(AbortKind::Fmt);
         self.block(&t);
         let dst = self.fresh();
         self.inst(&format!("{dst} = getelementptr i8, ptr {buf}, i64 {u}"));
@@ -1291,7 +1302,7 @@ impl<'a> LlvmFn<'a> {
         let bad2 = self.label();
         self.term(&format!("br i1 {fail}, label %{bad2}, label %{ok2}"));
         self.block(&bad2);
-        self.exit_abort();
+        self.exit_abort(AbortKind::Fmt);
         self.block(&ok2);
         let sum = self.fresh();
         self.inst(&format!("{sum} = add i64 {u}, {wi}"));

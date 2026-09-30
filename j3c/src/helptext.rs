@@ -88,9 +88,10 @@ alive while drawing; destroy uploaded textures when done.
 Set j3.j3cPath when `j3c` is not on PATH.
 
 3D scenes without the editor window (for agents and scripts):
-    j3c -e scene list        objects by name path; add/set/delete/check too
-    j3c -e scene ground Box  place objects: ground, ontop, scatter
+    j3c -e scene list        objects by name path; add/set/delete/check/stats/diff too
+    j3c -e scene ring|wall|stairs|spiral ...  build shapes; ground, ontop, scatter place
     j3c -e render --view iso the scene as the game draws it, to a PNG
+    j3c -e render --at 0,2,5 --yaw 90   look from any spot (--views for several, --hide to see in)
     j3c run --frames 120 --screenshot shot.png --headless
     j3c -e gen               run assets/gen/*.j3 mesh generators (j3.gfx.meshgen)
     j3c -e mcp               the same as MCP tools for an agent; with the
@@ -117,6 +118,7 @@ j3.toml
 [emit]
     backend  llvm (default) or c
     opt      0, 1, 2, 3, s, or z. LLVM default is 2
+    incremental  at opt 0, reuse one object per module. Default true
     debug    debug info. Default true, unless [cc] fast is set
     fast     strip bounds-check aborts, same as --fast
     target   one triple, or an array. Empty means the host.

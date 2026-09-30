@@ -34,6 +34,8 @@ pub struct EmitOpts {
     pub cpu: String,
     pub clang: String,
     pub flags: Vec<String>,
+    /// Opt 0 reuses per-module objects. `false` forces one clang invocation.
+    pub incremental: bool,
     /// Process cwd when running the binary (package root).
     pub cwd: Option<std::path::PathBuf>,
 }
@@ -51,6 +53,7 @@ impl Default for EmitOpts {
             cpu: String::new(),
             clang: "clang".to_string(),
             flags: Vec::new(),
+            incremental: true,
             cwd: None,
         }
     }
@@ -83,6 +86,7 @@ impl EmitOpts {
                 m.emit.clang.clone()
             },
             flags: m.emit.flags.clone(),
+            incremental: m.emit.incremental,
             cwd: Some(m.root.clone()),
         })
     }

@@ -57,7 +57,7 @@ pub enum StmtKind {
         body: Block,
     },
     /// Bounds-check / panic abort. `--fast` strips these. Not a Linux syscall.
-    Abort,
+    Abort(AbortKind),
     /// Integer division by zero. `--fast` does not strip this.
     Div0,
     /// Nested `{}`. Defers in `body` run at the end of this block.
@@ -113,6 +113,28 @@ impl Stmt {
                 then_block,
                 else_block: None,
             },
+        }
+    }
+}
+
+/// Why a runtime check failed; picks the message `j3c` prints before exit 102.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbortKind {
+    Index,
+    Slice,
+    Div0,
+    Fmt,
+    NoReturn,
+}
+
+impl AbortKind {
+    pub fn message(self) -> &'static str {
+        match self {
+            AbortKind::Index => "index out of bounds",
+            AbortKind::Slice => "slice range out of bounds",
+            AbortKind::Div0 => "integer divide by zero",
+            AbortKind::Fmt => "string interpolation overflowed its buffer",
+            AbortKind::NoReturn => "function ended without returning a value",
         }
     }
 }

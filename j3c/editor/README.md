@@ -459,4 +459,9 @@ a UI font for its panels; projects can supply their own meshes
 and image textures (image loading needs SDL2_image). The scene format is a line
 based J3 save file with `scene.*`, `node.<index>.*`, `param.<id>.*`, and
 `over.<instance>.<source>.*` keys. Object IDs are stable even when nodes are
-removed or reordered.
+removed or reordered. Rotations in the file (`node.<i>.rx/ry/rz`) are radians,
+applied as `T * Rz * Ry * Rx * S`; the tools (`j3c -e scene`, MCP) and the
+inspector use degrees. A generator that writes scene text itself must convert:
+`j3c -e scene check` warns on a stored rotation above two turns. Rotating about +Y
+by `a` sends local +x to `(cos a, 0, -sin a)`, so a slab pointing along `(dx, dz)`
+needs `ry = -atan2(dz, dx)`.

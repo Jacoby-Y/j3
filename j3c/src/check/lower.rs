@@ -1144,6 +1144,9 @@ impl<'a> Lower<'a> {
                     Rvalue::use_op(span, Operand::f64_const(span, c.ty, *v))
                 }
             }
+            ConstPayload::Bool(v) => {
+                Rvalue::use_op(span, Operand::bool_const(span, c.ty, *v))
+            }
             ConstPayload::String(b) => Rvalue::use_op(span, Operand::bytes(span, c.ty, b)),
         }
     }
@@ -1252,6 +1255,10 @@ impl<'a> Lower<'a> {
                     kind: ConstPayload::Float(v),
                     ..
                 }) => Some(v.to_string().into_bytes()),
+                Some(ConstVal {
+                    kind: ConstPayload::Bool(v),
+                    ..
+                }) => Some(if *v { b"true".to_vec() } else { b"false".to_vec() }),
                 None => None,
             },
             _ => None,
@@ -1367,6 +1374,23 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The `panicAt` next to `j3.sys.panic`, when `id` is that `panic`.
+    fn panic_at_for(&self, id: FuncId) -> Option<FuncId> {
+        let f = self.cx.func(id);
+        if self.cx.name_str(f.name) != "panic" || f.method_of.is_some() {
+            return None;
+        }
+        let is_sys = |m: &[crate::intern::Name]| {
+            m.len() == 2 && self.cx.name_str(m[0]) == "j3" && self.cx.name_str(m[1]) == "sys"
+        };
+        if !is_sys(&f.module) {
+            return None;
+        }
+        self.cx.funcs().iter().find(|g| {
+            self.cx.name_str(g.name) == "panicAt" && g.module == f.module
+        }).map(|g| g.id)
+    }
+
     fn call_id(
         &mut self,
         span: Span,
@@ -1374,6 +1398,32 @@ impl<'a> Lower<'a> {
         recv: Option<Place>,
         args: &[Expr],
     ) -> Result<Rvalue, CheckError> {
+        // `panic(msg)` reports where it was called: call `panicAt(file, line, msg)` instead.
+        if let (None, 1) = (&recv, args.len()) {
+            if let Some(at) = self.panic_at_for(id) {
+                let fty = self.cx.func(at).ty;
+                let ret = self.cx.fn_sig(fty).map(|s| s.1).ok_or_else(|| {
+                    CheckError::new(self.path, span, "not a function")
+                })?;
+                let line = self
+                    .cx
+                    .file(span.file)
+                    .map(|f| crate::parse::line_of(&f.src, span.start))
+                    .unwrap_or(0);
+                // Last two path components (`src/main.j3`): short, and the same on every machine.
+                let short: Vec<&str> = self.path.rsplit(['/', '\\']).take(2).collect();
+                let short = short.into_iter().rev().collect::<Vec<_>>().join("/");
+                let file = Operand::bytes(span, self.cx.common.string, short.as_bytes());
+                let line = Operand::int(span, self.cx.common.int, line as u64);
+                let msg = self.operand(&args[0], Some(self.cx.common.string))?;
+                return Ok(Rvalue::call(
+                    span,
+                    ret,
+                    Operand::fn_addr(span, fty, at),
+                    vec![file, line, msg],
+                ));
+            }
+        }
         let fty = self.cx.func(id).ty;
         let (params, ret) = match self.cx.fn_sig(fty) {
             Some(s) => (s.0.clone(), s.1),
@@ -2487,7 +2537,7 @@ impl<'a> Lower<'a> {
         self.b.push(crate::ir::stmt::Stmt {
             ty: self.cx.common.void,
             span,
-            kind: crate::ir::stmt::StmtKind::Abort,
+            kind: crate::ir::stmt::StmtKind::Abort(crate::ir::stmt::AbortKind::Index),
         });
         let then_block = self.b.end_block(saved);
         self.b.push(crate::ir::stmt::Stmt {
@@ -2524,7 +2574,7 @@ impl<'a> Lower<'a> {
         self.b.push(crate::ir::stmt::Stmt {
             ty: self.cx.common.void,
             span,
-            kind: crate::ir::stmt::StmtKind::Abort,
+            kind: crate::ir::stmt::StmtKind::Abort(crate::ir::stmt::AbortKind::Slice),
         });
         let then_block = self.b.end_block(saved);
         self.b.push(crate::ir::stmt::Stmt {
@@ -2590,7 +2640,7 @@ impl<'a> Lower<'a> {
         self.b.push(crate::ir::stmt::Stmt {
             ty: self.cx.common.void,
             span,
-            kind: crate::ir::stmt::StmtKind::Abort,
+            kind: crate::ir::stmt::StmtKind::Abort(crate::ir::stmt::AbortKind::Slice),
         });
         let then_block = self.b.end_block(saved);
         self.b.push(crate::ir::stmt::Stmt {

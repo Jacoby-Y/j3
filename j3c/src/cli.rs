@@ -53,14 +53,20 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
             print!("{}", crate::helptext::GUIDE);
             0
         }
-        "run" => match take_run_flags(rest) {
-            Ok(rest) => run_dispatch(&rest),
-            Err(e) => {
-                eprintln!("j3c run: {e}");
-                1
+        "run" => {
+            progress_on();
+            match take_run_flags(rest) {
+                Ok(rest) => run_dispatch(&rest),
+                Err(e) => {
+                    eprintln!("j3c run: {e}");
+                    1
+                }
             }
-        },
-        "build" => dispatch(rest, build_cwd, build_samples_err, build_path, true),
+        }
+        "build" => {
+            progress_on();
+            dispatch(rest, build_cwd, build_samples_err, build_path, true)
+        }
         "fmt" => fmt_cmd(rest),
         "lsp" => crate::lsp::serve(),
         other => {
@@ -591,6 +597,7 @@ fn peel_run(rest: &[String]) -> (bool, Option<&str>, Vec<String>) {
 /// A project with scripts runs in dev mode (`devrun`); everything else runs as before.
 /// A `.j3s` path is a one-shot tool, not the dev watcher.
 fn run_user(path: Option<&str>, args: &[String]) -> i32 {
+    status("checking");
     if let Ok(Input::Project(m)) = load_input(path) {
         let manifest = Some(m.clone());
         let opts = match emit_opts(&manifest) {
@@ -608,7 +615,7 @@ fn run_user(path: Option<&str>, args: &[String]) -> i32 {
                 match crate::devrun::watch(&m, &opts, fast, &mut built, args) {
                     Ok(code) => {
                         if code != 0 {
-                            eprintln!("j3c: program exited {code}");
+                            eprintln!("j3c: program exited {code}{}", exit_reason(code));
                         }
                         code
                     }
@@ -696,18 +703,24 @@ fn run_loaded(
                 if opts.cwd.is_none() {
                     opts.cwd = extra_cwd;
                 }
+                let fast = manifest.as_ref().map(|m| m.cc.fast || m.emit.fast).unwrap_or(false);
+                if up_to_date(&prog, &opts, fast) {
+                    if let Some(exe) = &opts.cc.out {
+                        status("up to date");
+                        status("running");
+                        return match emit::run_exe_in(exe, opts.cwd.as_deref(), args) {
+                            Ok(result) => report_run(result),
+                            Err(e) => {
+                                print_fail(&e);
+                                1
+                            }
+                        };
+                    }
+                }
                 match emit::run_program_with(&prog.cx, &prog.modules, &opts, args) {
                     Ok(result) => {
-                        print!("{}", String::from_utf8_lossy(&result.stdout));
-                        if result.status != 0 {
-                            eprintln!("j3c: program exited {}", result.status);
-                            let err = String::from_utf8_lossy(&result.stderr);
-                            if !err.is_empty() {
-                                eprintln!("{err}");
-                            }
-                            print_hint(&err);
-                        }
-                        result.status
+                        mark_built(&prog, &opts, fast);
+                        report_run(result)
                     }
                     Err(e) => {
                         print_fail(&e);
@@ -756,10 +769,12 @@ fn run_samples() -> i32 {
 }
 
 fn build_cwd() -> i32 {
+    status("checking");
     build_loaded(compile_user(None))
 }
 
 fn build_path(path: &str) -> i32 {
+    status("checking");
     let started = std::time::Instant::now();
     let prog = compile_user(Some(path));
     timing("parse + check", started);
@@ -802,9 +817,105 @@ fn mark_built(prog: &compile::Program, opts: &emit::EmitOpts, fast: bool) {
 }
 
 /// With `J3C_TIMINGS` set, print how long a build phase took to stderr.
+/// `run` / `build` keep a 3-line status instead, so timings stay quiet there.
 pub(crate) fn timing(phase: &str, since: std::time::Instant) {
+    if PROGRESS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     if std::env::var_os("J3C_TIMINGS").is_some() {
         eprintln!("j3c: {phase}: {:.3}s", since.elapsed().as_secs_f64());
+    }
+}
+
+static PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `run` and `build` turn this on so a long check or compile doesn't sit silent.
+fn progress_on() {
+    PROGRESS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Three status slots. Emit and clang names share the last line and overwrite it.
+struct ProgressView {
+    slots: [String; 3],
+    /// Lines currently on the terminal, so the next update can move back over them.
+    drawn: usize,
+    tty: bool,
+    /// Non-tty logs stop after this many lines.
+    plain: u8,
+}
+
+fn progress_view() -> &'static std::sync::Mutex<ProgressView> {
+    static VIEW: std::sync::OnceLock<std::sync::Mutex<ProgressView>> = std::sync::OnceLock::new();
+    VIEW.get_or_init(|| {
+        std::sync::Mutex::new(ProgressView {
+            slots: [String::new(), String::new(), String::new()],
+            drawn: 0,
+            tty: std::io::IsTerminal::is_terminal(&std::io::stderr()),
+            plain: 0,
+        })
+    })
+}
+
+/// Which of the 3 lines this message belongs on.
+/// The phase stays on the first line, the module name overwrites the second,
+/// and `running` uses the third.
+fn status_slot(msg: &str) -> usize {
+    if msg.starts_with("emit ") || msg.starts_with("clang ") {
+        1
+    } else if msg == "running" {
+        2
+    } else {
+        0
+    }
+}
+
+/// A progress line on stderr. Quiet unless this process is a `run` or `build`.
+/// On a terminal the block is at most 3 lines and the last line updates in place.
+pub(crate) fn status(msg: &str) {
+    if !PROGRESS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Ok(mut view) = progress_view().lock() else {
+        return;
+    };
+    let slot = status_slot(msg);
+    if msg == "up to date" {
+        view.slots[1].clear();
+        view.slots[2].clear();
+    } else if msg == "linking" {
+        view.slots[1].clear();
+    }
+    view.slots[slot] = format!("j3c: {msg}");
+    if view.tty {
+        view.redraw();
+    } else if !msg.starts_with("emit ") && !msg.starts_with("clang ") && view.plain < 3 {
+        eprintln!("j3c: {msg}");
+        view.plain += 1;
+    }
+}
+
+impl ProgressView {
+    fn redraw(&mut self) {
+        use std::io::Write;
+        let visible: Vec<&str> = self.slots.iter().filter(|s| !s.is_empty()).map(|s| s.as_str()).collect();
+        let mut err = std::io::stderr().lock();
+        if self.drawn > 0 {
+            let _ = write!(err, "\x1b[{}A", self.drawn);
+        }
+        let rows = self.drawn.max(visible.len());
+        for i in 0..rows {
+            if i < visible.len() {
+                let _ = writeln!(err, "\x1b[2K{}", visible[i]);
+            } else {
+                let _ = writeln!(err, "\x1b[2K");
+            }
+        }
+        if rows > visible.len() {
+            let extra = rows - visible.len();
+            let _ = write!(err, "\x1b[{extra}A\x1b[J");
+        }
+        let _ = err.flush();
+        self.drawn = visible.len();
     }
 }
 
@@ -828,6 +939,7 @@ fn build_loaded(prog: Result<(compile::Program, Option<Manifest>), String>) -> i
                     }
                     let fast = manifest.as_ref().map(|m| m.cc.fast || m.emit.fast).unwrap_or(false);
                     if up_to_date(&prog, &opts, fast) {
+                        status("up to date");
                         println!("{}", opts.cc.out.as_ref().expect("out path").display());
                         return 0;
                     }
@@ -869,27 +981,43 @@ fn build_loaded(prog: Result<(compile::Program, Option<Manifest>), String>) -> i
     }
 }
 
+/// What a non-zero exit code means (`panic` 101, runtime check 102, signal 128+n).
+fn exit_reason(code: i32) -> String {
+    match code {
+        101 => " (panic)".into(),
+        102 => " (runtime check failed)".into(),
+        129..=159 => format!(" (killed by signal {})", code - 128),
+        _ => String::new(),
+    }
+}
+
+fn report_run(result: emit::RunResult) -> i32 {
+    print!("{}", String::from_utf8_lossy(&result.stdout));
+    if result.status != 0 {
+        eprintln!("j3c: program exited {}{}", result.status, exit_reason(result.status));
+        let err = String::from_utf8_lossy(&result.stderr);
+        if err.is_empty() {
+            eprintln!("j3c: it wrote nothing to stderr");
+        } else {
+            eprintln!("{err}");
+        }
+        print_hint(&err);
+    }
+    result.status
+}
+
 fn link_built(prog: &compile::Program, opts: &emit::EmitOpts) -> i32 {
-    let started = std::time::Instant::now();
-    let emitted = emit::emit_text(&prog.cx, &prog.modules, opts);
-    timing("emit", started);
-    match emitted {
-        Ok(text) => match emit::compile_text(&text, opts) {
-            Ok(exe) => {
-                println!("{}", exe.display());
-                0
-            }
-            Err(e) => {
-                if opts.target.is_empty() {
-                    print_fail(&e);
-                } else {
-                    print_fail(&format!("target {}:\n{e}", opts.target));
-                }
-                1
-            }
-        },
+    match emit::compile_program(&prog.cx, &prog.modules, opts) {
+        Ok(exe) => {
+            println!("{}", exe.display());
+            0
+        }
         Err(e) => {
-            eprintln!("j3c: emit failed: {e}");
+            if opts.target.is_empty() {
+                print_fail(&e);
+            } else {
+                print_fail(&format!("target {}:\n{e}", opts.target));
+            }
             1
         }
     }
@@ -912,7 +1040,10 @@ fn check_cmd(rest: &[String]) -> i32 {
             return 1;
         }
     }
-    match compile_user(path) {
+    let t_check = std::time::Instant::now();
+    let res = compile_user(path);
+    timing("check total", t_check);
+    match res {
         Ok((prog, manifest)) => {
             if let Err(e) = crate::preflight::check(&prog, manifest.as_ref()) {
                 if json {
@@ -1194,6 +1325,95 @@ mod tests {
         assert_eq!(run(["check".into(), path.clone()]), 1);
         assert_eq!(run(["run".into(), path]), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_skips_unchanged_sources() {
+        let dir = std::env::temp_dir().join(format!("j3-run-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("j3.toml"), "[package]\nname = \"skip\"\nentry = \"src/main.j3\"\n").unwrap();
+        std::fs::write(&dir.join("src/main.j3"), "module skip;\n\nfn main() {\n}\n").unwrap();
+        let path = dir.display().to_string();
+        let exe = dir.join("target/skip");
+        assert_eq!(run(["run".into(), path.clone()]), 0);
+        let first = std::fs::metadata(&exe).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(run(["run".into(), path]), 0);
+        assert_eq!(
+            std::fs::metadata(&exe).unwrap().modified().unwrap(),
+            first,
+            "unchanged run relinked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incremental_edit_recompiles_one_module() {
+        let dir = std::env::temp_dir().join(format!("j3-incr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("j3.toml"),
+            "[package]\nname = \"incr\"\nentry = \"src/main.j3\"\n\n[emit]\nbackend = llvm\nopt = 0\ndebug = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/main.j3"),
+            "module incr;\n\nuse j3.io.printLn;\nuse helper.word;\n\nfn main() {\n    printLn(word());\n}\n",
+        )
+        .unwrap();
+        let helper = dir.join("src/helper.j3");
+        std::fs::write(&helper, "module helper;\n\npub fn word(): string {\n    return \"one\";\n}\n").unwrap();
+        let path = dir.display().to_string();
+        assert_eq!(build_path(&path), 0);
+        let exe = dir.join("target/incr");
+        let first = std::process::Command::new(&exe).output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&first.stdout).contains("one"),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let (prog, manifest) = compile_user(Some(&path)).unwrap();
+        let mut opts = emit_opts(&manifest).unwrap();
+        opts.cc.opt = "2".into();
+        opts.incremental = false;
+        opts.cc.out = Some(dir.join("target/incr-o2"));
+        let whole = emit::run_program_with(&prog.cx, &prog.modules, &opts, &[]).unwrap();
+        assert_eq!(whole.stdout, first.stdout, "per-module output differed from one clang invocation");
+
+        let before = obj_mtimes(&dir);
+        std::fs::write(&helper, "module helper;\n\npub fn word(): string {\n    return \"two\";\n}\n").unwrap();
+        assert_eq!(build_path(&path), 0);
+        let second = std::process::Command::new(&exe).output().unwrap();
+        assert!(String::from_utf8_lossy(&second.stdout).contains("two"));
+        let after = obj_mtimes(&dir);
+        for (name, modified) in &before {
+            if name.contains("helper") {
+                continue;
+            }
+            let same = after.iter().find(|(n, _)| n == name).map(|(_, t)| *t);
+            assert_eq!(same, Some(*modified), "{name} was rebuilt");
+        }
+        let helper_before: Vec<_> = before.iter().filter(|(n, _)| n.contains("helper")).map(|(n, _)| n.clone()).collect();
+        let helper_after: Vec<_> = after.iter().filter(|(n, _)| n.contains("helper")).map(|(n, _)| n.clone()).collect();
+        assert_eq!(helper_after.len(), 1, "{helper_after:?}");
+        assert_ne!(helper_before, helper_after, "helper object was reused after an edit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn obj_mtimes(root: &std::path::Path) -> Vec<(String, std::time::SystemTime)> {
+        let mut out = Vec::new();
+        let dir = root.join("target/j3c-obj");
+        for ent in std::fs::read_dir(&dir).unwrap().flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".o") {
+                continue;
+            }
+            out.push((name, ent.metadata().unwrap().modified().unwrap()));
+        }
+        out.sort();
+        out
     }
 
     #[test]

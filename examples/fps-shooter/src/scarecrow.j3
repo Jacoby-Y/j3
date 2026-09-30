@@ -1,0 +1,391 @@
+// Scarecrow: a giant straw-stuffed golem in a pumpkin mask that stomps through the corn. It
+// strings together a rotation of attacks: corn-bomb volleys, a leap onto a marked ring (blast
+// and shockwave), hay rollers fanning out along warned lanes (jump them), a rain of corn bombs
+// from the sky, and (phase two) furrows that tear through the ground toward you. Get too close
+// and it spins its arms, a blast and a wave. The glowing corn heart in its chest is the weak
+// spot, open while it throws, rains, or is winded after a leap or spin. Phase two is faster,
+// with bigger volleys, and its bombs leave the ground burning.
+
+module fps_shooter.scarecrow;
+
+use j3.math.{ Mat4, Vec3, clamp, cos, max, min, sin, sqrt };
+use fps_shooter.bosskit.{ Boss, Bosses, BAR, BODY, WEAK, CORN_BOMB, addPart, bit, blastPlayer, box, bulk, clearParts, flat, flatDist,
+    forward, frame, groundTop, limb, lobRock, mark, puff, root, smoke, turn, walk, wave, yawTo, beam };
+use fps_shooter.level.Level;
+use fps_shooter.player.Player;
+use fps_shooter.sfx;
+
+const FALL: int = 0;
+const STALK: int = 1;
+const BOMBS: int = 2;
+const SPIN: int = 3;
+const IDLE: int = 4;
+const CROUCH: int = 5;
+const LEAP: int = 6;
+const SETTLE: int = 7;
+const ROLL: int = 8;
+const RAIN: int = 9;
+const FURROW: int = 10;
+
+const FALL_T: f32 = 2.0;
+const STALK_T: f32 = 3.0;
+const STALK_T2: f32 = 1.9;
+const SPEED: f32 = 5.0;
+const SPEED2: f32 = 6.5;
+const BOMBS_T: f32 = 3.6;
+/// Spin: it triggers this close, winds up for SPIN_WIND, then blasts this far.
+const SPIN_NEAR: f32 = 7.5;
+const SPIN_WIND: f32 = 0.8;
+const SPIN_T: f32 = 2.0;
+const SPIN_R: f32 = 9.5;
+const SPIN_DMG: f32 = 26;
+const SPIN_CD: f32 = 6;
+const BOMB_DMG: f32 = 22;
+/// The leap: crouch, fly (LEAP_H high) onto a ring, land and get winded.
+const CROUCH_T: f32 = 0.8;
+const LEAP_T: f32 = 1.7;
+const LEAP_H: f32 = 15;
+const LEAP_R: f32 = 6.5;
+const LEAP_DMG: f32 = 32;
+const SETTLE_T: f32 = 2.4;
+/// Hay rollers: lanes warn for ROLL_WARN, then a bar sweeps each at ROLL_SPEED.
+const ROLL_T: f32 = 4.0;
+const ROLL_WARN: f32 = 1.2;
+const ROLL_SPEED: f32 = 17;
+const ROLL_LEN: f32 = 46;
+const ROLL_DMG: f32 = 24;
+const RAIN_T: f32 = 3.6;
+const FURROW_T: f32 = 3.2;
+const LEASH: f32 = 42;
+/// The corn heart takes this many times the damage while the chest is open.
+const HEART: f32 = 3.5;
+
+fn corn(): Vec3 { return Vec3.xyz(2.4, 1.7, 0.2); }
+fn to(b: &Boss, state: int, len: f32) { b.state = state; b.t = 0; b.len = len; b.step = 0; }
+
+pub fn begin(bs: &Bosses) {
+    let b = &bs.b;
+    b.state = FALL;
+    b.t = 0;
+    b.aim = b.pos;
+    b.from = b.pos + Vec3.xyz(0, 45, 0);
+    b.len = FALL_T;
+    b.pos = b.from;
+    b.intro = FALL_T;
+    b.step = 0;
+    b.cd = 0;
+    b.cd2 = 2;
+    b.cycle = 0;
+    b.heat = 0;
+    b.squash = 1;
+    mark(bs, b.aim, 6, FALL_T, corn());
+}
+
+/// Where a hand is; raised while it throws (the bombs leave from the right one).
+fn handAt(b: &Boss, side: f32): Vec3 {
+    let up = b.heat;
+    let local = Vec3.xyz(side * 3.6, 5.6 + up * 2.6, -0.5 - up * 1.2);
+    return frame(b.pos, b.yaw).transformPoint(local);
+}
+
+fn volley(bs: &Bosses, p: &Player, lvl: &Level) {
+    let b = &bs.b;
+    let from = handAt(b, 1);
+    let aim = p.pos + flat(p.vel) * 0.5;
+    let dir = flat(aim - from).normalize();
+    let side = Vec3.xyz(0 - dir.z, 0, dir.x);
+    lobRock(bs, lvl, CORN_BOMB, from, aim, BOMB_DMG, corn() * 0.4);
+    lobRock(bs, lvl, CORN_BOMB, from, aim + side * 5, BOMB_DMG, corn() * 0.4);
+    lobRock(bs, lvl, CORN_BOMB, from, aim - side * 5, BOMB_DMG, corn() * 0.4);
+    if b.phase2 {
+        lobRock(bs, lvl, CORN_BOMB, from, aim + dir * 6, BOMB_DMG, corn() * 0.4);
+        lobRock(bs, lvl, CORN_BOMB, from, aim - dir * 4 + side * 9, BOMB_DMG, corn() * 0.4);
+    }
+    sfx.at(sfx.BOW, from);
+    puff(bs, from, Vec3.xyz(0, 3, 0), 0.5, 0.5, 0.8, 0, Vec3.xyz(1, 0.85, 0.3), corn() * 0.3);
+}
+
+/// One bomb falling out of the sky: every third right on the player, the rest scattered round.
+fn rainBomb(bs: &Bosses, p: &Player, lvl: &Level, n: int) {
+    let aim = p.pos + flat(p.vel) * 0.9;
+    if n % 3 != 0 {
+        aim = p.pos + Vec3.xyz((bs.rng.unit() - 0.5) * 18, 0, (bs.rng.unit() - 0.5) * 18);
+    }
+    let from = Vec3.xyz(aim.x + (bs.rng.unit() - 0.5) * 8, aim.y + 32, aim.z + (bs.rng.unit() - 0.5) * 8);
+    lobRock(bs, lvl, CORN_BOMB, from, aim, BOMB_DMG, corn() * 0.4);
+}
+
+/// Hay rollers: a fan of lanes out from the boss toward the player, each swept by a low bar.
+fn rollers(bs: &Bosses, p: &Player) {
+    let b = &bs.b;
+    let lanes = if b.phase2 { 5 } else { 3 };
+    let gap: f32 = if b.phase2 { 0.4 } else { 0.55 };
+    let dir = flat(p.pos - b.pos).normalize();
+    let i = 0;
+    while i < lanes {
+        let a = (f32(i) - f32(lanes - 1) * 0.5) * gap;
+        let d = Vec3.xyz(dir.x * cos(a) - dir.z * sin(a), 0, dir.x * sin(a) + dir.z * cos(a));
+        beam(bs, BAR, b.pos + d * 3.5, d, ROLL_LEN, 1.3, ROLL_WARN, ROLL_SPEED, 1.0, ROLL_DMG, corn());
+        i += 1;
+    }
+    sfx.at(sfx.WARN, b.pos);
+}
+
+/// Furrows tearing toward the player: they crack the ground, then burst up where they ended.
+fn furrows(bs: &Bosses, p: &Player) {
+    let b = &bs.b;
+    let dir = flat(p.pos - b.pos).normalize();
+    let i = 0;
+    while i < 5 {
+        let a = (f32(i) - 2) * 0.32;
+        let d = Vec3.xyz(dir.x * cos(a) - dir.z * sin(a), 0, dir.x * sin(a) + dir.z * cos(a));
+        root(bs, b.pos + d * 3, d, 36, 24, 1.4, 22);
+        i += 1;
+    }
+    sfx.at(sfx.ROAR, b.pos);
+}
+
+/// A landing spot near the player, kept inside the leash, on top of whatever is there.
+fn landing(b: &Boss, p: &Player, lvl: &Level): Vec3 {
+    let want = flat(p.pos + p.vel * 0.3);
+    let fromHome = want - flat(b.home);
+    if fromHome.length() > LEASH { want = flat(b.home) + fromHome.normalize() * LEASH; }
+    let y = groundTop(lvl, want.x, want.z, 1.6, 80);
+    if y < -50 { y = b.home.y; }
+    return Vec3.xyz(want.x, y, want.z);
+}
+
+/// The leap's landing: a blast under it and a shockwave.
+fn slam(bs: &Bosses, p: &Player) {
+    let b = &bs.b;
+    sfx.at(sfx.SLAM, b.pos);
+    blastPlayer(bs, p, b.pos + Vec3.xyz(0, 0.5, 0), LEAP_R, LEAP_DMG, 14);
+    wave(bs, b.pos, 17, 38, 0.9, 20, corn());
+    smoke(bs, b.pos, 12, 5, Vec3.xyz(0.75, 0.62, 0.3), Vec3.zero());
+    bs.shake = max(bs.shake, 0.06 * clamp(1 - flatDist(p.pos, b.pos) / 40, 0.2, 1));
+    b.squash = 0.6;
+}
+
+/// The next attack in the rotation. Phase one runs four; phase two runs six, with furrows.
+fn nextAttack(bs: &Bosses) {
+    let b = &bs.b;
+    let n = b.cycle;
+    b.cycle += 1;
+    let k = 0;
+    if b.phase2 {
+        let seq: [5]int = [1, 0, 4, 3, 1];
+        k = seq[n % 5];
+    } else {
+        let seq1: [3]int = [0, 1, 3];
+        k = seq1[n % 3];
+    }
+    if k == 0 { to(b, BOMBS, BOMBS_T); b.cd = 0.6; }
+    else if k == 1 { to(b, CROUCH, CROUCH_T); }
+    else if k == 2 { to(b, ROLL, ROLL_T); }
+    else if k == 3 { to(b, RAIN, RAIN_T); b.cd = 0.4; }
+    else { to(b, FURROW, FURROW_T); }
+}
+
+pub fn update(bs: &Bosses, p: &Player, lvl: &Level, dt: f32) {
+    let b = &bs.b;
+    b.t += dt;
+    b.anim += dt;
+    b.squash = b.squash + (1 - b.squash) * min(dt * 7, 1);
+    b.open = b.open + (b.openTo - b.open) * min(dt * 6, 1);
+    b.cd2 = max(b.cd2 - dt, 0);
+    b.cue = false;
+    let armsUp: f32 = 0;
+    if b.state == BOMBS || b.state == RAIN || b.state == ROLL || b.state == FURROW || b.state == LEAP { armsUp = 1; }
+    b.heat = b.heat + (armsUp - b.heat) * min(dt * 6, 1);
+    let k = clamp(b.t / b.len, 0, 1);
+    if b.state == FALL {
+        b.pos = b.from + (b.aim - b.from) * (k * k);
+        if k >= 1 {
+            b.pos = b.aim;
+            slam(bs, p);
+            to(b, STALK, 1.5);
+            b.openTo = 1;
+        }
+    } else if b.state == STALK {
+        b.openTo = 0;
+        let dir = flat(p.pos - b.pos);
+        b.yaw = turn(b.yaw, yawTo(b.pos, p.pos), dt * 2.2);
+        let speed = if b.phase2 { SPEED2 } else { SPEED };
+        let go = dir.normalize() * speed;
+        let away = flat(b.pos - b.home);
+        // Past the leash, it walks back toward home instead.
+        if away.length() > LEASH { go = flat(b.home - b.pos).normalize() * speed; }
+        if dir.length() > 6 || away.length() > LEASH { walk(bs, lvl, go, 2.4, 0.7, dt); }
+        if b.engaged && b.intro <= 0 && b.cd2 <= 0 && dir.length() < SPIN_NEAR {
+            to(b, SPIN, SPIN_T);
+        } else if b.t >= (if b.phase2 { STALK_T2 } else { STALK_T }) {
+            if !b.engaged { b.t = 0; }
+            else { nextAttack(bs); }
+        }
+    } else if b.state == BOMBS {
+        b.openTo = 1;
+        if b.open > 0.55 { b.cue = true; }
+        b.yaw = turn(b.yaw, yawTo(b.pos, p.pos), dt * 2.5);
+        b.cd -= dt;
+        if b.cd <= 0 && b.t < b.len - 0.8 {
+            volley(bs, p, lvl);
+            b.cd = if b.phase2 { 1.0 } else { 1.3 };
+        }
+        if b.t >= b.len { b.openTo = 0; to(b, STALK, 1); }
+    } else if b.state == RAIN {
+        b.openTo = 1;
+        if b.open > 0.55 { b.cue = true; }
+        b.yaw = turn(b.yaw, yawTo(b.pos, p.pos), dt * 1.2);
+        b.cd -= dt;
+        if b.cd <= 0 && b.t < b.len - 0.7 {
+            rainBomb(bs, p, lvl, b.step);
+            b.step += 1;
+            b.cd = if b.phase2 { 0.17 } else { 0.27 };
+        }
+        if b.t >= b.len { b.openTo = 0; to(b, STALK, 1); }
+    } else if b.state == ROLL {
+        b.openTo = 0;
+        b.yaw = turn(b.yaw, yawTo(b.pos, p.pos), dt * 1.5);
+        if b.step == 0 { rollers(bs, p); b.step = 1; }
+        if b.t >= b.len { to(b, STALK, 0.8); }
+    } else if b.state == FURROW {
+        // Fists planted: the furrows tear out, then the heart is open while they burst.
+        b.openTo = if b.step >= 1 { 1 } else { 0 };
+        if b.open > 0.55 { b.cue = true; }
+        b.yaw = turn(b.yaw, yawTo(b.pos, p.pos), dt * 1.5);
+        if b.step == 0 && b.t > 0.5 { furrows(bs, p); b.step = 1; }
+        if b.t >= b.len { b.openTo = 0; to(b, STALK, 1); }
+    } else if b.state == CROUCH {
+        b.squash = min(b.squash, 1 - 0.3 * k);
+        b.yaw = turn(b.yaw, yawTo(b.pos, p.pos), dt * 3);
+        if b.t >= b.len {
+            if !b.engaged { to(b, STALK, 1); }
+            else {
+                let big = landing(b, p, lvl);
+                b.from = b.pos;
+                b.aim = big;
+                to(b, LEAP, LEAP_T);
+                b.squash = 1.3;
+                mark(bs, big, LEAP_R, LEAP_T, corn());
+                sfx.at(sfx.JUMP, b.pos);
+            }
+        }
+    } else if b.state == LEAP {
+        b.pos = b.from + (b.aim - b.from) * k + Vec3.xyz(0, LEAP_H * 4 * k * (1 - k), 0);
+        b.yaw = turn(b.yaw, yawTo(b.from, b.aim), dt * 6);
+        if k >= 1 {
+            b.pos = b.aim;
+            slam(bs, p);
+            to(b, SETTLE, SETTLE_T);
+            b.openTo = 1;
+        }
+    } else if b.state == SETTLE {
+        // Winded: the heart is open. Phase two throws a second shockwave a beat later.
+        b.openTo = 1;
+        if b.open > 0.55 { b.cue = true; }
+        if b.phase2 && b.step == 0 && b.t > 0.45 {
+            wave(bs, b.pos, 17, 38, 0.9, 20, corn());
+            sfx.at(sfx.SLAM, b.pos);
+            b.step = 1;
+        }
+        if b.t >= b.len { b.openTo = 0; to(b, STALK, 0.8); }
+    } else if b.state == SPIN {
+        // Winds up (a ring where the blast will reach), spins: blast, wave, heart open.
+        b.openTo = if b.step == 3 { 1 } else { 0 };
+        if b.open > 0.55 { b.cue = true; }
+        if b.step == 0 { mark(bs, b.pos, SPIN_R, SPIN_WIND, corn()); sfx.at(sfx.WARN, b.pos); b.step = 2; }
+        if b.step == 2 && b.t >= SPIN_WIND {
+            blastPlayer(bs, p, b.pos + Vec3.xyz(0, 0.5, 0), SPIN_R, SPIN_DMG, 22);
+            wave(bs, b.pos, 16, 30, 0.8, 14, corn());
+            smoke(bs, b.pos, 10, 5, Vec3.xyz(0.75, 0.62, 0.3), Vec3.zero());
+            bs.shake = max(bs.shake, 0.07);
+            sfx.at(sfx.ROAR, b.pos);
+            b.step = 3;
+        }
+        if b.step == 3 { b.yaw = b.yaw + dt * 14; } else { b.yaw = turn(b.yaw, yawTo(b.pos, p.pos), dt * 1.5); }
+        if b.t >= b.len {
+            b.openTo = 0;
+            b.cd2 = SPIN_CD;
+            to(b, STALK, 1);
+        }
+    } else {
+        b.yaw = b.yaw + dt * 0.2;
+        if b.engaged { to(b, STALK, 1); }
+    }
+    pose(bs);
+    bs.glowAt = b.pos + Vec3.xyz(0, 4.8, 0) + forward(b.yaw) * -1.5;
+    bs.glowColor = corn() * (0.05 + b.open * 0.12);
+    bs.glowR = 6 + b.open * 4;
+}
+
+/// Leg swing while it walks.
+fn stride(b: &Boss): f32 {
+    if b.state == STALK { return sin(b.anim * 4) * 0.7; }
+    return 0;
+}
+
+fn pose(bs: &Bosses) {
+    let b = &bs.b;
+    clearParts(bs);
+    let t = frame(b.pos, b.yaw);
+    // The heart first, so a shot into it counts where it overlaps the torso.
+    addPart(bs, t.transformPoint(Vec3.xyz(0, 4.9, -1.2)), 1.0, if b.open > 0.55 { HEART } else { 1 }, WEAK);
+    addPart(bs, t.transformPoint(Vec3.xyz(0, 4.9, 0)), 2.6, 1, BODY);
+    addPart(bs, t.transformPoint(Vec3.xyz(0, 7.6, -0.2)), 1.7, 1, BODY);
+    addPart(bs, t.transformPoint(Vec3.xyz(0, 2.0, 0)), 1.9, 1, BODY);
+    addPart(bs, handAt(b, -1), 1.0, 1, BODY);
+    addPart(bs, handAt(b, 1), 1.0, 1, BODY);
+    bulk(bs, 2.8, b.pos.y, b.pos.y + 9);
+}
+
+pub fn draw(bs: &Bosses) {
+    let b = &bs.b;
+    let straw = Vec3.xyz(0.92, 0.74, 0.28);
+    let straw2 = Vec3.xyz(0.75, 0.58, 0.2);
+    let sack = Vec3.xyz(0.7, 0.58, 0.4);
+    let denim = Vec3.xyz(0.25, 0.35, 0.62);
+    let wood = Vec3.xyz(0.4, 0.27, 0.15);
+    let pump = Vec3.xyz(0.95, 0.5, 0.1);
+    let black = Vec3.xyz(0.04, 0.03, 0.03);
+    let o = b.open;
+    let sq = b.squash;
+    let sqw = 1 / sqrt(sq);
+    let t = frame(b.pos, b.yaw).mul(Mat4.scale(sqw, sq, sqw));
+    let sw = stride(b);
+    let heart = Vec3.xyz(2.4, 1.7, 0.3) * (0.35 + o * 2 + 0.15 * sin(b.anim * 5));
+    // Legs: denim over straw, with floppy boots.
+    box(bs, t, Vec3.xyz(-1.2, 1.7, sw), Vec3.xyz(1.5, 3.4, 1.5), denim, Vec3.zero());
+    box(bs, t, Vec3.xyz(1.2, 1.7, 0.0 - sw), Vec3.xyz(1.5, 3.4, 1.5), denim, Vec3.zero());
+    box(bs, t, Vec3.xyz(-1.2, 0.3, sw - 0.5), Vec3.xyz(1.8, 0.6, 2.6), wood, Vec3.zero());
+    box(bs, t, Vec3.xyz(1.2, 0.3, 0.0 - sw - 0.5), Vec3.xyz(1.8, 0.6, 2.6), wood, Vec3.zero());
+    // Belt, then a sack torso stuffed with straw, torn open over the heart.
+    box(bs, t, Vec3.xyz(0, 3.6, 0), Vec3.xyz(3.4, 0.6, 2.2), wood, Vec3.zero());
+    box(bs, t, Vec3.xyz(0, 4.9, 0.2), Vec3.xyz(3.8, 2.4, 2.4), sack, Vec3.zero());
+    box(bs, t, Vec3.xyz(0, 4.9, -1.05), Vec3.xyz(2.0, 1.8, 0.4), straw2, Vec3.zero());
+    bit(bs, t, Vec3.xyz(0, 4.9, -1.2), Vec3.xyz(1.2 + o * 0.3, 1.2 + o * 0.3, 0.7), black, heart);
+    // Straw poking out of the collar and the seams.
+    bit(bs, t, Vec3.xyz(-1.6, 6.15, 0), Vec3.xyz(0.4, 0.7, 0.4), straw, Vec3.zero());
+    bit(bs, t, Vec3.xyz(1.5, 6.2, -0.2), Vec3.xyz(0.4, 0.9, 0.4), straw, Vec3.zero());
+    bit(bs, t, Vec3.xyz(1.9, 3.9, -0.4), Vec3.xyz(0.5, 0.6, 0.4), straw, Vec3.zero());
+    // The post it hangs from, poking out behind, and the crossbar under the sack.
+    box(bs, t, Vec3.xyz(0, 6.0, 1.4), Vec3.xyz(0.6, 5.0, 0.6), wood, Vec3.zero());
+    box(bs, t, Vec3.xyz(0, 6.2, 1.2), Vec3.xyz(7.2, 0.5, 0.5), wood, Vec3.zero());
+    // Arms: sleeves from the shoulders to straw-filled gloves.
+    let side: f32 = -1;
+    while side < 2 {
+        box(bs, t, Vec3.xyz(side * 2.3, 6.0, 0), Vec3.xyz(1.6, 1.2, 2.0), sack, Vec3.zero());
+        let hand = handAt(b, side);
+        limb(bs, t.transformPoint(Vec3.xyz(side * 2.4, 6.0, 0)), hand, 0.95, 0.95, sack, Vec3.zero());
+        box(bs, frame(hand, b.yaw), Vec3.zero(), Vec3.xyz(1.5, 1.5, 1.5), straw, if b.state == BOMBS { corn() * 0.25 } else { Vec3.zero() });
+        side += 2;
+    }
+    // Head: a pumpkin with a carved glowing face, a crooked hat on top.
+    box(bs, t, Vec3.xyz(0, 7.7, -0.2), Vec3.xyz(2.8, 2.4, 2.6), pump, Vec3.zero());
+    box(bs, t, Vec3.xyz(0, 6.5, -0.2), Vec3.xyz(0.5, 0.6, 0.5), Vec3.xyz(0.3, 0.5, 0.15), Vec3.zero());
+    bit(bs, t, Vec3.xyz(-0.7, 7.95, -1.52), Vec3.xyz(0.6, 0.6, 0.1), black, Vec3.xyz(2.6, 1.6, 0.2));
+    bit(bs, t, Vec3.xyz(0.7, 7.95, -1.52), Vec3.xyz(0.6, 0.6, 0.1), black, Vec3.xyz(2.6, 1.6, 0.2));
+    bit(bs, t, Vec3.xyz(0, 7.2, -1.52), Vec3.xyz(1.8, 0.4 + o * 0.5, 0.1), black, corn() * (0.4 + o * 0.5));
+    box(bs, t, Vec3.xyz(0, 9.0, -0.2), Vec3.xyz(4.2, 0.25, 4.2), wood, Vec3.zero());
+    box(bs, t, Vec3.xyz(0.2, 9.8, -0.2), Vec3.xyz(2.2, 1.4, 2.2), wood, Vec3.zero());
+    box(bs, t, Vec3.xyz(0.2, 9.35, -0.2), Vec3.xyz(2.3, 0.3, 2.3), Vec3.xyz(0.6, 0.15, 0.1), Vec3.zero());
+}

@@ -6,10 +6,14 @@ module fps_shooter;
 
 use j3.app.App;
 use j3.game;
-use j3.game.{ Font, Key };
+use j3.game.{ Font, Key, Mouse };
 use j3.gfx;
 use j3.math.{ Vec3, max };
+
+/// Seconds of immunity after closing a level-up, skill or shrine card.
+const PICK_IMMUNE: f32 = 2;
 use j3.memory.Arena;
+use j3.text.same;
 use j3.scene3d;
 use j3.scene3d.Scene;
 use fps_shooter.biome;
@@ -17,6 +21,7 @@ use fps_shooter.debug;
 use fps_shooter.debug.Flags;
 use fps_shooter.biome.Biomes;
 use fps_shooter.boss;
+use fps_shooter.challenge;
 use fps_shooter.bosskit.Bosses;
 use fps_shooter.enemies;
 use fps_shooter.enemies.Enemies;
@@ -29,6 +34,7 @@ use fps_shooter.guns.Guns;
 use fps_shooter.hud;
 use fps_shooter.level;
 use fps_shooter.level.Level;
+use fps_shooter.menu;
 use fps_shooter.minimap;
 use fps_shooter.perks;
 use fps_shooter.perf;
@@ -66,17 +72,47 @@ struct World {
     skills: Skills;
     /// M: the whole map up, game paused.
     mapOpen: bool;
+    victoryDismissed: bool = false;
+    /// Challenge runs: the areas open when the last meteor drop was owed, and Boss Rush xp held back until the shrine card is done.
+    aidSeen: int = 16;
+    rushXp: int = 0;
+    /// On the main menu, before the run starts. The camera turns slowly from `menuYaw`.
+    atTitle: bool = false;
+    menuYaw: f32 = 0;
+    menuT: f32 = 0;
+    /// What a menu picked last frame (menu.GO, RESTART, TITLE), acted on at the top of the update.
+    todo: int = 0;
     font: Font;
+    mid: Font;
     big: Font;
+    huge: Font;
+}
+
+/// `unlock` in tools/debug.j3s: every biome is open, so the border walls stay down.
+fn openAll(lvl: &Level, sh: &Shrines, unlock: bool) {
+    if !unlock { return; }
+    lvl.open = 1023;
+    level.setGates(lvl);
+    let tile = 0;
+    while tile < 10 { shrine.placeArea(sh, tile); tile += 1; }
+}
+
+/// The debug seed, or one from the clock.
+fn worldSeed(set: int): int {
+    if set != 0 { return set; }
+    return game.micros() * 2 + game.ticks() * 1000003 + 1;
 }
 
 fn boot(mem: &Arena): World {
     let flags = debug.load(mem);
-    let scene = scene3d.load("scenes/main.j3scene", mem);
+    let scene = level.load("scenes/main.j3scene", mem);
+    // A launch deals its own map (a run keeps it until the next launch).
+    // A fixed map still goes through `arrange` (seed 0) so the unused staging strip is dropped.
+    if flags.fixedMap { level.arrange(&scene, 0, 1, -1); } else { level.arrange(&scene, worldSeed(flags.seed), flags.hub, flags.biome); }
     let lvl = level.build(&scene, mem);
     return World { mem: mem, flags: flags, perf: perf.create(mem, flags.bench), scene: scene, level: lvl, player: player.create(&lvl), guns: guns.create(mem),
         enemies: enemies.create(mem), perks: perks.create(mem), score: score.create(mem),
-        shrines: shrine.create(mem), gear: gear.create(), gates: gates.create(), biomes: biome.create(), bosses: boss.create(mem), skills: skills.create(mem), mapOpen: false, font: Font { raw: 0 }, big: Font { raw: 0 } };
+        shrines: shrine.create(mem), gear: gear.create(), gates: gates.create(), biomes: biome.create(), bosses: boss.create(mem), skills: skills.create(mem), mapOpen: false, font: Font { raw: 0 }, mid: Font { raw: 0 }, big: Font { raw: 0 }, huge: Font { raw: 0 } };
 }
 
 fn startup(w: &World) {
@@ -86,6 +122,8 @@ fn startup(w: &World) {
     perks.selfCheck(w.mem);
     // Boxes need the meshes' bounds, which upload fills in.
     w.level = level.build(&w.scene, w.mem);
+    player.cavernCheck(&w.level);
+    gates.selfCheck(w.mem);
     w.player = player.create(&w.level);
     guns.upload(&w.guns, w.mem);
     enemies.upload(&w.enemies, w.mem);
@@ -95,26 +133,143 @@ fn startup(w: &World) {
     skills.upload(&w.skills, w.mem);
     shrine.load(&w.shrines, &w.scene, &w.level, w.mem);
     w.font = game.loadFont("assets/font.ttf", 16);
+    w.mid = game.loadFont("assets/font.ttf", 24);
     w.big = game.loadFont("assets/font.ttf", 44);
+    w.huge = game.loadFont("assets/font.ttf", 76);
     score.load(&w.score);
+    level.plain(true);
     enemies.selfCheck(w.mem, &w.scene);
+    enemies.cavernCheck(w.mem, &w.level, &w.scene);
     guns.selfCheck(w.mem, &w.scene);
     boss.selfCheck(w.mem);
+    boss.progressionCheck(w.mem, &w.level);
+    shrine.selfCheck(w.mem, &w.shrines, &w.level);
     skills.selfCheck(w.mem);
+    level.plain(false);
     // After the checks, which build their own generators. A launch gets its own card and shrine deal.
     perks.reseed(&w.perks);
+    perks.startAt(&w.perks, w.flags.level);
     shrine.reseed(&w.shrines);
+    challenge.set(w.flags.challenge);
+    w.player.hp = player.maxHp(&w.player);
+    guns.loadout(&w.guns, &w.player);
     let held = w.flags.guns;
     if held.len == 0 { held = w.flags.gun; }
     guns.preview(&w.guns, &w.player, w.mem, held);
+    let listed = 0;
+    while listed < w.flags.perks.len {
+        let pick = debug.piece(w.mem, w.flags.perks, listed);
+        listed = pick.next;
+        let bit = 0;
+        if same(pick.name, "air") { bit = player.AIR_DMG; }
+        if same(pick.name, "drone") { bit = player.DRONE; }
+        if same(pick.name, "jetpack") { bit = player.JETPACK; }
+        if same(pick.name, "turret") { bit = player.TURRET; }
+        if bit != 0 && !player.has(&w.player, bit) { w.player.stats.gifts += bit; }
+    }
     boss.preview(&w.bosses, &w.player, &w.level, &w.enemies, w.mem, w.flags.bosses, w.flags.boss, w.flags.watch);
     skills.preview(&w.skills, &w.player, w.flags.skill, w.flags.skillAuto);
+    openAll(&w.level, &w.shrines, w.flags.unlock);
+    if same(w.flags.area, "hollows") || same(w.flags.area, "volcano-seal") {
+        w.level.open = 511;
+        w.gates.used = 8;
+        w.player.pos = Vec3.xyz(168, 27.5, -162);
+        w.player.pitch = -0.75;
+        if same(w.flags.area, "hollows") {
+            w.level.open = 1023;
+            w.gates.used = 9;
+            w.player.pos = Vec3.xyz(168, -60, -141);
+            w.player.yaw = -0.8;
+            w.player.pitch = -0.12;
+        }
+        w.player.safe = w.player.pos;
+        level.setGates(&w.level);
+        biome.update(&w.biomes, &w.player, 1);
+    }
     sfx.load();
-    game.captureMouse(true);
+    startChallenge(w);
+    w.enemies.endless = w.flags.endless;
+    enemies.setDifficulty(w.flags.difficulty);
+    if w.flags.difficulty > enemies.MEDIUM { enemies.openHard(); }
+    w.atTitle = !w.flags.skipMenu && w.perf.mode == 0;
+    w.menuYaw = w.player.yaw;
+    game.captureMouse(!w.atTitle);
     perf.start(&w.perf, &w.enemies, &w.player, &w.level);
 }
 
+/// A run under challenge rules: 5 meteors to the Hub to start with, and 3 more for each area opened later.
+fn startChallenge(w: &World) {
+    w.aidSeen = w.level.open;
+    w.rushXp = 0;
+    let ch = challenge.mode();
+    if ch != challenge.NONE && ch != challenge.RUSH { enemies.owe(&w.enemies, 4, 5); }
+}
+
+/// Meteors for every area that opened since the last look.
+fn aid(w: &World, step: f32) {
+    let t = 0;
+    while t < 9 {
+        if level.isOpen(&w.level, t) && (w.aidSeen / level.bit(t)) % 2 == 0 { enemies.owe(&w.enemies, t, 3); }
+        t += 1;
+    }
+    w.aidSeen = w.level.open;
+    enemies.aidTick(&w.enemies, &w.player, &w.level, step);
+}
+
+fn restart(w: &World) {
+    enemies.revive(&w.enemies, &w.player);
+    perks.reset(&w.perks);
+    perks.startAt(&w.perks, w.flags.level);
+    shrine.reset(&w.shrines);
+    w.victoryDismissed = false;
+    w.enemies.endless = w.flags.endless;
+    gates.reset(&w.gates, &w.level);
+    openAll(&w.level, &w.shrines, w.flags.unlock);
+    guns.loadout(&w.guns, &w.player);
+    guns.refill(&w.guns, &w.player);
+    boss.reset(&w.bosses);
+    skills.reset(&w.skills, &w.player);
+    startChallenge(w);
+    game.captureMouse(true);
+}
+
+/// What a menu picked: play or resume or try again, restart the run, or back to the title.
+fn act(w: &World) {
+    let pick = w.todo;
+    w.todo = 0;
+    if pick == menu.GO {
+        if w.enemies.died {
+            restart(w);
+        } else if w.atTitle {
+            w.atTitle = false;
+            w.player.yaw = w.menuYaw;
+            game.captureMouse(true);
+        } else {
+            game.captureMouse(true);
+        }
+    } else if pick == menu.RESTART {
+        score.clear(&w.score);
+        restart(w);
+    } else if pick == menu.TITLE {
+        score.clear(&w.score);
+        challenge.set(w.flags.challenge);
+        restart(w);
+        w.atTitle = true;
+        w.menuT = 0;
+        w.player.yaw = w.menuYaw;
+        game.captureMouse(false);
+    }
+}
+
+/// A card closed: back to the game, unless another card is still waiting.
+fn resume(w: &World) {
+    if w.skills.offering || w.shrines.offering || w.perks.offering { return; }
+    game.captureMouse(true);
+    w.player.immuneT = PICK_IMMUNE;
+}
+
 fn update(w: &World, dt: f32) {
+
     if w.perf.mode > 0 {
         perf.capture(&w.perf, &w.enemies);
         enemies.beginUpdate(&w.enemies, &w.player, 0.01);
@@ -124,26 +279,61 @@ fn update(w: &World, dt: f32) {
         if w.perf.mode > 1 { boss.benchmark(&w.bosses, &w.player, &w.level, &w.enemies, 0.01); }
         return;
     }
+    if w.todo != 0 { act(w); }
+    if w.atTitle {
+        guns.cancelDraw(&w.guns);
+        game.captureMouse(false);
+        w.menuT += dt;
+        w.player.yaw = w.menuYaw + w.menuT * 0.05;
+        if game.keyPressed(Key.Escape) { menu.back(); }
+        if game.keyPressed(Key.Enter) { w.todo = menu.GO; }
+        return;
+    }
+    if w.enemies.died {
+        w.enemies.downT += dt;
+        guns.cancelDraw(&w.guns);
+        game.captureMouse(false);
+        let go = w.enemies.downT > 0.45 && (game.keyPressed(Key.Space) || game.keyPressed(Key.Enter));
+        if go { restart(w); }
+        return;
+    }
+    if boss.won(&w.bosses) && !w.victoryDismissed {
+        guns.cancelDraw(&w.guns);
+        game.captureMouse(false);
+        if game.keyPressed(Key.Enter) && challenge.mode() != challenge.NONE {
+            if enemies.difficulty() >= enemies.MEDIUM { enemies.openHard(); }
+            w.todo = menu.TITLE;
+            return;
+        }
+        if game.keyPressed(Key.Enter) {
+            w.victoryDismissed = true;
+            w.enemies.endless = true;
+            if enemies.difficulty() >= enemies.MEDIUM { enemies.openHard(); }
+            game.captureMouse(true);
+        }
+        return;
+    }
     if !game.mouseCaptured() { guns.cancelDraw(&w.guns); }
     // A boss's skill, a shrine gift or a level-up hand up: frozen until it's picked.
+    if w.skills.offering || w.shrines.offering || w.perks.offering { w.guns.shake = 0; }
     if w.skills.offering {
-        if skills.choose(&w.skills, &w.player, dt) { game.captureMouse(true); }
+        if skills.choose(&w.skills, &w.player, dt) { resume(w); }
         return;
     }
     if w.shrines.offering {
-        if shrine.choose(&w.shrines, &w.player, dt) { game.captureMouse(true); }
+        if shrine.choose(&w.shrines, &w.player, dt) { resume(w); }
         return;
     }
     if w.perks.offering {
         // Several level ups at once: one hand after another.
         if perks.update(&w.perks, &w.player, dt) {
-            if w.perks.pending > 0 { perks.offer(&w.perks, &w.player); } else { game.captureMouse(true); }
+            if w.perks.pending > 0 { perks.offer(&w.perks, &w.player); } else { resume(w); }
         }
         return;
     }
     // Escape pauses (the mouse comes free for the menu) and resumes. Paused, nothing moves.
-    if game.keyPressed(Key.Escape) { game.captureMouse(!game.mouseCaptured()); }
-    if !game.mouseCaptured() { guns.cancelDraw(&w.guns); return; }
+    if game.keyPressed(Key.Escape) && !menu.back() { game.captureMouse(!game.mouseCaptured()); }
+    if !game.mouseCaptured() { w.guns.shake = 0; guns.cancelDraw(&w.guns); return; }
     if game.keyPressed(Key.M) { w.mapOpen = !w.mapOpen; }
     if w.mapOpen { guns.cancelDraw(&w.guns); return; }
     let ear = player.look(&w.player);
@@ -152,15 +342,19 @@ fn update(w: &World, dt: f32) {
     if step > 0.05 { step = 0.05; }
     enemies.beginUpdate(&w.enemies, &w.player, step);
     player.update(&w.player, &w.level, step);
+    player.wind(&w.player, step);
     biome.update(&w.biomes, &w.player, step);
-    gates.update(&w.gates, &w.level, &w.shrines, w.perks.level, step);
+    w.gates.hollowsOk = boss.surfaceWon(&w.bosses);
+    w.enemies.lvl = w.perks.level;
+    if !challenge.on(challenge.RUSH) { gates.update(&w.gates, &w.level, &w.shrines, w.perks.level, step); }
     guns.update(&w.guns, &w.player, &w.level, &w.scene, &w.enemies, &w.shrines, &w.bosses, step);
     gear.update(&w.gear, &w.player, &w.level, &w.scene, &w.enemies, &w.bosses, step);
     skills.update(&w.skills, &w.player, &w.level, &w.enemies, &w.bosses, &w.shrines, &w.guns, step);
     if shrine.update(&w.shrines, &w.player, &w.enemies, &w.level, w.perks.level, step) {
         // Every gift owned or rejected: a normal card instead.
         if w.shrines.epic {
-            w.shrines.epic = false;
+            let tile = shrine.takeArea(&w.shrines);
+            boss.awaken(&w.bosses, &w.player, &w.level, &w.enemies, tile);
             perks.offerEpic(&w.perks);
         } else if w.shrines.bonus {
             w.shrines.bonus = false;
@@ -170,27 +364,52 @@ fn update(w: &World, dt: f32) {
     }
     if boss.update(&w.bosses, &w.player, &w.level, &w.enemies, step) {
         score.bonus(&w.score, "BOSS DOWN", BOSS_PTS);
-        skills.offer(&w.skills);
+        if challenge.on(challenge.RUSH) {
+            // A random shrine gift now, and four levels of xp once it's settled.
+            shrine.reward(&w.shrines, &w.player);
+            w.shrines.bonus = false;
+            w.rushXp = perks.xpForLevels(&w.perks, 4);
+            // The boss's own skill too (its card first, then the gift); a legendary reward is skipped.
+            skills.offer(&w.skills, boss.defeated(&w.bosses));
+        } else if !skills.offer(&w.skills, boss.defeated(&w.bosses)) { perks.offerLegendary(&w.perks); }
         game.captureMouse(false);
     }
+    if boss.won(&w.bosses) && !w.victoryDismissed { return; }
     w.guns.shake = max(w.guns.shake, w.bosses.shake);
     score.update(&w.score, &w.player, &w.enemies, step);
     enemies.update(&w.enemies, &w.player, &w.level, &w.scene, step);
-    if w.enemies.died {
-        w.enemies.died = false;
-        perks.reset(&w.perks);
-        shrine.reseed(&w.shrines);
-        gates.reset(&w.gates, &w.level);
-        guns.refill(&w.guns, &w.player);
-        boss.reset(&w.bosses);
-        skills.reset(&w.skills, &w.player);
+    if !boss.up(&w.bosses) && !w.enemies.endless {
+        let downed = boss.defeated(&w.bosses);
+        if downed >= enemies.HORDE_BOSSES { enemies.horde(&w.enemies, &w.player, &w.level, step); }
+        if downed >= enemies.SPECIAL_BOSSES { enemies.special(&w.enemies, &w.player, &w.level, step); }
     }
+    if w.enemies.endless {
+        // Hordes and specials come twice as often, even during a fight.
+        enemies.horde(&w.enemies, &w.player, &w.level, step * 2);
+        enemies.special(&w.enemies, &w.player, &w.level, step * 2);
+        if enemies.colossusDue(&w.enemies, &w.player, step) { boss.endlessColossus(&w.bosses, &w.player, &w.level, &w.enemies); }
+    }
+    let special = 0;
+    if same(w.flags.spawn, "shield") { special = enemies.SHIELD; }
+    if same(w.flags.spawn, "flag") { special = enemies.FLAG; }
+    if same(w.flags.spawn, "meteor") { special = enemies.METEOR; }
+    if challenge.on(challenge.RUSH) { boss.rush(&w.bosses, &w.player, &w.level, &w.enemies, step); }
+    else if challenge.mode() != challenge.NONE { aid(w, step); }
+    enemies.emberTick(&w.enemies, &w.player, &w.level, step);
+    enemies.debugSpawn(&w.enemies, &w.player, &w.level, special, 3, step);
+    enemies.debugElite(&w.enemies, &w.player, &w.level, w.flags.spawnElite, w.flags.spawnMod, 3, step);
+    w.guns.shake = max(w.guns.shake, w.enemies.shake);
+    if w.enemies.died { return; }
     // 100 of a biome's own enemies down: a free legendary hand.
     if w.enemies.cleared >= 0 && !w.perks.offering {
         w.enemies.cleared = -1;
         perks.offerLegendary(&w.perks);
         game.captureMouse(false);
         return;
+    }
+    if w.rushXp > 0 && !w.shrines.offering {
+        w.enemies.xp += w.rushXp;
+        w.rushXp = 0;
     }
     if perks.earn(&w.perks, &w.enemies) {
         perks.offer(&w.perks, &w.player);
@@ -224,7 +443,7 @@ fn draw(w: &World) {
         boss.draw(&w.bosses);
         shrine.draw(&w.shrines);
         gear.draw(&w.gear, &w.player, false);
-        gates.drawLocks(&w.gates, &w.shrines);
+        gates.drawLocks(&w.gates, &w.shrines, &w.level);
     }
     scene3d.lights(&w.scene);
     guns.lights(&w.guns, look);
@@ -237,23 +456,42 @@ fn draw(w: &World) {
     w.perf.sceneMs += f32(game.micros() - cameraSceneAt) / 1000;
     perf.draw(&w.perf, &w.enemies);
     enemies.draw(&w.enemies, &w.player);
+    player.drawWind(w.enemies.cube);
     boss.draw(&w.bosses);
     shrine.draw(&w.shrines);
     gear.draw(&w.gear, &w.player, true);
     skills.draw(&w.skills);
-    gates.drawLocks(&w.gates, &w.shrines);
+    gates.drawLocks(&w.gates, &w.shrines, &w.level);
     gates.drawWalls(&w.gates, &w.level);
     boss.drawBlended(&w.bosses);
+    if w.atTitle {
+        w.todo = menu.title(w.font, w.big, w.huge, &w.player, game.windowSize(), w.score.best);
+        return;
+    }
     guns.draw(&w.guns, look);
+    biome.overlay(&w.biomes);
     score.draw(&w.score);
-    hud.draw(w.font, w.big, &w.guns, &w.player, &w.enemies, &w.perks, w.perks.offering || w.shrines.offering || w.skills.offering);
+    hud.draw(w.font, w.mid, w.big, &w.guns, &w.player, &w.enemies, &w.perks, &w.bosses, &w.shrines);
     boss.hud(&w.bosses, &w.player, w.font, w.big);
+    boss.challengeHud(&w.bosses, w.font, w.big);
     minimap.draw(&w.level, &w.player, &w.enemies, &w.shrines, &w.bosses, w.mapOpen, w.font, w.big);
     if w.perks.offering { perks.draw(&w.perks, w.font, w.big); }
     biome.hud(&w.biomes, w.font, w.big);
-    gates.hud(&w.gates, w.perks.level, w.font, w.big);
+    if !challenge.on(challenge.RUSH) { gates.hud(&w.gates, w.perks.level, &w.level, w.player.pos, w.font, w.big); }
     shrine.hud(&w.shrines, w.font, w.big);
     skills.hud(&w.skills, w.font, w.big);
+    if boss.won(&w.bosses) && !w.victoryDismissed { boss.victory(w.font, w.big); }
+    let cards = w.perks.offering || w.shrines.offering || w.skills.offering;
+    let won = boss.won(&w.bosses) && !w.victoryDismissed;
+    if w.enemies.died {
+        let over = menu.death(w.font, w.big, w.huge, &w.enemies, &w.score, &w.perks, game.windowSize());
+        if over != 0 { w.todo = over; }
+    } else if !game.mouseCaptured() && !cards && !won {
+        let paused = menu.pause(w.font, w.big, &w.player, &w.enemies, &w.perks, &w.skills, game.windowSize());
+        if paused != 0 { w.todo = paused; }
+    } else {
+        menu.close();
+    }
 }
 
 fn main() {

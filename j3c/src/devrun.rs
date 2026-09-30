@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::check::Program;
@@ -86,6 +86,7 @@ pub fn prepare(m: &Manifest, opts: &EmitOpts, fast: bool) -> Result<Prepared, St
     let current = exe.exists() && old.lines().next() == Some(key.as_str());
     let mut rebuilt = false;
     if current {
+        crate::cli::status("up to date");
         crate::cli::timing("dev binary up to date", Instant::now());
     } else {
         if exe.exists() {
@@ -100,6 +101,7 @@ pub fn prepare(m: &Manifest, opts: &EmitOpts, fast: bool) -> Result<Prepared, St
         }
         let mut opts = opts.clone();
         opts.cc.out = Some(exe.clone());
+        crate::cli::status("emitting");
         let started = Instant::now();
         if split_vm(&opts) {
             let vm = vm_funcs(&prog);
@@ -201,12 +203,49 @@ fn launch(exe: &Path, root: &Path, args: &[String]) -> Result<Child, String> {
     let exe = exe
         .canonicalize()
         .map_err(|e| format!("run {}: {e}", exe.display()))?;
-    Command::new(&exe)
+    let mut child = Command::new(&exe)
         .args(args)
         .current_dir(&root)
         .env("J3_ROOT", &root)
+        .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("run {}: {e}", exe.display()))
+        .map_err(|e| format!("run {}: {e}", exe.display()))?;
+    // Pass stderr through live, but hold back the crash handler's raw `j3 ...:` address lines
+    // until the process ends so they can be turned into function names.
+    let pipe = child.stderr.take().expect("piped stderr");
+    let crash = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let held = crash.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+            if line.starts_with("j3 crash:") || line.starts_with("j3 base:") || line.starts_with("j3 pc:") || line.starts_with("j3 at:") {
+                let mut h = held.lock().unwrap();
+                h.push_str(&line);
+                h.push('\n');
+            } else {
+                eprintln!("{line}");
+            }
+        }
+    });
+    CRASH.with(|c| *c.borrow_mut() = Some((crash, exe)));
+    Ok(child)
+}
+
+thread_local! {
+    /// Held crash-report lines and the exe that wrote them, for the running child.
+    static CRASH: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Mutex<String>>, PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Print the symbolized crash report of the child that just exited, if it wrote one.
+fn report_crash() {
+    std::thread::sleep(Duration::from_millis(50)); // let the reader thread drain the pipe
+    if let Some((held, exe)) = CRASH.with(|c| c.borrow_mut().take()) {
+        let text = held.lock().unwrap().clone();
+        if let Some(out) = emit::host::symbolize(&exe, &text) {
+            eprint!("{out}");
+        }
+    }
 }
 
 fn mtimes(paths: &[PathBuf]) -> Vec<Option<SystemTime>> {
@@ -235,11 +274,13 @@ pub fn watch(
     built: &mut Built,
     args: &[String],
 ) -> Result<i32, String> {
+    crate::cli::status("running");
     let mut child = launch(&built.exe, &m.root, args)?;
     let mut seen = mtimes(&built.scripts);
     loop {
         if let Some(status) = child.try_wait().map_err(|e| format!("wait: {e}"))? {
-            return Ok(status.code().unwrap_or(1));
+            report_crash();
+            return Ok(crate::emit::host::exit_code(&status));
         }
         std::thread::sleep(Duration::from_millis(100));
         let now = mtimes(&built.scripts);

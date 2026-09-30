@@ -132,6 +132,7 @@ pub fn compile_llvm(
         }
         let _ = fs::remove_file(stamp);
     }
+    crate::cli::status("compiling");
     let started = std::time::Instant::now();
     let out = cmd.output().map_err(|e| format!("spawn {clang}: {e}"))?;
     if std::env::var_os("J3C_TIMINGS").is_some() {
@@ -194,6 +195,7 @@ pub fn compile_llvm_split(
         cmd.arg("-o").arg(obj).arg(src);
         cmd
     };
+    crate::cli::status("compiling");
     let started = std::time::Instant::now();
     let vm_key = {
         use std::hash::{Hash, Hasher};
@@ -323,6 +325,7 @@ pub fn compile_c(c_source: &str, opts: &CcOpts, target: &str, clang: &str) -> Re
     }
     cmd.arg("-o").arg(&exe_path).arg(&src_path);
     append_link_args(&mut cmd, opts, c_source, target)?;
+    crate::cli::status("compiling");
     let cc = cmd.output().map_err(|e| format!("spawn {compiler}: {e}"))?;
 
     if !cc.status.success() {
@@ -337,6 +340,18 @@ pub fn compile_c(c_source: &str, opts: &CcOpts, target: &str, clang: &str) -> Re
 
 pub fn run_exe(exe: &Path) -> Result<RunResult, String> {
     run_exe_in(exe, None, &[])
+}
+
+/// Exit code, or `128 + n` when a signal killed the process (the shell convention).
+pub(crate) fn exit_code(status: &std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(n) = status.signal() {
+            return 128 + n;
+        }
+    }
+    status.code().unwrap_or(1)
 }
 
 pub fn run_exe_in(exe: &Path, cwd: Option<&Path>, args: &[String]) -> Result<RunResult, String> {
@@ -355,14 +370,107 @@ pub fn run_exe_in(exe: &Path, cwd: Option<&Path>, args: &[String]) -> Result<Run
     let run = cmd
         .output()
         .map_err(|e| format!("run {}: {e}", exe.display()))?;
+    let stderr = match symbolize(&absolute, &String::from_utf8_lossy(&run.stderr)) {
+        Some(text) => text.into_bytes(),
+        None => run.stderr,
+    };
     Ok(RunResult {
-        status: run.status.code().unwrap_or(1),
+        status: exit_code(&run.status),
         stdout: run.stdout,
-        stderr: run.stderr,
+        stderr,
     })
 }
 
-fn link_gc_flag(target: &str) -> &'static str {
+fn signal_name(n: i32) -> &'static str {
+    match n {
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        11 => "SIGSEGV",
+        _ => "signal",
+    }
+}
+
+fn hex(s: &str) -> Option<u64> {
+    u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+}
+
+/// Rewrite the crash handler's `j3 crash:` / `j3 pc:` / `j3 at:` lines (raw addresses) into
+/// `function at file:line` using `nm` and `addr2line` when installed. `None` when `err` has no
+/// crash report, so ordinary stderr passes through untouched.
+pub(crate) fn symbolize(exe: &Path, err: &str) -> Option<String> {
+    let mut sig = None;
+    let mut base = None;
+    let mut addrs: Vec<u64> = Vec::new();
+    let mut rest = String::new();
+    for line in err.lines() {
+        if let Some(v) = line.strip_prefix("j3 crash: signal ") {
+            sig = v.trim().parse::<i32>().ok();
+        } else if let Some(v) = line.strip_prefix("j3 base: ") {
+            base = hex(v);
+        } else if let Some(v) = line.strip_prefix("j3 pc: ").or_else(|| line.strip_prefix("j3 at: ")) {
+            addrs.extend(hex(v));
+        } else {
+            rest.push_str(line);
+            rest.push('\n');
+        }
+    }
+    let sig = sig?;
+    let mut out = rest;
+    out.push_str(&format!("crash: {} ({sig})\n", signal_name(sig)));
+    let names = base.and_then(|b| addr_names(exe, b, &addrs));
+    let mut prev: Option<String> = None;
+    let mut count = 0;
+    let flush = |out: &mut String, prev: &mut Option<String>, count: &mut usize| {
+        if let Some(p) = prev.take() {
+            out.push_str(&format!("  {p}"));
+            if *count > 1 {
+                out.push_str(&format!("  (x{count})"));
+            }
+            out.push('\n');
+        }
+        *count = 0;
+    };
+    for (i, a) in addrs.iter().enumerate() {
+        let text = match &names {
+            Some(n) => n[i].clone(),
+            None => format!("{a:#x}"),
+        };
+        if prev.as_deref() != Some(text.as_str()) {
+            flush(&mut out, &mut prev, &mut count);
+            prev = Some(text);
+        }
+        count += 1;
+    }
+    flush(&mut out, &mut prev, &mut count);
+    Some(out)
+}
+
+/// `function at file:line` for each runtime address; needs `nm` (to find the load offset from
+/// `main`) and `addr2line`. Return addresses (all but the first, the faulting pc) step back a byte.
+fn addr_names(exe: &Path, runtime_main: u64, addrs: &[u64]) -> Option<Vec<String>> {
+    let nm = Command::new("nm").arg(exe).output().ok()?;
+    let nm = String::from_utf8_lossy(&nm.stdout).into_owned();
+    let static_main = nm.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        let (addr, kind, name) = (it.next()?, it.next()?, it.next()?);
+        (name == "main" && kind.eq_ignore_ascii_case("t")).then(|| hex(addr)).flatten()
+    })?;
+    let offset = runtime_main.wrapping_sub(static_main);
+    let mut cmd = Command::new("addr2line");
+    cmd.args(["-f", "-C", "-p", "-e"]).arg(exe);
+    for (i, a) in addrs.iter().enumerate() {
+        let a = a.wrapping_sub(offset).wrapping_sub(u64::from(i > 0));
+        cmd.arg(format!("{a:#x}"));
+    }
+    let out = cmd.output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let names: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    (names.len() == addrs.len()).then_some(names)
+}
+
+pub(crate) fn link_gc_flag(target: &str) -> &'static str {
     let t = target.to_ascii_lowercase();
     if t.contains("apple") || t.contains("darwin") {
         "-Wl,-dead_strip"
@@ -388,7 +496,7 @@ fn keep_flag(flag: &str, target: &str) -> bool {
     !f.contains("rpath") && !f.contains("--disable-new-dtags")
 }
 
-fn append_link_args(cmd: &mut Command, opts: &CcOpts, source: &str, target: &str) -> Result<(), String> {
+pub(crate) fn append_link_args(cmd: &mut Command, opts: &CcOpts, source: &str, target: &str) -> Result<(), String> {
     for file in &opts.files {
         cmd.arg(file);
     }
@@ -538,7 +646,7 @@ fn find_soname(dir: &Path, name: &str) -> Option<String> {
     best.map(|p| p.display().to_string())
 }
 
-fn clang_opt(opt: &str) -> &str {
+pub(crate) fn clang_opt(opt: &str) -> &str {
     match opt {
         "" => "0",
         "S" => "s",

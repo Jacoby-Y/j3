@@ -4,8 +4,10 @@ mod c;
 pub mod bc;
 mod c_expr;
 mod c_ty;
-mod host;
+pub(crate) mod host;
+mod incr;
 mod llvm;
+mod llvm_crash;
 mod llvm_expr;
 mod llvm_ty;
 mod opts;
@@ -29,6 +31,26 @@ pub fn emit_text(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<Strin
     match opts.backend {
         Backend::C => emit_program(cx, modules),
         Backend::Llvm => emit_llvm(cx, modules, opts),
+    }
+}
+
+/// Emit and clang. Opt 0 with an output path compiles one object per module
+/// and reuses objects whose IR did not change.
+pub fn compile_program(
+    cx: &IrCx,
+    modules: &[Module],
+    opts: &EmitOpts,
+) -> Result<std::path::PathBuf, String> {
+    if incr::enabled(opts) {
+        incr::compile(cx, modules, opts)
+    } else {
+        crate::cli::status("emitting");
+        let started = std::time::Instant::now();
+        let text = emit_text(cx, modules, opts)?;
+        if std::env::var_os("J3C_TIMINGS").is_some() {
+            eprintln!("j3c: emit: {:.3}s", started.elapsed().as_secs_f64());
+        }
+        compile_text(&text, opts)
     }
 }
 
@@ -60,8 +82,8 @@ pub fn run_program_with(
     opts: &EmitOpts,
     args: &[String],
 ) -> Result<RunResult, String> {
-    let text = emit_text(cx, modules, opts)?;
-    let exe = compile_text(&text, opts)?;
+    let exe = compile_program(cx, modules, opts)?;
+    crate::cli::status("running");
     let result = host::run_exe_in(&exe, opts.cwd.as_deref(), args);
     if opts.cc.out.is_none() {
         let _ = std::fs::remove_file(&exe);

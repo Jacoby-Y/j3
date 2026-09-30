@@ -28,7 +28,7 @@ Without --project it follows the editor: the project `j3c editor` has open, else
 nearest j3.toml at or above the current directory. With --project DIR it stays on the
 nearest j3.toml at or above DIR. Tools: scene_list,
 scene_get, scene_add, scene_add_many, scene_set, scene_delete, place, undo, render, check, play, console, import,
-asset_search, asset_online_search, asset_fetch, gen. `j3c -e mcp --tools` prints each tool's
+asset_search, asset_online_search, asset_fetch, gen, scene_stats, scene_diff. `j3c -e mcp --tools` prints each tool's
 arguments and the CLI command that does the same work.
 
 Saving and undo depend on the editor. With `j3c editor` open on the project, scene edits go
@@ -42,14 +42,41 @@ Claude Code:  claude mcp add -s user j3 -- j3c -e mcp
 const INSTRUCTIONS: &str = "\
 Tools for a j3 game project: scenes are trees of named objects (meshes, cameras, lights, \
 groups, placed scenes) in scenes/*.j3scene. Name objects by name, by Parent/Child path, or \
-by #id. Positions are local to the parent, rotations are degrees, y is up, and 1 unit is \
-about 1 meter. Work in a loop: change the scene (scene_add/scene_set; scene_add_many for several objects at once; place to ground, stack, \
-scatter, or lay out grid pieces like walls and floors instead of guessing heights), then look at it with \
-render (use focus to frame one object, view=top to check layout), then fix what looks \
-wrong. Run check before play. When the person has the editor open, your edits appear there \
-as undoable steps and are not saved until they save (or you call scene_set with save). \
-Without the editor, undo puts a scene file back as it was before your last change. \
-Need a model, material, or sky the project lacks? asset_online_search, then asset_fetch.";
+by #id. Positions are local to the parent, rotations are degrees (in the tools; scene files \
+store radians), y is up, and 1 unit is about 1 meter.
+
+Work in a loop: change the scene, LOOK at it with render, fix what looks wrong, run check.
+- Build with the bulk tools, not many single calls. place: ring (round walls, slabs sized to \
+close the circle), wall (with a door gap), stairs, spiral, grid (modular pieces), scatter \
+(random copies, grounded), ground/ontop (rest on surfaces instead of guessing heights). \
+scene_add_many batches anything else in one undo step.
+- Bulk edits: scene_set and scene_delete take globs (DecoCorn*). scene_list with filter and \
+group_by=prefix shows what names exist.
+- Look from where the player would be: render with at [x,y,z] + yaw/pitch (degrees; yaw 0 \
+faces -z, 90 faces -x), views for several angles in one image, hide (Roof*) to see inside, \
+view=top with ortho for a plan. Rendering from a camera you add just to look is not needed.
+- Verify before you say done: check (scene rules, the project's own rules, and code), \
+scene_stats (draw cost), scene_diff (review your own changes). play runs the game headless.
+- Read behaviour from tags (scene_set tags=a,b=1), not name prefixes, in new game code.
+When the person has the editor open, your edits appear there as undoable steps and are not \
+saved until they save (or you call scene_set with save). Without the editor, undo puts a \
+scene file back as it was before your last change. Need a model, material, or sky the \
+project lacks? asset_online_search, then asset_fetch.";
+
+/// The server instructions, plus the project's own notes: the file `notes = "..."` names in
+/// `j3.editor.toml` (first 4000 bytes), so a project can say what its checks and tags mean.
+fn instructions(root: Option<&Path>) -> String {
+    let mut text = INSTRUCTIONS.to_string();
+    let Some(root) = root else { return text };
+    let Some(rel) = crate::editor::config_value(root, "notes") else { return text };
+    let p = Path::new(&rel);
+    if p.is_absolute() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) { return text; }
+    if let Ok(notes) = fs::read_to_string(root.join(p)) {
+        let cut = (0..=notes.len().min(4000)).rev().find(|i| notes.is_char_boundary(*i)).unwrap_or(0);
+        text += &format!("\n\nThis project ({rel}):\n{}", notes[..cut].trim());
+    }
+    text
+}
 
 pub fn cmd(rest: &[String]) -> i32 {
     let mut project = None;
@@ -79,7 +106,7 @@ pub fn cmd(rest: &[String]) -> i32 {
     }
     let follow = project.is_none();
     let root = scene::find_root(&project.unwrap_or_else(|| PathBuf::from(".")));
-    let mut server = Server { root, follow, next: 0, was_live: false };
+    let mut server = Server { root, follow, next: 0, was_live: false, coach: Coach::default() };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     serve(&mut server, stdin.lock(), &mut stdout.lock());
@@ -95,6 +122,76 @@ struct Server {
     next: u64,
     /// The last scene request went to the open editor, not the file.
     was_live: bool,
+    coach: Coach,
+}
+
+/// What the agent has done so far, so replies can point at a better tool at the moment it
+/// would have helped. Hints are short, say what to call, and each fires once per streak.
+#[derive(Default)]
+struct Coach {
+    /// `scene_add` calls in a row.
+    adds_in_a_row: u32,
+    sets_in_a_row: u32,
+    /// Scene edits since the last render.
+    edits_unseen: u32,
+    renders: u32,
+    /// The scene was checked since the last edit.
+    checked: bool,
+}
+
+impl Coach {
+    /// Hints for a finished call to `name` with `args`.
+    fn hints(&mut self, name: &str, args: &Json, failed: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        if failed { return out; }
+        if name == "scene_add" {
+            self.adds_in_a_row += 1;
+            if self.adds_in_a_row == 5 {
+                out.push("hint: five scene_add calls in a row. For repeated shapes, place does it in one step: ring (round walls), wall (with a door), stairs, spiral, grid, scatter. scene_add_many batches other objects.".into());
+            }
+        } else {
+            self.adds_in_a_row = 0;
+        }
+        if name == "scene_add_many" {
+            let n = match args.get("adds") { Some(Json::Arr(a)) => a.len(), _ => 0 };
+            if n >= 30 {
+                out.push(format!("hint: {n} objects added by hand. If they follow a pattern, place ring/wall/stairs/spiral/grid/scatter makes it from a few numbers, and is easier to change."));
+            }
+        }
+        if name == "scene_set" {
+            self.sets_in_a_row += 1;
+            if self.sets_in_a_row == 5 {
+                out.push("hint: five scene_set calls in a row. If they change objects with similar names, node takes a glob (DecoCorn*) and sets all of them; scene_list with group_by=prefix shows the name groups.".into());
+            }
+        } else {
+            self.sets_in_a_row = 0;
+        }
+        if EDITS.contains(&name) {
+            self.edits_unseen += 1;
+            self.checked = false;
+            if self.edits_unseen == 8 {
+                out.push("hint: eight edits since you last looked. Call render (at/yaw/pitch for inside a room, views for several angles) before building more.".into());
+            }
+        }
+        if name == "render" {
+            self.renders += 1;
+            self.edits_unseen = 0;
+            let from_a_spot = args.get("at").is_some() || args.get("views").is_some();
+            if !from_a_spot && self.renders <= 2 {
+                out.push("hint: render also takes at [x,y,z] with yaw/pitch (degrees) to look from any spot, views for up to 16 angles in one image, hide (e.g. \"Roof*\") to see into a building. Use them to check a room is reachable, not just that it exists.".into());
+            }
+        }
+        if name == "check" {
+            if !self.checked {
+                out.push("hint: before you finish, scene_diff lists what you changed (review it), and scene_stats shows draw cost (above 60 distinct looks is slow).".into());
+            }
+            self.checked = true;
+        }
+        if name == "play" && !self.checked {
+            out.push("hint: check hasn't run since your last edit. It is faster than play and names the object at fault.".into());
+        }
+        out
+    }
 }
 
 fn serve(server: &mut Server, input: impl BufRead, out: &mut impl Write) {
@@ -178,7 +275,7 @@ impl Server {
                         ("protocolVersion", s(version)),
                         ("capabilities", Json::obj(vec![("tools", Json::obj(vec![("listChanged", Json::Bool(false))]))])),
                         ("serverInfo", Json::obj(vec![("name", s("j3c")), ("version", s(env!("CARGO_PKG_VERSION")))])),
-                        ("instructions", s(INSTRUCTIONS)),
+                        ("instructions", Json::Str(instructions(self.root().ok().as_deref()))),
                     ]),
                 )
             }
@@ -231,6 +328,7 @@ impl Server {
                 .to_string(),
             ));
         }
+        for h in self.coach.hints(name, args, answer.error) { answer.content.push(text_block(h)); }
         Ok(answer)
     }
 
@@ -239,16 +337,26 @@ impl Server {
         match name {
             "scene_list" => {
                 let rel = scene_arg(&root, args)?;
-                let mut reply = self.scene_request(&root, &rel, &["list".into()])?;
-                if let Some(filter) = str_arg(args, "filter") {
+                let mut req = vec!["list".to_string()];
+                let filter = str_arg(args, "filter");
+                let glob = filter.as_deref().is_some_and(|f| f.contains(['*', '?']));
+                if glob { req.push(format!("filter={}", filter.as_deref().unwrap_or(""))); }
+                if str_arg(args, "group_by").as_deref() == Some("prefix") { req.push("group=prefix".into()); }
+                let mut reply = self.scene_request(&root, &rel, &req)?;
+                if let Some(filter) = filter.filter(|_| !glob) {
                     let f = filter.to_lowercase();
                     reply.lines.retain(|l| l[0] != "node" || l.iter().take(4).any(|c| c.to_lowercase().contains(&f)));
                 }
                 let count = reply.lines.iter().filter(|l| l[0] == "node").count();
-                let head = format!(
-                    "{count} objects in {rel} (#id path kind asset, world position; rotations are degrees){}\n",
-                    if self.was_live { ", live in the open editor" } else { "" }
-                );
+                let groups = reply.lines.iter().filter(|l| l[0] == "group").count();
+                let head = if groups > 0 {
+                    format!("{groups} name prefixes in {rel} (count, prefix)\n")
+                } else {
+                    format!(
+                        "{count} objects in {rel} (#id path kind asset, world position; rotations are degrees){}\n",
+                        if self.was_live { ", live in the open editor" } else { "" }
+                    )
+                };
                 Ok(answer_from(&reply, "list", &rel, head))
             }
             "scene_get" => {
@@ -321,7 +429,15 @@ impl Server {
                         }
                     }
                     "grid" => return self.batch(&root, &rel, grid_requests(args)?),
-                    other => return Err(format!("op `{other}`: expected ground, ontop, scatter, or grid")),
+                    "ring" | "stairs" | "spiral" | "wall" => {
+                        let Json::Obj(items) = args else { return Err("place needs an object of arguments".into()) };
+                        let mut kv = Vec::new();
+                        for (k, v) in items {
+                            if !matches!(k.as_str(), "op" | "scene") && !matches!(v, Json::Null) { kv.push(format!("{k}={}", value_str(v)?)); }
+                        }
+                        return self.batch(&root, &rel, scene::pattern_requests(&op, &kv)?);
+                    }
+                    other => return Err(format!("op `{other}`: expected ground, ontop, scatter, grid, ring, stairs, spiral, or wall")),
                 }
                 let reply = self.scene_request(&root, &rel, &req)?;
                 Ok(answer_from(&reply, &op, &rel, String::new()))
@@ -334,6 +450,16 @@ impl Server {
                 Ok(Answer::text(scene::undo(&root, &rel)?))
             }
             "render" => self.render(&root, args),
+            "scene_stats" => {
+                let rel = scene_arg(&root, args)?;
+                let reply = self.scene_request(&root, &rel, &["stats".into()])?;
+                Ok(answer_from(&reply, "stats", &rel, String::new()))
+            }
+            "scene_diff" => {
+                let rel = scene_arg(&root, args)?;
+                let d = scene::diff(&root, &rel, str_arg(args, "against").as_deref())?;
+                Ok(Answer::text(format!("{rel}: {}", d.text(80).trim_end())))
+            }
             "check" => check(&root, args),
             "play" => play(&root, args),
             "console" => console(&root, args, self.live(&root)),
@@ -422,8 +548,15 @@ impl Server {
         let failed = crate::gen::run_all(root, false).failed;
         if !failed.is_empty() { return Err(format!("a mesh generator failed:\n{}", failed.join("\n"))); }
         let mut opts = Vec::new();
-        for key in ["camera", "view", "focus", "select"] {
-            if let Some(v) = str_arg(args, key) { opts.push(format!("{key}={v}")); }
+        for key in ["camera", "view", "focus", "select", "at", "yaw", "pitch", "fov", "hide", "ambient", "ortho"] {
+            match args.get(key) {
+                None | Some(Json::Null) => {}
+                Some(v) => opts.push(format!("{key}={}", value_str(v)?)),
+            }
+        }
+        if let Some(Json::Arr(views)) = args.get("views") {
+            let views = views.iter().map(value_str).collect::<Result<Vec<_>, _>>()?;
+            opts.push(format!("views={}", views.join(";")));
         }
         let w = args.get("width").and_then(Json::as_i64).unwrap_or(640);
         let h = args.get("height").and_then(Json::as_i64).unwrap_or(360);
@@ -694,16 +827,7 @@ fn grid_requests(args: &Json) -> Result<Vec<Vec<String>>, String> {
         let what = need_str(p, "what")?;
         let turn = num(p.get("turn"), 0.0);
         if turn.fract() != 0.0 { return Err(format!("turn {turn} is not a whole number of quarter turns")); }
-        let mut req = vec!["add".to_string()];
-        if what.ends_with(".j3scene") {
-            req.extend(["instance".into(), format!("scene={what}")]);
-        } else if what.ends_with(".j3mesh") || what.starts_with("builtin:") {
-            req.extend(["mesh".into(), format!("asset={what}")]);
-        } else if SHAPES.contains(&what.as_str()) {
-            req.push(what);
-        } else {
-            return Err(format!("grid piece `{what}`: expected a .j3scene, .j3mesh, builtin: asset, or shape"));
-        }
+        let mut req = scene::add_what(&what)?;
         let (x, z, floor) = (num(p.get("x"), 0.0), num(p.get("z"), 0.0), num(p.get("floor"), 0.0));
         req.push(format!("pos={},{},{}", number(x * cell), number(floor * height), number(z * cell)));
         req.push(format!("rot=0,{},0", number(turn * 90.0)));
@@ -714,7 +838,6 @@ fn grid_requests(args: &Json) -> Result<Vec<Vec<String>>, String> {
     Ok(reqs)
 }
 
-const SHAPES: &[&str] = &["cube", "sphere", "cylinder", "cone", "capsule", "torus", "quad", "plane", "sky"];
 
 fn scene_arg(root: &Path, args: &Json) -> Result<String, String> {
     scene::scene_rel(root, str_arg(args, "scene").as_deref())
@@ -731,7 +854,7 @@ fn check(root: &Path, args: &Json) -> Result<Answer, String> {
     let mut errors: i64 = 0;
     let placed = scene::placed_scenes(root);
     for rel in &scenes {
-        let reply = scene::run_tool(root, rel, &scene::check_args(root, rel, &placed))?;
+        let reply = scene::check_scene(root, rel, &placed)?;
         if let Some(e) = reply.error() {
             lines.push(format!("{rel}: error: {e}"));
             errors += 1;
@@ -1005,7 +1128,7 @@ const CLI_SAME: &[(&str, &str)] = &[
     ("scene_add_many", ""),
     ("scene_set", "j3c -e scene set <object> key=value ..."),
     ("scene_delete", "j3c -e scene delete <object> ..."),
-    ("place", "j3c -e scene ground|ontop|scatter ... (grid is MCP only)"),
+    ("place", "j3c -e scene ground|ontop|scatter|ring|stairs|spiral|wall ... (grid is MCP only)"),
     ("undo", "j3c -e scene undo"),
     ("render", "j3c -e render"),
     ("check", "j3c -e scene check --all, then j3c check"),
@@ -1016,6 +1139,8 @@ const CLI_SAME: &[(&str, &str)] = &[
     ("asset_online_search", ""),
     ("asset_fetch", ""),
     ("gen", "j3c -e gen [--force]"),
+    ("scene_stats", "j3c -e scene stats [--all]"),
+    ("scene_diff", "j3c -e scene diff [OLD]"),
 ];
 
 /// `j3c -e mcp --tools`: every tool's arguments, from the same definitions as `tools/list`.
@@ -1075,7 +1200,7 @@ fn type_text(prop: &Json) -> String {
 
 const TOOL_NAMES: &[&str] = &[
     "scene_list", "scene_get", "scene_add", "scene_add_many", "scene_set", "scene_delete", "place", "undo", "render", "check", "play", "console", "import",
-    "asset_search", "asset_online_search", "asset_fetch", "gen",
+    "asset_search", "asset_online_search", "asset_fetch", "gen", "scene_stats", "scene_diff",
 ];
 
 /// Tool definitions, as JSON text so they read like the schema they are.
@@ -1085,10 +1210,11 @@ fn tools() -> Json {
 
 const TOOLS: &str = r#"[
 {"name":"scene_list","title":"List scene objects",
- "description":"List every object in a scene: #id, Parent/Child path, kind (group, mesh, camera, light, instance), asset, world position, rotation (degrees), scale, script. Objects placed by an instance (another scene file) are not listed; edit that scene instead.",
+ "description":"Start here to learn what a scene holds (filter with a glob; group_by prefix counts names like DecoCorn). List every object in a scene: #id, Parent/Child path, kind (group, mesh, camera, light, instance), asset, world position, rotation (degrees), scale, script. Objects placed by an instance (another scene file) are not listed; edit that scene instead.",
  "inputSchema":{"type":"object","properties":{
    "scene":{"type":"string","description":"Scene file, e.g. scenes/main.j3scene. Default: the scene in j3.editor.toml."},
-   "filter":{"type":"string","description":"Only objects whose id, path, or kind contains this text."}}},
+   "filter":{"type":"string","description":"Only objects whose id, path, or kind contains this text; with * or ? a glob on name or path (DecoCorn*)."},
+   "group_by":{"type":"string","enum":["prefix"],"description":"Count objects by name with trailing digits dropped instead of listing them."}}},
  "annotations":{"readOnlyHint":true}},
 {"name":"scene_get","title":"Get an object",
  "description":"All fields of one object, including its script's props (param.<prop>). Pass node \"@scene\" for scene lighting (sun, sky, fog, shadows, URP).",
@@ -1097,7 +1223,7 @@ const TOOLS: &str = r#"[
    "scene":{"type":"string"}}},
  "annotations":{"readOnlyHint":true}},
 {"name":"scene_add","title":"Add an object",
- "description":"Add an object and return its #id and path. Shapes (cube, sphere, cylinder, cone, capsule, torus, quad, plane, sky) are meshes with that built-in asset. Top-level meshes rest on y=0 unless pos is given; names are made unique. For a mesh file use kind mesh with fields.asset; to place another scene use kind instance with fields.scene.",
+ "description":"Add one object and return its #id and path. For more than a few, use scene_add_many, or place for rings, walls, stairs, grids and scatter. Shapes (cube, sphere, cylinder, cone, capsule, torus, quad, plane, sky) are meshes with that built-in asset. Top-level meshes rest on y=0 unless pos is given; names are made unique. For a mesh file use kind mesh with fields.asset; to place another scene use kind instance with fields.scene.",
  "inputSchema":{"type":"object","required":["kind"],"properties":{
    "kind":{"type":"string","enum":["group","mesh","camera","light","instance","cube","sphere","cylinder","cone","capsule","torus","quad","plane","sky"]},
    "name":{"type":"string"},
@@ -1105,29 +1231,29 @@ const TOOLS: &str = r#"[
    "fields":{"type":"object","description":"Same keys as scene_set, e.g. {\"pos\":[0,1,0],\"scale\":2,\"material\":\"assets/materials/wood.j3mat\"}."},
    "scene":{"type":"string"}}}},
 {"name":"scene_add_many","title":"Add several objects",
- "description":"Add several objects in one step (one file write, or one undo step in the editor). Each item is a scene_add argument object. All or nothing: if one fails, none are added.",
+ "description":"Use this (or place) instead of many scene_add calls. Add several objects in one step (one file write, or one undo step in the editor). Each item is a scene_add argument object. All or nothing: if one fails, none are added.",
  "inputSchema":{"type":"object","required":["adds"],"properties":{
    "adds":{"type":"array","items":{"type":"object","required":["kind"],"properties":{
      "kind":{"type":"string"},"name":{"type":"string"},"parent":{"type":"string"},"fields":{"type":"object"}}}},
    "scene":{"type":"string"}}}},
 {"name":"scene_set","title":"Change an object",
- "description":"Set fields on an object (all or nothing). Keys: name; pos [x,y,z] (local to parent), x, y, z; rot [x,y,z] degrees; scale [x,y,z] or one number; parent (\"\" for top level; keeps local transform); asset (mesh file or builtin:cube|sphere|cylinder|cone|capsule|torus|quad|plane|sky); texture; material (.j3mat); scene (instance's scene file); script (a .j3s path, \"\" for none); param.<prop> (a prop of the object's script, typed by its props block); tint [r,g,b] or one number (meshes and placed scenes; multiplies color, 1 unchanged, above 1 allowed, e.g. [0.7,1,1.8] turns green teal); color [r,g,b] 0-1 and range (lights); fov, near, far (cameras); effects (cameras: kind=camera .j3fx files run in order, \"a.j3fx|b.j3fx\"; \"\" for none) and fx.<file stem>.<param> (their params); alpha opaque|cutout|blend; opacity; doubleSided; prop.<name> (on an instance: a prop its scene declares; \"\" goes back to the default). With node \"@scene\": prop.<name> = \"<type>:<default>\" declares a prop on this scene (type int, float, text, bool, material, mesh, scene; \"\" removes it), and sun [x,y,z] (direction toward the sun), sunColor, sky, fogStart, fogEnd, shadows, shadowSize, urp, urpBounces, urpSamples, urpShadows, urpShadowNear (meters traced sun shadows reach; the shadow map covers the rest; 0 no limit). save: true also saves the scene in the open editor.",
+ "description":"Set fields on an object (all or nothing). node may be a glob (DecoCorn*, *Tree?) to set every matching object; preview with scene_list filter. Keys: name; pos [x,y,z] (local to parent), x, y, z; rot [x,y,z] degrees; scale [x,y,z] or one number; parent (\"\" for top level; keeps local transform); asset (mesh file or builtin:cube|sphere|cylinder|cone|capsule|torus|quad|plane|sky); texture; material (.j3mat); scene (instance's scene file); script (a .j3s path, \"\" for none); tags (comma-separated, e.g. \"nocollide,launch=30\"; the game reads them with scene3d.hasTag/tagValue); param.<prop> (a prop of the object's script, typed by its props block); tint [r,g,b] or one number (meshes and placed scenes; multiplies color, 1 unchanged, above 1 allowed, e.g. [0.7,1,1.8] turns green teal); color [r,g,b] 0-1 and range (lights); fov, near, far (cameras); effects (cameras: kind=camera .j3fx files run in order, \"a.j3fx|b.j3fx\"; \"\" for none) and fx.<file stem>.<param> (their params); alpha opaque|cutout|blend; opacity; doubleSided; prop.<name> (on an instance: a prop its scene declares; \"\" goes back to the default). With node \"@scene\": prop.<name> = \"<type>:<default>\" declares a prop on this scene (type int, float, text, bool, material, mesh, scene; \"\" removes it), and sun [x,y,z] (direction toward the sun), sunColor, sky, fogStart, fogEnd, shadows, shadowSize, urp, urpBounces, urpSamples, urpShadows, urpShadowNear (meters traced sun shadows reach; the shadow map covers the rest; 0 no limit). save: true also saves the scene in the open editor.",
  "inputSchema":{"type":"object","required":["node"],"properties":{
    "node":{"type":"string","description":"Name, Parent/Child path, #id, or @scene."},
    "fields":{"type":"object"},
    "save":{"type":"boolean","description":"With the editor open, save the scene after the change (without it, edits stay unsaved in the editor)."},
    "scene":{"type":"string"}}}},
 {"name":"scene_delete","title":"Delete objects",
- "description":"Delete objects and everything under them.",
+ "description":"Delete objects and everything under them. A node may be a glob (DecoCorn*) for every match; preview with scene_list filter.",
  "inputSchema":{"type":"object","properties":{
    "node":{"type":"string"},
    "nodes":{"type":"array","items":{"type":"string"}},
    "scene":{"type":"string"}}},
  "annotations":{"destructiveHint":true}},
 {"name":"place","title":"Place objects",
- "description":"Placement without coordinates. ground: drop or lift node so its lowest point rests on the surface below it (or on target only; y=0 if nothing is below). ontop: center node over target and rest it on target's top. scatter: add count copies of what (a shape like cube or cylinder, a .j3mesh or builtin: asset, or a .j3scene placed as instances) at random spots in area [x0,z0,x1,z1] (in parent's space) under a new Scatter group, each grounded, with random yaw and a scale between scale[0] and scale[1]; the same seed gives the same layout. grid: add pieces (walls, floors, roof parts) on a grid in one step: each piece's what (a .j3scene, .j3mesh, builtin: asset, or shape) goes at [x*cell, floor*height, z*cell] turned turn*90 degrees about y, under parent.",
+ "description":"Use for anything repeated or resting on something, instead of computing coordinates by hand. Placement without coordinates. ground: drop or lift node so its lowest point rests on the surface below it (or on target only; y=0 if nothing is below). ontop: center node over target and rest it on target's top. scatter: add count copies of what (a shape like cube or cylinder, a .j3mesh or builtin: asset, or a .j3scene placed as instances) at random spots in area [x0,z0,x1,z1] (in parent's space) under a new Scatter group, each grounded, with random yaw and a scale between scale[0] and scale[1]; the same seed gives the same layout. grid: add pieces (walls, floors, roof parts) on a grid in one step: each piece's what (a .j3scene, .j3mesh, builtin: asset, or shape) goes at [x*cell, floor*height, z*cell] turned turn*90 degrees about y, under parent. ring, stairs, spiral, wall build a shape from copies of what (default cube; size is scale, builtin shapes are 1 m) in one step, named name, under parent; angles are degrees. ring: count pieces at radius around center [x,z] (arc [a0,a1] for part of a circle), bottoms at y; face tangent (default: slabs whose local x points outward, widened so the ring has no slits when size z is 0), out or in (local +z faces out or in). stairs: steps from [x,y,z] along dir (x, -x, z, -z), each rise higher and run long, width wide; solid fills to the floor. spiral: floating slabs at radius around center, each turn degrees further and rise higher (keep rise*360/turn above about 2.5 m headroom), thickness thick, width radial, depth tangential. wall: a run from [x,z] to [x,z], height high and thickness thick, with door [width,height,at] cut at meters along it (lintel over it).",
  "inputSchema":{"type":"object","required":["op"],"properties":{
-   "op":{"type":"string","enum":["ground","ontop","scatter","grid"]},
+   "op":{"type":"string","enum":["ground","ontop","scatter","grid","ring","stairs","spiral","wall"]},
    "node":{"type":"string","description":"Object to move (ground, ontop)."},
    "target":{"type":"string","description":"ontop: object to put node on. ground: rest only on this object."},
    "what":{"type":"string","description":"scatter: shape, mesh asset, or scene file."},
@@ -1141,7 +1267,26 @@ const TOOLS: &str = r#"[
    "name":{"type":"string","description":"scatter: base name of the copies."},
    "ground":{"type":"boolean","default":true},
    "cell":{"type":"number","default":1,"description":"grid: cell size."},
-   "height":{"type":"number","description":"grid: floor height (default cell)."},
+   "height":{"type":"number","description":"grid: floor height (default cell). wall: its height (default 3)."},
+   "center":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2,"description":"ring, spiral: [x,z]."},
+   "radius":{"type":"number","description":"ring, spiral."},
+   "y":{"type":"number","description":"ring, spiral, wall: base height."},
+   "size":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3,"description":"ring: piece scale [radial, height, tangential]; tangential 0 fits the ring."},
+   "face":{"type":"string","enum":["tangent","out","in"]},
+   "arc":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2,"description":"ring: from and to angle, degrees."},
+   "from":{"type":"array","items":{"type":"number"},"description":"stairs: [x,y,z] of the bottom edge's middle. wall: [x,z]."},
+   "to":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2,"description":"wall: [x,z]."},
+   "dir":{"type":"string","enum":["x","-x","z","-z"]},
+   "steps":{"type":"integer"},
+   "rise":{"type":"number","default":0.4},
+   "run":{"type":"number","default":1},
+   "width":{"type":"number","description":"stairs (default 2.5), spiral slab radial size (default 2)."},
+   "solid":{"type":"boolean","default":true},
+   "turn":{"type":"number","default":20,"description":"spiral: degrees per step."},
+   "start":{"type":"number","default":0,"description":"spiral: first step's angle, degrees."},
+   "thickness":{"type":"number","description":"spiral slab (default 0.6), wall (default 1.5)."},
+   "depth":{"type":"number","default":1.2,"description":"spiral: slab size along the turn."},
+   "door":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3,"description":"wall: [width, height, at]."},
    "pieces":{"type":"array","maxItems":2000,"items":{"type":"object","required":["what"],"properties":{
      "what":{"type":"string"},"x":{"type":"number"},"z":{"type":"number"},"floor":{"type":"number"},
      "turn":{"type":"integer","description":"Quarter turns about y."},"name":{"type":"string"}}}},
@@ -1151,18 +1296,26 @@ const TOOLS: &str = r#"[
  "inputSchema":{"type":"object","properties":{"scene":{"type":"string"}}},
  "annotations":{"destructiveHint":true}},
 {"name":"render","title":"Render the scene",
- "description":"Draw the scene as the game would (lights, shadows, sky, URP) and return the image, so you can see what you built. Default: through the main camera, or an overview if there is none. view frames all objects from a side; focus frames one object (with view's side); select outlines an object in orange. With the editor open it renders the live, unsaved scene.",
+ "description":"Look at what you built; do this after every few edits, and from where the player would stand (at) for rooms, doors, stairs and jumps. Draw the scene as the game would (lights, shadows, sky, URP) and return the image. Default: through the main camera, or an overview if there is none. view frames all objects from a side; focus frames one object (with view's side); select outlines an object in orange. at looks from any spot (no camera object needed): yaw and pitch are degrees like a camera's rot y and x (yaw 0 looks toward -z, 90 toward -x, 180 toward +z, -90 toward +x; pitch above 0 looks up). views puts several such views in one image, two per row, width x height each. hide leaves out objects by name glob (Roof*) to see inside. ambient lifts dark interiors (default 0.25 with at/views). ortho with view top gives a true plan. With the editor open it renders the live, unsaved scene.",
  "inputSchema":{"type":"object","properties":{
    "scene":{"type":"string"},
    "camera":{"type":"string","description":"Camera object to look through."},
    "view":{"type":"string","enum":["iso","front","back","side","top"]},
    "focus":{"type":"string","description":"Object to frame."},
    "select":{"type":"string","description":"Object to outline."},
+   "at":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3,"description":"Eye position [x,y,z] in world space."},
+   "yaw":{"type":"number","default":0,"description":"With at: degrees; 0 looks toward -z, 90 toward -x."},
+   "pitch":{"type":"number","default":0,"description":"With at: degrees; above 0 looks up."},
+   "views":{"type":"array","maxItems":16,"items":{"type":"array","items":{"type":"number"},"minItems":5,"maxItems":5},"description":"Several [x,y,z,yaw,pitch] views in one image, left to right, top to bottom."},
+   "fov":{"type":"number","description":"Vertical field of view in degrees."},
+   "hide":{"type":"string","description":"Comma-separated name globs to leave out with their children, e.g. \"Roof*,Ceiling\"."},
+   "ambient":{"type":"number","description":"0 to 1: white mixed into the ambient light; render only."},
+   "ortho":{"type":"boolean","description":"view/focus without perspective."},
    "width":{"type":"integer","default":640},
    "height":{"type":"integer","default":360}}},
  "annotations":{"readOnlyHint":true}},
 {"name":"check","title":"Check scenes and code",
- "description":"Find problems before playing: broken parents, missing mesh/material/texture/scene files, placement cycles, missing scripts, object fields pointing at deleted objects, same-named siblings, and J3 compile errors (with file and line).",
+ "description":"Run before play and before saying you are done; it names the object at fault, and runs the project's own rules (tools/check.j3s) too. Find problems before playing: broken parents, missing mesh/material/texture/scene files, placement cycles, missing scripts, object fields pointing at deleted objects, same-named siblings, and J3 compile errors (with file and line).",
  "inputSchema":{"type":"object","properties":{
    "scene":{"type":"string","description":"One scene; default every scene under scenes/."},
    "code":{"type":"boolean","default":true,"description":"Also typecheck the project's code."}}},
@@ -1217,7 +1370,17 @@ const TOOLS: &str = r#"[
    "pos":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}}}},
 {"name":"gen","title":"Run mesh generators",
  "description":"Run the project's mesh generator scripts: each assets/gen/<name>.j3 builds a mesh in code with j3.gfx.meshgen (box, cylinder, cone, frustum, sphere, capsule, torus, lathe, extrude, heightField, tri, quad; color, glow; at, turn, size, push, pop) and ends with b.save(meshgen.output(\"assets/gen/<name>.j3mesh\")). Write the script with your file tools, then run this; use the .j3mesh as a mesh asset. Unchanged scripts are skipped unless force. Render and play run it too. `j3c doc j3.gfx.meshgen` has the API.",
- "inputSchema":{"type":"object","properties":{"force":{"type":"boolean","default":false}}}}
+ "inputSchema":{"type":"object","properties":{"force":{"type":"boolean","default":false}}}},
+{"name":"scene_stats","title":"Scene draw cost",
+ "description":"Run after adding many objects or tints; slow scenes are usually too many distinct looks. How much a scene costs to draw: objects (placed scenes included), meshes, distinct looks (mesh, material, texture, tint: one instanced draw call each per pass), the ten biggest looks, and cutout/blended meshes that draw one by one. Above 60 looks frame time suffers; snap tints to a small palette.",
+ "inputSchema":{"type":"object","properties":{"scene":{"type":"string"}}},
+ "annotations":{"readOnlyHint":true}},
+{"name":"scene_diff","title":"What changed in a scene",
+ "description":"Review your own work before finishing. Objects added, removed, moved (over 1 cm, with positions), and changed (field old -> new) in a scene file since git HEAD, or since another scene file (against). Matched by Parent/Child path, so renumbered ids don't matter. Reads saved files, not unsaved editor changes. Use it to review your own edits.",
+ "inputSchema":{"type":"object","properties":{
+   "scene":{"type":"string"},
+   "against":{"type":"string","description":"Project-relative .j3scene to compare with; default the scene at git HEAD."}}},
+ "annotations":{"readOnlyHint":true}}
 ]"#;
 
 #[cfg(test)]
@@ -1231,8 +1394,43 @@ mod tests {
     }
 
     #[test]
+    fn coach_points_at_bulk_tools_once() {
+        let none = Json::Obj(Vec::new());
+        let mut c = Coach::default();
+        let mut hints = Vec::new();
+        for _ in 0..6 { hints.extend(c.hints("scene_add", &none, false)); }
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert!(hints[0].contains("place"));
+        // Eight edits without a render, then the render resets the count.
+        let mut c = Coach::default();
+        let n = (0..8).flat_map(|_| c.hints("scene_delete", &none, false)).count();
+        assert_eq!(n, 1);
+        assert!(!c.hints("render", &none, false).is_empty(), "first plain render mentions at/views");
+        assert_eq!(c.edits_unseen, 0);
+        // play before check warns; after check it doesn't.
+        let mut c = Coach::default();
+        assert_eq!(c.hints("play", &none, false).len(), 1);
+        c.hints("check", &none, false);
+        assert!(c.hints("play", &none, false).is_empty());
+        // Failures get no hints.
+        assert!(c.hints("scene_add", &none, true).is_empty());
+    }
+
+    #[test]
+    fn project_notes_join_the_instructions() {
+        let root = std::env::temp_dir().join(format!("j3_notes_test_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("j3.editor.toml"), "[editor]\nscene = \"a.j3scene\"\nnotes = \"N.md\"\n").unwrap();
+        fs::write(root.join("N.md"), "pads need floors").unwrap();
+        assert!(instructions(Some(&root)).ends_with("pads need floors"));
+        fs::write(root.join("j3.editor.toml"), "notes = \"../N.md\"\n").unwrap();
+        assert_eq!(instructions(Some(&root)), INSTRUCTIONS);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn handshake_and_tool_list() {
-        let mut server = Server { root: Err("no project".into()), follow: false, next: 0, was_live: false };
+        let mut server = Server { root: Err("no project".into()), follow: false, next: 0, was_live: false, coach: Coach::default() };
         let replies = run(
             &mut server,
             concat!(
@@ -1269,7 +1467,7 @@ mod tests {
         }
         assert!(text.contains("    adds*: array of object"), "{text}");
         assert!(text.contains("        kind*: string"), "{text}");
-        assert!(text.contains("op*: string (ground|ontop|scatter|grid)"), "{text}");
+        assert!(text.contains("op*: string (ground|ontop|scatter|grid|ring|stairs|spiral|wall)"), "{text}");
         for t in &tools {
             assert!(t.get("inputSchema").and_then(|s| s.get("type")).is_some());
         }
@@ -1318,7 +1516,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("assets/imported")).unwrap();
         fs::write(root.join("rock.j3mesh"), "# j3mesh 1\n0\n").unwrap();
-        let mut server = Server { root: Err("unused".into()), follow: false, next: 0, was_live: false };
+        let mut server = Server { root: Err("unused".into()), follow: false, next: 0, was_live: false, coach: Coach::default() };
         let args = |extra: &str| json::parse(&format!(r#"{{"path":"rock.j3mesh","place":false{extra}}}"#)).unwrap();
         let text = |a: Answer| a.content[0].get("text").and_then(Json::as_str).unwrap().to_string();
         assert!(text(server.import(&root, &args("")).unwrap()).starts_with("imported"));

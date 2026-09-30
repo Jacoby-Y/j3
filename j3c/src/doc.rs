@@ -171,6 +171,8 @@ fn lang_page() -> String {
 
 A number literal takes the other operand's type: with `far: f32`, `2 * far` and `far * 0.5` are `f32`. A variable never converts: with `n: int`, `far * n` is a type error; write `far * f32(n)`. `f32(x)`, `int(x)`, and friends convert explicitly.
 
+`const NAME = value` is a module constant. The value is an int expression (`+ - * / %`), a float, a bool (`true`, `false`, or `!` of one), or a string. `-1.5` is the float it looks like.
+
 One file is one module. `use j3.io.printLn` brings in one name. `use j3.memory.{{ Arena, List }}` brings in several. `pub` is what another module can name.
 
 `if` and `while` take no parentheses. Braces are required. An `if` used as a value needs `else`. `&&` and `||` stop at the first decisive operand.

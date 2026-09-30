@@ -6,6 +6,13 @@
 //   focus=<object>    frame that object and its children (with view, default iso)
 //   select=<object>   outline that object in orange
 //   out=<path>        PNG to write (default target/j3-editor/render.png)
+//   at=x,y,z yaw=d pitch=d fov=d   look from a spot: yaw and pitch in degrees, the same as a
+//                     camera object's rot y and x (yaw 0 looks toward -z, 90 toward -x;
+//                     pitch above 0 looks up)
+//   views=x,y,z,yaw,pitch;...   several `at` views side by side in one image (size per view)
+//   hide=<glob>,...   leave out objects (and their children) whose name matches, e.g. Roof*
+//   ambient=<0..1>    lift the dark: mixes white into the sky ambient (default 0.25 with at)
+//   ortho=true        framed views (view/focus) without perspective; view=top is a plan
 
 module j3_editor.render;
 
@@ -14,14 +21,14 @@ use j3.game;
 use j3.gfx;
 use j3.gfx.{ Orbit, Target };
 use j3.io.printLn;
-use j3.math.{ Mat4, Vec3, PI, asin, atan2, sin, sqrt };
+use j3.math.{ Mat4, Vec3, PI, asin, atan2, cos, sin, sqrt };
 use j3.memory.{ Arena, scratch };
 use j3.result.Result;
 use j3.data.save;
 use j3.scene3d;
 use j3.scene3d.{ Env, Node, Scene, CAMERA, MESH };
 use j3.text.{ Text, same };
-use j3_editor.tool.{ fields, pathOf, resolve };
+use j3_editor.tool.{ fields, globAny, numbers, pathOf, resolve };
 use j3_editor.util.cut;
 use j3_editor.viewport.drawBox;
 
@@ -34,10 +41,26 @@ pub struct Shot {
     select: string;
     focus: string;
     out: string;
+    /// Look from `at` (`hasAt`) toward `yaw`/`pitch` degrees; `fov` 0 keeps the default.
+    at: Vec3;
+    hasAt: bool;
+    yaw: f32;
+    pitch: f32;
+    fov: f32;
+    /// `x,y,z,yaw,pitch` views separated by `;`, drawn side by side.
+    views: string;
+    hide: string;
+    /// Below 0: the default (0.25 for `at` views, else none).
+    ambient: f32;
+    ortho: bool;
+    /// Set by `parseShot` when an option is malformed.
+    bad: string;
 }
 
 pub fn parseShot(request: string): Shot {
-    let shot = Shot { camera: "", view: "", w: 640, h: 360, select: "", focus: "", out: "target/j3-editor/render.png" };
+    let shot = Shot { camera: "", view: "", w: 640, h: 360, select: "", focus: "", out: "target/j3-editor/render.png",
+        at: Vec3.zero(), hasAt: false, yaw: 0, pitch: 0, fov: 0, views: "", hide: "", ambient: -1, ortho: false, bad: "" };
+    let nums = scratch(0).alloc::<f32>(4);
     let args = fields(request, scratch(0));
     let i = 0;
     while i < args.len {
@@ -52,6 +75,20 @@ pub fn parseShot(request: string): Shot {
         if same(key, "select") { shot.select = value; }
         if same(key, "focus") { shot.focus = value; }
         if same(key, "out") && value.len > 0 { shot.out = value; }
+        if same(key, "hide") { shot.hide = value; }
+        if same(key, "views") { shot.views = value; }
+        if same(key, "ortho") { shot.ortho = same(value, "true") || same(value, "1"); }
+        if same(key, "at") {
+            if numbers(value, nums) == 3 { shot.at = Vec3.xyz(nums[0], nums[1], nums[2]); shot.hasAt = true; }
+            else { shot.bad = "at wants x,y,z"; }
+        }
+        if same(key, "yaw") || same(key, "pitch") || same(key, "fov") || same(key, "ambient") {
+            if numbers(value, nums) != 1 { shot.bad = "yaw, pitch, fov, and ambient want one number"; }
+            else if same(key, "yaw") { shot.yaw = nums[0]; }
+            else if same(key, "pitch") { shot.pitch = nums[0]; }
+            else if same(key, "fov") { shot.fov = nums[0]; }
+            else { shot.ambient = nums[0]; }
+        }
         if same(key, "size") {
             let x = 0;
             while x < value.len && value[x] != 120 { x += 1; }
@@ -77,14 +114,35 @@ pub struct Lens {
     fog: bool;
     /// The camera object it looks through (its effects run), or 0.
     camera: int;
+    /// White mixed into the sky ambient (0 none).
+    ambient: f32;
+    /// Half height of an orthographic view, or 0 for perspective.
+    ortho: f32;
+}
+
+pub fn newLens(): Lens {
+    return Lens { cam: Orbit.create(Vec3.zero(), 0, 0, 5), fov: 60, near: 0.05, far: 1000, label: "", fog: true, camera: 0, ambient: 0, ortho: 0 };
+}
+
+/// An orbit at `eye` looking along `forward`.
+fn lookAlong(eye: Vec3, forward: Vec3): Orbit {
+    let f = forward.normalize();
+    return Orbit.create(eye + f * 5, atan2(0 - f.x, 0 - f.z), asin(0 - f.y), 5);
 }
 
 /// An orbit that sees what camera object `id` sees.
 pub fn throughCamera(scene: &Scene, id: int): Orbit {
     let model = scene3d.world(scene, id);
     let eye = model.transformPoint(Vec3.xyz(0, 0, 0));
-    let forward = (model.transformPoint(Vec3.xyz(0, 0, -1)) - eye).normalize();
-    return Orbit.create(eye + forward * 5, atan2(0 - forward.x, 0 - forward.z), asin(0 - forward.y), 5);
+    return lookAlong(eye, model.transformPoint(Vec3.xyz(0, 0, -1)) - eye);
+}
+
+/// Where a camera object at `eye` with rot `pitch`,`yaw`,0 (degrees) looks: (0,0,-1) turned
+/// about x by pitch, then about y by yaw.
+fn forwardOf(yaw: f32, pitch: f32): Vec3 {
+    let a = yaw * PI / 180;
+    let p = pitch * PI / 180;
+    return Vec3.xyz(0 - sin(a) * cos(p), sin(p), 0 - cos(a) * cos(p));
 }
 
 /// Whether `id` is `root` or under it.
@@ -154,8 +212,9 @@ fn sceneBounds(scene: &Scene, root: int, lo: &Vec3, hi: &Vec3): bool {
     return any;
 }
 
-/// The whole scene framed from `view`'s side, filling a 60 degree lens.
-fn framed(scene: &Scene, root: int, view: string): Orbit {
+/// The whole scene framed from `view`'s side, filling a 60 degree lens, and the half
+/// height an orthographic view needs to fit it (`orthoHalf`).
+fn framed(scene: &Scene, root: int, view: string, orthoHalf: &f32): Orbit {
     let lo = Vec3.xyz(-1, -1, -1);
     let hi = Vec3.xyz(1, 1, 1);
     sceneBounds(scene, root, &lo, &hi);
@@ -168,7 +227,8 @@ fn framed(scene: &Scene, root: int, view: string): Orbit {
     if same(view, "front") { yaw = 0; pitch = 0.05; }
     if same(view, "back") { yaw = PI; pitch = 0.05; }
     if same(view, "side") { yaw = PI / 2; pitch = 0.05; }
-    if same(view, "top") { yaw = 0; pitch = 1.55; }
+    if same(view, "top") { yaw = 0; pitch = 1.5695; }
+    *orthoHalf = radius * 1.05;
     // Distance at which a sphere of `radius` fits a 60 degree view (sin 30 = 0.5), plus room around it.
     return Orbit.create(center, yaw, pitch, radius / sin(PI / 6) * 1.1);
 }
@@ -180,6 +240,32 @@ pub fn lensFor(scene: &Scene, shot: Shot, lens: &Lens, out: &Text): bool {
     lens.near = 0.05;
     lens.far = 1000;
     lens.camera = 0;
+    lens.ortho = 0;
+    lens.ambient = if shot.ambient > 0 { shot.ambient } else { 0 };
+    if shot.bad.len > 0 {
+        out.pushStr("err\t");
+        out.pushStr(shot.bad);
+        out.push(10);
+        return false;
+    }
+    if shot.hasAt {
+        lens.cam = lookAlong(shot.at, forwardOf(shot.yaw, shot.pitch));
+        if shot.fov > 0 { lens.fov = shot.fov; }
+        if shot.ambient < 0 { lens.ambient = 0.25; }
+        let t0 = Text.new(scratch(0));
+        t0.pushStr("at ");
+        t0.pushFloat(shot.at.x);
+        t0.push(44);
+        t0.pushFloat(shot.at.y);
+        t0.push(44);
+        t0.pushFloat(shot.at.z);
+        t0.pushStr(" yaw ");
+        t0.pushFloat(shot.yaw);
+        t0.pushStr(" pitch ");
+        t0.pushFloat(shot.pitch);
+        lens.label = t0.str();
+        return true;
+    }
     let id = 0;
     if shot.camera.len > 0 {
         let at = resolve(scene, shot.camera, out);
@@ -224,7 +310,9 @@ pub fn lensFor(scene: &Scene, shot: Shot, lens: &Lens, out: &Text): bool {
         root = scene.nodes[f].id;
     }
     lens.fog = false;
-    lens.cam = framed(scene, root, view);
+    lens.cam = framed(scene, root, view, &lens.ortho);
+    if !shot.ortho { lens.ortho = 0; }
+    if shot.fov > 0 { lens.fov = shot.fov; }
     let t2 = Text.new(scratch(0));
     t2.pushStr("view ");
     t2.pushStr(view);
@@ -246,7 +334,7 @@ pub fn drawShot(scene: &Scene, matrices: []Mat4, lens: Lens, target: Target, sel
     gfx.setViewRect(0, win.y - f32(target.h), f32(target.w), f32(target.h));
     let env = scene3d.environment(scene);
     if lens.fog { gfx.setFog(env.fogStart, env.fogEnd); } else { gfx.setFog(100000, 100001); }
-    gfx.setOrtho(0);
+    gfx.setOrtho(lens.ortho);
     gfx.setFov(lens.fov);
     gfx.setClip(lens.near, lens.far);
     let r = env.shadowSize;
@@ -254,7 +342,9 @@ pub fn drawShot(scene: &Scene, matrices: []Mat4, lens: Lens, target: Target, sel
     if env.shadows { scene3d.drawWith(scene, matrices); }
     scene3d.lights(scene);
     let fx = lens.camera != 0 && scene3d.beginEffects(scene, lens.camera);
-    gfx.cameraPass(lens.cam, env.sunDir, env.sky, env.sunColor);
+    // ponytail: ambient lifts the sky color the lit shader uses; the clear color lifts too.
+    let sky = env.sky + (Vec3.xyz(1, 1, 1) - env.sky) * lens.ambient;
+    gfx.cameraPass(lens.cam, env.sunDir, sky, env.sunColor);
     scene3d.drawSky(scene);
     scene3d.drawWith(scene, matrices);
     if fx { scene3d.endEffects(scene, lens.camera); }
@@ -266,10 +356,8 @@ pub fn drawShot(scene: &Scene, matrices: []Mat4, lens: Lens, target: Target, sel
     gfx.setViewState(main);
 }
 
-/// Read `target` back and write it to `path` as a PNG.
-pub fn savePng(target: Target, path: string): bool {
-    let mem = Arena.create(target.w * target.h * 4 * 3 + 4096);
-    let canvas = Canvas.create(&mem, i32(target.w), i32(target.h), Mode.Pixel);
+/// Read `target` back into `canvas` (same size), opaque.
+fn readBack(target: Target, canvas: &Canvas) {
     gfx.setOutputFbo(target.fbo);
     gfx.readPixels(target.w, target.h, canvas.pixels);
     gfx.setOutputFbo(0);
@@ -279,10 +367,134 @@ pub fn savePng(target: Target, path: string): bool {
         canvas.pixels[i] = 255;
         i += 4;
     }
-    let ok = false;
-    match canvas.savePng(path, &mem) {
-        Result.Ok(_) { ok = true; }
-        Result.Err(_) {}
+}
+
+/// Read `target` back and write it to `path` as a PNG.
+pub fn savePng(target: Target, path: string): bool {
+    let mem = Arena.create(target.w * target.h * 4 * 3 + 4096);
+    let canvas = Canvas.create(&mem, i32(target.w), i32(target.h), Mode.Pixel);
+    readBack(target, &canvas);
+    let ok = writePng(canvas, path, &mem);
+    mem.destroy();
+    return ok;
+}
+
+fn writePng(canvas: Canvas, path: string, mem: &Arena): bool {
+    match canvas.savePng(path, mem) {
+        Result.Ok(_) { return true; }
+        Result.Err(_) { return false; }
+    }
+}
+
+/// Collapse the matrices of objects `hide` names (comma-separated globs) and of everything
+/// under them, so they draw nothing.
+fn hideIn(scene: &Scene, matrices: []Mat4, hide: string) {
+    if hide.len == 0 { return; }
+    let i = 0;
+    while i < scene.len {
+        let at = i;
+        let steps = 0;
+        let hidden = false;
+        while at >= 0 && steps <= scene.len && !hidden {
+            hidden = globAny(hide, scene.nodes[at].name);
+            at = scene3d.index(scene, scene.nodes[at].parent);
+            steps += 1;
+        }
+        if hidden {
+            matrices[i].m[0] = 0; matrices[i].m[1] = 0; matrices[i].m[2] = 0;
+            matrices[i].m[4] = 0; matrices[i].m[5] = 0; matrices[i].m[6] = 0;
+            matrices[i].m[8] = 0; matrices[i].m[9] = 0; matrices[i].m[10] = 0;
+        }
+        i += 1;
+    }
+}
+
+/// Render `shot` of `scene` to its PNG and write `ok  <out>  <what it looked through>` (or
+/// `err`). `frames` draws per view: the headless renderer needs a few so the URP trace and
+/// shadow maps are ready.
+pub fn capture(scene: &Scene, shot: Shot, frames: int, out: &Text): bool {
+    let lens = newLens();
+    let select = 0;
+    if shot.select.len > 0 {
+        let at = resolve(scene, shot.select, out);
+        if at < 0 { return false; }
+        select = scene.nodes[at].id;
+    }
+    let matrices = scratch(0).alloc::<Mat4>(scene.len);
+    scene3d.worlds(scene, matrices);
+    hideIn(scene, matrices, shot.hide);
+    // One view, or `views` split on `;`, each `x,y,z,yaw,pitch`.
+    let count = 1;
+    if shot.views.len > 0 {
+        let c = 0;
+        while c < shot.views.len {
+            if shot.views[c] == 59 { count += 1; }
+            c += 1;
+        }
+    }
+    if count > 16 {
+        out.pushStr("err\tviews takes at most 16 views\n");
+        return false;
+    }
+    let cols = if count > 1 { 2 } else { 1 };
+    let rows = (count + cols - 1) / cols;
+    let mem = Arena.create(shot.w * shot.h * 4 * (cols * rows + 2) + 4096);
+    let sheet = Canvas.create(&mem, i32(shot.w * cols), i32(shot.h * rows), Mode.Pixel);
+    let tile = Canvas.create(&mem, i32(shot.w), i32(shot.h), Mode.Pixel);
+    let target = gfx.makeTarget(shot.w, shot.h);
+    let labels = Text.new(scratch(0));
+    let ok = true;
+    let from = 0;
+    let v = 0;
+    while v < count && ok {
+        let one = shot;
+        if shot.views.len > 0 {
+            let to = from;
+            while to < shot.views.len && shot.views[to] != 59 { to += 1; }
+            let nums = scratch(0).alloc::<f32>(6);
+            if numbers(cut(shot.views, from, to), nums) != 5 {
+                out.pushStr("err\teach of views is x,y,z,yaw,pitch; views are separated by ;\n");
+                ok = false;
+                break;
+            }
+            one.at = Vec3.xyz(nums[0], nums[1], nums[2]);
+            one.yaw = nums[3];
+            one.pitch = nums[4];
+            one.hasAt = true;
+            from = to + 1;
+        }
+        if !lensFor(scene, one, &lens, out) { ok = false; break; }
+        let frame = 0;
+        while frame < frames {
+            if frames > 1 { game.poll(); }
+            drawShot(scene, matrices, lens, target, select);
+            frame += 1;
+        }
+        readBack(target, &tile);
+        sheet.blit(tile, i32((v - (v / cols) * cols) * shot.w), i32((v / cols) * shot.h));
+        if v > 0 { labels.pushStr("; "); }
+        if count > 1 {
+            labels.pushInt(v + 1);
+            labels.pushStr(if v - (v / cols) * cols == 0 { " (left) " } else { " (right) " });
+        }
+        labels.pushStr(lens.label);
+        v += 1;
+    }
+    gfx.freeTarget(&target);
+    if ok {
+        if writePng(sheet, shot.out, &mem) {
+            out.pushStr("ok\t");
+            out.pushStr(shot.out);
+            out.push(9);
+            if count > 1 { out.pushStr("views left to right, top to bottom: "); }
+            out.pushStr(labels.str());
+            out.push(10);
+        } else {
+            out.pushStr("err\tcould not write ");
+            out.pushStr(shot.out);
+            out.push(10);
+            ok = false;
+        }
     }
     mem.destroy();
     return ok;
@@ -305,36 +517,7 @@ pub fn cli(request: string, path: string): int {
     game.initGlHidden("J3 render", shot.w, shot.h);
     gfx.init();
     scene3d.upload(&scene);
-    let lens = Lens { cam: Orbit.create(Vec3.zero(), 0, 0, 5), fov: 60, near: 0.05, far: 1000, label: "", fog: true, camera: 0 };
-    let code = 1;
-    if lensFor(&scene, shot, &lens, &out) {
-        let select = 0;
-        if shot.select.len > 0 {
-            let at = resolve(&scene, shot.select, &out);
-            if at >= 0 { select = scene.nodes[at].id; }
-        }
-        let matrices = mem.alloc::<Mat4>(scene.len);
-        scene3d.worlds(&scene, matrices);
-        let target = gfx.makeTarget(shot.w, shot.h);
-        // A few frames, so anything built on first draw (the URP trace, shadow maps) is ready.
-        let frame = 0;
-        while frame < 3 {
-            game.poll();
-            drawShot(&scene, matrices, lens, target, select);
-            frame += 1;
-        }
-        if savePng(target, shot.out) {
-            out.pushStr("ok\t");
-            out.pushStr(shot.out);
-            out.push(9);
-            out.pushStr(lens.label);
-            code = 0;
-        } else {
-            out.pushStr("err\tcould not write ");
-            out.pushStr(shot.out);
-        }
-        gfx.freeTarget(&target);
-    }
+    let code = if capture(&scene, shot, 3, &out) { 0 } else { 1 };
     scene3d.release(&scene);
     game.destroy();
     let text = out.str();

@@ -294,7 +294,7 @@ pub fn registry(root: &Path, scan: &Scan) -> Result<String, String> {
     }
     for a in &scan.attachments {
         let Some(s) = shapes.get(&a.script) else { continue };
-        let at = scene_line(root, &a.scene, a.line);
+        let at = || scene_line(root, &a.scene, a.line);
         for f in &s.fns {
             let (want, sig): (&[&str], &str) = match f.name.name.as_str() {
                 "start" => (&["&Scene"], "pub fn start(scene: &Scene)"),
@@ -305,7 +305,7 @@ pub fn registry(root: &Path, scan: &Scan) -> Result<String, String> {
                 errors.push_str(&scene_error(
                     &a.scene,
                     a.line,
-                    &at,
+                    &at(),
                     &format!(
                         "{} is attached here, so the scene calls its `{}`, which must be `{sig}`",
                         a.script, f.name.name
@@ -330,7 +330,7 @@ pub fn registry(root: &Path, scan: &Scan) -> Result<String, String> {
                     errors.push_str(&scene_error(
                         &a.scene,
                         a.line,
-                        &at,
+                        &at(),
                         &format!("{} needs prop `{name}`, and this object doesn't set it", a.script),
                         &format!("set it in the inspector, or add `param.{}.{name}` lines", a.id),
                     ));

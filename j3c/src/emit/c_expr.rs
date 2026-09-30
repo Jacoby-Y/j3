@@ -10,7 +10,7 @@ use crate::ir::operand::{ConstKind, Operand};
 use crate::ir::place::{Place, PlaceRoot, Proj};
 use crate::ir::rvalue::{Rvalue, RvalueKind};
 use crate::ir::stmt::{Stmt, StmtKind};
-use crate::ir::ty::{FloatTy, Ty, TyKind};
+use crate::ir::ty::{FloatTy, IntTy, Ty, TyKind};
 
 struct DeferFrame {
     blocks: Vec<crate::ir::body::Block>,
@@ -259,7 +259,7 @@ impl<'a> CWriter<'a> {
         let cap = crate::ir::wrap::INTERP_CAP;
         if ty == self.cx.common.string {
             return Ok(format!(
-                "{pad}if (({used}) + ({e}).len > {cap}ll) {{ _exit(1); }}\n\
+                "{pad}if (({used}) + ({e}).len > {cap}ll) {{ J3_FAIL(\"string interpolation overflowed its buffer\"); }}\n\
                  {pad}memcpy(({buf}) + ({used}), ({e}).ptr, (size_t)({e}).len);\n\
                  {pad}{used} = ({used}) + ({e}).len;\n"
             ));
@@ -276,9 +276,9 @@ impl<'a> CWriter<'a> {
             return Ok(format!(
                 "{pad}{{\n\
                  {pad}    int64_t j3_room = {cap}ll - ({used});\n\
-                 {pad}    if (j3_room <= 0) {{ _exit(1); }}\n\
+                 {pad}    if (j3_room <= 0) {{ J3_FAIL(\"string interpolation overflowed its buffer\"); }}\n\
                  {pad}    int64_t j3_w = (int64_t)snprintf((char *)({buf}) + ({used}), (size_t)j3_room, {fmt});\n\
-                 {pad}    if (j3_w < 0 || j3_w >= j3_room) {{ _exit(1); }}\n\
+                 {pad}    if (j3_w < 0 || j3_w >= j3_room) {{ J3_FAIL(\"string interpolation overflowed its buffer\"); }}\n\
                  {pad}    {used} = ({used}) + j3_w;\n\
                  {pad}}}\n"
             ));
@@ -320,7 +320,7 @@ impl<'a> CWriter<'a> {
         let lit = c_bytes_literal(bytes);
         let cap = crate::ir::wrap::INTERP_CAP;
         Ok(format!(
-            "{pad}if (({used}) + {len}ll > {cap}ll) {{ _exit(1); }}\n\
+            "{pad}if (({used}) + {len}ll > {cap}ll) {{ J3_FAIL(\"string interpolation overflowed its buffer\"); }}\n\
              {pad}memcpy(({buf}) + ({used}), {lit}, {len}ull);\n\
              {pad}{used} = ({used}) + {len}ll;\n",
             len = bytes.len()
@@ -564,7 +564,8 @@ impl<'a> CWriter<'a> {
                 s.push_str(&format!("{pad}continue;\n"));
                 Ok(s)
             }
-            StmtKind::Abort | StmtKind::Div0 => Ok(format!("{pad}_exit(1);\n")),
+            StmtKind::Abort(k) => Ok(format!("{pad}J3_FAIL(\"{}\");\n", k.message())),
+            StmtKind::Div0 => Ok(format!("{pad}J3_FAIL(\"{}\");\n", crate::ir::stmt::AbortKind::Div0.message())),
             StmtKind::Block(inner) => {
                 let mut s = format!("{pad}{{\n");
                 s.push_str(&self.emit_block(inner, false, indent + 1)?);
@@ -625,7 +626,7 @@ impl<'a> CWriter<'a> {
                         crate::ir::rvalue::InterpPart::Lit(bytes) => {
                             let lit = c_bytes_literal(bytes);
                             s.push_str(&format!(
-                                "{pad}if (({used_s}) + {len}ll > {cap}ll) {{ _exit(1); }}\n\
+                                "{pad}if (({used_s}) + {len}ll > {cap}ll) {{ J3_FAIL(\"string interpolation overflowed its buffer\"); }}\n\
                                  {pad}memcpy(({buf_s}) + ({used_s}), {lit}, {len}ull);\n\
                                  {pad}{used_s} = ({used_s}) + {len}ll;\n",
                                 len = bytes.len()
@@ -711,13 +712,119 @@ pub(crate) fn global_c_name(cx: &IrCx, g: &crate::ir::entity::GlobalDef) -> Stri
     )
 }
 
+/// Linker symbol. The suffix is a hash of the signature (and a method's type
+/// arguments), not [`crate::ir::ids::FuncId`]: ids are assigned from the entry
+/// file outward, so a new function there would rename the stdlib and bust an
+/// object cache.
 pub(crate) fn func_c_name(cx: &IrCx, func: &crate::ir::entity::Func) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    c_ty::module_ident(cx, &func.module).hash(&mut h);
+    cx.name_str(func.name).hash(&mut h);
+    if let Some(sid) = func.method_of {
+        let def = cx.struct_def(sid);
+        c_ty::module_ident(cx, &def.module).hash(&mut h);
+        cx.name_str(def.name).hash(&mut h);
+        for (n, t) in &def.ty_args {
+            n.hash(&mut h);
+            stable_ty(cx, *t).hash(&mut h);
+        }
+    }
+    if let Some((params, ret)) = cx.fn_sig(func.ty) {
+        for p in params {
+            stable_ty(cx, *p).hash(&mut h);
+        }
+        stable_ty(cx, ret).hash(&mut h);
+    }
     format!(
-        "j3_{}_{}_{}",
+        "j3_{}_{}_{:016x}",
         c_ty::module_ident(cx, &func.module),
         c_ty::sanitize(cx.name_str(func.name)),
-        func.id.0
+        h.finish()
     )
+}
+
+/// Type text that does not use intern ids, so two compiles of the same source match.
+pub(crate) fn stable_ty(cx: &IrCx, ty: Ty) -> String {
+    fn go(cx: &IrCx, ty: Ty, depth: usize) -> String {
+        if depth > 32 {
+            return "rec".to_string();
+        }
+        let d = depth + 1;
+        match cx.ty_kind(ty) {
+            TyKind::Void => "void".to_string(),
+            TyKind::Bool => "bool".to_string(),
+            TyKind::Int(IntTy::I8) => "i8".to_string(),
+            TyKind::Int(IntTy::I16) => "i16".to_string(),
+            TyKind::Int(IntTy::I32) => "i32".to_string(),
+            TyKind::Int(IntTy::I64) => "int".to_string(),
+            TyKind::Int(IntTy::U8) => "u8".to_string(),
+            TyKind::Int(IntTy::U16) => "u16".to_string(),
+            TyKind::Int(IntTy::U32) => "u32".to_string(),
+            TyKind::Int(IntTy::U64) => "u64".to_string(),
+            TyKind::Float(FloatTy::F32) => "f32".to_string(),
+            TyKind::Float(FloatTy::F64) => "float".to_string(),
+            TyKind::Ptr => "ptr".to_string(),
+            TyKind::CStr => "cstr".to_string(),
+            TyKind::String => "string".to_string(),
+            TyKind::Ref(inner) => format!("&{}", go(cx, *inner, d)),
+            TyKind::Array { elem, len } => format!("[{len}]{}", go(cx, *elem, d)),
+            TyKind::Slice { elem } => format!("[]{}", go(cx, *elem, d)),
+            TyKind::Fn { params, ret } => {
+                let mut s = String::from("fn(");
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str(&go(cx, *p, d));
+                }
+                s.push(')');
+                s.push_str(&go(cx, *ret, d));
+                s
+            }
+            TyKind::Struct(id) => {
+                let def = cx.struct_def(*id);
+                let mut s = format!(
+                    "{}.{}",
+                    c_ty::module_ident(cx, &def.module),
+                    cx.name_str(def.name)
+                );
+                if !def.ty_args.is_empty() {
+                    s.push('<');
+                    for (i, (n, t)) in def.ty_args.iter().enumerate() {
+                        if i > 0 {
+                            s.push(',');
+                        }
+                        s.push_str(n);
+                        s.push('=');
+                        s.push_str(&go(cx, *t, d));
+                    }
+                    s.push('>');
+                }
+                s
+            }
+            TyKind::Enum(id) => {
+                let def = cx.enum_def(*id);
+                let mut s = format!(
+                    "{}.{}{{",
+                    c_ty::module_ident(cx, &def.module),
+                    cx.name_str(def.name)
+                );
+                for v in &def.variants {
+                    s.push_str(cx.name_str(v.name));
+                    if let Some(p) = v.payload {
+                        s.push(':');
+                        s.push_str(&go(cx, p, d));
+                    }
+                    s.push(';');
+                }
+                s.push('}');
+                s
+            }
+        }
+    }
+    go(cx, ty, 0)
 }
 
 fn c_bytes_literal(bytes: &[u8]) -> String {

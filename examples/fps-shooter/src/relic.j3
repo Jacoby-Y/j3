@@ -1,0 +1,219 @@
+// Relic hunts through the air, strafing around the player and throwing volleys of
+// rune-covered rocks at their predicted position. Breaking seals exposes the core.
+module fps_shooter.relic;
+
+use j3.math.{ Vec3, Mat4, TAU, clamp, cos, max, min, sin };
+use fps_shooter.bosskit.{ Boss, Bosses, BODY, WEAK, SUB, RUNE_ROCK, addPart, bit, box,
+    burst, clearParts, flat, flatDist, frame, groundTop, puff, lobRock, turn, walled, yawTo };
+use fps_shooter.challenge;
+use fps_shooter.level;
+use fps_shooter.level.Level;
+use fps_shooter.player.Player;
+use fps_shooter.sfx;
+
+const ORBIT: int = 0;
+const ALIGN: int = 1;
+const FIRE: int = 2;
+const RECOVER: int = 3;
+const PLATES: int = 4;
+/// Two ordinary attacks, then a third from just over the ground, sat there this long.
+const SIT_EVERY: int = 2;
+const SIT_T: f32 = 7;
+const SIT_UP: f32 = 0.6;
+
+fn glow(): Vec3 { return Vec3.xyz(0.2, 2.1, 1.4); }
+
+fn to(b: &Boss, state: int, len: f32) {
+    b.state = state;
+    b.t = 0;
+    b.len = len;
+}
+
+pub fn begin(bs: &Bosses) {
+    let b = &bs.b;
+    b.intro = 0.8;
+    b.pos.y += 7;
+    b.vel = Vec3.zero();
+    b.cd = 0;
+    b.cycle = 0;
+    b.armor = PLATES;
+    b.anim = 0;
+    let i = 0;
+    while i < PLATES {
+        bs.subOn[i] = true;
+        bs.sub[i] = 30;
+        i += 1;
+    }
+    to(b, ORBIT, 0.9);
+}
+
+/// Sunk to the ground to align and throw, so a blade can reach the core: every third attack (`cycle` -1), and
+/// every attack in melee only runs. `heat` is how far down.
+fn low(b: &Boss): bool { return (challenge.on(challenge.MELEE) || b.cycle < 0) && (b.state == ALIGN || b.state == FIRE); }
+
+fn core(b: &Boss): Vec3 { return b.pos + Vec3.xyz(0, 4.8 - b.heat * 2.6 + sin(b.anim * 1.8) * 0.35, 0); }
+
+fn plate(b: &Boss, i: int): Mat4 {
+    let a = b.yaw + f32(i) * TAU / 4;
+    let r: f32 = if b.state == ALIGN { 3.4 } else { 2.7 };
+    let at = core(b) + Vec3.xyz(0 - sin(a) * r, sin(b.anim * 2 + f32(i)) * 0.4, 0 - cos(a) * r);
+    return frame(at, a);
+}
+
+fn pose(bs: &Bosses) {
+    clearParts(bs);
+    let b = &bs.b;
+    let i = 0;
+    while i < PLATES {
+        if bs.subOn[i] {
+            let t = plate(b, i);
+            // The turquoise seal is on the outside of each orbiting slab.
+            addPart(bs, t.transformPoint(Vec3.xyz(0, 0, -0.6)), 0.65, 0.8, SUB + i);
+            addPart(bs, t.transformPoint(Vec3.zero()), 1.15, 0.7, BODY);
+        }
+        i += 1;
+    }
+    addPart(bs, core(b), 1.35, if b.armor == 0 { 3 } else { if b.open > 0 { 1.8 } else { 0.8 } }, WEAK);
+}
+
+/// Fly at the player's altitude, with lateral motion and a floor under the whole armor ring.
+fn chase(bs: &Bosses, p: &Player, lvl: &Level, dt: f32) {
+    let b = &bs.b;
+    let radius: f32 = if b.state == FIRE { 18 } else { 25 };
+    let angle = b.anim * (if b.phase2 { 0.85 } else { 0.65 });
+    if low(b) { radius = 9; }
+    let goal = p.pos + Vec3.xyz(cos(angle) * radius, 7 + sin(angle * 1.5) * 3, sin(angle) * radius);
+    if !b.engaged { goal = b.home + Vec3.xyz(0, 7, 0); }
+    if flatDist(goal, b.home) > 52 {
+        let horiz = b.home + flat(goal - b.home).normalize() * 52;
+        goal.x = horiz.x; goal.z = horiz.z;
+    }
+    let cx = f32(b.tile % 3 - 1) * level.TILE;
+    let cz = f32(b.tile / 3 - 1) * level.TILE;
+    goal.x = clamp(goal.x, cx - 65, cx + 65);
+    goal.z = clamp(goal.z, cz - 65, cz + 65);
+    goal.y = clamp(goal.y, b.home.y + 5, 64);
+    if b.cycle < 0 && low(b) { goal = b.aim; }
+    if low(b) && b.engaged { goal.y = groundTop(lvl, goal.x, goal.z, 3.8, 72) + SIT_UP; }
+    let off = goal - b.pos;
+    let speed: f32 = if b.phase2 { 25 } else { 20 };
+    let want = off.normalize() * min(speed, off.length() * 2);
+    b.vel = b.vel + (want - b.vel) * min(dt * 4, 1);
+    let at = b.pos + b.vel * dt;
+    let floor = groundTop(lvl, at.x, at.z, 3.8, 72);
+    // Rise over the ruins before crossing them; never disappear through a wall.
+    if walled(lvl, at.x, at.z, 3.8, at.y + 1, 0, 9) {
+        at.x = b.pos.x; at.z = b.pos.z;
+        at.y = min(64, b.pos.y + speed * dt);
+    } else { at.y = max(at.y, floor + 1); }
+    // Ground detector: sunk, the core stays within 3 m of the ground beneath.
+    if low(b) && floor > -50 { at.y = min(at.y, max(floor + 0.8, b.pos.y - 30 * dt)); }
+    b.pos = at;
+    b.yaw += dt * (if b.phase2 { 1.4 } else { 0.9 });
+}
+
+fn volley(bs: &Bosses, p: &Player, lvl: &Level) {
+    let b = &bs.b;
+    let from = core(b) + Vec3.xyz(cos(f32(b.step) * 2.4) * 3.5, sin(f32(b.step) * 2.4) * 2, 0);
+    let aim = p.pos + flat(p.vel) * 0.25;
+    let spread = Vec3.xyz(cos(f32(b.step) * 2.4), 0, sin(f32(b.step) * 2.4)) * 3;
+    lobRock(bs, lvl, RUNE_ROCK, from, aim + spread, 12, glow() * 0.6);
+    burst(bs, from, 4, 3, Vec3.xyz(0.4, 0.8, 0.65), glow());
+    sfx.at(sfx.BOW, from);
+}
+
+pub fn update(bs: &Bosses, p: &Player, lvl: &Level, dt: f32) {
+    let b = &bs.b;
+    b.anim += dt;
+    let sunk: f32 = if low(b) { 1 } else { 0 };
+    b.heat += (sunk - b.heat) * min(dt * 4, 1);
+    chase(bs, p, lvl, dt);
+    let i = 0;
+    while i < PLATES {
+        if bs.subOn[i] && bs.sub[i] <= 0 {
+            bs.subOn[i] = false;
+            b.armor -= 1;
+            burst(bs, plate(b, i).transformPoint(Vec3.zero()), 26, 9, Vec3.xyz(0.5, 0.63, 0.56), glow());
+            sfx.at(sfx.SHATTER, core(b));
+        }
+        i += 1;
+    }
+    // Armor opens while throwing too, rewarding shots during the aggressive phase.
+    b.open = if b.armor == 0 || b.state == FIRE { 1 } else { 0 };
+    b.cue = b.open > 0;
+    if b.engaged && b.intro <= 0 {
+        b.t += dt;
+        if b.state == ORBIT && b.t >= b.len {
+            if b.cycle >= SIT_EVERY {
+                // Land near the player and stay put for the whole attack.
+                b.cycle = -1;
+                b.aim = p.pos + flat(b.pos - p.pos).normalize() * 9;
+                if groundTop(lvl, b.aim.x, b.aim.z, 3.8, p.pos.y + 3) < p.pos.y - 3 { b.aim = p.pos; }
+            } else { b.cycle += 1; }
+            to(b, ALIGN, if challenge.on(challenge.MELEE) || b.cycle < 0 { 1.1 } else { 0.5 });
+        } else if b.state == ALIGN && b.t >= b.len {
+            b.step = 0;
+            b.cd = 0;
+            let fireT: f32 = if challenge.on(challenge.MELEE) { 4.5 } else { 1.5 };
+            if b.cycle < 0 { fireT = SIT_T; }
+            to(b, FIRE, fireT);
+        } else if b.state == FIRE {
+            b.cd -= dt;
+            if b.cd <= 0 {
+                volley(bs, p, lvl);
+                b.step += 1;
+                let gap: f32 = if b.phase2 { 0.5 } else { 0.65 };
+                if challenge.on(challenge.MELEE) { gap = gap * 0.5; }
+                b.cd = gap;
+            }
+            if b.t >= b.len { to(b, RECOVER, 1.0); }
+        } else if b.state == RECOVER && b.t >= b.len {
+            if b.cycle < 0 { b.cycle = 0; }
+            to(b, ORBIT, 0.55);
+        }
+    }
+    pose(bs);
+    bs.glowAt = core(b);
+    bs.glowColor = glow() * 0.7;
+    bs.glowR = if b.open > 0 { 13 } else { 8 };
+}
+
+pub fn draw(bs: &Bosses) {
+    let b = &bs.b;
+    let stone = Vec3.xyz(0.47, 0.58, 0.51);
+    let dark = Vec3.xyz(0.24, 0.34, 0.3);
+    let t = frame(core(b), b.anim * 0.5).mul(Mat4.rotate(Vec3.xyz(1, 0, 1).normalize(), 0.65));
+    box(bs, t, Vec3.zero(), Vec3.xyz(1.9, 1.9, 1.9), dark, glow() * (if b.armor == 0 { 1.5 } else { 0.35 }));
+    let i = 0;
+    while i < PLATES {
+        if bs.subOn[i] {
+            let slab = plate(b, i);
+            box(bs, slab, Vec3.zero(), Vec3.xyz(1.8, 3.1, 0.85), stone, Vec3.zero());
+            box(bs, slab, Vec3.xyz(0, 1.65, 0), Vec3.xyz(2.1, 0.4, 1.05), dark, Vec3.zero());
+            box(bs, slab, Vec3.xyz(0, -1.65, 0), Vec3.xyz(2.1, 0.4, 1.05), dark, Vec3.zero());
+            let rune = slab.mul(Mat4.translate(0, 0, -0.6)).mul(Mat4.rotate(Vec3.xyz(0, 0, 1), 0.785));
+            bit(bs, rune, Vec3.zero(), Vec3.xyz(0.85, 0.85, 0.25), Vec3.xyz(0.4, 1, 0.8), glow());
+            bit(bs, slab, Vec3.xyz(0, 1.0, -0.44), Vec3.xyz(0.12, 0.6, 0.06), dark, glow() * 0.5);
+            bit(bs, slab, Vec3.xyz(0, -1.0, -0.44), Vec3.xyz(0.12, 0.6, 0.06), dark, glow() * 0.5);
+        }
+        i += 1;
+    }
+    if b.state == ALIGN {
+        let charge = clamp(b.t / b.len, 0, 1);
+        let stoneIndex = 0;
+        while stoneIndex < 5 {
+            let angle = f32(stoneIndex) * TAU / 5 + b.anim * 2;
+            let at = core(b) + Vec3.xyz(cos(angle) * 4, sin(angle) * 3, 0);
+            let chargeRune = frame(at, angle);
+            bit(bs, chargeRune, Vec3.zero(), Vec3.xyz(0.65, 0.65, 0.65), stone, glow() * charge);
+            stoneIndex += 1;
+        }
+    }
+    // A broken crown hovers above the core, separate from the destructible armor.
+    i = 0;
+    while i < 6 {
+        let a = f32(i) * TAU / 6 - b.anim * 0.3;
+        box(bs, frame(core(b) + Vec3.xyz(cos(a) * 1.6, 2.9, sin(a) * 1.6), a), Vec3.zero(), Vec3.xyz(0.5, 1.0, 0.5), stone, Vec3.zero());
+        i += 1;
+    }
+}

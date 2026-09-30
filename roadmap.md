@@ -13,7 +13,7 @@ Language v1, typed IR, C and LLVM printers, `--fast`. Short-circuit, if-expr arm
 ## Left
 
 - **Scale** — one translation unit per `cc`, and mono re-walks the AST, when dungeon plus monomorphization hurts. Not before.
-- **Debug** — gdb/lldb on the named locals. Lines and `DILocalVariable` are in the LLVM printer.
+- **Better panics** — see the section below. Lines and `DILocalVariable` are already in the LLVM printer, so gdb/lldb work when one is installed.
 - **Tooling** — rename.
 - **Packages** — `j3.toml` deps. Language-level tests stay `cargo test` plus a playable example until then.
 - **Ship a Windows binary** — mingw `clang` and the SDL import libs. A missing lib stays a link error. Distribution is one binary plus an assets folder.
@@ -26,14 +26,36 @@ Later, not this list: Wasm, consoles, threads, a J3 shader language, SIMD.
 Nothing in the examples is waiting on a language change. Hold these until something forces them:
 
 - **One translation unit.** Still one `.ll` and one `clang`, and generics re-lower into one IR context. Measure dungeon check vs emit vs clang first. Stop if check is cheap. Do not CFG-ify check to get there.
-- **`j3.toml` deps, LSP rename, Wasm, threads, shaders.** Nothing in the examples is blocked on them.
+- **Rename, `j3.toml` deps, Wasm, threads, shaders.** Nothing in the examples is blocked on them.
 - **Pack / install.** Dungeon rpath is `$ORIGIN/../lib`, and assets try three roots (`assets/`, `examples/dungeon/assets/`, `../examples/dungeon/assets/`). Matters when there is a build to hand someone.
+
+## Build speed
+
+fps-shooter (54 modules, ~45k lines with stdlib), `J3C_TIMINGS=1` shows the stages. Shipped: `check` 0.80s -> 0.17s (import-cycle DFS walked every path of the import DAG), cold build 1.45s -> 0.75s (emit runs inside the parallel clang workers, biggest module first, `mold` when on PATH), struct edit 54 -> 3 modules recompiled (object key hashes only the layouts a module names), rebuilt/touched j3c no longer invalidates objects (key hashes the compiler's bytes). Open: `lower_module` clones per-module maps (0.06s), LSP still rechecks everything per edit, no function-level pruning.
+
+## Better panics
+
+Shipped (LLVM backend unless noted):
+
+- Every compiler runtime check names itself: `file:line: index out of bounds` (also slice range, divide by zero, interpolation overflow, missing return) and exits **102**. The C backend prints the reason without `file:line`.
+- `panic(msg)` prints `file:line: msg` and exits **101** (the compiler rewrites it to `panicAt`).
+- `j3c run` says `program exited N (panic | runtime check failed | killed by signal S)`, and notes when stderr was empty. A signal death is `128+S`.
+- Debug builds (`[emit] debug = true`, x86-64 Linux) install a crash handler for SIGSEGV/SIGABRT/SIGFPE/SIGBUS/SIGILL, with an alternate stack so stack overflow reports. It prints raw addresses; `j3c run` turns them into `function at file:line` through `nm` and `addr2line`.
+
+Still open:
+
+1. The `.j3s` VM's `abort` op and the C backend do not report `file:line`.
+2. The trace stops at 32 frames and needs `nm` + `addr2line` installed; without them it prints raw addresses. A binary run outside `j3c run` prints the raw `j3 at:` lines.
+3. Handler for aarch64, macOS and Windows.
+4. The original fps-shooter silent exit is unconfirmed; it should now say which check failed.
+
+Not in scope: exceptions, unwinding, or `defer` on panic.
 
 ## Language features
 
 Friction, not blockers. The games compile without any of this. Spec still forbids traits, capturing closures, a borrow checker, drop, user attributes, operand swap, and a comptime interpreter. Literal context lands before a sweep that deletes `f32(2)`.
 
-Shipped since this list was written: inclusive `for` (`..=`, test `inclusive_for_runs`), default field values (test `default_fields_fill_omitted`; stdlib structs may still omit defaults), and `for` index scope ending with the loop (test `for_index_ends_with_the_loop`). `let i` then `for i` is still a shadowing error (`let_then_for_still_shadows`).
+Already shipped from this list: inclusive `for`, default field values (stdlib structs may still omit defaults), and `for` index scope ending with the loop. `let i` then `for i` is still a shadowing error.
 
 1. **Literals on the left of `+` `-` `*` `/`.** Gameplay is `f32`. A literal with no context becomes `int` or `f64`. The checker types the left operand with no expected type, then types the right from the left. `far * 2` can be `f32`. `2 * far` cannot. `math.perspective` writes `f32(2) * far * near`. `lookAt` writes `f32(0) - f.x` (nine times in `math.j3`). About 37 `f32(0) -` sites and about 70 `f32(<number>)` casts. Unary `-f.x` already typechecks. `f32(tx * tw)` stays an explicit int-to-float cast. Spike: an untyped literal on the left takes the right operand's type, or the destination type, so `m[14] = 2 * far` is `f32`. A `2f32` suffix is the alternative if the cast should stay visible. Do not change the no-context default from `f64` to `f32`.
 

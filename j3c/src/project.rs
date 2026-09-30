@@ -25,6 +25,8 @@ pub struct Emit {
     pub cpu: String,
     pub clang: String,
     pub flags: Vec<String>,
+    /// Opt 0 reuses one object per module. Default true.
+    pub incremental: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +76,7 @@ impl Default for Emit {
             cpu: String::new(),
             clang: "clang".to_string(),
             flags: Vec::new(),
+            incremental: true,
         }
     }
 }
@@ -266,6 +269,9 @@ fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, String> {
     }
     if let Some(v) = tbl.get("emit", "flags") {
         emit.flags = v.as_list("emit.flags")?;
+    }
+    if let Some(s) = tbl.get("emit", "incremental").and_then(TomlVal::as_str) {
+        emit.incremental = s != "false" && s != "0";
     }
     let mut link = Link::default();
     if let Some(v) = tbl.get("link", "libs") {

@@ -171,6 +171,7 @@ fn load_and_check_with(
         overlays,
         scene_scan: None,
     };
+    let t_load = std::time::Instant::now();
     loader.load_path(&entry_path)?;
     loader.load_module(&["j3".to_string(), "sys".to_string()])?;
     loader.load_imports()?;
@@ -182,6 +183,7 @@ fn load_and_check_with(
         loader.load_imports()?;
     }
     check_import_cycles(&loader.files)?;
+    crate::cli::timing(&format!("  load + parse ({} files)", loader.files.len()), t_load);
     let srcs: Vec<(String, String)> = loader
         .files
         .iter()
@@ -580,8 +582,9 @@ fn check_import_cycles(files: &[ParsedFile]) -> Result<(), String> {
             }
         }
     }
+    let mut done = HashSet::new();
     for start in &keys {
-        if let Some(cycle) = cycle_from(&graph, start) {
+        if let Some(cycle) = cycle_from(&graph, start, &mut done) {
             return Err(format!("import cycle: {}", cycle.join(" -> ")));
         }
     }
@@ -610,12 +613,17 @@ fn use_mod_key(u: &parse::UseItem, loaded: &[String]) -> Option<String> {
     None
 }
 
-fn cycle_from(graph: &HashMap<String, Vec<String>>, start: &str) -> Option<Vec<String>> {
+fn cycle_from(
+    graph: &HashMap<String, Vec<String>>,
+    start: &str,
+    done: &mut HashSet<String>,
+) -> Option<Vec<String>> {
     fn dfs(
         graph: &HashMap<String, Vec<String>>,
         node: &str,
         stack: &mut Vec<String>,
         on_stack: &mut HashSet<String>,
+        done: &mut HashSet<String>,
     ) -> Option<Vec<String>> {
         if on_stack.contains(node) {
             let i = stack.iter().position(|s| s == node)?;
@@ -623,23 +631,24 @@ fn cycle_from(graph: &HashMap<String, Vec<String>>, start: &str) -> Option<Vec<S
             c.push(node.to_string());
             return Some(c);
         }
-        if stack.iter().any(|s| s == node) {
+        if done.contains(node) {
             return None;
         }
         stack.push(node.to_string());
         on_stack.insert(node.to_string());
         if let Some(nexts) = graph.get(node) {
             for n in nexts {
-                if let Some(c) = dfs(graph, n, stack, on_stack) {
+                if let Some(c) = dfs(graph, n, stack, on_stack, done) {
                     return Some(c);
                 }
             }
         }
         on_stack.remove(node);
         stack.pop();
+        done.insert(node.to_string());
         None
     }
-    dfs(graph, start, &mut Vec::new(), &mut HashSet::new())
+    dfs(graph, start, &mut Vec::new(), &mut HashSet::new(), done)
 }
 
 fn source_exists(path: &Path) -> bool {
@@ -689,6 +698,62 @@ mod tests {
 
     fn exec(prog: &Program) -> emit::RunResult {
         emit::run_program(&prog.cx, &prog.modules, &llvm_opts()).expect("emit/run")
+    }
+
+    #[test]
+    fn sys_start_symbol_is_stable_when_entry_grows() {
+        fn symbol(src: &str) -> String {
+            let dir = std::env::temp_dir().join(format!(
+                "j3-sym-{}-{}",
+                std::process::id(),
+                src.len()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("main.j3");
+            std::fs::write(&file, src).unwrap();
+            let prog = compile_path(&file).expect("check");
+            let ll = emit::emit_llvm(&prog.cx, &prog.modules, &llvm_opts()).expect("llvm");
+            let needle = "j3_j3_sys_start_";
+            let i = ll.find(needle).expect("j3.sys.start symbol");
+            let rest = &ll[i..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            let sym = rest[..end].to_string();
+            let _ = std::fs::remove_dir_all(&dir);
+            sym
+        }
+        let plain = symbol("module a;\n\nfn main() {\n}\n");
+        let extra = symbol("module a;\n\nfn extra() {\n}\n\nfn main() {\n}\n");
+        assert_eq!(plain, extra, "a new entry function renamed j3.sys.start");
+    }
+
+    /// A failed runtime check exits 102 and a `panic` exits 101; both say `file:line`.
+    #[test]
+    fn runtime_failures_name_the_place_and_use_distinct_exit_codes() {
+        fn run(name: &str, src: &str) -> emit::RunResult {
+            let dir = std::env::temp_dir().join(format!("j3-fail-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("main.j3");
+            std::fs::write(&file, src).unwrap();
+            let prog = compile_path(&file).expect("check");
+            let out = exec(&prog);
+            let _ = std::fs::remove_dir_all(&dir);
+            out
+        }
+        let oob = run(
+            "oob",
+            "module a;\n\nuse j3.sys.argCount;\n\nfn main() {\n    let xs: [2]int = [1, 2];\n    let i = 5 + argCount();\n    xs[i] = 3;\n}\n",
+        );
+        let err = String::from_utf8_lossy(&oob.stderr);
+        assert_eq!(oob.status, 102, "{err}");
+        assert!(err.contains("main.j3:8: index out of bounds"), "{err}");
+        let boom = run("panic", "module a;\n\nuse j3.sys.panic;\n\nfn main() {\n    panic(\"boom\");\n}\n");
+        let err = String::from_utf8_lossy(&boom.stderr);
+        assert_eq!(boom.status, 101, "{err}");
+        assert!(err.contains("main.j3:6: boom"), "{err}");
     }
 
     #[test]
@@ -1872,6 +1937,27 @@ fn main() {
         .expect("compile");
         let run = exec(&prog);
         assert_ne!(run.status, 0, "% 0 should abort");
+    }
+
+    #[test]
+    fn const_literal_types_run() {
+        let prog = compile_src(
+            "constlit",
+            "module t;\nuse j3.io.printLn;\nconst FLAG: bool = true;\nconst OFF: bool = !FLAG;\nconst NUDGE: f32 = -0.5;\nfn main() {\n    if FLAG && !OFF && NUDGE < 0 {\n        printLn(`ok`);\n    }\n}\n",
+        )
+        .expect("compile");
+        let run = exec(&prog);
+        assert_eq!(run.status, 0, "stderr {}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "ok\n");
+    }
+
+    #[test]
+    fn const_bool_rejects_an_int() {
+        let err = match compile_src("constbad", "module t;\nconst FLAG: bool = 1;\nfn main() {}\n") {
+            Ok(_) => panic!("expected a type error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("const type does not match"), "{err}");
     }
 
     #[test]

@@ -269,6 +269,14 @@ fn add_editor_files(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A quoted `key = "value"` from `j3.editor.toml` (any section), if present and non-empty.
+pub(crate) fn config_value(root: &Path, key: &str) -> Option<String> {
+    let config = fs::read_to_string(root.join("j3.editor.toml")).ok()?;
+    let value = config.lines().filter_map(|line| line.split_once('=')).find(|(k, _)| k.trim() == key)?.1.trim();
+    let value = value.strip_prefix('"')?.strip_suffix('"')?;
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 pub(crate) fn scene_path(root: &Path) -> Result<PathBuf, String> {
     let config = fs::read_to_string(root.join("j3.editor.toml"))
         .map_err(|e| format!("read j3.editor.toml: {e}"))?;
