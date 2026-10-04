@@ -128,6 +128,14 @@ pub enum AbortKind {
 }
 
 impl AbortKind {
+    /// Every kind, in `code` order (the packed-abort table in the LLVM printer).
+    pub const ALL: [AbortKind; 5] =
+        [AbortKind::Index, AbortKind::Slice, AbortKind::Div0, AbortKind::Fmt, AbortKind::NoReturn];
+
+    pub fn code(self) -> u64 {
+        self as u64
+    }
+
     pub fn message(self) -> &'static str {
         match self {
             AbortKind::Index => "index out of bounds",

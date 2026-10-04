@@ -134,6 +134,10 @@ pub fn emit_llvm_part(
     if dbg.enabled() {
         out.push_str("declare void @llvm.dbg.declare(metadata, metadata, metadata)\n\n");
     }
+    // Whole programs print every failed check through one routine; split and per-module
+    // builds keep a message per site (they exist for fast dev builds, not for size).
+    let pack = matches!(part, Part::Whole);
+    let mut abort_files: Vec<String> = Vec::new();
     for module in modules {
         for id in &module.funcs {
             let func = cx.func(*id);
@@ -154,12 +158,19 @@ pub fn emit_llvm_part(
                     };
                     let mut f = LlvmFn::new(cx, body, slot);
                     f.external = part.split();
+                    f.nounwind = super::host::release_nounwind(opts.cc.release, triple);
+                    if pack {
+                        f.abort_files = Some(&mut abort_files);
+                    }
                     out.push_str(&f.emit_func(func)?);
                     out.push('\n');
                 }
                 FuncKind::Decl | FuncKind::Lib { .. } => {}
             }
         }
+    }
+    if pack && !abort_files.is_empty() {
+        out.push_str(&abort_routine(&abort_files));
     }
 
     if !matches!(part, Part::Only(_)) {
@@ -192,6 +203,83 @@ pub fn emit_llvm_part(
         out.push_str("; use lib \"m\"\n");
     }
     Ok(out)
+}
+
+/// `@j3_abort(i64 file << 40 | line << 8 | kind)`: prints `file:line: message\n` to stderr and
+/// exits 102, the same text a per-site message gave. One copy replaces a string and a call
+/// sequence at every bounds, divide, and format check.
+fn abort_routine(files: &[String]) -> String {
+    use crate::ir::stmt::AbortKind;
+    let mut out = String::from("\n");
+    let table = |name: &str, texts: Vec<String>, out: &mut String| {
+        let mut items = Vec::new();
+        for (i, s) in texts.iter().enumerate() {
+            let mut body = String::new();
+            for b in s.bytes() {
+                if b.is_ascii_graphic() && b != b'"' && b != b'\\' || b == b' ' {
+                    body.push(b as char);
+                } else {
+                    body.push_str(&format!("\\{b:02X}"));
+                }
+            }
+            out.push_str(&format!(
+                "@{name}.s{i} = private unnamed_addr constant [{} x i8] c\"{body}\"\n",
+                s.len()
+            ));
+            items.push(format!("%j3_string {{ ptr @{name}.s{i}, i64 {} }}", s.len()));
+        }
+        out.push_str(&format!(
+            "@{name} = private unnamed_addr constant [{} x %j3_string] [{}]\n",
+            texts.len(),
+            items.join(", ")
+        ));
+    };
+    table("j3_abort_files", files.iter().map(|f| format!("{f}:")).collect(), &mut out);
+    table(
+        "j3_abort_kinds",
+        AbortKind::ALL.iter().map(|k| format!(": {}\n", k.message())).collect(),
+        &mut out,
+    );
+    out.push_str(
+        "define internal void @j3_abort(i64 %v) noinline cold noreturn nounwind {
+entry:
+  %buf = alloca [12 x i8], align 1
+  %kind = and i64 %v, 255
+  %line = lshr i64 %v, 8
+  %line32 = and i64 %line, 4294967295
+  %file = lshr i64 %v, 40
+  %fp = getelementptr %j3_string, ptr @j3_abort_files, i64 %file, i32 0
+  %fl = getelementptr %j3_string, ptr @j3_abort_files, i64 %file, i32 1
+  %fptr = load ptr, ptr %fp
+  %flen = load i64, ptr %fl
+  %w0 = call i64 @write(i32 2, ptr %fptr, i64 %flen)
+  br label %digits
+digits:
+  %n = phi i64 [ %line32, %entry ], [ %q, %digits ]
+  %pos = phi i64 [ 12, %entry ], [ %p1, %digits ]
+  %p1 = sub i64 %pos, 1
+  %r = urem i64 %n, 10
+  %q = udiv i64 %n, 10
+  %c = add i64 %r, 48
+  %c8 = trunc i64 %c to i8
+  %dp = getelementptr i8, ptr %buf, i64 %p1
+  store i8 %c8, ptr %dp
+  %more = icmp ne i64 %q, 0
+  br i1 %more, label %digits, label %done
+done:
+  %len = sub i64 12, %p1
+  %w1 = call i64 @write(i32 2, ptr %dp, i64 %len)
+  %kp = getelementptr %j3_string, ptr @j3_abort_kinds, i64 %kind, i32 0
+  %kl = getelementptr %j3_string, ptr @j3_abort_kinds, i64 %kind, i32 1
+  %kptr = load ptr, ptr %kp
+  %klen = load i64, ptr %kl
+  %w2 = call i64 @write(i32 2, ptr %kptr, i64 %klen)
+  call void @_exit(i32 102)
+  unreachable
+}
+",
+    );
+    out
 }
 
 /// One module's LLVM text. Types are duplicated. This module's functions and

@@ -29,13 +29,14 @@ enum OsKind {
 }
 
 fn os_kind(target: &str) -> OsKind {
-    let t = target.to_ascii_lowercase();
-    if t.contains("windows") {
-        OsKind::Windows
-    } else if t.contains("apple") || t.contains("darwin") {
-        OsKind::Macos
-    } else {
-        OsKind::Linux
+    use crate::emit::host::{target_os, TargetOs};
+    if target.is_empty() {
+        return OsKind::Linux;
+    }
+    match target_os(target) {
+        TargetOs::Windows => OsKind::Windows,
+        TargetOs::Macos => OsKind::Macos,
+        TargetOs::Linux | TargetOs::Other => OsKind::Linux,
     }
 }
 
@@ -99,7 +100,7 @@ fn tool_host(entry: &Path) -> Result<String, String> {
     });
     if !ready {
         return Err(format!(
-            "{} has no `pub fn main()`\n  = help: this file is a tool entry; scene scripts are started by the game (`node.<i>.script`)",
+            "{} has no `pub fn main()`\n  = help: this file is a tool entry; scene scripts are started by the game (`script=` on an object)",
             entry.display()
         ));
     }
@@ -379,6 +380,14 @@ impl Loader {
                 OsKind::Linux => "sys.j3",
                 OsKind::Windows => "sys_windows.j3",
                 OsKind::Macos => "sys_macos.j3",
+            };
+            return stdlib_dir().join("j3").join(name);
+        }
+        if parts.len() == 2 && parts[0] == "j3" && parts[1] == "netsys" {
+            let name = match self.os {
+                OsKind::Linux => "netsys.j3",
+                OsKind::Windows => "netsys_windows.j3",
+                OsKind::Macos => "netsys_macos.j3",
             };
             return stdlib_dir().join("j3").join(name);
         }

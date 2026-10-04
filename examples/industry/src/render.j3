@@ -1,0 +1,320 @@
+// Cache exposed terrain faces in sections; edits rebuild only nearby meshes.
+module industry.render;
+
+use j3.gfx;
+use j3.game;
+use industry.terrain_mesh;
+use industry.terrain_mesh.Region;
+use industry.terrain_lod;
+use j3.gfx.Mesh;
+use j3.math;
+use j3.sys;
+use j3.io.printLn;
+use industry.render_cache.TerrainCache;
+use j3.gfx.voxel;
+use j3.gfx.voxel.Hit;
+use j3.math.{ Mat4, Vec3 };
+use industry.data.block;
+use industry.data.defs;
+use industry.placement.Plan;
+use industry.world;
+use industry.world.World;
+use industry.mining;
+use industry.mining.Progress;
+use industry.models;
+use industry.models.Models;
+use industry.machine.dispatch;
+use industry.visibility;
+
+// Height of the translucent wall at a locked chunk edge, in one-voxel bands.
+const BARRIER_BANDS: int = 28;
+
+// Rebuilds dirty chunks until `budgetUs` microseconds are spent (0 means no limit), so a new chunk
+// fills in over several frames instead of one long stall. At least one section is always rebuilt.
+pub fn rebuild(w: &World, budgetUs: int) {
+    let begin = game.micros();
+    let pending = false;
+    for cz in 0..world.CHUNKS { for cx in 0..world.CHUNKS {
+        let chunk = cx + cz * world.CHUNKS;
+        if w.unlocked[chunk] == 0 || w.chunkDirty[chunk] == 0 { continue; }
+        if !rebuildChunk(w, cx, cz, begin, budgetUs) { pending = true; }
+    } }
+    w.dirty = pending;
+    // TEMP timing
+    if game.micros() - begin > 8000 { printLn(`[time] rebuild frame: {game.micros() - begin}us, pending {pending}`); }
+}
+
+fn spent(begin: int, budgetUs: int): bool { return budgetUs > 0 && game.micros() - begin >= budgetUs; }
+
+// True when the chunk is fully rebuilt; false when the budget ran out first.
+fn rebuildChunk(w: &World, cx: int, cz: int, begin: int, budgetUs: int): bool {
+    for sy in 0..world.SECTIONS_Y { for dz in 0..world.SECTIONS_PER_CHUNK { for dx in 0..world.SECTIONS_PER_CHUNK {
+        let section = world.sectionIndex(cx * world.SECTIONS_PER_CHUNK + dx, sy, cz * world.SECTIONS_PER_CHUNK + dz);
+        if w.sectionDirty[section] == 0 { continue; }
+        if spent(begin, budgetUs) { return false; }
+        rebuildSection(w, section);
+    } } }
+    if spent(begin, budgetUs) { return false; }
+    let ts = game.micros();
+    rebuildShadowChunk(w, cx, cz);
+    // TEMP timing
+    printLn(`[time] shadow chunk {cx},{cz}: {game.micros() - ts}us`);
+    w.chunkDirty[cx + cz * world.CHUNKS] = 0;
+    return true;
+}
+
+pub fn sectionRegion(section: int): Region {
+    let x = section % world.SECTIONS_X * world.SECTION_X;
+    let y = section / (world.SECTIONS_X * world.SECTIONS_X) * world.SECTION_Y;
+    let z = (section / world.SECTIONS_X) % world.SECTIONS_X * world.SECTION_X;
+    return Region { x0: x, y0: y, z0: z, x1: x + world.SECTION_X,
+        y1: math.mini(y + world.SECTION_Y, world.SY), z1: z + world.SECTION_X };
+}
+
+fn rebuildSection(w: &World, section: int) {
+    if w.sectionMeshes[section].count > 0 { gfx.free(&w.sectionMeshes[section]); }
+    if w.sectionLodMeshes[section].count > 0 { gfx.free(&w.sectionLodMeshes[section]); }
+    w.sectionMeshes[section] = Mesh {}; w.sectionLodMeshes[section] = Mesh {};
+    storeSection(w, section, 0);
+    let region = sectionRegion(section);
+    let t0 = game.micros();
+    let count = terrain_mesh.detailedRegion(w, region);
+    let t1 = game.micros(); let t2 = t1; let t3 = t1; let t4 = t1;
+    if count > 0 {
+        let lx = w.scratch[0]; let ly = w.scratch[1]; let lz = w.scratch[2];
+        let hx = lx; let hy = ly; let hz = lz;
+        for vertex in 0..count / 10 {
+            let at = vertex * 10;
+            lx = math.min(lx, w.scratch[at]); hx = math.max(hx, w.scratch[at]);
+            ly = math.min(ly, w.scratch[at + 1]); hy = math.max(hy, w.scratch[at + 1]);
+            lz = math.min(lz, w.scratch[at + 2]); hz = math.max(hz, w.scratch[at + 2]);
+        }
+        w.sectionMin[section] = Vec3.xyz(lx, ly, lz);
+        w.sectionMax[section] = Vec3.xyz(hx, hy, hz);
+        w.sectionMeshes[section] = gfx.upload(w.scratch[0..count]);
+        t2 = game.micros();
+        let merged = terrain_mesh.mergedRegion(w, region);
+        t3 = game.micros();
+        if merged > 0 {
+            w.sectionLodMeshes[section] = gfx.upload(w.scratch[0..merged]);
+            storeSection(w, section, merged);
+        }
+        t4 = game.micros();
+    }
+    // TEMP timing: remove once the lag is found.
+    if t4 - t0 > 2000 { printLn(`[time] section {section}: detail {t1 - t0}us, bounds+upload {t2 - t1}us, merged {t3 - t2}us, lod upload+store {t4 - t3}us`); }
+    trackSection(w, section, count > 0);
+    w.sectionDirty[section] = 0;
+}
+
+// Owned merged CPU data is replaced and unmapped on edits, never allocated during drawing.
+pub fn storeSection(w: &World, section: int, count: int) {
+    if w.sectionCpu[section].vertices.len > 0 { sys.munmap(w.sectionCpu[section].address, w.sectionCpu[section].vertices.len * 4); }
+    w.sectionCpu[section].vertices = w.scratch[0..0];
+    if count == 0 { return; }
+    let address = sys.mmapAnon(count * 4); let vertices: []f32 = @slice(address, count);
+    for component in 0..count { vertices[component] = w.scratch[component]; }
+    w.sectionCpu[section] = TerrainCache { vertices: vertices, address: address };
+}
+
+// Concatenate retained merged section vertices: no full-chunk remeshing on edits.
+pub fn shadowVertices(w: &World, cx: int, cz: int): int {
+    let at = 0;
+    for sy in 0..world.SECTIONS_Y { for dz in 0..world.SECTIONS_PER_CHUNK { for dx in 0..world.SECTIONS_PER_CHUNK {
+        let section = world.sectionIndex(cx * world.SECTIONS_PER_CHUNK + dx, sy, cz * world.SECTIONS_PER_CHUNK + dz);
+        let vertices = w.sectionCpu[section].vertices;
+        if at + vertices.len > w.scratch.len { sys.panic("combined shadow mesh capacity exhausted"); }
+        for component in 0..vertices.len { w.scratch[at + component] = vertices[component]; }
+        at += vertices.len;
+    } } }
+    return at;
+}
+
+fn rebuildShadowChunk(w: &World, cx: int, cz: int) {
+    let chunk = cx + cz * world.CHUNKS;
+    if w.chunkShadowMeshes[chunk].count > 0 { gfx.free(&w.chunkShadowMeshes[chunk]); }
+    w.chunkShadowMeshes[chunk] = Mesh {};
+    let count = shadowVertices(w, cx, cz);
+    if count > 0 { w.chunkShadowMeshes[chunk] = gfx.upload(w.scratch[0..count]); }
+}
+
+// Dense nonempty list avoids scanning every possible section in small worlds.
+pub fn trackSection(w: &World, section: int, nonempty: bool) {
+    let slot = w.sectionSlots[section] - 1;
+    if nonempty && slot < 0 {
+        w.activeSections[w.sectionCount] = section;
+        w.sectionSlots[section] = w.sectionCount + 1; w.sectionCount += 1;
+        w.chunkSectionCount[world.sectionChunk(section)] += 1;
+    }
+    if !nonempty && slot >= 0 {
+        w.sectionCount -= 1;
+        let last = w.activeSections[w.sectionCount]; w.activeSections[slot] = last;
+        w.sectionSlots[last] = slot + 1; w.sectionSlots[section] = 0;
+        w.chunkSectionCount[world.sectionChunk(section)] -= 1;
+    }
+}
+
+fn cellLine(a: Vec3, b: Vec3, color: Vec3) {
+    gfx.drawLine(a * world.VOXEL, b * world.VOXEL, color);
+}
+
+// A thin outline sits just outside the selected cube to avoid depth fighting.
+pub fn hover(w: &World, hit: Hit) {
+    if !hit.ok { return; }
+    let x = f32(hit.x) - 0.006;
+    let y = f32(hit.y) - 0.006;
+    let z = f32(hit.z) - 0.006;
+    let width = 1;
+    let tall = 1;
+    if world.machine(world.get(w, hit.x, hit.y, hit.z)) {
+        let anchor = world.anchorAt(w, hit.x, hit.y, hit.z);
+        x = f32(world.anchorX(anchor)) - 0.006;
+        y = f32(world.anchorY(anchor)) - 0.006;
+        z = f32(world.anchorZ(anchor)) - 0.006;
+        width = 2;
+        tall = world.height(w.cells[anchor]);
+    }
+    let x1 = x + f32(width) + 0.012;
+    let y1 = y + f32(tall) + 0.012;
+    let z1 = z + f32(width) + 0.012;
+    let c = Vec3.xyz(0.92, 0.86, 0.63);
+    cellLine(Vec3.xyz(x, y, z), Vec3.xyz(x1, y, z), c);
+    cellLine(Vec3.xyz(x, y, z1), Vec3.xyz(x1, y, z1), c);
+    cellLine(Vec3.xyz(x, y1, z), Vec3.xyz(x1, y1, z), c);
+    cellLine(Vec3.xyz(x, y1, z1), Vec3.xyz(x1, y1, z1), c);
+    cellLine(Vec3.xyz(x, y, z), Vec3.xyz(x, y, z1), c);
+    cellLine(Vec3.xyz(x1, y, z), Vec3.xyz(x1, y, z1), c);
+    cellLine(Vec3.xyz(x, y1, z), Vec3.xyz(x, y1, z1), c);
+    cellLine(Vec3.xyz(x1, y1, z), Vec3.xyz(x1, y1, z1), c);
+    cellLine(Vec3.xyz(x, y, z), Vec3.xyz(x, y1, z), c);
+    cellLine(Vec3.xyz(x1, y, z), Vec3.xyz(x1, y1, z), c);
+    cellLine(Vec3.xyz(x, y, z1), Vec3.xyz(x, y1, z1), c);
+    cellLine(Vec3.xyz(x1, y, z1), Vec3.xyz(x1, y1, z1), c);
+}
+
+// Two opposite faces on one plane: no horizontal slab faces between gradient bands.
+pub fn makeBarrier(w: &World): Mesh {
+    let at = gfx.emitFace(w.scratch, 0, 0, 0, 0, gfx.FACE_NX, 0.015, 0.02, 0.025, 0);
+    at = gfx.emitFace(w.scratch, at, -1, 0, 0, gfx.FACE_PX, 0.015, 0.02, 0.025, 0);
+    return gfx.upload(w.scratch[0..at]);
+}
+
+pub fn boundaries(w: &World, mesh: Mesh) {
+    for cz in 0..world.CHUNKS {
+        for cx in 0..world.CHUNKS {
+            if w.unlocked[cx + cz * world.CHUNKS] == 0 { continue; }
+            let x = cx * world.CHUNK; let z = cz * world.CHUNK;
+            for side in 0..4 {
+                let px = x; let pz = z;
+                let rotation: f32 = 0;
+                let nx = x - 1; let nz = z;
+                if side == 1 { px += world.CHUNK; nx = px; }
+                if side == 2 { rotation = 1.5707963; nx = x; nz = z - 1; }
+                if side == 3 { rotation = 1.5707963; pz += world.CHUNK; nx = x; nz = pz; }
+                if world.active(w, nx, nz) { continue; }
+                let base = Mat4.translate(f32(px) * world.VOXEL, f32(world.GROUND) * world.VOXEL,
+                    f32(pz) * world.VOXEL).mul(Mat4.rotate(Vec3.xyz(0, 1, 0), rotation));
+                let wall = base.mul(Mat4.scale(world.VOXEL, f32(BARRIER_BANDS) * world.VOXEL, f32(world.CHUNK) * world.VOXEL));
+                if !gfx.visible(wall, Vec3.xyz(0, 0, 0), Vec3.xyz(0, 1, 1)) { continue; }
+                for band in 0..BARRIER_BANDS {
+                    let model = base.mul(Mat4.translate(0, f32(band) * world.VOXEL, 0))
+                        .mul(Mat4.scale(world.VOXEL, world.VOXEL, f32(world.CHUNK) * world.VOXEL));
+                    gfx.drawBlended(mesh, model, 0.22 * (1 - f32(band) / f32(BARRIER_BANDS)));
+                }
+            }
+        }
+    }
+}
+
+pub fn footprint(plan: Plan) {
+    let color = Vec3.xyz(0.95, 0.25, 0.19);
+    if plan.ok { color = Vec3.xyz(0.23, 0.94, 0.54); }
+    let size: f32 = 1;
+    if world.machine(plan.id) { size = 2; }
+    let x = f32(plan.x); let y = f32(plan.y) + 0.02; let z = f32(plan.z);
+    cellLine(Vec3.xyz(x, y, z), Vec3.xyz(x + size, y, z), color);
+    cellLine(Vec3.xyz(x + size, y, z), Vec3.xyz(x + size, y, z + size), color);
+    cellLine(Vec3.xyz(x + size, y, z + size), Vec3.xyz(x, y, z + size), color);
+    cellLine(Vec3.xyz(x, y, z + size), Vec3.xyz(x, y, z), color);
+}
+
+// Reusable target mesh; only its six faces change, without rebuilding the world.
+pub fn makeMiningShade(w: &World): Mesh {
+    let at = 0;
+    for face in 0..6 {
+        at = gfx.emitFace(w.scratch, at, 0, 0, 0, face, 1, 1, 1, 0);
+    }
+    return gfx.upload(w.scratch[0..at]);
+}
+
+pub fn miningFeedback(w: &World, assets: &Models, shade: &Mesh, p: &Progress, seconds: f32) {
+    let progress = mining.fraction(p);
+    if progress <= 0 || world.get(w, p.x, p.y, p.z) != p.kind { return; }
+    let brightness = 1 - (0.06 + progress * 0.16);
+    gfx.material(Vec3.xyz(brightness, brightness, brightness), Vec3.xyz(0, 0, 0));
+    gfx.depthBias(1);
+    if world.machine(p.kind) {
+        let anchor = world.anchorAt(w, p.x, p.y, p.z);
+        let model = models.transform(world.anchorX(anchor), world.anchorY(anchor), world.anchorZ(anchor), w.facing[anchor]);
+        let pose: u8 = 0;
+        if dispatch.running(w, anchor) { pose = u8(int(seconds * 6) % 4); }
+        models.machine(assets, p.kind, model, pose);
+    } else if block.isNode(p.kind) {
+        let ore = defs.oreInfo(defs.oreOfNode(p.kind));
+        let mesh = assets.mesh[ore.nodeModel];
+        gfx.draw(mesh, models.transform(p.x / world.FOOTPRINT * world.FOOTPRINT, p.y / world.FOOTPRINT * world.FOOTPRINT, p.z / world.FOOTPRINT * world.FOOTPRINT, 0));
+    } else {
+        let color = block.tint(p.kind, p.x, p.y, p.z);
+        let at = 0;
+        for face in 0..6 {
+            let corners = voxel.corners(w.cells, world.SX, world.SY, world.SZ, p.x, p.y, p.z, face);
+            at = gfx.emitFaceAo(w.scratch, at, 0, 0, 0, face, color.x, color.y, color.z, 0,
+                voxel.shade(corners.a), voxel.shade(corners.b), voxel.shade(corners.c), voxel.shade(corners.d));
+        }
+        gfx.update(shade, w.scratch[0..at]);
+        gfx.draw(*shade, Mat4.translate(f32(p.x) * world.VOXEL,
+            f32(p.y) * world.VOXEL, f32(p.z) * world.VOXEL)
+            .mul(Mat4.scale(world.VOXEL, world.VOXEL, world.VOXEL)));
+    }
+    gfx.depthBias(0);
+    gfx.surface(gfx.plainSurface());
+}
+
+pub fn drawTerrain(w: &World, eye: Vec3) {
+    let model = Mat4.scale(world.VOXEL, world.VOXEL, world.VOXEL);
+    let camera = gfx.inCameraPass();
+    if !camera { drawShadowTerrain(w, model); return; }
+    let frustum = visibility.current(model);
+    for chunk in 0..w.chunkLod.len {
+        w.chunkLod[chunk] = terrain_lod.level(chunk % world.CHUNKS, chunk / world.CHUNKS, eye, w.chunkLod[chunk]);
+    }
+    for index in 0..w.sectionCount {
+        let section = w.activeSections[index];
+        let mesh = w.sectionLodMeshes[section];
+        if camera && w.chunkLod[world.sectionChunk(section)] == 0 { mesh = w.sectionMeshes[section]; }
+        if mesh.count > 0 && visibility.visible(&frustum, w.sectionMin[section], w.sectionMax[section]) { gfx.draw(mesh, model); }
+    }
+}
+
+// Cull every section, then batch only chunks whose nonempty sections all survive.
+fn drawShadowTerrain(w: &World, model: Mat4) {
+    let frustum = visibility.current(model);
+    for chunk in 0..w.chunkVisibleCount.len { w.chunkVisibleCount[chunk] = 0; }
+    for index in 0..w.sectionCount {
+        let section = w.activeSections[index]; w.sectionVisible[section] = 0;
+        if visibility.visible(&frustum, w.sectionMin[section], w.sectionMax[section]) {
+            w.sectionVisible[section] = 1; w.chunkVisibleCount[world.sectionChunk(section)] += 1;
+        }
+    }
+    for chunk in 0..w.chunkVisibleCount.len {
+        if shadowBatch(w, chunk) { gfx.draw(w.chunkShadowMeshes[chunk], model); }
+    }
+    for entry in 0..w.sectionCount {
+        let sectionAt = w.activeSections[entry]; let owner = world.sectionChunk(sectionAt);
+        if w.sectionVisible[sectionAt] != 0 && w.sectionLodMeshes[sectionAt].count > 0 && !shadowBatch(w, owner) { gfx.draw(w.sectionLodMeshes[sectionAt], model); }
+    }
+}
+
+pub fn shadowBatch(w: &World, chunk: int): bool {
+    return w.chunkDirty[chunk] == 0 && w.chunkVisibleCount[chunk] > 0 && w.chunkVisibleCount[chunk] == w.chunkSectionCount[chunk];
+}

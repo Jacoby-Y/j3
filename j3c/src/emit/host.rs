@@ -25,6 +25,8 @@ pub struct CcOpts {
     pub std: String,
     pub opt: String,
     pub debug: bool,
+    /// `--release`: strip, trim the link, drop unwind tables (see [`release_flags`]).
+    pub release: bool,
     pub out: Option<PathBuf>,
 }
 
@@ -51,6 +53,7 @@ impl CcOpts {
             std: m.cc.std.clone(),
             opt: m.cc.opt.clone(),
             debug: !m.cc.fast,
+            release: false,
             out: Some(m.out_path()),
         }
     }
@@ -116,11 +119,18 @@ pub fn compile_llvm(
     if !cpu.is_empty() {
         cmd.arg(format!("-mcpu={cpu}"));
     }
+    let release = cc.release.then(|| release_flags(target_os(target), lld_present()));
+    if let Some(r) = &release {
+        cmd.args(&r.compile);
+    }
     for flag in extra {
         cmd.arg(flag);
     }
     cmd.arg("-o").arg(&exe_path).arg(&src_path);
     append_link_args(&mut cmd, cc, ll_source, target)?;
+    if let Some(r) = &release {
+        cmd.args(&r.link);
+    }
     // A named output rebuilt from the same IR and command is already up to date. Most
     // editor Plays change only scene files, which the program reads at run time.
     let stamp_path = cc.out.as_ref().map(|p| p.with_extension("j3c-stamp"));
@@ -323,8 +333,15 @@ pub fn compile_c(c_source: &str, opts: &CcOpts, target: &str, clang: &str) -> Re
     if opts.debug {
         cmd.arg("-g");
     }
+    let release = opts.release.then(|| release_flags(target_os(target), lld_present()));
+    if let Some(r) = &release {
+        cmd.args(&r.compile);
+    }
     cmd.arg("-o").arg(&exe_path).arg(&src_path);
     append_link_args(&mut cmd, opts, c_source, target)?;
+    if let Some(r) = &release {
+        cmd.args(&r.link);
+    }
     crate::cli::status("compiling");
     let cc = cmd.output().map_err(|e| format!("spawn {compiler}: {e}"))?;
 
@@ -468,6 +485,87 @@ fn addr_names(exe: &Path, runtime_main: u64, addrs: &[u64]) -> Option<Vec<String
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let names: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     (names.len() == addrs.len()).then_some(names)
+}
+
+/// What a target needs to know about its platform. One place to add the next one: a new
+/// `TargetOs` arm and a row in [`release_flags`]. `Other` (wasm, android, ...) gets only
+/// the portable size wins and no linker flags, so an unknown linker never sees a flag it rejects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetOs {
+    Linux,
+    Windows,
+    Macos,
+    Other,
+}
+
+/// `""` is the host.
+pub(crate) fn target_os(triple: &str) -> TargetOs {
+    let t = triple.to_ascii_lowercase();
+    if t.is_empty() {
+        return if cfg!(windows) {
+            TargetOs::Windows
+        } else if cfg!(target_os = "macos") {
+            TargetOs::Macos
+        } else {
+            TargetOs::Linux
+        };
+    }
+    if t.contains("windows") {
+        TargetOs::Windows
+    } else if t.contains("apple") || t.contains("darwin") {
+        TargetOs::Macos
+    } else if ["linux", "freebsd", "netbsd", "openbsd"].iter().any(|n| t.contains(n)) {
+        TargetOs::Linux
+    } else {
+        TargetOs::Other
+    }
+}
+
+pub(crate) struct ReleaseFlags {
+    /// Clang compile flags.
+    pub compile: Vec<&'static str>,
+    /// Appended after the inputs and libraries.
+    pub link: Vec<&'static str>,
+}
+
+/// Flags that shrink a shipped binary (`j3c build --release`).
+/// - Linux/ELF: strip, no build-id, no RELRO, GNU hash only, no unwind tables (J3 has no
+///   exceptions and the crash handler walks frame pointers); identical-code folding with lld.
+/// - Windows (mingw): strip, no timestamp. Unwind tables stay: x64 needs `.pdata` for SEH.
+/// - macOS (ld64): strip locals and debug (`-s` is ignored there). Compact unwind stays.
+pub(crate) fn release_flags(os: TargetOs, lld: bool) -> ReleaseFlags {
+    match os {
+        TargetOs::Linux => {
+            let mut link = vec!["-Wl,-s", "-Wl,--build-id=none", "-Wl,-z,norelro", "-Wl,--hash-style=gnu"];
+            if lld {
+                link.extend(["-fuse-ld=lld", "-Wl,--icf=safe"]);
+            }
+            ReleaseFlags {
+                compile: vec!["-fno-asynchronous-unwind-tables", "-fno-unwind-tables"],
+                link,
+            }
+        }
+        TargetOs::Windows => ReleaseFlags { compile: vec![], link: vec!["-Wl,-s", "-Wl,--no-insert-timestamp"] },
+        TargetOs::Macos => ReleaseFlags { compile: vec![], link: vec!["-Wl,-x", "-Wl,-S"] },
+        TargetOs::Other => ReleaseFlags { compile: vec![], link: vec![] },
+    }
+}
+
+/// `ld.lld` on `PATH`, looked up once.
+fn lld_present() -> bool {
+    static LLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LLD.get_or_init(|| {
+        Command::new("ld.lld")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Unwind tables are dropped in release builds only where [`release_flags`] drops them.
+pub(crate) fn release_nounwind(release: bool, triple: &str) -> bool {
+    release && target_os(triple) == TargetOs::Linux
 }
 
 pub(crate) fn link_gc_flag(target: &str) -> &'static str {
@@ -684,6 +782,26 @@ mod tests {
         assert_eq!(super::link_gc_flag("x86_64-pc-windows-gnu"), "-Wl,--gc-sections");
         assert_eq!(super::link_gc_flag("arm64-apple-darwin"), "-Wl,-dead_strip");
         assert_eq!(super::link_gc_flag("x86_64-apple-darwin"), "-Wl,-dead_strip");
+    }
+
+    #[test]
+    fn release_flags_per_platform() {
+        use super::{release_flags, target_os, TargetOs};
+        assert_eq!(target_os("x86_64-pc-linux-gnu"), TargetOs::Linux);
+        assert_eq!(target_os("x86_64-pc-windows-gnu"), TargetOs::Windows);
+        assert_eq!(target_os("arm64-apple-darwin"), TargetOs::Macos);
+        assert_eq!(target_os("wasm32-unknown-unknown"), TargetOs::Other);
+        let linux = release_flags(TargetOs::Linux, false);
+        assert!(linux.link.contains(&"-Wl,-s") && !linux.link.contains(&"-fuse-ld=lld"));
+        assert!(linux.compile.contains(&"-fno-unwind-tables"));
+        assert!(release_flags(TargetOs::Linux, true).link.contains(&"-Wl,--icf=safe"));
+        let win = release_flags(TargetOs::Windows, true);
+        assert!(win.compile.is_empty() && !win.link.contains(&"-Wl,--icf=safe"));
+        assert!(release_flags(TargetOs::Macos, true).link.contains(&"-Wl,-x"));
+        let other = release_flags(TargetOs::Other, true);
+        assert!(other.compile.is_empty() && other.link.is_empty());
+        assert!(!super::release_nounwind(true, "x86_64-pc-windows-gnu"));
+        assert!(super::release_nounwind(true, "x86_64-pc-linux-gnu"));
     }
 
     #[test]

@@ -25,5 +25,6 @@ pub mod png;
 pub mod project;
 pub mod scaffold;
 pub mod scene;
+pub mod scenefile;
 pub mod span;
 pub mod stdlib;

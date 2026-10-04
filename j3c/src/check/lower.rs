@@ -453,7 +453,7 @@ impl<'a> Lower<'a> {
                     format!("no scene attaches {path}, so no object has one"),
                 )
                 .help(format!(
-                    "attach it to an object in the editor (a `node.<i>.script s={path}` line)"
+                    "attach it to an object in the editor (`script={path}` on its line)"
                 ))
             })
     }

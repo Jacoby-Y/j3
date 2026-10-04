@@ -23,6 +23,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
         *g = None;
     }
     FAST.store(false, std::sync::atomic::Ordering::Relaxed);
+    RELEASE.store(false, std::sync::atomic::Ordering::Relaxed);
     crate::project::FILE_ONLY.store(false, std::sync::atomic::Ordering::Relaxed);
 
     let cmd = args[0].as_str();
@@ -68,6 +69,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
             dispatch(rest, build_cwd, build_samples_err, build_path, true)
         }
         "fmt" => fmt_cmd(rest),
+        "size" => size_cmd(rest),
         "lsp" => crate::lsp::serve(),
         other => {
             eprintln!("j3c: unknown command `{other}`");
@@ -142,6 +144,8 @@ fn dispatch(
 }
 
 static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `--release`: smallest binary (opt s, no `-g`, stripped, no unwind tables).
+static RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn peel_args(rest: &[String]) -> (bool, Option<&str>) {
     let mut fast = false;
@@ -151,6 +155,8 @@ fn peel_args(rest: &[String]) -> (bool, Option<&str>) {
         let a = rest[i].as_str();
         if a == "--fast" {
             fast = true;
+        } else if a == "--release" {
+            RELEASE.store(true, std::sync::atomic::Ordering::Relaxed);
         } else if a == "--emit" {
             if let Some(v) = rest.get(i + 1) {
                 EMIT.store(emit_code(v), std::sync::atomic::Ordering::Relaxed);
@@ -251,7 +257,7 @@ fn print_help() {
     println!("    j3c <command> [file.j3 | project]");
     println!();
     println!("commands:");
-    println!("    new [name]       write j3.toml, src/main.j3, and AGENTS.md (hello)");
+    println!("    new [name]       write j3.toml, src/main.j3, AGENTS.md, CLAUDE.md (hello)");
     println!("    new [name] --app SDL window (links SDL2)");
     println!("    new [name] --template fps  first-person 3D game with a scene (SDL2 + GL)");
     println!("    editor [--new] [project]  open the 3D scene editor");
@@ -289,6 +295,8 @@ fn print_help() {
     println!("    --fast           with run/build: strip bounds-check Abort; no `-g`");
     println!("    --emit llvm|c    backend (default llvm; override [emit] backend)");
     println!("    --opt N          0/1/2/3/s/z (override [emit] opt)");
+    println!("    --release        with run/build: smallest binary (opt s, no `-g`, stripped; keeps checks)");
+    println!("    size [path]      what is in `target/<name>`: sections, code per module, biggest functions");
     println!("    run samples      emit, compile, execute place tests");
     println!("    help manifest    print j3.toml keys");
     println!("    version          print version");
@@ -570,6 +578,8 @@ fn peel_run(rest: &[String]) -> (bool, Option<&str>, Vec<String>) {
         let a = rest[i].as_str();
         if a == "--fast" {
             fast = true;
+        } else if a == "--release" {
+            RELEASE.store(true, std::sync::atomic::Ordering::Relaxed);
         } else if a == "--emit" {
             if let Some(v) = rest.get(i + 1) {
                 EMIT.store(emit_code(v), std::sync::atomic::Ordering::Relaxed);
@@ -638,6 +648,98 @@ pub(crate) fn print_error(e: &str) {
     print_fail(e);
 }
 
+/// `j3c size [path] [--target T]`: what is in the built binary. Reads it with `llvm-nm` /
+/// `llvm-size` (ELF, PE, and Mach-O) or the binutils ones; a stripped binary has no symbols,
+/// so build without `--release` to see the per-function breakdown.
+fn size_cmd(rest: &[String]) -> i32 {
+    let mut path = None;
+    let mut target = String::new();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--target" => {
+                i += 1;
+                target = rest.get(i).cloned().unwrap_or_default();
+            }
+            a if !a.starts_with('-') && path.is_none() => path = Some(a),
+            _ => {}
+        }
+        i += 1;
+    }
+    let m = match load_input(path) {
+        Ok(Input::Project(m)) => m,
+        Ok(_) => {
+            eprintln!("j3c size: needs a project (a directory with j3.toml)");
+            return 1;
+        }
+        Err(e) => {
+            print_fail(&e);
+            return 1;
+        }
+    };
+    let mut exe = if target.is_empty() { m.out_path() } else { m.out_path_for(&target) };
+    if !exe.is_file() && exe.with_extension("exe").is_file() {
+        exe = exe.with_extension("exe");
+    }
+    let Ok(meta) = std::fs::metadata(&exe) else {
+        eprintln!("j3c size: {} is not built; run `j3c build` first", exe.display());
+        return 1;
+    };
+    let tool = |names: &[&str], args: &[&str]| -> Option<String> {
+        names.iter().find_map(|n| {
+            let out = std::process::Command::new(n).args(args).arg(&exe).output().ok()?;
+            out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        })
+    };
+    println!("{}  {} bytes", exe.display(), meta.len());
+    if let Some(s) = tool(&["llvm-size", "size"], &[]) {
+        // `text data bss dec hex file`: code and read-only data, initialised data, zeroed memory.
+        if let Some(n) = s.lines().nth(1).map(|l| l.split_whitespace().take(3).collect::<Vec<_>>()) {
+            if let [text, data, bss] = n[..] {
+                println!("code+rodata {text}  data {data}  bss {bss} (bss is memory, not file size)");
+            }
+        }
+    }
+    let Some(nm) = tool(&["llvm-nm", "nm"], &["-S", "--defined-only"]) else {
+        eprintln!("j3c size: `llvm-nm` or `nm` not found");
+        return 0;
+    };
+    let mut funcs: Vec<(u64, String)> = Vec::new();
+    for l in nm.lines() {
+        let p: Vec<&str> = l.split_whitespace().collect();
+        if let [_, size, kind, name] = p[..] {
+            let name = name.trim_start_matches('_');
+            if kind.eq_ignore_ascii_case("t") && name.starts_with("j3_") {
+                funcs.push((u64::from_str_radix(size, 16).unwrap_or(0), name.to_string()));
+            }
+        }
+    }
+    if funcs.is_empty() {
+        println!("no symbols (stripped): build without --release to see code per module");
+        return 0;
+    }
+    let mut groups: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for (size, name) in &funcs {
+        let mut parts = name.split('_').skip(1);
+        let first = parts.next().unwrap_or("");
+        let key = if first == "j3" { format!("j3.{}", parts.next().unwrap_or("")) } else { first.to_string() };
+        *groups.entry(key).or_default() += size;
+    }
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("code per module (stdlib is j3.*; names are approximate):");
+    for (name, size) in groups.iter().take(12) {
+        println!("  {size:>9}  {name}");
+    }
+    funcs.sort_by(|a, b| b.0.cmp(&a.0));
+    println!("biggest functions:");
+    for (size, name) in funcs.iter().take(15) {
+        let short = name.rsplit_once('_').map(|(a, _)| a).unwrap_or(name);
+        println!("  {size:>9}  {}", short.trim_start_matches("j3_"));
+    }
+    0
+}
+
 fn print_fail(e: &str) {
     if e.contains("error:") || e.contains("warning:") || e.contains("-->") {
         eprint!("{e}");
@@ -682,6 +784,14 @@ fn emit_opts(manifest: &Option<Manifest>) -> Result<emit::EmitOpts, String> {
     }
     if FAST.load(std::sync::atomic::Ordering::Relaxed) {
         opts.cc.debug = false;
+    }
+    if RELEASE.load(std::sync::atomic::Ordering::Relaxed) {
+        opts.cc.release = true;
+        opts.cc.debug = false;
+        opts.incremental = false;
+        if !OPT.lock().map(|g| g.is_some()).unwrap_or(false) {
+            opts.cc.opt = "s".to_string();
+        }
     }
     opts.backend = emit::resolve_backend(opts.backend, forced, &opts.clang)?;
     Ok(opts)

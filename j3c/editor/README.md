@@ -116,7 +116,7 @@ The first camera in the scene is the one games start with (tagged "main camera")
 
 The inspector edits the local transform. Drag a number box left or right to
 change it (hold Shift for fine steps), or click it to type. Rotation is shown in
-degrees and stored in radians.
+degrees, as it is in the scene file.
 
 A mesh's **Shape** is a built-in cube, sphere, quad, plane, or sky, or **File...**
 for a `.j3mesh` from the assets. Built-in shapes are stored as `builtin:<name>` and
@@ -426,19 +426,19 @@ pub fn update(scene: &Scene, dt: f32) {
 ```
 
 The inspector shows the script's props; press **Rescan (F5)** after changing a
-props block. Values are stored per object as `param.<id>.<prop>` lines, and a
+props block. Values are stored on the object's line as `param.<prop>=value`, and a
 prop keeps its default until an object sets it. A prop with no default must be
 set on every object the script is on; `j3c check` points at the scene line when
 one isn't, or when a value has the wrong type.
 
 | Prop type | Inspector | Scene line |
 |-----------|-----------|------------|
-| `f32`, `f64` | number box | `param.<id>.<prop> f=1.5` |
-| `int` and sized ints | number box, rounded | `param.<id>.<prop>=3` |
-| `bool` | switch | `param.<id>.<prop>=1` |
-| `string` | text field | `param.<id>.<prop> s=text` |
-| `Vec3` | three number boxes | `.x` / `.y` / `.z` numbers |
-| `NodeId` | button; click it, then an object | `param.<id>.<prop> r=<object id>` |
+| `f32`, `f64` | number box | `param.<prop>=1.5` (a whole number works too) |
+| `int` and sized ints | number box, rounded | `param.<prop>=3` |
+| `bool` | switch | `param.<prop>=1` |
+| `string` | text field | `param.<prop>="text"` |
+| `Vec3` | three number boxes | `param.<prop>.x=0.5` / `.y` / `.z` numbers |
+| `NodeId` | button; click it, then an object | `param.<prop>=#<object id>` |
 
 A `NodeId` prop follows copies: when an object and the object it points at are
 copied or placed together, the copy points at the other copy.
@@ -456,12 +456,65 @@ props or state relaunches the same game binary. Neither compiles the game again.
 
 The editor targets Linux with SDL2, OpenGL 3.3, and SDL2_ttf. It bundles
 a UI font for its panels; projects can supply their own meshes
-and image textures (image loading needs SDL2_image). The scene format is a line
-based J3 save file with `scene.*`, `node.<index>.*`, `param.<id>.*`, and
-`over.<instance>.<source>.*` keys. Object IDs are stable even when nodes are
-removed or reordered. Rotations in the file (`node.<i>.rx/ry/rz`) are radians,
-applied as `T * Rz * Ry * Rx * S`; the tools (`j3c -e scene`, MCP) and the
-inspector use degrees. A generator that writes scene text itself must convert:
-`j3c -e scene check` warns on a stored rotation above two turns. Rotating about +Y
-by `a` sends local +x to `(cos a, 0, -sin a)`, so a slab pointing along `(dx, dz)`
-needs `ry = -atan2(dz, dx)`.
+and image textures (image loading needs SDL2_image).
+
+## Scene file format
+
+A `.j3scene` file is text, one object per line, written the same way by the editor, the tools
+(`j3c -e scene`, MCP), `j3c -e scene fmt`, and `tools/j3scene_migrate.py` (which converts the
+old `node.<i>.<field>=` format). `scene3d` is the real reader and writer; the editor rewrites a
+file in this layout whenever it saves, so a hand edit is normalised then (or by `fmt`).
+
+```
+j3scene 2 next=262
+env sun=0.55,0.42,0.35 fogEnd=260
+
+Floor27 cube pos=0,-1,0 scale=160,2,160 material=grain tint=0.25,0.52,0.24 #1
+
+// north gate; the door opens toward the hub
+Gate group pos=0,0,-20 #4
+  ArchTop cube pos=0,4.25,0 scale=6,0.5,1 material=stone #7
+  Door cube pos=0,1.5,0 scale=4,3,0.2 script=scripts/door.j3s param.speed=2.5 param.opens=#7 #8
+
+Kiosk place scenes/props/kiosk.j3scene pos=8,0,-4 rot=0,90,0 prop.label="Ammo Shop" #122
+PlayerCam camera pos=0,1.7,30 fov=75 fx=vignette fx.vignette.strength=0.4 #121
+prop.door.type s=bool
+```
+
+- **Header**: `j3scene 2 next=<next free id>`. Ids are stable and never reused, because `#7` references and a
+  placing scene's per-copy values name them.
+- **Object line**: `Name kind [path] key=value... #id`. Indent is two spaces a level and sets the parent (an odd
+  indent or a jump of two levels is a parse error naming the line, and the file is left alone). Siblings keep
+  their order. A line without `#id` gets a free one. Names with a space, `"`, `=` or a leading `#`/`//` are
+  quoted (`"Big Door"`).
+- **Kinds**: a built-in shape (`cube sphere cylinder cone capsule torus quad plane sky`), `mesh [file.j3mesh]`,
+  `place <scene.j3scene>` (a placed scene), `group`, `light`, `camera`.
+- **Keys**, in this order, and only the ones the kind uses: `pos rot scale` (all kinds), `material texture tint
+  alpha opacity doubleSided` (meshes; `tint` also on `place`), `color range` (lights), `fov near far fx`
+  (cameras), then `script tags`, `param.*`, `prop.*`, `over.*`. A key at its default is left out.
+  `scale` and `tint` take one number for all three axes. `alpha` is `opaque|cutout|blend`.
+- **Tags the renderer reads**: `decal` (or `decal=2`) pulls a mesh toward the camera in depth. Faces lying on one plane are
+  handled without it: the smaller of two overlapping coplanar objects is pulled forward on its own, and `check` names such pairs.
+  Use `decal` for what the scan misses (faces over 2 mm apart, meshes over 2000 triangles).
+- **Units**: positions in meters, **rotation in degrees** (`rot=x,y,z`, applied `T * Rz * Ry * Rx * S`), colors 0 to 1
+  (above 1 brightens a tint). Numbers have at most six decimals (rotation three), no trailing zeros. Rotating
+  about +Y by `a` sends local +x to `(cos a, 0, -sin a)`, so a slab pointing along `(dx, dz)` needs
+  `ry = -atan2(dz, dx)`.
+- **Short names**: `material=grain` is `assets/materials/grain.j3mat` and `fx=vignette` is
+  `assets/fx/vignette.j3fx` (several: `a|b`); a value with a `/` or `.` is a path as written.
+- **Script values**: `param.<prop>=` and `fx.<effect>.<param>=` use the literal's shape for the type: `"text"` a
+  string, `#7` an object, `3.0` a float, `3` an integer (a float prop takes either). `prop.<name>="text"` on a
+  `place` line sets a prop its scene declares; `over.<path>.<field>=` overrides one object of the placed
+  scene in this copy (`<path>` is the object's id there, `4/9` through nested scenes; the field keeps the
+  stored name, rotation in radians).
+- **`env`**: the scene's lighting as `sun sunColor sky fogStart fogEnd shadows shadowSize urp urpBounces urpSamples
+  urpShadows urpShadowNear`, only what differs from the defaults (it is left out when nothing does).
+- **Notes**: `//` lines directly above an object are its note (the inspector's **Note** field); a comment
+  anywhere else is dropped at the next save.
+- **Layout**: objects come depth first in tree order; a blank line goes before each top-level object that has
+  children and before the one after it. After the objects: the scene's `prop.<name>.type` /
+  `.default` declarations, one per line, sorted.
+
+`j3c -e scene list tree=1` and `get` print the lines as the file has them, and `apply` takes lines back, so an
+agent can read, edit and write objects in one syntax. Files in the old format (`scene.version=1`,
+`node.<i>.*`, rotation in radians) still load; the first save writes the new one.

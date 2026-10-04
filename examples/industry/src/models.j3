@@ -1,0 +1,145 @@
+// File-backed industrial parts, built once and shared with ghosts and shadows.
+module industry.models;
+use j3.gfx;
+use j3.gfx.Mesh;
+use industry.subvoxels;
+use industry.model_mesh;
+use industry.subvoxels.Grid;
+use j3.math.{ Vec3, Mat4 };
+use j3.memory.Arena;
+use industry.data.block;
+use industry.data.content;
+use industry.data.defs;
+use industry.data.conveyor;
+use industry.machine.dispatch;
+use industry.world;
+use industry.world.World;
+use industry.visibility;
+use industry.visibility.Frustum;
+
+// One mesh per model id, indexed by the ids in `industry.data.content`.
+pub struct Models { mesh: []Mesh; }
+
+pub fn load(id: int, mem: &Arena): Grid {
+    let def = defs.modelInfo(id);
+    let g = subvoxels.load(def.path, mem);
+    g.glow = def.glow;
+    return g;
+}
+
+// The mesh table lives for the whole run.
+pub fn create(): Models {
+    content.load();
+    let keep = Arena.create(4096);
+    let models = Models { mesh: keep.alloc::<Mesh>(defs.modelCount()) };
+    for id in 0..defs.modelCount() {
+        let mem = Arena.create(1024 * 1024);
+        let g = load(id, &mem);
+        models.mesh[id] = gfx.upload(model_mesh.vertices(&g));
+        mem.destroy();
+    }
+    return models;
+}
+
+// Exact cardinal matrices avoid trig drift away from the 1/8 grid.
+pub fn quarter(dir: u8): Mat4 {
+    let m = Mat4.identity();
+    if dir % 4 == 1 { m.m[0] = 0; m.m[2] = 1; m.m[8] = -1; m.m[10] = 0; }
+    if dir % 4 == 2 { m.m[0] = -1; m.m[10] = -1; }
+    if dir % 4 == 3 { m.m[0] = 0; m.m[2] = -1; m.m[8] = 1; m.m[10] = 0; }
+    return m;
+}
+
+pub fn transform(x: int, y: int, z: int, dir: u8): Mat4 {
+    return Mat4.translate((f32(x) + 1) * world.VOXEL, f32(y) * world.VOXEL, (f32(z) + 1) * world.VOXEL)
+        .mul(quarter(dir))
+        .mul(Mat4.scale(world.VOXEL, world.VOXEL, world.VOXEL));
+}
+
+pub fn bitTransform(model: Mat4, pose: u8): Mat4 {
+    let turn = Mat4.identity();
+    if pose % 4 == 1 { turn.m[0] = 0; turn.m[1] = 1; turn.m[4] = -1; turn.m[5] = 0; }
+    if pose % 4 == 2 { turn.m[0] = -1; turn.m[5] = -1; }
+    if pose % 4 == 3 { turn.m[0] = 0; turn.m[1] = -1; turn.m[4] = 1; turn.m[5] = 0; }
+    return model.mul(Mat4.translate(0, 1, 0)).mul(turn).mul(Mat4.translate(0, -1, 0));
+}
+
+pub fn machine(models: &Models, id: u8, model: Mat4, pose: u8) {
+    let def = defs.blockInfo(id);
+    gfx.draw(models.mesh[def.model], model);
+    if def.overlayMode == defs.OVERLAY_SPIN { gfx.draw(models.mesh[def.overlay], bitTransform(model, pose)); }
+}
+
+pub fn ghost(models: &Models, id: u8, model: Mat4, ok: bool) {
+    let def = defs.blockInfo(id);
+    let mesh = models.mesh[def.model];
+    gfx.drawBlended(mesh, model, 0.48);
+    if def.overlayMode == defs.OVERLAY_SPIN { gfx.drawBlended(models.mesh[def.overlay], bitTransform(model, 0), 0.48); }
+    let color = Vec3.xyz(0.95, 0.26, 0.2);
+    if ok { color = Vec3.xyz(0.24, 0.95, 0.55); }
+    gfx.drawMark(mesh, model, color);
+}
+
+pub fn visible(frustum: &Frustum, model: Mat4): bool {
+    // Full authoring canvas also contains every cardinal drill-bit animation pose.
+    // All world models use uniform VOXEL scale and cardinal yaw: X/Z bounds stay symmetric.
+    let radius = 1.5 * world.VOXEL;
+    return visibility.visible(frustum,
+        Vec3.xyz(model.m[12] - radius, model.m[13], model.m[14] - radius),
+        Vec3.xyz(model.m[12] + radius, model.m[13] + 4 * world.VOXEL, model.m[14] + radius));
+}
+
+fn append(w: &World, model: int, matrix: Mat4) {
+    w.drawMatrices[w.batchStart[model] + w.drawCounts[model]] = matrix;
+    w.drawCounts[model] += 1;
+}
+
+pub fn drawWorld(w: &World, models: &Models, seconds: f32) {
+    let frustum = visibility.current(Mat4.identity());
+    let count = defs.modelCount();
+    for model in 0..count { w.drawCounts[model] = 0; }
+    let ores = defs.oreCount();
+    for chunk in 0..w.unlocked.len {
+        if w.unlocked[chunk] == 0 { continue; }
+        for ore in 0..ores {
+            let nodeModel = w.nodeModels[chunk * ores + ore];
+            let oreDef = defs.oreInfo(ore);
+            if world.ring(chunk % world.CHUNKS, chunk / world.CHUNKS) < oreDef.minRing { continue; }
+            if visible(&frustum, nodeModel) { append(w, oreDef.nodeModel, nodeModel); }
+        }
+    }
+    for slot in 1..w.slotHigh + 1 {
+        let id = w.slotKind[slot];
+        if id == 0 { continue; }
+        let at = world.slotAnchor(w, slot);
+        let def = defs.blockInfo(id);
+        let x = world.anchorX(at); let y = world.anchorY(at); let z = world.anchorZ(at);
+        let model = transform(x, y, z, w.facing[at]);
+        if visible(&frustum, model) {
+            append(w, def.model, model);
+            if def.overlayMode == defs.OVERLAY_SPIN {
+                let pose: u8 = 0;
+                if dispatch.running(w, at) { pose = u8(int(seconds * 6) % 4); }
+                append(w, def.overlay, bitTransform(model, pose));
+            }
+            if def.overlayMode == defs.OVERLAY_LIT && dispatch.running(w, at) { append(w, def.overlay, model); }
+        }
+        if !block.isBelt(id) { continue; }
+        for place in 0..w.belts[slot].count {
+            let p = w.belts[slot].progress[place] - 1;
+            let dir = w.facing[at]; if p < 0 { dir = w.belts[slot].entry[place]; }
+            let rise: f32 = 0;
+            if defs.blockRoute(id) == defs.ROUTE_LIFT { p = 0; rise = w.belts[slot].progress[place] / 2; }
+            let cargoModel = Mat4.translate((f32(x) + 1 + conveyor.dx(dir) * p) * world.VOXEL,
+                (f32(y) + 1 + rise) * world.VOXEL, (f32(z) + 1 + conveyor.dz(dir) * p) * world.VOXEL)
+                .mul(Mat4.scale(world.VOXEL, world.VOXEL, world.VOXEL));
+            if !visible(&frustum, cargoModel) { continue; }
+            let cargo = defs.itemInfo(w.belts[slot].cargo[place]); let cargoGroup = cargo.cargo;
+            if cargoGroup >= 0 { append(w, cargoGroup, cargoModel); }
+        }
+    }
+    for batch in 0..count {
+        let start = w.batchStart[batch]; let drawn = w.drawCounts[batch];
+        if drawn > 0 { gfx.drawInstanced(models.mesh[batch], w.drawMatrices[start..start + drawn]); }
+    }
+}

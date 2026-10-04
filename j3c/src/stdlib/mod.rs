@@ -50,6 +50,10 @@ const FILES: &[(&str, &str)] = &[
     ("scene3d/editor/paste.j3", include_str!("../../stdlib/j3/scene3d/editor/paste.j3")),
     ("scene3d/editor/uses.j3", include_str!("../../stdlib/j3/scene3d/editor/uses.j3")),
     ("gfx/voxel.j3", include_str!("../../stdlib/j3/gfx/voxel.j3")),
+    ("net.j3", include_str!("../../stdlib/j3/net.j3")),
+    ("netsys.j3", include_str!("../../stdlib/j3/netsys.j3")),
+    ("netsys_macos.j3", include_str!("../../stdlib/j3/netsys_macos.j3")),
+    ("netsys_windows.j3", include_str!("../../stdlib/j3/netsys_windows.j3")),
 ];
 
 /// A short hash of what `j3c doc`, `guide`, and help print in this build: the embedded stdlib
@@ -148,6 +152,10 @@ mod tests {
             "sys.j3",
             "sys_windows.j3",
             "sys_macos.j3",
+            "net.j3",
+            "netsys.j3",
+            "netsys_windows.j3",
+            "netsys_macos.j3",
             "game/input.j3",
             "io.j3",
             "math.j3",

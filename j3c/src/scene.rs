@@ -14,11 +14,13 @@ usage: j3c -e scene [--project DIR] [--scene FILE] [--json] <op> [args]
 Objects are named by name, by Parent/Child path, or by #id. Positions are in the parent's
 space; rotations are degrees. --scene defaults to the scene in j3.editor.toml.
 
-  list [filter=GLOB] [group=prefix]
+  list [filter=GLOB] [group=prefix] [tree=1]
                                every object: id, path, kind, asset, world position; filter
                                keeps names or paths matching (* and ?); group=prefix counts
-                               names with trailing digits dropped (DecoCorn12 -> DecoCorn)
-  get <object>|@scene          fields and script props (@scene: lighting)
+                               names with trailing digits dropped (DecoCorn12 -> DecoCorn);
+                               tree=1 prints the scene file's own lines instead
+  get <object>|@scene          the object's file lines (with its children), then its fields and
+                               script props (@scene: lighting)
   add <kind> [key=value ...]   kind: group mesh camera light instance cube sphere cylinder
                                cone capsule torus quad plane sky
   set <object> key=value ...   <object> may be a glob (DecoCorn*, *Tree?): sets every match
@@ -33,6 +35,16 @@ space; rotations are degrees. --scene defaults to the scene in j3.editor.toml.
                                urpBounces urpSamples urpShadows urpShadowNear
                                prop.<name>=<type>:<default> declares a prop (empty drops)
   delete <object> ...          delete objects and everything under them; globs too
+  apply [parent=OBJECT] FILE|-  add or replace objects written in the scene file's own syntax
+                               (what `get` and `list tree=1` print: `Name kind key=value #id`,
+                               indent nests). A line with an existing #id replaces that object
+                               (what it leaves out goes back to the default); without one it adds
+  split <object> ... out=FILE [instance=1] [center=1]
+                               move top-level objects (and what is under them) into a new scene
+                               file; center=1 recentres it on them, instance=1 leaves a placed
+                               copy where they were. Games load such files with scene3d.loadParts
+  inline <instance>            replace a placed scene with real copies of its objects
+  fmt                          rewrite the scene file in the canonical layout (after a hand edit)
   ground <object> [on=<obj>]   rest it on the surface below (or on one object)
   ring radius=R count=N [center=x,z] [y=0] [size=sx,sy,sz] [face=tangent|out|in] [arc=a0,a1]
                                N pieces on a circle; tangent (default) turns local x outward
@@ -136,6 +148,22 @@ fn execute(rest: &[String]) -> Result<i32, String> {
         } else {
             print!("{}", to_text(&reply));
         }
+        return Ok(if reply.ok { 0 } else { 1 });
+    }
+    if args[0] == "apply" {
+        // apply [parent=OBJECT] FILE|-   (the object lines, as `get` prints them)
+        let parent = args.iter().find_map(|a| a.strip_prefix("parent=")).map(str::to_string);
+        let source = args.iter().skip(1).find(|a| !a.starts_with("parent=")).ok_or("apply needs a file of object lines, or - for stdin")?;
+        let text = if source == "-" {
+            let mut t = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut t).map_err(|e| e.to_string())?;
+            t
+        } else {
+            fs::read_to_string(source).map_err(|e| format!("read {source}: {e}"))?
+        };
+        let rel = scene_rel(&root, scene.as_deref())?;
+        let reply = run_tool(&root, &rel, &apply_args(&text, parent.as_deref())?)?;
+        if json { println!("{}", to_json("apply", &rel, &reply).stringify()); } else { print!("{}", to_text(&reply)); }
         return Ok(if reply.ok { 0 } else { 1 });
     }
     if args == ["undo"] {
@@ -312,40 +340,31 @@ impl Diff {
     }
 }
 
-/// A scene file's objects as (path, fields), from its `node.<i>.<field>[ t]=<value>` lines.
-/// Same-path objects get `#2`, `#3`, ... in file order.
-fn scene_objects(text: &str) -> Vec<(String, std::collections::BTreeMap<String, String>)> {
-    use std::collections::{BTreeMap, HashMap};
-    let mut nodes: BTreeMap<usize, BTreeMap<String, String>> = BTreeMap::new();
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("node.") else { continue };
-        let Some((slot, rest)) = rest.split_once('.') else { continue };
-        let Ok(slot) = slot.parse::<usize>() else { continue };
-        let Some((key, value)) = rest.split_once('=') else { continue };
-        let field = key.split(' ').next().unwrap_or(key);
-        nodes.entry(slot).or_default().insert(field.to_string(), value.to_string());
-    }
-    let by_id: HashMap<&str, &BTreeMap<String, String>> =
-        nodes.values().filter_map(|f| Some((f.get("id")?.as_str(), f))).collect();
-    let path_of = |f: &BTreeMap<String, String>| {
-        let mut parts = vec![f.get("name").cloned().unwrap_or_default()];
-        let mut parent = f.get("parent").map(String::as_str).unwrap_or("0");
-        while parent != "0" && parts.len() < 64 {
-            let Some(p) = by_id.get(parent) else { break };
-            parts.push(p.get("name").cloned().unwrap_or_default());
-            parent = p.get("parent").map(String::as_str).unwrap_or("0");
+/// A scene file's objects with their `Parent/Child` path; same-path objects get `#2`, `#3`, ...
+/// in file order. Reads either file version.
+fn scene_objects(text: &str) -> Vec<(String, crate::scenefile::Object)> {
+    use std::collections::HashMap;
+    let (objects, _) = crate::scenefile::parse(text);
+    let by_id: HashMap<i64, &crate::scenefile::Object> = objects.iter().map(|o| (o.id, o)).collect();
+    let path_of = |o: &crate::scenefile::Object| {
+        let mut parts = vec![o.name.clone()];
+        let mut parent = o.parent;
+        while parent != 0 && parts.len() < 64 {
+            let Some(p) = by_id.get(&parent) else { break };
+            parts.push(p.name.clone());
+            parent = p.parent;
         }
         parts.reverse();
         parts.join("/")
     };
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut out = Vec::new();
-    for f in nodes.values() {
-        let mut path = path_of(f);
+    for o in &objects {
+        let mut path = path_of(o);
         let n = seen.entry(path.clone()).or_insert(0);
         *n += 1;
         if *n > 1 { path = format!("{path}#{n}"); }
-        out.push((path, f.clone()));
+        out.push((path, o.clone()));
     }
     out
 }
@@ -372,32 +391,32 @@ pub(crate) fn diff(root: &Path, rel: &str, old: Option<&str>) -> Result<Diff, St
     };
     let old = scene_objects(&before);
     let new = scene_objects(&now);
-    let old_map: std::collections::HashMap<&str, &std::collections::BTreeMap<String, String>> =
-        old.iter().map(|(p, f)| (p.as_str(), f)).collect();
+    let old_map: std::collections::HashMap<&str, &crate::scenefile::Object> =
+        old.iter().map(|(p, o)| (p.as_str(), o)).collect();
     let new_paths: std::collections::HashSet<&str> = new.iter().map(|(p, _)| p.as_str()).collect();
-    let num = |f: &std::collections::BTreeMap<String, String>, k: &str| -> f64 {
-        f.get(k).and_then(|v| v.parse().ok()).unwrap_or(0.0)
-    };
-    let pos = |f: &std::collections::BTreeMap<String, String>| [num(f, "px"), num(f, "py"), num(f, "pz")];
     let show = |p: [f64; 3]| format!("{:.2},{:.2},{:.2}", p[0], p[1], p[2]);
     let mut d = Diff { against, added: Vec::new(), removed: Vec::new(), moved: Vec::new(), changed: Vec::new() };
-    for (path, f) in &new {
+    for (path, o) in &new {
         let Some(was) = old_map.get(path.as_str()) else {
-            d.added.push(format!("{path} at {}", show(pos(f))));
+            d.added.push(format!("{path} at {}", show(o.pos)));
             continue;
         };
-        let (a, b) = (pos(was), pos(f));
+        let (a, b) = (was.pos, o.pos);
         let dist = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
         if dist > 0.01 { d.moved.push(format!("{path} {} -> {} ({dist:.2} m)", show(a), show(b))); }
-        let fields: Vec<String> = f
-            .iter()
-            .filter(|(k, v)| !matches!(k.as_str(), "px" | "py" | "pz" | "id" | "parent") && was.get(*k) != Some(*v))
-            .map(|(k, v)| format!("{k} {} -> {}", was.get(k).map(String::as_str).unwrap_or("(none)"), v))
-            .collect();
+        let before: std::collections::BTreeMap<String, String> = was.fields().into_iter().collect();
+        let now: std::collections::BTreeMap<String, String> = o.fields().into_iter().collect();
+        let mut fields = Vec::new();
+        for key in before.keys().chain(now.keys()).collect::<std::collections::BTreeSet<_>>() {
+            let (x, y) = (before.get(key), now.get(key));
+            if x != y {
+                fields.push(format!("{key} {} -> {}", x.map(String::as_str).unwrap_or("(default)"), y.map(String::as_str).unwrap_or("(default)")));
+            }
+        }
         if !fields.is_empty() { d.changed.push(format!("{path}: {}", fields.join(", "))); }
     }
     for (path, f) in &old {
-        if !new_paths.contains(path.as_str()) { d.removed.push(format!("{path} at {}", show(pos(f)))); }
+        if !new_paths.contains(path.as_str()) { d.removed.push(format!("{path} at {}", show(f.pos))); }
     }
     Ok(d)
 }
@@ -673,16 +692,15 @@ impl Reply {
     }
 }
 
-/// Every scene another scene places (`.scene s=` lines), read once.
+/// Every scene another scene places (`place` objects), read once.
 // ponytail: can't see scenes loaded from code; those still get the "no camera" warning only if unplaced.
 pub(crate) fn placed_scenes(root: &Path) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     for file in all_scenes(root).unwrap_or_default() {
         let Ok(text) = fs::read_to_string(root.join(&file)) else { continue };
-        for line in text.lines() {
-            let Some((_, placed)) = line.split_once(".scene s=") else { continue };
-            let placed = placed.trim().trim_start_matches("./");
-            if placed != file { out.insert(placed.to_string()); }
+        for o in crate::scenefile::parse(&text).0 {
+            let placed = o.scene.trim().trim_start_matches("./");
+            if o.kind == crate::scenefile::INSTANCE && !placed.is_empty() && placed != file { out.insert(placed.to_string()); }
         }
     }
     out
@@ -780,7 +798,16 @@ pub(crate) fn run_tool(root: &Path, rel: &str, args: &[String]) -> Result<Reply,
     Ok(Reply::parse(&text, out.status.success()))
 }
 
-const CHANGES: &[&str] = &["add", "set", "delete", "ground", "ontop", "scatter"];
+const CHANGES: &[&str] = &["add", "set", "delete", "ground", "ontop", "scatter", "fmt", "apply", "split", "inline"];
+
+/// The `apply` request for a block of object lines (the scene file's own syntax). Line breaks
+/// travel as byte 31 because a request is one tab-separated line.
+pub(crate) fn apply_args(text: &str, parent: Option<&str>) -> Result<Vec<String>, String> {
+    if text.contains(['\t', '\x1e', '\x1f']) { return Err("the object lines have a tab or control character".into()); }
+    let mut args = vec!["apply".to_string(), format!("lines={}", text.trim_end().replace("\r\n", "\n").replace('\n', "\x1f"))];
+    if let Some(p) = parent { args.push(format!("parent={p}")); }
+    Ok(args)
+}
 
 #[cfg(test)]
 mod pattern_tests {
@@ -947,6 +974,8 @@ pub(crate) fn to_json(op: &str, scene: &str, reply: &Reply) -> Json {
         }
         _ => {}
     }
+    let lines: Vec<Json> = reply.lines.iter().filter(|l| l[0] == "text").map(|l| Json::Str(l[1..].join("\t"))).collect();
+    if !lines.is_empty() { pairs.push(("lines", Json::Arr(lines))); }
     if let Some(l) = reply.lines.iter().find(|l| l[0] == "added") {
         pairs.push(("id", Json::Num(at(l, 1).parse().unwrap_or(0.0))));
         pairs.push(("path", Json::Str(at(l, 2).into())));
@@ -976,6 +1005,7 @@ pub(crate) fn to_text(reply: &Reply) -> String {
             "added" => out += &format!("added #{} {}\n", at(l, 1), at(l, 2)),
             "issue" => out += &format!("{}: {}\n", at(l, 1), l[3..].join(" ")),
             "look" => out += &format!("  {:>5}x {} {} {} tint {}  (e.g. {})\n", at(l, 1), at(l, 2), at(l, 3), at(l, 4), at(l, 5), at(l, 6)),
+            "text" => out += &format!("{}\n", l[1..].join("\t")),
             "ok" => out += &format!("{}\n", l[1..].join(" ")),
             "err" => out += &format!("error: {}\n", l[1..].join(" ")),
             _ => out += &format!("{}\n", l.join(" ")),
@@ -993,7 +1023,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("j3_part_scene_test_{}", std::process::id()));
         fs::create_dir_all(root.join("scenes")).unwrap();
         fs::write(root.join("j3.editor.toml"), "[editor]\nscene = \"scenes/main.j3scene\"\n").unwrap();
-        fs::write(root.join("scenes/main.j3scene"), "node.0.scene s=scenes/house.j3scene\nnode.1.scene s=./scenes/shed.j3scene\n").unwrap();
+        fs::write(root.join("scenes/main.j3scene"), "node.0.kind=3\nnode.0.scene s=scenes/house.j3scene\nnode.1.kind=3\nnode.1.scene s=./scenes/shed.j3scene\n").unwrap();
         fs::write(root.join("scenes/shed.j3scene"), "").unwrap();
         fs::write(root.join("scenes/house.j3scene"), "").unwrap();
         fs::write(root.join("scenes/lonely.j3scene"), "").unwrap();
@@ -1034,7 +1064,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("scenes")).unwrap();
         let node = |i: usize, id: u32, parent: u32, name: &str, x: f32| {
-            format!("node.{i}.id={id}\nnode.{i}.parent={parent}\nnode.{i}.name s={name}\nnode.{i}.px f={x}\nnode.{i}.tr f=1.0\n")
+            format!("node.{i}.id={id}\nnode.{i}.parent={parent}\nnode.{i}.kind=1\nnode.{i}.name s={name}\nnode.{i}.px f={x}\nnode.{i}.tr f=1.0\n")
         };
         fs::write(root.join("scenes/a.j3scene"), [node(0, 1, 0, "House", 0.0), node(1, 2, 1, "Door", 1.0), node(2, 3, 0, "Old", 0.0)].concat()).unwrap();
         // Ids shift (as after a split); matching is by path.
@@ -1045,8 +1075,16 @@ mod tests {
         assert_eq!(d.removed, ["Old at 0.00,0.00,0.00"]);
         assert_eq!(d.moved.len(), 1, "{:?}", d.moved);
         assert!(d.moved[0].starts_with("House/Door "), "{:?}", d.moved);
-        assert_eq!(d.changed, ["House: tr 1.0 -> 0.5"]);
+        assert_eq!(d.changed, ["House: tint (default) -> 0.5,1,1"]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_sends_line_breaks_as_one_byte() {
+        let args = apply_args("A cube #1\n  B cube #2\n", Some("Hub")).unwrap();
+        assert_eq!(args, ["apply", "lines=A cube #1\x1f  B cube #2", "parent=Hub"]);
+        assert!(request_text(&args).is_ok());
+        assert!(apply_args("a\tb", None).is_err());
     }
 
     #[test]

@@ -1,0 +1,165 @@
+// LOD tile storage and scheduling. Levels 1..LMAX each keep a ring of tiles around the player;
+// a level-L tile covers 2^L x 2^L columns at 2^L-voxel cells. Tiles are meshed from the generator
+// (render/lod_mesher.j3), so nothing but the mesh is stored. Whether a tile is drawn is decided
+// in render/world_draw.j3.
+
+module mini_voxel.render.lod;
+
+use j3.gfx;
+use j3.gfx.Mesh;
+use j3.memory.Arena;
+use j3.math.{ absi, maxi };
+use mini_voxel.config.{ COVER_MARGIN, K, LMAX, LOD_R, NEAR };
+use mini_voxel.render.lod_mesher;
+use mini_voxel.render.mesher.Mesher;
+use mini_voxel.world.edits.Edits;
+use mini_voxel.util.grid.{ NONE, fdiv, fmod };
+use mini_voxel.util.spiral.Spiral;
+use mini_voxel.util.time;
+
+pub struct Lod {
+    meshes: []Mesh; // LMAX rings of LOD_R x LOD_R slots
+    tx: []int; // which tile a slot holds
+    tz: []int;
+    built: []bool;
+    stale: []bool; // built from older terrain: keeps drawing, rebuilt when its turn comes
+    version: int; // bumped when a tile goes stale
+}
+
+/// Where the player is and how far to draw. `near` is the full-resolution radius in columns.
+pub struct Focus {
+    pcx: int;
+    pcz: int;
+    view: int;
+    near: int; // drawn at full resolution
+    mesh: int; // meshed ahead of drawing
+    gen: int; // generated ahead of meshing
+}
+
+pub fn create(mem: &Arena): Lod {
+    let n = LMAX * LOD_R * LOD_R;
+    let l = Lod { meshes: mem.alloc::<Mesh>(n), tx: mem.alloc::<int>(n), tz: mem.alloc::<int>(n), built: mem.alloc::<bool>(n), stale: mem.alloc::<bool>(n), version: 0 };
+    let i = 0;
+    while i < n { l.meshes[i] = Mesh {}; l.tx[i] = 0; l.tz[i] = 0; l.built[i] = false; l.stale[i] = false; i += 1; }
+    return l;
+}
+
+pub fn focus(pcx: int, pcz: int, view: int): Focus {
+    let near = if view < NEAR { view } else { NEAR };
+    return Focus { pcx: pcx, pcz: pcz, view: view, near: near, mesh: near + 1, gen: near + 2 };
+}
+
+pub fn pow2(l: int): int {
+    return lod_mesher.pow2(l);
+}
+
+fn slot(l: int, tx: int, tz: int): int {
+    return ((l - 1) * LOD_R + fmod(tz, LOD_R)) * LOD_R + fmod(tx, LOD_R);
+}
+
+pub fn ready(lod: &Lod, l: int, tx: int, tz: int): bool {
+    let s = slot(l, tx, tz);
+    return lod.built[s] && lod.tx[s] == tx && lod.tz[s] == tz;
+}
+
+/// The built mesh of a ready tile.
+pub fn mesh(lod: &Lod, l: int, tx: int, tz: int): Mesh {
+    return lod.meshes[slot(l, tx, tz)];
+}
+
+/// Tile is in level `l`'s ring (within K tiles of the player) and its centre is inside the view.
+pub fn inRegion(f: &Focus, l: int, tx: int, tz: int): bool {
+    let s = pow2(l);
+    if absi(tx - fdiv(f.pcx, s)) > K || absi(tz - fdiv(f.pcz, s)) > K { return false; }
+    let dx = tx * s + s / 2 - f.pcx;
+    let dz = tz * s + s / 2 - f.pcz;
+    let r = f.view + s;
+    return dx * dx + dz * dz <= r * r;
+}
+
+/// A level-`l` tile lies deep inside the finer ring (more than COVER_MARGIN finer tiles from its
+/// edge, and inside the view), so the finer meshes hide it and it needs no mesh of its own.
+/// Level 1 is covered by the full-resolution columns, level l by level l-1 tiles. Such a tile counts
+/// as available when drawing: its parent splits, and the children below it are in the finer ring and
+/// not themselves covered by the next ring in, so they are built.
+pub fn covered(f: &Focus, l: int, tx: int, tz: int): bool {
+    let s = pow2(l);
+    let x0 = tx * s; let x1 = x0 + s - 1;
+    let z0 = tz * s; let z1 = z0 + s - 1;
+    let m = COVER_MARGIN;
+    if l == 1 {
+        if x0 < f.pcx - f.near + m || x1 > f.pcx + f.near - m { return false; }
+        if z0 < f.pcz - f.near + m || z1 > f.pcz + f.near - m { return false; }
+    } else {
+        let fs = pow2(l - 1); // columns per finer tile
+        let cx = fdiv(f.pcx, fs); let cz = fdiv(f.pcz, fs);
+        if x0 < (cx - K + m) * fs || x1 > (cx + K - m + 1) * fs - 1 { return false; }
+        if z0 < (cz - K + m) * fs || z1 > (cz + K - m + 1) * fs - 1 { return false; }
+    }
+    let ax = maxi(absi(x0 - f.pcx), absi(x1 - f.pcx));
+    let az = maxi(absi(z0 - f.pcz), absi(z1 - f.pcz));
+    return ax * ax + az * az <= f.view * f.view;
+}
+
+/// Mesh tiles that are wanted but not built, nearest first, until `deadline` (0: all). A tile is
+/// wanted when it is in its ring and view and not deep under a finer ring (`covered`); anything else
+/// is what shows where a finer mesh is missing. `order` is a `util/spiral.j3` list of radius K.
+/// Returns true when nothing is left to build. GL work.
+pub fn build(lod: &Lod, m: &Mesher, ed: &Edits, f: &Focus, order: &Spiral, deadline: int): bool {
+    let n = 0;
+    while n == 0 || time.within(deadline) {
+        let bl = 0; let bx = 0; let bz = 0; let best = NONE;
+        let l = 1;
+        while l <= LMAX {
+            let s = pow2(l);
+            let cx = fdiv(f.pcx, s);
+            let cz = fdiv(f.pcz, s);
+            let i = 0;
+            while i < order.n {
+                let tx = cx + order.dx[i]; let tz = cz + order.dz[i];
+                if (!ready(lod, l, tx, tz) || lod.stale[slot(l, tx, tz)]) && inRegion(f, l, tx, tz) && !covered(f, l, tx, tz) {
+                    let ex = tx * s + s / 2 - f.pcx;
+                    let ez = tz * s + s / 2 - f.pcz;
+                    let d2 = ex * ex + ez * ez;
+                    if d2 < best { best = d2; bl = l; bx = tx; bz = tz; }
+                    break;
+                }
+                i += 1;
+            }
+            l += 1;
+        }
+        if best == NONE { return true; }
+        let sl = slot(bl, bx, bz);
+        if lod.meshes[sl].vao != 0 { gfx.free(&lod.meshes[sl]); }
+        lod.meshes[sl] = lod_mesher.meshTile(m, ed, bl, bx, bz);
+        lod.tx[sl] = bx; lod.tz[sl] = bz; lod.built[sl] = true; lod.stale[sl] = false;
+        n += 1;
+    }
+    return false;
+}
+
+/// The terrain under column (cx, cz) changed: mark the tile covering it at every level stale.
+pub fn invalidate(lod: &Lod, cx: int, cz: int) {
+    let l = 1;
+    while l <= LMAX {
+        let s = pow2(l);
+        let tx = fdiv(cx, s); let tz = fdiv(cz, s);
+        let sl = slot(l, tx, tz);
+        if lod.built[sl] && lod.tx[sl] == tx && lod.tz[sl] == tz { lod.stale[sl] = true; lod.version += 1; }
+        l += 1;
+    }
+}
+
+pub fn meshVerts(lod: &Lod): int {
+    let n = 0;
+    let i = 0;
+    while i < LMAX * LOD_R * LOD_R { n += lod.meshes[i].count; i += 1; }
+    return n;
+}
+
+pub fn builtTiles(lod: &Lod): int {
+    let n = 0;
+    let i = 0;
+    while i < LMAX * LOD_R * LOD_R { if lod.built[i] { n += 1; } i += 1; }
+    return n;
+}

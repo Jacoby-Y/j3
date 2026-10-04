@@ -11,7 +11,7 @@ use crate::project::{self, Input, Manifest};
 use crate::span::{FileId, Span};
 use crate::stdlib::stdlib_dir;
 
-const HIDDEN: &[&str] = &["game_headless.j3", "sys_windows.j3", "sys_macos.j3"];
+const HIDDEN: &[&str] = &["game_headless.j3", "sys_windows.j3", "sys_macos.j3", "netsys.j3", "netsys_windows.j3", "netsys_macos.j3"];
 
 /// Public so the runtime or editor can reach them, but not what a game calls.
 const INTERNAL: &[(&str, &str)] = &[
@@ -205,9 +205,9 @@ Scripts
     `shared {{ opened: int = 0; }}` is one value every instance reads and writes. A top-level `let` is per-instance state. Every default and initializer is a literal. A script may also declare `struct` and `enum`; those names share the script's namespace, and the script type's name is taken.
     Only `pub fn`s are callable from outside. Outside code can't read an instance's fields or copy one; pass `&Door`.
     `const Door = @script(\"scripts/door.j3s\");` (path from the project root) gives the type; `Door {{ hinge: h }}` makes one, and `door.toggle()` calls it. A script can hold other scripts the same way.
-    In a scene, `node.<i>.script s=scripts/door.j3s` attaches one to an object and `param.<id>.<prop>` lines set its props. `use j3.scene3d.scripts;` then `scripts.start(&scene)` and `scripts.update(&scene, dt)` run every attached script's `pub fn start(scene: &Scene)` and `pub fn update(scene: &Scene, dt: f32)`; `scene.script::<Door>(node)` finds one. A `node: NodeId` prop is the object the script is on.
+    In a scene, `script=scripts/door.j3s` on an object's line attaches one and `param.<prop>=value` beside it sets its props. `use j3.scene3d.scripts;` then `scripts.start(&scene)` and `scripts.update(&scene, dt)` run every attached script's `pub fn start(scene: &Scene)` and `pub fn update(scene: &Scene, dt: f32)`; `scene.script::<Door>(node)` finds one. A `node: NodeId` prop is the object the script is on.
     `j3c run` runs scripts on a bytecode VM: editing a script re-runs without compiling the program, and while it runs a code edit swaps in. `j3c build` compiles every script in. `j3c dump-bc scripts/door.j3s` shows the bytecode.
-    `j3c run path/to/tool.j3s` runs that file once: it makes one instance and calls `pub fn main()`. Arguments after the path are `j3.sys.arg` (`arg(0)` is the program). A scene script is still attached with `node.<i>.script`, not run this way.
+    `j3c run path/to/tool.j3s` runs that file once: it makes one instance and calls `pub fn main()`. Arguments after the path are `j3.sys.arg` (`arg(0)` is the program). A scene script is still attached with `script=` on an object, not run this way.
 
 Types
     {types}
@@ -285,7 +285,7 @@ fn editor_page() -> String {
 For agents editing an editor project (not the editor itself):
 - Project-owned: `j3.editor.toml` (main scene), `scenes/*.j3scene`, `assets/`, `scripts/*.j3s` (attached to objects; `j3c doc lang` has a Scripts section).
 - Generated, don't hand-edit: everything under `target/` (`target/j3-editor/`, `target/j3s/` bytecode).
-- An object's script is `node.<i>.script s=scripts/door.j3s`; its props are `param.<id>.<prop>` lines. `j3c check` reports a wrong prop type or a missing required prop against the scene line. `j3c -e script-props scripts/door.j3s` lists what the inspector edits.
+- An object's script is `script=scripts/door.j3s` on its line; its props are `param.<prop>=value` beside it. `j3c check` reports a wrong prop type or a missing required prop against the scene line. `j3c -e script-props scripts/door.j3s` lists what the inspector edits.
 - Edit scenes with `j3c -e scene` (by object name, `Parent/Child` path, or `#id`), not by hand: `j3c -e scene --help`.
 - Look at what you built: `j3c -e render [--view iso|top|front] [--focus NAME] [--out F.png]`, and
   `j3c run --frames 120 --screenshot F.png --headless` for the running game.
@@ -546,7 +546,7 @@ fn render_module(m: &Module, item: Option<&str>) -> Result<String, String> {
 fn attached(scan: &scene_scripts::Scan) -> String {
     let scripts = scan.scripts();
     if scripts.is_empty() {
-        return "No scene attaches a script yet (`node.<i>.script s=scripts/x.j3s`).\n".to_string();
+        return "No scene attaches a script yet (`script=scripts/x.j3s` on an object line).\n".to_string();
     }
     let mut out = String::from(
         "attached scripts (one instance per object; find one with\n    `const Spin = @script(\"scripts/spin.j3s\");` then `scene.script::<Spin>(node)`)\n",

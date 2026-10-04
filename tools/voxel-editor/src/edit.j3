@@ -1,0 +1,297 @@
+// Mouse editing: picking under the cursor and the tools' drags. A drag takes an undo snapshot
+// on press, and every move rolls back to it and redraws the shape, so what you see is the
+// edit that will stay.
+
+module voxel_editor.edit;
+
+use j3.game;
+use j3.game.{ Key, Mouse };
+use j3.gfx;
+use j3.gfx.Orbit;
+use j3.math.{ Vec2, Vec3, sqrt };
+use j3.memory.Arena;
+use j3.text.Text;
+use voxel_editor.model;
+use voxel_editor.pick;
+use voxel_editor.pick.Pick;
+use voxel_editor.view;
+use voxel_editor.world;
+use voxel_editor.world.{ BOTTOM, BOX, CYLINDER, FILL, LEFT, LINE, PENCIL, PICKER, RIGHT, SPHERE, TOP, World };
+
+pub fn say(w: &World, msg: string) {
+    w.status.clear();
+    w.status.pushStr(msg);
+}
+
+pub fn say2(w: &World, a: string, b: string) {
+    w.status.clear();
+    w.status.pushStr(a);
+    w.status.pushStr(b);
+}
+
+/// The 3D area: what is left between the panels.
+pub fn viewOrigin(): Vec2 {
+    return Vec2 { x: LEFT, y: TOP };
+}
+
+pub fn viewSize(): Vec2 {
+    let win = game.windowSize();
+    return Vec2 { x: win.x - LEFT - RIGHT, y: win.y - TOP - BOTTOM };
+}
+
+pub fn overView(p: Vec2): bool {
+    let o = viewOrigin();
+    let s = viewSize();
+    return p.x >= o.x && p.y >= o.y && p.x < o.x + s.x && p.y < o.y + s.y;
+}
+
+fn lo(a: int, b: int): int { if a < b { return a; } return b; }
+fn hi(a: int, b: int): int { if a > b { return a; } return b; }
+
+/// Reset the camera to look at the whole model.
+pub fn frame(w: &World) {
+    let diag = sqrt(f32(w.m.sx * w.m.sx + w.m.sy * w.m.sy + w.m.sz * w.m.sz));
+    w.cam = Orbit.create(view.center(&w.m), 0.7, 0.5, diag * 1.1 + 2);
+}
+
+/// Look at the model from a side: front, right, top, or iso.
+pub fn look(w: &World, yaw: f32, pitch: f32) {
+    w.cam.yaw = yaw;
+    w.cam.pitch = pitch;
+}
+
+/// Pick the voxel under the pointer.
+pub fn hoverPick(w: &World) {
+    let ray = gfx.mouseRay(w.cam);
+    w.hover = pick.cast(&w.m, ray.origin, ray.dir);
+}
+
+fn adding(w: &World): bool {
+    return w.mode == model.ADD;
+}
+
+/// The cell a shape starts at: in front of the face when adding, the voxel itself otherwise.
+fn startCell(w: &World, p: Pick, out: &[3]int): bool {
+    if adding(w) {
+        if !p.ok { return false; }
+        out[0] = p.px;
+        out[1] = p.py;
+        out[2] = p.pz;
+    } else {
+        if !p.solid { return false; }
+        out[0] = p.x;
+        out[1] = p.y;
+        out[2] = p.z;
+    }
+    return model.inside(&w.m, out[0], out[1], out[2]);
+}
+
+/// Distance in cells between the anchor and the current cell, along the layer.
+fn radius(w: &World): f32 {
+    let sum: f32 = 0;
+    for k in 0..3 {
+        if k == w.axis { continue; }
+        let d = f32(w.cur[k] - w.anchor[k]);
+        sum += d * d;
+    }
+    return sqrt(sum);
+}
+
+/// Draw the active shape into the model (after a rollback).
+fn shape(w: &World) {
+    let toward = if adding(w) { w.sign } else { 0 - w.sign };
+    let reach = toward * (w.depth - 1);
+    if w.tool == BOX {
+        let lo3: [3]int = [lo(w.anchor[0], w.cur[0]), lo(w.anchor[1], w.cur[1]), lo(w.anchor[2], w.cur[2])];
+        let hi3: [3]int = [hi(w.anchor[0], w.cur[0]), hi(w.anchor[1], w.cur[1]), hi(w.anchor[2], w.cur[2])];
+        // Along the face's axis the box is `depth` deep, away from the surface when adding.
+        lo3[w.axis] = lo(w.anchor[w.axis], w.anchor[w.axis] + reach);
+        hi3[w.axis] = hi(w.anchor[w.axis], w.anchor[w.axis] + reach);
+        model.box(&w.m, lo3[0], lo3[1], lo3[2], hi3[0], hi3[1], hi3[2], w.mode, w.color, w.hollow);
+    } else if w.tool == SPHERE {
+        model.sphere(&w.m, w.anchor[0], w.anchor[1], w.anchor[2], radius(w), w.mode, w.color, w.hollow);
+    } else if w.tool == CYLINDER {
+        model.cylinder(&w.m, w.anchor[0], w.anchor[1], w.anchor[2], radius(w), toward * w.depth, w.axis, w.mode, w.color, w.hollow);
+    } else if w.tool == LINE {
+        model.line(&w.m, w.anchor[0], w.anchor[1], w.anchor[2], w.cur[0], w.cur[1], w.cur[2], w.mode, w.color);
+    }
+}
+
+/// Pencil stroke from the last cell to `cur`, a brush at every step.
+fn stroke(w: &World) {
+    let dx = w.cur[0] - w.last[0];
+    let dy = w.cur[1] - w.last[1];
+    let dz = w.cur[2] - w.last[2];
+    let n = hi(hi(absI(dx), absI(dy)), absI(dz));
+    for i in 1..=n {
+        let t = f32(i) / f32(n);
+        model.brush(&w.m, w.last[0] + int(f32(dx) * t + 0.5 * sgn(dx)), w.last[1] + int(f32(dy) * t + 0.5 * sgn(dy)),
+            w.last[2] + int(f32(dz) * t + 0.5 * sgn(dz)), w.brush, w.mode, w.color);
+    }
+    w.last = w.cur;
+}
+
+fn absI(v: int): int { if v < 0 { return 0 - v; } return v; }
+
+fn sgn(v: int): f32 {
+    if v < 0 { return -1; }
+    return 1;
+}
+
+/// Left button went down in the view.
+pub fn press(w: &World) {
+    let p = w.hover;
+    if game.keyDown(Key.Alt) || w.tool == world.PICKER {
+        if p.solid {
+            w.color = model.get(&w.m, p.x, p.y, p.z);
+            say(w, "Picked that color");
+        }
+        return;
+    }
+    if w.tool == FILL {
+        if !p.solid {
+            say(w, "Click a voxel to fill its region");
+            return;
+        }
+        model.snapshot(&w.m);
+        let c = if w.mode == model.ERASE { 0 } else { w.color };
+        let n = model.flood(&w.m, p.x, p.y, p.z, c, if w.layerFill { p.axis } else { -1 });
+        if n == 0 { model.discardSnapshot(&w.m); }
+        return;
+    }
+    let from: [3]int = [0, 0, 0];
+    if !startCell(w, p, &from) { return; }
+    model.snapshot(&w.m);
+    w.active = true;
+    w.anchor = from;
+    w.cur = from;
+    w.last = from;
+    w.axis = p.axis;
+    w.sign = p.sign;
+    if w.lock >= 0 {
+        // Locked plane: extrude toward the camera.
+        let ray = gfx.mouseRay(w.cam);
+        let dir = ray.dir;
+        let d: [3]f32 = [dir.x, dir.y, dir.z];
+        w.axis = w.lock;
+        w.sign = if d[w.lock] > 0 { -1 } else { 1 };
+    }
+    if w.tool == PENCIL {
+        model.brush(&w.m, from[0], from[1], from[2], w.brush, w.mode, w.color);
+    } else {
+        shape(w);
+    }
+}
+
+/// Left button held: follow the pointer in the layer the drag started on.
+pub fn drag(w: &World) {
+    if !w.active { return; }
+    let ray = gfx.mouseRay(w.cam);
+    let at: [3]int = [0, 0, 0];
+    if !pick.onLayer(&w.m, ray.origin, ray.dir, w.axis, w.anchor[w.axis], &at) { return; }
+    if at[0] == w.cur[0] && at[1] == w.cur[1] && at[2] == w.cur[2] { return; }
+    w.cur = at;
+    if w.tool == PENCIL {
+        stroke(w);
+    } else {
+        model.rollback(&w.m);
+        shape(w);
+    }
+}
+
+/// Left button up: keep the edit, or drop the undo step when nothing changed.
+pub fn release(w: &World) {
+    if !w.active { return; }
+    w.active = false;
+    if model.sameAsSnapshot(&w.m) { model.discardSnapshot(&w.m); }
+}
+
+/// Esc during a drag: put everything back.
+pub fn cancel(w: &World) {
+    if !w.active { return; }
+    w.active = false;
+    model.rollback(&w.m);
+    model.discardSnapshot(&w.m);
+}
+
+/// The layer the next click draws on, as a grid tinted by its axis, so the plane is never a guess.
+fn drawPlane(w: &World) {
+    let cell: [3]int = [0, 0, 0];
+    let axis = w.axis;
+    if w.active {
+        cell = w.anchor;
+    } else {
+        if !w.hover.ok || w.tool == PICKER || w.tool == FILL { return; }
+        if !startCell(w, w.hover, &cell) { return; }
+        axis = if w.lock >= 0 { w.lock } else { w.hover.axis };
+    }
+    let tint = Vec3.xyz(0.9, 0.3, 0.3);
+    if axis == 1 { tint = Vec3.xyz(0.3, 0.85, 0.3); }
+    if axis == 2 { tint = Vec3.xyz(0.35, 0.5, 1); }
+    let size: [3]int = [w.m.sx, w.m.sy, w.m.sz];
+    let u = if axis == 0 { 1 } else { 0 };
+    let v = if axis == 2 { 1 } else { 2 };
+    let c = f32(cell[axis]) + 0.5;
+    for i in 0..=size[u] {
+        let a: [3]f32 = [0, 0, 0];
+        let b: [3]f32 = [0, 0, 0];
+        a[axis] = c; b[axis] = c;
+        a[u] = f32(i); b[u] = f32(i);
+        a[v] = 0; b[v] = f32(size[v]);
+        view.line(Vec3.xyz(a[0], a[1], a[2]), Vec3.xyz(b[0], b[1], b[2]), tint * 0.5);
+    }
+    for j in 0..=size[v] {
+        let a2: [3]f32 = [0, 0, 0];
+        let b2: [3]f32 = [0, 0, 0];
+        a2[axis] = c; b2[axis] = c;
+        a2[v] = f32(j); b2[v] = f32(j);
+        a2[u] = 0; b2[u] = f32(size[u]);
+        view.line(Vec3.xyz(a2[0], a2[1], a2[2]), Vec3.xyz(b2[0], b2[1], b2[2]), tint * 0.5);
+    }
+}
+
+/// Wire boxes on the cell under the pointer (and the drag's anchor), tinted by what the click does.
+pub fn drawCursor(w: &World) {
+    let tint = Vec3.xyz(0.4, 0.95, 0.5);
+    if w.mode == model.ERASE { tint = Vec3.xyz(1, 0.4, 0.35); }
+    if w.mode == model.PAINT { tint = Vec3.xyz(0.45, 0.65, 1); }
+    if w.tool == PICKER || w.tool == FILL { tint = Vec3.xyz(1, 1, 1); }
+    drawPlane(w);
+    let p = w.hover;
+    if w.active {
+        box1(w.cur[0], w.cur[1], w.cur[2], tint);
+        box1(w.anchor[0], w.anchor[1], w.anchor[2], Vec3.xyz(1, 0.85, 0.3));
+        return;
+    }
+    if !p.ok { return; }
+    if !adding(w) || w.tool == PICKER || w.tool == FILL {
+        if p.solid { box1(p.x, p.y, p.z, tint); }
+        return;
+    }
+    box1(p.px, p.py, p.pz, tint);
+}
+
+fn box1(x: int, y: int, z: int, tint: Vec3) {
+    let e: f32 = 0.02;
+    view.wireBox(Vec3.xyz(f32(x) - e, f32(y) - e, f32(z) - e), Vec3.xyz(f32(x + 1) + e, f32(y + 1) + e, f32(z + 1) + e), tint);
+}
+
+/// A rectangle where mirrored editing reflects.
+pub fn drawMirrors(w: &World) {
+    let tint = Vec3.xyz(0.35, 0.9, 0.9);
+    let sx = f32(w.m.sx);
+    let sy = f32(w.m.sy);
+    let sz = f32(w.m.sz);
+    if w.m.symX {
+        let mid = sx / 2;
+        view.wireBox(Vec3.xyz(mid, 0, 0), Vec3.xyz(mid, sy, sz), tint);
+    }
+    if w.m.symY {
+        let mid2 = sy / 2;
+        view.wireBox(Vec3.xyz(0, mid2, 0), Vec3.xyz(sx, mid2, sz), tint);
+    }
+    if w.m.symZ {
+        let mid3 = sz / 2;
+        view.wireBox(Vec3.xyz(0, 0, mid3), Vec3.xyz(sx, sy, mid3), tint);
+    }
+}

@@ -44,6 +44,11 @@ pub(crate) struct LlvmFn<'a> {
     file: String,
     /// Split builds link two objects, so every definition is visible to the other one.
     pub(crate) external: bool,
+    /// Whole-program builds share one abort routine: a check site passes `file << 40 | line << 8 | kind`
+    /// and this list (the file part) is printed once by `abort_routine`. `None` keeps a message per site.
+    pub(crate) abort_files: Option<&'a mut Vec<String>>,
+    /// Release builds: no function unwinds (J3 has no exceptions), so no unwind tables.
+    pub(crate) nounwind: bool,
 }
 
 impl<'a> LlvmFn<'a> {
@@ -61,6 +66,8 @@ impl<'a> LlvmFn<'a> {
             line: 1,
             file: String::new(),
             external: false,
+            abort_files: None,
+            nounwind: false,
         }
     }
 
@@ -78,6 +85,8 @@ impl<'a> LlvmFn<'a> {
             line: 1,
             file: String::new(),
             external: false,
+            abort_files: None,
+            nounwind: false,
         }
     }
 
@@ -133,6 +142,20 @@ impl<'a> LlvmFn<'a> {
         if self.terminated {
             return;
         }
+        if let Some(files) = self.abort_files.as_mut() {
+            let at = match files.iter().position(|f| *f == self.file) {
+                Some(i) => i,
+                None => {
+                    files.push(self.file.clone());
+                    files.len() - 1
+                }
+            };
+            let packed = (at as u64) << 40 | (self.line as u64) << 8 | kind.code();
+            self.inst(&format!("call void @j3_abort(i64 {packed})"));
+            self.inst("unreachable");
+            self.terminated = true;
+            return;
+        }
         let msg = format!("{}:{}: {}\n", self.file, self.line, kind.message());
         let p = self.bytes_global(msg.as_bytes());
         let w = self.fresh();
@@ -183,11 +206,14 @@ impl<'a> LlvmFn<'a> {
             .and_then(|d| d.subprogram(func.id))
             .unwrap_or(0);
         self.note_span(func.span);
-        let dbg_attr = if self.scope != 0 {
+        let mut dbg_attr = if self.scope != 0 {
             format!(" #0 !dbg !{}", self.scope)
         } else {
             String::new()
         };
+        if self.nounwind {
+            dbg_attr.insert_str(0, " nounwind");
+        }
         let mut args = String::new();
         for (i, p) in params.iter().enumerate() {
             if i > 0 {

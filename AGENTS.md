@@ -20,24 +20,25 @@ Ask the tools first. They ship with the compiler, so they match the binary you r
 
 ## Agent workflow for scenes
 
-Scenes are `scenes/*.j3scene` text files (one field per line, `node.<i>.<field>=`). Edit them through the tools, not by hand: the tools keep ids, parents, and undo correct, and `scene3d` is the only reader and writer of the format.
+Scenes are `scenes/*.j3scene` text files (one object per line). Edit them through the tools, not by hand: the tools keep ids, parents, and undo correct, and `scene3d` is the only reader and writer of the format.
 
 **MCP server.** `claude mcp add -s user j3 -- j3c -e mcp`. It follows the project the editor has open, else the one around the working directory (`--project DIR` pins one). Its startup instructions and every tool description say when to use the tool; replies carry hints when a better tool exists. A project can add its own notes with `notes = "AGENT_NOTES.md"` in `j3.editor.toml` (see `examples/fps-shooter`). After rebuilding `j3c`, run `./build.sh` (installs to `~/.bin/j3c`) and restart the server, since running servers keep the old binary.
 
 **The loop:** change, look, check.
 
-1. Learn the scene: `scene_list` (glob `filter`, `group_by=prefix`), `scene_get`.
-2. Build with bulk tools, not many single calls: `place` (`ring`, `wall` with a door, `stairs`, `spiral`, `grid`, `scatter`, `ground`, `ontop`), `scene_add_many`, globs in `scene_set`/`scene_delete`.
+1. Learn the scene: `scene_list` (glob `filter`, `group_by=prefix`, `tree` for the file's own lines), `scene_get` (an object and its children as file lines).
+2. Build with bulk tools, not many single calls: `place` (`ring`, `wall` with a door, `stairs`, `spiral`, `grid`, `scatter`, `ground`, `ontop`), `scene_add_many`, `scene_apply` (objects written as scene lines, or a subtree copied from `scene_get`), globs in `scene_set`/`scene_delete`. `scene_split`/`scene_inline` move objects into their own scene file and back.
 3. Look from where the player stands: `render` with `at`/`yaw`/`pitch`, `views` for several angles in one image, `hide` (`Roof*`) to see inside, `view=top` + `ortho` for a plan. A render after every few edits beats one at the end.
 4. Verify: `check` (scene rules, the project's `check` script, and code), `scene_stats` (draw cost; above 60 distinct looks is slow), `scene_diff` (review your own edits against git HEAD), `play` (runs the game headless, returns a frame).
 
 The same operations exist on the command line: `j3c -e scene --help`, `j3c -e render --help`, `j3c -e gen`, and `j3c -e mcp --tools` (each MCP tool's arguments next to its CLI twin). Use the CLI when there is no MCP server; nothing else differs.
 
 Facts that cost agents time:
-- **Rotations are degrees in the tools and radians in `.j3scene` files.** Anything that writes scene text directly must convert. `check` warns on a stored rotation above two turns. A slab pointing along `(dx, dz)` needs `ry = -atan2(dz, dx)`; yaw 0 looks toward -z.
+- **A `.j3scene` file is one line per object** (`Name kind key=value #id`, indent for children, defaults left out; format in `j3c/editor/README.md`), and rotations are **degrees** there and in the tools. `list tree=1` and `get` print the lines, `scene_apply` takes lines back, `j3c -e scene fmt` normalises a hand edit, and `tools/j3scene_migrate.py` converts old files (`node.<i>.*`, radians). `check` warns on a rotation above two turns. A slab pointing along `(dx, dz)` needs `rot` y `= -atan2(dz, dx)`; yaw 0 looks toward -z.
 - With `j3c editor` open, tool edits are live undo steps in it and unsaved until the person saves. With it closed they write the file and `undo` restores it (20 kept). Every reply says which happened.
 - Put project rules in a `check` script (`j3.editor.toml`: `check = "tools/check.j3s"`, prints `error: ` / `warning: ` lines), so a mistake becomes a named object instead of a bug found in play. `examples/fps-shooter/tools/check.j3s` is the pattern.
 - Objects carry `tags` (`scene_set tags=nocollide,launch=30`; `scene3d.hasTag` / `tagValue`). Prefer them to name prefixes in new game code.
+- **Z-fighting:** the renderer pulls the smaller of two objects with overlapping faces on one plane toward the camera in depth by itself (`scene3d.flushUpdate`, rescanned once objects stop moving); `check` still names the pairs so you can fix the scene at the source. `tags=decal` (`decal=2` to stack) forces it for an object the scan misses (faces more than 2 mm apart, meshes over 2000 triangles).
 
 ## Repo map
 
@@ -51,7 +52,7 @@ Facts that cost agents time:
 | `editors/vscode/` | Cursor/VS Code extension: highlighting (`j3c dump-syntax`), `j3c lsp`, `j3.toml` keys, Run/Build/Format |
 | `roadmap.md`, `EDITOR.md` | Direction and status. Editor brainstorms go in `EDITOR.md`, not code |
 | `plans/` | Numbered handoff plans (import pipeline, scene authoring, URP performance, animation, effects, ...). Read one before redoing that area |
-| `tools/` | `j3mesh_import.py` |
+| `tools/` | `j3mesh_import.py`, `j3scene_migrate.py` (v1 `.j3scene` to the one-line-per-object format); `voxel-editor/` is a voxel model editor (window) plus `vox run` for agents, `.j3voxel` files (`tools/voxel-editor/README.md`) |
 | `build.sh` | Release-build `j3c` and install it to `~/.bin/j3c` |
 
 ## Examples
@@ -69,6 +70,7 @@ Facts that cost agents time:
 ## Working here
 
 - Build and test from `j3c/`: `cargo build --release`, `cargo test`. The editor program is rebuilt per `j3c` version into `~/.cache/j3/editor`; `J3_EDITOR_SRC=$PWD/j3c/editor/src` builds it from disk, so set it while editing `j3c/editor/src/` and unset it for normal use.
+- Ship small with `j3c build --release` (opt s, no `-g`, stripped; fps-shooter 4.5 MB to 1.3 MB). `j3c size` shows sections, code per module and the biggest functions of a dev build. Dev builds (`opt = 0`, `debug`) are for the loop, not for sending to people.
 - Wrap anything long or windowed (`j3c editor`, `j3c run` of a game, renders) in `timeout`, so nothing blocks the session.
 - Driver shader crashes can hide behind NVIDIA's disk cache: test GLSL with `__GL_SHADER_DISK_CACHE=0`.
 - Many `j3c/src/compile.rs` tests name examples that no longer exist (`bounce`, `dungeon`, `island`, `minecraft`, `defense`, `raytrace`, ...), so `cargo test` shows failures that are not regressions. Fix or delete them when you touch that file.

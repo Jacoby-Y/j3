@@ -42,14 +42,17 @@ Claude Code:  claude mcp add -s user j3 -- j3c -e mcp
 const INSTRUCTIONS: &str = "\
 Tools for a j3 game project: scenes are trees of named objects (meshes, cameras, lights, \
 groups, placed scenes) in scenes/*.j3scene. Name objects by name, by Parent/Child path, or \
-by #id. Positions are local to the parent, rotations are degrees (in the tools; scene files \
-store radians), y is up, and 1 unit is about 1 meter.
+by #id. Positions are local to the parent, rotations are degrees (in the tools and in scene \
+files), y is up, and 1 unit is about 1 meter. A scene file is one line per object, `Name kind \
+key=value #id`, indent for children; scene_get and scene_list tree=true print those lines and \
+scene_apply takes them back.
 
 Work in a loop: change the scene, LOOK at it with render, fix what looks wrong, run check.
 - Build with the bulk tools, not many single calls. place: ring (round walls, slabs sized to \
 close the circle), wall (with a door gap), stairs, spiral, grid (modular pieces), scatter \
 (random copies, grounded), ground/ontop (rest on surfaces instead of guessing heights). \
-scene_add_many batches anything else in one undo step.
+scene_add_many batches anything else in one undo step, and scene_apply writes many varied \
+objects (or a whole subtree you copied from scene_get) as scene lines in one.
 - Bulk edits: scene_set and scene_delete take globs (DecoCorn*). scene_list with filter and \
 group_by=prefix shows what names exist.
 - Look from where the player would be: render with at [x,y,z] + yaw/pitch (degrees; yaw 0 \
@@ -342,6 +345,8 @@ impl Server {
                 let glob = filter.as_deref().is_some_and(|f| f.contains(['*', '?']));
                 if glob { req.push(format!("filter={}", filter.as_deref().unwrap_or(""))); }
                 if str_arg(args, "group_by").as_deref() == Some("prefix") { req.push("group=prefix".into()); }
+                let tree = args.get("tree").and_then(as_bool).unwrap_or(false);
+                if tree { req.push("tree=1".into()); }
                 let mut reply = self.scene_request(&root, &rel, &req)?;
                 if let Some(filter) = filter.filter(|_| !glob) {
                     let f = filter.to_lowercase();
@@ -349,7 +354,9 @@ impl Server {
                 }
                 let count = reply.lines.iter().filter(|l| l[0] == "node").count();
                 let groups = reply.lines.iter().filter(|l| l[0] == "group").count();
-                let head = if groups > 0 {
+                let head = if tree {
+                    format!("objects in {rel} as the scene file writes them (indent is depth; `scene_apply` takes these lines back){}\n", if self.was_live { ", live in the open editor" } else { "" })
+                } else if groups > 0 {
                     format!("{groups} name prefixes in {rel} (count, prefix)\n")
                 } else {
                     format!(
@@ -364,6 +371,37 @@ impl Server {
                 let node = need_str(args, "node")?;
                 let reply = self.scene_request(&root, &rel, &["get".into(), node])?;
                 Ok(answer_from(&reply, "get", &rel, String::new()))
+            }
+            "scene_apply" => {
+                let rel = scene_arg(&root, args)?;
+                let lines = need_str(args, "lines")?;
+                let req = scene::apply_args(&lines, str_arg(args, "parent").as_deref())?;
+                let reply = self.scene_request(&root, &rel, &req)?;
+                Ok(answer_from(&reply, "apply", &rel, String::new()))
+            }
+            "scene_split" => {
+                let rel = scene_arg(&root, args)?;
+                let mut req = vec!["split".to_string()];
+                match args.get("nodes") {
+                    Some(Json::Arr(items)) => { for item in items { req.push(value_str(item)?); } }
+                    _ => req.push(need_str(args, "node").map_err(|_| "scene_split needs node or nodes".to_string())?),
+                }
+                req.push(format!("out={}", need_str(args, "out")?));
+                for key in ["instance", "center"] {
+                    if args.get(key).and_then(as_bool).unwrap_or(false) { req.push(format!("{key}=1")); }
+                }
+                let reply = self.scene_request(&root, &rel, &req)?;
+                Ok(answer_from(&reply, "split", &rel, String::new()))
+            }
+            "scene_inline" => {
+                let rel = scene_arg(&root, args)?;
+                let reply = self.scene_request(&root, &rel, &["inline".into(), need_str(args, "node")?])?;
+                Ok(answer_from(&reply, "inline", &rel, String::new()))
+            }
+            "scene_fmt" => {
+                let rel = scene_arg(&root, args)?;
+                let reply = self.scene_request(&root, &rel, &["fmt".into()])?;
+                Ok(answer_from(&reply, "fmt", &rel, String::new()))
             }
             "scene_add" => {
                 let rel = scene_arg(&root, args)?;
@@ -1118,7 +1156,7 @@ fn asset_search(root: &Path, args: &Json) -> Result<Answer, String> {
 }
 
 /// Tools that change a scene; their replies say whether the change went to the editor or the file.
-const EDITS: &[&str] = &["scene_add", "scene_add_many", "scene_set", "scene_delete", "place"];
+const EDITS: &[&str] = &["scene_add", "scene_add_many", "scene_set", "scene_delete", "scene_apply", "scene_fmt", "scene_split", "scene_inline", "place"];
 
 /// The CLI command doing each tool's work; "" when only MCP has it.
 const CLI_SAME: &[(&str, &str)] = &[
@@ -1126,6 +1164,10 @@ const CLI_SAME: &[(&str, &str)] = &[
     ("scene_get", "j3c -e scene get <object>|@scene"),
     ("scene_add", "j3c -e scene add <kind> key=value ..."),
     ("scene_add_many", ""),
+    ("scene_apply", "j3c -e scene apply FILE|-"),
+    ("scene_split", "j3c -e scene split <object> ... out=FILE"),
+    ("scene_inline", "j3c -e scene inline <instance>"),
+    ("scene_fmt", "j3c -e scene fmt"),
     ("scene_set", "j3c -e scene set <object> key=value ..."),
     ("scene_delete", "j3c -e scene delete <object> ..."),
     ("place", "j3c -e scene ground|ontop|scatter|ring|stairs|spiral|wall ... (grid is MCP only)"),
@@ -1199,7 +1241,7 @@ fn type_text(prop: &Json) -> String {
 }
 
 const TOOL_NAMES: &[&str] = &[
-    "scene_list", "scene_get", "scene_add", "scene_add_many", "scene_set", "scene_delete", "place", "undo", "render", "check", "play", "console", "import",
+    "scene_list", "scene_get", "scene_add", "scene_add_many", "scene_apply", "scene_split", "scene_inline", "scene_fmt", "scene_set", "scene_delete", "place", "undo", "render", "check", "play", "console", "import",
     "asset_search", "asset_online_search", "asset_fetch", "gen", "scene_stats", "scene_diff",
 ];
 
@@ -1214,10 +1256,11 @@ const TOOLS: &str = r#"[
  "inputSchema":{"type":"object","properties":{
    "scene":{"type":"string","description":"Scene file, e.g. scenes/main.j3scene. Default: the scene in j3.editor.toml."},
    "filter":{"type":"string","description":"Only objects whose id, path, or kind contains this text; with * or ? a glob on name or path (DecoCorn*)."},
-   "group_by":{"type":"string","enum":["prefix"],"description":"Count objects by name with trailing digits dropped instead of listing them."}}},
+   "group_by":{"type":"string","enum":["prefix"],"description":"Count objects by name with trailing digits dropped instead of listing them."},
+   "tree":{"type":"boolean","description":"Print the objects as the scene file writes them: one line each, indent is depth, `Name kind key=value #id`. scene_apply takes those lines back."}}},
  "annotations":{"readOnlyHint":true}},
 {"name":"scene_get","title":"Get an object",
- "description":"All fields of one object, including its script's props (param.<prop>). Pass node \"@scene\" for scene lighting (sun, sky, fog, shadows, URP).",
+ "description":"One object as the scene file writes it (its line, then its children's, indented; scene_apply takes the lines back), then all its fields including its script's props (param.<prop>). Pass node \"@scene\" for scene lighting (sun, sky, fog, shadows, URP).",
  "inputSchema":{"type":"object","required":["node"],"properties":{
    "node":{"type":"string","description":"Name, Parent/Child path, #id, or @scene."},
    "scene":{"type":"string"}}},
@@ -1236,6 +1279,29 @@ const TOOLS: &str = r#"[
    "adds":{"type":"array","items":{"type":"object","required":["kind"],"properties":{
      "kind":{"type":"string"},"name":{"type":"string"},"parent":{"type":"string"},"fields":{"type":"object"}}}},
    "scene":{"type":"string"}}}},
+{"name":"scene_apply","title":"Write objects as scene lines",
+ "description":"Add or replace objects written the way the scene file writes them, which is what scene_get and scene_list tree print: `Name kind key=value ... #id`, two spaces of indent per level of nesting, `//` lines above an object are its note. Kinds: group, mesh [path], place <scene>, light, camera, or a shape (cube sphere cylinder cone capsule torus quad plane sky). Keys: pos rot (degrees) scale (one number or three) tint color range fov near far material (grain means assets/materials/grain.j3mat) texture fx alpha opacity doubleSided script tags param.<prop>=value prop.<name>=value. Numbers with a . are floats, \"text\" is a string, #7 is an object. A line whose #id is an object in the scene replaces that object: fields it leaves out go back to their defaults (use scene_set to change one field). A line without #id, or with an unused one, adds an object with a new id; objects it nests keep their place under it, and #refs between new lines follow. Top-level lines go under parent. One undo step; all or nothing. Use it to add many varied objects at once, copy a subtree (get it, edit the lines, drop the ids), or rewrite one object whole.",
+ "inputSchema":{"type":"object","required":["lines"],"properties":{
+   "lines":{"type":"string","description":"The object lines, separated by newlines."},
+   "parent":{"type":"string","description":"Object to put the top-level lines under (name, path, or #id); default top level."},
+   "scene":{"type":"string"}}}},
+{"name":"scene_split","title":"Move objects into their own scene file",
+ "description":"Move top-level objects, and everything under them, into a new scene file out (project-relative, must not exist yet), keeping their params. With center the new file is centred on the objects' middle (x, z); with instance a placed copy of the new file is left where they were, so the world looks the same and the part can be edited or reused on its own. Use it to break a big scene into regions or to make a reusable piece (a house, a tree); a game can load several files into one world with scene3d.loadParts. Objects inside another object must be moved to the top level first (scene_set parent \"\").",
+ "inputSchema":{"type":"object","required":["out"],"properties":{
+   "node":{"type":"string","description":"Object to move (name, path, #id, or a glob)."},
+   "nodes":{"type":"array","items":{"type":"string"}},
+   "out":{"type":"string","description":"New scene file, e.g. scenes/biomes/forest.j3scene."},
+   "instance":{"type":"boolean","default":false},
+   "center":{"type":"boolean","default":false},
+   "scene":{"type":"string"}}}},
+{"name":"scene_inline","title":"Turn a placed scene into real objects",
+ "description":"Replace a placed scene (an instance object) with real copies of its objects, so they can be edited in this scene. Per-copy values and the placement's tint are kept; scenes the placed scene places stay placed. The instance becomes a group.",
+ "inputSchema":{"type":"object","required":["node"],"properties":{
+   "node":{"type":"string","description":"The instance object."},
+   "scene":{"type":"string"}}}},
+{"name":"scene_fmt","title":"Rewrite a scene file in the canonical layout",
+ "description":"Rewrite the scene file in the canonical layout: tree order, defaults left out, numbers trimmed. Only needed after the file was edited by hand; the tools always write it this way. Fails (changing nothing) when the file has a line it can't read, naming the line.",
+ "inputSchema":{"type":"object","properties":{"scene":{"type":"string"}}}},
 {"name":"scene_set","title":"Change an object",
  "description":"Set fields on an object (all or nothing). node may be a glob (DecoCorn*, *Tree?) to set every matching object; preview with scene_list filter. Keys: name; pos [x,y,z] (local to parent), x, y, z; rot [x,y,z] degrees; scale [x,y,z] or one number; parent (\"\" for top level; keeps local transform); asset (mesh file or builtin:cube|sphere|cylinder|cone|capsule|torus|quad|plane|sky); texture; material (.j3mat); scene (instance's scene file); script (a .j3s path, \"\" for none); tags (comma-separated, e.g. \"nocollide,launch=30\"; the game reads them with scene3d.hasTag/tagValue); param.<prop> (a prop of the object's script, typed by its props block); tint [r,g,b] or one number (meshes and placed scenes; multiplies color, 1 unchanged, above 1 allowed, e.g. [0.7,1,1.8] turns green teal); color [r,g,b] 0-1 and range (lights); fov, near, far (cameras); effects (cameras: kind=camera .j3fx files run in order, \"a.j3fx|b.j3fx\"; \"\" for none) and fx.<file stem>.<param> (their params); alpha opaque|cutout|blend; opacity; doubleSided; prop.<name> (on an instance: a prop its scene declares; \"\" goes back to the default). With node \"@scene\": prop.<name> = \"<type>:<default>\" declares a prop on this scene (type int, float, text, bool, material, mesh, scene; \"\" removes it), and sun [x,y,z] (direction toward the sun), sunColor, sky, fogStart, fogEnd, shadows, shadowSize, urp, urpBounces, urpSamples, urpShadows, urpShadowNear (meters traced sun shadows reach; the shadow map covers the rest; 0 no limit). save: true also saves the scene in the open editor.",
  "inputSchema":{"type":"object","required":["node"],"properties":{

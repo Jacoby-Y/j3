@@ -2,7 +2,7 @@
 
 J3 compiler crate. The contract is this file, `../roadmap.md`'s non-goals, and `../speculative/` (01–08 run, 09 typechecks, `10_j3ui.j3` typechecks). If this file and those disagree with an example, the example's test in `compile.rs` is what `cargo test` locks.
 
-Host: Rust, no crates.io deps. **Emit is LLVM by default** (text `.ll` + host `clang`). C is optional (`--emit c` or `[emit] backend = c`). Script bytecode is a third printer over the same checked IR. The runtime bytecode VM in J3 is allowed; the comptime interpreter remains out of scope. No libLLVM, no crates.io. `--fast` strips OOB `Abort`. The IR with places is the backend contract.
+Host: Rust, no crates.io deps. **Emit is LLVM by default** (text `.ll` + host `clang`). C is optional (`--emit c` or `[emit] backend = c`). Script bytecode is a third printer over the same checked IR. The runtime bytecode VM in J3 is allowed; the comptime interpreter remains out of scope. No libLLVM, no crates.io. `--fast` strips OOB `Abort`. `--release` ships small: opt `s`, no `-g`, stripped, per-platform link flags (`emit::host::release_flags`/`target_os`; Linux also drops unwind tables). Whole-program LLVM builds print failed checks through one `@j3_abort` (`emit/llvm.rs` `abort_routine`, packed `file<<40|line<<8|kind`); split and per-module builds keep a message per site. The IR with places is the backend contract.
 
 ## Commands
 
@@ -83,13 +83,14 @@ Procedural 2D art lives in `stdlib/j3/gfx/canvas.j3`: RGBA8 `Canvas`, pixel/smoo
 | `examples/hello.j3` | Built-in hello for `dump-*` and `j3c run examples/hello.j3`. |
 | `src/compile.rs` | Load entry + stdlib modules, parse, check. `.j3s` files load through `@script` paths (`compile/script_deps.rs`) and scene attachments. |
 | `src/compile/dev.rs` | Dev-mode IR pass: script structs become `{ handle: ptr }`, script literals `j3.script.devNew`, `pub` script fns `devCall` stubs, plus a thunk per native fn a script may call (called now, or `pub` in a module a script `use`s), registered from `main`. |
-| `src/compile/scene_scripts.rs` | Scans `*.j3scene` for `node.<i>.script`, checks props/params/hooks against each script (errors point at the scene line), and makes `j3.scene3d.scripts` in memory (instances, `start`/`update`, `find__*` behind `scene.script::<T>(node)`). |
+| `src/compile/scene_scripts.rs` | Scans `*.j3scene` (via `scenefile`) for `script=` / `node.<i>.script`, checks props/params/hooks against each script (errors point at the scene line), and makes `j3.scene3d.scripts` in memory (instances, `start`/`update`, `find__*` behind `scene.script::<T>(node)`). |
 | `src/devrun.rs` | `j3c run` with scripts: writes `target/j3s/*.j3sb`, keys the dev binary on `.j3` sources + lowered native IR (so script edits skip clang), compiles the VM as its own `-O2` object below opt 2, and watches `.j3s` (live swap via `target/j3s/reload`, relaunch on a layout change). |
 | `src/check/script.rs` | Script → struct/methods/globals lowering and script-scope rules. |
 | `src/parse/` | Grammar: lex + recursive descent. Shared with `lsp` + `fmt`. `syntax.rs` is keyword/attr/intrinsic/type names + TextMate dump (`dump-syntax`). |
 | `src/fmt.rs` | Token reprint; comments copied from source gaps |
 | `src/lsp/` | Stdio LSP. `json.rs` is a tiny parser (no serde). Hover, goto, completion, signature, symbols, import edits |
 | `src/mcp.rs` | `j3c -e mcp`: MCP server (newline JSON-RPC on stdio, reuses `lsp/json.rs`). Scene (incl. `scene_add_many` batches), place (incl. grid), undo (file backups in `scene.rs`), render, check, play, console, import, asset_search, asset_online_search, asset_fetch, gen tools; live-editor mode through `target/j3-editor/events` + `replies` |
+| `src/scenefile.rs` | `.j3scene` text as Rust sees it (v1 and v2): `parse`, `write_v2`, `rename_v2`. No second J3 parser; this only serves the CLI side. |
 | `src/scene.rs` | `j3c -e scene` and `j3c -e render`: runs the editor binary's headless `cli`/`render` modes (`editor/src/tool.j3`, `render.j3`) and formats replies as text or JSON |
 | `src/gen.rs` | `j3c -e gen`: runs `assets/gen/*.j3` mesh scripts (`j3c run --file`), cached by script hash; also before project builds |
 | `src/online.rs` | Poly Haven / ambientCG / Kenney search and fetch through `curl` (zips unpacked with `png::inflate`, `.hdr` skies tone-mapped to PNG), cache in `~/.cache/j3/assets`, `assets/CREDITS.txt`; MCP `asset_online_search`/`asset_fetch` and the editor's Get assets |
@@ -102,6 +103,7 @@ Procedural 2D art lives in `stdlib/j3/gfx/canvas.j3`: RGBA8 `Canvas`, pixel/smoo
 | `src/emit/mod.rs` | Printers + `run_program`. Consumes IR only. Never parse J3. |
 | `src/emit/bc.rs` | Versioned `.j3sb` printer over checked script IR: typed opcodes, register 0 is the frame pointer, fused compare-branch, `abi.rs` offsets. The opcode table is shared with `stdlib/j3/script.j3` (the VM, written in J3). |
 | `src/emit/opts.rs` | `Backend` + `EmitOpts` from `[emit]` |
+| `src/emit/host.rs` | clang/cc invocation, link args, `TargetOs` + `release_flags` (one row per platform; `Other` gets no linker flags), crash symbolizer. `j3c size` is in `cli.rs` |
 | `src/emit/c.rs` | Modules → C text (`j3_*` names). Host `int main` calls `j3.sys.start` if present, else user `main`. |
 | `src/emit/c_expr.rs` | Places, operands, rvalues, statements |
 | `src/emit/c_ty.rs` | IR `Ty` → C type names / slice typedefs |
@@ -153,7 +155,7 @@ If a change makes those strings go away, the IR is wrong.
 
 Source of truth: `stdlib/j3/*.j3`, compiled into the binary with `include_str`. A copied `j3c` does not need that directory. `J3_STDLIB` replaces the embedded copy. `j3c run` parses `sys` + `io` + the entry file. `j3.sys.start` calls user `main` then `exit(0)`. mmap/Arena IR is later.
 
-Scenes: rotation in `.j3scene` files is radians, in the tools (`j3c -e scene`, MCP, inspector) degrees. Code that writes scene text directly converts.
+Scenes: a `.j3scene` file is one line per object, rotation in degrees (format: `editor/README.md`, "Scene file format"). `scene3d` (`parse`, `write`, `nodeText`) is the reader and writer; `src/scenefile.rs` reads both file versions for the Rust side (diff, script checks, asset renames) and `tools/j3scene_migrate.py` converts v1 files, so a rule changed in one is changed in all three (`j3c -e scene fmt` on a v1 file must match the migrator byte for byte). Old files (`node.<i>.*`, radians) still load.
 
 ## How data is owned
 

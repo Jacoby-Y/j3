@@ -1,8 +1,8 @@
-//! Scripts attached to objects in scene files (`node.<i>.script s=<path>`).
+//! Scripts attached to objects in scene files (`script=<path>` on an object line, `node.<i>.script s=<path>` in v1).
 //!
 //! The loader scans every `.j3scene` under the project root. Each attached script joins the
 //! program, and `j3.scene3d.scripts` is synthesized in memory (no file on disk): one
-//! instance list per script type, filled from the objects' `param.<id>.<prop>` lines when
+//! instance list per script type, filled from the objects' `param.<prop>=` values (v1: `param.<id>.<prop>` lines) when
 //! the scene starts, plus `start`/`update` for every instance and a `find` per type behind
 //! `scene.script<Door>(node)`. A `node: NodeId` prop is the object the script is attached to
 //! unless the scene sets it. Scene mistakes are reported against the scene file's line.
@@ -28,15 +28,7 @@ pub struct Attachment {
     pub script: String,
 }
 
-/// One `param.<id>.<field>` line.
-#[derive(Clone, Debug)]
-pub struct Param {
-    pub field: String,
-    /// ' ' (int or bool), 'f', 's', or 'r' (object).
-    pub kind: char,
-    pub value: String,
-    pub line: usize,
-}
+pub use crate::scenefile::Param;
 
 #[derive(Default)]
 pub struct Scan {
@@ -79,44 +71,12 @@ pub fn scan(root: &Path) -> Scan {
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        let mut ids: BTreeMap<String, i64> = BTreeMap::new();
-        let mut scripts: Vec<(String, String, usize)> = Vec::new();
-        for (n, line) in text.lines().enumerate() {
-            if let Some(rest) = line.strip_prefix("node.") {
-                let Some((index, field)) = rest.split_once('.') else { continue };
-                if let Some(id) = field.strip_prefix("id=") {
-                    if let Ok(id) = id.trim().parse() {
-                        ids.insert(index.to_string(), id);
-                    }
-                } else if let Some(script) = field.strip_prefix("script s=") {
-                    if !script.is_empty() {
-                        scripts.push((index.to_string(), script.to_string(), n + 1));
-                    }
-                }
-            } else if let Some(rest) = line.strip_prefix("param.") {
-                let Some((id, field)) = rest.split_once('.') else { continue };
-                let Ok(id) = id.parse::<i64>() else { continue };
-                let Some((key, value)) = field.split_once('=') else { continue };
-                let (name, kind) = match key.split_once(' ') {
-                    Some((name, k)) => (name, k.chars().next().unwrap_or(' ')),
-                    None => (key, ' '),
-                };
-                out.params.entry((rel.clone(), id)).or_default().push(Param {
-                    field: name.to_string(),
-                    kind,
-                    value: value.to_string(),
-                    line: n + 1,
-                });
+        for o in crate::scenefile::parse(&text).0 {
+            if o.params.len() > 0 {
+                out.params.entry((rel.clone(), o.id)).or_default().extend(o.params.iter().cloned());
             }
-        }
-        for (index, script, line) in scripts {
-            if let Some(id) = ids.get(&index) {
-                out.attachments.push(Attachment {
-                    scene: rel.clone(),
-                    line,
-                    id: *id,
-                    script,
-                });
+            if !o.script.is_empty() {
+                out.attachments.push(Attachment { scene: rel.clone(), line: o.script_line, id: o.id, script: o.script });
             }
         }
     }
@@ -196,7 +156,7 @@ fn param_fits(kind: PropKind, param: &Param) -> bool {
         PropKind::Bool => param.kind == ' ' && (param.value == "0" || param.value == "1"),
         PropKind::Text => param.kind == 's',
         PropKind::Object => param.kind == 'r',
-        PropKind::Vector => param.kind == 'f',
+        PropKind::Vector => param.kind == 'f' || param.kind == ' ',
         PropKind::Other => false,
     }
 }
@@ -332,7 +292,7 @@ pub fn registry(root: &Path, scan: &Scan) -> Result<String, String> {
                         a.line,
                         &at(),
                         &format!("{} needs prop `{name}`, and this object doesn't set it", a.script),
-                        &format!("set it in the inspector, or add `param.{}.{name}` lines", a.id),
+                        &format!("set it in the inspector, or add `param.{name}=<value>` to the object's line (`param.{}.{name}` in a v1 file)", a.id),
                     ));
                 }
                 continue;

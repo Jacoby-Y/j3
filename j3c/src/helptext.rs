@@ -138,7 +138,7 @@ j3.toml
     opt      optimization. [emit] opt inherits this when [emit] is omitted
     fast     strip bounds-check aborts
 
-CLI flags override the file: --emit llvm|c, --opt N, --fast.
+CLI flags override the file: --emit llvm|c, --opt N, --fast, --release (opt s, no -g, stripped; `j3c size` shows what is in the binary).
 No [emit] section inherits [cc] opt.
 
 Environment

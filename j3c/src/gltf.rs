@@ -774,35 +774,30 @@ fn append_node(
     Ok(())
 }
 
-fn safe_line(s: &str) -> String {
-    s.chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect()
-}
-
 /// Write `parts` as a standalone scene file at `out`, parents before children, ids from 1.
 /// The editor pastes it into the open scene, so the scene file itself is never touched.
 fn write_scene(out: &Path, parts: &[Part]) -> Result<(), String> {
-    let mut text = format!("scene.version=1\nscene.count={}\nscene.nextId={}\n", parts.len(), parts.len() + 1);
-    for (p, part) in parts.iter().enumerate() {
-        let id = p + 1;
-        let parent = if part.parent < 0 { 0 } else { part.parent as usize + 1 };
-        let prefix = format!("node.{p}.");
-        text.push_str(&format!("{prefix}id={id}\n{prefix}parent={parent}\n{prefix}kind={}\n{prefix}name s={}\n{prefix}asset s={}\n{prefix}texture s={}\n{prefix}script s=\n{prefix}doubleSided={}\n", part.kind, safe_line(&part.name), part.asset, part.texture, if part.double_sided { 1 } else { 0 }));
-        for (axis, value) in ["px", "py", "pz"].iter().zip(part.position) {
-            text.push_str(&format!("{prefix}{axis} f={value:.6}\n"));
-        }
-        for (axis, value) in ["rx", "ry", "rz"].iter().zip(part.rotation) {
-            text.push_str(&format!("{prefix}{axis} f={value:.6}\n"));
-        }
-        for (axis, value) in ["sx", "sy", "sz"].iter().zip(part.scale) {
-            text.push_str(&format!("{prefix}{axis} f={value:.6}\n"));
-        }
-        if part.alpha != 0 {
-            text.push_str(&format!("{prefix}alpha={}\n{prefix}opacity f={:.6}\n", part.alpha, part.opacity));
-        }
-    }
-    fs::write(out, text).map_err(|e| e.to_string())
+    let objects: Vec<crate::scenefile::Object> = parts
+        .iter()
+        .enumerate()
+        .map(|(p, part)| {
+            let mut o = crate::scenefile::Object::new(p);
+            o.id = p as i64 + 1;
+            o.parent = if part.parent < 0 { 0 } else { part.parent + 1 };
+            o.kind = part.kind;
+            o.name = part.name.replace(['\n', '\r'], " ");
+            o.asset = part.asset.clone();
+            o.texture = part.texture.clone();
+            o.double_sided = part.double_sided;
+            o.alpha = part.alpha;
+            o.opacity = part.opacity as f64;
+            o.pos = part.position.map(f64::from);
+            o.rot = part.rotation.map(f64::from);
+            o.scale = part.scale.map(f64::from);
+            o
+        })
+        .collect();
+    fs::write(out, crate::scenefile::write_v2(&objects, parts.len() as i64 + 1)).map_err(|e| e.to_string())
 }
 
 /// Convert a glTF file and write its hierarchy to the scene file `scene`.

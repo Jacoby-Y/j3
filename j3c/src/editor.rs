@@ -95,6 +95,7 @@ fn execute(rest: &[String]) -> Result<(), String> {
     } else {
         let fresh = !root.join("j3.editor.toml").exists();
         add_editor_files(&root)?;
+        crate::scaffold::add_scenes_section(&root);
         if fresh {
             println!(
                 "Added j3.editor.toml and scenes/main.j3scene to {}",
@@ -147,6 +148,9 @@ fn create_project(root: &Path, fps: bool) -> Result<(), String> {
             return Err(format!("{} already exists", root.join(relative).display()));
         }
     }
+    if root.join("AGENTS.md").exists() {
+        return Err(format!("{} already exists", root.join("AGENTS.md").display()));
+    }
     fs::create_dir_all(root.join("assets")).map_err(|e| e.to_string())?;
     for (relative, text) in files {
         let path = root.join(relative);
@@ -155,7 +159,7 @@ fn create_project(root: &Path, fps: bool) -> Result<(), String> {
         }
         fs::write(path, text).map_err(|e| e.to_string())?;
     }
-    Ok(())
+    crate::scaffold::write_agent_files(root, true)
 }
 
 /// Every file of a new editor project (`j3c doc recipes scene3d` prints them too).
@@ -170,31 +174,10 @@ pub(crate) fn project_files(name: &str, fps: bool) -> Vec<(&'static str, String)
     ]
 }
 
-const START_SCENE: &str = "scene.version=1\nscene.count=2\nscene.nextId=3\n\
-node.0.id=1\nnode.0.parent=0\nnode.0.kind=2\nnode.0.name s=Camera\nnode.0.asset s=\nnode.0.texture s=\nnode.0.script s=\n\
-node.0.px f=0\nnode.0.py f=2\nnode.0.pz f=7\nnode.0.rx f=-0.2\nnode.0.ry f=0\nnode.0.rz f=0\n\
-node.0.sx f=1\nnode.0.sy f=1\nnode.0.sz f=1\nnode.0.fov f=60\nnode.0.near f=0.15\nnode.0.far f=200\n\
-node.1.id=2\nnode.1.parent=0\nnode.1.kind=1\nnode.1.name s=Cube\nnode.1.asset s=builtin:cube\nnode.1.texture s=\nnode.1.script s=scripts/spin.j3s\n\
-node.1.px f=0\nnode.1.py f=0\nnode.1.pz f=0\nnode.1.rx f=0\nnode.1.ry f=0\nnode.1.rz f=0\n\
-node.1.sx f=1\nnode.1.sy f=1\nnode.1.sz f=1\n";
+const START_SCENE: &str = "j3scene 2 next=3\n\nCamera camera pos=0,2,7 rot=-11.459,0,0 #1\nCube cube script=scripts/spin.j3s #2\n";
 
 /// The `--template fps` scene: a camera (where the walker starts), a floor, and things to bump into.
-const FPS_SCENE: &str = "scene.version=1\nscene.count=5\nscene.nextId=6\n\
-node.0.id=1\nnode.0.parent=0\nnode.0.kind=2\nnode.0.name s=Camera\nnode.0.asset s=\nnode.0.texture s=\nnode.0.script s=\n\
-node.0.px f=0\nnode.0.py f=0\nnode.0.pz f=8\nnode.0.rx f=0\nnode.0.ry f=0\nnode.0.rz f=0\n\
-node.0.sx f=1\nnode.0.sy f=1\nnode.0.sz f=1\nnode.0.fov f=70\nnode.0.near f=0.1\nnode.0.far f=200\n\
-node.1.id=2\nnode.1.parent=0\nnode.1.kind=1\nnode.1.name s=Ground\nnode.1.asset s=builtin:plane\nnode.1.texture s=\nnode.1.script s=\n\
-node.1.px f=0\nnode.1.py f=0\nnode.1.pz f=0\nnode.1.rx f=0\nnode.1.ry f=0\nnode.1.rz f=0\n\
-node.1.sx f=40\nnode.1.sy f=1\nnode.1.sz f=40\n\
-node.2.id=3\nnode.2.parent=0\nnode.2.kind=1\nnode.2.name s=Crate\nnode.2.asset s=builtin:cube\nnode.2.texture s=\nnode.2.script s=\n\
-node.2.px f=3\nnode.2.py f=0.5\nnode.2.pz f=0\nnode.2.rx f=0\nnode.2.ry f=0\nnode.2.rz f=0\n\
-node.2.sx f=1\nnode.2.sy f=1\nnode.2.sz f=1\n\
-node.3.id=4\nnode.3.parent=0\nnode.3.kind=1\nnode.3.name s=Wall\nnode.3.asset s=builtin:cube\nnode.3.texture s=\nnode.3.script s=\n\
-node.3.px f=0\nnode.3.py f=1\nnode.3.pz f=-6\nnode.3.rx f=0\nnode.3.ry f=0\nnode.3.rz f=0\n\
-node.3.sx f=8\nnode.3.sy f=2\nnode.3.sz f=0.5\n\
-node.4.id=5\nnode.4.parent=0\nnode.4.kind=1\nnode.4.name s=Spinner\nnode.4.asset s=builtin:cube\nnode.4.texture s=\nnode.4.script s=scripts/spin.j3s\n\
-node.4.px f=-3\nnode.4.py f=0.5\nnode.4.pz f=0\nnode.4.rx f=0\nnode.4.ry f=0\nnode.4.rz f=0\n\
-node.4.sx f=1\nnode.4.sy f=1\nnode.4.sz f=1\n";
+const FPS_SCENE: &str = "j3scene 2 next=6\n\nCamera camera pos=0,0,8 fov=70 near=0.1 #1\nGround plane scale=40,1,40 #2\nCrate cube pos=3,0.5,0 #3\nWall cube pos=0,1,-6 scale=8,2,0.5 #4\nSpinner cube pos=-3,0.5,0 script=scripts/spin.j3s #5\n";
 
 /// Example mesh generator for new projects; `j3c -e gen` turns it into `assets/gen/tree.j3mesh`.
 pub(crate) const TREE_GEN: &str = "// A low-poly tree built in code: a tapered trunk and three cones of leaves.
@@ -263,7 +246,7 @@ fn add_editor_files(root: &Path) -> Result<(), String> {
         if let Some(parent) = scene.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        fs::write(&scene, "scene.version=1\nscene.count=0\nscene.nextId=1\n")
+        fs::write(&scene, "j3scene 2 next=1\n")
             .map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -301,40 +284,22 @@ pub(crate) fn scene_path(root: &Path) -> Result<PathBuf, String> {
     Ok(root.join(rel))
 }
 
-fn scene_int(values: &HashMap<&str, &str>, key: &str) -> Result<i64, String> {
-    values
-        .get(key)
-        .copied()
-        .ok_or_else(|| format!("scene: missing `{key}`"))?
-        .parse::<i64>()
-        .map_err(|_| format!("scene: invalid `{key}`"))
-}
-
 fn validate_scene(path: &Path) -> Result<(), String> {
     let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut values = HashMap::new();
-    for line in text.lines() {
-        if let Some((key, value)) = line.split_once('=') {
-            values.entry(key).or_insert(value);
-        }
+    if !text.starts_with("j3scene") && !text.lines().any(|l| l == "scene.version=1") {
+        return Err("scene: not a j3scene file (expected `j3scene 2` or `scene.version=1`)".into());
     }
-    if scene_int(&values, "scene.version")? != 1 {
-        return Err("scene: unsupported version (expected 1)".into());
-    }
-    let count = scene_int(&values, "scene.count")?;
-    if count < 0 {
-        return Err("scene: invalid object count".into());
+    let (objects, error) = crate::scenefile::parse(&text);
+    if let Some(error) = error {
+        return Err(format!("scene: {error}"));
     }
     let mut parents = HashMap::new();
-    for i in 0..count {
-        let id = scene_int(&values, &format!("node.{i}.id"))?;
-        let parent = scene_int(&values, &format!("node.{i}.parent"))?;
-        let kind = scene_int(&values, &format!("node.{i}.kind"))?;
-        if id <= 0 || parents.insert(id, parent).is_some() {
-            return Err(format!("scene: duplicate or invalid object ID {id}"));
+    for o in &objects {
+        if o.id <= 0 || parents.insert(o.id, o.parent).is_some() {
+            return Err(format!("scene: duplicate or invalid object ID {}", o.id));
         }
-        if !(0..=4).contains(&kind) {
-            return Err(format!("scene: object {id} has invalid kind {kind}"));
+        if !(0..=4).contains(&o.kind) {
+            return Err(format!("scene: object {} has invalid kind {}", o.id, o.kind));
         }
     }
     for (&id, &parent) in &parents {
@@ -684,6 +649,15 @@ fn rename_asset(root: &Path, old: &str, new: &str) -> Result<usize, String> {
     for scene in scenes.iter().filter(|p| p.ends_with(".j3scene")) {
         let path = root.join(scene);
         let Ok(text) = fs::read_to_string(&path) else { continue };
+        if text.starts_with("j3scene") {
+            if let Some(out) = crate::scenefile::rename_v2(&text, old, new) {
+                let temp = path.with_extension("j3tmp");
+                fs::write(&temp, out).map_err(|e| e.to_string())?;
+                fs::rename(&temp, &path).map_err(|e| e.to_string())?;
+                changed += 1;
+            }
+            continue;
+        }
         let mut hit = false;
         // Node paths and asset fields are whole values, so only exact matches change.
         let lines: Vec<String> = text

@@ -1,0 +1,159 @@
+// Industry: a small, editable voxel world. Research and automation grow from here.
+// `update` and `draw` only sequence the frame; rules live in the modules they call.
+module industry.gameplay;
+
+use j3.game;
+use j3.math.Vec3;
+use industry.chunks;
+use industry.console;
+use industry.data.conveyor;
+use industry.inventory;
+use industry.inventory_ui;
+use industry.interact;
+use industry.lighting;
+use industry.machine.belts;
+use industry.machine.container;
+use industry.machine.market;
+use industry.mining;
+use industry.models;
+use industry.placement;
+use industry.player;
+use industry.render;
+use industry.session;
+use industry.session.Game;
+use industry.ui;
+use industry.wire_draw;
+use industry.wiring;
+use industry.world;
+use industry.world.World;
+
+// Machines run at this fixed rate whatever the frame time, so a slow frame cannot
+// lose production. At most MAX_SIM_STEPS catch up after a hitch; older time is dropped.
+pub const SIM_STEP: f32 = 0.016666668;
+pub const MAX_SIM_STEPS: int = 120;
+const STAGE_POWER: int = 0;
+const STAGE_FURNACE: int = 1;
+const STAGE_BELTS: int = 2;
+const STAGE_DRILL: int = 3;
+const STAGES: int = 4;
+
+// One machine stage of a step. With `g.profile` set, its time accumulates in `g.stageUs`.
+fn runStage(g: &Game, stage: int) {
+    let begin = 0;
+    if g.profile { begin = game.micros(); }
+    if stage == STAGE_POWER { g.power.update(&g.world, SIM_STEP); }
+    if stage == STAGE_FURNACE { g.furnace.update(&g.world, SIM_STEP); }
+    if stage == STAGE_BELTS { belts.update(&g.world, SIM_STEP); }
+    if stage == STAGE_DRILL { g.drill.update(&g.world, SIM_STEP); }
+    if g.profile { g.stageUs[stage] += game.micros() - begin; }
+}
+
+pub fn simulate(g: &Game, dt: f32) {
+    g.clock += dt;
+    let steps = 0;
+    while g.clock >= SIM_STEP - 0.00001 && steps < MAX_SIM_STEPS {
+        // Power first, so machines read this step's supply; then existing batches before belts deliver new input.
+        for stage in 0..STAGES { runStage(g, stage); }
+        g.clock -= SIM_STEP;
+        steps += 1;
+    }
+    if steps == MAX_SIM_STEPS { g.clock = 0; }
+}
+
+// What the player points at, and what placing would do there. Read by update and draw.
+fn aim(g: &Game) {
+    let eye = player.lookCells(&g.player);
+    g.hit = world.pick(&g.world, eye.eye, eye.forward());
+    g.looked = 0;
+    if g.hit.ok { g.looked = world.get(&g.world, g.hit.x, g.hit.y, g.hit.z); }
+    g.plan = placement.resolveInventory(&g.world, &g.player, &g.carried, g.hit, g.rotation, game.keyDown(game.Key.Shift));
+}
+
+pub fn update(g: &Game, dt: f32) {
+    simulate(g, dt);
+    mining.pause(&g.mining, dt);
+    if g.noteTime > 0 { g.noteTime -= dt; }
+    wiring.tidy(g);
+    if g.inventoryOpen {
+        if (g.openStore >= 0 && !container.valid(&g.world, g.openStore)) ||
+            game.keyPressed(game.Key.Tab) || game.keyPressed(game.Key.E) || game.keyPressed(game.Key.Escape) {
+            session.closeInventory(g);
+        }
+        return;
+    }
+    if console.update(&g.console, &g.world, &g.carried) { return; }
+    if game.keyPressed(game.Key.Tab) {
+        g.inventoryOpen = true;
+        game.captureMouse(false);
+        return;
+    }
+    player.selectSlot(&g.player);
+    if game.keyPressed(game.Key.R) { g.rotation = conveyor.rotate(g.rotation); }
+    if game.keyPressed(game.Key.Escape) { game.captureMouse(false); return; }
+    let wasCaptured = game.mouseCaptured();
+    // Avoid pre-capture cursor movement on the focus click.
+    if wasCaptured { player.update(&g.player, &g.world, dt); }
+    aim(g);
+    if interact.keys(g) { return; }
+    if !wasCaptured {
+        if !game.mousePressed(game.Mouse.Left) && !game.mousePressed(game.Mouse.Right) { return; }
+        game.captureMouse(true);
+    }
+    interact.mouse(g, dt);
+    chunks.tick(&g.world, dt);
+}
+
+pub fn draw(g: &Game) {
+    if g.world.dirty { render.rebuild(&g.world, 4000); }
+    let eye = player.lookCells(&g.player);
+    let seconds = f32(game.ticks()) * 0.001;
+    lighting.begin(&g.world, player.camera(&g.player), &g.assets, seconds);
+    render.drawTerrain(&g.world, eye.eye * world.VOXEL);
+    models.drawWorld(&g.world, &g.assets, seconds);
+    render.boundaries(&g.world, g.barrier);
+    render.miningFeedback(&g.world, &g.assets, &g.miningShade, &g.mining, seconds);
+    render.hover(&g.world, g.hit);
+    wire_draw.draw(&g.world, g.wireFrom, g.hit);
+    if g.inventoryOpen { drawInventory(g); return; }
+    if g.plan.visible {
+        render.footprint(g.plan);
+        if world.machine(g.plan.id) {
+            models.ghost(&g.assets, g.plan.id, models.transform(g.plan.x, g.plan.y, g.plan.z, g.plan.dir), g.plan.ok);
+        }
+    }
+    ui.draw(&g.player, &g.carried, g.inventoryIcons, g.world.coins, mining.fraction(&g.mining),
+        unlockCost(&g.world, g.player.body.pos));
+    ui.context(&g.world, g.hit, inventory.slotItem(&g.carried, g.player.slot));
+    ui.note(wireHint(g));
+    if g.console.open { console.draw(&g.console); }
+}
+
+fn drawInventory(g: &Game) {
+    let closed = false;
+    if g.openStore >= 0 && container.valid(&g.world, g.openStore) {
+        let stored = container.contents(&g.world, g.openStore);
+        if market.valid(&g.world, g.openStore) {
+            closed = inventory_ui.drawMarket(&stored, &g.carried, g.inventoryIcons, g.world.coins);
+        } else {
+            closed = inventory_ui.draw(&stored, &g.carried, g.inventoryIcons);
+        }
+    } else {
+        closed = inventory_ui.drawInventory(&g.carried, g.inventoryIcons, &g.selectedInventory);
+    }
+    if closed { session.closeInventory(g); }
+}
+
+// Price of the chunk the prompt offers, or -1 when none is near.
+fn unlockCost(w: &World, pos: Vec3): int {
+    let target = chunks.nearby(w, pos);
+    if target < 0 { return -1; }
+    return chunks.cost(w, target % world.CHUNKS, target / world.CHUNKS);
+}
+
+// Short line above the hotbar: the last wiring result, else what the wire in hand does next.
+fn wireHint(g: &Game): string {
+    if g.noteTime > 0 { return g.note; }
+    if !wiring.holding(g) { return ""; }
+    if g.wireFrom < 0 { return "[RMB] POST OR MACHINE: START WIRE"; }
+    return "[RMB] OTHER END: CONNECT";
+}

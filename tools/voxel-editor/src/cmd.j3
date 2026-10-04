@@ -1,0 +1,644 @@
+// The command language. The window, the CLI (`vox run`), and agents all edit through it:
+// one command per line or `;`, words split on spaces, `#` starts a comment. `help` lists them.
+
+module voxel_editor.cmd;
+
+use j3.memory.Arena;
+use j3.text.{ Text, same };
+use voxel_editor.format;
+use voxel_editor.mesh;
+use voxel_editor.model;
+use voxel_editor.model.Model;
+use voxel_editor.util.{ cut, glyph, own, parseF, parseI, pushHex2, startsWith, trim, words };
+
+/// The command list, as `help` prints it.
+pub fn helpText(out: &Text) {
+    out.pushStr("voxel editor commands (a color is a palette index, a palette name, or #rrggbb; y is up)\n");
+    out.pushStr("  file     new SX SY SZ | open FILE | save [FILE] | import FILE [dx dy dz] | export-mesh FILE [scale]\n");
+    out.pushStr("           name NAME | size SX SY SZ | crop [pad] | clear | undo | redo\n");
+    out.pushStr("  draw     set X Y Z COLOR | erase X Y Z | paint X Y Z COLOR\n");
+    out.pushStr("           box X0 Y0 Z0 X1 Y1 Z1 COLOR [hollow]\n");
+    out.pushStr("           sphere CX CY CZ R COLOR [hollow]    ellipsoid CX CY CZ RX RY RZ COLOR [hollow]\n");
+    out.pushStr("           cylinder X Y Z R LEN x|y|z COLOR [hollow]   (from X Y Z toward +axis; negative LEN goes back)\n");
+    out.pushStr("           line X0 Y0 Z0 X1 Y1 Z1 COLOR       fill X Y Z COLOR [plane x|y|z]   (recolor a connected region)\n");
+    out.pushStr("           replace COLOR COLOR|air            end any shape with `erase` to cut it, or `paint` to recolor only\n");
+    out.pushStr("  edit     shift DX DY DZ | flip x|y|z | mirror x|y|z [+] | rotate x|y|z [turns] | hollow\n");
+    out.pushStr("           copy X0 Y0 Z0 X1 Y1 Z1 DX DY DZ [move] | sym [x] [y] [z] | sym off (mirror every edit)\n");
+    out.pushStr("  palette  color INDEX #RRGGBB [name] | addcolor #RRGGBB [name] | colorname INDEX NAME\n");
+    out.pushStr("           palette | palette preset NAME | palette load FILE | palette save FILE | palette trim\n");
+    out.pushStr("  look     info | dump [x|y|z] [N]   (ascii layers) | help\n");
+}
+
+/// Words of one command and where we are in them.
+struct Args {
+    w: []string;
+    i: int;
+    out: &Text;
+    ok: bool;
+    mode: int;
+    hollow: bool;
+}
+
+fn problem(a: &Args, msg: string) {
+    if !a.ok { return; }
+    a.ok = false;
+    a.out.pushStr("error: ");
+    a.out.pushStr(msg);
+    a.out.push(10);
+}
+
+fn more(a: &Args): bool {
+    return a.i < a.w.len;
+}
+
+fn problem3(a: &Args, p1: string, p2: string, p3: string) {
+    if !a.ok { return; }
+    let t = Text.new(a.out.arena);
+    t.pushStr(p1);
+    t.pushStr(p2);
+    t.pushStr(p3);
+    problem(a, t.str());
+}
+
+fn nextInt(a: &Args, what: string): int {
+    let v = 0;
+    if a.i >= a.w.len {
+        problem3(a, "missing ", what, " (`help` shows the arguments)");
+        return 0;
+    }
+    if !parseI(a.w[a.i], &v) { problem3(a, what, " must be a whole number, got ", a.w[a.i]); }
+    a.i += 1;
+    return v;
+}
+
+fn nextFloat(a: &Args, what: string): f32 {
+    let v: f32 = 0;
+    if a.i >= a.w.len {
+        problem3(a, "missing ", what, "");
+        return 0;
+    }
+    if !parseF(a.w[a.i], &v) { problem3(a, what, " must be a number, got ", a.w[a.i]); }
+    a.i += 1;
+    return v;
+}
+
+fn nextWord(a: &Args, what: string): string {
+    if a.i >= a.w.len {
+        problem3(a, "missing ", what, "");
+        return "";
+    }
+    a.i += 1;
+    return a.w[a.i - 1];
+}
+
+fn axisOf(a: &Args, s: string): int {
+    if same(s, "x") { return 0; }
+    if same(s, "y") { return 1; }
+    if same(s, "z") { return 2; }
+    problem(a, "an axis is x, y, or z");
+    return 0;
+}
+
+/// A color argument: index, name, `air`, or `#rrggbb` (added to the palette when new).
+fn colorOf(m: &Model, a: &Args, s: string): int {
+    let v = 0;
+    if same(s, "air") { return 0; }
+    if parseI(s, &v) {
+        if v < 0 || v > m.palLen { problem3(a, "the palette has no color ", s, "; `color INDEX #rrggbb` defines one"); }
+        return v;
+    }
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    if s.len > 0 && s[0] == 35 && model.parseHex(s, &r, &g, &b) {
+        let at = model.addColor(m, r, g, b);
+        if at == 0 { problem(a, "the palette is full (255 colors)"); }
+        return at;
+    }
+    let named = model.findName(m, s);
+    if named != 0 { return named; }
+    if model.namedColor(s, &r, &g, &b) {
+        named = model.addColor(m, r, g, b);
+        if named == 0 { problem(a, "the palette is full (255 colors)"); }
+        else if model.findName(m, s) == 0 { model.nameColor(m, named, s); }
+        return named;
+    }
+    problem3(a, "unknown color ", s, ": use a palette index, a name from `palette`, or #rrggbb");
+    return 0;
+}
+
+/// Take `hollow`, `erase`, and `paint` words off the end so the positional ones stay.
+fn flags(a: &Args) {
+    a.mode = model.ADD;
+    a.hollow = false;
+    let n = a.w.len;
+    while n > a.i {
+        let s = a.w[n - 1];
+        if same(s, "hollow") { a.hollow = true; }
+        else if same(s, "erase") { a.mode = model.ERASE; }
+        else if same(s, "paint") { a.mode = model.PAINT; }
+        else { break; }
+        n -= 1;
+    }
+    a.w = a.w[0..n];
+}
+
+fn needColor(m: &Model, a: &Args): int {
+    if a.mode == model.ERASE { return 0; }
+    return colorOf(m, a, nextWord(a, "a color"));
+}
+
+fn extra(a: &Args) {
+    if a.ok && a.i < a.w.len { problem3(a, "unexpected ", a.w[a.i], " (`help` shows the arguments)"); }
+}
+
+fn list(m: &Model, out: &Text) {
+    out.pushStr("palette (");
+    out.pushInt(m.palLen);
+    out.pushStr(" colors):\n");
+    for i in 1..=m.palLen {
+        out.pushStr("  ");
+        out.pushInt(i);
+        out.pushStr("  #");
+        pushHex2(out, model.color(m, i, 0));
+        pushHex2(out, model.color(m, i, 1));
+        pushHex2(out, model.color(m, i, 2));
+        if m.names[i].len > 0 {
+            out.push(32);
+            out.pushStr(m.names[i]);
+        }
+        out.push(10);
+    }
+}
+
+fn info(m: &Model, out: &Text) {
+    out.pushStr("name ");
+    out.pushStr(m.name);
+    out.pushStr("  size ");
+    out.pushInt(m.sx);
+    out.push(32);
+    out.pushInt(m.sy);
+    out.push(32);
+    out.pushInt(m.sz);
+    out.pushStr("  voxels ");
+    out.pushInt(model.count(m));
+    out.pushStr("  colors ");
+    out.pushInt(m.palLen);
+    if m.symX || m.symY || m.symZ {
+        out.pushStr("  sym");
+        if m.symX { out.pushStr(" x"); }
+        if m.symY { out.pushStr(" y"); }
+        if m.symZ { out.pushStr(" z"); }
+    }
+    out.push(10);
+    let lo: [3]int = [0, 0, 0];
+    let hi: [3]int = [0, 0, 0];
+    if model.bounds(m, &lo, &hi) {
+        out.pushStr("bounds x ");
+        out.pushInt(lo[0]);
+        out.pushStr("..");
+        out.pushInt(hi[0]);
+        out.pushStr("  y ");
+        out.pushInt(lo[1]);
+        out.pushStr("..");
+        out.pushInt(hi[1]);
+        out.pushStr("  z ");
+        out.pushInt(lo[2]);
+        out.pushStr("..");
+        out.pushInt(hi[2]);
+        out.push(10);
+    } else {
+        out.pushStr("empty\n");
+    }
+    // Voxels per color.
+    let counts = m.work[0..256];
+    for i in 0..256 { counts[i] = 0; }
+    for i in 0..m.sx * m.sy * m.sz { counts[int(m.cells[i])] += 1; }
+    let unused = 0;
+    for i in 1..=m.palLen {
+        if counts[i] == 0 {
+            unused += 1;
+            continue;
+        }
+        out.pushStr("  ");
+        out.push(glyph(i));
+        out.pushStr(" ");
+        out.pushInt(i);
+        out.pushStr("  #");
+        pushHex2(out, model.color(m, i, 0));
+        pushHex2(out, model.color(m, i, 1));
+        pushHex2(out, model.color(m, i, 2));
+        if m.names[i].len > 0 {
+            out.push(32);
+            out.pushStr(m.names[i]);
+        }
+        out.pushStr("  x");
+        out.pushInt(counts[i]);
+        out.push(10);
+    }
+    if unused > 0 {
+        out.pushStr("  (");
+        out.pushInt(unused);
+        out.pushStr(" palette colors unused; `palette` lists them)\n");
+    }
+}
+
+/// Layers as characters: `.` is air, 1-9 a-z A-Z the palette index (`#` above 61).
+/// y layers print top first, rows are z (front, +z, at the bottom), columns are x.
+fn dump(m: &Model, axis: int, only: int, out: &Text) {
+    let n = if axis == 0 { m.sx } else { if axis == 1 { m.sy } else { m.sz } };
+    let letters = ["x", "y", "z"];
+    let first = 0;
+    let last = n - 1;
+    if only >= 0 { first = only; last = only; }
+    if only >= n {
+        out.pushStr("error: layer ");
+        out.pushInt(only);
+        out.pushStr(" is past the model (0..");
+        out.pushInt(n - 1);
+        out.pushStr(")\n");
+        return;
+    }
+    let k = last;
+    while k >= first {
+        out.pushStr(letters[axis]);
+        out.push(61);
+        out.pushInt(k);
+        if axis == 1 { out.pushStr("  (columns x, rows z)"); }
+        else if axis == 0 { out.pushStr("  (columns z, rows y, top first)"); }
+        else { out.pushStr("  (columns x, rows y, top first)"); }
+        out.push(10);
+        if axis == 1 {
+            for z in 0..m.sz {
+                for x in 0..m.sx { out.push(glyph(model.get(m, x, k, z))); }
+                out.push(10);
+            }
+        } else {
+            let row = m.sy - 1;
+            while row >= 0 {
+                if axis == 0 {
+                    for z in 0..m.sz { out.push(glyph(model.get(m, k, row, z))); }
+                } else {
+                    for x in 0..m.sx { out.push(glyph(model.get(m, x, row, k))); }
+                }
+                out.push(10);
+                row -= 1;
+            }
+        }
+        k -= 1;
+    }
+}
+
+fn editing(name: string): bool {
+    return same(name, "set") || same(name, "erase") || same(name, "paint") || same(name, "box")
+        || same(name, "sphere") || same(name, "ellipsoid") || same(name, "cylinder") || same(name, "line")
+        || same(name, "fill") || same(name, "replace") || same(name, "shift") || same(name, "flip")
+        || same(name, "mirror") || same(name, "rotate") || same(name, "hollow") || same(name, "copy")
+        || same(name, "clear") || same(name, "size") || same(name, "crop") || same(name, "new")
+        || same(name, "import");
+}
+
+/// `NAME.j3voxel` when `path` is a bare name.
+pub fn fileName(path: string, mem: &Arena): string {
+    let dot = false;
+    for i in 0..path.len {
+        if path[i] == 46 { dot = true; }
+        if path[i] == 47 { dot = false; }
+    }
+    if dot { return path; }
+    let t = Text.new(mem);
+    t.pushStr(path);
+    t.pushStr(".j3voxel");
+    return t.str();
+}
+
+/// Read `count` whole numbers into `v`; `names` says what they are in the error.
+fn ints(a: &Args, v: &[10]int, count: int, names: string) {
+    for i in 0..count {
+        if a.i >= a.w.len {
+            problem3(a, "missing numbers: wants ", names, "");
+            return;
+        }
+        let one = 0;
+        if !parseI(a.w[a.i], &one) {
+            problem3(a, "expected whole numbers for ", names, "");
+            return;
+        }
+        v[i] = one;
+        a.i += 1;
+    }
+}
+
+/// Run one command. Output (results, then `error: ...` when it failed) goes to `out`.
+pub fn run(m: &Model, line: string, out: &Text): bool {
+    let mem = Arena.create(256 * 1024);
+    defer mem.destroy();
+    let w = words(trim(line), &mem);
+    if w.len == 0 { return true; }
+    let note = Text.new(&mem);
+    let a = Args { w: w, i: 1, out: &note, ok: true, mode: model.ADD, hollow: false };
+    let cmd = w[0];
+    let wasUndo = m.undoCount;
+    let edits = editing(cmd);
+    if edits { model.snapshot(m); }
+    flags(&a);
+    let n: [10]int = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let c = 0;
+    let f: f32 = 0;
+    let g: f32 = 0;
+    let h: f32 = 0;
+    let word = "";
+    let err = Text.new(&mem);
+    if same(cmd, "help") {
+        helpText(&note);
+    } else if same(cmd, "info") {
+        info(m, &note);
+    } else if same(cmd, "dump") {
+        n[0] = 1;
+        n[1] = -1;
+        if more(&a) {
+            if parseI(a.w[a.i], &n[1]) { a.i += 1; }
+            else { n[0] = axisOf(&a, nextWord(&a, "an axis")); }
+            if more(&a) { n[1] = nextInt(&a, "a layer"); }
+        }
+        if a.ok { dump(m, n[0], n[1], &note); }
+    } else if same(cmd, "new") {
+        ints(&a, &n, 3, "SX SY SZ");
+        extra(&a);
+        if a.ok {
+            m.sx = model.clampSide(n[0]);
+            m.sy = model.clampSide(n[1]);
+            m.sz = model.clampSide(n[2]);
+            model.clear(m);
+            note.pushStr("ok new ");
+            note.pushInt(m.sx);
+            note.push(32);
+            note.pushInt(m.sy);
+            note.push(32);
+            note.pushInt(m.sz);
+            note.push(10);
+        }
+    } else if same(cmd, "name") {
+        m.name = own(m.mem, nextWord(&a, "a name"));
+        model.touch(m);
+    } else if same(cmd, "size") {
+        ints(&a, &n, 3, "SX SY SZ");
+        extra(&a);
+        if a.ok { model.resize(m, n[0], n[1], n[2]); }
+    } else if same(cmd, "crop") {
+        if more(&a) { n[0] = nextInt(&a, "padding"); }
+        if a.ok && !model.crop(m, n[0]) { problem(&a, "nothing to crop: the model is empty"); }
+    } else if same(cmd, "clear") {
+        model.clear(m);
+    } else if same(cmd, "open") {
+        word = fileName(nextWord(&a, "a file"), &mem);
+        if a.ok {
+            if format.load(word, m, &err) {
+                note.pushStr("ok opened ");
+                note.pushStr(word);
+                note.push(10);
+            } else { problem(&a, err.str()); }
+        }
+    } else if same(cmd, "save") {
+        if more(&a) { word = fileName(nextWord(&a, "a file"), &mem); }
+        if a.ok && word.len == 0 { problem(&a, "save wants a file"); }
+        if a.ok {
+            if format.save(word, m, &err) {
+                note.pushStr("ok saved ");
+                note.pushStr(word);
+                note.push(10);
+            } else { problem(&a, err.str()); }
+        }
+    } else if same(cmd, "import") {
+        word = fileName(nextWord(&a, "a file"), &mem);
+        if more(&a) { ints(&a, &n, 3, "DX DY DZ"); }
+        extra(&a);
+        if a.ok {
+            let other = model.create(&mem, 1, 1, 1);
+            if format.load(word, &other, &err) {
+                n[3] = model.merge(m, &other, n[0], n[1], n[2]);
+                note.pushStr("ok imported ");
+                note.pushInt(n[3]);
+                note.pushStr(" voxels from ");
+                note.pushStr(word);
+                note.push(10);
+            } else { problem(&a, err.str()); }
+        }
+    } else if same(cmd, "export-mesh") {
+        word = nextWord(&a, "a file");
+        f = 0.1;
+        if more(&a) { f = nextFloat(&a, "scale"); }
+        if a.ok && f <= 0 { problem(&a, "scale must be above 0"); }
+        if a.ok {
+            if mesh.exportMesh(m, word, f, &err) {
+                note.pushStr("ok mesh ");
+                note.pushStr(word);
+                note.push(10);
+            } else { problem(&a, err.str()); }
+        }
+    } else if same(cmd, "set") || same(cmd, "paint") || same(cmd, "erase") {
+        ints(&a, &n, 3, "X Y Z");
+        if same(cmd, "erase") { a.mode = model.ERASE; }
+        if same(cmd, "paint") { a.mode = model.PAINT; }
+        c = needColor(m, &a);
+        extra(&a);
+        if a.ok { model.apply(m, n[0], n[1], n[2], a.mode, c); }
+    } else if same(cmd, "box") {
+        ints(&a, &n, 6, "X0 Y0 Z0 X1 Y1 Z1");
+        c = needColor(m, &a);
+        extra(&a);
+        if a.ok { model.box(m, n[0], n[1], n[2], n[3], n[4], n[5], a.mode, c, a.hollow); }
+    } else if same(cmd, "sphere") {
+        ints(&a, &n, 3, "CX CY CZ");
+        f = nextFloat(&a, "R");
+        c = needColor(m, &a);
+        extra(&a);
+        if a.ok { model.sphere(m, n[0], n[1], n[2], f, a.mode, c, a.hollow); }
+    } else if same(cmd, "ellipsoid") {
+        ints(&a, &n, 3, "CX CY CZ");
+        f = nextFloat(&a, "RX");
+        g = nextFloat(&a, "RY");
+        h = nextFloat(&a, "RZ");
+        c = needColor(m, &a);
+        extra(&a);
+        if a.ok { model.ellipsoid(m, n[0], n[1], n[2], f, g, h, a.mode, c, a.hollow); }
+    } else if same(cmd, "cylinder") {
+        ints(&a, &n, 3, "X Y Z");
+        f = nextFloat(&a, "R");
+        n[3] = nextInt(&a, "LEN");
+        n[4] = axisOf(&a, nextWord(&a, "an axis"));
+        c = needColor(m, &a);
+        extra(&a);
+        if a.ok { model.cylinder(m, n[0], n[1], n[2], f, n[3], n[4], a.mode, c, a.hollow); }
+    } else if same(cmd, "line") {
+        ints(&a, &n, 6, "X0 Y0 Z0 X1 Y1 Z1");
+        c = needColor(m, &a);
+        extra(&a);
+        if a.ok { model.line(m, n[0], n[1], n[2], n[3], n[4], n[5], a.mode, c); }
+    } else if same(cmd, "fill") {
+        ints(&a, &n, 3, "X Y Z");
+        c = colorOf(m, &a, nextWord(&a, "a color"));
+        n[3] = -1;
+        if more(&a) && same(a.w[a.i], "plane") {
+            a.i += 1;
+            n[3] = axisOf(&a, nextWord(&a, "an axis"));
+        }
+        extra(&a);
+        if a.ok {
+            if model.get(m, n[0], n[1], n[2]) == 0 { problem(&a, "fill starts on a voxel, but that cell is empty or outside the grid"); }
+            else {
+                n[4] = model.flood(m, n[0], n[1], n[2], c, n[3]);
+                note.pushStr("ok recolored ");
+                note.pushInt(n[4]);
+                note.pushStr(" voxels\n");
+            }
+        }
+    } else if same(cmd, "replace") {
+        n[0] = colorOf(m, &a, nextWord(&a, "a color to replace"));
+        n[1] = colorOf(m, &a, nextWord(&a, "the new color (or air)"));
+        extra(&a);
+        if a.ok {
+            n[2] = model.replace(m, n[0], n[1]);
+            note.pushStr("ok replaced ");
+            note.pushInt(n[2]);
+            note.pushStr(" voxels\n");
+        }
+    } else if same(cmd, "shift") {
+        ints(&a, &n, 3, "DX DY DZ");
+        extra(&a);
+        if a.ok { model.shift(m, n[0], n[1], n[2]); }
+    } else if same(cmd, "flip") {
+        n[0] = axisOf(&a, nextWord(&a, "an axis"));
+        extra(&a);
+        if a.ok { model.flip(m, n[0]); }
+    } else if same(cmd, "mirror") {
+        n[0] = axisOf(&a, nextWord(&a, "an axis"));
+        if more(&a) && same(nextWord(&a, "+"), "+") { n[1] = 1; }
+        extra(&a);
+        if a.ok { model.mirror(m, n[0], n[1] == 1); }
+    } else if same(cmd, "rotate") {
+        n[0] = axisOf(&a, nextWord(&a, "an axis"));
+        n[1] = 1;
+        if more(&a) { n[1] = nextInt(&a, "turns"); }
+        extra(&a);
+        if a.ok { model.rotate(m, n[0], n[1]); }
+    } else if same(cmd, "hollow") {
+        model.hollowAll(m);
+    } else if same(cmd, "copy") {
+        ints(&a, &n, 9, "X0 Y0 Z0 X1 Y1 Z1 DX DY DZ");
+        if more(&a) && same(nextWord(&a, "move"), "move") { n[9] = 1; }
+        extra(&a);
+        if a.ok { model.copyBox(m, n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9] == 1); }
+    } else if same(cmd, "sym") {
+        m.symX = false;
+        m.symY = false;
+        m.symZ = false;
+        while more(&a) {
+            word = nextWord(&a, "x, y, z, or off");
+            if same(word, "x") { m.symX = true; }
+            else if same(word, "y") { m.symY = true; }
+            else if same(word, "z") { m.symZ = true; }
+            else if !same(word, "off") { problem(&a, "sym takes x, y, z, or off"); }
+        }
+    } else if same(cmd, "undo") {
+        if !model.undo(m) { problem(&a, "nothing to undo"); }
+    } else if same(cmd, "redo") {
+        if !model.redo(m) { problem(&a, "nothing to redo"); }
+    } else if same(cmd, "color") {
+        n[0] = nextInt(&a, "INDEX");
+        word = nextWord(&a, "#rrggbb");
+        if a.ok && (n[0] < 1 || n[0] > 255) { problem(&a, "a palette index is 1 to 255"); }
+        if a.ok && !model.parseHex(word, &n[1], &n[2], &n[3]) { problem(&a, "a color is #rrggbb"); }
+        if a.ok {
+            model.setColor(m, n[0], n[1], n[2], n[3]);
+            if more(&a) { model.nameColor(m, n[0], nextWord(&a, "a name")); }
+        }
+    } else if same(cmd, "addcolor") {
+        word = nextWord(&a, "#rrggbb");
+        if a.ok && !model.parseHex(word, &n[1], &n[2], &n[3]) { problem(&a, "a color is #rrggbb"); }
+        if a.ok {
+            n[0] = model.addColor(m, n[1], n[2], n[3]);
+            if n[0] == 0 { problem(&a, "the palette is full (255 colors)"); }
+            else {
+                if more(&a) { model.nameColor(m, n[0], nextWord(&a, "a name")); }
+                note.pushStr("ok color ");
+                note.pushInt(n[0]);
+                note.push(10);
+            }
+        }
+    } else if same(cmd, "colorname") {
+        n[0] = nextInt(&a, "INDEX");
+        word = nextWord(&a, "a name");
+        if a.ok && (n[0] < 1 || n[0] > m.palLen) { problem(&a, "no such palette color"); }
+        if a.ok { model.nameColor(m, n[0], word); }
+    } else if same(cmd, "palette") {
+        if !more(&a) { list(m, &note); }
+        else {
+            word = nextWord(&a, "preset, load, save, or trim");
+            if same(word, "preset") {
+                word = nextWord(&a, "a preset name");
+                if a.ok && !model.loadPreset(m, word) { problem3(&a, "presets: ", model.presetNames(), ""); }
+            } else if same(word, "load") {
+                word = nextWord(&a, "a file");
+                if a.ok && !format.loadPalette(word, m, &err) { problem(&a, err.str()); }
+            } else if same(word, "save") {
+                word = nextWord(&a, "a file");
+                if a.ok && !format.savePalette(word, m, &err) { problem(&a, err.str()); }
+            } else if same(word, "trim") {
+                n[0] = model.trimPalette(m);
+                note.pushStr("ok dropped ");
+                note.pushInt(n[0]);
+                note.pushStr(" unused colors\n");
+            } else { problem(&a, "palette takes preset, load, save, or trim"); }
+        }
+    } else {
+        problem3(&a, "unknown command ", cmd, "; `help` lists them");
+    }
+    if !a.ok {
+        // A failed command leaves no undo step and no partial edit.
+        if edits && m.undoCount > wasUndo {
+            model.undo(m);
+            m.redoCount = 0;
+        }
+    } else if edits && a.mode == model.ADD && m.undoCount > wasUndo && drawing(cmd) && model.sameAsSnapshot(m) {
+        model.discardSnapshot(m);
+        note.pushStr("note: nothing changed; the shape may be outside the grid (x 0..");
+        note.pushInt(m.sx - 1);
+        note.pushStr(", y 0..");
+        note.pushInt(m.sy - 1);
+        note.pushStr(", z 0..");
+        note.pushInt(m.sz - 1);
+        note.pushStr(") or those voxels already had that color\n");
+    }
+    out.pushStr(note.str());
+    return a.ok;
+}
+
+fn drawing(cmd: string): bool {
+    return same(cmd, "set") || same(cmd, "box") || same(cmd, "sphere") || same(cmd, "ellipsoid")
+        || same(cmd, "cylinder") || same(cmd, "line");
+}
+
+/// Run commands separated by `;` or newlines; stop at the first error.
+pub fn runAll(m: &Model, text: string, out: &Text): bool {
+    let at = 0;
+    let n = 0;
+    while at <= text.len {
+        let end = at;
+        while end < text.len && text[end] != 59 && text[end] != 10 { end += 1; }
+        let one = trim(cut(text, at, end));
+        if one.len > 0 {
+            n += 1;
+            if !run(m, one, out) {
+                out.pushStr("stopped at command ");
+                out.pushInt(n);
+                out.pushStr(": ");
+                out.pushStr(one);
+                out.push(10);
+                return false;
+            }
+        }
+        at = end + 1;
+    }
+    return true;
+}

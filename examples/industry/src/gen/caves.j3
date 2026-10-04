@@ -1,0 +1,194 @@
+// Caves are a density field: every voxel asks `open` whether it is air, from 3D noise of its world position.
+// Chunks never need to know about each other, so seams and unlock order cannot matter.
+// Three layers: spaghetti tunnels (two noise surfaces crossing), cheese caverns (blobs of low noise),
+// and thin noodle links. Outer chunks also get sinkhole shafts from the surface.
+module industry.gen.caves;
+use j3.math;
+use j3.math.Vec3;
+use j3.gfx.voxel;
+use industry.data.block;
+use industry.gen.elevation;
+use industry.gen.noise3;
+use industry.gen.random;
+use industry.world;
+use industry.world.World;
+
+const FLOOR: int = 3;
+// Shaft columns end here, in the middle of the tunnel band.
+const SHAFT_BOTTOM: int = 46;
+const SHAFT_FLARE: int = 14;
+
+// How much of each ring is hollow: sparse near the start, dense at the rim.
+fn richness(ring: int): f32 {
+    let table: [5]f32 = [0.5, 0.5, 0.6, 0.75, 0.9];
+    return table[ring];
+}
+
+// The noise fields behind `open` are sampled on a lattice every STEP voxels and blended between, so a
+// chunk pass evaluates noise ~25x less than once per voxel. Lattice points sit on world multiples of STEP,
+// so neighbouring chunks agree on every shared point and seams cannot appear.
+const STEP: int = 4;
+const LAT: int = 13; // lattice points per chunk side: world.CHUNK / STEP + 1
+const FIELDS: int = 6;
+
+// `table` holds a chunk's lattice points; empty means every point is computed on demand.
+struct Lattice { seed: int; table: []f32; gx0: int; gz0: int; ny: int; }
+
+// Raw noise of field `f` at lattice point (gx, gy, gz): 0 blob, 1 and 3 tunnel surfaces, 2 tunnel swell,
+// 4 and 5 noodle surfaces.
+fn raw(seed: int, f: int, gx: int, gy: int, gz: int): f32 {
+    let x = f32(gx * STEP); let y = f32(gy * STEP); let z = f32(gz * STEP);
+    if f == 0 { return noise3.fbm2(seed + 4, x / 44, y / 24, z / 44, 0.4); }
+    if f == 1 { return noise3.sample(seed, x / 26, y / 22, z / 26); }
+    if f == 2 { return noise3.sample(seed + 3, x / 90, y / 60, z / 90); }
+    if f == 3 { return noise3.sample(seed + 1, x / 26, y / 22, z / 26); }
+    if f == 4 { return noise3.sample(seed + 5, x / 15, y / 12, z / 15); }
+    return noise3.sample(seed + 6, x / 15, y / 12, z / 15);
+}
+
+fn mix(a: f32, b: f32, t: f32): f32 { return a + (b - a) * t; }
+
+// Field `f` at voxel (x, y, z): trilinear blend of the 8 surrounding lattice points.
+fn field(l: &Lattice, f: int, x: int, y: int, z: int): f32 {
+    let gx = x / STEP; let gy = y / STEP; let gz = z / STEP;
+    let tx = f32(x % STEP) / f32(STEP); let ty = f32(y % STEP) / f32(STEP); let tz = f32(z % STEP) / f32(STEP);
+    if l.table.len == 0 {
+        let c = l.seed;
+        let x00 = mix(raw(c, f, gx, gy, gz), raw(c, f, gx + 1, gy, gz), tx);
+        let x10 = mix(raw(c, f, gx, gy, gz + 1), raw(c, f, gx + 1, gy, gz + 1), tx);
+        let x01 = mix(raw(c, f, gx, gy + 1, gz), raw(c, f, gx + 1, gy + 1, gz), tx);
+        let x11 = mix(raw(c, f, gx, gy + 1, gz + 1), raw(c, f, gx + 1, gy + 1, gz + 1), tx);
+        return mix(mix(x00, x10, tz), mix(x01, x11, tz), ty);
+    }
+    let i = ((f * l.ny + gy) * LAT + gz - l.gz0) * LAT + gx - l.gx0;
+    let t = l.table;
+    let c00 = mix(t[i], t[i + 1], tx);
+    let c10 = mix(t[i + LAT], t[i + LAT + 1], tx);
+    let c01 = mix(t[i + LAT * LAT], t[i + LAT * LAT + 1], tx);
+    let c11 = mix(t[i + LAT * LAT + LAT], t[i + LAT * LAT + LAT + 1], tx);
+    return mix(mix(c00, c10, tz), mix(c01, c11, tz), ty);
+}
+
+// Whether the voxel at (x, y, z) is cave air. `roof` is the highest cave voxel in that column.
+fn carve(l: &Lattice, x: int, y: int, z: int, roof: int, rich: f32): bool {
+    if y < FLOOR || y > roof { return false; }
+    // Caves close smoothly toward the roof and the floor instead of being cut flat.
+    let fade = math.clamp(f32(math.mini(roof - y, y - FLOOR)) / 8, 0, 1);
+    // Caverns: wide and low blobs, rarer toward the roof.
+    let blob = field(l, 0, x, y, z);
+    if blob > 0.45 + (1 - fade) * 0.6 + (1 - rich) * 0.5 { return true; }
+    // Tunnels: where two noise surfaces both pass near zero. The width swells and pinches with distance.
+    let a = field(l, 1, x, y, z);
+    if math.abs(a) < 0.14 {
+        let swell = 0.5 + 0.5 * field(l, 2, x, y, z);
+        let width = (0.065 + 0.05 * swell) * rich * fade;
+        if math.abs(a) < width && math.abs(field(l, 3, x, y, z)) < width { return true; }
+    }
+    // Noodles: thin and twisty, linking pockets the larger layers leave apart.
+    let thin = field(l, 4, x, y, z);
+    let limit = 0.05 * rich * fade;
+    return math.abs(thin) < limit && math.abs(field(l, 5, x, y, z)) < limit;
+}
+
+// One voxel on its own, with no cached lattice: the same answer `generate` carves.
+pub fn open(seed: int, x: int, y: int, z: int, roof: int): bool {
+    let spare: [1]f32 = [0.0];
+    let none = spare[0..0];
+    let l = Lattice { seed: seed, table: none, gx0: 0, gz0: 0, ny: 0 };
+    return carve(&l, x, y, z, roof, richness(elevation.ring(x / world.CHUNK, z / world.CHUNK)));
+}
+
+pub fn entrance(seed: int, cx: int, cz: int): bool {
+    if elevation.ring(cx, cz) != 4 { return false; }
+    let rng = random.at(seed, cx, 0, cz, 3);
+    return rng.intRange(0, 10) == 0;
+}
+
+// Surface center of the chunk's shaft. Kept well inside the chunk so the widest flare still fits.
+pub fn entranceAt(seed: int, cx: int, cz: int): Vec3 {
+    let rng = random.at(seed, cx, 1, cz, 9);
+    let x = cx * world.CHUNK + 17 + rng.intRange(0, 14);
+    let z = cz * world.CHUNK + 17 + rng.intRange(0, 14);
+    return Vec3.xyz(f32(x), f32(elevation.height(seed, x, z) + 1), f32(z));
+}
+
+// A wandering round shaft from the surface down to SHAFT_BOTTOM, flaring into a chamber at its foot.
+fn shaft(w: &World, cx: int, cz: int) {
+    let top = entranceAt(w.seed, cx, cz);
+    let px = int(top.x); let pz = int(top.z);
+    for y in SHAFT_BOTTOM..int(top.y) + 4 {
+        let fy = f32(y) / 16;
+        let ox = px + int(4 * noise3.sample(w.seed + 7, fy, 0.5, f32(cx)));
+        let oz = pz + int(4 * noise3.sample(w.seed + 8, fy, 0.5, f32(cz)));
+        let r = 3 + int(2 * (0.5 + 0.5 * noise3.sample(w.seed + 9, fy, 3.5, f32(cx + cz))));
+        let flare = SHAFT_BOTTOM + SHAFT_FLARE - y;
+        if flare > 0 { r += flare / 2; }
+        for z in oz - r..oz + r + 1 { for x in ox - r..ox + r + 1 {
+            let dx = x - ox; let dz = z - oz;
+            if dx * dx + dz * dz <= r * r { w.cells[voxel.index(x, y, z, world.SX, world.SZ)] = block.AIR; }
+        } }
+    }
+}
+
+// The sliced chunk pass: `prepare`, then `fill` for each lattice row, then `row` for each of the chunk's
+// 48 rows, then `shaftIfAny`. `terrain.step` runs them a few at a time.
+fn lattice(w: &World, cx: int, cz: int): Lattice {
+    let table = w.caveTable[0..FIELDS * w.caveNy * LAT * LAT];
+    return Lattice { seed: w.seed, table: table, gx0: cx * world.CHUNK / STEP, gz0: cz * world.CHUNK / STEP, ny: w.caveNy };
+}
+
+// Lattice rows of the chunk: up to one past the highest roof, so the blend never reads beyond the table.
+pub fn prepare(w: &World, cx: int, cz: int): int {
+    let top = 0;
+    for z in cz * world.CHUNK..(cz + 1) * world.CHUNK { for x in cx * world.CHUNK..(cx + 1) * world.CHUNK {
+        top = math.maxi(top, elevation.height(w.seed, x, z) - 6);
+    } }
+    w.caveNy = top / STEP + 2;
+    return w.caveNy;
+}
+
+// Noise for lattice row `gy` (all fields).
+pub fn fill(w: &World, cx: int, cz: int, gy: int) {
+    let l = lattice(w, cx, cz);
+    for f in 0..FIELDS { for gz in 0..LAT { for gx in 0..LAT {
+        l.table[((f * l.ny + gy) * LAT + gz) * LAT + gx] = raw(w.seed, f, l.gx0 + gx, gy, l.gz0 + gz);
+    } } }
+}
+
+// Carves the chunk's row `dz` (0..CHUNK) of columns.
+pub fn row(w: &World, cx: int, cz: int, dz: int) {
+    let l = lattice(w, cx, cz);
+    let rich = richness(elevation.ring(cx, cz));
+    let z = cz * world.CHUNK + dz;
+    for x in cx * world.CHUNK..(cx + 1) * world.CHUNK {
+        let roof = elevation.height(w.seed, x, z) - 6;
+        for y in FLOOR..roof + 1 {
+            if carve(&l, x, y, z, roof, rich) { w.cells[voxel.index(x, y, z, world.SX, world.SZ)] = block.AIR; }
+        }
+    }
+}
+
+pub fn shaftIfAny(w: &World, cx: int, cz: int) {
+    if entrance(w.seed, cx, cz) { shaft(w, cx, cz); }
+}
+
+// A spot to stand in the chunk's caves: air with four free cells above and solid below,
+// nearest the chunk center. Vec3.xyz(0, 0, 0) when the chunk has none.
+pub fn find(w: &World, cx: int, cz: int): Vec3 {
+    let best = Vec3.xyz(0, 0, 0);
+    let bestDistance = 1000000;
+    let mx = cx * world.CHUNK + world.CHUNK / 2; let mz = cz * world.CHUNK + world.CHUNK / 2;
+    for z in cz * world.CHUNK..(cz + 1) * world.CHUNK {
+        for x in cx * world.CHUNK..(cx + 1) * world.CHUNK {
+            let distance = (x - mx) * (x - mx) + (z - mz) * (z - mz);
+            if distance >= bestDistance { continue; }
+            for y in FLOOR + 1..world.GROUND - 8 {
+                if world.get(w, x, y - 1, z) == block.AIR { continue; }
+                let free = true;
+                for dy in 0..4 { if world.get(w, x, y + dy, z) != block.AIR { free = false; } }
+                if free { best = Vec3.xyz(f32(x), f32(y), f32(z)); bestDistance = distance; break; }
+            }
+        }
+    }
+    return best;
+}
