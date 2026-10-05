@@ -61,6 +61,7 @@ pub fn prepare(files: &mut [ParsedFile]) -> Result<(), CheckError> {
                             name: f.name.clone(),
                             ty: f.ty.clone(),
                             value: f.default.clone(),
+                            thread: false,
                         }));
                     }
                 }

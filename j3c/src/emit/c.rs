@@ -6,7 +6,7 @@ use crate::emit::c_expr::{self, CWriter};
 use crate::emit::c_ty::{self, c_type};
 use crate::ir::cx::IrCx;
 use crate::ir::entity::{ConstInit, FuncKind};
-use crate::ir::ids::StructId;
+use crate::ir::ids::{EnumId, StructId};
 use crate::ir::module::Module;
 use crate::ir::operand::{ConstKind, Operand};
 use crate::ir::ty::{Ty, TyKind};
@@ -45,8 +45,14 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
             let cname = c_ty::struct_c_name(cx, *id);
             out.push_str(&format!("typedef struct {cname} {cname};\n"));
         }
+        for id in &module.enums {
+            if !cx.enum_def(*id).is_c_like() {
+                let cname = c_ty::enum_c_name(cx, *id);
+                out.push_str(&format!("typedef struct {cname} {cname};\n"));
+            }
+        }
     }
-    if modules.iter().any(|m| !m.structs.is_empty()) {
+    if modules.iter().any(|m| !m.structs.is_empty() || !m.enums.is_empty()) {
         out.push('\n');
     }
 
@@ -61,31 +67,6 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
         }
     }
     emit_slice_typedefs(cx, &early_slices, &mut out)?;
-
-    for module in modules {
-        for id in &module.enums {
-            let def = cx.enum_def(*id);
-            if def.is_c_like() {
-                continue;
-            }
-            let cname = c_ty::enum_c_name(cx, *id);
-            out.push_str(&format!("typedef struct {cname} {{\n"));
-            out.push_str("    int32_t tag;\n");
-            out.push_str("    union {\n");
-            for (i, v) in def.variants.iter().enumerate() {
-                if let Some(pty) = v.payload {
-                    let ty = c_type(cx, pty)?;
-                    if ty.ends_with('*') {
-                        out.push_str(&format!("        {ty}v{i};\n"));
-                    } else {
-                        out.push_str(&format!("        {ty} v{i};\n"));
-                    }
-                }
-            }
-            out.push_str("    } u;\n");
-            out.push_str(&format!("}} {cname};\n\n"));
-        }
-    }
 
     let mut fn_tys = Vec::new();
     collect_fn_tys(cx, modules, &mut fn_tys);
@@ -115,15 +96,16 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
                 Some(v) => format!(" = {}", emit_const_init(cx, v)?),
                 None => String::new(),
             };
+            let st = if g.thread { "static _Thread_local" } else { "static" };
             if let Some((elem, len)) = c_ty::array_parts(cx, g.ty) {
                 let elem_c = c_type(cx, elem)?;
-                out.push_str(&format!("static {elem_c} {name}[{len}]{init};\n"));
+                out.push_str(&format!("{st} {elem_c} {name}[{len}]{init};\n"));
             } else {
                 let ty = c_type(cx, g.ty)?;
                 if ty.ends_with('*') {
-                    out.push_str(&format!("static {ty}{name}{init};\n"));
+                    out.push_str(&format!("{st} {ty}{name}{init};\n"));
                 } else {
-                    out.push_str(&format!("static {ty} {name}{init};\n"));
+                    out.push_str(&format!("{st} {ty} {name}{init};\n"));
                 }
             }
         }
@@ -335,69 +317,117 @@ fn static_f64(bits: u64) -> Result<String, String> {
     Err(format!("f64 static init did not round-trip: bits={bits}"))
 }
 
+/// A by-value type body: a struct or a tagged enum. C needs a body after the bodies it holds.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Body {
+    Struct(StructId),
+    Enum(EnumId),
+}
+
 fn emit_struct_bodies(cx: &IrCx, modules: &[Module], out: &mut String) -> Result<(), String> {
-    let mut ids = Vec::new();
+    let mut nodes = Vec::new();
     for module in modules {
         for id in &module.structs {
-            if !ids.contains(id) {
-                ids.push(*id);
+            let n = Body::Struct(*id);
+            if !nodes.contains(&n) {
+                nodes.push(n);
+            }
+        }
+        for id in &module.enums {
+            let n = Body::Enum(*id);
+            if !cx.enum_def(*id).is_c_like() && !nodes.contains(&n) {
+                nodes.push(n);
             }
         }
     }
     let mut ordered = Vec::new();
     let mut seen = HashSet::new();
-    for id in ids {
-        visit_struct(cx, id, &mut seen, &mut ordered);
+    for n in nodes {
+        visit_body(cx, n, &mut seen, &mut ordered);
     }
-    for id in ordered {
-        let def = cx.struct_def(id);
-        let packed = if def.packed {
-            " __attribute__((packed))"
-        } else {
-            ""
-        };
-        let cname = c_ty::struct_c_name(cx, id);
-        out.push_str(&format!("struct {cname} {{\n"));
-        for field in &def.fields {
-            let fname = c_ty::sanitize(cx.name_str(field.name));
-            if let Some((elem, len)) = c_ty::array_parts(cx, field.ty) {
-                let elem_c = c_type(cx, elem)?;
-                out.push_str(&format!("    {elem_c} {fname}[{len}];\n"));
-                continue;
-            }
-            let ty = c_type(cx, field.ty)?;
-            if ty.ends_with('*') {
-                out.push_str(&format!("    {ty}{fname};\n"));
-            } else {
-                out.push_str(&format!("    {ty} {fname};\n"));
-            }
+    for n in ordered {
+        match n {
+            Body::Struct(id) => emit_struct_body(cx, id, out)?,
+            Body::Enum(id) => emit_enum_body(cx, id, out)?,
         }
-        out.push_str(&format!("}}{packed};\n\n"));
     }
     Ok(())
 }
 
-fn visit_struct(
-    cx: &IrCx,
-    id: StructId,
-    seen: &mut HashSet<StructId>,
-    ordered: &mut Vec<StructId>,
-) {
-    if !seen.insert(id) {
-        return;
-    }
-    for field in &cx.struct_def(id).fields {
-        for dep in value_structs(cx, field.ty) {
-            visit_struct(cx, dep, seen, ordered);
+fn emit_struct_body(cx: &IrCx, id: StructId, out: &mut String) -> Result<(), String> {
+    let def = cx.struct_def(id);
+    let packed = if def.packed {
+        " __attribute__((packed))"
+    } else {
+        ""
+    };
+    let cname = c_ty::struct_c_name(cx, id);
+    out.push_str(&format!("struct {cname} {{\n"));
+    for field in &def.fields {
+        let fname = c_ty::sanitize(cx.name_str(field.name));
+        if let Some((elem, len)) = c_ty::array_parts(cx, field.ty) {
+            let elem_c = c_type(cx, elem)?;
+            out.push_str(&format!("    {elem_c} {fname}[{len}];\n"));
+            continue;
+        }
+        let ty = c_type(cx, field.ty)?;
+        if ty.ends_with('*') {
+            out.push_str(&format!("    {ty}{fname};\n"));
+        } else {
+            out.push_str(&format!("    {ty} {fname};\n"));
         }
     }
-    ordered.push(id);
+    out.push_str(&format!("}}{packed};\n\n"));
+    Ok(())
 }
 
-fn value_structs(cx: &IrCx, ty: Ty) -> Vec<StructId> {
+fn emit_enum_body(cx: &IrCx, id: EnumId, out: &mut String) -> Result<(), String> {
+    let def = cx.enum_def(id);
+    let cname = c_ty::enum_c_name(cx, id);
+    out.push_str(&format!("struct {cname} {{\n"));
+    out.push_str("    int32_t tag;\n");
+    out.push_str("    union {\n");
+    for (i, v) in def.variants.iter().enumerate() {
+        if let Some(pty) = v.payload {
+            let ty = c_type(cx, pty)?;
+            if ty.ends_with('*') {
+                out.push_str(&format!("        {ty}v{i};\n"));
+            } else {
+                out.push_str(&format!("        {ty} v{i};\n"));
+            }
+        }
+    }
+    out.push_str("    } u;\n");
+    out.push_str("};\n\n");
+    Ok(())
+}
+
+fn visit_body(cx: &IrCx, n: Body, seen: &mut HashSet<Body>, ordered: &mut Vec<Body>) {
+    if !seen.insert(n) {
+        return;
+    }
+    let held: Vec<Ty> = match n {
+        Body::Struct(id) => cx.struct_def(id).fields.iter().map(|f| f.ty).collect(),
+        Body::Enum(id) => cx
+            .enum_def(id)
+            .variants
+            .iter()
+            .filter_map(|v| v.payload)
+            .collect(),
+    };
+    for ty in held {
+        for dep in value_bodies(cx, ty) {
+            visit_body(cx, dep, seen, ordered);
+        }
+    }
+    ordered.push(n);
+}
+
+fn value_bodies(cx: &IrCx, ty: Ty) -> Vec<Body> {
     match cx.ty_kind(ty) {
-        TyKind::Struct(id) => vec![*id],
-        TyKind::Array { elem, .. } => value_structs(cx, *elem),
+        TyKind::Struct(id) => vec![Body::Struct(*id)],
+        TyKind::Enum(id) if !cx.enum_def(*id).is_c_like() => vec![Body::Enum(*id)],
+        TyKind::Array { elem, .. } => value_bodies(cx, *elem),
         _ => Vec::new(),
     }
 }

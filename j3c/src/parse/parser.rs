@@ -10,10 +10,11 @@ struct ItemAttrs {
     debug: bool,
     try_catch: Option<(Ident, Ident)>,
     singleton: bool,
+    thread: bool,
 }
 use crate::parse::error::ParseError;
 use crate::parse::syntax::{
-    is_j3ui_widget, ATTR_DEBUG, ATTR_SINGLETON, ATTR_TRY_CATCH, INTRINSIC_SCRIPT, INTRINSIC_SIZEOF,
+    is_j3ui_widget, ATTR_DEBUG, ATTR_SINGLETON, ATTR_THREAD, ATTR_TRY_CATCH, INTRINSIC_SCRIPT, INTRINSIC_SIZEOF,
     INTRINSIC_SLICE, INTRINSIC_SYSCALL, J3UI_END, J3UI_IF, J3UI_POP, SCRIPT_PROPS, SCRIPT_SHARED,
 };
 use crate::parse::token::{Token, TokenKind};
@@ -141,7 +142,7 @@ impl<'a> Parser<'a> {
                 if vis_pub {
                     return Err(self.err("`pub` on singleton `let` is not used"));
                 }
-                Ok(Item::Let(self.mod_let_item(doc)?))
+                Ok(Item::Let(self.mod_let_item(doc, attrs.thread)?))
             }
             TokenKind::If | TokenKind::While | TokenKind::For => {
                 self.forbid_doc(&doc)?;
@@ -178,7 +179,7 @@ impl<'a> Parser<'a> {
             TokenKind::Struct => Ok(Item::Struct(self.struct_item(vis_pub, false, doc)?)),
             TokenKind::Enum => Ok(Item::Enum(self.enum_item(
                 vis_pub,
-                ItemAttrs { debug: false, try_catch: None, singleton: false },
+                ItemAttrs { debug: false, try_catch: None, singleton: false, thread: false },
                 doc,
             )?)),
             TokenKind::Ident if !vis_pub && self.cur().text == SCRIPT_PROPS => {
@@ -281,6 +282,7 @@ impl<'a> Parser<'a> {
             debug: false,
             try_catch: None,
             singleton: false,
+            thread: false,
         };
         while self.cur().kind == TokenKind::Hash {
             let _ = self.bump();
@@ -301,6 +303,12 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     out.singleton = true;
+                }
+                ATTR_THREAD => {
+                    if self.cur().kind == TokenKind::LParen {
+                        return Err(ParseError::new(name.span, "`#[thread]` takes no arguments"));
+                    }
+                    out.thread = true;
                 }
                 ATTR_TRY_CATCH => {
                     self.expect(TokenKind::LParen, "expected `(` after `#[TryCatch`")?;
@@ -332,10 +340,13 @@ impl<'a> Parser<'a> {
         if attrs.singleton {
             return Err(self.err(&format!("`#[singleton]` cannot sit on `{what}`")));
         }
+        if attrs.thread {
+            return Err(self.err(&format!("`#[thread]` cannot sit on `{what}`")));
+        }
         Ok(())
     }
 
-    fn mod_let_item(&mut self, doc: String) -> Result<ModLetItem, ParseError> {
+    fn mod_let_item(&mut self, doc: String, thread: bool) -> Result<ModLetItem, ParseError> {
         let start = self.cur().span;
         self.expect(TokenKind::Let, "expected `let`")?;
         let name = self.ident()?;
@@ -354,6 +365,7 @@ impl<'a> Parser<'a> {
             name,
             ty,
             value,
+            thread,
         })
     }
 
@@ -1644,6 +1656,20 @@ impl<'a> Parser<'a> {
                         Ok(Expr {
                             span: join(start, self.prev_end(start)),
                             kind: ExprKind::Syscall { args },
+                        })
+                    }
+                    n if crate::ir::op::AtomicOp::from_name(n).is_some() => {
+                        let op = crate::ir::op::AtomicOp::from_name(n).unwrap();
+                        let args = self.args()?;
+                        if args.len() != op.values() + 1 {
+                            return Err(ParseError::new(
+                                name.span,
+                                format!("`@{}` takes a pointer and {} value(s)", op.name(), op.values()),
+                            ));
+                        }
+                        Ok(Expr {
+                            span: join(start, self.prev_end(start)),
+                            kind: ExprKind::Atomic { op, args },
                         })
                     }
                     INTRINSIC_SIZEOF => {

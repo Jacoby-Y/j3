@@ -9,6 +9,7 @@ Non-goals: no GC, borrow checker, traits, drop, capturing closures, or comptime 
 - **Language:** typed IR, LLVM (default) and C printers, `--fast`, `--release`. Short-circuit, if-expr arms, `defer`, `+=`, interpolation, wrapping ints, inclusive `..=`, default fields, `@j3ui`, scripts (`.j3s`, bytecode VM plus AOT).
 - **Tooling:** `j3c lsp` (hover, goto, completion, signature help, outline, import quick-fix, format, cross-buffer diagnostics), `j3c fmt`, `j3c doc`, `j3c size`, the scene editor and MCP server.
 - **Runtime checks:** every check names itself as `file:line: reason` and exits 102; `panic` exits 101. Debug builds on x86-64 Linux install a crash handler, symbolized by `j3c run`.
+- **Threads (Linux):** `j3.thread` (pool, queue, mutex), `#[thread]` globals, `@atomic*`. See Multithreading.
 - **Stdlib:** `App` stages, ECS, collide, space, physics (light: 2D AABB and a 3D voxel-stopping body, no contact solver), path, anim, input, assets, save, particles, camera rig, UI, `j3.gfx` (GL 3.3, one shadow map, 4 point lights, instancing), voxel grid, math, mesh formats, SDL audio with groups, fades, and positional channels, `scene3d`.
 
 ## Left
@@ -53,60 +54,36 @@ Not blockers; the games compile without any of this.
 
 ## Multithreading
 
-Goal: let a game move CPU-heavy work (world meshing, generation, pathfinding, asset decoding, baking) off the frame thread without the language growing a memory model. Keep it small: threads, locks, a queue. No async, no scheduler, no shared GC.
+Goal: let a game move CPU-heavy work (world meshing, generation, pathfinding, asset decoding, baking) off the frame thread without the language growing a memory model. Threads, locks, a queue, a pool. No async, no scheduler, no shared GC.
 
-### Starting point
+### Shipped (Linux)
 
-Threads already work with no compiler change. A J3 function passes as a `fn(ptr): ptr` to libc's `pthread_create` through `use lib "c"`, runs concurrently, and joins. What is missing is a safe, portable stdlib surface, and the answers to the questions below.
+`j3.thread` (`j3c doc threads` is the guide, `j3c doc recipes threads` a program, `speculative/13_threads.j3`, run on both backends): `spawn`/`join`, `Mutex`, `Cond`, `Queue<T>` (blocking and non-blocking), `Pool` (`submit`, non-blocking `trySubmit`, `pendingJobs`, `wait`, `parallelFor`, `shutdown`), `cores()`. A frame thread feeds the pool with `trySubmit` and drains a results `Queue` with `tryPop`, dropping results whose version stamp went stale; `j3c doc recipes threads` is that program. It is pthreads through `use lib "c"`; libc is always linked, so there is no raw `clone` path.
 
-What exists: `fn(T)` values (non-capturing), C FFI, `mmapAnon`, `@syscall`.
-What does not: atomics, a thread API, thread-safe stdlib guarantees, a Windows path.
+Language: `#[thread]` on a module `let` (one copy per thread; `thread_local` in LLVM, `_Thread_local` in C) and `@atomicLoad` / `@atomicStore` / `@atomicAdd` / `@atomicCas` on an `int` through a pointer (sequentially consistent). The VM rejects atomics; `#[thread]` is ignored there since scripts run on the owner thread only.
+
+Stdlib: `memory.SCRATCH`, `text.cstrScratch`, and `sys.THREAD_NAME` are `#[thread]`. A panic on a named thread prints `[name] ` first. Every thread gets a crash stack, so a stack overflow in a worker still reaches the crash handler (its trace has addresses but not the thread name).
 
 ### Rules of the model
 
-1. **Share by handing off.** A worker owns the buffers it was given; the owner reads results only after a completion signal. A queue and a semaphore are the only cross-thread ordering tool. Do not spin on a plain flag: LLVM may hoist the load.
+1. **Share by handing off.** A worker owns the buffers it was given; the owner reads results only after a completion signal. Everything written before `unlock`, `signal`, `push`, or an atomic store is visible after the matching `lock`, `wait`, `pop`, or atomic load, and nothing else is ordered. Do not spin on a plain flag.
 2. **Static functions only.** The thread entry is a plain `fn(ptr)`; its state arrives as one `ptr` to a struct the spawner owns. No capturing closures.
-3. **One arena per thread.** `Arena` is not shared. Workers allocate from their own arena or from buffers handed in. The main arena is never touched concurrently.
-4. **Platform calls stay on the owner thread.** GL, SDL, window, audio, and file dialogs are main-thread only. Workers compute; the main thread uploads and draws.
-5. **Races are the user's to avoid.** No compiler enforcement in v1. Byte-wise reads of data another thread is editing are tolerated only where a version stamp makes the result discardable.
+3. **One arena per thread.** `Arena` is not shared. `memory.scratch` is per thread; pool workers rewind it after each job.
+4. **Platform calls stay on the owner thread.** GL, SDL, window, audio, and file dialogs are main-thread only, as is all `j3.game`, `j3.gfx`, `j3.scene3d`, `j3.ui`, and `j3.app` state. Workers compute; the main thread uploads and draws.
+5. **Races are the user's to avoid.** No compiler enforcement. Byte-wise reads of data another thread is editing are tolerated only where a version stamp makes the result discardable.
+6. **Determinism.** Pool scheduling is nondeterministic. Anything that feeds saves, replays, or netcode reduces results in a fixed order (`parallelFor` writing `out[i]` does).
 
-### Stdlib: `j3.thread`
+### Left
 
-| Item | What |
-|---|---|
-| `spawn(f: fn(ptr), arg: ptr): Thread` | start a thread; `join(&t)` waits |
-| `Mutex` | `lock`, `unlock`, `tryLock` |
-| `Sem` | counting semaphore: `post`, `wait`, `tryWait` |
-| `Queue` | fixed-capacity ring of slots with a mutex and a semaphore; single or multiple producers; blocking `pop` for workers, non-blocking `tryPop` for the frame thread |
-| `Pool` | N workers draining one `Queue` of jobs (`fn(ptr)` plus a `ptr`); `submit`, `shutdown` |
-| `cores()` | logical core count, to size a pool |
-
-Per-OS files follow `sys` / `sys_windows` / `sys_macos`: pthreads on Linux and macOS, `CreateThread` and `SRWLOCK` on Windows. The Linux version is built first.
-
-### Phases
-
-1. **Primitives.** `Thread`, `Mutex`, `Sem` on Linux, with a test that hammers a shared counter under a mutex and a producer/consumer test. Check `--fast`, debug, and `--release` builds, and that the crash handler reports a fault from a worker.
-2. **Queue and Pool.** Job slots owned by the pool, so submitting never allocates. Document the hand-off rule with one complete recipe in `j3c doc recipes`.
-3. **Thread-safety audit of the stdlib.** Mark each module as pure, per-instance, or global. Known suspects are shared scratch buffers (for example the `text.cstr` buffer), lazily built tables, and `printLn`. Anything global gets a lock or a per-thread copy. Pure modules (`math`, `gfx.voxel`, `gfx.mesh` emit, `gfx.noise`, `gfx.canvas` on its own arena) are documented as safe on any thread.
-4. **Windows and macOS** variants, and `j3.toml` / `[emit]` target selection.
-5. **Debugging aids.** Thread names in crash traces and panics, and a `j3c run` note when a worker panics.
-6. **Scripts.** The `.j3s` VM stays single-threaded and runs on the owner thread. A script can request work through a native job queue, but never runs on a worker.
-
-### Patterns the library should make easy
-
-- **Producer/consumer with versioning.** Main thread dispatches `(job, version)`, a worker computes into its own buffer, main thread accepts the result only if the version is still current, then uploads. Used for chunked or sectioned meshing, generation, and baking.
-- **Fork/join over a range.** Split `0..n` across the pool and wait on a countdown semaphore.
-- **Background loading.** Decode images, audio, and models on a worker; main thread creates GPU and audio objects.
-
-### Risks and open questions
-
-- **No atomics.** Mutex and semaphore are enough for queues, but a counter read by the frame thread costs a lock. Decide whether to add `@atomic_load`, `@atomic_store`, and `@atomic_add` intrinsics to the LLVM printer (cheap there; the C and VM backends need matching forms).
-- **Memory ordering.** State the guarantee: everything written before `post` or `unlock` is visible after the matching `wait` or `lock`, and nothing else.
-- **Allocation cost.** Per-thread arenas need a reset story so a worker's scratch is reused, not remapped, per job.
-- **Hot reload.** `j3c run` swaps script code into a running game. Workers must be quiescent at the swap, or scripts must never be called from them.
-- **Determinism.** Pool scheduling is nondeterministic. Anything that feeds saves, replays, or netcode must reduce results in a fixed order.
-- **Older libc.** Before glibc 2.34 pthreads live in `libpthread`; link it when the target is older.
+- **Stdlib audit.** Done by reading module globals and imports: the safe-on-a-worker list, the main-thread-only modules, and the pure `gfx` functions (`emitFace`, `emitFaceAo`, `boxInClip`, `rayAabb`, `plainSurface`, `fxWidth`) are in `j3c doc threads` and each module's header. Not done: `printLn` is two `write`s, so lines from two threads can interleave; `gfx` methods on structs were not audited.
+- **Windows and macOS:** `CreateThread` and `SRWLOCK` / pthreads variants selected like `sys` (`thread_windows.j3`).
+- **Scripts:** the `.j3s` VM stays single-threaded. A script requesting work through a native job queue is not built.
+- **Hot reload:** `j3c run` swaps script code into a running game. Safe today because scripts never run on workers; keep it that way.
+- **Crash traces** do not name the thread (panics do).
+- **Older libc:** before glibc 2.34 pthreads live in `libpthread`; link it when the target is older.
+- **Atomics** are `int` only and have no relaxed or acquire/release forms.
+- **Job priority and cancel.** There is neither; `j3c doc threads` documents the workaround (few jobs in flight, urgent ones first; a per-job `@atomicStore` flag for cancel). Add a real cancel only if a game needs one.
 
 ### Out of scope
 
-`async`/`await`, green threads, work stealing, thread-local storage, data-parallel kernels, a race detector in the compiler. Revisit only after a game needs one.
+`async`/`await`, green threads, work stealing, data-parallel kernels, a race detector in the compiler. Revisit only after a game needs one.

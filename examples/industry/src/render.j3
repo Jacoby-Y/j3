@@ -4,23 +4,26 @@ module industry.render;
 use j3.gfx;
 use j3.game;
 use industry.terrain_mesh;
-use industry.terrain_mesh.Region;
+use industry.mesh_job;
+use industry.mesh_job.Job;
+use industry.mesher;
 use industry.terrain_lod;
 use j3.gfx.Mesh;
 use j3.math;
 use j3.sys;
-use j3.io.printLn;
 use industry.render_cache.TerrainCache;
 use j3.gfx.voxel;
 use j3.gfx.voxel.Hit;
 use j3.math.{ Mat4, Vec3 };
 use industry.data.block;
 use industry.data.defs;
+use industry.data.content;
+use industry.chunks;
 use industry.placement.Plan;
 use industry.world;
 use industry.world.World;
 use industry.mining;
-use industry.mining.Progress;
+use industry.mining.{ Progress, Target };
 use industry.models;
 use industry.models.Models;
 use industry.machine.dispatch;
@@ -29,92 +32,105 @@ use industry.visibility;
 // Height of the translucent wall at a locked chunk edge, in one-voxel bands.
 const BARRIER_BANDS: int = 28;
 
-// Rebuilds dirty chunks until `budgetUs` microseconds are spent (0 means no limit), so a new chunk
-// fills in over several frames instead of one long stall. At least one section is always rebuilt.
-pub fn rebuild(w: &World, budgetUs: int) {
+// Upload time per frame; at least one finished mesh is always taken.
+const UPLOAD_BUDGET_US: int = 2000;
+
+// Per frame: takes finished section meshes from the workers, starts jobs for the dirty sections nearest
+// `eye` (in cells), and rebuilds the shadow mesh of chunks whose sections have all settled.
+pub fn rebuild(w: &World, eye: Vec3) {
+    if !mesher.ready() { rebuildNow(w); return; }
     let begin = game.micros();
+    while true {
+        let slot = mesher.collect();
+        if slot < 0 { break; }
+        let j = mesher.job(slot);
+        w.sectionBusy[j.section] = 0;
+        if j.version == w.sectionVersion[j.section] { apply(w, j); }
+        mesher.release(slot);
+        if game.micros() - begin >= UPLOAD_BUDGET_US { break; }
+    }
+    while true {
+        let section = nearestDirty(w, eye);
+        if section < 0 || !mesher.dispatch(w, section) { break; }
+    }
+    w.dirty = rebuildShadows(w);
+}
+
+// Everything dirty, on this thread, before returning: for startup and tools.
+pub fn rebuildNow(w: &World) {
+    let j = mesh_job.create(0, 0, 0, world.SECTION_X, world.SECTION_Y, world.SECTION_X);
+    for section in 0..world.SECTION_COUNT {
+        if w.sectionDirty[section] == 0 || w.unlocked[world.sectionChunk(section)] == 0 { continue; }
+        mesher.load(&j, w, section);
+        terrain_mesh.build(&j);
+        apply(w, &j);
+    }
+    mesh_job.destroy(&j);
+    w.dirty = rebuildShadows(w);
+}
+
+// The dirty section closest to `eye` that no job is building, or -1.
+fn nearestDirty(w: &World, eye: Vec3): int {
+    let best = -1; let bestDistance: f32 = 0;
+    for section in 0..world.SECTION_COUNT {
+        if w.sectionDirty[section] == 0 || w.sectionBusy[section] != 0 { continue; }
+        if w.unlocked[world.sectionChunk(section)] == 0 { continue; }
+        let r = mesher.sectionRegion(section);
+        let dx = f32(r.x0 + world.SECTION_X / 2) - eye.x;
+        let dy = f32(r.y0 + world.SECTION_Y / 2) - eye.y;
+        let dz = f32(r.z0 + world.SECTION_X / 2) - eye.z;
+        let distance = dx * dx + dy * dy + dz * dz;
+        if best < 0 || distance < bestDistance { best = section; bestDistance = distance; }
+    }
+    return best;
+}
+
+// True while some chunk still waits for its sections.
+fn rebuildShadows(w: &World): bool {
     let pending = false;
     for cz in 0..world.CHUNKS { for cx in 0..world.CHUNKS {
         let chunk = cx + cz * world.CHUNKS;
         if w.unlocked[chunk] == 0 || w.chunkDirty[chunk] == 0 { continue; }
-        if !rebuildChunk(w, cx, cz, begin, budgetUs) { pending = true; }
+        if !settled(w, cx, cz) { pending = true; continue; }
+        rebuildShadowChunk(w, cx, cz);
+        w.chunkDirty[chunk] = 0;
     } }
-    w.dirty = pending;
-    // TEMP timing
-    if game.micros() - begin > 8000 { printLn(`[time] rebuild frame: {game.micros() - begin}us, pending {pending}`); }
+    return pending;
 }
 
-fn spent(begin: int, budgetUs: int): bool { return budgetUs > 0 && game.micros() - begin >= budgetUs; }
-
-// True when the chunk is fully rebuilt; false when the budget ran out first.
-fn rebuildChunk(w: &World, cx: int, cz: int, begin: int, budgetUs: int): bool {
+// No section of the chunk is dirty or being built.
+fn settled(w: &World, cx: int, cz: int): bool {
     for sy in 0..world.SECTIONS_Y { for dz in 0..world.SECTIONS_PER_CHUNK { for dx in 0..world.SECTIONS_PER_CHUNK {
         let section = world.sectionIndex(cx * world.SECTIONS_PER_CHUNK + dx, sy, cz * world.SECTIONS_PER_CHUNK + dz);
-        if w.sectionDirty[section] == 0 { continue; }
-        if spent(begin, budgetUs) { return false; }
-        rebuildSection(w, section);
+        if w.sectionDirty[section] != 0 || w.sectionBusy[section] != 0 { return false; }
     } } }
-    if spent(begin, budgetUs) { return false; }
-    let ts = game.micros();
-    rebuildShadowChunk(w, cx, cz);
-    // TEMP timing
-    printLn(`[time] shadow chunk {cx},{cz}: {game.micros() - ts}us`);
-    w.chunkDirty[cx + cz * world.CHUNKS] = 0;
     return true;
 }
 
-pub fn sectionRegion(section: int): Region {
-    let x = section % world.SECTIONS_X * world.SECTION_X;
-    let y = section / (world.SECTIONS_X * world.SECTIONS_X) * world.SECTION_Y;
-    let z = (section / world.SECTIONS_X) % world.SECTIONS_X * world.SECTION_X;
-    return Region { x0: x, y0: y, z0: z, x1: x + world.SECTION_X,
-        y1: math.mini(y + world.SECTION_Y, world.SY), z1: z + world.SECTION_X };
-}
-
-fn rebuildSection(w: &World, section: int) {
+// Replaces a section's meshes with a finished job's.
+fn apply(w: &World, j: &Job) {
+    let section = j.section;
     if w.sectionMeshes[section].count > 0 { gfx.free(&w.sectionMeshes[section]); }
     if w.sectionLodMeshes[section].count > 0 { gfx.free(&w.sectionLodMeshes[section]); }
     w.sectionMeshes[section] = Mesh {}; w.sectionLodMeshes[section] = Mesh {};
-    storeSection(w, section, 0);
-    let region = sectionRegion(section);
-    let t0 = game.micros();
-    let count = terrain_mesh.detailedRegion(w, region);
-    let t1 = game.micros(); let t2 = t1; let t3 = t1; let t4 = t1;
-    if count > 0 {
-        let lx = w.scratch[0]; let ly = w.scratch[1]; let lz = w.scratch[2];
-        let hx = lx; let hy = ly; let hz = lz;
-        for vertex in 0..count / 10 {
-            let at = vertex * 10;
-            lx = math.min(lx, w.scratch[at]); hx = math.max(hx, w.scratch[at]);
-            ly = math.min(ly, w.scratch[at + 1]); hy = math.max(hy, w.scratch[at + 1]);
-            lz = math.min(lz, w.scratch[at + 2]); hz = math.max(hz, w.scratch[at + 2]);
-        }
-        w.sectionMin[section] = Vec3.xyz(lx, ly, lz);
-        w.sectionMax[section] = Vec3.xyz(hx, hy, hz);
-        w.sectionMeshes[section] = gfx.upload(w.scratch[0..count]);
-        t2 = game.micros();
-        let merged = terrain_mesh.mergedRegion(w, region);
-        t3 = game.micros();
-        if merged > 0 {
-            w.sectionLodMeshes[section] = gfx.upload(w.scratch[0..merged]);
-            storeSection(w, section, merged);
-        }
-        t4 = game.micros();
+    if j.count > 0 {
+        w.sectionMin[section] = j.lo; w.sectionMax[section] = j.hi;
+        w.sectionMeshes[section] = gfx.upload(j.out[0..j.count]);
+        if j.lodCount > 0 { w.sectionLodMeshes[section] = gfx.upload(j.lod[0..j.lodCount]); }
     }
-    // TEMP timing: remove once the lag is found.
-    if t4 - t0 > 2000 { printLn(`[time] section {section}: detail {t1 - t0}us, bounds+upload {t2 - t1}us, merged {t3 - t2}us, lod upload+store {t4 - t3}us`); }
-    trackSection(w, section, count > 0);
+    storeSection(w, section, j.lod, j.lodCount);
+    trackSection(w, section, j.count > 0);
     w.sectionDirty[section] = 0;
 }
 
 // Owned merged CPU data is replaced and unmapped on edits, never allocated during drawing.
-pub fn storeSection(w: &World, section: int, count: int) {
+pub fn storeSection(w: &World, section: int, vertices: []f32, count: int) {
     if w.sectionCpu[section].vertices.len > 0 { sys.munmap(w.sectionCpu[section].address, w.sectionCpu[section].vertices.len * 4); }
     w.sectionCpu[section].vertices = w.scratch[0..0];
     if count == 0 { return; }
-    let address = sys.mmapAnon(count * 4); let vertices: []f32 = @slice(address, count);
-    for component in 0..count { vertices[component] = w.scratch[component]; }
-    w.sectionCpu[section] = TerrainCache { vertices: vertices, address: address };
+    let address = sys.mmapAnon(count * 4); let kept: []f32 = @slice(address, count);
+    for component in 0..count { kept[component] = vertices[component]; }
+    w.sectionCpu[section] = TerrainCache { vertices: kept, address: address };
 }
 
 // Concatenate retained merged section vertices: no full-chunk remeshing on edits.
@@ -199,7 +215,7 @@ pub fn makeBarrier(w: &World): Mesh {
     return gfx.upload(w.scratch[0..at]);
 }
 
-pub fn boundaries(w: &World, mesh: Mesh) {
+pub fn boundaries(w: &World, assets: &Models, mesh: Mesh) {
     for cz in 0..world.CHUNKS {
         for cx in 0..world.CHUNKS {
             if w.unlocked[cx + cz * world.CHUNKS] == 0 { continue; }
@@ -212,6 +228,15 @@ pub fn boundaries(w: &World, mesh: Mesh) {
                 if side == 2 { rotation = 1.5707963; nx = x; nz = z - 1; }
                 if side == 3 { rotation = 1.5707963; pz += world.CHUNK; nx = x; nz = pz; }
                 if world.active(w, nx, nz) { continue; }
+                let lockTarget = chunks.lockSide(w, cx, cz, side);
+                if lockTarget >= 0 {
+                    let lock = content.M_LOCK;
+                    if w.coins >= chunks.cost(w, lockTarget % world.CHUNKS, lockTarget / world.CHUNKS) { lock = content.M_LOCK_GOLD; }
+                    // The lock's flat face points along the wall's normal.
+                    gfx.draw(assets.mesh[lock], Mat4.translate(chunks.lockX(cx, side) * world.VOXEL, f32(chunks.lockY(w, cx, cz, side)) * world.VOXEL,
+                        chunks.lockZ(cz, side) * world.VOXEL).mul(Mat4.rotate(Vec3.xyz(0, 1, 0), 1.5707963 * f32(1 - side / 2)))
+                        .mul(Mat4.scale(world.VOXEL * 0.75, world.VOXEL * 0.75, world.VOXEL * 0.75)));
+                }
                 let base = Mat4.translate(f32(px) * world.VOXEL, f32(world.GROUND) * world.VOXEL,
                     f32(pz) * world.VOXEL).mul(Mat4.rotate(Vec3.xyz(0, 1, 0), rotation));
                 let wall = base.mul(Mat4.scale(world.VOXEL, f32(BARRIER_BANDS) * world.VOXEL, f32(world.CHUNK) * world.VOXEL));
@@ -247,8 +272,12 @@ pub fn makeMiningShade(w: &World): Mesh {
     return gfx.upload(w.scratch[0..at]);
 }
 
-pub fn miningFeedback(w: &World, assets: &Models, shade: &Mesh, p: &Progress, seconds: f32) {
-    let progress = mining.fraction(p);
+pub fn miningFeedback(w: &World, assets: &Models, shade: &Mesh, all: &Progress, seconds: f32) {
+    for i in 0..mining.SLOTS { miningTarget(w, assets, shade, &all.targets[i], seconds); }
+}
+
+fn miningTarget(w: &World, assets: &Models, shade: &Mesh, p: &Target, seconds: f32) {
+    let progress = mining.fractionOf(p);
     if progress <= 0 || world.get(w, p.x, p.y, p.z) != p.kind { return; }
     let brightness = 1 - (0.06 + progress * 0.16);
     gfx.material(Vec3.xyz(brightness, brightness, brightness), Vec3.xyz(0, 0, 0));
@@ -262,7 +291,12 @@ pub fn miningFeedback(w: &World, assets: &Models, shade: &Mesh, p: &Progress, se
     } else if block.isNode(p.kind) {
         let ore = defs.oreInfo(defs.oreOfNode(p.kind));
         let mesh = assets.mesh[ore.nodeModel];
-        gfx.draw(mesh, models.transform(p.x / world.FOOTPRINT * world.FOOTPRINT, p.y / world.FOOTPRINT * world.FOOTPRINT, p.z / world.FOOTPRINT * world.FOOTPRINT, 0));
+        // Nodes may sit off the 2-cell grid: the origin is the low corner of the 2x2x2 block of this kind.
+        let ox = p.x; let oy = p.y; let oz = p.z;
+        if world.get(w, ox - 1, oy, oz) == p.kind { ox -= 1; }
+        if world.get(w, ox, oy - 1, oz) == p.kind { oy -= 1; }
+        if world.get(w, ox, oy, oz - 1) == p.kind { oz -= 1; }
+        gfx.draw(mesh, models.transform(ox, oy, oz, 0));
     } else {
         let color = block.tint(p.kind, p.x, p.y, p.z);
         let at = 0;

@@ -177,6 +177,7 @@ Learn J3 from `j3c` only: `j3c guide`, `j3c doc`, `j3c help`. Do not search the 
 
 - Start from the task: `j3c doc` lists recipes and modules by what you're building; `j3c doc recipes <name>` prints a whole program that checks.
 - Find a name: `j3c doc search <word>`, or `j3c doc <name>`. A module on one screen: `j3c doc <module> --short`.
+- Heavy work off the frame thread (meshing, generation, decoding): `j3c doc recipes threads`, then `j3c doc threads`. Window, GL, SDL, and `j3.gfx`/`j3.game`/`j3.scene3d` state are main-thread only; workers compute and hand results back.
 - Check your work: `j3c check`, then `j3c run --frames 120 --screenshot shot.png --headless` and look at the picture (`j3c doc recipes check`).
 - 3D scenes and the editor: `j3c doc recipes scene3d`, `j3c doc editor`. `j3c editor` on this project adds the scene-tool guide here.
 

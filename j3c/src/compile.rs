@@ -1021,6 +1021,24 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&run.stdout), "bye\n");
     }
 
+    /// The `threads` recipe is a real program: it must give one answer on LLVM and on C.
+    #[test]
+    fn threads_recipe_runs_on_both_backends() {
+        let r = crate::helptext::recipes().into_iter().find(|r| r.name == "threads").unwrap();
+        let src = &r.files.iter().find(|(p, _)| p.ends_with(".j3")).unwrap().1;
+        let path = std::env::temp_dir().join(format!("j3-recipe-threads-{}.j3", std::process::id()));
+        std::fs::write(&path, src).unwrap();
+        let prog = compile_path(&path).expect("recipe compiles");
+        let _ = std::fs::remove_file(&path);
+        for backend in [emit::Backend::Llvm, emit::Backend::C] {
+            let mut opts = emit::EmitOpts::default();
+            opts.backend = backend;
+            let run = emit::run_program(&prog.cx, &prog.modules, &opts).expect("run");
+            assert_eq!(run.status, 0, "stderr {}", String::from_utf8_lossy(&run.stderr));
+            assert_eq!(String::from_utf8_lossy(&run.stdout), "accepted=8 stale=1 total=262131\n");
+        }
+    }
+
     #[test]
     fn both_backends_run_01_through_08() {
         let cases: &[(&str, bool, &str)] = &[
@@ -1048,6 +1066,11 @@ mod tests {
             ("06_enums_errors.j3", false, "north\nhit 2\nmissing\n"),
             ("07_memory.j3", false, "entities=1 hits=1\n"),
             ("08_game_loop.j3", true, "bye\n"),
+            (
+                "13_threads.j3",
+                false,
+                "locked=40000 atomic=40000 main seen=0\nqueue sum=5050\nsquares total=332833500\ntrySubmit first=true second=false pending=2 ran=2 after=0\n",
+            ),
         ];
 
         for &(name, headless, expected) in cases {
@@ -1092,6 +1115,23 @@ mod tests {
                 String::from_utf8_lossy(&c_run.stderr)
             );
         }
+    }
+
+    #[test]
+    fn thread_attr_and_atomics_are_checked() {
+        let err = compile_src("thread_fn", "module t;\n#[thread]\nfn main() {}\n").err().expect("must fail");
+        assert!(err.contains("#[thread]"), "{err}");
+        let err = compile_src("thread_plain_let", "module t;\n#[thread]\nlet x: int = 0;\nfn main() {}\n")
+            .err().expect("must fail");
+        assert!(err.contains("singleton"), "{err}");
+        let err = compile_src("atomic_arity", "module t;\nfn main() { let x = 0; @atomicAdd(&x); }\n")
+            .err().expect("must fail");
+        assert!(err.contains("atomicAdd"), "{err}");
+        let ok = compile_src(
+            "atomic_ok",
+            "module t;\nfn main() { let x = 0; @atomicAdd(&x, 1); let b = @atomicCas(&x, 1, 2); }\n",
+        );
+        assert!(ok.is_ok(), "{:?}", ok.err());
     }
 
     #[test]

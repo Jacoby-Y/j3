@@ -1025,6 +1025,7 @@ impl<'a> Lower<'a> {
                 args,
             } => self.call(expr.span, func, type_args, args, expected),
             ExprKind::Syscall { args } => self.syscall(expr.span, args),
+            ExprKind::Atomic { op, args } => self.atomic(expr.span, *op, args),
             ExprKind::Cast { expr: inner, ty } => {
                 let to = self.resolve_ty(ty)?;
                 let from = self.operand(inner, None)?;
@@ -1542,6 +1543,25 @@ impl<'a> Lower<'a> {
             rest.push(self.operand(a, None)?);
         }
         Ok(Rvalue::syscall(span, int_ty, nr, rest))
+    }
+
+    fn atomic(
+        &mut self,
+        span: Span,
+        op: crate::ir::op::AtomicOp,
+        args: &[Expr],
+    ) -> Result<Rvalue, CheckError> {
+        let int_ty = self.cx.common.int;
+        let mut ops = vec![self.operand(&args[0], None)?];
+        for a in &args[1..] {
+            ops.push(self.operand(a, Some(int_ty))?);
+        }
+        let ty = if op == crate::ir::op::AtomicOp::Cas {
+            self.cx.common.bool
+        } else {
+            int_ty
+        };
+        Ok(Rvalue::atomic(span, ty, op, ops))
     }
 
     fn place(&mut self, expr: &Expr) -> Result<Place, CheckError> {

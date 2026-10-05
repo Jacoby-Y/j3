@@ -52,6 +52,8 @@ pub struct ModLetItem {
     pub name: Ident,
     pub ty: Type,
     pub value: Option<Expr>,
+    /// `#[thread]`: one copy per thread.
+    pub thread: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -352,6 +354,11 @@ pub enum ExprKind {
         args: Vec<Expr>,
     },
     Syscall {
+        args: Vec<Expr>,
+    },
+    /// `@atomicLoad(p)`, `@atomicStore(p, v)`, `@atomicAdd(p, v)`, `@atomicCas(p, old, new)`.
+    Atomic {
+        op: crate::ir::op::AtomicOp,
         args: Vec<Expr>,
     },
     /// The type of a project-local `.j3s` file.

@@ -80,6 +80,8 @@ Write each screen as its own `@j3ui` component so `draw` stays a short list of c
 
 `begin` opens a downward column (width 220, row height 28). Inside `@j3ui`, a bare widget name is a method on the first parameter. `panel`, `row`, `scroll`, and `card` close themselves. `button` runs its body on the click. `buttonOff` never clicks. Set `ui.theme` after `begin` (`Theme.dusk`, `Theme.yard`, or a few colors of your own). Place `x` and `y` from `windowSize` so a panel stays put when the window changes. Two widgets with the same caption need `pushId` / `popId`.
 
+Structure screens (controls, inventory, storage): the player inventory stays on the left and a panel the same size as the build menu replaces the build menu on the right (`src/inventory_ui.j3`). Do not invent another layout.
+
 ## Fonts
 
 `Ui.begin` takes a font. Load a `.ttf` that lives in the project (`assets/font.ttf`).

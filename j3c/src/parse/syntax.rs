@@ -11,11 +11,13 @@ use crate::parse::token::{TokenKind, BOOL_LITS, KEYWORDS};
 pub const ATTR_DEBUG: &str = "Debug";
 pub const ATTR_SINGLETON: &str = "singleton";
 pub const ATTR_TRY_CATCH: &str = "TryCatch";
-pub const ATTRIBUTES: &[&str] = &[ATTR_DEBUG, ATTR_SINGLETON, ATTR_TRY_CATCH];
+pub const ATTR_THREAD: &str = "thread";
+pub const ATTRIBUTES: &[&str] = &[ATTR_DEBUG, ATTR_SINGLETON, ATTR_TRY_CATCH, ATTR_THREAD];
 
 pub const INTRINSIC_SYSCALL: &str = "syscall";
 pub const INTRINSIC_SIZEOF: &str = "sizeof";
 pub const INTRINSIC_SLICE: &str = "slice";
+pub const INTRINSIC_ATOMICS: &[&str] = &["atomicLoad", "atomicStore", "atomicAdd", "atomicCas"];
 pub const INTRINSIC_J3UI: &str = "j3ui";
 pub const INTRINSIC_SCRIPT: &str = "script";
 pub const SCRIPT_PROPS: &str = "props";
@@ -26,6 +28,10 @@ pub const INTRINSICS: &[&str] = &[
     INTRINSIC_SLICE,
     INTRINSIC_J3UI,
     INTRINSIC_SCRIPT,
+    "atomicLoad",
+    "atomicStore",
+    "atomicAdd",
+    "atomicCas",
 ];
 
 /// `@j3ui` widgets whose body is the call, then `end`.

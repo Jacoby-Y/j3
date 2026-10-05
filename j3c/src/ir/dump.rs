@@ -318,6 +318,16 @@ fn dump_rvalue(cx: &IrCx, body: &Body, rvalue: &Rvalue, out: &mut String) {
             }
             out.push(')');
         }
+        RvalueKind::Atomic { op, args } => {
+            out.push_str(&format!("@{}(", op.name()));
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_operand(cx, body, arg, out);
+            }
+            out.push(')');
+        }
         RvalueKind::Aggregate { fields } => {
             dump_ty(cx, rvalue.ty, out);
             out.push_str(" { ");

@@ -1493,6 +1493,11 @@ fn peek_ty(
             }
         }
         ExprKind::Syscall { .. } => Ok(cx.common.int),
+        ExprKind::Atomic { op, .. } => Ok(if *op == crate::ir::op::AtomicOp::Cas {
+            cx.common.bool
+        } else {
+            cx.common.int
+        }),
         ExprKind::SizeOf(_) => Ok(cx.common.int),
         ExprKind::SliceFrom { .. } => Err(CheckError::new(
             path,
@@ -1725,6 +1730,7 @@ fn collect_globals(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Result<(), 
             ty,
             span: l.span,
             init,
+            thread: l.thread,
         });
         mods[i].globals.insert(l.name.name, id);
         mods[i].ir.globals.push(id);
@@ -2689,7 +2695,7 @@ fn fold_global_init(
             }
             Ok(ConstInit::Elems(out))
         }
-        ExprKind::Call { .. } | ExprKind::Syscall { .. } => Err(CheckError::new(
+        ExprKind::Call { .. } | ExprKind::Syscall { .. } | ExprKind::Atomic { .. } => Err(CheckError::new(
             path,
             expr.span,
             "singleton init cannot call",

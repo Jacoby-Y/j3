@@ -1,0 +1,302 @@
+// Overlays: pixel layers on a part, painted onto its surface (`grow` 0) or onto a shell `grow`
+// voxels out from it. One face is one pixel, the size of a voxel; the pixels live in
+// `Model.texels` (see `model.texKey`). The shell is derived from the part's voxels each time:
+// the part dilated by `grow` (square corners), minus any cell that holds a model voxel, minus
+// cells an earlier overlay's shell claimed. A pixel only counts on an *exposed* face: one whose
+// neighbor is neither in the shell nor a model voxel.
+
+module voxel_editor.overlay;
+
+use j3.gfx.voxel;
+use j3.memory.Arena;
+use j3.text.same;
+use voxel_editor.model;
+use voxel_editor.model.{ MAXOVERLAYS, Model, Overlay };
+use voxel_editor.util.own;
+
+pub const MAXGROW: int = 4;
+
+/// Overlay id named `name`, or 0.
+pub fn find(m: &Model, name: string): int {
+    for i in 1..=m.overlayCount {
+        if same(m.overlays[i].name, name) { return i; }
+    }
+    return 0;
+}
+
+/// Add an overlay; its id, or 0 when the name is taken or the table is full.
+pub fn add(m: &Model, name: string, part: int, grow: int): int {
+    if name.len == 0 || find(m, name) != 0 || m.overlayCount >= MAXOVERLAYS { return 0; }
+    m.overlayCount += 1;
+    m.overlays[m.overlayCount] = Overlay { name: own(m.mem, name), part: part, grow: grow, visible: true };
+    model.touch(m);
+    return m.overlayCount;
+}
+
+/// Face names, in `texKey` order.
+pub fn faceName(f: int): string {
+    if f == 0 { return "px"; }
+    if f == 1 { return "nx"; }
+    if f == 2 { return "py"; }
+    if f == 3 { return "ny"; }
+    if f == 4 { return "pz"; }
+    return "nz";
+}
+
+/// 0..5 for px nx py ny pz nz, -1 for anything else.
+pub fn faceByName(s: string): int {
+    for f in 0..6 {
+        if same(s, faceName(f)) { return f; }
+    }
+    return -1;
+}
+
+fn dx(f: int): int { if f == 0 { return 1; } if f == 1 { return -1; } return 0; }
+fn dy(f: int): int { if f == 2 { return 1; } if f == 3 { return -1; } return 0; }
+fn dz(f: int): int { if f == 4 { return 1; } if f == 5 { return -1; } return 0; }
+
+/// The box around part `p`'s voxels; false when it has none.
+fn partBounds(m: &Model, p: int, lo3: &[3]int, hi3: &[3]int): bool {
+    let any = false;
+    for y in 0..m.sy {
+        for z in 0..m.sz {
+            for x in 0..m.sx {
+                let at = voxel.index(x, y, z, m.sx, m.sz);
+                if m.cells[at] == 0 || int(m.part[at]) != p { continue; }
+                if !any {
+                    lo3[0] = x; lo3[1] = y; lo3[2] = z;
+                    hi3[0] = x; hi3[1] = y; hi3[2] = z;
+                    any = true;
+                }
+                if x < lo3[0] { lo3[0] = x; }
+                if y < lo3[1] { lo3[1] = y; }
+                if z < lo3[2] { lo3[2] = z; }
+                if x > hi3[0] { hi3[0] = x; }
+                if y > hi3[1] { hi3[1] = y; }
+                if z > hi3[2] { hi3[2] = z; }
+            }
+        }
+    }
+    return any;
+}
+
+/// The part's voxels plus `grow` need room; what `size` and `shift` would make it fit. `need` gets the grid
+/// size and `by` the shift (0 when the model already fits on that axis). False when the part has no voxels.
+pub fn room(m: &Model, id: int, need: &[3]int, by: &[3]int): bool {
+    let ov = m.overlays[id];
+    let a: [3]int = [0, 0, 0];
+    let b: [3]int = [0, 0, 0];
+    if !partBounds(m, ov.part, &a, &b) { return false; }
+    let size: [3]int = [m.sx, m.sy, m.sz];
+    for k in 0..3 {
+        by[k] = if a[k] - ov.grow < 0 { ov.grow - a[k] } else { 0 };
+        need[k] = size[k] + by[k];
+        if b[k] + by[k] + ov.grow + 1 > need[k] { need[k] = b[k] + by[k] + ov.grow + 1; }
+    }
+    return true;
+}
+
+/// One pass of a dilation by `r` along `axis`: `out[i]` is set when `src` has a cell within `r` of it.
+fn grown(m: &Model, src: []u8, out: []u8, axis: int, r: int) {
+    for y in 0..m.sy {
+        for z in 0..m.sz {
+            for x in 0..m.sx {
+                let at = voxel.index(x, y, z, m.sx, m.sz);
+                let hit = false;
+                for d in -r..=r {
+                    let sx = x + (if axis == 0 { d } else { 0 });
+                    let sy = y + (if axis == 1 { d } else { 0 });
+                    let sz = z + (if axis == 2 { d } else { 0 });
+                    if model.inside(m, sx, sy, sz) && src[voxel.index(sx, sy, sz, m.sx, m.sz)] != 0 { hit = true; }
+                }
+                out[at] = if hit { 1 } else { 0 };
+            }
+        }
+    }
+}
+
+/// Fill `out` (one byte per grid cell) with 1 where overlay `id` has a cell. The overlay's own cells: the
+/// part's voxels at `grow` 0, else the shell. Returns 0 when fine, 1 when the part has no voxels, 2 when
+/// the shell would leave the grid.
+fn fill(m: &Model, id: int, out: []u8, mem: &Arena): int {
+    let ov = m.overlays[id];
+    let n = m.sx * m.sy * m.sz;
+    let body = mem.alloc::<u8>(n);
+    for i in 0..n { body[i] = if m.cells[i] != 0 && int(m.part[i]) == ov.part { 1 } else { 0 }; }
+    let a: [3]int = [0, 0, 0];
+    let b: [3]int = [0, 0, 0];
+    if !partBounds(m, ov.part, &a, &b) {
+        for i in 0..n { out[i] = 0; }
+        return 1;
+    }
+    if ov.grow == 0 {
+        for i in 0..n { out[i] = body[i]; }
+        return 0;
+    }
+    for k in 0..3 {
+        if a[k] - ov.grow < 0 || b[k] + ov.grow >= (if k == 0 { m.sx } else { if k == 1 { m.sy } else { m.sz } }) {
+            for i in 0..n { out[i] = 0; }
+            return 2;
+        }
+    }
+    let tmp = mem.alloc::<u8>(n);
+    grown(m, body, tmp, 0, ov.grow);
+    grown(m, tmp, out, 1, ov.grow);
+    grown(m, out, tmp, 2, ov.grow);
+    for i in 0..n { out[i] = if tmp[i] != 0 && m.cells[i] == 0 { 1 } else { 0 }; }
+    // Earlier shells keep their cells.
+    for j in 1..id {
+        if m.overlays[j].grow == 0 { continue; }
+        let other = mem.alloc::<u8>(n);
+        if fill(m, j, other, mem) == 0 {
+            for i in 0..n { if other[i] != 0 { out[i] = 0; } }
+        }
+    }
+    return 0;
+}
+
+/// The overlay's cells in `out` (a byte per grid cell, filled by this call). 0 when fine, 1 when
+/// the part is gone or empty, 2 when the shell would leave the grid.
+pub fn cells(m: &Model, id: int, out: []u8): int {
+    let mem = Arena.create(m.sx * m.sy * m.sz * 12 + 1024 * 1024);
+    defer mem.destroy();
+    return fill(m, id, out, &mem);
+}
+
+/// The box around the overlay's cells; false when it has none.
+pub fn cellBox(m: &Model, cellsOf: []u8, lo3: &[3]int, hi3: &[3]int): bool {
+    let any = false;
+    for y in 0..m.sy {
+        for z in 0..m.sz {
+            for x in 0..m.sx {
+                if cellsOf[voxel.index(x, y, z, m.sx, m.sz)] == 0 { continue; }
+                if !any {
+                    lo3[0] = x; lo3[1] = y; lo3[2] = z;
+                    hi3[0] = x; hi3[1] = y; hi3[2] = z;
+                    any = true;
+                }
+                if x < lo3[0] { lo3[0] = x; }
+                if y < lo3[1] { lo3[1] = y; }
+                if z < lo3[2] { lo3[2] = z; }
+                if x > hi3[0] { hi3[0] = x; }
+                if y > hi3[1] { hi3[1] = y; }
+                if z > hi3[2] { hi3[2] = z; }
+            }
+        }
+    }
+    return any;
+}
+
+/// Whether face `f` of cell `(x, y, z)` shows: its neighbor is not an overlay cell or a model voxel.
+pub fn exposed(m: &Model, cellsOf: []u8, x: int, y: int, z: int, f: int): bool {
+    let nx = x + dx(f);
+    let ny = y + dy(f);
+    let nz = z + dz(f);
+    if !model.inside(m, nx, ny, nz) { return true; }
+    let at = voxel.index(nx, ny, nz, m.sx, m.sz);
+    return cellsOf[at] == 0 && m.cells[at] == 0;
+}
+
+/// Cells, exposed faces, painted pixels, and stranded pixels (painted but no longer on an exposed face).
+pub fn counts(m: &Model, id: int, cellsOf: []u8, nCells: &int, nFaces: &int, nPainted: &int, nStranded: &int) {
+    *nCells = 0;
+    *nFaces = 0;
+    for y in 0..m.sy {
+        for z in 0..m.sz {
+            for x in 0..m.sx {
+                if cellsOf[voxel.index(x, y, z, m.sx, m.sz)] == 0 { continue; }
+                *nCells += 1;
+                for f in 0..6 {
+                    if exposed(m, cellsOf, x, y, z, f) { *nFaces += 1; }
+                }
+            }
+        }
+    }
+    let first = 0;
+    let end = 0;
+    model.texRange(m, id, &first, &end);
+    *nPainted = end - first;
+    *nStranded = 0;
+    for i in first..end {
+        let key = model.texKeyOf(m.texels[i]);
+        let x = model.texX(key);
+        let y = model.texY(key);
+        let z = model.texZ(key);
+        if !model.inside(m, x, y, z) || cellsOf[voxel.index(x, y, z, m.sx, m.sz)] == 0 || !exposed(m, cellsOf, x, y, z, model.texFace(key)) {
+            *nStranded += 1;
+        }
+    }
+}
+
+/// Paint one face of one cell; false when that face is not on the overlay's exposed surface.
+pub fn paint(m: &Model, id: int, cellsOf: []u8, x: int, y: int, z: int, f: int, rgb: int): bool {
+    if !model.inside(m, x, y, z) || cellsOf[voxel.index(x, y, z, m.sx, m.sz)] == 0 || !exposed(m, cellsOf, x, y, z, f) { return false; }
+    return model.texSet(m, model.texKey(id, f, x, y, z), rgb);
+}
+
+fn lo(a: int, b: int): int { if a < b { return a; } return b; }
+fn hi(a: int, b: int): int { if a > b { return a; } return b; }
+
+/// Paint (`rgb` 0..0xffffff) or erase (`rgb` -1) every exposed face inside a box, on face `f` or all faces (-1).
+/// Returns how many pixels changed; `full` is set when the pixel pool ran out.
+pub fn boxFaces(m: &Model, id: int, cellsOf: []u8, x0: int, y0: int, z0: int, x1: int, y1: int, z1: int, f: int, rgb: int, full: &bool): int {
+    let changed = 0;
+    for y in hi(lo(y0, y1), 0)..=lo(hi(y0, y1), m.sy - 1) {
+        for z in hi(lo(z0, z1), 0)..=lo(hi(z0, z1), m.sz - 1) {
+            for x in hi(lo(x0, x1), 0)..=lo(hi(x0, x1), m.sx - 1) {
+                if cellsOf[voxel.index(x, y, z, m.sx, m.sz)] == 0 { continue; }
+                for face in 0..6 {
+                    if f >= 0 && face != f { continue; }
+                    if !exposed(m, cellsOf, x, y, z, face) { continue; }
+                    if rgb < 0 {
+                        if model.texDel(m, model.texKey(id, face, x, y, z)) { changed += 1; }
+                    } else if model.texGet(m, model.texKey(id, face, x, y, z)) != rgb {
+                        if !model.texSet(m, model.texKey(id, face, x, y, z), rgb) { *full = true; return changed; }
+                        changed += 1;
+                    }
+                }
+            }
+        }
+    }
+    return changed;
+}
+
+/// Drop pixels that are no longer on an exposed face. Returns how many went.
+pub fn prune(m: &Model, id: int, cellsOf: []u8): int {
+    let first = 0;
+    let end = 0;
+    model.texRange(m, id, &first, &end);
+    let dropped = 0;
+    let keep = first;
+    for i in first..end {
+        let packed = m.texels[i];
+        let key = model.texKeyOf(packed);
+        let x = model.texX(key);
+        let y = model.texY(key);
+        let z = model.texZ(key);
+        if model.inside(m, x, y, z) && cellsOf[voxel.index(x, y, z, m.sx, m.sz)] != 0 && exposed(m, cellsOf, x, y, z, model.texFace(key)) {
+            m.texels[keep] = packed;
+            keep += 1;
+        } else {
+            dropped += 1;
+        }
+    }
+    for i in end..m.texelCount {
+        m.texels[keep + i - end] = m.texels[i];
+    }
+    m.texelCount -= dropped;
+    model.touch(m);
+    return dropped;
+}
+
+/// Drop every pixel of overlay `id`.
+pub fn clearPixels(m: &Model, id: int): int {
+    let first = 0;
+    let end = 0;
+    model.texRange(m, id, &first, &end);
+    let gone = end - first;
+    for i in end..m.texelCount { m.texels[i - gone] = m.texels[i]; }
+    m.texelCount -= gone;
+    model.touch(m);
+    return gone;
+}

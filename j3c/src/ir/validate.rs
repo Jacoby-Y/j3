@@ -309,6 +309,14 @@ fn validate_rvalue(cx: &IrCx, body: &Body, rvalue: &Rvalue) -> Result<(), Valida
                 return Err(ValidateError::new("@syscall type must be int".to_string()));
             }
         }
+        RvalueKind::Atomic { op, args } => {
+            if args.len() != op.values() + 1 {
+                return Err(ValidateError::new("@atomic operand count".to_string()));
+            }
+            for arg in args {
+                validate_operand(cx, body, arg)?;
+            }
+        }
         RvalueKind::Aggregate { fields } => {
             for f in fields {
                 validate_operand(cx, body, f)?;

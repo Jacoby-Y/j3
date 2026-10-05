@@ -552,6 +552,12 @@ fn hash_rvalue_into(cx: &IrCx, rv: &Rvalue, out: &mut String) {
                 hash_operand_into(cx, a, out);
             }
         }
+        RvalueKind::Atomic { op, args } => {
+            out.push_str(op.name());
+            for a in args {
+                hash_operand_into(cx, a, out);
+            }
+        }
         RvalueKind::Aggregate { fields } => {
             for f in fields {
                 hash_operand_into(cx, f, out);

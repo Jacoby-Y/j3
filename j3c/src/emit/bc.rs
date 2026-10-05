@@ -1517,6 +1517,7 @@ impl<'a> Codegen<'a> {
             RvalueKind::Call { func, args } => self.call(NO_REG, rv.ty, func, args),
             RvalueKind::Use(_) => Ok(()),
             RvalueKind::Syscall { .. } => Err("`@syscall` isn't supported in scripts".to_string()),
+            RvalueKind::Atomic { .. } => Err("atomics aren't supported in scripts".to_string()),
             _ => Err("unsupported void expression".to_string()),
         }
     }
@@ -1577,6 +1578,9 @@ impl<'a> Codegen<'a> {
             RvalueKind::Call { func, args } => self.call(dst, rv.ty, func, args)?,
             RvalueKind::Syscall { .. } => {
                 return Err("`@syscall` isn't supported in scripts".to_string())
+            }
+            RvalueKind::Atomic { .. } => {
+                return Err("atomics aren't supported in scripts".to_string())
             }
             RvalueKind::Aggregate { .. } | RvalueKind::Enum { .. } => {
                 return Err("aggregate value in a scalar slot".to_string())
@@ -1728,6 +1732,9 @@ impl<'a> Codegen<'a> {
             }
             RvalueKind::Syscall { .. } => {
                 return Err("`@syscall` isn't supported in scripts".to_string())
+            }
+            RvalueKind::Atomic { .. } => {
+                return Err("atomics aren't supported in scripts".to_string())
             }
             RvalueKind::Interpolate { .. } => {
                 return Err("interpolate must be lowered before bytecode".to_string())
@@ -1970,6 +1977,11 @@ fn walk_rvalue(rv: &Rvalue, f: &mut dyn FnMut(&Place, bool)) {
         }
         RvalueKind::Syscall { nr, args } => {
             walk_operand(nr, f);
+            for arg in args {
+                walk_operand(arg, f);
+            }
+        }
+        RvalueKind::Atomic { args, .. } => {
             for arg in args {
                 walk_operand(arg, f);
             }

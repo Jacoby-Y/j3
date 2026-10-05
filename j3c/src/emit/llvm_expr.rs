@@ -826,6 +826,42 @@ impl<'a> LlvmFn<'a> {
                 ));
                 Ok((v, "i64".to_string()))
             }
+            RvalueKind::Atomic { op, args } => {
+                let (p, _) = self.operand(&args[0])?;
+                let mut vals = Vec::new();
+                for a in &args[1..] {
+                    vals.push(self.syscall_word(a)?);
+                }
+                use crate::ir::op::AtomicOp;
+                match op {
+                    AtomicOp::Load => {
+                        let v = self.fresh();
+                        self.inst(&format!("{v} = load atomic i64, ptr {p} seq_cst, align 8"));
+                        Ok((v, "i64".to_string()))
+                    }
+                    AtomicOp::Store => {
+                        self.inst(&format!("store atomic i64 {}, ptr {p} seq_cst, align 8", vals[0]));
+                        Ok(("0".to_string(), "i64".to_string()))
+                    }
+                    AtomicOp::Add => {
+                        let v = self.fresh();
+                        self.inst(&format!("{v} = atomicrmw add ptr {p}, i64 {} seq_cst", vals[0]));
+                        Ok((v, "i64".to_string()))
+                    }
+                    AtomicOp::Cas => {
+                        let r = self.fresh();
+                        self.inst(&format!(
+                            "{r} = cmpxchg ptr {p}, i64 {}, i64 {} seq_cst seq_cst",
+                            vals[0], vals[1]
+                        ));
+                        let ok = self.fresh();
+                        self.inst(&format!("{ok} = extractvalue {{ i64, i1 }} {r}, 1"));
+                        let z = self.fresh();
+                        self.inst(&format!("{z} = zext i1 {ok} to i8"));
+                        Ok((z, "i8".to_string()))
+                    }
+                }
+            }
             RvalueKind::Aggregate { fields } => self.aggregate(rv.ty, fields),
             RvalueKind::Enum { variant, payload } => {
                 if self.cx.enum_def(variant.enum_id).is_c_like() {

@@ -81,3 +81,39 @@ impl UnaryOp {
         }
     }
 }
+
+/// `@atomicLoad` / `@atomicStore` / `@atomicAdd` / `@atomicCas` on an `int`, sequentially consistent.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AtomicOp {
+    Load,
+    Store,
+    Add,
+    Cas,
+}
+
+impl AtomicOp {
+    /// Name after the `@`.
+    pub fn name(self) -> &'static str {
+        match self {
+            AtomicOp::Load => "atomicLoad",
+            AtomicOp::Store => "atomicStore",
+            AtomicOp::Add => "atomicAdd",
+            AtomicOp::Cas => "atomicCas",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<AtomicOp> {
+        [AtomicOp::Load, AtomicOp::Store, AtomicOp::Add, AtomicOp::Cas]
+            .into_iter()
+            .find(|o| o.name() == s)
+    }
+
+    /// Operands: the pointer, then this many `int` values.
+    pub fn values(self) -> usize {
+        match self {
+            AtomicOp::Load => 0,
+            AtomicOp::Store | AtomicOp::Add => 1,
+            AtomicOp::Cas => 2,
+        }
+    }
+}

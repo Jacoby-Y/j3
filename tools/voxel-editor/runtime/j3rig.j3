@@ -1,0 +1,614 @@
+// Load and pose a rigged `.j3voxel` in a game. Copy this file next to `j3voxel.j3` in your
+// project's src/ and rename the modules to match: `module mygame.j3rig;`, and the two `use j3voxel...;`
+// lines below become `use mygame.j3voxel...;` (as in `j3voxel.j3`). A model with no `part` lines loads
+// with `count == 0` and draws as one static mesh. `load` keeps its data in `mem`; give `upload` a scratch
+// arena, since its vertex arrays are only needed until they are on the GPU.
+//
+//   let rig = j3rig.load("assets/hero.j3voxel", mem, 0.1);   // 0.1 units per voxel, like j3voxel.mesh
+//   j3rig.upload(&rig, scratch);                             // one mesh per part and overlay (needs the GL context)
+//   let angles = j3rig.newAngles(&rig, mem);                 // degrees: part * 3 + (x, y, z)
+//   let mats = j3rig.newMats(&rig, mem);
+//   ...each frame:
+//   j3rig.sample(&rig, j3rig.findClip(&rig, "walk"), time, angles);   // or j3rig.pose(&rig, "wave", angles)
+//   j3rig.setAngle(&rig, angles, "Head", 0, 30, 0);                   // procedural tweaks on top
+//   j3rig.draw(&rig, Mat4.translate(x, y, z), angles, mats);
+//
+// Overlays (pixel layers on a part, such as armor) draw with their part: `j3rig.setOverlay(&rig, "helmet",
+// false)` hides one. Nothing else to do; `upload` builds them.
+//
+// Parts turn about their joints (limits apply), children follow their parent, x/z are centered
+// on 0 and the bottom is y = 0, the same as `j3voxel.mesh`. Format: tools/voxel-editor/README.md,
+// sections Rigging and Overlays. Rotation order is y, then x, then z. The model faces +z; its left (`.L`) is +x.
+
+module j3rig;
+
+use j3.data.save;
+use j3.gfx;
+use j3.gfx.Mesh;
+use j3.gfx.voxel;
+use j3.io;
+use j3.math.{ Mat4, PI, Vec3, floor };
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.text.same;
+use j3voxel;
+use j3voxel.Voxels;
+
+const CLIP_KEYS: int = 8;
+
+pub struct Rig {
+    vox: Voxels;
+    scale: f32;
+    /// Parts are numbered 1..count (0 means no part).
+    count: int;
+    names: []string;
+    parent: []int;
+    /// Joint position in model units, `id * 3`.
+    pivot: []f32;
+    /// Rotation limits in degrees, `id * 6`: x min, x max, y min, y max, z min, z max.
+    limit: []f32;
+    /// Part number per voxel cell, like `vox.cells`.
+    part: []u8;
+    /// One mesh per part (index 0 is voxels with no part); `has[i]` is false for an empty one.
+    meshes: []Mesh;
+    has: []bool;
+    poseCount: int;
+    poseNames: []string;
+    /// Saved poses 1..poseCount, each `(count + 1) * 3` angles.
+    poses: []f32;
+    clipCount: int;
+    clipNames: []string;
+    clipSeconds: []f32;
+    clipLoop: []bool;
+    clipLen: []int;
+    /// Pose numbers, `clip * 8 + key`.
+    clipKeys: []int;
+    /// Overlays 1..ovCount: name, part, shown, and their mesh (`ovHas[i]` is false when it has no pixels).
+    ovCount: int;
+    ovNames: []string;
+    ovPart: []int;
+    ovVisible: []bool;
+    ovMeshes: []Mesh;
+    ovHas: []bool;
+    /// Painted pixels: the overlay, the cell `x + y * 64 + z * 4096`, the face (0 px, 1 nx, 2 py, 3 ny, 4 pz, 5 nz), and rgb.
+    texCount: int;
+    texOv: []u8;
+    texCell: []int;
+    texFace: []u8;
+    texRgb: []int;
+}
+
+fn space(b: u8): bool {
+    return b == 32 || b == 9 || b == 13;
+}
+
+/// The words of one line.
+fn words(line: []u8, mem: &Arena): []string {
+    let n = 0;
+    let i = 0;
+    while i < line.len {
+        while i < line.len && space(line[i]) { i += 1; }
+        if i < line.len {
+            n += 1;
+            while i < line.len && !space(line[i]) { i += 1; }
+        }
+    }
+    let out = mem.alloc::<string>(n);
+    let k = 0;
+    i = 0;
+    while i < line.len {
+        while i < line.len && space(line[i]) { i += 1; }
+        let start = i;
+        while i < line.len && !space(line[i]) { i += 1; }
+        if i > start {
+            out[k] = line[start..i] as string;
+            k += 1;
+        }
+    }
+    return out;
+}
+
+fn num(s: string): f32 {
+    return save.parseFloat(s as []u8, 0);
+}
+
+fn whole(s: string): int {
+    return int(num(s));
+}
+
+fn emptyRig(mem: &Arena): Rig {
+    return Rig {
+        vox: Voxels { sx: 0, sy: 0, sz: 0, cells: mem.alloc::<u8>(0), pal: mem.alloc::<u8>(0) },
+        scale: 1, count: 0, names: mem.alloc::<string>(0), parent: mem.alloc::<int>(0), pivot: mem.alloc::<f32>(0),
+        limit: mem.alloc::<f32>(0), part: mem.alloc::<u8>(0), meshes: mem.alloc::<Mesh>(0), has: mem.alloc::<bool>(0),
+        poseCount: 0, poseNames: mem.alloc::<string>(0), poses: mem.alloc::<f32>(0), clipCount: 0,
+        clipNames: mem.alloc::<string>(0), clipSeconds: mem.alloc::<f32>(0), clipLoop: mem.alloc::<bool>(0),
+        clipLen: mem.alloc::<int>(0), clipKeys: mem.alloc::<int>(0),
+        ovCount: 0, ovNames: mem.alloc::<string>(0), ovPart: mem.alloc::<int>(0), ovVisible: mem.alloc::<bool>(0),
+        ovMeshes: mem.alloc::<Mesh>(0), ovHas: mem.alloc::<bool>(0), texCount: 0, texOv: mem.alloc::<u8>(0),
+        texCell: mem.alloc::<int>(0), texFace: mem.alloc::<u8>(0), texRgb: mem.alloc::<int>(0),
+    };
+}
+
+/// Parse `.j3voxel` text with a rig. `vox.sx` is 0 when the voxels are unusable; `count` is 0 without parts.
+/// `scale` is units per voxel.
+pub fn parse(src: []u8, mem: &Arena, scale: f32): Rig {
+    let r = emptyRig(mem);
+    r.vox = j3voxel.parse(src, mem);
+    r.scale = scale;
+    if r.vox.sx == 0 { return r; }
+    // Count first so the tables can be sized.
+    let parts = 0;
+    let poses = 0;
+    let clips = 0;
+    let ovs = 0;
+    let texels = 0;
+    let pos = 0;
+    while pos < src.len {
+        let end = pos;
+        while end < src.len && src[end] != 10 { end += 1; }
+        let w = words(src[pos..end], mem);
+        pos = end + 1;
+        if w.len == 0 { continue; }
+        if same(w[0], "part") && w.len >= 2 { parts += 1; }
+        if same(w[0], "pose") && w.len >= 2 { poses += 1; }
+        if same(w[0], "clip") && w.len >= 4 { clips += 1; }
+        if same(w[0], "ov") && w.len >= 4 { ovs += 1; }
+        if same(w[0], "ot") && w.len >= 7 { texels += if w.len > 7 { whole(w[7]) } else { 1 }; }
+    }
+    r.count = parts;
+    r.names = mem.alloc::<string>(parts + 1);
+    r.parent = mem.alloc::<int>(parts + 1);
+    r.pivot = mem.alloc::<f32>((parts + 1) * 3);
+    r.limit = mem.alloc::<f32>((parts + 1) * 6);
+    r.part = mem.alloc::<u8>(r.vox.sx * r.vox.sy * r.vox.sz);
+    r.meshes = mem.alloc::<Mesh>(parts + 1);
+    r.has = mem.alloc::<bool>(parts + 1);
+    r.poseCount = poses;
+    r.poseNames = mem.alloc::<string>(poses + 1);
+    r.poses = mem.alloc::<f32>((poses + 1) * (parts + 1) * 3);
+    r.clipCount = clips;
+    r.clipNames = mem.alloc::<string>(clips + 1);
+    r.clipSeconds = mem.alloc::<f32>(clips + 1);
+    r.clipLoop = mem.alloc::<bool>(clips + 1);
+    r.clipLen = mem.alloc::<int>(clips + 1);
+    r.clipKeys = mem.alloc::<int>((clips + 1) * CLIP_KEYS);
+    r.ovCount = ovs;
+    r.ovNames = mem.alloc::<string>(ovs + 1);
+    r.ovPart = mem.alloc::<int>(ovs + 1);
+    r.ovVisible = mem.alloc::<bool>(ovs + 1);
+    r.ovMeshes = mem.alloc::<Mesh>(ovs + 1);
+    r.ovHas = mem.alloc::<bool>(ovs + 1);
+    r.texOv = mem.alloc::<u8>(texels);
+    r.texCell = mem.alloc::<int>(texels);
+    r.texFace = mem.alloc::<u8>(texels);
+    r.texRgb = mem.alloc::<int>(texels);
+    let parentNames = mem.alloc::<string>(parts + 1);
+    for i in 1..=parts {
+        for k in 0..6 { r.limit[i * 6 + k] = if k % 2 == 0 { -180 } else { 180 }; }
+    }
+    let sx = f32(r.vox.sx);
+    let sz = f32(r.vox.sz);
+    let pi = 0;
+    let ci = 0;
+    let oi = 0;
+    let pn = 0;
+    pos = 0;
+    while pos < src.len {
+        let stop = pos;
+        while stop < src.len && src[stop] != 10 { stop += 1; }
+        let line = words(src[pos..stop], mem);
+        pos = stop + 1;
+        if line.len == 0 { continue; }
+        if same(line[0], "part") && line.len >= 2 {
+            pn += 1;
+            r.names[pn] = line[1];
+            parentNames[pn] = "";
+            let q = 2;
+            while q < line.len {
+                if same(line[q], "parent") && q + 1 < line.len {
+                    parentNames[pn] = line[q + 1];
+                    q += 2;
+                } else if same(line[q], "pivot") && q + 3 < line.len {
+                    r.pivot[pn * 3] = (num(line[q + 1]) - sx / 2) * scale;
+                    r.pivot[pn * 3 + 1] = num(line[q + 2]) * scale;
+                    r.pivot[pn * 3 + 2] = (num(line[q + 3]) - sz / 2) * scale;
+                    q += 4;
+                } else if same(line[q], "limit") && q + 6 < line.len {
+                    for k in 0..6 { r.limit[pn * 6 + k] = num(line[q + 1 + k]); }
+                    q += 7;
+                } else {
+                    q += 1;
+                }
+            }
+        } else if same(line[0], "vp") && line.len >= 5 {
+            let x = whole(line[1]);
+            let y = whole(line[2]);
+            let z = whole(line[3]);
+            let id = whole(line[4]);
+            let run = 1;
+            if line.len > 5 { run = whole(line[5]); }
+            for k in 0..run {
+                if x + k < r.vox.sx && y < r.vox.sy && z < r.vox.sz && id <= parts {
+                    r.part[voxel.index(x + k, y, z, r.vox.sx, r.vox.sz)] = u8(id);
+                }
+            }
+        }
+    }
+    for i in 1..=parts {
+        r.parent[i] = 0;
+        if parentNames[i].len > 0 { r.parent[i] = find(&r, parentNames[i]); }
+    }
+    // Poses and clips name parts and poses, so they come after the parts are known.
+    pos = 0;
+    while pos < src.len {
+        let fin = pos;
+        while fin < src.len && src[fin] != 10 { fin += 1; }
+        let ws = words(src[pos..fin], mem);
+        pos = fin + 1;
+        if ws.len == 0 { continue; }
+        if same(ws[0], "pose") && ws.len >= 2 {
+            pi += 1;
+            r.poseNames[pi] = ws[1];
+            let at = 2;
+            while at + 3 < ws.len {
+                let pid = find(&r, ws[at]);
+                if pid > 0 {
+                    for k in 0..3 { r.poses[pi * (parts + 1) * 3 + pid * 3 + k] = num(ws[at + 1 + k]); }
+                }
+                at += 4;
+            }
+        } else if same(ws[0], "ov") && ws.len >= 4 {
+            oi += 1;
+            r.ovNames[oi] = ws[1];
+            r.ovPart[oi] = find(&r, ws[2]);
+            r.ovVisible[oi] = !(ws.len > 4 && same(ws[4], "hidden"));
+        } else if same(ws[0], "clip") && ws.len >= 4 {
+            ci += 1;
+            r.clipNames[ci] = ws[1];
+            r.clipSeconds[ci] = num(ws[2]);
+            r.clipLoop[ci] = same(ws[3], "loop");
+            let n = 0;
+            for k in 4..ws.len {
+                let slot = findPose(&r, ws[k]);
+                if slot > 0 && n < CLIP_KEYS {
+                    r.clipKeys[ci * CLIP_KEYS + n] = slot;
+                    n += 1;
+                }
+            }
+            r.clipLen[ci] = n;
+        }
+    }
+    // Painted pixels name overlays, so they come last.
+    pos = 0;
+    while pos < src.len {
+        let last = pos;
+        while last < src.len && src[last] != 10 { last += 1; }
+        let wt = words(src[pos..last], mem);
+        pos = last + 1;
+        if wt.len < 7 || !same(wt[0], "ot") { continue; }
+        let tov = findOverlay(&r, wt[1]);
+        if tov == 0 { continue; }
+        let tf = -1;
+        for k in 0..6 {
+            if same(wt[5], faceName(k)) { tf = k; }
+        }
+        if tf < 0 { continue; }
+        let rgb = hexRgb(wt[6]);
+        let tx = whole(wt[2]);
+        let ty = whole(wt[3]);
+        let tz = whole(wt[4]);
+        let tr = 1;
+        if wt.len > 7 { tr = whole(wt[7]); }
+        for k in 0..tr {
+            if r.texCount < r.texOv.len {
+                r.texOv[r.texCount] = u8(tov);
+                r.texCell[r.texCount] = (tx + k) + ty * 64 + tz * 4096;
+                r.texFace[r.texCount] = u8(tf);
+                r.texRgb[r.texCount] = rgb;
+                r.texCount += 1;
+            }
+        }
+    }
+    return r;
+}
+
+fn faceName(f: int): string {
+    if f == 0 { return "px"; }
+    if f == 1 { return "nx"; }
+    if f == 2 { return "py"; }
+    if f == 3 { return "ny"; }
+    if f == 4 { return "pz"; }
+    return "nz";
+}
+
+fn hexRgb(s: string): int {
+    let v = 0;
+    for i in 0..s.len {
+        let c = s[i];
+        let d = 0;
+        if c >= 48 && c <= 57 { d = int(c) - 48; }
+        else if c >= 97 && c <= 102 { d = int(c) - 87; }
+        else if c >= 65 && c <= 70 { d = int(c) - 55; }
+        v = v * 16 + d;
+    }
+    return v;
+}
+
+/// Overlay number named `name`, or 0.
+pub fn findOverlay(r: &Rig, name: string): int {
+    for i in 1..=r.ovCount {
+        if same(r.ovNames[i], name) { return i; }
+    }
+    return 0;
+}
+
+/// Show or hide an overlay. False for an unknown name.
+pub fn setOverlay(r: &Rig, name: string, shown: bool): bool {
+    let id = findOverlay(r, name);
+    if id == 0 { return false; }
+    r.ovVisible[id] = shown;
+    return true;
+}
+
+fn faceConst(f: int): int {
+    if f == 0 { return gfx.FACE_PX; }
+    if f == 1 { return gfx.FACE_NX; }
+    if f == 2 { return gfx.FACE_PY; }
+    if f == 3 { return gfx.FACE_NY; }
+    if f == 4 { return gfx.FACE_PZ; }
+    return gfx.FACE_NZ;
+}
+
+/// Vertices for overlay `id`: one flat face per painted pixel, placed like the parts' meshes.
+pub fn overlayMesh(r: &Rig, id: int, mem: &Arena): []f32 {
+    let n = 0;
+    for i in 0..r.texCount {
+        if int(r.texOv[i]) == id { n += 1; }
+    }
+    let out = mem.alloc::<f32>(n * 60);
+    let at = 0;
+    for i in 0..r.texCount {
+        if int(r.texOv[i]) != id { continue; }
+        let cell = r.texCell[i];
+        let rgb = r.texRgb[i];
+        at = gfx.emitFace(out, at, f32(cell % 64), f32((cell / 64) % 64), f32(cell / 4096), faceConst(int(r.texFace[i])),
+            f32(rgb / 65536) / 255, f32((rgb / 256) % 256) / 255, f32(rgb % 256) / 255, 0);
+    }
+    let k = 0;
+    while k < at {
+        out[k] = (out[k] - f32(r.vox.sx) / 2) * r.scale;
+        out[k + 1] = out[k + 1] * r.scale;
+        out[k + 2] = (out[k + 2] - f32(r.vox.sz) / 2) * r.scale;
+        k += 10;
+    }
+    return out[0..at];
+}
+
+/// Read and parse a file; `vox.sx` is 0 when it is missing.
+pub fn load(path: string, mem: &Arena, scale: f32): Rig {
+    match io.readFile(path, mem) {
+        Result.Ok(bytes) { return parse(bytes, mem, scale); }
+        Result.Err(_) { return emptyRig(mem); }
+    }
+}
+
+/// Part number named `name`, or 0.
+pub fn find(r: &Rig, name: string): int {
+    for i in 1..=r.count {
+        if same(r.names[i], name) { return i; }
+    }
+    return 0;
+}
+
+/// Saved pose number named `name`, or 0.
+pub fn findPose(r: &Rig, name: string): int {
+    for i in 1..=r.poseCount {
+        if same(r.poseNames[i], name) { return i; }
+    }
+    return 0;
+}
+
+/// Clip number named `name`, or 0.
+pub fn findClip(r: &Rig, name: string): int {
+    for i in 1..=r.clipCount {
+        if same(r.clipNames[i], name) { return i; }
+    }
+    return 0;
+}
+
+/// Room for one pose: `(count + 1) * 3` degrees, all zero (the rest pose).
+pub fn newAngles(r: &Rig, mem: &Arena): []f32 {
+    return mem.alloc::<f32>((r.count + 1) * 3);
+}
+
+pub fn newMats(r: &Rig, mem: &Arena): []Mat4 {
+    return mem.alloc::<Mat4>(r.count + 1);
+}
+
+/// Copy a saved pose into `angles`. False for an unknown name.
+pub fn pose(r: &Rig, name: string, angles: []f32): bool {
+    let slot = findPose(r, name);
+    if slot == 0 { return false; }
+    let n = (r.count + 1) * 3;
+    for i in 0..n { angles[i] = r.poses[slot * n + i]; }
+    return true;
+}
+
+/// Set one part's angles (degrees about x, y, z). False for an unknown part.
+pub fn setAngle(r: &Rig, angles: []f32, name: string, rx: f32, ry: f32, rz: f32): bool {
+    let id = find(r, name);
+    if id == 0 { return false; }
+    angles[id * 3] = rx;
+    angles[id * 3 + 1] = ry;
+    angles[id * 3 + 2] = rz;
+    return true;
+}
+
+/// Pose between two saved poses (`t` 0 is `a`, 1 is `b`) into `angles`.
+pub fn blend(r: &Rig, a: int, b: int, t: f32, angles: []f32) {
+    let n = (r.count + 1) * 3;
+    for i in 0..n { angles[i] = r.poses[a * n + i] + (r.poses[b * n + i] - r.poses[a * n + i]) * t; }
+}
+
+/// The clip `id` at `t` seconds into `angles`: its saved poses spread evenly over its length (a loop
+/// goes from the last pose back to the first and wraps; a one-shot holds the last pose).
+pub fn sample(r: &Rig, id: int, t: f32, angles: []f32) {
+    if id < 1 || id > r.clipCount || r.clipLen[id] == 0 || r.clipSeconds[id] <= 0 { return; }
+    let n = r.clipLen[id];
+    let first = r.clipKeys[id * CLIP_KEYS];
+    if n == 1 {
+        blend(r, first, first, 0, angles);
+        return;
+    }
+    let u: f32 = 0;
+    let a = 0;
+    if r.clipLoop[id] {
+        let turns = t / r.clipSeconds[id];
+        u = (turns - floor(turns)) * f32(n);
+        a = int(floor(u));
+    } else {
+        let frac = t / r.clipSeconds[id];
+        if frac < 0 { frac = 0; }
+        if frac > 1 { frac = 1; }
+        u = frac * f32(n - 1);
+        a = int(floor(u));
+        if a > n - 2 { a = n - 2; }
+    }
+    let b = (a + 1) % n;
+    blend(r, r.clipKeys[id * CLIP_KEYS + a], r.clipKeys[id * CLIP_KEYS + b], u - f32(a), angles);
+}
+
+fn clampDeg(v: f32, lo: f32, hi: f32): f32 {
+    if v < lo { return lo; }
+    if v > hi { return hi; }
+    return v;
+}
+
+fn turn(r: &Rig, angles: []f32, id: int): Mat4 {
+    let k = PI / 180;
+    let rx = clampDeg(angles[id * 3], r.limit[id * 6], r.limit[id * 6 + 1]) * k;
+    let ry = clampDeg(angles[id * 3 + 1], r.limit[id * 6 + 2], r.limit[id * 6 + 3]) * k;
+    let rz = clampDeg(angles[id * 3 + 2], r.limit[id * 6 + 4], r.limit[id * 6 + 5]) * k;
+    let px = r.pivot[id * 3];
+    let py = r.pivot[id * 3 + 1];
+    let pz = r.pivot[id * 3 + 2];
+    let spin = Mat4.rotate(Vec3.xyz(0, 1, 0), ry).mul(Mat4.rotate(Vec3.xyz(1, 0, 0), rx)).mul(Mat4.rotate(Vec3.xyz(0, 0, 1), rz));
+    return Mat4.translate(px, py, pz).mul(spin).mul(Mat4.translate(0 - px, 0 - py, 0 - pz));
+}
+
+fn worldOf(r: &Rig, angles: []f32, id: int, depth: int): Mat4 {
+    if id == 0 || depth > r.count { return Mat4.identity(); }
+    return worldOf(r, angles, r.parent[id], depth + 1).mul(turn(r, angles, id));
+}
+
+/// Matrix per part (index 0 is identity) taking the rest model to the posed one, in model units.
+pub fn matrices(r: &Rig, angles: []f32, mats: []Mat4) {
+    mats[0] = Mat4.identity();
+    for i in 1..=r.count { mats[i] = worldOf(r, angles, i, 0); }
+}
+
+/// Where part `name`'s joint is in the posed model (model units, before `base`).
+pub fn jointAt(r: &Rig, angles: []f32, name: string): Vec3 {
+    let id = find(r, name);
+    let at = Vec3.xyz(r.pivot[id * 3], r.pivot[id * 3 + 1], r.pivot[id * 3 + 2]);
+    return worldOf(r, angles, r.parent[id], 0).transformPoint(at);
+}
+
+fn open(r: &Rig, x: int, y: int, z: int, face: int): bool {
+    let nx = x;
+    let ny = y;
+    let nz = z;
+    if face == gfx.FACE_NX { nx -= 1; }
+    if face == gfx.FACE_PX { nx += 1; }
+    if face == gfx.FACE_NY { ny -= 1; }
+    if face == gfx.FACE_PY { ny += 1; }
+    if face == gfx.FACE_NZ { nz -= 1; }
+    if face == gfx.FACE_PZ { nz += 1; }
+    if j3voxel.at(&r.vox, nx, ny, nz) == 0 { return true; }
+    // A neighbor in another part still gets a face, so a part that turns keeps its skin at the joint.
+    return r.part[voxel.index(nx, ny, nz, r.vox.sx, r.vox.sz)] != r.part[voxel.index(x, y, z, r.vox.sx, r.vox.sz)];
+}
+
+fn neighborSolid(r: &Rig, x: int, y: int, z: int, face: int): bool {
+    let nx = x;
+    let ny = y;
+    let nz = z;
+    if face == gfx.FACE_NX { nx -= 1; }
+    if face == gfx.FACE_PX { nx += 1; }
+    if face == gfx.FACE_NY { ny -= 1; }
+    if face == gfx.FACE_PY { ny += 1; }
+    if face == gfx.FACE_NZ { nz -= 1; }
+    if face == gfx.FACE_PZ { nz += 1; }
+    return j3voxel.at(&r.vox, nx, ny, nz) != 0;
+}
+
+/// Vertices (10 floats each) for part `id`'s voxels: same placement as `j3voxel.mesh`. Ambient
+/// occlusion ignores other parts (they may turn away), and a face against another part is lit like
+/// skin so an opened joint shows no black wedge. Empty when the part has no visible voxels.
+pub fn partMesh(r: &Rig, id: int, mem: &Arena): []f32 {
+    let v = &r.vox;
+    let alone = mem.alloc::<u8>(v.sx * v.sy * v.sz);
+    for i in 0..alone.len { alone[i] = if int(r.part[i]) == id { v.cells[i] } else { 0 }; }
+    let faces = 0;
+    for y in 0..v.sy {
+        for z in 0..v.sz {
+            for x in 0..v.sx {
+                if alone[voxel.index(x, y, z, v.sx, v.sz)] == 0 { continue; }
+                for f in 0..6 { if open(r, x, y, z, f) { faces += 1; } }
+            }
+        }
+    }
+    let out = mem.alloc::<f32>(faces * 60);
+    let n = 0;
+    for y in 0..v.sy {
+        for z in 0..v.sz {
+            for x in 0..v.sx {
+                let c = int(alone[voxel.index(x, y, z, v.sx, v.sz)]);
+                if c == 0 { continue; }
+                for f in 0..6 {
+                    if !open(r, x, y, z, f) { continue; }
+                    let emi: f32 = if neighborSolid(r, x, y, z, f) { 0.55 } else { 0 };
+                    let k = voxel.corners(alone, v.sx, v.sy, v.sz, x, y, z, f);
+                    n = gfx.emitFaceAo(out, n, f32(x), f32(y), f32(z), f, f32(v.pal[c * 3]) / 255,
+                        f32(v.pal[c * 3 + 1]) / 255, f32(v.pal[c * 3 + 2]) / 255, emi,
+                        voxel.shade(k.a), voxel.shade(k.b), voxel.shade(k.c), voxel.shade(k.d));
+                }
+            }
+        }
+    }
+    let i = 0;
+    while i < n {
+        out[i] = (out[i] - f32(v.sx) / 2) * r.scale;
+        out[i + 1] = out[i + 1] * r.scale;
+        out[i + 2] = (out[i + 2] - f32(v.sz) / 2) * r.scale;
+        i += 10;
+    }
+    return out[0..n];
+}
+
+/// Upload one mesh per part (call once the GL context exists).
+pub fn upload(r: &Rig, mem: &Arena) {
+    for i in 0..=r.count {
+        let verts = partMesh(r, i, mem);
+        r.has[i] = verts.len > 0;
+        if verts.len > 0 { r.meshes[i] = gfx.upload(verts); }
+    }
+    for o in 1..=r.ovCount {
+        let faces = overlayMesh(r, o, mem);
+        r.ovHas[o] = faces.len > 0;
+        if faces.len > 0 { r.ovMeshes[o] = gfx.upload(faces); }
+    }
+}
+
+/// Draw the posed model: `angles` as set by `pose`, `sample`, or `setAngle`, `mats` from `newMats`,
+/// `base` placing the model in the world.
+pub fn draw(r: &Rig, base: Mat4, angles: []f32, mats: []Mat4) {
+    matrices(r, angles, mats);
+    for i in 0..=r.count {
+        if r.has[i] { gfx.draw(r.meshes[i], base.mul(mats[i])); }
+    }
+    for o in 1..=r.ovCount {
+        if r.ovHas[o] && r.ovVisible[o] { gfx.draw(r.ovMeshes[o], base.mul(mats[r.ovPart[o]])); }
+    }
+}

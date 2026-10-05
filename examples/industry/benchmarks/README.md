@@ -6,7 +6,7 @@ python3 benchmarks/run.py gpu-after --renderer native --prepare-only
 python3 benchmarks/run.py release-after --release
 ```
 
-Each run snapshots the current source/scripts under `target/benchmarks/<label>/project`, checks that benchmark and production compiler settings match, and runs three samples per scene (600 frames, or 180 for the expensive factory case). It saves raw logs, one screenshot per scene, peak RSS, and median metrics in `results.json`. Each game invocation has a five-minute timeout. `--scenes start surface cave entrance factory` selects cases; `--source <snapshot-project>` measures saved source. Labels can be resumed for selected scenes.
+Each run snapshots the current source/scripts under `target/benchmarks/<label>/project`, checks that benchmark and production compiler settings match, and runs three samples per scene (600 frames, or 180 for the expensive factory case). It saves raw logs, one screenshot per scene, peak RSS, and median metrics in `results.json`. Each game invocation has a five-minute timeout. `--scenes start surface cave entrance factory` selects cases (`particles` is also accepted: 300 frames from the surface with the particle pool kept full of debris; it is not in the default set); `--source <snapshot-project>` measures saved source. Labels can be resumed for selected scenes.
 
 `--profile-stages` switches on the game's own per-stage timers (a `target/benchmark-profile.txt` file in the snapshot) and reports furnace, belt and drill averages after warmup in a 180-frame factory run. Profile these separately from acceptance samples so timer overhead does not affect the frame-time comparison. `--release` builds with `j3c run --release` (opt s) instead of the project settings; compare release runs only with release runs.
 

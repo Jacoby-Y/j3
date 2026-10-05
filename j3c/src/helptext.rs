@@ -201,6 +201,12 @@ pub fn recipes() -> Vec<Recipe> {
             files: vec![("assets/gen/tree.j3", crate::editor::TREE_GEN.to_string())],
         },
         Recipe {
+            name: "threads",
+            what: "build chunks on a worker pool and accept only current results, no window",
+            text: RECIPE_THREADS,
+            files: vec![("j3.toml", "[package]\nname = \"chunks\"\nentry = \"src/main.j3\"\n".to_string()), ("src/main.j3", THREADS_MAIN.to_string())],
+        },
+        Recipe {
             name: "material",
             what: "a `.j3mat` material with a `.j3fx` shader effect",
             text: RECIPE_MATERIAL,
@@ -312,6 +318,128 @@ fn main() {
         }
     }
     printLn(\"wrote coin.png\");
+    arena.destroy();
+}
+";
+
+const RECIPE_THREADS: &str = "\
+A headless program: a `Pool` builds chunks off the main thread while a loop that stands in
+for the frame thread feeds it and collects results without ever blocking. This is the shape
+of world meshing, generation, decoding, and baking. `j3c doc threads` is the full guide
+(rules, which modules are safe, common mistakes); `speculative/13_threads.j3` shows every
+primitive.
+
+The idea: hand work over, do not share it.
+- A job is a plain `fn(ptr)` plus one `ptr` to a struct main owns. Put everything the job needs
+  in that struct: its input, the buffer it alone writes, and the `&Queue` its result goes to.
+  There are no closures. The struct must outlive the job (here: slots in an arena).
+- A worker writes only what it was given. Main reads a result only after it comes back through
+  the results `Queue` (or after `pool.wait()`). Nothing else orders threads; never spin on a
+  plain flag. `@atomicAdd` / `@atomicLoad` are for counters and cancel flags.
+- Never block the frame thread. `pool.trySubmit` returns false when the job queue is full:
+  keep the job and try again next frame. `results.tryPop` returns a result or nothing. `submit`,
+  `wait`, `push`, `pop`, and `join` can all wait; use them in loaders and tools.
+- Size the results queue at least as large as the jobs in flight, or workers block in `push`
+  until main drains it.
+- Version stamps: each result carries the version it was built from. Main drops a result whose
+  version is no longer current (here chunk 3 is edited, so its first build is stale). To cancel
+  a running job, put a flag in its struct, set it with `@atomicStore`, and have the job check
+  `@atomicLoad` between steps.
+- GL, SDL, windows, and audio are main-thread only, and so is `j3.gfx` / `j3.game` / `j3.scene3d`
+  state. Workers compute (`gfx.emitFace`, `voxel`, `noise`, `canvas`, `math`, `game.path` are
+  safe); main uploads and draws.
+- `memory.scratch` is per thread and a worker rewinds it after every job, so copy results into
+  the struct main gave you. One `Arena` is never shared between threads.
+- Results arrive in any order. If they feed saves or replays, reduce in a fixed order
+  (`pool.parallelFor(n, f, ctx)` splits `0..n` for you; have `f` write `out[i]`).
+- Call `pool.shutdown()` before destroying the arena the pool lives in.
+";
+
+const THREADS_MAIN: &str = "\
+module chunks;
+
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.thread.{ Pool, Queue, cores };
+
+const CHUNKS: int = 8;
+const CELLS: int = 4096;
+
+/// What main hands a worker: a chunk, the version it is built from, its own buffer, and where
+/// to send the result. It must stay alive until the job has run.
+struct Work {
+    chunk: int;
+    version: int;
+    cells: []int;
+    done: &Queue<Done>;
+}
+
+/// What the worker hands back.
+struct Done {
+    chunk: int;
+    version: int;
+    sum: int;
+}
+
+/// Runs on a worker. Writes only `w.cells`, then reports.
+fn build(arg: ptr) {
+    let w = arg as &Work;
+    let sum = 0;
+    for i in 0..w.cells.len {
+        w.cells[i] = (w.chunk * 31 + i * w.version) % 17;
+        sum += w.cells[i];
+    }
+    w.done.push(Done { chunk: w.chunk, version: w.version, sum: sum });
+}
+
+fn main() {
+    let arena = Arena.create(4 * 1024 * 1024);
+    // A small job queue on purpose: `trySubmit` says no when it is full, and the loop below
+    // just tries again on its next pass.
+    let pool = Pool.create(&arena, cores(), 4);
+    // At least as large as the jobs in flight, so a worker never blocks pushing its result.
+    let results = Queue<Done>.create(&arena, 16);
+
+    let jobs = CHUNKS + 1;
+    let work = arena.alloc::<Work>(jobs);
+    let current = arena.alloc::<int>(CHUNKS);
+    for i in 0..CHUNKS {
+        current[i] = 1;
+        work[i] = Work { chunk: i, version: 1, cells: arena.alloc::<int>(CELLS), done: &results };
+    }
+    // Chunk 3 is edited right after its first build was queued: that result is now stale, and
+    // a second build with its own buffer replaces it.
+    current[3] = 2;
+    work[CHUNKS] = Work { chunk: 3, version: 2, cells: arena.alloc::<int>(CELLS), done: &results };
+
+    let next = 0;
+    let accepted = 0;
+    let stale = 0;
+    let total = 0;
+    // Each pass of this loop is one frame: it never waits on a worker.
+    while accepted + stale < jobs {
+        while next < jobs && pool.trySubmit(build, &work[next] as ptr) {
+            next += 1;
+        }
+        while true {
+            match results.tryPop() {
+                Option.None {
+                    break;
+                }
+                Option.Some(d) {
+                    if d.version == current[d.chunk] {
+                        accepted += 1;
+                        total += d.sum;
+                    } else {
+                        stale += 1;
+                    }
+                }
+            }
+        }
+    }
+    printLn(`accepted={accepted} stale={stale} total={total}`);
+    pool.shutdown();
     arena.destroy();
 }
 ";

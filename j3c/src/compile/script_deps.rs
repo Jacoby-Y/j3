@@ -114,7 +114,9 @@ fn expr(e: &Expr, out: &mut Vec<ScriptRef>) {
                 expr(value, out);
             }
         }
-        ExprKind::ArrayLit { elems } | ExprKind::Syscall { args: elems } => {
+        ExprKind::ArrayLit { elems }
+        | ExprKind::Syscall { args: elems }
+        | ExprKind::Atomic { args: elems, .. } => {
             for value in elems {
                 expr(value, out);
             }

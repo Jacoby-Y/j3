@@ -40,6 +40,7 @@ const FILES: &[(&str, &str)] = &[
     ("sys_macos.j3", include_str!("../../stdlib/j3/sys_macos.j3")),
     ("sys_windows.j3", include_str!("../../stdlib/j3/sys_windows.j3")),
     ("text.j3", include_str!("../../stdlib/j3/text.j3")),
+    ("thread.j3", include_str!("../../stdlib/j3/thread.j3")),
     ("game/tile.j3", include_str!("../../stdlib/j3/game/tile.j3")),
     ("ui.j3", include_str!("../../stdlib/j3/ui.j3")),
     ("gfx/urp/raytrace.j3", include_str!("../../stdlib/j3/gfx/urp/raytrace.j3")),

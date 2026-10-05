@@ -107,6 +107,8 @@ pub struct GlobalDef {
     pub span: Span,
     /// `None` = BSS zero. Const-folded singleton initializer.
     pub init: Option<ConstInit>,
+    /// `#[thread]`: one copy per thread.
+    pub thread: bool,
 }
 
 #[derive(Clone, Debug)]

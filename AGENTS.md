@@ -14,6 +14,7 @@ Ask the tools first. They ship with the compiler, so they match the binary you r
 | Learn the language | `j3c doc lang`, then `speculative/01`–`08` (they compile and run) |
 | Write UI | `j3c doc j3ui`, `speculative/10_j3ui.j3`, `examples/gallery` |
 | Write `.j3s` scripts | `j3c doc recipes script`, `speculative/11_script/`, `examples/scripted` |
+| Move heavy work off the frame thread | `j3c doc recipes threads`, then `j3c doc threads` (rules, which modules are safe, mistakes). GL, SDL, and `gfx`/`game`/`scene3d` state are main-thread only |
 | Build or edit 3D scenes | `j3c doc editor`, `j3c/editor/README.md` (controls, file format, import limits) |
 | Drive the editor as an agent | see **Agent workflow** below |
 | Know what is left to build | `roadmap.md`, `EDITOR.md` (**Still left**, **Agentic use help**), `plans/` |
@@ -47,12 +48,12 @@ Facts that cost agents time:
 | `j3c/` | Compiler crate. **Map and contract: `j3c/AGENTS.md`** |
 | `j3c/src/scene.rs`, `j3c/src/mcp.rs` | `j3c -e scene`/`render` and the MCP server: thin wrappers that run the editor binary headless |
 | `j3c/editor/src/` | The editor program, in J3, one module per file. `tool.j3` is every scene op (`check`, `stats`, `place` helpers, globs); `render.j3` is `-e render`; `live.j3` is commands sent to an open editor. `README.md` is the user guide |
-| `j3c/stdlib/j3/` | Stdlib in J3, embedded in the binary (rebuild `j3c` after editing it; `J3_STDLIB` overrides). Top level: `sys`, `io`, `math`, `rand`, `memory`, `option`, `result`, `text`, `app`, `game`, `gfx`, `ui`, `scene3d`, `script` (the `.j3s` VM). Folders: `game/` (`ecs` `input` `anim` `fx` `collide` `space` `physics` `path` `tile`), `gfx/` (`mesh` `meshgen` `voxel` `bvh` `canvas` `noise` `urp/`), `data/` (`save` `assets` `res` `scene` `debug`), `scene3d/` (`fpwalk`, `fx`, `editor/` used only by the editor). A folder is part of the name: `use j3.game.ecs;`. `j3.sys` is `sys.j3` / `sys_windows.j3` / `sys_macos.j3` by `[emit] target` |
+| `j3c/stdlib/j3/` | Stdlib in J3, embedded in the binary (rebuild `j3c` after editing it; `J3_STDLIB` overrides). Top level: `sys`, `io`, `math`, `rand`, `memory`, `thread` (Linux pthreads: `Pool`, `Queue`, `Mutex`), `option`, `result`, `text`, `app`, `game`, `gfx`, `ui`, `scene3d`, `script` (the `.j3s` VM). Folders: `game/` (`ecs` `input` `anim` `fx` `collide` `space` `physics` `path` `tile`), `gfx/` (`mesh` `meshgen` `voxel` `bvh` `canvas` `noise` `urp/`), `data/` (`save` `assets` `res` `scene` `debug`), `scene3d/` (`fpwalk`, `fx`, `editor/` used only by the editor). A folder is part of the name: `use j3.game.ecs;`. `j3.sys` is `sys.j3` / `sys_windows.j3` / `sys_macos.j3` by `[emit] target` |
 | `speculative/` | `01`–`08` compile and run, `09` typechecks `j3.game`, `10_j3ui.j3` is the `@j3ui` sample, `11_script/` is a `.j3s` script (AOT and on the VM) |
 | `editors/vscode/` | Cursor/VS Code extension: highlighting (`j3c dump-syntax`), `j3c lsp`, `j3.toml` keys, Run/Build/Format |
 | `roadmap.md`, `EDITOR.md` | Direction and status. Editor brainstorms go in `EDITOR.md`, not code |
 | `plans/` | Numbered handoff plans (import pipeline, scene authoring, URP performance, animation, effects, ...). Read one before redoing that area |
-| `tools/` | `j3mesh_import.py`, `j3scene_migrate.py` (v1 `.j3scene` to the one-line-per-object format); `voxel-editor/` is a voxel model editor (window) plus `vox run` for agents, `.j3voxel` files (`tools/voxel-editor/README.md`) |
+| `tools/` | `j3mesh_import.py`, `j3scene_migrate.py` (v1 `.j3scene` to the one-line-per-object format); `voxel-editor/` is a voxel model editor (window) plus `vox run` for agents: models, rigs with joints, poses and clips, pixel overlays (armor), `.j3voxel` files, `runtime/j3rig.j3` for games (`tools/voxel-editor/AGENTS.md`, `README.md`) |
 | `build.sh` | Release-build `j3c` and install it to `~/.bin/j3c` |
 
 ## Examples

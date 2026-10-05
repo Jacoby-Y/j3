@@ -232,6 +232,28 @@ impl<'a> CWriter<'a> {
                 s.push(')');
                 Ok(s)
             }
+            RvalueKind::Atomic { op, args } => {
+                let p = self.operand(&args[0])?;
+                let p = format!("(int64_t *)(void *)({p})");
+                let mut vals = Vec::new();
+                for a in &args[1..] {
+                    vals.push(self.syscall_word(a)?);
+                }
+                use crate::ir::op::AtomicOp;
+                Ok(match op {
+                    AtomicOp::Load => format!("__atomic_load_n({p}, __ATOMIC_SEQ_CST)"),
+                    AtomicOp::Store => {
+                        format!("(__atomic_store_n({p}, {}, __ATOMIC_SEQ_CST), (int64_t)0)", vals[0])
+                    }
+                    AtomicOp::Add => {
+                        format!("__atomic_fetch_add({p}, {}, __ATOMIC_SEQ_CST)", vals[0])
+                    }
+                    AtomicOp::Cas => format!(
+                        "({{ int64_t j3_exp = {}; (uint8_t)__atomic_compare_exchange_n({p}, &j3_exp, {}, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }})",
+                        vals[0], vals[1]
+                    ),
+                })
+            }
             RvalueKind::Aggregate { fields } => self.aggregate(rvalue.ty, fields),
             RvalueKind::Enum { variant, payload } => self.enum_val(*variant, payload),
             RvalueKind::Cast { from } => {

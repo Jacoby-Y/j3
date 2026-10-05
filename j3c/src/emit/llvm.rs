@@ -106,7 +106,8 @@ pub fn emit_llvm_part(
             let ty = ll_type(cx, g.ty)?;
             if matches!(part, Part::Only(_)) {
                 out.push_str(&format!(
-                    "@{name} = external global {ty}, align {}\n",
+                    "@{name} = external {}global {ty}, align {}\n",
+                    tls(g),
                     llvm_ty::align(cx, g.ty)
                 ));
                 continue;
@@ -117,7 +118,8 @@ pub fn emit_llvm_part(
             };
             let linkage = if part.split() { "" } else { "internal " };
             out.push_str(&format!(
-                "@{name} = {linkage}global {ty} {init}, align {}\n",
+                "@{name} = {linkage}{}global {ty} {init}, align {}\n",
+                tls(g),
                 llvm_ty::align(cx, g.ty)
             ));
         }
@@ -353,10 +355,14 @@ pub(crate) fn emit_llvm_module(
                     Some(v) => ll_const_init(cx, g.ty, v)?,
                     None => "zeroinitializer".to_string(),
                 };
-                out.push_str(&format!("@{name} = global {ty} {init}, align {align}\n"));
+                out.push_str(&format!(
+                    "@{name} = {}global {ty} {init}, align {align}\n",
+                    tls(g)
+                ));
             } else {
                 out.push_str(&format!(
-                    "@{name} = external global {ty}, align {align}\n"
+                    "@{name} = external {}global {ty}, align {align}\n",
+                    tls(g)
                 ));
             }
         }
@@ -639,5 +645,14 @@ fn ll_const_init(cx: &IrCx, ty: Ty, init: &ConstInit) -> Result<String, String> 
             }
             Ok(format!("[ {} ]", parts.join(", ")))
         }
+    }
+}
+
+/// `thread_local ` for a `#[thread]` global, else empty.
+fn tls(g: &crate::ir::entity::GlobalDef) -> &'static str {
+    if g.thread {
+        "thread_local "
+    } else {
+        ""
     }
 }

@@ -1,7 +1,7 @@
 //! Rvalues: something that produces a value. Always has a `ty`.
 
 use crate::ir::ids::VariantId;
-use crate::ir::op::{BinOp, UnaryOp};
+use crate::ir::op::{AtomicOp, BinOp, UnaryOp};
 use crate::ir::operand::Operand;
 use crate::ir::place::Place;
 use crate::ir::ty::Ty;
@@ -37,6 +37,12 @@ pub enum RvalueKind {
     /// `@syscall(nr, args...)`. Type is `int`.
     Syscall {
         nr: Operand,
+        args: Vec<Operand>,
+    },
+    /// `@atomicLoad(p)` and friends: `args[0]` is the pointer, the rest are `int` values.
+    /// Type is `int`, or `bool` for `Cas`.
+    Atomic {
+        op: AtomicOp,
         args: Vec<Operand>,
     },
     Aggregate {
@@ -100,6 +106,14 @@ impl Rvalue {
             ty: int_ty,
             span,
             kind: RvalueKind::Syscall { nr, args },
+        }
+    }
+
+    pub fn atomic(span: Span, ty: Ty, op: AtomicOp, args: Vec<Operand>) -> Rvalue {
+        Rvalue {
+            ty,
+            span,
+            kind: RvalueKind::Atomic { op, args },
         }
     }
 
