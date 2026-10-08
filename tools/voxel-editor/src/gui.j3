@@ -8,11 +8,12 @@ use j3.game.{ Font, Key, Mouse };
 use j3.gfx;
 use j3.gfx.Orbit;
 use j3.io.{ exists, printLn };
-use j3.math.{ Vec2, Vec3 };
+use j3.math.{ Vec2, Vec3, clamp };
 use j3.memory.{ Arena, scratch };
 use j3.sys;
-use j3.text.Text;
+use j3.text.{ Text, same };
 use j3.ui.{ Ui, typing };
+use voxel_editor.clipedit;
 use voxel_editor.cmd;
 use voxel_editor.edit;
 use voxel_editor.edit.{ cancel, frame, hoverPick, overView, say, viewOrigin, viewSize };
@@ -20,30 +21,48 @@ use voxel_editor.files;
 use voxel_editor.hostio;
 use voxel_editor.model;
 use voxel_editor.panels;
+use voxel_editor.tabs;
+use voxel_editor.timeline;
+use voxel_editor.gizmo;
 use voxel_editor.pick;
+use voxel_editor.util.endsWith;
 use voxel_editor.view;
 use voxel_editor.world;
-use voxel_editor.world.{ BOTTOM, BOX, CYLINDER, FILL, LEFT, LINE, PENCIL, PICKER, RIGHT, SPHERE, TOP, World };
+use voxel_editor.world.{ Tab, BOTTOM, BOX, CYLINDER, FILL, LEFT, LINE, MAX_PANEL, MAX_TIMELINE, MIN_PANEL, MIN_TIMELINE, PENCIL, PICKER, RIGHT, SPHERE, TIMELINE, TOP, World };
 
 fn boot(mem: &Arena): World {
-    let given = sys.arg(1);
+    // `vox --add FILE...`: bring back the last workspace, then add the files it does not have (the active tab stays).
+    let add = same(sys.arg(1), "--add");
+    let first = if add { 2 } else { 1 };
+    let given = sys.arg(first);
     let w = World {
-        mem: mem, m: model.create(mem, 16, 16, 16), view: view.create(), font: Font { raw: 0 },
+        mem: mem, m: model.create(mem, 16, 16, 16), tabs: mem.alloc::<Tab>(tabs.MAX), tabCount: 0, tab: 0, view: view.create(), font: Font { raw: 0 },
         cam: Orbit.create(Vec3.xyz(8, 8, 8), 0.7, 0.5, 40), ortho: false, grid: true, shaded: true,
-        path: Text.new(mem), stamp: 0, pollTicks: 0, tool: PENCIL, mode: model.ADD, color: 4, brush: 1, depth: 1,
+        path: Text.new(mem), stamp: 0, pollTicks: 0, saveTicks: 0, tool: PENCIL, mode: model.ADD, color: 4, brush: 1, depth: 1,
         hollow: false, layerFill: false, hover: pick.none(), active: false, anchor: [0, 0, 0], cur: [0, 0, 0],
         last: [0, 0, 0], axis: 1, sign: 1, lock: -1, lastMouse: Vec2 { x: 0, y: 0 }, status: Text.new(mem),
         console: Text.new(mem), hexEdit: Text.new(mem), nameEdit: Text.new(mem), palFile: Text.new(mem),
         palTop: 0, palEditing: false, closeWarned: false, showHelp: false, log: Text.new(mem),
         rigTab: false, partTop: 0, partDrag: false, partTint: false, ovActive: 0, ovCells: mem.alloc::<u8>(model.MAX * model.MAX * model.MAX), ovRev: -1, ovDrag: false,
-        ovFile: Text.new(mem), ovGrow: 1, partName: Text.new(mem), poseName: Text.new(mem),
+        ovFile: Text.new(mem), ovGrow: 1, partName: Text.new(mem), poseName: Text.new(mem), left: LEFT, right: RIGHT, edge: 0, gz: gizmo.none(), clip: 0, playing: false, playT: 0.0, key: -1, keyDrag: false, scrub: false, autokey: true, tl: TIMELINE, picking: false,
     };
-    w.path.pushStr(if given.len > 0 { given } else { "models/untitled.j3voxel" });
+    tabs.init(&w);
     w.palFile.pushStr("mine");
     w.ovFile.pushStr("overlay.png");
     say(&w, "Left-drag draws. Right-drag orbits. F2 shows every key.");
+    if add && tabs.restore(&w) {
+        let keep = w.tab;
+        for i in first..sys.argCount() { tabs.openArg(&w, sys.arg(i)); }
+        tabs.switchTo(&w, keep);
+        return w;
+    }
+    w.path.pushStr(if given.len > 0 && endsWith(given, ".j3voxel") { given } else { "models/untitled.j3voxel" });
     if exists(files.pathNow(&w)) { files.open(&w); }
     else { w.m.name = "untitled"; }
+    // `vox A.j3voxel B.j3voxel DIR ...` opens a tab each; no arguments brings back the last workspace.
+    for i in first + 1..sys.argCount() { tabs.openArg(&w, sys.arg(i)); }
+    if given.len > 0 && !endsWith(given, ".j3voxel") { tabs.openFolder(&w, given); }
+    if given.len == 0 { tabs.restore(&w); }
     return w;
 }
 
@@ -99,6 +118,7 @@ fn shortcuts(w: &World) {
     }
     if game.keyPressed(Key.H) { w.hollow = !w.hollow; }
     if game.keyPressed(Key.F) { frame(w); }
+    if game.keyPressed(Key.Space) && w.clip != 0 { w.playing = !w.playing; }
 }
 
 fn camera(w: &World, mp: Vec2) {
@@ -129,23 +149,48 @@ fn camera(w: &World, mp: Vec2) {
     }
 }
 
-fn input(w: &World, dt: f32) {
-    let mp = game.mousePos();
-    if game.closeRequested() {
-        if w.m.dirty && !w.closeWarned {
-            w.closeWarned = true;
-            say(w, "Unsaved changes. Ctrl+S saves; close the window again to quit anyway.");
-        } else {
-            game.requestQuit();
-        }
+/// Drag the edge of a side panel to resize it.
+fn resize(w: &World, mp: Vec2) {
+    let win = game.windowSize();
+    let grab: f32 = 5;
+    if game.mousePressed(Mouse.Left) && mp.y > TOP && mp.y < win.y - BOTTOM {
+        if mp.x > w.left - grab && mp.x < w.left + grab { w.edge = 1; }
+        if mp.x > win.x - w.right - grab && mp.x < win.x - w.right + grab { w.edge = 2; }
     }
-    if !typing() { shortcuts(w); }
+    let below = win.y - BOTTOM - edit.timelineHeight(w);
+    if game.mousePressed(Mouse.Left) && w.rigTab && mp.x > w.left + grab && mp.x < win.x - w.right - grab && mp.y > below - grab && mp.y < below + grab { w.edge = 3; }
+    if !game.mouseDown(Mouse.Left) {
+        if w.edge != 0 { tabs.remember(w); } // a panel was resized
+        w.edge = 0;
+    }
+    if w.edge == 3 { w.tl = clamp(win.y - BOTTOM - mp.y, MIN_TIMELINE, MAX_TIMELINE); }
+    if w.edge == 1 { w.left = clamp(mp.x, MIN_PANEL, MAX_PANEL); }
+    if w.edge == 2 { w.right = clamp(win.x - mp.x, MIN_PANEL, MAX_PANEL); }
+}
+
+fn input(w: &World, dt: f32) {
+    clipedit.step(w, dt);
+    let mp = game.mousePos();
+    resize(w, mp);
+    if game.closeRequested() {
+        tabs.remember(w); // unsaved edits go to drafts and come back next time
+        game.requestQuit();
+    }
+    w.saveTicks += 1;
+    if w.saveTicks >= 300 && !w.active { // every few seconds, so a killed window loses little
+        w.saveTicks = 0;
+        tabs.remember(w);
+    }
+    if !typing() { shortcuts(w); tabs.keys(w); }
+    let chosen = files.picked(w);
+    if chosen.len > 0 { tabs.open(w, chosen); }
     files.watch(w);
-    let inView = overView(mp);
+    let inView = overView(w, mp) && w.edge == 0;
     if inView { camera(w, mp); }
     let orbiting = game.mouseDown(Mouse.Right) || game.mouseDown(Mouse.Middle);
-    if inView && !orbiting { hoverPick(w); } else if !w.active { w.hover = pick.none(); }
-    if inView && !orbiting && game.mousePressed(Mouse.Left) { edit.press(w); }
+    let handled = gizmo.update(w, mp, inView && !orbiting);
+    if inView && !orbiting && !handled { hoverPick(w); } else if !w.active { w.hover = pick.none(); }
+    if inView && !orbiting && !handled && game.mousePressed(Mouse.Left) { edit.press(w); }
     if game.mouseDown(Mouse.Left) { edit.drag(w); }
     if game.mouseReleased(Mouse.Left) {
         edit.release(w);
@@ -159,14 +204,15 @@ fn input(w: &World, dt: f32) {
 
 fn drawScene(w: &World) {
     view.remesh(&w.view, &w.m);
-    let o = viewOrigin();
-    let s = viewSize();
+    let o = viewOrigin(w);
+    let s = viewSize(w);
     gfx.setViewRect(o.x, o.y, s.x, s.y);
     let half: f32 = 0;
     if w.ortho { half = w.cam.radius * 0.5774; }
     view.pass(&w.view, &w.m, w.cam, half, w.grid);
     edit.drawMirrors(w);
     edit.drawCursor(w);
+    gizmo.draw(w);
 }
 
 /// Run what was typed in the console box; show its output.
@@ -189,6 +235,7 @@ fn draw(w: &World) {
     ui.theme = panels.theme();
     panels.leftPanel(&ui, w);
     panels.rightPanel(&ui, w);
+    timeline.draw(&ui, w);
     panels.topBar(&ui, w);
     panels.helpCard(w);
     panels.logCard(w);
@@ -204,7 +251,7 @@ fn draw(w: &World) {
         t.pushStr(", ");
         t.pushInt(if w.hover.solid { w.hover.z } else { w.hover.pz });
         game.setColor(game.rgb(230, 232, 240));
-        game.drawText(w.font, Vec2 { x: LEFT + 12, y: win.y - BOTTOM - 26 }, t.str());
+        game.drawText(w.font, Vec2 { x: w.left + 12, y: win.y - BOTTOM - edit.timelineHeight(w) - 26 }, t.str());
     }
 }
 

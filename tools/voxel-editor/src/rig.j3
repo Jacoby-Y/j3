@@ -11,7 +11,7 @@ use j3.text.{ Text, same };
 use voxel_editor.model;
 use voxel_editor.overlay;
 use voxel_editor.model.{ CLIPKEYS, Clip, MAXCLIPS, MAXPARTS, MAXPOSES, POSE, Model, Part };
-use voxel_editor.util.own;
+use voxel_editor.util.{ cut, own, parseF };
 
 /// Part id named `name`, or 0.
 pub fn find(m: &Model, name: string): int {
@@ -318,18 +318,40 @@ pub fn addClip(m: &Model, name: string, seconds: f32, loops: bool): int {
         m.clipCount += 1;
         id = m.clipCount;
     }
-    m.clips[id] = Clip { name: own(m.mem, name), seconds: seconds, loop: loops, count: 0, keys: ["", "", "", "", "", "", "", ""] };
+    let none: [16]string = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""];
+    let zero: [16]f32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    m.clips[id] = Clip { name: own(m.mem, name), seconds: seconds, loop: loops, count: 0, keys: none, times: zero };
     model.touch(m);
     return id;
 }
 
-/// Append a pose name to a clip. False when it holds 8 already.
-pub fn clipKey(m: &Model, id: int, pose: string): bool {
+/// Append a pose to a clip at `time` seconds (below 0: not placed yet; `settleClip` spreads those evenly). False when full.
+pub fn clipKeyAt(m: &Model, id: int, pose: string, time: f32): bool {
     if m.clips[id].count >= CLIPKEYS { return false; }
     m.clips[id].keys[m.clips[id].count] = own(m.mem, pose);
+    m.clips[id].times[m.clips[id].count] = time;
     m.clips[id].count += 1;
     model.touch(m);
     return true;
+}
+
+/// A clip word, `POSE` or `POSE@SECONDS`, appended. False when the clip is full or the time is not a number.
+pub fn clipKeyWord(m: &Model, id: int, word: string): bool {
+    let at = word.len;
+    for i in 0..word.len { if word[i] == 64 { at = i; } }
+    let time: f32 = -1;
+    if at < word.len && !parseF(cut(word, at + 1, word.len), &time) { return false; }
+    return clipKeyAt(m, id, cut(word, 0, at), time);
+}
+
+/// Keys with no time yet go evenly over the clip (a loop spaces them over all of it, a one-shot from first to last at the end).
+pub fn settleClip(m: &Model, id: int) {
+    let c = &m.clips[id];
+    let unset = false;
+    for j in 0..c.count { if c.times[j] < 0 { unset = true; } }
+    if !unset { return; }
+    let steps = if c.loop { c.count } else { c.count - 1 };
+    for j in 0..c.count { c.times[j] = if steps > 0 { c.seconds * f32(j) / f32(steps) } else { 0 }; }
 }
 
 pub fn removeClip(m: &Model, id: int) {
@@ -338,27 +360,96 @@ pub fn removeClip(m: &Model, id: int) {
     model.touch(m);
 }
 
+/// Change a clip's length, moving its keys with it so the motion only gets faster or slower.
+pub fn setSeconds(m: &Model, id: int, seconds: f32) {
+    let c = &m.clips[id];
+    for j in 0..c.count { c.times[j] = c.times[j] * seconds / c.seconds; }
+    c.seconds = seconds;
+    model.touch(m);
+}
+
+/// The key of clip `id` within `slack` seconds of `t`, or -1.
+pub fn keyNear(m: &Model, id: int, t: f32, slack: f32): int {
+    let c = m.clips[id];
+    let best = -1;
+    let gap = slack;
+    for j in 0..c.count {
+        let d = c.times[j] - t;
+        if d < 0 { d = 0 - d; }
+        if d <= gap { gap = d; best = j; }
+    }
+    return best;
+}
+
+/// Put `pose` into clip `id` at `time`, keeping the keys in time order. The new key's index, or -1 when the clip is full.
+pub fn insertKey(m: &Model, id: int, pose: string, time: f32): int {
+    let c = &m.clips[id];
+    if c.count >= CLIPKEYS { return -1; }
+    let at = c.count;
+    while at > 0 && c.times[at - 1] > time {
+        c.keys[at] = c.keys[at - 1];
+        c.times[at] = c.times[at - 1];
+        at -= 1;
+    }
+    c.keys[at] = own(m.mem, pose);
+    c.times[at] = time;
+    c.count += 1;
+    model.touch(m);
+    return at;
+}
+
+/// Move key `j` to `time`, kept between its neighbours. Returns where it went.
+pub fn moveKey(m: &Model, id: int, j: int, time: f32): f32 {
+    let c = &m.clips[id];
+    let lo: f32 = 0;
+    let hi = c.seconds;
+    if j > 0 { lo = c.times[j - 1] + 0.01; }
+    if j < c.count - 1 { hi = c.times[j + 1] - 0.01; }
+    c.times[j] = clampF(time, lo, hi);
+    model.touch(m);
+    return c.times[j];
+}
+
+/// Take key `j` out of the clip (its pose stays saved).
+pub fn removeKey(m: &Model, id: int, j: int) {
+    let c = &m.clips[id];
+    for k in j..c.count - 1 {
+        c.keys[k] = c.keys[k + 1];
+        c.times[k] = c.times[k + 1];
+    }
+    c.count -= 1;
+    model.touch(m);
+}
+
 /// Put the clip at `t` seconds into the live pose, blending the two saved poses around it. False when
-/// a key names a pose that does not exist. Keys are spread evenly over the clip's length.
+/// a key names a pose that does not exist. A loop wraps (the last key blends back into the first); a one-shot holds its ends.
 pub fn sampleClip(m: &Model, id: int, t: f32): bool {
     let c = m.clips[id];
     if c.count == 0 { return true; }
-    let u: f32 = 0;
-    let a = 0;
-    let b = 0;
-    if c.count > 1 {
-        if c.loop {
-            let turns = t / c.seconds;
-            u = (turns - floor(turns)) * f32(c.count);
-        } else {
-            let frac = clampF(t / c.seconds, 0, 1);
-            u = frac * f32(c.count - 1);
-        }
-        a = int(floor(u));
-        if !c.loop && a > c.count - 2 { a = c.count - 2; }
-        b = (a + 1) % c.count;
-        u = u - f32(a);
+    let tt = t;
+    if c.loop {
+        let turns = t / c.seconds;
+        tt = (turns - floor(turns)) * c.seconds;
     }
+    let a = 0;
+    for j in 0..c.count { if c.times[j] <= tt { a = j; } }
+    let b = a;
+    let ta = c.times[a];
+    let tb = c.times[a];
+    if c.loop && tt < c.times[0] {
+        a = c.count - 1;
+        b = 0;
+        ta = c.times[a] - c.seconds;
+        tb = c.times[0];
+    } else if a < c.count - 1 {
+        b = a + 1;
+        tb = c.times[b];
+    } else if c.loop {
+        b = 0;
+        tb = c.seconds + c.times[0];
+    }
+    let u: f32 = 0;
+    if tb - ta > 0.00001 { u = clampF((tt - ta) / (tb - ta), 0, 1); }
     let sa = findPose(m, c.keys[a]);
     let sb = findPose(m, c.keys[b]);
     if sa == 0 || sb == 0 { return false; }

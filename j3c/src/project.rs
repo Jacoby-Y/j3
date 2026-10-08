@@ -278,7 +278,14 @@ fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, String> {
         link.libs = v.as_list("link.libs")?;
     }
     if let Some(v) = tbl.get("link", "search") {
-        link.search = v.as_list("link.search")?;
+        link.search = v
+            .as_list("link.search")?
+            .into_iter()
+            .map(|d| match (d.strip_prefix("~/"), std::env::var("HOME")) {
+                (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+                _ => d,
+            })
+            .collect();
     }
     if let Some(v) = tbl.get("link", "files") {
         link.files = v.as_list("link.files")?;

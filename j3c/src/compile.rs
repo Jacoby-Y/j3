@@ -383,6 +383,13 @@ impl Loader {
             };
             return stdlib_dir().join("j3").join(name);
         }
+        if parts.len() == 2 && parts[0] == "j3" && parts[1] == "threadsys" {
+            let name = match self.os {
+                OsKind::Windows => "threadsys_windows.j3",
+                OsKind::Linux | OsKind::Macos => "threadsys.j3",
+            };
+            return stdlib_dir().join("j3").join(name);
+        }
         if parts.len() == 2 && parts[0] == "j3" && parts[1] == "netsys" {
             let name = match self.os {
                 OsKind::Linux => "netsys.j3",

@@ -594,11 +594,24 @@ fn keep_flag(flag: &str, target: &str) -> bool {
     !f.contains("rpath") && !f.contains("--disable-new-dtags")
 }
 
+/// `-lNAME` as the target names it: Windows has no libc/libdl to link and calls GL `opengl32`.
+fn windows_lib(name: &str) -> Option<&str> {
+    match name {
+        "c" | "dl" => None,
+        "GL" => Some("opengl32"),
+        other => Some(other),
+    }
+}
+
 pub(crate) fn append_link_args(cmd: &mut Command, opts: &CcOpts, source: &str, target: &str) -> Result<(), String> {
     for file in &opts.files {
         cmd.arg(file);
     }
     for dir in &opts.search {
+        // ponytail: path sniff; a per-target [link] table is the real fix
+        if !windows_target(target) && dir.contains("mingw") {
+            continue;
+        }
         cmd.arg(format!("-L{dir}"));
         if !foreign_target(target) {
             cmd.arg(format!("-Wl,-rpath-link,{dir}"));
@@ -611,12 +624,24 @@ pub(crate) fn append_link_args(cmd: &mut Command, opts: &CcOpts, source: &str, t
         }
     }
     for lib in &libs {
+        if windows_target(target) {
+            if let Some(name) = windows_lib(lib) {
+                cmd.arg(format!("-l{name}"));
+            }
+            continue;
+        }
         cmd.arg(link_lib(lib, &opts.search, target)?);
     }
     for flag in &opts.flags {
         if keep_flag(flag, target) {
             cmd.arg(flag);
         }
+    }
+    if windows_target(target) {
+        // The mingw link leaves the TLS directory (`#[thread]` globals) without base relocations, so
+        // an exe that Windows ASLR moves off 0x140000000 crashes at its first thread-local access.
+        cmd.arg("-Wl,--disable-dynamicbase");
+        cmd.arg("-Wl,--disable-high-entropy-va");
     }
     Ok(())
 }

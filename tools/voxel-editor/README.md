@@ -63,6 +63,10 @@ edits are never overwritten.
 
 Models are up to 64 voxels on a side; 1 voxel is 1 unit in the editor.
 
+### Workspace tabs
+
+Many models at once: `vox a.j3voxel b.j3voxel`, or `vox models/` (every `.j3voxel` in the folder), one tab each (max 8). The tab strip sits under the top bar; **+ Tab** adds a blank one, **Close Tab** / Ctrl+W closes (twice if unsaved), Ctrl+Tab / Ctrl+Shift+Tab cycles, and the **Open...** chooser opens in a new tab. Each tab keeps its own undo history, camera and clip. The workspace is written to `.vox-workspace` in the folder you started in whenever the tabs change and when the window closes (closing never asks): each tab's file, camera, clip and playhead, the active tab, tool, Rig tab, ortho/grid and panel sizes. Unsaved edits (including unsaved clips and poses) go to `.vox-drafts/` and come back still unsaved. Plain `vox` with no arguments restores it all (file names without spaces). *Untested in the window* (compiles, selftest ok).
+
 ## The `.j3voxel` format
 
 ```
@@ -189,7 +193,7 @@ and `--view right`; a joint cross that sits off the limb in `--render` (leave jo
 
 **Animation:** a clip runs through saved poses spread evenly over its seconds (`loop` returns from the
 last pose to the first). `clip at walk 0.3` poses the model at 0.3 s, so a render of each time is a
-frame to review. **In a game:** copy `runtime/j3rig.j3` beside `j3voxel.j3` (rename the modules as that
+frame to review. A clip key may carry its own time, `clip walk 0.8 loop a@0 b@0.3 c@0.5` (seconds from the start; no times means evenly spread). In the window, the Rig tab shows a **timeline** under the view (drag its top edge to resize): pick or make a clip, Play (Space), drag the red playhead or a key, and edit the pose with the handles (click a joint to select it, drag a ring to turn it, drag the orange diamond on a wrist to reach with the arm); with Auto-key on the edit becomes a key at the playhead, otherwise press Set key. Drag the edges of the side panels to resize them. Up to 64 poses and 16 keys per clip. **In a game:** copy `runtime/j3rig.j3` beside `j3voxel.j3` (rename the modules as that
 file says): `j3rig.load` / `upload`, then each frame `sample` (or `pose`, `blend`, `setAngle` by part name)
 into an angles array and `j3rig.draw(&rig, Mat4.translate(...), angles, mats)`. Parts are meshed
 separately and turned about their joints, with no skinning, so a part never bends.
