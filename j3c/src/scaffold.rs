@@ -13,19 +13,21 @@ pub fn cmd(rest: &[String]) -> i32 {
         if a == "--template" {
             match args.next().map(String::as_str) {
                 Some("fps") => template = Some("fps"),
+                Some("ui") => template = Some("ui"),
                 other => {
                     eprintln!("j3c: unknown template `{}`", other.unwrap_or(""));
-                    eprintln!("  = help: templates: fps");
+                    eprintln!("  = help: templates: fps, ui");
                     return 1;
                 }
             }
         } else if a == "--app" {
             app = true;
         } else if a == "--help" || a == "-h" {
-            println!("usage: j3c new [name] [--app | --template fps]");
+            println!("usage: j3c new [name] [--app | --template fps|ui]");
             println!("    j3c new mygame        printLn hello in ./mygame");
             println!("    j3c new mygame --app  SDL window (links SDL2)");
             println!("    j3c new mygame --template fps   first-person 3D game with a scene (SDL2 + GL)");
+            println!("    j3c new mygame --template ui    .j3ui components window (SDL2 + ttf + GL; `j3c doc j3ui`)");
             println!("    j3c new               write into the current directory");
             println!("    j3c new --app         window template in the current directory");
             return 0;
@@ -45,10 +47,15 @@ pub fn cmd(rest: &[String]) -> i32 {
             eprintln!("j3c: `--app` and `--template` don't go together");
             return 1;
         }
-        return match create_fps(name) {
+        let ui = template == Some("ui");
+        return match if ui { create_ui(name) } else { create_fps(name) } {
             Ok(root) => {
                 println!("{}", root.display());
-                println!("next: j3c check; j3c editor to edit scenes/main.j3scene");
+                if ui {
+                    println!("next: j3c check; j3c run --frames 30 --screenshot shot.png --headless");
+                } else {
+                    println!("next: j3c check; j3c editor to edit scenes/main.j3scene");
+                }
                 0
             }
             Err(e) => {
@@ -109,6 +116,40 @@ pub fn create(name: Option<&str>, app: bool) -> Result<(PathBuf, String), String
     write_agent_files(&root, false)?;
     Ok((root, module))
 }
+
+/// The `components` recipe project in a new directory (`--template ui`), plus AGENTS.md.
+pub fn create_ui(name: Option<&str>) -> Result<PathBuf, String> {
+    let (root, package) = locate(name)?;
+    if root.join("j3.toml").is_file() || root.join("AGENTS.md").is_file() {
+        return Err(format!("j3.toml or AGENTS.md already exists in {}", root.display()));
+    }
+    for (path, text) in crate::helptext::components_files(&module_name(&package)) {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).map_err(|e| format!("mkdir: {e}"))?;
+        std::fs::write(&file, text).map_err(|e| format!("write {path}: {e}"))?;
+    }
+    // The editor's own font, so text draws out of the box. Swap it for yours at the same path.
+    std::fs::create_dir_all(root.join("assets")).map_err(|e| format!("mkdir: {e}"))?;
+    std::fs::write(root.join("assets/font.ttf"), crate::editor::FONT).map_err(|e| format!("write assets/font.ttf: {e}"))?;
+    write_agent_files(&root, false)?;
+    let agents = root.join("AGENTS.md");
+    let text = std::fs::read_to_string(&agents).map_err(|e| format!("read AGENTS.md: {e}"))?;
+    std::fs::write(&agents, format!("{text}\n{UI_COMPONENTS}")).map_err(|e| format!("write AGENTS.md: {e}"))?;
+    Ok(root)
+}
+
+/// The `.j3ui` section of a `--template ui` project's AGENTS.md.
+const UI_COMPONENTS: &str = r#"## .j3ui components (this project's UI)
+
+This project's UI is `ui/*.j3ui` (markup + J3 + CSS, compiled by j3c), not the `@j3ui` immediate-mode section above. Guides: `j3c doc j3ui` (markup, props, events, bind, canvas), `j3c doc css` (what CSS works and what differs from a browser), `j3c doc recipes components`, `j3c doc recipes paint` (j3.gfx.paint straight from a game).
+
+- `ui/Name.j3ui` becomes `Name` / `NameProps` in module `<package>.ui`; `ui/` is scanned recursively and `ui/game/Bar.j3ui` is `game.Bar` in markup (`<game.Bar />`, always the full path from `ui/`) and `game_Bar` / `game_BarProps` in J3. `src/main.j3` mounts the root and calls `root.render(windowSize(), props)` each frame. Game state lives in plain J3 (`src/state.j3`); components read it through `props`.
+- Style in the component's `<style>` and the global `ui/theme.css`. Unsupported CSS warns at startup (`warning: file:line:col`); check it after a run. Layout helpers that work: `margin: auto` (centers a block with a width, a flex item or an absolute box), `aspect-ratio`, `outline` with `outline-offset` (focus rings, no layout space), `cursor` (set by the node under the pointer, so `:hover` / `:disabled` rules work), `text-decoration`, `font-style: italic` (faux), and `:not()`, `:nth-child()`, `:last-child`.
+- `j3c dump-ui ui` prints the generated J3; compile errors point at the `.j3ui` line.
+- Look and test without a window: `j3c run --frames 30 --screenshot shot.png --headless`, then read the PNG. Never run the app without `--headless`. For a built binary: `SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout 20 ./target/<name>`.
+- Goldens: list states in `golden.toml` and run `j3c golden .` (`--bless` to accept; by hand `J3_CAPTURE=out.png:30 J3_FIXED_DT=0.016` then `j3c -e imgdiff golden/x.png out.png`). Idle-cost check: `J3_STEADY=60:120`. Fake clicks and typing: `j3.ui.testkit`. Layout as text: `j3.ui.domhtml.dumpHtml(&root.dom, "target/ui-snapshot.html")`. All of it: `j3c doc testing`.
+- `assets/font.ttf` is a stock font j3c copied in (theme.css loads it); replace the file to change the typeface.
+"#;
 
 /// The editor's project files with a first-person main (`--template fps`), plus AGENTS.md.
 pub fn create_fps(name: Option<&str>) -> Result<PathBuf, String> {
@@ -178,8 +219,9 @@ Learn J3 from `j3c` only: `j3c guide`, `j3c doc`, `j3c help`. Do not search the 
 - Start from the task: `j3c doc` lists recipes and modules by what you're building; `j3c doc recipes <name>` prints a whole program that checks.
 - Find a name: `j3c doc search <word>`, or `j3c doc <name>`. A module on one screen: `j3c doc <module> --short`.
 - Heavy work off the frame thread (meshing, generation, decoding): `j3c doc recipes threads`, then `j3c doc threads`. Window, GL, SDL, and `j3.gfx`/`j3.game`/`j3.scene3d` state are main-thread only; workers compute and hand results back.
-- Check your work: `j3c check`, then `j3c run --frames 120 --screenshot shot.png --headless` and look at the picture (`j3c doc recipes check`).
+- Check your work: `j3c check`, then `j3c run --frames 120 --screenshot shot.png --headless` and look at the picture (`j3c doc recipes check`, `j3c doc testing`). Never run the game without `--headless` (a bare `j3c run` opens a window); a built binary needs `SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy` on the same command. Wrap runs in `timeout`.
 - 3D scenes and the editor: `j3c doc recipes scene3d`, `j3c doc editor`. `j3c editor` on this project adds the scene-tool guide here.
+- Ship it: `j3c build --release`; `[dist] build_outputs = ["zip", "deb"]` in j3.toml also writes a zip and a Linux `.deb` (menu entry, icon) to `target/dist/` (`j3c doc ship`).
 
 ## Shape
 
@@ -199,7 +241,7 @@ Per-object logic that you edit while the game runs goes in a `.j3s` script (`j3c
 The window can resize, including fullscreen. Pick one and keep it:
 
 - Fixed: draw into a constant pixel size. `setMinSize` / `setMaxSize` can lock it (`j3c doc j3.game`).
-- Ratio: that same layout, scaled to the window (`j3c doc j3.game windowSize`).
+- Ratio: call `game.setVirtualSize(1920, 1080)` once; everything (2D, 3D, `.j3ui`, `mousePos`) then works in those pixels, scaled to the window with black bars (`j3c doc j3.game setVirtualSize`). `windowSize()` returns the virtual size.
 - Fluid: place things from the current size so windowed and fullscreen both read well.
 
 Do not lock drawing to the size passed to `App.create` and ignore later resizes.
@@ -324,7 +366,7 @@ name = "{name}"
 entry = "src/main.j3"
 
 [emit]
-backend = llvm
+backend = "llvm"
 opt = 0
 debug = true
 # Dev loop. Ship with `j3c build --release` (opt s, no -g, stripped: about 3x smaller).
@@ -356,15 +398,23 @@ pub(crate) fn app_toml(name: &str) -> String {
 [package]
 name = "{name}"
 entry = "src/main.j3"
+version = "0.1.0"
+description = "{name}, made with j3"
 
 [emit]
-backend = llvm
+backend = "llvm"
 opt = 0
 debug = true
 # Dev loop. Ship with `j3c build --release` (opt s, no -g, stripped: about 3x smaller).
 
 [link]
 libs = ["SDL2"]
+
+[dist]
+# `j3c build --release` also writes these to target/dist/: a zip per target, and a .deb
+# (Linux) that installs to /opt with a menu entry. `j3c help manifest` lists every key.
+# build_outputs = ["zip", "deb"]
+# icon = "assets/icon.png"
 "#
     )
 }
@@ -471,6 +521,18 @@ mod tests {
     }
 
     #[test]
+    fn ui_template_checks() {
+        let dir = std::env::temp_dir().join(format!("j3-ui-template-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let made = create_ui(Some(dir.join("panel").to_str().unwrap())).expect("create");
+        assert!(made.join("ui/Screen.j3ui").is_file());
+        let agents = std::fs::read_to_string(made.join("AGENTS.md")).unwrap();
+        assert!(agents.contains("j3c doc css") && agents.contains("--headless"), "{agents}");
+        assert_eq!(crate::cli::run(["check".into(), made.display().to_string()]), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn fpwalk_template_typechecks() {
         let dir = scratch();
         let made = create_fps(Some(dir.join("walk").to_str().unwrap())).expect("create");
@@ -492,6 +554,43 @@ mod tests {
         assert!(main.contains("drawFrame"), "{main}");
         let code = crate::cli::run(["check".into(), made.display().to_string()]);
         assert_eq!(code, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every template names the project after its directory, never the placeholder `mygame`, and
+    /// writes the canonical quoted `backend`.
+    #[test]
+    fn templates_use_the_project_name() {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out) } else { out.push(p) }
+            }
+        }
+        let dir = scratch();
+        let roots = [
+            create(Some(dir.join("todo").to_str().unwrap()), false).unwrap().0,
+            create(Some(dir.join("todoapp").to_str().unwrap()), true).unwrap().0,
+            create_fps(Some(dir.join("todofps").to_str().unwrap())).unwrap(),
+            create_ui(Some(dir.join("todoui").to_str().unwrap())).unwrap(),
+        ];
+        for root in roots {
+            let name = root.file_name().unwrap().to_str().unwrap().to_string();
+            let mut files = Vec::new();
+            walk(&root, &mut files);
+            for f in files {
+                if f.extension().is_some_and(|x| x == "ttf") { continue; }
+                let text = std::fs::read_to_string(&f).unwrap_or_default();
+                if f.file_name().unwrap() != "AGENTS.md" {
+                    assert!(!text.contains("mygame"), "{} mentions mygame", f.display());
+                }
+                if f.file_name().unwrap() == "j3.toml" {
+                    assert!(text.contains(&format!("name = \"{name}\"")), "{text}");
+                    assert!(text.contains("backend = \"llvm\""), "{text}");
+                }
+            }
+        }
+        assert!(std::fs::metadata(dir.join("todoui/assets/font.ttf")).unwrap().len() > 10_000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

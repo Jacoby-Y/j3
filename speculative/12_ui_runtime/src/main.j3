@@ -1,0 +1,355 @@
+// Host for the hand-desugared idle-breakout UI (plan 022 stage 05). Normal use is the three lines in
+// `draw`: `render(windowSize(), props)` per frame. The rest is test scaffolding, chosen by argv[1]:
+//   (none)   run as an app;  golden  fixed clock, mouse off the window (for J3_CAPTURE=golden.png:30)
+//   test     synthetic mouse script that checks clicks, hover swallow, bind, fade; prints PASS/FAIL lines
+//   steady [N]  N (10000) idle frames; prints style/layout counters and arena growth
+// Headless:  SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout 10 target/idle test
+
+module idle;
+
+use idle.field;
+use idle.sim.Sim;
+use idle.ui.{ Game, GameProps };
+use j3.app.App;
+use j3.game.{ Font, loadFont, requestQuit, windowSize };
+use j3.io.printLn;
+use j3.math.Vec2;
+use j3.memory.Arena;
+use j3.sys;
+use j3.text.same;
+use j3.ui.dom.Dom;
+
+const MODE_APP: int = 0;
+const MODE_GOLDEN: int = 1;
+const MODE_TEST: int = 2;
+const MODE_STEADY: int = 3;
+
+struct World {
+    mem: &Arena;
+    sim: Sim;
+    font: Font;
+    root: Game;
+    mode: int;
+    frame: int;
+    fails: int;
+    // saved at the start of the steady run
+    used0: int;
+    laid0: int;
+    restyled0: int;
+    spent0: int;
+    gold0: int;
+    clicks0: int;
+    // where the script pressed
+    px: f32;
+    py: f32;
+    steadyN: int;
+}
+
+/// `steady N`: idle frames to run (default 10000; the offscreen GL driver needs about 0.9 ms per frame, so use 5000 under `timeout 10`).
+fn steadyFrames(): int {
+    let a = sys.arg(2);
+    let n = 0;
+    for i in 0..a.len {
+        n = n * 10 + int(a[i]) - 48;
+    }
+    if n == 0 {
+        return 10000;
+    }
+    return n;
+}
+
+fn boot(mem: &Arena): World {
+    let mode = MODE_APP;
+    let a = sys.arg(1);
+    if same(a, "golden") {
+        mode = MODE_GOLDEN;
+    } else if same(a, "test") {
+        mode = MODE_TEST;
+    } else if same(a, "steady") {
+        mode = MODE_STEADY;
+    }
+    let sim = Sim.new(mem);
+    sim.gold = 500;
+    sim.shop[0].owned = 1;
+    sim.ballCount = 1;
+    return World {
+        mem: mem, sim: sim, font: Font { raw: 0 }, root: Game.new(mem),
+        mode: mode, frame: 0, fails: 0,
+        used0: 0, laid0: 0, restyled0: 0, spent0: 0, gold0: 0, clicks0: 0, px: 0.0, py: 0.0, steadyN: steadyFrames(),
+    };
+}
+
+fn load(w: &World) {
+    w.font = loadFont("assets/font.ttf", 12);
+    if w.mode != MODE_APP {
+        w.root.dom.setFrameMs(16.0);
+    }
+}
+
+// ---- test helpers -------------------------------------------------------------------------------------
+
+fn check(w: &World, ok: bool, name: string) {
+    if ok {
+        printLn(`PASS {name}`);
+    } else {
+        printLn(`FAIL {name}`);
+        w.fails += 1;
+    }
+}
+
+struct Count {
+    k: int;
+}
+
+/// The `nth` element (document order) with tag `t` and, when `text` is non-empty, first child text `text`.
+fn dfs(d: &Dom, id: int, t: int, text: string, nth: int, c: &Count): int {
+    let n = d.nodes.items[id];
+    if n.kind == 0 && !n.ghost {
+        let hit = n.tag == t;
+        if hit && text.len > 0 {
+            hit = n.first >= 0 && d.nodes.items[n.first].kind == 1 && same(d.textOf(n.first), text);
+        }
+        if hit {
+            if c.k == nth {
+                return id;
+            }
+            c.k += 1;
+        }
+        let ch = n.first;
+        while ch >= 0 {
+            let r = dfs(d, ch, t, text, nth, c);
+            if r >= 0 {
+                return r;
+            }
+            ch = d.nodes.items[ch].next;
+        }
+    }
+    return -1;
+}
+
+fn findText(d: &Dom, tag: string, text: string): int {
+    let c = Count { k: 0 };
+    return dfs(d, 0, d.tag(tag), text, 0, &c);
+}
+
+fn findTag(d: &Dom, tag: string, nth: int): int {
+    let c = Count { k: 0 };
+    return dfs(d, 0, d.tag(tag), "", nth, &c);
+}
+
+/// Aim the script's mouse at the middle of node `id`.
+fn aim(w: &World, id: int) {
+    let d = &w.root.dom;
+    w.px = d.absX(id) + d.nodes.items[id].w / 2.0;
+    w.py = d.absY(id) + d.nodes.items[id].h / 2.0;
+}
+
+fn near(a: f32, b: f32): bool {
+    let e = a - b;
+    if e < 0.0 {
+        e = 0.0 - e;
+    }
+    return e < 0.6;
+}
+
+/// One synthetic mouse step: position and button for this frame.
+fn mouse(w: &World, p: Vec2, down: bool) {
+    w.root.dom.simInput(p.x, p.y, down, 0.0);
+    w.px = p.x;
+    w.py = p.y;
+}
+
+fn off(w: &World) {
+    w.root.dom.simInput(-10.0, -10.0, false, 0.0);
+}
+
+/// Click = move, press, release over three frames starting at `f0`; returns true on the frame
+/// after the release (results are visible).
+fn clickAt(w: &World, f0: int, p: Vec2): bool {
+    let f = w.frame - f0;
+    if f == 0 {
+        mouse(w, p, false);
+    } else if f == 1 {
+        mouse(w, p, true);
+    } else if f == 2 {
+        mouse(w, p, false);
+    } else {
+        off(w);
+    }
+    return f == 3;
+}
+
+/// The scripted run. Each stage waits for a layout, aims at a node found by text, then checks the sim.
+fn script(w: &World) {
+    let d = &w.root.dom;
+    let sim = &w.sim;
+    let f = w.frame;
+    if f < 4 {
+        off(w);
+        return;
+    }
+    // 1. UpgradeRow button raises the parent's gold-spend counter
+    if f < 10 {
+        if f == 4 {
+            w.spent0 = sim.spent;
+            w.gold0 = sim.gold;
+            let b = findText(d, "button", `{sim.clickCost}`);
+            if b < 0 {
+                check(w, false, "found the UpgradeRow button");
+                requestQuit();
+                return;
+            }
+            aim(w, b);
+        }
+        if clickAt(w, 4, Vec2 { x: w.px, y: w.py }) {
+            check(w, sim.spent - w.spent0 > 0 && w.gold0 - sim.gold == sim.spent - w.spent0, "click on UpgradeRow raises spent (parent on:buy ran)");
+        }
+        return;
+    }
+    // 2. a disabled button swallows the click
+    if f < 18 {
+        if f == 10 {
+            sim.gold = 0;
+        }
+        if f < 12 {
+            off(w);
+            return;
+        }
+        if f == 12 {
+            w.spent0 = sim.spent;
+            aim(w, findText(d, "button", `{sim.clickCost}`));
+        }
+        if clickAt(w, 12, Vec2 { x: w.px, y: w.py }) {
+            check(w, sim.spent == w.spent0, "disabled button ignores the click");
+            sim.gold = 5000;
+        }
+        return;
+    }
+    // 3. canvas mousedown with canvas-local coordinates
+    if f < 24 {
+        let cv = findTag(d, "canvas", 0);
+        if f == 18 {
+            w.clicks0 = sim.clicks;
+            w.px = d.absX(cv) + 130.0;
+            w.py = d.absY(cv) + 200.0;
+        }
+        if clickAt(w, 18, Vec2 { x: w.px, y: w.py }) {
+            let want = field.view(d.size(cv)).toField(Vec2 { x: 130.0, y: 200.0 });
+            check(w, sim.clicks == w.clicks0 + 1, "click on the canvas reaches on:mousedown");
+            check(w, near(sim.lastClick.x, want.x) && near(sim.lastClick.y, want.y), "canvas mouse is canvas-local");
+        }
+        return;
+    }
+    // 4. the HUD on top of the canvas swallows the click
+    if f < 30 {
+        if f == 24 {
+            w.clicks0 = sim.clicks;
+            let lv = findText(d, "span", "Level 1");
+            aim(w, d.nodes.items[lv].parent);
+        }
+        if clickAt(w, 24, Vec2 { x: w.px, y: w.py }) {
+            check(w, sim.clicks == w.clicks0, "click on the HUD does not reach the canvas");
+        }
+        return;
+    }
+    // 5. nav button sets the Sidebar let; bind:checked
+    if f < 36 {
+        if f == 30 {
+            aim(w, findText(d, "button", "Settings"));
+        }
+        if clickAt(w, 30, Vec2 { x: w.px, y: w.py }) {
+            check(w, w.root.c1.tab == 1, "nav button sets the Sidebar let (tab == 1)");
+        }
+        return;
+    }
+    if f < 42 {
+        if f == 36 {
+            aim(w, findTag(d, "input", 0));
+        }
+        if clickAt(w, 36, Vec2 { x: w.px, y: w.py }) {
+            check(w, sim.paused, "bind:checked toggles sim.paused");
+        }
+        return;
+    }
+    // bind:value: press at 10% of the range, drag to 80%
+    if f < 50 {
+        let rg = findTag(d, "input", 1);
+        let x0 = d.absX(rg);
+        let ww = d.nodes.items[rg].w;
+        let y = d.absY(rg) + d.nodes.items[rg].h / 2.0;
+        if f == 42 {
+            mouse(w, Vec2 { x: x0 + ww * 0.1, y: y }, false);
+        } else if f == 43 {
+            mouse(w, Vec2 { x: x0 + ww * 0.1, y: y }, true);
+        } else if f == 44 {
+            mouse(w, Vec2 { x: x0 + ww * 0.8, y: y }, true);
+        } else if f == 45 {
+            mouse(w, Vec2 { x: x0 + ww * 0.8, y: y }, false);
+        } else if f == 47 {
+            check(w, near(sim.timeScale, 3.5), `bind:value follows the drag (timeScale {sim.timeScale})`);
+            let ov = findText(d, "button", "Resume");
+            check(w, ov >= 0, "overlay with transition:fade is in the tree while paused");
+            aim(w, ov);
+        } else {
+            off(w);
+        }
+        return;
+    }
+    // 6. Resume, inside the canvas and the if-block; the overlay fades out as a ghost, then goes
+    if f < 54 {
+        if clickAt(w, 50, Vec2 { x: w.px, y: w.py }) {
+            check(w, !sim.paused, "Resume (in the canvas, in the if-block) sets sim.paused = false");
+        }
+        return;
+    }
+    if f < 80 {
+        off(w);
+        if f == 56 {
+            check(w, d.ghosts == 1, `leaving the if-block keeps a ghost for the fade (ghosts {d.ghosts})`);
+        }
+        if f == 79 {
+            check(w, d.ghosts == 0, `ghost removed after its fade (ghosts {d.ghosts})`);
+            check(w, findText(d, "button", "Resume") < 0, "overlay gone from the tree");
+            printLn(`script done, {w.fails} failures`);
+            requestQuit();
+        }
+    }
+}
+
+fn steady(w: &World) {
+    let d = &w.root.dom;
+    off(w);
+    if w.frame == 40 {
+        w.used0 = w.mem.used;
+        w.laid0 = d.laid;
+        w.restyled0 = d.restyled;
+    }
+    if w.frame == 40 + w.steadyN {
+        printLn(`steady: {w.frame - 40} idle frames, layouts {d.laid - w.laid0}, style recomputes {d.restyled - w.restyled0}, arena growth {w.mem.used - w.used0} bytes, nodes {d.count()}`);
+        requestQuit();
+    }
+}
+
+fn draw(w: &World) {
+    w.frame += 1;
+    if w.mode == MODE_TEST {
+        script(w);
+    } else if w.mode == MODE_STEADY || w.mode == MODE_GOLDEN {
+        w.root.dom.simInput(-10.0, -10.0, false, 0.0);
+        if w.mode == MODE_STEADY {
+            steady(w);
+        }
+    }
+    w.root.render(windowSize(), GameProps { sim: &w.sim, font: w.font });
+}
+
+fn main() {
+    let app = App<World>.createSized("idle breakout", 1280, 760, 64 * 1024 * 1024, boot);
+    app.useGl();
+    app.startup(load);
+    app.draw(draw);
+    app.run();
+    if app.world.fails > 0 {
+        sys.exit(1);
+    }
+}

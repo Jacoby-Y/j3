@@ -3,6 +3,7 @@
 mod complete;
 pub(crate) mod json;
 mod query;
+mod ui;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -53,6 +54,7 @@ pub fn serve() -> i32 {
         key: 0,
         prog: None,
     };
+    let mut ui_cache = ui::UiCache::new();
     let mut shutdown = false;
     loop {
         let raw = match read_message(&mut stdin) {
@@ -72,6 +74,21 @@ pub fn serve() -> i32 {
         };
         let method = msg.get("method").and_then(Json::as_str).unwrap_or("");
         let id = msg.get("id").cloned();
+        if matches!(
+            method,
+            "textDocument/hover"
+                | "textDocument/definition"
+                | "textDocument/completion"
+                | "textDocument/signatureHelp"
+                | "textDocument/documentSymbol"
+                | "textDocument/codeAction"
+                | "textDocument/formatting"
+        ) && ui::is_ui_request(&msg)
+        {
+            let result = ui::handle(method, &msg, &docs, &mut ui_cache);
+            reply(&mut stdout, id, result);
+            continue;
+        }
         match method {
             "initialize" => {
                 let result = Json::obj(vec![(
@@ -91,6 +108,9 @@ pub fn serve() -> i32 {
                                         Json::Str("{".to_string()),
                                         Json::Str("@".to_string()),
                                         Json::Str("[".to_string()),
+                                        Json::Str("<".to_string()),
+                                        Json::Str(" ".to_string()),
+                                        Json::Str(":".to_string()),
                                     ]),
                                 ),
                                 ("resolveProvider", Json::Bool(false)),
@@ -609,6 +629,17 @@ where
     f(prog, &path.display().to_string(), off)
 }
 
+/// An error path from the checker; `.j3ui` errors are relative to the project root.
+fn err_path(from: &Path, p: &str) -> PathBuf {
+    let p = PathBuf::from(p);
+    if p.is_relative() && ui::is_ui_path(&p) {
+        if let Ok(crate::project::Input::Project(m)) = crate::project::resolve(from) {
+            return m.root.join(p);
+        }
+    }
+    p
+}
+
 fn publish_diags(
     out: &mut impl Write,
     uri: &str,
@@ -619,39 +650,63 @@ fn publish_diags(
     let Some(path) = uri_to_path(uri) else {
         return;
     };
+    if path.extension().and_then(|e| e.to_str()) == Some("css") {
+        return; // CSS has completion only (lsp/ui.rs), no diagnostics
+    }
     let overlays = overlays_from(docs);
     let open = open_docs(docs);
     let mut target = uri.to_string();
     let mut diags = Vec::new();
     let key = docs_key(docs);
-    match parse::parse(text, crate::span::FileId(1)) {
-        Err(e) => {
-            cache.key = key;
-            cache.prog = None;
-            diags.push(diag_json(text, e.span, &e.message));
+    let pick = |e_path: &Path, target: &mut String| {
+        if let Some(found) = open.iter().find(|(_, p)| paths_match(p, e_path)) {
+            *target = found.0.clone();
         }
-        Ok(_) => match crate::compile::analyze_checked(&path, &overlays) {
-            Ok(prog) => {
-                cache.key = key;
-                cache.prog = Some(prog);
+    };
+    let read = |e_path: &Path, target: &str| -> String {
+        match docs.get(target) {
+            Some(buf) => buf.clone(),
+            None => crate::stdlib::read(e_path).unwrap_or_default(),
+        }
+    };
+    if ui::is_ui_path(&path) {
+        // A `.j3ui` buffer: generate, check, and publish on whichever `.j3ui` the error is in.
+        if let Some(u) = ui::analyze(&path, &overlays) {
+            if let Some(e) = u.err {
+                let ep = err_path(&path, &e.path);
+                let ep = if ep.is_relative() { u.root.join(&ep) } else { ep };
+                pick(&ep, &mut target);
+                let src = read(&ep, &target);
+                diags.push(diag_json(&src, e.span, &diag_text(&e)));
             }
+        }
+    } else {
+        match parse::parse(text, crate::span::FileId(1)) {
             Err(e) => {
                 cache.key = key;
                 cache.prog = None;
-                if let Some(found) = open.iter().find(|(_, p)| paths_match(p, Path::new(&e.path))) {
-                    target = found.0.clone();
-                }
-                let src = if target == uri && paths_match(Path::new(&e.path), &path) {
-                    text.to_string()
-                } else if let Some(buf) = docs.get(&target) {
-                    buf.clone()
-                } else {
-                    crate::stdlib::read(Path::new(&e.path)).unwrap_or_default()
-                };
-                diags.push(diag_json(&src, e.span, &diag_text(&e)));
+                diags.push(diag_json(text, e.span, &e.message));
             }
-        },
-    };
+            Ok(_) => match crate::compile::analyze_checked(&path, &overlays) {
+                Ok(prog) => {
+                    cache.key = key;
+                    cache.prog = Some(prog);
+                }
+                Err(e) => {
+                    cache.key = key;
+                    cache.prog = None;
+                    let ep = err_path(&path, &e.path);
+                    pick(&ep, &mut target);
+                    let src = if target == uri && paths_match(&ep, &path) {
+                        text.to_string()
+                    } else {
+                        read(&ep, &target)
+                    };
+                    diags.push(diag_json(&src, e.span, &diag_text(&e)));
+                }
+            },
+        }
+    }
     let mut sent = false;
     for (u, _) in &open {
         let items = if u == &target {
@@ -663,7 +718,7 @@ fn publish_diags(
         notify_diags(out, u, items);
     }
     if !sent {
-        notify_diags(out, uri, diags);
+        notify_diags(out, &target, diags);
     }
 }
 

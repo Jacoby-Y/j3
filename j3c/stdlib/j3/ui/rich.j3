@@ -1,0 +1,299 @@
+/// Measuring, hit testing and drawing the spans of a `rich` textarea (`j3.ui.spans.Span`) on one wrapped line.
+/// The text between span edges is a segment: bold segments are measured and drawn bold, a link is accent colored and
+/// underlined, italic (there is no slanted font) is drawn dimmed, and a token is one chip box: its label's width plus
+/// `PAD` each side, a rounded accent-tinted background. `j3.ui.area` calls these when the box holds spans; a plain
+/// box never gets here. Needs SDL_ttf for measuring and a `j3.gfx.paint` frame for `run`.
+
+module j3.ui.rich;
+
+use j3.game.{ Color, Font, fontLine, selRectW, selRectX, textBidi, textCaretX, textIndexAt, textSelRects, textWidth };
+use j3.gfx.paint;
+use j3.math.Vec2;
+use j3.ui.field.Look;
+use j3.ui.spans.{ isToken, SPAN_BOLD, SPAN_ITALIC, SPAN_LINK };
+use j3.ui.textedit.Edit;
+use j3.ui.textfit.{ fitPrefix, isCont };
+
+/// Horizontal padding of a token chip, each side.
+pub const PAD: f32 = 4.0;
+
+fn view(s: string, a: int, b: int): []u8 {
+    let t = s[a..b];
+    return []u8 { ptr: t.ptr, len: t.len };
+}
+
+/// The token starting at byte `p` (-1: none).
+fn tokAt(e: &Edit, p: int): int {
+    for k in 0..e.sp.len {
+        let s = e.sp.items[k];
+        if s.start == p && isToken(s.kind) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+/// End of the plain segment starting at `p`, at most `hi`: the next span edge.
+fn segEnd(e: &Edit, p: int, hi: int): int {
+    let q = hi;
+    for k in 0..e.sp.len {
+        let s = e.sp.items[k];
+        if s.start > p && s.start < q {
+            q = s.start;
+        }
+        let en = s.start + s.len;
+        if en > p && en < q {
+            q = en;
+        }
+    }
+    return q;
+}
+
+/// Whether a span of `kind` covers byte `p`.
+fn has(e: &Edit, p: int, kind: int): bool {
+    for k in 0..e.sp.len {
+        let s = e.sp.items[k];
+        if s.kind == kind && s.start <= p && p < s.start + s.len {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn tokW(e: &Edit, font: Font, bold: bool, s: string, t: int): f32 {
+    let sp = e.sp.items[t];
+    return textWidth(font, view(s, sp.start, sp.start + sp.len), bold) + 2.0 * PAD;
+}
+
+/// Width of `s[a..b]` with the spans' fonts.
+pub fn width(e: &Edit, font: Font, bold: bool, a: int, b: int): f32 {
+    let s = e.str();
+    let x: f32 = 0.0;
+    let p = a;
+    while p < b {
+        let t = tokAt(e, p);
+        if t >= 0 {
+            x += tokW(e, font, bold, s, t);
+            p = e.sp.items[t].start + e.sp.items[t].len;
+        } else {
+            let q = segEnd(e, p, b);
+            x += textWidth(font, view(s, p, q), bold || has(e, p, SPAN_BOLD));
+            p = q;
+        }
+    }
+    return x;
+}
+
+/// Visual x of the caret before byte `cur` on the line `a..b`: segments sit in logical order, and inside a segment
+/// right-to-left runs are reordered as it is drawn (`game.textCaretX`).
+pub fn caretX(e: &Edit, font: Font, bold: bool, a: int, b: int, cur: int): f32 {
+    let s = e.str();
+    let x: f32 = 0.0;
+    let p = a;
+    while p < b {
+        if cur <= p {
+            return x;
+        }
+        let t = tokAt(e, p);
+        if t >= 0 {
+            let en = e.sp.items[t].start + e.sp.items[t].len;
+            x += tokW(e, font, bold, s, t);
+            if cur < en {
+                return x - tokW(e, font, bold, s, t);
+            }
+            p = en;
+        } else {
+            let q = segEnd(e, p, b);
+            let bd = bold || has(e, p, SPAN_BOLD);
+            if cur <= q {
+                return x + textCaretX(font, view(s, p, q), bd, cur - p);
+            }
+            x += textWidth(font, view(s, p, q), bd);
+            p = q;
+        }
+    }
+    return x;
+}
+
+#[singleton]
+let RX: [64]f32;
+#[singleton]
+let RW: [64]f32;
+
+fn addRect(n: int, x: f32, w: f32): int {
+    if n >= 64 || w <= 0.0 { return n; }
+    RX[n] = x;
+    RW[n] = w;
+    return n + 1;
+}
+
+/// The rectangles (x, width; read with `rectX` / `rectW`) of the selection `lo..hi` on the line `a..b`: a token in range is its whole chip,
+/// a plain segment one rectangle per run it crosses (`game.textSelRects`, so an RTL segment lights the glyphs of the range, not the
+/// span between two carets). Returns how many.
+pub fn selRects(e: &Edit, font: Font, bold: bool, a: int, b: int, lo: int, hi: int): int {
+    let s = e.str();
+    let n = 0;
+    let x: f32 = 0.0;
+    let p = a;
+    while p < b {
+        let t = tokAt(e, p);
+        if t >= 0 {
+            let tw = tokW(e, font, bold, s, t);
+            let en = e.sp.items[t].start + e.sp.items[t].len;
+            if lo < en && hi > p {
+                n = addRect(n, x, tw);
+            }
+            x += tw;
+            p = en;
+        } else {
+            let q = segEnd(e, p, b);
+            let bd = bold || has(e, p, SPAN_BOLD);
+            if lo < q && hi > p {
+                let ia = if lo > p { lo } else { p };
+                let ib = if hi < q { hi } else { q };
+                let nr = textSelRects(font, view(s, p, q), bd, ia - p, ib - p);
+                for r in 0..nr {
+                    n = addRect(n, x + selRectX(r), selRectW(r));
+                }
+            }
+            x += textWidth(font, view(s, p, q), bd);
+            p = q;
+        }
+    }
+    return n;
+}
+
+pub fn rectX(k: int): f32 { return RX[k]; }
+pub fn rectW(k: int): f32 { return RW[k]; }
+
+/// How many bytes of `s[a..b]` fit in `w` px (a token is whole or not at all; the first one on a line always stays).
+pub fn fit(e: &Edit, font: Font, bold: bool, a: int, b: int, w: f32): int {
+    let s = e.str();
+    let x: f32 = 0.0;
+    let p = a;
+    while p < b {
+        let t = tokAt(e, p);
+        if t >= 0 {
+            let tw = tokW(e, font, bold, s, t);
+            if x + tw > w && p > a {
+                return p - a;
+            }
+            x += tw;
+            p = e.sp.items[t].start + e.sp.items[t].len;
+        } else {
+            let q = segEnd(e, p, b);
+            let bd = bold || has(e, p, SPAN_BOLD);
+            let n = fitPrefix(font, bd, view(s, p, q), w - x);
+            if p + n < q {
+                return p + n - a;
+            }
+            x += textWidth(font, view(s, p, q), bd);
+            p = q;
+        }
+    }
+    return b - a;
+}
+
+/// Bytes from `a` to the boundary nearest to local `x` on the line `a..b`.
+pub fn indexAt(e: &Edit, font: Font, bold: bool, a: int, b: int, x: f32): int {
+    let s = e.str();
+    let acc: f32 = 0.0;
+    let p = a;
+    while p < b {
+        let t = tokAt(e, p);
+        if t >= 0 {
+            let tw = tokW(e, font, bold, s, t);
+            let en = e.sp.items[t].start + e.sp.items[t].len;
+            if x < acc + tw {
+                return (if x - acc > tw / 2.0 { en } else { p }) - a;
+            }
+            acc += tw;
+            p = en;
+        } else {
+            let q = segEnd(e, p, b);
+            let bd = bold || has(e, p, SPAN_BOLD);
+            let sw = textWidth(font, view(s, p, q), bd);
+            if x < acc + sw {
+                if textBidi(font, view(s, p, q)) {
+                    return p + textIndexAt(font, view(s, p, q), bd, x - acc) - a;
+                }
+                let n = fitPrefix(font, bd, view(s, p, q), x - acc);
+                let i = p + n;
+                if i >= q {
+                    return q - a;
+                }
+                let nx = i + 1;
+                while nx < q && isCont(s[nx]) {
+                    nx += 1;
+                }
+                let w0 = textWidth(font, view(s, p, i), bd);
+                let w1 = textWidth(font, view(s, p, nx), bd);
+                return (if x - acc - w0 > (w1 - w0) / 2.0 { nx } else { i }) - a;
+            }
+            acc += sw;
+            p = q;
+        }
+    }
+    return b - a;
+}
+
+fn draw(font: Font, bold: bool, p: Vec2, msg: string, c: Color) {
+    if bold {
+        paint.textBold(font, p, msg, c);
+    } else {
+        paint.text(font, p, msg, c);
+    }
+}
+
+/// Draw `s[a..b]` from x `x0` at height `y`; returns the x it ended at.
+fn pieces(e: &Edit, font: Font, bold: bool, a: int, b: int, x0: f32, y: f32, look: &Look): f32 {
+    let s = e.str();
+    let lh = f32(fontLine(font));
+    let x = x0;
+    let p = a;
+    while p < b {
+        let t = tokAt(e, p);
+        if t >= 0 {
+            let sp = e.sp.items[t];
+            let tw = tokW(e, font, bold, s, t);
+            paint.roundRect(Vec2 { x: x, y: y }, Vec2 { x: tw, y: lh }, 4.0, look.chip);
+            draw(font, bold, Vec2 { x: x + PAD, y: y }, s[sp.start..sp.start + sp.len], look.text);
+            x += tw;
+            p = sp.start + sp.len;
+        } else {
+            let q = segEnd(e, p, b);
+            let bd = bold || has(e, p, SPAN_BOLD);
+            let link = has(e, p, SPAN_LINK);
+            let w = textWidth(font, view(s, p, q), bd);
+            let c = look.text;
+            if link {
+                c = look.link;
+            } else if has(e, p, SPAN_ITALIC) {
+                c = look.dim;
+            }
+            draw(font, bd, Vec2 { x: x, y: y }, s[p..q], c);
+            if link {
+                paint.rect(Vec2 { x: x, y: y + lh - 1.0 }, Vec2 { x: w, y: 1.0 }, c);
+            }
+            x += w;
+            p = q;
+        }
+    }
+    return x;
+}
+
+/// `field.run` for a box with spans: draws `s[a..b]` at height `y` with the IME composition `comp` inserted at
+/// byte `cur`; returns the caret x (-1 when `cur` is outside `a..b`).
+pub fn run(e: &Edit, font: Font, bold: bool, a: int, b: int, cur: int, comp: string, y: f32, look: &Look): f32 {
+    let inside = cur >= a && cur <= b;
+    if comp.len > 0 && inside {
+        let x0 = pieces(e, font, bold, a, cur, 0.0, y, look);
+        let cw = textWidth(font, []u8 { ptr: comp.ptr, len: comp.len }, bold);
+        draw(font, bold, Vec2 { x: x0, y: y }, comp, look.text);
+        paint.rect(Vec2 { x: x0, y: y + f32(fontLine(font)) - 1.0 }, Vec2 { x: cw, y: 1.0 }, look.text);
+        pieces(e, font, bold, cur, b, x0 + cw, y, look);
+        return x0 + cw;
+    }
+    let end = pieces(e, font, bold, a, b, 0.0, y, look);
+    return if inside { caretX(e, font, bold, a, b, cur) } else { -1.0 };
+}

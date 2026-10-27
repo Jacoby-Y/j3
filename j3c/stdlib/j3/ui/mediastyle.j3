@@ -1,0 +1,287 @@
+/// Reads the image and shape properties of a computed style (`object-fit`, `background-*`,
+/// `border-image-*`, `image-tint`, `clip-path`, `mask-image`) and turns them into `j3.ui.media`
+/// structs and `j3.gfx.paint` clips. No tree: `dom` passes the style id and the box size. Main thread only.
+
+module j3.ui.mediastyle;
+
+use j3.game.{ Color, Texture };
+use j3.gfx.clip;
+use j3.gfx.paint;
+use j3.gfx.paint.Stop;
+use j3.math.{ max, min, sqrt, Vec2 };
+use j3.ui.css.{ Css, P_IMAGE_RENDERING, P_BG_POS, P_BG_REPEAT, P_BG_SIZE, P_BORDER_IMG_W, P_BORDER_OUTSET, P_BORDER_REPEAT, P_BORDER_SLICE, P_CLIP_PATH, P_MASK_IMAGE, P_OBJECT_FIT, P_OBJECT_POS, P_TINT };
+use j3.ui.css.{ V_COLOR, V_GRAD, V_LIST, Value };
+use j3.ui.cssimage.{ BW_AUTO, BW_NUM, BW_PCT };
+use j3.ui.imgfit.{ REP_NONE, REP_REPEAT };
+use j3.ui.cssimage.{ CP_CIRCLE, CP_ELLIPSE, CP_INSET, CP_POLYGON, LU_CLOSEST, LU_FARTHEST, LU_PCT };
+use j3.ui.media;
+use j3.ui.media.{ BgStyle, ImgStyle };
+
+/// Stops of the gradient being baked (`paint.gradient` copies them into a ramp).
+#[singleton]
+let STOPS: [16]Stop;
+
+/// The outline being built for a `clip-path`.
+#[singleton]
+let OUT: [256]f32;
+
+/// Stops of the gradient layer at `paints[o]` (`[type, angle, nstops, stops...]`) as a ramp row.
+pub fn layerRow(css: &Css, o: int): int {
+    let a = css.paints.items;
+    let ns = int(a[o + 2]);
+    for i in 0..ns {
+        let q = o + 3 + i * 5;
+        STOPS[i] = Stop { at: a[q], color: Color { r: u8(a[q + 1]), g: u8(a[q + 2]), b: u8(a[q + 3]), a: u8(a[q + 4]) } };
+    }
+    return paint.gradient(STOPS[0..ns]);
+}
+
+fn unpack(c: int): Color {
+    return Color { r: u8((c / 16777216) % 256), g: u8((c / 65536) % 256), b: u8((c / 256) % 256), a: u8(c % 256) };
+}
+
+/// `image-tint`, or white (no tint).
+pub fn tintOf(css: &Css, st: int): Color {
+    let v = css.get(st, P_TINT);
+    if v.kind == V_COLOR {
+        return unpack(v.c);
+    }
+    return Color { r: 255, g: 255, b: 255, a: 255 };
+}
+
+/// A position property as `[x, xunit, y, yunit]`, `def` percent on both axes when unset.
+fn posOf(css: &Css, st: int, prop: int, def: f32): [4]f32 {
+    let v = css.get(st, prop);
+    if v.kind == V_LIST {
+        let a = css.paints.items;
+        return [a[v.i], a[v.i + 1], a[v.i + 2], a[v.i + 3]];
+    }
+    return [def, f32(LU_PCT), def, f32(LU_PCT)];
+}
+
+/// `image-rendering: pixelated`.
+fn nearestOf(css: &Css, st: int): bool {
+    return css.get(st, P_IMAGE_RENDERING).i == 1;
+}
+
+/// Entry `layer` of the comma list in `v` (`Value.c` entries, stride `stride`): its offset in `paints`.
+fn entryAt(v: Value, layer: int, stride: int): int {
+    let cnt = v.c;
+    if cnt < 1 {
+        cnt = 1;
+    }
+    return v.i + (layer % cnt) * stride;
+}
+
+/// The `background-*` of layer `layer` of a box with corner radii `tl tr br bl`.
+pub fn bgStyle(css: &Css, st: int, layer: int, tl: f32, tr: f32, br: f32, bl: f32): BgStyle {
+    let s = BgStyle { mode: 0, szx: 0.0, szxu: 2, szy: 0.0, szyu: 2, px: 0.0, pxu: 1, py: 0.0, pyu: 1, rx: REP_REPEAT, ry: REP_REPEAT, nearest: nearestOf(css, st), tint: tintOf(css, st), tl: tl, tr: tr, br: br, bl: bl };
+    let a = css.paints.items;
+    let sz = css.get(st, P_BG_SIZE);
+    if sz.kind == V_LIST {
+        let zo = entryAt(sz, layer, 5);
+        s.mode = int(a[zo]);
+        s.szx = a[zo + 1];
+        s.szxu = int(a[zo + 2]);
+        s.szy = a[zo + 3];
+        s.szyu = int(a[zo + 4]);
+    }
+    let ps = css.get(st, P_BG_POS);
+    if ps.kind == V_LIST {
+        let po = entryAt(ps, layer, 4);
+        s.px = a[po];
+        s.pxu = int(a[po + 1]);
+        s.py = a[po + 2];
+        s.pyu = int(a[po + 3]);
+    }
+    let rep = css.get(st, P_BG_REPEAT);
+    if rep.kind == V_LIST {
+        let ro = entryAt(rep, layer, 2);
+        s.rx = int(a[ro]);
+        s.ry = int(a[ro + 1]);
+    }
+    return s;
+}
+
+/// The `object-fit` / `object-position` of an `<img>`; `l t r b` is the border plus padding to inset by.
+pub fn imgStyle(css: &Css, st: int, l: f32, t: f32, r: f32, b: f32, tl: f32, tr: f32, br: f32, bl: f32): ImgStyle {
+    let p = posOf(css, st, P_OBJECT_POS, 50.0);
+    let fit = css.get(st, P_OBJECT_FIT);
+    return ImgStyle {
+        nearest: nearestOf(css, st), fit: fit.i, px: p[0], pxu: int(p[1]), py: p[2], pyu: int(p[3]), tint: tintOf(css, st),
+        tl: tl, tr: tr, br: br, bl: bl, l: l, t: t, r: r, b: b,
+    };
+}
+
+/// One `border-image-width` / `-outset` side in px: `v` in `unit` (see `cssimage.BW_*`), `bw` the border width, `side` the box length it is a % of.
+fn sideLen(v: f32, unit: int, bw: f32, side: f32): f32 {
+    if unit == BW_NUM {
+        return v * bw;
+    }
+    if unit == BW_PCT {
+        return v * side / 100.0;
+    }
+    if unit == BW_AUTO {
+        return 0.0;
+    }
+    return v;
+}
+
+/// Draw the nine-slice `tex` over a `w` x `h` border box for `border-image-*`; `bt br bb bl` are the border widths.
+pub fn drawBorderImage(css: &Css, st: int, tex: Texture, w: f32, h: f32, bt: f32, br: f32, bb: f32, bl: f32) {
+    let a = css.paints.items;
+    let sl: [4]f32 = [-1.0, -1.0, -1.0, -1.0];
+    let bw: [4]f32 = [bt, br, bb, bl];
+    let widths: [4]f32 = [bt, br, bb, bl];
+    let fill = false;
+    let v = css.get(st, P_BORDER_SLICE);
+    if v.kind == V_LIST {
+        let mask = int(a[v.i + 5]);
+        for i in 0..4 {
+            sl[i] = a[v.i + i];
+            if mask % 2 == 1 {
+                let dim = f32(tex.w);
+                if i % 2 == 0 {
+                    dim = f32(tex.h);
+                }
+                sl[i] = sl[i] * dim / 100.0;
+            }
+            mask = mask / 2;
+        }
+        fill = a[v.i + 4] > 0.5;
+    }
+    // outset grows the area the image covers past the border box
+    let ox: [4]f32 = [0.0, 0.0, 0.0, 0.0];
+    let o = css.get(st, P_BORDER_OUTSET);
+    if o.kind == V_LIST {
+        for i in 0..4 {
+            ox[i] = sideLen(a[o.i + 2 * i], int(a[o.i + 2 * i + 1]), bw[i], 0.0);
+        }
+    }
+    let aw = w + ox[1] + ox[3];
+    let ah = h + ox[0] + ox[2];
+    let wv = css.get(st, P_BORDER_IMG_W);
+    if wv.kind == V_LIST {
+        for i in 0..4 {
+            let side = aw;
+            if i % 2 == 0 {
+                side = ah;
+            }
+            widths[i] = sideLen(a[wv.i + 2 * i], int(a[wv.i + 2 * i + 1]), bw[i], side);
+        }
+    }
+    let rx = REP_NONE;
+    let ry = REP_NONE;
+    let rp = css.get(st, P_BORDER_REPEAT);
+    if rp.kind == V_LIST {
+        rx = int(a[rp.i]);
+        ry = int(a[rp.i + 1]);
+    }
+    media.drawBorderImage(tex, Vec2 { x: 0.0 - ox[3], y: 0.0 - ox[0] }, aw, ah, sl, widths, fill, tintOf(css, st), rx, ry, nearestOf(css, st));
+}
+
+fn lenPx(v: f32, unit: int, ref: f32): f32 {
+    return clip.resolve(v, unit, ref);
+}
+
+/// A circle or ellipse radius along an axis: px, %, or `closest-side` / `farthest-side` from the
+/// center position `c` in a box side `side`.
+fn radiusOf(v: f32, unit: int, ref: f32, c: f32, side: f32): f32 {
+    if unit == LU_CLOSEST {
+        return min(c, side - c);
+    }
+    if unit == LU_FARTHEST {
+        return max(c, side - c);
+    }
+    return lenPx(v, unit, ref);
+}
+
+/// The outline of the `clip-path` at paints offset `o` for a `w` x `h` box, into `OUT`: the point
+/// count (at least 2; two equal points clip everything) and whether it is even-odd.
+fn buildShape(css: &Css, o: int, w: f32, h: f32, evenOdd: &bool): int {
+    let a = css.paints.items;
+    let kind = int(a[o]);
+    let out = OUT[0..256];
+    *evenOdd = false;
+    let n = 0;
+    if kind == CP_INSET {
+        let t = lenPx(a[o + 1], int(a[o + 2]), h);
+        let r = lenPx(a[o + 3], int(a[o + 4]), w);
+        let b = lenPx(a[o + 5], int(a[o + 6]), h);
+        let l = lenPx(a[o + 7], int(a[o + 8]), w);
+        let rad = lenPx(a[o + 9], int(a[o + 10]), min(w, h));
+        if w - l - r > 0.0 && h - t - b > 0.0 {
+            n = clip.rrect(out, l, t, w - l - r, h - t - b, rad, rad, rad, rad);
+        }
+    } else if kind == CP_CIRCLE {
+        let cx = lenPx(a[o + 3], int(a[o + 4]), w);
+        let cy = lenPx(a[o + 5], int(a[o + 6]), h);
+        let side = min(min(cx, w - cx), min(cy, h - cy));
+        let ru = int(a[o + 2]);
+        let circleRadius = lenPx(a[o + 1], ru, sqrt((w * w + h * h) * 0.5));
+        if ru == LU_CLOSEST {
+            circleRadius = side;
+        } else if ru == LU_FARTHEST {
+            circleRadius = max(max(cx, w - cx), max(cy, h - cy));
+        }
+        if circleRadius > 0.0 {
+            n = clip.ellipse(out, cx, cy, circleRadius, circleRadius);
+        }
+    } else if kind == CP_ELLIPSE {
+        let ex = lenPx(a[o + 5], int(a[o + 6]), w);
+        let ey = lenPx(a[o + 7], int(a[o + 8]), h);
+        let rx = radiusOf(a[o + 1], int(a[o + 2]), w, ex, w);
+        let ry = radiusOf(a[o + 3], int(a[o + 4]), h, ey, h);
+        if rx > 0.0 && ry > 0.0 {
+            n = clip.ellipse(out, ex, ey, rx, ry);
+        }
+    } else if kind == CP_POLYGON {
+        *evenOdd = a[o + 1] > 0.5;
+        let cnt = int(a[o + 2]);
+        for i in 0..cnt {
+            let q = o + 3 + i * 4;
+            out[2 * i] = lenPx(a[q], int(a[q + 1]), w);
+            out[2 * i + 1] = lenPx(a[q + 2], int(a[q + 3]), h);
+        }
+        out[2 * cnt] = out[0];
+        out[2 * cnt + 1] = out[1];
+        n = cnt + 1;
+    }
+    if n < 2 {
+        out[0] = 0.0;
+        out[1] = 0.0;
+        out[2] = 0.0;
+        out[3] = 0.0;
+        n = 2;
+    }
+    return n;
+}
+
+/// Push the `clip-path` of the style (outline slot 0); false when it has none (nothing to pop).
+pub fn pushClipPath(css: &Css, st: int, w: f32, h: f32): bool {
+    let v = css.get(st, P_CLIP_PATH);
+    if v.kind != V_LIST {
+        return false;
+    }
+    let eo = false;
+    let n = buildShape(css, v.i, w, h, &eo);
+    paint.pushShape(0, OUT[0..256], n, eo);
+    return true;
+}
+
+/// Push the `mask-image` of the style (a linear or radial gradient's alpha); false when it has none.
+pub fn pushMask(css: &Css, st: int, w: f32, h: f32): bool {
+    let v = css.get(st, P_MASK_IMAGE);
+    if v.kind != V_GRAD {
+        return false;
+    }
+    // the first layer: [type, angle, nstops, stops...] after the layer count
+    let layer = v.i + 1;
+    let ty = int(css.paints.items[layer]);
+    if ty > 1 {
+        return false;
+    }
+    let row = layerRow(css, layer);
+    paint.pushMask(ty + 1, row, css.paints.items[layer + 1] * 0.017453292, Vec2 { x: 0.0, y: 0.0 }, Vec2 { x: w, y: h });
+    return true;
+}

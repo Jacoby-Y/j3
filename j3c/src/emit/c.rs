@@ -96,7 +96,11 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
                 Some(v) => format!(" = {}", emit_const_init(cx, v)?),
                 None => String::new(),
             };
-            let st = if g.thread { "static _Thread_local" } else { "static" };
+            let st = if g.thread {
+                "static _Thread_local"
+            } else {
+                "static"
+            };
             if let Some((elem, len)) = c_ty::array_parts(cx, g.ty) {
                 let elem_c = c_type(cx, elem)?;
                 out.push_str(&format!("{st} {elem_c} {name}[{len}]{init};\n"));
@@ -240,6 +244,11 @@ fn emit_const_init(cx: &IrCx, init: &ConstInit) -> Result<String, String> {
     match init {
         ConstInit::Scalar(op) => match op {
             Operand::Const(c) => match &c.kind {
+                ConstKind::Bytes(bytes) => Ok(format!(
+                    "{{ .ptr = (uint8_t *){}, .len = {}ll }}",
+                    c_expr::c_bytes_literal(bytes),
+                    bytes.len()
+                )),
                 ConstKind::F32Bits(bits) => static_f32(*bits),
                 ConstKind::F64Bits(bits) => static_f64(*bits),
                 _ => {

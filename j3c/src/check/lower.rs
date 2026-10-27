@@ -32,6 +32,31 @@ struct OriginNs {
     struct_temp_env: HashMap<String, HashMap<String, Ty>>,
 }
 
+/// Lowering state read by every module and written by none, built once before the lower loop.
+pub(crate) struct Shared {
+    origins: HashMap<String, OriginNs>,
+    struct_temps: HashMap<String, parse::StructItem>,
+    struct_temp_env: HashMap<String, HashMap<String, Ty>>,
+}
+
+pub(crate) fn shared(mods: &[ModData]) -> Shared {
+    let mut struct_temps = HashMap::new();
+    let mut struct_temp_env = HashMap::new();
+    for m in mods.iter() {
+        for (k, v) in &m.struct_temps {
+            struct_temps.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        for (k, v) in &m.struct_temp_env {
+            struct_temp_env.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    Shared {
+        origins: generic_origins(mods),
+        struct_temps,
+        struct_temp_env,
+    }
+}
+
 fn generic_origins(mods: &[ModData]) -> HashMap<String, OriginNs> {
     let mut out = HashMap::new();
     for m in mods {
@@ -77,8 +102,11 @@ pub(crate) fn lower_module(
     mods: &mut [ModData],
     i: usize,
     main_id: FuncId,
+    shared: &Shared,
 ) -> Result<(), CheckError> {
-    let origins = generic_origins(mods);
+    let origins = &shared.origins;
+    let struct_temps = &shared.struct_temps;
+    let struct_temp_env = &shared.struct_temp_env;
     let path = mods[i].path.clone();
     let mut funcs = mods[i].funcs.clone();
     for (name, id) in &mods[i].imports {
@@ -96,16 +124,6 @@ pub(crate) fn lower_module(
     let globals = mods[i].globals.clone();
     let enum_temps = mods[i].enum_temps.clone();
     let mut enum_insts = mods[i].insts.clone();
-    let mut struct_temps = HashMap::new();
-    let mut struct_temp_env = HashMap::new();
-    for m in mods.iter() {
-        for (k, v) in &m.struct_temps {
-            struct_temps.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-        for (k, v) in &m.struct_temp_env {
-            struct_temp_env.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-    }
     let mut struct_insts = HashMap::new();
     for m in mods.iter() {
         for (k, v) in &m.struct_insts {
@@ -117,10 +135,9 @@ pub(crate) fn lower_module(
     let mut fn_substs = mods[i].fn_substs.clone();
     let mut pending_mono = mods[i].pending_mono.clone();
     let module_names = mods[i].names.clone();
-    let items = mods[i].ast.items.clone();
 
     let mut pending: Vec<(FuncId, FnItem)> = Vec::new();
-    for it in &items {
+    for it in &mods[i].ast.items {
         match it {
             Item::Fn(f) => pending.push((mods[i].funcs[&f.name.name], f.clone())),
             Item::Struct(s) => {
@@ -144,43 +161,47 @@ pub(crate) fn lower_module(
         .map(|(id, f)| (id, f, HashMap::new()))
         .collect();
     queue.append(&mut pending_mono);
-    let mut n = 0;
-    while n < queue.len() {
-        let (id, f, subst) = queue[n].clone();
-        n += 1;
-        if matches!(cx.func(id).kind, FuncKind::J3 { .. }) {
-            continue;
+    // A generic struct's merged environment depends only on the struct here, so build it once.
+    let mut merged_envs: HashMap<String, MergedEnv> = HashMap::new();
+    // Batches keep first-in-first-out order: instances queued while lowering run after.
+    while !queue.is_empty() {
+        let batch = std::mem::take(&mut queue);
+        for (id, f, subst) in batch {
+            if matches!(cx.func(id).kind, FuncKind::J3 { .. }) {
+                continue;
+            }
+            let body = lower_fn(
+                cx,
+                &path,
+                id,
+                &f,
+                origins,
+                &mut merged_envs,
+                &funcs,
+                &consts,
+                &types,
+                &mut methods,
+                &lib_ns,
+                &mod_ns,
+                &mod_types,
+                &globals,
+                &enum_temps,
+                &mut enum_insts,
+                struct_temps,
+                struct_temp_env,
+                &mut struct_insts,
+                &mut method_temps,
+                &mut method_insts,
+                &mut fn_substs,
+                &mut queue,
+                &module_names,
+                &mut mods[i].ir.enums,
+                &mut mods[i].ir.structs,
+                &mut mods[i].ir.funcs,
+                subst,
+            )?;
+            cx.func_mut(id).kind = FuncKind::J3 { body };
         }
-        let body = lower_fn(
-            cx,
-            &path,
-            id,
-            &f,
-            &origins,
-            &funcs,
-            &consts,
-            &types,
-            &mut methods,
-            &lib_ns,
-            &mod_ns,
-            &mod_types,
-            &globals,
-            &enum_temps,
-            &mut enum_insts,
-            &struct_temps,
-            &struct_temp_env,
-            &mut struct_insts,
-            &mut method_temps,
-            &mut method_insts,
-            &mut fn_substs,
-            &mut queue,
-            &module_names,
-            &mut mods[i].ir.enums,
-            &mut mods[i].ir.structs,
-            &mut mods[i].ir.funcs,
-            subst,
-        )?;
-        cx.func_mut(id).kind = FuncKind::J3 { body };
     }
     mods[i].insts = enum_insts;
     mods[i].methods = methods;
@@ -191,6 +212,14 @@ pub(crate) fn lower_module(
     Ok(())
 }
 
+/// Span of the temporary at the root of a field/index chain (`f()` in `f().x[0]`).
+fn temp_span(e: &Expr) -> Span {
+    match &e.kind {
+        ExprKind::Field { base, .. } | ExprKind::Index { base, .. } => temp_span(base),
+        _ => e.span,
+    }
+}
+
 struct Lower<'a> {
     cx: &'a mut IrCx,
     path: &'a str,
@@ -198,6 +227,8 @@ struct Lower<'a> {
     locals: HashMap<String, LocalId>,
     aliases: HashMap<String, Place>,
     script_sid: Option<StructId>,
+    /// Set while lowering a place that indexes through a slice (a store there hits real storage).
+    store_indirect: bool,
     script_props: HashSet<String>,
     funcs: &'a HashMap<String, FuncId>,
     consts: &'a HashMap<String, ConstVal>,
@@ -243,6 +274,7 @@ fn lower_fn(
     id: FuncId,
     f: &FnItem,
     origins: &HashMap<String, OriginNs>,
+    merged_envs: &mut HashMap<String, MergedEnv>,
     funcs: &HashMap<String, FuncId>,
     consts: &HashMap<String, ConstVal>,
     types: &HashMap<String, Ty>,
@@ -268,14 +300,14 @@ fn lower_fn(
 ) -> Result<crate::ir::body::Body, CheckError> {
     let mut body_path = path.to_string();
     let mut inst_note: Option<String> = None;
-    let merged: Option<MergedEnv> = if let Some(sid) = cx.func(id).method_of {
+    let merged: Option<&MergedEnv> = if let Some(sid) = cx.func(id).method_of {
         let sname = cx.name_str(cx.struct_def(sid).name).to_string();
         if let Some(o) = origins.get(&sname) {
             if o.path != path {
                 inst_note = Some(format!("while instantiating `{sname}` (from {path})"));
                 body_path = o.path.clone();
             }
-            Some(MergedEnv {
+            Some(merged_envs.entry(sname).or_insert_with(|| MergedEnv {
                 funcs: merge_map(&o.funcs, funcs),
                 consts: merge_map(&o.consts, consts),
                 types: merge_map(&o.types, types),
@@ -285,7 +317,7 @@ fn lower_fn(
                 globals: merge_map(&o.globals, globals),
                 struct_temps: merge_map(&o.struct_temps, struct_temps),
                 struct_temp_env: merge_map(&o.struct_temp_env, struct_temp_env),
-            })
+            }))
         } else {
             None
         }
@@ -332,6 +364,7 @@ fn lower_fn(
         locals,
         aliases: HashMap::new(),
         script_sid: None,
+        store_indirect: false,
         script_props: HashSet::new(),
         funcs: use_funcs,
         consts: use_consts,
@@ -601,7 +634,15 @@ impl<'a> Lower<'a> {
                 }
             },
             Stmt::Assign(s) => {
+                self.store_indirect = false;
                 let place = self.place(&s.place)?;
+                if self.writes_temporary(&s.place, &place) {
+                    return Err(CheckError::new(
+                        self.path,
+                        temp_span(&s.place),
+                        "cannot assign to a temporary (the result of a call or expression)",
+                    ));
+                }
                 if !place.access.assign {
                     if let Some(prop) = self.script_prop_name(&s.place) {
                         return Err(CheckError::new(
@@ -614,7 +655,7 @@ impl<'a> Lower<'a> {
                     return Err(CheckError::new(
                         self.path,
                         s.span,
-                        "cannot assign to this place",
+                        self.readonly_global(&place).unwrap_or("cannot assign to this place".to_string()),
                     ));
                 }
                 let rv = self.rvalue(&s.value, Some(place.ty))?;
@@ -625,7 +666,15 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             Stmt::AssignOp(s) => {
+                self.store_indirect = false;
                 let place = self.place(&s.place)?;
+                if self.writes_temporary(&s.place, &place) {
+                    return Err(CheckError::new(
+                        self.path,
+                        temp_span(&s.place),
+                        "cannot assign to a temporary (the result of a call or expression)",
+                    ));
+                }
                 if !place.access.assign {
                     if let Some(prop) = self.script_prop_name(&s.place) {
                         return Err(CheckError::new(
@@ -638,7 +687,7 @@ impl<'a> Lower<'a> {
                     return Err(CheckError::new(
                         self.path,
                         s.span,
-                        "cannot assign-op this place",
+                        self.readonly_global(&place).unwrap_or("cannot assign-op this place".to_string()),
                     ));
                 }
                 if let Some(id) = find_operator(self.cx, place.ty, s.op, self.methods) {
@@ -914,8 +963,7 @@ impl<'a> Lower<'a> {
                 }
                 if let Some(&gid) = self.globals.get(&n.name) {
                     let ty = self.cx.global(gid).ty;
-                    let place =
-                        Place::global(gid, ty, crate::ir::place::Access::let_binding(), n.span);
+                    let place = Place::global(gid, ty, self.global_access(gid), n.span);
                     return Ok(Rvalue::use_op(expr.span, Operand::Copy(place)));
                 }
                 if let Some(c) = self.consts.get(&n.name) {
@@ -971,6 +1019,30 @@ impl<'a> Lower<'a> {
                         crate::ir::abi::size(self.cx, t),
                     ),
                 ))
+            }
+            ExprKind::UiChoice { set, value, index } => {
+                let ty = self.resolve_ty(set)?;
+                let enum_id = match self.cx.ty_kind(ty) {
+                    TyKind::Enum(id) if self.cx.enum_def(*id).is_c_like() => *id,
+                    _ => return Err(CheckError::new(self.path, expr.span, "`@uiChoice` needs a payloadless candidate-set enum")),
+                };
+                let n = self.fold_int(index).filter(|n| *n >= 0 && (*n as usize) < self.cx.enum_def(enum_id).variants.len())
+                    .ok_or_else(|| CheckError::new(self.path, index.span, "`@uiChoice` arm index must be a constant within the candidate set"))?;
+                let op = self.operand(value, None)?;
+                let expected = if op.ty() == self.cx.common.int {
+                    Operand::int(expr.span, self.cx.common.int, n as u64)
+                } else if op.ty() == ty {
+                    let variant = VariantId { enum_id, index: n as u32 };
+                    let name = self.fresh("choice");
+                    let id = self.b.tmp(name, ty, expr.span);
+                    let place = self.b.local_place(id, expr.span);
+                    self.b.assign(expr.span, place.clone(), Rvalue::enum_new(expr.span, ty, variant, None));
+                    Operand::Copy(place)
+                } else {
+                    let name = self.cx.name_str(self.cx.enum_def(enum_id).name);
+                    return Err(CheckError::new(self.path, value.span, format!("component selector must be `int` or `{name}`")));
+                };
+                Ok(Rvalue::binary(expr.span, self.cx.common.bool, BinOp::Eq, op, expected))
             }
             ExprKind::SliceFrom { ptr, len } => self.slice_from(expr.span, ptr, len, expected),
             ExprKind::ArrayLit { elems } => self.array_lit(expr.span, elems, expected),
@@ -1108,6 +1180,7 @@ impl<'a> Lower<'a> {
                             ));
                         }
                     }
+                    // ponytail: `&` of a spilled temp acts like `&local` (the language does not stop a local's address escaping either).
                     let place = self.place(inner)?;
                     if !place.access.take_ref || !place.access.assign {
                         return Err(CheckError::new(
@@ -1409,7 +1482,7 @@ impl<'a> Lower<'a> {
                 let line = self
                     .cx
                     .file(span.file)
-                    .map(|f| crate::parse::line_of(&f.src, span.start))
+                    .map(|f| f.line(span.start))
                     .unwrap_or(0);
                 // Last two path components (`src/main.j3`): short, and the same on every machine.
                 let short: Vec<&str> = self.path.rsplit(['/', '\\']).take(2).collect();
@@ -1571,6 +1644,62 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Base of a field or index: a place, or any other expression (`f().x`, `xs[a..b].len`, `(a + b).x`),
+    /// spilled to a temp. Stores into it are rejected in `Assign`/`AssignOp` (`writes_temporary`).
+    fn base_place(&mut self, expr: &Expr) -> Result<Place, CheckError> {
+        if matches!(
+            expr.kind,
+            ExprKind::Name(_)
+                | ExprKind::String(_)
+                | ExprKind::Index { .. }
+                | ExprKind::Field { .. }
+                | ExprKind::Unary { op: parse::UnaryOp::Deref, .. }
+        ) {
+            return self.try_place(expr);
+        }
+        let keep = self.store_indirect;
+        let rv = self.rvalue(expr, None)?;
+        self.store_indirect = keep;
+        let n = self.fresh("i");
+        let id = self.b.tmp(n, rv.ty, expr.span);
+        let p = self.b.local_place(id, expr.span);
+        self.b.assign(expr.span, p.clone(), rv);
+        Ok(p)
+    }
+
+    /// True when a store into `place` (lowered from `expr`) would only hit a spilled temporary (`f().x = 1`).
+    /// A store through a reference result (`f().x` with `f(): &P`) has a Deref and is fine.
+    fn writes_temporary(&self, expr: &Expr, place: &Place) -> bool {
+        fn rooted(expr: &Expr) -> bool {
+            match &expr.kind {
+                ExprKind::Field { base, .. } | ExprKind::Index { base, .. } => rooted(base),
+                ExprKind::Name(_) | ExprKind::String(_) | ExprKind::Unary { op: parse::UnaryOp::Deref, .. } => false,
+                _ => true,
+            }
+        }
+        rooted(expr) && !self.store_indirect && !place.proj.iter().any(|p| matches!(p, crate::ir::place::Proj::Deref))
+    }
+
+    /// Names the array const a store would hit, for the error message.
+    fn readonly_global(&self, place: &Place) -> Option<String> {
+        match place.root {
+            crate::ir::place::PlaceRoot::Global(g) if self.cx.global(g).readonly => Some(format!(
+                "cannot assign into const array `{}`",
+                self.cx.name_str(self.cx.global(g).name)
+            )),
+            _ => None,
+        }
+    }
+
+    /// Array consts are read-only views: reads and slices work, stores do not.
+    fn global_access(&self, gid: GlobalId) -> crate::ir::place::Access {
+        if self.cx.global(gid).readonly {
+            crate::ir::place::Access::read_only_view()
+        } else {
+            crate::ir::place::Access::let_binding()
+        }
+    }
+
     fn try_place(&mut self, expr: &Expr) -> Result<Place, CheckError> {
         match &expr.kind {
             ExprKind::Name(n) => {
@@ -1582,12 +1711,7 @@ impl<'a> Lower<'a> {
                 }
                 if let Some(&gid) = self.globals.get(&n.name) {
                     let ty = self.cx.global(gid).ty;
-                    return Ok(Place::global(
-                        gid,
-                        ty,
-                        crate::ir::place::Access::let_binding(),
-                        n.span,
-                    ));
+                    return Ok(Place::global(gid, ty, self.global_access(gid), n.span));
                 }
                 Err(CheckError::new(
                     self.path,
@@ -1610,9 +1734,12 @@ impl<'a> Lower<'a> {
                 Ok(place)
             }
             ExprKind::Index { base, index } => {
-                let mut place = self.try_place(base)?;
+                let mut place = self.base_place(base)?;
                 while self.cx.ref_inner(place.ty).is_some() {
                     place = self.b.deref(self.cx, place, expr.span);
+                }
+                if matches!(self.cx.ty_kind(place.ty), TyKind::Slice { .. }) {
+                    self.store_indirect = true;
                 }
                 if self.cx.elem_ty(place.ty).is_none() {
                     return Err(CheckError::new(
@@ -1621,14 +1748,16 @@ impl<'a> Lower<'a> {
                         "index of non-array/slice",
                     ));
                 }
+                let keep = self.store_indirect;
                 let idx = self.operand(index, Some(self.cx.common.int))?;
+                self.store_indirect = keep;
                 let idx = self.bind_operand(idx, expr.span);
                 let len = self.seq_len(&place, expr.span)?;
                 self.bounds_check(expr.span, &idx, &len)?;
                 Ok(self.b.index(self.cx, place, idx, expr.span))
             }
             ExprKind::Field { base, field } => {
-                let mut place = self.try_place(base)?;
+                let mut place = self.base_place(base)?;
                 while self.cx.ref_inner(place.ty).is_some() {
                     place = self.b.deref(self.cx, place, field.span);
                 }
@@ -2163,7 +2292,7 @@ impl<'a> Lower<'a> {
                                     format!(
                                         "prop declared at {}:{}",
                                         file.path,
-                                        parse::line_of(&file.src, prop_span.start)
+                                        file.line(prop_span.start)
                                     )
                                 })
                                 .unwrap_or_else(|| "required prop declared in script".to_string());

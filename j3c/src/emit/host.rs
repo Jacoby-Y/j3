@@ -59,6 +59,24 @@ impl CcOpts {
     }
 }
 
+/// Where a build output keeps its bookkeeping (stamps, objects, the dev binary):
+/// `target/.j3c/<triple or host>/<exe name>/`, so `target/` holds only programs you run.
+/// A per-platform folder (`target/<triple>/<name>`) shares the one `.j3c`. An output that is
+/// already inside `.j3c` (the dev binary) keeps its files beside it.
+pub fn cache_dir(out: &Path, target: &str) -> PathBuf {
+    let parent = out.parent().unwrap_or(Path::new("."));
+    if parent.components().any(|c| c.as_os_str() == ".j3c") {
+        return parent.to_path_buf();
+    }
+    let slug = crate::project::target_slug(target);
+    let base = match parent.file_name() {
+        Some(n) if !target.is_empty() && n == slug.as_str() => parent.parent().unwrap_or(parent),
+        _ => parent,
+    };
+    let name = out.file_name().map(|n| n.to_os_string()).unwrap_or_else(|| "a.out".into());
+    base.join(".j3c").join(if target.is_empty() { "host" } else { slug.as_str() }).join(name)
+}
+
 pub fn compile_and_run(c_source: &str) -> Result<RunResult, String> {
     compile_and_run_with(c_source, &CcOpts::default())
 }
@@ -99,6 +117,8 @@ pub fn compile_llvm(
         }
         None => dir.join(format!("{stamp}.bin")),
     };
+    crate::phase::detail(&format!("writing IR ({} MB)", ll_source.len() >> 20));
+    let t_write = std::time::Instant::now();
     fs::write(&src_path, ll_source).map_err(|e| format!("write {}: {e}", src_path.display()))?;
 
     let opt = clang_opt(&cc.opt);
@@ -126,6 +146,10 @@ pub fn compile_llvm(
     for flag in extra {
         cmd.arg(flag);
     }
+    let time_report = std::env::var_os("J3C_TIME_REPORT").is_some();
+    if time_report {
+        cmd.arg("-ftime-report"); // per-pass clang timings, printed after the build
+    }
     cmd.arg("-o").arg(&exe_path).arg(&src_path);
     append_link_args(&mut cmd, cc, ll_source, target)?;
     if let Some(r) = &release {
@@ -133,18 +157,31 @@ pub fn compile_llvm(
     }
     // A named output rebuilt from the same IR and command is already up to date. Most
     // editor Plays change only scene files, which the program reads at run time.
-    let stamp_path = cc.out.as_ref().map(|p| p.with_extension("j3c-stamp"));
+    let stamp_path = match &cc.out {
+        Some(p) => {
+            let dir = cache_dir(p, target);
+            fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+            Some(dir.join("clang.key"))
+        }
+        None => None,
+    };
+    crate::phase::detail("hashing IR for the build cache key");
     let key = build_key(&src_path, ll_source, &cmd);
+    crate::cli::timing("  write IR + cache key", t_write);
     if let Some(stamp) = &stamp_path {
         if exe_path.exists() && fs::read_to_string(stamp).map(|k| k == key).unwrap_or(false) {
             let _ = fs::remove_file(&src_path);
+            crate::cli::status("compiling");
+            crate::phase::note("clang skipped: same IR and command as the last build");
             return Ok(exe_path);
         }
         let _ = fs::remove_file(stamp);
     }
     crate::cli::status("compiling");
+    let what = format!("clang -O{opt} whole program (one invocation, links too)");
+    crate::phase::detail(&what);
     let started = std::time::Instant::now();
-    let out = cmd.output().map_err(|e| format!("spawn {clang}: {e}"))?;
+    let out = crate::phase::run_ticking(&mut cmd, &what).map_err(|e| format!("spawn {clang}: {e}"))?;
     if std::env::var_os("J3C_TIMINGS").is_some() {
         eprintln!("j3c: clang: {:.3}s", started.elapsed().as_secs_f64());
     }
@@ -154,6 +191,9 @@ pub fn compile_llvm(
         return Err(format!("{clang} failed:\n{err}"));
     }
     let _ = fs::remove_file(&src_path);
+    if time_report {
+        eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    }
     if let Some(stamp) = &stamp_path {
         let _ = fs::write(stamp, &key);
     }
@@ -177,12 +217,13 @@ pub fn compile_llvm_split(
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     let clang = if clang.is_empty() { "clang" } else { clang };
-    let base = exe_path.display().to_string();
-    let vm_src = PathBuf::from(format!("{base}.vm.ll"));
-    let vm_obj = PathBuf::from(format!("{base}.vm.o"));
-    let vm_stamp = PathBuf::from(format!("{base}.vm.key"));
-    let main_src = PathBuf::from(format!("{base}.main.ll"));
-    let main_obj = PathBuf::from(format!("{base}.main.o"));
+    let dir = cache_dir(&exe_path, target);
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let vm_src = dir.join("vm.ll");
+    let vm_obj = dir.join("vm.o");
+    let vm_stamp = dir.join("vm.key");
+    let main_src = dir.join("main.ll");
+    let main_obj = dir.join("main.o");
     let compile = |src: &Path, obj: &Path, opt: &str, debug: bool| {
         let mut cmd = Command::new(clang);
         cmd.arg("-c")
@@ -383,6 +424,8 @@ pub fn run_exe_in(exe: &Path, cwd: Option<&Path>, args: &[String]) -> Result<Run
             .map_err(|e| format!("project root {}: {e}", dir.display()))?;
         cmd.current_dir(&root);
         cmd.env("J3_ROOT", root);
+        // a dev run lets F12 open the UI inspector (`j3.ui.inspect`); `J3_INSPECT=0` turns that off
+        cmd.env("J3_INSPECT", std::env::var("J3_INSPECT").unwrap_or_else(|_| "1".into()));
     }
     let run = cmd
         .output()

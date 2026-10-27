@@ -49,7 +49,7 @@ Keep the existing `# j3tile 1` parser for current projects. Introduce a versione
 
 ### 5. Input contexts, rebinding, and controller lifecycle (P2, M)
 
-Let a game define action sets for gameplay, menu and modal UI, with topmost/consumed input taking precedence; reuse `input.Actions` as the binding table. Support two bindings per action, keyboard and gamepad remapping, axis dead zones, press/release on both devices, and serialize choices through `save`. Expose connected/disconnected status for the two supported pads and safely close/reopen stale SDL handles on hotplug. Keep unsupported controller indices explicit rather than silently pretending they work.
+Let a game define action sets for gameplay, menu and modal UI, with topmost/consumed input taking precedence; reuse `input.Actions` as the binding table. Support two bindings per action, keyboard and gamepad remapping, axis dead zones, press/release on both devices, and serialize choices through `save`. Expose connected/disconnected status for the two supported pads and safely close/reopen stale SDL handles on hotplug. Keep unsupported controller indices explicit rather than silently pretending they work. The `.j3ui` side (spatial focus, pad activation, glyph prompts) is plan 023 stage 16 and consumes these action sets; Steam Input is plan 025.
 
 **Check:** menu click/confirm cannot also fire the attack action; remapped controls survive restart; unplugging a pad during play stops actions cleanly and reconnecting resumes them; keyboard remains usable throughout.
 

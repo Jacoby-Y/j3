@@ -32,14 +32,10 @@ pub enum Prepared {
     Dev(Built),
 }
 
-/// Where the dev binary lives, next to the release one.
+/// Where the dev binary lives: its own folder in `target/.j3c`, not beside the real one.
 pub fn dev_out(m: &Manifest) -> PathBuf {
-    let out = m.out_path();
-    let name = out
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "a.out".to_string());
-    out.with_file_name(format!("{name}-dev"))
+    let dev = m.out_path().with_file_name(format!("{}-dev", m.name));
+    emit::host::cache_dir(&dev, m.emit.primary()).join(dev.file_name().expect("dev name"))
 }
 
 /// Check, print scripts to bytecode, and make sure the dev binary is current.
@@ -70,7 +66,7 @@ pub fn prepare(m: &Manifest, opts: &EmitOpts, fast: bool) -> Result<Prepared, St
     let key = dev_key(&native_sources, &prog, opts, fast);
     crate::cli::timing(&format!("dev lower ({thunks} thunks)"), started);
     let exe = dev_out(m);
-    let stamp = exe.with_extension("j3c-dev");
+    let stamp = exe.with_file_name("dev.key");
     let modules: Vec<String> = prog
         .modules
         .iter()
@@ -103,7 +99,10 @@ pub fn prepare(m: &Manifest, opts: &EmitOpts, fast: bool) -> Result<Prepared, St
         opts.cc.out = Some(exe.clone());
         crate::cli::status("emitting");
         let started = Instant::now();
-        if split_vm(&opts) {
+        if emit::incr::enabled(&opts) {
+            emit::compile_program(&prog.cx, &prog.modules, &opts)?;
+            crate::cli::timing("emit + compile (per module)", started);
+        } else if split_vm(&opts) {
             let vm = vm_funcs(&prog);
             let main = emit::emit_llvm_part(&prog.cx, &prog.modules, &opts, emit::Part::Except(&vm))?;
             let vm_text = emit::emit_llvm_part(&prog.cx, &prog.modules, &opts, emit::Part::Only(&vm))?;
@@ -196,7 +195,7 @@ fn dev_key(sources: &u64, prog: &Program, opts: &EmitOpts, fast: bool) -> String
     format!("{:016x}", h.finish())
 }
 
-fn launch(exe: &Path, root: &Path, args: &[String]) -> Result<Child, String> {
+pub(crate) fn launch(exe: &Path, root: &Path, args: &[String], envs: &[(&str, &Path)]) -> Result<Child, String> {
     let root = root
         .canonicalize()
         .map_err(|e| format!("project root {}: {e}", root.display()))?;
@@ -207,6 +206,9 @@ fn launch(exe: &Path, root: &Path, args: &[String]) -> Result<Child, String> {
         .args(args)
         .current_dir(&root)
         .env("J3_ROOT", &root)
+        // a dev run lets F12 open the UI inspector (`j3.ui.inspect`); `J3_INSPECT=0` turns that off
+        .env("J3_INSPECT", std::env::var("J3_INSPECT").unwrap_or_else(|_| "1".into()))
+        .envs(envs.iter().copied())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("run {}: {e}", exe.display()))?;
@@ -238,7 +240,7 @@ thread_local! {
 }
 
 /// Print the symbolized crash report of the child that just exited, if it wrote one.
-fn report_crash() {
+pub(crate) fn report_crash() {
     std::thread::sleep(Duration::from_millis(50)); // let the reader thread drain the pipe
     if let Some((held, exe)) = CRASH.with(|c| c.borrow_mut().take()) {
         let text = held.lock().unwrap().clone();
@@ -275,7 +277,7 @@ pub fn watch(
     args: &[String],
 ) -> Result<i32, String> {
     crate::cli::status("running");
-    let mut child = launch(&built.exe, &m.root, args)?;
+    let mut child = launch(&built.exe, &m.root, args, &[])?;
     let mut seen = mtimes(&built.scripts);
     loop {
         if let Some(status) = child.try_wait().map_err(|e| format!("wait: {e}"))? {
@@ -311,7 +313,7 @@ pub fn watch(
                         "j3c: relaunching ({})",
                         if next.rebuilt { "rebuilt" } else { "script layout changed" }
                     );
-                    child = launch(&next.exe, &m.root, args)?;
+                    child = launch(&next.exe, &m.root, args, &[])?;
                 } else {
                     bump_reload(&m.root);
                     eprintln!("j3c: swapped script code");

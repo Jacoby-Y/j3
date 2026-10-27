@@ -90,12 +90,22 @@ function j3cPath() {
   }
   const folders = vscode.workspace.workspaceFolders;
   if (folders && folders.length) {
-    const cand = path.join(folders[0].uri.fsPath, "j3c", "target", "debug", "j3c");
-    try {
-      if (fs.existsSync(cand)) {
-        return cand;
-      }
-    } catch (_) {}
+    // Newest of the workspace's debug/release builds, so a stale one never shadows a fresh one.
+    let best = null;
+    let bestTime = 0;
+    for (const kind of ["debug", "release"]) {
+      const cand = path.join(folders[0].uri.fsPath, "j3c", "target", kind, "j3c");
+      try {
+        const t = fs.statSync(cand).mtimeMs;
+        if (t > bestTime) {
+          best = cand;
+          bestTime = t;
+        }
+      } catch (_) {}
+    }
+    if (best) {
+      return best;
+    }
   }
   return "j3c";
 }
@@ -124,6 +134,18 @@ function folder() {
   return f && f[0] ? f[0].uri.fsPath : ".";
 }
 
+// Buffers the server follows: J3 and `.j3ui` components, plus CSS next to the components
+// (`ui/theme.css`), which gets completion only.
+function synced(doc) {
+  if (doc.languageId === "j3" || doc.languageId === "j3ui") {
+    return true;
+  }
+  return doc.languageId === "css" && /[\\/]ui[\\/][^\\/]*\.css$/.test(doc.uri.fsPath);
+}
+
+const J3_DOCS = ["j3", "j3ui"];
+const THEME_CSS = { language: "css", pattern: "**/ui/*.css" };
+
 function rangeOf(r) {
   return new vscode.Range(
     r.start.line,
@@ -151,7 +173,7 @@ class Client {
     add(vscode.workspace.onDidChangeTextDocument((e) => this.change(e)));
     add(vscode.workspace.onDidCloseTextDocument((d) => this.close(d)));
 
-    add(vscode.languages.registerHoverProvider("j3", {
+    add(vscode.languages.registerHoverProvider(J3_DOCS, {
       provideHover: async (doc, pos) => {
         const r = await this.send("textDocument/hover", {
           textDocument: { uri: doc.uri.toString() },
@@ -164,7 +186,7 @@ class Client {
         return new vscode.Hover(md);
       },
     }));
-    add(vscode.languages.registerDefinitionProvider("j3", {
+    add(vscode.languages.registerDefinitionProvider(J3_DOCS, {
       provideDefinition: async (doc, pos) => {
         const r = await this.send("textDocument/definition", {
           textDocument: { uri: doc.uri.toString() },
@@ -177,7 +199,7 @@ class Client {
       },
     }));
     add(vscode.languages.registerCompletionItemProvider(
-      "j3",
+      [...J3_DOCS, THEME_CSS],
       {
         provideCompletionItems: async (doc, pos) => {
           const r = await this.send("textDocument/completion", {
@@ -191,10 +213,14 @@ class Client {
       ".",
       "{",
       "@",
-      "["
+      "[",
+      "<",
+      " ",
+      ":",
+      "-"
     ));
     add(vscode.languages.registerSignatureHelpProvider(
-      "j3",
+      J3_DOCS,
       {
         provideSignatureHelp: async (doc, pos) => {
           const r = await this.send("textDocument/signatureHelp", {
@@ -224,7 +250,7 @@ class Client {
       "(",
       ","
     ));
-    add(vscode.languages.registerDocumentSymbolProvider("j3", {
+    add(vscode.languages.registerDocumentSymbolProvider(J3_DOCS, {
       provideDocumentSymbols: async (doc) => {
         const r = await this.send("textDocument/documentSymbol", {
           textDocument: { uri: doc.uri.toString() },
@@ -244,7 +270,7 @@ class Client {
         });
       },
     }));
-    add(vscode.languages.registerCodeActionsProvider("j3", {
+    add(vscode.languages.registerCodeActionsProvider(J3_DOCS, {
       provideCodeActions: async (doc, range, context) => {
         const r = await this.send("textDocument/codeAction", {
           textDocument: { uri: doc.uri.toString() },
@@ -281,6 +307,7 @@ class Client {
         });
       },
     }));
+    // ponytail: no .j3ui formatting; the formatter reads J3 only, and a second one is not worth it.
     add(vscode.languages.registerDocumentFormattingEditProvider("j3", {
       provideDocumentFormattingEdits: async (doc) => {
         const r = await this.send("textDocument/formatting", {
@@ -341,13 +368,13 @@ class Client {
   }
 
   open(doc) {
-    if (doc.languageId !== "j3") {
+    if (!synced(doc)) {
       return;
     }
     this.notify("textDocument/didOpen", {
       textDocument: {
         uri: doc.uri.toString(),
-        languageId: "j3",
+        languageId: doc.languageId,
         version: doc.version,
         text: doc.getText(),
       },
@@ -355,7 +382,7 @@ class Client {
   }
 
   change(e) {
-    if (e.document.languageId !== "j3") {
+    if (!synced(e.document)) {
       return;
     }
     this.notify("textDocument/didChange", {
@@ -365,7 +392,7 @@ class Client {
   }
 
   close(doc) {
-    if (doc.languageId !== "j3") {
+    if (!synced(doc)) {
       return;
     }
     this.notify("textDocument/didClose", {

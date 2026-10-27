@@ -1,14 +1,16 @@
-//! Opt-0 builds: one object per module, reused when that module's IR is unchanged.
+//! Opt-0 builds (every opt with `incremental = "all"`): one object per module, reused when
+//! that module's IR is unchanged. Above opt 0 this gives up cross-module inlining.
 //!
 //! The whole-program source stamp still skips this entirely. A one-file edit
 //! re-emits and recompiles only the modules whose IR hash changed, then links.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::emit::c_expr::{self, stable_ty};
@@ -18,6 +20,7 @@ use crate::emit::opts::EmitOpts;
 use crate::ir::body::Block;
 use crate::ir::cx::IrCx;
 use crate::ir::entity::{ConstInit, FuncKind};
+use crate::ir::ids::FuncId;
 use crate::ir::module::Module;
 use crate::ir::operand::{ConstKind, Operand};
 use crate::ir::rvalue::{InterpPart, Rvalue, RvalueKind};
@@ -26,7 +29,7 @@ use crate::ir::stmt::{Stmt, StmtKind};
 pub(crate) fn enabled(opts: &EmitOpts) -> bool {
     opts.incremental
         && opts.backend == crate::emit::Backend::Llvm
-        && matches!(opts.cc.opt.as_str(), "" | "0")
+        && (opts.incremental_all || matches!(opts.cc.opt.as_str(), "" | "0"))
         && opts.cc.out.is_some()
 }
 
@@ -39,9 +42,13 @@ pub(crate) fn compile(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<
     if let Some(parent) = exe.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    let dir = exe.parent().unwrap_or(Path::new(".")).join("j3c-obj");
+    // One folder per output and target, or each build's sweep deletes the other's objects.
+    let dir = crate::emit::host::cache_dir(&exe, &opts.target).join("obj");
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
 
+    crate::cli::status("emitting");
+    crate::phase::detail("hashing modules against the object cache");
+    let t_keys = std::time::Instant::now();
     let layouts = layout_digest(cx, modules);
     let mut pending = Vec::new();
     for (index, module) in modules.iter().enumerate() {
@@ -49,49 +56,33 @@ pub(crate) fn compile(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<
         let key = object_key(cx, module, opts, &layouts);
         let obj = dir.join(format!("{label}-{key}.o"));
         let libs = dir.join(format!("{label}-{key}.libs"));
-        let hit = obj.is_file() && libs.is_file();
-        pending.push(Pending {
-            index,
-            label,
-            obj,
-            libs,
-            hit,
-        });
+        let parts = parts_of(&obj);
+        let hit = libs.is_file() && if parts > 0 { (0..parts).all(|n| part_path(&obj, n).is_file()) } else { obj.is_file() };
+        pending.push(Pending { index, label, obj, libs, parts, hit });
     }
     let misses = pending.iter().filter(|p| !p.hit).count();
-    if misses > 0 {
-        let word = if misses == 1 { "module" } else { "modules" };
-        crate::cli::status(&format!("compiling {misses} {word}"));
-    }
+    crate::cli::timing("  emit: hash modules", t_keys);
+    crate::cli::status("compiling");
+    crate::phase::note(&format!("{} of {} modules cached, {misses} to build", pending.len() - misses, pending.len()));
     let mut units = Vec::new();
     for item in pending {
-        if item.hit {
-            if timings() {
-                eprintln!("j3c: cached {}", item.label);
-            }
-            let note = fs::read_to_string(&item.libs).unwrap_or_default();
-            units.push(Unit {
-                index: item.index,
-                label: item.label,
-                obj: item.obj,
-                libs: item.libs,
-                miss: false,
-                note,
-            });
-            continue;
+        if item.hit && timings() {
+            eprintln!("j3c: cached {}", item.label);
         }
+        let note = if item.hit { fs::read_to_string(&item.libs).unwrap_or_default() } else { String::new() };
         units.push(Unit {
             index: item.index,
             label: item.label,
             obj: item.obj,
             libs: item.libs,
-            miss: true,
-            note: String::new(),
+            parts: item.parts,
+            miss: !item.hit,
+            note,
         });
     }
-    // Biggest modules first so the slowest job doesn't start last.
+    // Costliest modules first so the slowest job doesn't start last. IR dump length is a rough cost.
     let mut jobs: Vec<&Unit> = units.iter().filter(|u| u.miss).collect();
-    jobs.sort_by_key(|u| std::cmp::Reverse(modules[u.index].funcs.len()));
+    jobs.sort_by_cached_key(|u| std::cmp::Reverse(crate::ir::dump::dump_module(cx, &modules[u.index]).len()));
 
     let errors = Mutex::new(Vec::new());
     let queue = Mutex::new(0usize);
@@ -99,7 +90,10 @@ pub(crate) fn compile(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<
         .map(|n| n.get())
         .unwrap_or(1)
         .min(jobs.len().max(1));
-    let produced: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+    let produced: Mutex<Vec<(usize, String, usize)>> = Mutex::new(Vec::new());
+    let done_jobs = AtomicUsize::new(0);
+    let timed: Mutex<Vec<JobTime>> = Mutex::new(Vec::new());
+    let t_jobs = std::time::Instant::now();
     if !jobs.is_empty() {
         std::thread::scope(|scope| {
             for _ in 0..width {
@@ -114,8 +108,18 @@ pub(crate) fn compile(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<
                         i
                     };
                     let job = jobs[i];
-                    match emit_and_clang(cx, modules, job, opts) {
-                        Ok(note) => produced.lock().unwrap().push((job.index, note)),
+                    let seen = JobProgress {
+                        done: &done_jobs,
+                        total: jobs.len(),
+                    };
+                    let result = emit_and_clang(cx, modules, job, opts, &seen);
+                    let finished = done_jobs.fetch_add(1, Ordering::Relaxed) + 1;
+                    crate::phase::detail(&format!("{finished}/{} modules compiled", jobs.len()));
+                    match result {
+                        Ok((note, time, parts)) => {
+                            produced.lock().unwrap().push((job.index, note, parts));
+                            timed.lock().unwrap().push(time);
+                        }
                         Err(e) => errors.lock().unwrap().push(e),
                     }
                 });
@@ -123,17 +127,22 @@ pub(crate) fn compile(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<
         });
     }
     drop(jobs);
+    jobs_done_note(&timed, t_jobs, width);
     let errs = errors.into_inner().unwrap_or_default();
     if let Some(e) = errs.into_iter().next() {
         return Err(e);
     }
-    for (index, note) in produced.into_inner().unwrap_or_default() {
+    for (index, note, parts) in produced.into_inner().unwrap_or_default() {
         if let Some(unit) = units.iter_mut().find(|u| u.index == index) {
             unit.note = note;
+            unit.parts = parts;
         }
     }
     let notes: String = units.iter().map(|u| u.note.as_str()).collect();
-    let objs: Vec<PathBuf> = units.iter().map(|u| u.obj.clone()).collect();
+    let objs: Vec<PathBuf> = units
+        .iter()
+        .flat_map(|u| if u.parts > 0 { (0..u.parts).map(|n| part_path(&u.obj, n)).collect() } else { vec![u.obj.clone()] })
+        .collect();
     link_objs(&objs, &exe, &opts.cc, &opts.clang, &opts.target, &notes)?;
     sweep_stale(&dir, modules, cx, opts, &layouts);
     Ok(exe)
@@ -141,14 +150,17 @@ pub(crate) fn compile(cx: &IrCx, modules: &[Module], opts: &EmitOpts) -> Result<
 
 struct Pending {
     index: usize,
+    parts: usize,
     label: String,
     obj: PathBuf,
     libs: PathBuf,
     hit: bool,
 }
 
+/// `parts` > 0: the module was split, its objects are `part_path(obj, 0..parts)`.
 struct Unit {
     index: usize,
+    parts: usize,
     label: String,
     obj: PathBuf,
     libs: PathBuf,
@@ -156,17 +168,166 @@ struct Unit {
     note: String,
 }
 
-fn emit_and_clang(cx: &IrCx, modules: &[Module], job: &Unit, opts: &EmitOpts) -> Result<String, String> {
-    let started = std::time::Instant::now();
-    let ll = llvm::emit_llvm_module(cx, modules, job.index, opts)?;
-    if timings() {
-        eprintln!("j3c: emit {}: {:.3}s", job.label, started.elapsed().as_secs_f64());
-    }
-    clang_one(job, &ll, opts)
+/// How far the misses have got, for the inner status line.
+struct JobProgress<'a> {
+    done: &'a AtomicUsize,
+    total: usize,
 }
 
-fn clang_one(job: &Unit, ll: &str, opts: &EmitOpts) -> Result<String, String> {
-    let ll_path = job.obj.with_extension("ll");
+/// CPU seconds one module spent in each stage (jobs run in parallel, so these exceed wall time).
+struct JobTime {
+    label: String,
+    emit: f64,
+    clang: f64,
+}
+
+/// Record the build's cpu-time split and its slowest modules. Nothing to say if every module was cached.
+fn jobs_done_note(timed: &Mutex<Vec<JobTime>>, since: std::time::Instant, width: usize) {
+    let mut times = timed.lock().unwrap();
+    if times.is_empty() {
+        return;
+    }
+    let emit: f64 = times.iter().map(|t| t.emit).sum();
+    let clang: f64 = times.iter().map(|t| t.clang).sum();
+    crate::phase::note(&format!(
+        "{} modules on {width} threads: {:.2}s wall, {emit:.2}s emit cpu, {clang:.2}s clang cpu",
+        times.len(),
+        since.elapsed().as_secs_f64()
+    ));
+    times.sort_by(|a, b| (b.emit + b.clang).total_cmp(&(a.emit + a.clang)));
+    for t in times.iter().take(5) {
+        crate::phase::step(&format!("  slow: {} (emit {:.2}s, clang {:.2}s)", t.label, t.emit, t.clang), t.emit + t.clang);
+    }
+}
+
+fn emit_and_clang(
+    cx: &IrCx,
+    modules: &[Module],
+    job: &Unit,
+    opts: &EmitOpts,
+    seen: &JobProgress,
+) -> Result<(String, JobTime, usize), String> {
+    let started = std::time::Instant::now();
+    let done = || seen.done.load(Ordering::Relaxed);
+    crate::phase::detail(&format!("{}/{} done, emit {}", done(), seen.total, job.label));
+    let ll = llvm::emit_llvm_module(cx, modules, job.index, opts, None)?;
+    let mut emit = started.elapsed().as_secs_f64();
+    if timings() {
+        eprintln!("j3c: emit {}: {emit:.3}s", job.label);
+    }
+    crate::phase::detail(&format!("{}/{} done, clang {}", done(), seen.total, job.label));
+    let note = lib_notes(&ll);
+    let _ = fs::remove_file(parts_file(&job.obj));
+    let mut parts = 0;
+    match split_plan(cx, &modules[job.index], &ll, opts) {
+        None => clang_obj(&job.label, &job.obj, &ll, opts)?,
+        Some(sets) => {
+            parts = sets.len();
+            let total = parts;
+            drop(ll);
+            // The giant functions are the long pole: one clang per share, side by side.
+            let results: Vec<Result<f64, String>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = sets
+                    .iter()
+                    .enumerate()
+                    .map(|(n, set)| {
+                        scope.spawn(move || {
+                            let t = std::time::Instant::now();
+                            let ll = llvm::emit_llvm_module(cx, modules, job.index, opts, Some((n, set)))?;
+                            let spent = t.elapsed().as_secs_f64();
+                            clang_obj(&format!("{} [{}/{}]", job.label, n + 1, total), &part_path(&job.obj, n), &ll, opts)?;
+                            Ok(spent)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("chunk thread panicked".into()))).collect()
+            });
+            for r in results {
+                emit = emit.max(r?);
+            }
+            fs::write(parts_file(&job.obj), parts.to_string()).map_err(|e| format!("write parts file: {e}"))?;
+        }
+    }
+    fs::write(&job.libs, &note).map_err(|e| format!("write {}: {e}", job.libs.display()))?;
+    let clang = started.elapsed().as_secs_f64() - emit;
+    let label = if parts > 0 { format!("{} (split in {parts})", job.label) } else { job.label.clone() };
+    Ok((note, JobTime { label, emit, clang }, parts))
+}
+
+fn parts_file(obj: &Path) -> PathBuf {
+    obj.with_extension("parts")
+}
+
+/// Object `n` of a split module.
+fn part_path(obj: &Path, n: usize) -> PathBuf {
+    obj.with_extension(format!("p{n}.o"))
+}
+
+/// How many objects a module was split into last time (0 = one object).
+fn parts_of(obj: &Path) -> usize {
+    fs::read_to_string(parts_file(obj)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+/// Byte length of each `define` block in a module's LLVM text, by symbol.
+fn define_sizes(ll: &str) -> HashMap<&str, usize> {
+    let mut sizes = HashMap::new();
+    let mut open: Option<(&str, usize)> = None;
+    for line in ll.lines() {
+        if let Some(rest) = line.strip_prefix("define ") {
+            let name = rest.split('@').nth(1).and_then(|r| r.split('(').next()).unwrap_or("");
+            open = Some((name, 0));
+        }
+        if let Some((name, n)) = open.as_mut() {
+            *n += line.len() + 1;
+            if line == "}" {
+                sizes.insert(*name, *n);
+                open = None;
+            }
+        }
+    }
+    sizes
+}
+
+/// A function this large makes clang's backend slow on its own (it grows faster than linearly).
+const GIANT_FN: usize = 15_000;
+
+/// Split a module with several giant functions: one set of functions per object, balanced by
+/// the size of their LLVM text. None when it is not worth it (or `[emit] chunks = 0`).
+fn split_plan(cx: &IrCx, module: &Module, ll: &str, opts: &EmitOpts) -> Option<Vec<HashSet<FuncId>>> {
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cap = opts.chunks.unwrap_or(4).min((threads / 2).max(1));
+    if cap < 2 {
+        return None;
+    }
+    let sizes = define_sizes(ll);
+    let funcs: Vec<(FuncId, usize)> = module
+        .funcs
+        .iter()
+        .filter_map(|id| {
+            let func = cx.func(*id);
+            let size = *sizes.get(c_expr::func_c_name(cx, func).as_str())?;
+            Some((*id, size))
+        })
+        .collect();
+    let giants = funcs.iter().filter(|f| f.1 >= GIANT_FN).count();
+    let (total, max) = (funcs.iter().map(|f| f.1).sum::<usize>(), funcs.iter().map(|f| f.1).max().unwrap_or(0));
+    let mut n = giants.min(cap);
+    if n < 2 && max >= GIANT_FN && total - max >= max / 3 {
+        n = 2; // one giant: at least take everything else off its object
+    }
+    if n < 2 {
+        return None;
+    }
+    let weights: Vec<usize> = funcs.iter().map(|f| f.1).collect();
+    let mut sets = vec![HashSet::new(); n];
+    for ((id, _), c) in funcs.iter().zip(llvm::chunk_assign(&weights, n)) {
+        sets[c].insert(*id);
+    }
+    Some(sets)
+}
+
+fn clang_obj(label: &str, obj: &Path, ll: &str, opts: &EmitOpts) -> Result<(), String> {
+    let ll_path = obj.with_extension("ll");
     fs::write(&ll_path, ll).map_err(|e| format!("write {}: {e}", ll_path.display()))?;
     let clang = if opts.clang.is_empty() {
         "clang"
@@ -191,29 +352,26 @@ fn clang_one(job: &Unit, ll: &str, opts: &EmitOpts) -> Result<String, String> {
     for flag in &opts.flags {
         cmd.arg(flag);
     }
-    cmd.arg("-o").arg(&job.obj).arg(&ll_path);
-    crate::cli::status(&format!("clang {}", job.label));
+    let time_report = std::env::var_os("J3C_TIME_REPORT").is_some();
+    if time_report {
+        cmd.arg("-ftime-report");
+    }
+    cmd.arg("-o").arg(obj).arg(&ll_path);
     let started = std::time::Instant::now();
     let out = cmd.output().map_err(|e| format!("spawn {clang}: {e}"))?;
     let _ = fs::remove_file(&ll_path);
+    if time_report {
+        // One file per object next to it: `cat <obj dir>/*.time.txt`.
+        let _ = fs::write(obj.with_extension("time.txt"), &out.stderr);
+    }
     if timings() {
-        eprintln!(
-            "j3c: clang {}: {:.3}s",
-            job.label,
-            started.elapsed().as_secs_f64()
-        );
+        eprintln!("j3c: clang {label}: {:.3}s", started.elapsed().as_secs_f64());
     }
     if !out.status.success() {
-        let _ = fs::remove_file(&job.obj);
-        return Err(format!(
-            "{clang} failed on {}:\n{}",
-            job.label,
-            String::from_utf8_lossy(&out.stderr)
-        ));
+        let _ = fs::remove_file(obj);
+        return Err(format!("{clang} failed on {label}:\n{}", String::from_utf8_lossy(&out.stderr)));
     }
-    let note = lib_notes(ll);
-    fs::write(&job.libs, &note).map_err(|e| format!("write {}: {e}", job.libs.display()))?;
-    Ok(note)
+    Ok(())
 }
 
 fn mold_on_path() -> bool {
@@ -249,7 +407,7 @@ fn link_objs(
     append_link_args(&mut link, cc, notes, target)?;
     crate::cli::status("linking");
     let started = std::time::Instant::now();
-    let out = link.output().map_err(|e| format!("spawn {clang}: {e}"))?;
+    let out = crate::phase::run_ticking(&mut link, "linking").map_err(|e| format!("spawn {clang}: {e}"))?;
     if timings() {
         eprintln!("j3c: link: {:.3}s", started.elapsed().as_secs_f64());
     }
@@ -278,22 +436,20 @@ fn lib_notes(ll: &str) -> String {
 
 /// Drop objects whose hash is no longer the module's key.
 fn sweep_stale(dir: &Path, modules: &[Module], cx: &IrCx, opts: &EmitOpts, layouts: &Layouts) {
-    let mut keep = Vec::new();
-    for module in modules {
-        let label = module_label(cx, module);
-        let key = object_key(cx, module, opts, layouts);
-        keep.push(format!("{label}-{key}.o"));
-        keep.push(format!("{label}-{key}.libs"));
-    }
+    // Everything a current module wrote starts with `label-key.`: its .o, .libs, .parts and p<N>.o.
+    let keep: Vec<String> = modules
+        .iter()
+        .map(|module| format!("{}-{}.", module_label(cx, module), object_key(cx, module, opts, layouts)))
+        .collect();
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for ent in entries.flatten() {
         let name = ent.file_name().to_string_lossy().to_string();
-        if keep.iter().any(|k| k == &name) {
+        if keep.iter().any(|k| name.starts_with(k.as_str())) {
             continue;
         }
-        if name.ends_with(".o") || name.ends_with(".libs") || name.ends_with(".ll") {
+        if name.ends_with(".o") || name.ends_with(".libs") || name.ends_with(".ll") || name.ends_with(".parts") {
             let _ = fs::remove_file(ent.path());
         }
     }
@@ -333,6 +489,7 @@ fn compiler_id() -> u64 {
 
 fn object_key(cx: &IrCx, module: &Module, opts: &EmitOpts, layouts: &Layouts) -> String {
     let mut h = DefaultHasher::new();
+    opts.chunks.hash(&mut h);
     let text = module_ir(cx, module);
     layouts.for_module(&text).hash(&mut h);
     text.hash(&mut h);
@@ -584,5 +741,46 @@ fn hash_operand_into(cx: &IrCx, op: &Operand, out: &mut String) {
             out.push_str(&c_expr::func_c_name(cx, cx.func(*id)));
             out.push(';');
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every function is defined by exactly one chunk, and `@main` by exactly one object.
+    #[test]
+    fn chunks_define_each_function_once() {
+        let entry = Path::new(env!("CARGO_MANIFEST_DIR")).join("../speculative/01_basics.j3");
+        let prog = crate::compile::check_path_lib(&entry).expect("check");
+        let opts = EmitOpts::default();
+        let names = |ll: &str| -> Vec<String> {
+            ll.lines()
+                .filter_map(|l| l.strip_prefix("define "))
+                .map(|r| r.split('@').nth(1).unwrap_or("").split('(').next().unwrap_or("").to_string())
+                .collect()
+        };
+        let mut mains = 0;
+        for (index, module) in prog.modules.iter().enumerate() {
+            let part = llvm::chunk_assign(&llvm::func_weights(&prog.cx, module), 3);
+            let mut defs = Vec::new();
+            for n in 0..3 {
+                let set: HashSet<FuncId> = module.funcs.iter().zip(&part).filter(|(_, c)| **c == n).map(|(f, _)| *f).collect();
+                let ll = llvm::emit_llvm_module(&prog.cx, &prog.modules, index, &opts, Some((n, &set))).expect("emit");
+                for name in names(&ll) {
+                    if name == "main" {
+                        mains += 1;
+                    } else {
+                        defs.push(name);
+                    }
+                }
+            }
+            let whole = llvm::emit_llvm_module(&prog.cx, &prog.modules, index, &opts, None).expect("emit");
+            let mut want: Vec<String> = names(&whole).into_iter().filter(|n| n != "main").collect();
+            want.sort();
+            defs.sort();
+            assert_eq!(defs, want);
+        }
+        assert_eq!(mains, 1);
     }
 }

@@ -18,6 +18,7 @@
 - **Depends on**: none
 - **Category**: portability
 - **Planned at**: 2026-09-25
+- **Progress (2026-10-25, plan 027 chunk 3)**: `j3c` itself passes `cargo check --target x86_64-pc-windows-gnu` and its release build links (`editor.rs` stderr clone split by `cfg(unix)`/`cfg(windows)`); the exe has not been run on Windows.
 
 ## Why this matters
 
@@ -175,3 +176,5 @@ Branch `plan-013-other-platforms` in the main checkout. One commit per design it
 - The inventory from step 1 goes here.
 - Keep every OS-specific string in the sys modules or one helper per concern. No `if OS`
   checks spread through the editor.
+
+Added 2026-10-21: a shipped Steam game also needs the game runtime (not just the editor) proven on Windows and macOS: SDL2/ttf/mixer and GL linking, the `.j3ui` + `j3.gfx.paint` path, HiDPI and fractional scale, file dialogs, and the crash handler (Linux x86-64 only today). Plan 025 depends on this.

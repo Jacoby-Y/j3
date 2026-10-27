@@ -20,16 +20,6 @@ long-running MCP servers.
 
 | Status | Plan | Title | Priority | Effort | Depends on |
 |--------|------|-------|----------|--------|------------|
-| DONE | 002 | Agent tool robustness | P1 | M | — |
-| DONE | 001 | Import pipeline (PNG decode, batch import, bake, recolor) | P1 | L | — |
-| DONE | 003 | J3 language gaps (`%`, `text.contains`, `module.CONST`) | P2 | M | — |
-| DONE | 004 | Faster scene authoring (batch add, grid, file undo) | P2 | M | 002 |
-| DONE | 005 | First-person starter kit (`j3.scene3d.fpwalk`, `drawFrame`, fps template) | P2 | M | — |
-| DONE | 007 | Scene drawing performance and a frame profiler | P2 | L | — |
-| DONE | 006 | URP tracing performance (traced shadows first) | P1 | L | 007 steps 1-2 (soft) |
-| DONE | 014 | Editor polish (editing gaps, UI polish, editor speed) | P2 | M | — |
-| DONE | 012 | Online asset browser (Poly Haven, ambientCG, Kenney) | P2 | L | 001 (textures) |
-| DONE | 010 | Shader effects (`.j3fx`) | P2 | L | — |
 | TODO | 015 | Rendering gaps (lights, planar reflections, textured traces, cutoff) | P3 | M | 001 (for C); coordinate with 006/010 |
 | TODO | 011 | Editor extension API | P3 | L | 002 (nice to have) |
 | TODO | 008 | Incremental builds | P3 | L | — |
@@ -37,9 +27,12 @@ long-running MCP servers.
 | TODO | 016 | Move editor and asset logic into J3 | P2 | L | 001, 004 |
 | TODO | 017 | Everyday game framework gaps | P2 | L | 016 JSON reader for phase 4 only |
 | TODO | 009 | glTF animation, skinning, morph targets | P2 | L | — (deferred to last) |
-| DONE | 018 | J3s scripts (typed, per-instance, hot-reload VM) | P2 | XL | 008 helps; supersedes behaviors (016 phase 3) |
-| DONE | 019 | Two-level URP trace (moving objects no longer rebuild the BVH) | P1 | M | 006 |
-| DONE | 020 | Agent-facing docs and discovery (`doc search`, recipes, `--tools`) | P1 | L | — |
+| DONE | 022 | `.j3ui` components and `j3.gfx.paint` (8 stages, own folder: `022-j3ui-components/`) | P2 | XL | — |
+| IN PROGRESS | 023 | `.j3ui` for desktop apps: stages 1–3 DONE; paused before 4 (dynamic components), then rich input, data grid, CSS gaps and gamepad focus. [Restart handoff](023-handoff.md). | P1 | XL | 022 |
+| TODO | 025 | Steam integration (later): Steamworks via FFI, achievements, cloud saves, overlay, Steam Input, depot packaging | P3 | L | 013, 017 item 5, 023 stage 16 |
+| TODO | 024 | Accessibility platform bridge: AT-SPI over libdbus FFI first, then UI Automation and NSAccessibility | P2 | XL | 023 (old stage 12 step 1, done) |
+| DONE | 026 | UI/CSS features: drag-and-drop, flip, transitions, focus-visible, grid, text, colors, transforms, nesting, selectors, elements, stacking, inspector, hot reload, i18n, gamepad, a11y gaps, vertical-align, box-decoration-break, overflow axes; AT-SPI chunks 32-33 skipped, stay plan 024 ([chunks](026-ui-css-features.md)) | P1 | XL | 023 |
+| DONE | 027 | UI open issues from 026: rotated clip, RTL bidi neutrals, Windows check, spacing transitions, em in transform, url() vars, scroll stacking, tabindex, radio, glyph ([chunks](027-ui-open-issues.md)) | P2 | L | 026 |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 

@@ -171,7 +171,11 @@ fn load_and_check_with(
         script_root,
         overlays,
         scene_scan: None,
+        ui_cfg: ui_cfg(project),
+        ui_gen: None,
+        ui_err: None,
     };
+    crate::phase::begin("parse");
     let t_load = std::time::Instant::now();
     loader.load_path(&entry_path)?;
     loader.load_module(&["j3".to_string(), "sys".to_string()])?;
@@ -185,17 +189,33 @@ fn load_and_check_with(
     }
     check_import_cycles(&loader.files)?;
     crate::cli::timing(&format!("  load + parse ({} files)", loader.files.len()), t_load);
+    crate::phase::detail("copying sources for error messages");
     let srcs: Vec<(String, String)> = loader
         .files
         .iter()
         .map(|f| (f.path.clone(), f.src.clone()))
         .collect();
+    let ui_gen = loader.ui_gen.take();
+    crate::phase::begin("check");
     let checked = if require_main {
         check::check_files(loader.files)
     } else {
         check::check_files_lib(loader.files)
     };
-    let mut prog = checked.map_err(|e| e.render(&srcs))?;
+    let mut prog = checked.map_err(|e| match &ui_gen {
+        Some(g) => {
+            let mut all = srcs.clone();
+            all.extend(g.sources());
+            g.remap(e).render(&all)
+        }
+        None => e.render(&srcs),
+    })?;
+    crate::phase::detail("post-check passes");
+    if let Some(g) = &ui_gen {
+        if let Some(f) = prog.cx.files.iter_mut().find(|f| f.path == g.label) {
+            f.locator = Some(g.locator());
+        }
+    }
     if project.map(|m| m.cc.fast || m.emit.fast).unwrap_or(false) {
         crate::ir::fast::strip_aborts(&mut prog.cx);
     }
@@ -219,6 +239,15 @@ pub fn analyze_checked(
     path: &Path,
     overlays: &[(PathBuf, String)],
 ) -> Result<Program, crate::check::CheckError> {
+    analyze_ui(path, overlays).0
+}
+
+/// [`analyze_checked`] that also returns the generated `.j3ui` module (the span map), when the
+/// project has one. Generation errors come back as a check error on the `.j3ui`.
+pub fn analyze_ui(
+    path: &Path,
+    overlays: &[(PathBuf, String)],
+) -> (Result<Program, crate::check::CheckError>, Option<crate::ui::Generated>) {
     let project = match crate::project::resolve(path) {
         Ok(crate::project::Input::Project(m)) => Some(m),
         _ => None,
@@ -245,28 +274,40 @@ pub fn analyze_checked(
             .unwrap_or_else(|| entry.parent().unwrap_or(Path::new(".")).to_path_buf()),
         overlays: overlays.to_vec(),
         scene_scan: None,
+        ui_cfg: ui_cfg(project.as_ref()),
+        ui_gen: None,
+        ui_err: None,
     };
-    loader
-        .load_path(&entry)
-        .map_err(|e| crate::check::CheckError::new(path.display().to_string(), crate::span::Span::dummy(), e))?;
-    if path != entry.as_path() {
-        let _ = loader.load_path(path);
+    let loaded = (|| -> Result<(), String> {
+        loader.load_path(&entry)?;
+        if path != entry.as_path() {
+            let _ = loader.load_path(path);
+        }
+        loader.load_module(&["j3".to_string(), "sys".to_string()])?;
+        loader.load_imports()?;
+        if project.is_some() {
+            loader.load_scene_scripts()?;
+        }
+        check_import_cycles(&loader.files)
+    })();
+    if let Err(e) = loaded {
+        let ce = match loader.ui_err.take() {
+            Some(u) => {
+                let span = crate::span::Span { file: crate::span::FileId(1), start: u.err.lo as u32, end: u.err.hi as u32 };
+                let mut ce = crate::check::CheckError::new(u.path, span, u.err.msg);
+                ce.helps.extend(u.err.help);
+                ce
+            }
+            None => crate::check::CheckError::new(path.display().to_string(), crate::span::Span::dummy(), e),
+        };
+        return (Err(ce), None);
     }
-    loader
-        .load_module(&["j3".to_string(), "sys".to_string()])
-        .map_err(|e| crate::check::CheckError::new(path.display().to_string(), crate::span::Span::dummy(), e))?;
-    loader
-        .load_imports()
-        .map_err(|e| crate::check::CheckError::new(path.display().to_string(), crate::span::Span::dummy(), e))?;
-    if project.is_some() {
-        loader
-            .load_scene_scripts()
-            .map_err(|e| crate::check::CheckError::new(path.display().to_string(), crate::span::Span::dummy(), e))?;
-    }
-    check_import_cycles(&loader.files).map_err(|e| {
-        crate::check::CheckError::new(path.display().to_string(), crate::span::Span::dummy(), e)
-    })?;
-    check::check_files_lib(loader.files)
+    let ui_gen = loader.ui_gen.take();
+    let r = check::check_files_lib(loader.files).map_err(|e| match &ui_gen {
+        Some(g) => g.remap(e),
+        None => e,
+    });
+    (r, ui_gen)
 }
 
 const HELLO_SRC: &str = include_str!("../examples/hello.j3");
@@ -291,12 +332,47 @@ struct Loader {
     overlays: Vec<(PathBuf, String)>,
     /// Scene files scanned for attached scripts (once, on first need).
     scene_scan: Option<scene_scripts::Scan>,
+    /// `[ui]`: the `<package>.ui` module is generated from `*.j3ui` when something imports it.
+    ui_cfg: Option<UiCfg>,
+    ui_gen: Option<crate::ui::Generated>,
+    /// The last generation error, with its position (the LSP reads it).
+    ui_err: Option<crate::ui::BuildErr>,
+}
+
+struct UiCfg {
+    package: String,
+    root: PathBuf,
+    dir: String,
+    theme: Option<String>,
+}
+
+fn ui_cfg(project: Option<&Manifest>) -> Option<UiCfg> {
+    let m = project?;
+    let u = m.ui.as_ref()?;
+    Some(UiCfg { package: m.name.clone(), root: m.root.clone(), dir: u.dir.clone(), theme: u.theme.clone() })
 }
 
 impl Loader {
     fn load_path(&mut self, path: &Path) -> Result<(), String> {
         let text = self.read_text(path)?;
-        self.parse_text(path.display().to_string(), text)
+        let before = self.files.len();
+        self.parse_text(path.display().to_string(), text)?;
+        if self.files.len() > before && !path.to_string_lossy().ends_with(".j3s") {
+            self.load_parts(path)?;
+        }
+        Ok(())
+    }
+
+    /// Files in the folder beside `X.j3` that say `module <same name>;` are more of the same module
+    /// (`ui/dom.j3` + `ui/dom/*.j3`). A file there with another module name is its own module and
+    /// loads when something imports it.
+    fn load_parts(&mut self, path: &Path) -> Result<(), String> {
+        let key = self.files.last().map(|f| f.ast.module_key()).unwrap_or_default();
+        for part in crate::stdlib::parts(&path.with_extension("")) {
+            let text = self.read_text(&part)?;
+            self.parse_inner(part.display().to_string(), text, Some(&key))?;
+        }
+        Ok(())
     }
 
     fn read_text(&self, path: &Path) -> Result<String, String> {
@@ -315,6 +391,17 @@ impl Loader {
     }
 
     fn parse_text(&mut self, path: String, text: String) -> Result<(), String> {
+        self.parse_inner(path, text, None)
+    }
+
+    /// `part_of`: the module key of the main file when this is one of its parts; a file that names
+    /// another module is skipped, and a part is never dropped as already loaded.
+    fn parse_inner(&mut self, path: String, text: String, part_of: Option<&str>) -> Result<(), String> {
+        crate::phase::detail(&format!(
+            "file {}: {}",
+            self.files.len() + 1,
+            Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+        ));
         let file_id = FileId(self.next_file);
         self.next_file += 1;
         let ast = match if path.ends_with(".j3s") {
@@ -333,11 +420,22 @@ impl Loader {
             parse::parse(&text, file_id)
         } {
             Ok(f) => f,
-            Err(e) => return Err(parse::format_error(&path, &text, &e)),
+            Err(e) => {
+                if let Some(g) = self.ui_gen.as_ref().filter(|g| g.label == path) {
+                    return Err(g.render_parse_error(e.span, &e.message));
+                }
+                return Err(parse::format_error(&path, &text, &e));
+            }
         };
         let key = ast.module_key();
-        if !self.loaded.insert(key) {
-            return Ok(());
+        match part_of {
+            Some(main) if key != main => return Ok(()),
+            Some(_) => {}
+            None => {
+                if !self.loaded.insert(key) {
+                    return Ok(());
+                }
+            }
         }
         self.files.push(ParsedFile {
             path,
@@ -355,6 +453,14 @@ impl Loader {
         }
         if key == scene_scripts::MODULE {
             return self.load_registry();
+        }
+        if key == crate::i18n::MODULE {
+            // `[i18n]` of the project's j3.toml baked in as constants, so a built binary needs no j3.toml
+            let text = crate::i18n::config_module(&self.script_root);
+            return self.parse_text(crate::i18n::LABEL.to_string(), text);
+        }
+        if self.ui_cfg.as_ref().is_some_and(|u| format!("{}.ui", u.package) == key) {
+            return self.load_ui();
         }
         let path = self.module_path(parts);
         if !source_exists(&path) {
@@ -445,6 +551,8 @@ impl Loader {
             for (path, names) in uses {
                 if path.join(".") == scene_scripts::MODULE {
                     self.load_registry()?;
+                } else if path.join(".") == crate::i18n::MODULE {
+                    self.load_module(&path)?;
                 } else if names.is_some() {
                     self.load_module(&path)?;
                 } else if source_exists(&self.module_path(&path)) {
@@ -465,6 +573,33 @@ impl Loader {
     }
 
     /// `j3.scene3d.scripts`, made from the project's scenes.
+    fn load_ui(&mut self) -> Result<(), String> {
+        let cfg = self.ui_cfg.as_ref().unwrap();
+        let dir = cfg.root.join(&cfg.dir);
+        let mut files: Vec<crate::ui::SrcFile> = Vec::new();
+        let extra: Vec<PathBuf> = self.overlays.iter().map(|(p, _)| p.clone()).collect();
+        for f in crate::ui::scan::scan(&dir, &cfg.dir, &extra)? {
+            let text = self.read_text(&f.path)?;
+            files.push(crate::ui::SrcFile { path: f.shown, name: f.name, text });
+        }
+        let theme = match &cfg.theme {
+            Some(t) => Some(crate::ui::Theme { path: t.clone(), text: self.read_text(&cfg.root.join(t))? }),
+            None => None,
+        };
+        if files.is_empty() {
+            return Err(format!("cannot find module `{}.ui`: no .j3ui files in {}", cfg.package, dir.display()));
+        }
+        let package = cfg.package.clone();
+        let g = crate::ui::try_build(files, &package, theme).map_err(|e| {
+            let r = e.rendered.clone();
+            self.ui_err = Some(e);
+            r
+        })?;
+        let (label, text) = (g.label.clone(), g.text.clone());
+        self.ui_gen = Some(g);
+        self.parse_text(label, text)
+    }
+
     fn load_registry(&mut self) -> Result<(), String> {
         if self.loaded.contains(scene_scripts::MODULE) {
             return Ok(());
@@ -770,6 +905,46 @@ mod tests {
         let err = String::from_utf8_lossy(&boom.stderr);
         assert_eq!(boom.status, 101, "{err}");
         assert!(err.contains("main.j3:6: boom"), "{err}");
+    }
+
+    /// `f().len` and `f().x` work on a call that returns a string, a slice or a struct by value
+    /// (the call is spilled to a temp, as for a call that returns a reference).
+    #[test]
+    fn field_of_a_call_result() {
+        let dir = std::env::temp_dir().join(format!("j3-callfield-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.j3");
+        std::fs::write(
+            &file,
+            "module a;\n\nuse j3.io.printLn;\n\nstruct P {\n    x: int;\n}\n\nfn name(): string {\n    return \"abc\";\n}\n\nfn pt(): P {\n    return P { x: 7 };\n}\n\nfn main() {\n    printLn(`{name().len} {pt().x}`);\n}\n",
+        )
+        .unwrap();
+        let prog = compile_path(&file).expect("check");
+        let out = exec(&prog);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3 7");
+    }
+
+    /// `main/*.j3` that say `module a;` are more of module `a` (private names shared); one that
+    /// names another module is not merged.
+    #[test]
+    fn module_parts_share_one_namespace() {
+        let dir = std::env::temp_dir().join(format!("j3-parts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("main")).unwrap();
+        let file = dir.join("main.j3");
+        std::fs::write(
+            &file,
+            "module a;\n\nuse j3.io.printLn;\n\nfn main() {\n    printLn(`{helper(2)}`);\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("main/more.j3"), "module a;\n\nfn helper(x: int): int {\n    return x * 21;\n}\n").unwrap();
+        std::fs::write(dir.join("main/other.j3"), "module a.other;\n\nfn helper(x: int): int {\n    return 0;\n}\n").unwrap();
+        let prog = compile_path(&file).expect("check");
+        let out = exec(&prog);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42");
     }
 
     #[test]
@@ -2037,6 +2212,62 @@ fn main() {
     }
 
     #[test]
+    fn array_const_runs_on_both_backends() {
+        run_both_ok(&honesty("array_const.j3"), "ok\n");
+    }
+
+    #[test]
+    fn array_const_errors_have_spans() {
+        let head = "module t;\nstruct P {\n    x: int;\n}\nconst XS: [3]int = [1, 2, 3];\nconst PS: [1]P = [P { x: 1 }];\n";
+        let bad = |tag: &str, body: &str| match compile_src(tag, &format!("{head}fn main() {{\n{body}\n}}\n")) {
+            Ok(_) => panic!("expected error for {body}"),
+            Err(e) => e,
+        };
+        let e = compile_src("acl", "module t;\nconst Z: [2]int = [1, 2, 3];\nfn main() {}\n").err().expect("length mismatch");
+        assert!(e.contains("array length mismatch") && e.contains(":2:"), "{e}");
+        for (tag, body) in [("aca", "    XS[0] = 5;"), ("acb", "    XS[0] += 5;"), ("acc", "    PS[0].x = 2;")] {
+            let e = bad(tag, body);
+            assert!(e.contains("cannot assign into const array"), "{body}: {e}");
+        }
+        let e = bad("acd", "    let r = &XS[0];");
+        assert!(e.contains("cannot take `&`"), "{e}");
+    }
+
+    #[test]
+    fn array_const_bytes_and_negative_floats_match_on_both_backends() {
+        run_both_ok(&honesty("array_const_bytes.j3"), "ok\n");
+    }
+
+    /// Same exit code (102) and message on both backends.
+    #[test]
+    fn array_const_index_out_of_bounds_aborts() {
+        let src = "module t;\nuse j3.sys.argCount;\nconst XS: [2]int = [1, 2];\nfn main() {\n    let i = 5 + argCount();\n    let v = XS[i];\n    if v == 3 {\n        return;\n    }\n}\n";
+        let prog = compile_src("acoob", src).expect("check");
+        for backend in [emit::Backend::Llvm, emit::Backend::C] {
+            let mut o = emit::EmitOpts::default();
+            o.backend = backend;
+            if backend == emit::Backend::Llvm && !emit::clang_available(&o.clang) {
+                continue;
+            }
+            let run = emit::run_program(&prog.cx, &prog.modules, &o).expect("run");
+            let err = String::from_utf8_lossy(&run.stderr);
+            assert_eq!(run.status, 102, "{backend:?} {err}");
+            assert!(err.contains("index out of bounds"), "{backend:?} {err}");
+        }
+    }
+
+    /// A callee that writes through a `[]T` made from a const array writes ordinary module
+    /// data (the array is not in read-only memory): no crash, on both backends.
+    #[test]
+    fn array_const_slice_write_does_not_crash() {
+        let src = "module t;\nuse j3.io.printLn;\nconst XS: [3]int = [1, 2, 3];\nfn bump(a: []int) {\n    a[0] = 9;\n}\nfn main() {\n    bump(XS);\n    printLn(`{XS[0]}`);\n}\n";
+        let path = std::env::temp_dir().join(format!("j3c_acsw_{}.j3", std::process::id()));
+        std::fs::write(&path, src).unwrap();
+        run_both_ok(&path, "9\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn gaps_module_const_missing_is_named() {
         let err = match compile_src("mcnope", "module t;\nuse j3.gfx.mesh;\nfn main() {\n    let k = mesh.NOPE;\n}\n") {
             Ok(_) => panic!("expected missing const error"),
@@ -2053,6 +2284,45 @@ fn main() {
     #[test]
     fn if_expr_skips_untaken_arm() {
         run_ok(&honesty("if_expr_skip.j3"), "ok\n");
+    }
+
+    #[test]
+    fn else_if_expr_and_field_of_rvalue_on_both_backends() {
+        run_both_ok(&honesty("else_if_expr.j3"), "ok\nok2\n");
+    }
+
+    #[test]
+    fn else_if_expr_skips_untaken_arms_and_needs_final_else() {
+        let src = "module t;\nuse j3.io.printLn;\nfn main() {\n    let xs: [1]int = [7];\n    let i = 3;\n    let x = if i < 1 { xs[i] } else if i < 2 { xs[i + 1] } else if i < 4 { 5 } else { xs[i + 2] };\n    if x == 5 {\n        printLn(\"ok\");\n    }\n}\n";
+        let path = std::env::temp_dir().join(format!("j3c_eie_{}.j3", std::process::id()));
+        std::fs::write(&path, src).unwrap();
+        run_both_ok(&path, "ok\n");
+        let _ = std::fs::remove_file(&path);
+        let err = match compile_src("eie2", "module t;\nfn main() {\n    let i = 1;\n    let x = if i < 1 { 1 } else if i < 2 { 2 };\n}\n") {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("needs `else`"), "{err}");
+    }
+
+    #[test]
+    fn rvalue_base_evaluates_once_and_slice_results_stay_writable() {
+        run_both_ok(&honesty("rvalue_eval_once.j3"), "once\norder\nslice-store\n");
+    }
+
+    #[test]
+    fn assigning_into_a_temporary_is_an_error() {
+        for body in ["pt().x = 1;", "(Vec2 { x: 1.0, y: 1.0 } + Vec2 { x: 1.0, y: 1.0 }).x = 1.0;", "arr()[0] = 1;", "pt().x += 1;", "arr()[sl(arr())[0]] = 1;", "id(sl(arr())[1]).x = 3;"] {
+            let src = format!("module t;\nuse j3.math.Vec2;\nstruct P {{\n    x: int;\n}}\nfn pt(): P {{\n    return P {{ x: 1 }};\n}}\nfn arr(): [3]int {{\n    return [1, 2, 3];\n}}\nfn sl(a: [3]int): []int {{\n    return a;\n}}\nfn id(i: int): P {{\n    return P {{ x: i }};\n}}\nfn main() {{\n    {body}\n}}\n");
+            let err = match compile_src("tmpassign", &src) {
+                Ok(_) => panic!("expected error for {body}"),
+                Err(e) => e,
+            };
+            assert!(err.contains("temporary"), "{body}: {err}");
+            // span: the temporary at the root, line 13 (body line), col 5 for `pt()` / `arr()`, col 6 for the parenthesized sum
+            let want = if body.starts_with('(') { ":19:6" } else { ":19:5" };
+            assert!(err.contains(want), "{body}: wrong span {err}");
+        }
     }
 
     #[test]
@@ -2631,6 +2901,9 @@ node.1.id=2\nnode.1.parent=0\nnode.1.kind=1\nnode.1.name s=Other\n{extra}"
                     .to_string(),
             )],
             scene_scan: None,
+            ui_cfg: None,
+            ui_gen: None,
+            ui_err: None,
         };
         loader.load_path(&manifest.entry).expect("load main");
         let err = loader.load_imports().unwrap_err();

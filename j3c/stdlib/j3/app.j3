@@ -1,10 +1,25 @@
 /// Bevy-shaped runner. Stages: startup (once) / always / first+update+last @ 60 Hz / draw.
 /// Main thread only: window, GL, and audio state is not thread-safe (`j3c doc threads`).
+///
+/// Environment (handled in `j3.game`, so any App needs no code change):
+/// - `J3_CAPTURE=out.png:N` saves frame N (1-based, before it is shown) to `out.png`, then quits.
+/// - `J3_STEADY=a:b` (a < b) prints `steady layouts=N restyles=N arena_growth=N` at the end of frame b
+///   (counts since the end of frame a, all `.j3ui` roots, `App.mem` growth), quits, and after the normal
+///   teardown exits 1 when any is non-zero or the run ended before frame b, else 0.
+/// - `J3_HOT_QUIT` / `J3_HOT_WIN` / `J3_HOT_STATE` (file paths set by `j3c run --hot`): see `App.hot`.
+/// - `J3_FIXED_DT=0.016` makes every frame's dt that many seconds instead of measured time,
+///   so captures repeat exactly.
 
 module j3.app;
 
+use j3.data.save;
+use j3.data.save.Save;
 use j3.game;
-use j3.memory.{ Arena, rewindScratch, scratch, frameHook };
+use j3.game.display;
+use j3.io;
+use j3.io.printLn;
+use j3.memory.{ Arena, rewindScratch, scratch, frameHook, laidTotal, restyledTotal };
+use j3.sys.exit;
 
 /// Process heap. Created the first time `heap` runs.
 #[singleton]
@@ -21,6 +36,51 @@ const MAX_FRAME: f32 = 0.25;
 /// Most fixed steps one frame may run.
 const MAX_STEPS: int = 8;
 
+/// Frames seen by `hotPoll`.
+#[singleton]
+let HOT_TICK: int = 0;
+
+/// For a program with its own main loop (no `App.run`) under `j3c run --hot`: call it once per frame. True when
+/// j3c wants a restart, so save what you want kept to `hotStatePath()` (`j3.data.save`) and leave the loop. It
+/// looks at the disk every 8th call and is always false outside a hot run. Without it such a program is killed
+/// 3 s after a rebuild (no state, no window position). `App.run` does this for you.
+pub fn hotPoll(): bool {
+    if !HOT_READ {
+        HOT_QUIT = game.env("J3_HOT_QUIT");
+        HOT_READ = true;
+    }
+    if HOT_QUIT.len == 0 { return false; }
+    HOT_TICK += 1;
+    if HOT_TICK % 8 != 1 { return false; }
+    return io.exists(HOT_QUIT);
+}
+
+/// `J3_HOT_QUIT` as read by the first `hotPoll` call.
+#[singleton]
+let HOT_QUIT: string;
+#[singleton]
+let HOT_READ: bool = false;
+
+/// Last key of every file a hot restart writes. The files are written in place (the sys layer has no rename), so a
+/// kill mid-write leaves one without it; `hotRead` then treats the file as absent.
+fn hotStore(sv: &Save, path: string) {
+    save.putInt(sv, "hot.end", 1);
+    save.store(sv, path);
+}
+
+fn hotComplete(path: string, mem: &Arena): bool {
+    if !io.exists(path) { return false; }
+    let sv = save.load(path, mem);
+    if save.getInt(&sv, "hot.end", 0) == 1 { return true; }
+    printLn(`j3: hot restart file {path} is incomplete; starting fresh`);
+    return false;
+}
+
+/// Where a hot restart's state goes (read it back at start if the file exists); empty outside `j3c run --hot`.
+pub fn hotStatePath(): string {
+    return game.env("J3_HOT_STATE");
+}
+
 /// Lazily creates the process heap and scratch arena, then returns a pointer to HEAP.
 fn heap(cap: int): &Arena {
     if HEAP.ptr == 0 {
@@ -28,6 +88,32 @@ fn heap(cap: int): &Arena {
         scratch(SCRATCH_CAP);
     }
     return &HEAP;
+}
+
+/// `J3_STEADY=a:b` as {a, b}; {0, 0} when unset or malformed (malformed warns).
+fn steadyRange(): []int {
+    let v = game.env("J3_STEADY");
+    let r = scratch(SCRATCH_CAP).alloc::<int>(2);
+    r[0] = 0;
+    r[1] = 0;
+    if v.len == 0 { return r; }
+    let k = 0;
+    let part = 0;
+    let ok = true;
+    let digits = 0;
+    while k < v.len {
+        let c = v[k];
+        if c == 58 && part == 0 && digits > 0 { part = 1; digits = 0; }
+        else if c >= 48 && c <= 57 { r[part] = r[part] * 10 + int(c) - 48; digits += 1; }
+        else { ok = false; }
+        k += 1;
+    }
+    if !ok || part != 1 || digits == 0 || r[1] <= r[0] {
+        printLn("j3: J3_STEADY wants a:b with a < b (frame numbers, 1-based); ignored");
+        r[0] = 0;
+        r[1] = 0;
+    }
+    return r;
 }
 
 /// Fixed-timestep app runner over a user world `W`, with staged system lists.
@@ -40,6 +126,12 @@ pub struct App<W> {
     startups: []fn(&W);
     /// Number of entries in `startups`.
     n_start: int;
+    /// Shutdown callbacks (`App.shutdown`), run in registration order after the loop ends.
+    downs: []fn(&W);
+    /// Number of entries in `downs`.
+    n_down: int;
+    /// True while the shutdown callbacks run; `shutdown` then prints an error and ignores the call.
+    in_down: bool;
     /// Fixed-tick systems that run before `updates` each step.
     firsts: []fn(&W, f32);
     /// Number of entries in `firsts`.
@@ -74,10 +166,17 @@ pub struct App<W> {
     resizable: bool;
     /// When true, `run` calls `game.initGl` instead of `game.init`.
     gl: bool;
+    /// When true, `run` calls `game.setHiDpi(true)` before opening a GL window.
+    hidpi: bool;
+    /// Video settings file for `display.load`, or empty for none.
+    video: string;
     /// When true, `run` skips fixed steps. `always` and `draw` still run.
     paused: bool;
     /// Multiplier on the frame dt added into the fixed-step accumulator.
     scale: f32;
+    /// `App.hot` hooks (one slot each, empty when unset).
+    hot_save: []fn(&W, &Save);
+    hot_load: []fn(&W, &Save);
 
     /// Boots `W` on the default heap and returns an empty system schedule.
     fn create(title: string, width: int, height: int, boot: fn(&Arena): W): App<W> {
@@ -88,6 +187,9 @@ pub struct App<W> {
             world: world,
             startups: mem.alloc::<fn(&W)>(4),
             n_start: 0,
+            downs: mem.alloc::<fn(&W)>(2),
+            n_down: 0,
+            in_down: false,
             firsts: mem.alloc::<fn(&W, f32)>(4),
             n_first: 0,
             updates: mem.alloc::<fn(&W, f32)>(8),
@@ -105,8 +207,12 @@ pub struct App<W> {
             min_h: 180,
             resizable: true,
             gl: false,
+            hidpi: false,
+            video: "",
             paused: false,
             scale: 1,
+            hot_save: mem.alloc::<fn(&W, &Save)>(0),
+            hot_load: mem.alloc::<fn(&W, &Save)>(0),
         };
     }
 
@@ -125,6 +231,9 @@ pub struct App<W> {
             world: world,
             startups: mem.alloc::<fn(&W)>(4),
             n_start: 0,
+            downs: mem.alloc::<fn(&W)>(2),
+            n_down: 0,
+            in_down: false,
             firsts: mem.alloc::<fn(&W, f32)>(4),
             n_first: 0,
             updates: mem.alloc::<fn(&W, f32)>(8),
@@ -142,9 +251,27 @@ pub struct App<W> {
             min_h: 180,
             resizable: true,
             gl: false,
+            hidpi: false,
+            video: "",
             paused: false,
             scale: 1,
+            hot_save: mem.alloc::<fn(&W, &Save)>(0),
+            hot_load: mem.alloc::<fn(&W, &Save)>(0),
         };
+    }
+
+    /// Asks for a high-DPI drawable on the next `run` (needs `useGl`): layout stays in logical pixels
+    /// and drawing is scaled (`game.setHiDpi`). `J3_UI_SCALE=1.5` overrides the scale for testing.
+    fn hiDpi(this: &App<W>): &App<W> {
+        this.hidpi = true;
+        return this;
+    }
+
+    /// Saves the player's Video settings in `path` (`j3.game.display`): `run` opens the window in the
+    /// saved mode, resolution and monitor, with vsync and frame cap set. Missing file = the App's own size.
+    fn displaySettings(this: &App<W>, path: string): &App<W> {
+        this.video = path;
+        return this;
     }
 
     /// Enables OpenGL window init on the next `run`.
@@ -171,6 +298,29 @@ pub struct App<W> {
         }
         this.startups[this.n_start] = sys;
         this.n_start = this.n_start + 1;
+        return this;
+    }
+
+    /// Appends a shutdown callback (a module fn, no closures). Callbacks run once, in registration order,
+    /// when the loop ends for any reason (window close, `game.requestQuit`, `--frames`, `J3_STEADY`), before
+    /// `game.destroy`, so GL and the window are still alive. They do not run if the process aborts (`panic`).
+    /// The list grows as needed; registering from inside a shutdown callback prints an error and is ignored.
+    fn shutdown(this: &App<W>, sys: fn(&W)): &App<W> {
+        if this.in_down {
+            printLn("j3: App.shutdown called during shutdown; ignored");
+            return this;
+        }
+        if this.n_down >= this.downs.len {
+            let fresh = this.mem.alloc::<fn(&W)>(this.downs.len * 2 + 2);
+            let i = 0;
+            while i < this.n_down {
+                fresh[i] = this.downs[i];
+                i += 1;
+            }
+            this.downs = fresh;
+        }
+        this.downs[this.n_down] = sys;
+        this.n_down = this.n_down + 1;
         return this;
     }
 
@@ -291,22 +441,68 @@ pub struct App<W> {
         return this;
     }
 
+    /// Opt in to keeping app state across a `j3c run --hot` restart. `save` fills a `j3.data.save` blob just before the old
+    /// process exits; `load` reads it back right after the new one's startups. Both only ever run in a hot restart
+    /// (the first start and every other run, release builds included, call neither). Window position, size and mode
+    /// are kept without this. Without the hook the app restarts fresh.
+    fn hot(this: &App<W>, save: fn(&W, &Save), load: fn(&W, &Save)): &App<W> {
+        this.hot_save = this.mem.alloc::<fn(&W, &Save)>(1);
+        this.hot_save[0] = save;
+        this.hot_load = this.mem.alloc::<fn(&W, &Save)>(1);
+        this.hot_load[0] = load;
+        return this;
+    }
+
     /// Opens the window, runs startups, then loops always/fixed/draw until quit.
     fn run(this: &App<W>) {
+        let hot_quit = game.env("J3_HOT_QUIT");
+        let hot_win = game.env("J3_HOT_WIN");
+        let hot_state = game.env("J3_HOT_STATE");
+        let hot_pos = false;
+        let video = this.video;
+        if hot_win.len > 0 && hotComplete(hot_win, this.mem) {
+            video = hot_win;
+            hot_pos = true;
+        }
+        let saved = display.current();
+        if video.len > 0 {
+            // Before the window exists this only records, so it opens in the saved mode.
+            saved = display.loadAndApply(video, this.mem);
+        }
         if this.gl {
+            if this.hidpi { game.setHiDpi(true); }
             game.initGl(this.title, this.width, this.height);
         } else {
             game.init(this.title, this.width, this.height);
         }
         game.setResizable(this.resizable);
         game.setMinSize(this.min_w, this.min_h);
+        if video.len > 0 { display.apply(&saved); }
+        if hot_pos && saved.mode == game.WindowMode.Windowed {
+            let wv = save.load(hot_win, this.mem);
+            game.setWindowPos(save.getInt(&wv, "window.x", 0), save.getInt(&wv, "window.y", 0));
+        }
         let i = 0;
         while i < this.n_start {
             let cb_start = this.startups[i];
             cb_start(&this.world);
             i += 1;
         }
+        if hot_state.len > 0 && this.hot_load.len > 0 && hotComplete(hot_state, this.mem) {
+            let hv = save.load(hot_state, this.mem);
+            let cb_hot = this.hot_load[0];
+            cb_hot(&this.world, &hv);
+        }
         let acc: f32 = 0;
+        let sr = steadyRange();
+        let st_a = sr[0];
+        let st_b = sr[1];
+        let st_laid = 0;
+        let st_restyled = 0;
+        let st_used = 0;
+        let frame = 0;
+        let st_rc = 0;
+        let st_done = false;
         while true {
             rewindScratch();
             frameHook();
@@ -315,6 +511,10 @@ pub struct App<W> {
                 dt = MAX_FRAME;
             }
             if game.quitRequested() {
+                break;
+            }
+            // `j3c run --hot` asks for a restart by creating this file; looked for every 8th frame.
+            if hotPoll() {
                 break;
             }
             i = 0;
@@ -366,12 +566,57 @@ pub struct App<W> {
                 cb_draw(&this.world);
                 i += 1;
             }
+            frame += 1;
+            if st_b > 0 {
+                if frame == st_a {
+                    st_laid = laidTotal();
+                    st_restyled = restyledTotal();
+                    st_used = this.mem.used;
+                } else if frame == st_b {
+                    let dl = laidTotal() - st_laid;
+                    let dr = restyledTotal() - st_restyled;
+                    let dm = this.mem.used - st_used;
+                    printLn(`steady layouts={dl} restyles={dr} arena_growth={dm}`);
+                    if dl != 0 || dr != 0 || dm != 0 { st_rc = 1; }
+                    st_done = true;
+                    game.requestQuit();
+                }
+            }
             // `j3c run --frames N --screenshot FILE` stops and photographs in `game.present`.
             game.present();
+        }
+        if hot_quit.len > 0 && io.exists(hot_quit) {
+            if hot_win.len > 0 {
+                let cur = display.current();
+                display.store(&cur, hot_win, this.mem);
+                let pv = save.load(hot_win, this.mem);
+                let pos = game.windowPos();
+                save.putInt(&pv, "window.x", int(pos.x));
+                save.putInt(&pv, "window.y", int(pos.y));
+                hotStore(&pv, hot_win);
+            }
+            if hot_state.len > 0 && this.hot_save.len > 0 {
+                let ov = save.empty(this.mem);
+                let cb_hs = this.hot_save[0];
+                cb_hs(&this.world, &ov);
+                hotStore(&ov, hot_state);
+            }
+        }
+        this.in_down = true;
+        i = 0;
+        while i < this.n_down {
+            let cb_down = this.downs[i];
+            cb_down(&this.world);
+            i += 1;
         }
         game.destroy();
         rewindScratch();
         scratch(SCRATCH_CAP).destroy();
         this.mem.destroy();
+        if st_b > 0 && !st_done {
+            printLn(`steady: run ended at frame {frame} before {st_b}`);
+            st_rc = 1;
+        }
+        if st_rc != 0 { exit(i32(st_rc)); }
     }
 }

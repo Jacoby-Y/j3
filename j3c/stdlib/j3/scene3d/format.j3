@@ -1,0 +1,1029 @@
+// Part of j3.scene3d (scene file format v2: read, write, store); the module doc and `use`s are in ../scene3d.j3.
+module j3.scene3d;
+
+// ---- Scene file format v2 ----
+// One object per line, indented two spaces a level, defaults left out: see "Scene file format"
+// in j3c/editor/README.md. `tools/j3scene_migrate.py` writes the same text from v1 files, so a
+// rule changed here changes there. Rotation is degrees in the file and radians in `Node`.
+
+fn eol(bytes: []u8, at: int): int {
+    let end = at;
+    while end < bytes.len && bytes[end] != 10 { end += 1; }
+    return end;
+}
+
+fn skipSp(bytes: []u8, at: int, end: int): int {
+    while at < end && bytes[at] == 32 { at += 1; }
+    return at;
+}
+
+/// End of the token that starts at `at`: the next space outside quotes.
+fn tokEnd(bytes: []u8, at: int, end: int): int {
+    let i = at;
+    let quoted = false;
+    while i < end {
+        let b = bytes[i];
+        if quoted {
+            if b == 92 { i += 1; } else if b == 34 { quoted = false; }
+        } else if b == 34 {
+            quoted = true;
+        } else if b == 32 {
+            return i;
+        }
+        i += 1;
+    }
+    return end;
+}
+
+fn eqAt(bytes: []u8, at: int, end: int): int {
+    if at < end && bytes[at] == 34 { return -1; }
+    let i = at;
+    while i < end && bytes[i] != 61 { i += 1; }
+    if i >= end { return -1; }
+    return i;
+}
+
+fn hasByte(bytes: []u8, at: int, end: int, b: u8): bool {
+    while at < end {
+        if bytes[at] == b { return true; }
+        at += 1;
+    }
+    return false;
+}
+
+/// The `#id` that ends an object line, or 0. `start` gets where that token begins.
+fn trailingId(bytes: []u8, s: int, end: int, start: &int): int {
+    let e = end;
+    while e > s && (bytes[e - 1] == 32 || bytes[e - 1] == 13) { e -= 1; }
+    let b = e;
+    while b > s && bytes[b - 1] != 32 { b -= 1; }
+    if b + 1 >= e || bytes[b] != 35 { return 0; }
+    let i = b + 1;
+    while i < e {
+        if bytes[i] < 48 || bytes[i] > 57 { return 0; }
+        i += 1;
+    }
+    *start = b;
+    return save.parseInt(bytes, b + 1, 0);
+}
+
+/// A `key=value` line of the data section (`prop.door.type s=bool`): the first token ends in `=`
+/// or in ` f=`, ` s=`, ` r=`.
+fn isDataLine(bytes: []u8, s: int, end: int): bool {
+    let i = s;
+    while i < end && bytes[i] != 32 && bytes[i] != 61 && bytes[i] != 34 { i += 1; }
+    if i == s || i >= end { return false; }
+    if bytes[i] == 61 { return true; }
+    if bytes[i] != 32 || i + 2 >= end || bytes[i + 2] != 61 { return false; }
+    return bytes[i + 1] == 102 || bytes[i + 1] == 115 || bytes[i + 1] == 114;
+}
+
+/// What a v2 line is: 0 blank, 1 `//` note, 2 header, 3 `env`, 4 data, 5 object.
+fn lineKind(bytes: []u8, at: int, s: int, end: int): int {
+    if s >= end || (s == end - 1 && bytes[s] == 13) { return 0; }
+    if startsWith(bytes, s, end, "//") { return 1; }
+    if at == 0 && startsWith(bytes, s, end, "j3scene") { return 2; }
+    if s == at && startsWith(bytes, s, end, "env ") {
+        let t = skipSp(bytes, s + 3, end);
+        if eqAt(bytes, t, tokEnd(bytes, t, end)) >= 0 { return 3; }
+    }
+    if s == at && isDataLine(bytes, s, end) { return 4; }
+    return 5;
+}
+
+struct V2 {
+    scene: &Scene;
+    bytes: []u8;
+    rest: &Text;
+    arena: &Arena;
+    /// Next id for an object line without `#id`.
+    auto: int;
+    /// `stack[d]` is the id of the last object seen at depth `d`; `open` is how many are set.
+    stack: []int;
+    open: int;
+    note: Text;
+    hasNote: bool;
+    ln: int;
+}
+
+fn v2Fail(p: &V2, message: string) {
+    if p.scene.parseError.len > 0 { return; }
+    let t = Text.new(p.arena);
+    t.pushStr("line ");
+    t.pushInt(p.ln);
+    t.pushStr(": ");
+    t.pushStr(message);
+    p.scene.parseError = t.str();
+}
+
+fn v2FailKey(p: &V2, message: string, at: int, end: int) {
+    let t = Text.new(p.arena);
+    t.pushStr(message);
+    t.push(32);
+    t.pushStr(p.bytes[at..end] as string);
+    v2Fail(p, t.str());
+}
+
+/// The text of a token value: a quoted one without its quotes and escapes, else as written.
+fn unq(p: &V2, at: int, end: int): string {
+    let bytes = p.bytes;
+    if at < end && bytes[at] == 34 {
+        let stop = end;
+        if stop > at + 1 && bytes[stop - 1] == 34 { stop -= 1; }
+        let plain = true;
+        let i = at + 1;
+        while i < stop { if bytes[i] == 92 { plain = false; } i += 1; }
+        if plain { return bytes[at + 1..stop] as string; }
+        let t = Text.new(p.arena);
+        i = at + 1;
+        while i < stop {
+            if bytes[i] == 92 && i + 1 < stop { i += 1; }
+            t.push(bytes[i]);
+            i += 1;
+        }
+        return t.str();
+    }
+    return bytes[at..end] as string;
+}
+
+fn radians(degrees: f32): f32 { return f32(f64(degrees) * 0.017453292519943295); }
+
+/// `x,y,z` (or, with `uniform`, one number for all three) at `bytes[at..end]`.
+fn parseVec3(bytes: []u8, at: int, end: int, v: &Vec3, uniform: bool): bool {
+    let vals: [3]f32 = [0.0, 0.0, 0.0];
+    let n = 0;
+    let i = at;
+    while n < 3 && i < end {
+        vals[n] = save.parseFloat(bytes, i);
+        n += 1;
+        while i < end && bytes[i] != 44 { i += 1; }
+        i += 1;
+    }
+    if n == 3 { *v = Vec3.xyz(vals[0], vals[1], vals[2]); return true; }
+    if n == 1 && uniform { *v = Vec3.xyz(vals[0], vals[0], vals[0]); return true; }
+    return false;
+}
+
+/// `grain` is `assets/materials/grain.j3mat`; a value with a `/` or a `.` is a path as it is.
+fn expandName(p: &V2, at: int, end: int, folder: string, ext: string): string {
+    let raw = unq(p, at, end);
+    if raw.len == 0 || hasByte(raw as []u8, 0, raw.len, 47) || hasByte(raw as []u8, 0, raw.len, 46) { return raw; }
+    let t = Text.new(p.arena);
+    t.pushStr(folder);
+    t.pushStr(raw);
+    t.pushStr(ext);
+    return t.str();
+}
+
+/// One `a|b` list of short names, each expanded.
+fn expandList(p: &V2, at: int, end: int, folder: string, ext: string): string {
+    let raw = unq(p, at, end);
+    let t = Text.new(p.arena);
+    let from = 0;
+    while from <= raw.len {
+        let to = from;
+        while to < raw.len && raw[to] != 124 { to += 1; }
+        if from > 0 { t.push(124); }
+        let part = raw[from..to];
+        if part.len == 0 || hasByte(part as []u8, 0, part.len, 47) || hasByte(part as []u8, 0, part.len, 46) {
+            t.pushStr(part);
+        } else {
+            t.pushStr(folder);
+            t.pushStr(part);
+            t.pushStr(ext);
+        }
+        from = to + 1;
+    }
+    return t.str();
+}
+
+/// Append `<head><id>.<field>[ f| s| r]=<value>` to the data section. The literal's shape picks the
+/// type: `"text"` is a string, `#7` an object, a number with a `.` a float, any other an integer.
+fn v2Data(p: &V2, head: string, id: int, fa: int, fe: int, v: int, e: int, text: bool) {
+    let bytes = p.bytes;
+    let t = p.rest;
+    t.pushStr(head);
+    t.pushInt(id);
+    t.push(46);
+    t.pushStr(bytes[fa..fe] as string);
+    if text || (v < e && bytes[v] == 34) {
+        t.pushStr(" s=");
+        t.pushStr(unq(p, v, e));
+    } else if v < e && bytes[v] == 35 {
+        t.pushStr(" r=");
+        t.pushStr(bytes[v + 1..e] as string);
+    } else if hasByte(bytes, v, e, 46) {
+        t.pushStr(" f=");
+        t.pushStr(bytes[v..e] as string);
+    } else {
+        t.push(61);
+        t.pushStr(bytes[v..e] as string);
+    }
+    t.push(10);
+}
+
+fn v2Kind(p: &V2, n: &Node, a: int, e: int) {
+    let bytes = p.bytes;
+    if fieldIs(bytes, a, e, "group") { n.kind = GROUP; }
+    else if fieldIs(bytes, a, e, "mesh") { n.kind = MESH; }
+    else if fieldIs(bytes, a, e, "place") { n.kind = INSTANCE; }
+    else if fieldIs(bytes, a, e, "light") { n.kind = LIGHT; }
+    else if fieldIs(bytes, a, e, "camera") { n.kind = CAMERA; }
+    else if isShape(bytes[a..e] as string) {
+        n.kind = MESH;
+        let t = Text.new(p.arena);
+        t.pushStr("builtin:");
+        t.pushStr(bytes[a..e] as string);
+        n.asset = t.str();
+    } else {
+        v2FailKey(p, "unknown kind", a, e);
+    }
+}
+
+fn isShape(name: string): bool {
+    return same(name, "cube") || same(name, "sphere") || same(name, "cylinder") || same(name, "cone")
+        || same(name, "capsule") || same(name, "torus") || same(name, "quad") || same(name, "plane")
+        || same(name, "sky");
+}
+
+/// One token of an object line after its kind: a mesh or scene path, or `key=value`.
+fn v2Field(p: &V2, n: &Node, id: int, a: int, e: int) {
+    let bytes = p.bytes;
+    let eq = eqAt(bytes, a, e);
+    if eq < 0 {
+        if n.kind == MESH { n.asset = unq(p, a, e); }
+        else if n.kind == INSTANCE { n.scene = unq(p, a, e); }
+        else { v2FailKey(p, "a path only goes on mesh and place objects:", a, e); }
+        return;
+    }
+    let v = eq + 1;
+    let ok = true;
+    if fieldIs(bytes, a, eq, "pos") { ok = parseVec3(bytes, v, e, &n.position, false); }
+    else if fieldIs(bytes, a, eq, "rot") {
+        let d = Vec3.zero();
+        ok = parseVec3(bytes, v, e, &d, false);
+        n.rotation = Vec3.xyz(radians(d.x), radians(d.y), radians(d.z));
+    }
+    else if fieldIs(bytes, a, eq, "scale") { ok = parseVec3(bytes, v, e, &n.scale, true); }
+    else if fieldIs(bytes, a, eq, "tint") { ok = parseVec3(bytes, v, e, &n.tint, true); }
+    else if fieldIs(bytes, a, eq, "color") { ok = parseVec3(bytes, v, e, &n.color, true); }
+    else if fieldIs(bytes, a, eq, "range") { n.range = save.parseFloat(bytes, v); }
+    else if fieldIs(bytes, a, eq, "fov") { n.fov = save.parseFloat(bytes, v); }
+    else if fieldIs(bytes, a, eq, "near") { n.near = save.parseFloat(bytes, v); }
+    else if fieldIs(bytes, a, eq, "far") { n.far = save.parseFloat(bytes, v); }
+    else if fieldIs(bytes, a, eq, "opacity") { n.opacity = save.parseFloat(bytes, v); }
+    else if fieldIs(bytes, a, eq, "material") { n.material = expandName(p, v, e, "assets/materials/", ".j3mat"); }
+    else if fieldIs(bytes, a, eq, "fx") || fieldIs(bytes, a, eq, "effects") {
+        n.effects = expandList(p, v, e, "assets/fx/", ".j3fx");
+    }
+    else if fieldIs(bytes, a, eq, "texture") { n.texture = unq(p, v, e); }
+    else if fieldIs(bytes, a, eq, "script") { n.script = unq(p, v, e); }
+    else if fieldIs(bytes, a, eq, "tags") { n.tags = unq(p, v, e); }
+    else if fieldIs(bytes, a, eq, "asset") { n.asset = unq(p, v, e); }
+    else if fieldIs(bytes, a, eq, "scene") { n.scene = unq(p, v, e); }
+    else if fieldIs(bytes, a, eq, "doubleSided") { n.doubleSided = save.parseInt(bytes, v, 0) != 0; }
+    else if fieldIs(bytes, a, eq, "alpha") {
+        if fieldIs(bytes, v, e, "cutout") { n.alpha = CUTOUT; }
+        else if fieldIs(bytes, v, e, "blend") { n.alpha = BLEND; }
+        else if fieldIs(bytes, v, e, "opaque") { n.alpha = OPAQUE; }
+        else { n.alpha = save.parseInt(bytes, v, OPAQUE); }
+    }
+    else if startsWith(bytes, a, eq, "param.") { v2Data(p, "param.", id, a + 6, eq, v, e, false); }
+    else if startsWith(bytes, a, eq, "fx.") { v2Data(p, "param.", id, a, eq, v, e, false); }
+    else if startsWith(bytes, a, eq, "prop.") { v2Data(p, "over.", id, a, eq, v, e, true); }
+    else if startsWith(bytes, a, eq, "over.") { v2Data(p, "over.", id, a + 5, eq, v, e, false); }
+    else { v2FailKey(p, "unknown key", a, eq); }
+    if !ok { v2FailKey(p, "bad value in", a, e); }
+}
+
+fn v2Object(p: &V2, at: int, s: int, end: int) {
+    let bytes = p.bytes;
+    let scene = p.scene;
+    let depth = (s - at) / 2;
+    if (s - at) - depth * 2 != 0 {
+        v2Fail(p, "indent must be a multiple of two spaces");
+        depth = 0;
+    } else if depth > p.open || depth >= 64 {
+        v2Fail(p, "indented more than one level below its parent");
+        depth = 0;
+    }
+    let parent = 0;
+    if depth > 0 { parent = p.stack[depth - 1]; }
+    let idAt = end;
+    let id = trailingId(bytes, s, end, &idAt);
+    if id == 0 {
+        id = p.auto;
+        p.auto += 1;
+    }
+    let stop = idAt;
+    while stop > s && (bytes[stop - 1] == 32 || bytes[stop - 1] == 13) { stop -= 1; }
+    grow(scene, scene.len + 1);
+    let n = &scene.nodes[scene.len - 1];
+    n.id = id;
+    n.parent = parent;
+    if p.hasNote {
+        n.note = p.note.str();
+        p.note = Text.new(p.arena);
+        p.hasNote = false;
+    }
+    p.stack[depth] = id;
+    p.open = depth + 1;
+    let cur = s;
+    let te = tokEnd(bytes, cur, stop);
+    n.name = unq(p, cur, te);
+    cur = skipSp(bytes, te, stop);
+    te = tokEnd(bytes, cur, stop);
+    if cur >= stop { v2Fail(p, "object needs a kind after its name"); return; }
+    v2Kind(p, n, cur, te);
+    cur = skipSp(bytes, te, stop);
+    while cur < stop {
+        te = tokEnd(bytes, cur, stop);
+        v2Field(p, n, id, cur, te);
+        cur = skipSp(bytes, te, stop);
+    }
+}
+
+fn envComp(p: &V2, name: string, at: int, end: int) {
+    p.rest.pushStr("scene.env.");
+    p.rest.pushStr(name);
+    p.rest.pushStr(" f=");
+    p.rest.pushStr(p.bytes[at..end] as string);
+    p.rest.push(10);
+}
+
+/// `x,y,z` at `bytes[at..end]` as three float lines.
+fn envVec(p: &V2, x: string, y: string, z: string, at: int, end: int) {
+    let to = at;
+    while to < end && p.bytes[to] != 44 { to += 1; }
+    envComp(p, x, at, to);
+    let from = to + 1;
+    to = from;
+    while to < end && p.bytes[to] != 44 { to += 1; }
+    envComp(p, y, from, to);
+    from = to + 1;
+    envComp(p, z, from, end);
+}
+
+fn envScalar(p: &V2, name: string, at: int, end: int, float: bool) {
+    p.rest.pushStr("scene.env.");
+    p.rest.pushStr(name);
+    if float { p.rest.pushStr(" f="); } else { p.rest.push(61); }
+    p.rest.pushStr(p.bytes[at..end] as string);
+    p.rest.push(10);
+}
+
+fn v2Env(p: &V2, s: int, end: int) {
+    let bytes = p.bytes;
+    let cur = skipSp(bytes, s + 3, end);
+    while cur < end {
+        let te = tokEnd(bytes, cur, end);
+        let eq = eqAt(bytes, cur, te);
+        if eq < 0 { v2FailKey(p, "env needs key=value, got", cur, te); }
+        else {
+            let v = eq + 1;
+            if fieldIs(bytes, cur, eq, "sun") { envVec(p, "sunX", "sunY", "sunZ", v, te); }
+            else if fieldIs(bytes, cur, eq, "sunColor") { envVec(p, "sunR", "sunG", "sunB", v, te); }
+            else if fieldIs(bytes, cur, eq, "sky") { envVec(p, "skyR", "skyG", "skyB", v, te); }
+            else if fieldIs(bytes, cur, eq, "fogStart") { envScalar(p, "fogStart", v, te, true); }
+            else if fieldIs(bytes, cur, eq, "fogEnd") { envScalar(p, "fogEnd", v, te, true); }
+            else if fieldIs(bytes, cur, eq, "shadowSize") { envScalar(p, "shadowSize", v, te, true); }
+            else if fieldIs(bytes, cur, eq, "urpShadowNear") { envScalar(p, "urpShadowNear", v, te, true); }
+            else if fieldIs(bytes, cur, eq, "shadows") { envScalar(p, "shadows", v, te, false); }
+            else if fieldIs(bytes, cur, eq, "urp") { envScalar(p, "urp", v, te, false); }
+            else if fieldIs(bytes, cur, eq, "urpBounces") { envScalar(p, "urpBounces", v, te, false); }
+            else if fieldIs(bytes, cur, eq, "urpSamples") { envScalar(p, "urpSamples", v, te, false); }
+            else if fieldIs(bytes, cur, eq, "urpShadows") { envScalar(p, "urpShadows", v, te, false); }
+            else { v2FailKey(p, "unknown env key", cur, eq); }
+        }
+        cur = skipSp(bytes, te, end);
+    }
+}
+
+/// Read a v2 file: objects become `scene.nodes`; `env`, params, overrides and the data section
+/// become the v1 `key=value` lines in `rest` (the same data `scene.data` always held).
+fn parseV2(scene: &Scene, bytes: []u8, rest: &Text) {
+    let arena = scene.arena;
+    let p = V2 { scene: scene, bytes: bytes, rest: rest, arena: arena, auto: 1, stack: arena.alloc::<int>(64),
+        open: 0, note: Text.new(arena), hasNote: false, ln: 0 };
+    // First pass: the header's `next=` and the largest `#id`, so a line without one gets a free id.
+    let at = 0;
+    let end = 0;
+    let s = 0;
+    let kind = 0;
+    while at < bytes.len {
+        end = eol(bytes, at);
+        s = skipSp(bytes, at, end);
+        kind = lineKind(bytes, at, s, end);
+        if kind == 2 {
+            let k = s;
+            while k < end {
+                if startsWith(bytes, k, end, "next=") {
+                    let next = save.parseInt(bytes, k + 5, 1);
+                    if next > p.auto { p.auto = next; }
+                }
+                k += 1;
+            }
+        } else if kind == 5 {
+            let ignore = end;
+            let id = trailingId(bytes, s, end, &ignore);
+            if id >= p.auto { p.auto = id + 1; }
+        }
+        at = end + 1;
+    }
+    at = 0;
+    while at < bytes.len {
+        end = eol(bytes, at);
+        p.ln += 1;
+        s = skipSp(bytes, at, end);
+        kind = lineKind(bytes, at, s, end);
+        if kind == 1 {
+            let from = s + 2;
+            if from < end && bytes[from] == 32 { from += 1; }
+            let to = end;
+            if to > from && bytes[to - 1] == 13 { to -= 1; }
+            if p.hasNote { p.note.push(10); }
+            p.note.pushStr(bytes[from..to] as string);
+            p.hasNote = true;
+        } else if kind == 2 {
+            let h = s;
+            while h < end {
+                if startsWith(bytes, h, end, "next=") {
+                    rest.pushStr("scene.nextId=");
+                    rest.pushInt(save.parseInt(bytes, h + 5, 1));
+                    rest.push(10);
+                }
+                h += 1;
+            }
+        } else if kind == 3 {
+            v2Env(&p, s, end);
+        } else if kind == 4 {
+            rest.pushStr(bytes[s..end] as string);
+            rest.push(10);
+        } else if kind == 5 {
+            v2Object(&p, at, s, end);
+        }
+        at = end + 1;
+    }
+}
+
+/// `x` in millionths, rounded the way `pushNum` prints it: equal results print equal text.
+fn q6(x: f32): int {
+    let n = f64(x);
+    let neg = n < 0.0;
+    if neg { n = 0.0 - n; }
+    if n > 9000000000000.0 { n = 9000000000000.0; }
+    let s = int(n * 1000000.0 + 0.5);
+    if neg { return 0 - s; }
+    return s;
+}
+
+/// Radians `x` in thousandths of a degree, the way `pushDeg` prints it.
+fn qd(x: f32): int {
+    let n = f64(x) * 57.29577951308232;
+    let neg = n < 0.0;
+    if neg { n = 0.0 - n; }
+    if n > 9000000000000.0 { n = 9000000000000.0; }
+    let s = int(n * 1000.0 + 0.5);
+    if neg { return 0 - s; }
+    return s;
+}
+
+/// `n` (not negative) with `places` decimals (3 or 6), trailing zeros trimmed. True when it
+/// printed a `.`.
+fn pushDec(t: &Text, n: f64, neg: bool, places: int): bool {
+    let k = 1000000;
+    if places == 3 { k = 1000; }
+    if n > 9000000000000.0 { n = 9000000000000.0; }
+    let scaled = int(n * f64(k) + 0.5);
+    let whole = scaled / k;
+    let frac = scaled - whole * k;
+    if neg && scaled != 0 { t.push(45); }
+    t.pushInt(whole);
+    if frac == 0 { return false; }
+    t.push(46);
+    let place = k / 10;
+    let digits = "0123456789";
+    while frac > 0 {
+        t.push(digits[frac / place]);
+        frac = frac - (frac / place) * place;
+        place = place / 10;
+    }
+    return true;
+}
+
+fn pushNum(t: &Text, x: f32): bool {
+    let n = f64(x);
+    if n < 0.0 { return pushDec(t, 0.0 - n, true, 6); }
+    return pushDec(t, n, false, 6);
+}
+
+fn pushDeg(t: &Text, x: f32) {
+    let n = f64(x) * 57.29577951308232;
+    if f64(x) < 0.0 { pushDec(t, 0.0 - n, true, 3); }
+    else { pushDec(t, n, false, 3); }
+}
+
+fn pushVec(t: &Text, v: Vec3) {
+    pushNum(t, v.x);
+    t.push(44);
+    pushNum(t, v.y);
+    t.push(44);
+    pushNum(t, v.z);
+}
+
+fn pushVecOrUniform(t: &Text, v: Vec3) {
+    if q6(v.x) == q6(v.y) && q6(v.y) == q6(v.z) { pushNum(t, v.x); }
+    else { pushVec(t, v); }
+}
+
+fn pushQuoted(t: &Text, bytes: []u8, at: int, end: int) {
+    t.push(34);
+    let i = at;
+    while i < end {
+        let b = bytes[i];
+        if b == 92 || b == 34 { t.push(92); }
+        if b != 10 && b != 13 { t.push(b); }
+        i += 1;
+    }
+    t.push(34);
+}
+
+/// A value, quoted when it has a space or quote; `path` also when it has `=`.
+fn pushValue(t: &Text, s: string, path: bool) {
+    let b = s as []u8;
+    if hasByte(b, 0, b.len, 32) || hasByte(b, 0, b.len, 9) || hasByte(b, 0, b.len, 34) || (path && hasByte(b, 0, b.len, 61)) {
+        pushQuoted(t, b, 0, b.len);
+    } else {
+        t.pushStr(s);
+    }
+}
+
+fn pushName(t: &Text, s: string) {
+    let b = s as []u8;
+    if b.len == 0 || hasByte(b, 0, b.len, 32) || hasByte(b, 0, b.len, 9) || hasByte(b, 0, b.len, 34)
+        || hasByte(b, 0, b.len, 61) || b[0] == 35 || startsWith(b, 0, b.len, "//") {
+        pushQuoted(t, b, 0, b.len);
+    } else {
+        t.pushStr(s);
+    }
+}
+
+/// The value of a typed data line (suffix byte `sfx`, value at `bytes[v..end]`) as a v2 literal.
+fn pushTyped(t: &Text, bytes: []u8, sfx: int, v: int, end: int) {
+    if sfx == 102 {
+        if !pushNum(t, save.parseFloat(bytes, v)) { t.pushStr(".0"); }
+    } else if sfx == 115 {
+        pushQuoted(t, bytes, v, end);
+    } else if sfx == 114 {
+        t.push(35);
+        t.pushInt(save.parseInt(bytes, v, 0));
+    } else {
+        t.pushInt(save.parseInt(bytes, v, 0));
+    }
+}
+
+/// `value` as a short name when it is `<folder><name><ext>` with a plain name.
+fn shorten(value: string, folder: string, ext: string): string {
+    if value.len <= folder.len + ext.len { return value; }
+    if !startsWith(value as []u8, 0, value.len, folder) { return value; }
+    if !startsWith(value as []u8, value.len - ext.len, value.len, ext) { return value; }
+    let mid = value[folder.len..value.len - ext.len];
+    if hasByte(mid as []u8, 0, mid.len, 47) || hasByte(mid as []u8, 0, mid.len, 46) { return value; }
+    return mid;
+}
+
+fn fieldEnd(bytes: []u8, at: int, end: int): int {
+    while at < end && bytes[at] != 32 && bytes[at] != 61 { at += 1; }
+    return at;
+}
+
+/// Where the field of a `<prefix><id>.<field>` line starts.
+fn fieldAt(bytes: []u8, at: int, prefix: string): int {
+    let f = at + prefix.len;
+    while bytes[f] != 46 { f += 1; }
+    return f + 1;
+}
+
+fn fieldLess(bytes: []u8, a: int, b: int, prefix: string): bool {
+    let fa = fieldAt(bytes, a, prefix);
+    let fb = fieldAt(bytes, b, prefix);
+    let ea = fieldEnd(bytes, fa, eol(bytes, a));
+    let eb = fieldEnd(bytes, fb, eol(bytes, b));
+    while fa < ea && fb < eb {
+        if bytes[fa] != bytes[fb] { return bytes[fa] < bytes[fb]; }
+        fa += 1;
+        fb += 1;
+    }
+    return fa == ea && fb < eb;
+}
+
+/// Start offsets of the `<prefix><id>.` lines of `data`, sorted by field so the file is the same
+/// whatever order the table gave them. // ponytail: one scan of the data per object; index by id if params get common.
+fn pickLines(data: []u8, prefix: string, id: int, mem: &Arena): []int {
+    let count = 0;
+    let at = 0;
+    let end = 0;
+    while at < data.len {
+        end = eol(data, at);
+        if keyId(data, at, end, prefix) == id { count += 1; }
+        at = end + 1;
+    }
+    let out = mem.alloc::<int>(count);
+    let n = 0;
+    at = 0;
+    while at < data.len && n < count {
+        end = eol(data, at);
+        if keyId(data, at, end, prefix) == id {
+            let k = n;
+            while k > 0 && fieldLess(data, at, out[k - 1], prefix) {
+                out[k] = out[k - 1];
+                k -= 1;
+            }
+            out[k] = at;
+            n += 1;
+        }
+        at = end + 1;
+    }
+    return out;
+}
+
+fn pushPad(t: &Text, depth: int) {
+    let i = 0;
+    while i < depth { t.pushStr("  "); i += 1; }
+}
+
+fn pushDataToken(t: &Text, data: []u8, at: int, prefix: string, key: string) {
+    let end = eol(data, at);
+    let f = fieldAt(data, at, prefix);
+    let fe = fieldEnd(data, f, end);
+    let v = fe;
+    while v < end && data[v] != 61 { v += 1; }
+    let sfx = 0;
+    if fe + 1 < end && data[fe] == 32 { sfx = int(data[fe + 1]); }
+    t.push(32);
+    t.pushStr(key);
+    t.pushStr(data[f..fe] as string);
+    t.push(61);
+    if startsWith(data, f, fe, "prop.") { pushQuoted(t, data, v + 1, end); }
+    else { pushTyped(t, data, sfx, v + 1, end); }
+}
+
+/// The v2 text of object `at` (its slot in `scene.nodes`): its note lines, then its line, at
+/// `depth` levels of indent, newline-ended. Reads the scene's param and override lines.
+pub fn nodeText(scene: &Scene, at: int, depth: int, out: &Text, mem: &Arena) {
+    flushParams(scene);
+    let n = scene.nodes[at];
+    let k = n.kind;
+    if k != MESH && k != CAMERA && k != INSTANCE && k != LIGHT { k = GROUP; }
+    if n.note.len > 0 {
+        let nfrom = 0;
+        while nfrom <= n.note.len {
+            let nto = nfrom;
+            while nto < n.note.len && n.note[nto] != 10 { nto += 1; }
+            pushPad(out, depth);
+            out.pushStr("//");
+            if nto > nfrom { out.push(32); out.pushStr(n.note[nfrom..nto]); }
+            out.push(10);
+            nfrom = nto + 1;
+        }
+    }
+    pushPad(out, depth);
+    pushName(out, n.name);
+    out.push(32);
+    if k == MESH {
+        if startsWith(n.asset as []u8, 0, n.asset.len, "builtin:") && isShape(n.asset[8..n.asset.len]) {
+            out.pushStr(n.asset[8..n.asset.len]);
+        } else {
+            out.pushStr("mesh");
+            if n.asset.len > 0 { out.push(32); pushValue(out, n.asset, true); }
+        }
+    } else if k == INSTANCE {
+        out.pushStr("place");
+        if n.scene.len > 0 { out.push(32); pushValue(out, n.scene, true); }
+    } else if k == CAMERA { out.pushStr("camera"); }
+    else if k == LIGHT { out.pushStr("light"); }
+    else { out.pushStr("group"); }
+    let p = n.position;
+    if q6(p.x) != 0 || q6(p.y) != 0 || q6(p.z) != 0 { out.pushStr(" pos="); pushVec(out, p); }
+    let r = n.rotation;
+    if qd(r.x) != 0 || qd(r.y) != 0 || qd(r.z) != 0 {
+        out.pushStr(" rot=");
+        pushDeg(out, r.x);
+        out.push(44);
+        pushDeg(out, r.y);
+        out.push(44);
+        pushDeg(out, r.z);
+    }
+    let s = n.scale;
+    if q6(s.x) != 1000000 || q6(s.y) != 1000000 || q6(s.z) != 1000000 { out.pushStr(" scale="); pushVecOrUniform(out, s); }
+    if k == MESH {
+        if n.material.len > 0 {
+            out.pushStr(" material=");
+            pushValue(out, shorten(n.material, "assets/materials/", ".j3mat"), false);
+        }
+        if n.texture.len > 0 { out.pushStr(" texture="); pushValue(out, n.texture, false); }
+    }
+    let tint = n.tint;
+    if (k == MESH || k == INSTANCE) && (q6(tint.x) != 1000000 || q6(tint.y) != 1000000 || q6(tint.z) != 1000000) {
+        out.pushStr(" tint=");
+        pushVecOrUniform(out, tint);
+    }
+    if k == LIGHT {
+        let c = n.color;
+        if q6(c.x) != 1000000 || q6(c.y) != 900000 || q6(c.z) != 750000 { out.pushStr(" color="); pushVec(out, c); }
+        if q6(n.range) != 8000000 { out.pushStr(" range="); pushNum(out, n.range); }
+    }
+    if k == CAMERA {
+        if q6(n.fov) != 60000000 { out.pushStr(" fov="); pushNum(out, n.fov); }
+        if q6(n.near) != 150000 { out.pushStr(" near="); pushNum(out, n.near); }
+        if q6(n.far) != 200000000 { out.pushStr(" far="); pushNum(out, n.far); }
+        if n.effects.len > 0 {
+            let list = Text.new(mem);
+            let from = 0;
+            while from <= n.effects.len {
+                let to = from;
+                while to < n.effects.len && n.effects[to] != 124 { to += 1; }
+                if from > 0 { list.push(124); }
+                list.pushStr(shorten(n.effects[from..to], "assets/fx/", ".j3fx"));
+                from = to + 1;
+            }
+            out.pushStr(" fx=");
+            if hasByte(n.effects as []u8, 0, n.effects.len, 32) || hasByte(n.effects as []u8, 0, n.effects.len, 34) {
+                pushQuoted(out, list.bytes, 0, list.bytes.len);
+            } else {
+                out.pushStr(list.str());
+            }
+        }
+    }
+    if k == MESH {
+        if n.alpha != OPAQUE {
+            out.pushStr(" alpha=");
+            if n.alpha == BLEND { out.pushStr("blend"); } else if n.alpha == CUTOUT { out.pushStr("cutout"); } else { out.pushStr("opaque"); }
+            if q6(n.opacity) != 1000000 { out.pushStr(" opacity="); pushNum(out, n.opacity); }
+        }
+        if n.doubleSided { out.pushStr(" doubleSided=1"); }
+    }
+    if n.script.len > 0 { out.pushStr(" script="); pushValue(out, n.script, false); }
+    if n.tags.len > 0 { out.pushStr(" tags="); pushValue(out, n.tags, false); }
+    let data = scene.data.bytes;
+    let params = pickLines(data, "param.", n.id, mem);
+    let i = 0;
+    let f = 0;
+    while i < params.len {
+        f = fieldAt(data, params[i], "param.");
+        if !startsWith(data, f, eol(data, params[i]), "fx.") { pushDataToken(out, data, params[i], "param.", "param."); }
+        i += 1;
+    }
+    i = 0;
+    while i < params.len {
+        f = fieldAt(data, params[i], "param.");
+        if startsWith(data, f, eol(data, params[i]), "fx.") { pushDataToken(out, data, params[i], "param.", ""); }
+        i += 1;
+    }
+    if k == INSTANCE {
+        let overs = pickLines(data, "over.", n.id, mem);
+        i = 0;
+        while i < overs.len {
+            f = fieldAt(data, overs[i], "over.");
+            if startsWith(data, f, eol(data, overs[i]), "prop.") { pushDataToken(out, data, overs[i], "over.", ""); }
+            i += 1;
+        }
+        i = 0;
+        while i < overs.len {
+            f = fieldAt(data, overs[i], "over.");
+            if !startsWith(data, f, eol(data, overs[i]), "prop.") { pushDataToken(out, data, overs[i], "over.", "over."); }
+            i += 1;
+        }
+    }
+    out.pushStr(" #");
+    out.pushInt(n.id);
+    out.push(10);
+}
+
+/// The scene's own objects (not placed ones) depth first, parents before children, siblings in
+/// array order: `slots[k]` is a slot in `scene.nodes` and `depths[k]` its depth. Both need room
+/// for `scene.len`. An object whose parent loops back to itself is listed at depth 0. Returns how many.
+pub fn treeOrder(scene: &Scene, mem: &Arena, slots: []int, depths: []int): int {
+    let n = scene.len;
+    let first = mem.alloc::<int>(n + 1);
+    let next = mem.alloc::<int>(n + 1);
+    let resume = mem.alloc::<int>(n + 1);
+    let seen = mem.alloc::<int>(n + 1);
+    let i = 0;
+    while i <= n { first[i] = -1; next[i] = -1; resume[i] = -1; seen[i] = 0; i += 1; }
+    let roots = -1;
+    i = n - 1;
+    while i >= 0 {
+        if scene.nodes[i].owner == 0 {
+            let parent = -1;
+            if scene.nodes[i].parent != 0 { parent = index(scene, scene.nodes[i].parent); }
+            if parent >= 0 && parent != i && scene.nodes[parent].owner == 0 {
+                next[i] = first[parent];
+                first[parent] = i;
+            } else {
+                next[i] = roots;
+                roots = i;
+            }
+        }
+        i -= 1;
+    }
+    let count = 0;
+    let cur = roots;
+    let depth = 0;
+    let sp = 0;
+    while cur >= 0 {
+        slots[count] = cur;
+        depths[count] = depth;
+        count += 1;
+        seen[cur] = 1;
+        if first[cur] >= 0 {
+            resume[sp] = next[cur];
+            sp += 1;
+            cur = first[cur];
+            depth += 1;
+        } else {
+            cur = next[cur];
+            while cur < 0 && sp > 0 {
+                sp -= 1;
+                cur = resume[sp];
+                depth -= 1;
+            }
+        }
+    }
+    i = 0;
+    while i < n {
+        if scene.nodes[i].owner == 0 && seen[i] == 0 {
+            slots[count] = i;
+            depths[count] = 0;
+            count += 1;
+        }
+        i += 1;
+    }
+    return count;
+}
+
+fn envVecText(t: &Text, name: string, v: Vec3, a: f32, b: f32, c: f32) {
+    if q6(v.x) == q6(a) && q6(v.y) == q6(b) && q6(v.z) == q6(c) { return; }
+    t.push(32);
+    t.pushStr(name);
+    t.push(61);
+    pushVec(t, v);
+}
+
+fn envFloatText(t: &Text, name: string, v: f32, fallback: f32) {
+    if q6(v) == q6(fallback) { return; }
+    t.push(32);
+    t.pushStr(name);
+    t.push(61);
+    pushNum(t, v);
+}
+
+fn envIntText(t: &Text, name: string, v: int, fallback: int) {
+    if v == fallback { return; }
+    t.push(32);
+    t.pushStr(name);
+    t.push(61);
+    t.pushInt(v);
+}
+
+fn flagInt(b: bool): int {
+    if b { return 1; }
+    return 0;
+}
+
+/// The `env` line: lighting that differs from the defaults, or nothing.
+fn writeEnv(scene: &Scene, t: &Text, mem: &Arena) {
+    let e = environment(scene);
+    let tok = Text.new(mem);
+    envVecText(&tok, "sun", e.sunDir, 0.45, 0.8, 0.25);
+    envVecText(&tok, "sunColor", e.sunColor, 1.0, 0.95, 0.85);
+    envVecText(&tok, "sky", e.sky, 0.12, 0.17, 0.24);
+    envFloatText(&tok, "fogStart", e.fogStart, 80.0);
+    envFloatText(&tok, "fogEnd", e.fogEnd, 400.0);
+    envIntText(&tok, "shadows", flagInt(e.shadows), 1);
+    envFloatText(&tok, "shadowSize", e.shadowSize, 30.0);
+    envIntText(&tok, "urp", flagInt(e.urp), 0);
+    envIntText(&tok, "urpBounces", e.bounces, 2);
+    envIntText(&tok, "urpSamples", e.samples, 1);
+    envIntText(&tok, "urpShadows", flagInt(e.tracedShadows), 0);
+    envFloatText(&tok, "urpShadowNear", e.traceNear, 40.0);
+    if tok.bytes.len > 0 {
+        t.pushStr("env");
+        t.pushStr(tok.str());
+        t.push(10);
+    }
+}
+
+fn lineLess(bytes: []u8, a: int, b: int): bool {
+    let ea = eol(bytes, a);
+    let eb = eol(bytes, b);
+    while a < ea && b < eb {
+        if bytes[a] != bytes[b] { return bytes[a] < bytes[b]; }
+        a += 1;
+        b += 1;
+    }
+    return a == ea && b < eb;
+}
+
+/// The scene as v2 text (header, `env`, objects, then the `prop.` declarations).
+fn fileText(scene: &Scene, t: &Text, mem: &Arena) {
+    t.pushStr("j3scene 2 next=");
+    t.pushInt(scene.nextId);
+    t.push(10);
+    writeEnv(scene, t, mem);
+    let slots = mem.alloc::<int>(scene.len + 1);
+    let depths = mem.alloc::<int>(scene.len + 1);
+    let count = treeOrder(scene, mem, slots, depths);
+    let tmp = Arena.create(64 * 1024);
+    let prevKids = false;
+    let firstTop = true;
+    let k = 0;
+    while k < count {
+        if depths[k] == 0 {
+            let kids = k + 1 < count && depths[k + 1] > 0;
+            if firstTop || prevKids || kids { t.push(10); }
+            firstTop = false;
+            prevKids = kids;
+        }
+        nodeText(scene, slots[k], depths[k], t, &tmp);
+        tmp.rewind(0);
+        k += 1;
+    }
+    tmp.destroy();
+    let data = scene.data.bytes;
+    let props = 0;
+    let at = 0;
+    let end = 0;
+    while at < data.len {
+        end = eol(data, at);
+        if startsWith(data, at, end, "prop.") { props += 1; }
+        at = end + 1;
+    }
+    if props == 0 { return; }
+    let order = mem.alloc::<int>(props);
+    let n = 0;
+    at = 0;
+    while at < data.len {
+        end = eol(data, at);
+        if startsWith(data, at, end, "prop.") {
+            let j = n;
+            while j > 0 && lineLess(data, at, order[j - 1]) {
+                order[j] = order[j - 1];
+                j -= 1;
+            }
+            order[j] = at;
+            n += 1;
+        }
+        at = end + 1;
+    }
+    t.push(10);
+    let i = 0;
+    while i < n {
+        t.pushStr(data[order[i]..eol(data, order[i])] as string);
+        t.push(10);
+        i += 1;
+    }
+}
+
+/// Persist all node edits in one pass. Parameter lines stay in `data`.
+/// Returns false on a write error. Allocates nothing that outlives the call.
+pub fn store(scene: &Scene, path: string): bool {
+    // The file had something this reader could not use; writing now would lose it.
+    if scene.parseError.len > 0 { return false; }
+    flushParams(scene);
+    let mem = Arena.create(64 * 1024 + scene.len * 512 + scene.data.bytes.len);
+    let ok = write(scene, path, &mem);
+    mem.destroy();
+    return ok;
+}
+
+fn write(scene: &Scene, path: string, mem: &Arena): bool {
+    let t = Text.new(mem);
+    fileText(scene, &t, mem);
+    let temp = Text.new(mem);
+    temp.pushStr(path);
+    temp.pushStr(".j3tmp");
+    match io.writeFile(temp.str(), t.bytes) {
+        Result.Ok(_) {
+            let from = Text.new(mem);
+            from.pushStr(temp.str());
+            from.push(0);
+            let to = Text.new(mem);
+            to.pushStr(path);
+            to.push(0);
+            return libc.rename(&from.bytes[0] as cstr, &to.bytes[0] as cstr) == 0;
+        }
+        Result.Err(_) { return false; }
+    }
+}
+
+/// Whether `bytes[at..end]` starts with `prefix`.
+pub fn startsWith(bytes: []u8, at: int, end: int, prefix: string): bool {
+    if end - at < prefix.len { return false; }
+    let k = 0;
+    while k < prefix.len {
+        if bytes[at + k] != prefix[k] { return false; }
+        k += 1;
+    }
+    return true;
+}

@@ -380,7 +380,7 @@ fn validate_place(cx: &IrCx, body: &Body, place: &Place) -> Result<(), ValidateE
         }
         PlaceRoot::Global(id) => {
             let g = cx.global(id);
-            (g.ty, Access::let_binding())
+            (g.ty, if g.readonly { Access::read_only_view() } else { Access::let_binding() })
         }
     };
 

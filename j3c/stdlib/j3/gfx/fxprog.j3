@@ -1,0 +1,472 @@
+// Part of j3.gfx (material and post effect programs, effect params); the module doc and `use`s are in ../gfx.j3.
+module j3.gfx;
+
+/// A compiled material effect: its lit program and where its params go.
+struct FxProg {
+    /// The program is `lit.prog`; for a camera effect the other `lit` fields are unused.
+    lit: LitLocs;
+    count: int;
+    kinds: [8]int;
+    locs: [8]i32;
+    /// A material effect that displaces vertices: its shadow depth program, 0 for none.
+    depth: DepthLocs;
+    depthLocs: [8]i32;
+    /// A camera effect (`postProgram`), and its built-in uniforms.
+    post: bool;
+    pTime: i32;
+    pResolution: i32;
+    pNear: i32;
+    pFar: i32;
+    texCount: int;
+    texLocs: [4]i32;
+    texIds: [4]u32;
+}
+
+/// ponytail: 32 effect programs; raise it if a project needs more.
+#[singleton]
+let FXP: [32]FxProg;
+
+/// Compile a material effect: `glsl` (its `effect` hook) with a `uFx_<name>` uniform per
+/// param, into the stock lit shader. Returns the id for `Surface.fx`, or 0 with the driver's
+/// errors in `log`. `firstLine` gets the compiled line `glsl` starts on, for mapping errors.
+/// Effect draws use the plain lit variant: no traced shadows, mirrors, or glass.
+/// GLSL with an `#ifdef J3_VERTEX` block is also compiled into the vertex shader, with
+/// `J3_VERTEX` defined; that block defines `vec3 displace(vec3 pos, vec3 normal)` (world
+/// space, returns the new position). Its errors go to `vlog`, `vertFirst` set like `firstLine`.
+/// It runs in the shadow map pass too, so displaced meshes cast displaced shadows.
+pub fn effectProgram(glsl: string, params: []FxParam, log: &Text, firstLine: &int, vlog: &Text, vertFirst: &int): int {
+    ensure();
+    let slot = freeFx(log);
+    if slot < 0 { return 0; }
+    let fx = Text.new(scratch(0));
+    fxDecls(&fx, params);
+    fx.pushStr(glsl);
+    let vs = 0 as u32;
+    if contains(glsl, "#ifdef J3_VERTEX") {
+        vs = tryCompile(GL_VERTEX_SHADER, displaceVert(glsl, params, vertFirst), vlog);
+    } else {
+        vs = tryCompile(GL_VERTEX_SHADER, litVert(), log);
+    }
+    let fs = tryCompile(GL_FRAGMENT_SHADER, litSource(LIT_PLAIN, fx.str(), firstLine), log);
+    // The uniforms come first, so the hook's own first line is past them.
+    *firstLine = *firstLine + params.len;
+    let prog = tryLink(vs, fs, log);
+    if prog == 0 { return 0; }
+    let keep = LIT;
+    fillLit(prog);
+    FXP[slot].lit = LIT;
+    LIT = keep;
+    FXP[slot].post = false;
+    fxLocs(slot, prog, params);
+    FXP[slot].depth.prog = 0;
+    if contains(glsl, "#ifdef J3_VERTEX") {
+        // The lit vertex shader compiled, so this one reports nothing new.
+        let quiet = Text.new(scratch(0));
+        let depth = tryLink(tryCompile(GL_VERTEX_SHADER, displaceDepthVert(glsl, params), &quiet),
+            tryCompile(GL_FRAGMENT_SHADER, depthFrag(), &quiet), &quiet);
+        if depth != 0 {
+            FXP[slot].depth = DepthLocs { prog: depth, light: uloc(depth, "uLight"), model: uloc(depth, "uModel"),
+                inst: uloc(depth, "uInst"), albedo: uloc(depth, "uAlbedo"), cutout: uloc(depth, "uCutout"),
+                time: uloc(depth, "uTime") };
+            let k = 0;
+            while k < params.len && k < 8 {
+                let name = Text.new(scratch(0));
+                name.pushStr("uFx_");
+                name.pushStr(params[k].name);
+                FXP[slot].depthLocs[k] = uloc(depth, name.str());
+                k += 1;
+            }
+        }
+    }
+    return slot + 1;
+}
+
+/// Compile a camera effect: `glsl` defines `vec4 effect(vec2 uv)` and can read `uColor` (the
+/// frame so far), `uDepth`, `uNear`, `uFar`, `linearDepth(uv)`, `uTime`, `uResolution`, and
+/// its `uFx_<name>` params. Returns the id for `postPass`, or 0 with errors in `log`.
+pub fn postProgram(glsl: string, params: []FxParam, log: &Text, firstLine: &int): int {
+    ensure();
+    let slot = freeFx(log);
+    if slot < 0 { return 0; }
+    let src = Text.new(scratch(0));
+    src.pushStr(POST_TOP);
+    fxDecls(&src, params);
+    let lines = 1;
+    let i = 0;
+    while i < src.len() {
+        if src.bytes[i] == 10 { lines += 1; }
+        i += 1;
+    }
+    *firstLine = lines;
+    src.pushStr(glsl);
+    // The scene's depth goes through, so what's drawn after the effects still hides behind it.
+    src.pushStr("\nvoid main(){ oColor = effect(vUv); gl_FragDepth = texture(uDepth, vUv).r; }\n");
+    let prog = tryLink(tryCompile(GL_VERTEX_SHADER, POST_VERT, log), tryCompile(GL_FRAGMENT_SHADER, src.str(), log), log);
+    if prog == 0 { return 0; }
+    FXP[slot].lit.prog = prog;
+    FXP[slot].post = true;
+    FXP[slot].pTime = uloc(prog, "uTime");
+    FXP[slot].pResolution = uloc(prog, "uResolution");
+    FXP[slot].pNear = uloc(prog, "uNear");
+    FXP[slot].pFar = uloc(prog, "uFar");
+    glUseProgram(prog);
+    glUniform1i(uloc(prog, "uColor"), 0);
+    glUniform1i(uloc(prog, "uDepth"), 1);
+    glUseProgram(0);
+    fxLocs(slot, prog, params);
+    return slot + 1;
+}
+
+/// The lit vertex shader with an effect's `displace` moving each world position.
+fn displaceVert(glsl: string, params: []FxParam, firstLine: &int): string {
+    let t = Text.new(scratch(0));
+    t.pushStr(LIT_VERT_HEAD);
+    t.pushStr("uniform float uTime;\nuniform vec2 uResolution;\n#define J3_VERTEX 1\n");
+    t.pushStr(FX_STRUCT);
+    fxDecls(&t, params);
+    let lines = 1;
+    let i = 0;
+    while i < t.len() {
+        if t.bytes[i] == 10 { lines += 1; }
+        i += 1;
+    }
+    *firstLine = lines;
+    t.pushStr(glsl);
+    t.push(10);
+    t.pushStr(LIT_VERT_START);
+    t.pushStr("  world.xyz = displace(world.xyz, normalize(mat3(model) * aNrm));\n");
+    t.pushStr(LIT_VERT_END);
+    return t.str();
+}
+
+/// The shadow depth vertex shader with an effect's `displace`, so displaced meshes cast
+/// displaced shadows.
+fn displaceDepthVert(glsl: string, params: []FxParam): string {
+    let t = Text.new(scratch(0));
+    t.pushStr(DEPTH_VERT_HEAD);
+    t.pushStr("uniform float uTime;\nuniform vec2 uResolution;\n#define J3_VERTEX 1\n");
+    t.pushStr(FX_STRUCT);
+    fxDecls(&t, params);
+    t.pushStr(glsl);
+    t.push(10);
+    t.pushStr(DEPTH_VERT_START);
+    t.pushStr("  world.xyz = displace(world.xyz, normalize(mat3(model) * aNrm));\n");
+    t.pushStr(DEPTH_VERT_END);
+    return t.str();
+}
+
+/// A full-screen triangle; `vUv` runs 0..1 across the screen.
+const POST_VERT: string = "#version 330 core\nout vec2 vUv;\nvoid main(){\n  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n  vUv = p;\n  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n}\n";
+
+/// What a camera effect's GLSL sees before its own code.
+const POST_TOP: string = "#version 330 core\nin vec2 vUv;\nout vec4 oColor;\nuniform sampler2D uColor;\nuniform sampler2D uDepth;\nuniform float uTime;\nuniform vec2 uResolution;\nuniform float uNear;\nuniform float uFar;\n// Distance from the eye along the view axis, in world units.\nfloat linearDepth(vec2 uv) {\n  float z = texture(uDepth, uv).r * 2.0 - 1.0;\n  return 2.0 * uNear * uFar / (uFar + uNear - z * (uFar - uNear));\n}\n";
+
+/// Uniforms of a shadow depth program.
+struct DepthLocs {
+    prog: u32;
+    light: i32;
+    model: i32;
+    inst: i32;
+    albedo: i32;
+    cutout: i32;
+    time: i32;
+}
+
+/// A free `FXP` slot, or -1 with a line in `log`.
+fn freeFx(log: &Text): int {
+    let slot = 0;
+    while slot < 32 && FXP[slot].lit.prog != 0 { slot += 1; }
+    if slot < 32 { FXP[slot].texCount = 0; return slot; }
+    log.pushStr("too many effects (32)\n");
+    return 0 - 1;
+}
+
+/// A `uniform <type> uFx_<name>;` line per param.
+fn fxDecls(fx: &Text, params: []FxParam) {
+    let k = 0;
+    while k < params.len {
+        fx.pushStr("uniform ");
+        let kind = params[k].kind;
+        if kind == FX_COLOR { fx.pushStr("vec3"); }
+        else if kind == FX_INT { fx.pushStr("int"); }
+        else if kind == FX_BOOL { fx.pushStr("bool"); }
+        else { fx.pushStr("float"); }
+        fx.pushStr(" uFx_");
+        fx.pushStr(params[k].name);
+        fx.pushStr(";\n");
+        k += 1;
+    }
+}
+
+/// Record where effect `slot`'s params go in `prog`.
+fn fxLocs(slot: int, prog: u32, params: []FxParam) {
+    FXP[slot].count = params.len;
+    let k = 0;
+    while k < params.len && k < 8 {
+        FXP[slot].kinds[k] = params[k].kind;
+        let name = Text.new(scratch(0));
+        name.pushStr("uFx_");
+        name.pushStr(params[k].name);
+        FXP[slot].locs[k] = uloc(prog, name.str());
+        k += 1;
+    }
+}
+
+/// Camera-effect targets: the scene lands in `a` (color and depth), passes ping-pong
+/// between `a` and `b`, and the last one goes to `out` at the saved view rect.
+struct PostState {
+    a: Target;
+    b: Target;
+    vao: u32;
+    out: u32;
+    x: f32;
+    y: f32;
+    w: f32;
+    h: f32;
+    /// Color texture the next pass reads, and whether it's `a`'s.
+    read: u32;
+    inA: bool;
+}
+
+#[singleton]
+let POST: PostState;
+
+/// Post targets by size, so views of different sizes (split views, a render request) don't
+/// reallocate them every frame. `used` is `POST_CLOCK` at last use; the oldest is replaced.
+struct PostPair {
+    a: Target;
+    b: Target;
+    used: int;
+}
+
+// ponytail: 4 sizes; more views with camera effects than that reallocate each frame.
+#[singleton]
+let POOL: [4]PostPair;
+
+#[singleton]
+let POST_CLOCK: int = 0;
+
+/// Send the next camera pass into an offscreen target so `postPass` can run camera effects
+/// over it. Call before the camera pass; finish with `postPass(..., last = true)`.
+pub fn postBegin() {
+    ensure();
+    let sz = viewExtent();
+    // Physical pixels of the rect, so effects stay sharp under `game.setVirtualSize`.
+    let po = viewOrigin();
+    let pr = glView(po.x, po.y, sz.x, sz.y);
+    let w = int(pr.w);
+    let h = int(pr.h);
+    if w < 1 { w = 1; }
+    if h < 1 { h = 1; }
+    if POST.read != 0 { panic("gfx.postBegin: the last one wasn't finished with postPass(last)"); }
+    POST_CLOCK += 1;
+    let pick = 0;
+    let i = 0;
+    while i < 4 {
+        if POOL[i].a.fbo != 0 && POOL[i].a.w == w && POOL[i].a.h == h { pick = i; break; }
+        if POOL[i].used < POOL[pick].used { pick = i; }
+        i += 1;
+    }
+    if POOL[pick].a.fbo == 0 || POOL[pick].a.w != w || POOL[pick].a.h != h {
+        freeTarget(&POOL[pick].a);
+        freeTarget(&POOL[pick].b);
+        POOL[pick].a = makeTarget(w, h);
+        POOL[pick].b = makeTarget(w, h);
+    }
+    POOL[pick].used = POST_CLOCK;
+    POST.a = POOL[pick].a;
+    POST.b = POOL[pick].b;
+    if POST.vao == 0 {
+        let v: u32 = 0;
+        glGenVertexArrays(1, &v as ptr);
+        POST.vao = v;
+    }
+    POST.x = G.viewX;
+    POST.y = G.viewY;
+    POST.w = G.viewW;
+    POST.h = G.viewH;
+    POST.out = G.outputFbo;
+    POST.read = POST.a.color;
+    POST.inA = true;
+    G.outputFbo = POST.a.fbo;
+    // The camera pass puts the view rect at GL's bottom-left of the target.
+    let win = game.drawSize();
+    setViewRect(0, win.y - f32(h), f32(w), f32(h));
+}
+
+/// Run camera effect `fx` (`postProgram`'s id) over the frame, with its params in `vals`.
+/// `last` writes to where the camera pass would have gone and puts the view rect back.
+pub fn postPass(fx: int, vals: []f32, last: bool) {
+    if POST.read == 0 { return; }
+    let into = if POST.inA { POST.b.fbo } else { POST.a.fbo };
+    if last {
+        G.outputFbo = POST.out;
+        setViewRect(POST.x, POST.y, POST.w, POST.h);
+        into = POST.out;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, into);
+    if last {
+        let at = viewOrigin();
+        let sz = viewExtent();
+        let r = glView(at.x, at.y, sz.x, sz.y);
+        glViewport(i32(r.x), i32(r.y), i32(r.w), i32(r.h));
+    } else {
+        glViewport(0, 0, i32(POST.a.w), i32(POST.a.h));
+    }
+    // Depth test on so `gl_FragDepth` is written; ALWAYS so it's never rejected.
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(1);
+    glDepthFunc(GL_ALWAYS);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    let slot = fx - 1;
+    let ok = fx > 0 && fx <= 32 && FXP[slot].lit.prog != 0 && FXP[slot].post;
+    if ok {
+        glUseProgram(FXP[slot].lit.prog);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, POST.read);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, POST.a.depth);
+        glUniform1f(FXP[slot].pTime, f32(game.ticks()) / 1000);
+        glUniform2f(FXP[slot].pResolution, f32(POST.a.w), f32(POST.a.h));
+        let near = G.clipNear;
+        if near < 0.01 { near = f32(15) / f32(100); }
+        glUniform1f(FXP[slot].pNear, near);
+        glUniform1f(FXP[slot].pFar, G.clipFar);
+        fxUniforms(slot, vals, false);
+        glBindVertexArray(POST.vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindVertexArray(0);
+        glActiveTexture(GL_TEXTURE0);
+        if !last {
+            POST.read = if POST.inA { POST.b.color } else { POST.a.color };
+            POST.inA = !POST.inA;
+        }
+    }
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_CULL_FACE);
+    if last {
+        POST.read = 0;
+        // A bad last effect still has to show the frame.
+        if !ok { postCopy(); }
+    }
+}
+
+/// Copy the current post color to the bound output: the frame without effects.
+fn postCopy() {
+    if !G.ready { return; }
+    let first = 0;
+    let log = Text.new(scratch(0));
+    if COPY_FX == 0 || !FXP[COPY_FX - 1].post || FXP[COPY_FX - 1].lit.prog == 0 {
+        let none = []FxParam { ptr: 0 as &FxParam, len: 0 };
+        COPY_FX = postProgram("vec4 effect(vec2 uv) { return texture(uColor, uv); }\n", none, &log, &first);
+    }
+    if COPY_FX == 0 { return; }
+    let vals = []f32 { ptr: 0 as &f32, len: 0 };
+    let keep = POST.read;
+    POST.read = if POST.inA { POST.a.color } else { POST.b.color };
+    postPass(COPY_FX, vals, true);
+    POST.read = keep;
+}
+
+#[singleton]
+let COPY_FX: int = 0;
+
+/// Bind an externally owned 2D texture to a material effect's declared sampler.
+/// Main thread only. Up to four samplers use units 10..13, separate from built-ins.
+/// Returns false for an invalid effect, missing uniform, or full binding table.
+/// Passing a zero-id texture clears that sampler; free textures only after unbinding.
+pub fn effectTexture(fx: int, uniformName: string, image: Tex): bool {
+    ensure();
+    if fx < 1 || fx > 32 || FXP[fx - 1].lit.prog == 0 || FXP[fx - 1].post { return false; }
+    let f = &FXP[fx - 1];
+    let loc = uloc(f.lit.prog, uniformName);
+    if loc < 0 { return false; }
+    for k in 0..f.texCount {
+        if f.texLocs[k] == loc { f.texIds[k] = image.id; return true; }
+    }
+    if f.texCount >= 4 { return false; }
+    let k = f.texCount;
+    f.texLocs[k] = loc; f.texIds[k] = image.id; f.texCount += 1;
+    return true;
+}
+
+fn fxTextures(slot: int) {
+    let f = &FXP[slot];
+    for k in 0..f.texCount {
+        glActiveTexture(u32(GL_TEXTURE0 + 10 + k));
+        glBindTexture(GL_TEXTURE_2D, f.texIds[k]);
+        glUniform1i(f.texLocs[k], i32(10 + k));
+    }
+    glActiveTexture(GL_TEXTURE0);
+}
+
+/// Delete effect `fx` (`effectProgram`'s id). Surfaces still naming it draw stock.
+pub fn freeEffect(fx: int) {
+    if fx < 1 || fx > 32 || FXP[fx - 1].lit.prog == 0 { return; }
+    glDeleteProgram(FXP[fx - 1].lit.prog);
+    FXP[fx - 1].lit.prog = 0;
+    FXP[fx - 1].texCount = 0;
+    if FXP[fx - 1].depth.prog != 0 {
+        glDeleteProgram(FXP[fx - 1].depth.prog);
+        FXP[fx - 1].depth.prog = 0;
+    }
+}
+
+/// How a surface looks beyond its texture. `plainSurface()` changes nothing.
+pub struct Surface {
+    /// Multiplies the albedo.
+    tint: Vec3;
+    /// Unlit light the surface gives off.
+    glow: Vec3;
+    /// Highlight strength, 0..1.
+    spec: f32;
+    /// Highlight sharpness, 0 (broad) to 1 (pinpoint).
+    shine: f32;
+    /// How much it mirrors its surroundings, 0..1: 1 is a mirror at every angle, lower
+    /// values show mostly at grazing angles. Without a tracer it mirrors the sky (or sky box).
+    reflect: f32;
+    /// See-through where the surface faces the camera, solid at its edges, 0..1. Only
+    /// shows on blended draws. With `reflect`, reads as glass or water.
+    edge: f32;
+    /// Index of refraction; above 1 the surface is glass and bends what's behind it (from
+    /// `grab`). 1.5 is window glass, 1.33 water.
+    ior: f32;
+    /// Blurs reflections and dulls the sun glint in them, 0..1.
+    rough: f32;
+    /// How far light travels through the object, in world units, for glass bending and
+    /// tint. `scene3d` sets it from the object's size.
+    thickness: f32;
+    /// For glass: how frosted it is, 0 (clear) to 1 (a lit, solid-looking surface).
+    cloud: f32;
+    /// Texture coordinates are multiplied by this, then offset.
+    uvScale: Vec2;
+    uvOffset: Vec2;
+    /// Shader effect, from `effectProgram`; 0 is none.
+    fx: int;
+    /// The effect's param values in param order; a color takes three. Start a `Surface` from
+    /// `plainSurface()` rather than a literal, so fields added later don't break it.
+    fxVals: [16]f32;
+}
+
+/// Shader effect param kinds (`.j3fx` `param.<name>=<type>:<default>`).
+pub const FX_FLOAT: int = 0;
+pub const FX_INT: int = 1;
+pub const FX_BOOL: int = 2;
+pub const FX_COLOR: int = 3;
+/// ponytail: 8 params and 16 floats per effect; raise both if an effect needs more.
+pub const FX_PARAMS: int = 8;
+pub const FX_FLOATS: int = 16;
+
+/// One effect param: uniform `uFx_<name>`, its `FX_*` kind, and its default (a color uses
+/// all three, the rest `def[0]`).
+pub struct FxParam {
+    name: string;
+    kind: int;
+    def: [3]f32;
+}
+
+/// Floats a param of `kind` takes in `Surface.fxVals`.
+pub fn fxWidth(kind: int): int {
+    return if kind == FX_COLOR { 3 } else { 1 };
+}

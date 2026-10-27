@@ -6,10 +6,57 @@ use std::path::{Path, PathBuf};
 pub struct Manifest {
     pub root: PathBuf,
     pub name: String,
+    /// `[package] version`, default `0.1.0` (the `.deb` version).
+    pub version: String,
+    /// `[package] description`, default `<name>, made with j3`.
+    pub description: String,
     pub entry: PathBuf,
     pub cc: Cc,
     pub emit: Emit,
     pub link: Link,
+    pub dist: Dist,
+    /// `[ui]`: present when the project has `.j3ui` components.
+    pub ui: Option<Ui>,
+}
+
+/// `[ui]`: `dir` holds `*.j3ui`; `theme` is one global CSS file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ui {
+    pub dir: String,
+    pub theme: Option<String>,
+    /// `lint = false` (`"*"`) or `lint-off = ["rule", ...]`: CSS lint rules `j3c check` skips.
+    pub lint_off: Vec<String>,
+}
+
+/// `[dist]`: `j3c build --release` also writes each of `build_outputs` into `target/dist/`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Dist {
+    /// `build_outputs = ["zip", "deb"]`; `zip = true` is `["zip"]`.
+    pub outputs: Vec<Output>,
+    /// Files and folders shipped beside the program. Empty means whichever of
+    /// `assets`, `scripts`, `scenes` exist.
+    pub include: Vec<String>,
+    /// `.png` or `.svg` for the app menu (`.deb`).
+    pub icon: Option<String>,
+    /// Menu name. Empty: the package name, title-cased.
+    pub title: String,
+    /// `.desktop` Categories, default `Game;`.
+    pub categories: String,
+    /// `Name <email>`. Empty: `$DEBFULLNAME`/`$DEBEMAIL`, else git config.
+    pub maintainer: String,
+    /// Extra `.deb` Depends, after the ones `[link] libs` imply.
+    pub depends: Vec<String>,
+}
+
+/// One `[dist] build_outputs` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Output {
+    Zip,
+    Deb,
+}
+
+impl Output {
+    pub const ALL: [(&'static str, Output); 2] = [("zip", Output::Zip), ("deb", Output::Deb)];
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +74,10 @@ pub struct Emit {
     pub flags: Vec<String>,
     /// Opt 0 reuses one object per module. Default true.
     pub incremental: bool,
+    /// `incremental = "all"`: per-module objects at every opt, without cross-module inlining.
+    pub incremental_all: bool,
+    /// `chunks = N`: objects per big module (absent = automatic, 0 = never split).
+    pub chunks: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +128,8 @@ impl Default for Emit {
             clang: "clang".to_string(),
             flags: Vec::new(),
             incremental: true,
+            incremental_all: false,
+            chunks: None,
         }
     }
 }
@@ -100,13 +153,13 @@ impl Manifest {
         self.out_path_for(self.emit.primary())
     }
 
-    /// One target keeps `target/<name>`. Several get `target/<name>-<triple>`.
+    /// One target keeps `target/<name>`. Several get `target/<triple>/<name>`.
     pub fn out_path_for(&self, target: &str) -> PathBuf {
         let dir = self.root.join("target");
         if self.emit.targets.len() <= 1 {
             dir.join(&self.name)
         } else {
-            dir.join(format!("{}-{}", self.name, target_slug(target)))
+            dir.join(target_slug(target)).join(&self.name)
         }
     }
 }
@@ -127,7 +180,7 @@ fn is_foreign_target(target: &str) -> bool {
     t.contains("windows") || t.contains("apple") || t.contains("darwin")
 }
 
-fn target_slug(target: &str) -> String {
+pub fn target_slug(target: &str) -> String {
     target
         .chars()
         .map(|c| {
@@ -190,7 +243,7 @@ pub enum Input {
     Project(Manifest),
 }
 
-fn find_toml_up(start: &Path) -> Option<PathBuf> {
+pub(crate) fn find_toml_up(start: &Path) -> Option<PathBuf> {
     let mut dir = if start.is_file() {
         start.parent()?.to_path_buf()
     } else {
@@ -272,6 +325,10 @@ fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, String> {
     }
     if let Some(s) = tbl.get("emit", "incremental").and_then(TomlVal::as_str) {
         emit.incremental = s != "false" && s != "0";
+        emit.incremental_all = s == "all";
+    }
+    if let Some(s) = tbl.get("emit", "chunks").and_then(TomlVal::as_str) {
+        emit.chunks = s.parse().ok();
     }
     let mut link = Link::default();
     if let Some(v) = tbl.get("link", "libs") {
@@ -293,13 +350,71 @@ fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, String> {
     if let Some(v) = tbl.get("link", "flags") {
         link.flags = v.as_list("link.flags")?;
     }
+    let mut dist = Dist {
+        categories: "Game;".to_string(),
+        ..Dist::default()
+    };
+    if let Some(v) = tbl.get("dist", "build_outputs") {
+        for o in v.as_list("dist.build_outputs")? {
+            let Some(&(_, out)) = Output::ALL.iter().find(|(n, _)| *n == o) else {
+                let names: Vec<&str> = Output::ALL.iter().map(|(n, _)| *n).collect();
+                return Err(format!("j3.toml: dist.build_outputs: unknown `{o}` (have {})", names.join(", ")));
+            };
+            if !dist.outputs.contains(&out) {
+                dist.outputs.push(out);
+            }
+        }
+    }
+    if tbl.get("dist", "zip").and_then(TomlVal::as_str) == Some("true") && !dist.outputs.contains(&Output::Zip) {
+        dist.outputs.insert(0, Output::Zip);
+    }
+    if let Some(v) = tbl.get("dist", "include") {
+        dist.include = v.as_list("dist.include")?;
+    }
+    if let Some(v) = tbl.get("dist", "depends") {
+        dist.depends = v.as_list("dist.depends")?;
+    }
+    let dist_str = |key: &str| tbl.get("dist", key).and_then(TomlVal::as_str).map(str::to_string);
+    dist.icon = dist_str("icon");
+    dist.title = dist_str("title").unwrap_or_default();
+    if let Some(c) = dist_str("categories") {
+        dist.categories = c;
+    }
+    dist.maintainer = dist_str("maintainer").unwrap_or_default();
+    let version = tbl.get("package", "version").and_then(TomlVal::as_str).unwrap_or("0.1.0").to_string();
+    let description = match tbl.get("package", "description").and_then(TomlVal::as_str) {
+        Some(d) => d.to_string(),
+        None => format!("{name}, made with j3"),
+    };
+    let ui = if tbl.get("ui", "dir").is_some() || tbl.get("ui", "theme").is_some() {
+        Some(Ui {
+            dir: tbl.get("ui", "dir").and_then(TomlVal::as_str).unwrap_or("ui").to_string(),
+            theme: tbl.get("ui", "theme").and_then(TomlVal::as_str).map(str::to_string),
+            lint_off: {
+                let mut off = match tbl.get("ui", "lint-off") {
+                    Some(v) => v.as_list("ui.lint-off")?,
+                    None => Vec::new(),
+                };
+                if matches!(tbl.get("ui", "lint").and_then(TomlVal::as_str), Some("false")) {
+                    off.push("*".into());
+                }
+                off
+            },
+        })
+    } else {
+        None
+    };
     Ok(Manifest {
         root,
         name,
+        version,
+        description,
         entry,
         cc,
         emit,
         link,
+        dist,
+        ui,
     })
 }
 
@@ -327,6 +442,9 @@ impl TomlVal {
 
 struct TomlTable {
     vals: Vec<(String, String, TomlVal)>,
+    /// `[section]` headers with their line numbers, in file order (a header with no keys still counts).
+    heads: Vec<(String, usize)>,
+    lines: Vec<usize>,
 }
 
 impl TomlTable {
@@ -341,7 +459,7 @@ impl TomlTable {
 
 fn parse_toml(text: &str) -> Result<TomlTable, String> {
     let mut section = String::new();
-    let mut vals = Vec::new();
+    let (mut vals, mut heads, mut lines) = (Vec::new(), Vec::new(), Vec::new());
     for (i, raw) in text.lines().enumerate() {
         let line_no = i + 1;
         let line = strip_comment(raw).trim();
@@ -349,6 +467,7 @@ fn parse_toml(text: &str) -> Result<TomlTable, String> {
             continue;
         }
         if let Some(name) = parse_section(line) {
+            heads.push((name.clone(), line_no));
             section = name;
             continue;
         }
@@ -357,8 +476,9 @@ fn parse_toml(text: &str) -> Result<TomlTable, String> {
         }
         let (key, val) = parse_key_val(line, line_no)?;
         vals.push((section.clone(), key, val));
+        lines.push(line_no);
     }
-    Ok(TomlTable { vals })
+    Ok(TomlTable { vals, heads, lines })
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -561,7 +681,7 @@ target = ["x86_64-pc-linux-gnu", "x86_64-pc-windows-gnu", "arm64-apple-darwin"]
         assert_eq!(m.emit.primary(), "x86_64-pc-linux-gnu");
         assert_eq!(
             m.out_path_for("x86_64-pc-windows-gnu"),
-            tmp.join("target").join("multi-x86_64-pc-windows-gnu")
+            tmp.join("target").join("x86_64-pc-windows-gnu").join("multi")
         );
         let one = r#"
 [package]
@@ -595,8 +715,43 @@ target = "x86_64-pc-windows-gnu"
     }
 
     #[test]
+    fn dist_build_outputs() {
+        let dir = std::env::temp_dir().join(format!("j3-dist-toml-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.j3"), "").unwrap();
+        let m = |t: &str| parse_manifest(&format!("[package]\nname = \"g\"\n{t}"), dir.clone());
+        let a = m("[dist]\nbuild_outputs = [\"deb\", \"zip\", \"deb\"]\nicon = \"i.png\"\n").unwrap();
+        assert_eq!(a.dist.outputs, [Output::Deb, Output::Zip]);
+        assert_eq!(a.dist.icon.as_deref(), Some("i.png"));
+        assert_eq!(a.dist.categories, "Game;");
+        assert_eq!((a.version.as_str(), a.description.as_str()), ("0.1.0", "g, made with j3"));
+        assert_eq!(m("[dist]\nzip = true\n").unwrap().dist.outputs, [Output::Zip]);
+        assert!(m("[dist]\nbuild_outputs = [\"msi\"]\n").unwrap_err().contains("zip, deb"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn missing_name_is_error() {
         let err = parse_manifest("[link]\nlibs = [\"x\"]\n", PathBuf::from("/")).unwrap_err();
         assert!(err.contains("package"), "{err}");
     }
+}
+
+/// One `[section] key = "value"` from TOML text (used for the user config).
+pub(crate) fn toml_str(text: &str, section: &str, key: &str) -> Option<String> {
+    parse_toml(text).ok()?.get(section, key)?.as_str().map(str::to_string)
+}
+
+/// Section headers (with lines) and string/number entries `(section, key, value, line)` of TOML text, for
+/// `j3c golden`. Errors read `j3.toml:LINE: ...`; the caller renames the file.
+pub(crate) fn toml_doc(text: &str) -> Result<(Vec<(String, usize)>, Vec<(String, String, String, usize)>), String> {
+    let t = parse_toml(text)?;
+    let mut out = Vec::new();
+    for ((s, k, v), line) in t.vals.into_iter().zip(t.lines) {
+        match v {
+            TomlVal::Str(v) => out.push((s, k, v, line)),
+            TomlVal::List(_) => return Err(format!("j3.toml:{line}: `{k}` must be a string or number")),
+        }
+    }
+    Ok((t.heads, out))
 }

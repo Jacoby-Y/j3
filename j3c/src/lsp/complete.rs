@@ -56,6 +56,14 @@ pub fn complete(prog: &Program, path: &str, offset: u32) -> Vec<Completion> {
     complete_at(prog, path, &src, offset)
 }
 
+/// Members of `base` for `base.prefix`, looked up from `offset` in `path` (the `.j3ui` bridge).
+pub(super) fn member_items(prog: &Program, path: &str, offset: u32, base: &str, prefix: &str) -> Vec<Completion> {
+    match query::file_by_path(&prog.cx, path) {
+        Some(f) => members(prog, f.id, offset, base, prefix, true),
+        None => Vec::new(),
+    }
+}
+
 pub fn complete_at(prog: &Program, path: &str, src: &str, offset: u32) -> Vec<Completion> {
     complete_with(prog, path, src, src, offset)
 }
@@ -2047,7 +2055,7 @@ fn main() {
     #[test]
     fn incomplete_app_dot_lists_methods() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../examples/minecraft/src/main.j3");
+            .join("../examples/fps-shooter/src/main.j3");
         let mut src = std::fs::read_to_string(&path).unwrap();
         let at_run = src.find("    app.run();\n").expect("run");
         src.insert_str(at_run, "    app.\n");

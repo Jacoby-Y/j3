@@ -1,0 +1,345 @@
+// Part of j3.scene3d (camera and surface effects (.j3fx)); the module doc and `use`s are in ../scene3d.j3.
+module j3.scene3d;
+
+/// A `.j3fx` file and the program built from it.
+struct Effect {
+    path: string;
+    /// The text it was built from; a changed file rebuilds.
+    text: []u8;
+    file: FxFile;
+    /// `gfx.effectProgram`'s id; 0 when it's broken or a camera effect.
+    prog: int;
+    /// Why it can't be used, or empty.
+    error: string;
+    /// Built with GL; without a context (a headless tool) it is only parsed.
+    gl: bool;
+}
+
+// ponytail: 32 effect files, linear lookup, and a changed file is found by comparing its text.
+#[singleton]
+let EFFECTS: [32]Effect;
+
+/// Holds every effect's text, params, and errors. A rebuild leaves the old ones behind.
+// ponytail: leaks a file's text per edit (a few KB per save); per-effect arenas if it matters.
+#[singleton]
+let FX_MEM: Arena = Arena { ptr: 0, used: 0, cap: 0, head: 0 };
+
+#[singleton]
+let EFFECTS_LEN: int = 0;
+
+/// Effect errors not yet taken by `takeEffectErrors`.
+#[singleton]
+let FX_ERRS: [4096]u8;
+
+#[singleton]
+let FX_ERRS_LEN: int = 0;
+
+#[singleton]
+let FX_FULL: bool = false;
+
+fn hasFxExt(path: string): bool {
+    let n = path.len;
+    return n > 5 && path[n - 5] == 46 && path[n - 4] == 106 && path[n - 3] == 51 && path[n - 2] == 102 && path[n - 1] == 120;
+}
+
+/// Slot + 1 of effect file `path`, (re)building it when its text changed. 0 when there is no
+/// room. The slot stays, with `error` set, when the file is missing or broken.
+fn effectSlot(path: string): int {
+    let e = 0;
+    while e < EFFECTS_LEN && !same(EFFECTS[e].path, path) { e += 1; }
+    if e == EFFECTS_LEN {
+        // A path being typed into a field isn't a file yet; don't spend a slot on each keystroke.
+        if !hasFxExt(path) || !io.exists(path) { return 0; }
+        // Reuse a slot that never compiled (nothing holds its program), else take a new one.
+        e = 0;
+        while e < EFFECTS_LEN && !(EFFECTS[e].prog == 0 && EFFECTS[e].text.len == 0) { e += 1; }
+        if e == 32 {
+            if !FX_FULL {
+                io.printLn("scene3d: more than 32 effect files; the rest don't load");
+                FX_FULL = true;
+            }
+            return 0;
+        }
+        if e == EFFECTS_LEN { EFFECTS_LEN += 1; }
+        EFFECTS[e] = Effect { path: keepKey(path), text: []u8 { ptr: 0 as &u8, len: 0 },
+            file: FxFile { ok: false, error: "", camera: false, params: []FxParam { ptr: 0 as &FxParam, len: 0 }, glsl: "", bodyLine: 0 },
+            prog: 0, error: "", gl: false };
+    } else {
+        let tmp = Arena.create(16 * 1024);
+        let now = tmp.alloc::<u8>(0);
+        match io.readFile(path, &tmp) {
+            Result.Ok(b) { now = b; }
+            Result.Err(_) {}
+        }
+        let unchanged = same(now as string, EFFECTS[e].text as string) && now.len > 0;
+        tmp.destroy();
+        if unchanged && (EFFECTS[e].gl || !gfx.ready()) { return e + 1; }
+    }
+    let fe = &EFFECTS[e];
+    gfx.freeEffect(fe.prog);
+    fe.prog = 0;
+    fe.error = "";
+    fe.gl = gfx.ready();
+    if FX_MEM.ptr == 0 { FX_MEM = Arena.create(64 * 1024); }
+    let log = Text.new(&FX_MEM);
+    match io.readFile(path, &FX_MEM) {
+        Result.Ok(b) { fe.text = b; }
+        Result.Err(_) {
+            fe.text = []u8 { ptr: 0 as &u8, len: 0 };
+            log.pushStr(path);
+            log.pushStr(": can't read the effect file\n");
+        }
+    }
+    if log.len() == 0 {
+        fe.file = fx.parseEffect(fe.text, &FX_MEM);
+        if !fe.file.ok {
+            log.pushStr(path);
+            log.pushStr(": ");
+            log.pushStr(fe.file.error);
+            log.push(10);
+        } else if fe.gl {
+            let raw = Text.new(&FX_MEM);
+            let first = 0;
+            let vraw = Text.new(&FX_MEM);
+            let vfirst = 0;
+            if fe.file.camera { fe.prog = gfx.postProgram(fe.file.glsl, fe.file.params, &raw, &first); }
+            else { fe.prog = gfx.effectProgram(fe.file.glsl, fe.file.params, &raw, &first, &vraw, &vfirst); }
+            if fe.prog == 0 {
+                fx.mapGlslLog(raw.str(), path, first, fe.file.bodyLine, &log);
+                fx.mapGlslLog(vraw.str(), path, vfirst, fe.file.bodyLine, &log);
+            }
+        }
+    }
+    if log.len() > 0 {
+        fe.error = log.str();
+        io.printLn(trimEnd(fe.error));
+        let i = 0;
+        while i < fe.error.len && FX_ERRS_LEN < 4096 {
+            FX_ERRS[FX_ERRS_LEN] = fe.error[i];
+            FX_ERRS_LEN += 1;
+            i += 1;
+        }
+    }
+    return e + 1;
+}
+
+fn trimEnd(s: string): string {
+    let n = s.len;
+    while n > 0 && s[n - 1] == 10 { n -= 1; }
+    return []u8 { ptr: s.ptr, len: n } as string;
+}
+
+/// Fill `look.fxVals` from `fx.<name>` keys (a color is `fx.<name>.r/.g/.b`), or the defaults.
+fn fxValues(look: &Surface, file: &Save, params: []FxParam) {
+    let at = 0;
+    let k = 0;
+    while k < params.len {
+        let p = params[k];
+        let t = Text.new(scratch(0));
+        t.pushStr("fx.");
+        t.pushStr(p.name);
+        if p.kind == FX_COLOR {
+            let c = rgbKey(file, t.str(), Vec3.xyz(p.def[0], p.def[1], p.def[2]));
+            look.fxVals[at] = c.x;
+            look.fxVals[at + 1] = c.y;
+            look.fxVals[at + 2] = c.z;
+        } else if p.kind == FX_FLOAT {
+            look.fxVals[at] = save.getFloat(file, t.str(), p.def[0]);
+        } else {
+            look.fxVals[at] = f32(save.getInt(file, t.str(), int(p.def[0])));
+        }
+        at += fxWidth(p.kind);
+        k += 1;
+    }
+}
+
+/// Rebuild effect file `path` if it changed, then reload every material using it.
+pub fn refreshEffect(path: string) {
+    effectSlot(path);
+    let i = 0;
+    while i < MATS_LEN {
+        if same(MATS[i].fxPath, path) {
+            gfx.freeTex(&MATS[i].image);
+            loadMaterial(&MATS[i]);
+        }
+        i += 1;
+    }
+}
+
+/// Effect errors printed since the last call, one per line, copied into `mem`; then cleared.
+pub fn takeEffectErrors(mem: &Arena): string {
+    let t = Text.new(mem);
+    t.pushStr([]u8 { ptr: &FX_ERRS[0], len: FX_ERRS_LEN } as string);
+    FX_ERRS_LEN = 0;
+    return t.str();
+}
+
+/// Slot + 1 of effect file `path`, loading it only the first time (no rereading).
+fn knownEffect(path: string): int {
+    let e = 0;
+    while e < EFFECTS_LEN {
+        if same(EFFECTS[e].path, path) {
+            if !EFFECTS[e].gl && gfx.ready() { return effectSlot(path); }
+            return e + 1;
+        }
+        e += 1;
+    }
+    return effectSlot(path);
+}
+
+/// Effect file `path`'s params (copied into `arena`), loading it if needed. Empty when it
+/// can't be read or parsed.
+pub fn effectParams(path: string, arena: &Arena): []FxParam {
+    let e = knownEffect(path);
+    if e == 0 || !EFFECTS[e - 1].file.ok { return arena.alloc::<FxParam>(0); }
+    let src = EFFECTS[e - 1].file.params;
+    let out = arena.alloc::<FxParam>(src.len);
+    let k = 0;
+    while k < src.len {
+        out[k] = src[k];
+        let t = Text.new(arena);
+        t.pushStr(src[k].name);
+        out[k].name = t.str();
+        k += 1;
+    }
+    return out;
+}
+
+/// Camera `id`'s usable effects (`EFFECTS` slot + 1 each) into `out`; how many.
+fn cameraEffects(scene: &Scene, id: int, out: []int): int {
+    let at = index(scene, id);
+    if at < 0 || scene.nodes[at].kind != CAMERA { return 0; }
+    let list = scene.nodes[at].effects;
+    let n = 0;
+    let a = 0;
+    while a < list.len && n < out.len {
+        let b = a;
+        while b < list.len && list[b] != 124 { b += 1; }
+        if b > a {
+            let e = knownEffect([]u8 { ptr: (list.ptr as int + a) as &u8, len: b - a } as string);
+            if e > 0 && EFFECTS[e - 1].prog > 0 && EFFECTS[e - 1].file.camera {
+                out[n] = e;
+                n += 1;
+            }
+        }
+        a = b + 1;
+    }
+    return n;
+}
+
+/// Get ready for camera `id`'s effects: true (and the next camera pass goes offscreen) when
+/// it has any that work; then call `endEffects` after drawing. False does nothing.
+pub fn beginEffects(scene: &Scene, id: int): bool {
+    let list: [8]int = [0, 0, 0, 0, 0, 0, 0, 0];
+    if cameraEffects(scene, id, []int { ptr: &list[0], len: 8 }) == 0 { return false; }
+    gfx.postBegin();
+    return true;
+}
+
+/// Run camera `id`'s effects in order over the frame drawn since `beginEffects`, with its
+/// `fx.<stem>.<name>` params, and show the result where the camera pass would have gone.
+pub fn endEffects(scene: &Scene, id: int) {
+    let list: [8]int = [0, 0, 0, 0, 0, 0, 0, 0];
+    let n = cameraEffects(scene, id, []int { ptr: &list[0], len: 8 });
+    let vals: [16]f32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    if n == 0 {
+        // The list changed since `beginEffects`: still show the frame.
+        gfx.postPass(0, []f32 { ptr: &vals[0], len: 0 }, true);
+        return;
+    }
+    let k = 0;
+    while k < n {
+        let fe = EFFECTS[list[k] - 1];
+        let params = fe.file.params;
+        let stem = stemOf(fe.path);
+        let at = 0;
+        let p = 0;
+        while p < params.len {
+            let t = Text.new(scratch(0));
+            t.pushStr("fx.");
+            t.pushStr(stem);
+            t.push(46);
+            t.pushStr(params[p].name);
+            let def = params[p].def;
+            let kind = params[p].kind;
+            if kind == FX_COLOR {
+                let c = vector(scene, id, t.str(), Vec3.xyz(def[0], def[1], def[2]));
+                vals[at] = c.x;
+                vals[at + 1] = c.y;
+                vals[at + 2] = c.z;
+            } else if kind == FX_FLOAT {
+                vals[at] = number(scene, id, t.str(), def[0]);
+            } else if kind == FX_BOOL {
+                vals[at] = if flag(scene, id, t.str(), def[0] != 0) { 1 } else { 0 };
+            } else {
+                vals[at] = f32(integer(scene, id, t.str(), int(def[0])));
+            }
+            at += fxWidth(kind);
+            p += 1;
+        }
+        gfx.postPass(fe.prog, []f32 { ptr: &vals[0], len: at }, k == n - 1);
+        k += 1;
+    }
+}
+
+/// Every param camera `id`'s effect files declare, as `fx.<stem>.<name>` keys (in `arena`)
+/// with their params. Broken or missing files are skipped.
+pub fn cameraFxParams(scene: &Scene, id: int, keys: &[]string, arena: &Arena): []FxParam {
+    let out = arena.alloc::<FxParam>(64);
+    let names = arena.alloc::<string>(64);
+    let n = 0;
+    let at = index(scene, id);
+    if at >= 0 && scene.nodes[at].kind == CAMERA {
+        let list = scene.nodes[at].effects;
+        let a = 0;
+        while a < list.len {
+            let b = a;
+            while b < list.len && list[b] != 124 { b += 1; }
+            let path = []u8 { ptr: (list.ptr as int + a) as &u8, len: b - a } as string;
+            let e = if b > a { knownEffect(path) } else { 0 };
+            if e > 0 && EFFECTS[e - 1].file.ok {
+                let ps = EFFECTS[e - 1].file.params;
+                let k = 0;
+                while k < ps.len && n < 64 {
+                    let t = Text.new(arena);
+                    t.pushStr("fx.");
+                    t.pushStr(stemOf(path));
+                    t.push(46);
+                    t.pushStr(ps[k].name);
+                    names[n] = t.str();
+                    out[n] = ps[k];
+                    n += 1;
+                    k += 1;
+                }
+            }
+            a = b + 1;
+        }
+    }
+    *keys = []string { ptr: names.ptr, len: n };
+    return []FxParam { ptr: out.ptr, len: n };
+}
+
+/// `dir/name.ext` -> `name`.
+fn stemOf(path: string): string {
+    let a = path.len;
+    while a > 0 && path[a - 1] != 47 { a -= 1; }
+    let b = path.len;
+    let d = b;
+    while d > a && path[d - 1] != 46 { d -= 1; }
+    if d > a { b = d - 1; }
+    return []u8 { ptr: (path.ptr as int + a) as &u8, len: b - a } as string;
+}
+
+/// Whether effect file `path` is a camera effect (`kind=camera`).
+pub fn effectIsCamera(path: string): bool {
+    let e = knownEffect(path);
+    return e > 0 && EFFECTS[e - 1].file.camera;
+}
+
+/// Effect file `path`'s last error, or empty.
+pub fn effectError(path: string): string {
+    let e = knownEffect(path);
+    if e > 0 { return EFFECTS[e - 1].error; }
+    if !hasFxExt(path) { return "not a .j3fx file"; }
+    return if io.exists(path) { "" } else { "file not found" };
+}

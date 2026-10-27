@@ -1,0 +1,257 @@
+/// Draggable, resizable and dockable panels, run once per frame by `inputs.begin` (`step`) and
+/// `inputs.overlay` (`paint`). The math is `j3.ui.panelmath`; this module reads the pointer and writes
+/// the panel's `left` / `top` and forced size (`Node.atx`, `ow`) so layout does the rest.
+///
+/// Markup: `<div class="win" panel>` (`panel="dock"` to allow docking) is a `position: absolute` box in
+/// a `position: relative` workspace, or a `position: fixed` box in the window. A descendant with
+/// `panel-handle` drags it (a press on a button or input inside the handle does not); a descendant with
+/// `panel-resize` resizes it. The panel stays inside its workspace, never gets smaller than its CSS
+/// `min-width` / `min-height` (80 by 36 px otherwise) and follows a workspace that shrinks. Dragging a
+/// dockable panel's pointer within 28 px of the workspace's left, right or bottom edge previews that
+/// zone and snaps the panel there on release (full height, or full width at the bottom, keeping the
+/// floating size to restore); dragging a docked panel's handle floats it again. Docked panels refit
+/// when the workspace resizes. The state lives with the element: when a branch removes the panel, its
+/// position is forgotten.
+
+module j3.ui.panels;
+
+use j3.game;
+use j3.game.{ Color, Cursor };
+use j3.gfx.paint;
+use j3.gfx.paint.Corners;
+use j3.math.Vec2;
+use j3.math.{ max, min };
+use j3.ui.css.{ P_MIN_HEIGHT, P_MIN_WIDTH, V_PX };
+use j3.ui.dom;
+use j3.ui.dom.{ Dom, isFocusable };
+use j3.ui.panelmath;
+use j3.ui.panelmath.{ Grab, Panel, Rect };
+
+fn alive(d: &Dom, p: &Panel): bool {
+    if p.node < 0 {
+        return false;
+    }
+    let n = &d.nodes.items[p.node];
+    if n.kind != dom.K_ELEM || n.pk != dom.PK_PANEL || n.ghost {
+        p.node = -1;
+        return false;
+    }
+    return true;
+}
+
+/// The workspace of panel `id`: the window for a fixed box, else its parent's box (window px).
+fn work(d: &Dom, id: int): Rect {
+    let n = &d.nodes.items[id];
+    if n.isFixed {
+        return Rect { x: 0.0, y: 0.0, w: d.vw, h: d.vh };
+    }
+    return Rect { x: d.absX(n.parent), y: d.absY(n.parent), w: d.nodes.items[n.parent].w, h: d.nodes.items[n.parent].h };
+}
+
+fn minOf(d: &Dom, id: int, prop: int, dflt: f32): f32 {
+    let v = d.css.get(d.nodes.items[id].style, prop);
+    return if v.kind == V_PX { v.f } else { dflt };
+}
+
+/// The panel index above `from` (a handle, a grip or the panel itself), -1 for none.
+fn ownerOf(d: &Dom, from: int): int {
+    let c = from;
+    while c >= 0 {
+        if d.nodes.items[c].pk == dom.PK_PANEL {
+            return panelmath.find(d.pans.items, d.pans.len, c);
+        }
+        c = d.nodes.items[c].parent;
+    }
+    return -1;
+}
+
+/// A press on a handle or grip starts a drag, unless a control inside the handle took it.
+fn press(d: &Dom) {
+    if !d.down || d.prevDown || d.downHit < 0 || d.grab.mode != 0 {
+        return;
+    }
+    let role = 0;
+    let c = d.downHit;
+    while c >= 0 && role == 0 {
+        let k = d.nodes.items[c].pk;
+        if k == dom.PK_HANDLE || k == dom.PK_GRIP {
+            role = k;
+        } else if k == dom.PK_PANEL || isFocusable(d, c) {
+            return;
+        } else {
+            c = d.nodes.items[c].parent;
+        }
+    }
+    let at = ownerOf(d, c);
+    if at < 0 || !alive(d, &d.pans.items[at]) {
+        return;
+    }
+    let id = d.pans.items[at].node;
+    d.grab = Grab {
+        mode: if role == dom.PK_HANDLE { 1 } else { 2 },
+        panel: at,
+        gx: d.mx - d.absX(id),
+        gy: d.my - d.absY(id),
+        sx: d.mx,
+        sy: d.my,
+        w0: d.nodes.items[id].w,
+        h0: d.nodes.items[id].h,
+        live: false,
+    };
+}
+
+/// The floating size a docking panel will restore: what it has now, once.
+fn keepSize(d: &Dom, p: &Panel) {
+    if p.fw < 0.0 {
+        p.fw = d.nodes.items[p.node].w;
+    }
+    if p.fh < 0.0 {
+        p.fh = d.nodes.items[p.node].h;
+    }
+}
+
+fn drag(d: &Dom) {
+    let g = &d.grab;
+    if g.mode == 0 {
+        return;
+    }
+    let p = &d.pans.items[g.panel];
+    if !alive(d, p) {
+        d.grab = panelmath.noGrab();
+        return;
+    }
+    let id = p.node;
+    let n = &d.nodes.items[id];
+    let ws = work(d, id);
+    if !g.live {
+        if !panelmath.pastSlop(d.mx - g.sx, d.my - g.sy) {
+            if !d.down {
+                d.grab = panelmath.noGrab();
+            }
+            return;
+        }
+        g.live = true;
+        if !p.set {
+            p.set = true;
+            p.x = n.x;
+            p.y = n.y;
+        }
+        if g.mode == 1 && p.dock != panelmath.DOCK_NONE {
+            // pulled off a dock: float again, holding the panel by a point that exists at its old size
+            p.dock = panelmath.DOCK_NONE;
+            g.gx = min(g.gx, p.fw / 2.0);
+        }
+    }
+    if g.mode == 1 {
+        let w = if p.fw >= 0.0 { p.fw } else { n.w };
+        let h = if p.fh >= 0.0 { p.fh } else { n.h };
+        let at = panelmath.dragPos(d.mx - ws.x, d.my - ws.y, g.gx, g.gy, w, h, ws.w, ws.h);
+        p.x = at.x;
+        p.y = at.y;
+        p.zone = if p.canDock { panelmath.zoneAt(d.mx - ws.x, d.my - ws.y, ws.w, ws.h) } else { panelmath.DOCK_NONE };
+    } else {
+        let r = panelmath.resized(p.dock, d.mx - g.sx, d.my - g.sy, g.w0, g.h0);
+        if p.dock != panelmath.DOCK_BOTTOM {
+            p.fw = panelmath.clampSize(r.w, minOf(d, id, P_MIN_WIDTH, panelmath.MIN_W), ws.w);
+        }
+        if p.dock == panelmath.DOCK_NONE || p.dock == panelmath.DOCK_BOTTOM {
+            p.fh = panelmath.clampSize(r.h, minOf(d, id, P_MIN_HEIGHT, panelmath.MIN_H), ws.h);
+        }
+    }
+    if !d.down {
+        if p.zone != panelmath.DOCK_NONE {
+            keepSize(d, p);
+            p.dock = p.zone;
+        }
+        p.zone = panelmath.DOCK_NONE;
+        d.grab = panelmath.noGrab();
+    }
+}
+
+/// Put the panel where its state says: docked rectangle, or the dragged position and size kept
+/// inside the workspace. Writes only what changed, so a steady panel costs no layout.
+fn fit(d: &Dom, p: &Panel) {
+    let id = p.node;
+    let n = &d.nodes.items[id];
+    let ws = work(d, id);
+    let minW = minOf(d, id, P_MIN_WIDTH, panelmath.MIN_W);
+    let minH = minOf(d, id, P_MIN_HEIGHT, panelmath.MIN_H);
+    if p.dock != panelmath.DOCK_NONE {
+        let r = panelmath.dockRect(p.dock, p.fw, p.fh, ws.w, ws.h, minW, minH);
+        d.attrLeft(id, r.x);
+        d.attrTop(id, r.y);
+        d.panelSize(id, r.w, r.h);
+        return;
+    }
+    if !p.set {
+        // CSS placed it; take over once the workspace no longer holds it
+        if n.x >= -0.5 && n.y >= -0.5 && n.x + n.w <= ws.w + 0.5 && n.y + n.h <= ws.h + 0.5 {
+            return;
+        }
+        p.set = true;
+        p.x = n.x;
+        p.y = n.y;
+    }
+    if (n.w > ws.w || n.h > ws.h) && p.fw < 0.0 {
+        // shrinking: remember the natural size so the panel grows back with the workspace
+        keepSize(d, p);
+    }
+    let w = if p.fw >= 0.0 { panelmath.clampSize(p.fw, minW, ws.w) } else { n.w };
+    let h = if p.fh >= 0.0 { panelmath.clampSize(p.fh, minH, ws.h) } else { n.h };
+    d.attrLeft(id, panelmath.clampPos(p.x, w, ws.w));
+    d.attrTop(id, panelmath.clampPos(p.y, h, ws.h));
+    d.panelSize(id, if p.fw >= 0.0 { w } else { -1.0 }, if p.fh >= 0.0 { h } else { -1.0 });
+}
+
+/// Pointer shape over handles and grips.
+fn cursor(d: &Dom) {
+    let m = d.grab.mode;
+    let c = d.hover;
+    while m == 0 && c >= 0 {
+        let k = d.nodes.items[c].pk;
+        if k == dom.PK_HANDLE {
+            m = 1;
+        } else if k == dom.PK_GRIP {
+            m = 2;
+        } else if k == dom.PK_PANEL {
+            break;
+        }
+        c = d.nodes.items[c].parent;
+    }
+    if m == 1 {
+        game.setCursor(Cursor.Move);
+    } else if m == 2 {
+        game.setCursor(Cursor.ResizeAcross);
+    }
+}
+
+/// Run once per frame after `d.beginFrame` (the pointer is this frame's, the layout last frame's).
+pub fn step(d: &Dom) {
+    if d.pans.len == 0 {
+        return;
+    }
+    press(d);
+    drag(d);
+    for i in 0..d.pans.len {
+        if alive(d, &d.pans.items[i]) {
+            fit(d, &d.pans.items[i]);
+        }
+    }
+    cursor(d);
+}
+
+/// Draw the dock zone the dragged panel would snap to. Call after the paint walk.
+pub fn paint(d: &Dom) {
+    let g = &d.grab;
+    if g.mode != 1 || !g.live {
+        return;
+    }
+    let p = &d.pans.items[g.panel];
+    if p.zone == panelmath.DOCK_NONE || !alive(d, p) {
+        return;
+    }
+    let n = &d.nodes.items[p.node];
+    let ws = work(d, p.node);
+    let r = panelmath.dockRect(p.zone, if p.fw >= 0.0 { p.fw } else { n.w }, if p.fh >= 0.0 { p.fh } else { n.h }, ws.w, ws.h, minOf(d, p.node, P_MIN_WIDTH, panelmath.MIN_W), minOf(d, p.node, P_MIN_HEIGHT, panelmath.MIN_H));
+    paint.roundRectEx(Vec2 { x: ws.x + r.x, y: ws.y + r.y }, Vec2 { x: r.w, y: r.h }, Corners { tl: 6.0, tr: 6.0, br: 6.0, bl: 6.0 }, Color { r: 137, g: 180, b: 250, a: 60 }, 2.0, Color { r: 137, g: 180, b: 250, a: 200 });
+}

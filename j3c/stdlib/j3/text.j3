@@ -4,8 +4,8 @@
 
 module j3.text;
 
-use j3.memory.Arena;
-use j3.sys.panic;
+use j3.memory.{ Arena, scratch };
+use j3.sys.{ panic, write };
 
 /// Bytes in `cstrScratch`, including the trailing NUL.
 const CSTR_CAP: int = 1024;
@@ -30,6 +30,23 @@ pub fn cstr(s: string): cstr {
     cstrScratch[s.len] = 0;
     return &cstrScratch[0] as cstr;
 }
+
+/// An empty `Text` on the frame scratch arena (`j3.memory.scratch`; `App` rewinds it at the start of every frame).
+/// Build a string in a markup function and return `t.str()`; the view is valid until the next frame starts.
+pub fn scratchText(): Text {
+    let a = scratch(256 * 1024);
+    // ponytail: one warning past 1 MiB used; a loop without `App` must call `j3.memory.rewindScratch()` per frame
+    if a.used > 1048576 && !SCRATCH_WARNED {
+        SCRATCH_WARNED = true;
+        let m = "warning: scratchText: the scratch arena holds over 1 MiB; call j3.memory.rewindScratch() once per frame (App does)\n";
+        write(2, m.ptr as ptr, m.len);
+    }
+    return Text.new(a);
+}
+
+#[singleton]
+#[thread]
+let SCRATCH_WARNED: bool = false;
 
 /// Growable UTF-8 byte buffer allocated from an arena.
 pub struct Text {
@@ -73,6 +90,27 @@ pub struct Text {
         while i < s.len {
             this.push(s[i]);
             i += 1;
+        }
+    }
+
+    /// Append every byte of `b`, growing once.
+    fn pushBytes(this: &Text, b: []u8) {
+        let n = this.bytes.len;
+        if n + b.len > this.cap {
+            let next = if this.cap == 0 { 16 } else { this.cap * 2 };
+            while next < n + b.len {
+                next = next * 2;
+            }
+            let fresh = this.arena.alloc::<u8>(next);
+            for i in 0..n {
+                fresh[i] = this.bytes[i];
+            }
+            this.bytes = []u8 { ptr: fresh.ptr, len: n };
+            this.cap = next;
+        }
+        this.bytes = []u8 { ptr: this.bytes.ptr, len: n + b.len };
+        for i in 0..b.len {
+            this.bytes[n + i] = b[i];
         }
     }
 
@@ -143,6 +181,8 @@ pub struct Text {
     fn pushInt(this: &Text, n: int) {
         if n < 0 {
             this.push(45);
+        } else {
+            // digits are taken from the non-positive value, so the i64 minimum needs no negation
             n = 0 - n;
         }
         if n == 0 {
@@ -153,9 +193,10 @@ pub struct Text {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         let i = 0;
-        while n > 0 && i < 20 {
-            rev[i] = n - (n / 10) * 10;
-            n = n / 10;
+        while n < 0 && i < 20 {
+            let q = n / 10;
+            rev[i] = q * 10 - n;
+            n = q;
             i += 1;
         }
         let digits = "0123456789";
@@ -188,6 +229,76 @@ pub struct Text {
             frac = frac - (frac / place) * place;
         }
     }
+}
+
+/// Append `n` with a comma between thousands (`1,234,567`, `-42`) to `t` and return just what was appended,
+/// a view into `t` (valid until `t` grows or is cleared; the caller owns `t`). Every i64 works.
+pub fn fmtInt(t: &Text, n: int): string {
+    let start = t.bytes.len;
+    let v = n;
+    if v > 0 { v = 0 - v; }
+    if n < 0 { t.push(45); }
+    // digits of the non-positive `v`, least significant first (negative avoids overflow on the i64 minimum)
+    let rev: [20]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let k = 0;
+    if v == 0 {
+        rev[0] = 48;
+        k = 1;
+    }
+    while v < 0 {
+        let q = v / 10;
+        rev[k] = u8(48 + (q * 10 - v));
+        v = q;
+        k += 1;
+    }
+    while k > 0 {
+        k -= 1;
+        t.push(rev[k]);
+        if k > 0 && k - (k / 3) * 3 == 0 { t.push(44); }
+    }
+    return t.bytes[start..t.bytes.len] as string;
+}
+
+/// Append a file size to `t` (`0 B`, `999 B`, `1.0 KB`, `1.5 MB`, `2.0 GB`; TB, PB, EB follow) and return
+/// just what was appended, a view into `t` like `fmtInt`. Units are 1024 (a KB is 1024 bytes, as the desk-app
+/// file list showed), one decimal below the unit, truncated (1023.9 KB never rounds up to `1024.0 KB`).
+/// Negative sizes get a leading `-`.
+pub fn fmtBytes(t: &Text, n: int): string {
+    let start = t.bytes.len;
+    let v = n;
+    if v < 0 {
+        t.push(45);
+        // |n| without overflowing on the i64 minimum (which clamps to the maximum)
+        v = 0 - (v + 1);
+        if v < 9223372036854775807 { v += 1; }
+    }
+    if v < 1024 {
+        t.pushInt(v);
+        t.pushStr(" B");
+        return t.bytes[start..t.bytes.len] as string;
+    }
+    let units = " KMGTPE";
+    let p = 1024;
+    let u = 1;
+    while u < 6 && v / p >= 1024 {
+        p = p * 1024;
+        u += 1;
+    }
+    let rem = v - (v / p) * p;
+    // rem < p <= 2^60: scale both down once for EB so `rem * 10` cannot overflow
+    let d = p;
+    if d > 1125899906842624 {
+        rem = rem / 1024;
+        d = d / 1024;
+    }
+    let tenth = rem * 10 / d;
+    t.pushInt(v / p);
+    t.push(46);
+    t.pushInt(tenth);
+    t.push(32);
+    t.push(units[u]);
+    t.push(66);
+    return t.bytes[start..t.bytes.len] as string;
 }
 
 /// Byte-wise equality of two strings (length then contents).

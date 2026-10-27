@@ -109,6 +109,8 @@ pub struct GlobalDef {
     pub init: Option<ConstInit>,
     /// `#[thread]`: one copy per thread.
     pub thread: bool,
+    /// `const NAME: [N]T = [..]`: static read-only data; stores are a compile error.
+    pub readonly: bool,
 }
 
 #[derive(Clone, Debug)]

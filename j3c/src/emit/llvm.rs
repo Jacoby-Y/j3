@@ -5,7 +5,8 @@ use std::collections::HashSet;
 
 use crate::emit::c_expr;
 use crate::emit::c_ty;
-use crate::emit::llvm_expr::{DebugOut, LlvmFn};
+use crate::emit::llvm_expr::{self, DebugOut, LlvmFn};
+use crate::ir::operand::{ConstKind, Operand};
 use crate::emit::llvm_ty::{self, ll_type};
 use crate::emit::opts::EmitOpts;
 use crate::ir::abi;
@@ -112,10 +113,12 @@ pub fn emit_llvm_part(
                 ));
                 continue;
             }
+            let mut pre = String::new();
             let init = match &g.init {
-                Some(v) => ll_const_init(cx, g.ty, v)?,
+                Some(v) => ll_const_init(cx, g.ty, v, &name, &mut pre)?,
                 None => "zeroinitializer".to_string(),
             };
+            out.push_str(&pre);
             let linkage = if part.split() { "" } else { "internal " };
             out.push_str(&format!(
                 "@{name} = {linkage}{}global {ty} {init}, align {}\n",
@@ -128,11 +131,17 @@ pub fn emit_llvm_part(
         out.push('\n');
     }
 
+    crate::phase::detail("types, globals, debug scopes");
+    let t_dbg = std::time::Instant::now();
     let mut dbg = if opts.cc.debug && !matches!(part, Part::Only(_)) {
-        DebugOut::prepare(cx, modules)
+        DebugOut::prepare(cx, modules, None)
     } else {
         DebugOut::off()
     };
+    if matches!(part, Part::Whole) {
+        crate::cli::timing("  emit: types, globals, debug scopes", t_dbg);
+    }
+    let t_funcs = std::time::Instant::now();
     if dbg.enabled() {
         out.push_str("declare void @llvm.dbg.declare(metadata, metadata, metadata)\n\n");
     }
@@ -140,7 +149,11 @@ pub fn emit_llvm_part(
     // builds keep a message per site (they exist for fast dev builds, not for size).
     let pack = matches!(part, Part::Whole);
     let mut abort_files: Vec<String> = Vec::new();
-    for module in modules {
+    for (n, module) in modules.iter().enumerate() {
+        if matches!(part, Part::Whole) {
+            let name: Vec<&str> = module.name.iter().map(|p| cx.name_str(*p)).collect();
+            crate::phase::detail(&format!("functions {}/{} {}", n + 1, modules.len(), name.join(".")));
+        }
         for id in &module.funcs {
             let func = cx.func(*id);
             match &func.kind {
@@ -174,6 +187,9 @@ pub fn emit_llvm_part(
     if pack && !abort_files.is_empty() {
         out.push_str(&abort_routine(&abort_files));
     }
+    if matches!(part, Part::Whole) {
+        crate::cli::timing("  emit: function bodies", t_funcs);
+    }
 
     if !matches!(part, Part::Only(_)) {
         let entry = host_entry(cx, modules)?;
@@ -193,7 +209,12 @@ pub fn emit_llvm_part(
         out.push_str("  ret i32 0\n");
         out.push_str("}\n");
     }
+    crate::phase::detail("finishing debug metadata");
+    let t_meta = std::time::Instant::now();
     let meta = dbg.finish();
+    if matches!(part, Part::Whole) {
+        crate::cli::timing("  emit: debug metadata", t_meta);
+    }
     if !meta.is_empty() {
         out.push('\n');
         out.push_str(super::llvm_crash::ATTRS);
@@ -287,13 +308,25 @@ done:
 /// One module's LLVM text. Types are duplicated. This module's functions and
 /// globals are defined (external linkage); everything else is declared. `@main`
 /// is only in the module that owns `j3.sys.start` or user `main`.
+///
+/// `chunk` is (index, functions): a module with giant functions is split over several objects,
+/// and each defines only its share (see `chunk_assign`). Chunk 0 also owns the globals and `@main`.
 pub(crate) fn emit_llvm_module(
     cx: &IrCx,
     modules: &[Module],
     index: usize,
     opts: &EmitOpts,
+    chunk: Option<(usize, &HashSet<FuncId>)>,
 ) -> Result<String, String> {
     let mine = &modules[index];
+    let all: HashSet<FuncId>;
+    let (chunk_no, defined) = match chunk {
+        Some((n, set)) => (n, set),
+        None => {
+            all = mine.funcs.iter().copied().collect();
+            (0, &all)
+        }
+    };
     let triple = if opts.target.is_empty() {
         "x86_64-pc-linux-gnu"
     } else {
@@ -343,7 +376,7 @@ pub(crate) fn emit_llvm_module(
     }
     out.push('\n');
 
-    let owns_global = |id: &crate::ir::ids::GlobalId| mine.globals.iter().any(|g| g == id);
+    let owns_global = |id: &crate::ir::ids::GlobalId| chunk_no == 0 && mine.globals.iter().any(|g| g == id);
     for module in modules {
         for id in &module.globals {
             let g = cx.global(*id);
@@ -351,18 +384,20 @@ pub(crate) fn emit_llvm_module(
             let ty = ll_type(cx, g.ty)?;
             let align = llvm_ty::align(cx, g.ty);
             if owns_global(id) {
+                let mut pre = String::new();
                 let init = match &g.init {
-                    Some(v) => ll_const_init(cx, g.ty, v)?,
+                    Some(v) => ll_const_init(cx, g.ty, v, &name, &mut pre)?,
                     None => "zeroinitializer".to_string(),
                 };
+                out.push_str(&pre);
                 out.push_str(&format!(
                     "@{name} = {}global {ty} {init}, align {align}\n",
-                    tls(g)
+                    tls(g),
                 ));
             } else {
                 out.push_str(&format!(
                     "@{name} = external {}global {ty}, align {align}\n",
-                    tls(g)
+                    tls(g),
                 ));
             }
         }
@@ -372,14 +407,14 @@ pub(crate) fn emit_llvm_module(
     }
 
     let mut dbg = if opts.cc.debug {
-        DebugOut::prepare(cx, std::slice::from_ref(mine))
+        DebugOut::prepare(cx, std::slice::from_ref(mine), Some(defined))
     } else {
         DebugOut::off()
     };
     if dbg.enabled() {
         out.push_str("declare void @llvm.dbg.declare(metadata, metadata, metadata)\n\n");
     }
-    let owns_func = |id: &FuncId| mine.funcs.iter().any(|f| f == id);
+    let owns_func = |id: &FuncId| defined.contains(id);
     for module in modules {
         for id in &module.funcs {
             let func = cx.func(*id);
@@ -408,7 +443,7 @@ pub(crate) fn emit_llvm_module(
         }
     }
 
-    if index == entry_module(cx, modules)? {
+    if index == entry_module(cx, modules)? && chunk_no == 0 {
         let entry = host_entry(cx, modules)?;
         let crash = opts.cc.debug && super::llvm_crash::supported(triple);
         if crash {
@@ -436,6 +471,41 @@ pub(crate) fn emit_llvm_module(
         out.push_str("; use lib \"m\"\n");
     }
     Ok(out)
+}
+
+/// Rough cost of each function in `module.funcs`: length of its IR dump (0 for non-J3 kinds).
+#[cfg(test)]
+pub(crate) fn func_weights(cx: &IrCx, module: &Module) -> Vec<usize> {
+    module
+        .funcs
+        .iter()
+        .map(|id| {
+            let func = cx.func(*id);
+            match &func.kind {
+                FuncKind::J3 { .. } => {
+                    let mut s = String::new();
+                    crate::ir::dump::dump_func(cx, func, &mut s);
+                    s.len()
+                }
+                _ => 0,
+            }
+        })
+        .collect()
+}
+
+/// Which of `n` chunks defines each function, given their weights: biggest first into the
+/// lightest chunk.
+pub(crate) fn chunk_assign(w: &[usize], n: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..w.len()).collect();
+    order.sort_by_key(|i| std::cmp::Reverse(w[*i]));
+    let mut load = vec![0usize; n.max(1)];
+    let mut part = vec![0usize; w.len()];
+    for i in order {
+        let c = (0..load.len()).min_by_key(|c| load[*c]).unwrap_or(0);
+        load[c] += w[i].max(1);
+        part[i] = c;
+    }
+    part
 }
 
 /// Module that should define host `@main`: `j3.sys.start` if present, else the last `main`.
@@ -599,8 +669,25 @@ fn emit_enum_types(cx: &IrCx, modules: &[Module], out: &mut String) -> Result<()
     Ok(())
 }
 
-fn ll_const_init(cx: &IrCx, ty: Ty, init: &ConstInit) -> Result<String, String> {
+fn ll_const_init(
+    cx: &IrCx,
+    ty: Ty,
+    init: &ConstInit,
+    gname: &str,
+    pre: &mut String,
+) -> Result<String, String> {
     match init {
+        ConstInit::Scalar(Operand::Const(c)) if matches!(&c.kind, ConstKind::Bytes(_)) => {
+            // A string in static data: its bytes get a private global emitted before this one.
+            let ConstKind::Bytes(bytes) = &c.kind else { unreachable!() };
+            let n = pre.matches('\n').count();
+            pre.push_str(&format!(
+                "@.cb.{gname}.{n} = private unnamed_addr constant [{} x i8] {}\n",
+                bytes.len(),
+                llvm_expr::ll_bytes_lit(bytes)
+            ));
+            Ok(format!("{{ ptr @.cb.{gname}.{n}, i64 {} }}", bytes.len()))
+        }
         ConstInit::Scalar(op) => {
             let mut dummy = LlvmFn::const_only(cx);
             dummy.operand_const(op)
@@ -620,7 +707,7 @@ fn ll_const_init(cx: &IrCx, ty: Ty, init: &ConstInit) -> Result<String, String> 
                             Some(v) => parts.push(format!(
                                 "{} {}",
                                 ll_type(cx, f.ty)?,
-                                ll_const_init(cx, f.ty, v)?
+                                ll_const_init(cx, f.ty, v, gname, pre)?
                             )),
                             None => parts.push(format!("{} zeroinitializer", ll_type(cx, f.ty)?)),
                         }
@@ -640,7 +727,7 @@ fn ll_const_init(cx: &IrCx, ty: Ty, init: &ConstInit) -> Result<String, String> 
                 parts.push(format!(
                     "{} {}",
                     ll_type(cx, elem)?,
-                    ll_const_init(cx, elem, v)?
+                    ll_const_init(cx, elem, v, gname, pre)?
                 ));
             }
             Ok(format!("[ {} ]", parts.join(", ")))
@@ -656,3 +743,4 @@ fn tls(g: &crate::ir::entity::GlobalDef) -> &'static str {
         ""
     }
 }
+

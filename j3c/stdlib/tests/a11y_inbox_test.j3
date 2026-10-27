@@ -1,0 +1,145 @@
+// `a11y.Inbox` across threads: a real worker posts 1000 actions while the main thread runs frames and drains. Every post is
+// delivered once (none lost, none twice), the text copy is never torn, and `requestFrame` wakes. Run from the repo root, headless:
+//   SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout 120 j3c run j3c/stdlib/tests/a11y_inbox_test.j3 --headless
+
+module a11y_inbox_test;
+
+use j3.io.printLn;
+use j3.math.Vec2;
+use j3.memory.{ Arena, rewindScratch };
+use j3.sys.panic;
+use j3.text.{ same, scratchText };
+use j3.thread.{ join, spawn, Thread };
+use j3.ui.a11y;
+use j3.ui.a11y.Inbox;
+use j3.ui.css.Css;
+use j3.ui.dom.Dom;
+
+const TOTAL: int = 1000;
+
+struct Job {
+    ib: &Inbox;
+    h: int;
+    sent: int;
+    full: int;
+    done: int;
+}
+
+#[singleton]
+let CHECKS: int;
+#[singleton]
+let TB: int;
+
+fn ok(cond: bool, msg: string) {
+    CHECKS += 1;
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic(msg);
+    }
+}
+
+fn frame(d: &Dom) {
+    d.beginFrame(Vec2 { x: 300.0, y: 200.0 });
+    d.open(0, d.tag("div"), 1);
+    TB = d.open(0, d.tag("input"), 1);
+    d.attrType(TB, "text");
+    d.attrAria(TB, "Box");
+    d.close();
+    d.close();
+    d.layout();
+    d.endFrame();
+}
+
+/// The value is `n,n,n,...` (about 200 bytes): every part must be the same number.
+fn consistent(s: string): bool {
+    if s.len == 0 {
+        return true;
+    }
+    let first = 0;
+    while first < s.len && s[first] != 44 {
+        first += 1;
+    }
+    let i = 0;
+    while i < s.len {
+        for k in 0..first {
+            if i + k >= s.len || s[i + k] != s[k] {
+                return false;
+            }
+        }
+        i += first;
+        if i < s.len && s[i] != 44 {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn worker(p: ptr) {
+    let job = p as &Job;
+    for n in 0..TOTAL {
+        rewindScratch();
+        let t = scratchText();
+        for k in 0..40 {
+            if k > 0 { t.push(44); }
+            t.pushInt(n);
+        }
+        while !a11y.post(job.ib, job.h, a11y.A_SET, 0.0, t.str()) {
+            job.full += 1;
+        }
+        job.sent += 1;
+    }
+    @atomicStore(&job.done, 1);
+}
+
+/// An action handler that posts back during `drain`: with the lock held this hangs.
+fn repost(p: ptr) {
+    let ib = p as &Inbox;
+    a11y.post(ib, -1, a11y.A_FOCUS, 0.0, "");
+}
+
+fn main() {
+    let mem = Arena.create(64 * 1024 * 1024);
+    let css = Css.new(&mem);
+    let d = Dom.new(&mem, &css);
+    d.setFrameMs(16.0);
+    d.simInput(-5.0, -5.0, false, 0.0);
+    frame(&d);
+    frame(&d);
+    let ib = a11y.inbox(&mem, &d, 2);
+    let job = Job { ib: ib, h: d.handle(TB), sent: 0, full: 0, done: 0 };
+    let th = Thread { f: worker };
+    spawn(&th, "poster", worker, &job as ptr);
+    let got = 0;
+    let torn = 0;
+    let wakes = 0;
+    while @atomicLoad(&job.done) == 0 || ib.n > 0 {
+        if d.wantsFrame() { wakes += 1; }
+        got += a11y.drain(ib, &mem);
+        frame(&d);
+        if !consistent(d.strValue(TB)) { torn += 1; }
+    }
+    join(&th);
+    got += a11y.drain(ib, &mem);
+    frame(&d);
+    ok(job.sent == TOTAL, "the worker sent everything");
+    ok(got == TOTAL, `every post delivered exactly once (got {got})`);
+    ok(torn == 0, "no torn text");
+    ok(wakes > 0, "the loop was woken");
+    ok(same(d.strValue(TB), a11y_last()), "the last post won");
+    let ib2 = a11y.inbox(&mem, &d, 4);
+    a11y.onAction(ib2, repost, ib2 as ptr);
+    a11y.post(ib2, d.handle(TB), a11y.A_FOCUS, 0.0, "");
+    ok(a11y.drain(ib2, &mem) == 1 && ib2.n == 1, "an action may post back during drain (no deadlock); it waits for the next drain");
+    ok(a11y.drain(ib2, &mem) == 1, "the re-posted action runs next");
+    printLn(`a11y_inbox_test ok, checks passed: {CHECKS} (queue was full {job.full} times, woke {wakes})`);
+}
+
+fn a11y_last(): string {
+    let t = scratchText();
+    for k in 0..40 {
+        if k > 0 { t.push(44); }
+        t.pushInt(TOTAL - 1);
+    }
+    return t.str();
+}

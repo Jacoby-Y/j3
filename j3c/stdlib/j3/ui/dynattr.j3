@@ -1,0 +1,279 @@
+/// Dynamic attributes of one `.j3ui` element: `class="a r{n}"` holes and `style:prop` values. `j3.ui.dom`
+/// keeps one `Dyn` per element that uses them and applies it after the cascade (`build`). Each setter
+/// compares against the last value first, so a steady frame changes nothing and restyles nothing.
+
+module j3.ui.dynattr;
+
+use j3.memory.Arena;
+use j3.sys.panic;
+use j3.ui.csscalc.fontCalc;
+use j3.ui.css.{ P_FLEX_BASIS, P_FLEX_SHRINK, P_ORDER, P_LINE_CLAMP, Warning };
+use j3.ui.css.{ Decl, Rule, resolveUnits, Css, NPROPS, P_ALL, P_DISPLAY, V_NUM, V_PX, V_UNSET, V_VAR, Value };
+use j3.ui.cssmatch.declValue;
+use j3.ui.cssparse.inlineDecl;
+use j3.ui.cssvalue.{ C_ANGLE, C_LEN, C_NUM, catOf, inherits, mk, propId };
+
+/// `style:` attributes one element can have, and the declarations one of them can expand to (`border`).
+pub const SLOTS: int = 9;
+pub const PER: int = 12;
+
+pub struct Dyn {
+    /// `class` holes (channel 0) and a class passed from a parent component (channel 1): hash and length of the
+    /// last text (length -1 before the first), and the class ids it added (`cids` at `channel * 8`).
+    ch: []int;
+    cl: []int;
+    cn: []int;
+    cids: []int;
+    /// `style:` attribute k: kind (0 not set yet, 1 number, 2 text), the last number, the hash and
+    /// length of the last text, and its declarations (`sp`/`sv` at `k * PER`, `sn[k]` of them).
+    sk: []int;
+    sf: []f32;
+    sh: []int;
+    sl: []int;
+    sn: []int;
+    /// Where slot k keeps the `var()` fallbacks of its text in `css.fbs` and how many it may use: a new text\n    /// that fits is moved there, so animated text does not grow `fbs`.
+    fbo: []int;
+    fbc: []int;
+    sp: []int;
+    sv: []Value;
+    /// An override changed since `build`.
+    dirty: bool;
+    /// Two style ids built here (alternating, so the old one stays readable for a transition), the
+    /// one in use (`cur`), and the cascade style it was built over.
+    a: int;
+    b: int;
+    cur: int;
+    base: int;
+    /// The inline-style rule (`css.rules` index, -1 none yet) holding the current `style:` declarations from `rd` on, so a style
+    /// rebuilt from its rules (`cssmatch.rebuildReaders`, an animated custom property) applies them last, as `build` does.
+    rule: int;
+    rd: int;
+}
+
+pub fn new(mem: &Arena): Dyn {
+    let y = Dyn {
+        ch: mem.alloc::<int>(2), cl: mem.alloc::<int>(2), cn: mem.alloc::<int>(2), cids: mem.alloc::<int>(16),
+        sk: mem.alloc::<int>(SLOTS), sf: mem.alloc::<f32>(SLOTS), sh: mem.alloc::<int>(SLOTS), sl: mem.alloc::<int>(SLOTS), sn: mem.alloc::<int>(SLOTS),
+        fbo: mem.alloc::<int>(SLOTS), fbc: mem.alloc::<int>(SLOTS),
+        sp: mem.alloc::<int>(SLOTS * PER), sv: mem.alloc::<Value>(SLOTS * PER),
+        dirty: false, a: -1, b: -1, cur: -1, base: -1, rule: -1, rd: 0,
+    };
+    forget(&y);
+    return y;
+}
+
+/// Back to nothing set (a recycled element keeps its style ids).
+pub fn reset(y: &Dyn) {
+    for c in 0..2 {
+        y.ch[c] = 0;
+        y.cl[c] = -1;
+        y.cn[c] = 0;
+    }
+    for k in 0..SLOTS {
+        y.sk[k] = 0;
+        y.sn[k] = 0;
+    }
+    y.dirty = false;
+    y.cur = -1;
+}
+
+/// `reset`, and drop the style ids too (`Css.reset` killed them).
+pub fn forget(y: &Dyn) {
+    reset(y);
+    for k in 0..SLOTS {
+        y.fbo[k] = 0;
+        y.fbc[k] = 0;
+    }
+    y.a = -1;
+    y.b = -1;
+    y.base = -1;
+    y.rule = -1;
+    y.dirty = true;
+}
+
+pub fn hashOf(s: string): int {
+    let h = 5381;
+    for i in 0..s.len {
+        h = h * 33 + int(s[i]);
+    }
+    return h;
+}
+
+/// `style:name={v}`. Lengths take px; plain numbers (`opacity`, `flex`) stay numbers. True when it changed.
+pub fn setNum(css: &Css, y: &Dyn, k: int, name: string, v: f32): bool {
+    if v != v {
+        v = 0.0;
+    }
+    if y.sk[k] == 1 && y.sf[k] == v {
+        return false;
+    }
+    let p = propId(name);
+    if p < 0 {
+        panic("ui: style:<longhand>={number} needs a longhand property; write a string for a shorthand");
+    }
+    let cat = catOf(p);
+    if cat != C_LEN && cat != C_NUM && cat != C_ANGLE {
+        panic("ui: style:<prop>={number} on a property that takes text (colors, keywords); write it as a string");
+    }
+    let kind = V_NUM;
+    if cat == C_LEN {
+        kind = V_PX;
+    }
+    y.sk[k] = 1;
+    y.sf[k] = v;
+    y.sn[k] = 1;
+    y.sp[k * PER] = p;
+    y.sv[k * PER] = mk(kind, v, 0, 0);
+    if ((p == P_FLEX_BASIS || p == P_FLEX_SHRINK) && v < 0.0) || (p == P_ORDER && v != f32(int(v))) || (p == P_LINE_CLAMP && (v < 1.0 || v != f32(int(v)))) {
+        y.sn[k] = 0;
+        css.warns.push(Warning { file: "style:", line: 1, col: 1, msg: "invalid numeric property value (override cleared)" });
+    }
+    y.dirty = true;
+    return true;
+}
+
+/// The `var()` fallbacks the parse just pushed (`css.fbs[f0..]`) go into slot k's own range when they fit,
+/// and the pool is cut back, so a text that changes every frame keeps `fbs` flat. `decls[d0..d0 + n]`
+/// point at them and are rewritten.
+fn adoptFallbacks(css: &Css, y: &Dyn, k: int, f0: int, d0: int, n: int) {
+    let nf = css.fbs.len - f0;
+    if nf == 0 {
+        return;
+    }
+    if y.fbo[k] + y.fbc[k] > f0 || nf > y.fbc[k] {
+        // no range yet, a stale one, or too small: this parse's entries become the range
+        y.fbo[k] = f0;
+        y.fbc[k] = nf;
+        return;
+    }
+    let delta = y.fbo[k] - f0;
+    for i in 0..nf {
+        let v = css.fbs.items[f0 + i];
+        if v.kind == V_VAR && v.c > 0 {
+            v.c += delta;
+        }
+        css.fbs.items[y.fbo[k] + i] = v;
+    }
+    for j in 0..n {
+        let dv = &css.decls.items[d0 + j].v;
+        if dv.kind == V_VAR && dv.c > 0 {
+            dv.c += delta;
+        }
+    }
+    css.fbs.len = f0;
+}
+
+/// `style:name="text"`: CSS value text (`"50%"`, `"#f00"`, `"linear-gradient(...)"`; shorthands work).
+/// Empty text clears the override; invalid text is a warning in `css.warns` and clears it too.
+pub fn setStr(css: &Css, y: &Dyn, k: int, name: string, s: string): bool {
+    let h = hashOf(s);
+    if y.sk[k] == 2 && y.sh[k] == h && y.sl[k] == s.len {
+        return false;
+    }
+    y.sk[k] = 2;
+    y.sh[k] = h;
+    y.sl[k] = s.len;
+    let n = 0;
+    if s.len > 0 {
+        let d0 = css.decls.len;
+        let f0 = css.fbs.len;
+        n = inlineDecl(css, name, s);
+        if n > PER {
+            n = PER;
+        }
+        adoptFallbacks(css, y, k, f0, d0, n);
+        for j in 0..n {
+            let dc = css.decls.items[d0 + j];
+            y.sp[k * PER + j] = dc.prop;
+            y.sv[k * PER + j] = dc.v;
+        }
+        css.decls.len = d0;
+    }
+    y.sn[k] = n;
+    y.dirty = true;
+    return true;
+}
+
+/// A fresh computed style id (its values are written by `build`).
+pub fn alloc(css: &Css): int {
+    for q in 0..NPROPS {
+        css.vals.push(mk(V_UNSET, 0.0, 0, 0));
+    }
+    css.nstyles += 1;
+    return css.nstyles - 1;
+}
+
+/// Keep the current overrides of `y` as the declarations of its inline-style rule (made on first use, then rewritten in place).
+fn inlineRule(css: &Css, y: &Dyn) {
+    if y.rule < 0 {
+        y.rd = css.decls.len;
+        for q in 0..SLOTS * PER {
+            css.decls.push(Decl { prop: 0, v: mk(V_UNSET, 0.0, 0, 0) });
+        }
+        y.rule = css.rules.len;
+        css.rules.push(Rule { step0: 0, nsteps: 0, decl0: y.rd, ndecl: 0, spec: 0, scope: 0, order: 0, tag: -1, cls0: -1, mq: -1, pe: 0, sib: false, file: "", line: 0, col: 0 });
+    }
+    let n = 0;
+    for k in 0..SLOTS {
+        for j in 0..y.sn[k] {
+            css.decls.items[y.rd + n] = Decl { prop: y.sp[k * PER + j], v: y.sv[k * PER + j] };
+            n += 1;
+        }
+    }
+    css.rules.items[y.rule].ndecl = n;
+}
+
+/// Write style `base` with the overrides on top into `dst`. `parent` is the parent's style (for
+/// `inherit`). True only when inherited values or custom vars changed under `dst`: cached children
+/// then need new styles. Reusing an unchanged inline style must not flush the whole style cache.
+pub fn build(css: &Css, y: &Dyn, base: int, parent: int, dst: int): bool {
+    // computeStyle has finished; reuse its scratch (declValue does not run another cascade).
+    for q in 0..NPROPS { css.out[q] = css.vals.items[dst * NPROPS + q]; }
+    let fresh = css.out[P_DISPLAY].kind == V_UNSET;
+    let oldVars = css.varsOf(dst);
+    let vs = css.varsOf(base);
+    css.setVars(dst, vs);
+    if css.regs.len > 0 {
+        inlineRule(css, y);
+        css.setRulesPlus(dst, base, y.rule, parent);
+    }
+    for q in 0..NPROPS {
+        css.vals.items[dst * NPROPS + q] = css.vals.items[base * NPROPS + q];
+    }
+    for k in 0..SLOTS {
+        for j in 0..y.sn[k] {
+            let p = y.sp[k * PER + j];
+            if p == P_ALL {
+                for q in 0..NPROPS {
+                    let av = declValue(css, q, y.sv[k * PER + j], parent, vs);
+                    css.vals.items[dst * NPROPS + q] = av;
+                }
+                continue;
+            }
+            let v = declValue(css, p, y.sv[k * PER + j], parent, vs);
+            if v.kind != V_UNSET {
+                css.vals.items[dst * NPROPS + p] = v;
+            }
+        }
+    }
+    fontCalc(css, css.vals.items, dst * NPROPS, parent);
+    resolveUnits(css, css.vals.items, dst * NPROPS, parent);
+    // A fresh destination has no cached descendants to invalidate.
+    if fresh { return false; }
+    if oldVars != vs {
+        if css.vsn.items[oldVars] != css.vsn.items[vs] { return true; }
+        for i in 0..css.vsn.items[vs] {
+            let ca = css.vsEnt.items[css.vso.items[oldVars] + i];
+            let cb = css.vsEnt.items[css.vso.items[vs] + i];
+            if ca.name != cb.name || ca.v.kind != cb.v.kind || ca.v.f != cb.v.f || ca.v.i != cb.v.i || ca.v.c != cb.v.c { return true; }
+        }
+    }
+    for q in 0..NPROPS {
+        if inherits(q) {
+            let a = css.out[q];
+            let b = css.vals.items[dst * NPROPS + q];
+            if a.kind != b.kind || a.f != b.f || a.i != b.i || a.c != b.c { return true; }
+        }
+    }
+    return false;
+}

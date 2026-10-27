@@ -5,7 +5,7 @@ pub mod bc;
 mod c_expr;
 mod c_ty;
 pub(crate) mod host;
-mod incr;
+pub(crate) mod incr;
 mod llvm;
 mod llvm_crash;
 mod llvm_expr;

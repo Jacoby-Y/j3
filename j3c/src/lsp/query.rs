@@ -573,6 +573,51 @@ fn main() {
     }
 
     #[test]
+    fn array_const_analyzes_hovers_and_completes() {
+        let path = default_hello_path();
+        let src = "\
+module hello;
+
+/// Squares.
+const SQ: [3]int = [1, 4, 9];
+
+fn main() {
+    let x = SQ[1];
+    let _ = x;
+}
+";
+        let overlay = vec![(path.clone(), src.to_string())];
+        let prog = analyze(&path, &overlay).expect("analyze");
+        let shown = path.display().to_string();
+        let at = src.rfind("SQ").unwrap() as u32;
+        let h = hover(&prog, &shown, at);
+        eprintln!("array const hover: {:?}", h.as_ref().map(|h| h.text.clone()));
+        let items = complete(&prog, &shown, at + 1);
+        assert!(items.iter().any(|c| c.label == "SQ"), "completion lost SQ");
+    }
+
+    #[test]
+    fn else_if_expr_and_rvalue_field_analyze_and_hover() {
+        let path = default_hello_path();
+        let src = "\
+module hello;
+
+fn main() {
+    let xs: [4]int = [1, 2, 3, 4];
+    let i = 2;
+    let k = if i < 1 { 1 } else if i < 2 { 2 } else { 3 };
+    let n = xs[1..3].len;
+    let _ = k + n;
+}
+";
+        let overlay = vec![(path.clone(), src.to_string())];
+        let prog = analyze(&path, &overlay).expect("else-if and rvalue field analyze");
+        let shown = path.display().to_string();
+        let _ = hover(&prog, &shown, src.find("].len").unwrap() as u32 + 3);
+        let _ = hover(&prog, &shown, src.find("else if").unwrap() as u32 + 1);
+    }
+
+    #[test]
     fn complete_quat_rotate() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/mesh.j3");
         let prog = analyze(&path, &[]).expect("analyze mesh");

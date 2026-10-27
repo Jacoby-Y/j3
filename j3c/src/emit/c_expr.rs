@@ -449,8 +449,8 @@ impl<'a> CWriter<'a> {
         let Some(file) = self.cx.file(span.file) else {
             return String::new();
         };
-        let line = crate::parse::line_of(&file.src, span.start);
-        let path = file.path.replace('\\', "\\\\").replace('"', "\\\"");
+        let (path, line) = file.loc(span.start);
+        let path = path.replace('\\', "\\\\").replace('"', "\\\"");
         format!("{}#line {line} \"{path}\"\n", "    ".repeat(indent))
     }
 
@@ -849,7 +849,7 @@ pub(crate) fn stable_ty(cx: &IrCx, ty: Ty) -> String {
     go(cx, ty, 0)
 }
 
-fn c_bytes_literal(bytes: &[u8]) -> String {
+pub(super) fn c_bytes_literal(bytes: &[u8]) -> String {
     let mut s = String::from("\"");
     for b in bytes {
         match *b {
@@ -858,9 +858,11 @@ fn c_bytes_literal(bytes: &[u8]) -> String {
             b'\n' => s.push_str("\\n"),
             b'\r' => s.push_str("\\r"),
             b'\t' => s.push_str("\\t"),
-            b'\0' => s.push_str("\\0"),
+            // `?` would start a trigraph (`??=`).
+            b'?' => s.push_str("\\?"),
             c if (32..127).contains(&c) => s.push(c as char),
-            c => s.push_str(&format!("\\x{:02x}", c)),
+            // Fixed three-digit octal: a following digit is never swallowed.
+            c => s.push_str(&format!("\\{:03o}", c)),
         }
     }
     s.push('"');

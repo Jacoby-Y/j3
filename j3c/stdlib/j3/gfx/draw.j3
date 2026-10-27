@@ -1,0 +1,801 @@
+// Part of j3.gfx (camera and shadow passes, draw calls, instances, lights); the module doc and `use`s are in ../gfx.j3.
+module j3.gfx;
+
+/// Upload a mat4 uniform.
+fn uMat(loc: i32, m: Mat4) {
+    glUniformMatrix4fv(loc, 1, 0, &m.m[0] as ptr);
+}
+
+/// Expand an AABB by transforming point p through m.
+fn grow(m: Mat4, p: Vec3, minx: &f32, maxx: &f32, miny: &f32, maxy: &f32, minz: &f32, maxz: &f32) {
+    let q = m.transformPoint(p);
+    if q.x < *minx {
+        *minx = q.x;
+    }
+    if q.x > *maxx {
+        *maxx = q.x;
+    }
+    if q.y < *miny {
+        *miny = q.y;
+    }
+    if q.y > *maxy {
+        *maxy = q.y;
+    }
+    if q.z < *minz {
+        *minz = q.z;
+    }
+    if q.z > *maxz {
+        *maxz = q.z;
+    }
+}
+
+/// Orthographic light matrix fitting the world AABB around sun.
+fn fitLight(sun: Vec3, lo: Vec3, hi: Vec3): Mat4 {
+    let mid = Vec3.xyz((lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5, (lo.z + hi.z) * 0.5);
+    let rad = (hi - lo).length() * 0.5 + 2;
+    if rad < 1 {
+        rad = 1;
+    }
+    let dir = sun.normalize();
+    let eye = mid + dir * (rad + 4);
+    let up = Vec3.up();
+    if abs(dir.dot(up)) > 0.9 {
+        up = Vec3.xyz(1, 0, 0);
+    }
+    let view = Mat4.lookAt(eye, mid, up);
+    let first = view.transformPoint(lo);
+    let minx = first.x;
+    let maxx = first.x;
+    let miny = first.y;
+    let maxy = first.y;
+    let minz = first.z;
+    let maxz = first.z;
+    grow(view, Vec3.xyz(hi.x, lo.y, lo.z), &minx, &maxx, &miny, &maxy, &minz, &maxz);
+    grow(view, Vec3.xyz(lo.x, hi.y, lo.z), &minx, &maxx, &miny, &maxy, &minz, &maxz);
+    grow(view, Vec3.xyz(hi.x, hi.y, lo.z), &minx, &maxx, &miny, &maxy, &minz, &maxz);
+    grow(view, Vec3.xyz(lo.x, lo.y, hi.z), &minx, &maxx, &miny, &maxy, &minz, &maxz);
+    grow(view, Vec3.xyz(hi.x, lo.y, hi.z), &minx, &maxx, &miny, &maxy, &minz, &maxz);
+    grow(view, Vec3.xyz(lo.x, hi.y, hi.z), &minx, &maxx, &miny, &maxy, &minz, &maxz);
+    grow(view, Vec3.xyz(hi.x, hi.y, hi.z), &minx, &maxx, &miny, &maxy, &minz, &maxz);
+    let pad: f32 = 2;
+    return Mat4.ortho(minx - pad, maxx + pad, miny - pad, maxy + pad, f32(0) - maxz - pad, f32(0) - minz + pad).mul(view);
+}
+
+/// Begin the shadow depth pass for the given sun and world bounds.
+pub fn shadowPass(sun: Vec3, boundsMin: Vec3, boundsMax: Vec3) {
+    ensure();
+    G.sun = sun.normalize();
+    G.light = fitLight(G.sun, boundsMin, boundsMax);
+    G.pass = PASS_SHADOW;
+    G.mapUsed = false;
+    SHADOWS += 1;
+    game.profZone(game.ZONE_SHADOW);
+    // Nothing translucent yet: all light passes, at the far depth.
+    glBindFramebuffer(GL_FRAMEBUFFER, G.passFbo);
+    glViewport(0, 0, SHADOW, SHADOW);
+    glClearColor(1, 1, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindFramebuffer(GL_FRAMEBUFFER, G.shadowFbo);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(4, 4);
+    glCullFace(GL_BACK);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glUseProgram(G.depth);
+    uMat(G.dLight, G.light);
+}
+
+/// Begin the lit camera pass from an orbit camera.
+pub fn cameraPass(cam: Orbit, sun: Vec3, sky: Vec3, sunColor: Vec3) {
+    beginCamera(cam.eye(), cam.view(), sun, sky, sunColor, fov());
+    if G.orthoHalf > 0 {
+        let sz = viewExtent();
+        let aspect = sz.x / sz.y;
+        let h = G.orthoHalf;
+        // Nothing clips at the eye, so objects between it and the target stay visible.
+        G.proj = Mat4.ortho(f32(0) - h * aspect, h * aspect, f32(0) - h, h, f32(0) - G.clipFar, G.clipFar);
+        uMat(LIT.lProj, G.proj);
+    }
+}
+
+/// Begin the lit camera pass from a look camera.
+pub fn cameraPassLook(cam: Look, sun: Vec3, sky: Vec3, sunColor: Vec3) {
+    beginCamera(cam.eye, cam.view(), sun, sky, sunColor, fov());
+}
+
+/// Begin the lit camera pass with a game camera's vertical FOV in degrees.
+pub fn cameraPassLookFov(cam: Look, sun: Vec3, sky: Vec3, sunColor: Vec3, degrees: f32) {
+    let angle = clamp(degrees, 20, 120) * PI / f32(180);
+    beginCamera(cam.eye, cam.view(), sun, sky, sunColor, angle);
+}
+
+/// Shared camera-pass setup: viewport, clear, uniforms, and shadow bind.
+fn beginCamera(eye: Vec3, view: Mat4, sun: Vec3, sky: Vec3, sunColor: Vec3, angle: f32) {
+    ensure();
+    G.sun = sun.normalize();
+    G.sky = sky;
+    G.sunColor = sunColor;
+    G.eye = eye;
+    G.view = view;
+    let at = viewOrigin();
+    let sz = viewExtent();
+    let w = i32(sz.x);
+    let h = i32(sz.y);
+    if h < 1 {
+        h = 1;
+    }
+    let aspect = sz.x / sz.y;
+    if aspect < 0.1 {
+        aspect = 0.1;
+    }
+    let near = G.clipNear;
+    if near < 0.01 {
+        near = f32(15) / f32(100);
+    }
+    G.proj = Mat4.perspective(angle, aspect, near, G.clipFar);
+    G.pass = PASS_CAMERA;
+    game.profZone(game.ZONE_CAMERA);
+    G.grabbed = false;
+    glBindFramebuffer(GL_FRAMEBUFFER, G.outputFbo);
+    let r = glView(at.x, at.y, sz.x, sz.y);
+    glViewport(i32(r.x), i32(r.y), i32(r.w), i32(r.h));
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glCullFace(GL_BACK);
+    glClearColor(sky.x, sky.y, sky.z, 1);
+    // Clear only the view rect, so a second view (a picture-in-picture) leaves the first alone.
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(i32(r.x), i32(r.y), i32(r.w), i32(r.h));
+    glClear(GL_COLOR_BUFFER_BIT + GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+    useLit(LIT_PLAIN);
+    uMat(LIT.lProj, G.proj);
+    uMat(LIT.lView, G.view);
+    uMat(LIT.lLight, G.light);
+    glUniform3f(LIT.lSun, G.sun.x, G.sun.y, G.sun.z);
+    glUniform3f(LIT.lSunColor, sunColor.x, sunColor.y, sunColor.z);
+    glUniform3f(LIT.lSky, sky.x, sky.y, sky.z);
+    glUniform3f(LIT.lEye, G.eye.x, G.eye.y, G.eye.z);
+    glUniform1f(LIT.lFog0, G.fogStart);
+    glUniform1f(LIT.lFog1, G.fogEnd);
+    G.albedo = G.white;
+    bindAlbedo();
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, G.shadowTex);
+    glUniform1i(LIT.lShadow, 0);
+}
+
+/// Draw a mesh in the current shadow or camera pass. Opaque, back faces culled.
+pub fn draw(mesh: Mesh, model: Mat4) {
+    drawMesh(mesh, model, false, 0, Vec3.xyz(0, 0, 0), 0, 0, 1);
+}
+
+/// Draw both sides of an opaque mesh, matching glTF double-sided materials.
+pub fn drawDoubleSided(mesh: Mesh, model: Mat4) {
+    glDisable(GL_CULL_FACE);
+    drawMesh(mesh, model, false, 0, Vec3.xyz(0, 0, 0), 0, 0, 1);
+    glEnable(GL_CULL_FACE);
+}
+
+/// Draw only a mesh's back faces, in the camera pass. Drawn a little bigger than the mesh
+/// with an unlit `gfx.material(zero, color)`, it is an outline that follows the shape.
+pub fn drawHull(mesh: Mesh, model: Mat4) {
+    if G.pass != PASS_CAMERA {
+        return;
+    }
+    glCullFace(GL_FRONT);
+    drawMesh(mesh, model, false, 0, Vec3.xyz(0, 0, 0), 0, 0, 1);
+    glCullFace(GL_BACK);
+}
+
+/// Draw a mesh with alpha below 0.5 discarded and both sides visible.
+/// The shadow pass discards the same texels, so a card does not cast a solid rectangle.
+pub fn drawCutout(mesh: Mesh, model: Mat4) {
+    drawMesh(mesh, model, true, 0, Vec3.xyz(0, 0, 0), 0, 0, 1);
+}
+
+/// Draw the first `n` meshes, each at its model, all with the current surface and albedo:
+/// like `draw` (or `drawCutout`) in a loop, but in the camera pass the shader state is set
+/// once and each later mesh only sets its model. For many meshes sharing one look (terrain).
+/// The shadow pass batches the same way, except for translucent shadows (`shadowLet`).
+pub fn drawRun(meshes: []Mesh, models: []Mat4, n: int, cutout: bool) {
+    if n <= 0 {
+        return;
+    }
+    let see = G.shadowLet;
+    if G.pass == PASS_SHADOW && see.x <= 0.001 && see.y <= 0.001 && see.z <= 0.001 {
+        // drawMesh leaves the depth program (the effect's own, or the plain one) bound.
+        drawMesh(meshes[0], models[0], cutout, 0, Vec3.xyz(0, 0, 0), 0, 0, 1);
+        let own = G.surf.fx;
+        let fxDepth = own > 0 && own <= 32 && FXP[own - 1].depth.prog != 0;
+        let modelLoc = if fxDepth { FXP[own - 1].depth.model } else { G.dModel };
+        let inst = if fxDepth { FXP[own - 1].depth.inst } else { G.dInst };
+        if cutout {
+            glDisable(GL_CULL_FACE);
+        }
+        for k in 1..n {
+            if meshes[k].vbo == 0 || meshes[k].count <= 0 {
+                panic("gfx.drawRun");
+            }
+            uMat(modelLoc, models[k]);
+            submit(meshes[k], inst);
+        }
+        if cutout {
+            glEnable(GL_CULL_FACE);
+        }
+        return;
+    }
+    if G.pass != PASS_CAMERA || G.blendNext {
+        for k in 0..n {
+            drawMesh(meshes[k], models[k], cutout, 0, Vec3.xyz(0, 0, 0), 0, 0, 1);
+        }
+        return;
+    }
+    drawMesh(meshes[0], models[0], cutout, 0, Vec3.xyz(0, 0, 0), 0, 0, 1);
+    if cutout {
+        glDisable(GL_CULL_FACE);
+    }
+    for k in 1..n {
+        if meshes[k].vbo == 0 || meshes[k].count <= 0 {
+            panic("gfx.drawRun");
+        }
+        uMat(LIT.lModel, models[k]);
+        submit(meshes[k], LIT.lInst);
+    }
+    if cutout {
+        glEnable(GL_CULL_FACE);
+    }
+}
+
+/// Draw `mesh` (an inside-out unit sphere) as the sky: centered on the eye, behind
+/// everything, without depth. Draw it before the rest of the camera pass.
+pub fn drawSky(mesh: Mesh) {
+    if G.pass != PASS_CAMERA {
+        return;
+    }
+    // Any radius between the clip planes shows it whole.
+    let r = sqrt(G.clipNear * G.clipFar) * 2;
+    let model = Mat4.translate(G.eye.x, G.eye.y, G.eye.z).mul(Mat4.scale(r, r, r));
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    drawMesh(mesh, model, false, 0, Vec3.xyz(0, 0, 0), 0, 0, 1);
+    glEnable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+}
+
+/// Pull later camera-pass draws `level` steps toward the viewer in depth, so a surface lying
+/// flush on another (a decal, trim, a road line) wins without being moved. 0 turns it off.
+/// No-op outside the camera pass, whose shadow offset is its own.
+pub fn depthBias(level: f32) {
+    if G.pass != PASS_CAMERA {
+        return;
+    }
+    if level == 0 {
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        return;
+    }
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-level, -level * 4);
+}
+
+/// Unlit rim in `color`, following the albedo's alpha edge. No-op outside the camera pass.
+pub fn drawMark(mesh: Mesh, model: Mat4, color: Vec3) {
+    if G.pass != PASS_CAMERA {
+        return;
+    }
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-2, -2);
+    drawMesh(mesh, model, true, 1, color, 0, 0, 1);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+}
+
+/// Draw `mesh` with alpha `a`. Values below 1 enable blending for that draw.
+pub fn drawAlpha(mesh: Mesh, model: Mat4, a: f32) {
+    drawMesh(mesh, model, false, 0, Vec3.xyz(0, 0, 0), 0, 0, a);
+}
+
+/// Draw `mesh` blended over what is already drawn, with alpha `a` times the albedo texture's
+/// alpha. Draw these after opaque meshes, farthest first.
+pub fn drawBlended(mesh: Mesh, model: Mat4, a: f32) {
+    G.blendNext = true;
+    drawMesh(mesh, model, false, 0, Vec3.xyz(0, 0, 0), 0, 0, a);
+    G.blendNext = false;
+}
+
+pub fn plainSurface(): Surface {
+    return Surface {
+        tint: Vec3.xyz(1, 1, 1),
+        glow: Vec3.xyz(0, 0, 0),
+        spec: 0,
+        shine: 0,
+        reflect: 0,
+        edge: 0,
+        ior: 1,
+        rough: 0,
+        thickness: 1,
+        cloud: 0,
+        uvScale: Vec2 { x: 1, y: 1 },
+        uvOffset: Vec2 { x: 0, y: 0 },
+        fx: 0,
+        fxVals: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    };
+}
+
+/// Later draws use surface `s` until changed.
+pub fn surface(s: Surface) {
+    G.surf = s;
+}
+
+/// Multiply later draws' albedo by `tint` and add `glow` (unlit light the surface gives
+/// off), with an otherwise plain surface.
+pub fn material(tint: Vec3, glow: Vec3) {
+    let s = plainSurface();
+    s.tint = tint;
+    s.glow = glow;
+    G.surf = s;
+}
+
+/// Eye position of the latest camera pass.
+pub fn cameraEye(): Vec3 {
+    return G.eye;
+}
+
+/// Later shadow-pass draws let `through` of the sunlight past them (per color, 0..1).
+/// Black, the default, is a solid shadow; anything else is a see-through, tinted one.
+pub fn castShadow(through: Vec3) {
+    G.shadowLet = through;
+}
+
+/// Whether the box `lo`..`hi` can reach the clip volume of `clip` (projection × view × model).
+/// False only when all eight corners are outside one clip plane, so GL would clip it all anyway.
+pub fn boxInClip(clip: Mat4, lo: Vec3, hi: Vec3): bool {
+    let m = clip.m;
+    let outside: [6]int = [0, 0, 0, 0, 0, 0];
+    let c = 0;
+    while c < 8 {
+        let x = if c % 2 == 0 { lo.x } else { hi.x };
+        let y = if (c / 2) % 2 == 0 { lo.y } else { hi.y };
+        let z = if c / 4 == 0 { lo.z } else { hi.z };
+        let cx = m[0] * x + m[4] * y + m[8] * z + m[12];
+        let cy = m[1] * x + m[5] * y + m[9] * z + m[13];
+        let cz = m[2] * x + m[6] * y + m[10] * z + m[14];
+        let cw = m[3] * x + m[7] * y + m[11] * z + m[15];
+        if cx < 0 - cw { outside[0] += 1; }
+        if cx > cw { outside[1] += 1; }
+        if cy < 0 - cw { outside[2] += 1; }
+        if cy > cw { outside[3] += 1; }
+        if cz < 0 - cw { outside[4] += 1; }
+        if cz > cw { outside[5] += 1; }
+        c += 1;
+    }
+    let k = 0;
+    while k < 6 {
+        if outside[k] == 8 { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// Whether a mesh with local bounds `lo`..`hi` drawn at `model` can show in the current pass:
+/// on screen in the camera pass, inside the light's box in the shadow pass.
+pub fn visible(model: Mat4, lo: Vec3, hi: Vec3): bool {
+    if G.pass == PASS_SHADOW { return boxInClip(G.light.mul(model), lo, hi); }
+    if G.pass == PASS_CAMERA { return boxInClip(G.proj.mul(G.view).mul(model), lo, hi); }
+    return true;
+}
+
+/// Shadow passes begun so far.
+#[singleton]
+let SHADOWS: int = 0;
+
+/// Counts `shadowPass` calls, so a camera pass can tell which shadow pass it follows.
+pub fn shadowEpoch(): int {
+    return SHADOWS;
+}
+
+/// Whether draws now go to the camera (not the shadow map).
+pub fn inCameraPass(): bool {
+    return G.pass == PASS_CAMERA;
+}
+
+/// How many point lights shine at once.
+pub const LIGHTS: int = 8;
+
+/// Set point light `i` (0..7). Radius `0` turns that light off.
+pub fn light(i: int, pos: Vec3, color: Vec3, radius: f32) {
+    if i < 0 || i >= LIGHTS {
+        return;
+    }
+    G.pPos[i] = pos;
+    G.pCol[i] = color;
+    G.pRad[i] = radius;
+}
+
+/// Draw one copy of `mesh` per matrix with the current surface, in instanced GL draws.
+pub fn drawInstanced(mesh: Mesh, models: []Mat4) {
+    drawCopies(mesh, models, false);
+}
+
+/// One opaque instance. Tint and emission replace the current material's colors.
+pub struct Instance {
+    model: Mat4;
+    tint: Vec3;
+    emission: Vec3;
+}
+
+/// Draw colored copies, retaining the current surface's other properties.
+/// Custom effects use ordinary draws so their existing uniform contract is preserved.
+pub fn drawInstances(mesh: Mesh, instances: []Instance) { drawInstancesAlpha(mesh, instances, 1); }
+
+/// `drawInstances` with one alpha `a` for the whole batch. Below 1 it blends with depth writes off:
+/// draw these after the opaque scene; copies are not sorted against each other.
+pub fn drawInstancesAlpha(mesh: Mesh, instances: []Instance, a: f32) {
+    if G.pass == PASS_NONE || instances.len == 0 { return; }
+    let old = G.surf;
+    if old.fx > 0 {
+        let fallback = 0;
+        while fallback < instances.len {
+            G.surf.tint = instances[fallback].tint;
+            G.surf.glow = instances[fallback].emission;
+            drawAlpha(mesh, instances[fallback].model, a);
+            fallback += 1;
+        }
+        G.surf = old;
+        return;
+    }
+    G.surf.tint = Vec3.xyz(1, 1, 1);
+    G.surf.glow = Vec3.zero();
+    let at = 0;
+    while at < instances.len {
+        let n = instances.len - at;
+        if n > INST_MAX { n = INST_MAX; }
+        let i = 0;
+        while i < n {
+            let v = instances[at + i];
+            let k = 0;
+            while k < 16 { INST[i * 24 + k] = v.model.m[k]; k += 1; }
+            INST[i * 24 + 16] = v.tint.x;
+            INST[i * 24 + 17] = v.tint.y;
+            INST[i * 24 + 18] = v.tint.z;
+            INST[i * 24 + 20] = v.emission.x;
+            INST[i * 24 + 21] = v.emission.y;
+            INST[i * 24 + 22] = v.emission.z;
+            i += 1;
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, G.instBuf);
+        glBufferData(GL_ARRAY_BUFFER, n * 96, &INST[0] as ptr, GL_DYNAMIC_DRAW);
+        COPIES = n;
+        INSTANCE_COLOR = true;
+        drawMesh(mesh, instances[at].model, false, 0, Vec3.zero(), 0, 0, a);
+        INSTANCE_COLOR = false;
+        COPIES = 0;
+        at += n;
+    }
+    G.surf = old;
+}
+
+/// Batched back-face outlines, camera pass only.
+pub fn drawHullInstances(mesh: Mesh, instances: []Instance) {
+    if G.pass != PASS_CAMERA { return; }
+    glCullFace(GL_FRONT);
+    drawInstances(mesh, instances);
+    glCullFace(GL_BACK);
+}
+
+/// `drawInstanced` with back faces drawn too, like `drawDoubleSided`.
+pub fn drawInstancedDoubleSided(mesh: Mesh, models: []Mat4) {
+    drawCopies(mesh, models, true);
+}
+
+/// Draw `models.len` copies of `mesh`, `INST_MAX` per GL draw, with the current surface.
+fn drawCopies(mesh: Mesh, models: []Mat4, both: bool) {
+    if G.pass == PASS_NONE { return; }
+    ensure();
+    if both { glDisable(GL_CULL_FACE); }
+    let at = 0;
+    while at < models.len {
+        let n = models.len - at;
+        if n > INST_MAX { n = INST_MAX; }
+        let i = 0;
+        while i < n {
+            let m = models[at + i];
+            let k = 0;
+            while k < 16 {
+                INST[i * 16 + k] = m.m[k];
+                k += 1;
+            }
+            i += 1;
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, G.instBuf);
+        glBufferData(GL_ARRAY_BUFFER, n * 16 * 4, &INST[0] as ptr, GL_DYNAMIC_DRAW);
+        COPIES = n;
+        drawMesh(mesh, models[at], false, 0, Vec3.xyz(0, 0, 0), 0, 0, 1);
+        COPIES = 0;
+        at += n;
+    }
+    if both { glEnable(GL_CULL_FACE); }
+}
+
+/// Copies the next `drawMesh` draws from the instance buffer; 0 draws once with its model.
+#[singleton]
+let COPIES: int = 0;
+
+/// Draw `mesh`'s triangles with the bound program: once, or `COPIES` times with the
+/// per-copy matrices in attributes 5..8. `inst` is that program's uInst location.
+fn submit(mesh: Mesh, inst: i32) {
+    glBindVertexArray(mesh.vao);
+    if COPIES == 0 {
+        glDrawArrays(GL_TRIANGLES, 0, i32(mesh.count));
+        glBindVertexArray(0);
+        return;
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, G.instBuf);
+    let slot = 5;
+    while slot < 9 {
+        glEnableVertexAttribArray(u32(slot));
+        glVertexAttribPointer(u32(slot), 4, GL_FLOAT, 0, if INSTANCE_COLOR { 96 } else { 64 }, ((slot - 5) * 16) as ptr);
+        glVertexAttribDivisor(u32(slot), 1);
+        slot += 1;
+    }
+    if INSTANCE_COLOR {
+        slot = 9;
+        while slot < 11 {
+            glEnableVertexAttribArray(u32(slot));
+            glVertexAttribPointer(u32(slot), 3, GL_FLOAT, 0, 96, (64 + (slot - 9) * 16) as ptr);
+            glVertexAttribDivisor(u32(slot), 1);
+            slot += 1;
+        }
+    }
+    glUniform1f(inst, if INSTANCE_COLOR { 2 } else { 1 });
+    glDrawArraysInstanced(GL_TRIANGLES, 0, i32(mesh.count), i32(COPIES));
+    glUniform1f(inst, 0);
+    slot = 5;
+    while slot < (if INSTANCE_COLOR { 11 } else { 9 }) {
+        glVertexAttribDivisor(u32(slot), 0);
+        glDisableVertexAttribArray(u32(slot));
+        slot += 1;
+    }
+    glBindVertexArray(0);
+}
+
+/// Unlit world-space line in the camera pass.
+pub fn drawLine(a: Vec3, b: Vec3, color: Vec3) {
+    if G.pass != PASS_CAMERA {
+        return;
+    }
+    ensure();
+    LINE[0] = a.x;
+    LINE[1] = a.y;
+    LINE[2] = a.z;
+    LINE[3] = b.x;
+    LINE[4] = b.y;
+    LINE[5] = b.z;
+    glBindBuffer(GL_ARRAY_BUFFER, G.lineBuf);
+    glBufferData(GL_ARRAY_BUFFER, 24, &LINE[0] as ptr, GL_DYNAMIC_DRAW);
+    glUseProgram(G.lineProg);
+    uMat(G.lLineProj, G.proj);
+    uMat(G.lLineView, G.view);
+    glUniform3f(G.lLineColor, color.x, color.y, color.z);
+    glBindVertexArray(G.lineVao);
+    glDrawArrays(GL_LINES, 0, 2);
+    glBindVertexArray(0);
+}
+
+/// Shared draw for opaque and cutout meshes. `flat` above 0.5 replaces lighting with `color`.
+fn drawMesh(mesh: Mesh, model: Mat4, cutout: bool, flat: f32, color: Vec3, nx: f32, ny: f32, alpha: f32) {
+    ensure();
+    if G.pass == PASS_NONE {
+        panic("gfx.draw");
+    }
+    if mesh.vbo == 0 || mesh.count <= 0 {
+        panic("gfx.draw");
+    }
+    let cut: f32 = 0;
+    if cutout {
+        cut = 1;
+        glDisable(GL_CULL_FACE);
+    }
+    bindAlbedo();
+    if G.pass == PASS_SHADOW { G.mapUsed = true; }
+    let see = G.shadowLet;
+    if G.pass == PASS_SHADOW && (see.x > 0.001 || see.y > 0.001 || see.z > 0.001) {
+        // Multiply the light it lets through into the translucent shadow, keeping the
+        // nearest depth, instead of blocking the sun.
+        glBindFramebuffer(GL_FRAMEBUFFER, G.passFbo);
+        glUseProgram(G.passProg);
+        uMat(G.pLight, G.light);
+        uMat(G.pModel, model);
+        glUniform3f(G.pPass, see.x, see.y, see.z);
+        glDisable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFuncSeparate(GL_ZERO, GL_SRC_COLOR, GL_ONE, GL_ONE);
+        glBlendEquationSeparate(GL_FUNC_ADD, GL_MIN);
+        submit(mesh, G.pInst);
+        glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_BLEND);
+        glEnable(GL_DEPTH_TEST);
+        glBindFramebuffer(GL_FRAMEBUFFER, G.shadowFbo);
+        glUseProgram(G.depth);
+        if cutout {
+            glEnable(GL_CULL_FACE);
+        }
+        return;
+    }
+    let shadowInst = G.dInst;
+    if G.pass == PASS_SHADOW {
+        let own = G.surf.fx;
+        if own > 0 && own <= 32 && FXP[own - 1].depth.prog != 0 {
+            let d = FXP[own - 1].depth;
+            glUseProgram(d.prog);
+            uMat(d.light, G.light);
+            uMat(d.model, model);
+            glUniform1i(d.albedo, 1);
+            glUniform1f(d.cutout, cut);
+            glUniform1f(d.time, f32(game.ticks()) / 1000);
+            fxUniforms(own - 1, []f32 { ptr: &G.surf.fxVals[0], len: 16 }, true);
+            shadowInst = d.inst;
+        } else {
+            glUseProgram(G.depth);
+            uMat(G.dLight, G.light);
+            uMat(G.dModel, model);
+            glUniform1i(G.dAlbedo, 1);
+            glUniform1f(G.dCutout, cut);
+        }
+    } else {
+        let level = LIT_PLAIN;
+        if G.trace.count > 0 {
+            if G.traceShadows { level += LIT_SUN; }
+            if G.surf.ior > 1.001 { level += LIT_GLASS; } else if G.surf.reflect > 0.001 { level += LIT_MIRROR; }
+        }
+        let fx = G.surf.fx;
+        if fx > 0 && fx <= 32 && FXP[fx - 1].lit.prog != 0 {
+            LIT = FXP[fx - 1].lit;
+            glUseProgram(LIT.prog);
+            // A slice, not the array: passing a `[16]f32` field by value hits an LLVM-backend bug.
+            fxUniforms(fx - 1, []f32 { ptr: &G.surf.fxVals[0], len: 16 }, false);
+            fxTextures(fx - 1);
+        } else {
+            useLit(level);
+        }
+        uMat(LIT.lProj, G.proj);
+        uMat(LIT.lView, G.view);
+        uMat(LIT.lLight, G.light);
+        uMat(LIT.lModel, model);
+        glUniform3f(LIT.lSun, G.sun.x, G.sun.y, G.sun.z);
+        glUniform3f(LIT.lSunColor, G.sunColor.x, G.sunColor.y, G.sunColor.z);
+        glUniform3f(LIT.lSky, G.sky.x, G.sky.y, G.sky.z);
+        glUniform3f(LIT.lEye, G.eye.x, G.eye.y, G.eye.z);
+        glUniform1f(LIT.lFog0, G.fogStart);
+        glUniform1f(LIT.lFog1, G.fogEnd);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, G.shadowTex);
+        glUniform1i(LIT.lShadow, 0);
+        glUniform1i(LIT.lAlbedo, 1);
+        glUniform1f(LIT.lCutout, cut);
+        glUniform1f(LIT.lFlat, flat);
+        glUniform3f(LIT.lFlatColor, color.x, color.y, color.z);
+        glUniform1f(LIT.lAlpha, alpha);
+        let sf = G.surf;
+        glUniform3f(LIT.lTint, sf.tint.x, sf.tint.y, sf.tint.z);
+        glUniform3f(LIT.lGlow, sf.glow.x, sf.glow.y, sf.glow.z);
+        glUniform1f(LIT.lSpec, sf.spec);
+        glUniform1f(LIT.lShine, sf.shine);
+        glUniform1f(LIT.lReflect, sf.reflect);
+        glUniform1f(LIT.lEdge, sf.edge);
+        glUniform1f(LIT.lIor, sf.ior);
+        glUniform1f(LIT.lRough, sf.rough);
+        glUniform4f(LIT.lGrabRect, G.grabRect[0], G.grabRect[1], G.grabRect[2], G.grabRect[3]);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, if G.grabTex == 0 { G.white } else { G.grabTex });
+        glUniform1i(LIT.lGrab, 3);
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D, if G.skyTex == 0 { G.white } else { G.skyTex });
+        glUniform1i(LIT.lSkyTex, 4);
+        glUniform1f(LIT.lHasSky, if G.skyTex == 0 { 0 } else { 1 });
+        glActiveTexture(GL_TEXTURE7);
+        glBindTexture(GL_TEXTURE_2D, G.passTex);
+        glUniform1f(LIT.lGrabbed, if G.grabbed { 1 } else { 0 });
+        glUniform1f(LIT.lThickness, sf.thickness);
+        glUniform1f(LIT.lCloud, sf.cloud);
+        let tracing = G.trace.count > 0 && (sf.reflect > 0.001 || sf.ior > 1.001);
+        glUniform1f(LIT.lTraceOn, if tracing { 1 } else { 0 });
+        glUniform1f(LIT.lTraceShadowAll, if G.trace.count > 0 && G.traceShadows { 1 } else { 0 });
+        if G.trace.count > 0 {
+            glActiveTexture(GL_TEXTURE5);
+            glBindTexture(GL_TEXTURE_2D, G.trace.tris);
+            glActiveTexture(GL_TEXTURE6);
+            glBindTexture(GL_TEXTURE_2D, G.trace.nodes);
+            glActiveTexture(GL_TEXTURE8);
+            glBindTexture(GL_TEXTURE_2D, G.trace.top);
+            glActiveTexture(GL_TEXTURE9);
+            glBindTexture(GL_TEXTURE_2D, G.trace.inst);
+            glUniform1i(LIT.lBounces, i32(G.traceBounces));
+            glUniform1i(LIT.lSamples, i32(G.traceSamples));
+            glUniform1f(LIT.lTraceShadows, if G.traceShadows { 1 } else { 0 });
+            glUniform1f(LIT.lTraceNear, G.traceNear);
+            glUniform1f(LIT.lMapOn, if G.mapUsed { 1 } else { 0 });
+        }
+        glActiveTexture(GL_TEXTURE0);
+        glUniform2f(LIT.lUvScale, sf.uvScale.x, sf.uvScale.y);
+        glUniform2f(LIT.lUvOffset, sf.uvOffset.x, sf.uvOffset.y);
+        glUniform2f(LIT.lNudge, nx, ny);
+        glUniform1f(LIT.lTime, f32(game.ticks()) / 1000);
+        let res = viewExtent();
+        glUniform2f(LIT.lResolution, res.x, res.y);
+        uploadLights();
+        if alpha < 0.999 || G.blendNext {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(0);
+        }
+    }
+    submit(mesh, if G.pass == PASS_SHADOW { shadowInst } else { LIT.lInst });
+    if (alpha < 0.999 || G.blendNext) && G.pass != PASS_SHADOW {
+        glDepthMask(1);
+        glDisable(GL_BLEND);
+    }
+    if cutout {
+        glEnable(GL_CULL_FACE);
+    }
+}
+
+/// Upload effect program `slot`'s params from `vals` (in param order; a color takes three),
+/// into its shadow depth program when `depth`.
+fn fxUniforms(slot: int, vals: []f32, depth: bool) {
+    let k = 0;
+    let at = 0;
+    while k < FXP[slot].count {
+        let kind = FXP[slot].kinds[k];
+        if at + fxWidth(kind) > vals.len { return; }
+        let loc = if depth { FXP[slot].depthLocs[k] } else { FXP[slot].locs[k] };
+        if kind == FX_COLOR { glUniform3f(loc, vals[at], vals[at + 1], vals[at + 2]); }
+        else if kind == FX_FLOAT { glUniform1f(loc, vals[at]); }
+        else { glUniform1i(loc, i32(vals[at])); }
+        at += fxWidth(kind);
+        k += 1;
+    }
+}
+
+fn samplerUnits(prog: u32) {
+    glUseProgram(prog);
+    glUniform1i(uloc(prog, "uShadow"), 0);
+    glUniform1i(uloc(prog, "uAlbedo"), 1);
+    glUniform1i(uloc(prog, "uGrab"), 3);
+    glUniform1i(uloc(prog, "uSkyTex"), 4);
+    glUniform1i(uloc(prog, "uTris"), 5);
+    glUniform1i(uloc(prog, "uNodes"), 6);
+    glUniform1i(uloc(prog, "uTop"), 8);
+    glUniform1i(uloc(prog, "uObjects"), 9);
+    glUniform1i(uloc(prog, "uPassShadow"), 7);
+    glUseProgram(0);
+}
+
+/// Find `uLP[i]`, `uLC[i]`, `uLR[i]` in `prog`: the instanced program's when `inst`.
+fn lightLocs(prog: u32) {
+    let i = 0;
+    while i < LIGHTS {
+        LIT.lP[i] = uloc(prog, indexed("uLP[", i));
+        LIT.lC[i] = uloc(prog, indexed("uLC[", i));
+        LIT.lR[i] = uloc(prog, indexed("uLR[", i));
+        i += 1;
+    }
+}
+
+/// `name` + `i` + "]", for a uniform array element.
+fn indexed(name: string, i: int): string {
+    let t = Text.new(scratch(0));
+    t.pushStr(name);
+    t.pushInt(i);
+    t.pushStr("]");
+    return t.str();
+}
+
+/// Write the point lights into the lit program.
+fn uploadLights() {
+    let i = 0;
+    while i < LIGHTS {
+        glUniform3f(LIT.lP[i], G.pPos[i].x, G.pPos[i].y, G.pPos[i].z);
+        glUniform3f(LIT.lC[i], G.pCol[i].x, G.pCol[i].y, G.pCol[i].z);
+        glUniform1f(LIT.lR[i], G.pRad[i]);
+        i += 1;
+    }
+}

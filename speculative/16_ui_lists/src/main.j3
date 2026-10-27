@@ -1,0 +1,449 @@
+// Plan 023 stage 4 at runtime: keyed `{#each}` (state, DOM nodes and lifecycle follow the key through reverse,
+// filter, insert, clear, duplicates), keyed lists inside keyed lists, unkeyed lists inside unkeyed lists, and
+// idle frames that allocate nothing (also with 1000 keyed rows).
+// Headless:  SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout 60 j3c run speculative/16_ui_lists --headless
+// Prints PASS/FAIL lines; exit code 1 on a failure.
+
+module lists;
+
+use lists.state.{ Group, Item, State };
+use lists.ui.{ Screen, ScreenProps };
+use j3.app.App;
+use j3.game.{ micros, windowSize };
+use j3.rand.Rng;
+use j3.io.printLn;
+use j3.memory.{ Arena, rewindScratch };
+use j3.sys;
+use j3.ui.dom.Dom;
+
+struct World {
+    mem: &Arena;
+    state: State;
+    root: Screen;
+    frame: int;
+    fails: int;
+    used: int;
+    mark: int;
+    b200: int;
+    b300: int;
+    destroys0: int;
+    /// DOM node of the row first seen for item id
+    node: []int;
+}
+
+fn boot(mem: &Arena): World {
+    let w = World { mem: mem, state: State.new(mem), root: Screen.new(mem), frame: 0, fails: 0, used: 0, mark: 0, b200: 0, b300: 0, destroys0: 0, node: mem.alloc::<int>(4096) };
+    w.root.dom.setFrameMs(10.0);
+    return w;
+}
+
+fn check(w: &World, ok: bool, what: string) {
+    if ok {
+        printLn(`PASS {what}`);
+    } else {
+        printLn(`FAIL {what}`);
+        w.fails += 1;
+    }
+}
+
+/// `v` as text in `mem` (a template's buffer is reused by the next one).
+fn text(mem: &Arena, v: int): string {
+    let t = `{v}`;
+    let b = mem.alloc::<u8>(t.len);
+    for i in 0..t.len {
+        b[i] = t[i];
+    }
+    return b as string;
+}
+
+/// "5,4,3" to items with those ids (name = the id as text).
+fn items(mem: &Arena, spec: string): []Item {
+    let n = 0;
+    let i = 0;
+    while i < spec.len {
+        if spec[i] == 44 {
+            n += 1;
+        }
+        i += 1;
+    }
+    if spec.len == 0 {
+        return mem.alloc::<Item>(0);
+    }
+    let out = mem.alloc::<Item>(n + 1);
+    let k = 0;
+    let v = 0;
+    i = 0;
+    while i <= spec.len {
+        if i == spec.len || spec[i] == 44 {
+            out[k] = Item { id: v, name: text(mem, v) };
+            k += 1;
+            v = 0;
+        } else {
+            v = v * 10 + (spec[i] - 48) as int;
+        }
+        i += 1;
+    }
+    return out;
+}
+
+fn range(mem: &Arena, lo: int, n: int): []Item {
+    let out = mem.alloc::<Item>(n);
+    for i in 0..n {
+        out[i] = Item { id: lo + i, name: text(mem, lo + i) };
+    }
+    return out;
+}
+
+fn two(mem: &Arena, a: Group, b: Group): []Group {
+    let out = mem.alloc::<Group>(2);
+    out[0] = a;
+    out[1] = b;
+    return out;
+}
+
+fn group(id: int, rows: []Item): Group {
+    return Group { id: id, rows: rows };
+}
+
+/// The nth child list of the Screen's wrapper div: root > div > div.rows / .groups / .outer.
+fn list(d: &Dom, n: int): int {
+    let c = d.nodes.items[d.nodes.items[0].first].first;
+    for i in 0..n {
+        c = d.nodes.items[c].next;
+    }
+    return c;
+}
+
+/// The rows (`<p>`) under `parent`, left to right, as "id,id,..." read from their text.
+fn names(d: &Dom, parent: int): string {
+    let out = "";
+    let c = d.nodes.items[parent].first;
+    while c >= 0 {
+        let sp = d.nodes.items[c].last;
+        let s = d.textOf(d.nodes.items[sp].first);
+        out = if out.len == 0 { s } else { `{out},{s}` };
+        c = d.nodes.items[c].next;
+    }
+    return out;
+}
+
+/// `names` that also walks into `<section>`s.
+fn leafNames(d: &Dom, parent: int): string {
+    let out = "";
+    let c = d.nodes.items[parent].first;
+    while c >= 0 {
+        let s = "";
+        if d.nodes.items[c].tag == d.tag("p") {
+            s = d.textOf(d.nodes.items[d.nodes.items[c].last].first);
+        } else {
+            s = leafNames(d, c);
+        }
+        if s.len > 0 { out = if out.len == 0 { s } else { `{out},{s}` }; }
+        c = d.nodes.items[c].next;
+    }
+    return out;
+}
+
+/// The `<p>` rows under `parent` (skipping `<small>` markers), and whether each is the node it was first.
+fn pNames(d: &Dom, parent: int): string {
+    let out = "";
+    let c = d.nodes.items[parent].first;
+    while c >= 0 {
+        if d.nodes.items[c].tag == d.tag("p") {
+            let s = d.textOf(d.nodes.items[d.nodes.items[c].last].first);
+            out = if out.len == 0 { s } else { `{out},{s}` };
+        }
+        c = d.nodes.items[c].next;
+    }
+    return out;
+}
+
+/// "e" markers (even ids) sit right before their row, "t" (<h2>) markers (multiples of 3) right after.
+fn markersOk(d: &Dom, parent: int): bool {
+    let c = d.nodes.items[parent].first;
+    while c >= 0 {
+        if d.nodes.items[c].tag == d.tag("p") {
+            let s = d.textOf(d.nodes.items[d.nodes.items[c].last].first);
+            let id = 0;
+            for i in 0..s.len {
+                id = id * 10 + (s[i] - 48) as int;
+            }
+            let pv = d.nodes.items[c].prev;
+            let nx = d.nodes.items[c].next;
+            let wantE = id % 2 == 0;
+            let wantT = id % 3 == 0;
+            let hasE = pv >= 0 && d.nodes.items[pv].tag == d.tag("small");
+            let hasT = nx >= 0 && d.nodes.items[nx].tag == d.tag("h2");
+            if hasE != wantE || hasT != wantT {
+                return false;
+            }
+        }
+        c = d.nodes.items[c].next;
+    }
+    return true;
+}
+
+fn same(a: string, b: string): bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Every row in list 0 is the DOM node it had when first seen (the node moved, it wasn't rebuilt).
+fn nodesFollow(w: &World): bool {
+    let d = &w.root.dom;
+    let ok = true;
+    let c = d.nodes.items[list(d, 0)].first;
+    while c >= 0 {
+        let sp = d.nodes.items[c].last;
+        let s = d.textOf(d.nodes.items[sp].first);
+        let id = 0;
+        for i in 0..s.len {
+            id = id * 10 + (s[i] - 48) as int;
+        }
+        if w.node[id] != 0 && w.node[id] != c {
+            ok = false;
+        }
+        w.node[id] = c;
+        c = d.nodes.items[c].next;
+    }
+    return ok;
+}
+
+fn births(w: &World, a: int, b: int): bool {
+    let s = &w.state;
+    return s.birth[a] == b;
+}
+
+/// 10000 keyed rows (with optional marker nodes, so a row is a run of 1-3 nodes) shuffled in one frame:
+/// each row keeps its DOM node, the order follows, and the frame is fast (linear: was quadratic in the
+/// key match and in `keyBegin`'s run search).
+fn shuffle10k(w: &World) {
+    let s = &w.state;
+    let d = &w.root.dom;
+    let n = 10000;
+    let rows = range(w.mem, 0, n);
+    s.mixed = rows;
+    w.root.render(windowSize(), ScreenProps { state: s });
+    let before = w.mem.alloc::<int>(n);
+    let c = d.nodes.items[list(d, 3)].first;
+    let k = 0;
+    while c >= 0 {
+        if d.nodes.items[c].tag == d.tag("p") {
+            before[k] = c;
+            k += 1;
+        }
+        c = d.nodes.items[c].next;
+    }
+    check(w, k == n, "10000 keyed rows rendered");
+    let order = w.mem.alloc::<Item>(n);
+    for i in 0..n {
+        order[i] = rows[i];
+    }
+    let rng = Rng.new(777);
+    let i = n - 1;
+    while i > 0 {
+        let j = rng.intRange(0, i + 1);
+        let t = order[i];
+        order[i] = order[j];
+        order[j] = t;
+        i -= 1;
+    }
+    s.mixed = order;
+    let t0 = micros();
+    w.root.render(windowSize(), ScreenProps { state: s });
+    let us = micros() - t0;
+    printLn(`10000 keyed rows shuffled in one frame: {us} us`);
+    let ok = true;
+    c = d.nodes.items[list(d, 3)].first;
+    k = 0;
+    while c >= 0 {
+        if d.nodes.items[c].tag == d.tag("p") {
+            if k >= n || before[order[k].id] != c {
+                ok = false;
+            }
+            k += 1;
+        }
+        c = d.nodes.items[c].next;
+    }
+    check(w, ok && k == n, "10000 shuffled rows: every row kept its node, in the new order");
+    check(w, markersOk(d, list(d, 3)), "10000 shuffled rows: markers stay with their rows");
+    check(w, us < 500000, "10000-row shuffle frame is well under half a second");
+    s.mixed = w.mem.alloc::<Item>(0);
+}
+
+/// 10000 frames of insert-one-remove-one in a keyed list, and of replacing the groups (rows nested in
+/// rows) so the nested rows die with their parent. Row ids must be reused: the id table stops growing.
+/// Dead rows (struct and component state) are pooled, so the arena stops growing too.
+fn churn(w: &World) {
+    let s = &w.state;
+    let ra = w.mem.alloc::<Item>(5);
+    let gs = w.mem.alloc::<Group>(2);
+    for g in 0..2 {
+        gs[g] = Group { id: 0, rows: w.mem.alloc::<Item>(3) };
+    }
+    s.flag = false;
+    s.mixed = w.mem.alloc::<Item>(0);
+    s.extra = w.mem.alloc::<Item>(0);
+    s.cards = w.mem.alloc::<Item>(0);
+    s.outer = w.mem.alloc::<Group>(0);
+    let fa = w.mem.alloc::<Item>(3);
+    s.fades = fa;
+    s.rows = ra;
+    s.groups = gs;
+    let ids0 = w.root.dom.gpar.len;
+    for n in 0..10000 {
+        for i in 0..5 {
+            ra[i] = Item { id: 1000 + (n + i) % 3000, name: "x" };
+        }
+        for i in 0..3 {
+            fa[i] = Item { id: 2000 + (n + i) % 500, name: "f" };
+        }
+        for g in 0..2 {
+            gs[g].id = 5000 + n * 2 + g;
+            for i in 0..3 {
+                gs[g].rows[i] = Item { id: 100 + (n + i + g * 3) % 800, name: "x" };
+            }
+        }
+        w.root.render(windowSize(), ScreenProps { state: s });
+        if n == 200 {
+            w.used = w.mem.used;
+        }
+    }
+    // (a free list may still double its buffer once; before pooling this was about 8 MB)
+    check(w, w.mem.used - w.used < 1024, "10000 churned frames: dead rows are pooled, the arena stops growing");
+    check(w, w.root.dom.gpar.len - ids0 < 64, "10000 churned frames reuse row ids (fade ghosts included)");
+}
+
+fn draw(w: &World) {
+    let s = &w.state;
+    let d = &w.root.dom;
+    let f = w.frame;
+    if f == 0 {
+        s.rows = items(w.mem, "1,2,3,4,5");
+        s.groups = two(w.mem, group(1, items(w.mem, "11,12")), group(2, items(w.mem, "13")));
+        s.outer = two(w.mem, group(1, items(w.mem, "41,42")), group(2, items(w.mem, "43")));
+    } else if f == 2 {
+        s.rows = items(w.mem, "5,4,3,2,1");
+        s.groups = two(w.mem, group(2, items(w.mem, "13")), group(1, items(w.mem, "12,11")));
+    } else if f == 3 {
+        s.rows = items(w.mem, "5,3,1");
+    } else if f == 4 {
+        s.rows = items(w.mem, "5,9,3,7,1");
+    } else if f == 5 {
+        s.rows = items(w.mem, "");
+    } else if f == 6 {
+        s.rows = items(w.mem, "20,21");
+    } else if f == 7 {
+        s.rows = items(w.mem, "30,30,31");
+    } else if f == 9 {
+        s.rows = range(w.mem, 100, 1000);
+    } else if f == 13 {
+        s.rows = items(w.mem, "1");
+        s.mixed = items(w.mem, "1,2,3,4,6");
+        s.extra = items(w.mem, "200,201");
+        s.cards = items(w.mem, "300,301");
+        s.flag = true;
+    } else if f == 14 {
+        s.mixed = items(w.mem, "6,4,3,2,1");
+    } else if f == 15 {
+        s.flag = false;
+    } else if f == 16 {
+        s.flag = true;
+    } else if f == 17 {
+        s.cards = items(w.mem, "301,300");
+    } else if f == 18 {
+        s.fades = items(w.mem, "1,2,3");
+    } else if f == 19 {
+        s.fades = items(w.mem, "3,2,1");
+    } else if f == 20 {
+        s.fades = items(w.mem, "3,1");
+    }
+    w.root.render(windowSize(), ScreenProps { state: s });
+    w.root.render(windowSize(), ScreenProps { state: s });
+    if f == 0 {
+        check(w, s.mounts == 5 + 3 + 3 && s.destroys == 0, "first frame mounts every row once");
+        check(w, same(names(d, list(d, 0)), "1,2,3,4,5"), "rows in order");
+        check(w, nodesFollow(w), "record row nodes");
+        w.used = w.mem.used;
+    } else if f == 1 {
+        check(w, s.mounts == 11 && s.destroys == 0, "idle frame mounts and destroys nothing");
+        check(w, w.mem.used == w.used, "idle frame allocates nothing");
+    } else if f == 2 {
+        check(w, same(names(d, list(d, 0)), "5,4,3,2,1"), "reversed rows are in the new order");
+        check(w, s.mounts == 11 && s.destroys == 0, "reverse mounts and destroys nothing");
+        check(w, births(w, 1, 1) && births(w, 5, 5), "instance state follows the key through a reverse");
+        check(w, nodesFollow(w), "DOM nodes follow the key through a reverse");
+        check(w, births(w, 11, 6) && births(w, 12, 7) && births(w, 13, 8) && births(w, 43, 11), "nested keyed lists keep their rows");
+        check(w, same(leafNames(d, list(d, 1)), "13,12,11"), "groups reordered with their rows");
+    } else if f == 3 {
+        check(w, same(names(d, list(d, 0)), "5,3,1") && s.destroys == 2, "filtering destroys the dropped rows only");
+        check(w, births(w, 5, 5) && births(w, 3, 3) && births(w, 1, 1), "survivors keep their state");
+        check(w, nodesFollow(w), "DOM nodes follow the key through a filter");
+    } else if f == 4 {
+        check(w, same(names(d, list(d, 0)), "5,9,3,7,1") && s.mounts == 13, "insert mounts the new rows");
+        check(w, births(w, 5, 5) && births(w, 3, 3) && births(w, 1, 1) && births(w, 9, 12) && births(w, 7, 13), "old rows keep state, new ones are new");
+        check(w, nodesFollow(w), "DOM nodes follow the key through an insert");
+    } else if f == 5 {
+        check(w, same(names(d, list(d, 0)), "") && s.destroys == 7, "removing every row destroys them all");
+    } else if f == 6 {
+        check(w, same(names(d, list(d, 0)), "20,21") && s.mounts == 15, "all-new keys mount fresh rows");
+    } else if f == 7 {
+        check(w, same(names(d, list(d, 0)), "30,30,31") && s.mounts == 18, "duplicate keys still render every row");
+    } else if f == 8 {
+        check(w, s.mounts == 18 && s.destroys == 9, "duplicates are stable across frames");
+        check(w, same(leafNames(d, list(d, 2)), "41,42,43"), "unkeyed nested lists render");
+        w.used = w.mem.used;
+    } else if f == 10 {
+        check(w, nodesFollow(w) && w.state.rows.len == 1000, "1000 keyed rows");
+        w.used = w.mem.used;
+    } else if f == 12 {
+        check(w, w.mem.used == w.used, "1000 keyed rows: idle frames allocate nothing");
+    } else if f == 13 {
+        w.mark = s.mounts;
+        w.b200 = s.birth[200];
+        check(w, same(pNames(d, list(d, 3)), "1,2,3,4,6") && markersOk(d, list(d, 3)), "rows with optional markers before and after");
+        check(w, w.b200 > 0 && s.birth[300] > 0, "gated and slotted rows mounted");
+    } else if f == 14 {
+        check(w, same(pNames(d, list(d, 3)), "6,4,3,2,1") && markersOk(d, list(d, 3)), "markers stay with their rows through a reverse");
+    } else if f == 15 {
+        check(w, same(pNames(d, list(d, 4)), ""), "gated list is gone");
+        w.destroys0 = s.destroys;
+    } else if f == 16 {
+        check(w, s.mounts == w.mark + 2 && s.birth[200] != w.b200 && s.birth[200] > 0, "re-entering the {#if} mounts fresh rows");
+        check(w, same(names(d, list(d, 4)), "200,201"), "gated rows are back");
+        w.b300 = s.birth[300];
+    } else if f == 17 {
+        check(w, s.birth[300] == w.b300 && s.mounts == w.mark + 2, "rows in slot content follow the key");
+        check(w, same(leafNames(d, list(d, 5)), "301,300"), "slotted cards reversed");
+    } else if f == 18 {
+        check(w, d.ghosts == 0, "a new keyed row with transition:fade leaves no ghost");
+    } else if f == 19 {
+        check(w, same(pNames(d, list(d, 6)), "3,2,1") && d.ghosts == 0, "moving keyed rows leaves no leave ghosts");
+    } else if f == 20 {
+        check(w, d.ghosts == 1, "removing a keyed row leaves one fade ghost");
+    } else if f == 30 {
+        check(w, d.ghosts == 0, "the ghost is gone after its fade");
+        shuffle10k(w);
+        churn(w);
+        if w.fails == 0 {
+            printLn("all passed");
+        }
+        sys.exit(if w.fails == 0 { 0 } else { 1 });
+    }
+    rewindScratch();
+    w.frame += 1;
+}
+
+fn main() {
+    let app = App<World>.create("lists", 320, 240, boot);
+    app.useGl();
+    app.draw(draw);
+    app.run();
+}

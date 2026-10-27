@@ -144,6 +144,10 @@ fn expr(e: &Expr, out: &mut Vec<ScriptRef>) {
                 expr(arg, out);
             }
         }
+        ExprKind::UiChoice { value, index, .. } => {
+            expr(value, out);
+            expr(index, out);
+        }
         ExprKind::SliceFrom { ptr, len } => {
             expr(ptr, out);
             expr(len, out);

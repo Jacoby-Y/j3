@@ -140,7 +140,23 @@ pub fn check_files_lib(files: Vec<ParsedFile>) -> Result<Program, CheckError> {
     check_files_cfg(files, false)
 }
 
-fn check_files_cfg(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Program, CheckError> {
+fn check_files_cfg(files: Vec<ParsedFile>, require_main: bool) -> Result<Program, CheckError> {
+    // An error carries its module's path; for a span in a part file it names that file instead.
+    let mut seen = HashSet::new();
+    let part_paths: Vec<(FileId, String)> = files
+        .iter()
+        .filter(|f| !f.ast.is_script && !seen.insert(f.ast.module_key()))
+        .map(|f| (f.file_id, f.path.clone()))
+        .collect();
+    check_files_inner(files, require_main).map_err(|mut e| {
+        if let Some((_, path)) = part_paths.iter().find(|(id, _)| *id == e.span.file) {
+            e.path = path.clone();
+        }
+        e
+    })
+}
+
+fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Program, CheckError> {
     let t_all = std::time::Instant::now();
     script::prepare(&mut files)?;
     let mut cx = IrCx::new();
@@ -149,6 +165,15 @@ fn check_files_cfg(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Pro
     let mut mods: Vec<ModData> = Vec::new();
     for file in files {
         cx.add_file(file.file_id, file.path.clone(), file.src.clone());
+        // A part file (`ui/dom/*.j3` saying `module j3.ui.dom;`) adds its items to the module
+        // loaded just before it; its spans keep their own file id.
+        let key = file.ast.module_key();
+        if !file.ast.is_script {
+            if let Some(m) = mods.iter_mut().find(|m| m.key == key) {
+                m.ast.items.extend(file.ast.items);
+                continue;
+            }
+        }
         let mut names = Vec::new();
         for part in &file.ast.module {
             names.push(cx.intern_name(&part.name));
@@ -184,6 +209,7 @@ fn check_files_cfg(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Pro
     }
 
     crate::cli::timing("  check: setup", t_all);
+    crate::phase::detail("collecting names, types, functions");
     let t = std::time::Instant::now();
     for i in 0..mods.len() {
         collect_exports(&mut mods, i);
@@ -241,16 +267,21 @@ fn check_files_cfg(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Pro
     }
     let t = std::time::Instant::now();
     for i in 0..mods.len() {
+        crate::phase::detail(&format!("infer returns {}/{} {}", i + 1, mods.len(), mods[i].key));
         infer_omitted_rets(&mut cx, &mut mods, i)?;
     }
     crate::cli::timing("  check: infer rets", t);
 
     let t = std::time::Instant::now();
+    let shared = lower::shared(&mods);
     for i in 0..mods.len() {
-        lower::lower_module(&mut cx, &mut mods, i, main_id)?;
+        crate::phase::detail(&format!("lower {}/{} {}", i + 1, mods.len(), mods[i].key));
+        lower::lower_module(&mut cx, &mut mods, i, main_id, &shared)?;
     }
     crate::cli::timing("  check: lower", t);
 
+    crate::phase::detail("exports, docs, script aliases");
+    let t = std::time::Instant::now();
     let exports = program_exports(&cx, &mods);
     let const_docs = const_docs(&cx, &mods);
     let script_aliases = mods
@@ -273,10 +304,13 @@ fn check_files_cfg(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Pro
             })
         })
         .collect();
+    crate::cli::timing("  check: exports", t);
 
     let t = std::time::Instant::now();
     let mut modules = Vec::new();
-    for m in mods {
+    let total = mods.len();
+    for (n, m) in mods.into_iter().enumerate() {
+        crate::phase::detail(&format!("validate {}/{total} {}", n + 1, m.key));
         match validate_module(&cx, &m.ir) {
             Ok(()) => {}
             Err(e) => {
@@ -433,6 +467,10 @@ fn collect_consts(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Result<(), C
 
     for c in items {
         if matches!(c.value.kind, ExprKind::ScriptType(_)) {
+            continue;
+        }
+        // Array consts are read-only static data; `collect_globals` makes them.
+        if matches!(c.value.kind, ExprKind::ArrayLit { .. }) {
             continue;
         }
         if mods[i].consts.contains_key(&c.name.name) {
@@ -1182,7 +1220,6 @@ fn infer_omitted_rets(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Result<(
     }
 
     for (id, f) in pending {
-        let inferred = infer_fn_ret(cx, &f, &types, &funcs, &methods, &lib_ns, &consts, &path)?;
         let (params, old_ret) = match cx.fn_sig(cx.func(id).ty) {
             Some(s) => (s.0.clone(), s.1),
             None => {
@@ -1193,6 +1230,9 @@ fn infer_omitted_rets(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Result<(
                 ));
             }
         };
+        let inferred = infer_fn_ret(
+            cx, &f, &params, &types, &funcs, &methods, &lib_ns, &consts, &path,
+        )?;
         if inferred == old_ret {
             continue;
         }
@@ -1205,6 +1245,7 @@ fn infer_omitted_rets(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Result<(
 fn infer_fn_ret(
     cx: &IrCx,
     f: &FnItem,
+    params: &[Ty],
     types: &HashMap<String, Ty>,
     funcs: &HashMap<String, FuncId>,
     methods: &HashMap<(u32, String), FuncId>,
@@ -1213,11 +1254,9 @@ fn infer_fn_ret(
     path: &str,
 ) -> Result<Ty, CheckError> {
     let mut locals = HashMap::new();
-    for p in &f.params {
-        locals.insert(
-            p.name.name.clone(),
-            resolve_type_ref(cx, &p.ty, path, types)?,
-        );
+    // Signature collection already instantiated generic parameter types.
+    for (p, ty) in f.params.iter().zip(params) {
+        locals.insert(p.name.name.clone(), *ty);
     }
     let mut seen: Option<Ty> = None;
     collect_return_tys(
@@ -1499,6 +1538,7 @@ fn peek_ty(
             cx.common.int
         }),
         ExprKind::SizeOf(_) => Ok(cx.common.int),
+        ExprKind::UiChoice { .. } => Ok(cx.common.bool),
         ExprKind::SliceFrom { .. } => Err(CheckError::new(
             path,
             expr.span,
@@ -1689,16 +1729,42 @@ fn collect_globals(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Result<(), 
     let path = mods[i].path.clone();
     let names = mods[i].names.clone();
     let types = mods[i].types.clone();
-    let items: Vec<ModLetItem> = mods[i]
+    // `#[singleton] let` items, then `const NAME: [N]T = [..]` (read-only).
+    let mut items: Vec<(ModLetItem, bool)> = mods[i]
         .ast
         .items
         .iter()
         .filter_map(|it| match it {
-            Item::Let(l) => Some(l.clone()),
+            Item::Let(l) => Some((l.clone(), false)),
             _ => None,
         })
         .collect();
-    for l in items {
+    for it in &mods[i].ast.items {
+        if let Item::Const(c) = it {
+            if !matches!(c.value.kind, ExprKind::ArrayLit { .. }) {
+                continue;
+            }
+            let Some(ty) = &c.ty else {
+                return Err(CheckError::new(
+                    path.clone(),
+                    c.name.span,
+                    "array const needs a type: `const NAME: [N]T = [..];`",
+                ));
+            };
+            items.push((
+                ModLetItem {
+                    span: c.span,
+                    doc: c.doc.clone(),
+                    name: c.name.clone(),
+                    ty: ty.clone(),
+                    value: Some(c.value.clone()),
+                    thread: false,
+                },
+                true,
+            ));
+        }
+    }
+    for (l, readonly) in items {
         if mods[i].globals.contains_key(&l.name.name)
             || mods[i].funcs.contains_key(&l.name.name)
             || mods[i].consts.contains_key(&l.name.name)
@@ -1710,10 +1776,14 @@ fn collect_globals(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Result<(), 
             ));
         }
         let ty = resolve_type(cx, &l.ty, &path, &types)?;
+        if readonly && !matches!(cx.ty_kind(ty), TyKind::Array { .. }) {
+            return Err(CheckError::new(path.clone(), l.ty.span, "array const needs an array type `[N]T`"));
+        }
         let init = match &l.value {
             Some(v) => {
                 let folded = fold_global_init(cx, v, ty, &types, &mods[i].consts, &path)?;
-                if const_init_is_zero(&folded) {
+                // A read-only table stays real data even when all zero.
+                if !readonly && const_init_is_zero(&folded) {
                     None
                 } else {
                     Some(folded)
@@ -1731,6 +1801,7 @@ fn collect_globals(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Result<(), 
             span: l.span,
             init,
             thread: l.thread,
+            readonly,
         });
         mods[i].globals.insert(l.name.name, id);
         mods[i].ir.globals.push(id);
@@ -2264,6 +2335,17 @@ pub(crate) fn instantiate_struct(
     for (p, a) in temp.type_params.iter().zip(args.iter()) {
         subst.insert(p.name.clone(), *a);
     }
+    // Modules share an instance of the same declaration and type arguments.
+    // The declaration span distinguishes unrelated generics with the same name.
+    if let Some(index) = cx.structs().iter().position(|s| {
+        s.span == temp.span
+            && s.ty_args.len() == args.len()
+            && s.ty_args.iter().zip(&args).all(|((_, ty), arg)| ty == arg)
+    }) {
+        let id = StructId(index as u32);
+        env.struct_insts.insert(key, id);
+        return Ok(cx.ty_struct(id));
+    }
     // The generic's own module wins on a shared name (`Arena` in `arena.j3s`
     // must not replace `j3.memory.Arena` inside `List`).
     let mut merged_types = env
@@ -2603,6 +2685,25 @@ fn fold_global_init(
                 expr.span, expected, *v,
             )))
         }
+        ExprKind::Interpolate { .. } | ExprKind::String(_)
+            if matches!(cx.ty_kind(expected), TyKind::String) =>
+        {
+            let bytes = match &expr.kind {
+                ExprKind::String(b) => Some(b.clone()),
+                ExprKind::Interpolate { parts } => parts.iter().try_fold(Vec::new(), |mut acc, p| match p {
+                    parse::InterpPart::Lit(b) => {
+                        acc.extend_from_slice(b);
+                        Some(acc)
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            };
+            match bytes {
+                Some(b) => Ok(ConstInit::Scalar(Operand::bytes(expr.span, expected, &b))),
+                None => Err(CheckError::new(path, expr.span, "singleton init must be a constant")),
+            }
+        }
         ExprKind::Name(n) => match consts.get(&n.name) {
             Some(ConstVal {
                 kind: ConstPayload::Int(v),
@@ -2635,6 +2736,12 @@ fn fold_global_init(
                         expr.span, expected, neg as u64,
                     )))
                 }
+                crate::ir::operand::ConstKind::F32Bits(b) => Ok(ConstInit::Scalar(
+                    Operand::f32_const(expr.span, expected, -f32::from_bits(b)),
+                )),
+                crate::ir::operand::ConstKind::F64Bits(b) => Ok(ConstInit::Scalar(
+                    Operand::f64_const(expr.span, expected, -f64::from_bits(b)),
+                )),
                 _ => Err(CheckError::new(
                     path,
                     expr.span,
@@ -2686,7 +2793,7 @@ fn fold_global_init(
                 return Err(CheckError::new(
                     path,
                     expr.span,
-                    "singleton array length mismatch",
+                    format!("array length mismatch: the type has {len} elements, the literal has {}", elems.len()),
                 ));
             }
             let mut out = Vec::new();
@@ -2897,5 +3004,96 @@ fn eval_int(
             expr.span,
             "const initializer must be an integer expression",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generic_struct_instances_are_shared_across_modules() {
+        let sources = [
+            ("container", r#"
+module container;
+pub struct Box<T> {
+    value: T;
+    fn get(this: &Box<T>): T { return this.value; }
+}
+pub struct Item { value: int; }
+"#),
+            ("factory", r#"
+module factory;
+use container.{ Box, Item };
+pub fn make(): Box<Item> { return Box<Item> { value: Item { value: 42 } }; }
+"#),
+            ("consumer", r#"
+module consumer;
+use container.{ Box, Item };
+use factory.make;
+struct World { item: Box<Item>; }
+fn main() {
+    let world = World { item: make() };
+    let item = world.item.get();
+}
+"#),
+        ];
+        let files = sources.iter().enumerate().map(|(i, (name, src))| {
+            let file_id = FileId(i as u32 + 1);
+            ParsedFile {
+                path: format!("{name}.j3"),
+                src: src.to_string(),
+                ast: parse::parse(src, file_id).expect("parse cross-module generic"),
+                file_id,
+            }
+        }).collect();
+        let prog = check_files(files).expect("share generic instances across modules");
+        assert_eq!(prog.cx.structs().iter().filter(|s| !s.ty_args.is_empty()).count(), 1);
+    }
+
+    #[test]
+    fn omitted_returns_use_instantiated_parameter_types() {
+        let src = r#"
+module test;
+
+struct Box<T> { value: T; }
+
+fn clear(box: &Box<int>) { box.value = 0; }
+fn value(box: &Box<int>) { return box.value; }
+fn identity(box: &Box<int>) { return box; }
+
+struct Reader {
+    fn read(this: &Reader, box: &Box<int>) { return box.value; }
+}
+
+fn main() {
+    let box = Box<int> { value: 42 };
+    let reader = Reader {};
+    let n = value(&box);
+    let m = reader.read(&box);
+    let alias = identity(&box);
+    clear(alias);
+}
+"#;
+        let file_id = FileId(1);
+        let ast = parse::parse(src, file_id).expect("parse generic parameters");
+        let prog = check_files(vec![ParsedFile {
+            path: "test.j3".to_string(),
+            src: src.to_string(),
+            ast,
+            file_id,
+        }])
+        .expect("infer returns with generic parameters");
+        for id in &prog.modules[0].funcs {
+            let f = prog.cx.func(*id);
+            let name = prog.cx.name_str(f.name);
+            let (params, ret) = prog.cx.fn_sig(f.ty).expect("function signature");
+            match name {
+                "clear" => assert_eq!(ret, prog.cx.common.void),
+                "value" | "read" => assert_eq!(ret, prog.cx.common.int),
+                "identity" => assert_eq!(ret, params[0]),
+                _ => {}
+            }
+        }
     }
 }

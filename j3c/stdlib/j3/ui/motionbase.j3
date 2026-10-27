@@ -1,0 +1,401 @@
+/// Shared by `j3.ui.motion` (transitions, the per-frame step) and `j3.ui.motionkf` (`@keyframes` animations): the `Motion` state of a node, the
+/// blendable channels (`transform` and its parts past `NPROPS`), blending two values, and the overlay style the blends are written into.
+
+module j3.ui.motionbase;
+
+use j3.ui.xform;
+use j3.ui.xform.{ REC, XI, XN };
+use j3.ui.anim;
+use j3.ui.anim.{ SH, SH_MAX };
+use j3.ui.gradmix;
+use j3.ui.css.{ lenToPx, V_EM, V_REM, V_PCT, P_FONT_SIZE, animAt, animCount, animKind, transCount, transDelay, transEase, Css, Frame, Keyframes, MAX_ANIM, Value };
+use j3.ui.cssmatch.{ stopValue, varValue };
+use j3.ui.cssprop.calcProp;
+use j3.ui.csscalc.{ O_ADD, O_PCT, O_PX };
+use j3.ui.css.{ CK_COLOR, CK_GRAD, CK_LEN, CK_NONE, CK_NUM, CK_SHADOW, CK_VAR, CK_XFORM, NPROPS, VBASE };
+use j3.ui.css.{ P_ANIM_DELAY, P_ANIM_DIR, P_ANIM_DUR, P_ANIM_EASE, P_ANIM_FILL, P_ANIM_ITER, P_ANIM_NAME };
+use j3.ui.css.{ P_LETTER_SPACING, P_WORD_SPACING, P_DEFER, P_BG_IMAGE, P_BORDER_IMAGE, P_BOX_SHADOW, P_COLOR, P_FLEX, P_OPACITY, P_RADIUS_TL, P_TRANS0, P_TRANSFORM, P_TRANSLATE, P_SCALE };
+use j3.ui.css.{ V_ANG, V_ANIM, V_CALC, V_UNSET, V_COLOR, V_CURRENT, V_EASE, V_GRAD, V_NONE, V_NUM, V_PX, V_SHADOW, V_TRANS, V_XFORM };
+
+/// `step` result bits: something is still moving; a layout property changed.
+pub const STEP_LIVE: int = 1;
+pub const STEP_LAYOUT: int = 2;
+
+/// Tracks (transitions in flight) one node can run at once; more are dropped.
+pub const MAXT: int = 16;
+/// Custom properties one node animates at once (derived ones come after them, up to twice as many).
+pub const MAXV: int = 8;
+/// Floats of one shadow list: count plus `SH_MAX` shadows.
+pub const SHN: int = 37;
+
+/// Motion state of one node.
+pub struct Motion {
+    /// Tracks in flight, and per track: channel, start (after the delay), duration, `Css.eases` index,
+    /// and the values it blends between.
+    n: int;
+    p: [16]int;
+    t0: [16]f32;
+    dur: [16]f32;
+    ez: [16]int;
+    from: [16]Value;
+    to: [16]Value;
+    /// Shadow track endpoints (`[n, shadows...]`); the track's `from`/`to` are markers.
+    sf: [37]f32;
+    sto: [37]f32;
+    /// The running `@keyframes` of each animation slot (`animation-name` entry; `kname` interned, -1 none; `kf` the
+    /// index in `Css.kfs`, -1 when not running), when it started, and whether it only holds its final frame
+    /// (`animation-fill-mode: forwards`). A slot keeps its timeline while its name stays in the list.
+    kf: [4]int;
+    kname: [4]int;
+    kt0: [4]f32;
+    kheld: [4]bool;
+    /// The animation ran to its end (it does not restart until its name changes).
+    kfin: [4]bool;
+    /// Scratch `calc()` programs (`mixCalc`) for the lengths a keyframe mixes between px and `%`: the channel + 1 and offset in `Css.paints`.
+    cc: [8]int;
+    co: [8]int;
+    /// Overlay style id and the offset of its floats in `Css.paints` (`xform` at `pa`, a shadow at
+    /// `pa + 4`); -1 before the first use.
+    ov: int;
+    pa: int;
+    /// Gradient scratch in `Css.paints`, four ints per gradient channel (background, border image,
+    /// mask): output offset and capacity, snapshot offset and capacity. Grown on demand, never per frame.
+    g: [12]int;
+    /// Custom properties being animated this frame (`put` on a `VBASE` channel): interned names, current values, and the values
+    /// the node's computed style has for them (`motion.applyVars`). `vprev` was `vn` last frame.
+    vn: int;
+    vprev: int;
+    vname: [16]int;
+    vval: [16]Value;
+    vbase: [16]Value;
+    /// `vn` animated properties, then derived ones (`--b: var(--a)`, `cssvars.rederive`): `vt` in all. What descendants follow.
+    vt: int;
+    /// The scratch custom property set the overlay is rebuilt under (`cssmatch.scratchSet`, -1 none) and its capacity, and the
+    /// scratch region in `Css.paints` (offset, capacity) that gradients and the like rebuilt from `var()` are copied to.
+    vset: int;
+    vcap: int;
+    vp: int;
+    vpc: int;
+    /// This node follows an ancestor's animated custom property (its overlay is rebuilt each frame by `Dom.followVars`), and
+    /// this node's animated custom property has followers.
+    vf: bool;
+    vdesc: bool;
+    /// The computed style the overlay of a follower was copied from.
+    vfst: int;
+    /// Some track or running `@keyframes` of this Motion moves `letter-spacing` or `word-spacing` (`Dom.spMo` counts these).
+    sp: bool;
+}
+
+pub fn zeroValue(): Value {
+    return Value { kind: V_NONE, f: 0.0, i: 0, c: 0 };
+}
+
+// ---- channels -----------------------------------------------------------------------------------------
+
+/// The property of channel `cp`: the transform channels (`NPROPS` + 0 to 3) stand for `transform`, `translate`, `rotate`, `scale`.
+pub fn realProp(cp: int): int {
+    if cp >= VBASE {
+        return cp - 4;
+    }
+    if cp >= NPROPS {
+        return xprop(cp - NPROPS);
+    }
+    return cp;
+}
+
+pub fn xprop(j: int): int {
+    if j == 0 {
+        return P_TRANSFORM;
+    }
+    return P_TRANSLATE + j - 1;
+}
+
+/// True for the four transform properties (animated through the channels past `NPROPS`).
+pub fn isXProp(p: int): bool {
+    return p == P_TRANSFORM || (p >= P_TRANSLATE && p <= P_SCALE);
+}
+
+/// Where channel `cp`'s blend is written in `Css.paints` (`XN` floats for `transform`, `XI` for the single-function ones),
+/// and where a retargeted transition keeps the blend it starts from.
+pub fn outOff(m: &Motion, cp: int): int {
+    if cp == NPROPS {
+        return m.pa;
+    }
+    return m.pa + 2 * XN + SHN + (cp - NPROPS - 1) * 2 * XI;
+}
+
+pub fn snapOff(m: &Motion, cp: int): int {
+    if cp == NPROPS {
+        return m.pa + XN + SHN;
+    }
+    return outOff(m, cp) + XI;
+}
+
+/// Properties whose change moves boxes.
+pub fn layoutProp(cp: int): bool {
+    let k = animKind(realProp(cp));
+    return (k == CK_LEN && !(cp >= P_RADIUS_TL && cp < P_RADIUS_TL + 4)) || cp == P_FLEX;
+}
+
+pub fn kindOf(cp: int): int {
+    if cp >= VBASE {
+        return CK_VAR;
+    }
+    if cp >= NPROPS {
+        return CK_XFORM;
+    }
+    return animKind(cp);
+}
+
+pub fn num(f: f32): Value {
+    return Value { kind: V_NUM, f: f, i: 0, c: 0 };
+}
+
+/// Packed color of `prop` in `st` as a `V_COLOR` (`currentcolor` and unset resolved).
+pub fn colorVal(css: &Css, st: int, prop: int): Value {
+    let v = css.get(st, prop);
+    if v.kind == V_CURRENT {
+        v = css.get(st, P_COLOR);
+        if v.kind != V_COLOR {
+            v = Value { kind: V_COLOR, f: 0.0, i: 0, c: 255 };
+        }
+    }
+    if v.kind != V_COLOR {
+        v = Value { kind: V_COLOR, f: 0.0, i: 0, c: 0 };
+    }
+    return v;
+}
+
+/// The list offset of a `transform` value in `Css.paints` (-1 for none).
+pub fn xoff(v: Value): int {
+    if v.kind != V_XFORM {
+        return -1;
+    }
+    return v.i;
+}
+
+/// `v`, a declared value of channel `cp`, as that channel's blendable form.
+pub fn chanOf(css: &Css, v: Value, st: int, cp: int): Value {
+    if cp >= VBASE {
+        return v;
+    }
+    if animKind(cp) == CK_COLOR {
+        if v.kind == V_CURRENT {
+            return colorVal(css, st, cp);
+        }
+        if v.kind != V_COLOR {
+            return colorVal(css, st, cp);
+        }
+    }
+    if v.kind == V_EM || v.kind == V_REM || (v.kind == V_XFORM && v.c != 0) {
+        return lenToPx(css, v, css.get(st, P_FONT_SIZE).f);
+    }
+    return v;
+}
+
+/// The value of channel `cp` in computed style `st`.
+pub fn chanVal(css: &Css, st: int, cp: int): Value {
+    if cp >= VBASE {
+        return varValue(css, css.varsOf(st), cp - VBASE);
+    }
+    if cp >= NPROPS {
+        return css.get(st, realProp(cp));
+    }
+    if animKind(cp) == CK_COLOR {
+        return colorVal(css, st, cp);
+    }
+    return css.get(st, cp);
+}
+
+pub fn sameVal(css: &Css, cp: int, a: Value, b: Value): bool {
+    if kindOf(cp) == CK_XFORM {
+        return xform.same(css.paints.items, xoff(a), xoff(b));
+    }
+    return a.kind == b.kind && a.f == b.f && a.i == b.i && a.c == b.c;
+}
+
+/// True when `a` and `b` can blend (px to px, number to number, colors, shadows).
+pub fn blendable(css: &Css, cp: int, a: Value, b: Value): bool {
+    let k = kindOf(cp);
+    if k == CK_VAR {
+        return a.kind == b.kind && (a.kind == V_COLOR || a.kind == V_NUM || a.kind == V_PX || a.kind == V_PCT || a.kind == V_ANG);
+    }
+    if k == CK_GRAD {
+        return a.kind == V_GRAD && b.kind == V_GRAD && gradmix.compatible(css.paints.items, a.i, b.i);
+    }
+    if k == CK_LEN {
+        return a.kind == V_PX && b.kind == V_PX;
+    }
+    if k == CK_NUM {
+        return a.kind == V_NUM && b.kind == V_NUM;
+    }
+    if k == CK_XFORM {
+        return true;
+    }
+    if k == CK_SHADOW {
+        return (a.kind == V_SHADOW || a.kind == V_NONE) && (b.kind == V_SHADOW || b.kind == V_NONE);
+    }
+    return k == CK_COLOR;
+}
+
+/// `a` to `b` at curve value `e` for a number, length, or color channel.
+pub fn mixVal(cp: int, a: Value, b: Value, e: f32): Value {
+    let k = kindOf(cp);
+    if k == CK_VAR {
+        if a.kind == V_COLOR {
+            return Value { kind: V_COLOR, f: 0.0, i: 0, c: anim.mixColor(a.c, b.c, e) };
+        }
+        return Value { kind: a.kind, f: anim.mix(a.f, b.f, e), i: 0, c: 0 };
+    }
+    if k == CK_COLOR {
+        return Value { kind: V_COLOR, f: 0.0, i: 0, c: anim.mixColor(a.c, b.c, e) };
+    }
+    let f = anim.mix(a.f, b.f, e);
+    if k == CK_NUM {
+        if cp == P_OPACITY {
+            if f < 0.0 { f = 0.0; }
+            if f > 1.0 { f = 1.0; }
+        }
+        return num(f);
+    }
+    // lengths: only margins, insets and text spacing may go negative
+    if f < 0.0 && !(cp >= 2 && cp <= 5) && !(cp >= 20 && cp <= 23) && cp != P_LETTER_SPACING && cp != P_WORD_SPACING {
+        f = 0.0;
+    }
+    return Value { kind: V_PX, f: f, i: 0, c: 0 };
+}
+
+/// Gradient scratch slot of channel `cp`.
+pub fn gslot(cp: int): int {
+    if cp == P_BG_IMAGE {
+        return 0;
+    }
+    if cp == P_BORDER_IMAGE {
+        return 4;
+    }
+    return 8;
+}
+
+/// Offset in `Css.paints` of a region of `n` floats for channel `cp` (`snap` 0: the blend output, 2:
+/// the snapshot a retargeted transition starts from); it only grows, so a steady animation allocates nothing.
+pub fn gradRegion(m: &Motion, css: &Css, cp: int, snap: int, n: int): int {
+    let q = gslot(cp) + snap;
+    if m.g[q + 1] < n {
+        m.g[q] = css.paints.len;
+        m.g[q + 1] = n;
+        for z in 0..n {
+            css.paints.push(0.0);
+        }
+    }
+    return m.g[q];
+}
+
+/// Blend gradient values `a` to `b` at `e` into channel `cp`'s output region.
+pub fn mixGrad(m: &Motion, css: &Css, cp: int, a: Value, b: Value, e: f32): Value {
+    let o = gradRegion(m, css, cp, 0, gradmix.mixSize(css.paints.items, a.i, b.i));
+    gradmix.mix(css.paints.items, a.i, b.i, e, o);
+    return Value { kind: V_GRAD, f: 0.0, i: o, c: 0 };
+}
+
+/// Copy the gradient just blended for `cp` to its snapshot region (the output is rewritten next frame).
+pub fn snapGrad(m: &Motion, css: &Css, cp: int, v: Value): Value {
+    let n = gradmix.size(css.paints.items, v.i);
+    let o = gradRegion(m, css, cp, 2, n);
+    let a = css.paints.items;
+    for q in 0..n {
+        a[o + q] = a[v.i + q];
+    }
+    return Value { kind: V_GRAD, f: 0.0, i: o, c: 0 };
+}
+
+/// `mixVal` for every channel kind (gradients need the Motion's scratch region).
+pub fn mixOut(m: &Motion, css: &Css, cp: int, a: Value, b: Value, e: f32): Value {
+    if kindOf(cp) == CK_XFORM {
+        let o = outOff(m, cp);
+        xform.mix(css.paints.items, xoff(a), xoff(b), e, css.paints.items, o);
+        return Value { kind: V_XFORM, f: 0.0, i: o, c: 0 };
+    }
+    if kindOf(cp) == CK_GRAD {
+        return mixGrad(m, css, cp, a, b, e);
+    }
+    return mixVal(cp, a, b, e);
+}
+
+/// Put `v` into the overlay as the value of channel `cp`.
+pub fn put(m: &Motion, css: &Css, cp: int, v: Value) {
+    if cp >= VBASE {
+        for i in 0..m.vn {
+            if m.vname[i] == cp - VBASE {
+                m.vval[i] = v;
+                return;
+            }
+        }
+        if m.vn < MAXV {
+            m.vname[m.vn] = cp - VBASE;
+            m.vval[m.vn] = v;
+            m.vn += 1;
+        }
+        return;
+    }
+    if cp >= NPROPS {
+        css.vals.items[m.ov * NPROPS + realProp(cp)] = v;
+        return;
+    }
+    css.vals.items[m.ov * NPROPS + cp] = v;
+}
+
+/// Load a shadow list value (`V_SHADOW` or none) into `out` as `[n, shadows...]`.
+pub fn loadShadow(css: &Css, v: Value, out: []f32) {
+    out[0] = 0.0;
+    if v.kind != V_SHADOW {
+        return;
+    }
+    let a = css.paints.items;
+    let n = int(a[v.i]);
+    if n > SH_MAX {
+        n = SH_MAX;
+    }
+    out[0] = f32(n);
+    for q in 0..n * SH {
+        out[1 + q] = a[v.i + 1 + q];
+    }
+}
+
+/// Write the shadow list in `src` into the overlay.
+pub fn putShadow(m: &Motion, css: &Css, src: []f32, len: int) {
+    for q in 0..len {
+        css.paints.items[m.pa + XN + q] = src[q];
+    }
+    css.vals.items[m.ov * NPROPS + P_BOX_SHADOW] = Value { kind: V_SHADOW, f: 0.0, i: m.pa + XN, c: 0 };
+}
+
+// ---- overlay --------------------------------------------------------------------------------------------
+
+/// Make the overlay style on first use.
+pub fn ensureOverlay(m: &Motion, css: &Css) {
+    if m.ov >= 0 {
+        return;
+    }
+    m.ov = css.nstyles;
+    for q in 0..NPROPS {
+        css.vals.push(zeroValue());
+    }
+    css.nstyles += 1;
+    m.pa = css.paints.len;
+    for q in 0..(2 * XN + SHN + 6 * XI) {
+        css.paints.push(0.0);
+    }
+}
+
+/// Copy the computed style `tst` into the overlay (its animated values are rewritten by `step`).
+pub fn refresh(m: &Motion, css: &Css, tst: int) {
+    ensureOverlay(m, css);
+    for q in 0..NPROPS {
+        css.vals.items[m.ov * NPROPS + q] = css.vals.items[tst * NPROPS + q];
+    }
+}
+
+pub fn curve(css: &Css, ez: int, u: f32): f32 {
+    return anim.ease(&css.eases.items[ez], u);
+}
+

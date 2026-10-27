@@ -1,0 +1,1713 @@
+/// CSS subset for `.j3ui` components: parse at startup, match selectors against a node table,
+/// compute styles with the cascade. What is supported, in task form: `j3c doc css`.
+/// No GL, no window: any thread may use a `Css` it owns (`j3c doc threads`).
+///
+/// ```
+/// let css = Css.new(&mem);
+/// parse(&css, themeSrc, "ui/theme.css", 0);         // scope 0 = global
+/// parse(&css, cardSrc, "ui/BallCard.j3ui", 3);      // scope = component id
+/// let nodes = mem.alloc::<MatchNode>(n);            // stage 04 fills one per element
+/// let s = computeStyle(&css, nodes, id, parentStyle); // parentStyle -1 for the root
+/// let w = css.get(s, P_WIDTH);                      // a typed Value
+/// ```
+///
+/// Motion: `transform`, `transition`, `animation*`, `@keyframes`, easing functions (see `j3.ui.anim`, `j3.ui.motion`).
+/// `backdrop-filter: none | blur(Npx)` (or `blur(0)`) blurs previously painted pixels under a box,
+/// before its background and content. N is nonnegative Gaussian sigma; painting clamps it to 64.
+/// GL only, non-inherited, initially none; backdrop chains and custom-property filter values are unsupported.
+///
+/// Supported: selectors `*` tag `.class` `tag.class` descendant (space) child (`>`) `:hover` `:active` `:focus` `:focus-visible` `:focus-within`
+/// `:dragging` `:drop-target` `:disabled` `:first-child` `:last-child` `:nth-child(An+B)` `:nth-last-child()` `:only-child` `:*-of-type` `:empty` `:checked` `:enabled` `:placeholder-shown` `:not(a, .b)` `:root` `[type="x"]`; `@font-face` (`font-family`, `src: url()`);
+/// every property in `j3c doc css`, as typed `Value`s. Shorthands (`padding` `margin` `inset`
+/// `border` `border-left` ... `border-color` `border-radius` `gap` `font: inherit` `background`
+/// `grid-template-columns` `transition` `transform` `animation`) expand to the longhand `P_*` ids at parse
+/// time. `var(--x)` and `var(--x, fallback)` read a custom property declared on any selector and
+/// inherited down the tree; resolved in `computeStyle`, so re-parsing a changed theme and
+/// recomputing updates everything. A custom value is one color, length, number, time, or a `var()`
+/// (which may name other custom properties of the same element, in any order; cycles are invalid).
+/// An undefined or invalid `var()` without fallback leaves the property unset (inherited or initial).
+/// Nesting (`.a { &:hover {} .b {} > c {} @media (...) {} }`): `cssparse` joins each nested selector with its parent's text into a flat rule
+/// (specificity of the joined selector, not `:is()` of the parent list; text joins live in `cssnest`); a nested `@media` ANDs with the enclosing one (`Media.and`).
+/// Not supported (warns,
+/// the declaration or rule is skipped): `!important`, media features other than width, height, `prefers-reduced-motion` and `prefers-color-scheme`,
+/// other at-rules, `+` `~`, `#id`, pseudo-elements, units other than `px` `%` `ms` `s` `fr` `em` `rem` `vw` `vh`
+/// `vmin` `vmax` (`calc()` and friends: `V_CALC`).
+///
+/// Warnings: `css.warns` holds `Warning { file, line, col, msg }`. A bad declaration warns at its
+/// property name and parsing continues with the next one (like a browser); a bad selector drops
+/// its rule. Unknown properties warn.
+///
+/// Cascade: matched rules apply in ascending (specificity, source order). Specificity is
+/// `a*10000 + b*100 + c`; there are no ids so `a` is 0. Source order is parse order across all
+/// sheets, so parse the global sheet first.
+///
+/// Scoping (the Svelte rule): a rule from a sheet parsed with `scope != 0` matches only nodes
+/// whose `scope` equals it, and its specificity gets one extra class (`0,1,0`), so it beats a
+/// global rule of the same shape. With a descendant selector only the rightmost compound must
+/// match the scope; ancestors may belong to any component. That is how a Svelte child component
+/// is styled by its own rules and still sits inside its parent's tree.
+///
+/// Boxes: `aspect-ratio`, `outline-*` (a ring outside the border box, no layout space), `margin: auto` (layout reads it, see `dom.autoM`).
+///
+/// Text properties: `white-space` (normal nowrap pre-line pre pre-wrap), `text-overflow` (clip ellipsis),
+/// `overflow-wrap` / `word-wrap` (normal break-word anywhere), `text-shadow` (the `box-shadow` list),
+/// `-webkit-text-stroke` (shorthand of `text-stroke-width` and `text-stroke-color`), `background-clip`
+/// (border-box text; also `-webkit-background-clip`), and `overflow: x [y]` (`overflow-x`, `overflow-y`).
+///
+/// Inheritance: `color`, `font-size`, `font-weight`, `font-family`, `text-align`, `line-height`,
+/// `visibility`, `accent-color`, `white-space`, `overflow-wrap`, `text-shadow`, `text-stroke-*`, `text-decoration-line`, `font-style`, `font-variant-numeric`, `letter-spacing`, `word-spacing`, `text-transform`, `text-indent`, `cursor` inherit; everything else starts from its initial value. `inherit`, `initial`, `unset`, `revert` (and `revert-layer`, the same) work on any
+/// property, a shorthand and `all` (not in `@keyframes`). `revert` returns to the tag defaults, else `unset`. Computed styles are shared: styles with the same matched rules and parent style are
+/// one id (`computeStyle` caches on that), so a thousand identical cards cost one style.
+///
+/// Starting values (CSS initial values, no browser defaults; stage 04 decides block vs inline
+/// for an element with no `display`, since the initial value here is `inline`):
+///   display inline | position static | left right top bottom auto | flex-direction row
+///   flex 0 | gap row-gap 0px | justify-content flex-start | align-items stretch
+///   width height min-width min-height auto | padding margin 0px | box-sizing content-box
+///   overflow-y visible | background transparent | color black | border widths 0px
+///   border colors currentcolor | radii 0px | opacity 1 | font-size 16px | font-weight 400
+///   font-family default font (`V_STR` with `i = -1`) | text-align left | line-height auto
+///   accent-color auto | transform none | grid tracks none, repeat 1 | transitions none
+///
+/// Untested in a real game (goldens and `stdlib/tests/css_test.j3` only).
+
+module j3.ui.css;
+
+use j3.memory.{ Arena, List };
+use j3.text.{ Text, same };
+use j3.ui.anim.{ Ease, NPRESET, preset, steps };
+
+/// `Value.kind`: not set.
+pub const V_UNSET: int = 0;
+
+/// Length in px: `f`.
+pub const V_PX: int = 1;
+
+/// Percentage: `f` (50 is 50%).
+pub const V_PCT: int = 2;
+
+/// `auto` (also `normal` for line-height).
+pub const V_AUTO: int = 3;
+
+/// `none`.
+pub const V_NONE: int = 4;
+
+/// Unitless number: `f`.
+pub const V_NUM: int = 5;
+
+/// Color: `c` is `r*16777216 + g*65536 + b*256 + a`, each 0 to 255.
+pub const V_COLOR: int = 6;
+
+/// Keyword: `i` is the index in that property's keyword list (the `DISPLAY_*` ... constants).
+pub const V_KW: int = 7;
+
+/// One transition: `i` is the first longhand id, `f` the duration in ms, `c` packs how many longhands
+/// it covers (`border-color` is 4), its timing function and its delay (`transCount`, `transEase`,
+/// `transDelay`).
+pub const V_TRANS: int = 8;
+
+/// `transform`: `i` is the offset in `Css.paints` of `[translateX, translateY, rotate (radians), scale]`.
+pub const V_XFORM: int = 9;
+
+/// Grid track in `fr`: `f`.
+pub const V_FR: int = 10;
+
+/// Font family: `i` is the interned name, -1 for the default font.
+pub const V_STR: int = 11;
+
+/// `var(--name)` waiting for `computeStyle`: `i` is the interned custom property name.
+pub const V_VAR: int = 12;
+
+/// `inherit`.
+pub const V_INHERIT: int = 13;
+
+/// `currentcolor`.
+pub const V_CURRENT: int = 14;
+
+/// Background layers (gradients): `i` is the offset in `Css.paints` of `[nlayers, layers...]`, each
+/// layer `[type, angle in degrees, nstops, stops...]` (type 0 linear, 1 radial, 2 conic; a stop
+/// is `at r g b a`). The first layer is painted on top.
+pub const V_GRAD: int = 15;
+
+/// Box shadows: `i` is the offset in `Css.paints` of `[n, shadows...]`, each shadow
+/// `[inset, x, y, blur, spread, r, g, b, a]`. The first shadow is painted on top.
+pub const V_SHADOW: int = 16;
+
+/// A timing function: `i` is the index in `Css.eases`.
+pub const V_EASE: int = 17;
+
+/// `animation-name`: `i` is the interned `@keyframes` name.
+pub const V_ANIM: int = 18;
+
+/// `url("path")`: `i` is the interned path (`Css.name`). `background-image` and `border-image-source`.
+pub const V_URL: int = 19;
+
+/// A small list of numbers: `i` is the offset in `Css.paints` (the layout depends on the property).
+pub const V_LIST: int = 20;
+
+/// A length from `calc()`, `min()`, `max()`, `clamp()` or `vw`/`vh`/`vmin`/`vmax`: `i` is the offset in
+/// `Css.paints` and `c` the op count of a program `j3.ui.csscalc` evaluates at layout time. Only on
+/// sizes, insets, margins, padding and gaps; `dom` reads it through `lenOf`.
+pub const V_CALC: int = 21;
+
+/// `em` / `rem` length, `f` in em. Only between parse and `computeStyle`, which turns it into `V_PX`
+/// (`em` of the element's own `font-size`, of the parent's for `font-size` itself; `rem` of the root's).
+pub const V_EM: int = 22;
+pub const V_REM: int = 23;
+
+/// An angle in degrees (`f`), only as the value of a custom property (`--a: 90deg`); a property that takes an angle gets a `V_NUM`.
+pub const V_ANG: int = 24;
+
+/// The CSS-wide keywords `initial`, `unset` and `revert` (`revert-layer` too), only between parse and the cascade
+/// (`cssmatch.declValue` replaces them; `inherit` is `V_INHERIT`).
+pub const V_INITIAL: int = 25;
+pub const V_UNSETKW: int = 26;
+pub const V_REVERT: int = 27;
+
+/// A typed property value. Which fields matter depends on `kind`.
+pub struct Value {
+    kind: int;
+    f: f32;
+    i: int;
+    c: int;
+}
+
+pub const P_DISPLAY: int = 0;
+
+pub const P_POSITION: int = 1;
+
+pub const P_LEFT: int = 2;
+
+pub const P_RIGHT: int = 3;
+
+pub const P_TOP: int = 4;
+
+pub const P_BOTTOM: int = 5;
+
+pub const P_FLEX_DIRECTION: int = 6;
+
+/// `flex: n` is the grow factor (`V_NUM`).
+pub const P_FLEX: int = 7;
+
+/// Column gap (`gap` sets this and `P_ROW_GAP`).
+pub const P_GAP: int = 8;
+
+pub const P_ROW_GAP: int = 9;
+
+pub const P_JUSTIFY_CONTENT: int = 10;
+
+pub const P_ALIGN_ITEMS: int = 11;
+
+pub const P_WIDTH: int = 12;
+
+pub const P_HEIGHT: int = 13;
+
+pub const P_MIN_WIDTH: int = 14;
+
+pub const P_MIN_HEIGHT: int = 15;
+
+/// Padding top, right, bottom, left are `P_PADDING_TOP + 0..3`.
+pub const P_PADDING_TOP: int = 16;
+
+/// Margin top, right, bottom, left are `P_MARGIN_TOP + 0..3`.
+pub const P_MARGIN_TOP: int = 20;
+
+pub const P_BOX_SIZING: int = 24;
+
+pub const P_OVERFLOW_Y: int = 25;
+
+pub const P_BACKGROUND: int = 26;
+
+pub const P_COLOR: int = 27;
+
+/// Border widths top, right, bottom, left are `P_BORDER_TOP_WIDTH + 0..3`.
+pub const P_BORDER_TOP_WIDTH: int = 28;
+
+/// Border colors top, right, bottom, left are `P_BORDER_TOP_COLOR + 0..3`.
+pub const P_BORDER_TOP_COLOR: int = 32;
+
+/// Radii top-left, top-right, bottom-right, bottom-left are `P_RADIUS_TL + 0..3`.
+pub const P_RADIUS_TL: int = 36;
+
+pub const P_OPACITY: int = 40;
+
+pub const P_FONT_SIZE: int = 41;
+
+/// Weight as a number: `bold` is 700, `normal` 400.
+pub const P_FONT_WEIGHT: int = 42;
+
+pub const P_FONT_FAMILY: int = 43;
+
+pub const P_TEXT_ALIGN: int = 44;
+
+/// `V_NUM` (multiplier), `V_PX`, or `V_AUTO` for `normal`.
+pub const P_LINE_HEIGHT: int = 45;
+
+pub const P_ACCENT_COLOR: int = 46;
+
+/// `V_XFORM` or `V_NONE`.
+pub const P_TRANSFORM: int = 47;
+
+/// `grid-template-columns` (`P_GRID_COL0`), `grid-template-rows`, `grid-auto-columns`, `grid-auto-rows`: one `V_LIST`
+/// each (else `V_NONE`) at `i` = offset in `Css.paints` of `[fill, n, tracks...]`. `fill` 0 is a plain list, 1 is
+/// `repeat(auto-fill, ...)`, 2 `auto-fit`; `n` tracks (`MAX_TRACKS`) of four numbers `[minKind, min, maxKind, max]`
+/// (kinds `V_PX` `V_PCT` `V_AUTO` `V_FR`, `V_EM`/`V_REM` resolved at layout). `repeat(N, ...)` is expanded by the
+/// parser. More than `MAX_TRACKS` is a warning and the declaration is dropped.
+pub const P_GRID_COL0: int = 48;
+pub const P_GRID_ROWS: int = 49;
+pub const P_GRID_ACOLS: int = 50;
+pub const P_GRID_AROWS: int = 51;
+
+/// Most tracks in one list (`layoutGrid` keeps its column tables on the stack; implicit rows are not limited).
+pub const MAX_TRACKS: int = 64;
+
+/// `grid-auto-flow`: `V_KW` `i` 0 row, 1 column, +2 for `dense`.
+pub const P_GRID_FLOW: int = 52;
+
+/// Up to four `V_TRANS` at `P_TRANS0 + 0..3`.
+pub const P_TRANS0: int = 53;
+
+/// `z-index`: `V_NUM` or `V_AUTO`. Paint layer of a positioned element and its subtree (`Css.zs`).
+pub const P_Z_INDEX: int = 57;
+
+/// Number of longhand properties; a computed style is this many `Value`s.
+/// `background-image`: `V_GRAD` or `V_NONE`.
+pub const P_BG_IMAGE: int = 58;
+
+/// `box-shadow`: `V_SHADOW` or `V_NONE`.
+pub const P_BOX_SHADOW: int = 59;
+
+/// `border-style`: `BORDER_*`.
+pub const P_BORDER_STYLE: int = 60;
+
+/// `border-image-source`: `V_GRAD` or `V_NONE`; the first layer paints the border.
+pub const P_BORDER_IMAGE: int = 61;
+
+/// `white-space`: `WS_*`. Inherited.
+pub const P_WHITE_SPACE: int = 62;
+
+/// `text-overflow`: `TO_*`.
+pub const P_TEXT_OVERFLOW: int = 63;
+
+/// `overflow-wrap` (and `word-wrap`): `WRAP_*`. Inherited.
+pub const P_OVERFLOW_WRAP: int = 64;
+
+/// `text-shadow`: `V_SHADOW` (the `box-shadow` layout) or `V_NONE`. Inherited.
+pub const P_TEXT_SHADOW: int = 65;
+
+/// `text-stroke-width` (`-webkit-text-stroke-width`): `V_PX`. Inherited.
+pub const P_STROKE_WIDTH: int = 66;
+
+/// `text-stroke-color`: a color, `currentcolor` by default. Inherited.
+pub const P_STROKE_COLOR: int = 67;
+
+/// `background-clip`: `CLIP_*`.
+pub const P_BG_CLIP: int = 68;
+
+/// `animation-name`: `V_ANIM` or `V_NONE`.
+pub const P_ANIM_NAME: int = 69;
+
+/// `animation-duration` in ms (`V_NUM`).
+pub const P_ANIM_DUR: int = 70;
+
+/// `animation-timing-function`: `V_EASE`.
+pub const P_ANIM_EASE: int = 71;
+
+/// `animation-delay` in ms (`V_NUM`).
+pub const P_ANIM_DELAY: int = 72;
+
+/// `animation-iteration-count` (`V_NUM`, -1 for `infinite`).
+pub const P_ANIM_ITER: int = 73;
+
+/// `animation-direction`: `anim.DIR_*`.
+pub const P_ANIM_DIR: int = 74;
+
+/// `animation-fill-mode`: `anim.FILL_*`.
+pub const P_ANIM_FILL: int = 75;
+
+/// `ripple` (not CSS): a click wave. A color with `f` = duration in ms, or `V_NONE`.
+pub const P_RIPPLE: int = 76;
+
+/// `overflow-x`: like `overflow-y` (`OVERFLOW_*`).
+pub const P_OVERFLOW_X: int = 77;
+
+/// `pointer-events`: `PE_*`. The element is never a hit target when `none` (its children still can be).
+pub const P_POINTER_EVENTS: int = 78;
+
+/// `scrollbar-width`: `SBW_*`.
+pub const P_SB_WIDTH: int = 79;
+
+/// `scrollbar-color` thumb and track (`scrollbar-color: thumb track`); `V_CURRENT` is the default.
+pub const P_SB_THUMB: int = 80;
+
+pub const P_SB_TRACK: int = 81;
+
+/// `scroll-behavior`: `SMOOTH_*` (smooth turns on wheel inertia).
+pub const P_SCROLL_BEHAVIOR: int = 82;
+
+/// `overscroll-behavior`: `OVERSCROLL_*` (contain stops wheel chaining to the parent).
+pub const P_OVERSCROLL: int = 83;
+
+/// `position-try-fallbacks`: `TRY_*` (one keyword).
+pub const P_TRY: int = 84;
+
+/// `backdrop-color` (not CSS: `dialog::backdrop`): the dim behind a modal `<dialog>`.
+pub const P_BACKDROP: int = 85;
+
+/// `object-fit`: `FIT_*`.
+pub const P_OBJECT_FIT: int = 86;
+
+/// `object-position`: `V_LIST` `[x, xunit, y, yunit]` (unit 0 px, 1 %), or `V_NONE` (50% 50%).
+pub const P_OBJECT_POS: int = 87;
+
+/// `background-size`: `V_LIST` of comma entries `[mode, x, xunit, y, yunit]` (mode 0 lengths, 1 cover, 2 contain; unit 0 px, 1 %, 2 auto),
+/// the entry count in `c` (0: one); or `V_NONE` (auto). Layer `k` uses entry `k % count`; the same goes for `P_BG_POS` and `P_BG_REPEAT`.
+pub const P_BG_SIZE: int = 88;
+
+/// `background-position`: like `P_OBJECT_POS` (entries and `c` as `P_BG_SIZE`); `V_NONE` is 0% 0%.
+pub const P_BG_POS: int = 89;
+
+/// `background-repeat`: `V_LIST` of entries `[x, y]` (`imgfit.REP_*`: 0 repeat, 1 no-repeat, 2 space, 3 round), count in `c`; `V_NONE` is repeat.
+pub const P_BG_REPEAT: int = 90;
+
+/// `border-image-slice`: `V_LIST` `[top, right, bottom, left, fill, pct]`: source px, or % of the image where bit `side` of `pct` is set
+/// (sides in that order); `V_NONE` is a third of the image.
+pub const P_BORDER_SLICE: int = 91;
+
+/// `image-tint` (not CSS): a color multiplied into `<img>`, `background-image: url()` and `border-image`; `currentcolor` (the start) is none.
+pub const P_TINT: int = 92;
+
+/// `clip-path`: `V_LIST` `[kind, ...]` (`CP_*`; see `j3.ui.cssimage`) or `V_NONE`.
+pub const P_CLIP_PATH: int = 93;
+
+/// `mask-image`: `V_GRAD` (the first layer's alpha is the mask) or `V_NONE`.
+pub const P_MASK_IMAGE: int = 94;
+
+/// `backdrop-filter`: `V_NONE`, or `V_PX` with the Gaussian blur sigma in logical pixels.
+pub const P_BACKDROP_FILTER: int = 95;
+
+/// Content post effects: `V_NONE`, or a `V_LIST` of `FILTER_NAMES` amounts in `Css.paints`.
+pub const P_FILTER: int = 96;
+
+pub const P_MIX_BLEND_MODE: int = 97;
+
+/// J3 group projection extensions; perspective is positive px or none, rotations are degrees.
+pub const P_PERSPECTIVE: int = 98;
+
+pub const P_ROTATE_X: int = 99;
+
+pub const P_ROTATE_Y: int = 100;
+
+pub const FILTER_NAMES: string = "blur bloom grain scanlines crt brightness contrast saturate grayscale sepia invert hue-rotate";
+
+pub const NFILTERS: int = 12;
+
+/// `text-wave-amplitude` (px), `text-wave-length` (px between crests) and `text-wave-period` (ms for one
+/// crest to travel one length): J3 extension. Each glyph of the text is lifted by
+/// `amplitude * sin(tau * (t / period - x / length))`; amplitude 0 (the default) is off. Inherited.
+/// The shorthand is `text-wave: <amplitude> <length> <period>`.
+pub const P_WAVE_AMP: int = 101;
+
+pub const P_WAVE_LEN: int = 102;
+
+pub const P_WAVE_PERIOD: int = 103;
+
+/// `flex-wrap`: `V_KW` index of `nowrap wrap wrap-reverse` (0 nowrap, the default).
+pub const P_FLEX_WRAP: int = 104;
+
+/// `align-content` (cross-axis placement of wrapped flex lines): `V_KW` index of
+/// `stretch flex-start flex-end center space-between space-around space-evenly`.
+pub const P_ALIGN_CONTENT: int = 105;
+
+/// `user-select`: `V_KW` index of `auto none text` (0 auto). Inherited. Only `text` makes static text selectable
+/// (`auto` is not, unlike a browser): `j3.ui.textsel`.
+pub const P_USER_SELECT: int = 106;
+
+/// Maximum sizes: lengths or `none` (`V_AUTO`, the default); minimums win conflicting limits.
+pub const P_MAX_HEIGHT: int = 107;
+
+pub const P_MAX_WIDTH: int = 108;
+
+/// Flex item main size, shrink factor, cross alignment and stable visual order.
+pub const P_FLEX_BASIS: int = 109;
+pub const P_FLEX_SHRINK: int = 110;
+pub const P_ALIGN_SELF: int = 111;
+pub const P_ORDER: int = 112;
+
+/// Positive integer inline-run line limit, or none. Not inherited.
+pub const P_LINE_CLAMP: int = 113;
+/// visible (0) or hidden (1). Inherited, independent of display/layout.
+pub const P_VISIBILITY: int = 114;
+
+/// `content`: `"text"` (`V_STR`, `i` interned) or none (`V_NONE`, also `normal`). Only a `::before` / `::after` box reads it. Not inherited.
+pub const P_CONTENT: int = 115;
+
+/// `text-decoration-line`: `V_KW` index of `none underline line-through overline`. Inherited (a child cannot add its own on top, unlike a browser).
+pub const P_TEXT_DECORATION: int = 116;
+
+/// `font-style`: `V_KW` index of `normal italic oblique`. Inherited. Italic is a slanted draw of the regular face.
+pub const P_FONT_STYLE: int = 117;
+
+/// `cursor`: `V_KW` index of `auto default pointer text crosshair move not-allowed grab grabbing ew-resize ns-resize col-resize row-resize wait progress help`. Inherited. Read for the hovered node each frame (`dom.applyCursor`).
+pub const P_CURSOR: int = 118;
+
+/// `aspect-ratio`: `V_NUM` width / height, or `V_AUTO` (the default). Border box.
+pub const P_ASPECT_RATIO: int = 119;
+
+/// `outline-*`: drawn outside the border box, `outline-offset` px further out; no layout space. Style is the `border-style` list, initially `none`.
+pub const P_OUTLINE_WIDTH: int = 120;
+pub const P_OUTLINE_COLOR: int = 121;
+pub const P_OUTLINE_STYLE: int = 122;
+pub const P_OUTLINE_OFFSET: int = 123;
+
+/// `grid-column-start/end`, `grid-row-start/end` (`grid-column: 1 / span 2` sets two): `V_AUTO`, or `V_NUM` `f` = the
+/// line (1 based, negative counts from the end) with `i` 0, or `f` = the span with `i` 1.
+pub const P_GRID_CS: int = 124;
+pub const P_GRID_CE: int = 125;
+pub const P_GRID_RS: int = 126;
+pub const P_GRID_RE: int = 127;
+
+/// A line in those four can also be `V_STR` (`i` interned): a `grid-template-areas` name (`grid-area: main`), resolved at layout.
+
+/// `grid-template-areas`: `V_NONE`, or a `V_LIST` at `i` = offset in `Css.paints` of `[rows, cols, cells...]`, row by row; a
+/// cell is an interned area name, -1 for `.`. Every named area is a rectangle (checked by the parser).
+pub const P_GRID_AREAS: int = 128;
+
+/// `justify-items` (container) and `justify-self` (item): the horizontal twin of `align-items` / `align-self` for grid items;
+/// `V_KW` index of `stretch flex-start flex-end center baseline` (`justify-self` has `auto` first). `start` / `end` are
+/// parsed as `flex-start` / `flex-end`.
+pub const P_JUSTIFY_ITEMS: int = 129;
+pub const P_JUSTIFY_SELF: int = 130;
+
+/// `font-variant-numeric`: `V_KW` index of `normal tabular-nums proportional-nums lining-nums oldstyle-nums slashed-zero`. Inherited. Only
+/// `tabular-nums` (index 1) does anything: every ASCII digit gets the widest digit's advance, centred (`j3.game.TextMode`). One keyword, no combinations.
+pub const P_FONT_VARIANT_NUMERIC: int = 131;
+
+/// `letter-spacing` and `word-spacing`: a px length (`normal` is 0px; em / rem resolve like any length, negative allowed). Inherited.
+/// Both reach text through `j3.game.TextMode`; `letter-spacing` is not applied to shaped (complex script, right to left) runs.
+pub const P_LETTER_SPACING: int = 132;
+pub const P_WORD_SPACING: int = 133;
+
+/// `text-transform`: `V_KW` index of `none uppercase lowercase capitalize`. Inherited. Static text only (`dom.shownText`).
+pub const P_TEXT_TRANSFORM: int = 134;
+
+/// `text-indent`: a px length or a `V_PCT` of the block's content width; the first line of a block's inline content starts that far in. Inherited.
+pub const P_TEXT_INDENT: int = 135;
+
+/// The individual transform properties (CSS Transforms 2), each a `V_XFORM` of one function or `V_NONE`: `translate`
+/// (x[, y]), `rotate` (angle), `scale` (x[, y]); they apply before `transform` (translate, rotate, scale).
+pub const P_TRANSLATE: int = 136;
+pub const P_ROTATE: int = 137;
+pub const P_SCALE: int = 138;
+
+/// `transform-origin`: `V_NONE` (50% 50%) or a `V_XFORM` pointing at `[x, x is a percentage, y, y is a percentage]`.
+pub const P_ORIGIN: int = 139;
+
+/// `scroll-snap-type` (on the scroll container): `V_KW` `i` = axis (0 none, 1 x, 2 y, 3 both) + 4 when `mandatory` (else proximity).
+/// `scroll-snap-align` (on a child): `V_KW` `i` = block + 4 * inline, each 0 none, 1 start, 2 center, 3 end. `scroll-snap-stop`: `V_KW` normal always.
+/// `scroll-padding-*` (container) and `scroll-margin-*` (child): px lengths or `V_PCT` (padding only), top right bottom left. None inherited.
+pub const P_SNAP_TYPE: int = 140;
+pub const P_SNAP_ALIGN: int = 141;
+pub const P_SNAP_STOP: int = 142;
+pub const P_SCROLL_PAD: int = 143;
+pub const P_SCROLL_MARGIN: int = 147;
+
+/// `isolation`: `V_KW` index of `auto isolate`. `isolate` makes the box a stacking context (see `Node.ctx`).
+pub const P_ISOLATION: int = 151;
+
+/// `border-image-repeat`: `V_LIST` `[x, y]` (`imgfit.REP_*`: 0 repeat, 1 stretch, 2 space, 3 round), or `V_NONE` (stretch).
+pub const P_BORDER_REPEAT: int = 152;
+
+/// `border-image-width`: `V_LIST` `[v, unit] * 4` (top right bottom left; unit 0 a multiple of the border width, 1 px, 2 % of the box side, 3 auto
+/// = the slice), or `V_NONE` (the border widths).
+pub const P_BORDER_IMG_W: int = 153;
+
+/// `border-image-outset`: `V_LIST` `[v, unit] * 4` (unit 0 a multiple of the border width, 1 px), or `V_NONE`.
+pub const P_BORDER_OUTSET: int = 154;
+
+/// `image-rendering`: `V_KW` index of `auto pixelated` (`pixelated`, like `crisp-edges`, samples the texture with nearest filtering). Inherited.
+pub const P_IMAGE_RENDERING: int = 155;
+
+/// `vertical-align` (not inherited, inline boxes and atomic inline items only): `V_KW` index of `baseline top bottom middle text-top text-bottom sub super`
+/// (the default 0 is `baseline`), or a `V_PX` raise / `V_PCT` of the element's own line-height (positive raises). Snaps in a transition.
+pub const P_VALIGN: int = 156;
+
+/// `box-decoration-break` (not inherited): `V_KW` index of `slice clone`. `clone` gives every line piece of a wrapped inline box its own edges. Snaps.
+pub const P_BOX_BREAK: int = 157;
+
+pub const NPROPS: int = 158;
+
+/// The motion channel of registered custom property `--name` is `VBASE + name` (interned); the four before it are the transform channels (`motionbase`).
+pub const VBASE: int = NPROPS + 4;
+
+/// `transform`, `translate`, `rotate` and `scale` as the motion channels past the real properties (`X_CH` + 0 to 3; `motion.j3` blends each whole list).
+pub const X_CH: int = NPROPS;
+
+pub const PROP_NAMES: string = "display position left right top bottom flex-direction flex gap row-gap justify-content align-items width height min-width min-height padding-top padding-right padding-bottom padding-left margin-top margin-right margin-bottom margin-left box-sizing overflow-y background color border-top-width border-right-width border-bottom-width border-left-width border-top-color border-right-color border-bottom-color border-left-color border-top-left-radius border-top-right-radius border-bottom-right-radius border-bottom-left-radius opacity font-size font-weight font-family text-align line-height accent-color transform -grid-cols -grid-rows -grid-acols -grid-arows -grid-flow -transition-0 -transition-1 -transition-2 -transition-3 z-index background-image box-shadow border-style border-image-source white-space text-overflow overflow-wrap text-shadow text-stroke-width text-stroke-color background-clip animation-name animation-duration animation-timing-function animation-delay animation-iteration-count animation-direction animation-fill-mode ripple overflow-x pointer-events scrollbar-width -sb-thumb -sb-track scroll-behavior overscroll-behavior position-try-fallbacks backdrop-color object-fit object-position background-size background-position background-repeat border-image-slice image-tint clip-path mask-image backdrop-filter filter mix-blend-mode perspective rotate-x rotate-y text-wave-amplitude text-wave-length text-wave-period flex-wrap align-content user-select max-height max-width flex-basis flex-shrink align-self order line-clamp visibility content text-decoration-line font-style cursor aspect-ratio outline-width outline-color outline-style outline-offset -grid-cs -grid-ce -grid-rs -grid-re -grid-areas justify-items justify-self font-variant-numeric letter-spacing word-spacing text-transform text-indent translate rotate scale transform-origin scroll-snap-type scroll-snap-align scroll-snap-stop scroll-padding-top scroll-padding-right scroll-padding-bottom scroll-padding-left scroll-margin-top scroll-margin-right scroll-margin-bottom scroll-margin-left isolation border-image-repeat border-image-width border-image-outset image-rendering vertical-align box-decoration-break";
+
+// keyword indexes (the order of the lists in `kwList`)
+pub const DISPLAY_INLINE: int = 0;
+
+pub const DISPLAY_BLOCK: int = 1;
+
+pub const DISPLAY_FLEX: int = 2;
+
+pub const DISPLAY_GRID: int = 3;
+
+pub const DISPLAY_NONE: int = 4;
+
+/// `display: contents`: no box of its own; the children lay out as items of the parent grid (`dom.layoutGrid`).
+pub const DISPLAY_CONTENTS: int = 5;
+
+pub const POS_STATIC: int = 0;
+
+pub const POS_RELATIVE: int = 1;
+
+pub const POS_ABSOLUTE: int = 2;
+
+pub const POS_FIXED: int = 3;
+
+/// In flow like `relative`, but pushed to stay inside its scroll box's top edge (`j3.ui.sticky`).
+pub const POS_STICKY: int = 4;
+
+pub const PE_AUTO: int = 0;
+
+pub const PE_NONE: int = 1;
+
+pub const SBW_AUTO: int = 0;
+
+pub const SBW_THIN: int = 1;
+
+pub const SBW_NONE: int = 2;
+
+pub const SMOOTH_AUTO: int = 0;
+
+pub const SMOOTH_ON: int = 1;
+
+pub const OVERSCROLL_AUTO: int = 0;
+
+pub const OVERSCROLL_CONTAIN: int = 1;
+
+pub const TRY_NONE: int = 0;
+
+pub const TRY_INLINE: int = 1;
+
+pub const TRY_BLOCK: int = 2;
+
+pub const TRY_BOTH: int = 3;
+
+pub const DIR_ROW: int = 0;
+
+pub const DIR_COLUMN: int = 1;
+
+pub const DIR_ROW_REVERSE: int = 2;
+
+pub const DIR_COLUMN_REVERSE: int = 3;
+
+pub const JUSTIFY_START: int = 0;
+
+pub const JUSTIFY_END: int = 1;
+
+pub const JUSTIFY_CENTER: int = 2;
+
+pub const JUSTIFY_BETWEEN: int = 3;
+
+pub const JUSTIFY_AROUND: int = 4;
+
+pub const JUSTIFY_EVENLY: int = 5;
+
+pub const ALIGN_STRETCH: int = 0;
+
+pub const ALIGN_START: int = 1;
+
+pub const ALIGN_END: int = 2;
+
+pub const ALIGN_CENTER: int = 3;
+
+/// `align-content` also has these (`ALIGN_STRETCH`..`ALIGN_CENTER` as for `align-items`).
+pub const ALIGN_BETWEEN: int = 4;
+
+pub const ALIGN_AROUND: int = 5;
+
+pub const ALIGN_EVENLY: int = 6;
+
+pub const ALIGN_BASELINE: int = 4;
+
+pub const BOX_CONTENT: int = 0;
+
+pub const BOX_BORDER: int = 1;
+
+pub const OVERFLOW_VISIBLE: int = 0;
+
+pub const OVERFLOW_HIDDEN: int = 1;
+
+pub const OVERFLOW_AUTO: int = 2;
+
+pub const OVERFLOW_SCROLL: int = 3;
+
+pub const OVERFLOW_CLIP: int = 4;
+
+pub const TEXT_LEFT: int = 0;
+
+pub const TEXT_RIGHT: int = 1;
+
+pub const TEXT_CENTER: int = 2;
+pub const TEXT_JUSTIFY: int = 3;
+
+pub const BORDER_SOLID: int = 0;
+
+pub const BORDER_DASHED: int = 1;
+
+pub const BORDER_DOTTED: int = 2;
+
+pub const BORDER_NONE: int = 3;
+
+pub const WS_NORMAL: int = 0;
+
+pub const WS_NOWRAP: int = 1;
+
+pub const WS_PRE_LINE: int = 2;
+pub const WS_PRE: int = 3;
+pub const WS_PRE_WRAP: int = 4;
+
+pub const TO_CLIP: int = 0;
+
+pub const TO_ELLIPSIS: int = 1;
+
+pub const WRAP_NORMAL: int = 0;
+
+pub const WRAP_BREAK: int = 1;
+
+pub const FIT_FILL: int = 0;
+
+pub const FIT_CONTAIN: int = 1;
+
+pub const FIT_COVER: int = 2;
+
+pub const FIT_NONE: int = 3;
+
+pub const FIT_SCALE_DOWN: int = 4;
+
+pub const CLIP_BORDER: int = 0;
+
+pub const CLIP_TEXT: int = 1;
+
+/// `MatchNode.flags` bit: pointer is over the node.
+pub const FL_HOVER: int = 1;
+
+/// `MatchNode.flags` bit: pressed.
+pub const FL_ACTIVE: int = 2;
+
+/// `MatchNode.flags` bit: disabled.
+pub const FL_DISABLED: int = 4;
+
+/// `MatchNode.flags` bit: first child of its parent.
+pub const FL_FIRST_CHILD: int = 8;
+
+/// `MatchNode.flags` bit: last element child of its parent.
+pub const FL_LAST_CHILD: int = 16;
+
+/// `MatchNode.flags` bit: has keyboard/click focus (`:focus`).
+pub const FL_FOCUS: int = 32;
+
+pub const PS_ROOT: int = 64;
+
+/// `MatchNode.flags` bit: the source of the item drag in progress (`:dragging`, `j3.ui.drag`).
+pub const FL_DRAGGING: int = 128;
+
+/// `MatchNode.flags` bit: the element under a drag that accepts a drop (`:drop-target`).
+pub const FL_DROP: int = 256;
+
+/// `MatchNode.flags` bit: the element or a descendant has focus (`:focus-within`; the whole parent chain of the focus carries it).
+pub const FL_FOCUS_WITHIN: int = 512;
+
+/// `MatchNode.flags` bit: has focus and a keyboard user (or a text box) should see it (`:focus-visible`).
+pub const FL_FOCUS_VIS: int = 1024;
+
+/// `MatchNode.flags` bit: a checked checkbox or radio (`:checked`, set by `attrChecked`).
+pub const FL_CHECKED: int = 2048;
+
+/// `MatchNode.flags` bit: a text box with a `placeholder` and an empty value (`:placeholder-shown`).
+pub const FL_PH_SHOWN: int = 4096;
+
+/// `MatchNode.flags` bit on a text node (`pe` -1) only: it holds a non-whitespace byte, so its parent is not `:empty`. It sits between
+/// `FL_PH_SHOWN` and `FL_OPEN`, which the matcher loops over (`cssmatch.stepHolds`), and no selector name maps to it (`cssparse.pseudoBit`), so
+/// no `Step.pseudo` can hold it: neither a rule nor a `:not()` can test it. Only `structHolds` reads it, on text nodes.
+pub const FL_NONBLANK: int = 8192;
+
+/// `MatchNode.flags` bit: an open `<details>` (`:open`, set by `attrOpen` and by a click on its `<summary>`). The top bit the matcher loops over.
+pub const FL_OPEN: int = 16384;
+
+/// What the matcher needs to know about one element. Stage 04's tree keeps these in a slice
+/// indexed by node id; the matcher reads `nodes[id]` and walks `parent`.
+pub struct MatchNode {
+    /// Interned tag (`css.intern("div")`).
+    tag: int;
+    /// Interned class names.
+    classes: []int;
+    /// Parent node id, -1 for the root.
+    parent: int;
+    /// Previous sibling id, -1 for none. Raw: text nodes and pseudo-element boxes are in the chain, `pe` says which to skip.
+    prevSibling: int;
+    /// `FL_*` bits.
+    flags: int;
+    /// Interned value of the `type` attribute, -1 for none.
+    type: int;
+    /// Component id (0 = none).
+    scope: int;
+    /// A second component whose scoped rules that name one of this node's classes also match: the parent
+    /// that passed `class` to a component's root element (0 = none).
+    scope2: int;
+    /// Interned `id` attribute, -1 for none.
+    id: int;
+    /// 0 an element, 1 a `::before` box, 2 an `::after` box (its `parent` is the host the rules are matched against), -1 a text node, -2 an element that is leaving (a fading ghost). Selectors skip every value but 0 when walking siblings.
+    pe: int;
+    /// Next sibling id (raw, like `prevSibling`), -1 for none. Only the structural pseudo-classes read it.
+    next: int;
+    /// First child id (raw), -1 for none. Only `:empty` reads it.
+    first: int;
+}
+
+/// One problem found while parsing. `msg` lives in the `Css` arena.
+pub struct Warning {
+    file: string;
+    line: int;
+    col: int;
+    msg: string;
+}
+
+/// One `@font-face`. `path` is resolved against the CSS file's directory.
+pub struct FontFace {
+    family: int;
+    path: string;
+}
+
+/// What one `parse` call added.
+pub struct Sheet {
+    file: string;
+    scope: int;
+    rule0: int;
+    nrules: int;
+    warn0: int;
+    nwarn: int;
+}
+
+/// One compiled selector with its declarations. A selector list becomes one `Rule` per selector.
+pub struct Rule {
+    /// First step in `css.steps`; the last step is the rightmost compound.
+    step0: int;
+    nsteps: int;
+    /// Declarations in `css.decls`.
+    decl0: int;
+    ndecl: int;
+    /// `a*10000 + b*100 + c`, with the scope class already added.
+    spec: int;
+    scope: int;
+    /// Global source order.
+    order: int;
+    /// Tag of the rightmost compound (-1 for any): a cheap reject before the full match.
+    tag: int;
+    /// First class of the rightmost compound (-1 for none): the other cheap reject.
+    cls0: int;
+    /// Index into `css.media` of the `@media` condition the rule sits in (-1 for none).
+    mq: int;
+    /// 1 `::before`, 2 `::after`, 0 for an ordinary rule. The steps select the host element.
+    pe: int;
+    /// The selector has a `+` or `~`: `matchRule` backtracks; without one it walks ancestors greedily (the old, cheaper path).
+    sib: bool;
+    /// Where the selector was written (`j3.ui.inspect`); `""` and 0 for a rule made at runtime.
+    file: string;
+    line: int;
+    col: int;
+}
+
+/// One declaration as written, logged when `Css.lintOn` (`j3.ui.csslint`): its name and raw value text, where it
+/// stands, and the `Css.decls` it made (`d0`..`d0 + nd`; `nd` 0 when it failed). `kf` marks one inside `@keyframes`.
+pub struct DeclLog {
+    file: string;
+    line: int;
+    col: int;
+    name: string;
+    val: string;
+    d0: int;
+    nd: int;
+    kf: bool;
+}
+
+/// One `@media` condition: the viewport must satisfy every bound (`min-width` .. `max-height`, px;
+/// -1 means no min, a huge number no max).
+pub struct Media {
+    minW: f32;
+    maxW: f32;
+    minH: f32;
+    maxH: f32;
+    /// `not`: the whole condition is inverted.
+    neg: bool;
+    /// The next alternative of a comma / `or` list (`css.media` index), or -1; one holding is enough.
+    alt: int;
+    /// `prefers-reduced-motion`: 0 not tested, 1 `reduce`, 2 `no-preference`.
+    rm: int;
+    /// `prefers-color-scheme`: 0 not tested, 1 `dark`, 2 `light`.
+    cs: int;
+    /// A nested `@media`: the enclosing condition (`css.media` index) must hold too, or -1.
+    and: int;
+}
+
+pub const COMB_DESC: int = 0;
+pub const COMB_CHILD: int = 1;
+pub const COMB_NEXT: int = 2;
+pub const COMB_SIB: int = 3;
+
+pub struct Step {
+    tag: int;
+    ncls: int;
+    cls: [4]int;
+    attr: int;
+    pseudo: int;
+    /// How the next step relates to this one: `COMB_DESC` (space), `COMB_CHILD` (`a > b`), `COMB_NEXT` (`a + b`), `COMB_SIB` (`a ~ b`).
+    comb: int;
+    /// Interned `#id`, -1 for none.
+    id: int;
+    /// `:not(...)` arguments: `css.nots[not0..not0 + nnot]`, each a compound that must NOT match.
+    not0: int;
+    nnot: int;
+    /// `:nth-child(An+B)` when `nth`.
+    nth: bool;
+    nthA: int;
+    nthB: int;
+    /// What `nth` counts: `NK_CHILD`, `NK_LAST_CHILD`, `NK_TYPE` (`:nth-of-type`) or `NK_LAST_TYPE`.
+    nthK: int;
+    /// `SS_*` bits: the argument-less structural pseudo-classes (`:empty`, `:only-child`, `:first-of-type`, ...).
+    ss: int;
+    /// `:has(...)` arguments: `css.hass[has0..has0 + nhas]`, each a compound (its `comb` is how it relates to the subject: `COMB_DESC`
+    /// descendant, `COMB_CHILD`, `COMB_NEXT`, `COMB_SIB`); one must hold.
+    has0: int;
+    nhas: int;
+}
+
+pub const NK_CHILD: int = 0;
+pub const NK_LAST_CHILD: int = 1;
+pub const NK_TYPE: int = 2;
+pub const NK_LAST_TYPE: int = 3;
+
+pub const SS_EMPTY: int = 1;
+pub const SS_ONLY_CHILD: int = 2;
+pub const SS_FIRST_TYPE: int = 4;
+pub const SS_LAST_TYPE: int = 8;
+pub const SS_ONLY_TYPE: int = 16;
+
+pub struct Decl {
+    prop: int;
+    v: Value;
+}
+
+/// `Decl.prop` of a declaration whose value holds `var()` inside a compound value (a gradient stop, a shadow
+/// color, `color-mix()`, a border shorthand). `v.i` indexes `Css.dtpl`; the cascade substitutes the custom
+/// properties and parses the result again (`cssmatch.deferred`).
+pub const P_DEFER: int = -2;
+
+/// `Decl.prop` of the `all` shorthand: `v` is a CSS-wide keyword (`V_INHERIT`, `V_INITIAL`, `V_UNSETKW`, `V_REVERT`) for every property.
+pub const P_ALL: int = -3;
+
+/// The source of a deferred declaration: its property name, the value text and where it was written.
+/// `warned` is set once a resolution of it failed and said so (`cssmatch.applyDeferred`).
+pub struct Deferred {
+    name: string;
+    /// The longhand `name` is (`propId`), -1 for a shorthand: what a `@keyframes` stop animates.
+    prop: int;
+    text: string;
+    file: string;
+    line: int;
+    col: int;
+    warned: bool;
+}
+
+/// One `@keyframes` rule. Its stops are `Css.frames[f0..f0 + nf]`, ascending by `at`. `props` are
+/// the animatable properties any stop declares (`animKind`), at most 16.
+pub struct Keyframes {
+    name: int;
+    f0: int;
+    nf: int;
+    nprop: int;
+    props: [16]int;
+}
+
+/// A deferred `@keyframes` declaration (`decl` of `Css.decls`) resolved for custom property set `vs`; `v` is `V_UNSET` when it failed.
+pub struct KvStop {
+    decl: int;
+    vs: int;
+    v: Value;
+}
+
+/// One keyframe stop: `at` is 0 to 1; its declarations are `Css.decls[decl0..decl0 + ndecl]`.
+pub struct Frame {
+    at: f32;
+    decl0: int;
+    ndecl: int;
+}
+
+pub struct Custom {
+    name: int;
+    v: Value;
+}
+
+/// `@property` syntaxes (`Reg.syn`).
+pub const SY_ANY: int = 0;
+pub const SY_COLOR: int = 1;
+pub const SY_LEN: int = 2;
+pub const SY_NUM: int = 3;
+pub const SY_PCT: int = 4;
+pub const SY_LENPCT: int = 5;
+pub const SY_ANGLE: int = 6;
+/// `<url>` (a `url()`; `<image>` is not supported: gradients cannot be custom property values).
+pub const SY_URL: int = 7;
+
+/// A registered custom property (`@property`): its `SY_*` syntax, whether children inherit it, and its initial value (`V_UNSET` for none).
+pub struct Reg {
+    name: int;
+    syn: int;
+    inh: bool;
+    init: Value;
+}
+
+pub struct CacheEnt {
+    hash: int;
+    parent: int;
+    r0: int;
+    n: int;
+    style: int;
+}
+
+fn seedEases(mem: &Arena): List<Ease> {
+    let l = List<Ease>.new(mem);
+    for i in 0..NPRESET {
+        l.push(preset(i));
+    }
+    return l;
+}
+
+pub const SLOTS: int = 4096;
+
+pub const MAXM: int = 128;
+
+const MAXT: int = 192;
+
+/// A style source re-read from disk by hot reload (`j3.ui.domhot.hotFile`). `parse` uses `style`
+/// instead of its compiled-in text once `live` is set.
+pub struct HotFile {
+    path: string;
+    style: string;
+    rest: int;
+    live: bool;
+    /// Lines above the style text in the file (the first line of the style is `line0 + 1`), so warnings and `Rule.line` are file lines.
+    line0: int = 0;
+}
+
+/// The text of one `parse` call (for `domhtml.dumpHtml`).
+pub struct SrcText {
+    file: string;
+    text: string;
+    scope: int;
+}
+
+/// All parsed CSS plus the computed-style cache. Make one with `Css.new`, keep it in a `let`,
+/// and pass `&css`.
+pub struct Css {
+    mem: &Arena;
+    names: List<string>;
+    sheets: List<Sheet>;
+    rules: List<Rule>;
+    steps: List<Step>;
+    /// Compounds named by `:not(...)`, in the order their steps were compiled.
+    nots: List<Step>;
+    /// `:has()` arguments (see `Step.has0`).
+    hass: List<Step>;
+    /// Copies (with `nhas` 0) of the steps that carry a `:has()`: the cheap test of which ancestors a change could affect.
+    hasSubj: List<Step>;
+    /// 0 without `:has()` rules (nothing costs anything); else the relations in use as bits: 1 descendant, 2 child, 4 `+`, 8 `~`.
+    hasMode: int;
+    /// What a `:has()` argument tests, so a mutation of anything else never walks: class ids, `FL_*` bits, and 1 when it tests
+    /// an `#id`, `[type]` or `:empty`-like structure.
+    hasCls: List<int>;
+    hasFlags: int;
+    hasAttr: int;
+    /// 1 when a `:has()` sits in a compound other than the rightmost of some rule (`.card:has(> img) .title`): then restyling the carrier
+    /// restyles its subtree. Otherwise (only subject `:has()`) the subtree restyles only if the carrier's style id changed.
+    hasInner: int;
+    /// Bumped at the start of every style pass that has `:has()` rules; stamps `Node.hasEp` (ancestor walks done this round) and the memo.
+    hasGen: int;
+    /// During a style pass: `hmemo[k * hcap + id]` is `hasGen * 2 + result` of argument `k` (descendant / child form) on element `id`.
+    hasOn: bool;
+    hmemo: []int;
+    hcap: int;
+    /// Counters for tests: argument nodes tested by `:has()` matching, and ancestors visited by invalidation walks.
+    hasEvals: int;
+    hasWalked: int;
+    decls: List<Decl>;
+    /// Declarations waiting for `var()` (`P_DEFER`).
+    dtpl: List<Deferred>;
+    /// Scratch for substituting a deferred declaration (cleared per use, so rebuilding styles allocates nothing here).
+    dbuf: Text;
+    /// Entries 1.. of the `animation-*` longhands that hold a comma list (`animAt`): slot 0 is the property's own value, whose `c` is `count + 256 * offset` into this list.
+    anx: List<Value>;
+    /// `var()` in `@keyframes` stops, resolved per custom property set (`motion.stopValue`).
+    kvc: List<KvStop>;
+    /// Open-addressing index of `kvc` by (decl, vs): `kslots[h]` is an index into `kvc` plus one, 0 empty; its length is a power of two and grows with `kvc`.
+    kslots: []int;
+    /// Fallback values of `var(--x, fallback)`: a `V_VAR` with `c > 0` has its fallback at `fbs[c - 1]`.
+    fbs: List<Value>;
+    /// Custom property sets (`j3.ui.cssmatch`): set `s` is `vsEnt[vso[s] .. vso[s] + vsn[s]]`, set 0 is empty.
+    /// `svs[style]` is the set a computed style resolves `var()` against (children inherit it).
+    vsEnt: List<Custom>;
+    vso: List<int>;
+    vsn: List<int>;
+    svs: List<int>;
+    /// Registered custom properties (`@property`), the newest registration of a name wins. `noInh` counts those with `inherits: false`.
+    regs: List<Reg>;
+    noInh: int;
+    /// What `rebuildReaders` needs to recompute a style under other custom property values: per computed style the matched rules (`srl[sro[s]..+srn[s]]`, `sro` -1 when unknown) and the parent style.
+    srl: List<int>;
+    sro: List<int>;
+    /// Capacity of the `srl` range of an inline-style copy (`setRulesPlus`); 0 for the others.
+    scap: List<int>;
+    srn: List<int>;
+    spar: List<int>;
+    /// Per style, a bit mask (name mod 30) of the custom properties its rules read with `var()`; -1 not computed (`cssmatch.readsMask`).
+    sdep: List<int>;
+    /// Scratch of `rebuildReaders`: properties whose last value came from a `var()` reader.
+    omask: []bool;
+    /// Every `@font-face` seen.
+    fonts: List<FontFace>;
+    /// Every warning from every `parse`.
+    warns: List<Warning>;
+    /// `j3c check` sets it before parsing so `dlog` records every declaration (apps leave it off: no cost).
+    lintOn: bool;
+    dlog: List<DeclLog>;
+    vals: List<Value>;
+    /// Gradient, shadow, and transform numbers that `V_GRAD`, `V_SHADOW`, and `V_XFORM` values point into.
+    paints: List<f32>;
+    /// The last `XRES` px copies `xformPx` made (offset, floats; `xnext` is the slot to overwrite), so a restyle that
+    /// resolves the same em transform again reuses one instead of appending.
+    xres: List<int>;
+    xnext: int;
+    /// Timing functions (`V_EASE.i`); the first `anim.NPRESET` are the presets.
+    eases: List<Ease>;
+    kfs: List<Keyframes>;
+    frames: List<Frame>;
+    /// Computed styles made so far.
+    nstyles: int;
+    crules: List<int>;
+    /// Sibling combinators in the loaded rules: 0 none, 1 only a lone `+` (a change restyles the next sibling), 2 `~` or chained `+` (all following siblings).
+    sibMode: int;
+    /// 1 when a rule uses a selector that depends on siblings after, or on the children of, an element (`:nth-last-child`, `:*-of-type`,
+    /// `:only-child`, `:empty`): a child-list change then restyles the parent and all its element children. 0 costs nothing.
+    structMode: int;
+    /// Indexes into `rules` of the `::before` / `::after` rules.
+    peRules: List<int>;
+    cents: List<CacheEnt>;
+    slots: []int;
+    /// Scratch for `computeStyle`: matched rule ids, their sort keys, and the style being built.
+    midx: []int;
+    mkey: []int;
+    out: []Value;
+    /// Hot reload state (dev runs only): files seen, the next poll time in ms, and the first
+    /// warning not yet printed.
+    hot: List<HotFile>;
+    /// Every sheet text given to `parse` since the last `reset`.
+    srcs: List<SrcText>;
+    hotAt: int;
+    hotWarn: int;
+    /// Counts `reset`s: computed style ids come back in a new order afterwards, so anything cached by id is stale.
+    epoch: int;
+    /// `@media` conditions, the viewport they are tested against, and which of them held last time.
+    media: List<Media>;
+    vw: f32;
+    vh: f32;
+    msig: int;
+    /// The program's `prefers-reduced-motion: reduce` and `prefers-color-scheme: dark` answers (`setPrefs`).
+    reduced: bool;
+    dark: bool;
+    /// A program has called `setPrefs`: a later `Dom.new` must not overwrite its answers with the env defaults.
+    prefsSet: bool;
+    /// Some length uses `vw`/`vh`/`vmin`/`vmax`, so a viewport resize restyles everything (`setViewport`).
+    vpUnits: bool;
+    /// Computed `font-size` of the document root (node 0): what `rem` is. Set by `computeStyle` for a parentless node and by `dom.applyStyle` for node 0; popup and tooltip subtrees are children of their owner, never parentless.
+    rootFs: f32;
+    /// The built-in popup sheet (`j3.ui.uastyle`) is parsed; it must come before the theme.
+    ua: bool;
+    /// The rules `[uaLo, uaHi)` are the built-in popup and tag-default sheets: the origin `revert` rolls back to.
+    uaLo: int;
+    uaHi: int;
+    /// Interned `textarea`: a `<textarea>` is an `input` of this type, and a `textarea` selector matches it too.
+    tTextarea: int;
+
+    /// Empty set of sheets allocating from `mem`.
+    fn new(mem: &Arena): Css {
+        let slots = mem.alloc::<int>(SLOTS);
+        for i in 0..SLOTS {
+            slots[i] = 0;
+        }
+        let kslots = mem.alloc::<int>(64);
+        for i in 0..64 {
+            kslots[i] = 0;
+        }
+        let c = Css {
+            mem: mem,
+            names: List<string>.new(mem),
+            sheets: List<Sheet>.new(mem),
+            rules: List<Rule>.new(mem),
+            steps: List<Step>.new(mem),
+            nots: List<Step>.new(mem),
+            hass: List<Step>.new(mem),
+            hasSubj: List<Step>.new(mem),
+            hasMode: 0,
+            hasCls: List<int>.new(mem),
+            hasFlags: 0,
+            hasAttr: 0,
+            hasInner: 0,
+            hasGen: 1,
+            hasOn: false,
+            hmemo: mem.alloc::<int>(0),
+            hcap: 0,
+            hasEvals: 0,
+            hasWalked: 0,
+            decls: List<Decl>.new(mem),
+            dtpl: List<Deferred>.new(mem),
+            dbuf: Text.new(mem),
+            anx: List<Value>.new(mem),
+            kvc: List<KvStop>.new(mem),
+            kslots: kslots,
+            fbs: List<Value>.new(mem),
+            vsEnt: List<Custom>.new(mem),
+            vso: List<int>.new(mem),
+            vsn: List<int>.new(mem),
+            svs: List<int>.new(mem),
+            regs: List<Reg>.new(mem),
+            noInh: 0,
+            srl: List<int>.new(mem),
+            sro: List<int>.new(mem),
+            scap: List<int>.new(mem),
+            srn: List<int>.new(mem),
+            spar: List<int>.new(mem),
+            sdep: List<int>.new(mem),
+            omask: mem.alloc::<bool>(NPROPS),
+            fonts: List<FontFace>.new(mem),
+            warns: List<Warning>.new(mem),
+            lintOn: false,
+            dlog: List<DeclLog>.new(mem),
+            vals: List<Value>.new(mem),
+            paints: List<f32>.new(mem),
+            xres: List<int>.new(mem),
+            xnext: 0,
+            eases: seedEases(mem),
+            kfs: List<Keyframes>.new(mem),
+            frames: List<Frame>.new(mem),
+            nstyles: 0,
+            crules: List<int>.new(mem),
+            sibMode: 0,
+            structMode: 0,
+            peRules: List<int>.new(mem),
+            cents: List<CacheEnt>.new(mem),
+            slots: slots,
+            midx: mem.alloc::<int>(MAXM),
+            mkey: mem.alloc::<int>(MAXM),
+            out: mem.alloc::<Value>(NPROPS),
+            hot: List<HotFile>.new(mem),
+            srcs: List<SrcText>.new(mem),
+            hotAt: 0,
+            hotWarn: 0,
+            epoch: 0,
+            media: List<Media>.new(mem),
+            vw: 100000.0,
+            vh: 100000.0,
+            msig: 0,
+            reduced: false,
+            dark: false,
+            prefsSet: false,
+            vpUnits: false,
+            rootFs: 16.0,
+            ua: false,
+            uaLo: 0,
+            uaHi: 0,
+            tTextarea: -1,
+        };
+        c.tTextarea = c.intern("textarea");
+        c.clearVars();
+        return c;
+    }
+
+    /// Whether `@media` condition `mq` holds for the current viewport and preferences.
+    fn mediaHolds(this: &Css, mq: int): bool {
+        let m = &this.media.items[mq];
+        let h = this.vw >= m.minW && this.vw <= m.maxW && this.vh >= m.minH && this.vh <= m.maxH;
+        if m.rm != 0 && (m.rm == 1) != this.reduced { h = false; }
+        if m.cs != 0 && (m.cs == 1) != this.dark { h = false; }
+        if m.neg { h = !h; }
+        if m.and >= 0 && !this.mediaHolds(m.and) { h = false; }
+        return h || (m.alt >= 0 && this.mediaHolds(m.alt));
+    }
+
+    /// Re-test every condition; true when one changed its answer since the last call.
+    fn mediaChanged(this: &Css): bool {
+        let sig = 1;
+        for i in 0..this.media.len {
+            sig = sig * 2 + if this.mediaHolds(i) { 1 } else { 0 };
+            if sig > 1000000000000 {
+                sig = sig % 1000003;
+            }
+        }
+        let changed = sig != this.msig;
+        this.msig = sig;
+        return changed;
+    }
+
+    /// Tell the cascade the viewport size. True when some `@media` condition changed its answer
+    /// (the caller restyles), or a viewport unit is in use; a resize that crosses no breakpoint and
+    /// uses none costs one pass over the conditions.
+    fn setViewport(this: &Css, w: f32, h: f32): bool {
+        if w == this.vw && h == this.vh {
+            return false;
+        }
+        this.vw = w;
+        this.vh = h;
+        return this.mediaChanged() || this.vpUnits;
+    }
+
+    /// Set the `prefers-reduced-motion` / `prefers-color-scheme` answers. True when a condition flipped (restyle).
+    fn setPrefs(this: &Css, reduced: bool, dark: bool): bool {
+        this.prefsSet = true;
+        if reduced == this.reduced && dark == this.dark {
+            return false;
+        }
+        this.reduced = reduced;
+        this.dark = dark;
+        return this.mediaChanged();
+    }
+
+    /// Forget every sheet, custom property, font, warning, and computed style (names stay, so
+    /// interned ids held by nodes remain valid). Hot reload is `reset` then `parse` again; old
+    /// arena memory is not reclaimed (rewind the arena if that matters).
+    fn reset(this: &Css) {
+        this.epoch += 1;
+        this.sheets.len = 0;
+        this.rules.len = 0;
+        this.steps.len = 0;
+        this.decls.len = 0;
+        this.dtpl.len = 0;
+        this.anx.len = 0;
+        this.kvc.len = 0;
+        for i in 0..this.kslots.len {
+            this.kslots[i] = 0;
+        }
+        this.paints.len = 0;
+        this.xres.len = 0;
+        this.xnext = 0;
+        this.eases.len = NPRESET;
+        this.kfs.len = 0;
+        this.frames.len = 0;
+        this.fbs.len = 0;
+        this.svs.len = 0;
+        this.regs.len = 0;
+        this.noInh = 0;
+        this.srl.len = 0;
+        this.sro.len = 0;
+        this.scap.len = 0;
+        this.srn.len = 0;
+        this.spar.len = 0;
+        this.sdep.len = 0;
+        this.clearVars();
+        this.fonts.len = 0;
+        this.warns.len = 0;
+        this.dlog.len = 0;
+        this.srcs.len = 0;
+        this.vals.len = 0;
+        this.nstyles = 0;
+        this.media.len = 0;
+        this.msig = 0;
+        this.vpUnits = false;
+        this.rootFs = 16.0;
+        this.ua = false;
+        this.uaLo = 0;
+        this.uaHi = 0;
+        this.sibMode = 0;
+        this.structMode = 0;
+        this.hass.len = 0;
+        this.hasSubj.len = 0;
+        this.hasMode = 0;
+        this.hasCls.len = 0;
+        this.hasFlags = 0;
+        this.hasAttr = 0;
+        this.hasInner = 0;
+        this.hasOn = false;
+        this.peRules.len = 0;
+        this.clearCache();
+    }
+
+    /// Only the empty custom property set 0 remains.
+    fn clearVars(this: &Css) {
+        this.vsEnt.len = 0;
+        this.vso.len = 0;
+        this.vsn.len = 0;
+        this.vso.push(0);
+        this.vsn.push(0);
+    }
+
+    /// Drop the style cache (computed ids made before stay valid but nothing is shared with them).
+    fn clearCache(this: &Css) {
+        this.crules.len = 0;
+        this.cents.len = 0;
+        for i in 0..SLOTS {
+            this.slots[i] = 0;
+        }
+    }
+
+    /// Intern `name` (tag, class, attribute value, font family): the same text gives the same id.
+    /// Linear search; fine for the few dozen names a UI has.
+    fn intern(this: &Css, name: string): int {
+        for i in 0..this.names.len {
+            if same(this.names.items[i], name) {
+                return i;
+            }
+        }
+        let t = Text.new(this.mem);
+        t.pushStr(name);
+        this.names.push(t.str());
+        return this.names.len - 1;
+    }
+
+    /// The text of an interned id.
+    fn name(this: &Css, id: int): string {
+        return this.names.items[id];
+    }
+
+    /// The newest `@keyframes` named `name` (interned), or -1.
+    fn findKf(this: &Css, name: int): int {
+        let i = this.kfs.len - 1;
+        while i >= 0 && this.kfs.items[i].name != name {
+            i -= 1;
+        }
+        return i;
+    }
+
+    /// The custom property set of computed style `style` (0 = none).
+    fn varsOf(this: &Css, style: int): int {
+        if style < 0 || style >= this.svs.len {
+            return 0;
+        }
+        return this.svs.items[style];
+    }
+
+    fn setVars(this: &Css, style: int, vs: int) {
+        while this.svs.len <= style {
+            this.svs.push(0);
+        }
+        this.svs.items[style] = vs;
+    }
+
+    fn growRules(this: &Css, style: int) {
+        while this.sro.len <= style {
+            this.sro.push(-1);
+            this.srn.push(0);
+            this.spar.push(-1);
+            this.scap.push(0);
+        }
+    }
+
+    /// Remember the rules (`midx[0..nm]`) and parent a computed style was cut from, for `cssmatch.rebuildReaders`. Only kept
+    /// once a property is registered (`@property`): nothing else rebuilds a style from its rules.
+    fn setRules(this: &Css, style: int, nm: int, parent: int) {
+        if this.regs.len == 0 {
+            return;
+        }
+        this.growRules(style);
+        this.sro.items[style] = this.srl.len;
+        this.srn.items[style] = nm;
+        this.spar.items[style] = parent;
+        for m in 0..nm {
+            this.srl.push(this.midx[m]);
+        }
+    }
+
+    /// Style `dst` is style `base` with the inline-style rule `extra` (`dynattr`) on top: its rules are `base`'s plus `extra`, in a
+    /// range of its own that later calls rewrite in place.
+    fn setRulesPlus(this: &Css, dst: int, base: int, extra: int, parent: int) {
+        if this.regs.len == 0 {
+            return;
+        }
+        this.growRules(dst);
+        if base >= this.sro.len || this.sro.items[base] < 0 {
+            this.sro.items[dst] = -1;
+            return;
+        }
+        let nb = this.srn.items[base];
+        if this.sro.items[dst] < 0 || this.scap.items[dst] < nb + 1 {
+            this.sro.items[dst] = this.srl.len;
+            this.scap.items[dst] = nb * 2 + 2;
+            for q in 0..nb * 2 + 2 {
+                this.srl.push(0);
+            }
+        }
+        let o = this.sro.items[dst];
+        for q in 0..nb {
+            this.srl.items[o + q] = this.srl.items[this.sro.items[base] + q];
+        }
+        this.srl.items[o + nb] = extra;
+        this.srn.items[dst] = nb + 1;
+        this.spar.items[dst] = parent;
+        if dst < this.sdep.len {
+            this.sdep.items[dst] = -1;
+        }
+    }
+
+    /// The newest `@property` registration of custom property `name`, or -1.
+    fn regOf(this: &Css, name: int): int {
+        let i = this.regs.len - 1;
+        while i >= 0 && this.regs.items[i].name != name {
+            i -= 1;
+        }
+        return i;
+    }
+
+    /// Property `prop` of computed style `style`.
+    fn get(this: &Css, style: int, prop: int): Value {
+        return this.vals.items[style * NPROPS + prop];
+    }
+}
+
+/// `v` as a value of `@property` syntax `syn` (`SY_*`): lengths in em/rem become px (of `fs`, the font-size em means), a bare 0 is a length;
+/// `V_UNSET` when it does not have the type.
+pub fn coerceSyn(css: &Css, syn: int, v: Value, fs: f32): Value {
+    let bad = Value { kind: V_UNSET, f: 0.0, i: 0, c: 0 };
+    if v.kind == V_UNSET || v.kind == V_VAR || v.kind == V_INHERIT {
+        return bad;
+    }
+    if syn == SY_ANY {
+        return v;
+    }
+    if syn == SY_COLOR {
+        if v.kind == V_COLOR { return v; }
+        return bad;
+    }
+    if syn == SY_NUM {
+        if v.kind == V_NUM { return v; }
+        return bad;
+    }
+    if syn == SY_PCT {
+        if v.kind == V_PCT { return v; }
+        return bad;
+    }
+    if syn == SY_ANGLE {
+        if v.kind == V_ANG { return v; }
+        return bad;
+    }
+    if syn == SY_URL {
+        if v.kind == V_URL { return v; }
+        return bad;
+    }
+    if v.kind == V_NUM && v.f == 0.0 {
+        return Value { kind: V_PX, f: 0.0, i: 0, c: 0 };
+    }
+    v = lenToPx(css, v, fs);
+    if v.kind == V_PX || (syn == SY_LENPCT && v.kind == V_PCT) {
+        return v;
+    }
+    return bad;
+}
+
+/// `v` as px when it is `V_EM` (of `fs`), `V_REM` (of the root's font-size) or a `V_XFORM` that holds em / rem (`xformPx`); other kinds unchanged.
+pub fn lenToPx(css: &Css, v: Value, fs: f32): Value {
+    if v.kind == V_XFORM && v.c != 0 { return xformPx(css, v, fs); }
+    if v.kind == V_EM { return Value { kind: V_PX, f: v.f * fs, i: 0, c: 0 }; }
+    if v.kind == V_REM { return Value { kind: V_PX, f: v.f * css.rootFs, i: 0, c: 0 }; }
+    return v;
+}
+
+/// Turn the `V_EM` / `V_REM` values of the `NPROPS` values at `a[off..]` into px, and give each `V_CALC` the
+/// element's font-size (`f`, what `em` inside it means). `parent` is the parent style (-1: the root, whose
+/// `rem` is its own `font-size`). A `V_CALC` that already carries a size (`f != 0`) keeps it.
+pub fn resolveUnits(css: &Css, a: []Value, off: int, parent: int) {
+    let pfs: f32 = 16.0;
+    if parent >= 0 {
+        pfs = css.vals.items[parent * NPROPS + P_FONT_SIZE].f;
+    }
+    let fv = a[off + P_FONT_SIZE];
+    if fv.kind == V_EM { a[off + P_FONT_SIZE] = Value { kind: V_PX, f: fv.f * pfs, i: 0, c: 0 }; }
+    else if fv.kind == V_REM {
+        let rb: f32 = css.rootFs;
+        if parent < 0 { rb = 16.0; }
+        a[off + P_FONT_SIZE] = Value { kind: V_PX, f: fv.f * rb, i: 0, c: 0 };
+    }
+    let fs = a[off + P_FONT_SIZE].f;
+    if parent < 0 { css.rootFs = fs; }
+    for q in 0..NPROPS {
+        let v = a[off + q];
+        if v.kind == V_EM || v.kind == V_REM || (v.kind == V_XFORM && v.c != 0) { a[off + q] = lenToPx(css, v, fs); }
+        else if v.kind == V_CALC && v.f == 0.0 { a[off + q].f = fs; }
+    }
+}
+
+/// How many px copies `xformPx` remembers.
+const XRES: int = 8;
+
+/// A `V_XFORM` with `c` 1 (a `transform` / `translate` list with em / rem in a translate, flags in `pct` bits 8 to 64: x em, y em,
+/// x rem, y rem) or 2 (`transform-origin` `[x, xp, y, yp]`, `xp` 2 em, 3 rem) as a copy in px at the end of `Css.paints`
+/// (`c` 0), em of `fs`, rem of the root's font-size. Layout is `j3.ui.xform`'s.
+fn xformPx(css: &Css, v: Value, fs: f32): Value {
+    let o = css.paints.len;
+    let r = xformCopy(css, v, fs);
+    let n = css.paints.len - o;
+    let a = css.paints.items;
+    for k in 0..css.xres.len / 2 {
+        let q = css.xres.items[k * 2];
+        let same = css.xres.items[k * 2 + 1] == n && q + n <= o;
+        for z in 0..n {
+            if same && a[q + z] != a[o + z] { same = false; }
+        }
+        if same {
+            css.paints.len = o;
+            return Value { kind: V_XFORM, f: 0.0, i: q, c: 0 };
+        }
+    }
+    let slot = css.xnext % XRES;
+    if slot * 2 >= css.xres.len {
+        css.xres.push(o);
+        css.xres.push(n);
+    } else {
+        css.xres.items[slot * 2] = o;
+        css.xres.items[slot * 2 + 1] = n;
+    }
+    css.xnext += 1;
+    return r;
+}
+
+/// Forget the px copies `xformPx` remembers (after `paints.len` was cut back below them).
+pub fn forgetXres(css: &Css) {
+    css.xres.len = 0;
+    css.xnext = 0;
+}
+
+/// `xformPx`'s copy, appended to `Css.paints`.
+fn xformCopy(css: &Css, v: Value, fs: f32): Value {
+    let o = css.paints.len;
+    let s = v.i;
+    let rb = css.rootFs;
+    if v.c == 2 {
+        for z in 0..4 {
+            css.paints.push(css.paints.items[s + z]);
+        }
+        for z in 0..2 {
+            let m = int(css.paints.items[o + 1 + z * 2]);
+            if m >= 2 {
+                let b = fs;
+                if m == 3 { b = rb; }
+                css.paints.items[o + z * 2] = css.paints.items[o + z * 2] * b;
+                css.paints.items[o + 1 + z * 2] = 0.0;
+            }
+        }
+        return Value { kind: V_XFORM, f: 0.0, i: o, c: 0 };
+    }
+    let n = int(css.paints.items[s]);
+    for z in 0..1 + n * 8 {
+        css.paints.push(css.paints.items[s + z]);
+    }
+    for i in 0..n {
+        let r = o + 1 + i * 8;
+        let fl = int(css.paints.items[r + 7]);
+        if fl >= 8 {
+            if (fl / 8) % 2 == 1 { css.paints.items[r + 1] = css.paints.items[r + 1] * fs; }
+            if (fl / 16) % 2 == 1 { css.paints.items[r + 2] = css.paints.items[r + 2] * fs; }
+            if (fl / 32) % 2 == 1 { css.paints.items[r + 1] = css.paints.items[r + 1] * rb; }
+            if (fl / 64) % 2 == 1 { css.paints.items[r + 2] = css.paints.items[r + 2] * rb; }
+            css.paints.items[r + 7] = f32(fl % 8);
+        }
+    }
+    return Value { kind: V_XFORM, f: 0.0, i: o, c: 0 };
+}
+
+/// `animKind`: not animatable.
+pub const CK_NONE: int = 0;
+
+/// A number (`opacity`, `flex`).
+pub const CK_NUM: int = 1;
+
+/// A px length (sizes, insets, margins, padding, gaps, border widths, radii).
+pub const CK_LEN: int = 2;
+
+pub const CK_COLOR: int = 3;
+
+/// `box-shadow`.
+pub const CK_SHADOW: int = 4;
+
+/// `transform`: a function list (`motion.j3` blends it function by function, else as a matrix).
+pub const CK_XFORM: int = 5;
+
+/// `background-image`, `border-image-source`, `mask-image`: `V_GRAD` lists blend through `j3.ui.gradmix`.
+pub const CK_GRAD: int = 6;
+
+/// A registered custom property (`@property`): `motionbase.VBASE + name` channels.
+pub const CK_VAR: int = 7;
+
+/// How `transition` and `@keyframes` blend property `p` (`CK_*`).
+pub fn animKind(p: int): int {
+    if p == P_OPACITY || p == P_FLEX || p == P_FLEX_SHRINK { return CK_NUM; }
+    if p == P_BACKGROUND || p == P_COLOR || (p >= P_BORDER_TOP_COLOR && p < P_BORDER_TOP_COLOR + 4) { return CK_COLOR; }
+    if p == P_BOX_SHADOW { return CK_SHADOW; }
+    if p == P_TRANSFORM || (p >= P_TRANSLATE && p <= P_SCALE) { return CK_XFORM; }
+    if p == P_BG_IMAGE || p == P_BORDER_IMAGE || p == P_MASK_IMAGE { return CK_GRAD; }
+    if (p >= P_LEFT && p <= P_BOTTOM) || p == P_GAP || p == P_ROW_GAP || (p >= P_WIDTH && p <= P_MARGIN_TOP + 3) || p == P_MAX_HEIGHT || p == P_MAX_WIDTH || p == P_FLEX_BASIS || p == P_LETTER_SPACING || p == P_WORD_SPACING {
+        return CK_LEN;
+    }
+    if (p >= P_BORDER_TOP_WIDTH && p < P_BORDER_TOP_WIDTH + 4) || (p >= P_RADIUS_TL && p < P_RADIUS_TL + 4) {
+        return CK_LEN;
+    }
+    return CK_NONE;
+}
+
+/// Animations one element runs at once (`animation: a 1s, b 2s`); more are dropped with a warning.
+pub const MAX_ANIM: int = 4;
+
+/// Entry `k` of the comma list `animation-*` property `prop` holds in style `st`: a list shorter than `k + 1`
+/// repeats from its start. A single value (the usual case) has `c` 0.
+pub fn animAt(css: &Css, st: int, prop: int, k: int): Value {
+    let v = css.get(st, prop);
+    let n = v.c % 256;
+    if n <= 1 {
+        return v;
+    }
+    let j = k % n;
+    if j == 0 {
+        return v;
+    }
+    return css.anx.items[v.c / 256 + j - 1];
+}
+
+/// How many animations style `st` runs: the entries of `animation-name` (`none` entries count, they do nothing).
+pub fn animCount(css: &Css, st: int): int {
+    let n = css.get(st, P_ANIM_NAME).c % 256;
+    if n < 1 {
+        return 1;
+    }
+    if n > MAX_ANIM {
+        return MAX_ANIM;
+    }
+    return n;
+}
+
+/// Longhands a `V_TRANS` covers.
+pub fn transCount(v: Value): int {
+    return v.c % 256;
+}
+
+/// Timing function (`Css.eases` index) of a `V_TRANS`.
+pub fn transEase(v: Value): int {
+    return (v.c / 256) % 256;
+}
+
+/// Delay in ms of a `V_TRANS`.
+pub fn transDelay(v: Value): int {
+    return v.c / 65536;
+}
+
+pub fn hasBit(set: int, bit: int): bool {
+    return (set / bit) % 2 == 1;
+}

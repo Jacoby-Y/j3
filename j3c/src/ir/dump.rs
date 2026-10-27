@@ -70,7 +70,7 @@ pub fn dump_module_into(cx: &IrCx, module: &Module, out: &mut String) {
     }
 }
 
-fn dump_func(cx: &IrCx, func: &Func, out: &mut String) {
+pub(crate) fn dump_func(cx: &IrCx, func: &Func, out: &mut String) {
     match func.vis {
         Vis::Pub => out.push_str("pub "),
         Vis::Private => {}

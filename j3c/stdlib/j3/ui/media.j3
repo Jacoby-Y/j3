@@ -1,0 +1,566 @@
+/// Images and vector shapes of `.j3ui` elements, with no tree: the texture cache (one load per path),
+/// the per-element `Media` record that `<img>`, `<svg>` and `<path>` fill in, and the draw calls that
+/// turn resolved style numbers into `j3.gfx.paint` calls (`<img>` with `object-fit`, tiled
+/// `background-image`, nine-slice `border-image`, `<path>` fill and stroke). `dom` reads the CSS and
+/// calls these; geometry is in `j3.ui.imgfit`, `j3.gfx.nineslice`, `j3.gfx.clip` and `j3.gfx.path`.
+/// Main thread only (textures are GL). Rounded corners clip with the painter's shape slot 1.
+
+module j3.ui.media;
+
+use j3.game;
+use j3.game.{ Color, Texture };
+use j3.gfx.clip;
+use j3.gfx.nineslice;
+use j3.gfx.nineslice.Cell;
+use j3.gfx.paint;
+use j3.gfx.path;
+use j3.gfx.path.Path;
+use j3.io.printLn;
+use j3.math.{ maxi, Vec2 };
+use j3.memory.{ Arena, List };
+use j3.text.same;
+use j3.ui.imgfit;
+use j3.ui.cssnames.namedColor;
+use j3.ui.imgfit.Rect;
+
+/// One cached texture. `hash` and `path` are the key; a file that failed to load stays cached empty.
+pub struct Ent {
+    hash: int;
+    path: []u8;
+    tex: Texture;
+}
+
+/// The texture cache of a `Dom`.
+pub struct Imgs {
+    ents: List<Ent>;
+}
+
+pub fn newImgs(mem: &Arena): Imgs {
+    return Imgs { ents: List<Ent>.new(mem) };
+}
+
+fn hashOf(s: string): int {
+    let h = 5381;
+    for i in 0..s.len {
+        h = (h * 33 + int(s[i])) % 1000000007;
+    }
+    return h;
+}
+
+/// The texture of file `p`: loaded on first use and kept (a missing file warns once and stays empty).
+pub fn load(c: &Imgs, mem: &Arena, p: string): Texture {
+    let h = hashOf(p);
+    for i in 0..c.ents.len {
+        let e = &c.ents.items[i];
+        if e.hash == h && same(e.path as string, p) {
+            return e.tex;
+        }
+    }
+    let tex = game.tryLoadTexture(p);
+    if tex.raw == 0 {
+        printLn(`warning: image not found or unreadable: {p}`);
+    }
+    let copy = mem.alloc::<u8>(p.len);
+    for i in 0..p.len {
+        copy[i] = p[i];
+    }
+    c.ents.push(Ent { hash: h, path: copy, tex: tex });
+    return tex;
+}
+
+/// Textures set to nearest sampling (`image-rendering: pixelated`): raw handle per entry.
+#[singleton]
+let NEAREST: [32]int;
+#[singleton]
+let NEAREST_N: int;
+
+/// Sample `tex` with nearest (`image-rendering: pixelated`) or linear filtering. A texture drawn both ways in one
+/// frame flushes the batch on each switch. ponytail: the filter lives on the texture, so a switch costs a flush;
+/// 32 pixelated textures at most, more stay linear.
+pub fn setFilter(tex: Texture, nearest: bool) {
+    let raw = tex.raw as int;
+    for i in 0..NEAREST_N {
+        if NEAREST[i] == raw {
+            if !nearest {
+                NEAREST[i] = NEAREST[NEAREST_N - 1];
+                NEAREST_N -= 1;
+                game.p2TextureFilter(u32(raw), false);
+            }
+            return;
+        }
+    }
+    if nearest && NEAREST_N < 32 {
+        NEAREST[NEAREST_N] = raw;
+        NEAREST_N += 1;
+        game.p2TextureFilter(u32(raw), true);
+    }
+}
+
+/// Delete every cached texture (the cache stays usable and reloads on demand).
+pub fn freeAll(c: &Imgs) {
+    NEAREST_N = 0;
+    for i in 0..c.ents.len {
+        game.destroyTexture(c.ents.items[i].tex);
+    }
+    c.ents.len = 0;
+}
+
+/// Colors of a vector shape: 0 none, 1 `c`, 2 the element's `color` (`currentColor`), 3 its `accent-color` (`accent`).
+pub const PAINT_NONE: int = 0;
+pub const PAINT_COLOR: int = 1;
+pub const PAINT_CURRENT: int = 2;
+pub const PAINT_ACCENT: int = 3;
+
+/// What an `<img>`, `<svg>` or `<path>` element carries (index kept in `Node.media`).
+pub struct Media {
+    used: bool;
+    src: []u8;
+    srcLen: int;
+    /// The texture for `src` is stale.
+    need: bool;
+    tex: Texture;
+    /// Sprite sheet grid, first frame, frames per second.
+    cols: int;
+    rows: int;
+    frame: f32;
+    fps: f32;
+    vb: [4]f32;
+    hasVb: bool;
+    /// `<path>`: the text of `d`, the flattened points, whether they are current.
+    dText: []u8;
+    dLen: int;
+    pts: []f32;
+    flat: Path;
+    fillMode: int;
+    fillC: Color;
+    strokeMode: int;
+    strokeC: Color;
+    sw: f32;
+}
+
+pub fn newMedia(mem: &Arena): List<Media> {
+    return List<Media>.new(mem);
+}
+
+/// A free `Media` index in `l` (reused after `release`, else a new one).
+pub fn acquire(l: &List<Media>): int {
+    for i in 0..l.len {
+        if !l.items[i].used {
+            l.items[i].used = true;
+            return i;
+        }
+    }
+    l.push(blank());
+    l.items[l.len - 1].used = true;
+    return l.len - 1;
+}
+
+pub fn release(l: &List<Media>, i: int) {
+    l.items[i].used = false;
+    l.items[i].srcLen = 0;
+    l.items[i].dLen = 0;
+    l.items[i].need = false;
+    l.items[i].flat.n = 0;
+    l.items[i].cols = 1;
+    l.items[i].rows = 1;
+    l.items[i].fps = 0.0;
+    l.items[i].frame = 0.0;
+    l.items[i].hasVb = false;
+    l.items[i].fillMode = PAINT_CURRENT;
+    l.items[i].strokeMode = PAINT_NONE;
+    l.items[i].sw = 1.0;
+}
+
+fn blank(): Media {
+    let none = Color { r: 0, g: 0, b: 0, a: 0 };
+    return Media {
+        used: false, src: "" as []u8, srcLen: 0, need: false, tex: Texture { raw: 0, w: 0, h: 0 },
+        cols: 1, rows: 1, frame: 0.0, fps: 0.0, vb: [0.0, 0.0, 0.0, 0.0], hasVb: false,
+        dText: "" as []u8, dLen: 0, pts: "" as []f32, flat: Path { pts: "" as []f32, n: 0, minx: 0.0, miny: 0.0, maxx: 0.0, maxy: 0.0, ok: true },
+        fillMode: PAINT_CURRENT, fillC: none, strokeMode: PAINT_NONE, strokeC: none, sw: 1.0,
+    };
+}
+
+/// Copy `s` into `buf` when it differs; whether it changed. Grows `buf` from `mem`.
+fn store(mem: &Arena, buf: &[]u8, len: &int, s: string): bool {
+    let same_ = *len == s.len;
+    if same_ {
+        for i in 0..s.len {
+            if (*buf)[i] != s[i] {
+                same_ = false;
+            }
+        }
+    }
+    if same_ {
+        return false;
+    }
+    if s.len > buf.len {
+        *buf = mem.alloc::<u8>(s.len * 2);
+    }
+    for i in 0..s.len {
+        (*buf)[i] = s[i];
+    }
+    *len = s.len;
+    return true;
+}
+
+/// `Dom.attrMedia` kinds: `src`, `sprite="cols,rows"`, `viewBox="x y w h"`, `d`, `fill`, `stroke`.
+pub const M_SRC: int = 0;
+pub const M_SPRITE: int = 1;
+pub const M_VIEWBOX: int = 2;
+pub const M_D: int = 3;
+pub const M_FILL: int = 4;
+pub const M_STROKE: int = 5;
+
+/// `Dom.attrMediaNum` kinds: `frame`, `fps`, `stroke-width`.
+pub const N_FRAME: int = 0;
+pub const N_FPS: int = 1;
+pub const N_STROKE_WIDTH: int = 2;
+
+/// Set a string attribute; true when the size of the element may have changed.
+pub fn setStr(m: &Media, mem: &Arena, what: int, s: string): bool {
+    if what == M_SRC {
+        if store(mem, &m.src, &m.srcLen, s) {
+            m.need = true;
+            return true;
+        }
+    } else if what == M_SPRITE {
+        let v: [2]f32 = [1.0, 1.0];
+        let c = m.cols;
+        let r = m.rows;
+        if path.numbers(s, v[0..2]) == 2 {
+            m.cols = maxi(1, int(v[0]));
+            m.rows = maxi(1, int(v[1]));
+        }
+        return c != m.cols || r != m.rows;
+    } else if what == M_VIEWBOX {
+        let had = m.hasVb;
+        let w0 = m.vb[2];
+        let h0 = m.vb[3];
+        m.hasVb = path.numbers(s, m.vb[0..4]) == 4 && m.vb[2] > 0.0 && m.vb[3] > 0.0;
+        return had != m.hasVb || w0 != m.vb[2] || h0 != m.vb[3];
+    } else if what == M_D {
+        // flattened once per change
+        if store(mem, &m.dText, &m.dLen, s) {
+            if m.pts.len == 0 {
+                m.pts = mem.alloc::<f32>(2 * path.MAXPT);
+            }
+            m.flat = path.parseFit(m.dText[0..m.dLen] as string, m.pts);
+        }
+    } else if what == M_FILL {
+        m.fillMode = parsePaint(s, &m.fillC);
+    } else if what == M_STROKE {
+        m.strokeMode = parsePaint(s, &m.strokeC);
+    }
+    return false;
+}
+
+/// Set a number attribute.
+pub fn setNum(m: &Media, what: int, v: f32) {
+    if what == N_FRAME {
+        m.frame = v;
+    } else if what == N_FPS {
+        m.fps = v;
+    } else {
+        m.sw = v;
+    }
+}
+
+fn hexNib(c: int): int {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    return -1;
+}
+
+/// A `fill` / `stroke` value: `none`, `currentColor`, `accent`, a CSS color name (`red`, any case), `transparent`, `#rgb`, `#rrggbb`, `#rrggbbaa`. Returns the paint mode. No `rgb()` or `hsl()` here.
+pub fn parsePaint(s: string, out: &Color): int {
+    if same(s, "none") {
+        return PAINT_NONE;
+    }
+    if same(s, "currentColor") || same(s, "currentcolor") {
+        return PAINT_CURRENT;
+    }
+    if same(s, "accent") {
+        return PAINT_ACCENT;
+    }
+    if same(s, "white") || same(s, "black") || same(s, "transparent") {
+        let channel: u8 = 0;
+        if same(s, "white") { channel = 255; }
+        *out = Color { r: channel, g: channel, b: channel, a: 255 };
+        if same(s, "transparent") { out.a = 0; }
+        return PAINT_COLOR;
+    }
+    let nc = namedColor(s);
+    if nc >= 0 {
+        *out = Color { r: u8((nc / 65536) % 256), g: u8((nc / 256) % 256), b: u8(nc % 256), a: 255 };
+        return PAINT_COLOR;
+    }
+    if s.len >= 4 && int(s[0]) == 35 {
+        let nd = s.len - 1;
+        if nd == 3 || nd == 6 || nd == 8 {
+            let v: [8]int = [0, 0, 0, 0, 0, 0, 15, 15];
+            let ok = true;
+            for i in 0..nd {
+                let h = hexNib(int(s[1 + i]));
+                if h < 0 {
+                    ok = false;
+                }
+                v[i] = h;
+            }
+            if ok {
+                if nd == 3 {
+                    out.r = u8(v[0] * 17);
+                    out.g = u8(v[1] * 17);
+                    out.b = u8(v[2] * 17);
+                    out.a = 255;
+                } else {
+                    out.r = u8(v[0] * 16 + v[1]);
+                    out.g = u8(v[2] * 16 + v[3]);
+                    out.b = u8(v[4] * 16 + v[5]);
+                    out.a = 255;
+                    if nd == 8 {
+                        out.a = u8(v[6] * 16 + v[7]);
+                    }
+                }
+                return PAINT_COLOR;
+            }
+        }
+    }
+    return PAINT_NONE;
+}
+
+/// Natural size of an `<img>` (the sprite cell when it has a sheet), or of an `<svg>`'s viewBox
+/// (300 x 150 without one). The texture loads on first ask.
+pub fn natural(c: &Imgs, mem: &Arena, m: &Media, isSvg: bool): Vec2 {
+    if isSvg {
+        if m.hasVb {
+            return Vec2 { x: m.vb[2], y: m.vb[3] };
+        }
+        return Vec2 { x: 300.0, y: 150.0 };
+    }
+    if m.need {
+        m.need = false;
+        m.tex = Texture { raw: 0, w: 0, h: 0 };
+        if m.srcLen > 0 {
+            m.tex = load(c, mem, m.src[0..m.srcLen] as string);
+        }
+    }
+    return Vec2 { x: f32(m.tex.w) / f32(m.cols), y: f32(m.tex.h) / f32(m.rows) };
+}
+
+/// Resolved style of an image-like box. Corner radii are for the border box; `l t r b` are the
+/// border plus padding to inset the picture by.
+pub struct ImgStyle {
+    /// `image-rendering: pixelated`.
+    nearest: bool;
+    fit: int;
+    px: f32;
+    pxu: int;
+    py: f32;
+    pyu: int;
+    tint: Color;
+    tl: f32;
+    tr: f32;
+    br: f32;
+    bl: f32;
+    l: f32;
+    t: f32;
+    r: f32;
+    b: f32;
+}
+
+#[singleton]
+let SCR: [4096]f32;
+
+/// Clip to the box's rounded corners (slot 1) when any radius is set; whether it did.
+fn roundClip(w: f32, h: f32, tl: f32, tr: f32, br: f32, bl: f32): bool {
+    if tl <= 0.0 && tr <= 0.0 && br <= 0.0 && bl <= 0.0 {
+        return false;
+    }
+    let n = clip.rrect(SCR[0..2 * path.MAXPT], 0.0, 0.0, w, h, tl, tr, br, bl);
+    paint.pushShape(1, SCR[0..2 * path.MAXPT], n, false);
+    return true;
+}
+
+/// Draw an `<img>` in a `w` x `h` border box at the current origin.
+pub fn drawImg(m: &Media, w: f32, h: f32, s: &ImgStyle, nowMs: f32) {
+    if m.tex.raw == 0 || m.tex.w < 1 || m.tex.h < 1 {
+        return;
+    }
+    let iw = f32(m.tex.w);
+    let ih = f32(m.tex.h);
+    let src = Rect { x: 0.0, y: 0.0, w: iw, h: ih };
+    if m.cols > 1 || m.rows > 1 {
+        src = imgfit.cell(m.cols, m.rows, iw, ih, imgfit.frameAt(m.frame, m.fps, nowMs, m.cols * m.rows));
+    }
+    let bw = w - s.l - s.r;
+    let bh = h - s.t - s.b;
+    let pl = imgfit.fit(s.fit, bw, bh, src.x, src.y, src.w, src.h, s.px, s.pxu, s.py, s.pyu);
+    if pl.dw <= 0.0 {
+        return;
+    }
+    let rounded = roundClip(w, h, s.tl, s.tr, s.br, s.bl);
+    setFilter(m.tex, s.nearest);
+    paint.imageSrc(m.tex, Vec2 { x: pl.sx, y: pl.sy }, Vec2 { x: pl.sw, y: pl.sh }, Vec2 { x: s.l + pl.dx, y: s.t + pl.dy }, Vec2 { x: pl.dw, y: pl.dh }, s.tint);
+    if rounded {
+        paint.popShape(1);
+    }
+}
+
+/// Resolved `background-*` of a box.
+pub struct BgStyle {
+    mode: int;
+    szx: f32;
+    szxu: int;
+    szy: f32;
+    szyu: int;
+    px: f32;
+    pxu: int;
+    py: f32;
+    pyu: int;
+    /// `imgfit.REP_*` per axis.
+    rx: int;
+    ry: int;
+    nearest: bool;
+    tint: Color;
+    tl: f32;
+    tr: f32;
+    br: f32;
+    bl: f32;
+}
+
+/// Draw `tex` as the background of a `w` x `h` box (tiles cut to the box, rounded corners clip).
+pub fn drawBg(tex: Texture, w: f32, h: f32, s: &BgStyle) {
+    if tex.raw == 0 || tex.w < 1 || tex.h < 1 {
+        return;
+    }
+    let iw = f32(tex.w);
+    let ih = f32(tex.h);
+    let t = imgfit.tilesR(s.mode, s.szx, s.szxu, s.szy, s.szyu, s.px, s.pxu, s.py, s.pyu, s.rx, s.ry, w, h, iw, ih);
+    if t.nx == 0 {
+        return;
+    }
+    let rounded = roundClip(w, h, s.tl, s.tr, s.br, s.bl);
+    setFilter(tex, s.nearest);
+    for iy in 0..t.ny {
+        for ix in 0..t.nx {
+            let pl = imgfit.crop(t.x0 + f32(ix) * t.sx, t.y0 + f32(iy) * t.sy, t.w, t.h, 0.0, 0.0, iw, ih, w, h);
+            if pl.dw > 0.0 {
+                let bias: f32 = 0.0;
+                if s.nearest { bias = TIE; }
+                paint.imageSrc(tex, Vec2 { x: pl.sx + bias, y: pl.sy + bias }, Vec2 { x: pl.sw, y: pl.sh }, Vec2 { x: pl.dx, y: pl.dy }, Vec2 { x: pl.dw, y: pl.dh }, s.tint);
+            }
+        }
+    }
+    if rounded {
+        paint.popShape(1);
+    }
+}
+
+/// Quads of one tiled border-image piece (see `imgfit.tileCell`); one texture, so they batch.
+#[singleton]
+let QUADS: [32768]f32;
+
+/// Nearest sampling picks a texel by the uv at the pixel center; where that lands exactly on a texel edge, float noise
+/// across the quad's two triangles flips it from row to row. A hair of bias settles every tie the same way.
+const TIE: f32 = 0.002;
+
+fn drawTiled(tex: Texture, c: &Cell, pos: Vec2, tw: f32, th: f32, mx: int, my: int, tint: Color, nearest: bool) {
+    let n = imgfit.tileCell(c.dw, c.dh, c.sx, c.sy, c.sw, c.sh, tw, th, mx, my, QUADS[0..32768]);
+    let bias: f32 = 0.0;
+    if nearest { bias = TIE; }
+    for i in 0..n {
+        let o = i * 8;
+        paint.imageSrc(tex, Vec2 { x: QUADS[o + 4] + bias, y: QUADS[o + 5] + bias }, Vec2 { x: QUADS[o + 6], y: QUADS[o + 7] }, Vec2 { x: pos.x + c.dx + QUADS[o], y: pos.y + c.dy + QUADS[o + 1] }, Vec2 { x: QUADS[o + 2], y: QUADS[o + 3] }, tint);
+    }
+}
+
+/// Draw `tex` as a nine-slice border image over a `w` x `h` box at `pos`. `slice` is `[top, right, bottom,
+/// left]` in image px (negative: a third of the image), `widths` the border widths (zero: the slice).
+/// `rx` / `ry` (`imgfit.REP_*`) tile the top and bottom edges, the left and right edges, and the center:
+/// tiles keep the scale of their edge (border width over slice size), centered, cut at the ends.
+pub fn drawBorderImage(tex: Texture, pos: Vec2, w: f32, h: f32, slice: [4]f32, widths: [4]f32, fill: bool, tint: Color, rx: int, ry: int, nearest: bool) {
+    if tex.raw == 0 || tex.w < 1 || tex.h < 1 {
+        return;
+    }
+    setFilter(tex, nearest);
+    let iw = f32(tex.w);
+    let ih = f32(tex.h);
+    let sl = slice;
+    if sl[0] < 0.0 { sl[0] = ih / 3.0; }
+    if sl[1] < 0.0 { sl[1] = iw / 3.0; }
+    if sl[2] < 0.0 { sl[2] = ih / 3.0; }
+    if sl[3] < 0.0 { sl[3] = iw / 3.0; }
+    let bd = widths;
+    if bd[0] <= 0.0 { bd[0] = sl[0]; }
+    if bd[1] <= 0.0 { bd[1] = sl[1]; }
+    if bd[2] <= 0.0 { bd[2] = sl[2]; }
+    if bd[3] <= 0.0 { bd[3] = sl[3]; }
+    let s9 = nineslice.layout(iw, ih, sl[3], sl[0], sl[1], sl[2], w, h, bd[3], bd[0], bd[1], bd[2]);
+    if rx == imgfit.REP_NONE && ry == imgfit.REP_NONE {
+        nineslice.draw(tex, &s9, pos, fill, tint);
+        return;
+    }
+    // scale of each edge: border thickness over slice thickness
+    let top = nineslice.cell(&s9, 1);
+    let bot = nineslice.cell(&s9, 7);
+    let lef = nineslice.cell(&s9, 3);
+    let rig = nineslice.cell(&s9, 5);
+    let fx: f32 = 1.0;
+    if top.sh > 0.0 && top.dh > 0.0 { fx = top.dh / top.sh; }
+    else if bot.sh > 0.0 && bot.dh > 0.0 { fx = bot.dh / bot.sh; }
+    let fy: f32 = 1.0;
+    if lef.sw > 0.0 && lef.dw > 0.0 { fy = lef.dw / lef.sw; }
+    else if rig.sw > 0.0 && rig.dw > 0.0 { fy = rig.dw / rig.sw; }
+    for i in 0..9 {
+        if i == 4 && !fill {
+            continue;
+        }
+        let c = nineslice.cell(&s9, i);
+        if c.sw <= 0.0 || c.sh <= 0.0 || c.dw <= 0.0 || c.dh <= 0.0 {
+            continue;
+        }
+        if i == 1 || i == 7 {
+            drawTiled(tex, &c, pos, c.sw * c.dh / c.sh, c.dh, rx, imgfit.REP_NONE, tint, nearest);
+        } else if i == 3 || i == 5 {
+            drawTiled(tex, &c, pos, c.dw, c.sh * c.dw / c.sw, imgfit.REP_NONE, ry, tint, nearest);
+        } else if i == 4 {
+            drawTiled(tex, &c, pos, c.sw * fx, c.sh * fy, rx, ry, tint, nearest);
+        } else {
+            paint.imageSrc(tex, Vec2 { x: c.sx, y: c.sy }, Vec2 { x: c.sw, y: c.sh }, Vec2 { x: pos.x + c.dx, y: pos.y + c.dy }, Vec2 { x: c.dw, y: c.dh }, tint);
+        }
+    }
+}
+
+/// Draw a `<path>` through the view map: fill (a shape fill), then stroke (round-capped segments).
+pub fn drawPath(m: &Media, s: f32, ox: f32, oy: f32, cur: Color, acc: Color) {
+    if m.flat.n == 0 {
+        return;
+    }
+    if m.fillMode != PAINT_NONE {
+        let col = m.fillC;
+        if m.fillMode == PAINT_CURRENT {
+            col = cur;
+        } else if m.fillMode == PAINT_ACCENT {
+            col = acc;
+        }
+        let n = path.fillPoints(&m.flat, SCR[0..2 * path.MAXPT], s, s, ox, oy);
+        paint.fillShape(SCR[0..2 * path.MAXPT], n, false, col);
+    }
+    if m.strokeMode != PAINT_NONE && m.sw > 0.0 {
+        let stroke = m.strokeC;
+        if m.strokeMode == PAINT_CURRENT {
+            stroke = cur;
+        } else if m.strokeMode == PAINT_ACCENT {
+            stroke = acc;
+        }
+        for i in 0..m.flat.n - 1 {
+            let ax = m.flat.pts[2 * i];
+            let bx = m.flat.pts[2 * i + 2];
+            if !path.isSep(ax) && !path.isSep(bx) {
+                paint.line(Vec2 { x: ax * s + ox, y: m.flat.pts[2 * i + 1] * s + oy }, Vec2 { x: bx * s + ox, y: m.flat.pts[2 * i + 3] * s + oy }, m.sw * s, stroke);
+            }
+        }
+    }
+}

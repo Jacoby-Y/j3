@@ -1,0 +1,893 @@
+/// The editing model of a single-line text box: a UTF-8 buffer, a caret and a selection anchor, in
+/// bytes that always sit on code point boundaries. No Dom, no GL, no clipboard: callers pass the
+/// text to insert and read `selected`. `j3.ui.field` draws it, `j3.ui.inputs` feeds it keys.
+///
+/// ```
+/// let e = Edit.new(&mem);
+/// e.set("héllo");  e.insert(" wörld");  e.left(false, false);  e.deleteBack(false);
+/// let s = e.str();
+/// ```
+/// Control characters are dropped on insert (a tab becomes a space); a `textarea` (`nl`) keeps newlines.
+/// `maxlen` caps the length in code points on insert (0: none); `set` is not capped (the program decides).
+
+module j3.ui.textedit;
+
+use j3.memory.{ Arena, List };
+use j3.text.{ same, Text };
+use j3.ui.spans.{ covered, isToken, Span, spanEdit, SPAN_BOLD, SPAN_EMOJI, SPAN_ITALIC, SPAN_MENTION, uncover };
+use j3.ui.textfit.isCont;
+
+/// Most undo steps kept per box (and so most redo steps); the oldest is dropped past it.
+pub const UNDO_CAP: int = 100;
+
+/// Most bytes of text the undo stack may hold (each step is a copy of the whole text). The oldest steps
+/// go first, but the newest is always kept, so one huge text still has one undo step.
+pub const UNDO_BYTES: int = 4 * 1024 * 1024;
+
+/// Edit kinds for undo merging: typing and deleting runs merge into one step, anything else is its own.
+const K_NONE: int = 0;
+const K_TYPE: int = 1;
+const K_DEL: int = 2;
+const K_OTHER: int = 3;
+
+/// One undo or redo step: the whole state to go back to (spans included).
+pub struct Undo {
+    text: Text;
+    cur: int;
+    anc: int;
+    sp: List<Span>;
+}
+
+/// Bytes an undo step is charged per span, next to its text.
+const SPAN_BYTES: int = 32;
+
+/// A byte range `lo..hi`.
+pub struct WordRange {
+    lo: int;
+    hi: int;
+}
+
+/// Character class of byte `i` of `s` for word moves and selection: 0 space, 1 punctuation, 2 word. ASCII letters, digits
+/// and `_` are word, other ASCII is punctuation; a non-ASCII code point is a letter except no-break space and the Unicode space
+/// blocks (space), General Punctuation U+2000..U+206F and CJK punctuation U+3000..U+303F (punctuation). All bytes of one
+/// character share its class.
+pub fn charClass(s: []u8, i: int): int {
+    let b = int(s[i]);
+    if b < 128 {
+        if b == 32 || b == 10 || b == 9 || b == 13 { return 0; }
+        if b == 95 || (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) { return 2; }
+        return 1;
+    }
+    let j = i;
+    while j > 0 && i - j < 3 && (int(s[j]) >= 128 && int(s[j]) < 192) { j -= 1; }
+    let l = int(s[j]);
+    let c1 = if j + 1 < s.len { int(s[j + 1]) } else { 0 };
+    let c2 = if j + 2 < s.len { int(s[j + 2]) } else { 0 };
+    if l == 194 && c1 == 160 { return 0; }
+    if l == 227 && c1 == 128 { return if c2 == 128 { 0 } else if c2 < 144 { 1 } else { 2 }; }
+    if l == 226 && c1 == 128 {
+        if c2 <= 138 || c2 == 175 { return 0; }
+        return 1;
+    }
+    if l == 226 && c1 == 129 && c2 < 176 { return if c2 == 159 { 0 } else { 1 }; }
+    return 2;
+}
+
+/// The word around byte `i` of `s`: a run of one class (word characters, punctuation, or spaces; a newline ends a space
+/// run). The one definition of "word" for text boxes (`Edit.selectWord`) and static text (`j3.ui.textsel`).
+pub fn wordRange(s: []u8, i: int): WordRange {
+    if s.len == 0 { return WordRange { lo: 0, hi: 0 }; }
+    let p = if i > s.len { s.len } else { i };
+    if p >= s.len || (p > 0 && charClass(s, p) == 0 && charClass(s, p - 1) != 0) {
+        p = if p > 0 { p - 1 } else { 0 };
+    }
+    let c = charClass(s, p);
+    let lo = p;
+    while lo > 0 && charClass(s, lo - 1) == c && !(c == 0 && s[lo - 1] == 10) {
+        lo -= 1;
+    }
+    let hi = p;
+    while hi < s.len && charClass(s, hi) == c && !(c == 0 && s[hi] == 10) {
+        hi += 1;
+    }
+    return WordRange { lo: lo, hi: hi };
+}
+
+/// Where the caret was last painted (top left in the text box's window position), for `Dom.caretRect`.
+pub struct CaretRect {
+    x: f32;
+    y: f32;
+    w: f32;
+    h: f32;
+}
+
+/// One text box's state. `cur` is the caret, `anc` the other end of the selection (equal when
+/// nothing is selected). `vs` is the first byte shown (`j3.ui.field` scrolls it). `owner` is the
+/// node using it (-1 when free); `t0` the clock of the last edit, for the caret blink.
+/// The rest is for `j3.ui.area` (a `textarea`): `ver` counts edits, `ls` holds the byte index where each
+/// wrapped line starts (valid for `lver` and width `lw`), `ty` is the scroll in px, `gx` the goal x of
+/// Up/Down (-1 none), `lh` and `vh` the line height and view height at the last paint. `mask` is the
+/// password glyph string, `clicks` / `ct` / `ci` count fast clicks for word and line select, `fcur` / `fver`
+/// the caret and edit count the view last followed, `gcur` the caret where the last Up/Down left it,
+/// `up` the caret where End left it at a mid-word soft break (it shows at the end of that line, not the start of the next).
+/// Undo: `us` / `rs` are the undo and redo stacks (entries `0..un` / `0..rn` are live, the rest are spare
+/// buffers reused, so a long session allocates at most `UNDO_CAP` + 1 of each); `uk` is the kind of the last edit.
+/// A `rich` textarea (`rich`) also keeps `sp`, its spans (empty, and so free, in every other box); `px` / `py`
+/// are the caret's top left in the content box at the last paint (-1: none). `late` is the frame in which `changed` is
+/// also true (set by `Dom.insertToken`, which may run after the box was updated).
+pub struct Edit {
+    text: Text;
+    cur: int;
+    anc: int;
+    vs: int;
+    owner: int;
+    t0: f32;
+    nl: bool;
+    maxlen: int;
+    ver: int;
+    ls: List<int>;
+    lver: int;
+    lw: f32;
+    ty: f32;
+    gx: f32;
+    lh: f32;
+    vh: f32;
+    mask: Text;
+    clicks: int;
+    ct: f32;
+    ci: int;
+    fcur: int;
+    fver: int;
+    gcur: int;
+    up: int;
+    us: List<Undo>;
+    un: int;
+    rs: List<Undo>;
+    rn: int;
+    uk: int;
+    rich: bool;
+    late: int;
+    da: []u8;
+    db: []u8;
+    dn: int;
+    hv: []Span;
+    sp: List<Span>;
+    px: f32;
+    py: f32;
+
+    fn new(mem: &Arena): Edit {
+        return Edit { text: Text.new(mem), cur: 0, anc: 0, vs: 0, owner: -1, t0: 0.0, nl: false, maxlen: 0, ver: 0, ls: List<int>.new(mem), lver: -1, lw: -1.0, ty: 0.0, gx: -1.0, lh: 0.0, vh: 0.0, mask: Text.new(mem), clicks: 0, ct: -1000000.0, ci: -1, fcur: -1, fver: -1, gcur: -1, up: -1, us: List<Undo>.new(mem), un: 0, rs: List<Undo>.new(mem), rn: 0, uk: 0, rich: false, late: -1, da: mem.alloc::<u8>(0), db: mem.alloc::<u8>(0), dn: 0, hv: mem.alloc::<Span>(0), sp: List<Span>.new(mem), px: -1.0, py: -1.0 };
+    }
+
+    /// Back to a new box, keeping every buffer (a box that is made and freed again and again, like a grid's cell editor,
+    /// allocates nothing). Views of the old text (a bound variable) are overwritten by the next use.
+    fn reset(this: &Edit) {
+        this.text.clear();
+        this.mask.clear();
+        this.ls.len = 0;
+        this.sp.len = 0;
+        this.hv = this.hv[0..0];
+        this.cur = 0;
+        this.anc = 0;
+        this.vs = 0;
+        this.owner = -1;
+        this.t0 = 0.0;
+        this.nl = false;
+        this.maxlen = 0;
+        this.ver += 1;
+        this.lver = -1;
+        this.lw = -1.0;
+        this.ty = 0.0;
+        this.gx = -1.0;
+        this.lh = 0.0;
+        this.vh = 0.0;
+        this.clicks = 0;
+        this.ct = -1000000.0;
+        this.ci = -1;
+        this.fcur = -1;
+        this.fver = -1;
+        this.gcur = -1;
+        this.up = -1;
+        this.un = 0;
+        this.rn = 0;
+        this.uk = K_NONE;
+        this.rich = false;
+        this.late = -1;
+        this.dn = 0;
+        this.px = -1.0;
+        this.py = -1.0;
+    }
+
+    /// The text.
+    fn str(this: &Edit): string {
+        return this.text.str();
+    }
+
+    /// Replace everything with `s` (control characters dropped), caret at the end, nothing selected.
+    /// `s` may be a view of our own bytes (a bound variable holds `str()`): the copy runs forward, so it is safe.
+    fn set(this: &Edit, s: string) {
+        this.text.clear();
+        this.ver += 1;
+        for i in 0..s.len {
+            let b = s[i];
+            if b == 9 {
+                this.text.push(32);
+            } else if b >= 32 && b != 127 || (b == 10 && this.nl) {
+                this.text.push(b);
+            }
+        }
+        this.cur = this.text.len();
+        this.anc = this.cur;
+        this.vs = 0;
+        this.uk = K_NONE;
+        this.sp.len = 0;
+    }
+
+    /// Forget all undo and redo steps (a new owner of the slot).
+    fn clearUndo(this: &Edit) {
+        this.un = 0;
+        this.rn = 0;
+        this.uk = K_NONE;
+    }
+
+    /// Copy the current state into slot `i` of `l`, making the slot when it is new.
+    fn save(this: &Edit, l: &List<Undo>, i: int) {
+        while l.len <= i {
+            l.push(Undo { text: Text.new(this.text.arena), cur: 0, anc: 0, sp: List<Span>.new(this.text.arena) });
+        }
+        let u = &l.items[i];
+        u.text.clear();
+        u.text.pushStr(this.text.str());
+        u.cur = this.cur;
+        u.anc = this.anc;
+        u.sp.len = 0;
+        for k in 0..this.sp.len {
+            u.sp.push(this.sp.items[k]);
+        }
+    }
+
+    /// Make slot `i` of `l` the current state.
+    fn load(this: &Edit, l: &List<Undo>, i: int) {
+        let u = &l.items[i];
+        this.text.clear();
+        this.text.pushStr(u.text.str());
+        this.cur = u.cur;
+        this.anc = u.anc;
+        this.sp.len = 0;
+        for k in 0..u.sp.len {
+            this.sp.push(u.sp.items[k]);
+        }
+        this.vs = 0;
+        this.ver += 1;
+        this.uk = K_NONE;
+    }
+
+    /// Every entry owns its own `Text`; the shift moves each struct down one slot and the oldest, whose
+    /// buffer no other entry holds, becomes the spare at the end. Slots stay dense, so a big text
+    /// only ever grows the first few buffers.
+    fn evictOldest(this: &Edit) {
+        let first = this.us.items[0];
+        for i in 1..this.un {
+            this.us.items[i - 1] = this.us.items[i];
+        }
+        this.us.items[this.un - 1] = first;
+        this.un -= 1;
+    }
+
+    /// Push the current state on the undo stack, dropping the oldest steps past `UNDO_CAP` steps or
+    /// `UNDO_BYTES` bytes (the newest step always stays).
+    fn pushUndo(this: &Edit) {
+        if this.un >= UNDO_CAP {
+            this.evictOldest();
+        }
+        this.save(&this.us, this.un);
+        this.un += 1;
+        let total = 0;
+        for i in 0..this.un {
+            total += this.us.items[i].text.len() + this.us.items[i].sp.len * SPAN_BYTES;
+        }
+        while this.un > 1 && total > UNDO_BYTES {
+            total -= this.us.items[0].text.len() + this.us.items[0].sp.len * SPAN_BYTES;
+            this.evictOldest();
+        }
+    }
+
+    /// Called before every user edit of kind `k`: starts a step unless it continues a typing or
+    /// deleting run, and clears redo. True when it started one.
+    fn rec(this: &Edit, k: int): bool {
+        this.rn = 0;
+        let run = (k == K_TYPE || k == K_DEL) && k == this.uk;
+        this.uk = k;
+        if run {
+            return false;
+        }
+        this.pushUndo();
+        return true;
+    }
+
+    /// Ctrl+Z: go back one step. False when there is none.
+    fn undo(this: &Edit): bool {
+        if this.un == 0 {
+            return false;
+        }
+        this.save(&this.rs, this.rn);
+        this.rn += 1;
+        this.un -= 1;
+        this.load(&this.us, this.un);
+        return true;
+    }
+
+    /// Ctrl+Y / Ctrl+Shift+Z: redo the step undone last. False when there is none.
+    fn redo(this: &Edit): bool {
+        if this.rn == 0 {
+            return false;
+        }
+        this.pushUndo();
+        this.rn -= 1;
+        this.load(&this.rs, this.rn);
+        return true;
+    }
+
+    /// Whether `set(s)` would leave the text as it is (it drops control characters, so `s` may differ from `str()`).
+    fn matches(this: &Edit, s: string): bool {
+        let t = this.text.bytes;
+        let j = 0;
+        for i in 0..s.len {
+            let b = s[i];
+            if b == 9 {
+                b = 32;
+            }
+            if b >= 32 && b != 127 || (b == 10 && this.nl) {
+                if j >= t.len || t[j] != b {
+                    return false;
+                }
+                j += 1;
+            }
+        }
+        return j == t.len;
+    }
+
+    /// Selection start (the smaller end).
+    fn lo(this: &Edit): int {
+        return if this.cur < this.anc { this.cur } else { this.anc };
+    }
+
+    /// Selection end (the larger end).
+    fn hi(this: &Edit): int {
+        return if this.cur < this.anc { this.anc } else { this.cur };
+    }
+
+    /// The selected text (a view; empty when nothing is selected).
+    fn selected(this: &Edit): string {
+        let s = this.text.str();
+        return s[this.lo()..this.hi()];
+    }
+
+    /// Whether a range is selected.
+    fn hasSel(this: &Edit): bool {
+        return this.cur != this.anc;
+    }
+
+    /// Delete the selection (its own undo step) and collapse the caret to its start.
+    fn deleteSel(this: &Edit) {
+        this.rec(K_OTHER);
+        this.dropSel();
+    }
+
+    fn dropSel(this: &Edit) {
+        let a = this.snap(this.lo(), -1);
+        let b = this.snap(this.hi(), 1);
+        this.ver += 1;
+        this.text.remove(a, b - a);
+        if this.sp.len > 0 {
+            spanEdit(&this.sp, a, b - a, 0, false);
+        }
+        this.cur = a;
+        this.anc = a;
+    }
+
+    /// Code points in the text.
+    fn cps(this: &Edit): int {
+        let n = 0;
+        for i in 0..this.text.bytes.len {
+            if !isCont(this.text.bytes[i]) {
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// Type `s` over the selection (control characters dropped, a tab becomes a space, at most `maxlen`
+    /// code points in all).
+    /// Typing merges into one undo step; a typing run over a selection starts its own.
+    fn insert(this: &Edit, s: string) {
+        this.put(s, K_TYPE);
+    }
+
+    /// Like `insert`, but always its own undo step (a paste or an IME commit).
+    fn paste(this: &Edit, s: string) {
+        this.put(s, K_OTHER);
+    }
+
+    fn put(this: &Edit, s: string, kind: int) {
+        let sel = this.hasSel();
+        let pushed = this.rec(if sel { K_OTHER } else { kind });
+        let before = this.text.len();
+        if sel {
+            this.dropSel();
+        }
+        this.ver += 1;
+        let start = this.cur;
+        let base = this.text.len();
+        let room = if this.maxlen > 0 { this.maxlen - this.cps() } else { s.len };
+        let from = 0;
+        let i = 0;
+        let stop = false;
+        while !stop {
+            let keep = false;
+            let tab = false;
+            let j = i + 1;
+            if i >= s.len {
+                stop = true;
+            } else {
+                let b = s[i];
+                while j < s.len && isCont(s[j]) {
+                    j += 1;
+                }
+                tab = b == 9;
+                keep = (b >= 32 && b != 127) || (b == 10 && this.nl);
+                if keep || tab {
+                    if room <= 0 {
+                        stop = true;
+                        keep = false;
+                        tab = false;
+                    }
+                    room -= 1;
+                }
+            }
+            if !keep {
+                if i > from {
+                    this.text.insert(this.cur, s[from..i]);
+                    this.cur += i - from;
+                }
+                if tab {
+                    this.text.insert(this.cur, " ");
+                    this.cur += 1;
+                }
+                from = j;
+            }
+            i = j;
+        }
+        this.anc = this.cur;
+        if this.sp.len > 0 && this.text.len() > base {
+            spanEdit(&this.sp, start, 0, this.text.len() - base, true);
+        }
+        if pushed && !sel && this.text.len() == before {
+            // nothing fit (maxlength) or nothing to type: no step
+            this.un -= 1;
+            this.uk = K_NONE;
+        }
+    }
+
+    /// Backspace: the selection, else the code point before the caret (`word`: back to the start of the word).
+    fn deleteBack(this: &Edit, word: bool) {
+        if this.hasSel() {
+            this.deleteSel();
+            return;
+        }
+        let to = this.snap(if word { this.wordLeft(this.cur) } else { this.prev(this.cur) }, -1);
+        if to == this.cur {
+            return;
+        }
+        this.rec(K_DEL);
+        this.ver += 1;
+        this.text.remove(to, this.cur - to);
+        if this.sp.len > 0 {
+            spanEdit(&this.sp, to, this.cur - to, 0, false);
+        }
+        this.cur = to;
+        this.anc = to;
+    }
+
+    /// Delete: the selection, else the code point after the caret (`word`: to the end of the word).
+    fn deleteFwd(this: &Edit, word: bool) {
+        if this.hasSel() {
+            this.deleteSel();
+            return;
+        }
+        let to = this.snap(if word { this.wordRight(this.cur) } else { this.next(this.cur) }, 1);
+        if to == this.cur {
+            return;
+        }
+        this.rec(K_DEL);
+        this.ver += 1;
+        this.text.remove(this.cur, to - this.cur);
+        if this.sp.len > 0 {
+            spanEdit(&this.sp, this.cur, to - this.cur, 0, false);
+        }
+        this.anc = this.cur;
+    }
+
+    /// Byte index of the code point boundary before `i`.
+    fn prev(this: &Edit, i: int): int {
+        let s = this.text.bytes;
+        let j = i - 1;
+        while j > 0 && isCont(s[j]) {
+            j -= 1;
+        }
+        return if j < 0 { 0 } else { j };
+    }
+
+    /// Byte index of the code point boundary after `i`.
+    fn next(this: &Edit, i: int): int {
+        let s = this.text.bytes;
+        let j = i + 1;
+        while j < s.len && isCont(s[j]) {
+            j += 1;
+        }
+        return if j > s.len { s.len } else { j };
+    }
+
+    /// Start of the word before `i` (skips spaces, then one run of word characters or of punctuation).
+    fn wordLeft(this: &Edit, i: int): int {
+        let s = this.text.bytes;
+        let j = i;
+        while j > 0 && charClass(s, j - 1) == 0 {
+            j -= 1;
+        }
+        if j > 0 {
+            let c = charClass(s, j - 1);
+            while j > 0 && charClass(s, j - 1) == c {
+                j -= 1;
+            }
+        }
+        return j;
+    }
+
+    /// End of the word after `i` (skips one run of word characters or of punctuation, then spaces).
+    fn wordRight(this: &Edit, i: int): int {
+        let s = this.text.bytes;
+        let j = i;
+        if j < s.len && charClass(s, j) != 0 {
+            let c = charClass(s, j);
+            while j < s.len && charClass(s, j) == c {
+                j += 1;
+            }
+        }
+        while j < s.len && charClass(s, j) == 0 {
+            j += 1;
+        }
+        return j;
+    }
+
+    /// Put the caret at byte `i` (clamped, moved back onto a code point boundary); `extend` keeps the anchor.
+    fn moveTo(this: &Edit, i: int, extend: bool) {
+        let s = this.text.bytes;
+        let j = i;
+        if j > s.len {
+            j = s.len;
+        }
+        if j < 0 {
+            j = 0;
+        }
+        while j > 0 && j < s.len && isCont(s[j]) {
+            j -= 1;
+        }
+        if this.sp.len > 0 {
+            // a token is never entered: dragging a selection snaps outward from the anchor, a plain move to the nearest edge
+            let anc = this.anc;
+            let dir = 0;
+            if extend && j > anc {
+                dir = 1;
+            } else if extend && j < anc {
+                dir = -1;
+            }
+            j = this.snap(j, dir);
+        }
+        this.uk = K_NONE;
+        this.cur = j;
+        if !extend {
+            this.anc = j;
+        }
+    }
+
+    /// Left arrow. Without `extend` a selection collapses to its start.
+    fn left(this: &Edit, extend: bool, word: bool) {
+        if this.hasSel() && !extend {
+            this.moveTo(this.lo(), false);
+            return;
+        }
+        this.moveTo(this.snap(if word { this.wordLeft(this.cur) } else { this.prev(this.cur) }, -1), extend);
+    }
+
+    /// Right arrow. Without `extend` a selection collapses to its end.
+    fn right(this: &Edit, extend: bool, word: bool) {
+        if this.hasSel() && !extend {
+            this.moveTo(this.hi(), false);
+            return;
+        }
+        this.moveTo(this.snap(if word { this.wordRight(this.cur) } else { this.next(this.cur) }, 1), extend);
+    }
+
+    /// A string of one bullet (U+2022) per code point of `s`, for a password box; valid until the next call.
+    fn maskOf(this: &Edit, s: string): string {
+        this.mask.clear();
+        for i in 0..s.len {
+            if !isCont(s[i]) {
+                this.mask.push(226);
+                this.mask.push(128);
+                this.mask.push(162);
+            }
+        }
+        return this.mask.str();
+    }
+
+    /// Select the word around byte `i` (a run of spaces when `i` is in one); the caret goes to its end.
+    fn selectWord(this: &Edit, i: int) {
+        let w = wordRange(this.text.bytes, i);
+        let lo = w.lo;
+        let hi = w.hi;
+        this.uk = K_NONE;
+        this.anc = this.snap(lo, -1);
+        this.cur = this.snap(hi, 1);
+    }
+
+    /// Select the line (text between newlines) around byte `i`, without its newline.
+    fn selectLine(this: &Edit, i: int) {
+        let s = this.text.bytes;
+        let lo = i;
+        while lo > 0 && s[lo - 1] != 10 {
+            lo -= 1;
+        }
+        let hi = i;
+        while hi < s.len && s[hi] != 10 {
+            hi += 1;
+        }
+        this.uk = K_NONE;
+        this.anc = this.snap(lo, -1);
+        this.cur = this.snap(hi, 1);
+    }
+
+    /// The token that has byte `i` strictly inside it (-1: none, and always -1 with no spans).
+    fn tokenAt(this: &Edit, i: int): int {
+        for k in 0..this.sp.len {
+            let s = this.sp.items[k];
+            if isToken(s.kind) && s.start < i && i < s.start + s.len {
+                return k;
+            }
+        }
+        return -1;
+    }
+
+    /// `i`, moved out of a token it is inside: `dir` < 0 to its start, > 0 to its end, 0 to the nearer edge.
+    fn snap(this: &Edit, i: int, dir: int): int {
+        let k = this.tokenAt(i);
+        if k < 0 {
+            return i;
+        }
+        let s = this.sp.items[k];
+        let a = s.start;
+        let b = s.start + s.len;
+        if dir < 0 {
+            return a;
+        }
+        if dir > 0 {
+            return b;
+        }
+        return if i - a <= b - i { a } else { b };
+    }
+
+    /// A copy of `s` in the box's span-data buffer (span data must outlive the caller's string). The buffer is compacted
+    /// to the data still referenced (spans and undo steps) when it fills, so recycling one box allocates nothing new.
+    fn own(this: &Edit, s: string): string {
+        if s.len == 0 {
+            return "";
+        }
+        if this.dn + s.len > this.da.len {
+            this.compact(s.len);
+        }
+        let at = this.dn;
+        for i in 0..s.len {
+            this.da[at + i] = s[i];
+        }
+        this.dn += s.len;
+        return (this.da[at..at + s.len]) as string;
+    }
+
+    /// Move every live span data string (current spans, undo and redo steps) into the spare buffer, make it the
+    /// buffer, and leave room for `extra` more bytes. The spare only grows (doubling) when live data does.
+    fn compact(this: &Edit, extra: int) {
+        let live = extra;
+        for i in 0..this.sp.len {
+            live += this.sp.items[i].data.len;
+        }
+        for i in 0..this.un {
+            for k in 0..this.us.items[i].sp.len {
+                live += this.us.items[i].sp.items[k].data.len;
+            }
+        }
+        for i in 0..this.rn {
+            for k in 0..this.rs.items[i].sp.len {
+                live += this.rs.items[i].sp.items[k].data.len;
+            }
+        }
+        if this.db.len < live * 2 {
+            this.db = this.text.arena.alloc::<u8>(live * 4 + 256);
+        }
+        this.dn = 0;
+        this.moveData(&this.sp);
+        for i in 0..this.un {
+            this.moveData(&this.us.items[i].sp);
+        }
+        for i in 0..this.rn {
+            this.moveData(&this.rs.items[i].sp);
+        }
+        let t = this.da;
+        this.da = this.db;
+        this.db = t;
+    }
+
+    fn moveData(this: &Edit, l: &List<Span>) {
+        for k in 0..l.len {
+            let d = l.items[k].data;
+            if d.len > 0 {
+                for i in 0..d.len {
+                    this.db[this.dn + i] = d[i];
+                }
+                l.items[k].data = (this.db[this.dn..this.dn + d.len]) as string;
+                this.dn += d.len;
+            }
+        }
+    }
+
+    /// The spans, as a view of the box's own storage (what `bind:spans` reads). It is remembered, so `setSpans` knows when the
+    /// program only echoes it back.
+    fn spans(this: &Edit): []Span {
+        this.hv = []Span { ptr: this.sp.items.ptr, len: this.sp.len };
+        return this.hv;
+    }
+
+    /// Whether `v` is exactly the spans we hold.
+    fn spansMatch(this: &Edit, v: []Span): bool {
+        if v.len != this.sp.len {
+            return false;
+        }
+        for i in 0..v.len {
+            let a = v[i];
+            let b = this.sp.items[i];
+            if a.start != b.start || a.len != b.len || a.kind != b.kind || !same(a.data, b.data) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Replace the spans with `v` (a program's bound value; no undo step). The view `spans()` last gave out is the box's
+    /// own state and changes nothing (a program that echoes its binding never brings back stale spans); a shorter
+    /// slice of it truncates. Any other slice is copied: spans outside the text, empty, of an unknown kind or overlapping
+    /// an earlier token are dropped.
+    fn setSpans(this: &Edit, v: []Span) {
+        if v.ptr == this.sp.items.ptr || (v.ptr == this.hv.ptr && v.len == this.hv.len) {
+            if v.ptr == this.sp.items.ptr && v.len < this.sp.len {
+                this.sp.len = v.len;
+                this.ver += 1;
+            }
+            return;
+        }
+        if this.spansMatch(v) {
+            return;
+        }
+        this.sp.len = 0;
+        let n = this.text.len();
+        for i in 0..v.len {
+            let s = v[i];
+            let ok = s.len > 0 && s.start >= 0 && s.start + s.len <= n && s.kind >= SPAN_BOLD && s.kind <= SPAN_EMOJI;
+            for k in 0..this.sp.len {
+                let o = this.sp.items[k];
+                if ok && (isToken(s.kind) || isToken(o.kind)) && s.start < o.start + o.len && o.start < s.start + s.len {
+                    ok = false;
+                }
+            }
+            if ok {
+                this.sp.push(Span { start: s.start, len: s.len, kind: s.kind, data: this.own(s.data) });
+            }
+        }
+        this.ver += 1;
+    }
+
+    /// Ctrl+B / Ctrl+I: give the selection `kind` (bold or italic), or take it off when all of it has it. Tokens inside
+    /// are left plain. Its own undo step. False when the box is not `rich` or nothing is selected.
+    fn toggle(this: &Edit, kind: int): bool {
+        if !this.rich || !this.hasSel() {
+            return false;
+        }
+        let lo = this.snap(this.lo(), -1);
+        let hi = this.snap(this.hi(), 1);
+        this.rec(K_OTHER);
+        this.ver += 1;
+        let on = !covered(&this.sp, kind, lo, hi);
+        uncover(&this.sp, kind, lo, hi);
+        if on {
+            let p = lo;
+            while p < hi {
+                let q = hi;
+                let skip = -1;
+                for i in 0..this.sp.len {
+                    let t = this.sp.items[i];
+                    if isToken(t.kind) {
+                        if t.start <= p && p < t.start + t.len {
+                            skip = t.start + t.len;
+                        } else if t.start > p && t.start < q {
+                            q = t.start;
+                        }
+                    }
+                }
+                if skip >= 0 {
+                    p = skip;
+                } else {
+                    this.sp.push(Span { start: p, len: q - p, kind: kind, data: "" });
+                    p = q;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// Replace the text `lo..hi` with the atomic token `label` (kind `SPAN_MENTION` or `SPAN_EMOJI`, `data` its id):
+    /// one undo step, caret after the chip. For an autocomplete that swaps the typed trigger (`@ja`) for a mention.
+    /// Bold, italic and link spans are split around the label. False when the range is not inside the text.
+    fn replaceWithToken(this: &Edit, lo: int, hi: int, label: string, kind: int, data: string): bool {
+        if !isToken(kind) || lo < 0 || hi < lo || hi > this.text.len() || label.len == 0 {
+            return false;
+        }
+        let a = this.snap(lo, -1);
+        let b = this.snap(hi, 1);
+        this.rec(K_OTHER);
+        this.ver += 1;
+        this.text.remove(a, b - a);
+        if this.sp.len > 0 {
+            spanEdit(&this.sp, a, b - a, 0, false);
+        }
+        this.text.insert(a, label);
+        spanEdit(&this.sp, a, 0, label.len, false);
+        for k in SPAN_BOLD..SPAN_MENTION {
+            uncover(&this.sp, k, a, a + label.len);
+        }
+        this.sp.push(Span { start: a, len: label.len, kind: kind, data: this.own(data) });
+        this.cur = a + label.len;
+        this.anc = this.cur;
+        return true;
+    }
+
+    /// Select everything, caret at the end.
+    fn selectAll(this: &Edit) {
+        this.uk = K_NONE;
+        this.anc = 0;
+        this.cur = this.text.len();
+    }
+}
+
+/// Byte index in the bullet string of byte `i` of `s`.
+pub fn toMask(s: string, i: int): int {
+    let n = 0;
+    for k in 0..i {
+        if !isCont(s[k]) {
+            n += 3;
+        }
+    }
+    return n;
+}
+
+/// Byte index in `s` of the code point that bullet-string byte `j` belongs to.
+pub fn fromMask(s: string, j: int): int {
+    let cp = j / 3;
+    let i = 0;
+    while i < s.len && cp > 0 {
+        i += 1;
+        while i < s.len && isCont(s[i]) {
+            i += 1;
+        }
+        cp -= 1;
+    }
+    return i;
+}

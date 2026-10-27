@@ -10,6 +10,8 @@ Non-goals: no GC, borrow checker, traits, drop, capturing closures, or comptime 
 - **Tooling:** `j3c lsp` (hover, goto, completion, signature help, outline, import quick-fix, format, cross-buffer diagnostics), `j3c fmt`, `j3c doc`, `j3c size`, the scene editor and MCP server.
 - **Runtime checks:** every check names itself as `file:line: reason` and exits 102; `panic` exits 101. Debug builds on x86-64 Linux install a crash handler, symbolized by `j3c run`.
 - **Threads (Linux):** `j3.thread` (pool, queue, mutex), `#[thread]` globals, `@atomic*`. See Multithreading.
+- **Network and processes (Linux):** `j3.net.tcp`, `j3.net.dns` (`getaddrinfo`), `j3.net.tls` (system OpenSSL 3 through `dlopen`, always verified), `j3.net.http` (HTTP/1.1 client, chunked, redirects, streaming lines for SSE), `j3.data.json`, `j3.proc` (spawn with pipes, PATH lookup) on fork/exec/pipe in `j3.sys`. `j3c doc recipes http`, `examples/openrouter-chat`.
+- **UI components:** `.j3ui` (markup, J3 script, scoped CSS) compiled by `j3c` onto `j3.ui.css`/`dom` and the batched `j3.gfx.paint`; `examples/idle-breakout` is the golden reference (plan 022; editor support is stage 08); plan 023 added `{#let}`, data grid, rich textarea, caret popups, flex/selectors/inline boxes, `margin: auto`, `aspect-ratio`, `outline`, `cursor`, `text-decoration`, `font-style`, `:not()` / `:nth-child()` / `:last-child`, `j3c golden`, `J3_STEADY` and `j3.ui.testkit`; plan 026 added grid, transitions and `animate:flip`, drag-and-drop, more selectors and elements, transforms, `@property`, i18n, the F12 inspector, `run --hot`, CSS lint, gamepad focus and the a11y gaps; plan 027 added rotated overflow clips, RTL number neutrals, spacing transitions, `em` in transforms, `url()` custom properties, scroll boxes that are not stacking contexts, positive `tabindex`, radio groups and `<glyph>` input prompts; the screen reader bridge (plan 024) is left).
 - **Stdlib:** `App` stages, ECS, collide, space, physics (light: 2D AABB and a 3D voxel-stopping body, no contact solver), path, anim, input, assets, save, particles, camera rig, UI, `j3.gfx` (GL 3.3, one shadow map, 4 point lights, instancing), voxel grid, math, mesh formats, SDL audio with groups, fades, and positional channels, `scene3d`.
 
 ## Left
@@ -18,6 +20,7 @@ Non-goals: no GC, borrow checker, traits, drop, capturing closures, or comptime 
 - **Rename and `j3.toml` deps.** Language tests stay `cargo test` plus a playable example until packages exist.
 - **Ship a Windows binary:** mingw `clang` and SDL import libs. A missing lib stays a link error.
 - **Pack / install:** rpath and asset roots matter once there is a build to hand someone.
+- **Network follow-ups:** macOS and Windows for `j3.net.tcp`/`dns`/`tls` and `j3.proc` (stubs today), keep-alive and pooling, gzip, a non-blocking poll-style HTTP request for the frame thread, an HTTP server, WebSockets, `SSL_CTX` shared across requests, IP-literal certificate checks.
 - **Later:** Wasm, consoles, a J3 shader language, SIMD.
 
 ## Build speed

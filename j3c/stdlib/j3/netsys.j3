@@ -4,11 +4,12 @@
 
 module j3.netsys;
 
-use j3.sys.close;
+use j3.sys.{ close, errno };
 
-// `@syscall` is libc's `syscall()`: a failure returns -1 and sets errno.
+// `@syscall` is libc's `syscall()`: a failure returns -1 and sets errno (`j3.sys.errno`).
 use lib "c" as c {
-    fn __errno_location(): ptr;
+    fn getaddrinfo(node: cstr, service: ptr, hints: ptr, res: ptr): i32;
+    fn freeaddrinfo(res: ptr);
 }
 
 /// Linux amd64 `socket`.
@@ -21,16 +22,78 @@ const SYS_recvfrom: int = 45;
 const SYS_bind: int = 49;
 /// Linux amd64 `getsockname`.
 const SYS_getsockname: int = 51;
+/// Linux amd64 `poll`.
+const SYS_poll: int = 7;
+/// Linux amd64 `connect`.
+const SYS_connect: int = 42;
+/// Linux amd64 `listen`.
+const SYS_listen: int = 50;
+/// Linux amd64 `setsockopt`.
+const SYS_setsockopt: int = 54;
+/// Linux amd64 `getsockopt`.
+const SYS_getsockopt: int = 55;
+/// Linux amd64 `accept4`.
+const SYS_accept4: int = 288;
+/// Linux amd64 `fcntl`.
+const SYS_fcntl: int = 72;
+/// Linux amd64 `read`.
+const SYS_read: int = 0;
+/// Linux amd64 `sendto`, used as `send` with `MSG_NOSIGNAL`.
+const MSG_NOSIGNAL: int = 16384;
 
 /// `SOCK_DGRAM` plus `SOCK_NONBLOCK`, so `recvfrom` never waits.
 const SOCK_UDP_NONBLOCK: int = 2 + 2048;
-/// `EAGAIN`: a non-blocking read with nothing waiting.
+/// `EAGAIN`: a non-blocking read with nothing waiting, or a socket timeout.
 const EAGAIN: int = 11;
+/// `EINTR`: a signal cut the call short; try again.
+const EINTR: int = 4;
+/// `EINPROGRESS`: a non-blocking connect has started.
+const EINPROGRESS: int = 115;
+/// `ECONNREFUSED`.
+const ECONNREFUSED: int = 111;
+/// `ETIMEDOUT`.
+const ETIMEDOUT: int = 110;
+/// `SOCK_STREAM` plus `SOCK_CLOEXEC`, so a spawned child does not inherit the socket.
+const SOCK_TCP: int = 1 + 524288;
+/// `SOL_SOCKET`.
+const SOL_SOCKET: int = 1;
+/// `SO_REUSEADDR`.
+const SO_REUSEADDR: int = 2;
+/// `SO_ERROR`.
+const SO_ERROR: int = 4;
+/// `SO_RCVTIMEO`.
+const SO_RCVTIMEO: int = 20;
+/// `SO_SNDTIMEO`.
+const SO_SNDTIMEO: int = 21;
+/// `IPPROTO_TCP`.
+const IPPROTO_TCP: int = 6;
+/// `TCP_NODELAY`.
+const TCP_NODELAY: int = 1;
+/// `F_GETFL` / `F_SETFL` and `O_NONBLOCK`.
+const F_GETFL: int = 3;
+const F_SETFL: int = 4;
+const O_NONBLOCK: int = 2048;
+/// `poll` event bits.
+const POLLIN: int = 1;
+const POLLOUT: int = 4;
 
 /// `recvfrom` result: no datagram is waiting.
 pub const NONE: int = 0 - 1;
 /// Any call result: the OS refused.
 pub const FAIL: int = 0 - 2;
+/// TCP result: the wait ran past its timeout.
+pub const TIMEOUT: int = 0 - 3;
+/// `connectTimeout` result: nothing listens on that port.
+pub const REFUSED: int = 0 - 4;
+/// `lookup` result: the name does not exist.
+pub const NO_NAME: int = 0 - 5;
+
+/// `AF_INET`.
+pub const AF_INET: int = 2;
+/// `AF_INET6`.
+pub const AF_INET6: int = 10;
+/// Bytes of the largest socket address `lookup` returns (`sockaddr_in6`).
+pub const SA_MAX: int = 28;
 
 /// A new non-blocking IPv4 UDP socket, or a negative number.
 pub fn udp(): int {
@@ -63,8 +126,7 @@ pub fn recvfrom(fd: int, buf: ptr, n: int, sa: ptr): int {
     let len: int = 16;
     let r = @syscall(SYS_recvfrom, fd, buf, n, 0, sa, &len as ptr);
     if r < 0 {
-        let e = c.__errno_location() as &i32;
-        if int(*e) == EAGAIN {
+        if errno() == EAGAIN {
             return NONE;
         }
         return FAIL;
@@ -81,4 +143,215 @@ pub fn sockname(fd: int, sa: ptr): int {
 /// Close the socket.
 pub fn shut(fd: int) {
     close(fd);
+}
+
+/// Map a failed call to `TIMEOUT`, `REFUSED`, or `FAIL`.
+fn failure(): int {
+    let e = errno();
+    if e == EAGAIN || e == ETIMEDOUT {
+        return TIMEOUT;
+    }
+    if e == ECONNREFUSED {
+        return REFUSED;
+    }
+    return FAIL;
+}
+
+/// A new blocking TCP socket of `family` (`AF_INET` or `AF_INET6`), or `FAIL`.
+pub fn tcp(family: int): int {
+    let fd = @syscall(SYS_socket, family, SOCK_TCP, 0);
+    if fd < 0 {
+        return FAIL;
+    }
+    return fd;
+}
+
+fn setBlocking(fd: int, on: bool) {
+    let fl = @syscall(SYS_fcntl, fd, F_GETFL, 0);
+    if fl < 0 {
+        return;
+    }
+    let nb = (fl / O_NONBLOCK) % 2 == 1;
+    if on && nb {
+        @syscall(SYS_fcntl, fd, F_SETFL, fl - O_NONBLOCK);
+    } else if !on && !nb {
+        @syscall(SYS_fcntl, fd, F_SETFL, fl + O_NONBLOCK);
+    }
+}
+
+/// Wait up to `ms` (negative waits forever) until `fd` can read (`write` false) or write.
+/// 1 when ready, `TIMEOUT`, or `FAIL`.
+pub fn waitFd(fd: int, write: bool, ms: int): int {
+    // struct pollfd { int fd; short events; short revents; }
+    let pfd: [2]i32 = [i32(fd), 0];
+    let ev = if write { POLLOUT } else { POLLIN };
+    let half = &pfd[1] as ptr as &u16;
+    *half = u16(ev);
+    while true {
+        let r = @syscall(SYS_poll, &pfd[0] as ptr, 1, ms);
+        if r > 0 {
+            return 1;
+        }
+        if r == 0 {
+            return TIMEOUT;
+        }
+        if errno() != EINTR {
+            return FAIL;
+        }
+    }
+    return FAIL;
+}
+
+/// Connect `fd` to the socket address `sa` (`len` bytes), giving up after `ms`.
+/// 0, `TIMEOUT`, `REFUSED`, or `FAIL`. The socket is blocking again afterwards.
+pub fn connectTimeout(fd: int, sa: ptr, len: int, ms: int): int {
+    setBlocking(fd, false);
+    let r = @syscall(SYS_connect, fd, sa, len);
+    if r < 0 {
+        if errno() != EINPROGRESS {
+            let f = failure();
+            setBlocking(fd, true);
+            return f;
+        }
+        let w = waitFd(fd, true, ms);
+        if w < 0 {
+            setBlocking(fd, true);
+            return w;
+        }
+        let err: i32 = 0;
+        let elen: u32 = 4;
+        if @syscall(SYS_getsockopt, fd, SOL_SOCKET, SO_ERROR, &err as ptr, &elen as ptr) < 0 {
+            setBlocking(fd, true);
+            return FAIL;
+        }
+        setBlocking(fd, true);
+        if int(err) == ECONNREFUSED {
+            return REFUSED;
+        }
+        if int(err) == ETIMEDOUT {
+            return TIMEOUT;
+        }
+        if err != 0 {
+            return FAIL;
+        }
+        return 0;
+    }
+    setBlocking(fd, true);
+    return 0;
+}
+
+/// Make blocking reads and writes on `fd` fail with `TIMEOUT` after `ms` (0 waits forever).
+pub fn setTimeouts(fd: int, ms: int) {
+    // struct timeval { long sec; long usec; }
+    let tv: [2]int = [ms / 1000, (ms % 1000) * 1000];
+    @syscall(SYS_setsockopt, fd, SOL_SOCKET, SO_RCVTIMEO, &tv[0] as ptr, 16);
+    @syscall(SYS_setsockopt, fd, SOL_SOCKET, SO_SNDTIMEO, &tv[0] as ptr, 16);
+}
+
+/// Send small writes at once instead of batching them (`TCP_NODELAY`).
+pub fn noDelay(fd: int) {
+    let on: i32 = 1;
+    @syscall(SYS_setsockopt, fd, IPPROTO_TCP, TCP_NODELAY, &on as ptr, 4);
+}
+
+/// Bind `fd` to the IPv4 address `sa` (16 bytes) with `SO_REUSEADDR` and listen. Negative on failure.
+pub fn listenOn(fd: int, sa: ptr, backlog: int): int {
+    let on: i32 = 1;
+    @syscall(SYS_setsockopt, fd, SOL_SOCKET, SO_REUSEADDR, &on as ptr, 4);
+    if @syscall(SYS_bind, fd, sa, 16) < 0 {
+        return FAIL;
+    }
+    if @syscall(SYS_listen, fd, backlog) < 0 {
+        return FAIL;
+    }
+    return 0;
+}
+
+/// Wait for one connection on the listening `fd`. The new socket, or `FAIL`.
+pub fn accept(fd: int): int {
+    while true {
+        let r = @syscall(SYS_accept4, fd, 0, 0, 524288);
+        if r >= 0 {
+            return r;
+        }
+        if errno() != EINTR {
+            return failure();
+        }
+    }
+    return FAIL;
+}
+
+/// Read up to `n` bytes. Bytes read, 0 at end of stream, `TIMEOUT`, or `FAIL`.
+pub fn recv(fd: int, buf: ptr, n: int): int {
+    while true {
+        let r = @syscall(SYS_read, fd, buf, n);
+        if r >= 0 {
+            return r;
+        }
+        if errno() != EINTR {
+            return failure();
+        }
+    }
+    return FAIL;
+}
+
+/// Write up to `n` bytes (no `SIGPIPE` on a closed peer). Bytes written, `TIMEOUT`, or `FAIL`.
+pub fn send(fd: int, buf: ptr, n: int): int {
+    while true {
+        let r = @syscall(SYS_sendto, fd, buf, n, MSG_NOSIGNAL, 0, 0);
+        if r >= 0 {
+            return r;
+        }
+        if errno() != EINTR {
+            return failure();
+        }
+    }
+    return FAIL;
+}
+
+/// Resolve `host` (a name or a numeric address) for TCP. Copies up to `max` socket addresses into
+/// `out` (`SA_MAX` bytes each), their lengths into `lens` and families into `fams`.
+/// The count found, `NO_NAME`, or `FAIL`. Blocks; call it off the frame thread.
+pub fn lookup(host: cstr, port: int, out: []u8, lens: []int, fams: []int, max: int): int {
+    // struct addrinfo hints: ai_flags@0 ai_family@4 ai_socktype@8 ai_protocol@12 ... 48 bytes
+    let hints: [6]int = [0, 0, 0, 0, 0, 0];
+    let h32 = &hints[0] as ptr as &i32;
+    let st = ((&hints[0] as int) + 8) as ptr as &i32;
+    *h32 = 0;
+    *st = 1;
+    let res: ptr = 0;
+    let r = int(c.getaddrinfo(host, 0, &hints[0] as ptr, &res as ptr));
+    if r != 0 {
+        // EAI_NONAME -2, EAI_NODATA -5, EAI_AGAIN -3 (temporary): only the first two mean "no such name"
+        if r == 0 - 2 || r == 0 - 5 {
+            return NO_NAME;
+        }
+        return FAIL;
+    }
+    let n = 0;
+    let ai = res as int;
+    while ai != 0 && n < max {
+        let pfam = (ai + 4) as ptr as &i32;
+        let plen = (ai + 16) as ptr as &u32;
+        let paddr = (ai + 24) as ptr as &int;
+        let pnext = (ai + 40) as ptr as &int;
+        let fam = int(*pfam);
+        let alen = int(*plen);
+        let addr = *paddr;
+        if (fam == AF_INET || fam == AF_INET6) && alen <= SA_MAX && addr != 0 {
+            let src: []u8 = @slice(addr as ptr, alen);
+            for i in 0..SA_MAX {
+                out[n * SA_MAX + i] = if i < alen { src[i] } else { 0 };
+            }
+            // the port is big-endian at bytes 2..3 in both sockaddr_in and sockaddr_in6
+            out[n * SA_MAX + 2] = u8(port / 256);
+            out[n * SA_MAX + 3] = u8(port % 256);
+            lens[n] = alen;
+            fams[n] = fam;
+            n += 1;
+        }
+        ai = *pnext;
+    }
+    c.freeaddrinfo(res);
+    return n;
 }

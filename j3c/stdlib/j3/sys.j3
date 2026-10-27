@@ -4,6 +4,13 @@
 
 module j3.sys;
 
+// libc pieces with no raw syscall: errno (where `syscall()` stores the error) and the dynamic loader.
+use lib "c" as c {
+    fn __errno_location(): ptr;
+    fn dlopen(name: cstr, flags: i32): ptr;
+    fn dlsym(handle: ptr, name: cstr): ptr;
+}
+
 /// Linux amd64 `read`.
 const SYS_read: int = 0;
 /// Linux amd64 `write`.
@@ -21,6 +28,28 @@ const SYS_munmap: int = 11;
 /// Linux amd64 `exit_group`: ends every thread. Plain `exit` (60) ends only the calling
 /// thread, so a panic in a program with SDL or GL driver threads would leave it running.
 const SYS_exit_group: int = 231;
+/// Linux amd64 `poll`.
+const SYS_poll: int = 7;
+/// Linux amd64 `access`.
+const SYS_access: int = 21;
+/// Linux amd64 `dup2`.
+const SYS_dup2: int = 33;
+/// Linux amd64 `getpid`.
+const SYS_getpid: int = 39;
+/// Linux amd64 `fork`.
+const SYS_fork: int = 57;
+/// Linux amd64 `execve`.
+const SYS_execve: int = 59;
+/// Linux amd64 `wait4`.
+const SYS_wait4: int = 61;
+/// Linux amd64 `kill`.
+const SYS_kill: int = 62;
+/// Linux amd64 `chdir`.
+const SYS_chdir: int = 80;
+/// Linux amd64 `rt_sigaction`.
+const SYS_rt_sigaction: int = 13;
+/// Linux amd64 `pipe2`.
+const SYS_pipe2: int = 293;
 
 /// Open for reading only.
 pub const O_RDONLY: int = 0;
@@ -34,6 +63,19 @@ pub const O_TRUNC: int = 512;
 pub const SEEK_SET: int = 0;
 /// Seek from the end of the file.
 pub const SEEK_END: int = 2;
+/// `pipe` flag: close both ends in a child at `execve`.
+pub const O_CLOEXEC: int = 524288;
+/// `waitpid` flag: return 0 at once when the child is still running.
+pub const WNOHANG: int = 1;
+/// `kill` signal: ask to stop.
+pub const SIGTERM: int = 15;
+/// `kill` signal: stop now.
+pub const SIGKILL: int = 9;
+/// `pollFds` events: readable, writable; results add hang-up and error.
+pub const POLLIN: int = 1;
+pub const POLLOUT: int = 4;
+pub const POLLERR: int = 8;
+pub const POLLHUP: int = 16;
 
 /// `mmap` protection: pages may be read.
 const PROT_READ: int = 1;
@@ -97,6 +139,193 @@ pub fn munmap(p: ptr, len: int) {
 pub fn exit(code: i32) {
     @syscall(SYS_exit_group, code);
 }
+
+// Processes. `j3.proc` is the API (spawn a program, feed stdin, collect stdout and stderr);
+// these are the OS calls under it.
+
+/// Copy this process. 0 in the child, the child's pid in the parent, negative on failure.
+/// Only the calling thread is copied, so in a program with other threads (SDL, GL, `j3.thread`)
+/// the child may only make raw calls from this module (`dup2`, `chdir`, `execve`, `exit`)
+/// before `execve`: no allocation, no locks, no `j3.io`. `j3.proc` does this for you.
+pub fn fork(): int {
+    return @syscall(SYS_fork);
+}
+
+/// Replace this process with the program at `path` (NUL-terminated). `argv` and `envp` are
+/// NUL-terminated arrays of C string pointers. Returns only on failure, with `-errno`.
+pub fn execve(path: ptr, argv: ptr, envp: ptr): int {
+    let r = @syscall(SYS_execve, path, argv, envp);
+    if r < 0 {
+        return 0 - errno();
+    }
+    return r;
+}
+
+/// The process environment: a NUL-terminated array of `NAME=value` C strings, as `execve` takes.
+pub fn environ(): ptr {
+    if ARGV as int == 0 {
+        return 0;
+    }
+    // the kernel puts envp right after argv's NULL slot
+    return (ARGV as int + (ARGC + 1) * 8) as ptr;
+}
+
+/// Environment variable `name`, or "" when unset. Valid for the whole process.
+pub fn env(name: string): string {
+    let ep = environ();
+    if ep as int == 0 {
+        return "";
+    }
+    let i = 0;
+    while true {
+        let slot = (ep as int + i * 8) as ptr as &int;
+        let p = *slot;
+        if p == 0 {
+            return "";
+        }
+        let s = cstrView(p);
+        if s.len > name.len && s[name.len] == 61 {
+            let same = true;
+            for k in 0..name.len {
+                if s[k] != name[k] {
+                    same = false;
+                    break;
+                }
+            }
+            if same {
+                return s[name.len + 1..s.len];
+            }
+        }
+        i += 1;
+    }
+    return "";
+}
+
+/// The bytes of the NUL-terminated string at `p`, without the NUL.
+fn cstrView(p: int): string {
+    let n = 0;
+    while true {
+        let byte = ((p + n) as ptr) as &u8;
+        if *byte == 0 {
+            break;
+        }
+        n += 1;
+    }
+    let bytes: []u8 = @slice(p as ptr, n);
+    return bytes as string;
+}
+
+/// Make a pipe: `fds[0]` reads what `fds[1]` writes (`fds` holds at least 2). `flags` is 0 or
+/// `O_CLOEXEC`. Negative on failure.
+pub fn pipe(fds: []i32, flags: int): int {
+    if fds.len < 2 {
+        return -1;
+    }
+    return @syscall(SYS_pipe2, fds.ptr as ptr, flags);
+}
+
+/// Make `to` a copy of `from` (closing `to` first). Negative on failure.
+pub fn dup2(from: int, to: int): int {
+    return @syscall(SYS_dup2, from, to);
+}
+
+/// Change the working directory to `path` (NUL-terminated). Negative on failure.
+pub fn chdir(path: ptr): int {
+    return @syscall(SYS_chdir, path);
+}
+
+/// True when the file at `path` (NUL-terminated) exists and may be executed.
+pub fn canExec(path: ptr): bool {
+    return @syscall(SYS_access, path, 1) == 0;
+}
+
+/// Wait for child `pid` (`flags` 0 blocks, `WNOHANG` polls) and store its raw status in `status`.
+/// The pid, 0 when `WNOHANG` and it still runs, negative on failure. `exitCode` decodes `status`.
+pub fn waitpid(pid: int, status: &i32, flags: int): int {
+    while true {
+        let r = @syscall(SYS_wait4, pid, status as ptr, flags, 0);
+        if r >= 0 || errno() != 4 {
+            return r;
+        }
+    }
+    return 0 - 1;
+}
+
+/// A `waitpid` status as a shell would show it: the exit code, or 128 + the signal that ended it.
+pub fn exitCode(status: i32): int {
+    let s = int(status);
+    let sig = s % 128;
+    if sig == 0 {
+        return (s / 256) % 256;
+    }
+    return 128 + sig;
+}
+
+/// Send `sig` to process `pid`. Negative on failure.
+pub fn kill(pid: int, sig: int): int {
+    return @syscall(SYS_kill, pid, sig);
+}
+
+/// This process's id.
+pub fn getpid(): int {
+    return @syscall(SYS_getpid);
+}
+
+/// Wait up to `ms` (negative waits forever) for events on `n` `struct pollfd`s at `fds`
+/// (8 bytes each: i32 fd, i16 events, i16 revents). The count ready, 0 on timeout, negative on failure.
+pub fn pollFds(fds: ptr, n: int, ms: int): int {
+    while true {
+        let r = @syscall(SYS_poll, fds, n, ms);
+        if r >= 0 || errno() != 4 {
+            return r;
+        }
+    }
+    return 0 - 1;
+}
+
+/// `SIGPIPE`: a write to a pipe or socket whose reader is gone. It ends the process by default.
+const SIGPIPE: int = 13;
+
+/// Set `SIGPIPE` to ignored (`on`) or back to the default. Network and process code ignore it,
+/// so a write to a closed peer fails with an error instead of killing the program.
+/// `j3.proc` sets it back to the default in a child before `execve`.
+pub fn ignoreSigpipe(on: bool) {
+    // struct kernel_sigaction { handler; flags; restorer; mask }: SIG_DFL 0, SIG_IGN 1
+    let act: [4]int = [if on { 1 } else { 0 }, 0, 0, 0];
+    @syscall(SYS_rt_sigaction, SIGPIPE, &act[0] as ptr, 0, 8);
+}
+
+/// The last failed call's error number (`errno`).
+pub fn errno(): int {
+    let e = c.__errno_location() as &i32;
+    return int(*e);
+}
+
+/// Load the shared library `name` (`libssl.so.3`). 0 when it cannot be loaded.
+pub fn dlopen(name: string): ptr {
+    return c.dlopen(cstrTmp(name), 2);
+}
+
+/// Address of `name` in a library from `dlopen`, also searching its dependencies. 0 when missing.
+pub fn dlsym(handle: ptr, name: string): ptr {
+    return c.dlsym(handle, cstrTmp(name));
+}
+
+/// NUL-terminated copy of a short name (`dlopen`, `dlsym`), per thread. `j3.text.cstr` sits above this module.
+fn cstrTmp(s: string): cstr {
+    if s.len + 1 > 256 {
+        panic("dlopen: name too long");
+    }
+    for i in 0..s.len {
+        DL_NAME[i] = s[i];
+    }
+    DL_NAME[s.len] = 0;
+    return &DL_NAME[0] as cstr;
+}
+
+#[singleton]
+#[thread]
+let DL_NAME: [256]u8;
 
 /// Name of this thread, set by `j3.thread`. Panics print it. Empty on the main thread.
 #[singleton]

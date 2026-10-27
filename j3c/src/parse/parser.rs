@@ -15,7 +15,7 @@ struct ItemAttrs {
 use crate::parse::error::ParseError;
 use crate::parse::syntax::{
     is_j3ui_widget, ATTR_DEBUG, ATTR_SINGLETON, ATTR_THREAD, ATTR_TRY_CATCH, INTRINSIC_SCRIPT, INTRINSIC_SIZEOF,
-    INTRINSIC_SLICE, INTRINSIC_SYSCALL, J3UI_END, J3UI_IF, J3UI_POP, SCRIPT_PROPS, SCRIPT_SHARED,
+    INTRINSIC_SLICE, INTRINSIC_SYSCALL, INTRINSIC_UI_CHOICE, J3UI_END, J3UI_IF, J3UI_POP, SCRIPT_PROPS, SCRIPT_SHARED,
 };
 use crate::parse::token::{Token, TokenKind};
 use crate::span::Span;
@@ -819,6 +819,9 @@ impl<'a> Parser<'a> {
     }
 
     fn param_list(&mut self) -> Result<Vec<Param>, ParseError> {
+        if self.cur().kind == TokenKind::Dot {
+            return Err(self.err("methods are declared inside the struct body (`struct T { fn name(this: &T, ...) { ... } }`), not as `fn T.name(`; see `j3c doc lang`"));
+        }
         self.expect(TokenKind::LParen, "expected `(` after fn name")?;
         let mut params = Vec::new();
         if self.cur().kind != TokenKind::RParen {
@@ -1672,6 +1675,16 @@ impl<'a> Parser<'a> {
                             kind: ExprKind::Atomic { op, args },
                         })
                     }
+                    INTRINSIC_UI_CHOICE => {
+                        self.expect(TokenKind::LParen, "expected `(` after `@uiChoice`")?;
+                        let set = self.ty()?;
+                        self.expect(TokenKind::Comma, "expected `,` after candidate-set type")?;
+                        let value = Box::new(self.expr()?);
+                        self.expect(TokenKind::Comma, "expected `,` after selector")?;
+                        let index = Box::new(self.expr()?);
+                        self.expect(TokenKind::RParen, "expected `)` after `@uiChoice`")?;
+                        Ok(Expr { span: join(start, self.prev_end(start)), kind: ExprKind::UiChoice { set, value, index } })
+                    }
                     INTRINSIC_SIZEOF => {
                         self.expect(TokenKind::LParen, "expected `(` after `@sizeof`")?;
                         let ty = self.ty()?;
@@ -1797,9 +1810,14 @@ impl<'a> Parser<'a> {
         let then_expr = self.expr()?;
         self.expect(TokenKind::RBrace, "expected `}`")?;
         self.expect(TokenKind::Else, "if-expression needs `else`")?;
-        self.expect(TokenKind::LBrace, "expected `{`")?;
-        let else_expr = self.expr()?;
-        self.expect(TokenKind::RBrace, "expected `}`")?;
+        let else_expr = if self.cur().kind == TokenKind::If {
+            self.if_expr()?
+        } else {
+            self.expect(TokenKind::LBrace, "expected `{`")?;
+            let e = self.expr()?;
+            self.expect(TokenKind::RBrace, "expected `}`")?;
+            e
+        };
         Ok(Expr {
             span: join(start, self.prev_end(start)),
             kind: ExprKind::If {
@@ -2019,6 +2037,8 @@ fn split_interp(text: &str, span: Span) -> Result<Vec<InterpPart>, ParseError> {
     let mut parts = Vec::new();
     let mut lit = Vec::new();
     let chars: Vec<char> = text.chars().collect();
+    // byte offset of each char, so a hole's spans point into the file (the token starts at a backtick)
+    let offs: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '{' {
@@ -2046,7 +2066,7 @@ fn split_interp(text: &str, span: Span) -> Result<Vec<InterpPart>, ParseError> {
                 return Err(ParseError::new(span, "empty interpolate hole"));
             }
             let hole: String = chars[hole_start..i].iter().collect();
-            let expr = parse_hole_expr(&hole, span)?;
+            let expr = parse_hole_expr(&hole, span, span.start + 1 + offs[hole_start] as u32)?;
             parts.push(InterpPart::Expr(expr));
             i += 1;
             continue;
@@ -2070,8 +2090,12 @@ fn ident_at(name: &str, span: Span) -> Ident {
     }
 }
 
-fn parse_hole_expr(src: &str, span: Span) -> Result<Expr, ParseError> {
-    let tokens = crate::parse::lex::lex(src, span.file)?;
+fn parse_hole_expr(src: &str, span: Span, base: u32) -> Result<Expr, ParseError> {
+    let mut tokens = crate::parse::lex::lex(src, span.file)?;
+    for t in tokens.iter_mut() {
+        t.span.start += base;
+        t.span.end += base;
+    }
     let mut p = Parser {
         tokens: &tokens,
         i: 0,

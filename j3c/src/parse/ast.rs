@@ -369,6 +369,8 @@ pub enum ExprKind {
         fields: Vec<(Ident, Expr)>,
     },
     SizeOf(Type),
+    /// Compiler UI lowering: test an int index or a candidate-set enum against one arm.
+    UiChoice { set: Type, value: Box<Expr>, index: Box<Expr> },
     SliceFrom {
         ptr: Box<Expr>,
         len: Box<Expr>,

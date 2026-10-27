@@ -45,13 +45,37 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
             None => { eprintln!("usage: j3c dump-bc <file.j3s>"); 1 }
         },
         "dump-syntax" => dump_syntax(rest),
+        "dump-ui" => match rest.first() {
+            Some(path) => match crate::ui::dump(std::path::Path::new(path)) {
+                Ok(t) => {
+                    print!("{t}");
+                    0
+                }
+                Err(e) => {
+                    eprint!("{e}");
+                    1
+                }
+            },
+            None => {
+                eprintln!("usage: j3c dump-ui <file.j3ui|project dir>");
+                1
+            }
+        },
         "new" => crate::scaffold::cmd(rest),
         "editor" => crate::editor::cmd(rest),
         "-e" | "--editor" => editor_tool(rest),
         "check" => check_cmd(rest),
+        "i18n" => crate::i18n::cmd(rest),
         "doc" => crate::doc::cmd(rest),
         "guide" => {
             print!("{}", crate::helptext::GUIDE);
+            0
+        }
+        "run" if rest.iter().any(|a| a == "--help" || a == "-h") => {
+            println!("usage: j3c run [path | file.j3 | tool.j3s] [--frames N] [--screenshot F.png] [--headless] [--hot] [--file]");
+            println!("  --hot       rebuild and restart on .j3/.j3ui/.j3s edits; the old run stays up if the build fails (`j3c doc j3ui`).");
+            println!("  --headless  offscreen video, silent audio: no window. Agents always pass it (`j3c doc testing`).");
+            println!("  --frames N  stop an App after N frames; --screenshot saves the last one (relative to your cwd).");
             0
         }
         "run" => {
@@ -70,6 +94,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
         }
         "fmt" => fmt_cmd(rest),
         "size" => size_cmd(rest),
+        "golden" => crate::golden::cmd(rest),
         "lsp" => crate::lsp::serve(),
         other => {
             eprintln!("j3c: unknown command `{other}`");
@@ -90,11 +115,12 @@ fn editor_tool(args: &[String]) -> i32 {
         Some("scene") => crate::scene::cmd(rest),
         Some("render") => crate::scene::render_cmd(rest),
         Some("gen") => crate::gen::cmd(rest),
+        Some("imgdiff") => crate::imgdiff::cmd(rest),
         Some("mcp") => crate::mcp::cmd(rest),
         Some("script-props") => script_props_cmd(rest),
         other => {
             if let Some(o) = other { eprintln!("j3c -e: unknown editor tool `{o}`"); }
-            eprintln!("usage: j3c -e scene|render|gen|mcp|script-props ...  (or --editor)");
+            eprintln!("usage: j3c -e scene|render|gen|imgdiff|mcp|script-props ...  (or --editor)");
             1
         }
     }
@@ -239,6 +265,7 @@ fn take_run_flags(rest: &[String]) -> Result<Vec<String>, String> {
                 };
                 std::env::set_var("J3_SCREENSHOT", path);
             }
+            "--hot" => HOT.store(true, std::sync::atomic::Ordering::Relaxed),
             "--file" => crate::project::FILE_ONLY.store(true, std::sync::atomic::Ordering::Relaxed),
             "--headless" => {
                 std::env::set_var("SDL_VIDEODRIVER", "offscreen");
@@ -260,6 +287,7 @@ fn print_help() {
     println!("    new [name]       write j3.toml, src/main.j3, AGENTS.md, CLAUDE.md (hello)");
     println!("    new [name] --app SDL window (links SDL2)");
     println!("    new [name] --template fps  first-person 3D game with a scene (SDL2 + GL)");
+    println!("    new [name] --template ui   .j3ui components window (SDL2 + ttf + GL; `doc j3ui`)");
     println!("    editor [--new] [project]  open the 3D scene editor");
     println!("    -e scene <op> ... list/get/add/set/delete/check scene objects by name (`-e scene --help`)");
     println!("    -e render [opts] draw a scene to a PNG without a window (`-e render --help`)");
@@ -275,7 +303,11 @@ fn print_help() {
     println!("    doc search <w>   public names containing a word, in any module");
     println!("    doc recipes      complete checked programs: 2D app, 3D scene, canvas, script, ...");
     println!("    doc lang         language");
-    println!("    doc j3ui         UI component syntax");
+    println!("    doc j3ui         .j3ui components (j3ui-immediate: @j3ui functions)");
+    println!("    doc css          CSS subset for .j3ui");
+    println!("    doc testing      headless run, screenshots, goldens, imgdiff");
+    println!("    golden <dir> [names] [--bless]  headless goldens of a project: states in <dir>/golden.toml (`doc testing`)");
+    println!("    -e imgdiff a.png b.png [--tol N] [--max N] [--out d.png]  pixel diff for goldens (exit 1 = differs)");
     println!("    build [path]     emit, compile, write `target/<name>`");
     println!("    run [path]       emit, compile, execute");
     println!("    run --frames N [--screenshot F.png] [--headless]  stop an App after N frames;");
@@ -290,12 +322,13 @@ fn print_help() {
     println!("    dump-ir samples  print hand-built place-IR samples");
     println!("    dump-c [path]    print C from the program");
     println!("    dump-llvm [path] print LLVM IR from the program");
+    println!("    dump-ui <file.j3ui|dir> print the J3 generated from .j3ui components");
     println!("    dump-bc <file.j3s> print script bytecode");
-    println!("    dump-syntax [f]  print TextMate grammar (lexer/parser names)");
+    println!("    dump-syntax [--ui] [f]  print TextMate grammar (lexer/parser names; --ui for .j3ui)");
     println!("    --fast           with run/build: strip bounds-check Abort; no `-g`");
     println!("    --emit llvm|c    backend (default llvm; override [emit] backend)");
     println!("    --opt N          0/1/2/3/s/z (override [emit] opt)");
-    println!("    --release        with run/build: smallest binary (opt s, no `-g`, stripped; keeps checks)");
+    println!("    --release        with run/build: smallest binary (opt s, no `-g`, stripped; keeps checks); build also writes [dist] build_outputs (zip, deb: `j3c doc ship`)");
     println!("    size [path]      what is in `target/<name>`: sections, code per module, biggest functions");
     println!("    run samples      emit, compile, execute place tests");
     println!("    help manifest    print j3.toml keys");
@@ -328,7 +361,9 @@ fn print_provenance() {
 }
 
 fn dump_syntax(rest: &[String]) -> i32 {
-    let text = crate::parse::syntax::tm_grammar();
+    let ui = rest.first().is_some_and(|a| a == "--ui");
+    let rest = if ui { &rest[1..] } else { rest };
+    let text = if ui { crate::parse::syntax::ui_tm_grammar() } else { crate::parse::syntax::tm_grammar() };
     match rest.first() {
         None => {
             print!("{text}");
@@ -569,6 +604,9 @@ fn run_dispatch(rest: &[String]) -> i32 {
     }
 }
 
+/// `run --hot`: rebuild and restart on source edits (`hot.rs`).
+static HOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn peel_run(rest: &[String]) -> (bool, Option<&str>, Vec<String>) {
     let mut fast = false;
     let mut path = None;
@@ -620,8 +658,14 @@ fn run_user(path: Option<&str>, args: &[String]) -> i32 {
         crate::gen::before_build(&m.root);
         let fast = FAST.load(std::sync::atomic::Ordering::Relaxed);
         return match crate::devrun::prepare(&m, &opts, fast) {
+            Ok(crate::devrun::Prepared::NoScripts(prog)) if HOT.load(std::sync::atomic::Ordering::Relaxed) => {
+                crate::hot::run(&m, &opts, fast, Ok(*prog), args)
+            }
             Ok(crate::devrun::Prepared::NoScripts(prog)) => run_loaded(Ok((*prog, manifest)), None, args),
             Ok(crate::devrun::Prepared::Dev(mut built)) => {
+                if HOT.load(std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("j3c: --hot ignored: this project has .j3s scripts, and its own watcher handles them (script edits swap live; .j3 and markup edits need a restart)");
+                }
                 match crate::devrun::watch(&m, &opts, fast, &mut built, args) {
                     Ok(code) => {
                         if code != 0 {
@@ -634,6 +678,9 @@ fn run_user(path: Option<&str>, args: &[String]) -> i32 {
                         1
                     }
                 }
+            }
+            Err(e) if HOT.load(std::sync::atomic::Ordering::Relaxed) => {
+                crate::hot::run(&m, &opts, fast, Err(e), args)
             }
             Err(e) => {
                 print_fail(&e);
@@ -741,6 +788,9 @@ fn size_cmd(rest: &[String]) -> i32 {
 }
 
 fn print_fail(e: &str) {
+    if let Ok(mut last) = crate::config::LAST_ERR.lock() {
+        *last = e.to_string();
+    }
     if e.contains("error:") || e.contains("warning:") || e.contains("-->") {
         eprint!("{e}");
         if !e.ends_with('\n') {
@@ -910,7 +960,9 @@ fn source_key(prog: &compile::Program, opts: &emit::EmitOpts, fast: bool) -> Str
 }
 
 fn source_stamp(opts: &emit::EmitOpts) -> Option<PathBuf> {
-    opts.cc.out.as_ref().map(|p| p.with_extension("j3c-src"))
+    let dir = emit::host::cache_dir(opts.cc.out.as_ref()?, &opts.target);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("src.key"))
 }
 
 /// The output exists and was built from exactly these sources and options, so emit and
@@ -929,6 +981,10 @@ fn mark_built(prog: &compile::Program, opts: &emit::EmitOpts, fast: bool) {
 /// With `J3C_TIMINGS` set, print how long a build phase took to stderr.
 /// `run` / `build` keep a 3-line status instead, so timings stay quiet there.
 pub(crate) fn timing(phase: &str, since: std::time::Instant) {
+    // An indented name is a step inside a phase; `compilation.log` keeps those.
+    if phase.starts_with("  ") {
+        crate::phase::step(phase, since.elapsed().as_secs_f64());
+    }
     if PROGRESS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
@@ -942,90 +998,21 @@ static PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// `run` and `build` turn this on so a long check or compile doesn't sit silent.
 fn progress_on() {
     PROGRESS.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::phase::enable();
 }
 
-/// Three status slots. Emit and clang names share the last line and overwrite it.
-struct ProgressView {
-    slots: [String; 3],
-    /// Lines currently on the terminal, so the next update can move back over them.
-    drawn: usize,
-    tty: bool,
-    /// Non-tty logs stop after this many lines.
-    plain: u8,
-}
-
-fn progress_view() -> &'static std::sync::Mutex<ProgressView> {
-    static VIEW: std::sync::OnceLock<std::sync::Mutex<ProgressView>> = std::sync::OnceLock::new();
-    VIEW.get_or_init(|| {
-        std::sync::Mutex::new(ProgressView {
-            slots: [String::new(), String::new(), String::new()],
-            drawn: 0,
-            tty: std::io::IsTerminal::is_terminal(&std::io::stderr()),
-            plain: 0,
-        })
-    })
-}
-
-/// Which of the 3 lines this message belongs on.
-/// The phase stays on the first line, the module name overwrites the second,
-/// and `running` uses the third.
-fn status_slot(msg: &str) -> usize {
-    if msg.starts_with("emit ") || msg.starts_with("clang ") {
-        1
-    } else if msg == "running" {
-        2
-    } else {
-        0
-    }
-}
-
-/// A progress line on stderr. Quiet unless this process is a `run` or `build`.
-/// On a terminal the block is at most 3 lines and the last line updates in place.
+/// Old one-line messages, routed to the two-line status in `phase`: a known message starts
+/// an outer phase, anything else is inner progress.
 pub(crate) fn status(msg: &str) {
-    if !PROGRESS.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    let Ok(mut view) = progress_view().lock() else {
-        return;
-    };
-    let slot = status_slot(msg);
-    if msg == "up to date" {
-        view.slots[1].clear();
-        view.slots[2].clear();
-    } else if msg == "linking" {
-        view.slots[1].clear();
-    }
-    view.slots[slot] = format!("j3c: {msg}");
-    if view.tty {
-        view.redraw();
-    } else if !msg.starts_with("emit ") && !msg.starts_with("clang ") && view.plain < 3 {
-        eprintln!("j3c: {msg}");
-        view.plain += 1;
-    }
-}
-
-impl ProgressView {
-    fn redraw(&mut self) {
-        use std::io::Write;
-        let visible: Vec<&str> = self.slots.iter().filter(|s| !s.is_empty()).map(|s| s.as_str()).collect();
-        let mut err = std::io::stderr().lock();
-        if self.drawn > 0 {
-            let _ = write!(err, "\x1b[{}A", self.drawn);
-        }
-        let rows = self.drawn.max(visible.len());
-        for i in 0..rows {
-            if i < visible.len() {
-                let _ = writeln!(err, "\x1b[2K{}", visible[i]);
-            } else {
-                let _ = writeln!(err, "\x1b[2K");
-            }
-        }
-        if rows > visible.len() {
-            let extra = rows - visible.len();
-            let _ = write!(err, "\x1b[{extra}A\x1b[J");
-        }
-        let _ = err.flush();
-        self.drawn = visible.len();
+    match msg {
+        "checking" => crate::phase::begin("parse"),
+        "emitting" => crate::phase::begin("emit"),
+        "compiling" => crate::phase::begin("compile"),
+        "linking" => crate::phase::begin("link"),
+        "packaging" => crate::phase::begin("package"),
+        "running" => crate::phase::begin("running"),
+        "up to date" => crate::phase::begin("up to date"),
+        _ => crate::phase::detail(msg),
     }
 }
 
@@ -1035,6 +1022,36 @@ fn build_samples_err() -> i32 {
 }
 
 fn build_loaded(prog: Result<(compile::Program, Option<Manifest>), String>) -> i32 {
+    if !crate::config::compilation_tracking() {
+        return build_inner(prog);
+    }
+    let started = std::time::Instant::now();
+    let (root, modules, opts) = match &prog {
+        Ok((p, m)) => (
+            m.as_ref().map(|m| m.root.clone()).unwrap_or_default(),
+            p.modules.len(),
+            emit_opts(m).ok(),
+        ),
+        Err(_) => (PathBuf::new(), 0, None),
+    };
+    let code = build_inner(prog);
+    let (opt, backend, target) = opts
+        .map(|o| (o.cc.opt.clone(), format!("{:?}", o.backend).to_lowercase(), o.target.clone()))
+        .unwrap_or_default();
+    crate::config::log_compile(&crate::config::Compile {
+        root: &root,
+        opt: &opt,
+        backend: &backend,
+        target: &target,
+        modules,
+        secs: crate::phase::elapsed().max(started.elapsed().as_secs_f64()),
+        phases: crate::phase::report(),
+        ok: code == 0,
+    });
+    code
+}
+
+fn build_inner(prog: Result<(compile::Program, Option<Manifest>), String>) -> i32 {
     match prog {
         Ok((prog, manifest)) => match emit_opts(&manifest) {
             Ok(mut opts) => {
@@ -1048,42 +1065,82 @@ fn build_loaded(prog: Result<(compile::Program, Option<Manifest>), String>) -> i
                         opts.cc.out = Some(PathBuf::from("target").join("a.out"));
                     }
                     let fast = manifest.as_ref().map(|m| m.cc.fast || m.emit.fast).unwrap_or(false);
+                    let out = opts.cc.out.clone().expect("out path");
                     if up_to_date(&prog, &opts, fast) {
                         status("up to date");
-                        println!("{}", opts.cc.out.as_ref().expect("out path").display());
-                        return 0;
+                        println!("{}", out.display());
+                    } else {
+                        let built = link_built(&prog, &opts);
+                        if built != 0 {
+                            return built;
+                        }
+                        mark_built(&prog, &opts, fast);
                     }
-                    let built = link_built(&prog, &opts);
-                    if built == 0 { mark_built(&prog, &opts, fast); }
-                    return built;
+                    return package(&manifest, &[(opts.target.clone(), out)]);
                 }
                 let m = manifest.as_ref().expect("target list");
-                for triple in &targets {
-                    let built = match compile::compile_manifest_target(m, triple) {
-                        Ok(mut p) => {
-                            if FAST.load(std::sync::atomic::Ordering::Relaxed) {
-                                compile::apply_fast(&mut p);
-                            }
-                            p
-                        }
-                        Err(e) => {
-                            print_fail(&e);
-                            return 1;
-                        }
-                    };
-                    opts.target = triple.clone();
-                    opts.cc.out = Some(m.out_path_for(triple));
-                    if link_built(&built, &opts) != 0 {
-                        return 1;
-                    }
+                // Targets share nothing (own objects, own output), so build them side by side:
+                // each one's long pole leaves most cores idle.
+                let failed = std::thread::scope(|scope| {
+                    let jobs: Vec<_> = targets
+                        .iter()
+                        .map(|triple| {
+                            let mut opts = opts.clone();
+                            scope.spawn(move || {
+                                crate::phase::set_tag(triple);
+                                crate::phase::target(triple);
+                                let built = match compile::compile_manifest_target(m, triple) {
+                                    Ok(mut p) => {
+                                        if FAST.load(std::sync::atomic::Ordering::Relaxed) {
+                                            compile::apply_fast(&mut p);
+                                        }
+                                        p
+                                    }
+                                    Err(e) => {
+                                        print_fail(&e);
+                                        return 1;
+                                    }
+                                };
+                                opts.target = triple.clone();
+                                opts.cc.out = Some(m.out_path_for(triple));
+                                link_built(&built, &opts)
+                            })
+                        })
+                        .collect();
+                    jobs.into_iter().map(|j| j.join().unwrap_or(1)).any(|code| code != 0)
+                });
+                if failed {
+                    return 1;
                 }
-                0
+                let outs: Vec<_> = targets.iter().map(|t| (t.clone(), m.out_path_for(t))).collect();
+                package(&manifest, &outs)
             }
             Err(e) => {
                 print_fail(&e);
                 1
             }
         },
+        Err(e) => {
+            print_fail(&e);
+            1
+        }
+    }
+}
+
+/// `[dist] build_outputs` on a `--release` build: zip / `.deb` each target into `target/dist/`.
+fn package(manifest: &Option<Manifest>, built: &[(String, PathBuf)]) -> i32 {
+    let Some(m) = manifest.as_ref().filter(|m| !m.dist.outputs.is_empty()) else { return 0 };
+    if !RELEASE.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    status("packaging");
+    match crate::dist::package(m, built) {
+        Ok(zips) => {
+            for z in zips {
+                println!("{}", z.display());
+            }
+            0
+        }
         Err(e) => {
             print_fail(&e);
             1
@@ -1135,13 +1192,19 @@ fn link_built(prog: &compile::Program, opts: &emit::EmitOpts) -> i32 {
 
 fn check_cmd(rest: &[String]) -> i32 {
     let mut json = false;
+    let mut strict = false;
     let mut path = None;
     for a in rest {
         if a == "--json" {
             json = true;
+        } else if a == "--strict" {
+            strict = true;
+        } else if a == "--help" || a == "-h" {
+            println!("usage: j3c check [--json] [--strict] [path]\n\ntypechecks the project, then reports missing libraries and files, and (with [ui]) CSS lint\nwarnings for theme.css and every component <style> (`j3c doc css`, Lint).\n  --json    one JSON object: ok/entry (and css / i18n arrays of warnings) or the error\n  --strict  exit 1 when the CSS lint or i18n check finds anything (default: warnings only)\nAlso warns `file:line:col: message [i18n-missing]` when a `t(\"key\")`/`tf` key is not in the default locale or a locale has a key the default lacks (`j3c doc i18n`).\nSilence: /* j3-lint-ignore rule */ before a line, or [ui] lint = false / lint-off = [\"rule\"] in j3.toml.");
+            return 0;
         } else if a.starts_with('-') {
             eprintln!("j3c: unknown flag `{a}`");
-            eprintln!("  = help: `j3c check --json [path]`");
+            eprintln!("  = help: `j3c check [--json] [--strict] [path]`");
             return 1;
         } else if path.is_none() {
             path = Some(a.as_str());
@@ -1167,15 +1230,25 @@ fn check_cmd(rest: &[String]) -> i32 {
                 Some(m) => m.entry.display().to_string(),
                 None => path.unwrap_or(".").to_string(),
             };
+            // CSS lint: warnings only (exit code unchanged unless --strict)
+            let css = match manifest.as_ref().map(crate::csslint::lint_project) {
+                Some(Ok(w)) => w,
+                Some(Err(e)) => {
+                    eprintln!("note: css lint skipped: {e}");
+                    Vec::new()
+                }
+                None => Vec::new(),
+            };
+            let i18n = manifest.as_ref().map(|m| crate::i18n::lint(&m.root)).unwrap_or_default();
             if json {
-                println!(
-                    "{{\"ok\":true,\"entry\":{}}}",
-                    json_str(&entry)
-                );
+                println!("{}", check_json(&entry, &css, &i18n));
             } else {
+                for w in css.iter().chain(&i18n) {
+                    println!("{w}");
+                }
                 println!("checked {entry}");
             }
-            0
+            if strict && !(css.is_empty() && i18n.is_empty()) { 1 } else { 0 }
         }
         Err(e) => {
             if json {
@@ -1186,6 +1259,12 @@ fn check_cmd(rest: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// The `check --json` line for a project that typechecks; `css` and `i18n` are the warning arrays (omitted when empty).
+fn check_json(entry: &str, css: &[String], i18n: &[String]) -> String {
+    let arr = |key: &str, v: &[String]| if v.is_empty() { String::new() } else { format!(",\"{key}\":[{}]", v.iter().map(|w| json_str(w)).collect::<Vec<_>>().join(",")) };
+    format!("{{\"ok\":true,\"entry\":{}{}{}}}", json_str(entry), arr("css", css), arr("i18n", i18n))
 }
 
 fn json_str(s: &str) -> String {
@@ -1417,6 +1496,25 @@ mod tests {
     }
 
     #[test]
+    fn check_json_carries_i18n_warnings_and_strict_fails_on_them() {
+        let w = vec!["warning: a.j3:1:1: key `x` is not in locales/en.txt [i18n-missing]".to_string()];
+        let j = check_json("src/main.j3", &[], &w);
+        assert_eq!(j, "{\"ok\":true,\"entry\":\"src/main.j3\",\"i18n\":[\"warning: a.j3:1:1: key `x` is not in locales/en.txt [i18n-missing]\"]}");
+        assert_eq!(check_json("e", &[], &[]), "{\"ok\":true,\"entry\":\"e\"}");
+        let dir = std::env::temp_dir().join(format!("j3-check-i18n-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("locales")).unwrap();
+        std::fs::write(dir.join("j3.toml"), "[package]\nname = \"i18nc\"\nentry = \"src/main.j3\"\n").unwrap();
+        std::fs::write(dir.join("locales/en.txt"), "known = Known\n").unwrap();
+        std::fs::write(dir.join("src/main.j3"), "module i18nc;\nfn t(k: string): string { return k; }\nfn main() {\n    t(\"known\");\n    t(\"unknown\");\n}\n").unwrap();
+        let path = dir.display().to_string();
+        assert_eq!(run(["check".into(), path.clone()]), 0);
+        assert_eq!(run(["check".into(), "--strict".into(), path]), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn run_stops_when_check_fails() {
         let dir = std::env::temp_dir().join(format!("j3-run-gate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1512,9 +1610,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn incremental_all_splits_optimized_builds() {
+        let dir = std::env::temp_dir().join(format!("j3-incr-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("j3.toml"),
+            "[package]\nname = \"incrall\"\nentry = \"src/main.j3\"\n\n[emit]\nbackend = llvm\nopt = 2\nincremental = \"all\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/main.j3"),
+            "module incrall;\n\nuse j3.io.printLn;\n\nfn main() {\n    printLn(\"split\");\n}\n",
+        )
+        .unwrap();
+        assert_eq!(build_path(&dir.display().to_string()), 0);
+        let out = std::process::Command::new(dir.join("target/incrall")).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("split"));
+        assert!(!obj_mtimes(&dir).is_empty(), "opt 2 with incremental = all made no per-module objects");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn obj_mtimes(root: &std::path::Path) -> Vec<(String, std::time::SystemTime)> {
         let mut out = Vec::new();
-        let dir = root.join("target/j3c-obj");
+        let host = root.join("target/.j3c/host");
+        let dir = std::fs::read_dir(&host).unwrap().flatten().map(|e| e.path().join("obj")).find(|d| d.is_dir()).unwrap();
         for ent in std::fs::read_dir(&dir).unwrap().flatten() {
             let name = ent.file_name().to_string_lossy().to_string();
             if !name.ends_with(".o") {

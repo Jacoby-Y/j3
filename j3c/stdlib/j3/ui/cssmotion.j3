@@ -1,0 +1,418 @@
+/// Motion value parsers for `j3.ui.css`: times, easing functions, `transform`, `ripple`.
+
+module j3.ui.cssmotion;
+
+use j3.text.same;
+use j3.ui.anim.{ cubic, Ease, spring, steps };
+use j3.ui.css.{ Css, P_ORIGIN, P_ROTATE, P_TRANSFORM, P_TRANSLATE, V_COLOR, V_EM, V_NONE, V_PCT, V_PX, V_REM, V_UNSET, V_XFORM, Value };
+use j3.ui.xform.{ MAXF, REC, XK, XM, XR, XS, XT };
+use j3.ui.csslex.{ T_COMMA, T_FUNC, T_IDENT, T_NUM, T_RPAREN, Token };
+use j3.ui.cssvalue.{ angleOf, isWord, mk, P, parseColor, parseLen, parseLenU, pf, setv };
+use j3.ui.cssvalue.{ tk, txt, unitIs, wordIndex };
+
+#[singleton]
+#[thread]
+let ARGS: [4]f32;
+
+#[singleton]
+#[thread]
+let ARGN: int;
+
+/// A time token (`300ms`, `0.3s`, or a bare 0) as ms.
+pub fn timeOf(p: &P, t: &Token, out: &f32): bool {
+    if t.kind != T_NUM {
+        return false;
+    }
+    if t.us == t.ue {
+        *out = 0.0;
+        return t.f == 0.0;
+    }
+    if unitIs(p, t, "ms") {
+        *out = t.f;
+        return true;
+    }
+    if unitIs(p, t, "s") {
+        *out = t.f * 1000.0;
+        return true;
+    }
+    return false;
+}
+
+/// The numbers of the function at `TOK[k]` into `ARGS` (count in `ARGN`); tokens used including
+/// the name and `)`, 0 when an argument is not a number.
+fn numArgs(p: &P, k: int, n: int): int {
+    ARGN = 0;
+    let j = k + 1;
+    while j < n {
+        let t = tk(j);
+        if t.kind == T_RPAREN {
+            return j + 1 - k;
+        }
+        if ARGN >= 4 || t.kind != T_NUM {
+            return 0;
+        }
+        ARGS[ARGN] = t.f;
+        ARGN += 1;
+        j += 1;
+        if j < n && tk(j).kind == T_COMMA {
+            j += 1;
+        }
+    }
+    return 0;
+}
+
+/// Index of `e` in `css.eases` (added when new; the packed forms hold 255 at most).
+fn easeIdx(css: &Css, e: Ease): int {
+    for i in 0..css.eases.len {
+        let q = &css.eases.items[i];
+        if q.kind == e.kind && q.a == e.a && q.b == e.b && q.c == e.c && q.d == e.d {
+            return i;
+        }
+    }
+    if css.eases.len >= 255 {
+        return 0;
+    }
+    css.eases.push(e);
+    return css.eases.len - 1;
+}
+
+/// A timing function at `TOK[k]` (keyword, `cubic-bezier()`, `steps()`, `spring()`) as an
+/// `css.eases` index; returns tokens used, 0 when it is not one.
+pub fn parseEase(p: &P, k: int, n: int, out: &int): int {
+    let t = tk(k);
+    if t.kind == T_IDENT {
+        let w = txt(p, t);
+        let ix = wordIndex("ease linear ease-in ease-out ease-in-out bounce spring", w);
+        if ix >= 0 {
+            *out = ix;
+            return 1;
+        }
+        if same(w, "step-start") || same(w, "step-end") {
+            *out = easeIdx(p.css, steps(1.0, same(w, "step-start")));
+            return 1;
+        }
+        return 0;
+    }
+    if t.kind != T_FUNC {
+        return 0;
+    }
+    let name = txt(p, t);
+    if same(name, "steps") && k + 2 < n && tk(k + 1).kind == T_NUM {
+        let cnt = tk(k + 1).f;
+        if cnt < 1.0 {
+            return 0;
+        }
+        if tk(k + 2).kind == T_RPAREN {
+            *out = easeIdx(p.css, steps(cnt, false));
+            return 3;
+        }
+        if k + 4 < n && tk(k + 2).kind == T_COMMA && tk(k + 3).kind == T_IDENT && tk(k + 4).kind == T_RPAREN {
+            let sw = txt(p, tk(k + 3));
+            let start = same(sw, "start") || same(sw, "jump-start");
+            if start || same(sw, "end") || same(sw, "jump-end") {
+                *out = easeIdx(p.css, steps(cnt, start));
+                return 5;
+            }
+        }
+        return 0;
+    }
+    let u = numArgs(p, k, n);
+    if u == 0 {
+        return 0;
+    }
+    if same(name, "cubic-bezier") && ARGN == 4 && ARGS[0] >= 0.0 && ARGS[0] <= 1.0 && ARGS[2] >= 0.0 && ARGS[2] <= 1.0 {
+        *out = easeIdx(p.css, cubic(ARGS[0], ARGS[1], ARGS[2], ARGS[3]));
+        return u;
+    }
+    if same(name, "spring") && ARGN == 2 && ARGS[0] > 0.0 {
+        *out = easeIdx(p.css, spring(ARGS[0], ARGS[1]));
+        return u;
+    }
+    return 0;
+}
+
+#[singleton]
+#[thread]
+let XB: [65]f32;
+
+#[singleton]
+#[thread]
+let ARGI: [6]int;
+
+/// One length argument at token `j` into `*out`; a percentage adds `bit` to `*pct`, an `em` adds `bit * 8` and a
+/// `rem` `bit * 32` (the number is then in em / rem; `css.j3` `xformPx` turns it to px when the style is computed).
+fn lenArg(p: &P, j: int, out: &f32, pct: &int, bit: int): bool {
+    let v = mk(V_UNSET, 0.0, 0, 0);
+    if !parseLenU(p, tk(j), &v) {
+        return false;
+    }
+    if v.kind == V_PX {
+        *out = v.f;
+        return true;
+    }
+    if v.kind == V_PCT {
+        *out = v.f;
+        *pct = *pct + bit;
+        return true;
+    }
+    if v.kind == V_EM || v.kind == V_REM {
+        *out = v.f;
+        *pct = *pct + bit * (if v.kind == V_EM { 8 } else { 32 });
+        return true;
+    }
+    return false;
+}
+
+/// A unitless number token.
+fn numArg(j: int, out: &f32): bool {
+    let t = tk(j);
+    if t.kind != T_NUM || t.us != t.ue {
+        return false;
+    }
+    *out = t.f;
+    return true;
+}
+
+fn angArg(p: &P, j: int, out: &f32): bool {
+    let deg: f32 = 0.0;
+    if !angleOf(p, tk(j), &deg) {
+        return false;
+    }
+    *out = deg * 0.017453292;
+    return true;
+}
+
+/// The function at `TOK[j]` as a record in `XB[q..]`; tokens used including `)`, 0 when it is not valid.
+fn parseFn(p: &P, j: int, n: int, q: int): int {
+    let name = txt(p, tk(j));
+    let an = 0;
+    let e = j + 1;
+    while e < n && tk(e).kind != T_RPAREN {
+        if tk(e).kind == T_COMMA {
+            e += 1;
+            continue;
+        }
+        if an >= 6 {
+            return 0;
+        }
+        ARGI[an] = e;
+        an += 1;
+        e += 1;
+    }
+    if e >= n || an == 0 {
+        return 0;
+    }
+    for z in 0..REC {
+        XB[q + z] = 0.0;
+    }
+    let pct = 0;
+    let ok = false;
+    if same(name, "translate") || same(name, "translateX") || same(name, "translateY") {
+        XB[q] = f32(XT);
+        if same(name, "translateX") {
+            ok = an == 1 && lenArg(p, ARGI[0], &XB[q + 1], &pct, 1);
+        } else if same(name, "translateY") {
+            ok = an == 1 && lenArg(p, ARGI[0], &XB[q + 2], &pct, 2);
+        } else {
+            ok = an <= 2 && lenArg(p, ARGI[0], &XB[q + 1], &pct, 1) && (an == 1 || lenArg(p, ARGI[1], &XB[q + 2], &pct, 2));
+        }
+    } else if same(name, "rotate") {
+        XB[q] = f32(XR);
+        ok = an == 1 && angArg(p, ARGI[0], &XB[q + 1]);
+    } else if same(name, "scale") || same(name, "scaleX") || same(name, "scaleY") {
+        XB[q] = f32(XS);
+        XB[q + 1] = 1.0;
+        XB[q + 2] = 1.0;
+        if same(name, "scaleX") {
+            ok = an == 1 && numArg(ARGI[0], &XB[q + 1]);
+        } else if same(name, "scaleY") {
+            ok = an == 1 && numArg(ARGI[0], &XB[q + 2]);
+        } else {
+            ok = an <= 2 && numArg(ARGI[0], &XB[q + 1]);
+            XB[q + 2] = XB[q + 1];
+            if ok && an == 2 {
+                ok = numArg(ARGI[1], &XB[q + 2]);
+            }
+        }
+    } else if same(name, "skew") || same(name, "skewX") || same(name, "skewY") {
+        XB[q] = f32(XK);
+        if same(name, "skewX") {
+            ok = an == 1 && angArg(p, ARGI[0], &XB[q + 1]);
+        } else if same(name, "skewY") {
+            ok = an == 1 && angArg(p, ARGI[0], &XB[q + 2]);
+        } else {
+            ok = an <= 2 && angArg(p, ARGI[0], &XB[q + 1]) && (an == 1 || angArg(p, ARGI[1], &XB[q + 2]));
+        }
+    } else if same(name, "matrix") {
+        XB[q] = f32(XM);
+        ok = an == 6;
+        for z in 0..6 {
+            if ok && !numArg(ARGI[z], &XB[q + 1 + z]) {
+                ok = false;
+            }
+        }
+    }
+    if !ok {
+        return 0;
+    }
+    XB[q + 7] = f32(pct);
+    return e + 1 - j;
+}
+
+/// A horizontal / vertical / centre keyword at `j` as a percentage (class 1 x, 2 y, 3 both), else a length (class 0).
+fn originPart(p: &P, j: int, val: &f32, pct: &int): int {
+    let t = tk(j);
+    if t.kind == T_IDENT {
+        let w = txt(p, t);
+        *pct = 1;
+        if same(w, "left") { *val = 0.0; return 1; }
+        if same(w, "right") { *val = 100.0; return 1; }
+        if same(w, "top") { *val = 0.0; return 2; }
+        if same(w, "bottom") { *val = 100.0; return 2; }
+        if same(w, "center") { *val = 50.0; return 3; }
+        return -1;
+    }
+    *pct = 0;
+    let bit = 0;
+    if !lenArg(p, j, val, &bit, 1) {
+        return -1;
+    }
+    // 0 px, 1 %, 2 em, 3 rem (`xformPx` makes the last two px)
+    if bit == 1 { *pct = 1; } else if bit == 8 { *pct = 2; } else if bit == 32 { *pct = 3; }
+    return 0;
+}
+
+/// `transform` (a list of 2D functions: `translate` `translateX` `translateY` `rotate` `scale` `scaleX` `scaleY` `skew`
+/// `skewX` `skewY` `matrix`, at most `MAXF`), `translate: x [y]`, `rotate: angle`, `scale: x [y]`, `transform-origin: x [y]`
+/// (keywords, px, %, em or rem), or `none`. They are kept as the `j3.ui.xform` list and composed left to right at paint time.
+pub fn parseXform(p: &P, prop: int, k: int, n: int, out: &Value): int {
+    if isWord(p, tk(k), "none") {
+        out.kind = V_NONE;
+        return 1;
+    }
+    let cnt = 0;
+    let used = 0;
+    if prop == P_TRANSFORM {
+        let j = k;
+        while j < n {
+            if tk(j).kind != T_FUNC || cnt >= MAXF {
+                return 0;
+            }
+            let u = parseFn(p, j, n, 1 + cnt * REC);
+            if u == 0 {
+                return 0;
+            }
+            cnt += 1;
+            j += u;
+        }
+        used = n - k;
+    } else if prop == P_ORIGIN {
+        let x: f32 = 50.0;
+        let y: f32 = 50.0;
+        let xp = 1;
+        let yp = 1;
+        let oa = n - k;
+        if oa < 1 || oa > 2 {
+            return 0;
+        }
+        let v0: f32 = 0.0;
+        let p0 = 0;
+        let c0 = originPart(p, k, &v0, &p0);
+        let v1: f32 = 50.0;
+        let p1 = 1;
+        let c1 = 3;
+        if oa == 2 {
+            c1 = originPart(p, k + 1, &v1, &p1);
+        }
+        if c0 < 0 || c1 < 0 {
+            return 0;
+        }
+        if oa == 1 {
+            // one keyword names its own axis, the other stays centred
+            if c0 == 2 { y = v0; yp = p0; } else { x = v0; xp = p0; }
+        } else {
+            if c0 == 2 || c1 == 1 {
+                // `top left`: vertical first
+                if c0 == 1 || c1 == 2 {
+                    return 0;
+                }
+                x = v1; xp = p1; y = v0; yp = p0;
+            } else {
+                if c1 == 1 || c0 == 2 {
+                    return 0;
+                }
+                x = v0; xp = p0; y = v1; yp = p1;
+            }
+        }
+        let oh = p.css.paints.len;
+        pf(p, x);
+        pf(p, f32(xp));
+        pf(p, y);
+        pf(p, f32(yp));
+        setv(out, mk(V_XFORM, 0.0, oh, if xp >= 2 || yp >= 2 { 2 } else { 0 }));
+        return oa;
+    } else {
+        // the individual properties: one function's argument tokens, no parentheses
+        let an = n - k;
+        let pct = 0;
+        for z in 0..REC {
+            XB[1 + z] = 0.0;
+        }
+        if prop == P_TRANSLATE {
+            if an > 2 || !lenArg(p, k, &XB[2], &pct, 1) || (an == 2 && !lenArg(p, k + 1, &XB[3], &pct, 2)) {
+                return 0;
+            }
+            XB[1] = f32(XT);
+        } else if prop == P_ROTATE {
+            if an != 1 || !angArg(p, k, &XB[2]) {
+                return 0;
+            }
+            XB[1] = f32(XR);
+        } else {
+            XB[2] = 1.0;
+            XB[3] = 1.0;
+            if an > 2 || !numArg(k, &XB[2]) {
+                return 0;
+            }
+            XB[3] = XB[2];
+            if an == 2 && !numArg(k + 1, &XB[3]) {
+                return 0;
+            }
+            XB[1] = f32(XS);
+        }
+        XB[8] = f32(pct);
+        cnt = 1;
+        used = an;
+    }
+    let head = p.css.paints.len;
+    let em = 0;
+    pf(p, f32(cnt));
+    for z in 0..cnt * REC {
+        pf(p, XB[1 + z]);
+    }
+    for z in 0..cnt {
+        if int(XB[1 + z * REC + 7]) >= 8 { em = 1; }
+    }
+    setv(out, mk(V_XFORM, 0.0, head, em));
+    return used;
+}
+
+/// `ripple: <color> [<time>]` (not CSS): a wave from the press point, `f` = ms.
+pub fn parseRipple(p: &P, k: int, n: int, out: &Value): int {
+    if isWord(p, tk(k), "none") {
+        out.kind = V_NONE;
+        return 1;
+    }
+    let u = parseColor(p, k, n, out);
+    if u == 0 || out.kind != V_COLOR {
+        return 0;
+    }
+    out.f = 600.0;
+    if k + u < n && tk(k + u).kind == T_NUM {
+        if !timeOf(p, tk(k + u), &out.f) {
+            return 0;
+        }
+        u += 1;
+    }
+    return u;
+}

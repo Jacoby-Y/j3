@@ -5,7 +5,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::fd::AsFd;
+#[cfg(windows)]
+use std::os::windows::io::AsHandle;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -54,7 +57,7 @@ const FRONTEND: &[(&str, &str)] = &[
     ("watch.j3", include_str!("../editor/src/watch.j3")),
     ("widgets.j3", include_str!("../editor/src/widgets.j3")),
 ];
-const FONT: &[u8] = include_bytes!("../editor/font.ttf");
+pub(crate) const FONT: &[u8] = include_bytes!("../editor/font.ttf");
 
 pub fn cmd(rest: &[String]) -> i32 {
     match execute(rest) {
@@ -165,7 +168,7 @@ fn create_project(root: &Path, fps: bool) -> Result<(), String> {
 /// Every file of a new editor project (`j3c doc recipes scene3d` prints them too).
 pub(crate) fn project_files(name: &str, fps: bool) -> Vec<(&'static str, String)> {
     vec![
-        ("j3.toml", format!("[package]\nname = \"{name}\"\nentry = \"src/main.j3\"\n\n[emit]\nbackend = llvm\nopt = 0\ndebug = true\n\n[link]\nlibs = [\"SDL2\", \"GL\"]\n")),
+        ("j3.toml", format!("[package]\nname = \"{name}\"\nentry = \"src/main.j3\"\n\n[emit]\nbackend = \"llvm\"\nopt = 0\ndebug = true\n\n[link]\nlibs = [\"SDL2\", \"GL\"]\n")),
         ("j3.editor.toml", "[editor]\nscene = \"scenes/main.j3scene\"\n".to_string()),
         ("src/main.j3", if fps { fps_template(name) } else { game_template(name) }),
         ("scripts/spin.j3s", SPIN_SCRIPT.to_string()),
@@ -869,10 +872,14 @@ pub(crate) fn frontend(host: &Path) -> Result<(PathBuf, fs::File), String> {
             fs::write(temp.join("j3.toml"), "[package]\nname = \"j3_editor\"\nentry = \"src/main.j3\"\n\n[link]\nlibs = [\"SDL2\", \"GL\"]\n")
                 .map_err(|e| e.to_string())?;
             // Output goes to stderr: `j3c -e mcp` keeps stdout for the protocol.
+            #[cfg(unix)]
+            let err_fd = std::io::stderr().as_fd().try_clone_to_owned();
+            #[cfg(windows)]
+            let err_fd = std::io::stderr().as_handle().try_clone_to_owned();
             let status = Command::new(host)
                 .arg("build")
                 .arg(&temp)
-                .stdout(Stdio::from(std::io::stderr().as_fd().try_clone_to_owned().map_err(|e| e.to_string())?))
+                .stdout(Stdio::from(err_fd.map_err(|e| e.to_string())?))
                 .status()
                 .map_err(|e| format!("build editor: {e}"))?;
             if !status.success() { return Err("editor build failed".into()); }

@@ -13,6 +13,8 @@ const SCHEMA = {
         doc: "File that contains `main`. Default `src/main.j3`.",
         suggest: ['"src/main.j3"'],
       },
+      version: { doc: "Package version (the `.deb` version). Default `0.1.0`.", suggest: ['"0.1.0"'] },
+      description: { doc: "One line for the `.deb` and the menu entry." },
     },
   },
   cc: {
@@ -34,10 +36,14 @@ const SCHEMA = {
         doc: "`0`, `1`, `2`, `3`, `s`, or `z`. LLVM default is `2`.",
         values: OPTS,
       },
+      incremental: {
+        doc: 'At opt 0, reuse one object per module. Default `true`. `"all"` does it at every opt (faster rebuilds, no cross-module inlining); `--release` ignores it.',
+        values: ["true", "false", "all"],
+      },
       debug: { doc: "Debug info. Default `true`, unless `[cc] fast` is set.", values: BOOLS },
       fast: { doc: "Strip bounds-check aborts, same as `--fast`.", values: BOOLS },
       target: {
-        doc: "One triple, or an array of triples. Empty means the host.",
+        doc: "One triple, or an array of triples. Empty means the host. With several, `build` writes `target/<triple>/<name>`.",
         suggest: [
           "x86_64-unknown-linux-gnu",
           "x86_64-pc-windows-gnu",
@@ -62,6 +68,39 @@ const SCHEMA = {
       search: { doc: "Library search directories (`-L`).", list: true },
       files: { doc: "Extra object files or archives.", list: true },
       flags: { doc: "Extra linker flags, such as an rpath.", list: true },
+    },
+  },
+  dist: {
+    doc: "Packaging. `build_outputs = [\"zip\", \"deb\"]` makes `build --release` write them per target to `target/dist/`.",
+    keys: {
+      build_outputs: {
+        doc: "What `build --release` writes to `target/dist/`: `zip` (program, `include`, Windows DLLs) and `deb` (Linux: installs to `/opt/<name>` with a launcher, menu entry, and icon).",
+        list: true,
+        suggest: ['"zip"', '"deb"'],
+      },
+      icon: { doc: "`.png` (square 256 or 512) or `.svg` for the `.deb` menu entry.", suggest: ['"assets/icon.png"'] },
+      title: { doc: "Menu name. Default: the package name, title-cased." },
+      categories: { doc: "`.desktop` Categories. Default `Game;`.", suggest: ['"Game;"'] },
+      maintainer: { doc: "`Name <email>`. Default `$DEBFULLNAME`/`$DEBEMAIL`, else git config." },
+      depends: { doc: "Extra `.deb` Depends, after the ones found from the libraries the program loads.", list: true },
+      zip: {
+        doc: "`true` is `build_outputs = [\"zip\"]`: `build --release` also writes `target/dist/<name>-<os>-<arch>.zip` with a `<name>/` folder holding the program, the `include` list, and (Windows) the DLLs the .exe imports, found via `[link] search`.",
+        values: BOOLS,
+      },
+      include: {
+        doc: "Files and folders to ship. Default: whichever of `assets`, `scripts`, `scenes` exist.",
+        list: true,
+        suggest: ['"assets"', '"scripts"', '"scenes"'],
+      },
+    },
+  },
+  ui: {
+    doc: "`.j3ui` components. Every file in `dir` and its subfolders compiles to one module, `<package>.ui`.",
+    keys: {
+      dir: { doc: "Folder of `.j3ui` files. Default `ui`.", suggest: ['"ui"'] },
+      theme: { doc: "One global CSS file (scope 0), read at compile time.", suggest: ['"ui/theme.css"'] },
+      lint: { doc: "`false` turns the `j3c check` CSS lint off.", values: BOOLS },
+      "lint-off": { doc: "CSS lint rules `j3c check` skips (`j3c doc css`, Lint).", list: true, suggest: ['"never-matches"', '"duplicate-decl"', '"undefined-var"'] },
     },
   },
 };

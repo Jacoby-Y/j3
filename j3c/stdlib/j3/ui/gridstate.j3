@@ -1,0 +1,472 @@
+// State and navigation of a data grid (plan 023 stage 6): the active cell, the column widths that header and rows
+// share, and the edit lifecycle flags. Pure data, no Dom: `j3.ui.grid` reads the keyboard and the scroll box and
+// calls these. The app owns one `Grid` (markup `<div ... virtual row-height={h} grid={g.sized(n)}>`) and the cell
+// data; the grid reports `on:edit` events and the app writes the value.
+
+module j3.ui.gridstate;
+
+use j3.math.{ clampi, maxi, mini };
+use j3.memory.{ Arena, List };
+use j3.text.Text;
+use j3.ui.tsv;
+
+/// "Which cells have data" for Ctrl+arrow when the app sets none: all empty, so the arrows run to the edge.
+fn noData(row: int, col: int): bool {
+    return false;
+}
+
+/// "The text of cell (row, col)" for copy when the app sets none: nothing is copied.
+fn noText(row: int, col: int): string {
+    return "";
+}
+
+/// Largest copied or pasted text in bytes, and most pasted cells (anything past either is dropped).
+pub const MAX_BYTES: int = 4194304;
+pub const MAX_CELLS: int = 200000;
+
+/// Narrowest a column can be dragged to, in px.
+pub const MIN_W: f32 = 24.0;
+
+/// A grid bound this frame: its scroll box and the frame it was bound (`Dom.gridBind`; stale entries are dropped).
+pub struct GridRef {
+    node: int;
+    g: &Grid;
+    frame: int;
+}
+
+pub struct Grid {
+    rows: int;
+    cols: int;
+    /// Row height in px: the markup's `row-height`.
+    rowH: f32;
+    /// One width per column, read by the header and every row (`w(j)`); `total` is their sum.
+    widths: []f32;
+    total: f32;
+    /// Leading columns that stay put while the rest scroll sideways (set it, or `g.freeze(n)`). See `fw`, `bx`, `fz`.
+    frozen: int = 0;
+    /// A header edge drag (`grab`): the column (-1 none), the pointer x and the width when it began (`rset` once read).
+    rj: int = -1;
+    rset: bool = false;
+    /// Window x of the latest press anywhere (a drag starts from it, since the handler runs a frame after the press).
+    px: f32 = 0.0;
+    /// The grid box had focus when the latest press began: a press on the header blurs it, the drag gives it back.
+    keep: bool = false;
+    rx: f32 = 0.0;
+    rw0: f32 = 0.0;
+    /// The active cell.
+    row: int = 0;
+    col: int = 0;
+    /// An editor is open on the active cell. `draft` is the text of the editor box (`bind:value={g.draft}`).
+    editing: bool = false;
+    draft: string = "";
+    /// Editor bookkeeping (`j3.ui.grid`): the box was focused once; frames waited for it to appear.
+    seen: bool = false;
+    wait: int = 0;
+    /// Typing a character starts the editor with it instead of the cell text.
+    seed: Text;
+    init: Text;
+    /// The editor's text as of the last frame it existed: committed if its row goes away (the box is freed).
+    last: Text;
+    /// The edit event of a frame (`evFrame` = `Dom.frame`): kind 0 begin, 1 commit; `evText` is a view of the editor's buffer.
+    evFrame: int = -1;
+    evKind: int = 0;
+    evRow: int = 0;
+    evCol: int = 0;
+    evText: string = "";
+    seeded: bool = false;
+    /// Horizontal scroll of the grid box, written every frame, so a header can follow (`style:margin-left`).
+    sx: f32 = 0.0;
+    viewH: f32 = 0.0;
+    viewW: f32 = 0.0;
+    /// The active cell moved: scroll it into view.
+    reveal: bool = false;
+    /// Ctrl+arrow stops at the edge of a run of cells `filled(row, col)` says have data.
+    hasFilled: bool = false;
+    filled: fn(int, int): bool;
+    /// The range corner opposite the active cell (`row`, `col`); plain moves keep it on the active cell.
+    ar: int = 0;
+    ac: int = 0;
+    /// Where `row`/`col` were when the anchor was last set: a direct write to them (not `goto`) is seen by `sync`,
+    /// which collapses the range onto the new active cell.
+    lr: int = 0;
+    lc: int = 0;
+    /// Moves extend the range instead of collapsing it (set by `j3.ui.grid` for Shift+key and drag).
+    ext: bool = false;
+    /// A drag started on a cell is in progress.
+    drag: bool = false;
+    /// Copy: `cell(row, col)` gives the text of a cell (a module function; keep its data in a module `let`).
+    hasCell: bool = false;
+    cell: fn(int, int): string;
+    /// The TSV built by `copyText`.
+    clip: Text;
+    /// A staged paste (event kind 2): parsed fields (see `j3.ui.tsv`), the target `pasteRows` x `pasteCols` cells from
+    /// `(pasteRow, pasteCol)`; `pasteFill` repeats the single field over the target.
+    pdata: Text;
+    pends: List<int>;
+    prows: List<int>;
+    pasteRow: int = 0;
+    pasteCol: int = 0;
+    pasteRows: int = 0;
+    pasteCols: int = 0;
+    pasteFill: bool = false;
+    /// A paste was staged by `queuePaste`; the next frame fires its event.
+    pending: bool = false;
+
+    fn new(mem: &Arena, cols: int, rowH: f32, colW: f32): Grid {
+        let w = mem.alloc::<f32>(cols);
+        for j in 0..cols {
+            w[j] = colW;
+        }
+        return Grid { rows: 0, cols: cols, rowH: rowH, widths: w, total: colW * (cols as f32), seed: Text.new(mem), init: Text.new(mem), last: Text.new(mem), filled: noData, cell: noText, clip: Text.new(mem), pdata: Text.new(mem), pends: List<int>.new(mem), prows: List<int>.new(mem) };
+    }
+
+    /// The app's row count, written every frame in the markup: `grid={g.sized(state.rows.len)}`.
+    fn sized(this: &Grid, n: int): &Grid {
+        this.rows = n;
+        this.sync();
+        if !this.editing {
+            this.row = clampi(this.row, 0, maxi(0, n - 1)); // an open edit keeps its row; the commit clamps
+        }
+        this.ar = clampi(this.ar, 0, maxi(0, n - 1));
+        this.lr = this.row;
+        this.lc = this.col;
+        return this;
+    }
+
+    /// `row`/`col` were written directly: the range collapses onto the active cell (use `goto` to move).
+    fn sync(this: &Grid) {
+        if this.row != this.lr || this.col != this.lc {
+            this.ar = this.row;
+            this.ac = this.col;
+            this.lr = this.row;
+            this.lc = this.col;
+        }
+    }
+
+    /// Width of column `j` (0 past the end).
+    fn w(this: &Grid, j: int): f32 {
+        if j < 0 || j >= this.cols {
+            return 0.0;
+        }
+        return this.widths[j];
+    }
+
+    /// Set a column width (6c's drag) and keep `total` in step.
+    fn setWidth(this: &Grid, j: int, w: f32) {
+        this.widths[j] = w;
+        let t: f32 = 0.0;
+        for k in 0..this.cols {
+            t += this.widths[k];
+        }
+        this.total = t;
+    }
+
+    /// Freeze the first `n` columns (clamped to the column count).
+    fn freeze(this: &Grid, n: int) {
+        this.frozen = clampi(n, 0, this.cols);
+    }
+
+    /// Width of the frozen columns: the padding-left of a header row and a body row, which leaves their place to the
+    /// frozen cells (`position: absolute`), so the others start where they would without freezing.
+    fn fw(this: &Grid): f32 {
+        return this.colX(clampi(this.frozen, 0, this.cols));
+    }
+
+    /// Is column `j` frozen (`class:frozen={g.fz(j)}`).
+    fn fz(this: &Grid, j: int): bool {
+        return j < this.frozen;
+    }
+
+    /// `left` of body cell `j` inside its row (`style:left={g.bx(j)}`): the horizontal scroll plus the column's
+    /// offset for a frozen one, so it stays at the box's left edge (0 for the others, where `left` does nothing).
+    fn bx(this: &Grid, j: int): f32 {
+        if j >= this.frozen {
+            return 0.0;
+        }
+        return this.sx + this.colX(j);
+    }
+
+    /// `left` of header cell `j` (`style:left={g.hx(j)}`): its offset, in the unshifted header box (0 if not frozen).
+    fn hx(this: &Grid, j: int): f32 {
+        if j >= this.frozen {
+            return 0.0;
+        }
+        return this.colX(j);
+    }
+
+    /// The column under view x (px from the box's left edge): frozen columns are hit where they are drawn, the others
+    /// shifted by the horizontal scroll.
+    fn colAtView(this: &Grid, vx: f32): int {
+        if vx < this.fw() {
+            return this.colAt(vx);
+        }
+        return this.colAt(vx + this.sx);
+    }
+
+    /// A press on the header edge of column `j` (`on:mousedown={g.grab(j)}` on a thin box at the cell's right edge):
+    /// `j3.ui.grid` drags the width from the next frame while the button is down, never below `MIN_W`.
+    fn grab(this: &Grid, j: int) {
+        if j >= 0 && j < this.cols {
+            this.rj = j;
+            this.rset = false;
+        }
+    }
+
+    /// Left edge of column `j` in content px.
+    fn colX(this: &Grid, j: int): f32 {
+        let x: f32 = 0.0;
+        for k in 0..j {
+            x += this.widths[k];
+        }
+        return x;
+    }
+
+    /// The column under content x (clamped to the first and last column).
+    fn colAt(this: &Grid, x: f32): int {
+        let a: f32 = 0.0;
+        for j in 0..this.cols {
+            a += this.widths[j];
+            if x < a {
+                return j;
+            }
+        }
+        return maxi(0, this.cols - 1);
+    }
+
+    /// The row under content y (clamped).
+    fn rowAt(this: &Grid, y: f32): int {
+        if y <= 0.0 || this.rowH <= 0.0 {
+            return 0;
+        }
+        return mini(maxi(0, this.rows - 1), (y / this.rowH) as int);
+    }
+
+    /// Is `(i, j)` the active cell (the `class:active` test).
+    fn on(this: &Grid, i: int, j: int): bool {
+        return i == this.row && j == this.col;
+    }
+
+    /// Is the editor open on `(i, j)` (`{#if g.editAt(i, j)}<input bind:value={g.draft}>`).
+    fn editAt(this: &Grid, i: int, j: int): bool {
+        return this.editing && i == this.row && j == this.col;
+    }
+
+    /// The text the editor opens with: the typed character if typing started it, else the cell's `text`.
+    /// Call it in the `on:edit` handler's begin branch: `g.draft = g.initial(cellText)`. It copies, so `text` may be a
+    /// view that changes later in the frame.
+    fn initial(this: &Grid, text: string): string {
+        if this.seeded {
+            return this.seed.str();
+        }
+        this.init.clear();
+        this.init.pushStr(text);
+        return this.init.str();
+    }
+
+    /// Move the active cell (clamped); the range collapses onto it unless `ext`. Prefer it to writing `row`/`col`.
+    fn goto(this: &Grid, r: int, c: int) {
+        let r2 = clampi(r, 0, maxi(0, this.rows - 1));
+        let c2 = clampi(c, 0, maxi(0, this.cols - 1));
+        if r2 != this.row || c2 != this.col {
+            this.reveal = true;
+        }
+        this.sync();
+        this.row = r2;
+        this.col = c2;
+        if !this.ext {
+            this.ar = r2;
+            this.ac = c2;
+        }
+        this.lr = r2;
+        this.lc = c2;
+    }
+
+    /// More than one cell is selected.
+    fn hasRange(this: &Grid): bool {
+        return this.ar != this.row || this.ac != this.col;
+    }
+
+    /// The selected range, normalized (the active cell alone when nothing is extended).
+    fn r0(this: &Grid): int { return mini(this.ar, this.row); }
+    fn r1(this: &Grid): int { return maxi(this.ar, this.row); }
+    fn c0(this: &Grid): int { return mini(this.ac, this.col); }
+    fn c1(this: &Grid): int { return maxi(this.ac, this.col); }
+
+    /// Is `(i, j)` inside a multi-cell range (the `class:sel` test; the active cell alone is `on`).
+    fn inRange(this: &Grid, i: int, j: int): bool {
+        return this.hasRange() && i >= this.r0() && i <= this.r1() && j >= this.c0() && j <= this.c1();
+    }
+
+    /// Ctrl+A: every cell; the active cell moves to the last one.
+    fn selectAll(this: &Grid) {
+        this.ar = 0;
+        this.ac = 0;
+        this.row = maxi(0, this.rows - 1);
+        this.col = maxi(0, this.cols - 1);
+        this.lr = this.row;
+        this.lc = this.col;
+    }
+
+    /// Give `cell` to copy: `g.cells(text)` with `fn text(row: int, col: int): string`.
+    fn cells(this: &Grid, f: fn(int, int): string): &Grid {
+        this.hasCell = true;
+        this.cell = f;
+        return this;
+    }
+
+    /// The selected range (or the active cell) as TSV; "" without a `cell` function. At most about `MAX_BYTES`: whole
+    /// rows past that are left out. A view of `clip`, valid until the next call.
+    fn copyText(this: &Grid): string {
+        this.clip.clear();
+        if !this.hasCell {
+            return "";
+        }
+        let f = this.cell;
+        for i in this.r0()..this.r1() + 1 {
+            if this.clip.len() >= MAX_BYTES {
+                break;
+            }
+            for j in this.c0()..this.c1() + 1 {
+                if j > this.c0() {
+                    this.clip.push(9);
+                }
+                tsv.field(&this.clip, f(i, j));
+            }
+            this.clip.push(10);
+        }
+        // no newline after the last row, as spreadsheets copy a range
+        if this.clip.len() > 0 {
+            this.clip.pop();
+        }
+        return this.clip.str();
+    }
+
+    /// Stage a paste of `text` at the range's top left, clipped to the grid. A single field fills the whole range.
+    /// Returns false (nothing staged) for empty text. The caller fires the paste event (`j3.ui.grid.paste`).
+    fn stagePaste(this: &Grid, text: string): bool {
+        tsv.parse(text, &this.pdata, &this.pends, &this.prows, MAX_CELLS, MAX_BYTES);
+        if this.prows.len == 0 {
+            return false;
+        }
+        this.pasteRow = this.r0();
+        this.pasteCol = this.c0();
+        this.pasteFill = this.prows.len == 1 && tsv.rowLen(&this.prows, 0) == 1;
+        if this.pasteFill {
+            this.pasteRows = this.r1() - this.r0() + 1;
+            this.pasteCols = this.c1() - this.c0() + 1;
+        } else {
+            this.pasteRows = mini(this.prows.len, this.rows - this.pasteRow);
+            this.pasteCols = mini(tsv.maxCols(&this.prows), this.cols - this.pasteCol);
+        }
+        return this.pasteRows > 0 && this.pasteCols > 0;
+    }
+
+    /// Paste `text` at the next frame (for code that runs outside a frame, such as a menu command): stages it and the
+    /// grid fires the event in its next step. Ctrl+V does the same at once.
+    fn queuePaste(this: &Grid, text: string) {
+        if this.stagePaste(text) {
+            this.pending = true;
+        }
+    }
+
+    /// In the paste event: the text for target cell `(i, j)`, 0-based from the target's top left ("" past a short row).
+    /// A view of the staged buffer; copy it if you keep it.
+    fn pasteCell(this: &Grid, i: int, j: int): string {
+        if this.pasteFill {
+            return tsv.cell(&this.pdata, &this.pends, &this.prows, 0, 0);
+        }
+        return tsv.cell(&this.pdata, &this.pends, &this.prows, i, j);
+    }
+
+    /// After a paste: select the pasted area.
+    fn selectPasted(this: &Grid) {
+        this.ar = this.pasteRow;
+        this.ac = this.pasteCol;
+        this.row = this.pasteRow + this.pasteRows - 1;
+        this.col = this.pasteCol + this.pasteCols - 1;
+        this.lr = this.row;
+        this.lc = this.col;
+        this.reveal = true;
+    }
+
+    fn move(this: &Grid, dr: int, dc: int) {
+        this.goto(this.row + dr, this.col + dc);
+    }
+
+    /// Tab: the next cell, wrapping to the next row's first column; Shift+Tab the reverse. Stops at the corners.
+    fn tab(this: &Grid, dir: int) {
+        let c = this.col + dir;
+        let r = this.row;
+        if c >= this.cols {
+            if r + 1 >= this.rows {
+                return;
+            }
+            c = 0;
+            r += 1;
+        } else if c < 0 {
+            if r == 0 {
+                return;
+            }
+            c = this.cols - 1;
+            r -= 1;
+        }
+        this.goto(r, c);
+    }
+
+    /// PageUp / PageDown: a screenful of rows (`viewH` is the box height).
+    fn page(this: &Grid, dir: int) {
+        let n = maxi(1, (this.viewH / this.rowH) as int - 1);
+        this.move(dir * n, 0);
+    }
+
+    fn has(this: &Grid, r: int, c: int): bool {
+        if !this.hasFilled {
+            return false;
+        }
+        let f = this.filled;
+        return f(r, c);
+    }
+
+    /// Ctrl+arrow: like a spreadsheet. With data under the cursor and beside it, run to the last cell of that
+    /// run; else run to the next cell with data; else to the edge. Without `filled` it is the edge.
+    fn jump(this: &Grid, dr: int, dc: int) {
+        let r = this.row;
+        let c = this.col;
+        let nr = r + dr;
+        let nc = c + dc;
+        if nr < 0 || nr >= this.rows || nc < 0 || nc >= this.cols {
+            return;
+        }
+        if !this.hasFilled {
+            let er = r;
+            let ec = c;
+            if dr < 0 { er = 0; }
+            if dr > 0 { er = this.rows - 1; }
+            if dc < 0 { ec = 0; }
+            if dc > 0 { ec = this.cols - 1; }
+            this.goto(er, ec);
+            return;
+        }
+        if this.has(r, c) && this.has(nr, nc) {
+            // inside a run: its last cell
+            while nr + dr >= 0 && nr + dr < this.rows && nc + dc >= 0 && nc + dc < this.cols && this.has(nr + dr, nc + dc) {
+                nr += dr;
+                nc += dc;
+            }
+        } else {
+            // skip blanks to the next cell with data, or the edge
+            while !this.has(nr, nc) && nr + dr >= 0 && nr + dr < this.rows && nc + dc >= 0 && nc + dc < this.cols {
+                nr += dr;
+                nc += dc;
+            }
+        }
+        this.goto(nr, nc);
+    }
+
+    /// Home / End (Ctrl: the first / last cell of the sheet).
+    fn homeEnd(this: &Grid, end: bool, ctrl: bool) {
+        let c = if end { this.cols - 1 } else { 0 };
+        let r = if ctrl { if end { this.rows - 1 } else { 0 } } else { this.row };
+        this.goto(r, c);
+    }
+}

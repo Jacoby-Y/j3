@@ -36,6 +36,10 @@ pub struct EmitOpts {
     pub flags: Vec<String>,
     /// Opt 0 reuses per-module objects. `false` forces one clang invocation.
     pub incremental: bool,
+    /// Per-module objects at every opt (`incremental = "all"`), not just opt 0.
+    pub incremental_all: bool,
+    /// `[emit] chunks`: objects per big module (None = automatic, 0 = never split).
+    pub chunks: Option<usize>,
     /// Process cwd when running the binary (package root).
     pub cwd: Option<std::path::PathBuf>,
 }
@@ -54,6 +58,8 @@ impl Default for EmitOpts {
             clang: "clang".to_string(),
             flags: Vec::new(),
             incremental: true,
+            incremental_all: false,
+            chunks: None,
             cwd: None,
         }
     }
@@ -87,6 +93,8 @@ impl EmitOpts {
             },
             flags: m.emit.flags.clone(),
             incremental: m.emit.incremental,
+            incremental_all: m.emit.incremental_all,
+            chunks: m.emit.chunks,
             cwd: Some(m.root.clone()),
         })
     }

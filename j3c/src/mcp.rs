@@ -921,7 +921,18 @@ fn check(root: &Path, args: &Json) -> Result<Answer, String> {
             .map_err(|e| format!("j3c check: {e}"))?;
         let text = String::from_utf8_lossy(&out.stdout);
         match text.lines().rev().find_map(|l| json::parse(l).ok()) {
-            Some(result) if result.get("ok").and_then(as_bool) == Some(true) => {}
+            Some(result) if result.get("ok").and_then(as_bool) == Some(true) => {
+                // CSS lint lines (`warning: file:line:col: message [rule]`) ride along in `css`
+                // (`i18n` carries the `[i18n-missing]` ones the same way)
+                for key in ["css", "i18n"] {
+                    let Some(Json::Arr(css)) = result.get(key) else { continue };
+                    for w in css.iter().filter_map(Json::as_str) {
+                        lines.push(w.to_string());
+                        let message = w.strip_prefix("warning: ").unwrap_or(w);
+                        issues.push(Json::obj(vec![("severity", s("warning")), ("file", s("code")), ("message", Json::Str(message.to_string()))]));
+                    }
+                }
+            }
             Some(result) => {
                 errors += 1;
                 let message = result.get("message").and_then(Json::as_str).unwrap_or("does not compile").to_string();

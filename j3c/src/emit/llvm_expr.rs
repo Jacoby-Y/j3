@@ -131,8 +131,8 @@ impl<'a> LlvmFn<'a> {
             Some(f) => f,
             None => return,
         };
-        self.file = file.path.clone();
-        let line = crate::parse::line_of(&file.src, span.start);
+        let (path, line) = file.loc(span.start);
+        self.file = path;
         if line > 0 {
             self.line = line as u32;
         }
@@ -278,7 +278,7 @@ impl<'a> LlvmFn<'a> {
             let Some(file) = self.cx.file(span.file) else {
                 continue;
             };
-            let line = crate::parse::line_of(&file.src, span.start).max(1) as u32;
+            let line = file.line(span.start).max(1) as u32;
             let scope = self.scope;
             let ty = decl.ty;
             let ptr = self.local_ptr(decl.id);
@@ -425,6 +425,11 @@ impl<'a> LlvmFn<'a> {
             StmtKind::Return { value } => match value {
                 Some(v) => {
                     let (e, ty) = self.operand(v)?;
+                    let e = if matches!(self.cx.ty_kind(v.ty()), TyKind::Array { .. }) {
+                        self.load(&ty, &e)
+                    } else {
+                        e
+                    };
                     let slot = self.fresh();
                     self.inst(&format!("{slot} = alloca {ty}"));
                     self.store(&ty, &e, &slot)?;
@@ -725,17 +730,7 @@ impl<'a> LlvmFn<'a> {
     fn bytes_global(&mut self, bytes: &[u8]) -> String {
         let n = STR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let name = format!("@.b{n}");
-        let mut lit = String::from("c\"");
-        for b in bytes {
-            match *b {
-                b'\\' => lit.push_str("\\\\"),
-                b'"' => lit.push_str("\\22"),
-                0 => lit.push_str("\\00"),
-                c if (32..127).contains(&c) => lit.push(c as char),
-                c => lit.push_str(&format!("\\{c:02X}")),
-            }
-        }
-        lit.push('"');
+        let lit = ll_bytes_lit(bytes);
         // Module-level constants are prepended by rewriting: emit as a commentless
         // function-local via alloca+store for tiny lits, or a private global appended
         // at the top by collecting. We inject into `text` at the start via a marker.
@@ -799,6 +794,11 @@ impl<'a> LlvmFn<'a> {
                         alist.push_str(", ");
                     }
                     let (v, t) = self.operand(a)?;
+                    let v = if matches!(self.cx.ty_kind(a.ty()), TyKind::Array { .. }) {
+                        self.load(&t, &v)
+                    } else {
+                        v
+                    };
                     alist.push_str(&format!("{t} {v}"));
                 }
                 if rv.ty == self.cx.common.void {
@@ -807,7 +807,15 @@ impl<'a> LlvmFn<'a> {
                 } else {
                     let v = self.fresh();
                     self.inst(&format!("{v} = call {ll} {f}({alist})"));
-                    Ok((v, ll))
+                    if matches!(self.cx.ty_kind(rv.ty), TyKind::Array { .. }) {
+                        // Array rvalues use storage addresses inside a function.
+                        let slot = self.fresh();
+                        self.inst(&format!("{slot} = alloca {ll}"));
+                        self.store(&ll, &v, &slot)?;
+                        Ok((slot, ll))
+                    } else {
+                        Ok((v, ll))
+                    }
                 }
             }
             RvalueKind::Syscall { nr, args } => {
@@ -1401,13 +1409,13 @@ impl DebugOut {
         }
     }
 
-    pub fn prepare(cx: &IrCx, modules: &[Module]) -> DebugOut {
+    pub fn prepare(cx: &IrCx, modules: &[Module], keep: Option<&HashSet<FuncId>>) -> DebugOut {
         let mut files: Vec<(crate::span::FileId, u32)> = Vec::new();
         let mut seen = HashSet::new();
         for module in modules {
             for id in &module.funcs {
                 let func = cx.func(*id);
-                if !matches!(func.kind, FuncKind::J3 { .. }) || func.span.is_dummy() {
+                if !matches!(func.kind, FuncKind::J3 { .. }) || func.span.is_dummy() || keep.is_some_and(|k| !k.contains(id)) {
                     continue;
                 }
                 if cx.file(func.span.file).is_none() {
@@ -1476,7 +1484,7 @@ impl DebugOut {
         for module in modules {
             for id in &module.funcs {
                 let func = cx.func(*id);
-                if !matches!(func.kind, FuncKind::J3 { .. }) || func.span.is_dummy() {
+                if !matches!(func.kind, FuncKind::J3 { .. }) || func.span.is_dummy() || keep.is_some_and(|k| !k.contains(id)) {
                     continue;
                 }
                 let file = match cx.file(func.span.file) {
@@ -1487,7 +1495,7 @@ impl DebugOut {
                     Some((_, md)) => *md,
                     None => continue,
                 };
-                let line = crate::parse::line_of(&file.src, func.span.start).max(1) as u32;
+                let line = file.line(func.span.start).max(1) as u32;
                 let sp = dbg.alloc();
                 let name = ll_md_str(cx.name_str(func.name));
                 let link = ll_md_str(&c_expr::func_c_name(cx, func));
@@ -1805,4 +1813,58 @@ fn ll_md_str(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::check::{check_files, ParsedFile};
+    use crate::{emit, parse, span::FileId};
+
+    #[test]
+    fn arrays_cross_call_boundaries_by_value() {
+        let opts = emit::EmitOpts::default();
+        if !emit::clang_available(&opts.clang) {
+            return;
+        }
+        let src = r#"
+module test;
+fn pair(n: int): [2]int { return [n, n + 1]; }
+fn identity(xs: [2]int): [2]int { return xs; }
+fn forwarded(n: int): [2]int { return pair(n); }
+fn main() {
+    let xs = forwarded(41);
+    let ys = identity(xs);
+    xs[0] = 0;
+    if ys[0] != 41 || ys[1] != 42 || xs[0] != 0 {
+        @syscall(60, 1);
+    }
+}
+"#;
+        let file_id = FileId(1);
+        let prog = check_files(vec![ParsedFile {
+            path: "array_calls.j3".to_string(),
+            src: src.to_string(),
+            ast: parse::parse(src, file_id).expect("parse array calls"),
+            file_id,
+        }])
+        .expect("check array calls");
+        let run = emit::run_program(&prog.cx, &prog.modules, &opts).expect("emit array calls");
+        assert_eq!(run.status, 0, "{}", String::from_utf8_lossy(&run.stderr));
+    }
+}
+
+/// LLVM `c"..."` literal for raw bytes.
+pub(super) fn ll_bytes_lit(bytes: &[u8]) -> String {
+    let mut lit = String::from("c\"");
+    for b in bytes {
+        match *b {
+            b'\\' => lit.push_str("\\\\"),
+            b'"' => lit.push_str("\\22"),
+            0 => lit.push_str("\\00"),
+            c if (32..127).contains(&c) => lit.push(c as char),
+            c => lit.push_str(&format!("\\{c:02X}")),
+        }
+    }
+    lit.push('"');
+    lit
 }
