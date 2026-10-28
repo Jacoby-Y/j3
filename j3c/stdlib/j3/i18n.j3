@@ -1,0 +1,604 @@
+/// Translated text: one `key = text` file per locale (`locales/en.txt`), `t("key")`, placeholders, plurals, and
+/// locale-aware numbers. Call from `.j3ui` markup (`{t("shop.title")}`, `{tf("shop.buy", num(n))}`): the string
+/// comes from the frame scratch arena and text nodes compare bytes, so a steady frame does no work, and
+/// `setLocale` re-renders on the next build by itself. Main-thread state (`j3c doc i18n`, `j3c doc j3ui`).
+
+module j3.i18n;
+
+use j3.io.readFile;
+use j3.memory.{ Arena, scratch };
+use j3.result.Result;
+use j3.sys.write;
+use j3.i18nconfig;
+use j3.i18nplural;
+use j3.i18nplural.{ langOf, pushNum, pushReal, split };
+use j3.io.exists;
+use j3.sys.arg;
+use j3.text.{ Text, same, scratchText };
+
+/// One placeholder value for `tf`: build with `num`, `real`, `text`, and `named`.
+pub struct Arg {
+    /// `""` for a positional argument, else the `{name}` it fills.
+    name: string;
+    /// 0 integer, 1 string, 2 real.
+    kind: int;
+    s: string;
+    n: int;
+    f: f32;
+}
+
+/// An integer argument, printed with the locale's thousands separator. As the first (or `count`) argument it picks
+/// the plural form.
+pub fn num(v: int): Arg {
+    return Arg { name: "", kind: 0, s: "", n: v, f: 0.0 };
+}
+
+/// A fractional argument (up to three decimals, trailing zeros trimmed, the locale's decimal separator).
+pub fn real(v: f32): Arg {
+    return Arg { name: "", kind: 2, s: "", n: 0, f: v };
+}
+
+/// A string argument, inserted as is.
+pub fn text(v: string): Arg {
+    return Arg { name: "", kind: 1, s: v, n: 0, f: 0.0 };
+}
+
+/// `a` that fills `{name}` (and, named `count`, picks the plural form).
+pub fn named(name: string, a: Arg): Arg {
+    return Arg { name: name, kind: a.kind, s: a.s, n: a.n, f: a.f };
+}
+
+struct Tab {
+    /// Locale this table was loaded for (`pt-BR`).
+    name: string;
+    path: string;
+    /// The file's bytes; keys and values are views into it (or into an unescaped copy).
+    file: []u8;
+    n: int;
+    keys: []string;
+    vals: []string;
+    /// Open-addressing hash: 0 empty, else entry index + 1.
+    slots: []int;
+}
+
+struct Hit {
+    ok: bool;
+    s: string;
+}
+
+#[singleton]
+let ARENA: Arena;
+#[singleton]
+let TABS: [3]Tab;
+#[singleton]
+let NTAB: int;
+#[singleton]
+let SEEN: [256]string;
+#[singleton]
+let SEEN_N: int;
+#[singleton]
+let SUPPRESSED: bool;
+#[singleton]
+let INITED: bool;
+#[singleton]
+let QUIET: bool;
+#[singleton]
+let VERSION: int;
+#[singleton]
+let CUR: string;
+#[singleton]
+let DIR: string;
+#[singleton]
+let FALLBACK: string;
+
+// Setup
+
+/// Start with an explicit folder and locales: `dir/<locale>.txt` (looked for in the working directory, then beside the program), the starting locale, and the locale tried when a
+/// key is missing. Called for you (with `initProject`) by the first `t`.
+pub fn init(dir: string, default: string, fallback: string) {
+    if ARENA.ptr == 0 {
+        ARENA = Arena.create(1048576);
+    }
+    SEEN_N = 0;
+    INITED = true;
+    DIR = resolveDir(dir, default);
+    FALLBACK = copy(fallback);
+    setLocale(default);
+}
+
+/// `init` with the project's `[i18n] dir`, `default`, and `fallback` from `j3.toml`, which the compiler bakes into
+/// the build (`locales`, `en`, `en` when unset). Called by the first `t`.
+pub fn initProject() {
+    init(i18nconfig.DIR, i18nconfig.DEFAULT, i18nconfig.FALLBACK);
+}
+
+// `dir` as given when it holds the default locale from the working directory (`j3c run`, a zip unpacked and run
+// in place), else beside the program (a binary started from another folder), else as given.
+fn resolveDir(dir: string, default: string): string {
+    let probe = Text.new(&ARENA);
+    probe.pushStr(dir);
+    probe.push(47);
+    probe.pushStr(default);
+    probe.pushStr(".txt");
+    if exists(probe.bytes as string) {
+        return dir;
+    }
+    let exe = arg(0);
+    let slash = -1;
+    for i in 0..exe.len {
+        if exe[i] == 47 { slash = i; }
+    }
+    if slash >= 0 {
+        let p = Text.new(&ARENA);
+        p.pushStr(exe[0..slash + 1]);
+        p.pushStr(dir);
+        let q = Text.new(&ARENA);
+        q.pushStr(p.bytes as string);
+        q.push(47);
+        q.pushStr(default);
+        q.pushStr(".txt");
+        if exists(q.bytes as string) {
+            return p.bytes as string;
+        }
+    }
+    return dir;
+}
+
+fn ensure() {
+    if !INITED {
+        initProject();
+    }
+}
+
+/// Switch language (`de`, `pt-BR`). Loads `<dir>/pt-BR.txt`, then `pt.txt`, then the fallback locale's. A missing
+/// file is an empty table. Text built after this call uses the new strings; nothing is cached.
+pub fn setLocale(name: string) {
+    if !INITED {
+        initProject();
+    }
+    CUR = copy(name);
+    NTAB = 0;
+    loadTab(CUR);
+    let lang = langOf(CUR);
+    if lang.len < CUR.len {
+        loadTab(lang);
+    }
+    if !same(FALLBACK, CUR) && !same(FALLBACK, lang) {
+        loadTab(FALLBACK);
+    }
+    VERSION += 1;
+}
+
+/// The current locale as passed to `setLocale`.
+pub fn locale(): string {
+    ensure();
+    return CUR;
+}
+
+/// Bumps on every `setLocale` and every reload that changed something (for code that caches formatted text).
+pub fn version(): int {
+    return VERSION;
+}
+
+/// True for a right-to-left language (`ar`, `he`, `fa`, `ur`): flip your layout on it. The text itself is
+/// shaped and ordered by the renderer either way.
+pub fn rtl(): bool {
+    ensure();
+    let l = langOf(CUR);
+    return same(l, "ar") || same(l, "he") || same(l, "fa") || same(l, "ur");
+}
+
+/// Silence the once-per-key missing-key warning on stderr (the count in `missing()` still grows).
+pub fn quiet(on: bool) {
+    QUIET = on;
+}
+
+/// How many distinct keys were looked up and found nowhere.
+pub fn missing(): int {
+    return SEEN_N;
+}
+
+/// True when `key` exists in the current chain (no warning).
+pub fn has(key: string): bool {
+    ensure();
+    return pick(key, "").ok;
+}
+
+/// Re-read the loaded files and re-parse the ones that changed; true if any did. Call it every few frames in a
+/// dev build (`if frame % 15 == 0 { i18n.reloadIfChanged(); }`) for live translation edits; it reads the
+/// scratch arena, which `App` rewinds each frame.
+pub fn reloadIfChanged(): bool {
+    ensure();
+    let any = false;
+    for i in 0..NTAB {
+        let t = &TABS[i];
+        match readFile(t.path, scratch(262144)) {
+            Result.Ok(b) {
+                if !sameBytes(b, t.file) {
+                    parse(t, copyBytes(b));
+                    any = true;
+                }
+            }
+            Result.Err(_) {}
+        }
+    }
+    if any {
+        VERSION += 1;
+    }
+    return any;
+}
+
+// Lookup
+
+/// The text for `key` in the current locale, else its base language, else the fallback locale, else `key` itself
+/// (warned once on stderr).
+pub fn t(key: string): string {
+    ensure();
+    let h = pick(key, "");
+    if h.ok {
+        return h.s;
+    }
+    noteMissing(key);
+    return key;
+}
+
+/// `t` with one placeholder value: `tf("shop.buy", num(3))` fills `{0}` (and `{count}`, the number that picks the plural).
+pub fn tf(key: string, a: Arg): string {
+    let xs: [1]Arg = [a];
+    return tfn(key, xs[0..1]);
+}
+
+/// `tf` with two values.
+pub fn tf2(key: string, a: Arg, b: Arg): string {
+    let xs: [2]Arg = [a, b];
+    return tfn(key, xs[0..2]);
+}
+
+/// `tf` with three values.
+pub fn tf3(key: string, a: Arg, b: Arg, c: Arg): string {
+    let xs: [3]Arg = [a, b, c];
+    return tfn(key, xs[0..3]);
+}
+
+/// `tf` with any number of values. `{0}` is the first, `{name}` the one made with `named`. The plural form comes
+/// from the argument named `count`, else the first one when it is a number: `key.one`, `key.other`, ... then
+/// `key`. The result lives on the frame scratch arena.
+pub fn tfn(key: string, args: []Arg): string {
+    ensure();
+    let cat = "";
+    let ci = -1;
+    for i in 0..args.len {
+        if same(args[i].name, "count") && args[i].kind != 1 && ci < 0 {
+            ci = i;
+        }
+    }
+    if ci < 0 && args.len > 0 && args[0].kind != 1 {
+        ci = 0;
+    }
+    if ci >= 0 {
+        let a = args[ci];
+        let n = a.n;
+        let frac = false;
+        if a.kind == 2 {
+            let sp = split(a.f);
+            n = sp.n;
+            frac = sp.frac > 0;
+        }
+        cat = plural(langOf(CUR), n, frac);
+    }
+    let h = pick(key, cat);
+    if !h.ok {
+        noteMissing(key);
+        return key;
+    }
+    let out = scratchText();
+    let s = h.s;
+    let lang = langOf(CUR);
+    let i = 0;
+    while i < s.len {
+        let c = s[i];
+        if c == 123 && i + 1 < s.len && s[i + 1] == 123 {
+            out.push(123);
+            i += 2;
+        } else if c == 125 && i + 1 < s.len && s[i + 1] == 125 {
+            out.push(125);
+            i += 2;
+        } else if c == 123 {
+            let e = i + 1;
+            while e < s.len && s[e] != 125 {
+                e += 1;
+            }
+            if e >= s.len {
+                out.push(c);
+                i += 1;
+            } else {
+                let name = s[i + 1..e];
+                let ai = argIndex(name, args, ci);
+                if ai >= 0 {
+                    pushArg(&out, lang, args[ai]);
+                } else {
+                    out.pushStr(s[i..e + 1]);
+                }
+                i = e + 1;
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    return out.bytes as string;
+}
+
+fn argIndex(name: string, args: []Arg, ci: int): int {
+    if name.len > 0 {
+        let digits = true;
+        let v = 0;
+        for k in 0..name.len {
+            if name[k] < 48 || name[k] > 57 {
+                digits = false;
+            } else {
+                v = v * 10 + (int(name[k]) - 48);
+            }
+        }
+        if digits {
+            if v < args.len { return v; }
+            return -1;
+        }
+    }
+    for i in 0..args.len {
+        if same(args[i].name, name) {
+            return i;
+        }
+    }
+    if same(name, "count") { return ci; }
+    return -1;
+}
+
+fn pushArg(out: &Text, lang: string, a: Arg) {
+    if a.kind == 1 {
+        out.pushStr(a.s);
+    } else if a.kind == 0 {
+        pushNum(out, lang, a.n);
+    } else {
+        pushReal(out, lang, a.f);
+    }
+}
+
+/// `n` as the current locale writes it (`1,234` / `1.234` / `1 234`).
+pub fn fmtNum(n: int): string {
+    ensure();
+    let out = scratchText();
+    pushNum(&out, langOf(CUR), n);
+    return out.bytes as string;
+}
+
+/// `v` as the current locale writes it, up to three decimals.
+pub fn fmtReal(v: f32): string {
+    ensure();
+    let out = scratchText();
+    pushReal(&out, langOf(CUR), v);
+    return out.bytes as string;
+}
+
+fn pick(key: string, cat: string): Hit {
+    for i in 0..NTAB {
+        let tab = &TABS[i];
+        if cat.len > 0 {
+            let k = scratchText();
+            k.pushStr(key);
+            k.push(46);
+            k.pushStr(cat);
+            let at = lookup(tab, k.bytes as string);
+            if at >= 0 { return Hit { ok: true, s: tab.vals[at] }; }
+            let k2 = scratchText();
+            k2.pushStr(key);
+            k2.pushStr(".other");
+            let at2 = lookup(tab, k2.bytes as string);
+            if at2 >= 0 { return Hit { ok: true, s: tab.vals[at2] }; }
+        }
+        let plain = lookup(tab, key);
+        if plain >= 0 { return Hit { ok: true, s: tab.vals[plain] }; }
+    }
+    return Hit { ok: false, s: "" };
+}
+
+fn noteMissing(key: string) {
+    for i in 0..SEEN_N {
+        if same(SEEN[i], key) {
+            return;
+        }
+    }
+    if SEEN_N >= 256 {
+        // ponytail: 256 distinct keys remembered; past that one notice and no more warnings
+        if !SUPPRESSED && !QUIET {
+            SUPPRESSED = true;
+            let note = "warning: i18n: further missing keys suppressed\n";
+            write(2, note.ptr as ptr, note.len);
+        }
+        SUPPRESSED = true;
+        return;
+    }
+    SEEN[SEEN_N] = copy(key);
+    SEEN_N += 1;
+    if !QUIET {
+        let m = scratchText();
+        m.pushStr("warning: i18n: missing key \"");
+        m.pushStr(key);
+        m.pushStr("\" for locale ");
+        m.pushStr(CUR);
+        m.push(10);
+        write(2, m.bytes.ptr as ptr, m.bytes.len);
+    }
+}
+
+// Files
+
+fn loadTab(name: string) {
+    let t = &TABS[NTAB];
+    NTAB += 1;
+    let p = Text.new(&ARENA);
+    p.pushStr(DIR);
+    p.push(47);
+    p.pushStr(name);
+    p.pushStr(".txt");
+    t.name = copy(name);
+    t.path = p.bytes as string;
+    match readFile(t.path, &ARENA) {
+        Result.Ok(b) { parse(t, b); }
+        Result.Err(_) { parse(t, ARENA.alloc::<u8>(0)); }
+    }
+}
+
+fn parse(t: &Tab, bytes: []u8) {
+    t.file = bytes;
+    let lines = 1;
+    for b in bytes {
+        if b == 10 { lines += 1; }
+    }
+    t.keys = ARENA.alloc::<string>(lines);
+    t.vals = ARENA.alloc::<string>(lines);
+    t.slots = ARENA.alloc::<int>(lines * 2 + 1);
+    for i in 0..t.slots.len {
+        t.slots[i] = 0;
+    }
+    t.n = 0;
+    let i = 0;
+    while i < bytes.len {
+        let e = i;
+        while e < bytes.len && bytes[e] != 10 {
+            e += 1;
+        }
+        addLine(t, bytes[i..e]);
+        i = e + 1;
+    }
+}
+
+// `key = text`; `#` starts a comment line; `\n`, `\t`, `\\` in the text; later duplicate keys win.
+fn addLine(t: &Tab, line: []u8) {
+    let l = trim(line);
+    if l.len == 0 || l[0] == 35 {
+        return;
+    }
+    let eq = indexOf(l, 61);
+    if eq <= 0 {
+        return;
+    }
+    let key = trim(l[0..eq]) as string;
+    let v = trim(l[eq + 1..l.len]);
+    let val = v as string;
+    if indexOf(v, 92) >= 0 {
+        val = unescape(v);
+    }
+    let cap = t.slots.len;
+    let pos = slot(key, cap);
+    while t.slots[pos] != 0 {
+        if same(t.keys[t.slots[pos] - 1], key) {
+            t.vals[t.slots[pos] - 1] = val;
+            return;
+        }
+        pos = (pos + 1) % cap;
+    }
+    t.keys[t.n] = key;
+    t.vals[t.n] = val;
+    t.n += 1;
+    t.slots[pos] = t.n;
+}
+
+fn lookup(t: &Tab, key: string): int {
+    let cap = t.slots.len;
+    if cap == 0 {
+        return -1;
+    }
+    let pos = slot(key, cap);
+    while t.slots[pos] != 0 {
+        if same(t.keys[t.slots[pos] - 1], key) {
+            return t.slots[pos] - 1;
+        }
+        pos = (pos + 1) % cap;
+    }
+    return -1;
+}
+
+fn slot(key: string, cap: int): int {
+    let h = 5381;
+    for i in 0..key.len {
+        h = h * 33 + int(key[i]);
+    }
+    let m = h % cap;
+    if m < 0 { m += cap; }
+    return m;
+}
+
+fn unescape(v: []u8): string {
+    let o = Text.new(&ARENA);
+    let i = 0;
+    while i < v.len {
+        if v[i] == 92 && i + 1 < v.len {
+            let c = v[i + 1];
+            if c == 110 {
+                o.push(10);
+            } else if c == 116 {
+                o.push(9);
+            } else if c == 92 {
+                o.push(92);
+            } else {
+                o.push(92);
+                o.push(c);
+            }
+            i += 2;
+        } else {
+            o.push(v[i]);
+            i += 1;
+        }
+    }
+    return o.bytes as string;
+}
+
+fn trim(b: []u8): []u8 {
+    let a = 0;
+    let e = b.len;
+    while a < e && (b[a] == 32 || b[a] == 9 || b[a] == 13) {
+        a += 1;
+    }
+    while e > a && (b[e - 1] == 32 || b[e - 1] == 9 || b[e - 1] == 13) {
+        e -= 1;
+    }
+    return b[a..e];
+}
+
+fn indexOf(b: []u8, c: u8): int {
+    for i in 0..b.len {
+        if b[i] == c { return i; }
+    }
+    return -1;
+}
+
+fn sameBytes(a: []u8, b: []u8): bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] { return false; }
+    }
+    return true;
+}
+
+fn copyBytes(b: []u8): []u8 {
+    let c = ARENA.alloc::<u8>(b.len);
+    for i in 0..b.len {
+        c[i] = b[i];
+    }
+    return c;
+}
+
+fn copy(s: string): string {
+    let c = Text.new(&ARENA);
+    c.pushStr(s);
+    return c.bytes as string;
+}
+
+/// The CLDR plural category (`zero`, `one`, `two`, `few`, `many`, `other`) of `n` in language `lang`
+/// (`j3c doc j3.i18nplural plural` has the rules). `frac` says the number has a visible fraction (1.5).
+pub fn plural(lang: string, n: int, frac: bool): string {
+    return i18nplural.plural(lang, n, frac);
+}

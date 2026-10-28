@@ -1,0 +1,471 @@
+// Tests for the text layout rules in j3.ui.dom (white-space, text-overflow, overflow-wrap) and for
+// j3.ui.textfit / j3.ui.textanim. Run from the repo root, headless (SDL_ttf measures; no window opens):
+//   SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout 60 j3c run j3c/stdlib/tests/text_test.j3
+// Panics on the first failed check.
+
+module text_test;
+
+use j3.game.{ selRectW, selRectX, textBidi, textCaretX, textIndexAt, textSelRects, Font, fontFallback, fontLine, fontShape, loadFont, textShaping, textWidth, tryLoadFont };
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.sys.panic;
+use j3.text.{ Text, fmtBytes, fmtInt, same };
+use j3.ui.css.{ Css, CLIP_TEXT, P_BG_CLIP, P_OVERFLOW_WRAP, P_OVERFLOW_Y, P_STROKE_COLOR, P_STROKE_WIDTH, P_TEXT_SHADOW, V_SHADOW, WRAP_BREAK };
+use j3.ui.cssparse.parse;
+use j3.ui.dom.{ Dom, Frag };
+use j3.ui.textanim;
+use j3.ui.textfit;
+
+#[singleton]
+let FONTPATH: string;
+const SHEET: string = "@font-face { font-family: \"T\"; src: url(\"examples/big_ui_test/assets/font.ttf\"); } @font-face { font-family: \"S\"; src: url(\"examples/big_ui_test/assets/symbols.ttf\"); } .box { font-family: \"T\"; font-size: 16px; width: 100px; } .nw { white-space: nowrap; } .el { white-space: nowrap; text-overflow: ellipsis; overflow-y: hidden; } .elv { white-space: nowrap; text-overflow: ellipsis; } .bw { overflow-wrap: break-word; } .pl { white-space: pre-line; } .fb { font-family: \"T\", \"S\", sans-serif; } .fn { font-family: \"T\", sans-serif; font-size: 16px; width: 100px; } .fx { text-shadow: 1px 2px 3px #ff0000, 0 0 5px #00ff00; -webkit-text-stroke: 2px #0000ff; -webkit-background-clip: text; word-wrap: break-word; overflow: hidden; }";
+
+#[singleton]
+let CHECKS: int;
+
+fn ok(cond: bool, msg: string) {
+    CHECKS += 1;
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic(msg);
+    }
+}
+
+fn near(a: f32, b: f32, tol: f32, msg: string) {
+    let d = a - b;
+    if d < 0.0 { d = 0.0 - d; }
+    if d > tol { printLn(`{a} vs {b}`); }
+    ok(d <= tol, msg);
+}
+
+fn size(s: string): int {
+    return s.len;
+}
+
+fn bytes(s: string): []u8 {
+    return []u8 { ptr: s.ptr, len: s.len };
+}
+
+struct Built {
+    d: Dom;
+    id: int;
+}
+
+/// A fresh tree with one `.box` block of `cls` and `text`, laid out at `w` x 400. A new `Dom` each time:
+/// classes are only ever added to a reused node.
+fn block(mem: &Arena, css: &Css, cls: string, text: string, w: f32): Built {
+    let d = Dom.new(mem, css);
+    d.begin();
+    let id = d.open(0, d.tag("div"), 1);
+    d.cls(id, "box");
+    if cls.len > 0 {
+        d.cls(id, cls);
+    }
+    d.text(text);
+    d.close();
+    d.end();
+    d.layoutAt(w, 400.0);
+    return Built { d: d, id: id };
+}
+
+fn lines(b: &Built): int {
+    let n = 0;
+    let lastY: f32 = -1000.0;
+    let f = b.d.nodes.items[b.id].frag0;
+    while f >= 0 {
+        let y = b.d.frags.items[f].y;
+        if y - lastY > 0.5 || lastY - y > 0.5 {
+            n += 1;
+            lastY = y;
+        }
+        f = b.d.frags.items[f].next;
+    }
+    return n;
+}
+
+fn lastFrag(b: &Built): Frag {
+    let f = b.d.nodes.items[b.id].frag0;
+    while b.d.frags.items[f].next >= 0 {
+        f = b.d.frags.items[f].next;
+    }
+    return b.d.frags.items[f];
+}
+
+fn testNoWrap(mem: &Arena, css: &Css) {
+    let t = "alpha beta gamma delta epsilon zeta";
+    let n = block(mem, css, "nw", t, 400.0);
+    ok(lines(&n) == 1, "nowrap: one line");
+    let fr = lastFrag(&n);
+    ok(fr.x + fr.w > 150.0, "nowrap: the line runs past the 100px box");
+    let w = block(mem, css, "", t, 400.0);
+    ok(lines(&w) > 1, "normal: the same text wraps");
+}
+
+fn testEllipsis(mem: &Arena, css: &Css) {
+    let t = "alpha beta gamma delta epsilon zeta";
+    let e = block(mem, css, "el", t, 400.0);
+    ok(lines(&e) == 1, "ellipsis: one line");
+    let fr = lastFrag(&e);
+    ok(fr.ell >= 0.0, "ellipsis: the last run carries one");
+    ok(fr.x + fr.w <= 100.5, "ellipsis: run plus ellipsis fits the box");
+    ok(fr.end < 35, "ellipsis: text was cut");
+    let short = block(mem, css, "el", "alpha", 400.0);
+    let sf = lastFrag(&short);
+    ok(sf.ell < 0.0, "ellipsis: text that fits is untouched");
+    let vis = block(mem, css, "elv", t, 400.0);
+    let vf = lastFrag(&vis);
+    ok(vf.ell < 0.0, "ellipsis needs overflow other than visible, like a browser");
+    // UTF-8: the cut falls between code points
+    let u = block(mem, css, "el", "ñandú façade Привет мир αβγδε and then a long tail", 400.0);
+    let uf = lastFrag(&u);
+    let tn = u.d.nodes.items[u.id].first;
+    ok(uf.ell >= 0.0, "ellipsis utf8: cut");
+    ok(!textfit.isCont(u.d.nodes.items[tn].buf[uf.end]), "ellipsis utf8: the cut is on a code point boundary");
+    ok(uf.x + uf.w <= 100.5, "ellipsis utf8: fits");
+}
+
+fn testBreakWord(mem: &Arena, css: &Css) {
+    let word = "Supercalifragilisticexpialidocious";
+    let plain = block(mem, css, "", word, 400.0);
+    ok(lines(&plain) == 1, "normal: a long word stays on one line");
+    let pf = lastFrag(&plain);
+    ok(pf.w > 150.0, "normal: and overflows");
+    let id = block(mem, css, "bw", word, 400.0);
+    ok(lines(&id) >= 3, "break-word: several lines");
+    let covered = 0;
+    let f = id.d.nodes.items[id.id].frag0;
+    while f >= 0 {
+        let fr = id.d.frags.items[f];
+        ok(fr.w <= 100.5, "break-word: every piece fits the box");
+        covered += fr.end - fr.start;
+        f = fr.next;
+    }
+    ok(covered == word.len, "break-word: no letters lost");
+    // 2-byte code points: pieces start and end on even offsets
+    let e = block(mem, css, "bw", "éééééééééééééééééééééééééé", 400.0);
+    let g = e.d.nodes.items[e.id].frag0;
+    while g >= 0 {
+        let fe = e.d.frags.items[g];
+        ok(fe.start % 2 == 0 && fe.end % 2 == 0, "break-word utf8: pieces hold whole code points");
+        g = fe.next;
+    }
+    // a zero-width box still terminates (one code point per line)
+    let z = block(mem, css, "bw", "abc", 0.0);
+    ok(lines(&z) >= 1, "zero width: terminates");
+    // a very long word: pieces still fit and nothing is lost (the cost follows the piece, not the word)
+    let big = "0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz";
+    let bg = block(mem, css, "bw", big, 400.0);
+    let seen = 0;
+    let h = bg.d.nodes.items[bg.id].frag0;
+    while h >= 0 {
+        let fh = bg.d.frags.items[h];
+        ok(fh.w <= 100.5, "long word: every piece fits");
+        seen += fh.end - fh.start;
+        h = fh.next;
+    }
+    ok(seen == big.len, "long word: no letters lost");
+    let empty = block(mem, css, "bw", "", 400.0);
+    ok(empty.d.nodes.items[empty.id].frag0 < 0, "empty text: no runs");
+}
+
+fn testPreLine(mem: &Arena, css: &Css) {
+    let b = block(mem, css, "pl", "a\nb\n\nc", 400.0);
+    let lh = f32(fontLine(loadFont(FONTPATH, 16)));
+    let h = b.d.nodes.items[b.id].h;
+    ok(h > lh * 3.9 && h < lh * 4.1, "pre-line: a blank line counts");
+    ok(lines(&b) == 3, "pre-line: three lines have text");
+    let t = block(mem, css, "pl", "a\n", 400.0);
+    ok(t.d.nodes.items[t.id].h < lh * 1.1, "pre-line: a trailing newline adds no line");
+}
+
+fn iv(css: &Css, st: int, p: int): int {
+    let v = css.get(st, p);
+    return v.i;
+}
+
+fn fv(css: &Css, st: int, p: int): f32 {
+    let v = css.get(st, p);
+    return v.f;
+}
+
+fn cv(css: &Css, st: int, p: int): int {
+    let v = css.get(st, p);
+    return v.c;
+}
+
+fn kv(css: &Css, st: int, p: int): int {
+    let v = css.get(st, p);
+    return v.kind;
+}
+
+/// The CSS side: values parse, vendor names alias, and the inherited ones reach the text node.
+fn testStyle(mem: &Arena, css: &Css) {
+    let b = block(mem, css, "fx", "x", 400.0);
+    let st = b.d.nodes.items[b.id].style;
+    let tst = b.d.nodes.items[b.d.nodes.items[b.id].first].style;
+    ok(kv(css, st, P_TEXT_SHADOW) == V_SHADOW, "text-shadow parses");
+    let o = iv(css, st, P_TEXT_SHADOW);
+    ok(css.paints.items[o] == 2.0, "text-shadow: two shadows");
+    ok(css.paints.items[o + 1 + 3] == 3.0, "text-shadow: blur of the first");
+    ok(fv(css, st, P_STROKE_WIDTH) == 2.0, "-webkit-text-stroke width");
+    ok(cv(css, st, P_STROKE_COLOR) == 65535, "-webkit-text-stroke color (blue)");
+    ok(iv(css, st, P_BG_CLIP) == CLIP_TEXT, "-webkit-background-clip: text");
+    ok(iv(css, st, P_OVERFLOW_WRAP) == WRAP_BREAK, "word-wrap aliases overflow-wrap");
+    ok(iv(css, st, P_OVERFLOW_Y) == 1, "overflow: hidden sets overflow-y");
+    ok(kv(css, tst, P_TEXT_SHADOW) == V_SHADOW, "text-shadow inherits");
+    ok(fv(css, tst, P_STROKE_WIDTH) == 2.0, "text-stroke inherits");
+    ok(iv(css, tst, P_OVERFLOW_WRAP) == WRAP_BREAK, "overflow-wrap inherits");
+    ok(iv(css, tst, P_BG_CLIP) == 0, "background-clip does not inherit");
+}
+
+fn testFit() {
+    let font = loadFont(FONTPATH, 16);
+    let s = "héllo wörld";
+    let n = textfit.fitPrefix(font, false, bytes(s), 1000.0);
+    ok(n == s.len, "fitPrefix: everything fits");
+    ok(textfit.fitPrefix(font, false, bytes(s), 0.0) == 0, "fitPrefix: zero width");
+    ok(textfit.fitPrefix(font, false, bytes(""), 50.0) == 0, "fitPrefix: empty");
+    let w = textWidth(font, bytes(s[0..6]), false);
+    let m = textfit.fitPrefix(font, false, bytes(s), w + 0.5);
+    ok(m == 6, "fitPrefix: exact prefix width keeps the prefix (6 bytes = h é l l o)");
+    ok(!textfit.isCont(s[m]) , "fitPrefix: boundary");
+    ok(size(textfit.codePoints("héllo", 2)) == 3, "codePoints: two code points are three bytes");
+}
+
+fn testAnim() {
+    ok(size(textanim.typewriter("héllo", 0.1, 20.0)) == 3, "typewriter: two code points at 0.1s * 20");
+    ok(size(textanim.typewriter("héllo", 0.0, 20.0)) == 0, "typewriter: nothing at t = 0");
+    ok(size(textanim.typewriter("héllo", 99.0, 20.0)) == 6, "typewriter: whole text when done");
+    ok(size(textanim.words("one two three", 0.5, 4.0)) == 7, "words: two words without the trailing space");
+    ok(size(textanim.words("one two three", 9.0, 4.0)) == 13, "words: all");
+    ok(size(textanim.words("", 1.0, 4.0)) == 0, "words: empty");
+    ok(textanim.cycle(7.0, 2.0, 1.0) > 0.99 && textanim.cycle(7.0, 2.0, 1.0) < 1.01, "cycle: 7 mod 3");
+    ok(textanim.blink(0.1, 1.0) && !textanim.blink(0.6, 1.0), "blink: first half on");
+}
+
+fn testFallback(mem: &Arena, css: &Css) {
+    ok(css.fonts.len == 2, "two @font-face");
+    let sym = "A🎮B";
+    let plain = block(mem, css, "nw", sym, 400.0);
+    let fb = block(mem, css, "fb", sym, 400.0);
+    let pf = loadFont(css.fonts.items[0].path, 16);
+    let sf = loadFont(css.fonts.items[1].path, 16);
+    let pw = textWidth(pf, bytes(sym), false);
+    // no chain yet: one font for everything
+    ok(lastFrag(&plain).w == pw, "no chain: the primary measures the whole run");
+    fontFallback(pf, sf);
+    let cw = textWidth(pf, bytes(sym), false);
+    let want = textWidth(pf, bytes("A"), false) + textWidth(sf, bytes("🎮"), false) + textWidth(pf, bytes("B"), false);
+    ok(cw == want, "chain: runs are measured with the font that has the glyph");
+    ok(cw != pw, "chain: the symbol no longer uses the primary's missing-glyph box");
+    ok(lastFrag(&fb).w == want, "layout of a font-family list matches the chain's measure");
+    // another list with the same first family has its own chain (no symbol face: the primary's box)
+    let fn2 = block(mem, css, "fn", sym, 400.0);
+    ok(lastFrag(&fn2).w != want, "a list with another fallback list does not share the chain");
+    let fb2 = block(mem, css, "fb", sym, 400.0);
+    ok(lastFrag(&fb2).w == want, "and the first list keeps its own");
+    // a second add is ignored, marks stay with the code point before them
+    fontFallback(pf, sf);
+    ok(textWidth(pf, bytes(sym), false) == cw, "duplicate fallback ignored");
+    let kept = textWidth(pf, bytes("A🎮️B"), false);
+    ok(kept == cw, "a variation selector joins the run before it (and has no width)");
+    ok(textWidth(pf, bytes("héllo"), false) == textWidth(loadFont(css.fonts.items[0].path, 16), bytes("héllo"), false), "latin text stays in the primary");
+    ok(css.warns.len == 0, "font-family list parses");
+}
+
+/// Shaping: Arabic letters join (narrower than isolated forms), and mixed text measures as its runs.
+fn testShaping() {
+    let f = tryLoadFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24);
+    if f.raw == 0 || !textShaping() {
+        printLn("shaping: skipped (no DejaVu or no HarfBuzz)");
+        return;
+    }
+    let ar = "سلام";
+    let joined = textWidth(f, bytes(ar), false);
+    fontShape(f, true, "Arab");
+    let direct = textWidth(f, bytes(ar), false);
+    fontShape(f, false, "Latn");
+    ok(joined == direct, "arabic run is measured shaped (rtl, Arab)");
+    let isolated = textWidth(f, bytes("س"), false) + textWidth(f, bytes("ل"), false) + textWidth(f, bytes("ا"), false) + textWidth(f, bytes("م"), false);
+    ok(joined < isolated, "arabic letters join: narrower than the isolated forms");
+    let mixed = textWidth(f, bytes("ab سلام 12"), false);
+    ok(mixed == textWidth(f, bytes("ab "), false) + joined + textWidth(f, bytes(" 12"), false), "mixed text measures as the sum of its runs");
+}
+
+/// Caret x, hit test and selection rectangles of reordered text: index to x is monotonic per run direction, x to index
+/// round trips at each boundary, a selection across a direction change is two rectangles.
+fn testCaretRtl() {
+    let f = tryLoadFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24);
+    if f.raw == 0 || !textShaping() {
+        printLn("rtl caret: skipped (no DejaVu or no HarfBuzz)");
+        return;
+    }
+    // (no lam-alef: that pair is one ligature glyph, so its prefix widths are not monotone)
+    let ar = bytes("كتب");
+    ok(textBidi(f, ar), "arabic is reordered");
+    ok(!textBidi(f, bytes("abc def")), "latin is not");
+    let w = textWidth(f, ar, false);
+    // base direction is right to left: index 0 is the right edge, the end the left edge, x falls as the index grows
+    near(textCaretX(f, ar, false, 0), w, 1.0, "arabic: caret at index 0 is the right edge");
+    near(textCaretX(f, ar, false, ar.len), 0.0, 1.0, "arabic: caret at the end is the left edge");
+    let prev: f32 = w + 1.0;
+    let i = 0;
+    while i <= ar.len {
+        let x = textCaretX(f, ar, false, i);
+        ok(x < prev, "arabic: x decreases with the index");
+        prev = x;
+        ok(textIndexAt(f, ar, false, x) == i, "arabic: x maps back to the index");
+        i += 2;
+    }
+    ok(textIndexAt(f, ar, false, -10.0) == ar.len && textIndexAt(f, ar, false, w + 10.0) == 0, "arabic: past the edges");
+    // "abc אבג def": letters are 2 bytes, abc[0..4) hebrew [4..10) def [10..]
+    let m = bytes("abc אבג def");
+    let wa = textWidth(f, bytes("abc "), false);
+    let wh = textWidth(f, bytes("אבג"), false);
+    ok(textBidi(f, m), "mixed is reordered");
+    near(textCaretX(f, m, false, 2), textWidth(f, bytes("ab"), false), 1.0, "mixed: ltr prefix x");
+    near(textCaretX(f, m, false, 4), wa, 1.0, "mixed: boundary belongs to the preceding ltr run (right edge of 'abc ')");
+    near(textCaretX(f, m, false, 10), wa, 1.0, "mixed: end of the hebrew run is its left edge");
+    near(textCaretX(f, m, false, 6), wa + wh - textWidth(f, bytes("א"), false), 1.5, "mixed: inside rtl run x counts from the right");
+    let k = 6;
+    let last: f32 = wa + wh + 1.0;
+    while k <= 10 {
+        let xk = textCaretX(f, m, false, k);
+        ok(xk < last, "mixed: x decreases through the hebrew run");
+        last = xk;
+        ok(textIndexAt(f, m, false, xk) == k || k == 10, "mixed: round trip inside the run");
+        k += 2;
+    }
+    let j = 0;
+    let lastl: f32 = -1.0;
+    while j <= 4 {
+        let xj = textCaretX(f, m, false, j);
+        ok(xj > lastl, "mixed: x grows through the ltr run");
+        lastl = xj;
+        ok(textIndexAt(f, m, false, xj) == j || j == 4, "mixed: ltr round trip (index 4 shares its point with the hebrew run end)");
+        j += 1;
+    }
+    j = 10;
+    while j < m.len {
+        ok(textIndexAt(f, m, false, textCaretX(f, m, false, j + 1)) == j + 1, "mixed: trailing ltr round trip");
+        j += 1;
+    }
+    // selection across the boundary: "c " and the first hebrew letter (the right end of the rtl run)
+    let n = textSelRects(f, m, false, 2, 6);
+    ok(n == 2, "selection across a direction change is two rectangles");
+    near(selRectX(0), textWidth(f, bytes("ab"), false), 1.0, "first rectangle starts at 'c'");
+    near(selRectX(1) + selRectW(1), wa + wh, 1.0, "second rectangle ends at the right edge of the hebrew run");
+    ok(textSelRects(f, m, false, 4, 10) == 1, "a whole run is one rectangle");
+    ok(textSelRects(f, m, false, 0, m.len) == 1, "everything merges into one rectangle");
+    near(selRectW(0), textWidth(f, m, false), 1.5, "and covers the line");
+    ok(textSelRects(f, bytes("abc"), false, 1, 2) == 1, "plain text: one rectangle");
+}
+
+/// `j3.text.fmtInt` / `fmtBytes`: boundaries, negatives, i64 extremes, and the returned view is only what was appended.
+fn testFmt(mem: &Arena) {
+    let t = Text.new(mem);
+    let big = 9223372036854775807;
+    let small = 0 - big - 1;
+    ok(same(fmtInt(&t, 0), "0"), "fmtInt 0");
+    t.clear();
+    ok(same(fmtInt(&t, 999), "999"), "fmtInt 999");
+    t.clear();
+    ok(same(fmtInt(&t, 1000), "1,000"), "fmtInt 1000");
+    t.clear();
+    ok(same(fmtInt(&t, 1234567), "1,234,567"), "fmtInt 1234567");
+    t.clear();
+    ok(same(fmtInt(&t, 0 - 1234567), "-1,234,567"), "fmtInt negative");
+    t.clear();
+    ok(same(fmtInt(&t, 0 - 100), "-100"), "fmtInt -100 has no comma");
+    t.clear();
+    ok(same(fmtInt(&t, big), "9,223,372,036,854,775,807"), "fmtInt max");
+    t.clear();
+    ok(same(fmtInt(&t, small), "-9,223,372,036,854,775,808"), "fmtInt min");
+    t.clear();
+    t.pushStr("a=");
+    let part = fmtInt(&t, 12345);
+    ok(same(part, "12,345") && same(t.str(), "a=12,345"), "fmtInt appends and returns only its part");
+    t.clear();
+    t.pushInt(small);
+    t.pushStr(" ");
+    t.pushInt(big);
+    t.pushStr(" ");
+    t.pushInt(0 - 7);
+    t.pushStr(" ");
+    t.pushInt(0);
+    ok(same(t.str(), "-9223372036854775808 9223372036854775807 -7 0"), "pushInt handles the i64 extremes");
+    t.clear();
+    ok(same(fmtBytes(&t, 0), "0 B"), "fmtBytes 0");
+    t.clear();
+    ok(same(fmtBytes(&t, 999), "999 B"), "fmtBytes 999");
+    t.clear();
+    ok(same(fmtBytes(&t, 1000), "1000 B"), "fmtBytes 1000 is still bytes");
+    t.clear();
+    ok(same(fmtBytes(&t, 1023), "1023 B"), "fmtBytes 1023");
+    t.clear();
+    ok(same(fmtBytes(&t, 1024), "1.0 KB"), "fmtBytes 1024");
+    t.clear();
+    ok(same(fmtBytes(&t, 1536), "1.5 KB"), "fmtBytes 1536");
+    t.clear();
+    ok(same(fmtBytes(&t, 1048575), "1023.9 KB"), "fmtBytes just under 1 MB never shows 1024.0");
+    t.clear();
+    ok(same(fmtBytes(&t, 1572864), "1.5 MB"), "fmtBytes 1.5 MB");
+    t.clear();
+    ok(same(fmtBytes(&t, 2147483648), "2.0 GB"), "fmtBytes 2 GB");
+    t.clear();
+    ok(same(fmtBytes(&t, 0 - 1536), "-1.5 KB"), "fmtBytes negative");
+    t.clear();
+    ok(same(fmtBytes(&t, big), "7.9 EB"), "fmtBytes max is EB");
+    t.clear();
+    ok(same(fmtBytes(&t, small), "-7.9 EB"), "fmtBytes min is EB");
+}
+
+/// Color emoji: the fixed 109 px strike is scaled to the font size (measure, line height), and a line with emoji is as tall as one without.
+fn testEmoji(mem: &Arena) {
+    let path = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
+    let e16 = tryLoadFont(path, 16);
+    if e16.raw == 0 {
+        printLn("emoji: SKIPPED (no color emoji font at /usr/share/fonts/truetype/noto/NotoColorEmoji.ttf)");
+        return;
+    }
+    let e32 = loadFont(path, 32);
+    let w16 = textWidth(e16, bytes("🥳"), false);
+    let w32 = textWidth(e32, bytes("🥳"), false);
+    ok(w16 >= 12.0 && w16 <= 24.0, "emoji at 16 px measures about the font size, not the 109 px strike");
+    ok(w32 >= 24.0 && w32 <= 44.0, "emoji at 32 px measures about the font size");
+    ok(w32 > w16 * 1.8 && w32 < w16 * 2.2, "emoji width is proportional to the size");
+    ok(fontLine(e16) == 16 && fontLine(e32) == 32, "emoji font line height is the font size");
+    let sheet = "@font-face { font-family: \"T\"; src: url(\"examples/big_ui_test/assets/font.ttf\"); } @font-face { font-family: \"E\"; src: url(\"/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf\"); } .a { font-family: \"T\", \"E\"; font-size: 16px; } .b { font-family: \"T\", \"E\"; font-size: 32px; }";
+    let css = Css.new(mem);
+    parse(&css, sheet, "emoji.css", 1);
+    ok(css.warns.len == 0, "emoji sheet parses");
+    for k in 0..2 {
+        let cls = "a";
+        if k == 1 { cls = "b"; }
+        let plain = block(mem, &css, cls, "Hello world", 600.0);
+        let mixed = block(mem, &css, cls, "Hello 🥳 world", 600.0);
+        ok(mixed.d.nodes.items[mixed.id].h == plain.d.nodes.items[plain.id].h, "a line with emoji is as tall as a plain one");
+        ok(lastFrag(&mixed).w > lastFrag(&plain).w, "the emoji takes width");
+    }
+}
+
+fn main() {
+    let mem = Arena.create(64 * 1024 * 1024);
+    let css = Css.new(&mem);
+    parse(&css, SHEET, "test.css", 1);
+    ok(css.warns.len == 0, "sheet parses with no warnings");
+    FONTPATH = css.fonts.items[0].path;
+    testNoWrap(&mem, &css);
+    testEllipsis(&mem, &css);
+    testBreakWord(&mem, &css);
+    testPreLine(&mem, &css);
+    testStyle(&mem, &css);
+    testFit();
+    testAnim();
+    testFallback(&mem, &css);
+    testShaping();
+    testEmoji(&mem);
+    testCaretRtl();
+    testFmt(&mem);
+    printLn(`text_test: {CHECKS} checks passed`);
+}

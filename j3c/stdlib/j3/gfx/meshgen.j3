@@ -1,0 +1,425 @@
+/// Build meshes from code: boxes, cylinders, cones, spheres, capsules, tori, lathes,
+/// extrusions, and height fields, placed with a transform stack and colored per part, then
+/// saved as a `.j3mesh`. A script in a project's `assets/gen/<name>.j3` that ends with
+/// `b.save(meshgen.output("assets/gen/<name>.j3mesh"))` is run by `j3c -e gen` (and before
+/// builds, renders, and plays) whenever it changes; scenes use the `.j3mesh` it writes.
+///
+/// Units are world units (about a meter), y is up, and angles are degrees. Triangles wind
+/// counter-clockwise seen from outside. Every vertex has position, normal, color, glow, and
+/// uv: the 12-float layout `j3.gfx.mesh` calls v2.
+module j3.gfx.meshgen;
+
+use lib "c" as libc {
+    fn getenv(name: cstr): cstr;
+    fn strlen(s: cstr): int;
+}
+
+use j3.io;
+use j3.math.{ Mat4, Vec2, Vec3, PI, TAU, cos, sin, sqrt };
+use j3.memory.Arena;
+use j3.gfx.mesh;
+use j3.result.Result;
+use j3.text.cstr;
+
+/// Floats per vertex.
+pub const STRIDE: int = 12;
+/// How deep `push` can nest.
+const DEPTH: int = 16;
+
+pub struct Builder {
+    arena: &Arena;
+    /// `len` floats of `verts` are used.
+    verts: []f32;
+    len: int;
+    /// Color and glow (0 or 1) of the vertices added next.
+    tint: Vec3;
+    light: f32;
+    /// Transform applied to the parts added next, and the ones `push` saved.
+    xf: Mat4;
+    stack: []Mat4;
+    depth: int;
+
+    fn new(arena: &Arena): Builder {
+        return Builder {
+            arena: arena, verts: arena.alloc::<f32>(12 * 256), len: 0,
+            tint: Vec3.xyz(1, 1, 1), light: 0,
+            xf: Mat4.identity(), stack: arena.alloc::<Mat4>(DEPTH), depth: 0,
+        };
+    }
+
+    /// Color of the next parts, 0 to 1 per channel.
+    fn color(this: &Builder, r: f32, g: f32, b: f32) { this.tint = Vec3.xyz(r, g, b); }
+
+    /// Whether the next parts glow (unlit, full color).
+    fn glow(this: &Builder, on: bool) { this.light = if on { 1 } else { 0 }; }
+
+    /// Save the transform; `pop` brings it back.
+    fn push(this: &Builder) {
+        if this.depth < DEPTH {
+            this.stack[this.depth] = this.xf;
+            this.depth += 1;
+        }
+    }
+
+    fn pop(this: &Builder) {
+        if this.depth > 0 {
+            this.depth -= 1;
+            this.xf = this.stack[this.depth];
+        }
+    }
+
+    /// Back to no transform (the stack stays).
+    fn reset(this: &Builder) { this.xf = Mat4.identity(); }
+
+    /// Move the next parts by `x, y, z` (in the current transform's space).
+    fn at(this: &Builder, x: f32, y: f32, z: f32) { this.xf = this.xf.mul(Mat4.translate(x, y, z)); }
+
+    /// Turn the next parts by degrees about X, then Y, then Z (as scene objects turn).
+    fn turn(this: &Builder, x: f32, y: f32, z: f32) {
+        let k = PI / 180;
+        let r = Mat4.rotate(Vec3.xyz(0, 0, 1), z * k).mul(Mat4.rotate(Vec3.xyz(0, 1, 0), y * k))
+            .mul(Mat4.rotate(Vec3.xyz(1, 0, 0), x * k));
+        this.xf = this.xf.mul(r);
+    }
+
+    /// Stretch the next parts.
+    fn size(this: &Builder, x: f32, y: f32, z: f32) { this.xf = this.xf.mul(Mat4.scale(x, y, z)); }
+
+    /// One vertex, through the transform. The normal goes through its inverse transpose so
+    /// stretched parts still shade right.
+    fn vertex(this: &Builder, p: Vec3, n: Vec3, u: f32, v: f32) {
+        if this.len + STRIDE > this.verts.len {
+            let grown = this.arena.alloc::<f32>(this.verts.len * 2);
+            let i = 0;
+            while i < this.len { grown[i] = this.verts[i]; i += 1; }
+            this.verts = grown;
+        }
+        let q = this.xf.transformPoint(p);
+        let invert = this.xf.affineInverse();
+        let inv = invert.m;
+        let m = Vec3.xyz(inv[0] * n.x + inv[1] * n.y + inv[2] * n.z, inv[4] * n.x + inv[5] * n.y + inv[6] * n.z,
+            inv[8] * n.x + inv[9] * n.y + inv[10] * n.z).normalize();
+        let o = this.verts;
+        let at = this.len;
+        o[at] = q.x;
+        o[at + 1] = q.y;
+        o[at + 2] = q.z;
+        o[at + 3] = m.x;
+        o[at + 4] = m.y;
+        o[at + 5] = m.z;
+        o[at + 6] = this.tint.x;
+        o[at + 7] = this.tint.y;
+        o[at + 8] = this.tint.z;
+        o[at + 9] = this.light;
+        o[at + 10] = u;
+        o[at + 11] = v;
+        this.len += STRIDE;
+    }
+
+    /// A flat triangle, counter-clockwise seen from its front.
+    fn tri(this: &Builder, a: Vec3, b: Vec3, c: Vec3) {
+        let n = (b - a).cross(c - a).normalize();
+        this.vertex(a, n, 0, 0);
+        this.vertex(b, n, 1, 0);
+        this.vertex(c, n, 0, 1);
+    }
+
+    /// A flat quad `a b c d` in order around its edge, counter-clockwise from the front.
+    fn quad(this: &Builder, a: Vec3, b: Vec3, c: Vec3, d: Vec3) {
+        let n = (b - a).cross(c - a).normalize();
+        this.vertex(a, n, 0, 1);
+        this.vertex(b, n, 1, 1);
+        this.vertex(c, n, 1, 0);
+        this.vertex(a, n, 0, 1);
+        this.vertex(c, n, 1, 0);
+        this.vertex(d, n, 0, 0);
+    }
+
+    /// A `w` by `h` by `d` box centered on the origin.
+    fn box(this: &Builder, w: f32, h: f32, d: f32) {
+        let x = w / 2;
+        let y = h / 2;
+        let z = d / 2;
+        let p000 = Vec3.xyz(0 - x, 0 - y, 0 - z);
+        let p100 = Vec3.xyz(x, 0 - y, 0 - z);
+        let p010 = Vec3.xyz(0 - x, y, 0 - z);
+        let p110 = Vec3.xyz(x, y, 0 - z);
+        let p001 = Vec3.xyz(0 - x, 0 - y, z);
+        let p101 = Vec3.xyz(x, 0 - y, z);
+        let p011 = Vec3.xyz(0 - x, y, z);
+        let p111 = Vec3.xyz(x, y, z);
+        this.quad(p001, p101, p111, p011);
+        this.quad(p100, p000, p010, p110);
+        this.quad(p101, p100, p110, p111);
+        this.quad(p000, p001, p011, p010);
+        this.quad(p011, p111, p110, p010);
+        this.quad(p000, p100, p101, p001);
+    }
+
+    /// A ring of `sides` quads around Y from radius `r0` at height `y0` to `r1` at `y1`;
+    /// `v0`/`v1` are the texture rows at each end and `n0`/`n1` the outward normals there,
+    /// as (out, up) in the profile's plane.
+    fn band(this: &Builder, r0: f32, y0: f32, r1: f32, y1: f32, sides: int, v0: f32, v1: f32, n0: Vec2, n1: Vec2) {
+        let s = 0;
+        while s < sides {
+            let a0 = f32(s) / f32(sides) * TAU;
+            let a1 = f32(s + 1) / f32(sides) * TAU;
+            let c0 = cos(a0);
+            let s0 = sin(a0);
+            let c1 = cos(a1);
+            let s1 = sin(a1);
+            let u0 = f32(s) / f32(sides);
+            let u1 = f32(s + 1) / f32(sides);
+            let lo0 = Vec3.xyz(c0 * r0, y0, s0 * r0);
+            let lo1 = Vec3.xyz(c1 * r0, y0, s1 * r0);
+            let hi0 = Vec3.xyz(c0 * r1, y1, s0 * r1);
+            let hi1 = Vec3.xyz(c1 * r1, y1, s1 * r1);
+            let nlo0 = Vec3.xyz(c0 * n0.x, n0.y, s0 * n0.x);
+            let nlo1 = Vec3.xyz(c1 * n0.x, n0.y, s1 * n0.x);
+            let nhi0 = Vec3.xyz(c0 * n1.x, n1.y, s0 * n1.x);
+            let nhi1 = Vec3.xyz(c1 * n1.x, n1.y, s1 * n1.x);
+            // Counter-clockwise from outside: lo0 hi0 hi1, lo0 hi1 lo1.
+            this.vertex(lo0, nlo0, u0, v0);
+            this.vertex(hi0, nhi0, u0, v1);
+            this.vertex(hi1, nhi1, u1, v1);
+            this.vertex(lo0, nlo0, u0, v0);
+            this.vertex(hi1, nhi1, u1, v1);
+            this.vertex(lo1, nlo1, u1, v0);
+            s += 1;
+        }
+    }
+
+    /// A flat disc of radius `r` at height `y`, facing up (or down when `down`).
+    fn disc(this: &Builder, r: f32, y: f32, sides: int, down: bool) {
+        let n = if down { Vec3.xyz(0, -1, 0) } else { Vec3.xyz(0, 1, 0) };
+        let center = Vec3.xyz(0, y, 0);
+        let s = 0;
+        while s < sides {
+            let a0 = f32(s) / f32(sides) * TAU;
+            let a1 = f32(s + 1) / f32(sides) * TAU;
+            let p0 = Vec3.xyz(cos(a0) * r, y, sin(a0) * r);
+            let p1 = Vec3.xyz(cos(a1) * r, y, sin(a1) * r);
+            this.vertex(center, n, 0.5, 0.5);
+            if down {
+                this.vertex(p0, n, 0.5 + cos(a0) * 0.5, 0.5 + sin(a0) * 0.5);
+                this.vertex(p1, n, 0.5 + cos(a1) * 0.5, 0.5 + sin(a1) * 0.5);
+            } else {
+                this.vertex(p1, n, 0.5 + cos(a1) * 0.5, 0.5 + sin(a1) * 0.5);
+                this.vertex(p0, n, 0.5 + cos(a0) * 0.5, 0.5 + sin(a0) * 0.5);
+            }
+            s += 1;
+        }
+    }
+
+    /// An upright cylinder of radius `r` and height `h`, centered on the origin, with caps.
+    fn cylinder(this: &Builder, r: f32, h: f32, sides: int) {
+        let side = Vec2 { x: 1, y: 0 };
+        this.band(r, 0 - h / 2, r, h / 2, sides, 1, 0, side, side);
+        this.disc(r, h / 2, sides, false);
+        this.disc(r, 0 - h / 2, sides, true);
+    }
+
+    /// A cone of base radius `r` and height `h`, base at `-h/2`, tip at `h/2`.
+    fn cone(this: &Builder, r: f32, h: f32, sides: int) {
+        let side = slope(r, 0 - h / 2, 0, h / 2);
+        this.band(r, 0 - h / 2, 0, h / 2, sides, 1, 0, side, side);
+        this.disc(r, 0 - h / 2, sides, true);
+    }
+
+    /// A cylinder narrowing from radius `r0` at the bottom to `r1` at the top.
+    fn frustum(this: &Builder, r0: f32, r1: f32, h: f32, sides: int) {
+        let side = slope(r0, 0 - h / 2, r1, h / 2);
+        this.band(r0, 0 - h / 2, r1, h / 2, sides, 1, 0, side, side);
+        this.disc(r1, h / 2, sides, false);
+        this.disc(r0, 0 - h / 2, sides, true);
+    }
+
+    /// A sphere of radius `r` from `rings` bands of `sides` quads.
+    fn sphere(this: &Builder, r: f32, sides: int, rings: int) {
+        this.lathe(this.arc(r, 0, rings, 0 - PI / 2, PI / 2), sides);
+    }
+
+    /// A capsule: a cylinder of radius `r` with round ends, `h` tall in all.
+    fn capsule(this: &Builder, r: f32, h: f32, sides: int) {
+        let body = h / 2 - r;
+        if body < 0 { body = 0; }
+        let rings = sides / 4;
+        if rings < 3 { rings = 3; }
+        let bottom = this.arc(r, 0 - body, rings, 0 - PI / 2, 0);
+        let top = this.arc(r, body, rings, 0, PI / 2);
+        let profile = this.arena.alloc::<Vec2>(bottom.len + top.len);
+        let i = 0;
+        while i < bottom.len { profile[i] = bottom[i]; i += 1; }
+        let j = 0;
+        while j < top.len { profile[bottom.len + j] = top[j]; j += 1; }
+        this.lathe(profile, sides);
+    }
+
+    /// Points of a quarter or half circle of radius `r` centered at height `y`, from angle
+    /// `from` to `to` (radians, 0 is the equator), as a lathe profile.
+    fn arc(this: &Builder, r: f32, y: f32, steps: int, from: f32, to: f32): []Vec2 {
+        let out = this.arena.alloc::<Vec2>(steps + 1);
+        let i = 0;
+        while i <= steps {
+            let a = from + (to - from) * f32(i) / f32(steps);
+            out[i] = Vec2 { x: cos(a) * r, y: y + sin(a) * r };
+            i += 1;
+        }
+        return out;
+    }
+
+    /// Spin `profile` (x is the radius, y the height, bottom to top) around Y: vases, trunks,
+    /// bottles, columns. Ends at radius 0 close by themselves.
+    fn lathe(this: &Builder, profile: []Vec2, sides: int) {
+        let last = profile.len - 1;
+        let i = 0;
+        while i < last {
+            let v0 = 1 - f32(i) / f32(last);
+            let v1 = 1 - f32(i + 1) / f32(last);
+            let a = profile[i];
+            let b = profile[i + 1];
+            // Normals from the neighbors on both sides, so curves shade smooth.
+            let before = profile[if i > 0 { i - 1 } else { i }];
+            let after = profile[if i + 2 <= last { i + 2 } else { i + 1 }];
+            this.band(a.x, a.y, b.x, b.y, sides, v0, v1, slope(before.x, before.y, b.x, b.y),
+                slope(a.x, a.y, after.x, after.y));
+            i += 1;
+        }
+    }
+
+    /// A ring: radius `major` to the tube's center, tube radius `minor`, lying flat.
+    fn torus(this: &Builder, major: f32, minor: f32, sides: int, tube: int) {
+        let s = 0;
+        while s < sides {
+            let t = 0;
+            while t < tube {
+                let k = 0;
+                while k < 6 {
+                    // Cell corners (s, t) (s+1, t) (s, t+1) (s+1, t+1); a c d, a d b.
+                    let ds = 0;
+                    let dt = 0;
+                    if k == 1 { dt = 1; } else if k == 2 || k == 4 { ds = 1; dt = 1; } else if k == 5 { ds = 1; }
+                    let a = f32(s + ds) / f32(sides) * TAU;
+                    let b = f32(t + dt) / f32(tube) * TAU;
+                    let out = Vec3.xyz(cos(a), 0, sin(a));
+                    let n = out * cos(b) + Vec3.xyz(0, sin(b), 0);
+                    this.vertex(out * major + n * minor, n, f32(s + ds) / f32(sides), f32(t + dt) / f32(tube));
+                    k += 1;
+                }
+                t += 1;
+            }
+            s += 1;
+        }
+    }
+
+    /// A flat `w` by `d` grid of `cells` by `cells` squares on XZ, facing up.
+    fn plane(this: &Builder, w: f32, d: f32, cells: int) {
+        this.heightField(w, d, cells, 0 as ptr, flatHeight);
+    }
+
+    /// Terrain: a `w` by `d` grid on XZ whose height at `(x, z)` is `height(ctx, x, z)`,
+    /// with smooth normals.
+    fn heightField(this: &Builder, w: f32, d: f32, cells: int, ctx: ptr, height: fn(ptr, f32, f32): f32) {
+        let step = Vec2 { x: w / f32(cells), y: d / f32(cells) };
+        let j = 0;
+        while j < cells {
+            let i = 0;
+            while i < cells {
+                let k = 0;
+                while k < 6 {
+                    let di = 0;
+                    let dj = 0;
+                    if k == 1 { dj = 1; } else if k == 2 || k == 4 { di = 1; dj = 1; } else if k == 5 { di = 1; }
+                    let x = f32(i + di) * step.x - w / 2;
+                    let z = f32(j + dj) * step.y - d / 2;
+                    let e = step.x * 0.5;
+                    let n = Vec3.xyz(height(ctx, x - e, z) - height(ctx, x + e, z), e * 2,
+                        height(ctx, x, z - e) - height(ctx, x, z + e)).normalize();
+                    this.vertex(Vec3.xyz(x, height(ctx, x, z), z), n, f32(i + di) / f32(cells), f32(j + dj) / f32(cells));
+                    k += 1;
+                }
+                i += 1;
+            }
+            j += 1;
+        }
+    }
+
+    /// A prism: the convex polygon `points` on XZ, raised from y 0 to `h`, with top and
+    /// bottom. Points go counter-clockwise with x to the right and z up the page, like
+    /// (0, 0), (1, 0), (1, 1), (0, 1).
+    fn extrude(this: &Builder, points: []Vec2, h: f32) {
+        let n = points.len;
+        if n < 3 { return; }
+        let i = 0;
+        while i < n {
+            let a = points[i];
+            let b = points[if i + 1 == n { 0 } else { i + 1 }];
+            this.quad(Vec3.xyz(b.x, 0, b.y), Vec3.xyz(a.x, 0, a.y), Vec3.xyz(a.x, h, a.y), Vec3.xyz(b.x, h, b.y));
+            i += 1;
+        }
+        let k = 1;
+        while k + 1 < n {
+            let p0 = points[0];
+            let p1 = points[k];
+            let p2 = points[k + 1];
+            this.tri(Vec3.xyz(p0.x, h, p0.y), Vec3.xyz(p2.x, h, p2.y), Vec3.xyz(p1.x, h, p1.y));
+            this.tri(Vec3.xyz(p0.x, 0, p0.y), Vec3.xyz(p1.x, 0, p1.y), Vec3.xyz(p2.x, 0, p2.y));
+            k += 1;
+        }
+    }
+
+    /// Every part added so far, in the 12-float layout.
+    fn vertices(this: &Builder): []f32 {
+        return []f32 { ptr: this.verts.ptr, len: this.len };
+    }
+
+    /// Write the mesh to `path` as a `.j3mesh` file. False when it can't be written.
+    fn save(this: &Builder, path: string): bool {
+        let text = mesh.emitUv(this.arena, this.vertices());
+        match io.writeFile(path, text) {
+            Result.Ok(_) { return true; }
+            Result.Err(_) { return false; }
+        }
+    }
+}
+
+fn flatHeight(_ctx: ptr, _x: f32, _z: f32): f32 { return 0; }
+
+/// Outward normal, as (out, up), of a profile going from radius `r0` at `y0` to `r1` at `y1`.
+fn slope(r0: f32, y0: f32, r1: f32, y1: f32): Vec2 {
+    let dr = r1 - r0;
+    let dy = y1 - y0;
+    let len = sqrt(dr * dr + dy * dy);
+    if len < 0.000001 { return Vec2 { x: 1, y: 0 }; }
+    return Vec2 { x: dy / len, y: 0 - dr / len };
+}
+
+/// Where a generator script writes its mesh: `$J3_GEN_OUT` when `j3c -e gen` runs it, else
+/// `fallback` (for running the script by hand).
+pub fn output(fallback: string): string {
+    let raw = libc.getenv(cstr("J3_GEN_OUT"));
+    if raw == 0 { return fallback; }
+    let len = libc.strlen(raw);
+    if len < 1 { return fallback; }
+    return []u8 { ptr: raw as &u8, len: len } as string;
+}
+
+/// Unit shapes for `builtin:` meshes, sized to fit a 1x1x1 box like the cube.
+pub fn unitShape(name: string, arena: &Arena): []f32 {
+    let b = Builder.new(arena);
+    if same(name, "cylinder") { b.cylinder(0.5, 1, 32); }
+    if same(name, "cone") { b.cone(0.5, 1, 32); }
+    if same(name, "capsule") { b.capsule(0.25, 1, 24); }
+    if same(name, "torus") { b.torus(0.35, 0.15, 40, 16); }
+    return b.vertices();
+}
+
+fn same(a: string, b: string): bool {
+    if a.len != b.len { return false; }
+    let i = 0;
+    while i < a.len {
+        if a[i] != b[i] { return false; }
+        i += 1;
+    }
+    return true;
+}

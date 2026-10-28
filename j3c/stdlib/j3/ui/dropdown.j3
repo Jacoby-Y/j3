@@ -1,0 +1,645 @@
+/// The two popups of the input widgets: a `<select>` list (single and `multiple`) and the
+/// `<input type="color">` panel. `input(d)` runs from `j3.ui.inputs.begin` (opening, hover, picking,
+/// keys, closing on an outside press, and building the list); `paint(d)` draws the open one above the page. Only
+/// one is open at a time (`Dom.pop`).
+///
+/// The select list is a real DOM subtree (`j3.ui.popnode`, a child of the select on the overlay layer) so
+/// ordinary CSS styles it: `.j3-select-list` (the box: background, border, `box-shadow`, `padding`, `max-height`
+/// with its normal scrollbar, `min-width`), `.j3-option` (a row; `:hover` the highlighted one, `:disabled`,
+/// `.selected` the chosen ones), `.j3-check` (the check mark, an `<svg>` a theme can resize, recolor with
+/// `accent-color` or hide) and `.j3-label` (the text); see `j3.ui.uastyle`. It opens below its box, or above when
+/// there is more room there, at least as wide as the select. A list longer than 40 options builds only the rows
+/// near the viewport (spacers stand for the rest), so 5000 options cost the same as 40. The color panel is
+/// a real subtree too: `.j3-color-panel`, `.j3-color-sv`, `.j3-color-hue`, `.j3-color-preview`, `.j3-color-value`.
+///
+/// A `<select>` value is the chosen `<option>`'s value (its `value` attribute, else its text). With
+/// `multiple` it is the comma list of the picked values, in the order they were picked.
+
+module j3.ui.dropdown;
+
+use j3.math.{ max, min, maxi, mini };
+use j3.text.same;
+use j3.ui.colorpick;
+use j3.ui.css.FL_DISABLED;
+use j3.ui.dom;
+use j3.ui.dom.{ Dom, isDisabled, nextOption, optLabel, optSelected, optValue };
+use j3.ui.media;
+use j3.ui.popnode;
+use j3.ui.popup;
+use j3.ui.popup.Popup;
+use j3.ui.virt;
+use j3.ui.virt.Win;
+
+/// A select list is at least this wide (px) and as wide as its select.
+const MINW: f32 = 120.0;
+/// Lists up to this many options build every row; longer ones build the viewport's rows only.
+const ALL: int = 40;
+
+fn alive(d: &Dom, id: int): bool {
+    return id >= 0 && id < d.nodes.len && d.nodes.items[id].kind == dom.K_ELEM && !d.nodes.items[id].ghost;
+}
+
+fn isSelect(d: &Dom, id: int): bool {
+    return d.nodes.items[id].tag == d.tSelect;
+}
+
+fn isColor(d: &Dom, id: int): bool {
+    return d.nodes.items[id].tag == d.tInput && d.mnodes.items[id].type == d.vColor;
+}
+
+fn close(d: &Dom) {
+    d.pop = popup.closed();
+}
+
+fn countOptions(d: &Dom, sel: int): int {
+    let n = 0;
+    let o = nextOption(d, sel, -1);
+    while o >= 0 {
+        n += 1;
+        o = nextOption(d, sel, o);
+    }
+    return n;
+}
+
+/// Option number `k` of `sel` (-1 when there are fewer).
+fn nth(d: &Dom, sel: int, k: int): int {
+    let o = nextOption(d, sel, -1);
+    let i = 0;
+    while o >= 0 && i < k {
+        o = nextOption(d, sel, o);
+        i += 1;
+    }
+    return o;
+}
+
+// ---- opening and choosing --------------------------------------------------------------------------
+
+fn openSelect(d: &Dom, id: int) {
+    let hot = 0;
+    let i = 0;
+    let o = nextOption(d, id, -1);
+    while o >= 0 {
+        if optSelected(d, id, o) {
+            hot = i;
+            break;
+        }
+        i += 1;
+        o = nextOption(d, id, o);
+    }
+    d.pop = popup.closed();
+    d.pop.kind = popup.SELECT;
+    d.pop.owner = id;
+    d.pop.hot = hot;
+    d.pop.pend = true;
+}
+
+fn openColor(d: &Dom, id: int) {
+    let rgb = colorpick.parseHex(d.nodes.items[id].sval);
+    d.pop = popup.closed();
+    d.pop.kind = popup.COLOR;
+    d.pop.owner = id;
+    d.pop.hsv = colorpick.toHsv(if rgb < 0 { 0 } else { rgb });
+}
+
+/// Set the value of `sel` to `v` (single choice).
+fn setValue(d: &Dom, sel: int, v: string) {
+    let n = &d.nodes.items[sel];
+    if same(n.sval, v) {
+        return;
+    }
+    let e = &d.eds.items[d.claim(sel)];
+    e.set(v);
+    n.sval = e.str();
+    n.chg = d.frame;
+    dom.aNote(d, dom.EV_VALUE, sel);
+}
+
+/// Add `v` to the comma list of `sel`, or remove it when it is there.
+fn toggleValue(d: &Dom, sel: int, v: string) {
+    let n = &d.nodes.items[sel];
+    let e = &d.eds.items[d.claim(sel)];
+    e.set(n.sval);
+    let b = e.text.bytes;
+    let i = 0;
+    let found = false;
+    while i <= b.len && !found {
+        let j = i;
+        while j < b.len && b[j] != 44 {
+            j += 1;
+        }
+        let cur = e.str();
+        if j > i && same(cur[i..j], v) {
+            found = true;
+            if i > 0 {
+                e.text.remove(i - 1, j - i + 1);
+            } else {
+                e.text.remove(0, if j < b.len { j + 1 } else { j });
+            }
+        }
+        i = j + 1;
+    }
+    if !found {
+        if e.text.len() > 0 {
+            e.text.push(44);
+        }
+        e.text.pushStr(v);
+    }
+    n.sval = e.str();
+    n.chg = d.frame;
+    dom.aNote(d, dom.EV_VALUE, sel);
+}
+
+/// Pick option number `row` of the open list. A single choice closes it.
+fn choose(d: &Dom, row: int) {
+    let sel = d.pop.owner;
+    let o = nth(d, sel, row);
+    if o < 0 || isDisabled(d, o) {
+        return;
+    }
+    if d.nodes.items[sel].multi {
+        toggleValue(d, sel, optValue(d, o));
+    } else {
+        setValue(d, sel, optValue(d, o));
+        close(d);
+    }
+}
+
+fn setColor(d: &Dom, id: int) {
+    let n = &d.nodes.items[id];
+    let rgb = colorpick.fromHsv(d.pop.hsv.h, d.pop.hsv.s, d.pop.hsv.v);
+    if rgb == colorpick.parseHex(n.sval) {
+        return;
+    }
+    let e = &d.eds.items[d.claim(id)];
+    colorpick.writeHex(rgb, &e.text);
+    n.sval = e.str();
+    n.chg = d.frame;
+    dom.aNote(d, dom.EV_VALUE, id);
+}
+
+// ---- input -----------------------------------------------------------------------------------------
+
+/// Mouse and keys for the open popup and for focused closed selects and color inputs.
+pub fn input(d: &Dom) {
+    let p = &d.pop;
+    if p.kind != popup.NONE && (!alive(d, p.owner) || !dom.styleVisible(d, p.owner)) {
+        close(d);
+    }
+    let pressed = d.down && !d.prevDown;
+    let t = d.downHit;
+    if pressed && p.kind != popup.NONE && !onPopup(d) && t != p.owner {
+        close(d);
+    }
+    if pressed && t >= 0 && !isDisabled(d, t) {
+        let was = p.kind != popup.NONE && p.owner == t;
+        if isSelect(d, t) || isColor(d, t) {
+            close(d);
+            if !was {
+                if isSelect(d, t) { openSelect(d, t); } else { openColor(d, t); }
+            }
+        }
+    }
+    if p.kind == popup.SELECT {
+        selectFrame(d, pressed);
+    } else if p.kind == popup.COLOR {
+        panelInput(d, pressed);
+    } else {
+        closedKeys(d);
+    }
+    if d.pop.kind == popup.COLOR {
+        buildPanel(d);
+    }
+    if d.pop.kind == popup.NONE && d.ptRoot >= 0 {
+        popnode.close(d);
+    }
+}
+
+/// Whether the press this frame landed on the open popup (a list row, its scrollbar, or the color panel).
+fn onPopup(d: &Dom): bool {
+    return popnode.contains(d, d.ptRoot, d.rawHit);
+}
+
+/// Enter / Space open the focused select or color box; Up / Down step a single select.
+fn closedKeys(d: &Dom) {
+    let f = d.focus;
+    if f < 0 || !alive(d, f) || !dom.styleVisible(d, f) || isDisabled(d, f) {
+        return;
+    }
+    let k = &d.kin;
+    if isColor(d, f) && (k.enter || k.space) {
+        openColor(d, f);
+    } else if isSelect(d, f) {
+        if k.enter || k.space {
+            openSelect(d, f);
+        } else if !d.nodes.items[f].multi && (k.up || k.down || k.typed.len > 0) {
+            let cur = -1;
+            let i = 0;
+            let o = nextOption(d, f, -1);
+            while o >= 0 && cur < 0 {
+                if optSelected(d, f, o) {
+                    cur = i;
+                }
+                i += 1;
+                o = nextOption(d, f, o);
+            }
+            let to = cur;
+            if k.up { to = maxi(0, cur - 1); }
+            if k.down { to = mini(countOptions(d, f) - 1, cur + 1); }
+            if !k.up && !k.down {
+                to = typeAhead(d, f, cur);
+            }
+            let o2 = nth(d, f, to);
+            if to >= 0 && to != cur && o2 >= 0 && !isDisabled(d, o2) {
+                setValue(d, f, optValue(d, o2));
+            }
+        }
+    }
+}
+
+/// ASCII-case-insensitive prefix test; other bytes (UTF-8) must match exactly.
+pub fn startsWith(s: string, pre: []u8): bool {
+    if pre.len > s.len {
+        return false;
+    }
+    for i in 0..pre.len {
+        let a = int(s[i]);
+        let b = int(pre[i]);
+        if a >= 65 && a <= 90 { a += 32; }
+        if b >= 65 && b <= 90 { b += 32; }
+        if a != b {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Shared select/menu prefix, bounded to whole incoming UTF-8 strings. `taCycle` starts after focus.
+pub fn prefix(d: &Dom, owner: int): bool {
+    let t = d.kin.typed;
+    if d.taOwner != owner || d.now - d.taAt > 1000.0 { d.taLen = 0; }
+    d.taOwner = owner;
+    if t.len == 0 || d.kin.ctrl || int(t[0]) <= 32 || t.len > d.ta.len { return false; }
+    if d.taLen + t.len > d.ta.len { d.taLen = 0; }
+    let fresh = d.taLen == 0;
+    for i in 0..t.len { d.ta[d.taLen + i] = t[i]; }
+    d.taLen += t.len;
+    d.taAt = d.now;
+    let rep = d.taLen > 1 && int(d.ta[0]) < 128;
+    for i in 1..d.taLen { if d.ta[i] != d.ta[0] { rep = false; } }
+    d.taCycle = fresh || rep;
+    if rep { d.taLen = 1; }
+    return true;
+}
+
+/// Type-ahead: this frame's typed text joins a prefix that lasts 1 s between keys; returns the index of the
+/// next enabled option (after `cur`, or `cur` itself while the prefix grows) whose label starts with it,
+/// else -1. Typing one letter again and again steps through the options that start with it.
+fn typeAhead(d: &Dom, sel: int, cur: int): int {
+    if !prefix(d, sel) { return -1; }
+    let pre = d.ta[0..d.taLen];
+    let n = countOptions(d, sel);
+    let start = if d.taCycle { cur + 1 } else { maxi(cur, 0) };
+    for i in 0..n {
+        let k = (start + i) % n;
+        let o = nth(d, sel, k);
+        if o >= 0 && !isDisabled(d, o) && startsWith(optLabel(d, o), pre) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+/// The index of the list row at or above node `id` (-1 for none).
+fn rowOf(d: &Dom, id: int): int {
+    let c = id;
+    while c >= 0 && !d.nodes.items[c].rt {
+        if d.nodes.items[c].pidx >= 0 {
+            return d.nodes.items[c].pidx;
+        }
+        c = d.nodes.items[c].parent;
+    }
+    return -1;
+}
+
+/// The built row node for option number `i` of the list `root` (-1 when it is not alive).
+fn rowNode(d: &Dom, root: int, i: int): int {
+    let c = d.nodes.items[root].first;
+    while c >= 0 {
+        if d.nodes.items[c].pidx == i {
+            return c;
+        }
+        c = d.nodes.items[c].next;
+    }
+    return -1;
+}
+
+/// Read the row pitch and the offset of row 0 from last frame's layout (the rows built then); false when no row
+/// was built yet.
+fn measure(d: &Dom, root: int, p: &Popup): bool {
+    let a = -1;
+    let b = -1;
+    let c = d.nodes.items[root].first;
+    while c >= 0 && b < 0 {
+        if d.nodes.items[c].pidx >= 0 && d.nodes.items[c].laid {
+            if a < 0 {
+                a = c;
+            } else {
+                b = c;
+            }
+        }
+        c = d.nodes.items[c].next;
+    }
+    if a < 0 {
+        return false;
+    }
+    let na = &d.nodes.items[a];
+    if b >= 0 && d.nodes.items[b].pidx > na.pidx {
+        p.rh = (d.nodes.items[b].y - na.y) / f32(d.nodes.items[b].pidx - na.pidx);
+    }
+    p.oy = na.y - f32(na.pidx) * p.rh;
+    return true;
+}
+
+/// Scroll the list so row `hot` shows (when `pend`: at the fourth row from the top, as a select opens).
+fn reveal(d: &Dom, root: int, p: &Popup, hot: int) {
+    let nl = &d.nodes.items[root];
+    let top = f32(hot) * p.rh;
+    let want = nl.scrollY;
+    if p.pend {
+        want = top - 3.0 * p.rh;
+    }
+    if top < want {
+        want = top;
+    }
+    if top + p.rh + 2.0 * p.oy > want + nl.h {
+        want = top + p.rh + 2.0 * p.oy - nl.h;
+    }
+    if want != nl.scrollY {
+        d.scrollBy(root, want - nl.scrollY);
+    }
+}
+
+/// One frame of the open select: pointer and keys on last frame's list, then the list is built for this one.
+fn selectFrame(d: &Dom, pressed: bool) {
+    let p = &d.pop;
+    let sel = p.owner;
+    let n = countOptions(d, sel);
+    if p.hot >= n {
+        p.hot = maxi(0, n - 1);
+    }
+    let root = popnode.open(d, sel, "j3-list", "j3-select-list");
+    let built = measure(d, root, p);
+    if d.moved {
+        p.kb = false;
+    }
+    let hv = rowOf(d, d.hover);
+    if (d.moved || pressed) && hv >= 0 {
+        p.hot = hv;
+    }
+    let row = if pressed { rowOf(d, d.downHit) } else { -1 };
+    if row >= 0 {
+        choose(d, row);
+        if d.pop.kind == popup.NONE {
+            return;
+        }
+    }
+    let k = &d.kin;
+    let hot = p.hot;
+    let page = maxi(1, int(d.nodes.items[root].h / p.rh) - 1);
+    if k.down { hot += 1; }
+    if k.up { hot -= 1; }
+    if k.pgdn { hot += page; }
+    if k.pgup { hot -= page; }
+    if k.home { hot = 0; }
+    if k.end { hot = n - 1; }
+    let ta = typeAhead(d, sel, p.hot);
+    if ta >= 0 {
+        hot = ta;
+    }
+    if hot != p.hot {
+        p.hot = maxi(0, mini(n - 1, hot));
+        p.kb = true;
+        reveal(d, root, p, p.hot);
+    } else if built && p.pend {
+        reveal(d, root, p, p.hot);
+    }
+    if built {
+        p.pend = false;
+    }
+    if k.enter || k.space {
+        choose(d, p.hot);
+        if d.pop.kind == popup.NONE {
+            return;
+        }
+    }
+    if k.esc || k.tab {
+        close(d);
+        return;
+    }
+    buildRows(d, root, p, n);
+    // the highlight is the pointer's row, or `hot` when the keyboard moved it or the pointer is elsewhere
+    if p.kb || rowOf(d, d.hover) < 0 {
+        d.kbHover = rowNode(d, root, p.hot);
+    }
+}
+
+/// Make the rows of the list: every option, or for a long list the ones near the viewport between two spacers.
+fn buildRows(d: &Dom, root: int, p: &Popup, n: int) {
+    let sel = p.owner;
+    let nl = &d.nodes.items[root];
+    d.styleNum(root, 0, "min-width", max(d.nodes.items[sel].w, MINW));
+    let w = Win { lo: 0, hi: n, top: 0.0, bottom: 0.0 };
+    if n > ALL {
+        w = virt.window(n, p.rh, nl.scrollY, if nl.h > 0.0 { nl.h } else { 8.0 * p.rh }, virt.OVERSCAN);
+    }
+    let sc = d.mnodes.items[sel].scope;
+    let tOpt = d.tag("j3-option");
+    let tPad = d.tag("j3-pad");
+    let tLabel = d.tag("j3-label");
+    let cOpt = d.css.intern("j3-option");
+    let cSel = d.css.intern("selected");
+    let cCheck = d.css.intern("j3-check");
+    let cLabel = d.css.intern("j3-label");
+    let cPad = d.css.intern("j3-pad");
+    popnode.build(d, root);
+    if w.lo > 0 {
+        let sp0 = d.open(0, tPad, sc);
+        d.clsId(sp0, cPad);
+        d.styleNum(sp0, 0, "height", w.top);
+        d.close();
+    }
+    let o = nth(d, sel, w.lo);
+    for i in w.lo..w.hi {
+        if o < 0 {
+            break;
+        }
+        let tok = d.enter(1 + i / 4096);
+        let r = d.open(i % 4096, tOpt, sc);
+        d.clsId(r, cOpt);
+        let on = optSelected(d, sel, o);
+        d.clsIfId(r, cSel, on);
+        d.setFlag(r, FL_DISABLED, isDisabled(d, o));
+        d.nodes.items[r].pidx = i;
+        // the check mark: always there (it keeps the label's place), drawn only for a chosen option
+        let ck = d.open(0, d.tSvg, sc);
+        d.clsId(ck, cCheck);
+        if d.nodes.items[ck].born == d.frame {
+            d.attrMedia(ck, media.M_VIEWBOX, "-1 -1 10 8");
+        }
+        if on {
+            let pt = d.open(0, d.tPath, sc);
+            if d.nodes.items[pt].born == d.frame {
+                d.attrMedia(pt, media.M_D, "M0 3 L3 6 L8 0");
+                d.attrMedia(pt, media.M_FILL, "none");
+                d.attrMedia(pt, media.M_STROKE, "accent");
+                d.attrMediaNum(pt, media.N_STROKE_WIDTH, 1.8);
+            }
+            d.close();
+        }
+        d.close();
+        let lb = d.open(1, tLabel, sc);
+        d.clsId(lb, cLabel);
+        d.nodes.items[lb].optionSource = o;
+        dom.optionVisuals(d, o);
+        d.close();
+        d.close();
+        d.leave(tok);
+        o = nextOption(d, sel, o);
+    }
+    if w.hi < n {
+        let tail = d.enter(4095);
+        let sp1 = d.open(0, tPad, sc);
+        d.clsId(sp1, cPad);
+        d.styleNum(sp1, 0, "height", w.bottom);
+        d.close();
+        d.leave(tail);
+    }
+    popnode.done(d);
+}
+
+fn panelInput(d: &Dom, pressed: bool) {
+    let p = &d.pop;
+    let id = p.owner;
+    let root = d.ptRoot;
+    let sq = if root >= 0 { d.nodes.items[root].first } else { -1 };
+    let bar = if sq >= 0 { d.nodes.items[sq].next } else { -1 };
+    if pressed {
+        p.drag = if popnode.contains(d, sq, d.rawHit) { 1 } else { 0 };
+        if popnode.contains(d, bar, d.rawHit) { p.drag = 2; }
+    }
+    if !d.down { p.drag = 0; }
+    if p.drag > 0 && sq >= 0 && bar >= 0 {
+        let area = if p.drag == 1 { sq } else { bar };
+        let n = &d.nodes.items[area];
+        let x = min(1.0, max(0.0, (d.mx - d.absX(area)) / max(n.w, 1.0)));
+        if p.drag == 1 {
+            p.hsv.s = x;
+            p.hsv.v = 1.0 - min(1.0, max(0.0, (d.my - d.absY(area)) / max(n.h, 1.0)));
+        } else { p.hsv.h = x * 359.9; }
+        setColor(d, id);
+    } else {
+        // the program changed the color while the panel is open
+        let rgb = colorpick.parseHex(d.nodes.items[id].sval);
+        if rgb >= 0 && rgb != colorpick.fromHsv(p.hsv.h, p.hsv.s, p.hsv.v) {
+            p.hsv = colorpick.toHsv(rgb);
+        }
+    }
+    if d.kin.esc || d.kin.enter || d.kin.tab {
+        close(d);
+    }
+}
+
+// ---- real color controls and overlay placement ------------------------------------------------------
+
+/// A dynamic flat color, formatted on the stack; the DOM copies changed strings into its reusable style slot.
+fn flatColor(d: &Dom, id: int, rgb: int) {
+    let n = &d.nodes.items[id];
+    // restyle/hot reload forgets inline slots while preserving the node's cached RGB.
+    if n.pidx == rgb && n.dyn >= 0 && d.dyns.items[n.dyn].sk[0] == 2 { return; }
+    n.pidx = rgb;
+    let buf: [7]u8 = [0, 0, 0, 0, 0, 0, 0];
+    buf[0] = 35;
+    let digits = "0123456789abcdef";
+    let div = 1048576;
+    for i in 1..7 {
+        buf[i] = digits[(rgb / div) % 16];
+        div = div / 16;
+    }
+    d.styleStr(id, 0, "background", buf[0..7] as string);
+}
+
+fn part(d: &Dom, slot: int, cls: string, sc: int): int {
+    let id = d.open(slot, d.tag("j3-color"), sc);
+    d.cls(id, cls);
+    return id;
+}
+
+fn buildPanel(d: &Dom) {
+    let p = &d.pop;
+    let root = popnode.open(d, p.owner, "j3-panel", "j3-color-panel");
+    let sc = d.mnodes.items[p.owner].scope;
+    popnode.build(d, root);
+    let sq = part(d, 0, "j3-color-sv", sc);
+    flatColor(d, sq, colorpick.fromHsv(p.hsv.h, 1.0, 1.0));
+    let saturation = part(d, 0, "j3-color-saturation", sc);
+    d.close();
+    let shade = part(d, 1, "j3-color-shade", sc);
+    d.close();
+    let mark = part(d, 2, "j3-color-marker", sc);
+    d.close();
+    d.close();
+    let bar = part(d, 1, "j3-color-hue", sc);
+    let hm = part(d, 0, "j3-color-handle", sc);
+    flatColor(d, hm, colorpick.fromHsv(p.hsv.h, 1.0, 1.0));
+    d.close();
+    d.close();
+    let foot = part(d, 2, "j3-color-footer", sc);
+    let swatch = part(d, 0, "j3-color-preview", sc);
+    flatColor(d, swatch, colorpick.fromHsv(p.hsv.h, p.hsv.s, p.hsv.v));
+    d.close();
+    let label = part(d, 1, "j3-color-value", sc);
+    d.text(d.nodes.items[p.owner].sval);
+    d.close();
+    d.close();
+    popnode.done(d);
+}
+
+/// Marker positions are derived geometry, like the popup anchor. Resolve them after layout so opening,
+/// resize and a theme's marker size all use this frame's boxes without another restyle/layout pass.
+fn markers(d: &Dom, root: int) {
+    let sq = d.nodes.items[root].first;
+    let bar = d.nodes.items[sq].next;
+    let mark = &d.nodes.items[d.nodes.items[sq].last];
+    let handle = &d.nodes.items[d.nodes.items[bar].first];
+    mark.x = d.pop.hsv.s * d.nodes.items[sq].w - mark.w * 0.5;
+    mark.y = (1.0 - d.pop.hsv.v) * d.nodes.items[sq].h - mark.h * 0.5;
+    handle.x = d.pop.hsv.h / 359.9 * d.nodes.items[bar].w - handle.w * 0.5;
+}
+
+/// Place the real input popup after layout (also callable by tests without painting).
+pub fn settle(d: &Dom) {
+    let p = &d.pop;
+    if p.kind != popup.NONE && d.ptRoot >= 0 && alive(d, p.owner) {
+        let o = &d.nodes.items[p.owner];
+        popnode.place(d, d.ptRoot, d.absX(p.owner), d.absY(p.owner), o.w, o.h, if p.kind == popup.SELECT { 2.0 * p.rh + 8.0 } else { d.nodes.items[d.ptRoot].h });
+        if p.kind == popup.COLOR {
+            markers(d, d.ptRoot);
+            let n = &d.nodes.items[d.ptRoot];
+            p.x = n.x; p.y = n.y; p.w = n.w; p.h = n.h;
+        }
+    }
+}
+
+/// Draw the open popup in root coordinates after the page.
+pub fn paint(d: &Dom) {
+    if d.pop.kind == popup.NONE { return; }
+    if !alive(d, d.pop.owner) || !dom.styleVisible(d, d.pop.owner) {
+        close(d);
+        popnode.close(d);
+        return;
+    }
+    if d.ptRoot >= 0 {
+        settle(d);
+        popnode.paint(d, d.ptRoot);
+    }
+}

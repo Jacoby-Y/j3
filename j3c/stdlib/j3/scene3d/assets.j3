@@ -1,0 +1,794 @@
+// Part of j3.scene3d (materials, built-in and asset meshes, the shared mesh cache); the module doc and `use`s are in ../scene3d.j3.
+module j3.scene3d;
+
+/// Upload mesh assets after the GL context exists.
+pub fn upload(scene: &Scene) {
+    let i = 0;
+    while i < scene.len {
+        reload(scene, scene.nodes[i].id);
+        i += 1;
+    }
+}
+
+/// One uploaded mesh + texture pair, shared by every node that uses both paths.
+struct Shared {
+    asset: string;
+    texture: string;
+    gpu: Mesh;
+    image: Tex;
+    /// The vertices (12 floats each), kept for URP tracing.
+    verts: []f32;
+    lo: Vec3;
+    hi: Vec3;
+    refs: int;
+}
+
+/// A loaded `.j3mat` file. Objects point at it by slot, so editing it updates them all.
+struct Material {
+    path: string;
+    look: Surface;
+    /// `OPAQUE`, `CUTOUT`, or `BLEND` for every object using it; -1 leaves each object's own.
+    mode: int;
+    opacity: f32;
+    /// Objects using it shine on others as point lights: `glow` times `strength`, out to
+    /// `range`.
+    emit: bool;
+    strength: f32;
+    range: f32;
+    /// Its texture or generated noise, or none.
+    image: Tex;
+    /// Its `fx` effect file, or empty.
+    fxPath: string;
+}
+
+#[singleton]
+let MATS: [64]Material;
+
+#[singleton]
+let MATS_LEN: int = 0;
+
+/// Slot + 1 of material `path`, loading it the first time. 0 when there is no room left.
+// ponytail: 64 materials, linear lookup; a table if projects use hundreds.
+fn materialSlot(path: string): int {
+    let i = 0;
+    while i < MATS_LEN {
+        if same(MATS[i].path, path) { return i + 1; }
+        i += 1;
+    }
+    if MATS_LEN >= 64 { return 0; }
+    MATS[MATS_LEN] = Material {
+        path: keepKey(path), look: gfx.plainSurface(), mode: -1, opacity: 1,
+        emit: false, strength: 1, range: 6, image: Tex { id: 0, w: 0, h: 0 }, fxPath: "",
+    };
+    loadMaterial(&MATS[MATS_LEN]);
+    MATS_LEN += 1;
+    return MATS_LEN;
+}
+
+/// Read material `path` again after its file changed; every object using it follows.
+pub fn refreshMaterial(path: string) {
+    let i = 0;
+    while i < MATS_LEN {
+        if same(MATS[i].path, path) {
+            gfx.freeTex(&MATS[i].image);
+            loadMaterial(&MATS[i]);
+        }
+        i += 1;
+    }
+}
+
+/// Fill `m` from its file. Keys:
+/// - `tint`, `glow` (`<key>.r/.g/.b`); `spec`, `shine`, `reflect`, `rough`, `edge`, `ior`, `cloud`
+///   (see `gfx.Surface`); `emit` (0/1), `emit.strength`, `emit.range` (see `lights`);
+///   `uv.scale.x/.y`, `uv.offset.x/.y`;
+/// - `mode` (-1 each object's own, else `OPAQUE`/`CUTOUT`/`BLEND`) and `opacity`;
+/// - `texture s=`, or `noise=1` with the `noise.*` and `ramp.*` keys `noiseOf` and `rampOf` read.
+fn loadMaterial(m: &Material) {
+    let mem = Arena.create(64 * 1024);
+    let file = save.load(m.path, &mem);
+    fillMaterial(m, &file, &mem);
+    mem.destroy();
+}
+
+/// Show material `path` as `file` describes it on every object using it, without writing
+/// the file (an editor's unsaved edits). `refreshMaterial` goes back to the file.
+pub fn previewMaterial(path: string, file: &Save) {
+    let slot = materialSlot(path);
+    if slot == 0 { return; }
+    gfx.freeTex(&MATS[slot - 1].image);
+    let mem = Arena.create(64 * 1024);
+    fillMaterial(&MATS[slot - 1], file, &mem);
+    mem.destroy();
+}
+
+/// Material `path`'s texture or baked noise (id 0 when it has neither).
+pub fn materialImage(path: string): Tex {
+    let slot = materialSlot(path);
+    if slot == 0 { return Tex { id: 0, w: 0, h: 0 }; }
+    return MATS[slot - 1].image;
+}
+
+fn fillMaterial(m: &Material, file: &Save, mem: &Arena) {
+    m.look = gfx.plainSurface();
+    m.look.tint = rgbKey(file, "tint", Vec3.xyz(1, 1, 1));
+    m.look.glow = rgbKey(file, "glow", Vec3.xyz(0, 0, 0));
+    m.look.spec = save.getFloat(file, "spec", 0);
+    m.look.shine = save.getFloat(file, "shine", 0.3);
+    m.look.reflect = save.getFloat(file, "reflect", 0);
+    m.look.edge = save.getFloat(file, "edge", 0);
+    m.look.ior = save.getFloat(file, "ior", 1);
+    if m.look.ior < 1 { m.look.ior = 1; }
+    m.look.rough = save.getFloat(file, "rough", 0);
+    m.look.cloud = save.getFloat(file, "cloud", 0);
+    m.emit = save.getInt(file, "emit", 0) != 0;
+    m.strength = save.getFloat(file, "emit.strength", 1);
+    m.range = save.getFloat(file, "emit.range", 6);
+    m.look.uvScale.x = save.getFloat(file, "uv.scale.x", 1);
+    m.look.uvScale.y = save.getFloat(file, "uv.scale.y", 1);
+    m.look.uvOffset.x = save.getFloat(file, "uv.offset.x", 0);
+    m.look.uvOffset.y = save.getFloat(file, "uv.offset.y", 0);
+    m.fxPath = "";
+    let fxPath = save.getStr(file, "fx", "");
+    if fxPath.len > 0 {
+        // Not `effectSlot`: a load never rebuilds an effect other materials already use
+        // (their `look.fx` would point at a freed program); `refreshEffect` does, for all.
+        let e = knownEffect(fxPath);
+        if e > 0 {
+            m.fxPath = EFFECTS[e - 1].path;
+            if EFFECTS[e - 1].prog > 0 && !EFFECTS[e - 1].file.camera {
+                m.look.fx = EFFECTS[e - 1].prog;
+                fxValues(&m.look, file, EFFECTS[e - 1].file.params);
+            }
+        }
+    }
+    m.mode = save.getInt(file, "mode", -1);
+    m.opacity = save.getFloat(file, "opacity", 1);
+    m.image = Tex { id: 0, w: 0, h: 0 };
+    if save.getInt(file, "noise", 0) != 0 {
+        let n = noiseOf(file, mem);
+        let r = rampOf(file);
+        let size = save.getInt(file, "noise.size", 256);
+        if size < 16 { size = 16; }
+        if size > 1024 { size = 1024; }
+        let pixels = noise.bake(&n, &r, size, mem);
+        m.image = gfx.tex(pixels, i32(size), i32(size));
+    } else {
+        let path = save.getStr(file, "texture", "");
+        if path.len > 0 {
+            let rgba = loadImage(path, mem);
+            if rgba.pixels.len > 0 { m.image = gfx.tex(rgba.pixels, rgba.w, rgba.h); }
+        }
+    }
+}
+
+/// The noise a material file describes (`noise.kind`, `.fractal`, `.octaves`, `.lacunarity`,
+/// `.gain`, `.scale`, `.seed`, `.warp`, `.cell`, `.contrast`, `.brightness`, `.invert`,
+/// `.steps`, `.threshold`).
+pub fn noiseOf(file: &Save, mem: &Arena): Noise {
+    let n = noise.make(save.getInt(file, "noise.seed", 1), mem);
+    n.kind = save.getInt(file, "noise.kind", PERLIN);
+    n.fractal = save.getInt(file, "noise.fractal", FBM);
+    n.octaves = save.getInt(file, "noise.octaves", 4);
+    n.lacunarity = save.getInt(file, "noise.lacunarity", 2);
+    n.gain = save.getFloat(file, "noise.gain", 0.5);
+    n.scale = save.getFloat(file, "noise.scale", 8);
+    n.warp = save.getFloat(file, "noise.warp", 0);
+    n.cell = save.getInt(file, "noise.cell", NEAREST);
+    n.contrast = save.getFloat(file, "noise.contrast", 1);
+    n.brightness = save.getFloat(file, "noise.brightness", 0);
+    n.invert = save.getInt(file, "noise.invert", 0) != 0;
+    n.steps = save.getInt(file, "noise.steps", 0);
+    n.threshold = save.getFloat(file, "noise.threshold", 0);
+    return n;
+}
+
+/// The color ramp of a material file: `ramp.count` stops of `ramp.<i>.pos` and
+/// `ramp.<i>.r/.g/.b`. Files from before ramps use `noise.a` and `noise.b`.
+pub fn rampOf(file: &Save): Ramp {
+    let r = noise.ramp2(rgbKey(file, "noise.a", Vec3.xyz(0.2, 0.2, 0.2)), rgbKey(file, "noise.b", Vec3.xyz(0.9, 0.9, 0.9)));
+    let count = save.getInt(file, "ramp.count", 0);
+    if count < 2 { return r; }
+    if count > 4 { count = 4; }
+    r.count = count;
+    let i = 0;
+    while i < count {
+        let t = Text.new(scratch(1));
+        t.pushStr("ramp.");
+        t.pushInt(i);
+        let prefix = t.len();
+        t.pushStr(".pos");
+        r.pos[i] = save.getFloat(file, t.str(), f32(i) / f32(count - 1));
+        t.remove(prefix, t.len() - prefix);
+        r.color[i] = rgbKey(file, t.str(), Vec3.xyz(0, 0, 0));
+        i += 1;
+    }
+    return r;
+}
+
+/// Built-in shapes and images, named `builtin:<name>`: they need no file and work the
+/// same in an editor and a game.
+pub const BUILTIN: string = "builtin:";
+/// Meshes: `builtin:cube` (unit), `builtin:sphere` (radius 0.5), `builtin:quad` (1x1 on XY
+/// facing +Z), `builtin:plane` (1x1 on XZ facing up), and `builtin:sky` (an inside-out
+/// sphere drawn behind everything).
+/// A cloudy sky image made for `builtin:sky`.
+pub const SKY_CLOUDS: string = "builtin:sky-clouds";
+
+/// Whether `path` names a built-in shape or image.
+pub fn isBuiltin(path: string): bool {
+    let prefix = BUILTIN;
+    if path.len < prefix.len { return false; }
+    let i = 0;
+    while i < prefix.len {
+        if path[i] != prefix[i] { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Whether mesh node `n` is a sky.
+pub fn isSky(n: Node): bool {
+    return n.kind == MESH && same(n.asset, "builtin:sky");
+}
+
+fn exists(path: string): bool {
+    return isBuiltin(path) || io.exists(path);
+}
+
+/// Mesh `asset` as 12 floats a vertex (with UVs): a built-in shape, or a file whose UVs,
+/// when it has none, come from `boxUv`. Empty when it can't be read.
+fn meshVerts(asset: string, arena: &Arena): []f32 {
+    if isBuiltin(asset) { return builtinMesh(asset, arena); }
+    let verts = mesh.load(asset, arena);
+    if verts.len == 0 { return verts; }
+    let source = save.load(asset, arena);
+    if mesh.floatsPerVertex(source.bytes) == 12 { return verts; }
+    return boxUv(verts, arena);
+}
+
+/// The vertices (12 floats each) of mesh asset `asset`, built-in or a file, without the
+/// GPU: for bounds and ray tests in tools. Empty when it can't be read.
+pub fn assetVerts(asset: string, arena: &Arena): []f32 {
+    return meshVerts(asset, arena);
+}
+
+/// Image `path` as RGBA: a built-in one, or a file through `game.loadRgba`.
+fn loadImage(path: string, arena: &Arena): Rgba {
+    if same(path, SKY_CLOUDS) { return skyClouds(arena); }
+    return game.loadRgba(path, arena);
+}
+
+fn builtinMesh(asset: string, arena: &Arena): []f32 {
+    if same(asset, "builtin:cube") { return cubeVerts(arena); }
+    if same(asset, "builtin:sphere") { return sphereVerts(arena, false); }
+    if same(asset, "builtin:sky") { return sphereVerts(arena, true); }
+    if same(asset, "builtin:quad") { return gridVerts(arena, 1, false); }
+    if same(asset, "builtin:plane") { return gridVerts(arena, 16, true); }
+    // "builtin:" is 8 bytes; the rest names a meshgen shape (cylinder, cone, capsule, torus).
+    if asset.len > 8 {
+        return meshgen.unitShape([]u8 { ptr: (asset.ptr as int + 8) as &u8, len: asset.len - 8 } as string, arena);
+    }
+    return arena.alloc::<f32>(0);
+}
+
+/// Write one vertex at `v` (a vertex index): white, glowing only when `emi`.
+fn vert(out: []f32, v: int, p: Vec3, n: Vec3, u: f32, t: f32, emi: bool) {
+    let at = v * 12;
+    out[at] = p.x;
+    out[at + 1] = p.y;
+    out[at + 2] = p.z;
+    out[at + 3] = n.x;
+    out[at + 4] = n.y;
+    out[at + 5] = n.z;
+    out[at + 6] = 1;
+    out[at + 7] = 1;
+    out[at + 8] = 1;
+    out[at + 9] = if emi { 1 } else { 0 };
+    out[at + 10] = u;
+    out[at + 11] = t;
+}
+
+fn axisOf(i: int, value: f32): Vec3 {
+    if i == 0 { return Vec3.xyz(value, 0, 0); }
+    if i == 1 { return Vec3.xyz(0, value, 0); }
+    return Vec3.xyz(0, 0, value);
+}
+
+fn cubeVerts(arena: &Arena): []f32 {
+    let out = arena.alloc::<f32>(36 * 12);
+    let v = 0;
+    let axis = 0;
+    while axis < 3 {
+        let side = 0;
+        while side < 2 {
+            let sign: f32 = if side == 0 { -1 } else { 1 };
+            let n = axisOf(axis, sign);
+            // The two axes across the face, in turn after `axis`, so a (+u, +v) turn faces out.
+            let ua = axis + 1;
+            if ua > 2 { ua = 0; }
+            let va = ua + 1;
+            if va > 2 { va = 0; }
+            let k = 0;
+            while k < 6 {
+                // Corners a b c d = (-,-) (+,-) (-,+) (+,+); outward winding per side.
+                let corner = 0;
+                if sign > 0 {
+                    if k == 1 { corner = 1; } else if k == 2 || k == 4 { corner = 3; } else if k == 5 { corner = 2; }
+                } else {
+                    if k == 1 || k == 5 { corner = 3; } else if k == 2 { corner = 1; } else if k == 4 { corner = 2; }
+                }
+                let a: f32 = if corner == 1 || corner == 3 { 0.5 } else { -0.5 };
+                let b: f32 = if corner >= 2 { 0.5 } else { -0.5 };
+                let p = n * 0.5 + axisOf(ua, a) + axisOf(va, b);
+                vert(out, v, p, n, a + 0.5, 0.5 - b, false);
+                v += 1;
+                k += 1;
+            }
+            side += 1;
+        }
+        axis += 1;
+    }
+    return out;
+}
+
+/// UV sphere of radius 0.5. `inside` faces it inward, unlit, for a sky.
+fn sphereVerts(arena: &Arena, inside: bool): []f32 {
+    let segs = 48;
+    let rings = 24;
+    let out = arena.alloc::<f32>(segs * rings * 6 * 12);
+    let v = 0;
+    let r = 0;
+    while r < rings {
+        let s = 0;
+        while s < segs {
+            let k = 0;
+            while k < 6 {
+                // Cell corners a b c d = (s, r) (s+1, r) (s, r+1) (s+1, r+1); a b c, b d c.
+                let ds = 0;
+                let dr = 0;
+                if inside {
+                    if k == 1 || k == 3 { dr = 1; } else if k == 2 || k == 5 { ds = 1; } else if k == 4 { ds = 1; dr = 1; }
+                } else {
+                    if k == 1 || k == 3 { ds = 1; } else if k == 2 || k == 5 { dr = 1; } else if k == 4 { ds = 1; dr = 1; }
+                }
+                let u = f32(s + ds) / f32(segs);
+                let t = f32(r + dr) / f32(rings);
+                let theta = u * TAU;
+                let phi = t * PI;
+                let n = Vec3.xyz(sin(phi) * cos(theta), cos(phi), sin(phi) * sin(theta));
+                let shown = if inside { n * -1 } else { n };
+                vert(out, v, n * 0.5, shown, 1 - u, t, inside);
+                v += 1;
+                k += 1;
+            }
+            s += 1;
+        }
+        r += 1;
+    }
+    return out;
+}
+
+/// A 1x1 square split into `cells` x `cells`: on XZ facing up when `flat`, else on XY
+/// facing +Z.
+fn gridVerts(arena: &Arena, cells: int, flat: bool): []f32 {
+    let out = arena.alloc::<f32>(cells * cells * 6 * 12);
+    let n = if flat { Vec3.xyz(0, 1, 0) } else { Vec3.xyz(0, 0, 1) };
+    let v = 0;
+    let j = 0;
+    while j < cells {
+        let i = 0;
+        while i < cells {
+            let k = 0;
+            while k < 6 {
+                // Corners a b c d = (i, j) (i+1, j) (i, j+1) (i+1, j+1).
+                let di = 0;
+                let dj = 0;
+                if flat {
+                    // a c d, a d b faces +Y.
+                    if k == 1 { dj = 1; } else if k == 2 || k == 4 { di = 1; dj = 1; } else if k == 5 { di = 1; }
+                } else {
+                    // a b d, a d c faces +Z.
+                    if k == 1 { di = 1; } else if k == 2 || k == 4 { di = 1; dj = 1; } else if k == 5 { dj = 1; }
+                }
+                let a = f32(i + di) / f32(cells);
+                let b = f32(j + dj) / f32(cells);
+                let p = if flat { Vec3.xyz(a - 0.5, 0, b - 0.5) } else { Vec3.xyz(a - 0.5, b - 0.5, 0) };
+                let t = if flat { b } else { 1 - b };
+                vert(out, v, p, n, a, t, false);
+                v += 1;
+                k += 1;
+            }
+            i += 1;
+        }
+        j += 1;
+    }
+    return out;
+}
+
+/// A 512x256 wrap-around sky: blue overhead, pale at the horizon, grey below, with Perlin
+/// clouds that thin out toward the horizon.
+fn skyClouds(arena: &Arena): Rgba {
+    let w = 512;
+    let h = 256;
+    let px = arena.alloc::<u8>(w * h * 4);
+    let n = noise.make(7, arena);
+    n.scale = 6;
+    n.octaves = 5;
+    let top = Vec3.xyz(0.22, 0.42, 0.78);
+    let horizon = Vec3.xyz(0.72, 0.82, 0.93);
+    let ground = Vec3.xyz(0.45, 0.48, 0.52);
+    let y = 0;
+    while y < h {
+        let t = (f32(y) + 0.5) / f32(h);
+        let sky = horizon;
+        if t < 0.5 {
+            let up = 1 - t * 2;
+            sky = horizon + (top - horizon) * (up * (2 - up));
+        } else {
+            let down = (t - 0.5) * 2;
+            if down > 1 { down = 1; }
+            sky = horizon + (ground - horizon) * sqrt(down);
+        }
+        // Clouds thin out toward the horizon and overhead, where the image pinches together.
+        let mask = (0.5 - t) * 5;
+        if t * 4 < mask { mask = t * 4; }
+        if mask < 0 { mask = 0; }
+        if mask > 1 { mask = 1; }
+        let x = 0;
+        while x < w {
+            let c = sky;
+            if mask > 0 {
+                let d = noise.sample(&n, (f32(x) + 0.5) / f32(w), t * 0.5);
+                let cloud = (d - 0.5) * 3.5;
+                if cloud < 0 { cloud = 0; }
+                if cloud > 1 { cloud = 1; }
+                cloud = cloud * mask;
+                c = sky + (Vec3.xyz(1, 1, 1) - sky) * cloud;
+            }
+            let at = (y * w + x) * 4;
+            px[at] = u8(c.x * 255);
+            px[at + 1] = u8(c.y * 255);
+            px[at + 2] = u8(c.z * 255);
+            px[at + 3] = 255;
+            x += 1;
+        }
+        y += 1;
+    }
+    return Rgba { pixels: px, w: i32(w), h: i32(h) };
+}
+
+/// The box around `verts` (12 floats a vertex).
+fn bounds(verts: []f32, lo: &Vec3, hi: &Vec3) {
+    let v = 0;
+    while v + 2 < verts.len {
+        let p = Vec3.xyz(verts[v], verts[v + 1], verts[v + 2]);
+        if v == 0 {
+            lo.x = p.x; lo.y = p.y; lo.z = p.z;
+            hi.x = p.x; hi.y = p.y; hi.z = p.z;
+        } else {
+            if p.x < lo.x { lo.x = p.x; }
+            if p.y < lo.y { lo.y = p.y; }
+            if p.z < lo.z { lo.z = p.z; }
+            if p.x > hi.x { hi.x = p.x; }
+            if p.y > hi.y { hi.y = p.y; }
+            if p.z > hi.z { hi.z = p.z; }
+        }
+        v += 12;
+    }
+}
+
+/// `verts` (10 floats a vertex, no UVs) with UVs added by box projection: each face takes
+/// the two position axes across its normal, so textures and materials show on meshes made
+/// without UVs. A unit cube gets 0..1 on every face.
+fn boxUv(verts: []f32, arena: &Arena): []f32 {
+    let count = verts.len / 10;
+    let out = arena.alloc::<f32>(count * 12);
+    let i = 0;
+    while i < count {
+        let k = 0;
+        while k < 10 {
+            out[i * 12 + k] = verts[i * 10 + k];
+            k += 1;
+        }
+        let px = verts[i * 10];
+        let py = verts[i * 10 + 1];
+        let pz = verts[i * 10 + 2];
+        let nx = absf(verts[i * 10 + 3]);
+        let ny = absf(verts[i * 10 + 4]);
+        let nz = absf(verts[i * 10 + 5]);
+        let u = px;
+        let v = py;
+        if nx >= ny && nx >= nz { u = pz; }
+        else if ny >= nz { v = pz; }
+        out[i * 12 + 10] = u + 0.5;
+        out[i * 12 + 11] = 0.5 - v;
+        i += 1;
+    }
+    return out;
+}
+
+fn absf(v: f32): f32 {
+    if v < 0 { return 0 - v; }
+    return v;
+}
+
+fn rgbKey(file: &Save, name: string, fallback: Vec3): Vec3 {
+    let t = Text.new(scratch(0));
+    t.pushStr(name);
+    t.pushStr(".r");
+    let r = save.getFloat(file, t.str(), fallback.x);
+    t.pop();
+    t.pushStr("g");
+    let g = save.getFloat(file, t.str(), fallback.y);
+    t.pop();
+    t.pushStr("b");
+    return Vec3.xyz(r, g, save.getFloat(file, t.str(), fallback.z));
+}
+
+#[singleton]
+let SHARED: []Shared;
+
+#[singleton]
+let SHARED_LEN: int = 0;
+
+/// Open-addressing table from mesh/texture paths to `SHARED` index + 1.
+#[singleton]
+let SHARED_SLOTS: []int;
+
+/// Holds the cache's path strings, which must outlive any one scene's arena.
+#[singleton]
+let KEYS: Arena = Arena { ptr: 0, used: 0, cap: 0, head: 0 };
+
+/// A copy of `verts` that outlives the load.
+// ponytail: copies live in KEYS for good, so reloading a mesh file leaks its old copy.
+fn keepVerts(verts: []f32): []f32 {
+    if KEYS.ptr == 0 { KEYS = Arena.create(16 * 1024); }
+    let out = KEYS.alloc::<f32>(verts.len);
+    let i = 0;
+    while i < verts.len {
+        out[i] = verts[i];
+        i += 1;
+    }
+    return out;
+}
+
+fn keepKey(value: string): string {
+    if KEYS.ptr == 0 { KEYS = Arena.create(16 * 1024); }
+    let t = Text.new(&KEYS);
+    t.pushStr(value);
+    return t.str();
+}
+
+fn sharedHash(asset: string, texture: string, size: int): int {
+    let h = 0;
+    let i = 0;
+    while i < asset.len {
+        h = h * 33 + int(asset[i]);
+        h = h - (h / size) * size;
+        i += 1;
+    }
+    h = h * 33 + 255;
+    h = h - (h / size) * size;
+    i = 0;
+    while i < texture.len {
+        h = h * 33 + int(texture[i]);
+        h = h - (h / size) * size;
+        i += 1;
+    }
+    return h;
+}
+
+fn sharedSlot(asset: string, texture: string): int {
+    if SHARED_SLOTS.len == 0 { return -1; }
+    let h = sharedHash(asset, texture, SHARED_SLOTS.len);
+    while SHARED_SLOTS[h] != 0 {
+        let at = SHARED_SLOTS[h] - 1;
+        if same(SHARED[at].asset, asset) && same(SHARED[at].texture, texture) { return at; }
+        h = nextSlot(h, SHARED_SLOTS.len);
+    }
+    return -1;
+}
+
+fn reserveShared() {
+    if KEYS.ptr == 0 { KEYS = Arena.create(16 * 1024); }
+    if SHARED_LEN >= SHARED.len {
+        let size = if SHARED.len == 0 { 16 } else { SHARED.len * 2 };
+        let grown = KEYS.alloc::<Shared>(size);
+        let i = 0;
+        while i < SHARED_LEN { grown[i] = SHARED[i]; i += 1; }
+        SHARED = grown;
+    }
+    if (SHARED_LEN + 1) * 2 >= SHARED_SLOTS.len {
+        let slotSize = if SHARED_SLOTS.len == 0 { 32 } else { SHARED_SLOTS.len * 2 };
+        let table = KEYS.alloc::<int>(slotSize);
+        let slotIndex = 0;
+        while slotIndex < slotSize { table[slotIndex] = 0; slotIndex += 1; }
+        slotIndex = 0;
+        while slotIndex < SHARED_LEN {
+            let h = sharedHash(SHARED[slotIndex].asset, SHARED[slotIndex].texture, slotSize);
+            while table[h] != 0 { h = nextSlot(h, slotSize); }
+            table[h] = slotIndex + 1;
+            slotIndex += 1;
+        }
+        SHARED_SLOTS = table;
+    }
+}
+
+fn insertShared(entry: Shared) {
+    reserveShared();
+    let at = SHARED_LEN;
+    SHARED[at] = entry;
+    SHARED_LEN += 1;
+    let h = sharedHash(entry.asset, entry.texture, SHARED_SLOTS.len);
+    while SHARED_SLOTS[h] != 0 { h = nextSlot(h, SHARED_SLOTS.len); }
+    SHARED_SLOTS[h] = at + 1;
+}
+
+/// Uses of the cache entry holding `asset` + `texture`, or 0 when it isn't cached.
+pub fn sharedRefs(asset: string, texture: string): int {
+    let at = sharedSlot(asset, texture);
+    if at >= 0 { return SHARED[at].refs; }
+    return 0;
+}
+
+/// Give up a node's GPU mesh and texture, freeing them when no other node uses them.
+pub fn unload(n: &Node) {
+    if n.gpu.vao == 0 && n.image.id == 0 { return; }
+    let k = sharedSlot(n.asset, n.texture);
+    if k < 0 || SHARED[k].gpu.vao != n.gpu.vao || SHARED[k].image.id != n.image.id { k = 0; }
+    let shared = false;
+    while k < SHARED_LEN && !shared {
+        if SHARED[k].refs > 0 && SHARED[k].gpu.vao == n.gpu.vao && SHARED[k].image.id == n.image.id {
+            shared = true;
+            SHARED[k].refs -= 1;
+            if SHARED[k].refs == 0 {
+                gfx.free(&SHARED[k].gpu);
+                gfx.freeTex(&SHARED[k].image);
+            }
+        }
+        k += 1;
+    }
+    if !shared {
+        gfx.free(&n.gpu);
+        gfx.freeTex(&n.image);
+    }
+    n.gpu = Mesh {};
+    n.image = Tex { id: 0, w: 0, h: 0 };
+}
+
+/// Refresh one node's GPU resources after its asset path changes.
+pub fn reload(scene: &Scene, id: int) {
+    let i = index(scene, id);
+    if i < 0 { return; }
+    let n = &scene.nodes[i];
+    unload(n);
+    n.boundLo = Vec3.xyz(-0.5, -0.5, -0.5);
+    n.boundHi = Vec3.xyz(0.5, 0.5, 0.5);
+    if n.kind == MESH { n.missing = false; }
+    n.mat = 0;
+    if n.kind == MESH && n.material.len > 0 {
+        n.mat = materialSlot(n.material);
+        if !io.exists(n.material) { n.missing = true; }
+    }
+    if n.kind != MESH || n.asset.len == 0 { return; }
+    let cached = sharedSlot(n.asset, n.texture);
+    if cached >= 0 && SHARED[cached].refs > 0 {
+        // ponytail: a deleted file keeps drawing from the cache until the scene reloads; flag it now.
+        n.missing = n.missing || !exists(n.asset);
+        SHARED[cached].refs += 1;
+        n.gpu = SHARED[cached].gpu;
+        n.image = SHARED[cached].image;
+        n.boundLo = SHARED[cached].lo;
+        n.boundHi = SHARED[cached].hi;
+        return;
+    }
+    let scratch = Arena.create(1024 * 1024);
+    let verts = meshVerts(n.asset, &scratch);
+    if verts.len == 0 { n.missing = true; }
+    let kept = KEYS.alloc::<f32>(0);
+    if verts.len > 0 {
+        bounds(verts, &n.boundLo, &n.boundHi);
+        n.gpu = gfx.uploadUv(verts);
+        kept = keepVerts(verts);
+    }
+    if n.texture.len > 0 {
+        let rgba = loadImage(n.texture, &scratch);
+        if rgba.pixels.len > 0 {
+            n.image = gfx.tex(rgba.pixels, rgba.w, rgba.h);
+        } else if !exists(n.texture) {
+            // Only a gone file; without SDL2_image every texture fails to load.
+            n.missing = true;
+        }
+    }
+    scratch.destroy();
+    // A failed load isn't cached, so fixing the file and reloading picks it up.
+    if n.gpu.vao != 0 {
+        if cached >= 0 {
+            SHARED[cached].gpu = n.gpu;
+            SHARED[cached].image = n.image;
+            SHARED[cached].lo = n.boundLo;
+            SHARED[cached].hi = n.boundHi;
+            SHARED[cached].refs = 1;
+            SHARED[cached].verts = kept;
+        } else {
+            insertShared(Shared {
+                asset: keepKey(n.asset), texture: keepKey(n.texture),
+                gpu: n.gpu, image: n.image, verts: kept, lo: n.boundLo, hi: n.boundHi, refs: 1,
+            });
+        }
+    }
+}
+
+/// Re-read one mesh/texture pair and update every supplied live scene together. The caller
+/// supplies all scenes that can hold this cache entry; GPU ids stay stable for shared users.
+pub fn rebuild(asset: string, texture: string, scenes: []Scene): bool {
+    let slot = sharedSlot(asset, texture);
+    if slot < 0 || SHARED[slot].refs == 0 {
+        // A missing mesh is not cached; retry its nodes through the normal loader.
+        let loaded = false;
+        let s = 0;
+        while s < scenes.len {
+            let i = 0;
+            while i < scenes[s].len {
+                let n = &scenes[s].nodes[i];
+                if n.kind == MESH && same(n.asset, asset) && same(n.texture, texture) {
+                    reload(&scenes[s], n.id);
+                    if n.gpu.vao != 0 { loaded = true; }
+                }
+                i += 1;
+            }
+            s += 1;
+        }
+        return loaded;
+    }
+
+    let scratch = Arena.create(1024 * 1024);
+    let verts = meshVerts(asset, &scratch);
+    if verts.len == 0 { scratch.destroy(); return false; }
+    let lo = Vec3.xyz(0, 0, 0);
+    let hi = Vec3.xyz(0, 0, 0);
+    bounds(verts, &lo, &hi);
+    let rgba = loadImage(texture, &scratch);
+    if texture.len > 0 && rgba.pixels.len == 0 { scratch.destroy(); return false; }
+    gfx.updateUv(&SHARED[slot].gpu, verts);
+    SHARED[slot].verts = keepVerts(verts);
+    if texture.len > 0 {
+        if SHARED[slot].image.id == 0 {
+            SHARED[slot].image = gfx.tex(rgba.pixels, rgba.w, rgba.h);
+        } else {
+            gfx.updateTex(&SHARED[slot].image, rgba.pixels, rgba.w, rgba.h);
+        }
+    }
+    SHARED[slot].lo = lo;
+    SHARED[slot].hi = hi;
+    let sceneIndex = 0;
+    while sceneIndex < scenes.len {
+        let nodeIndex = 0;
+        while nodeIndex < scenes[sceneIndex].len {
+            let node = &scenes[sceneIndex].nodes[nodeIndex];
+            if node.kind == MESH && same(node.asset, asset) && same(node.texture, texture) {
+                if node.gpu.vao == SHARED[slot].gpu.vao {
+                    node.gpu = SHARED[slot].gpu;
+                    node.image = SHARED[slot].image;
+                    node.boundLo = lo;
+                    node.boundHi = hi;
+                } else if node.gpu.vao == 0 {
+                    reload(&scenes[sceneIndex], node.id);
+                }
+            }
+            nodeIndex += 1;
+        }
+        sceneIndex += 1;
+    }
+    scratch.destroy();
+    return true;
+}
+
+pub fn release(scene: &Scene) {
+    let i = 0;
+    while i < scene.len {
+        unload(&scene.nodes[i]);
+        i += 1;
+    }
+    if scene.placed as ptr != 0 { scene.placed.destroy(); }
+}

@@ -1,0 +1,446 @@
+/// Bevy-shaped ECS without traits: generational entities, SoA columns,
+/// deferred Commands, frame Events. Game World owns an Ecs plus columns.
+/// Any thread: no module state, so a worker can use a value it owns (`j3c doc threads`).
+
+module j3.game.ecs;
+
+use j3.memory.{ Arena, scratch };
+
+/// Generational entity handle: sparse `id` plus generation to detect reuse.
+pub struct Entity {
+    /// Sparse index into ECS tables (`0 - 1` means none).
+    id: int;
+    /// Generation; must match `Ecs.gen[id]` for a live handle.
+    gen: int;
+
+    /// True when both id and generation match.
+    fn operator==(this: Entity, other: Entity): bool {
+        return this.id == other.id && this.gen == other.gen;
+    }
+
+    /// True when id or generation differs.
+    fn operator!=(this: Entity, other: Entity): bool {
+        return this.id != other.id || this.gen != other.gen;
+    }
+
+    /// Sentinel entity with id `-1`.
+    fn none(): Entity {
+        return Entity { id: 0 - 1, gen: 0 };
+    }
+}
+
+/// Sparse-set entity store with freelist recycle and dense alive iteration.
+pub struct Ecs {
+    /// Per-slot generation counters.
+    gen: []int;
+    /// Nonzero when the sparse slot is currently alive.
+    live: []u8;
+    /// Dense packed list of alive sparse ids.
+    dense: []int;
+    /// Sparse id → index in `dense`, or `-1` if unused.
+    loc: []int;
+    /// Recycled sparse ids available for spawn.
+    free: []int;
+    /// Allocated capacity of the sparse tables.
+    cap: int;
+    /// High-water mark of ever-used sparse ids.
+    used: int;
+    /// Count of currently alive entities.
+    alive: int;
+    /// Number of ids on the freelist.
+    nfree: int;
+    /// Arena that owns grown table storage.
+    arena: &Arena;
+
+    /// Allocates sparse tables with at least 8 slots.
+    fn create(arena: &Arena, cap: int): Ecs {
+        let n = cap;
+        if n < 8 {
+            n = 8;
+        }
+        let loc = arena.alloc::<int>(n);
+        let i = 0;
+        while i < n {
+            loc[i] = 0 - 1;
+            i += 1;
+        }
+        return Ecs {
+            gen: arena.alloc::<int>(n),
+            live: arena.alloc::<u8>(n),
+            dense: arena.alloc::<int>(n),
+            loc: loc,
+            free: arena.alloc::<int>(n),
+            cap: n,
+            used: 0,
+            alive: 0,
+            nfree: 0,
+            arena: arena,
+        };
+    }
+
+    /// Returns how many entities are currently alive.
+    fn len(this: &Ecs): int {
+        return this.alive;
+    }
+
+    /// True if `e` is live and its generation still matches.
+    fn isAlive(this: &Ecs, e: Entity): bool {
+        if e.id < 0 || e.id >= this.used {
+            return false;
+        }
+        return this.live[e.id] != 0 && this.gen[e.id] == e.gen;
+    }
+
+    /// Entity handle for the `i`-th alive entry in dense order.
+    fn entity(this: &Ecs, i: int): Entity {
+        let id = this.dense[i];
+        return Entity { id: id, gen: this.gen[id] };
+    }
+
+    /// Allocates an entity from the freelist or the next unused id.
+    fn spawn(this: &Ecs): Entity {
+        if this.nfree == 0 && this.used >= this.cap {
+            this.grow();
+        }
+        let id = 0;
+        if this.nfree > 0 {
+            this.nfree = this.nfree - 1;
+            id = this.free[this.nfree];
+        } else {
+            id = this.used;
+            this.used = this.used + 1;
+        }
+        this.live[id] = 1;
+        if this.gen[id] == 0 {
+            this.gen[id] = 1;
+        }
+        this.dense[this.alive] = id;
+        this.loc[id] = this.alive;
+        this.alive = this.alive + 1;
+        return Entity { id: id, gen: this.gen[id] };
+    }
+
+    /// Marks `e` dead, bumps its generation, and returns the id to the freelist.
+    fn despawn(this: &Ecs, e: Entity) {
+        if !this.isAlive(e) {
+            return;
+        }
+        let id = e.id;
+        let slot = this.loc[id];
+        this.alive = this.alive - 1;
+        let last = this.dense[this.alive];
+        this.dense[slot] = last;
+        this.loc[last] = slot;
+        this.loc[id] = 0 - 1;
+        this.live[id] = 0;
+        this.gen[id] = this.gen[id] + 1;
+        this.free[this.nfree] = id;
+        this.nfree = this.nfree + 1;
+    }
+
+    /// Doubles sparse table capacity, copying existing entries.
+    fn grow(this: &Ecs) {
+        let cap = this.cap;
+        let next = cap * 2;
+        if next < 16 {
+            next = 16;
+        }
+        let gen = this.arena.alloc::<int>(next);
+        let live = this.arena.alloc::<u8>(next);
+        let dense = this.arena.alloc::<int>(next);
+        let loc = this.arena.alloc::<int>(next);
+        let free = this.arena.alloc::<int>(next);
+        let i = 0;
+        while i < cap {
+            gen[i] = this.gen[i];
+            live[i] = this.live[i];
+            dense[i] = this.dense[i];
+            loc[i] = this.loc[i];
+            free[i] = this.free[i];
+            i += 1;
+        }
+        while i < next {
+            loc[i] = 0 - 1;
+            i += 1;
+        }
+        this.gen = gen;
+        this.live = live;
+        this.dense = dense;
+        this.loc = loc;
+        this.free = free;
+        this.cap = next;
+    }
+}
+
+/// Sparse SoA component column keyed by entity id and generation.
+pub struct Column<T> {
+    /// Component values indexed by entity id.
+    items: []T;
+    /// Nonzero when this column has a live component at that id.
+    mask: []u8;
+    /// Generation recorded at insert; must match the entity handle.
+    gen: []int;
+    /// Arena used when growing the column.
+    arena: &Arena;
+
+    /// Empty column with zero-length buffers.
+    fn new(arena: &Arena): Column<T> {
+        return Column<T> {
+            items: arena.alloc::<T>(0),
+            mask: arena.alloc::<u8>(0),
+            gen: arena.alloc::<int>(0),
+            arena: arena,
+        };
+    }
+
+    /// True if this column stores a component for live entity `e`.
+    fn has(this: &Column<T>, e: Entity): bool {
+        if e.id < 0 || e.id >= this.mask.len {
+            return false;
+        }
+        return this.mask[e.id] != 0 && this.gen[e.id] == e.gen;
+    }
+
+    /// Returns the component value for `e` (caller must ensure `has`).
+    fn get(this: &Column<T>, e: Entity): T {
+        return this.items[e.id];
+    }
+
+    /// Mutable reference to the component for `e`.
+    fn at(this: &Column<T>, e: Entity): &T {
+        return &this.items[e.id];
+    }
+
+    /// Scratch-allocated list of alive entities that have this component.
+    fn matching(this: &Column<T>, ecs: &Ecs): []Entity {
+        let out = scratch(1).alloc::<Entity>(ecs.alive);
+        let k = 0;
+        let i = 0;
+        while i < ecs.alive {
+            let e = ecs.entity(i);
+            if this.has(e) {
+                out[k] = e;
+                k += 1;
+            }
+            i += 1;
+        }
+        return []Entity { ptr: out.ptr, len: k };
+    }
+
+    /// Alive entities that have this component and `other`. A third column is another `join`.
+    fn join<U>(this: &Column<T>, ecs: &Ecs, other: &Column<U>): []Entity {
+        return this.matching2(ecs, other.mask, other.gen);
+    }
+
+    /// Like `matching`, but also requires presence in a second mask/gen pair.
+    fn matching2(this: &Column<T>, ecs: &Ecs, mask: []u8, gen: []int): []Entity {
+        let out = scratch(1).alloc::<Entity>(ecs.alive);
+        let k = 0;
+        let i = 0;
+        while i < ecs.alive {
+            let e = ecs.entity(i);
+            if this.has(e) && e.id >= 0 && e.id < mask.len && mask[e.id] != 0 && gen[e.id] == e.gen {
+                out[k] = e;
+                k += 1;
+            }
+            i += 1;
+        }
+        return []Entity { ptr: out.ptr, len: k };
+    }
+
+    /// Writes `v` at `e.id`, growing the column if needed.
+    fn insert(this: &Column<T>, e: Entity, v: T) {
+        this.ensure(e.id + 1);
+        this.items[e.id] = v;
+        this.mask[e.id] = 1;
+        this.gen[e.id] = e.gen;
+    }
+
+    /// Clears the mask bit for `e` without shrinking storage.
+    fn remove(this: &Column<T>, e: Entity) {
+        if e.id < 0 || e.id >= this.mask.len {
+            return;
+        }
+        this.mask[e.id] = 0;
+    }
+
+    /// Grows items/mask/gen so index `n - 1` is in range.
+    fn ensure(this: &Column<T>, n: int) {
+        if n <= this.items.len {
+            return;
+        }
+        let cap = this.items.len;
+        let next = cap;
+        if next < 8 {
+            next = 8;
+        }
+        while next < n {
+            next = next * 2;
+        }
+        let items = this.arena.alloc::<T>(next);
+        let mask = this.arena.alloc::<u8>(next);
+        let gen = this.arena.alloc::<int>(next);
+        let i = 0;
+        while i < cap {
+            items[i] = this.items[i];
+            mask[i] = this.mask[i];
+            gen[i] = this.gen[i];
+            i += 1;
+        }
+        this.items = items;
+        this.mask = mask;
+        this.gen = gen;
+    }
+}
+
+/// Deferred despawn queue; spawn is immediate via `Ecs`.
+pub struct Commands {
+    /// Entities queued for despawn on `flush`.
+    kill: []Entity;
+    /// Number of pending despawns.
+    len: int;
+    /// Arena used when growing `kill`.
+    arena: &Arena;
+
+    /// Empty command buffer.
+    fn new(arena: &Arena): Commands {
+        return Commands {
+            kill: arena.alloc::<Entity>(0),
+            len: 0,
+            arena: arena,
+        };
+    }
+
+    /// Spawns immediately through `ecs` (not deferred).
+    fn spawn(this: &Commands, ecs: &Ecs): Entity {
+        return ecs.spawn();
+    }
+
+    /// Queues `e` for despawn on the next `flush`.
+    fn despawn(this: &Commands, e: Entity) {
+        if this.len >= this.kill.len {
+            let cap = this.kill.len;
+            let next = 8;
+            if cap != 0 {
+                next = cap * 2;
+            }
+            let kill = this.arena.alloc::<Entity>(next);
+            let i = 0;
+            while i < this.len {
+                kill[i] = this.kill[i];
+                i += 1;
+            }
+            this.kill = kill;
+        }
+        this.kill[this.len] = e;
+        this.len = this.len + 1;
+    }
+
+    /// Applies all queued despawns to `ecs` and clears the queue.
+    fn flush(this: &Commands, ecs: &Ecs) {
+        let i = 0;
+        while i < this.len {
+            ecs.despawn(this.kill[i]);
+            i += 1;
+        }
+        this.len = 0;
+    }
+}
+
+/// Growable frame event queue of type `T`.
+pub struct Events<T> {
+    /// Stored events; only the first `len` are valid.
+    items: []T;
+    /// Number of sent events since last `clear`.
+    len: int;
+    /// Arena used when growing `items`.
+    arena: &Arena;
+
+    /// Empty event queue.
+    fn new(arena: &Arena): Events<T> {
+        return Events<T> {
+            items: arena.alloc::<T>(0),
+            len: 0,
+            arena: arena,
+        };
+    }
+
+    /// Appends an event, growing the buffer if needed.
+    fn send(this: &Events<T>, v: T) {
+        if this.len >= this.items.len {
+            let cap = this.items.len;
+            let next = 8;
+            if cap != 0 {
+                next = cap * 2;
+            }
+            let items = this.arena.alloc::<T>(next);
+            let i = 0;
+            while i < this.len {
+                items[i] = this.items[i];
+                i += 1;
+            }
+            this.items = items;
+        }
+        this.items[this.len] = v;
+        this.len = this.len + 1;
+    }
+
+    /// Returns the event at index `i`.
+    fn get(this: &Events<T>, i: int): T {
+        return this.items[i];
+    }
+
+    /// Drops all events without freeing capacity.
+    fn clear(this: &Events<T>) {
+        this.len = 0;
+    }
+}
+
+/// Immediate listener list. `listen` takes a free function; it cannot close over a world.
+pub struct Signal<T> {
+    /// Registered listeners. Only the first `n` are live.
+    fns: []fn(T);
+    /// Number of listeners.
+    n: int;
+    /// Arena used when `fns` grows.
+    arena: &Arena;
+
+    /// Empty signal.
+    fn new(arena: &Arena): Signal<T> {
+        return Signal<T> {
+            fns: arena.alloc::<fn(T)>(0),
+            n: 0,
+            arena: arena,
+        };
+    }
+
+    /// Append `f`. Called immediately from `emit`, in listen order.
+    fn listen(this: &Signal<T>, f: fn(T)) {
+        if this.n >= this.fns.len {
+            let cap = this.fns.len;
+            let next = 8;
+            if cap != 0 {
+                next = cap * 2;
+            }
+            let fns = this.arena.alloc::<fn(T)>(next);
+            let i = 0;
+            while i < this.n {
+                fns[i] = this.fns[i];
+                i += 1;
+            }
+            this.fns = fns;
+        }
+        this.fns[this.n] = f;
+        this.n = this.n + 1;
+    }
+
+    /// Call every listener with `v` now.
+    fn emit(this: &Signal<T>, v: T) {
+        let i = 0;
+        while i < this.n {
+            let f = this.fns[i];
+            f(v);
+            i += 1;
+        }
+    }
+}

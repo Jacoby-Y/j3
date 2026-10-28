@@ -1,0 +1,155 @@
+// Tests for j3.apkassets (the Android first-launch asset copy) over a directory source. Run from the repo root:
+//   timeout 60 j3c run j3c/stdlib/tests/apkassets_test.j3
+// Needs /tmp writable. Panics on the first failed check.
+
+module apkassets_test;
+
+use j3.apkassets.{ boot, safePath, sync, Source };
+use j3.io.printLn;
+use j3.sys.{ close, lseek, open, openMode, panic, read, write, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_END, SEEK_SET };
+use j3.text.cstr;
+
+use lib "c" as c {
+    fn system(cmd: cstr): i32;
+}
+
+const BIG: int = 200000;
+const SRC: string = "/tmp/j3_apkassets_src";
+/// Added to every reported size: simulates a source that returns fewer bytes than it promised.
+#[singleton]
+let PADSIZE: int = 0;
+#[singleton]
+let PATHBUF: [512]u8;
+#[singleton]
+let LOGS: int = 0;
+
+fn ok(cond: bool, msg: string) {
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic(msg);
+    }
+}
+
+// Source over the directory SRC: relative path -> file below it.
+fn srcOpen(path: ptr): ptr {
+    let k = 0;
+    let root = SRC;
+    for i in 0..root.len { PATHBUF[k] = root[i]; k += 1; }
+    PATHBUF[k] = 47;
+    k += 1;
+    let q = path as int;
+    while k < 500 {
+        let cp = (q as ptr) as &u8;
+        let b = *cp;
+        if b == 0 { break; }
+        PATHBUF[k] = b;
+        k += 1;
+        q += 1;
+    }
+    PATHBUF[k] = 0;
+    let fd = open(&PATHBUF[0] as ptr, O_RDONLY);
+    if fd < 0 { return 0 as ptr; }
+    return (fd + 1) as ptr;
+}
+fn srcRead(h: ptr, buf: ptr, n: int): int { return read(h as int - 1, buf, n); }
+fn srcClose(h: ptr) { close(h as int - 1); }
+fn srcSize(h: ptr): int {
+    let fd = h as int - 1;
+    let n = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
+    return n + PADSIZE;
+}
+fn srcLog(msg: ptr) { LOGS += 1; }
+fn srcMs(): int { return 0; }
+
+fn source(): Source {
+    return Source { open: srcOpen, read: srcRead, close: srcClose, size: srcSize, log: srcLog, ms: srcMs };
+}
+
+fn put(rel: string, data: string) {
+    let fd = openMode(cstr(`{SRC}/{rel}`) as ptr, O_WRONLY + O_CREAT + O_TRUNC, 420);
+    ok(fd >= 0, "put open");
+    write(fd, data.ptr as ptr, data.len);
+    close(fd);
+}
+
+/// Run a shell command; true when it exits 0.
+fn sh(cmd: string): bool { return c.system(cstr(cmd)) == 0; }
+
+const DST: string = "/tmp/j3_apkassets_dst";
+
+fn main() {
+    sh("rm -rf /tmp/j3_apkassets_src /tmp/j3_apkassets_dst /tmp/j3_apkassets_dst2 && mkdir -p /tmp/j3_apkassets_src/sub/deep /tmp/j3_apkassets_dst");
+    put("a.txt", "hello");
+    put("sub/deep/b.bin", "nested");
+    // 200000 bytes: more than three 64 KB copy buffers
+    ok(sh("head -c 200000 /dev/urandom > /tmp/j3_apkassets_src/big.bin"), "make big file");
+
+    ok(safePath("a/b.txt") && safePath("a.b/c") && safePath("a/..b") && safePath("..a"), "safe paths");
+    ok(!safePath("/etc/x") && !safePath("../x") && !safePath("a/../x") && !safePath("a/..") && !safePath("a\\b")
+        && !safePath("") && !safePath("a//b") && !safePath("a/"), "unsafe paths");
+
+    // fresh copy: three good files (one nested, one big), three rejected lines, stamp written
+    let m1 = "j3assets 1 s1\na.txt\n\nsub/deep/b.bin\r\nbig.bin\n../evil\n/abs\nback\\slash\n";
+    let r = sync(m1, source(), DST);
+    ok(r.manifest && !r.upToDate && r.copied == 3 && r.failed == 0 && r.rejected == 3, "fresh copy counts");
+    ok(sh("cmp -s /tmp/j3_apkassets_src/a.txt /tmp/j3_apkassets_dst/a.txt"), "a.txt copied");
+    ok(sh("cmp -s /tmp/j3_apkassets_src/sub/deep/b.bin /tmp/j3_apkassets_dst/sub/deep/b.bin"), "nested file copied");
+    ok(sh("cmp -s /tmp/j3_apkassets_src/big.bin /tmp/j3_apkassets_dst/big.bin"), "big file copied whole");
+    ok(sh("test \"$(cat /tmp/j3_apkassets_dst/j3assets.stamp)\" = s1"), "stamp is s1");
+    ok(sh("test -z \"$(find /tmp/j3_apkassets_dst -name '*.tmp')\""), "no tmp files left");
+    ok(!sh("test -e /tmp/evil"), "nothing escaped the destination");
+
+    // same stamp: nothing copied, even though the source changed
+    put("a.txt", "changed");
+    r = sync(m1, source(), DST);
+    ok(r.manifest && r.upToDate && r.copied == 0, "skip on same stamp");
+    ok(sh("test \"$(cat /tmp/j3_apkassets_dst/a.txt)\" = hello"), "dest untouched");
+
+    // new stamp: everything is copied again
+    let m2 = "j3assets 1 s2\na.txt\nsub/deep/b.bin\nbig.bin\n";
+    r = sync(m2, source(), DST);
+    ok(r.copied == 3 && r.failed == 0 && !r.upToDate, "recopy on new stamp");
+    ok(sh("test \"$(cat /tmp/j3_apkassets_dst/a.txt)\" = changed"), "a.txt updated");
+    ok(sh("test \"$(cat /tmp/j3_apkassets_dst/j3assets.stamp)\" = s2"), "stamp is s2");
+
+    // a missing file: the others are still copied, the stamp stays at s2, and nothing half-written is left
+    put("a.txt", "third");
+    let m3 = "j3assets 1 s3\nmissing.txt\na.txt\nbig.bin\n";
+    r = sync(m3, source(), DST);
+    ok(r.copied == 2 && r.failed == 1, "missing file counts");
+    ok(sh("test \"$(cat /tmp/j3_apkassets_dst/a.txt)\" = third"), "later files still copied");
+    ok(sh("test \"$(cat /tmp/j3_apkassets_dst/j3assets.stamp)\" = s2"), "no stamp after a failure");
+    ok(sh("test ! -e /tmp/j3_apkassets_dst/missing.txt && test -z \"$(find /tmp/j3_apkassets_dst -name '*.tmp')\""), "no partial file");
+    put("missing.txt", "now here");
+    r = sync(m3, source(), DST);
+    ok(r.copied == 3 && r.failed == 0, "retry copies everything");
+    ok(sh("test \"$(cat /tmp/j3_apkassets_dst/j3assets.stamp)\" = s3"), "stamp is s3 after the retry");
+
+    // truncated source (fewer bytes than its size): counted as failed, no rename, no stamp
+    PADSIZE = 10;
+    let m4 = "j3assets 1 s4\na.txt\n";
+    r = sync(m4, source(), DST);
+    PADSIZE = 0;
+    ok(r.copied == 0 && r.failed == 1, "truncated asset fails");
+    ok(sh("test \"$(cat /tmp/j3_apkassets_dst/j3assets.stamp)\" = s3 && test \"$(cat /tmp/j3_apkassets_dst/a.txt)\" = third"), "truncated: stamp and old file kept");
+    ok(sh("test -z \"$(find /tmp/j3_apkassets_dst -name '*.tmp')\""), "truncated: tmp removed");
+    ok(!safePath("j3assets.stamp") && !safePath("x.tmp") && !safePath("d/a.txt.tmp") && safePath("sub/j3assets.stamp") && safePath("tmp"), "reserved names");
+    r = sync("j3assets 1 s5\nj3assets.stamp\nx.tmp\na.txt\n", source(), DST);
+    ok(r.rejected == 2 && r.copied == 1, "reserved names rejected in a manifest");
+
+    // bad header: nothing happens
+    r = sync("nonsense\na.txt\n", source(), DST);
+    ok(!r.manifest && r.copied == 0, "bad header");
+    r = sync("j3assets 1 has space\na.txt\n", source(), DST);
+    ok(!r.manifest, "stamp with a space");
+
+    // boot: reads j3assets.txt from the source, copies, then chdirs into dest
+    put("j3assets.txt", "j3assets 1 b1\na.txt\n");
+    sh("mkdir -p /tmp/j3_apkassets_dst2");
+    ok(boot(source(), "/tmp/j3_apkassets_dst2"), "boot chdir");
+    ok(sh("test \"$(pwd -P)\" = /tmp/j3_apkassets_dst2 && test -f a.txt && test -f j3assets.stamp"), "boot copied and moved cwd");
+    ok(LOGS > 0, "log was called");
+    sh("rm -rf /tmp/j3_apkassets_src /tmp/j3_apkassets_dst /tmp/j3_apkassets_dst2");
+    printLn("apkassets_test: ok");
+}

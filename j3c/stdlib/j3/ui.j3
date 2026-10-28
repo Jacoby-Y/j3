@@ -1,0 +1,2083 @@
+/// Immediate-mode labels, buttons, and boxes. One column per `begin`; `row` / `panel` / `card` / `scroll` push a stack.
+/// `@j3ui` function syntax: `j3c doc j3ui-immediate`. For CSS-styled retained `.j3ui` files, see `j3c doc j3ui`.
+/// Main thread only (`j3c doc threads`).
+
+module j3.ui;
+
+use j3.game.{
+    Camera, Color, Cursor, Font, Key, Mouse, Texture, clipboard, setCursor, drawRect, drawText, drawTextBold, drawTexture,
+    keyDown, keyPressed, mouseDown, mousePos, mousePressed, mouseReleased, mouseWheel, rgb, rgba,
+    setClipboard, setColor, textInput, textSize, textSizeBold, textTyped, ticks, windowSize,
+};
+use j3.math.{ Mat4, Vec2, Vec3, clamp, lerp, sqrt };
+use j3.memory.{ Arena, scratch };
+use j3.data.save.parseFloat;
+use j3.text.Text;
+use j3.sys.panic;
+
+/// How far `panel` insets its content.
+const PAD: f32 = 12;
+/// Layout frames `panel` and `row` may nest.
+const STACK: int = 8;
+/// Id frames `pushId` may nest. `0` is "no widget".
+const IDS: int = 8;
+
+/// Colors for text, buttons, and panel chrome.
+pub struct Theme {
+    /// Label and button caption.
+    text: Color;
+    /// Idle button and bar track.
+    button: Color;
+    /// Button under the cursor.
+    buttonHot: Color;
+    /// Button held down.
+    buttonDown: Color;
+    /// Panel fill.
+    panel: Color;
+    /// Panel outline.
+    edge: Color;
+    /// Panel hairline and bar fill.
+    accent: Color;
+
+    /// Dungeon menu colors. This is what `Ui.begin` starts with.
+    fn dusk(): Theme {
+        return Theme {
+            text: rgb(240, 230, 210),
+            button: rgb(36, 40, 52),
+            buttonHot: rgb(70, 80, 104),
+            buttonDown: rgb(22, 26, 36),
+            panel: rgb(16, 18, 24),
+            edge: rgb(48, 52, 64),
+            accent: rgb(90, 110, 150),
+        };
+    }
+
+    /// Warm yard colors used by the leaves HUD.
+    fn yard(): Theme {
+        return Theme {
+            text: rgb(236, 228, 206),
+            button: rgb(36, 48, 38),
+            buttonHot: rgb(58, 78, 56),
+            buttonDown: rgb(24, 32, 26),
+            panel: rgb(22, 28, 24),
+            edge: rgb(168, 132, 72),
+            accent: rgb(196, 154, 64),
+        };
+    }
+}
+
+/// Saved cursor under a `panel`, `card`, `row`, or `scroll`.
+struct UiFrame {
+    /// `0` panel or card, `1` row, `2` scroll.
+    kind: int;
+    /// Cursor x to restore when the frame ends.
+    x: f32;
+    /// Cursor y to restore when the frame ends.
+    y: f32;
+    /// Column width to restore.
+    w: f32;
+    /// Row height to restore.
+    h: f32;
+    /// Parent was laying out across.
+    across: bool;
+    /// Panel outer width. Unused for a row.
+    spanW: f32;
+    /// Panel outer height. Unused for a row.
+    spanH: f32;
+    /// Width consumed by a row's children.
+    usedW: f32;
+    /// Tallest child in a row.
+    usedH: f32;
+    /// Parent clip was active.
+    clip: bool;
+    /// Parent clip top.
+    clipTop: f32;
+    /// Parent clip bottom.
+    clipBot: f32;
+    /// Scroll slot id.
+    scrollId: int;
+    /// Scroll offset used for this frame.
+    scrollOff: f32;
+    /// Window top of a scroll frame.
+    winTop: f32;
+}
+
+/// Hot widget, held widget, and the id stack. Survives `Ui.begin` rebuilding the cursor.
+struct UiInput {
+    /// Widget under the cursor this frame. `0` is none.
+    hot: int;
+    /// Widget that received the press. Cleared when the button is up.
+    active: int;
+    /// Live `pushId` frames.
+    idTop: int;
+    /// Id salt, outermost first.
+    ids: [8]int;
+    /// Widget that receives keys. `0` is none.
+    focus: int;
+    /// Focusable ids drawn this frame.
+    order: [32]int;
+    /// Count of `order`.
+    norder: int;
+    /// Pointer position when a `drag` widget was pressed.
+    dragX: f32;
+    /// Pointer position when a `drag` widget was pressed.
+    dragY: f32;
+    /// A `field` held keyboard focus during the last frame.
+    typing: bool;
+    /// Set by `field` while drawing this frame; copied to `typing` by the next `begin`.
+    typingNow: bool;
+    /// The next `field` drawn takes focus (see `focusNext`).
+    grab: bool;
+    /// Select the focused text's whole text the next time it's edited (Tab, `focusNext`, a
+    /// number box switching to typing).
+    allSelected: bool;
+    /// The other end of the selection from `caret`; equal to it when nothing is selected.
+    anchor: int;
+    /// The last press in a text box, for double-clicks: which box, when, and where.
+    clickId: int;
+    clickAt: int;
+    clickX: f32;
+    /// While true, no widget sees the pointer (a popup owns it).
+    blocked: bool;
+    /// A `field` dropped typed text because it was full; cleared by `fieldFull`.
+    full: bool;
+    /// Byte offset of the caret in the focused text.
+    caret: int;
+    /// Widget `caret` belongs to; a different focused widget starts with the caret at the end.
+    caretFor: int;
+    /// Key being held for `repeated`.
+    held: Key;
+    /// `ticks()` when `held` repeats next.
+    heldAt: int;
+    /// `number` widget being typed into. `0` is none.
+    editing: int;
+    /// `number` widget the left button went down on.
+    numPress: int;
+    /// Pixels the pointer moved while `numPress` was held.
+    numMoved: f32;
+    /// The value when that drag started (or Shift last changed), and whether Shift was held.
+    numStart: f32;
+    numFine: bool;
+}
+
+/// Arena behind `numText`.
+#[singleton]
+let numMem: Arena;
+
+/// Text of the `number` widget being typed into.
+#[singleton]
+let numText: Text;
+
+/// One immediate UI per frame shares this. A second `begin` resets hot and the id stack.
+#[singleton]
+let uiInput: UiInput;
+
+/// How many scroll offsets we remember.
+const SCROLL_N: int = 16;
+
+/// Saved wheel offset for one `scroll` id.
+struct ScrollSlot {
+    /// False until this slot is used.
+    live: bool;
+    /// Caller id.
+    id: int;
+    /// Pixels the content has moved up.
+    off: f32;
+    /// Content height measured last frame. `0` until the first `end`.
+    span: f32;
+}
+
+/// Thumb drag for one `scroll`. `live` is false when the button is up.
+struct ScrollDrag {
+    /// True while the thumb or track is held.
+    live: bool;
+    /// Caller id of the `scroll` being dragged.
+    id: int;
+    /// Mouse y at the press.
+    grab: f32;
+    /// Offset at the press.
+    off: f32;
+}
+
+/// Scrollbar geometry for one window. `x` `y` `w` `h` are the track.
+struct BarGeom {
+    /// Track left.
+    x: f32;
+    /// Track top.
+    y: f32;
+    /// Track width.
+    w: f32;
+    /// Track height.
+    h: f32;
+    /// Thumb top.
+    thumbY: f32;
+    /// Thumb height.
+    thumbH: f32;
+    /// How far the content can move.
+    maxOff: f32;
+    /// How far the thumb can move.
+    travel: f32;
+}
+
+/// Scroll offsets survive `Ui.begin`.
+#[singleton]
+let scrollSlot: [16]ScrollSlot;
+
+/// Thumb drag survives `Ui.begin` while the button is held.
+#[singleton]
+let scrollDrag: ScrollDrag;
+
+/// Width reserved on the right of a `scroll` for the bar.
+const GUTTER: f32 = 14;
+
+/// Index of `id`, or -1.
+fn scrollFind(id: int): int {
+    let i = 0;
+    while i < SCROLL_N {
+        if scrollSlot[i].live && scrollSlot[i].id == id {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+/// Slot for `id`, creating one when missing. A full table reuses slot 0.
+fn scrollTake(id: int): int {
+    let have = scrollFind(id);
+    if have >= 0 {
+        return have;
+    }
+    let slot = 0;
+    let n = 0;
+    while n < SCROLL_N {
+        if !scrollSlot[n].live {
+            slot = n;
+            n = SCROLL_N;
+        } else {
+            n += 1;
+        }
+    }
+    scrollSlot[slot].live = true;
+    scrollSlot[slot].id = id;
+    scrollSlot[slot].off = 0;
+    scrollSlot[slot].span = 0;
+    return slot;
+}
+
+/// Stored offset for `id`, or 0.
+fn scrollGet(id: int): f32 {
+    let i = scrollFind(id);
+    if i < 0 {
+        return 0;
+    }
+    return scrollSlot[i].off;
+}
+
+/// Content height stored for `id`, or 0.
+fn scrollSpan(id: int): f32 {
+    let i = scrollFind(id);
+    if i < 0 {
+        return 0;
+    }
+    return scrollSlot[i].span;
+}
+
+/// Store `off` for `id`.
+fn scrollPut(id: int, off: f32) {
+    let slot = scrollTake(id);
+    scrollSlot[slot].off = off;
+}
+
+/// Store the measured content height for `id`.
+fn scrollMark(id: int, span: f32) {
+    let slot = scrollTake(id);
+    scrollSlot[slot].span = span;
+}
+
+/// Clamp a channel lerp into `0..255`.
+fn byte(v: f32): u8 {
+    let n = v;
+    if n < 0 {
+        n = 0;
+    }
+    if n > 255 {
+        n = 255;
+    }
+    return u8(int(n));
+}
+
+/// Lerp each channel. `t` is `0..1`.
+fn mixColor(a: Color, b: Color, t: f32): Color {
+    return rgba(
+        byte(lerp(f32(a.r), f32(b.r), t)),
+        byte(lerp(f32(a.g), f32(b.g), t)),
+        byte(lerp(f32(a.b), f32(b.b), t)),
+        byte(lerp(f32(a.a), f32(b.a), t)),
+    );
+}
+
+/// Keep a corner radius inside the rect.
+fn limitRadius(w: f32, h: f32, radius: f32): f32 {
+    let r = radius;
+    if r < 0 {
+        r = 0;
+    }
+    let cap = h * 0.5;
+    if w * 0.5 < cap {
+        cap = w * 0.5;
+    }
+    if r > cap {
+        r = cap;
+    }
+    return r;
+}
+
+/// How far a cap row sits in from the side. `row` is pixels from the cap edge.
+fn capInset(r: f32, row: f32): f32 {
+    let dy = r - row - 0.5;
+    if dy < 0 {
+        dy = 0;
+    }
+    let rest = r * r - dy * dy;
+    if rest < 0 {
+        rest = 0;
+    }
+    return r - sqrt(rest);
+}
+
+/// Side inset for one scanline of a rounded rect.
+fn rowInset(r: f32, h: f32, row: f32): f32 {
+    if r < 1 {
+        return 0;
+    }
+    let inset = f32(0);
+    if row < r {
+        inset = capInset(r, row);
+    }
+    let fromBot = h - row - 1;
+    if fromBot < r {
+        let b = capInset(r, fromBot);
+        if b > inset {
+            inset = b;
+        }
+    }
+    return inset;
+}
+
+/// Filled rounded rect. `radius` below 1 is a plain rect.
+fn fillRound(x: f32, y: f32, w: f32, h: f32, radius: f32, color: Color) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let r = limitRadius(w, h, radius);
+    if r < 1 {
+        setColor(color);
+        drawRect(Vec2 { x: x, y: y }, Vec2 { x: w, y: h });
+        return;
+    }
+    let ri = int(r);
+    if ri < 1 {
+        setColor(color);
+        drawRect(Vec2 { x: x, y: y }, Vec2 { x: w, y: h });
+        return;
+    }
+    setColor(color);
+    let mid = h - f32(ri) * 2;
+    if mid > 0 {
+        drawRect(Vec2 { x: x, y: y + f32(ri) }, Vec2 { x: w, y: mid });
+    }
+    let i = 0;
+    while i < ri {
+        let inset = capInset(r, f32(i));
+        let rw = w - inset * 2;
+        if rw > 0 {
+            drawRect(Vec2 { x: x + inset, y: y + f32(i) }, Vec2 { x: rw, y: 1 });
+            drawRect(Vec2 { x: x + inset, y: y + h - f32(i) - 1 }, Vec2 { x: rw, y: 1 });
+        }
+        i += 1;
+    }
+}
+
+/// Vertical gradient with rounded ends. One scanline per pixel.
+fn fillWash(x: f32, y: f32, w: f32, h: f32, top: Color, bottom: Color, radius: f32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let r = limitRadius(w, h, radius);
+    let n = int(h);
+    if n < 1 {
+        n = 1;
+    }
+    let i = 0;
+    while i < n {
+        let t = f32(0);
+        if n > 1 {
+            t = f32(i) / f32(n - 1);
+        }
+        let inset = rowInset(r, h, f32(i));
+        let rw = w - inset * 2;
+        if rw > 0 {
+            setColor(mixColor(top, bottom, t));
+            drawRect(Vec2 { x: x + inset, y: y + f32(i) }, Vec2 { x: rw, y: 1 });
+        }
+        i += 1;
+    }
+}
+
+/// Soft drop shadow under a rect. One pixel per layer so the edge fades instead of banding.
+/// Drawn before the fill so the fill covers the middle.
+fn fillShadow(x: f32, y: f32, w: f32, h: f32, radius: f32) {
+    let i = 12;
+    while i >= 1 {
+        let g = f32(i);
+        fillRound(
+            x - g * 0.45,
+            y + g * 0.3,
+            w + g * 0.9,
+            h + g * 0.65,
+            radius + g * 0.15,
+            rgba(0, 0, 0, byte(f32(14 + (13 - i) * 5))),
+        );
+        i -= 1;
+    }
+}
+
+/// Track and thumb for a scroll window.
+fn barGeom(winX: f32, winY: f32, winW: f32, winH: f32, off: f32, content: f32): BarGeom {
+    let trackW = f32(8);
+    let trackX = winX + winW - trackW - 3;
+    let trackY = winY + 3;
+    let trackH = winH - 6;
+    if trackH < 1 {
+        trackH = 1;
+    }
+    let thumbH = trackH;
+    if content > winH && content > 0 {
+        thumbH = trackH * (winH / content);
+        if thumbH < 16 {
+            thumbH = 16;
+        }
+        if thumbH > trackH {
+            thumbH = trackH;
+        }
+    }
+    let maxOff = content - winH;
+    if maxOff < 0 {
+        maxOff = 0;
+    }
+    let travel = trackH - thumbH;
+    if travel < 0 {
+        travel = 0;
+    }
+    let thumbY = trackY;
+    let shown = off;
+    if shown < 0 {
+        shown = 0;
+    }
+    if shown > maxOff {
+        shown = maxOff;
+    }
+    if maxOff > 0 && travel > 0 {
+        thumbY = trackY + travel * (shown / maxOff);
+    }
+    return BarGeom {
+        x: trackX,
+        y: trackY,
+        w: trackW,
+        h: trackH,
+        thumbY: thumbY,
+        thumbH: thumbH,
+        maxOff: maxOff,
+        travel: travel,
+    };
+}
+
+/// Draw the track and thumb.
+fn paintBar(g: BarGeom, track: Color, thumb: Color) {
+    fillRound(g.x, g.y, g.w, g.h, 3, track);
+    fillRound(g.x, g.thumbY, g.w, g.thumbH, 3, thumb);
+}
+
+/// Zero layout frame.
+fn blank(): UiFrame {
+    return UiFrame {
+        kind: 0,
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+        across: false,
+        spanW: 0,
+        spanH: 0,
+        usedW: 0,
+        usedH: 0,
+        clip: false,
+        clipTop: 0,
+        clipBot: 0,
+        scrollId: 0,
+        scrollOff: 0,
+        winTop: 0,
+    };
+}
+
+/// Drop hot and ids. Keep `active` and a scrollbar drag while the left button is held.
+/// Tab and shift-tab move `focus` through last frame's focusable widgets.
+fn armInput() {
+    if keyPressed(Key.Tab) && !keyDown(Key.Ctrl) && uiInput.norder > 0 {
+        let dir = 1;
+        if keyDown(Key.Shift) {
+            dir = 0 - 1;
+        }
+        moveFocus(dir);
+    }
+    uiInput.norder = 0;
+    uiInput.typing = uiInput.typingNow;
+    uiInput.typingNow = false;
+    textInput(false);
+    uiInput.hot = 0;
+    uiInput.idTop = 0;
+    if !mouseDown(Mouse.Left) {
+        uiInput.active = 0;
+        scrollDrag.live = false;
+    }
+}
+
+/// Step `focus` through `order` by `dir` (`1` or `-1`).
+fn moveFocus(dir: int) {
+    let at = 0;
+    let found = false;
+    let i = 0;
+    while i < uiInput.norder {
+        if uiInput.order[i] == uiInput.focus {
+            at = i;
+            found = true;
+        }
+        i += 1;
+    }
+    if !found {
+        uiInput.focus = uiInput.order[0];
+        return;
+    }
+    let next = at + dir;
+    if next < 0 {
+        next = uiInput.norder - 1;
+    }
+    if next >= uiInput.norder {
+        next = 0;
+    }
+    uiInput.focus = uiInput.order[next];
+}
+
+/// Remember `id` as focusable, in draw order.
+fn remember(id: int) {
+    if uiInput.norder >= 32 {
+        return;
+    }
+    uiInput.order[uiInput.norder] = id;
+    uiInput.norder = uiInput.norder + 1;
+}
+
+/// True on the frame `key` went down, then every 35 ms once it has been held for 400 ms.
+// ponytail: one held key at a time, which is all a text caret needs.
+fn repeated(key: Key): bool {
+    if keyPressed(key) {
+        uiInput.held = key;
+        uiInput.heldAt = ticks() + 400;
+        return true;
+    }
+    if !keyDown(key) || uiInput.held != key {
+        return false;
+    }
+    let now = ticks();
+    if now < uiInput.heldAt {
+        return false;
+    }
+    uiInput.heldAt = now + 35;
+    return true;
+}
+
+/// Bytes of `s` from `a` up to `b`.
+fn span(s: string, a: int, b: int): string {
+    return []u8 { ptr: (s.ptr as int + a) as &u8, len: b - a } as string;
+}
+
+/// Start of the UTF-8 character before byte `at` (which must be above 0).
+fn prevChar(s: string, at: int): int {
+    let i = at - 1;
+    while i > 0 && s[i] >= 128 && s[i] < 192 {
+        i -= 1;
+    }
+    return i;
+}
+
+/// Start of the UTF-8 character after the one at byte `at` (which must be inside `s`).
+fn nextChar(s: string, at: int): int {
+    let i = at + 1;
+    while i < s.len && s[i] >= 128 && s[i] < 192 {
+        i += 1;
+    }
+    return i;
+}
+
+/// Letters, digits, `_`, and any non-ASCII byte make up words for Ctrl+arrows and double-clicks.
+fn wordByte(b: u8): bool {
+    return (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b >= 128;
+}
+
+/// Start of the word before byte `at`, skipping spaces and punctuation first.
+fn wordBack(s: string, at: int): int {
+    let i = at;
+    while i > 0 && !wordByte(s[i - 1]) { i -= 1; }
+    while i > 0 && wordByte(s[i - 1]) { i -= 1; }
+    return i;
+}
+
+/// End of the word after byte `at`, skipping spaces and punctuation first.
+fn wordAhead(s: string, at: int): int {
+    let i = at;
+    while i < s.len && !wordByte(s[i]) { i += 1; }
+    while i < s.len && wordByte(s[i]) { i += 1; }
+    return i;
+}
+
+fn selStart(): int {
+    if uiInput.anchor < uiInput.caret { return uiInput.anchor; }
+    return uiInput.caret;
+}
+
+fn selEnd(): int {
+    if uiInput.anchor > uiInput.caret { return uiInput.anchor; }
+    return uiInput.caret;
+}
+
+/// Put the caret at `at`, dragging the selection along when `extend`, else dropping it.
+fn moveCaret(at: int, extend: bool) {
+    uiInput.caret = at;
+    if !extend { uiInput.anchor = at; }
+}
+
+/// Remove the selected bytes of `text`. True when there was a selection.
+fn cutSelection(text: &Text): bool {
+    let a = selStart();
+    let b = selEnd();
+    if a == b { return false; }
+    text.remove(a, b - a);
+    moveCaret(a, false);
+    return true;
+}
+
+/// Apply this frame's typing, clipboard, and caret keys to `text`, which widget `id` edits,
+/// like a desktop text box: Shift selects, Ctrl moves and deletes by words, typing and
+/// pasting replace the selection. Keeps it at most `limit` bytes. True when the text changes.
+fn editText(id: int, text: &Text, limit: int): bool {
+    textInput(true);
+    uiInput.typingNow = true;
+    if uiInput.caretFor != id || uiInput.caret > text.len() || uiInput.caret < 0 {
+        uiInput.caretFor = id;
+        moveCaret(text.len(), false);
+    }
+    if uiInput.allSelected {
+        uiInput.allSelected = false;
+        uiInput.anchor = 0;
+        uiInput.caret = text.len();
+    }
+    if uiInput.anchor < 0 || uiInput.anchor > text.len() { uiInput.anchor = uiInput.caret; }
+    let changed = false;
+    let ctrl = keyDown(Key.Ctrl);
+    let shift = keyDown(Key.Shift);
+    if ctrl && keyPressed(Key.A) {
+        uiInput.anchor = 0;
+        uiInput.caret = text.len();
+    }
+    if ctrl && (keyPressed(Key.C) || keyPressed(Key.X)) && selStart() < selEnd() {
+        setClipboard(span(text.str(), selStart(), selEnd()));
+        if keyPressed(Key.X) && cutSelection(text) { changed = true; }
+    }
+    let typed = textTyped();
+    if ctrl && keyPressed(Key.V) {
+        typed = clipboard();
+    }
+    let back = repeated(Key.Backspace);
+    let forward = repeated(Key.Delete);
+    if (typed.len > 0 || back || forward) && cutSelection(text) {
+        changed = true;
+        back = false;
+        forward = false;
+    }
+    let at = uiInput.caret;
+    if back && at > 0 {
+        let from = prevChar(text.str(), at);
+        if ctrl { from = wordBack(text.str(), at); }
+        text.remove(from, at - from);
+        moveCaret(from, false);
+        changed = true;
+    } else if forward && at < text.len() {
+        let to = nextChar(text.str(), at);
+        if ctrl { to = wordAhead(text.str(), at); }
+        text.remove(at, to - at);
+        changed = true;
+    }
+    let s = text.str();
+    if repeated(Key.Left) {
+        if selStart() < selEnd() && !shift {
+            moveCaret(selStart(), false);
+        } else if uiInput.caret > 0 {
+            if ctrl { moveCaret(wordBack(s, uiInput.caret), shift); }
+            else { moveCaret(prevChar(s, uiInput.caret), shift); }
+        }
+    }
+    if repeated(Key.Right) {
+        if selStart() < selEnd() && !shift {
+            moveCaret(selEnd(), false);
+        } else if uiInput.caret < s.len {
+            if ctrl { moveCaret(wordAhead(s, uiInput.caret), shift); }
+            else { moveCaret(nextChar(s, uiInput.caret), shift); }
+        }
+    }
+    if keyPressed(Key.Home) { moveCaret(0, shift); }
+    if keyPressed(Key.End) { moveCaret(s.len, shift); }
+    // Control bytes (pasted newlines and tabs) are dropped.
+    let i = 0;
+    while i < typed.len {
+        if typed[i] >= 32 {
+            if text.len() >= limit {
+                uiInput.full = true;
+                break;
+            }
+            text.insert(uiInput.caret, span(typed, i, i + 1));
+            moveCaret(uiInput.caret + 1, false);
+            changed = true;
+        }
+        i += 1;
+    }
+    return changed;
+}
+
+/// True when a text `field` had keyboard focus last frame. Gate single-key shortcuts on this.
+pub fn typing(): bool {
+    return uiInput.typing;
+}
+
+/// True once after a `field` refused typing because it holds 240 bytes already.
+pub fn fieldFull(): bool {
+    let was = uiInput.full;
+    uiInput.full = false;
+    return was;
+}
+
+/// Drop keyboard focus, e.g. when the user clicks outside every widget.
+pub fn clearFocus() {
+    // A number being typed into is committed when focus moves away, unless Escape did it.
+    if keyPressed(Key.Escape) {
+        uiInput.editing = 0;
+    }
+    uiInput.focus = 0;
+    uiInput.typing = false;
+}
+
+/// Give keyboard focus to the next `field` drawn, with its text selected so typing replaces it.
+pub fn focusNext() {
+    uiInput.grab = true;
+}
+
+/// True when a widget was under the cursor this frame.
+pub fn hovering(): bool {
+    return uiInput.hot != 0;
+}
+
+/// Hide the pointer from widgets until `block(false)`, e.g. while a popup menu is open.
+pub fn block(on: bool) {
+    uiInput.blocked = on;
+}
+
+/// Pointer movement since the active drag started. Zero when nothing is held.
+pub fn dragDelta(): Vec2 {
+    if !mouseDown(Mouse.Left) {
+        return Vec2 { x: 0, y: 0 };
+    }
+    let mp = mousePos();
+    return Vec2 { x: mp.x - uiInput.dragX, y: mp.y - uiInput.dragY };
+}
+
+/// True when the cursor is inside the rect.
+fn inside(pos: Vec2, size: Vec2): bool {
+    if uiInput.blocked {
+        return false;
+    }
+    let mp = mousePos();
+    return mp.x >= pos.x && mp.x <= pos.x + size.x && mp.y >= pos.y && mp.y <= pos.y + size.y;
+}
+
+/// Immediate-mode widgets. `begin` starts a downward column.
+pub struct Ui {
+    /// Left edge of the next widget.
+    x: f32;
+    /// Top edge of the next widget.
+    y: f32;
+    /// Column width. Row widgets size to their text instead.
+    w: f32;
+    /// Row height.
+    h: f32;
+    /// Extra pixels below each widget or row in a column. Default 0.
+    space: f32;
+    /// When true, `number` shows whole numbers.
+    whole: bool;
+    /// Font for text. `raw == 0` draws a rectangle instead of glyphs.
+    font: Font;
+    /// When true, `label` uses the emboldened face.
+    heavy: bool;
+    /// Colors. Assign after `begin` to restyle a column.
+    theme: Theme;
+    /// True while laying out a `row`.
+    across: bool;
+    /// Nested `panel` / `row` / `scroll` frames.
+    depth: int;
+    /// Layout stack. Read only up to `depth`.
+    stack: [8]UiFrame;
+    /// True inside a `scroll` window.
+    clip: bool;
+    /// Top of the open scroll window.
+    clipTop: f32;
+    /// Bottom of the open scroll window.
+    clipBot: f32;
+
+    /// Start a column at `(x, y)` with width 220, row height 28, and `Theme.dusk`.
+    fn begin(font: Font, x: f32, y: f32): Ui {
+        armInput();
+        let frame = blank();
+        return Ui {
+            x: x,
+            y: y,
+            w: 220,
+            h: 28,
+            space: 0,
+            whole: false,
+            font: font,
+            heavy: false,
+            theme: Theme.dusk(),
+            across: false,
+            depth: 0,
+            stack: [frame, frame, frame, frame, frame, frame, frame, frame],
+            clip: false,
+            clipTop: 0,
+            clipBot: 0,
+        };
+    }
+
+    /// True when the row overlaps the open scroll window.
+    fn shown(this: &Ui, y: f32, h: f32): bool {
+        if !this.clip {
+            return true;
+        }
+        if y + h <= this.clipTop {
+            return false;
+        }
+        if y >= this.clipBot {
+            return false;
+        }
+        return true;
+    }
+
+    /// Hash `msg` with the `pushId` salt. `0` is reserved for "no widget".
+    fn widget(this: &Ui, msg: string): int {
+        let h = 2166136261;
+        let i = 0;
+        while i < msg.len {
+            h = h * 16777619 + int(msg[i]);
+            i += 1;
+        }
+        let n = 0;
+        while n < uiInput.idTop {
+            h = h * 16777619 + uiInput.ids[n];
+            n += 1;
+        }
+        if h == 0 {
+            h = 1;
+        }
+        return h;
+    }
+
+    /// Push `n` onto the id salt so repeated labels stay distinct.
+    fn pushId(this: &Ui, n: int) {
+        if uiInput.idTop >= IDS {
+            panic("ui id");
+        }
+        uiInput.ids[uiInput.idTop] = n;
+        uiInput.idTop = uiInput.idTop + 1;
+    }
+
+    /// Pop the id salt pushed by `pushId`.
+    fn popId(this: &Ui) {
+        if uiInput.idTop == 0 {
+            panic("ui id");
+        }
+        uiInput.idTop = uiInput.idTop - 1;
+    }
+
+    /// Measured text width, or 120 when there is no font.
+    fn words(this: &Ui, msg: string): f32 {
+        if this.font.raw == 0 {
+            return 120;
+        }
+        let sz = textSize(this.font, msg);
+        if this.heavy {
+            sz = textSizeBold(this.font, msg);
+        }
+        if sz.x < 1 {
+            return 8;
+        }
+        return sz.x;
+    }
+
+    /// Advance the cursor by `dw` across or `dh` down. A row records the span.
+    fn place(this: &Ui, dw: f32, dh: f32) {
+        if this.across {
+            this.x = this.x + dw;
+            if this.depth > 0 {
+                let top = this.depth - 1;
+                this.stack[top].usedW = this.stack[top].usedW + dw;
+                if dh > this.stack[top].usedH {
+                    this.stack[top].usedH = dh;
+                }
+            }
+        } else {
+            this.y = this.y + dh;
+            if dh > 0 {
+                this.y = this.y + this.space;
+            }
+        }
+    }
+
+    /// Remember the cursor and start a nested frame of `kind` (`0` panel, `1` row).
+    fn open(this: &Ui, kind: int, bw: f32, bh: f32) {
+        if this.depth >= STACK {
+            panic("ui stack");
+        }
+        let at = this.depth;
+        this.stack[at].kind = kind;
+        this.stack[at].x = this.x;
+        this.stack[at].y = this.y;
+        this.stack[at].w = this.w;
+        this.stack[at].h = this.h;
+        this.stack[at].across = this.across;
+        this.stack[at].spanW = bw;
+        this.stack[at].spanH = bh;
+        this.stack[at].usedW = 0;
+        this.stack[at].usedH = 0;
+        this.stack[at].clip = false;
+        this.stack[at].clipTop = 0;
+        this.stack[at].clipBot = 0;
+        this.stack[at].scrollId = 0;
+        this.stack[at].scrollOff = 0;
+        this.stack[at].winTop = 0;
+        this.depth = at + 1;
+    }
+
+    /// Draw a bordered panel and inset the cursor. Pair with `end`.
+    fn panel(this: &Ui, w: f32, h: f32) {
+        let x = this.x;
+        let y = this.y;
+        if this.shown(y, h) {
+            setColor(this.theme.edge);
+            drawRect(Vec2 { x: x - 3, y: y - 3 }, Vec2 { x: w + 6, y: h + 6 });
+            setColor(this.theme.panel);
+            drawRect(Vec2 { x: x, y: y }, Vec2 { x: w, y: h });
+            setColor(this.theme.accent);
+            drawRect(Vec2 { x: x, y: y }, Vec2 { x: w, y: 4 });
+        }
+        this.open(0, w, h);
+        this.x = x + PAD;
+        this.y = y + PAD;
+        let inner = w - PAD * 2;
+        if inner < 0 {
+            inner = 0;
+        }
+        this.w = inner;
+        this.across = false;
+    }
+
+    /// Lay the next widgets out left to right. Pair with `end`.
+    fn row(this: &Ui) {
+        this.open(1, 0, 0);
+        this.across = true;
+    }
+
+    /// Open a window `height` pixels tall. Wheel over it scrolls. Pair with `end`.
+    /// Rows fully outside the window are not drawn. A bar on the right shows the
+    /// offset; drag the thumb or click the track. The content column is `GUTTER` narrower.
+    fn scroll(this: &Ui, id: int, height: f32) {
+        let winX = this.x;
+        let winY = this.y;
+        let winW = this.w;
+        let off = scrollGet(id);
+        let span = scrollSpan(id);
+        let g = barGeom(winX, winY, winW, height, off, span);
+        let mp = mousePos();
+        if mp.x >= winX && mp.x <= winX + winW && mp.y >= winY && mp.y <= winY + height {
+            let wheel = mouseWheel();
+            if wheel != 0 {
+                off = clamp(off - wheel * this.h, 0, g.maxOff);
+                scrollPut(id, off);
+            }
+        }
+        let gutter = inside(Vec2 { x: winX + winW - GUTTER, y: winY }, Vec2 { x: GUTTER, y: height });
+        if gutter && mousePressed(Mouse.Left) {
+            scrollDrag.live = true;
+            scrollDrag.id = id;
+            scrollDrag.grab = mp.y;
+            scrollDrag.off = off;
+            let onThumb = mp.y >= g.thumbY && mp.y <= g.thumbY + g.thumbH;
+            if !onThumb && g.travel > 0 {
+                let t = (mp.y - g.y - g.thumbH * 0.5) / g.travel;
+                off = clamp(t, 0, 1) * g.maxOff;
+                scrollDrag.off = off;
+                scrollDrag.grab = mp.y;
+                scrollPut(id, off);
+            }
+        }
+        if scrollDrag.live && scrollDrag.id == id && mouseDown(Mouse.Left) {
+            if g.travel > 0 {
+                off = scrollDrag.off + (mp.y - scrollDrag.grab) * (g.maxOff / g.travel);
+            }
+            off = clamp(off, 0, g.maxOff);
+            scrollPut(id, off);
+        }
+        this.open(2, winW, height);
+        let at = this.depth - 1;
+        this.stack[at].clip = this.clip;
+        this.stack[at].clipTop = this.clipTop;
+        this.stack[at].clipBot = this.clipBot;
+        this.stack[at].scrollId = id;
+        this.stack[at].scrollOff = off;
+        this.stack[at].winTop = winY;
+        this.clip = true;
+        this.clipTop = winY;
+        this.clipBot = winY + height;
+        this.y = winY - off;
+        this.w = winW - GUTTER;
+        if this.w < 0 {
+            this.w = 0;
+        }
+        this.across = false;
+    }
+
+    /// Close the matching `panel`, `card`, `row`, or `scroll`. Panics if the stack is empty.
+    fn end(this: &Ui) {
+        if this.depth == 0 {
+            panic("ui end");
+        }
+        this.depth = this.depth - 1;
+        let at = this.depth;
+        let kind = this.stack[at].kind;
+        let sx = this.stack[at].x;
+        let sy = this.stack[at].y;
+        let sw = this.stack[at].w;
+        let sh = this.stack[at].h;
+        let parent = this.stack[at].across;
+        let bw = this.stack[at].spanW;
+        let bh = this.stack[at].spanH;
+        if kind == 1 {
+            bw = this.stack[at].usedW;
+            bh = this.stack[at].usedH;
+        }
+        if kind == 2 {
+            let content = (this.y + this.stack[at].scrollOff) - this.stack[at].winTop;
+            let maxOff = content - bh;
+            if maxOff < 0 {
+                maxOff = 0;
+            }
+            let shown = this.stack[at].scrollOff;
+            if shown > maxOff {
+                shown = maxOff;
+                scrollPut(this.stack[at].scrollId, maxOff);
+            }
+            scrollMark(this.stack[at].scrollId, content);
+            let g = barGeom(sx, sy, bw, bh, shown, content);
+            let thumb = this.theme.accent;
+            let mp = mousePos();
+            if mp.x >= g.x && mp.x <= g.x + g.w && mp.y >= g.thumbY && mp.y <= g.thumbY + g.thumbH {
+                thumb = mixColor(this.theme.accent, this.theme.text, 0.4);
+            }
+            if scrollDrag.live && scrollDrag.id == this.stack[at].scrollId {
+                thumb = this.theme.text;
+            }
+            if maxOff > 0 {
+                paintBar(g, this.theme.button, thumb);
+            }
+            this.clip = this.stack[at].clip;
+            this.clipTop = this.stack[at].clipTop;
+            this.clipBot = this.stack[at].clipBot;
+        }
+        this.x = sx;
+        this.y = sy;
+        this.w = sw;
+        this.h = sh;
+        this.across = parent;
+        this.place(bw, bh);
+    }
+
+    /// `v` as `number` shows it: two decimals, or rounded when `whole`.
+    fn shownNumber(this: &Ui, v: f32): string {
+        if !this.whole {
+            return fixed2(v);
+        }
+        let t = Text.new(scratch(0));
+        let n = v + 0.5;
+        if v < 0 {
+            n = v - 0.5;
+        }
+        t.pushInt(int(n));
+        return t.str();
+    }
+
+    /// Move the cursor by `n` pixels along the current axis.
+    fn gap(this: &Ui, n: f32) {
+        if this.across {
+            this.place(n, 0);
+        } else {
+            this.y = this.y + n;
+        }
+    }
+
+    /// Draw `msg` and advance one row, or the text width inside a `row`.
+    fn label(this: &Ui, msg: string) {
+        let wide = this.w;
+        if this.across {
+            wide = this.words(msg);
+        }
+        if this.shown(this.y, this.h) {
+            if this.font.raw != 0 {
+                setColor(this.theme.text);
+                if this.heavy {
+                    drawTextBold(this.font, Vec2 { x: this.x, y: this.y }, msg);
+                } else {
+                    drawText(this.font, Vec2 { x: this.x, y: this.y }, msg);
+                }
+            } else {
+                setColor(this.theme.text);
+                let bar = wide;
+                if !this.across {
+                    bar = 120;
+                }
+                drawRect(Vec2 { x: this.x, y: this.y }, Vec2 { x: bar, y: 16 });
+            }
+        }
+        if this.across {
+            this.place(wide + 8, this.h);
+        } else {
+            this.place(this.w, this.h);
+        }
+    }
+
+    /// Draw `msg` with SDL_ttf's bold style, then advance like `label`.
+    fn labelBold(this: &Ui, msg: string) {
+        this.heavy = true;
+        this.label(msg);
+        this.heavy = false;
+    }
+
+    /// Draw a button. Mouse click, or Enter/Space while focused with Tab, activates it.
+    fn button(this: &Ui, msg: string): bool {
+        let wide = this.w;
+        if this.across {
+            wide = this.words(msg) + 16;
+        }
+        let pos = Vec2 { x: this.x, y: this.y };
+        let size = Vec2 { x: wide, y: this.h };
+        let id = this.widget(msg);
+        remember(id);
+        let hit = false;
+        if this.shown(pos.y, size.y) {
+            hit = inside(pos, size);
+        }
+        if hit {
+            uiInput.hot = id;
+        }
+        let clicked = false;
+        // A mouse click drops keyboard focus, so a later Enter does not click the button again.
+        if hit && mousePressed(Mouse.Left) {
+            uiInput.active = id;
+            uiInput.focus = 0;
+            clicked = true;
+        }
+        if uiInput.focus == id && (keyPressed(Key.Enter) || keyPressed(Key.Space)) {
+            clicked = true;
+        }
+        if uiInput.active == id {
+            setColor(this.theme.buttonDown);
+        } else if hit || uiInput.focus == id {
+            setColor(this.theme.buttonHot);
+        } else {
+            setColor(this.theme.button);
+        }
+        if this.shown(pos.y, size.y) {
+            drawRect(pos, size);
+            if this.font.raw != 0 {
+                setColor(this.theme.text);
+                drawText(this.font, Vec2 { x: pos.x + 8, y: pos.y + 4 }, msg);
+            }
+        }
+        if this.across {
+            this.place(wide + 6, this.h);
+        } else {
+            this.place(wide, this.h + 6);
+        }
+        return clicked;
+    }
+
+    /// Width of `s` in pixels, 0 when empty.
+    fn width(this: &Ui, s: string): f32 {
+        if s.len == 0 { return 0; }
+        return this.words(s);
+    }
+
+    /// First byte of `s` shown in a box `room` wide: the tail when it fits, but never past
+    /// `caret`.
+    fn shownFrom(this: &Ui, s: string, caret: int, room: f32): int {
+        let start = 0;
+        while start < s.len && this.words(span(s, start, s.len)) > room {
+            start = nextChar(s, start);
+        }
+        if start > caret { start = caret; }
+        return start;
+    }
+
+    /// The caret position in `s` nearest to `x` pixels right of where byte `start` is drawn.
+    fn caretAt(this: &Ui, s: string, start: int, x: f32): int {
+        let best = start;
+        let gap = x;
+        if gap < 0 { gap = 0 - gap; }
+        let i = start;
+        while i < s.len {
+            i = nextChar(s, i);
+            let d = this.width(span(s, start, i)) - x;
+            if d < 0 { d = 0 - d; }
+            if d < gap {
+                gap = d;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    /// Draw `s` inside a text box, scrolled so the caret stays in view when `focused`, with
+    /// the selection highlighted.
+    fn editBox(this: &Ui, pos: Vec2, size: Vec2, s: string, focused: bool) {
+        let room = size.x - 20;
+        let caret = s.len;
+        if focused && uiInput.caret >= 0 && uiInput.caret < s.len {
+            caret = uiInput.caret;
+        }
+        let start = this.shownFrom(s, caret, room);
+        let end = s.len;
+        while end > caret && this.words(span(s, start, end)) > room {
+            end = prevChar(s, end);
+        }
+        let shown = span(s, start, end);
+        if focused && selStart() < selEnd() {
+            let a = selStart();
+            let b = selEnd();
+            if a < start { a = start; }
+            if b > end { b = end; }
+            if a < b {
+                let x0 = pos.x + 8 + this.width(span(s, start, a));
+                let x1 = pos.x + 8 + this.width(span(s, start, b));
+                setColor(mixColor(this.theme.accent, this.theme.buttonDown, 0.35));
+                drawRect(Vec2 { x: x0, y: pos.y + 4 }, Vec2 { x: x1 - x0 + 1, y: size.y - 8 });
+            }
+        }
+        setColor(this.theme.text);
+        if shown.len > 0 {
+            drawText(this.font, Vec2 { x: pos.x + 8, y: pos.y + 4 }, shown);
+        }
+        if focused {
+            let x = pos.x + 9 + this.width(span(s, start, caret));
+            drawRect(Vec2 { x: x, y: pos.y + 5 }, Vec2 { x: 1, y: size.y - 10 });
+        }
+    }
+
+    /// True while the widget `label` (under the current `pushId` salt) has keyboard focus,
+    /// e.g. to act on Enter in a `field`.
+    fn focused(this: &Ui, label: string): bool {
+        return uiInput.focus == this.widget(label);
+    }
+
+    /// Edit `text`. Click or tab to focus. Returns true when the buffer changes.
+    fn field(this: &Ui, label: string, text: &Text): bool {
+        let wide = this.w;
+        if this.across && this.depth > 0 {
+            // In a row, the field takes what's left of it; put buttons before the field.
+            let top = this.depth - 1;
+            wide = this.stack[top].x + this.stack[top].w - this.x;
+            if wide < 60 {
+                wide = 60;
+            }
+        } else if this.across {
+            wide = 180;
+        }
+        let pos = Vec2 { x: this.x, y: this.y };
+        let size = Vec2 { x: wide, y: this.h };
+        let id = this.widget(label);
+        remember(id);
+        let hit = false;
+        if this.shown(pos.y, size.y) {
+            hit = inside(pos, size);
+        }
+        if hit {
+            uiInput.hot = id;
+            setCursor(Cursor.Text);
+        }
+        if hit && mousePressed(Mouse.Left) {
+            let was = uiInput.focus == id && uiInput.caretFor == id;
+            let mp = mousePos();
+            let s = text.str();
+            let before = s.len;
+            if was { before = uiInput.caret; }
+            // Where the click lands in the text as it's shown now.
+            let start = this.shownFrom(s, before, size.x - 20);
+            let at = this.caretAt(s, start, mp.x - pos.x - 8);
+            let now = ticks();
+            let twice = was && uiInput.clickId == id && now - uiInput.clickAt < 400
+                && mp.x - uiInput.clickX < 4 && uiInput.clickX - mp.x < 4;
+            uiInput.focus = id;
+            uiInput.active = id;
+            uiInput.allSelected = false;
+            uiInput.caretFor = id;
+            if twice {
+                // Double-click: the word under the pointer.
+                let a = at;
+                while a > 0 && wordByte(s[a - 1]) { a -= 1; }
+                let b = at;
+                while b < s.len && wordByte(s[b]) { b += 1; }
+                uiInput.anchor = a;
+                uiInput.caret = b;
+                uiInput.clickId = 0;
+            } else {
+                moveCaret(at, was && keyDown(Key.Shift));
+                uiInput.clickId = id;
+                uiInput.clickAt = now;
+                uiInput.clickX = mp.x;
+            }
+        } else if uiInput.active == id && uiInput.focus == id && mouseDown(Mouse.Left) && uiInput.clickId == id {
+            // Dragging selects.
+            let held = mousePos();
+            let shownText = text.str();
+            let first = this.shownFrom(shownText, uiInput.caret, size.x - 20);
+            uiInput.caret = this.caretAt(shownText, first, held.x - pos.x - 8);
+        }
+        if uiInput.grab {
+            uiInput.grab = false;
+            uiInput.focus = id;
+            uiInput.caretFor = 0;
+            uiInput.allSelected = true;
+        }
+        let changed = false;
+        if uiInput.focus == id && keyPressed(Key.Enter) {
+            uiInput.focus = 0;
+        }
+        if uiInput.focus == id {
+            changed = editText(id, text, 240);
+        }
+        if this.shown(pos.y, size.y) {
+            if uiInput.focus == id {
+                setColor(this.theme.buttonDown);
+            } else if hit {
+                setColor(this.theme.buttonHot);
+            } else {
+                setColor(this.theme.button);
+            }
+            drawRect(pos, size);
+            if uiInput.focus == id {
+                setColor(this.theme.accent);
+                drawRect(Vec2 { x: pos.x, y: pos.y + size.y - 2 }, Vec2 { x: size.x, y: 2 });
+            }
+            if this.font.raw != 0 {
+                if text.len() == 0 && uiInput.focus != id {
+                    setColor(mixColor(this.theme.text, this.theme.button, 0.5));
+                    drawText(this.font, Vec2 { x: pos.x + 8, y: pos.y + 4 }, label);
+                } else {
+                    this.editBox(pos, size, text.str(), uiInput.focus == id);
+                }
+            }
+        }
+        if this.across {
+            this.place(wide + 6, this.h);
+        } else {
+            this.place(wide, this.h + 6);
+        }
+        return changed;
+    }
+
+    /// Hold to drag. True while the pointer is down on this widget. `dragDelta` is the motion.
+    fn drag(this: &Ui, label: string): bool {
+        let wide = this.w;
+        if this.across {
+            wide = this.words(label) + 16;
+        }
+        let pos = Vec2 { x: this.x, y: this.y };
+        let size = Vec2 { x: wide, y: this.h };
+        let id = this.widget(label);
+        let hit = false;
+        if this.shown(pos.y, size.y) {
+            hit = inside(pos, size);
+        }
+        if hit && mousePressed(Mouse.Left) {
+            uiInput.active = id;
+            let mp = mousePos();
+            uiInput.dragX = mp.x;
+            uiInput.dragY = mp.y;
+        }
+        let held = uiInput.active == id && mouseDown(Mouse.Left);
+        if this.shown(pos.y, size.y) {
+            if held {
+                setColor(this.theme.buttonDown);
+            } else if hit {
+                setColor(this.theme.buttonHot);
+            } else {
+                setColor(this.theme.button);
+            }
+            drawRect(pos, size);
+            if this.font.raw != 0 {
+                setColor(this.theme.text);
+                drawText(this.font, Vec2 { x: pos.x + 8, y: pos.y + 4 }, label);
+            }
+        }
+        if this.across {
+            this.place(wide + 6, this.h);
+        } else {
+            this.place(wide, this.h + 6);
+        }
+        return held;
+    }
+
+    /// Draw `msg` at a world point. Does not advance the layout cursor.
+    fn worldLabel(this: &Ui, cam: Camera, world: Vec2, msg: string) {
+        if this.font.raw == 0 {
+            return;
+        }
+        let at = cam.toScreen(world);
+        setColor(this.theme.text);
+        drawText(this.font, at, msg);
+    }
+
+    /// Draw `msg` at a 3D point projected by `viewProj`. Skips points behind the camera.
+    fn worldLabel3(this: &Ui, viewProj: Mat4, world: Vec3, msg: string) {
+        if this.font.raw == 0 {
+            return;
+        }
+        let w = viewProj.m[3] * world.x + viewProj.m[7] * world.y + viewProj.m[11] * world.z + viewProj.m[15];
+        if w <= 0 {
+            return;
+        }
+        let ndc = viewProj.transformPoint(world);
+        let win = windowSize();
+        let sx = (ndc.x * 0.5 + 0.5) * win.x;
+        let sy = (f32(1) - (ndc.y * 0.5 + 0.5)) * win.y;
+        setColor(this.theme.text);
+        drawText(this.font, Vec2 { x: sx, y: sy }, msg);
+    }
+
+    /// Draw a 0..1 track in `accent` over the `button` color, then advance one row.
+    fn bar(this: &Ui, frac: f32) {
+        let t = clamp(frac, 0, 1);
+        let wide = this.w;
+        if this.across {
+            wide = 160;
+        }
+        if this.shown(this.y, 10) {
+            setColor(this.theme.button);
+            drawRect(Vec2 { x: this.x, y: this.y }, Vec2 { x: wide, y: 10 });
+            setColor(this.theme.accent);
+            drawRect(Vec2 { x: this.x, y: this.y }, Vec2 { x: wide * t, y: 10 });
+        }
+        if this.across {
+            this.place(wide + 8, this.h);
+        } else {
+            this.place(wide, this.h);
+        }
+    }
+
+    /// Draw `tex` at the cursor and advance by its height, or its width inside a `row`.
+    fn image(this: &Ui, tex: Texture) {
+        if this.shown(this.y, f32(tex.h)) {
+            drawTexture(tex, Vec2 { x: this.x, y: this.y });
+        }
+        let tw = f32(tex.w);
+        let th = f32(tex.h);
+        if this.across {
+            this.place(tw, th);
+        } else {
+            this.place(this.w, th);
+        }
+    }
+
+    /// Drag a value in `lo..hi`. Returns true when `value` changes.
+    fn slider(this: &Ui, label: string, value: &f32, lo: f32, hi: f32): bool {
+        let wide = this.w;
+        if this.across {
+            wide = 160;
+        }
+        let pos = Vec2 { x: this.x, y: this.y };
+        let size = Vec2 { x: wide, y: this.h };
+        let id = this.widget(label);
+        let hit = false;
+        if this.shown(pos.y, size.y) {
+            hit = inside(pos, size);
+        }
+        if hit {
+            uiInput.hot = id;
+        }
+        if hit && mousePressed(Mouse.Left) {
+            uiInput.active = id;
+        }
+        let changed = false;
+        if uiInput.active == id && mouseDown(Mouse.Left) {
+            let mp = mousePos();
+            let t = f32(0);
+            if size.x > 0 {
+                t = clamp((mp.x - pos.x) / size.x, 0, 1);
+            }
+            let next = lo + (hi - lo) * t;
+            if next != *value {
+                *value = next;
+                changed = true;
+            }
+        }
+        let span = hi - lo;
+        let fill = f32(0);
+        if span != 0 {
+            fill = clamp((*value - lo) / span, 0, 1);
+        }
+        if this.shown(pos.y, size.y) {
+            setColor(this.theme.button);
+            drawRect(pos, size);
+            setColor(this.theme.accent);
+            drawRect(pos, Vec2 { x: wide * fill, y: this.h });
+            if this.font.raw != 0 {
+                setColor(this.theme.text);
+                drawText(this.font, Vec2 { x: pos.x + 8, y: pos.y + 4 }, label);
+            }
+        }
+        if this.across {
+            this.place(wide + 6, this.h);
+        } else {
+            this.place(wide, this.h + 6);
+        }
+        return changed;
+    }
+
+    /// Drag left/right to change `value` by `speed` per pixel; shift drags 10x finer.
+    /// Shows `label` on the left and the value on the right. Returns true when `value` changes.
+    /// Inside a `row` it is 84 pixels wide.
+    fn number(this: &Ui, label: string, value: &f32, speed: f32): bool {
+        let wide = this.w;
+        if this.across {
+            wide = 84;
+        }
+        let pos = Vec2 { x: this.x, y: this.y };
+        let size = Vec2 { x: wide, y: this.h };
+        let id = this.widget(label);
+        let hit = false;
+        if this.shown(pos.y, size.y) {
+            hit = inside(pos, size);
+        }
+        if hit {
+            uiInput.hot = id;
+            if uiInput.editing != id { setCursor(Cursor.ResizeAcross); }
+        }
+        let mp = mousePos();
+        let changed = false;
+        // Typing ends on Enter or when focus moves away, and Escape drops the typed text.
+        if uiInput.editing == id {
+            if uiInput.focus == id && keyPressed(Key.Escape) {
+                uiInput.editing = 0;
+                uiInput.focus = 0;
+            } else if uiInput.focus != id || keyPressed(Key.Enter) {
+                let typed = numText.str() as []u8;
+                if hasDigit(typed) {
+                    *value = parseFloat(typed, 0);
+                    changed = true;
+                }
+                uiInput.editing = 0;
+                if uiInput.focus == id {
+                    uiInput.focus = 0;
+                }
+            }
+        }
+        let editing = uiInput.editing == id;
+        if editing {
+            remember(id);
+            editText(id, &numText, 24);
+        }
+        if hit && mousePressed(Mouse.Left) && !editing {
+            uiInput.active = id;
+            uiInput.dragX = mp.x;
+            uiInput.numPress = id;
+            uiInput.numMoved = 0;
+            uiInput.numStart = *value;
+            uiInput.numFine = keyDown(Key.Shift);
+        }
+        if uiInput.active == id && mouseDown(Mouse.Left) && !editing {
+            // Measured from where the drag started, so callers that round (whole numbers)
+            // still move once the pointer has gone far enough.
+            let fine = keyDown(Key.Shift);
+            if fine != uiInput.numFine {
+                uiInput.numFine = fine;
+                uiInput.numStart = *value;
+                uiInput.dragX = mp.x;
+            }
+            let step = speed;
+            if fine {
+                step = speed * 0.1;
+            }
+            let moved = mp.x - uiInput.dragX;
+            let next = uiInput.numStart + moved * step;
+            if next != *value && moved != 0 {
+                if abs(moved) > uiInput.numMoved { uiInput.numMoved = abs(moved); }
+                *value = next;
+                changed = true;
+            }
+        }
+        // A click without a drag switches to typing, with the value selected.
+        if uiInput.numPress == id && mouseReleased(Mouse.Left) {
+            uiInput.numPress = 0;
+            if uiInput.numMoved < 3 && hit {
+                if numMem.head == 0 {
+                    numMem = Arena.create(256);
+                    numText = Text.new(&numMem);
+                }
+                numText.clear();
+                numText.pushStr(this.shownNumber(*value));
+                uiInput.editing = id;
+                uiInput.focus = id;
+                uiInput.caretFor = 0;
+                uiInput.allSelected = true;
+            }
+        }
+        if this.shown(pos.y, size.y) && editing {
+            fillRound(pos.x, pos.y, wide, this.h, 4, this.theme.buttonDown);
+            setColor(this.theme.accent);
+            drawRect(Vec2 { x: pos.x, y: pos.y + size.y - 2 }, Vec2 { x: size.x, y: 2 });
+            if this.font.raw != 0 {
+                this.editBox(pos, size, numText.str(), uiInput.focus == id);
+            }
+        } else if this.shown(pos.y, size.y) {
+            let face = this.theme.button;
+            if uiInput.active == id {
+                face = this.theme.buttonDown;
+            } else if hit {
+                face = this.theme.buttonHot;
+            }
+            fillRound(pos.x, pos.y, wide, this.h, 4, face);
+            if this.font.raw != 0 {
+                setColor(mixColor(this.theme.text, this.theme.button, 0.4));
+                drawText(this.font, Vec2 { x: pos.x + 7, y: pos.y + 4 }, label);
+                let shown = this.shownNumber(*value);
+                let tw = this.words(shown);
+                setColor(this.theme.text);
+                drawText(this.font, Vec2 { x: pos.x + wide - tw - 7, y: pos.y + 4 }, shown);
+            }
+        }
+        if this.across {
+            this.place(wide + 6, this.h);
+        } else {
+            this.place(wide, this.h + 6);
+        }
+        return changed;
+    }
+
+    /// Draw `msg` like `button`. It never clicks.
+    fn buttonOff(this: &Ui, msg: string) {
+        let wide = this.w;
+        if this.across {
+            wide = this.words(msg) + 16;
+        }
+        if this.shown(this.y, this.h) {
+            let face = mixColor(this.theme.button, this.theme.panel, 0.45);
+            let ink = mixColor(this.theme.text, this.theme.button, 0.55);
+            setColor(face);
+            drawRect(Vec2 { x: this.x, y: this.y }, Vec2 { x: wide, y: this.h });
+            if this.font.raw != 0 {
+                setColor(ink);
+                drawText(this.font, Vec2 { x: this.x + 8, y: this.y + 4 }, msg);
+            }
+        }
+        if this.across {
+            this.place(wide + 6, this.h);
+        } else {
+            this.place(wide, this.h + 6);
+        }
+    }
+
+    /// Rounded panel filled with a vertical gradient and a drop shadow. Pair with `end`.
+    fn card(this: &Ui, w: f32, h: f32, top: Color, bottom: Color, radius: f32) {
+        let x = this.x;
+        let y = this.y;
+        if this.shown(y, h) {
+            fillShadow(x, y, w, h, radius);
+            fillWash(x, y, w, h, top, bottom, radius);
+        }
+        this.open(0, w, h);
+        this.x = x + PAD;
+        this.y = y + PAD;
+        let inner = w - PAD * 2;
+        if inner < 0 {
+            inner = 0;
+        }
+        this.w = inner;
+        this.across = false;
+    }
+
+    /// Rounded vertical gradient. Advances by its size. Does not open a frame.
+    fn wash(this: &Ui, w: f32, h: f32, top: Color, bottom: Color, radius: f32) {
+        if this.shown(this.y, h) {
+            fillWash(this.x, this.y, w, h, top, bottom, radius);
+        }
+        if this.across {
+            this.place(w + 8, h);
+        } else {
+            this.place(w, h + 8);
+        }
+    }
+
+    /// Rounded `panel` fill with a drop shadow.
+    fn drop(this: &Ui, w: f32, h: f32, radius: f32) {
+        if this.shown(this.y, h) {
+            fillShadow(this.x, this.y, w, h, radius);
+            fillRound(this.x, this.y, w, h, radius, this.theme.panel);
+        }
+        if this.across {
+            this.place(w + 8, h);
+        } else {
+            this.place(w, h + 8);
+        }
+    }
+
+    /// Thin track and a round handle. `label` salts the id and is not drawn.
+    /// Returns true when `value` changes.
+    fn range(this: &Ui, label: string, value: &f32, lo: f32, hi: f32): bool {
+        let wide = this.w;
+        if this.across {
+            wide = 180;
+        }
+        let pos = Vec2 { x: this.x, y: this.y };
+        let size = Vec2 { x: wide, y: this.h };
+        let id = this.widget(label);
+        let hit = false;
+        if this.shown(pos.y, size.y) {
+            hit = inside(pos, size);
+        }
+        if hit {
+            uiInput.hot = id;
+        }
+        if hit && mousePressed(Mouse.Left) {
+            uiInput.active = id;
+        }
+        let knob = f32(16);
+        let travel = wide - knob;
+        if travel < 1 {
+            travel = 1;
+        }
+        let changed = false;
+        if uiInput.active == id && mouseDown(Mouse.Left) {
+            let mp = mousePos();
+            let t = clamp((mp.x - pos.x - knob * 0.5) / travel, 0, 1);
+            let next = lo + (hi - lo) * t;
+            if next != *value {
+                *value = next;
+                changed = true;
+            }
+        }
+        let span = hi - lo;
+        let fill = f32(0);
+        if span != 0 {
+            fill = clamp((*value - lo) / span, 0, 1);
+        }
+        if this.shown(pos.y, size.y) {
+            let trackH = f32(4);
+            let trackX = pos.x + knob * 0.5;
+            let trackY = pos.y + (this.h - trackH) * 0.5;
+            fillRound(trackX, trackY, travel, trackH, 2, this.theme.button);
+            if fill > 0 {
+                fillRound(trackX, trackY, travel * fill, trackH, 2, this.theme.accent);
+            }
+            let hx = pos.x + travel * fill;
+            let hy = pos.y + (this.h - knob) * 0.5;
+            let ring = this.theme.edge;
+            if uiInput.active == id {
+                ring = this.theme.accent;
+            } else if hit {
+                ring = this.theme.buttonHot;
+            }
+            fillRound(hx - 1, hy - 1, knob + 2, knob + 2, (knob + 2) * 0.5, ring);
+            fillRound(hx, hy, knob, knob, knob * 0.5, this.theme.text);
+        }
+        if this.across {
+            this.place(wide + 6, this.h);
+        } else {
+            this.place(wide, this.h + 6);
+        }
+        return changed;
+    }
+
+    /// Pill switch. `msg` is drawn beside it. Returns true when `on` flips.
+    fn toggle(this: &Ui, msg: string, on: &bool): bool {
+        let pillW = f32(48);
+        let pillH = f32(26);
+        let y = this.y + (this.h - pillH) * 0.5;
+        let words = this.words(msg);
+        let wide = pillW + 8 + words;
+        let hit = false;
+        if this.shown(this.y, this.h) {
+            hit = inside(Vec2 { x: this.x, y: this.y }, Vec2 { x: wide, y: this.h });
+        }
+        let id = this.widget(msg);
+        if hit {
+            uiInput.hot = id;
+        }
+        let changed = false;
+        if hit && mousePressed(Mouse.Left) {
+            uiInput.active = id;
+            let next = true;
+            if *on {
+                next = false;
+            }
+            *on = next;
+            changed = true;
+        }
+        if this.shown(this.y, this.h) {
+            let track = this.theme.button;
+            if *on {
+                track = this.theme.accent;
+            }
+            if hit {
+                track = mixColor(track, this.theme.text, 0.18);
+            }
+            fillRound(this.x, y, pillW, pillH, pillH * 0.5, track);
+            let knob = f32(20);
+            let kx = this.x + 3;
+            if *on {
+                kx = this.x + pillW - 3 - knob;
+            }
+            let ky = y + (pillH - knob) * 0.5;
+            fillRound(kx, ky + 1, knob, knob, knob * 0.5, rgba(0, 0, 0, 70));
+            fillRound(kx, ky, knob, knob, knob * 0.5, this.theme.text);
+            if this.font.raw != 0 {
+                setColor(this.theme.text);
+                drawText(this.font, Vec2 { x: this.x + pillW + 8, y: this.y + 4 }, msg);
+            }
+        }
+        if this.across {
+            this.place(wide + 6, this.h);
+        } else {
+            this.place(wide, this.h + 6);
+        }
+        return changed;
+    }
+
+    /// Box and caption. Click flips `on`. Returns true when it flips.
+    fn check(this: &Ui, msg: string, on: &bool): bool {
+        let box = f32(18);
+        let y = this.y + (this.h - box) * 0.5;
+        let wide = box + 8 + this.words(msg);
+        let hit = false;
+        if this.shown(this.y, this.h) {
+            hit = inside(Vec2 { x: this.x, y: this.y }, Vec2 { x: wide, y: this.h });
+        }
+        let id = this.widget(msg);
+        if hit {
+            uiInput.hot = id;
+        }
+        let changed = false;
+        if hit && mousePressed(Mouse.Left) {
+            uiInput.active = id;
+            let next = true;
+            if *on {
+                next = false;
+            }
+            *on = next;
+            changed = true;
+        }
+        if this.shown(this.y, this.h) {
+            let face = this.theme.button;
+            if hit {
+                face = this.theme.buttonHot;
+            }
+            fillRound(this.x, y, box, box, 4, face);
+            if *on {
+                fillRound(this.x + 4, y + 4, box - 8, box - 8, 2, this.theme.accent);
+            }
+            if this.font.raw != 0 {
+                setColor(this.theme.text);
+                drawText(this.font, Vec2 { x: this.x + box + 8, y: this.y + 4 }, msg);
+            }
+        }
+        if this.across {
+            this.place(wide + 6, this.h);
+        } else {
+            this.place(wide, this.h + 6);
+        }
+        return changed;
+    }
+
+    /// Caption, minus, the value, and plus. Stops at `lo` and `hi`.
+    /// Returns true when `value` changes.
+    fn stepper(this: &Ui, msg: string, value: &int, lo: int, hi: int): bool {
+        this.pushId(this.widget(msg));
+        let x = this.x;
+        let y = this.y;
+        let cap = this.words(msg);
+        if this.font.raw != 0 && this.shown(y, this.h) {
+            setColor(this.theme.text);
+            drawText(this.font, Vec2 { x: x, y: y + 4 }, msg);
+        }
+        let bw = this.h;
+        if bw < 22 {
+            bw = 22;
+        }
+        let bx = x + cap + 8;
+        let changed = false;
+        if pressAt(this, "-", bx, y, bw, this.h, *value > lo) {
+            *value = *value - 1;
+            changed = true;
+        }
+        let num = `{*value}`;
+        let nx = bx + bw + 4;
+        let numW = f32(36);
+        if this.font.raw != 0 && this.shown(y, this.h) {
+            setColor(this.theme.text);
+            let tw = this.words(num);
+            drawText(this.font, Vec2 { x: nx + (numW - tw) * 0.5, y: y + 4 }, num);
+        }
+        let px = nx + numW + 4;
+        if pressAt(this, "+", px, y, bw, this.h, *value < hi) {
+            *value = *value + 1;
+            changed = true;
+        }
+        this.popId();
+        let total = px + bw - x;
+        if this.across {
+            this.place(total + 6, this.h);
+        } else {
+            this.place(total, this.h + 6);
+        }
+        return changed;
+    }
+
+    /// Small accent pill. The caption is the whole widget.
+    fn chip(this: &Ui, msg: string) {
+        let wide = this.words(msg) + 16;
+        let tall = f32(22);
+        let y = this.y + (this.h - tall) * 0.5;
+        if this.shown(y, tall) {
+            fillRound(this.x, y, wide, tall, tall * 0.5, this.theme.accent);
+            if this.font.raw != 0 {
+                setColor(this.theme.text);
+                drawText(this.font, Vec2 { x: this.x + 8, y: y + 2 }, msg);
+            }
+        }
+        if this.across {
+            this.place(wide + 6, this.h);
+        } else {
+            this.place(wide, this.h + 6);
+        }
+    }
+
+    /// One-pixel rule across the column.
+    fn rule(this: &Ui) {
+        let y = this.y + 6;
+        if this.shown(y, 1) {
+            setColor(this.theme.edge);
+            let wide = this.w;
+            if this.across {
+                wide = 80;
+            }
+            drawRect(Vec2 { x: this.x, y: y }, Vec2 { x: wide, y: 1 });
+        }
+        if this.across {
+            this.place(88, this.h);
+        } else {
+            this.place(this.w, 14);
+        }
+    }
+}
+
+/// True when `bytes` holds at least one decimal digit.
+fn hasDigit(bytes: []u8): bool {
+    let i = 0;
+    while i < bytes.len {
+        if bytes[i] >= 48 && bytes[i] <= 57 {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// Absolute value.
+fn abs(v: f32): f32 {
+    if v < 0 {
+        return 0 - v;
+    }
+    return v;
+}
+
+/// `v` with two decimals, e.g. `-1.25`. Lives in the scratch arena.
+fn fixed2(v: f32): string {
+    let t = Text.new(scratch(0));
+    let n = v;
+    if n < 0 {
+        n = 0 - n;
+    }
+    let cents = int(n * 100 + 0.5);
+    if v < 0 && cents > 0 {
+        t.push(45);
+    }
+    t.pushInt(cents / 100);
+    t.push(46);
+    let frac = cents - (cents / 100) * 100;
+    if frac < 10 {
+        t.push(48);
+    }
+    t.pushInt(frac);
+    return t.str();
+}
+
+/// Fixed rect button. Does not move the cursor. `on` false draws dim and never clicks.
+fn pressAt(ui: &Ui, caption: string, x: f32, y: f32, w: f32, h: f32, on: bool): bool {
+    let pos = Vec2 { x: x, y: y };
+    let size = Vec2 { x: w, y: h };
+    let id = ui.widget(caption);
+    let hit = false;
+    if on && ui.shown(y, h) {
+        hit = inside(pos, size);
+    }
+    if hit {
+        uiInput.hot = id;
+    }
+    let clicked = false;
+    if hit && mousePressed(Mouse.Left) {
+        uiInput.active = id;
+        clicked = true;
+    }
+    let face = ui.theme.button;
+    let ink = ui.theme.text;
+    if !on {
+        face = mixColor(ui.theme.button, ui.theme.panel, 0.45);
+        ink = mixColor(ui.theme.text, ui.theme.button, 0.5);
+    } else if uiInput.active == id {
+        face = ui.theme.buttonDown;
+    } else if hit {
+        face = ui.theme.buttonHot;
+    }
+    if ui.shown(y, h) {
+        fillRound(x, y, w, h, 6, face);
+        if ui.font.raw != 0 {
+            setColor(ink);
+            let tw = ui.words(caption);
+            drawText(ui.font, Vec2 { x: x + (w - tw) * 0.5, y: y + 4 }, caption);
+        }
+    }
+    return clicked;
+}

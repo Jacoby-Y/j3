@@ -1,0 +1,338 @@
+// Bricks, balls, gold, upgrades, prestige. No drawing and no UI: the UI reads
+// these fields and calls these methods.
+
+module idle.sim;
+
+use j3.math.{ Vec2, sqrt };
+use j3.memory.Arena;
+use j3.rand.Rng;
+
+pub const COLS = 10;
+pub const ROWS = 12;
+/// Field size in field units; field.view fits it into the canvas.
+pub const FIELD_W: f32 = 500.0;
+pub const FIELD_H: f32 = 700.0;
+pub const BRICK_H: f32 = 22.0;
+/// Gap above the first brick row.
+pub const TOP: f32 = 40.0;
+pub const MAX_BALLS = 200;
+/// Fixed sim tick (200 Hz), so a run replays the same at any frame rate.
+pub const TICK: f32 = 0.005;
+
+/// Ball kinds, index into `Sim.shop`.
+pub const BASIC = 0;
+pub const FAST = 1;
+pub const HEAVY = 2;
+pub const SPLASH = 3;
+pub const KINDS = 4;
+
+pub struct Ball {
+    pos: Vec2;
+    vel: Vec2;
+    kind: int;
+}
+
+/// One buyable ball kind and its two upgrades.
+pub struct Shop {
+    name: string;
+    blurb: string;
+    owned: int;
+    cost: int;
+    damage: int;
+    damageLvl: int = 1;
+    damageCost: int;
+    speed: f32;
+    speedLvl: int = 1;
+    speedCost: int;
+    radius: f32;
+}
+
+pub struct Sim {
+    /// Hit points per brick, row-major, 0 is empty.
+    bricks: []int;
+    alive: int;
+    balls: []Ball;
+    ballCount: int = 0;
+    shop: []Shop;
+    gold: int = 0;
+    /// Gold earned this run; prestige pays from it.
+    earned: int = 0;
+    broken: int = 0;
+    level: int = 1;
+    clickDamage: int = 1;
+    clickCost: int = 25;
+    /// Prestige currency. Each one is +10% gold.
+    crystals: int = 0;
+    prestiges: int = 0;
+    /// Damage dealt in the current second, and the last full second.
+    dmgAcc: int = 0;
+    dps: int = 0;
+    dpsTimer: f32 = 0;
+    /// Scaled time not yet simulated, below one TICK.
+    acc: f32 = 0;
+    rng: Rng;
+    // Settings.
+    paused: bool = false;
+    timeScale: f32 = 1;
+    showHp: bool = true;
+    // Test hooks for speculative/12_ui_runtime (not in idle-breakout): gold spent, canvas clicks.
+    spent: int = 0;
+    clicks: int = 0;
+    lastClick: Vec2;
+
+    fn new(mem: &Arena): Sim {
+        let shop = mem.alloc::<Shop>(KINDS);
+        stockShop(shop);
+        let sim = Sim {
+            bricks: mem.alloc::<int>(COLS * ROWS),
+            alive: 0,
+            balls: mem.alloc::<Ball>(MAX_BALLS),
+            shop: shop,
+            rng: Rng.new(7),
+            lastClick: Vec2 { x: -1, y: -1 },
+        };
+        sim.fill();
+        sim.gold = 25;
+        return sim;
+    }
+
+    fn fill(this: &Sim) {
+        this.alive = 0;
+        for r in 0..ROWS {
+            for c in 0..COLS {
+                let hp = this.level * (1 + (ROWS - 1 - r) / 4);
+                if (c + r + this.level) % 7 == 0 {
+                    hp = 0;
+                }
+                this.bricks[r * COLS + c] = hp;
+                if hp > 0 {
+                    this.alive += 1;
+                }
+            }
+        }
+    }
+
+    fn update(this: &Sim, dt: f32) {
+        if this.paused {
+            return;
+        }
+        // ponytail: frames longer than 0.25 s (a window drag) lose the rest.
+        let frame = dt;
+        if frame > 0.25 {
+            frame = 0.25;
+        }
+        this.acc += frame * this.timeScale;
+        while this.acc >= TICK {
+            this.acc -= TICK;
+            this.tick();
+        }
+    }
+
+    fn tick(this: &Sim) {
+        for i in 0..this.ballCount {
+            this.step(&this.balls[i], TICK);
+        }
+        this.dpsTimer += TICK;
+        if this.dpsTimer >= 1 {
+            this.dps = this.dmgAcc;
+            this.dmgAcc = 0;
+            this.dpsTimer = 0;
+        }
+        if this.alive == 0 {
+            this.level += 1;
+            this.fill();
+        }
+    }
+
+    /// Move in pieces of at most 8 units, so fast balls can't skip a brick.
+    fn step(this: &Sim, b: &Ball, dt: f32) {
+        let n = int(b.vel.length() * dt / 8) + 1;
+        for i in 0..n {
+            this.move(b, dt / f32(n));
+        }
+    }
+
+    fn move(this: &Sim, b: &Ball, dt: f32) {
+        let s = this.shop[b.kind];
+        let old = b.pos;
+        b.pos = b.pos + b.vel * dt;
+        if b.pos.x < s.radius || b.pos.x > FIELD_W - s.radius {
+            b.vel.x = 0 - b.vel.x;
+            b.pos.x = old.x;
+        }
+        if b.pos.y < s.radius || b.pos.y > FIELD_H - s.radius {
+            b.vel.y = 0 - b.vel.y;
+            b.pos.y = old.y;
+        }
+        // Test the leading edge, so a ball bounces off a brick instead of sinking in.
+        let lead = b.vel.normalize() * s.radius;
+        let cell = cellAt(b.pos + lead);
+        let was = cellAt(old + lead);
+        // A refill can land a brick on a ball; it leaves without hitting.
+        if cell < 0 || this.bricks[cell] == 0 || was == cell {
+            return;
+        }
+        this.hit(cell, s.damage);
+        if b.kind == SPLASH {
+            this.splash(cell, s.damage / 2 + 1);
+        }
+        // ponytail: axis from which cell edge was crossed; corner hits flip y.
+        if was >= 0 && was % COLS != cell % COLS && was / COLS == cell / COLS {
+            b.vel.x = 0 - b.vel.x;
+        } else {
+            b.vel.y = 0 - b.vel.y;
+        }
+        b.pos = old;
+    }
+
+    fn splash(this: &Sim, cell: int, dmg: int) {
+        let r = cell / COLS;
+        let c = cell % COLS;
+        if c > 0 { this.hit(cell - 1, dmg); }
+        if c < COLS - 1 { this.hit(cell + 1, dmg); }
+        if r > 0 { this.hit(cell - COLS, dmg); }
+        if r < ROWS - 1 { this.hit(cell + COLS, dmg); }
+    }
+
+    fn hit(this: &Sim, cell: int, dmg: int) {
+        let hp = this.bricks[cell];
+        if hp == 0 {
+            return;
+        }
+        let dealt = dmg;
+        if dealt > hp {
+            dealt = hp;
+        }
+        this.bricks[cell] = hp - dealt;
+        this.dmgAcc += dealt;
+        if hp - dealt == 0 {
+            this.alive -= 1;
+            this.broken += 1;
+            let pay = this.level * (10 + this.crystals) / 10;
+            if pay < 1 {
+                pay = 1;
+            }
+            this.gold += pay;
+            this.earned += pay;
+        }
+    }
+
+    /// Click at a field-space point.
+    fn click(this: &Sim, at: Vec2) {
+        this.clicks += 1;
+        this.lastClick = at;
+        let cell = cellAt(at);
+        if cell >= 0 {
+            this.hit(cell, this.clickDamage);
+        }
+    }
+
+    fn spend(this: &Sim, cost: int): bool {
+        if this.gold < cost {
+            return false;
+        }
+        this.gold -= cost;
+        this.spent += cost;
+        return true;
+    }
+
+    fn buyBall(this: &Sim, kind: int) {
+        let s = &this.shop[kind];
+        if this.ballCount >= MAX_BALLS || !this.spend(s.cost) {
+            return;
+        }
+        let angle = this.rng.floatRange(3.6, 5.8);
+        this.balls[this.ballCount] = Ball {
+            pos: Vec2 { x: FIELD_W / 2, y: FIELD_H - 40 },
+            vel: Vec2.fromAngle(angle) * s.speed,
+            kind: kind,
+        };
+        this.ballCount += 1;
+        s.owned += 1;
+        s.cost = s.cost * 115 / 100 + 1;
+    }
+
+    fn upgradeDamage(this: &Sim, kind: int) {
+        let s = &this.shop[kind];
+        if !this.spend(s.damageCost) {
+            return;
+        }
+        s.damage += s.damage / 4 + 1;
+        s.damageLvl += 1;
+        s.damageCost = s.damageCost * 150 / 100;
+    }
+
+    fn upgradeSpeed(this: &Sim, kind: int) {
+        let s = &this.shop[kind];
+        if !this.spend(s.speedCost) {
+            return;
+        }
+        s.speed = s.speed * 1.1;
+        s.speedLvl += 1;
+        s.speedCost = s.speedCost * 160 / 100;
+        for i in 0..this.ballCount {
+            let b = &this.balls[i];
+            if b.kind == kind {
+                b.vel = b.vel.normalize() * s.speed;
+            }
+        }
+    }
+
+    fn upgradeClick(this: &Sim) {
+        if !this.spend(this.clickCost) {
+            return;
+        }
+        this.clickDamage += this.clickDamage / 2 + 1;
+        this.clickCost = this.clickCost * 140 / 100;
+    }
+
+    /// Crystals a prestige now would pay.
+    fn prestigeGain(this: &Sim): int {
+        return int(sqrt(f32(this.earned) / 1000));
+    }
+
+    /// Trade the run for crystals. Settings stay.
+    fn prestige(this: &Sim) {
+        let gain = this.prestigeGain();
+        if gain == 0 {
+            return;
+        }
+        this.crystals += gain;
+        this.prestiges += 1;
+        this.gold = 25;
+        this.earned = 0;
+        this.level = 1;
+        this.ballCount = 0;
+        this.clickDamage = 1;
+        this.clickCost = 25;
+        stockShop(this.shop);
+        this.fill();
+    }
+}
+
+/// Starting prices and stats for every ball kind.
+fn stockShop(shop: []Shop) {
+    shop[BASIC] = Shop { name: "Basic", blurb: "Bounces. Hits.", owned: 0, cost: 25, damage: 1, damageCost: 50, speed: 260, speedCost: 40, radius: 6 };
+    shop[FAST] = Shop { name: "Fast", blurb: "Twice the speed, half the punch.", owned: 0, cost: 200, damage: 1, damageCost: 300, speed: 520, speedCost: 250, radius: 4 };
+    shop[HEAVY] = Shop { name: "Heavy", blurb: "Slow and brutal.", owned: 0, cost: 1500, damage: 8, damageCost: 2000, speed: 160, speedCost: 1200, radius: 10 };
+    shop[SPLASH] = Shop { name: "Splash", blurb: "Hits the neighbours too.", owned: 0, cost: 8000, damage: 3, damageCost: 9000, speed: 240, speedCost: 6000, radius: 7 };
+}
+
+/// Brick index under a field-space point, or -1.
+pub fn cellAt(p: Vec2): int {
+    if p.x < 0 || p.x >= FIELD_W || p.y < TOP {
+        return -1;
+    }
+    let c = int(p.x / (FIELD_W / f32(COLS)));
+    let r = int((p.y - TOP) / BRICK_H);
+    if r >= ROWS {
+        return -1;
+    }
+    return r * COLS + c;
+}
+
+/// Top-left of brick `cell` in field space.
+pub fn brickPos(cell: int): Vec2 {
+    let w = FIELD_W / f32(COLS);
+    return Vec2 { x: f32(cell % COLS) * w, y: TOP + f32(cell / COLS) * BRICK_H };
+}

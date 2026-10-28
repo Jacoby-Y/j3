@@ -1,0 +1,996 @@
+/// Selector matching and the cascade for `j3.ui.css`: `computeStyle(&css, nodes, id, parentStyle)`.
+
+module j3.ui.cssmatch;
+
+use j3.ui.css.{ CacheEnt, COMB_CHILD, COMB_DESC, COMB_NEXT, COMB_SIB, Css, Custom, hasBit, MatchNode, FL_NONBLANK, FL_OPEN, NK_LAST_CHILD, NK_LAST_TYPE, NK_TYPE, SS_EMPTY, SS_FIRST_TYPE, SS_LAST_TYPE, SS_ONLY_CHILD, SS_ONLY_TYPE, MAXM, NPROPS, P_LINE_HEIGHT, PS_ROOT, Step };
+use j3.memory.Arena;
+use j3.text.{ contains, same, Text };
+use j3.ui.csscalc.fontCalc;
+use j3.ui.cssparse.inlineDecl;
+use j3.ui.css.{ P_FONT_SIZE, resolveUnits, Rule, SLOTS, V_AUTO, V_CALC, V_EM, V_REM, V_COLOR, V_INHERIT, V_INITIAL, V_REVERT, V_UNSETKW, V_NUM, V_PCT, V_PX };
+use j3.ui.css.{ coerceSyn, KvStop, P_ALL, P_DEFER, V_ANG, V_CURRENT, V_UNSET, V_URL, V_VAR, Value, Warning };
+use j3.ui.cssvalue.{ C_ANGLE, C_COLOR, C_LEN, C_NUM, catOf, inherits, initial };
+
+fn matchStep(css: &Css, si: int, nodes: []MatchNode, id: int): bool {
+    return stepHolds(css, &css.steps.items[si], nodes, id);
+}
+
+/// Does the compound `st` (a rule step or a `:not()` argument) select `nodes[id]`?
+fn stepHolds(css: &Css, st: &Step, nodes: []MatchNode, id: int): bool {
+    let nd = &nodes[id];
+    if st.tag >= 0 && nd.tag != st.tag && !(st.tag == css.tTextarea && nd.type == st.tag) {
+        return false;
+    }
+    if st.attr >= 0 && nd.type != st.attr {
+        return false;
+    }
+    if st.id >= 0 && nd.id != st.id {
+        return false;
+    }
+    for c in 0..st.ncls {
+        let want = st.cls[c];
+        let found = false;
+        for j in 0..nd.classes.len {
+            if nd.classes[j] == want {
+                found = true;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    if st.pseudo != 0 {
+        let bit = 1;
+        while bit <= FL_OPEN {
+            if hasBit(st.pseudo, bit) {
+                if bit == PS_ROOT {
+                    if nd.parent >= 0 {
+                        return false;
+                    }
+                } else if !hasBit(nd.flags, bit) {
+                    return false;
+                }
+            }
+            bit = bit * 2;
+        }
+    }
+    if st.nth && !nthHolds(nodes, id, st.nthA, st.nthB, st.nthK) {
+        return false;
+    }
+    if st.ss != 0 && !structHolds(nodes, id, st.ss) {
+        return false;
+    }
+    for k in st.not0..st.not0 + st.nnot {
+        if stepHolds(css, &css.nots.items[k], nodes, id) {
+            return false;
+        }
+    }
+    if st.nhas > 0 && !hasHolds(css, st, nodes, id) {
+        return false;
+    }
+    return true;
+}
+
+/// Could a `:has()` rule select `nodes[id]` (the rest of its compound holds, the arguments ignored)? Gates which ancestors restyle.
+pub fn hasSubject(css: &Css, nodes: []MatchNode, id: int): bool {
+    for k in 0..css.hasSubj.len {
+        if stepHolds(css, &css.hasSubj.items[k], nodes, id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Does one of the `:has()` arguments of `st` hold for element `id`? Searches the children, the subtree (early exit), or the later
+/// siblings of `id`, one `stepHolds` per node visited. Text, `::before` / `::after` boxes and leaving elements are not visited.
+/// Descendant and child arguments are memoized per element and argument for the length of a style pass (`beginPass`), so a subtree is
+/// searched once per argument however many rules and descendants ask: a pass costs O(nodes) per argument, not O(nodes x subtree).
+/// ponytail: `+` / `~` arguments are not memoized (they cost the later siblings); add a memo if long sibling lists with `~` get slow.
+fn hasHolds(css: &Css, st: &Step, nodes: []MatchNode, id: int): bool {
+    for k in st.has0..st.has0 + st.nhas {
+        let a = &css.hass.items[k];
+        if a.comb == COMB_NEXT || a.comb == COMB_SIB {
+            let q = nextEl(nodes, id);
+            while q >= 0 {
+                css.hasEvals += 1;
+                if stepHolds(css, a, nodes, q) {
+                    return true;
+                }
+                q = if a.comb == COMB_NEXT { -1 } else { nextEl(nodes, q) };
+            }
+        } else if hasKid(css, k, a, nodes, id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Argument `k` (`a`, a `>` or descendant one) of a `:has()` on `id`: a child matches, or for a descendant argument a child has one.
+fn hasKid(css: &Css, k: int, a: &Step, nodes: []MatchNode, id: int): bool {
+    let slot = -1;
+    if css.hasOn && id < css.hcap {
+        slot = k * css.hcap + id;
+        if css.hmemo[slot] / 2 == css.hasGen {
+            return css.hmemo[slot] % 2 == 1;
+        }
+    }
+    let res = false;
+    let c = nodes[id].first;
+    while c >= 0 && !res {
+        if nodes[c].pe == 0 {
+            css.hasEvals += 1;
+            res = stepHolds(css, a, nodes, c) || (a.comb == COMB_DESC && hasKid(css, k, a, nodes, c));
+        }
+        c = nodes[c].next;
+    }
+    if slot >= 0 {
+        css.hmemo[slot] = css.hasGen * 2 + (if res { 1 } else { 0 });
+    }
+    return res;
+}
+
+/// Start a style pass over `n` nodes: `:has()` results are remembered until `endPass`. Does nothing without `:has()` rules.
+pub fn beginPass(css: &Css, n: int) {
+    if css.hasMode == 0 {
+        return;
+    }
+    css.hasGen += 1;
+    let cap = 16;
+    while cap < n {
+        cap = cap * 2;
+    }
+    if cap != css.hcap || css.hmemo.len < css.hass.len * cap {
+        css.hmemo = css.mem.alloc::<int>(css.hass.len * cap);
+        for i in 0..css.hmemo.len {
+            css.hmemo[i] = 0;
+        }
+        css.hcap = cap;
+    }
+    css.hasOn = true;
+}
+
+pub fn endPass(css: &Css) {
+    css.hasOn = false;
+}
+
+/// `:nth-child(An+B)` and its `last` / `of-type` forms (`kind`, `NK_*`): is the 1-based position of element `id` among its parent's
+/// elements (from the end for the `last` ones, only those of its tag for the `type` ones) `A*n + B` for some n >= 0?
+/// ponytail: counts the siblings on every match, O(siblings); cache the index on the node if a long list gets slow.
+fn nthHolds(nodes: []MatchNode, id: int, a: int, b: int, kind: int): bool {
+    let pos = 1 + countSibs(nodes, id, kind == NK_LAST_CHILD || kind == NK_LAST_TYPE, kind >= NK_TYPE, -1);
+    if a == 0 {
+        return pos == b;
+    }
+    let d = pos - b;
+    return d % a == 0 && d / a >= 0;
+}
+
+/// How many element siblings come before `id` (after it when `after`), only those of its tag when `typed`; stops at `cap` when >= 0.
+fn countSibs(nodes: []MatchNode, id: int, after: bool, typed: bool, cap: int): int {
+    let n = 0;
+    let q = if after { nextEl(nodes, id) } else { prevEl(nodes, id) };
+    while q >= 0 && (cap < 0 || n < cap) {
+        if !typed || nodes[q].tag == nodes[id].tag {
+            n += 1;
+        }
+        q = if after { nextEl(nodes, q) } else { prevEl(nodes, q) };
+    }
+    return n;
+}
+
+/// The argument-less structural pseudo-classes (`SS_*` bits, all of them must hold).
+fn structHolds(nodes: []MatchNode, id: int, ss: int): bool {
+    if hasBit(ss, SS_EMPTY) {
+        // Selectors 4: no element child and no text but whitespace (`::before` / `::after` boxes do not count)
+        let c = nodes[id].first;
+        while c >= 0 {
+            if nodes[c].pe == 0 || (nodes[c].pe == -1 && hasBit(nodes[c].flags, FL_NONBLANK)) {
+                return false;
+            }
+            c = nodes[c].next;
+        }
+    }
+    if hasBit(ss, SS_ONLY_CHILD) && (prevEl(nodes, id) >= 0 || nextEl(nodes, id) >= 0) {
+        return false;
+    }
+    if (hasBit(ss, SS_FIRST_TYPE) || hasBit(ss, SS_ONLY_TYPE)) && countSibs(nodes, id, false, true, 1) > 0 {
+        return false;
+    }
+    if (hasBit(ss, SS_LAST_TYPE) || hasBit(ss, SS_ONLY_TYPE)) && countSibs(nodes, id, true, true, 1) > 0 {
+        return false;
+    }
+    return true;
+}
+
+/// The closest later sibling that is an element, -1 for none.
+fn nextEl(nodes: []MatchNode, id: int): int {
+    let p = nodes[id].next;
+    while p >= 0 && nodes[p].pe != 0 {
+        p = nodes[p].next;
+    }
+    return p;
+}
+
+/// The closest earlier sibling that is an element (text nodes and pseudo-element boxes do not count), -1 for none.
+pub fn prevEl(nodes: []MatchNode, id: int): int {
+    let p = nodes[id].prevSibling;
+    while p >= 0 && nodes[p].pe != 0 {
+        p = nodes[p].prevSibling;
+    }
+    return p;
+}
+
+/// Does `nodes[id]` match step `s` of the rule that starts at `step0`, with the steps left of it
+/// related by their combinators? Backtracks over the ancestors (` `) and earlier siblings (`~`).
+fn matchAt(css: &Css, s: int, step0: int, nodes: []MatchNode, id: int): bool {
+    if !matchStep(css, s, nodes, id) {
+        return false;
+    }
+    if s == step0 {
+        return true;
+    }
+    let cb = css.steps.items[s - 1].comb;
+    if cb == COMB_CHILD {
+        let p = nodes[id].parent;
+        return p >= 0 && matchAt(css, s - 1, step0, nodes, p);
+    }
+    if cb == COMB_NEXT {
+        let q = prevEl(nodes, id);
+        return q >= 0 && matchAt(css, s - 1, step0, nodes, q);
+    }
+    if cb == COMB_SIB {
+        let e = prevEl(nodes, id);
+        while e >= 0 {
+            if matchAt(css, s - 1, step0, nodes, e) {
+                return true;
+            }
+            e = prevEl(nodes, e);
+        }
+        return false;
+    }
+    let a = nodes[id].parent;
+    while a >= 0 {
+        if matchAt(css, s - 1, step0, nodes, a) {
+            return true;
+        }
+        a = nodes[a].parent;
+    }
+    return false;
+}
+
+fn matchRule(css: &Css, r: &Rule, nodes: []MatchNode, id: int): bool {
+    let last = r.step0 + r.nsteps - 1;
+    if r.sib {
+        return matchAt(css, last, r.step0, nodes, id);
+    }
+    // only descendant and child steps: the nearest matching ancestor is always enough (no backtracking)
+    if !matchStep(css, last, nodes, id) {
+        return false;
+    }
+    let cur = id;
+    let s = last - 1;
+    while s >= r.step0 {
+        cur = nodes[cur].parent;
+        if css.steps.items[s].comb == COMB_CHILD {
+            if cur < 0 || !matchStep(css, s, nodes, cur) {
+                return false;
+            }
+        } else {
+            while cur >= 0 && !matchStep(css, s, nodes, cur) {
+                cur = nodes[cur].parent;
+            }
+            if cur < 0 {
+                return false;
+            }
+        }
+        s -= 1;
+    }
+    return true;
+}
+
+/// Does the `::before` / `::after` rule `r` select element `host` (media and component scope included)?
+pub fn peHolds(css: &Css, r: &Rule, nodes: []MatchNode, host: int): bool {
+    let foreign = r.scope != 0 && r.scope != nodes[host].scope;
+    if foreign && (r.scope != nodes[host].scope2 || r.cls0 < 0) {
+        return false;
+    }
+    if r.mq >= 0 && !css.mediaHolds(r.mq) {
+        return false;
+    }
+    return matchRule(css, r, nodes, host);
+}
+
+/// The declaration (index in `Css.decls`) of custom property `name` (with the `--`) in the newest plain `:root` rule that has it, -1 for none.
+fn rootDecl(css: &Css, name: string): int {
+    let want = NPROPS + css.intern(name);
+    let ri = css.rules.len - 1;
+    while ri >= 0 {
+        let r = css.rules.items[ri];
+        if r.nsteps == 0 {
+            // an inline-style rule (`dynattr`), not part of any sheet
+            ri -= 1;
+            continue;
+        }
+        let st = css.steps.items[r.step0];
+        if r.nsteps == 1 && st.tag < 0 && st.attr < 0 && st.ncls == 0 && hasBit(st.pseudo, PS_ROOT) {
+            let d = r.decl0 + r.ndecl - 1;
+            while d >= r.decl0 {
+                if css.decls.items[d].prop == want {
+                    return d;
+                }
+                d -= 1;
+            }
+        }
+        ri -= 1;
+    }
+    return -1;
+}
+
+/// The number of custom property `name` (with the `--`) declared by the newest plain `:root` rule, or
+/// `dflt` when it is absent or not a number. A time (`500ms`, `0.5s`) reads as milliseconds. Needs no node.
+pub fn customNum(css: &Css, name: string, dflt: f32): f32 {
+    let d = rootDecl(css, name);
+    if d >= 0 && css.decls.items[d].v.kind == V_NUM {
+        return css.decls.items[d].v.f;
+    }
+    return dflt;
+}
+
+fn fits(cat: int, prop: int, v: &Value): bool {
+    if cat == C_COLOR {
+        return v.kind == V_COLOR;
+    }
+    if cat == C_LEN {
+        return v.kind == V_PX || v.kind == V_PCT || v.kind == V_AUTO || v.kind == V_CALC || v.kind == V_EM || v.kind == V_REM;
+    }
+    if cat == C_ANGLE {
+        return v.kind == V_ANG;
+    }
+    if cat == C_NUM {
+        return v.kind == V_NUM || (prop == P_LINE_HEIGHT && (v.kind == V_PX || v.kind == V_EM || v.kind == V_REM));
+    }
+    return false;
+}
+
+/// Custom property `name` in set `vs` (or in the set under construction at `vsEnt[vs0..]` when `vs < 0`);
+/// kind `V_UNSET` when absent or invalid, `V_VAR` when it still waits for another `var()`.
+fn lookupVar(css: &Css, vs: int, vs0: int, name: int): Value {
+    let o = vs0;
+    let e = css.vsEnt.len;
+    if vs >= 0 {
+        o = css.vso.items[vs];
+        e = o + css.vsn.items[vs];
+    }
+    for i in o..e {
+        if css.vsEnt.items[i].name == name {
+            if css.vsEnt.items[i].v.kind != V_UNSET {
+                return css.vsEnt.items[i].v;
+            }
+            break;
+        }
+    }
+    return regInit(css, name);
+}
+
+/// The initial value of `@property`-registered custom property `name` (`V_UNSET` when it is not registered or has none).
+fn regInit(css: &Css, name: int): Value {
+    if css.regs.len > 0 {
+        let r = css.regOf(name);
+        if r >= 0 {
+            return css.regs.items[r].init;
+        }
+    }
+    return unset();
+}
+
+/// Custom property `name` in set `vs` as an element sees it, with the registered initial value when the set lacks it.
+pub fn varValue(css: &Css, vs: int, name: int): Value {
+    return lookupVar(css, vs, 0, name);
+}
+
+/// What `var()` value `v` is in set `vs` / `vs0` (see `lookupVar`). For property `prop` (-1 for the
+/// value of a custom property) the found value must have the property's type (a fallback is already
+/// typed). Result `V_UNSET`: invalid, skip the declaration. `V_VAR`: waits for another custom property.
+pub fn resolveVar(css: &Css, prop: int, vs: int, vs0: int, v: Value): Value {
+    let e = lookupVar(css, vs, vs0, v.i);
+    if e.kind == V_VAR {
+        return v;
+    }
+    if e.kind != V_UNSET {
+        if prop < 0 || prop >= NPROPS {
+            return e;
+        }
+        if fits(catOf(prop), prop, &e) {
+            if e.kind == V_ANG {
+                return Value { kind: V_NUM, f: e.f, i: 0, c: 0 };
+            }
+            return e;
+        }
+        return unset();
+    }
+    if v.c > 0 {
+        let fb = css.fbs.items[v.c - 1];
+        if fb.kind == V_VAR {
+            return resolveVar(css, prop, vs, vs0, fb);
+        }
+        return fb;
+    }
+    return unset();
+}
+
+/// What the declaration `prop: v` sets under parent style `parent`, with custom property set `vs`:
+/// `var()` and `inherit` resolved. Kind `V_UNSET` means skip it (an unknown or ill-typed `var()`).
+pub fn declValue(css: &Css, prop: int, v: Value, parent: int, vs: int): Value {
+    if v.kind == V_VAR {
+        v = resolveVar(css, prop, vs, 0, v);
+    }
+    if prop < 0 || prop >= NPROPS {
+        return v;
+    }
+    if v.kind == V_INHERIT {
+        if parent >= 0 {
+            return css.vals.items[parent * NPROPS + prop];
+        }
+        return initial(prop);
+    }
+    if v.kind == V_INITIAL {
+        return initial(prop);
+    }
+    if v.kind == V_UNSETKW || v.kind == V_REVERT {
+        // `revert` only reaches here where there is no earlier origin to return to (`cascade` looks that up first)
+        if parent >= 0 && inherits(prop) {
+            return css.vals.items[parent * NPROPS + prop];
+        }
+        return initial(prop);
+    }
+    return v;
+}
+
+/// `revert` of property `prop` in rule `ids[off + m]`: the last tag-default (or popup) declaration of it among the matched rules
+/// `ids[off..off + nm]`, else `unset`. A rule that is itself built in has nothing earlier: `unset`.
+fn revertValue(css: &Css, ids: []int, off: int, nm: int, m: int, prop: int, parent: int, vs: int): Value {
+    let v = Value { kind: V_UNSETKW, f: 0.0, i: 0, c: 0 };
+    let ri = ids[off + m];
+    if ri >= css.uaLo && ri < css.uaHi {
+        return declValue(css, prop, v, parent, vs);
+    }
+    for j in 0..nm {
+        let uj = ids[off + j];
+        if uj < css.uaLo || uj >= css.uaHi {
+            continue;
+        }
+        let r = css.rules.items[uj];
+        for d in 0..r.ndecl {
+            let dc = css.decls.items[r.decl0 + d];
+            if dc.prop == prop {
+                v = dc.v;
+            }
+        }
+    }
+    return declValue(css, prop, v, parent, vs);
+}
+
+fn unset(): Value {
+    return Value { kind: V_UNSET, f: 0.0, i: 0, c: 0 };
+}
+
+/// The custom property set of a style that declares `--x` in its matched rules (`css.midx[0..nm]`) on top
+/// of its parent's set `base`: a copy of `base` with the new values, last declaration winning. Values that
+/// are `var()`s are resolved against the set itself, so order does not matter and a cycle stays invalid.
+fn ownVars(css: &Css, nm: int, base: int, parent: int): int {
+    let n0 = css.vsEnt.len;
+    let fs: f32 = 16.0;
+    if parent >= 0 {
+        fs = css.vals.items[parent * NPROPS + P_FONT_SIZE].f;
+    }
+    for i in 0..css.vsn.items[base] {
+        let ce = css.vsEnt.items[css.vso.items[base] + i];
+        if css.noInh > 0 && !inheritsVar(css, ce.name) {
+            continue;
+        }
+        css.vsEnt.push(ce);
+    }
+    for m in 0..nm {
+        let r = css.rules.items[css.midx[m]];
+        for d in 0..r.ndecl {
+            let dc = css.decls.items[r.decl0 + d];
+            if dc.prop < NPROPS {
+                continue;
+            }
+            let dv = dc.v;
+            if dv.kind == V_INITIAL {
+                // the guaranteed-invalid value: `lookupVar` then reads the registered initial-value, if any
+                dv = unset();
+            } else if dv.kind == V_INHERIT || dv.kind == V_UNSETKW || dv.kind == V_REVERT {
+                dv = unset();
+                if dc.v.kind == V_INHERIT || inheritsVar(css, dc.prop - NPROPS) {
+                    // the parent's value (its set is `base`, which also holds the ones that do not inherit)
+                    for i in 0..css.vsn.items[base] {
+                        let be = css.vsEnt.items[css.vso.items[base] + i];
+                        if be.name == dc.prop - NPROPS {
+                            dv = be.v;
+                        }
+                    }
+                }
+            } else if css.regs.len > 0 && dv.kind != V_VAR {
+                // a registered property takes only values of its type; a bad declaration is dropped
+                let rg = css.regOf(dc.prop - NPROPS);
+                if rg >= 0 {
+                    dv = coerceSyn(css, css.regs.items[rg].syn, dv, fs);
+                    if dv.kind == V_UNSET {
+                        continue;
+                    }
+                }
+            }
+            let at = n0;
+            while at < css.vsEnt.len && css.vsEnt.items[at].name != dc.prop - NPROPS {
+                at += 1;
+            }
+            if at == css.vsEnt.len {
+                css.vsEnt.push(Custom { name: dc.prop - NPROPS, v: dv });
+            } else {
+                css.vsEnt.items[at].v = dv;
+            }
+        }
+    }
+    // resolve var() values; each pass settles at least one or stops
+    let changed = true;
+    while changed {
+        changed = false;
+        for i in n0..css.vsEnt.len {
+            let v = css.vsEnt.items[i].v;
+            if v.kind == V_VAR {
+                let rv = resolveVar(css, -1, -1, n0, v);
+                if rv.kind != V_VAR || rv.i != v.i || rv.c != v.c {
+                    css.vsEnt.items[i].v = rv;
+                    changed = true;
+                }
+            }
+        }
+    }
+    // still waiting: a cycle
+    for i in n0..css.vsEnt.len {
+        if css.vsEnt.items[i].v.kind == V_VAR {
+            css.vsEnt.items[i].v = unset();
+        }
+        if css.regs.len > 0 && css.vsEnt.items[i].v.kind != V_UNSET {
+            // a `var()` that resolved to a value of the wrong type
+            let rj = css.regOf(css.vsEnt.items[i].name);
+            if rj >= 0 {
+                css.vsEnt.items[i].v = coerceSyn(css, css.regs.items[rj].syn, css.vsEnt.items[i].v, fs);
+            }
+        }
+    }
+    css.vso.push(n0);
+    css.vsn.push(css.vsEnt.len - n0);
+    return css.vso.len - 1;
+}
+
+/// False for a registered custom property with `inherits: false`.
+fn inheritsVar(css: &Css, name: int): bool {
+    let r = css.regOf(name);
+    return r < 0 || css.regs.items[r].inh;
+}
+
+/// Does set `vs` hold a registered property that does not inherit?
+fn hasNoInherit(css: &Css, vs: int): bool {
+    for i in 0..css.vsn.items[vs] {
+        if !inheritsVar(css, css.vsEnt.items[css.vso.items[vs] + i].name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Write custom property value `e` as CSS text; false for a kind that has no spelling here.
+pub fn pushValue(t: &Text, e: Value): bool {
+    if e.kind == V_COLOR {
+        let hex = "0123456789abcdef";
+        t.push(35);
+        for sh in 0..4 {
+            let b = (e.c / (if sh == 0 { 16777216 } else if sh == 1 { 65536 } else if sh == 2 { 256 } else { 1 })) % 256;
+            t.push(hex[b / 16]);
+            t.push(hex[b % 16]);
+        }
+    } else if e.kind == V_CURRENT {
+        t.pushStr("currentcolor");
+    } else if e.kind == V_NUM {
+        t.pushFloat(e.f);
+    } else if e.kind == V_ANG {
+        t.pushFloat(e.f);
+        t.pushStr("deg");
+    } else if e.kind == V_PX || e.kind == V_PCT || e.kind == V_EM || e.kind == V_REM {
+        t.pushFloat(e.f);
+        t.pushStr(if e.kind == V_PX { "px" } else if e.kind == V_PCT { "%" } else if e.kind == V_EM { "em" } else { "rem" });
+    } else if e.kind == V_AUTO {
+        t.pushStr("auto");
+    } else {
+        return false;
+    }
+    return true;
+}
+
+pub fn isNameChar(c: int): bool {
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 95;
+}
+
+/// `src` with every `var(--x)` / `var(--x, fallback)` replaced by custom property `--x` of set `vs` (or the
+/// fallback text, itself substituted). False when one has neither or the value has no spelling.
+fn substVars(css: &Css, src: string, vs: int, t: &Text, depth: int): bool {
+    let i = 0;
+    while i < src.len {
+        let c = int(src[i]);
+        if c != 118 || i + 4 > src.len || !same(src[i..i + 4], "var(") || (i > 0 && isNameChar(int(src[i - 1]))) {
+            t.push(src[i]);
+            i += 1;
+            continue;
+        }
+        let j = i + 4;
+        while j < src.len && int(src[j]) == 32 {
+            j += 1;
+        }
+        let ns = j;
+        while j < src.len && isNameChar(int(src[j])) {
+            j += 1;
+        }
+        if j - ns <= 2 || int(src[ns]) != 45 || int(src[ns + 1]) != 45 || depth > 8 {
+            return false;
+        }
+        let name = css.intern(src[ns..j]);
+        while j < src.len && int(src[j]) == 32 {
+            j += 1;
+        }
+        let fb0 = -1;
+        let fb1 = -1;
+        if j < src.len && int(src[j]) == 44 {
+            fb0 = j + 1;
+            let d = 1;
+            j += 1;
+            while j < src.len && d > 0 {
+                if int(src[j]) == 40 { d += 1; }
+                if int(src[j]) == 41 { d -= 1; }
+                j += 1;
+            }
+            if d > 0 {
+                return false;
+            }
+            fb1 = j - 1;
+        } else if j < src.len && int(src[j]) == 41 {
+            j += 1;
+        } else {
+            return false;
+        }
+        if fb0 > fb1 && fb0 >= 0 {
+            return false;
+        }
+        let e = lookupVar(css, vs, 0, name);
+        if e.kind == V_URL {
+            // quoted, with whichever quote the path does not contain (the lexer has no escapes)
+            let path = css.name(e.i);
+            let q = if contains(path, "\"") { "'" } else { "\"" };
+            if contains(path, q) {
+                return false;
+            }
+            t.pushStr("url(");
+            t.pushStr(q);
+            t.pushStr(path);
+            t.pushStr(q);
+            t.push(41);
+        } else if e.kind != V_UNSET && e.kind != V_VAR {
+            if !pushValue(t, e) {
+                return false;
+            }
+        } else if fb0 >= 0 {
+            if !substVars(css, src[fb0..fb1], vs, t, depth + 1) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        i = j;
+    }
+    return true;
+}
+
+/// The value of keyframe declaration `di` (of `Css.decls`) for property `prop` on an element with custom property set `vs`:
+/// a `var()` resolved, a deferred compound value (`P_DEFER`) substituted and parsed again. The deferred ones are cached
+/// per (declaration, set) in `Css.kvc`, so a running animation parses nothing. `V_UNSET`: it does not apply to this element.
+pub fn stopValue(css: &Css, di: int, prop: int, vs: int): Value {
+    let dc = css.decls.items[di];
+    if dc.prop != P_DEFER {
+        if dc.v.kind != V_VAR {
+            return dc.v;
+        }
+        return declValue(css, prop, dc.v, -1, vs);
+    }
+    let at = kvSlot(css, di, vs);
+    if css.kslots[at] != 0 {
+        return css.kvc.items[css.kslots[at] - 1].v;
+    }
+    let r = unset();
+    let tp = &css.dtpl.items[dc.v.i];
+    let t = &css.dbuf;
+    t.clear();
+    if substVars(css, tp.text, vs, t, 0) {
+        let d0 = css.decls.len;
+        let w0 = css.warns.len;
+        let n = inlineDecl(css, tp.name, t.str());
+        for j in 0..n {
+            let d2 = css.decls.items[d0 + j];
+            if d2.prop == prop {
+                r = declValue(css, prop, d2.v, -1, vs);
+            }
+        }
+        css.decls.len = d0;
+        css.warns.len = w0;
+    }
+    if r.kind == V_UNSET {
+        failDeferred(css, dc.v.i, "a var() here is undefined or the value is invalid after substituting it");
+    }
+    kvAdd(css, di, vs, r);
+    return r;
+}
+
+/// The slot of (`di`, `vs`) in `Css.kslots`: its own entry, or the empty one it would go in.
+fn kvSlot(css: &Css, di: int, vs: int): int {
+    let n = css.kslots.len;
+    let h = (di * 1000003 + vs * 7919) % n;
+    if h < 0 {
+        h += n;
+    }
+    while css.kslots[h] != 0 {
+        let e = &css.kvc.items[css.kslots[h] - 1];
+        if e.decl == di && e.vs == vs {
+            break;
+        }
+        h = (h + 1) % n;
+    }
+    return h;
+}
+
+/// Remember `v` for (`di`, `vs`) (not there yet); the index doubles when it is half full.
+fn kvAdd(css: &Css, di: int, vs: int, v: Value) {
+    css.kvc.push(KvStop { decl: di, vs: vs, v: v });
+    if css.kvc.len * 2 > css.kslots.len {
+        css.kslots = css.mem.alloc::<int>(css.kslots.len * 2);
+        for i in 0..css.kslots.len {
+            css.kslots[i] = 0;
+        }
+        for k in 0..css.kvc.len {
+            css.kslots[kvSlot(css, css.kvc.items[k].decl, css.kvc.items[k].vs)] = k + 1;
+        }
+        return;
+    }
+    css.kslots[kvSlot(css, di, vs)] = css.kvc.len;
+}
+
+/// A declaration kept with `var()` inside (`P_DEFER`, see `cssparse.declare`): substitute the custom
+/// properties of `vs`, parse the text as an ordinary declaration, and apply what it sets to `css.out`.
+/// Any failure skips it, like an undefined `var()`. Runs once per computed style (the cache is keyed by
+/// the matched rules and the parent, which fix the custom properties).
+fn applyDeferred(css: &Css, di: int, parent: int, vs: int) {
+    let tp = &css.dtpl.items[di];
+    let t = &css.dbuf;
+    t.clear();
+    if !substVars(css, tp.text, vs, t, 0) {
+        failDeferred(css, di, "a var() here is undefined or holds a value that cannot be written back (time, calc, keyword)");
+        return;
+    }
+    let d0 = css.decls.len;
+    let w0 = css.warns.len;
+    let n = inlineDecl(css, tp.name, t.str());
+    if n == 0 {
+        css.warns.len = w0;
+        failDeferred(css, di, "invalid value after substituting var()");
+        return;
+    }
+    for j in 0..n {
+        let dc = css.decls.items[d0 + j];
+        let v = declValue(css, dc.prop, dc.v, parent, vs);
+        if v.kind != V_UNSET {
+            css.out[dc.prop] = v;
+            css.omask[dc.prop] = true;
+        }
+    }
+    css.decls.len = d0;
+    css.warns.len = w0;
+}
+
+/// A deferred declaration did not resolve: say so once, at its place in the sheet (it may be a typo, or a
+/// variable that only some subtrees define; either way the declaration is skipped for this element).
+fn failDeferred(css: &Css, di: int, why: string) {
+    let tp = &css.dtpl.items[di];
+    if tp.warned {
+        return;
+    }
+    tp.warned = true;
+    let m = Text.new(css.mem);
+    m.pushStr("'");
+    m.pushStr(tp.name);
+    m.pushStr("' does not apply: ");
+    m.pushStr(why);
+    css.warns.push(Warning { file: tp.file, line: tp.line, col: tp.col, msg: m.str() });
+}
+
+/// Fill `css.out` for an element under `parent` with custom property set `vs` from the rules `ids[off..off + nm]` (ascending specificity):
+/// inherited and initial values, the declarations in order, then units. `mask` records in `css.omask` which properties
+/// the last winning declaration set through a `var()`.
+pub fn cascade(css: &Css, ids: []int, off: int, nm: int, parent: int, vs: int, mask: bool) {
+    for q in 0..NPROPS {
+        if parent >= 0 && inherits(q) {
+            css.out[q] = css.vals.items[parent * NPROPS + q];
+        } else {
+            css.out[q] = initial(q);
+        }
+        css.omask[q] = false;
+    }
+    for m in 0..nm {
+        let r = css.rules.items[ids[off + m]];
+        for d in 0..r.ndecl {
+            let dc = css.decls.items[r.decl0 + d];
+            if dc.prop == P_DEFER {
+                applyDeferred(css, dc.v.i, parent, vs);
+                continue;
+            }
+            if dc.prop >= NPROPS {
+                continue;
+            }
+            if dc.prop == P_ALL {
+                for q in 0..NPROPS {
+                    let av = dc.v;
+                    if av.kind == V_REVERT {
+                        av = revertValue(css, ids, off, nm, m, q, parent, vs);
+                    } else {
+                        av = declValue(css, q, av, parent, vs);
+                    }
+                    css.out[q] = av;
+                    css.omask[q] = false;
+                }
+                continue;
+            }
+            let v = declValue(css, dc.prop, dc.v, parent, vs);
+            if dc.v.kind == V_REVERT {
+                v = revertValue(css, ids, off, nm, m, dc.prop, parent, vs);
+            }
+            if v.kind != V_UNSET {
+                css.out[dc.prop] = v;
+                css.omask[dc.prop] = mask && dc.v.kind == V_VAR;
+            }
+        }
+    }
+    fontCalc(css, css.out, 0, parent);
+    resolveUnits(css, css.out, 0, parent);
+}
+
+fn buildStyle(css: &Css, nm: int, parent: int): int {
+    let vs = css.varsOf(parent);
+    let own = false;
+    for m in 0..nm {
+        let r0 = css.rules.items[css.midx[m]];
+        for d in 0..r0.ndecl {
+            if css.decls.items[r0.decl0 + d].prop >= NPROPS {
+                own = true;
+            }
+        }
+    }
+    if own || (css.noInh > 0 && hasNoInherit(css, vs)) {
+        vs = ownVars(css, nm, vs, parent);
+    }
+    cascade(css, css.midx, 0, nm, parent, vs, false);
+    for q in 0..NPROPS {
+        css.vals.push(css.out[q]);
+    }
+    css.nstyles += 1;
+    css.setVars(css.nstyles - 1, vs);
+    css.setRules(css.nstyles - 1, nm, parent);
+    return css.nstyles - 1;
+}
+
+/// Match every rule against `nodes[id]` into `css.midx[0..n]` (ascending specificity, then source order); returns n.
+/// `j3.ui.inspect` calls it for the pinned element.
+pub fn collect(css: &Css, nodes: []MatchNode, id: int): int {
+    let nm = 0;
+    // a `::before` / `::after` box takes the rules of that kind, matched against its host element
+    let rpe = if nodes[id].pe > 0 { nodes[id].pe } else { 0 };
+    let hid = if rpe > 0 { nodes[id].parent } else { id };
+    let scope = nodes[hid].scope;
+    let scope2 = nodes[hid].scope2;
+    let tag = nodes[hid].tag;
+    let classes = nodes[hid].classes;
+    let ncls = classes.len;
+    for s in 0..css.sheets.len {
+        let sh = &css.sheets.items[s];
+        // a sheet of the parent that passed a class to this root: only rules that name a class, see `scope2`
+        let foreign = sh.scope != 0 && sh.scope != scope;
+        if foreign && sh.scope != scope2 {
+            continue;
+        }
+        for ri in sh.rule0..sh.rule0 + sh.nrules {
+            let r = &css.rules.items[ri];
+            if r.pe != rpe {
+                continue;
+            }
+            if r.tag >= 0 && r.tag != tag && !(r.tag == css.tTextarea && nodes[hid].type == r.tag) {
+                continue;
+            }
+            if foreign && r.cls0 < 0 {
+                continue;
+            }
+            if r.mq >= 0 && !css.mediaHolds(r.mq) {
+                continue;
+            }
+            if r.cls0 >= 0 {
+                let has = false;
+                for j in 0..ncls {
+                    if classes[j] == r.cls0 {
+                        has = true;
+                    }
+                }
+                if !has {
+                    continue;
+                }
+            }
+            if nm < MAXM && matchRule(css, r, nodes, hid) {
+                // insertion by (spec, order)
+                // a passed class beats the component's own rule of the same specificity
+                let key = (r.spec + (if foreign { 1 } else { 0 })) * 1048576 + r.order;
+                let at = nm;
+                while at > 0 && css.mkey[at - 1] > key {
+                    css.mkey[at] = css.mkey[at - 1];
+                    css.midx[at] = css.midx[at - 1];
+                    at -= 1;
+                }
+                css.mkey[at] = key;
+                css.midx[at] = ri;
+                nm += 1;
+            }
+        }
+    }
+    return nm;
+}
+
+/// Computed style id for `nodes[id]`. `parent` is the style id `computeStyle` returned for the
+/// node's parent (-1 for the root); compute parents first. Styles are shared: the same matched
+/// rules under the same parent style return the same id. Read values with `css.get(style, P_*)`.
+/// Ponytail limits: 128 matching rules per node (extra ones are ignored) and a 4096-slot cache
+/// that is cleared when full.
+pub fn computeStyle(css: &Css, nodes: []MatchNode, id: int, parent: int): int {
+    let nm = collect(css, nodes, id);
+    let h = parent + 7;
+    for m in 0..nm {
+        h = h * 1000003 + css.midx[m] + 1;
+    }
+    let slot = h % SLOTS;
+    if slot < 0 {
+        slot += SLOTS;
+    }
+    while css.slots[slot] != 0 {
+        let ce = css.cents.items[css.slots[slot] - 1];
+        if ce.hash == h && ce.parent == parent && ce.n == nm {
+            let same_ = true;
+            for m in 0..nm {
+                if css.crules.items[ce.r0 + m] != css.midx[m] {
+                    same_ = false;
+                }
+            }
+            if same_ {
+                if parent < 0 { css.rootFs = css.get(ce.style, P_FONT_SIZE).f; }
+                return ce.style;
+            }
+        }
+        slot = (slot + 1) % SLOTS;
+    }
+    if css.cents.len >= SLOTS / 2 {
+        css.clearCache();
+        slot = ((h % SLOTS) + SLOTS) % SLOTS;
+    }
+    let style = buildStyle(css, nm, parent);
+    let r0 = css.crules.len;
+    for m in 0..nm {
+        css.crules.push(css.midx[m]);
+    }
+    css.cents.push(CacheEnt { hash: h, parent: parent, r0: r0, n: nm, style: style });
+    css.slots[slot] = css.cents.len;
+    if parent < 0 { css.rootFs = css.get(style, P_FONT_SIZE).f; }
+    return style;
+}

@@ -1,0 +1,348 @@
+// Bundled desktop scene editor. Run by `j3c editor` with the project as cwd.
+
+module j3_editor.files;
+
+use j3.game;
+use j3.io;
+use j3.result.Result;
+use j3.io.printLn;
+use j3.memory.{ Arena, scratch };
+use j3.scene3d;
+use j3.scene3d.{ Scene, MESH, INSTANCE };
+use j3.data.save;
+use j3.text.{ Text, cstr, same };
+use j3_editor.console.say;
+use j3_editor.history.{ modified, snapshot };
+use j3_editor.materials.{ matBefore, matChanged };
+use j3_editor.scenes.openMaterialTab;
+use j3_editor.selection.{ scriptIndex, catalogKey, loadParams };
+use j3_editor.tabs.{ autosavePath, dropAutosave, saveSession, stash };
+use j3_editor.types.{ AUTOSAVE_MS, MatEdit, Prune, World };
+use j3_editor.util.{ cut, fileExists, isOnline, makeDir, remember, setText };
+
+/// The host writes paths in index order. Keep them in an array for frame-time readers.
+pub fn readAssets(w: &World) {
+    let count = save.getInt(&w.assets, "assets.count", 0);
+    if count < 0 { count = 0; }
+    w.assetPaths = w.catMem.alloc::<string>(count + 16);
+    w.assetCount = 0;
+    let data = w.assets.bytes as string;
+    let start = 0;
+    while start < data.len && w.assetCount < count {
+        let end = start;
+        while end < data.len && data[end] != 10 { end += 1; }
+        if end - start > 12 && same(cut(data, start, start + 7), "assets.") {
+            let value = start + 7;
+            while value + 2 < end {
+                if data[value] == 32 && data[value + 1] == 115 && data[value + 2] == 61 { break; }
+                value += 1;
+            }
+            if value + 2 < end {
+                let path = cut(data, value + 3, end);
+                w.assetPaths[w.assetCount] = path;
+                w.assetCount += 1;
+            }
+        }
+        start = end + 1;
+    }
+}
+
+/// True when `file` is placed anywhere in `scene`, nested placements included.
+pub fn places(scene: &Scene, file: string): bool {
+    let i = 0;
+    while i < scene.len {
+        if scene.nodes[i].kind == INSTANCE && same(scene.nodes[i].scene, file) { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+/// Rebuild placed scenes in the tabs that show `written`, after it was saved.
+pub fn refreshFor(w: &World, written: string) {
+    stash(w);
+    let i = 0;
+    while i < w.tabCount {
+        if places(&w.tabs[i].scene, written) { scene3d.refresh(&w.tabs[i].scene, w.tabs[i].path); }
+        i += 1;
+    }
+    w.scene = w.tabs[w.active].scene;
+    w.worldsReady = false;
+    w.hoverNode = 0;
+    snapshot(w);
+}
+
+/// Write every tab with unsaved changes.
+pub fn saveAll(w: &World): bool {
+    stash(w);
+    let ok = true;
+    let wrote = scratch(0).alloc::<bool>(w.tabCount);
+    let i = 0;
+    while i < w.tabCount {
+        wrote[i] = false;
+        if i != w.active && w.tabs[i].dirty && w.tabs[i].mat as ptr != 0 {
+            if storeMaterial(w, w.tabs[i].mat, w.tabs[i].path) { w.tabs[i].dirty = false; } else { ok = false; }
+        } else if i != w.active && w.tabs[i].dirty {
+            if storeScene(w, &w.tabs[i].scene, w.tabs[i].path) {
+                w.tabs[i].dirty = false;
+                wrote[i] = true;
+            } else {
+                ok = false;
+            }
+        }
+        i += 1;
+    }
+    if w.dirty {
+        if writeActive(w) { wrote[w.active] = true; } else { ok = false; }
+    }
+    i = 0;
+    while i < wrote.len {
+        if wrote[i] { refreshFor(w, w.tabs[i].path); }
+        i += 1;
+    }
+    if ok { say(w, "All scenes saved"); } else { say(w, "Could not write a scene file"); }
+    return ok;
+}
+
+/// True when object `id`'s script still has prop `field`. Unknown scripts keep theirs.
+pub fn declared(ctx: ptr, id: int, field: string): bool {
+    let p = ctx as &Prune;
+    let at = scene3d.index(p.scene, id);
+    if at < 0 { return false; }
+    let name = p.scene.nodes[at].script;
+    if name.len == 0 { return false; }
+    let b = scriptIndex(p.w, name);
+    if b < 0 { return true; }
+    let count = save.getInt(&p.w.catalog, catalogKey(p.w, b, -1, "count"), 0);
+    let j = 0;
+    while j < count {
+        let declaredName = save.getStr(&p.w.catalog, catalogKey(p.w, b, j, "name"), "");
+        if same(declaredName, field) { return true; }
+        // vec3 and color fields are stored as `<name>.x`, `.y`, and `.z`.
+        let n = declaredName.len;
+        if field.len == n + 2 && field[n] == 46 && same(cut(field, 0, n), declaredName) { return true; }
+        j += 1;
+    }
+    return false;
+}
+
+/// Drop prop values no script has anymore, then write the scene.
+pub fn storeScene(w: &World, scene: &Scene, path: string): bool {
+    let p = Prune { w: w, scene: scene };
+    scene3d.retainParams(scene, &p as ptr, declared);
+    if !scene3d.store(scene, path) { return false; }
+    // Our own write is not an outside change.
+    remember(w, path);
+    dropAutosave(path);
+    return true;
+}
+
+/// Every minute, copy each scene with unsaved changes next to the build output. A clean
+/// save, close, or quit deletes the copy, so one found on open means the editor crashed.
+pub fn autosave(w: &World) {
+    let now = game.ticks();
+    if now - w.autosaveMs < AUTOSAVE_MS { return; }
+    w.autosaveMs = now;
+    saveSession(w);
+    stash(w);
+    let i = 0;
+    while i < w.tabCount {
+        let t = &w.tabs[i];
+        if t.dirty && t.mat as ptr != 0 { save.store(&t.mat.file, autosavePath(t.path)); }
+        else if t.dirty { scene3d.store(&t.scene, autosavePath(t.path)); }
+        i += 1;
+    }
+}
+
+/// Swap the active scene or material for its crash copy, as one undoable edit.
+pub fn recover(w: &World) {
+    if w.matTab {
+        matBefore(w);
+        w.mat.file = save.load(autosavePath(w.path), w.scene.arena);
+        matChanged(w);
+        dropAutosave(w.path);
+        setText(&w.recoverPath, "");
+        say(w, "Recovered unsaved changes; save to keep them");
+        return;
+    }
+    let saved = scene3d.load(autosavePath(w.path), w.scene.arena);
+    modified(w);
+    scene3d.release(&w.scene);
+    w.scene = saved;
+    scene3d.upload(&w.scene);
+    w.selected = 0;
+    w.hoverNode = 0;
+    dropAutosave(w.path);
+    setText(&w.recoverPath, "");
+    say(w, "Recovered unsaved changes; save to keep them");
+}
+
+/// Leave the editor, deleting crash copies: whatever wasn't saved was discarded on purpose.
+pub fn quit(w: &World) {
+    saveSession(w);
+    stash(w);
+    let i = 0;
+    while i < w.tabCount {
+        dropAutosave(w.tabs[i].path);
+        i += 1;
+    }
+    game.requestQuit();
+}
+
+pub fn writeActive(w: &World): bool {
+    if w.matTab {
+        if !storeMaterial(w, w.mat, w.path) { return false; }
+        w.dirty = false;
+        return true;
+    }
+    if !storeScene(w, &w.scene, w.path) { return false; }
+    w.dirty = false;
+    return true;
+}
+
+pub fn storeMaterial(w: &World, m: &MatEdit, path: string): bool {
+    save.store(&m.file, path);
+    dropAutosave(path);
+    scene3d.refreshMaterial(path);
+    return fileExists(path);
+}
+
+/// Save the open scene; other scenes that place it pick up the change.
+pub fn saveScene(w: &World): bool {
+    if isOnline(w.path) { return true; }
+    if writeActive(w) {
+        refreshFor(w, w.path);
+        if w.matTab { say(w, "Material saved"); } else { say(w, "Scene saved"); }
+        return true;
+    }
+    say(w, "Could not write scene file");
+    return false;
+}
+
+/// Save, then build and run this tab's scene. A running game is closed and restarted.
+pub fn play(w: &World) {
+    if saveAll(w) {
+        say(w, "Building game...");
+        let t = Text.new(scratch(0));
+        t.pushStr("J3EDITOR PLAY ");
+        t.pushStr(sceneTabPath(w));
+        printLn(t.str());
+    }
+}
+
+/// The active tab's scene, or from a material or Get Assets tab the first scene tab's.
+pub fn sceneTabPath(w: &World): string {
+    if !w.matTab && !isOnline(w.path) { return w.path; }
+    let i = 0;
+    while i < w.tabCount {
+        if w.tabs[i].mat as ptr == 0 && !isOnline(w.tabs[i].path) { return w.tabs[i].path; }
+        i += 1;
+    }
+    return w.path;
+}
+
+pub fn stopGame(w: &World) {
+    printLn("J3EDITOR STOP");
+}
+
+/// Ask the host to rescan assets and reread j3.editor.toml.
+pub fn rescan(w: &World) {
+    printLn("J3EDITOR RESCAN");
+    say(w, "Rescanning assets and j3.editor.toml...");
+}
+
+/// Ask the host to import `path` into this tab's scene.
+pub fn importFile(w: &World, path: string, scene: string) {
+    if w.matTab || isOnline(w.path) {
+        say(w, "Switch to a scene tab to import models into it");
+        return;
+    }
+    let t = Text.new(scratch(0));
+    t.pushStr("J3EDITOR IMPORT ");
+    t.pushStr(path);
+    t.push(9);
+    t.pushStr(scene);
+    if w.importAsScene { t.pushStr("\tscene"); }
+    printLn(t.str());
+    say(w, "Importing...");
+}
+
+/// Reload both catalogs into fresh memory, so repeated refreshes don't pile up.
+pub fn reloadCatalogs(w: &World) {
+    // Menu items point into the old asset list.
+    w.menuOpen = false;
+    w.menuFile = "";
+    w.catMem.destroy();
+    *w.catMem = Arena.create(64 * 1024);
+    w.catalog = save.load("target/j3-editor/catalog", w.catMem);
+    w.assets = save.load("target/j3-editor/assets-catalog", w.catMem);
+    readAssets(w);
+    loadParams(w);
+}
+
+/// Point the orbit camera at the selection and back off to fit it.
+pub fn focus(w: &World) {
+    let at = scene3d.index(&w.scene, w.selected);
+    if at < 0 { return; }
+    let n = w.scene.nodes[at];
+    let model = scene3d.world(&w.scene, n.id);
+    let lo = model.transformPoint(n.boundLo);
+    let hi = model.transformPoint(n.boundHi);
+    w.cam.target = (lo + hi) * 0.5;
+    let size = (hi - lo).length();
+    if n.kind != MESH { size = 1; }
+    w.cam.radius = size * 2.2 + 1.5;
+}
+
+/// Write a starter `.j3fx` under assets/fx/: a material effect, or a camera one.
+pub fn newEffect(w: &World, camera: bool) {
+    makeDir("assets");
+    makeDir("assets/fx");
+    let n = 1;
+    let t = Text.new(scratch(0));
+    let looking = true;
+    while looking {
+        t = Text.new(scratch(0));
+        t.pushStr(if camera { "assets/fx/camera" } else { "assets/fx/effect" });
+        t.pushInt(n);
+        t.pushStr(".j3fx");
+        looking = fileExists(t.str()) && n < 999;
+        n += 1;
+    }
+    let body = if camera { CAMERA_FX } else { MATERIAL_FX };
+    match io.writeFile(t.str(), body as []u8) {
+        Result.Ok(_) {}
+        Result.Err(_) { say(w, "Couldn't write the effect file"); return; }
+    }
+    rescan(w);
+    let msg = Text.new(scratch(0));
+    msg.pushStr("Wrote ");
+    msg.pushStr(t.str());
+    msg.pushStr("; edit its GLSL in a text editor, and saves show here");
+    say(w, msg.str());
+}
+
+const MATERIAL_FX: string = "kind=material\nparam.strength=float:1\n---\n// Runs after lighting and glow, before fog. `s` has pos, normal, view, uv, albedo, alpha.\n// To move vertices too, see Effects in the editor README.\nvec3 effect(Surface s, vec3 lit) {\n  return lit * uFx_strength;\n}\n";
+
+const CAMERA_FX: string = "kind=camera\nparam.strength=float:1\n---\n// Runs over the whole frame: uColor is the picture so far. Also uDepth, linearDepth(uv),\n// uNear, uFar, uTime, uResolution.\nvec4 effect(vec2 uv) {\n  vec3 c = texture(uColor, uv).rgb;\n  float gray = dot(c, vec3(0.299, 0.587, 0.114));\n  return vec4(mix(vec3(gray), c, uFx_strength), 1.0);\n}\n";
+
+/// Write a new material file under assets/materials/ and open it in a tab.
+pub fn newMaterial(w: &World) {
+    makeDir("assets");
+    makeDir("assets/materials");
+    let n = 1;
+    let t = Text.new(scratch(0));
+    let looking = true;
+    while looking {
+        t = Text.new(scratch(0));
+        t.pushStr("assets/materials/material");
+        t.pushInt(n);
+        t.pushStr(".j3mat");
+        looking = fileExists(t.str()) && n < 999;
+        n += 1;
+    }
+    let file = save.empty(scratch(0));
+    save.putFloat(&file, "tint.r", 1);
+    save.store(&file, t.str());
+    rescan(w);
+    openMaterialTab(w, t.str());
+}

@@ -1,0 +1,1714 @@
+/// The CSS parser entry point: declarations, selectors, rule blocks, `@keyframes`, `@font-face`, and `parse(&css, src, file, scope)`.
+
+module j3.ui.cssparse;
+
+use j3.text.{ Text, same };
+use j3.ui.css.{ animKind, CK_NONE, COMB_CHILD, COMB_DESC, COMB_NEXT, COMB_SIB, Css, FL_ACTIVE, FL_DISABLED, FL_DRAGGING, FL_DROP, FL_CHECKED, FL_FIRST_CHILD, FL_FOCUS, FL_OPEN, FL_PH_SHOWN, FL_FOCUS_VIS, FL_FOCUS_WITHIN, FL_LAST_CHILD, NK_CHILD, NK_LAST_CHILD, NK_LAST_TYPE, NK_TYPE, SS_EMPTY, SS_FIRST_TYPE, SS_LAST_TYPE, SS_ONLY_CHILD, SS_ONLY_TYPE };
+use j3.ui.css.{ FL_HOVER, FontFace, Frame, hasBit, Keyframes, P_BACKGROUND, P_BG_IMAGE, P_BG_POS, P_BG_REPEAT, P_BG_SIZE, P_BORDER_IMAGE, P_BORDER_IMG_W, P_BORDER_OUTSET, P_BORDER_REPEAT, P_BORDER_SLICE };
+use j3.ui.css.{ P_BORDER_TOP_COLOR, P_BORDER_TOP_WIDTH, P_FONT_FAMILY, P_FONT_SIZE, P_FONT_WEIGHT, P_GAP, P_LINE_HEIGHT, P_MARGIN_TOP };
+use j3.ui.css.{ P_SCROLL_MARGIN, P_SCROLL_PAD };
+use j3.ui.css.{ Media, NPROPS, P_PADDING_TOP, P_RADIUS_TL, P_ROW_GAP, PS_ROOT, Rule, Sheet, SrcText, Step };
+use j3.ui.css.DeclLog;
+use j3.ui.css.{ coerceSyn, Reg, SY_ANGLE, SY_ANY, SY_COLOR, SY_LEN, SY_LENPCT, SY_NUM, SY_PCT, SY_URL, Value, Deferred, P_ANIM_FILL, P_ANIM_NAME, P_ALL, P_DEFER, V_AUTO, V_COLOR, V_INHERIT, V_INITIAL, V_NONE, V_NUM, V_REVERT, V_UNSET, V_UNSETKW };
+use j3.ui.csslex.{ Lexer, next, T_AT, T_COLON, T_COMMA, T_DELIM, T_EOF, T_FUNC };
+use j3.ui.csslex.{ T_IDENT, T_LBRACE, T_LBRACK, T_LPAREN, T_NUM, T_PCT, T_RBRACE, T_RBRACK };
+use j3.ui.csslex.{ T_HASH, T_RPAREN, T_SEMI, T_STR, T_URL, Token };
+use j3.ui.cssvalue.{ gradients, isWord, mk, P, parseColor, parseLen, propId, setTk, tk, unitIs };
+use j3.ui.cssvalue.{ txt, warnAt, warnName };
+use j3.ui.cssprop.{ animation, animList, hasListComma, hasUrl, borderSides, box4, decoration, emit, outline, overflow2, parseVal, scrollbarColor, stroke, wave };
+use j3.ui.cssprop.{ parseCustom, transitions, wideKind, wideShort };
+use j3.ui.cssgrid;
+use j3.ui.cssnest.{ join, part };
+use j3.ui.cssimage.{ bgShorthand, borderImage };
+
+#[singleton]
+#[thread]
+let PEND: [576]Rule;
+
+/// `@media` conditions open at the top level (saved `p.mq`), and the resolved selector list of each open rule level (nesting).
+#[singleton]
+#[thread]
+let MQS: [8]int;
+
+#[singleton]
+#[thread]
+let PT: [9]string;
+
+/// `@keyframes name { from { ... } 50%, 80% { ... } to { ... } }`. The stops are sorted; a stop
+/// may set `animation-timing-function` for the span after it.
+fn keyframes(p: &P, at: Token) {
+    let nm = next(&p.lx);
+    let b = next(&p.lx);
+    if nm.kind != T_IDENT || b.kind != T_LBRACE {
+        warnAt(p, at.line, at.col, "@keyframes needs a name and a block");
+        if b.kind == T_LBRACE {
+            skipBlock(p);
+        }
+        return;
+    }
+    let css = p.css;
+    let kf = Keyframes { name: css.intern(txt(p, &nm)), f0: css.frames.len, nf: 0, nprop: 0, props: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] };
+    let stops: [8]f32 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    while true {
+        let t = next(&p.lx);
+        if t.kind == T_EOF || t.kind == T_RBRACE {
+            break;
+        }
+        let ns = 0;
+        let bad = false;
+        while t.kind != T_LBRACE {
+            if t.kind == T_EOF || t.kind == T_RBRACE {
+                return;
+            }
+            if t.kind == T_PCT && ns < 8 && t.f >= 0.0 && t.f <= 100.0 {
+                stops[ns] = t.f / 100.0;
+                ns += 1;
+            } else if isWord(p, &t, "from") && ns < 8 {
+                stops[ns] = 0.0;
+                ns += 1;
+            } else if isWord(p, &t, "to") && ns < 8 {
+                stops[ns] = 1.0;
+                ns += 1;
+            } else if t.kind != T_COMMA {
+                bad = true;
+            }
+            t = next(&p.lx);
+        }
+        if bad || ns == 0 {
+            warnAt(p, t.line, t.col, "keyframe selector must be from, to, or a percentage");
+            skipBlock(p);
+            continue;
+        }
+        let d0 = css.decls.len;
+        p.ndecl = 0;
+        p.kf = true;
+        parseBlock(p);
+        p.kf = false;
+        for s in 0..ns {
+            css.frames.push(Frame { at: stops[s], decl0: d0, ndecl: p.ndecl });
+            kf.nf += 1;
+        }
+    }
+    // ascending by stop (stable), then the properties the stops animate
+    for i in 1..kf.nf {
+        let f = css.frames.items[kf.f0 + i];
+        let j = i;
+        while j > 0 && css.frames.items[kf.f0 + j - 1].at > f.at {
+            css.frames.items[kf.f0 + j] = css.frames.items[kf.f0 + j - 1];
+            j -= 1;
+        }
+        css.frames.items[kf.f0 + j] = f;
+    }
+    for i in 0..kf.nf {
+        let fr = css.frames.items[kf.f0 + i];
+        for d in 0..fr.ndecl {
+            let pr = css.decls.items[fr.decl0 + d].prop;
+            if pr == P_DEFER {
+                // `var()` inside a compound value: the longhand it sets is animated, its value is resolved per element (`motion.stopValue`)
+                let tp = &css.dtpl.items[css.decls.items[fr.decl0 + d].v.i];
+                pr = tp.prop;
+                if pr < 0 {
+                    warnAt(p, tp.line, tp.col, "var() in a shorthand inside @keyframes is not animated; use the longhand");
+                    continue;
+                }
+            }
+            let have = animKind(pr) == CK_NONE && pr < NPROPS;
+            for q in 0..kf.nprop {
+                if kf.props[q] == pr {
+                    have = true;
+                }
+            }
+            if !have && kf.nprop < 16 {
+                kf.props[kf.nprop] = pr;
+                kf.nprop += 1;
+            }
+        }
+    }
+    css.kfs.push(kf);
+}
+
+/// In `@keyframes`: cut the declarations just made at `css.decls[d0..]` that are `initial`, `unset`, `revert` or `all` (CSS forbids them there), with a warning at the declaration's own place.
+fn dropWide(p: &P, d0: int, line: int, col: int) {
+    let css = p.css;
+    for i in d0..css.decls.len {
+        let dc = css.decls.items[i];
+        if dc.prop != P_DEFER && (dc.v.kind == V_INITIAL || dc.v.kind == V_UNSETKW || dc.v.kind == V_REVERT || dc.prop == P_ALL) {
+            warnAt(p, line, col, "initial, unset, revert and all are ignored in @keyframes");
+            p.ndecl -= css.decls.len - d0;
+            css.decls.len = d0;
+            return;
+        }
+    }
+}
+
+/// `SY_*` of an `@property` syntax string, -1 for one that is not supported.
+fn syntaxOf(s: string): int {
+    if same(s, "*") { return SY_ANY; }
+    if same(s, "<color>") { return SY_COLOR; }
+    if same(s, "<length>") { return SY_LEN; }
+    if same(s, "<number>") { return SY_NUM; }
+    if same(s, "<percentage>") { return SY_PCT; }
+    if same(s, "<length-percentage>") { return SY_LENPCT; }
+    if same(s, "<angle>") { return SY_ANGLE; }
+    if same(s, "<url>") { return SY_URL; }
+    return -1;
+}
+
+/// One descriptor of an `@property` block (`syntax`, `inherits`, `initial-value`); a bad one warns and counts as missing.
+fn descriptor(p: &P, name: string, line: int, col: int, n: int) {
+    if same(name, "syntax") {
+        let sx = -1;
+        if n == 1 && tk(0).kind == T_STR {
+            sx = syntaxOf(txt(p, tk(0)));
+        }
+        if sx < 0 {
+            warnAt(p, line, col, "@property syntax must be '<color>', '<length>', '<number>', '<percentage>', '<length-percentage>', '<angle>', '<url>' or '*' ('<image>' is not supported)");
+            return;
+        }
+        p.pdSyn = sx;
+        p.pdSeen += if p.pdSeen % 2 == 0 { 1 } else { 0 };
+    } else if same(name, "inherits") {
+        if n != 1 || !(isWord(p, tk(0), "true") || isWord(p, tk(0), "false")) {
+            warnAt(p, line, col, "@property inherits must be true or false");
+            return;
+        }
+        p.pdInh = isWord(p, tk(0), "true");
+        p.pdSeen += if (p.pdSeen / 2) % 2 == 0 { 2 } else { 0 };
+    } else if same(name, "initial-value") {
+        p.pdInit = p.lx.src[p.vs..p.ve];
+        p.pdLine = line;
+        p.pdCol = col;
+        p.pdSeen += if p.pdSeen / 4 == 0 { 4 } else { 0 };
+    } else {
+        warnName(p, line, col, "unknown @property descriptor '", name, "'");
+    }
+}
+
+/// `@property --name { syntax: '<color>'; inherits: true; initial-value: red; }`: register a typed custom property.
+/// Without `syntax` and `inherits`, or (unless the syntax is `*`) a valid `initial-value`, the rule is ignored with a warning.
+fn property(p: &P, at: Token) {
+    let nm = next(&p.lx);
+    let b = next(&p.lx);
+    let name = txt(p, &nm);
+    if nm.kind != T_IDENT || name.len <= 2 || int(name[0]) != 45 || int(name[1]) != 45 || b.kind != T_LBRACE {
+        warnAt(p, at.line, at.col, "@property needs a custom property name (--x) and a block");
+        if b.kind == T_LBRACE {
+            skipBlock(p);
+        }
+        return;
+    }
+    let css = p.css;
+    p.mode = 2;
+    p.pdSeen = 0;
+    p.pdInit = "";
+    parseBlock(p);
+    p.mode = 0;
+    let w0 = css.warns.len;
+    if p.pdSeen % 2 == 0 {
+        warnName(p, at.line, at.col, "@property ", name, " ignored: it needs a valid syntax descriptor");
+        return;
+    }
+    if (p.pdSeen / 2) % 2 == 0 {
+        warnName(p, at.line, at.col, "@property ", name, " ignored: it needs an inherits descriptor");
+        return;
+    }
+    let iv = Value { kind: V_UNSET, f: 0.0, i: 0, c: 0 };
+    if p.pdSeen / 4 == 1 {
+        let d0 = css.decls.len;
+        let k = inlineDecl(css, name, p.pdInit);
+        if k == 1 {
+            iv = coerceSyn(css, p.pdSyn, css.decls.items[d0].v, 16.0);
+        }
+        css.decls.len = d0;
+        css.warns.len = w0;
+        if iv.kind == V_UNSET {
+            warnAt(p, p.pdLine, p.pdCol, "@property initial-value does not match its syntax (or has a var())");
+            warnName(p, at.line, at.col, "@property ", name, " ignored");
+            return;
+        }
+    } else if p.pdSyn != SY_ANY {
+        warnName(p, at.line, at.col, "@property ", name, " ignored: it needs an initial-value (only syntax '*' may leave it out)");
+        return;
+    }
+    css.regs.push(Reg { name: css.intern(name), syn: p.pdSyn, inh: p.pdInh, init: iv });
+    if !p.pdInh {
+        css.noInh += 1;
+    }
+}
+
+/// Vendor and legacy names for properties that have a standard spelling here.
+fn realName(name: string): string {
+    if same(name, "-webkit-text-stroke-width") { return "text-stroke-width"; }
+    if same(name, "-webkit-text-stroke-color") { return "text-stroke-color"; }
+    if same(name, "-webkit-background-clip") { return "background-clip"; }
+    if same(name, "word-wrap") { return "overflow-wrap"; }
+    return name;
+}
+
+/// `--name: value`: a custom property declaration, kept in `css.decls` as prop `NPROPS + interned name`.
+fn custom(p: &P, name: string, n: int): bool {
+    let v = mk(V_UNSET, 0.0, 0, 0);
+    if n == 1 && wideKind(p, tk(0)) > 0 {
+        emit(p, NPROPS + p.css.intern(name), mk(wideKind(p, tk(0)), 0.0, 0, 0));
+        return true;
+    }
+    if n == 0 || parseCustom(p, 0, n, &v) != n {
+        return false;
+    }
+    emit(p, NPROPS + p.css.intern(name), v);
+    return true;
+}
+
+fn dirOf(file: string): int {
+    let i = file.len;
+    while i > 0 && int(file[i - 1]) != 47 {
+        i -= 1;
+    }
+    return i;
+}
+
+/// `rel` against the directory of `file`, collapsing leading `../`.
+fn joinPath(p: &P, rel: string): string {
+    let d = dirOf(p.file);
+    let dir = p.file[0..d];
+    let r = rel;
+    if r.len > 0 && int(r[0]) == 47 {
+        return r;
+    }
+    while true {
+        if r.len >= 3 && int(r[0]) == 46 && int(r[1]) == 46 && int(r[2]) == 47 && dir.len > 0 {
+            // drop one directory segment
+            let e = dir.len - 1;
+            let s = e;
+            while s > 0 && int(dir[s - 1]) != 47 {
+                s -= 1;
+            }
+            if same(dir[s..e], "..") {
+                break;
+            }
+            dir = dir[0..s];
+            r = r[3..];
+        } else if r.len >= 2 && int(r[0]) == 46 && int(r[1]) == 47 {
+            r = r[2..];
+        } else {
+            break;
+        }
+    }
+    let t = Text.new(p.css.mem);
+    t.pushStr(dir);
+    t.pushStr(r);
+    return t.str();
+}
+
+/// Handle one `name: TOK[0..n)`.
+fn declare(p: &P, name: string, line: int, col: int, n: int) {
+    if p.mode == 1 {
+        if same(name, "font-family") && n >= 1 && (tk(0).kind == T_STR || tk(0).kind == T_IDENT) {
+            p.ffFamily = p.css.intern(txt(p, tk(0)));
+            p.ffHave = true;
+        } else if same(name, "src") && n >= 1 && tk(0).kind == T_URL {
+            p.ffPath = joinPath(p, txt(p, tk(0)));
+        } else {
+            warnName(p, line, col, "unsupported @font-face declaration '", name, "'");
+        }
+        return;
+    }
+    if p.mode == 2 {
+        descriptor(p, name, line, col, n);
+        return;
+    }
+    let ok = false;
+    name = realName(name);
+    let d0 = p.css.decls.len;
+    let w0 = p.css.warns.len;
+    let nd0 = p.ndecl;
+    let wk = 0;
+    if n == 1 {
+        wk = wideKind(p, tk(0));
+    }
+    if name.len > 2 && int(name[0]) == 45 && int(name[1]) == 45 {
+        ok = custom(p, name, n);
+    } else if wk > 0 && wideShort(p, name, mk(wk, 0.0, 0, 0)) {
+        ok = true;
+    } else if same(name, "padding") {
+        ok = box4(p, P_PADDING_TOP, n);
+    } else if same(name, "margin") {
+        ok = box4(p, P_MARGIN_TOP, n);
+    } else if same(name, "scroll-padding") {
+        ok = box4(p, P_SCROLL_PAD, n);
+    } else if same(name, "scroll-margin") {
+        ok = box4(p, P_SCROLL_MARGIN, n);
+    } else if same(name, "inset") {
+        ok = box4(p, -1, n);
+    } else if same(name, "border-color") {
+        ok = box4(p, P_BORDER_TOP_COLOR, n);
+    } else if same(name, "border-width") {
+        ok = box4(p, P_BORDER_TOP_WIDTH, n);
+    } else if same(name, "border-radius") {
+        ok = box4(p, P_RADIUS_TL, n);
+    } else if same(name, "border") {
+        ok = borderSides(p, 0, 4, n);
+    } else if same(name, "border-top") {
+        ok = borderSides(p, 0, 1, n);
+    } else if same(name, "border-right") {
+        ok = borderSides(p, 1, 1, n);
+    } else if same(name, "border-bottom") {
+        ok = borderSides(p, 2, 1, n);
+    } else if same(name, "border-left") {
+        ok = borderSides(p, 3, 1, n);
+    } else if same(name, "outline") {
+        ok = outline(p, n);
+    } else if same(name, "text-decoration") {
+        ok = decoration(p, n);
+    } else if same(name, "overflow") {
+        ok = overflow2(p, n);
+    } else if same(name, "scrollbar-color") {
+        ok = scrollbarColor(p, n);
+    } else if same(name, "gap") {
+        let a = mk(V_UNSET, 0.0, 0, 0);
+        let used = parseVal(p, P_GAP, 0, n, &a);
+        if used > 0 && used == n {
+            emit(p, P_ROW_GAP, a);
+            emit(p, P_GAP, a);
+            ok = true;
+        } else if used > 0 {
+            let b = mk(V_UNSET, 0.0, 0, 0);
+            if parseVal(p, P_GAP, used, n, &b) == n - used {
+                emit(p, P_ROW_GAP, a);
+                emit(p, P_GAP, b);
+                ok = true;
+            }
+        }
+    } else if same(name, "-webkit-text-stroke") || same(name, "text-stroke") {
+        ok = stroke(p, n);
+    } else if same(name, "text-wave") {
+        ok = wave(p, n);
+    } else if same(name, "font") {
+        if n == 1 && isWord(p, tk(0), "inherit") {
+            let inh = mk(V_INHERIT, 0.0, 0, 0);
+            emit(p, P_FONT_SIZE, inh);
+            emit(p, P_FONT_WEIGHT, inh);
+            emit(p, P_FONT_FAMILY, inh);
+            emit(p, P_LINE_HEIGHT, inh);
+            ok = true;
+        }
+    } else if cssgrid.declare(p, name, n, &ok) {
+    } else if same(name, "transition") {
+        ok = transitions(p, n);
+    } else if same(name, "animation") {
+        ok = animation(p, n);
+    } else if same(name, "background") {
+        let bgv = mk(V_UNSET, 0.0, 0, 0);
+        let img = mk(V_NONE, 0.0, 0, 0);
+        let nused = 0;
+        if n > 0 && hasUrl(0, n) {
+            // image layers with url(): the shorthand also sets position, size and repeat per layer
+            let pos = mk(V_NONE, 0.0, 0, 0);
+            let sz = mk(V_NONE, 0.0, 0, 0);
+            let rep = mk(V_NONE, 0.0, 0, 0);
+            ok = bgShorthand(p, n, &img, &pos, &sz, &rep, &bgv);
+            if ok {
+                if bgv.kind == V_UNSET {
+                    bgv = mk(V_COLOR, 0.0, 0, 0);
+                }
+                emit(p, P_BG_IMAGE, img);
+                emit(p, P_BACKGROUND, bgv);
+                emit(p, P_BG_REPEAT, rep);
+                emit(p, P_BG_SIZE, sz);
+                emit(p, P_BG_POS, pos);
+            }
+        } else if n > 0 && tk(0).kind == T_FUNC && tk(0).e - tk(0).s > 9 {
+            nused = gradients(p, 0, n, &img, true);
+            if nused > 0 && nused < n && tk(nused).kind == T_COMMA {
+                // the last layer may be a base color
+                ok = parseVal(p, P_BACKGROUND, nused + 1, n, &bgv) == n - nused - 1;
+            } else {
+                ok = nused == n;
+                bgv = mk(V_COLOR, 0.0, 0, 0);
+            }
+            if ok {
+                emit(p, P_BG_IMAGE, img);
+                emit(p, P_BACKGROUND, bgv);
+            }
+        } else {
+            ok = parseVal(p, P_BACKGROUND, 0, n, &bgv) == n && n > 0;
+            if ok {
+                emit(p, P_BG_IMAGE, img);
+                emit(p, P_BACKGROUND, bgv);
+            }
+        }
+    } else if same(name, "border-image") {
+        let bi = mk(V_UNSET, 0.0, 0, 0);
+        let sl = mk(V_NONE, 0.0, 0, 0);
+        let wd = mk(V_NONE, 0.0, 0, 0);
+        let ot = mk(V_NONE, 0.0, 0, 0);
+        let rp = mk(V_NONE, 0.0, 0, 0);
+        ok = n > 0 && borderImage(p, n, &bi, &sl, &wd, &ot, &rp);
+        if ok {
+            if bi.kind == V_UNSET {
+                bi = mk(V_NONE, 0.0, 0, 0);
+            }
+            emit(p, P_BORDER_IMAGE, bi);
+            emit(p, P_BORDER_SLICE, sl);
+            emit(p, P_BORDER_REPEAT, rp);
+            emit(p, P_BORDER_IMG_W, wd);
+            emit(p, P_BORDER_OUTSET, ot);
+        }
+    } else {
+        let prop = propId(name);
+        if prop < 0 {
+            warnName(p, line, col, "unknown property '", name, "'");
+            return;
+        }
+        let v = mk(V_UNSET, 0.0, 0, 0);
+        if prop >= P_ANIM_NAME && prop <= P_ANIM_FILL && hasListComma(p, n) {
+            ok = animList(p, prop, n);
+        } else if wk > 0 {
+            emit(p, prop, mk(wk, 0.0, 0, 0));
+            ok = true;
+        } else {
+            ok = n > 0 && parseVal(p, prop, 0, n, &v) == n;
+            if ok {
+                emit(p, prop, v);
+            }
+        }
+    }
+    if !ok && p.late && p.ve > p.vs && !(name.len > 2 && int(name[0]) == 45 && int(name[1]) == 45) && hasVar(p, n) {
+        // `var()` inside a compound value: keep the text, the cascade substitutes and parses it again
+        p.css.decls.len = d0;
+        p.css.warns.len = w0;
+        p.ndecl = nd0;
+        p.css.dtpl.push(Deferred { name: name, prop: propId(name), text: p.lx.src[p.vs..p.ve], file: p.file, line: line, col: col, warned: false });
+        emit(p, P_DEFER, mk(V_UNSET, 0.0, p.css.dtpl.len - 1, 0));
+        return;
+    }
+    if !ok && !p.late && hasVar(p, n) && !(name.len > 2 && int(name[0]) == 45 && int(name[1]) == 45) {
+        warnName(p, line, col, "var() inside a compound value is not supported in style: text ('", name, "'): put the declaration in a class of a stylesheet");
+    } else if !ok {
+        for i in 0..n {
+            if n > 1 && wideKind(p, tk(i)) > 0 {
+                warnName(p, line, col, "inherit, initial, unset and revert must be the whole value of '", name, "'");
+                return;
+            }
+        }
+        warnName(p, line, col, "invalid value for '", name, "'");
+    }
+}
+
+/// Does `TOK[0..n)` contain a `var(`?
+fn hasVar(p: &P, n: int): bool {
+    for i in 0..n {
+        if tk(i).kind == T_FUNC && same(txt(p, tk(i)), "var") {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn pseudoBit(name: string): int {
+    if same(name, "hover") { return FL_HOVER; }
+    if same(name, "active") { return FL_ACTIVE; }
+    if same(name, "disabled") { return FL_DISABLED; }
+    if same(name, "first-child") { return FL_FIRST_CHILD; }
+    if same(name, "last-child") { return FL_LAST_CHILD; }
+    if same(name, "focus") { return FL_FOCUS; }
+    if same(name, "focus-within") { return FL_FOCUS_WITHIN; }
+    if same(name, "focus-visible") { return FL_FOCUS_VIS; }
+    if same(name, "checked") { return FL_CHECKED; }
+    if same(name, "placeholder-shown") { return FL_PH_SHOWN; }
+    if same(name, "open") { return FL_OPEN; }
+    if same(name, "root") { return PS_ROOT; }
+    if same(name, "dragging") { return FL_DRAGGING; }
+    if same(name, "drop-target") { return FL_DROP; }
+    return 0;
+}
+
+/// The `SS_*` bit of an argument-less structural pseudo-class, 0 for any other name.
+fn ssBit(name: string): int {
+    if same(name, "empty") { return SS_EMPTY; }
+    if same(name, "only-child") { return SS_ONLY_CHILD; }
+    if same(name, "first-of-type") { return SS_FIRST_TYPE; }
+    if same(name, "last-of-type") { return SS_LAST_TYPE; }
+    if same(name, "only-of-type") { return SS_ONLY_TYPE; }
+    return 0;
+}
+
+/// The `NK_*` kind of an `:nth-...()` function name, -1 for any other name.
+fn nthKind(name: string): int {
+    if same(name, "nth-child") { return NK_CHILD; }
+    if same(name, "nth-last-child") { return NK_LAST_CHILD; }
+    if same(name, "nth-of-type") { return NK_TYPE; }
+    if same(name, "nth-last-of-type") { return NK_LAST_TYPE; }
+    return -1;
+}
+
+/// `before` / `after` (the pseudo-element name) as `Rule.pe`, 0 for any other word.
+fn peKind(name: string): int {
+    if same(name, "before") { return 1; }
+    if same(name, "after") { return 2; }
+    return 0;
+}
+
+fn newStep(): Step {
+    return Step { tag: -1, ncls: 0, cls: [0, 0, 0, 0], attr: -1, pseudo: 0, comb: COMB_DESC, id: -1, not0: 0, nnot: 0, nth: false, nthA: 0, nthB: 0, nthK: 0, ss: 0, has0: 0, nhas: 0 };
+}
+
+/// The integer at `t[k..]` (digits only) into `*v`, returning the index after it; `k` when there are none.
+fn nthNum(t: string, k: int, v: &int): int {
+    let i = k;
+    let x = 0;
+    while i < t.len && int(t[i]) >= 48 && int(t[i]) <= 57 {
+        x = x * 10 + (int(t[i]) - 48);
+        i += 1;
+    }
+    *v = x;
+    return i;
+}
+
+/// `An+B` of `:nth-child`: `odd`, `even`, `N`, `n`, `-n+3`, `2n + 1`. False for anything else.
+fn nthParse(s: string, oa: &int, ob: &int): bool {
+    let lo = 0;
+    let hi = s.len;
+    while lo < hi && int(s[lo]) == 32 {
+        lo += 1;
+    }
+    while hi > lo && int(s[hi - 1]) == 32 {
+        hi -= 1;
+    }
+    let t = s[lo..hi];
+    if same(t, "odd") {
+        *oa = 2;
+        *ob = 1;
+        return true;
+    }
+    if same(t, "even") {
+        *oa = 2;
+        *ob = 0;
+        return true;
+    }
+    let k = 0;
+    let sign = 1;
+    if k < t.len && int(t[k]) == 45 {
+        sign = -1;
+        k += 1;
+    } else if k < t.len && int(t[k]) == 43 {
+        k += 1;
+    }
+    let num = 0;
+    let e = nthNum(t, k, &num);
+    let hasNum = e > k;
+    k = e;
+    if k < t.len && int(t[k]) == 110 {
+        k += 1;
+        *oa = sign * (if hasNum { num } else { 1 });
+        while k < t.len && int(t[k]) == 32 {
+            k += 1;
+        }
+        if k == t.len {
+            *ob = 0;
+            return true;
+        }
+        let sign2 = 1;
+        if int(t[k]) == 45 {
+            sign2 = -1;
+        } else if int(t[k]) != 43 {
+            return false;
+        }
+        k += 1;
+        while k < t.len && int(t[k]) == 32 {
+            k += 1;
+        }
+        let b = 0;
+        let e2 = nthNum(t, k, &b);
+        if e2 == k || e2 != t.len {
+            return false;
+        }
+        *ob = sign2 * b;
+        return true;
+    }
+    if !hasNum || k != t.len {
+        return false;
+    }
+    *oa = 0;
+    *ob = sign * num;
+    return true;
+}
+
+/// Parentheses opened and not yet closed in `TOK[a..b)` (a comma inside a nested `(...)` does not split a `:not()` / `:has()` list).
+fn openParens(a: int, b: int): int {
+    let n = 0;
+    for k in a..b {
+        if tk(k).kind == T_FUNC || tk(k).kind == T_LPAREN {
+            n += 1;
+        } else if tk(k).kind == T_RPAREN {
+            n -= 1;
+        }
+    }
+    return n;
+}
+
+/// One argument of `:not(...)`, `TOK[a..b)`: a compound of a tag, `*`, `.class`, `#id`, `:pseudo-class` and `[type=x]` (no combinators, no
+/// nesting) into `out`. Returns its specificity (`a*10000 + b*100 + c`), -1 with a warning when it is not supported.
+fn notArg(p: &P, a: int, b: int, out: &Step): int {
+    let na = 0;
+    let nb = 0;
+    let nc = 0;
+    let started = false;
+    let i = a;
+    while i < b {
+        let t = tk(i);
+        if t.kind == T_IDENT && !started {
+            out.tag = p.css.intern(txt(p, t));
+            nc += 1;
+        } else if t.kind == T_DELIM && t.ch == 42 && !started {
+            started = true;
+        } else if t.kind == T_DELIM && t.ch == 46 && i + 1 < b && tk(i + 1).kind == T_IDENT && out.ncls < 4 {
+            out.cls[out.ncls] = p.css.intern(txt(p, tk(i + 1)));
+            out.ncls += 1;
+            nb += 1;
+            i += 1;
+        } else if t.kind == T_HASH && out.id < 0 {
+            out.id = p.css.intern(txt(p, t));
+            na += 1;
+        } else if t.kind == T_COLON && i + 1 < b && tk(i + 1).kind == T_IDENT && pseudoBit(txt(p, tk(i + 1))) != 0 {
+            let bit = pseudoBit(txt(p, tk(i + 1)));
+            if !hasBit(out.pseudo, bit) {
+                out.pseudo += bit;
+            }
+            nb += 1;
+            i += 1;
+        } else if t.kind == T_COLON && i + 1 < b && tk(i + 1).kind == T_IDENT && ssBit(txt(p, tk(i + 1))) != 0 {
+            if !hasBit(out.ss, ssBit(txt(p, tk(i + 1)))) { out.ss += ssBit(txt(p, tk(i + 1))); }
+            p.css.structMode = 1;
+            nb += 1;
+            i += 1;
+        } else if t.kind == T_LBRACK && i + 4 < b && tk(i + 1).kind == T_IDENT && same(txt(p, tk(i + 1)), "type") && tk(i + 2).kind == T_DELIM && tk(i + 2).ch == 61 && (tk(i + 3).kind == T_STR || tk(i + 3).kind == T_IDENT) && tk(i + 4).kind == T_RBRACK {
+            out.attr = p.css.intern(txt(p, tk(i + 3)));
+            nb += 1;
+            i += 4;
+        } else {
+            warnAt(p, t.line, t.col, ":not() takes a tag, class, #id, :pseudo-class or [type] (no combinators or nesting)");
+            return -1;
+        }
+        started = true;
+        i += 1;
+    }
+    if !started {
+        warnAt(p, tk(a).line, tk(a).col, "empty :not()");
+        return -1;
+    }
+    return na * 10000 + nb * 100 + nc;
+}
+
+/// One argument of `:has(...)`, `TOK[a..b)`: an optional `>`, `+` or `~` and one compound (what `:not()` takes) into `out`, with
+/// `out.comb` the relation to the subject. Returns its specificity, -1 with a warning for a nested `:has()` or a complex selector.
+fn hasArg(p: &P, a: int, b: int, out: &Step): int {
+    let lo = a;
+    out.comb = COMB_DESC;
+    if lo < b && tk(lo).kind == T_DELIM && (tk(lo).ch == 62 || tk(lo).ch == 43 || tk(lo).ch == 126) {
+        out.comb = if tk(lo).ch == 62 { COMB_CHILD } else if tk(lo).ch == 43 { COMB_NEXT } else { COMB_SIB };
+        lo += 1;
+    }
+    for k in lo + 1..b {
+        if tk(k).sp || (tk(k).kind == T_DELIM && (tk(k).ch == 62 || tk(k).ch == 43 || tk(k).ch == 126)) {
+            warnAt(p, tk(k).line, tk(k).col, ":has() takes one compound selector, optionally after > + or ~ (no .a .b)");
+            return -1;
+        }
+    }
+    if lo >= b {
+        warnAt(p, tk(a).line, tk(a).col, "empty :has()");
+        return -1;
+    }
+    let comb = out.comb;
+    let sp = notArg(p, lo, b, out);
+    out.comb = comb;
+    return sp;
+}
+
+/// Compile `TOK[a..b)` into steps and one pending rule; false (with a warning) when unsupported.
+fn compileSel(p: &P, a: int, b: int): bool {
+    if a >= b {
+        return false;
+    }
+    let step0 = p.css.steps.len;
+    let cur = newStep();
+    let started = false;
+    let nb = 0;
+    let nc = 0;
+    let na = 0;
+    let pe = 0;
+    let i = a;
+    let bad = "";
+    let bl = tk(a).line;
+    let bc = tk(a).col;
+    while i < b && bad.len == 0 {
+        let t = tk(i);
+        if pe != 0 {
+            bad = "a pseudo-element must end the selector";
+            break;
+        }
+        if t.sp && started {
+            p.css.steps.push(cur);
+            cur = newStep();
+            started = false;
+        }
+        if t.kind == T_IDENT && !started {
+            cur.tag = p.css.intern(txt(p, t));
+            nc += 1;
+            started = true;
+        } else if t.kind == T_DELIM && t.ch == 42 && !started {
+            started = true;
+        } else if t.kind == T_DELIM && t.ch == 46 && i + 1 < b && tk(i + 1).kind == T_IDENT && !tk(i + 1).sp {
+            if cur.ncls >= 4 {
+                bad = "more than 4 classes in one compound selector";
+            } else {
+                cur.cls[cur.ncls] = p.css.intern(txt(p, tk(i + 1)));
+                cur.ncls += 1;
+                nb += 1;
+                started = true;
+                i += 1;
+            }
+        } else if t.kind == T_HASH && !(t.sp && started) {
+            if cur.id >= 0 {
+                bad = "two #ids in one compound selector";
+            } else {
+                cur.id = p.css.intern(txt(p, t));
+                na += 1;
+                started = true;
+            }
+        } else if t.kind == T_COLON && i + 2 < b && tk(i + 1).kind == T_COLON && tk(i + 2).kind == T_IDENT && !tk(i + 1).sp && !tk(i + 2).sp {
+            pe = peKind(txt(p, tk(i + 2)));
+            if pe == 0 {
+                warnName(p, t.line, t.col, "unsupported pseudo-element '::", txt(p, tk(i + 2)), "'");
+                bad = "-";
+            }
+            nc += 1;
+            started = true;
+            i += 2;
+        } else if t.kind == T_COLON && i + 1 < b && tk(i + 1).kind == T_FUNC {
+            // `:not(a, .b)` and `:nth-child(2n+1)`: the arguments sit between the parens
+            let fname = txt(p, tk(i + 1));
+            let close = i + 2;
+            let depth = 1;
+            while close < b && depth > 0 {
+                if tk(close).kind == T_FUNC || tk(close).kind == T_LPAREN {
+                    depth += 1;
+                } else if tk(close).kind == T_RPAREN {
+                    depth -= 1;
+                }
+                close += 1;
+            }
+            close -= 1;
+            if depth > 0 {
+                close = b;
+            }
+            if close >= b {
+                bad = "missing ) in selector";
+            } else if same(fname, "not") {
+                if cur.nnot == 0 {
+                    cur.not0 = p.css.nots.len;
+                }
+                let argLo = i + 2;
+                let q = i + 2;
+                // the specificity of `:not()` is that of its most specific argument
+                let top = 0;
+                while q <= close && bad.len == 0 {
+                    if q == close || (tk(q).kind == T_COMMA && openParens(i + 2, q) == 0) {
+                        let ns = newStep();
+                        let sp = notArg(p, argLo, q, &ns);
+                        if sp < 0 {
+                            bad = "-";
+                        } else {
+                            p.css.nots.push(ns);
+                            cur.nnot += 1;
+                            if sp > top { top = sp; }
+                        }
+                        argLo = q + 1;
+                    }
+                    q += 1;
+                }
+                na += top / 10000;
+                nb += (top / 100) % 100;
+                nc += top % 100;
+                started = true;
+                i = close;
+            } else if same(fname, "has") {
+                if cur.nhas > 0 {
+                    bad = "two :has() in one compound selector";
+                    break;
+                }
+                cur.has0 = p.css.hass.len;
+                let hLo = i + 2;
+                let hq = i + 2;
+                // the specificity of `:has()` is that of its most specific argument
+                let htop = 0;
+                while hq <= close && bad.len == 0 {
+                    if hq == close || (tk(hq).kind == T_COMMA && openParens(i + 2, hq) == 0) {
+                        let hs = newStep();
+                        let hsp = hasArg(p, hLo, hq, &hs);
+                        if hsp < 0 {
+                            bad = "-";
+                        } else {
+                            p.css.hass.push(hs);
+                            cur.nhas += 1;
+                            if hsp > htop { htop = hsp; }
+                        }
+                        hLo = hq + 1;
+                    }
+                    hq += 1;
+                }
+                na += htop / 10000;
+                nb += (htop / 100) % 100;
+                nc += htop % 100;
+                started = true;
+                i = close;
+            } else if nthKind(fname) >= 0 {
+                let fa = 0;
+                let fb = 0;
+                let textLo = tk(i + 1).e + 1;
+                let textHi = tk(close).s;
+                if textHi < textLo || cur.nth || !nthParse(p.lx.src[textLo..textHi], &fa, &fb) {
+                    bad = "unsupported :nth-*() argument (odd, even, N, An+B)";
+                } else {
+                    cur.nth = true;
+                    cur.nthA = fa;
+                    cur.nthB = fb;
+                    cur.nthK = nthKind(fname);
+                    if cur.nthK != NK_CHILD {
+                        p.css.structMode = 1;
+                    }
+                    nb += 1;
+                    started = true;
+                    i = close;
+                }
+            } else {
+                warnName(p, t.line, t.col, "unsupported pseudo-class ':", fname, "()'");
+                bad = "-";
+            }
+        } else if t.kind == T_COLON && i + 1 < b && tk(i + 1).kind == T_IDENT {
+            let pk = peKind(txt(p, tk(i + 1)));
+            if pk != 0 {
+                // the old one-colon spelling
+                pe = pk;
+                nc += 1;
+                started = true;
+                i += 1;
+            } else if ssBit(txt(p, tk(i + 1))) != 0 {
+                if !hasBit(cur.ss, ssBit(txt(p, tk(i + 1)))) { cur.ss += ssBit(txt(p, tk(i + 1))); }
+                p.css.structMode = 1;
+                nb += 1;
+                started = true;
+                i += 1;
+            } else if same(txt(p, tk(i + 1)), "enabled") {
+                // `:not(:disabled)`
+                if cur.nnot == 0 {
+                    cur.not0 = p.css.nots.len;
+                }
+                let en = newStep();
+                en.pseudo = FL_DISABLED;
+                p.css.nots.push(en);
+                cur.nnot += 1;
+                nb += 1;
+                started = true;
+                i += 1;
+            } else {
+                let bit = pseudoBit(txt(p, tk(i + 1)));
+                if bit == 0 {
+                    warnName(p, t.line, t.col, "unsupported pseudo-class ':", txt(p, tk(i + 1)), "'");
+                    bad = "-";
+                } else {
+                    if !hasBit(cur.pseudo, bit) {
+                        cur.pseudo += bit;
+                    }
+                    nb += 1;
+                    started = true;
+                    i += 1;
+                }
+            }
+        } else if t.kind == T_LBRACK && i + 4 < b && tk(i + 1).kind == T_IDENT && same(txt(p, tk(i + 1)), "type") && tk(i + 2).kind == T_DELIM && tk(i + 2).ch == 61 && (tk(i + 3).kind == T_STR || tk(i + 3).kind == T_IDENT) && tk(i + 4).kind == T_RBRACK {
+            cur.attr = p.css.intern(txt(p, tk(i + 3)));
+            nb += 1;
+            started = true;
+            i += 4;
+        } else if t.kind == T_DELIM && (t.ch == 62 || t.ch == 43 || t.ch == 126) && (started || p.css.steps.len > step0) {
+            let cb = COMB_CHILD;
+            if t.ch == 43 {
+                cb = COMB_NEXT;
+            } else if t.ch == 126 {
+                cb = COMB_SIB;
+            }
+            if started {
+                cur.comb = cb;
+                p.css.steps.push(cur);
+                cur = newStep();
+                started = false;
+            } else if p.css.steps.items[p.css.steps.len - 1].comb != COMB_DESC {
+                bad = "two combinators in a row";
+            } else {
+                // `a > b`: the space before `>` already closed `a`
+                p.css.steps.items[p.css.steps.len - 1].comb = cb;
+            }
+        } else {
+            bad = "selector is not supported";
+        }
+        i += 1;
+    }
+    if bad.len > 0 {
+        if int(bad[0]) != 45 {
+            warnAt(p, bl, bc, bad);
+        }
+        p.css.steps.len = step0;
+        return false;
+    }
+    if !started {
+        p.css.steps.len = step0;
+        warnAt(p, bl, bc, "empty selector");
+        return false;
+    }
+    let cls0 = -1;
+    if cur.ncls > 0 {
+        cls0 = cur.cls[0];
+    }
+    p.css.steps.push(cur);
+    if p.npend - p.pbase >= 64 {
+        p.css.steps.len = step0;
+        warnAt(p, bl, bc, "more than 64 selectors in one rule");
+        return false;
+    }
+    if p.scope != 0 {
+        nb += 1;
+    }
+    let nsteps = p.css.steps.len - step0;
+    PEND[p.npend] = Rule { step0: step0, nsteps: nsteps, decl0: 0, ndecl: 0, spec: na * 10000 + nb * 100 + nc, scope: p.scope, order: 0, tag: cur.tag, cls0: cls0, mq: p.mq, pe: pe, sib: false, file: p.file, line: bl, col: bc };
+    p.npend += 1;
+    return true;
+}
+
+/// Skip to the end of a `{...}` whose `{` is already read.
+fn skipBlock(p: &P) {
+    let depth = 1;
+    while depth > 0 {
+        let t = next(&p.lx);
+        if t.kind == T_EOF {
+            return;
+        }
+        if t.kind == T_LBRACE {
+            depth += 1;
+        } else if t.kind == T_RBRACE {
+            depth -= 1;
+        }
+    }
+}
+
+/// Declarations up to the closing `}`.
+fn parseBlock(p: &P) {
+    body(p, true);
+}
+
+/// Compile one expanded nested selector (its own text, so `&` is already replaced); its warnings are moved to `line:col`
+/// of the nested rule, since the text has no place in the file.
+fn compileJoined(p: &P, js: string, line: int, col: int): bool {
+    let lx = Lexer { src: js, pos: 0, line: 1, ls: 0 };
+    let n = 0;
+    while true {
+        let t = next(&lx);
+        if t.kind == T_EOF {
+            break;
+        }
+        if n >= 192 {
+            warnAt(p, line, col, "selector is too long");
+            return false;
+        }
+        setTk(n, t);
+        n += 1;
+    }
+    let keep = p.lx.src;
+    let w0 = p.css.warns.len;
+    let r0 = p.npend;
+    p.lx.src = js;
+    let ok = compileSel(p, 0, n);
+    p.lx.src = keep;
+    for i in r0..p.npend {
+        PEND[i].line = line;
+    }
+    for i in w0..p.css.warns.len {
+        p.css.warns.items[i].line = line;
+        p.css.warns.items[i].col = col;
+    }
+    return ok;
+}
+
+/// Record what the `:has()` step `st` tests (`Css.hasMode` and its filters, `Css.hasSubj`).
+fn noteHas(css: &Css, st: Step) {
+    let subj = st;
+    subj.nhas = 0;
+    css.hasSubj.push(subj);
+    for k in st.has0..st.has0 + st.nhas {
+        let a = &css.hass.items[k];
+        let rel = if a.comb == COMB_DESC { 1 } else if a.comb == COMB_CHILD { 2 } else if a.comb == COMB_NEXT { 4 } else { 8 };
+        if !hasBit(css.hasMode, rel) {
+            css.hasMode += rel;
+        }
+        for c in 0..a.ncls {
+            css.hasCls.push(a.cls[c]);
+        }
+        let bit = 1;
+        while bit <= 8192 {
+            if hasBit(a.pseudo, bit) && !hasBit(css.hasFlags, bit) {
+                css.hasFlags += bit;
+            }
+            bit = bit * 2;
+        }
+        if a.id >= 0 || a.attr >= 0 || a.ss != 0 {
+            css.hasAttr = 1;
+        }
+    }
+}
+
+/// Push the rules of the pending selectors with the `p.ndecl` declarations since `d0` (nothing when there is no valid selector, or
+/// `skipEmpty` and no declarations: the bare parent segments of a block that has nested rules).
+fn flush(p: &P, d0: int, skipEmpty: bool) {
+    let css = p.css;
+    if p.npend == p.pbase || (skipEmpty && p.ndecl == 0) {
+        css.decls.len = d0;
+        return;
+    }
+    for i in p.pbase..p.npend {
+        let r = PEND[i];
+        r.decl0 = d0;
+        r.ndecl = p.ndecl;
+        r.mq = p.mq;
+        r.order = css.rules.len;
+        if r.pe != 0 {
+            css.peRules.push(css.rules.len);
+        }
+        // sibling combinators: a lone `+` only restyles the next sibling, anything else all following ones
+        let nsib = 0;
+        let longSib = false;
+        for k in r.step0..r.step0 + r.nsteps - 1 {
+            let cb = css.steps.items[k].comb;
+            if cb == COMB_NEXT {
+                nsib += 1;
+            } else if cb == COMB_SIB {
+                longSib = true;
+            }
+        }
+        r.sib = longSib || nsib > 0;
+        for k in r.step0..r.step0 + r.nsteps {
+            if css.steps.items[k].nhas > 0 {
+                if k != r.step0 + r.nsteps - 1 {
+                    css.hasInner = 1;
+                }
+                noteHas(css, css.steps.items[k]);
+            }
+        }
+        // `:nth-child` counts the siblings before it: one inserted or removed restyles every later one
+        for k in r.step0..r.step0 + r.nsteps {
+            if css.steps.items[k].nth {
+                longSib = true;
+            }
+        }
+        if longSib || nsib > 1 {
+            css.sibMode = 2;
+        } else if nsib == 1 && css.sibMode == 0 {
+            css.sibMode = 1;
+        }
+        css.rules.push(r);
+    }
+}
+
+/// A nested style rule whose prelude is `src[lo..hi]` and whose `{` is read: join it with the parent list `PT[lev]` (`&` is the
+/// parent, no `&` means a descendant; every nested x parent pair becomes one flat selector), parse the block, and push its rules.
+/// Any bad selector drops the whole rule (like a browser), with the warning at `line:col`.
+fn nestedRule(p: &P, lev: int, lo: int, hi: int, line: int, col: int) {
+    let css = p.css;
+    let base = p.pbase;
+    let np = p.npend;
+    if lev >= 8 {
+        warnAt(p, line, col, "rules nested more than 8 deep are skipped");
+        skipBlock(p);
+        return;
+    }
+    if np == base {
+        // the parent selector was invalid and has warned
+        skipBlock(p);
+        return;
+    }
+    let sel = p.lx.src[lo..hi];
+    let out = Text.new(css.mem);
+    let s0 = css.steps.len;
+    p.pbase = base + 64;
+    p.npend = base + 64;
+    let ok = true;
+    let ni = 0;
+    let nlo = 0;
+    let nhi = 0;
+    while ok {
+        ni = part(sel, ni, &nlo, &nhi);
+        if ni < 0 {
+            break;
+        }
+        let ns = sel[nlo..nhi];
+        if ns.len == 0 {
+            warnAt(p, line, col, "empty selector");
+            ok = false;
+            break;
+        }
+        let qi = 0;
+        let qlo = 0;
+        let qhi = 0;
+        while ok {
+            qi = part(PT[lev], qi, &qlo, &qhi);
+            if qi < 0 {
+                break;
+            }
+            let par = PT[lev][qlo..qhi];
+            let j = Text.new(css.mem);
+            let why = join(&j, par, ns);
+            if why.len > 0 {
+                warnAt(p, line, col, why);
+                ok = false;
+                break;
+            }
+            let js = j.str();
+            if out.len() > 0 {
+                out.pushStr(", ");
+            }
+            out.pushStr(js);
+            if !compileJoined(p, js, line, col) {
+                ok = false;
+            }
+        }
+    }
+    if !ok {
+        css.steps.len = s0;
+        p.pbase = base;
+        p.npend = np;
+        skipBlock(p);
+        return;
+    }
+    PT[lev + 1] = out.str();
+    p.nlev = lev + 1;
+    body(p, true);
+    p.nlev = lev;
+    p.pbase = base;
+    p.npend = np;
+}
+
+/// Declarations up to the closing `}`. In a style rule (`p.nlev >= 0`) the block may also hold nested rules and `@media`: the
+/// declarations before one become a rule for the pending selectors, the nested rules follow, and declarations after them are a
+/// further rule with the same selectors (a browser's "nested declarations"), so source order wins. `first` is false in a nested
+/// `@media`, whose declarations never belong to the parent's first segment.
+fn body(p: &P, first: bool) {
+    let css = p.css;
+    let lev = p.nlev;
+    let d0 = css.decls.len;
+    let nested = false;
+    if lev >= 0 {
+        p.ndecl = 0;
+    }
+    while true {
+        let pos0 = p.lx.pos;
+        let t = next(&p.lx);
+        if t.kind == T_EOF || t.kind == T_RBRACE {
+            break;
+        }
+        if t.kind == T_SEMI {
+            continue;
+        }
+        if lev >= 0 && t.kind == T_AT {
+            nested = true;
+            flush(p, d0, true);
+            if same(txt(p, &t), "media") {
+                let saved = p.mq;
+                if media(p, t) {
+                    p.mqd += 1;
+                    p.ndecl = 0;
+                    body(p, false);
+                    p.mqd -= 1;
+                    p.mq = saved;
+                }
+            } else {
+                warnName(p, t.line, t.col, "at-rule '@", txt(p, &t), "' is not supported inside a rule");
+                while true {
+                    let u = next(&p.lx);
+                    if u.kind == T_EOF || u.kind == T_SEMI || u.kind == T_RBRACE {
+                        break;
+                    }
+                    if u.kind == T_LBRACE {
+                        skipBlock(p);
+                        break;
+                    }
+                }
+            }
+            d0 = css.decls.len;
+            p.ndecl = 0;
+            continue;
+        }
+        if lev >= 0 && t.kind != T_IDENT {
+            // a nested rule: `&:hover {`, `.x {`, `> li {`
+            let open = false;
+            while true {
+                let w = next(&p.lx);
+                if w.kind == T_LBRACE {
+                    open = true;
+                    break;
+                }
+                if w.kind == T_SEMI || w.kind == T_EOF || w.kind == T_RBRACE {
+                    break;
+                }
+            }
+            if !open {
+                warnAt(p, t.line, t.col, "selector without a block");
+                continue;
+            }
+            nested = true;
+            flush(p, d0, true);
+            nestedRule(p, lev, pos0, p.lx.pos - 1, t.line, t.col);
+            d0 = css.decls.len;
+            p.ndecl = 0;
+            continue;
+        }
+        let nameTok = t;
+        let bad = false;
+        let closed = false;
+        let noColon = false;
+        let isRule = false;
+        let n = 0;
+        if t.kind != T_IDENT {
+            warnAt(p, t.line, t.col, "expected a property name");
+            bad = true;
+        } else {
+            let c = next(&p.lx);
+            if c.kind != T_COLON {
+                if lev >= 0 && c.kind == T_LBRACE {
+                    // `div {`
+                    nested = true;
+                    flush(p, d0, true);
+                    nestedRule(p, lev, pos0, p.lx.pos - 1, t.line, t.col);
+                    d0 = css.decls.len;
+                    p.ndecl = 0;
+                    continue;
+                }
+                if lev >= 0 && c.kind != T_SEMI && c.kind != T_EOF && c.kind != T_RBRACE {
+                    // `div p {` or a typo: decided at the `{`
+                    noColon = true;
+                } else {
+                    warnAt(p, t.line, t.col, "expected ':' after the property name");
+                }
+                bad = true;
+                if c.kind == T_SEMI || c.kind == T_EOF {
+                    continue;
+                }
+                if c.kind == T_RBRACE {
+                    break;
+                }
+            }
+        }
+        let depth = 0;
+        p.vs = p.lx.pos;
+        while true {
+            let v = next(&p.lx);
+            p.ve = p.lx.pos - 1;
+            if v.kind == T_EOF {
+                p.ve = p.lx.pos;
+                closed = true;
+                break;
+            }
+            if v.kind == T_SEMI && depth == 0 {
+                break;
+            }
+            if v.kind == T_RBRACE && depth == 0 {
+                closed = true;
+                break;
+            }
+            if v.kind == T_LBRACE {
+                if lev >= 0 {
+                    // `a:hover {`
+                    isRule = true;
+                    break;
+                }
+                if !bad {
+                    warnAt(p, nameTok.line, nameTok.col, "nested blocks are not supported");
+                }
+                bad = true;
+                skipBlock(p);
+                continue;
+            }
+            if v.kind == T_LPAREN || v.kind == T_FUNC {
+                depth += 1;
+            } else if v.kind == T_RPAREN && depth > 0 {
+                depth -= 1;
+            }
+            if v.kind == T_DELIM && v.ch == 33 && !bad {
+                warnAt(p, nameTok.line, nameTok.col, "!important is not supported");
+                bad = true;
+            }
+            if n < 192 {
+                setTk(n, v);
+                n += 1;
+            } else if !bad {
+                warnAt(p, nameTok.line, nameTok.col, "value is too long");
+                bad = true;
+            }
+        }
+        if isRule {
+            nested = true;
+            flush(p, d0, true);
+            nestedRule(p, lev, pos0, p.lx.pos - 1, nameTok.line, nameTok.col);
+            d0 = css.decls.len;
+            p.ndecl = 0;
+            continue;
+        }
+        if noColon {
+            warnAt(p, nameTok.line, nameTok.col, "expected ':' after the property name");
+        }
+        if !bad {
+            let kd0 = css.decls.len;
+            declare(p, txt(p, &nameTok), nameTok.line, nameTok.col, n);
+            if css.lintOn && p.mode == 0 {
+                css.dlog.push(DeclLog { file: p.file, line: nameTok.line, col: nameTok.col, name: txt(p, &nameTok), val: p.lx.src[p.vs..p.ve], d0: kd0, nd: css.decls.len - kd0, kf: p.kf });
+            }
+            if p.kf {
+                dropWide(p, kd0, nameTok.line, nameTok.col);
+            }
+        }
+        if closed {
+            break;
+        }
+    }
+    if lev >= 0 {
+        flush(p, d0, !first || nested);
+    }
+}
+
+/// `@media screen and (min-width: 600px) and (max-height: 400px) { rules }`: width and height bounds
+/// in px joined by `and` (`screen`, `all`, `only` are accepted and ignored), `not` before a condition,
+/// and alternatives separated by `,` or `or`. The rules inside carry the condition (`Rule.mq`);
+/// `Css.setViewport` decides when it holds. Also `(prefers-reduced-motion: reduce | no-preference)` and
+/// `(prefers-color-scheme: dark | light)`, answered by `Css.setPrefs` (the program's choice, not the OS's), and
+/// `(pointer: coarse | fine)` / `(hover: none | hover)`, answered by `Css.setTouch`.
+/// Inside another `@media` (or in a style rule) the conditions AND (`Media.and`). Not supported: other features, parenthesised `and`/`or` groups.
+fn media(p: &P, at: Token): bool {
+    let fresh = Media { minW: -1.0, maxW: 1000000000.0, minH: -1.0, maxH: 1000000000.0, neg: false, alt: -1, rm: 0, cs: 0, ptr: 0, hov: 0, and: -1 };
+    if p.mqd >= 8 {
+        warnAt(p, at.line, at.col, "@media nested more than 8 deep is skipped");
+        skipBlock(p);
+        return false;
+    }
+    // inside another @media the enclosing condition must hold too
+    let outer = p.mq;
+    let m = fresh;
+    let css = p.css;
+    let base = css.media.len;
+    let last = -1;
+    let bad = false;
+    while true {
+        let t = next(&p.lx);
+        if t.kind == T_EOF {
+            css.media.len = base;
+            return false;
+        }
+        if t.kind == T_LBRACE || t.kind == T_COMMA || isWord(p, &t, "or") {
+            // one alternative is complete
+            m.and = outer;
+            css.media.push(m);
+            if last >= 0 {
+                css.media.items[last].alt = css.media.len - 1;
+            }
+            last = css.media.len - 1;
+            m = fresh;
+            if t.kind == T_LBRACE {
+                break;
+            }
+        } else if t.kind == T_IDENT {
+            if isWord(p, &t, "not") {
+                m.neg = true;
+            } else if !(isWord(p, &t, "screen") || isWord(p, &t, "all") || isWord(p, &t, "and") || isWord(p, &t, "only")) {
+                bad = true;
+            }
+        } else if t.kind == T_LPAREN {
+            let nm = next(&p.lx);
+            let co = next(&p.lx);
+            let v = next(&p.lx);
+            let rp = next(&p.lx);
+            let unit = p.lx.src[v.us..v.ue];
+            if nm.kind == T_IDENT && co.kind == T_COLON && v.kind == T_IDENT && rp.kind == T_RPAREN && isWord(p, &nm, "prefers-reduced-motion")
+                && (isWord(p, &v, "reduce") || isWord(p, &v, "no-preference")) {
+                m.rm = if isWord(p, &v, "reduce") { 1 } else { 2 };
+            } else if nm.kind == T_IDENT && co.kind == T_COLON && v.kind == T_IDENT && rp.kind == T_RPAREN && isWord(p, &nm, "prefers-color-scheme")
+                && (isWord(p, &v, "dark") || isWord(p, &v, "light")) {
+                m.cs = if isWord(p, &v, "dark") { 1 } else { 2 };
+            } else if nm.kind == T_IDENT && co.kind == T_COLON && v.kind == T_IDENT && rp.kind == T_RPAREN && isWord(p, &nm, "pointer")
+                && (isWord(p, &v, "coarse") || isWord(p, &v, "fine")) {
+                m.ptr = if isWord(p, &v, "coarse") { 1 } else { 2 };
+            } else if nm.kind == T_IDENT && co.kind == T_COLON && v.kind == T_IDENT && rp.kind == T_RPAREN && isWord(p, &nm, "hover")
+                && (isWord(p, &v, "none") || isWord(p, &v, "hover")) {
+                m.hov = if isWord(p, &v, "none") { 1 } else { 2 };
+            } else if nm.kind != T_IDENT || co.kind != T_COLON || v.kind != T_NUM || rp.kind != T_RPAREN || !(unit.len == 0 || same(unit, "px")) {
+                bad = true;
+            } else if isWord(p, &nm, "min-width") {
+                m.minW = v.f;
+            } else if isWord(p, &nm, "max-width") {
+                m.maxW = v.f;
+            } else if isWord(p, &nm, "min-height") {
+                m.minH = v.f;
+            } else if isWord(p, &nm, "max-height") {
+                m.maxH = v.f;
+            } else {
+                bad = true;
+            }
+        } else {
+            bad = true;
+        }
+    }
+    if bad {
+        css.media.len = base;
+        warnAt(p, at.line, at.col, "unsupported @media condition (use screen and (min-width: Npx) and (max-width: Npx), also heights, prefers-reduced-motion, prefers-color-scheme, pointer, hover; not, comma and or lists)");
+        skipBlock(p);
+        return false;
+    }
+    p.mq = base;
+    if css.media.len == base + 1 {
+        // a single plain condition: share an equal earlier entry
+        let n = css.media.items[base];
+        for i in 0..base {
+            let o = css.media.items[i];
+            if o.minW == n.minW && o.maxW == n.maxW && o.minH == n.minH && o.maxH == n.maxH && o.neg == n.neg && o.alt == n.alt && o.rm == n.rm && o.cs == n.cs && o.ptr == n.ptr && o.hov == n.hov && o.and == n.and {
+                p.mq = i;
+                css.media.len = base;
+                return true;
+            }
+        }
+    }
+    return true;
+}
+
+fn atRule(p: &P, at: Token) {
+    if same(txt(p, &at), "media") {
+        let saved = p.mq;
+        if media(p, at) {
+            MQS[p.mqd] = saved;
+            p.mqd += 1;
+        }
+        return;
+    }
+    if same(txt(p, &at), "font-face") {
+        let b = next(&p.lx);
+        if b.kind != T_LBRACE {
+            warnAt(p, at.line, at.col, "@font-face needs a block");
+            return;
+        }
+        p.mode = 1;
+        p.ffHave = false;
+        p.ffPath = "";
+        parseBlock(p);
+        p.mode = 0;
+        if p.ffHave && p.ffPath.len > 0 {
+            p.css.fonts.push(FontFace { family: p.ffFamily, path: p.ffPath });
+        } else {
+            warnAt(p, at.line, at.col, "@font-face needs font-family and src: url()");
+        }
+        return;
+    }
+    if same(txt(p, &at), "property") {
+        property(p, at);
+        return;
+    }
+    if same(txt(p, &at), "keyframes") {
+        keyframes(p, at);
+        return;
+    }
+    warnName(p, at.line, at.col, "at-rule '@", txt(p, &at), "' is not supported");
+    while true {
+        let t = next(&p.lx);
+        if t.kind == T_EOF || t.kind == T_SEMI {
+            return;
+        }
+        if t.kind == T_LBRACE {
+            skipBlock(p);
+            return;
+        }
+    }
+}
+
+/// `style:name="text"`: parse `text` as the value of property `name` and append its declarations
+/// to `css.decls` (a shorthand gives several). Returns how many; 0 with a warning when the value is
+/// not valid. The caller copies them out and cuts `css.decls` back.
+pub fn inlineDecl(css: &Css, name: string, text: string): int {
+    let p = P {
+        css: css,
+        lx: Lexer { src: text, pos: 0, line: 1, ls: 0 },
+        file: "style:",
+        scope: 0,
+        npend: 0,
+        mode: 0,
+        ffFamily: 0,
+        ffPath: "",
+        ffHave: false,
+        ndecl: 0,
+        mq: -1,
+        vs: 0,
+        ve: 0,
+        late: false,
+        pdSeen: 0,
+        pdSyn: 0,
+        pdInh: false,
+        pdInit: "",
+        pdLine: 0,
+        pdCol: 0,
+        nlev: -1,
+        pbase: 0,
+        mqd: 0,
+        kf: false,
+    };
+    let n = 0;
+    while true {
+        let t = next(&p.lx);
+        if t.kind == T_EOF {
+            break;
+        }
+        if n >= 192 {
+            warnAt(&p, 1, 1, "value is too long");
+            return 0;
+        }
+        setTk(n, t);
+        n += 1;
+    }
+    let w0 = css.warns.len;
+    declare(&p, name, 1, 1, n);
+    if css.warns.len > w0 {
+        return 0;
+    }
+    return p.ndecl;
+}
+
+/// Parse `src` as CSS and append its rules, `@font-face`s, custom properties, and warnings to
+/// `css`. `file` is for messages and for resolving `url()`; `scope` is 0 for global CSS or the
+/// component id for a component's `<style>`. Parse the global sheet first (source order breaks
+/// specificity ties). Invalidates the style cache: recompute styles after calling it.
+pub fn parse(css: &Css, text: string, file: string, scope: int): Sheet {
+    return parseAt(css, text, file, scope, 0);
+}
+
+/// `parse` for a style block that starts below the top of `file` (a `.j3ui`): `line0` lines come before it, so line numbers are the file's.
+pub fn parseAt(css: &Css, text: string, file: string, scope: int, line0: int): Sheet {
+    css.clearCache();
+    let src = text;
+    for i in 0..css.hot.len {
+        let h = &css.hot.items[i];
+        if h.live && same(h.path, file) {
+            src = h.style;
+            line0 = h.line0;
+        }
+    }
+    let p = P {
+        css: css,
+        lx: Lexer { src: src, pos: 0, line: 1 + line0, ls: 0 },
+        file: file,
+        scope: scope,
+        npend: 0,
+        mode: 0,
+        ffFamily: 0,
+        ffPath: "",
+        ffHave: false,
+        ndecl: 0,
+        mq: -1,
+        vs: 0,
+        ve: 0,
+        late: true,
+        pdSeen: 0,
+        pdSyn: 0,
+        pdInh: false,
+        pdInit: "",
+        pdLine: 0,
+        pdCol: 0,
+        nlev: -1,
+        pbase: 0,
+        mqd: 0,
+        kf: false,
+    };
+    css.srcs.push(SrcText { file: file, text: src, scope: scope });
+    let sheet = Sheet { file: file, scope: scope, rule0: css.rules.len, nrules: 0, warn0: css.warns.len, nwarn: 0 };
+    while true {
+        let pos0 = p.lx.pos;
+        let t = next(&p.lx);
+        if t.kind == T_EOF {
+            break;
+        }
+        if t.kind == T_AT {
+            atRule(&p, t);
+            continue;
+        }
+        if t.kind == T_RBRACE && p.mqd > 0 {
+            p.mqd -= 1;
+            p.mq = MQS[p.mqd];
+            continue;
+        }
+        if t.kind == T_RBRACE || t.kind == T_SEMI {
+            warnAt(&p, t.line, t.col, "unexpected token");
+            continue;
+        }
+        // prelude up to `{`
+        let n = 0;
+        setTk(0, t);
+        n = 1;
+        let tooLong = false;
+        let open = false;
+        let bracePos = 0;
+        while true {
+            let v = next(&p.lx);
+            if v.kind == T_LBRACE {
+                open = true;
+                bracePos = p.lx.pos - 1;
+                break;
+            }
+            if v.kind == T_EOF || v.kind == T_RBRACE {
+                break;
+            }
+            if n < 192 {
+                setTk(n, v);
+                n += 1;
+            } else {
+                tooLong = true;
+            }
+        }
+        if !open {
+            warnAt(&p, t.line, t.col, "selector without a block");
+            if tooLong {
+                continue;
+            }
+            continue;
+        }
+        p.npend = 0;
+        if tooLong {
+            warnAt(&p, t.line, t.col, "selector is too long");
+        } else {
+            let g0 = 0;
+            // a comma inside `:not( )` does not end the selector
+            let depth = 0;
+            for i in 0..=n {
+                if i < n && tk(i).kind == T_FUNC {
+                    depth += 1;
+                } else if i < n && tk(i).kind == T_RPAREN && depth > 0 {
+                    depth -= 1;
+                }
+                if i == n || (tk(i).kind == T_COMMA && depth == 0) {
+                    compileSel(&p, g0, i);
+                    g0 = i + 1;
+                }
+            }
+        }
+        p.ndecl = 0;
+        // declarations overwrite TOK, so the selectors were compiled first; the block pushes its own rules (nested ones too)
+        PT[0] = p.lx.src[pos0..bracePos];
+        p.nlev = 0;
+        p.pbase = 0;
+        parseBlock(&p);
+        p.nlev = -1;
+    }
+    sheet.nrules = css.rules.len - sheet.rule0;
+    sheet.nwarn = css.warns.len - sheet.warn0;
+    css.sheets.push(sheet);
+    return sheet;
+}

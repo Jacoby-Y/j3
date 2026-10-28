@@ -1,0 +1,1130 @@
+// The voxel model: a grid of palette indices (0 is air), the palette, symmetry, and undo.
+// Every edit goes through `apply`, so mirrored editing works for every tool. Callers take a
+// `snapshot` before an edit (a gesture, or one command) so `undo` can put the model back.
+
+module voxel_editor.model;
+
+use j3.gfx.voxel;
+use j3.math.floor;
+use j3.memory.Arena;
+use j3.text.same;
+use voxel_editor.util.{ hexValue, own };
+
+/// Largest side of a model, in voxels.
+pub const MAX: int = 64;
+pub const ADD: int = 0;
+pub const ERASE: int = 1;
+pub const PAINT: int = 2;
+const UNDOS: int = 40;
+/// Parts are numbered 1..MAXPARTS; 0 means no part.
+pub const MAXPARTS: int = 32;
+/// Named poses, beside the live pose in slot 0.
+pub const MAXPOSES: int = 64;
+/// Floats in one pose: x, y, z rotation (degrees) per part, index `part * 3`.
+pub const POSE: int = (MAXPARTS + 1) * 3;
+
+/// Overlays: pixel layers on a part (see `overlay.j3`).
+pub const MAXOVERLAYS: int = 16;
+/// Painted pixels shared by all overlays, one `int` each: key * 2^24 + rgb.
+pub const MAXTEXELS: int = 32768;
+/// Keys per overlay: 6 faces of a 64 cubed grid.
+const KEYS_PER_OVERLAY: int = 6 * 64 * 64 * 64;
+const RGB_RANGE: int = 16777216;
+
+/// A pixel layer on one part. `grow` 0 paints the part's own surface, N puts the pixels on a shell N voxels out.
+pub struct Overlay {
+    name: string;
+    part: int;
+    grow: int;
+    visible: bool;
+}
+
+/// Animation clips, each a loop or one-shot through saved poses.
+pub const MAXCLIPS: int = 8;
+/// Poses one clip can pass through.
+pub const CLIPKEYS: int = 16;
+
+/// A clip: saved poses (by name) at `times` (seconds from the start, in order) over `seconds`. A loop returns from the last pose
+/// to the first.
+pub struct Clip {
+    name: string;
+    seconds: f32;
+    loop: bool;
+    count: int;
+    keys: [16]string;
+    times: [16]f32;
+}
+
+/// A rigid limb. Its joint is `pivot` (voxel-edge coordinates: voxel `x` spans `x..x+1`), turning
+/// the part and its children relative to `parent` (0 for a root).
+pub struct Part {
+    name: string;
+    parent: int;
+    px: f32;
+    py: f32;
+    pz: f32;
+    /// Rotation limits in degrees, per axis.
+    lx0: f32;
+    lx1: f32;
+    ly0: f32;
+    ly1: f32;
+    lz0: f32;
+    lz1: f32;
+}
+
+/// One undo step: the whole model.
+pub struct Snap {
+    sx: int;
+    sy: int;
+    sz: int;
+    palLen: int;
+    cells: []u8;
+    pal: []u8;
+    names: []string;
+    part: []u8;
+    parts: []Part;
+    partCount: int;
+    active: int;
+    poses: []f32;
+    poseNames: []string;
+    poseCount: int;
+    clips: []Clip;
+    clipCount: int;
+    overlays: []Overlay;
+    overlayCount: int;
+    texels: []int;
+    texelCount: int;
+}
+
+pub struct Model {
+    mem: &Arena;
+    name: string;
+    sx: int;
+    sy: int;
+    sz: int;
+    /// `sx * sy * sz` ids used, indexed with `voxel.index(x, y, z, sx, sz)`. Room for `MAX` cubed.
+    cells: []u8;
+    /// Palette color `i` (1..palLen) is rgb at `pal[i * 3]`.
+    pal: []u8;
+    names: []string;
+    palLen: int;
+    symX: bool;
+    symY: bool;
+    symZ: bool;
+    tmp: []u8;
+    work: []int;
+    /// Part id per cell (0 none), parallel to `cells`; only meaningful where a voxel is. New voxels
+    /// get `active`.
+    part: []u8;
+    ptmp: []u8;
+    /// Parts 1..partCount (slot 0 unused).
+    parts: []Part;
+    partCount: int;
+    active: int;
+    /// Slot 0 is the live pose; named poses are slots 1..poseCount (names in `poseNames[slot]`).
+    poses: []f32;
+    poseNames: []string;
+    poseCount: int;
+    /// Clips 1..clipCount (slot 0 unused).
+    clips: []Clip;
+    clipCount: int;
+    /// Overlays 1..overlayCount (slot 0 unused), and their pixels sorted by key (see `texKey`).
+    overlays: []Overlay;
+    overlayCount: int;
+    texels: []int;
+    texelCount: int;
+    undos: []Snap;
+    undoCount: int;
+    redos: []Snap;
+    redoCount: int;
+    /// Moves on every change, so a viewer knows when to rebuild its mesh.
+    rev: int;
+    /// Changed since the last save.
+    dirty: bool;
+}
+
+pub fn create(mem: &Arena, sx: int, sy: int, sz: int): Model {
+    let m = Model {
+        mem: mem, name: "model", sx: 1, sy: 1, sz: 1,
+        cells: mem.alloc::<u8>(MAX * MAX * MAX), pal: mem.alloc::<u8>(256 * 3), names: mem.alloc::<string>(256),
+        palLen: 0, symX: false, symY: false, symZ: false,
+        tmp: mem.alloc::<u8>(MAX * MAX * MAX), work: mem.alloc::<int>(MAX * MAX * MAX),
+        part: mem.alloc::<u8>(MAX * MAX * MAX), ptmp: mem.alloc::<u8>(MAX * MAX * MAX),
+        parts: mem.alloc::<Part>(MAXPARTS + 1), partCount: 0, active: 0,
+        poses: mem.alloc::<f32>((MAXPOSES + 1) * POSE), poseNames: mem.alloc::<string>(MAXPOSES + 1), poseCount: 0,
+        clips: mem.alloc::<Clip>(MAXCLIPS + 1), clipCount: 0,
+        overlays: mem.alloc::<Overlay>(MAXOVERLAYS + 1), overlayCount: 0, texels: mem.alloc::<int>(MAXTEXELS), texelCount: 0,
+        undos: mem.alloc::<Snap>(UNDOS), undoCount: 0, redos: mem.alloc::<Snap>(UNDOS), redoCount: 0,
+        rev: 1, dirty: false,
+    };
+    m.sx = clampSide(sx);
+    m.sy = clampSide(sy);
+    m.sz = clampSide(sz);
+    loadPreset(&m, "default");
+    m.dirty = false;
+    return m;
+}
+
+pub fn clampSide(n: int): int {
+    if n < 1 { return 1; }
+    if n > MAX { return MAX; }
+    return n;
+}
+
+pub fn touch(m: &Model) {
+    m.rev += 1;
+    m.dirty = true;
+}
+
+pub fn inside(m: &Model, x: int, y: int, z: int): bool {
+    return x >= 0 && y >= 0 && z >= 0 && x < m.sx && y < m.sy && z < m.sz;
+}
+
+/// The id at `(x, y, z)`, 0 outside the grid.
+pub fn get(m: &Model, x: int, y: int, z: int): int {
+    if !inside(m, x, y, z) { return 0; }
+    return int(m.cells[voxel.index(x, y, z, m.sx, m.sz)]);
+}
+
+pub fn count(m: &Model): int {
+    let n = 0;
+    for i in 0..m.sx * m.sy * m.sz {
+        if m.cells[i] != 0 { n += 1; }
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------------------- palette
+
+pub fn color(m: &Model, i: int, ch: int): int {
+    return int(m.pal[i * 3 + ch]);
+}
+
+pub fn setColor(m: &Model, i: int, r: int, g: int, b: int) {
+    if i < 1 || i > 255 { return; }
+    m.pal[i * 3] = u8(r);
+    m.pal[i * 3 + 1] = u8(g);
+    m.pal[i * 3 + 2] = u8(b);
+    if i > m.palLen {
+        // A gap stays black until set.
+        m.palLen = i;
+    }
+    touch(m);
+}
+
+pub fn nameColor(m: &Model, i: int, name: string) {
+    if i < 1 || i > m.palLen { return; }
+    m.names[i] = own(m.mem, name);
+    touch(m);
+}
+
+/// Palette index with exactly this color, or 0.
+pub fn findColor(m: &Model, r: int, g: int, b: int): int {
+    for i in 1..=m.palLen {
+        if color(m, i, 0) == r && color(m, i, 1) == g && color(m, i, 2) == b { return i; }
+    }
+    return 0;
+}
+
+/// Palette index named `name`, or 0.
+pub fn findName(m: &Model, name: string): int {
+    for i in 1..=m.palLen {
+        if m.names[i].len > 0 && same(m.names[i], name) { return i; }
+    }
+    return 0;
+}
+
+/// The index of this color, adding it when the palette lacks it. 0 when the palette is full.
+pub fn addColor(m: &Model, r: int, g: int, b: int): int {
+    let at = findColor(m, r, g, b);
+    if at != 0 { return at; }
+    if m.palLen >= 255 { return 0; }
+    setColor(m, m.palLen + 1, r, g, b);
+    return m.palLen;
+}
+
+/// `rrggbb`, `#rrggbb`, `rgb`, or `#rgb`.
+pub fn parseHex(s: string, r: &int, g: &int, b: &int): bool {
+    let a = 0;
+    if s.len > 0 && s[0] == 35 { a = 1; }
+    let n = s.len - a;
+    if n != 6 && n != 3 { return false; }
+    let v = mem6(s, a, n);
+    if v < 0 { return false; }
+    if n == 6 {
+        *r = v / 65536;
+        *g = (v / 256) % 256;
+        *b = v % 256;
+    } else {
+        *r = (v / 256) * 17;
+        *g = ((v / 16) % 16) * 17;
+        *b = (v % 16) * 17;
+    }
+    return true;
+}
+
+fn mem6(s: string, a: int, n: int): int {
+    let v = 0;
+    for i in 0..n {
+        let d = hexValue(s[a + i]);
+        if d < 0 { return -1; }
+        v = v * 16 + d;
+    }
+    return v;
+}
+
+/// Replace the palette with a built-in one. Voxels keep their indices.
+pub fn loadPreset(m: &Model, name: string): bool {
+    let hex = "";
+    if same(name, "default") {
+        hex = "1a1c2c 5d275d b13e53 ef7d57 ffcd75 a7f070 38b764 257179 29366f 3b5dc9 41a6f6 73eff7 f4f4f4 94b0c2 566c86 333c57";
+    } else if same(name, "earth") {
+        hex = "2b1d14 4a3426 6b4a35 8c6a4a b08d62 d2b48c e8d5b0 3d5a3a 5b7f45 86a35a b5c97a 7a8a8f 55646b 3a4147 a3472f d07a3a";
+    } else if same(name, "pastel") {
+        hex = "ffb3ba ffdfba ffffba baffc9 bae1ff d5baff ffbaf0 f4f4f4 c9c9d9 9a9ab0 6b6b85 45455c e8c7a9 b5e8d4 f7d6e0 cfd8ff";
+    } else if same(name, "gray") {
+        hex = "000000 111111 222222 333333 444444 555555 666666 777777 888888 999999 aaaaaa bbbbbb cccccc dddddd eeeeee ffffff";
+    } else if same(name, "neon") {
+        hex = "0d0221 261447 541388 f1e9da ff2a6d d1f7ff 05d9e8 01012b ff9f1c ffe74c 7ae582 00a896 7209b7 3a0ca3 4cc9f0 f72585";
+    } else {
+        return false;
+    }
+    m.palLen = 0;
+    let i = 0;
+    let slot = 1;
+    while i < hex.len {
+        let r = 0;
+        let g = 0;
+        let b = 0;
+        if i + 6 <= hex.len && parseHex(sub(hex, i, i + 6), &r, &g, &b) {
+            m.names[slot] = "";
+            setColor(m, slot, r, g, b);
+            slot += 1;
+        }
+        i += 7;
+    }
+    return true;
+}
+
+fn sub(s: string, a: int, b: int): string {
+    return []u8 { ptr: (s.ptr as int + a) as &u8, len: b - a } as string;
+}
+
+/// Common color words, so `box ... red` works without defining red first.
+pub fn namedColor(name: string, r: &int, g: &int, b: &int): bool {
+    let hex = "";
+    if same(name, "red") { hex = "e63946"; }
+    else if same(name, "green") { hex = "3fb950"; }
+    else if same(name, "blue") { hex = "3b82f6"; }
+    else if same(name, "yellow") { hex = "ffd23f"; }
+    else if same(name, "orange") { hex = "f77f00"; }
+    else if same(name, "purple") { hex = "8e44ad"; }
+    else if same(name, "pink") { hex = "ff8fab"; }
+    else if same(name, "brown") { hex = "7b4b2a"; }
+    else if same(name, "white") { hex = "f4f4f4"; }
+    else if same(name, "black") { hex = "16181d"; }
+    else if same(name, "gray") || same(name, "grey") { hex = "8a8f98"; }
+    else if same(name, "cyan") { hex = "2ec4b6"; }
+    else if same(name, "tan") { hex = "d2b48c"; }
+    else if same(name, "skin") { hex = "e8b894"; }
+    else { return false; }
+    return parseHex(hex, r, g, b);
+}
+
+pub fn presetNames(): string {
+    return "default earth pastel gray neon";
+}
+
+/// Remove palette entries no voxel uses, renumbering the voxels. Returns how many went.
+pub fn trimPalette(m: &Model): int {
+    let used = m.work;
+    for i in 0..256 { used[i] = 0; }
+    for i in 0..m.sx * m.sy * m.sz { used[int(m.cells[i])] = 1; }
+    let map = m.work[256..512];
+    let next = 1;
+    for i in 1..=m.palLen {
+        if used[i] != 0 {
+            map[i] = next;
+            m.pal[next * 3] = m.pal[i * 3];
+            m.pal[next * 3 + 1] = m.pal[i * 3 + 1];
+            m.pal[next * 3 + 2] = m.pal[i * 3 + 2];
+            m.names[next] = m.names[i];
+            next += 1;
+        } else {
+            map[i] = 0;
+        }
+    }
+    let removed = m.palLen - (next - 1);
+    for i in 0..m.sx * m.sy * m.sz {
+        if m.cells[i] != 0 { m.cells[i] = u8(map[int(m.cells[i])]); }
+    }
+    for i in next..=m.palLen { m.names[i] = ""; }
+    m.palLen = next - 1;
+    touch(m);
+    return removed;
+}
+
+// -------------------------------------------------------------------------------------- undo
+
+fn capture(m: &Model, s: &Snap) {
+    let n = m.sx * m.sy * m.sz;
+    if s.cells.len == 0 {
+        s.cells = m.mem.alloc::<u8>(MAX * MAX * MAX);
+        s.pal = m.mem.alloc::<u8>(256 * 3);
+        s.names = m.mem.alloc::<string>(256);
+        s.part = m.mem.alloc::<u8>(MAX * MAX * MAX);
+        s.parts = m.mem.alloc::<Part>(MAXPARTS + 1);
+        s.poses = m.mem.alloc::<f32>((MAXPOSES + 1) * POSE);
+        s.poseNames = m.mem.alloc::<string>(MAXPOSES + 1);
+        s.clips = m.mem.alloc::<Clip>(MAXCLIPS + 1);
+        s.overlays = m.mem.alloc::<Overlay>(MAXOVERLAYS + 1);
+    }
+    // Pixels cost 256 KB a step, so only models that have them pay.
+    if m.texelCount > 0 && s.texels.len == 0 { s.texels = m.mem.alloc::<int>(MAXTEXELS); }
+    s.sx = m.sx;
+    s.sy = m.sy;
+    s.sz = m.sz;
+    s.palLen = m.palLen;
+    for i in 0..n { s.cells[i] = m.cells[i]; }
+    for i in 0..768 { s.pal[i] = m.pal[i]; }
+    for i in 0..256 { s.names[i] = m.names[i]; }
+    for i in 0..n { s.part[i] = m.part[i]; }
+    s.partCount = m.partCount;
+    s.active = m.active;
+    for i in 0..=m.partCount { s.parts[i] = m.parts[i]; }
+    s.poseCount = m.poseCount;
+    for i in 0..(MAXPOSES + 1) * POSE { s.poses[i] = m.poses[i]; }
+    for i in 0..=m.poseCount { s.poseNames[i] = m.poseNames[i]; }
+    s.clipCount = m.clipCount;
+    for i in 0..=m.clipCount { s.clips[i] = m.clips[i]; }
+    s.overlayCount = m.overlayCount;
+    for i in 0..=m.overlayCount { s.overlays[i] = m.overlays[i]; }
+    s.texelCount = m.texelCount;
+    for i in 0..m.texelCount { s.texels[i] = m.texels[i]; }
+}
+
+fn restore(m: &Model, s: &Snap) {
+    m.sx = s.sx;
+    m.sy = s.sy;
+    m.sz = s.sz;
+    m.palLen = s.palLen;
+    for i in 0..s.sx * s.sy * s.sz { m.cells[i] = s.cells[i]; }
+    for i in 0..768 { m.pal[i] = s.pal[i]; }
+    for i in 0..256 { m.names[i] = s.names[i]; }
+    for i in 0..s.sx * s.sy * s.sz { m.part[i] = s.part[i]; }
+    m.partCount = s.partCount;
+    m.active = s.active;
+    for i in 0..=s.partCount { m.parts[i] = s.parts[i]; }
+    m.poseCount = s.poseCount;
+    for i in 0..(MAXPOSES + 1) * POSE { m.poses[i] = s.poses[i]; }
+    for i in 0..=s.poseCount { m.poseNames[i] = s.poseNames[i]; }
+    m.clipCount = s.clipCount;
+    for i in 0..=s.clipCount { m.clips[i] = s.clips[i]; }
+    m.overlayCount = s.overlayCount;
+    for i in 0..=s.overlayCount { m.overlays[i] = s.overlays[i]; }
+    m.texelCount = s.texelCount;
+    for i in 0..s.texelCount { m.texels[i] = s.texels[i]; }
+    touch(m);
+}
+
+/// Push the current state as an undo step (and forget redo).
+pub fn snapshot(m: &Model) {
+    m.redoCount = 0;
+    if m.undoCount == UNDOS {
+        // Drop the oldest, reusing its buffers for the newest.
+        let oldest = m.undos[0];
+        for i in 1..UNDOS { m.undos[i - 1] = m.undos[i]; }
+        m.undos[UNDOS - 1] = oldest;
+        m.undoCount = UNDOS - 1;
+    }
+    capture(m, &m.undos[m.undoCount]);
+    m.undoCount += 1;
+}
+
+/// Drop the newest undo step again (a gesture that changed nothing).
+pub fn discardSnapshot(m: &Model) {
+    if m.undoCount > 0 { m.undoCount -= 1; }
+}
+
+pub fn undo(m: &Model): bool {
+    if m.undoCount == 0 { return false; }
+    if m.redoCount == UNDOS {
+        let oldest = m.redos[0];
+        for i in 1..UNDOS { m.redos[i - 1] = m.redos[i]; }
+        m.redos[UNDOS - 1] = oldest;
+        m.redoCount = UNDOS - 1;
+    }
+    capture(m, &m.redos[m.redoCount]);
+    m.redoCount += 1;
+    m.undoCount -= 1;
+    restore(m, &m.undos[m.undoCount]);
+    return true;
+}
+
+pub fn redo(m: &Model): bool {
+    if m.redoCount == 0 { return false; }
+    capture(m, &m.undos[m.undoCount]);
+    m.undoCount += 1;
+    m.redoCount -= 1;
+    restore(m, &m.redos[m.redoCount]);
+    return true;
+}
+
+// -------------------------------------------------------------------------------- single cells
+
+fn one(m: &Model, x: int, y: int, z: int, mode: int, c: int) {
+    if !inside(m, x, y, z) { return; }
+    let at = voxel.index(x, y, z, m.sx, m.sz);
+    if mode == ADD {
+        m.cells[at] = u8(c);
+        m.part[at] = if c == 0 { 0 } else { u8(m.active) };
+    }
+    else if mode == ERASE { m.cells[at] = 0; m.part[at] = 0; }
+    else if m.cells[at] != 0 { m.cells[at] = u8(c); }
+}
+
+/// Write a cell with an explicit part (moving voxels keeps their parts).
+fn put(m: &Model, x: int, y: int, z: int, c: int, p: int) {
+    if !inside(m, x, y, z) { return; }
+    let at = voxel.index(x, y, z, m.sx, m.sz);
+    m.cells[at] = u8(c);
+    m.part[at] = u8(p);
+}
+
+/// Copy cells and parts to `tmp` / `ptmp`.
+fn stash(m: &Model) {
+    for i in 0..m.sx * m.sy * m.sz { m.tmp[i] = m.cells[i]; m.ptmp[i] = m.part[i]; }
+}
+
+/// Write one voxel (and its mirrors, when symmetry is on). `mode` is ADD, ERASE, or PAINT
+/// (recolor only what is already there).
+pub fn apply(m: &Model, x: int, y: int, z: int, mode: int, c: int) {
+    let nx = if m.symX { 2 } else { 1 };
+    let ny = if m.symY { 2 } else { 1 };
+    let nz = if m.symZ { 2 } else { 1 };
+    for a in 0..nx {
+        for b in 0..ny {
+            for d in 0..nz {
+                one(m, if a == 1 { m.sx - 1 - x } else { x }, if b == 1 { m.sy - 1 - y } else { y },
+                    if d == 1 { m.sz - 1 - z } else { z }, mode, c);
+            }
+        }
+    }
+    m.rev += 1;
+    m.dirty = true;
+}
+
+// ------------------------------------------------------------------------------------- shapes
+
+fn lo(a: int, b: int): int { if a < b { return a; } return b; }
+fn hi(a: int, b: int): int { if a > b { return a; } return b; }
+
+/// A cube of `size` voxels centered near `(x, y, z)`.
+pub fn brush(m: &Model, x: int, y: int, z: int, size: int, mode: int, c: int) {
+    let a = (size - 1) / 2;
+    for i in 0..size {
+        for j in 0..size {
+            for k in 0..size { apply(m, x - a + i, y - a + j, z - a + k, mode, c); }
+        }
+    }
+}
+
+/// The box between two corners, inclusive. `hollow` leaves only its skin.
+pub fn box(m: &Model, x0: int, y0: int, z0: int, x1: int, y1: int, z1: int, mode: int, c: int, hollow: bool) {
+    let ax = hi(lo(x0, x1), 0);
+    let ay = hi(lo(y0, y1), 0);
+    let az = hi(lo(z0, z1), 0);
+    let bx = lo(hi(x0, x1), m.sx - 1);
+    let by = lo(hi(y0, y1), m.sy - 1);
+    let bz = lo(hi(z0, z1), m.sz - 1);
+    let fx = lo(x0, x1);
+    let fy = lo(y0, y1);
+    let fz = lo(z0, z1);
+    let gx = hi(x0, x1);
+    let gy = hi(y0, y1);
+    let gz = hi(z0, z1);
+    for y in ay..=by {
+        for z in az..=bz {
+            for x in ax..=bx {
+                if hollow && x > fx && x < gx && y > fy && y < gy && z > fz && z < gz { continue; }
+                apply(m, x, y, z, mode, c);
+            }
+        }
+    }
+}
+
+fn inEllipsoid(x: int, y: int, z: int, cx: f32, cy: f32, cz: f32, rx: f32, ry: f32, rz: f32): bool {
+    let dx = (f32(x) - cx) / rx;
+    let dy = (f32(y) - cy) / ry;
+    let dz = (f32(z) - cz) / rz;
+    return dx * dx + dy * dy + dz * dz <= 1;
+}
+
+/// An ellipsoid centered on voxel `(cx, cy, cz)`. Radii are in voxels: radius 0 is one voxel.
+pub fn ellipsoid(m: &Model, cx: int, cy: int, cz: int, rx: f32, ry: f32, rz: f32, mode: int, c: int, hollow: bool) {
+    let px = rx + 0.5;
+    let py = ry + 0.5;
+    let pz = rz + 0.5;
+    let fx = f32(cx);
+    let fy = f32(cy);
+    let fz = f32(cz);
+    let ex = int(floor(px));
+    let ey = int(floor(py));
+    let ez = int(floor(pz));
+    for y in cy - ey..=cy + ey {
+        for z in cz - ez..=cz + ez {
+            for x in cx - ex..=cx + ex {
+                if !inEllipsoid(x, y, z, fx, fy, fz, px, py, pz) { continue; }
+                if hollow && inEllipsoid(x - 1, y, z, fx, fy, fz, px, py, pz) && inEllipsoid(x + 1, y, z, fx, fy, fz, px, py, pz)
+                    && inEllipsoid(x, y - 1, z, fx, fy, fz, px, py, pz) && inEllipsoid(x, y + 1, z, fx, fy, fz, px, py, pz)
+                    && inEllipsoid(x, y, z - 1, fx, fy, fz, px, py, pz) && inEllipsoid(x, y, z + 1, fx, fy, fz, px, py, pz) {
+                    continue;
+                }
+                apply(m, x, y, z, mode, c);
+            }
+        }
+    }
+}
+
+pub fn sphere(m: &Model, cx: int, cy: int, cz: int, r: f32, mode: int, c: int, hollow: bool) {
+    ellipsoid(m, cx, cy, cz, r, r, r, mode, c, hollow);
+}
+
+fn inDisc(a: int, b: int, ca: int, cb: int, r: f32): bool {
+    let da = f32(a - ca);
+    let db = f32(b - cb);
+    return da * da + db * db <= r * r;
+}
+
+/// A cylinder along `axis` (0 x, 1 y, 2 z). `(x, y, z)` is the first layer's center and it runs
+/// `len` voxels toward +axis (negative `len` runs the other way). `hollow` leaves a closed shell.
+pub fn cylinder(m: &Model, x: int, y: int, z: int, r: f32, len: int, axis: int, mode: int, c: int, hollow: bool) {
+    let step = 1;
+    let n = len;
+    if len < 0 { step = -1; n = 0 - len; }
+    let rr = r + 0.5;
+    let e = int(floor(rr));
+    for k in 0..n {
+        for i in -e..=e {
+            for j in -e..=e {
+                if !inDisc(i, j, 0, 0, rr) { continue; }
+                if hollow && k > 0 && k < n - 1 && inDisc(i - 1, j, 0, 0, rr) && inDisc(i + 1, j, 0, 0, rr)
+                    && inDisc(i, j - 1, 0, 0, rr) && inDisc(i, j + 1, 0, 0, rr) {
+                    continue;
+                }
+                if axis == 0 { apply(m, x + k * step, y + i, z + j, mode, c); }
+                else if axis == 1 { apply(m, x + i, y + k * step, z + j, mode, c); }
+                else { apply(m, x + i, y + j, z + k * step, mode, c); }
+            }
+        }
+    }
+}
+
+/// A one-voxel line.
+pub fn line(m: &Model, x0: int, y0: int, z0: int, x1: int, y1: int, z1: int, mode: int, c: int) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let dz = z1 - z0;
+    let n = hi(hi(absI(dx), absI(dy)), absI(dz));
+    if n == 0 {
+        apply(m, x0, y0, z0, mode, c);
+        return;
+    }
+    for i in 0..=n {
+        let t = f32(i) / f32(n);
+        apply(m, x0 + int(floor(f32(dx) * t + 0.5)), y0 + int(floor(f32(dy) * t + 0.5)),
+            z0 + int(floor(f32(dz) * t + 0.5)), mode, c);
+    }
+}
+
+fn absI(v: int): int { if v < 0 { return 0 - v; } return v; }
+
+/// Recolor the connected region of voxels (sharing a face) that has the color of `(x, y, z)`.
+/// Returns how many voxels changed. With `plane` 0..2 the region stays in one layer of that axis.
+pub fn flood(m: &Model, x: int, y: int, z: int, c: int, plane: int): int {
+    if !inside(m, x, y, z) { return 0; }
+    let from = get(m, x, y, z);
+    if from == c || from == 0 { return 0; }
+    let head = 0;
+    let tail = 0;
+    m.work[tail] = voxel.index(x, y, z, m.sx, m.sz);
+    tail += 1;
+    m.cells[m.work[0]] = u8(c);
+    let changed = 1;
+    while head < tail {
+        let at = m.work[head];
+        head += 1;
+        let cx = at % m.sx;
+        let cz = (at / m.sx) % m.sz;
+        let cy = at / (m.sx * m.sz);
+        for d in 0..6 {
+            let nx = cx;
+            let ny = cy;
+            let nz = cz;
+            if d == 0 { nx -= 1; }
+            if d == 1 { nx += 1; }
+            if d == 2 { ny -= 1; }
+            if d == 3 { ny += 1; }
+            if d == 4 { nz -= 1; }
+            if d == 5 { nz += 1; }
+            if plane == 0 && nx != x { continue; }
+            if plane == 1 && ny != y { continue; }
+            if plane == 2 && nz != z { continue; }
+            if !inside(m, nx, ny, nz) { continue; }
+            let ni = voxel.index(nx, ny, nz, m.sx, m.sz);
+            if int(m.cells[ni]) != from { continue; }
+            m.cells[ni] = u8(c);
+            m.work[tail] = ni;
+            tail += 1;
+            changed += 1;
+        }
+    }
+    touch(m);
+    return changed;
+}
+
+/// Every voxel of color `from` becomes `to` (0 deletes them). Returns how many.
+pub fn replace(m: &Model, from: int, to: int): int {
+    let n = 0;
+    for i in 0..m.sx * m.sy * m.sz {
+        if int(m.cells[i]) == from {
+            m.cells[i] = u8(to);
+            if to == 0 { m.part[i] = 0; }
+            n += 1;
+        }
+    }
+    touch(m);
+    return n;
+}
+
+pub fn clear(m: &Model) {
+    for i in 0..m.sx * m.sy * m.sz { m.cells[i] = 0; m.part[i] = 0; }
+    touch(m);
+}
+
+// -------------------------------------------------------------------------------- transforms
+
+/// Slide everything by `(dx, dy, dz)`; what leaves the grid is lost.
+pub fn shift(m: &Model, dx: int, dy: int, dz: int) {
+    stash(m);
+    for i in 0..m.sx * m.sy * m.sz { m.cells[i] = 0; m.part[i] = 0; }
+    for y in 0..m.sy {
+        for z in 0..m.sz {
+            for x in 0..m.sx {
+                let at = voxel.index(x, y, z, m.sx, m.sz);
+                if m.tmp[at] != 0 { put(m, x + dx, y + dy, z + dz, int(m.tmp[at]), int(m.ptmp[at])); }
+            }
+        }
+    }
+    for i in 1..=m.partCount {
+        m.parts[i].px += f32(dx);
+        m.parts[i].py += f32(dy);
+        m.parts[i].pz += f32(dz);
+    }
+    texRemap(m, 0, dx, dy, dz);
+    touch(m);
+}
+
+/// Mirror the whole model across `axis`.
+pub fn flip(m: &Model, axis: int) {
+    stash(m);
+    for y in 0..m.sy {
+        for z in 0..m.sz {
+            for x in 0..m.sx {
+                let ox = if axis == 0 { m.sx - 1 - x } else { x };
+                let oy = if axis == 1 { m.sy - 1 - y } else { y };
+                let oz = if axis == 2 { m.sz - 1 - z } else { z };
+                m.cells[voxel.index(x, y, z, m.sx, m.sz)] = m.tmp[voxel.index(ox, oy, oz, m.sx, m.sz)];
+                m.part[voxel.index(x, y, z, m.sx, m.sz)] = m.ptmp[voxel.index(ox, oy, oz, m.sx, m.sz)];
+            }
+        }
+    }
+    for i in 1..=m.partCount {
+        if axis == 0 { m.parts[i].px = f32(m.sx) - m.parts[i].px; }
+        if axis == 1 { m.parts[i].py = f32(m.sy) - m.parts[i].py; }
+        if axis == 2 { m.parts[i].pz = f32(m.sz) - m.parts[i].pz; }
+    }
+    texRemap(m, 1, axis, 0, 0);
+    touch(m);
+}
+
+/// Copy the low half over the high half along `axis` (`fromHigh` copies the other way), so the
+/// model is symmetric.
+pub fn mirror(m: &Model, axis: int, fromHigh: bool) {
+    for y in 0..m.sy {
+        for z in 0..m.sz {
+            for x in 0..m.sx {
+                let ox = if axis == 0 { m.sx - 1 - x } else { x };
+                let oy = if axis == 1 { m.sy - 1 - y } else { y };
+                let oz = if axis == 2 { m.sz - 1 - z } else { z };
+                let here = if axis == 0 { x } else { if axis == 1 { y } else { z } };
+                let there = if axis == 0 { ox } else { if axis == 1 { oy } else { oz } };
+                // Visit each pair once, from the side that is the source.
+                let source = if fromHigh { here > there } else { here < there };
+                if source {
+                    m.cells[voxel.index(ox, oy, oz, m.sx, m.sz)] = m.cells[voxel.index(x, y, z, m.sx, m.sz)];
+                    m.part[voxel.index(ox, oy, oz, m.sx, m.sz)] = m.part[voxel.index(x, y, z, m.sx, m.sz)];
+                }
+            }
+        }
+    }
+    touch(m);
+}
+
+/// Turn the model 90 degrees about `axis`, `turns` times.
+pub fn rotate(m: &Model, axis: int, turns: int) {
+    let t = ((turns % 4) + 4) % 4;
+    for step in 0..t {
+        stash(m);
+        let nsx = m.sx;
+        let nsy = m.sy;
+        let nsz = m.sz;
+        if axis == 0 { nsy = m.sz; nsz = m.sy; }
+        if axis == 1 { nsx = m.sz; nsz = m.sx; }
+        if axis == 2 { nsx = m.sy; nsy = m.sx; }
+        for y in 0..m.sy {
+            for z in 0..m.sz {
+                for x in 0..m.sx {
+                    let nx = x;
+                    let ny = y;
+                    let nz = z;
+                    if axis == 0 { ny = z; nz = m.sy - 1 - y; }
+                    if axis == 1 { nx = z; nz = m.sx - 1 - x; }
+                    if axis == 2 { nx = y; ny = m.sx - 1 - x; }
+                    m.cells[voxel.index(nx, ny, nz, nsx, nsz)] = m.tmp[voxel.index(x, y, z, m.sx, m.sz)];
+                    m.part[voxel.index(nx, ny, nz, nsx, nsz)] = m.ptmp[voxel.index(x, y, z, m.sx, m.sz)];
+                }
+            }
+        }
+        for i in 1..=m.partCount {
+            let opx = m.parts[i].px;
+            let opy = m.parts[i].py;
+            let opz = m.parts[i].pz;
+            if axis == 0 { m.parts[i].py = opz; m.parts[i].pz = f32(m.sy) - opy; }
+            if axis == 1 { m.parts[i].px = opz; m.parts[i].pz = f32(m.sx) - opx; }
+            if axis == 2 { m.parts[i].px = opy; m.parts[i].py = f32(m.sx) - opx; }
+        }
+        texRemap(m, 2, axis, 0, 0);
+        m.sx = nsx;
+        m.sy = nsy;
+        m.sz = nsz;
+    }
+    touch(m);
+}
+
+/// New grid size; voxels keep their coordinates and those outside are lost.
+pub fn resize(m: &Model, sx: int, sy: int, sz: int) {
+    let nsx = clampSide(sx);
+    let nsy = clampSide(sy);
+    let nsz = clampSide(sz);
+    stash(m);
+    let osx = m.sx;
+    let osy = m.sy;
+    let osz = m.sz;
+    for i in 0..nsx * nsy * nsz { m.cells[i] = 0; m.part[i] = 0; }
+    for y in 0..lo(osy, nsy) {
+        for z in 0..lo(osz, nsz) {
+            for x in 0..lo(osx, nsx) {
+                m.cells[voxel.index(x, y, z, nsx, nsz)] = m.tmp[voxel.index(x, y, z, osx, osz)];
+                m.part[voxel.index(x, y, z, nsx, nsz)] = m.ptmp[voxel.index(x, y, z, osx, osz)];
+            }
+        }
+    }
+    m.sx = nsx;
+    m.sy = nsy;
+    m.sz = nsz;
+    texRemap(m, 3, nsx, nsy, nsz);
+    touch(m);
+}
+
+/// Corners of the box around every voxel; false when the model is empty.
+pub fn bounds(m: &Model, lo3: &[3]int, hi3: &[3]int): bool {
+    let any = false;
+    for y in 0..m.sy {
+        for z in 0..m.sz {
+            for x in 0..m.sx {
+                if m.cells[voxel.index(x, y, z, m.sx, m.sz)] == 0 { continue; }
+                if !any {
+                    lo3[0] = x; lo3[1] = y; lo3[2] = z;
+                    hi3[0] = x; hi3[1] = y; hi3[2] = z;
+                    any = true;
+                }
+                if x < lo3[0] { lo3[0] = x; }
+                if y < lo3[1] { lo3[1] = y; }
+                if z < lo3[2] { lo3[2] = z; }
+                if x > hi3[0] { hi3[0] = x; }
+                if y > hi3[1] { hi3[1] = y; }
+                if z > hi3[2] { hi3[2] = z; }
+            }
+        }
+    }
+    return any;
+}
+
+/// Shrink the grid to the voxels' bounding box (plus `pad` empty voxels around it).
+pub fn crop(m: &Model, pad: int): bool {
+    let a: [3]int = [0, 0, 0];
+    let b: [3]int = [0, 0, 0];
+    if !bounds(m, &a, &b) { return false; }
+    shift(m, pad - a[0], pad - a[1], pad - a[2]);
+    resize(m, b[0] - a[0] + 1 + pad * 2, b[1] - a[1] + 1 + pad * 2, b[2] - a[2] + 1 + pad * 2);
+    return true;
+}
+
+/// Empty the inside of solid shapes, leaving voxels that touch air.
+pub fn hollowAll(m: &Model) {
+    stash(m);
+    for y in 0..m.sy {
+        for z in 0..m.sz {
+            for x in 0..m.sx {
+                if m.tmp[voxel.index(x, y, z, m.sx, m.sz)] == 0 { continue; }
+                let skin = voxel.get(m.tmp, m.sx, m.sy, m.sz, x - 1, y, z) == 0 || voxel.get(m.tmp, m.sx, m.sy, m.sz, x + 1, y, z) == 0
+                    || voxel.get(m.tmp, m.sx, m.sy, m.sz, x, y - 1, z) == 0 || voxel.get(m.tmp, m.sx, m.sy, m.sz, x, y + 1, z) == 0
+                    || voxel.get(m.tmp, m.sx, m.sy, m.sz, x, y, z - 1) == 0 || voxel.get(m.tmp, m.sx, m.sy, m.sz, x, y, z + 1) == 0;
+                if !skin { m.cells[voxel.index(x, y, z, m.sx, m.sz)] = 0; m.part[voxel.index(x, y, z, m.sx, m.sz)] = 0; }
+            }
+        }
+    }
+    touch(m);
+}
+
+/// Copy the solid voxels of a box to another place (`dx, dy, dz` away). `move` clears the source.
+pub fn copyBox(m: &Model, x0: int, y0: int, z0: int, x1: int, y1: int, z1: int, dx: int, dy: int, dz: int, move: bool) {
+    let ax = hi(lo(x0, x1), 0);
+    let ay = hi(lo(y0, y1), 0);
+    let az = hi(lo(z0, z1), 0);
+    let bx = lo(hi(x0, x1), m.sx - 1);
+    let by = lo(hi(y0, y1), m.sy - 1);
+    let bz = lo(hi(z0, z1), m.sz - 1);
+    stash(m);
+    for y in ay..=by {
+        for z in az..=bz {
+            for x in ax..=bx {
+                if move && m.tmp[voxel.index(x, y, z, m.sx, m.sz)] != 0 {
+                    m.cells[voxel.index(x, y, z, m.sx, m.sz)] = 0;
+                    m.part[voxel.index(x, y, z, m.sx, m.sz)] = 0;
+                }
+            }
+        }
+    }
+    for y in ay..=by {
+        for z in az..=bz {
+            for x in ax..=bx {
+                let at = voxel.index(x, y, z, m.sx, m.sz);
+                if m.tmp[at] != 0 { put(m, x + dx, y + dy, z + dz, int(m.tmp[at]), int(m.ptmp[at])); }
+            }
+        }
+    }
+    touch(m);
+}
+
+/// Stamp `other` into `m` at `(dx, dy, dz)`, adding its colors to the palette. Returns the
+/// number of voxels placed.
+pub fn merge(m: &Model, other: &Model, dx: int, dy: int, dz: int): int {
+    let map = m.work[0..256];
+    for i in 0..256 { map[i] = 0; }
+    for i in 1..=other.palLen {
+        let at = addColor(m, color(other, i, 0), color(other, i, 1), color(other, i, 2));
+        map[i] = at;
+        if at != 0 && other.names[i].len > 0 && m.names[at].len == 0 && findName(m, other.names[i]) == 0 {
+            m.names[at] = own(m.mem, other.names[i]);
+        }
+    }
+    let placed = 0;
+    for y in 0..other.sy {
+        for z in 0..other.sz {
+            for x in 0..other.sx {
+                let v = int(other.cells[voxel.index(x, y, z, other.sx, other.sz)]);
+                if v == 0 || !inside(m, x + dx, y + dy, z + dz) { continue; }
+                one(m, x + dx, y + dy, z + dz, ADD, map[v]);
+                placed += 1;
+            }
+        }
+    }
+    touch(m);
+    return placed;
+}
+
+// ------------------------------------------------------------------------------ overlay pixels
+
+/// Sort key of the pixel on `face` (0 px, 1 nx, 2 py, 3 ny, 4 pz, 5 nz) of cell `(x, y, z)` in
+/// overlay `ov` (1..8). Pixels sort by overlay, face, y, z, x, so a run along +x is adjacent.
+pub fn texKey(ov: int, face: int, x: int, y: int, z: int): int {
+    return ((((ov - 1) * 6 + face) * 64 + y) * 64 + z) * 64 + x;
+}
+
+pub fn texOverlay(key: int): int { return key / KEYS_PER_OVERLAY + 1; }
+pub fn texFace(key: int): int { return (key / (64 * 64 * 64)) % 6; }
+pub fn texY(key: int): int { return (key / (64 * 64)) % 64; }
+pub fn texZ(key: int): int { return (key / 64) % 64; }
+pub fn texX(key: int): int { return key % 64; }
+pub fn texRgb(packed: int): int { return packed % RGB_RANGE; }
+pub fn texKeyOf(packed: int): int { return packed / RGB_RANGE; }
+
+/// Index of the first pixel whose key is `key` or more (`texelCount` when none).
+pub fn texFind(m: &Model, key: int): int {
+    let a = 0;
+    let b = m.texelCount;
+    while a < b {
+        let mid = (a + b) / 2;
+        if texKeyOf(m.texels[mid]) < key { a = mid + 1; } else { b = mid; }
+    }
+    return a;
+}
+
+/// The rgb painted at `key`, or -1.
+pub fn texGet(m: &Model, key: int): int {
+    let at = texFind(m, key);
+    if at < m.texelCount && texKeyOf(m.texels[at]) == key { return texRgb(m.texels[at]); }
+    return -1;
+}
+
+/// Paint (or recolor) one pixel. False when the pixel pool is full.
+pub fn texSet(m: &Model, key: int, rgb: int): bool {
+    let at = texFind(m, key);
+    if at < m.texelCount && texKeyOf(m.texels[at]) == key {
+        m.texels[at] = key * RGB_RANGE + rgb;
+        touch(m);
+        return true;
+    }
+    if m.texelCount >= MAXTEXELS { return false; }
+    let i = m.texelCount;
+    while i > at {
+        m.texels[i] = m.texels[i - 1];
+        i -= 1;
+    }
+    m.texels[at] = key * RGB_RANGE + rgb;
+    m.texelCount += 1;
+    touch(m);
+    return true;
+}
+
+/// Clear one pixel; true when there was one.
+pub fn texDel(m: &Model, key: int): bool {
+    let at = texFind(m, key);
+    if at >= m.texelCount || texKeyOf(m.texels[at]) != key { return false; }
+    for i in at..m.texelCount - 1 { m.texels[i] = m.texels[i + 1]; }
+    m.texelCount -= 1;
+    touch(m);
+    return true;
+}
+
+/// Pixels of overlay `ov`: first index and one past the last.
+pub fn texRange(m: &Model, ov: int, first: &int, end: &int) {
+    *first = texFind(m, (ov - 1) * KEYS_PER_OVERLAY);
+    *end = texFind(m, ov * KEYS_PER_OVERLAY);
+}
+
+/// Delete overlay `ov` and its pixels; later overlays move down a number.
+pub fn removeOverlay(m: &Model, ov: int) {
+    let n = 0;
+    for i in 0..m.texelCount {
+        let key = texKeyOf(m.texels[i]);
+        let o = texOverlay(key);
+        if o == ov { continue; }
+        m.texels[n] = if o > ov { (key - KEYS_PER_OVERLAY) * RGB_RANGE + texRgb(m.texels[i]) } else { m.texels[i] };
+        n += 1;
+    }
+    m.texelCount = n;
+    for i in ov..m.overlayCount { m.overlays[i] = m.overlays[i + 1]; }
+    m.overlayCount -= 1;
+    touch(m);
+}
+
+/// Unit normal of face 0..5 along `axis` (0 x, 1 y, 2 z), +1 or -1, 0 elsewhere.
+fn faceComp(f: int, axis: int): int {
+    if f / 2 != axis { return 0; }
+    return if f % 2 == 0 { 1 } else { -1 };
+}
+
+fn faceOfVec(a: int, b: int, c: int): int {
+    if a == 1 { return 0; }
+    if a == -1 { return 1; }
+    if b == 1 { return 2; }
+    if b == -1 { return 3; }
+    if c == 1 { return 4; }
+    return 5;
+}
+
+fn sortTexels(m: &Model) {
+    let gap = m.texelCount / 2;
+    while gap > 0 {
+        for i in gap..m.texelCount {
+            let v = m.texels[i];
+            let j = i;
+            while j >= gap && m.texels[j - gap] > v {
+                m.texels[j] = m.texels[j - gap];
+                j -= gap;
+            }
+            m.texels[j] = v;
+        }
+        gap = gap / 2;
+    }
+}
+
+/// Move pixels along with an edit: kind 0 shift `(p, q, r)`, 1 flip across axis `p`, 2 quarter turn
+/// about axis `p` (call before the sizes change), 3 keep only what fits a `p x q x r` grid.
+pub fn texRemap(m: &Model, kind: int, p: int, q: int, r: int) {
+    let n = 0;
+    for i in 0..m.texelCount {
+        let key = texKeyOf(m.texels[i]);
+        let x = texX(key);
+        let y = texY(key);
+        let z = texZ(key);
+        let f = texFace(key);
+        let nx = x;
+        let ny = y;
+        let nz = z;
+        let nf = f;
+        let keep = true;
+        if kind == 0 {
+            nx = x + p;
+            ny = y + q;
+            nz = z + r;
+            keep = nx >= 0 && ny >= 0 && nz >= 0 && nx < m.sx && ny < m.sy && nz < m.sz;
+        } else if kind == 1 {
+            if p == 0 { nx = m.sx - 1 - x; }
+            if p == 1 { ny = m.sy - 1 - y; }
+            if p == 2 { nz = m.sz - 1 - z; }
+            if f / 2 == p { nf = if f % 2 == 0 { f + 1 } else { f - 1 }; }
+        } else if kind == 2 {
+            let a = faceComp(f, 0);
+            let b = faceComp(f, 1);
+            let c = faceComp(f, 2);
+            if p == 0 { ny = z; nz = m.sy - 1 - y; nf = faceOfVec(a, c, 0 - b); }
+            if p == 1 { nx = z; nz = m.sx - 1 - x; nf = faceOfVec(c, b, 0 - a); }
+            if p == 2 { nx = y; ny = m.sx - 1 - x; nf = faceOfVec(b, 0 - a, c); }
+        } else {
+            keep = x < p && y < q && z < r;
+        }
+        if keep {
+            m.texels[n] = texKey(texOverlay(key), nf, nx, ny, nz) * RGB_RANGE + texRgb(m.texels[i]);
+            n += 1;
+        }
+    }
+    m.texelCount = n;
+    sortTexels(m);
+}
+
+/// Put the model back to the newest undo step without removing it (to redo a live preview).
+pub fn rollback(m: &Model) {
+    if m.undoCount > 0 { restore(m, &m.undos[m.undoCount - 1]); }
+}
+
+/// Whether the cells equal the newest undo step's (a gesture that changed nothing).
+pub fn sameAsSnapshot(m: &Model): bool {
+    if m.undoCount == 0 { return false; }
+    let s = m.undos[m.undoCount - 1];
+    if s.sx != m.sx || s.sy != m.sy || s.sz != m.sz || s.palLen != m.palLen { return false; }
+    for i in 0..m.sx * m.sy * m.sz {
+        if s.cells[i] != m.cells[i] || s.part[i] != m.part[i] { return false; }
+    }
+    for i in 0..768 {
+        if s.pal[i] != m.pal[i] { return false; }
+    }
+    if s.texelCount != m.texelCount || s.overlayCount != m.overlayCount { return false; }
+    for i in 0..m.texelCount {
+        if s.texels[i] != m.texels[i] { return false; }
+    }
+    return true;
+}

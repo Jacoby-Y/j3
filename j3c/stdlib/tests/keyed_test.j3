@@ -1,0 +1,310 @@
+// Tests for j3.ui.keyed (keyed {#each} matching): steady frames, reorders, duplicates, a 10k shuffle.
+//   SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout 60 j3c run j3c/stdlib/tests/keyed_test.j3
+// Panics on the first failed check; the 10k timing is printed and asserted well under 200 ms.
+
+module keyed_test;
+
+use j3.game.micros;
+use j3.io.printLn;
+use j3.memory.{ Arena, List };
+use j3.rand.Rng;
+use j3.sys.panic;
+use j3.text.Text;
+use j3.ui.keyed.{ Keyed, encode, decode };
+
+fn ok(cond: bool, msg: string) {
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic("keyed_test");
+    }
+}
+
+/// Feed key ids (key text is `k<id>`) and finish.
+fn frame(k: &Keyed, names: []string, ids: List<int>) {
+    k.begin();
+    for i in 0..ids.len {
+        k.add(names[ids.items[i]]);
+    }
+    k.finish("t");
+}
+
+fn list(mem: &Arena, xs: []int): List<int> {
+    let l = List<int>.new(mem);
+    for i in 0..xs.len {
+        l.push(xs[i]);
+    }
+    return l;
+}
+
+fn seq(mem: &Arena, n: int): List<int> {
+    let l = List<int>.new(mem);
+    for i in 0..n {
+        l.push(i);
+    }
+    return l;
+}
+
+/// Unique ids: `from[i]` is where id `now[i]` sat in `prev` (-1 if absent); `dead` the ids no longer present.
+fn checkUnique(k: &Keyed, prev: List<int>, now: List<int>, what: string) {
+    ok(k.from.len == now.len, `{what}: from length`);
+    let pos = List<int>.new(k.mem);
+    for i in 0..prev.len {
+        while pos.len <= prev.items[i] { pos.push(-1); }
+        pos.items[prev.items[i]] = i;
+    }
+    let claimed = 0;
+    for i in 0..now.len {
+        let want = if now.items[i] < pos.len { pos.items[now.items[i]] } else { -1 };
+        ok(k.from.items[i] == want, `{what}: from[{i}] is {k.from.items[i]}, want {want}`);
+        if want >= 0 { claimed += 1; }
+    }
+    ok(k.dead.len == prev.len - claimed, `{what}: dead count`);
+}
+
+/// `addInt` keys: ids map to big, negative and clustered ints; same results as text keys.
+fn intFrame(k: &Keyed, vals: []int, ids: List<int>) {
+    k.begin();
+    for i in 0..ids.len {
+        k.addInt(vals[ids.items[i]]);
+    }
+    k.finish("t");
+}
+
+fn intKeys(mem: &Arena, ids: List<int>, sh: List<int>, N: int) {
+    let vals = mem.alloc::<int>(N + 10);
+    for i in 0..N + 10 {
+        vals[i] = i;
+        if i % 3 == 0 {
+            vals[i] = i * 4294967296 + 7;
+        }
+        if i % 3 == 1 {
+            vals[i] = 0 - i * 1000003;
+        }
+    }
+    vals[0] = 0 - 9223372036854775807;
+    vals[1] = 9223372036854775807;
+    // encode/decode round trip (the duplicate warning prints decode), incl. negatives and the extremes
+    let buf = mem.alloc::<u8>(9);
+    let rt = [0, 1, 255, 256, 65535, 65536, 0 - 1, 0 - 256, 0 - 257, 9223372036854775807, 0 - 9223372036854775807, 0 - 9223372036854775807 - 1, 4294967296 + 7];
+    for q in 0..rt.len {
+        let n = encode(buf, 0, rt[q]);
+        ok(n >= 2 && n <= 9, "encode length");
+        ok(decode(buf[0..n]) == rt[q], `int round trip {rt[q]}`);
+    }
+    ok(encode(buf, 0, 17) == 2, "small ints are two bytes");
+    let k = Keyed.new(mem);
+    let a = seq(mem, 50);
+    intFrame(&k, vals, a);
+    ok(k.changed, "int: first frame changed");
+    intFrame(&k, vals, a);
+    ok(!k.changed, "int: steady");
+    let used = mem.checkpoint();
+    for f in 0..200 {
+        intFrame(&k, vals, a);
+        ok(!k.changed, "int: steady frame");
+    }
+    ok(mem.checkpoint() == used, "int: steady frames allocate nothing");
+    let rev = List<int>.new(mem);
+    for i in 0..50 { rev.push(49 - i); }
+    intFrame(&k, vals, rev);
+    checkUnique(&k, a, rev, "int reverse");
+    let b = list(mem, [5, 1, 2, 3, 4]);
+    intFrame(&k, vals, b);
+    let c = list(mem, [5, 9, 1, 3, 4, 8]);
+    intFrame(&k, vals, c);
+    checkUnique(&k, b, c, "int insert/remove");
+    ok(k.dead.len == 1 && k.dead.items[0] == 2, "int: removed row 2 is dead");
+    let e = List<int>.new(mem);
+    intFrame(&k, vals, e);
+    ok(k.changed && k.from.len == 0 && k.dead.len == 6, "int: to empty");
+    // a key that differs only in a high byte is a different key
+    let k1 = Keyed.new(mem);
+    k1.begin(); k1.addInt(1); k1.addInt(256); k1.addInt(65536); k1.finish("t");
+    k1.begin(); k1.addInt(65536); k1.addInt(1); k1.addInt(256); k1.finish("t");
+    ok(k1.from.items[0] == 2 && k1.from.items[1] == 0 && k1.from.items[2] == 1, "int: keys 1, 256, 65536 stay apart");
+    // duplicates: stable by position
+    let k2 = Keyed.new(mem);
+    intFrame(&k2, vals, list(mem, [1, 2, 1, 3, 1]));
+    intFrame(&k2, vals, list(mem, [3, 1, 1, 2, 1, 1]));
+    let w = [3, 0, 2, 1, 4, -1];
+    for i in 0..6 {
+        ok(k2.from.items[i] == w[i], `int dup from[{i}] is {k2.from.items[i]}`);
+    }
+    ok(k2.dead.len == 0, "int dup none dead");
+    // 10k shuffle
+    let kk = Keyed.new(mem);
+    intFrame(&kk, vals, ids);
+    let t0 = micros();
+    kk.begin();
+    for q in 0..sh.len { kk.addInt(vals[sh.items[q]]); }
+    kk.finish("t");
+    let us = micros() - t0;
+    printLn(`10k shuffled int finish: {us} us`);
+    checkUnique(&kk, ids, sh, "int shuffle");
+    ok(kk.dead.len == 0, "int shuffle none dead");
+    ok(us < 200000, "int 10k shuffle under 200 ms");
+    // plain ids 0..N (what a pool or a database gives): the number to compare with the text timing
+    let kr = Keyed.new(mem);
+    intFrame(&kr, ids.items, ids);
+    let t1 = micros();
+    kr.begin();
+    for q in 0..sh.len { kr.addInt(sh.items[q]); }
+    kr.finish("t");
+    printLn(`10k shuffled plain-id int finish: {micros() - t1} us`);
+    checkUnique(&kr, ids, sh, "plain int shuffle");
+    // pushInt appends at the tail like push
+    let kp = Keyed.new(mem);
+    intFrame(&kp, vals, list(mem, [1, 2]));
+    kp.pushInt(vals[3]);
+    ok(kp.cn == 3, "int push appends");
+}
+
+fn main() {
+    let mem = Arena.create(1048576);
+    let N = 10000;
+    let names = mem.alloc::<string>(N + 10);
+    for i in 0..N + 10 {
+        let tx = Text.new(&mem);
+        tx.pushStr(`k{i}`);
+        names[i] = tx.str();
+    }
+    let k = Keyed.new(&mem);
+
+    // steady: same keys, no change, no arena growth
+    let a = seq(&mem, 50);
+    frame(&k, names, a);
+    ok(k.changed, "first frame changed");
+    frame(&k, names, a);
+    ok(!k.changed, "steady");
+    let used = mem.checkpoint();
+    for f in 0..200 {
+        frame(&k, names, a);
+        ok(!k.changed, "steady frame");
+    }
+    ok(mem.checkpoint() == used, "steady frames allocate nothing");
+
+    // reverse
+    let rev = List<int>.new(&mem);
+    for i in 0..50 { rev.push(49 - i); }
+    frame(&k, names, rev);
+    ok(k.changed, "reverse changed");
+    checkUnique(&k, a, rev, "reverse");
+    ok(k.dead.len == 0, "reverse no dead");
+
+    // insert and remove
+    let b = list(&mem, [5, 1, 2, 3, 4]);
+    frame(&k, names, b);
+    let c = list(&mem, [5, 9, 1, 3, 4, 8]);
+    frame(&k, names, c);
+    checkUnique(&k, b, c, "insert/remove");
+    ok(k.dead.len == 1 && k.dead.items[0] == 2, "removed row 2 is dead");
+
+    // all new, then empty, then non-empty
+    let d = list(&mem, [20, 21, 22]);
+    frame(&k, names, d);
+    checkUnique(&k, c, d, "all new");
+    ok(k.dead.len == 6, "all old dead");
+    let e = List<int>.new(&mem);
+    frame(&k, names, e);
+    ok(k.changed && k.from.len == 0 && k.dead.len == 3, "to empty");
+    frame(&k, names, e);
+    ok(!k.changed, "empty steady");
+    frame(&k, names, d);
+    ok(k.changed && k.from.len == 3 && k.from.items[0] == -1 && k.dead.len == 0, "from empty");
+
+    // duplicates: stable by position
+    let k2 = Keyed.new(&mem);
+    frame(&k2, names, list(&mem, [1, 2, 1, 3, 1]));
+    frame(&k2, names, list(&mem, [3, 1, 1, 2, 1, 1]));
+    let w = [3, 0, 2, 1, 4, -1];
+    ok(k2.from.len == 6, "dup from length");
+    for i in 0..6 {
+        ok(k2.from.items[i] == w[i], `dup from[{i}] is {k2.from.items[i]}`);
+    }
+    ok(k2.dead.len == 0, "dup none dead");
+    frame(&k2, names, list(&mem, [1, 2]));
+    ok(k2.from.items[0] == 1 && k2.from.items[1] == 3 && k2.dead.len == 4, "dup shrink");
+
+    // 10k shuffle against a reference
+    let ids = seq(&mem, N);
+    let kk = Keyed.new(&mem);
+    frame(&kk, names, ids);
+    let rng = Rng.new(12345);
+    let sh = seq(&mem, N);
+    let i = N - 1;
+    while i > 0 {
+        let j = rng.intRange(0, i + 1);
+        let t = sh.items[i];
+        sh.items[i] = sh.items[j];
+        sh.items[j] = t;
+        i -= 1;
+    }
+    let t0 = micros();
+    kk.begin();
+    for q in 0..sh.len { kk.add(names[sh.items[q]]); }
+    printLn(`adds: {micros() - t0} us`);
+    kk.finish("t");
+    let us = micros() - t0;
+    printLn(`10k shuffled finish: {us} us`);
+    checkUnique(&kk, ids, sh, "shuffle");
+    ok(kk.dead.len == 0, "shuffle none dead");
+    ok(us < 200000, "10k shuffle under 200 ms");
+    // and back, plus half replaced
+    let half = List<int>.new(&mem);
+    for q in 0..N {
+        half.push(if q % 2 == 0 { sh.items[q] } else { N + q % 10 });
+    }
+    frame(&kk, names, half);
+    ok(kk.from.len == N, "half from length");
+    for q in 0..N {
+        if q % 2 == 0 {
+            ok(kk.from.items[q] == q, "half kept");
+        }
+    }
+    // grow and shrink: 0 -> 10k -> 3 -> 10k (tables are sized per frame, stale slots are never read)
+    let kg = Keyed.new(&mem);
+    frame(&kg, names, ids);
+    let small = list(&mem, [7, 9000, 3]);
+    frame(&kg, names, small);
+    checkUnique(&kg, ids, small, "shrink");
+    ok(kg.dead.len == N - 3, "shrink dead");
+    frame(&kg, names, sh);
+    checkUnique(&kg, small, sh, "regrow");
+    // find (key to row) and sameAs (compare rows of two lists), used by virtual lists
+    let kf = Keyed.new(&mem);
+    ok(kf.find(names[5]) == -1, "find before any finish");
+    frame(&kf, names, sh);
+    let fo = true;
+    for q in 0..N {
+        if kf.find(names[sh.items[q]]) != q {
+            fo = false;
+        }
+    }
+    ok(fo, "find returns the row of every key");
+    ok(kf.find("nope") == -1 && kf.find("") == -1, "find: missing keys");
+    frame(&kf, names, small);
+    ok(kf.find(names[9000]) == 1 && kf.find(names[8]) == -1, "find follows the latest keys");
+    let ko = Keyed.new(&mem);
+    frame(&ko, names, list(&mem, [3, 9000, 7]));
+    ok(kf.sameAs(1, &ko, 1) && kf.sameAs(2, &ko, 0) && !kf.sameAs(0, &ko, 0), "sameAs compares keys across lists");
+    // push: rows added at the tail (rehashes as it grows) are found, old ones still are
+    let kp = Keyed.new(&mem);
+    frame(&kp, names, list(&mem, [1, 2]));
+    let pk = true;
+    for q in 2..3000 {
+        kp.push(names[q + 1]);
+        if kp.cn != q + 1 {
+            pk = false;
+        }
+    }
+    for q in 0..3000 {
+        if kp.find(names[if q < 2 { q + 1 } else { q + 1 }]) != q {
+            pk = false;
+        }
+    }
+    ok(pk && kp.find(names[3001]) == -1, "push appends keys and keeps find right across rehashes");
+    kf.reset();
+    ok(kf.find(names[9000]) == -1, "find after reset");
+    intKeys(&mem, ids, sh, N);
+    printLn("keyed_test: PASS");
+}

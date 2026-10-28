@@ -1,0 +1,390 @@
+/// Per-node motion for `.j3ui`: CSS `transition` and `@keyframes` animations. A node that moves owns
+/// a `Motion` and an overlay style (a private copy of its computed style whose animated values are
+/// rewritten each frame), so layout and paint read the moving values through the ordinary style
+/// readers. No Dom, no GL: `j3.ui.dom` owns the Motions and calls `onStyle` when a node's computed
+/// style changes and `step` once per frame for the nodes in motion.
+///
+/// Animated: colors (background, color, border colors), `opacity`, `flex`, `transform` (function lists blend function by function, else as matrices), `box-shadow`, and px lengths (sizes, insets, margin, padding, gap, border width,
+/// radii). Lengths that are `auto` on either end jump instead of blending, as in a browser; `%` blends with `%`, and in @keyframes with px as a `calc()` (`mixPct`).
+/// Several animations per element (`animation: a 1s, b 2s`): each slot keeps its timeline, the later slot wins a shared property.
+/// Gradients (`background-image`, `border-image-source`, `mask-image`) blend through `j3.ui.gradmix`
+/// (same layer count and types; the rule for different stop counts is there), else they flip halfway.
+///
+/// ```
+/// let m = motion.fresh();
+/// motion.onStyle(&m, &css, oldStyle, newStyle, now);   // starts transitions and animations
+/// let r = motion.step(&m, &css, newStyle, now, 0.0);   // r & motionbase.STEP_LIVE: still moving
+/// ```
+
+module j3.ui.motion;
+
+use j3.ui.xform;
+use j3.ui.xform.{ REC, XI, XN };
+use j3.ui.anim;
+use j3.ui.anim.{ SH, SH_MAX };
+use j3.ui.gradmix;
+use j3.ui.css.{ lenToPx, V_EM, V_REM, V_PCT, P_FONT_SIZE, animAt, animCount, animKind, transCount, transDelay, transEase, Css, Frame, Keyframes, MAX_ANIM, Value, SY_URL };
+use j3.ui.cssmatch.stopValue;
+use j3.ui.cssprop.calcProp;
+use j3.ui.csscalc.{ O_ADD, O_PCT, O_PX };
+use j3.ui.css.{ CK_COLOR, CK_GRAD, CK_LEN, CK_NONE, CK_NUM, CK_SHADOW, CK_VAR, CK_XFORM, NPROPS, VBASE };
+use j3.ui.css.{ P_ANIM_DELAY, P_ANIM_DIR, P_ANIM_DUR, P_ANIM_EASE, P_ANIM_FILL, P_ANIM_ITER, P_ANIM_NAME };
+use j3.ui.css.{ P_LETTER_SPACING, P_WORD_SPACING, P_DEFER, P_BG_IMAGE, P_BORDER_IMAGE, P_BOX_SHADOW, P_COLOR, P_FLEX, P_OPACITY, P_RADIUS_TL, P_TRANS0, P_TRANSFORM, P_TRANSLATE, P_SCALE };
+use j3.ui.css.{ V_ANG, V_ANIM, V_CALC, V_LIST, V_UNSET, V_COLOR, V_CURRENT, V_EASE, V_GRAD, V_NONE, V_NUM, V_PX, V_SHADOW, V_TRANS, V_XFORM };
+
+use j3.ui.motionbase.{ MAXT, MAXV, STEP_LAYOUT, STEP_LIVE, Motion, SHN, blendable, chanOf, chanVal, colorVal, curve, ensureOverlay, gradRegion, gslot, isXProp, kindOf, layoutProp, loadShadow, mixGrad, mixOut, mixVal, num, outOff, put, putShadow, realProp, refresh, sameVal, snapGrad, snapOff, xoff, xprop, zeroValue };
+use j3.ui.motionkf.{ startAnims, stepSlot };
+use j3.ui.motionvar.applyVars;
+
+#[singleton]
+let ZERO: Motion;
+#[singleton]
+let SA: [37]f32;
+
+/// A Motion with nothing running and no overlay.
+pub fn fresh(): Motion {
+    let m = ZERO;
+    for k in 0..MAX_ANIM {
+        m.kf[k] = -1;
+        m.kname[k] = -1;
+    }
+    m.ov = -1;
+    m.pa = -1;
+    m.vset = -1;
+    return m;
+}
+
+/// Make `m` (fresh) take over the overlay style and scratch regions of a recycled Motion `old`.
+pub fn adopt(m: &Motion, old: &Motion) {
+    m.ov = old.ov;
+    m.pa = old.pa;
+    m.g = old.g;
+    m.cc = old.cc;
+    m.co = old.co;
+    m.vset = old.vset;
+    m.vcap = old.vcap;
+    m.vp = old.vp;
+    m.vpc = old.vpc;
+}
+
+/// Forget the overlay style and scratch regions (they died with `css.reset()`).
+pub fn forget(m: &Motion) {
+    m.ov = -1;
+    m.pa = -1;
+    for q in 0..12 {
+        m.g[q] = 0;
+    }
+    for q in 0..8 {
+        m.cc[q] = 0;
+    }
+    m.vset = -1;
+    m.vcap = 0;
+    m.vp = 0;
+    m.vpc = 0;
+}
+
+/// Tracks plus the animations that run: what `Dom.animating` counts.
+pub fn live(m: &Motion): int {
+    let c = m.n;
+    for k in 0..MAX_ANIM {
+        if m.kf[k] >= 0 && !m.kheld[k] {
+            c += 1;
+        }
+    }
+    return c;
+}
+
+/// True when a track or a running animation of `m` moves `letter-spacing` or `word-spacing` or a custom property (which may feed them): text nodes then read it from the overlay (`enterTextNode`).
+pub fn spacing(m: &Motion, css: &Css): bool {
+    for i in 0..m.n {
+        if m.p[i] == P_LETTER_SPACING || m.p[i] == P_WORD_SPACING || m.p[i] >= VBASE {
+            return true;
+        }
+    }
+    for k in 0..MAX_ANIM {
+        if m.kf[k] >= 0 {
+            let kf = &css.kfs.items[m.kf[k]];
+            for q in 0..kf.nprop {
+                if kf.props[q] == P_LETTER_SPACING || kf.props[q] == P_WORD_SPACING || kf.props[q] >= NPROPS {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// True when the node still needs its overlay style (a track, or an animation running or holding).
+pub fn active(m: &Motion): bool {
+    if m.n > 0 || m.vf {
+        return true;
+    }
+    for k in 0..MAX_ANIM {
+        if m.kf[k] >= 0 {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Drop the overlay's claim on this Motion (the style id is kept for reuse by a recycled Motion).
+pub fn release(m: &Motion) {
+    m.n = 0;
+    m.vn = 0;
+    m.vt = 0;
+    m.vprev = 0;
+    m.vf = false;
+    m.vdesc = false;
+    m.sp = false;
+    for k in 0..MAX_ANIM {
+        m.kf[k] = -1;
+        m.kname[k] = -1;
+        m.kheld[k] = false;
+        m.kfin[k] = false;
+    }
+}
+
+// ---- transitions ------------------------------------------------------------------------------------------
+
+fn findTrack(m: &Motion, cp: int): int {
+    for i in 0..m.n {
+        if m.p[i] == cp {
+            return i;
+        }
+    }
+    return -1;
+}
+
+fn dropTrack(m: &Motion, i: int) {
+    m.n -= 1;
+    if i != m.n {
+        m.p[i] = m.p[m.n];
+        m.t0[i] = m.t0[m.n];
+        m.dur[i] = m.dur[m.n];
+        m.ez[i] = m.ez[m.n];
+        m.from[i] = m.from[m.n];
+        m.to[i] = m.to[m.n];
+    }
+}
+
+/// The `V_TRANS` of `st` that covers property `rp` (kind `V_NONE` when none).
+fn transFor(css: &Css, st: int, rp: int): Value {
+    for t in 0..4 {
+        let v = css.get(st, P_TRANS0 + t);
+        if v.kind == V_TRANS && ((rp >= v.i && rp < v.i + transCount(v)) || (rp >= NPROPS && v.i == 0 && transCount(v) == NPROPS)) {
+            return v;
+        }
+    }
+    return zeroValue();
+}
+
+/// Where track `i` is at `now` (0 to 1 along time).
+fn trackU(m: &Motion, i: int, now: f32): f32 {
+    let u = (now - m.t0[i]) / m.dur[i];
+    if u < 0.0 {
+        return 0.0;
+    }
+    if u > 1.0 {
+        return 1.0;
+    }
+    return u;
+}
+
+/// Current shadow list of track `i` into `out`.
+fn trackShadow(m: &Motion, css: &Css, i: int, now: f32, out: []f32): int {
+    return anim.mixShadows(m.sf[0..SHN], 0, m.sto[0..SHN], 0, curve(css, m.ez[i], trackU(m, i, now)), out);
+}
+
+/// Start, retarget, or cancel the transition of channel `cp` for a style change `old` to `st`.
+fn transChan(m: &Motion, css: &Css, cp: int, old: int, st: int, now: f32) {
+    let tv = transFor(css, st, realProp(cp));
+    let ti = findTrack(m, cp);
+    if tv.kind != V_TRANS || tv.f <= 0.0 {
+        if ti >= 0 {
+            dropTrack(m, ti);
+        }
+        return;
+    }
+    let fromV = chanVal(css, old, cp);
+    let toV = chanVal(css, st, cp);
+    if ti >= 0 && sameVal(css, cp, m.to[ti], toV) {
+        return;
+    }
+    if ti < 0 && sameVal(css, cp, fromV, toV) {
+        return;
+    }
+    if !blendable(css, cp, fromV, toV) {
+        if ti >= 0 {
+            dropTrack(m, ti);
+        }
+        return;
+    }
+    let shadow = kindOf(cp) == CK_SHADOW;
+    if shadow {
+        // snapshot where the shadow is now, then aim at the new list
+        if ti >= 0 {
+            trackShadow(m, css, ti, now, SA[0..SHN]);
+            for q in 0..SHN {
+                m.sf[q] = SA[q];
+            }
+        } else {
+            loadShadow(css, fromV, m.sf[0..SHN]);
+        }
+        loadShadow(css, toV, m.sto[0..SHN]);
+    } else if ti >= 0 {
+        fromV = mixOut(m, css, cp, m.from[ti], m.to[ti], curve(css, m.ez[ti], trackU(m, ti, now)));
+        if kindOf(cp) == CK_GRAD {
+            fromV = snapGrad(m, css, cp, fromV);
+        }
+        if kindOf(cp) == CK_XFORM {
+            // the blend sits in the overlay, which is rewritten next frame: keep a copy to start from
+            let so = snapOff(m, cp);
+            let oo = outOff(m, cp);
+            for q in 0..1 + int(css.paints.items[oo]) * REC {
+                css.paints.items[so + q] = css.paints.items[oo + q];
+            }
+            fromV = Value { kind: V_XFORM, f: 0.0, i: so, c: 0 };
+        }
+    }
+    if ti < 0 {
+        if m.n >= MAXT {
+            return;
+        }
+        ti = m.n;
+        m.n += 1;
+    }
+    m.p[ti] = cp;
+    m.t0[ti] = now + f32(transDelay(tv));
+    m.dur[ti] = tv.f;
+    m.ez[ti] = transEase(tv);
+    m.from[ti] = fromV;
+    m.to[ti] = toV;
+}
+
+fn gk(css: &Css, st: int, p: int): int {
+    let v = css.get(st, p);
+    return v.kind;
+}
+
+/// True when style `st` can start motion: an `animation-name`, or (not `first`, the node's first
+/// style) a `transition`.
+pub fn wants(css: &Css, st: int, first: bool): bool {
+    for k in 0..animCount(css, st) {
+        if animAt(css, st, P_ANIM_NAME, k).kind == V_ANIM {
+            return true;
+        }
+    }
+    return (!first && gk(css, st, P_TRANS0) == V_TRANS);
+}
+
+/// The computed style of a node changed from `old` (-1 for its first style) to `st`: start,
+/// retarget, or cancel its transitions, start or stop its animation, and refresh the overlay.
+pub fn onStyle(m: &Motion, css: &Css, old: int, st: int, now: f32) {
+    if old >= 0 && (m.n > 0 || gk(css, st, P_TRANS0) == V_TRANS) {
+        for cp in 0..(NPROPS + 4) {
+            if kindOf(cp) != CK_NONE && !isXProp(cp) {
+                transChan(m, css, cp, old, st, now);
+            }
+        }
+    }
+    if old >= 0 && css.regs.len > 0 && css.varsOf(old) != css.varsOf(st) && (m.n > 0 || gk(css, st, P_TRANS0) == V_TRANS) {
+        // registered custom properties blend like any other transitioned property
+        for r in 0..css.regs.len {
+            if css.regs.items[r].syn != 0 && css.regs.items[r].syn != SY_URL {
+                transChan(m, css, VBASE + css.regs.items[r].name, old, st, now);
+            }
+        }
+    }
+    startAnims(m, css, st, now);
+    if active(m) {
+        refresh(m, css, st);
+    }
+}
+
+// ---- per frame ---------------------------------------------------------------------------------------------------
+
+/// Advance the transitions of the node on custom properties (`vars`) or on everything else to `now`, writing the overlay
+/// (a custom property goes to the node's `vval`, see `motionbase.put`). True when a layout property moved.
+fn stepTracks(m: &Motion, css: &Css, tst: int, now: f32, vars: bool): bool {
+    let layout = false;
+    let i = m.n - 1;
+    while i >= 0 {
+        let cp = m.p[i];
+        if (cp >= VBASE) != vars {
+            i -= 1;
+            continue;
+        }
+        if layoutProp(cp) {
+            layout = true;
+        }
+        let u = trackU(m, i, now);
+        let shadow = kindOf(cp) == CK_SHADOW;
+        if u >= 1.0 {
+            // a finished custom property track leaves no override: `applyVars` puts the readers back
+            if cp < VBASE && shadow {
+                css.vals.items[m.ov * NPROPS + cp] = css.get(tst, cp);
+            } else if cp < VBASE {
+                put(m, css, cp, chanVal(css, tst, cp));
+            }
+            dropTrack(m, i);
+        } else if shadow {
+            let len = trackShadow(m, css, i, now, SA[0..SHN]);
+            putShadow(m, css, SA[0..SHN], len);
+        } else {
+            put(m, css, cp, mixOut(m, css, cp, m.from[i], m.to[i], curve(css, m.ez[i], u)));
+        }
+        i -= 1;
+    }
+    return layout;
+}
+
+/// Advance the node's tracks and animation to `now` and rewrite the overlay (`tst` is the node's
+/// computed style, `extraDelay` an `animation-delay` added by markup). Returns `STEP_*` bits.
+/// Custom properties come first: their tracks and keyframes are sampled, then the properties that read them are rebuilt,
+/// then everything else is written over that.
+pub fn step(m: &Motion, css: &Css, tst: int, now: f32, extraDelay: f32): int {
+    let layout = false;
+    let moving = false;
+    m.vn = 0;
+    stepTracks(m, css, tst, now, true);
+    for pass in 0..2 {
+        for k in 0..MAX_ANIM {
+            if m.kf[k] >= 0 {
+                stepSlot(m, css, tst, k, now, extraDelay, pass, true);
+            }
+        }
+    }
+    if m.vn > 0 || m.vprev > 0 {
+        if applyVars(m, css, tst, m, false) == STEP_LAYOUT {
+            layout = true;
+        }
+    }
+    m.vprev = m.vn;
+    if stepTracks(m, css, tst, now, false) {
+        layout = true;
+    }
+    if m.n > 0 {
+        moving = true;
+    }
+    for pass in 0..2 {
+        for k in 0..MAX_ANIM {
+            if m.kf[k] >= 0 {
+                let ra = stepSlot(m, css, tst, k, now, extraDelay, pass, false);
+                if ra % 2 == 1 {
+                    moving = true;
+                }
+                if (ra / 2) % 2 == 1 {
+                    layout = true;
+                }
+            }
+        }
+    }
+    let r = 0;
+    if moving {
+        r += STEP_LIVE;
+    }
+    if layout {
+        r += STEP_LAYOUT;
+    }
+    return r;
+}

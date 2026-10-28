@@ -1,0 +1,285 @@
+// Bundled desktop scene editor. Run by `j3c editor` with the project as cwd.
+
+module j3_editor.scenes;
+
+use j3.scene3d.editor.uses;
+use j3.gfx.Orbit;
+use j3.math.Vec3;
+use j3.memory.{ Arena, scratch };
+use j3.scene3d;
+use j3.scene3d.{ MESH, INSTANCE };
+use j3.data.save;
+use j3.text.{ Text, same };
+use j3_editor.console.say;
+use j3_editor.history.{ deltaStack, modified };
+use j3_editor.selection.select;
+use j3_editor.shared.shared;
+use j3_editor.tabs.{ autosavePath, dropAutosave, growTabs, stash, tidyPanes, unstash };
+use j3_editor.types.{ HISTORY, MatEdit, PREVIEW_CUBE, PREVIEW_PLANE, PREVIEW_SPHERE, Tab, World };
+use j3_editor.util.{ fileExists, keep, nameChar, newArena, own, setText, stem };
+
+/// Show `path` in its tab, opening one if needed.
+pub fn openScene(w: &World, path: string) {
+    let g = shared();
+    stash(w);
+    let i = 0;
+    while i < w.tabCount {
+        if same(w.tabs[i].path, path) {
+            unstash(w, i);
+            return;
+        }
+        i += 1;
+    }
+    growTabs(w);
+    let mem = newArena(w.mem, 1024 * 1024);
+    let scene = scene3d.load(path, mem);
+    scene3d.upload(&scene);
+    w.tabs[w.tabCount] = Tab {
+        path: own(mem, path),
+        mat: 0 as &MatEdit,
+        scene: scene,
+        cam: Orbit.create(Vec3.xyz(0, 0.5, 0), 0.7, 0.45, 9),
+        selected: 0,
+        undos: deltaStack(mem, HISTORY),
+        undoCount: 0,
+        redos: deltaStack(mem, HISTORY),
+        redoCount: 0,
+        dirty: false,
+        viewCam: 0,
+        savedCam: Orbit.create(Vec3.xyz(0, 0.5, 0), 0.7, 0.45, 9),
+        ortho: false,
+        axisView: false,
+        pane: g.focus,
+        front: false,
+        previewLock: 0,
+    };
+    w.tabCount += 1;
+    unstash(w, w.tabCount - 1);
+    let t = Text.new(scratch(0));
+    t.pushStr("Opened ");
+    t.pushStr(path);
+    say(w, t.str());
+    warnMissing(w);
+    checkRecover(w);
+}
+
+/// Edit material `path` in its own tab (opening one if needed), shown on a preview mesh.
+pub fn openMaterialTab(w: &World, path: string) {
+    let g = shared();
+    stash(w);
+    let i = 0;
+    while i < w.tabCount {
+        if same(w.tabs[i].path, path) {
+            unstash(w, i);
+            return;
+        }
+        i += 1;
+    }
+    growTabs(w);
+    let mem = newArena(w.mem, 1024 * 1024);
+    let edit = mem.alloc::<MatEdit>(1);
+    edit[0] = MatEdit {
+        file: save.load(path, mem),
+        undos: mem.alloc::<[]u8>(HISTORY),
+        undoCount: 0,
+        redos: mem.alloc::<[]u8>(HISTORY),
+        redoCount: 0,
+        gesture: false,
+        pending: false,
+        shownMs: 0,
+        shape: PREVIEW_SPHERE,
+    };
+    let scene = scene3d.load("", mem);
+    let id = scene3d.add(&scene, MESH, "Preview", 0);
+    let at = scene3d.index(&scene, id);
+    scene.nodes[at].asset = previewMesh(PREVIEW_SPHERE);
+    let size = previewSize(PREVIEW_SPHERE);
+    scene.nodes[at].scale = Vec3.xyz(size, size, size);
+    scene.nodes[at].material = own(mem, path);
+    scene.nodes[at].position.y = 0.8;
+    scene3d.upload(&scene);
+    w.tabs[w.tabCount] = Tab {
+        path: own(mem, path),
+        mat: &edit[0],
+        scene: scene,
+        cam: Orbit.create(Vec3.xyz(0, 0.8, 0), 0.7, 0.35, 3.4),
+        selected: 0,
+        undos: deltaStack(mem, 1),
+        undoCount: 0,
+        redos: deltaStack(mem, 1),
+        redoCount: 0,
+        dirty: false,
+        viewCam: 0,
+        savedCam: Orbit.create(Vec3.xyz(0, 0.8, 0), 0.7, 0.35, 3.4),
+        ortho: false,
+        axisView: false,
+        pane: g.focus,
+        front: false,
+        previewLock: 0,
+    };
+    w.tabCount += 1;
+    unstash(w, w.tabCount - 1);
+    say(w, "Editing the material; Save writes it, and objects using it change as you edit");
+    checkRecover(w);
+}
+
+pub fn previewMesh(shape: int): string {
+    if shape == PREVIEW_CUBE { return "builtin:cube"; }
+    if shape == PREVIEW_PLANE { return "builtin:plane"; }
+    return "builtin:sphere";
+}
+
+/// How much `previewMesh(shape)` is scaled up in a material tab.
+pub fn previewSize(shape: int): f32 {
+    if shape == PREVIEW_CUBE { return 1.2; }
+    if shape == PREVIEW_PLANE { return 2.4; }
+    return 1.6;
+}
+
+/// Name the first placed scene whose file is gone, if any, and say when nesting was cut off.
+pub fn warnMissing(w: &World) {
+    if w.scene.tooDeep { say(w, "Scenes are placed more than 8 levels deep; the deeper ones aren't shown"); }
+    let i = 0;
+    while i < w.scene.len {
+        let n = w.scene.nodes[i];
+        if n.missing && n.owner == 0 {
+            let t = Text.new(scratch(0));
+            t.pushStr("Missing file for ");
+            t.pushStr(n.name);
+            t.pushStr(": ");
+            if n.kind == INSTANCE { t.pushStr(n.scene); }
+            else if !fileExists(n.asset) { t.pushStr(n.asset); }
+            else { t.pushStr(n.texture); }
+            say(w, t.str());
+            return;
+        }
+        i += 1;
+    }
+}
+
+/// Close tab `i`, asking first when it has unsaved changes unless `force`.
+pub fn closeTab(w: &World, i: int, force: bool) {
+    stash(w);
+    if w.tabCount <= 1 {
+        say(w, "The last open scene stays open");
+        return;
+    }
+    if w.tabs[i].dirty && !force {
+        w.closing = true;
+        w.closeTab = i;
+        return;
+    }
+    dropAutosave(w.tabs[i].path);
+    let wasMaterial = w.tabs[i].mat as ptr != 0;
+    let matPath = own(scratch(1), w.tabs[i].path);
+    scene3d.release(&w.tabs[i].scene);
+    w.tabs[i].scene.arena.destroy();
+    let k = i;
+    while k + 1 < w.tabCount {
+        w.tabs[k] = w.tabs[k + 1];
+        k += 1;
+    }
+    w.tabCount -= 1;
+    let next = w.active;
+    if i < w.active { next = w.active - 1; }
+    if next >= w.tabCount { next = w.tabCount - 1; }
+    unstash(w, next);
+    tidyPanes(w);
+    // Unsaved material edits were only shown; the objects go back to the file.
+    if wasMaterial { scene3d.refreshMaterial(matPath); }
+}
+
+pub fn anyDirty(w: &World): bool {
+    stash(w);
+    let i = 0;
+    while i < w.tabCount {
+        if w.tabs[i].dirty { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+pub fn startNaming(w: &World) {
+    let n = 2;
+    let t = Text.new(scratch(0));
+    let looking = true;
+    while looking {
+        t = Text.new(scratch(0));
+        t.pushStr("scenes/scene");
+        t.pushInt(n);
+        t.pushStr(".j3scene");
+        looking = fileExists(t.str()) && n < 999;
+        n += 1;
+    }
+    setText(&w.sceneName, stem(t.str()));
+    w.naming = true;
+    w.nameFocus = true;
+    w.menuOpen = false;
+}
+
+/// Create `scenes/<name>.j3scene` from the name prompt and open it.
+pub fn createScene(w: &World) {
+    let name = w.sceneName.str();
+    let i = 0;
+    while i < name.len {
+        if !nameChar(name[i]) {
+            say(w, "Scene names use letters, digits, - and _");
+            return;
+        }
+        i += 1;
+    }
+    if name.len == 0 {
+        say(w, "Type a scene name");
+        return;
+    }
+    let t = Text.new(scratch(0));
+    t.pushStr("scenes/");
+    t.pushStr(name);
+    t.pushStr(".j3scene");
+    let path = t.str();
+    w.naming = false;
+    if fileExists(path) {
+        openScene(w, path);
+        say(w, "That scene already exists; opened it");
+        return;
+    }
+    let blank = scene3d.load(path, scratch(0));
+    if !scene3d.store(&blank, path) {
+        say(w, "Could not write the scene file (is there a scenes/ folder?)");
+        return;
+    }
+    if w.assetCount >= w.assetPaths.len {
+        let more = w.catMem.alloc::<string>(w.assetPaths.len * 2);
+        let copyIndex = 0;
+        while copyIndex < w.assetCount { more[copyIndex] = w.assetPaths[copyIndex]; copyIndex += 1; }
+        w.assetPaths = more;
+    }
+    w.assetPaths[w.assetCount] = own(w.catMem, path);
+    w.assetCount += 1;
+    openScene(w, path);
+    say(w, "New scene. Add objects, save it, then drop it into other scenes from Assets");
+}
+
+/// Place scene `file` in the open scene.
+pub fn addInstance(w: &World, file: string, parent: int, at: Vec3) {
+    if uses.uses(file, w.path) {
+        say(w, "A scene can't contain itself");
+        return;
+    }
+    let id = scene3d.add(&w.scene, INSTANCE, keep(w, stem(file)), parent);
+    let slot = scene3d.index(&w.scene, id);
+    w.scene.nodes[slot].scene = keep(w, file);
+    if parent == 0 { w.scene.nodes[slot].position = at; }
+    scene3d.refresh(&w.scene, w.path);
+    select(w, id);
+    modified(w);
+    let t = Text.new(scratch(0));
+    t.pushStr("Added scene ");
+    t.pushStr(stem(file));
+    say(w, t.str());
+}
+
+/// Offer the active scene's or material's crash copy, if it has one.
+pub fn checkRecover(w: &World) {
+    if fileExists(autosavePath(w.path)) { setText(&w.recoverPath, w.path); }
+}

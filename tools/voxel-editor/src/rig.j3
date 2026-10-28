@@ -1,0 +1,717 @@
+// Rigging: parts (rigid limbs), the joints that join them, poses, and checks. A part is a set of
+// voxels (`Model.part` ids); its joint is its pivot, turning it and its children about the parent.
+// Voxel edge coordinates: voxel `x` spans `x..x+1`, so a pivot on a face is a whole number.
+
+module voxel_editor.rig;
+
+use j3.gfx.voxel;
+use j3.math.{ Mat4, PI, Vec3, floor };
+use j3.memory.Arena;
+use j3.text.{ Text, same };
+use voxel_editor.model;
+use voxel_editor.overlay;
+use voxel_editor.model.{ CLIPKEYS, Clip, MAXCLIPS, MAXPARTS, MAXPOSES, POSE, Model, Part };
+use voxel_editor.util.{ cut, own, parseF };
+
+/// Part id named `name`, or 0.
+pub fn find(m: &Model, name: string): int {
+    for i in 1..=m.partCount {
+        if same(m.parts[i].name, name) { return i; }
+    }
+    return 0;
+}
+
+pub fn blank(name: string, parent: int): Part {
+    return Part {
+        name: name, parent: parent, px: 0, py: 0, pz: 0,
+        lx0: -180, lx1: 180, ly0: -180, ly1: 180, lz0: -180, lz1: 180,
+    };
+}
+
+/// Add a part; its id, or 0 when the name is taken or the table is full.
+pub fn add(m: &Model, name: string, parent: int): int {
+    if name.len == 0 || find(m, name) != 0 || m.partCount >= MAXPARTS { return 0; }
+    m.partCount += 1;
+    m.parts[m.partCount] = blank(own(m.mem, name), parent);
+    model.touch(m);
+    return m.partCount;
+}
+
+/// True when `child` is `ancestor` or sits below it.
+pub fn under(m: &Model, child: int, ancestor: int): bool {
+    let at = child;
+    let steps = 0;
+    while at != 0 && steps <= MAXPARTS {
+        if at == ancestor { return true; }
+        at = m.parts[at].parent;
+        steps += 1;
+    }
+    return false;
+}
+
+/// Delete a part: its voxels become unassigned, its children move up to its parent, and higher
+/// ids shift down.
+pub fn remove(m: &Model, id: int) {
+    let up = m.parts[id].parent;
+    for i in 0..m.sx * m.sy * m.sz {
+        let p = int(m.part[i]);
+        if p == id { m.part[i] = 0; }
+        else if p > id { m.part[i] = u8(p - 1); }
+    }
+    for i in 1..=m.partCount {
+        if m.parts[i].parent == id { m.parts[i].parent = up; }
+    }
+    for i in id..m.partCount { m.parts[i] = m.parts[i + 1]; }
+    m.partCount -= 1;
+    for i in 1..=m.partCount {
+        if m.parts[i].parent > id { m.parts[i].parent -= 1; }
+    }
+    // Poses: drop the removed part's slot in every pose.
+    for s in 0..=m.poseCount {
+        for i in id..=m.partCount {
+            for k in 0..3 { m.poses[s * POSE + i * 3 + k] = m.poses[s * POSE + (i + 1) * 3 + k]; }
+        }
+        for k in 0..3 { m.poses[s * POSE + (m.partCount + 1) * 3 + k] = 0; }
+    }
+    if m.active == id { m.active = 0; }
+    else if m.active > id { m.active -= 1; }
+    // Overlays on the removed part go with it; later parts renumber.
+    let o = m.overlayCount;
+    while o >= 1 {
+        if m.overlays[o].part == id { model.removeOverlay(m, o); }
+        o -= 1;
+    }
+    for k in 1..=m.overlayCount {
+        if m.overlays[k].part > id { m.overlays[k].part -= 1; }
+    }
+    model.touch(m);
+}
+
+/// Drop every part, pose, clip and overlay; voxels become unassigned.
+pub fn clearRig(m: &Model) {
+    m.overlayCount = 0;
+    m.texelCount = 0;
+    m.partCount = 0;
+    m.active = 0;
+    m.poseCount = 0;
+    m.clipCount = 0;
+    for i in 0..m.sx * m.sy * m.sz { m.part[i] = 0; }
+    for i in 0..(model.MAXPOSES + 1) * model.POSE { m.poses[i] = 0; }
+    model.touch(m);
+}
+
+/// Voxels in part `id` (0 counts the unassigned ones).
+pub fn voxels(m: &Model, id: int): int {
+    let n = 0;
+    for i in 0..m.sx * m.sy * m.sz {
+        if m.cells[i] != 0 && int(m.part[i]) == id { n += 1; }
+    }
+    return n;
+}
+
+/// Box around part `id`'s voxels; false when it has none.
+pub fn bounds(m: &Model, id: int, lo3: &[3]int, hi3: &[3]int): bool {
+    let any = false;
+    for y in 0..m.sy {
+        for z in 0..m.sz {
+            for x in 0..m.sx {
+                let at = voxel.index(x, y, z, m.sx, m.sz);
+                if m.cells[at] == 0 || int(m.part[at]) != id { continue; }
+                if !any {
+                    lo3[0] = x; lo3[1] = y; lo3[2] = z;
+                    hi3[0] = x; hi3[1] = y; hi3[2] = z;
+                    any = true;
+                }
+                if x < lo3[0] { lo3[0] = x; }
+                if y < lo3[1] { lo3[1] = y; }
+                if z < lo3[2] { lo3[2] = z; }
+                if x > hi3[0] { hi3[0] = x; }
+                if y > hi3[1] { hi3[1] = y; }
+                if z > hi3[2] { hi3[2] = z; }
+            }
+        }
+    }
+    return any;
+}
+
+/// Give the voxels in a box to part `id` (0 unassigns). Returns how many voxels moved.
+pub fn assignBox(m: &Model, id: int, x0: int, y0: int, z0: int, x1: int, y1: int, z1: int): int {
+    let moved = 0;
+    for y in lo(y0, y1)..=hi(y0, y1) {
+        for z in lo(z0, z1)..=hi(z0, z1) {
+            for x in lo(x0, x1)..=hi(x0, x1) {
+                if !model.inside(m, x, y, z) { continue; }
+                let at = voxel.index(x, y, z, m.sx, m.sz);
+                if m.cells[at] == 0 || int(m.part[at]) == id { continue; }
+                m.part[at] = u8(id);
+                moved += 1;
+            }
+        }
+    }
+    model.touch(m);
+    return moved;
+}
+
+/// Give every voxel of palette color `c` to part `id`.
+pub fn assignColor(m: &Model, id: int, c: int): int {
+    let moved = 0;
+    for i in 0..m.sx * m.sy * m.sz {
+        if int(m.cells[i]) == c && int(m.part[i]) != id {
+            m.part[i] = u8(id);
+            moved += 1;
+        }
+    }
+    model.touch(m);
+    return moved;
+}
+
+/// Give every unassigned voxel to part `id`.
+pub fn assignRest(m: &Model, id: int): int {
+    let moved = 0;
+    for i in 0..m.sx * m.sy * m.sz {
+        if m.cells[i] != 0 && m.part[i] == 0 {
+            m.part[i] = u8(id);
+            moved += 1;
+        }
+    }
+    model.touch(m);
+    return moved;
+}
+
+/// Move the voxels of part `from` whose `axis` coordinate is `at` or more into part `to`.
+pub fn splitAt(m: &Model, from: int, axis: int, at: int, to: int): int {
+    let moved = 0;
+    for y in 0..m.sy {
+        for z in 0..m.sz {
+            for x in 0..m.sx {
+                let cell = voxel.index(x, y, z, m.sx, m.sz);
+                if m.cells[cell] == 0 || int(m.part[cell]) != from { continue; }
+                let c = if axis == 0 { x } else { if axis == 1 { y } else { z } };
+                if c >= at {
+                    m.part[cell] = u8(to);
+                    moved += 1;
+                }
+            }
+        }
+    }
+    model.touch(m);
+    return moved;
+}
+
+fn lo(a: int, b: int): int { if a < b { return a; } return b; }
+fn hi(a: int, b: int): int { if a > b { return a; } return b; }
+
+/// Put the joint where the part meets its parent (the middle of the touching faces), or at the
+/// middle of the part when it has no parent or does not touch it. False when the part is empty.
+pub fn pivotAuto(m: &Model, id: int): bool {
+    let up = m.parts[id].parent;
+    let sx: f32 = 0;
+    let sy: f32 = 0;
+    let sz: f32 = 0;
+    let n = 0;
+    if up != 0 {
+        for y in 0..m.sy {
+            for z in 0..m.sz {
+                for x in 0..m.sx {
+                    let cell = voxel.index(x, y, z, m.sx, m.sz);
+                    if m.cells[cell] == 0 || int(m.part[cell]) != id { continue; }
+                    for d in 0..6 {
+                        let ox = if d == 0 { -1 } else { if d == 1 { 1 } else { 0 } };
+                        let oy = if d == 2 { -1 } else { if d == 3 { 1 } else { 0 } };
+                        let oz = if d == 4 { -1 } else { if d == 5 { 1 } else { 0 } };
+                        if !model.inside(m, x + ox, y + oy, z + oz) { continue; }
+                        let nb = voxel.index(x + ox, y + oy, z + oz, m.sx, m.sz);
+                        if m.cells[nb] == 0 || int(m.part[nb]) != up { continue; }
+                        sx += f32(x) + 0.5 + f32(ox) * 0.5;
+                        sy += f32(y) + 0.5 + f32(oy) * 0.5;
+                        sz += f32(z) + 0.5 + f32(oz) * 0.5;
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    if n > 0 {
+        m.parts[id].px = sx / f32(n);
+        m.parts[id].py = sy / f32(n);
+        m.parts[id].pz = sz / f32(n);
+        model.touch(m);
+        return true;
+    }
+    let a: [3]int = [0, 0, 0];
+    let b: [3]int = [0, 0, 0];
+    if !bounds(m, id, &a, &b) { return false; }
+    m.parts[id].px = f32(a[0] + b[0] + 1) * 0.5;
+    m.parts[id].py = f32(a[1] + b[1] + 1) * 0.5;
+    m.parts[id].pz = f32(a[2] + b[2] + 1) * 0.5;
+    model.touch(m);
+    return true;
+}
+
+// ----------------------------------------------------------------------------------------- poses
+
+/// Set one part's rotation (degrees) in the live pose.
+pub fn setPose(m: &Model, id: int, rx: f32, ry: f32, rz: f32) {
+    m.poses[id * 3] = rx;
+    m.poses[id * 3 + 1] = ry;
+    m.poses[id * 3 + 2] = rz;
+    model.touch(m);
+}
+
+pub fn resetPose(m: &Model) {
+    for i in 0..POSE { m.poses[i] = 0; }
+    model.touch(m);
+}
+
+/// Pose slot named `name` (1..poseCount), or 0.
+pub fn findPose(m: &Model, name: string): int {
+    for i in 1..=m.poseCount {
+        if same(m.poseNames[i], name) { return i; }
+    }
+    return 0;
+}
+
+/// Store the live pose as `name` (replacing a pose of that name). False when full.
+pub fn savePose(m: &Model, name: string): bool {
+    let slot = findPose(m, name);
+    if slot == 0 {
+        if m.poseCount >= MAXPOSES { return false; }
+        m.poseCount += 1;
+        slot = m.poseCount;
+        m.poseNames[slot] = own(m.mem, name);
+    }
+    for i in 0..POSE { m.poses[slot * POSE + i] = m.poses[i]; }
+    model.touch(m);
+    return true;
+}
+
+/// Make named pose `slot` the live pose.
+pub fn loadPose(m: &Model, slot: int) {
+    for i in 0..POSE { m.poses[i] = m.poses[slot * POSE + i]; }
+    model.touch(m);
+}
+
+pub fn removePose(m: &Model, slot: int) {
+    for s in slot..m.poseCount {
+        m.poseNames[s] = m.poseNames[s + 1];
+        for i in 0..POSE { m.poses[s * POSE + i] = m.poses[(s + 1) * POSE + i]; }
+    }
+    m.poseCount -= 1;
+    model.touch(m);
+}
+
+// ---------------------------------------------------------------------------------------- clips
+
+/// Clip id named `name`, or 0.
+pub fn findClip(m: &Model, name: string): int {
+    for i in 1..=m.clipCount {
+        if same(m.clips[i].name, name) { return i; }
+    }
+    return 0;
+}
+
+/// Add or replace a clip with no poses yet; its id, or 0 when the table is full.
+pub fn addClip(m: &Model, name: string, seconds: f32, loops: bool): int {
+    let id = findClip(m, name);
+    if id == 0 {
+        if m.clipCount >= MAXCLIPS { return 0; }
+        m.clipCount += 1;
+        id = m.clipCount;
+    }
+    let none: [16]string = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""];
+    let zero: [16]f32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    m.clips[id] = Clip { name: own(m.mem, name), seconds: seconds, loop: loops, count: 0, keys: none, times: zero };
+    model.touch(m);
+    return id;
+}
+
+/// Append a pose to a clip at `time` seconds (below 0: not placed yet; `settleClip` spreads those evenly). False when full.
+pub fn clipKeyAt(m: &Model, id: int, pose: string, time: f32): bool {
+    if m.clips[id].count >= CLIPKEYS { return false; }
+    m.clips[id].keys[m.clips[id].count] = own(m.mem, pose);
+    m.clips[id].times[m.clips[id].count] = time;
+    m.clips[id].count += 1;
+    model.touch(m);
+    return true;
+}
+
+/// A clip word, `POSE` or `POSE@SECONDS`, appended. False when the clip is full or the time is not a number.
+pub fn clipKeyWord(m: &Model, id: int, word: string): bool {
+    let at = word.len;
+    for i in 0..word.len { if word[i] == 64 { at = i; } }
+    let time: f32 = -1;
+    if at < word.len && !parseF(cut(word, at + 1, word.len), &time) { return false; }
+    return clipKeyAt(m, id, cut(word, 0, at), time);
+}
+
+/// Keys with no time yet go evenly over the clip (a loop spaces them over all of it, a one-shot from first to last at the end).
+pub fn settleClip(m: &Model, id: int) {
+    let c = &m.clips[id];
+    let unset = false;
+    for j in 0..c.count { if c.times[j] < 0 { unset = true; } }
+    if !unset { return; }
+    let steps = if c.loop { c.count } else { c.count - 1 };
+    for j in 0..c.count { c.times[j] = if steps > 0 { c.seconds * f32(j) / f32(steps) } else { 0 }; }
+}
+
+pub fn removeClip(m: &Model, id: int) {
+    for i in id..m.clipCount { m.clips[i] = m.clips[i + 1]; }
+    m.clipCount -= 1;
+    model.touch(m);
+}
+
+/// Change a clip's length, moving its keys with it so the motion only gets faster or slower.
+pub fn setSeconds(m: &Model, id: int, seconds: f32) {
+    let c = &m.clips[id];
+    for j in 0..c.count { c.times[j] = c.times[j] * seconds / c.seconds; }
+    c.seconds = seconds;
+    model.touch(m);
+}
+
+/// The key of clip `id` within `slack` seconds of `t`, or -1.
+pub fn keyNear(m: &Model, id: int, t: f32, slack: f32): int {
+    let c = m.clips[id];
+    let best = -1;
+    let gap = slack;
+    for j in 0..c.count {
+        let d = c.times[j] - t;
+        if d < 0 { d = 0 - d; }
+        if d <= gap { gap = d; best = j; }
+    }
+    return best;
+}
+
+/// Put `pose` into clip `id` at `time`, keeping the keys in time order. The new key's index, or -1 when the clip is full.
+pub fn insertKey(m: &Model, id: int, pose: string, time: f32): int {
+    let c = &m.clips[id];
+    if c.count >= CLIPKEYS { return -1; }
+    let at = c.count;
+    while at > 0 && c.times[at - 1] > time {
+        c.keys[at] = c.keys[at - 1];
+        c.times[at] = c.times[at - 1];
+        at -= 1;
+    }
+    c.keys[at] = own(m.mem, pose);
+    c.times[at] = time;
+    c.count += 1;
+    model.touch(m);
+    return at;
+}
+
+/// Move key `j` to `time`, kept between its neighbours. Returns where it went.
+pub fn moveKey(m: &Model, id: int, j: int, time: f32): f32 {
+    let c = &m.clips[id];
+    let lo: f32 = 0;
+    let hi = c.seconds;
+    if j > 0 { lo = c.times[j - 1] + 0.01; }
+    if j < c.count - 1 { hi = c.times[j + 1] - 0.01; }
+    c.times[j] = clampF(time, lo, hi);
+    model.touch(m);
+    return c.times[j];
+}
+
+/// Take key `j` out of the clip (its pose stays saved).
+pub fn removeKey(m: &Model, id: int, j: int) {
+    let c = &m.clips[id];
+    for k in j..c.count - 1 {
+        c.keys[k] = c.keys[k + 1];
+        c.times[k] = c.times[k + 1];
+    }
+    c.count -= 1;
+    model.touch(m);
+}
+
+/// Put the clip at `t` seconds into the live pose, blending the two saved poses around it. False when
+/// a key names a pose that does not exist. A loop wraps (the last key blends back into the first); a one-shot holds its ends.
+pub fn sampleClip(m: &Model, id: int, t: f32): bool {
+    let c = m.clips[id];
+    if c.count == 0 { return true; }
+    let tt = t;
+    if c.loop {
+        let turns = t / c.seconds;
+        tt = (turns - floor(turns)) * c.seconds;
+    }
+    let a = 0;
+    for j in 0..c.count { if c.times[j] <= tt { a = j; } }
+    let b = a;
+    let ta = c.times[a];
+    let tb = c.times[a];
+    if c.loop && tt < c.times[0] {
+        a = c.count - 1;
+        b = 0;
+        ta = c.times[a] - c.seconds;
+        tb = c.times[0];
+    } else if a < c.count - 1 {
+        b = a + 1;
+        tb = c.times[b];
+    } else if c.loop {
+        b = 0;
+        tb = c.seconds + c.times[0];
+    }
+    let u: f32 = 0;
+    if tb - ta > 0.00001 { u = clampF((tt - ta) / (tb - ta), 0, 1); }
+    let sa = findPose(m, c.keys[a]);
+    let sb = findPose(m, c.keys[b]);
+    if sa == 0 || sb == 0 { return false; }
+    for i in 0..POSE { m.poses[i] = m.poses[sa * POSE + i] + (m.poses[sb * POSE + i] - m.poses[sa * POSE + i]) * u; }
+    model.touch(m);
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------- posing
+
+fn clampF(v: f32, a: f32, b: f32): f32 {
+    if v < a { return a; }
+    if v > b { return b; }
+    return v;
+}
+
+/// Part `id`'s own turn in pose `slot` (0 is the live pose): its rotation (limited, degrees,
+/// order y then x then z) about its pivot.
+fn localTurn(m: &Model, slot: int, id: int): Mat4 {
+    let p = m.parts[id];
+    let k = PI / 180;
+    let rx = clampF(m.poses[slot * POSE + id * 3], p.lx0, p.lx1) * k;
+    let ry = clampF(m.poses[slot * POSE + id * 3 + 1], p.ly0, p.ly1) * k;
+    let rz = clampF(m.poses[slot * POSE + id * 3 + 2], p.lz0, p.lz1) * k;
+    let turn = Mat4.rotate(Vec3.xyz(0, 1, 0), ry).mul(Mat4.rotate(Vec3.xyz(1, 0, 0), rx)).mul(Mat4.rotate(Vec3.xyz(0, 0, 1), rz));
+    return Mat4.translate(p.px, p.py, p.pz).mul(turn).mul(Mat4.translate(0 - p.px, 0 - p.py, 0 - p.pz));
+}
+
+/// Where part `id` ends up: its parent's matrix, then its own turn about its pivot. Maps a point
+/// in the rest model to the posed model.
+pub fn worldMatrix(m: &Model, slot: int, id: int, depth: int): Mat4 {
+    if id == 0 || depth > MAXPARTS { return Mat4.identity(); }
+    return worldMatrix(m, slot, m.parts[id].parent, depth + 1).mul(localTurn(m, slot, id));
+}
+
+/// Matrices for part 0 (identity) and every part, in `mats` (room for MAXPARTS + 1).
+pub fn matrices(m: &Model, slot: int, mats: []Mat4) {
+    mats[0] = Mat4.identity();
+    for i in 1..=m.partCount { mats[i] = worldMatrix(m, slot, i, 0); }
+}
+
+/// The pivot of part `id` in the posed model.
+pub fn pivotWorld(m: &Model, slot: int, id: int): Vec3 {
+    let up = m.parts[id].parent;
+    let at = Vec3.xyz(m.parts[id].px, m.parts[id].py, m.parts[id].pz);
+    return worldMatrix(m, slot, up, 0).transformPoint(at);
+}
+
+/// Whether `v` is inside part `id`'s limit on axis 0..2.
+pub fn inLimit(m: &Model, id: int, axis: int, v: f32): bool {
+    let p = m.parts[id];
+    if axis == 0 { return v >= p.lx0 && v <= p.lx1; }
+    if axis == 1 { return v >= p.ly0 && v <= p.ly1; }
+    return v >= p.lz0 && v <= p.lz1;
+}
+
+// ------------------------------------------------------------------------------------------ check
+
+fn issue(out: &Text, level: string, part: string, msg: string) {
+    out.pushStr(level);
+    out.pushStr(": ");
+    if part.len > 0 {
+        out.pushStr(part);
+        out.pushStr(": ");
+    }
+    out.pushStr(msg);
+    out.push(10);
+}
+
+/// Rig problems as `error: ` / `warning: ` lines in `out`. Returns the number of errors.
+pub fn check(m: &Model, out: &Text): int {
+    let errors = 0;
+    if m.partCount == 0 {
+        issue(out, "warning", "", "no parts yet (`part new NAME`, or `rig humanoid`)");
+        return 0;
+    }
+    for i in 1..=m.partCount {
+        let nm = m.parts[i].name;
+        let up = m.parts[i].parent;
+        if up < 0 || up > m.partCount || up == i {
+            issue(out, "error", nm, "parent is not another part");
+            errors += 1;
+        } else if up != 0 {
+            // A cycle never reaches a root within MAXPARTS steps.
+            let at = up;
+            let steps = 0;
+            while at != 0 && steps <= MAXPARTS {
+                at = m.parts[at].parent;
+                steps += 1;
+            }
+            if at != 0 {
+                issue(out, "error", nm, "parent chain loops");
+                errors += 1;
+            }
+        }
+        for j in 1..i {
+            if same(m.parts[j].name, nm) {
+                issue(out, "error", nm, "name used twice");
+                errors += 1;
+            }
+        }
+        let a: [3]int = [0, 0, 0];
+        let b: [3]int = [0, 0, 0];
+        if !bounds(m, i, &a, &b) {
+            issue(out, "warning", nm, "has no voxels");
+        } else {
+            let px = m.parts[i].px;
+            let py = m.parts[i].py;
+            let pz = m.parts[i].pz;
+            if px < f32(a[0]) - 1 || px > f32(b[0] + 1) + 1 || py < f32(a[1]) - 1 || py > f32(b[1] + 1) + 1
+                || pz < f32(a[2]) - 1 || pz > f32(b[2] + 1) + 1 {
+                issue(out, "warning", nm, "pivot is more than a voxel outside the part (`part pivot-auto` puts it at the joint)");
+            }
+        }
+        if m.parts[i].lx0 > m.parts[i].lx1 || m.parts[i].ly0 > m.parts[i].ly1 || m.parts[i].lz0 > m.parts[i].lz1 {
+            issue(out, "error", nm, "a rotation limit has min above max");
+            errors += 1;
+        }
+    }
+    if m.overlayCount > 0 {
+        let ovMem = Arena.create(m.sx * m.sy * m.sz + 64 * 1024);
+        defer ovMem.destroy();
+        let ovCells = ovMem.alloc::<u8>(m.sx * m.sy * m.sz);
+        for o in 1..=m.overlayCount {
+            let ovState = overlay.cells(m, o, ovCells);
+            let ovName = m.overlays[o].name;
+            if ovState == 2 {
+                issue(out, "error", ovName, "overlay shell leaves the grid (`size` bigger or `shift` the model, or lower its grow)");
+                errors += 1;
+            } else if ovState == 1 {
+                issue(out, "warning", ovName, "overlay's part has no voxels");
+            } else {
+                let nc = 0;
+                let nf = 0;
+                let np = 0;
+                let ns = 0;
+                overlay.counts(m, o, ovCells, &nc, &nf, &np, &ns);
+                if ns > 0 {
+                    let st = Text.new(out.arena);
+                    st.pushInt(ns);
+                    st.pushStr(" painted faces are no longer on its surface (`overlay prune NAME` drops them)");
+                    issue(out, "warning", ovName, st.str());
+                }
+            }
+        }
+    }
+    let loose = voxels(m, 0);
+    if loose > 0 {
+        let t = Text.new(out.arena);
+        t.pushInt(loose);
+        t.pushStr(" voxels belong to no part (`part assign-rest NAME`)");
+        issue(out, "warning", "", t.str());
+    }
+    return errors;
+}
+
+// -------------------------------------------------------------------------------------- templates
+
+/// Humanoid parts, in an order where each parent comes first. Facing +z, so a character's left (`.L`) is +x.
+fn humanoidName(s: int): string {
+    if s == 0 { return "Hips"; }
+    if s == 1 { return "Torso"; }
+    if s == 2 { return "Head"; }
+    if s == 3 { return "UpperArm.L"; }
+    if s == 4 { return "LowerArm.L"; }
+    if s == 5 { return "UpperArm.R"; }
+    if s == 6 { return "LowerArm.R"; }
+    if s == 7 { return "UpperLeg.L"; }
+    if s == 8 { return "LowerLeg.L"; }
+    if s == 9 { return "UpperLeg.R"; }
+    return "LowerLeg.R";
+}
+
+/// Index of a humanoid part's parent, -1 for the root.
+fn humanoidUp(s: int): int {
+    if s == 0 { return -1; }
+    if s == 1 || s == 7 || s == 9 { return 0; }
+    if s == 2 || s == 3 || s == 5 { return 1; }
+    if s == 4 { return 3; }
+    if s == 6 { return 5; }
+    if s == 8 { return 7; }
+    return 9;
+}
+
+/// Which humanoid part (index into HUMANOID) a voxel belongs to. `h` is the 0..1 height fraction,
+/// `dx` the offset from the middle in voxels (+x is the left side).
+fn humanoidPart(h: f32, dx: f32, inTorso: bool): int {
+    if h >= 0.82 { return 2; }
+    if !inTorso && h >= 0.40 {
+        let upper = h >= 0.66;
+        if dx >= 0 { return if upper { 3 } else { 4 }; }
+        return if upper { 5 } else { 6 };
+    }
+    if h < 0.48 || !inTorso {
+        let upperLeg = h >= 0.24;
+        if dx >= 0 { return if upperLeg { 7 } else { 8 }; }
+        return if upperLeg { 9 } else { 10 };
+    }
+    if h < 0.56 { return 0; }
+    return 1;
+}
+
+/// Split the model into a humanoid rig by body proportions (head on top, arms outside the
+/// torso, legs below), then put the joints where the parts touch. Replaces the current parts.
+/// `torsoHalf` is half the torso width in voxels (0 picks 17% of the height). Returns the number
+/// of parts made, 0 when the model is empty.
+pub fn humanoid(m: &Model, torsoHalfIn: int): int {
+    let a: [3]int = [0, 0, 0];
+    let b: [3]int = [0, 0, 0];
+    if !model.bounds(m, &a, &b) { return 0; }
+    m.partCount = 0;
+    m.active = 0;
+    for i in 0..m.sx * m.sy * m.sz { m.part[i] = 0; }
+    let height = f32(b[1] - a[1] + 1);
+    let mid = f32(a[0] + b[0] + 1) * 0.5;
+    let half = f32(torsoHalfIn);
+    if torsoHalfIn <= 0 { half = floor(height * 0.17 + 0.5); }
+    // Sort voxels into slots first, then create the parts that got any (parents resolved upward).
+    let ids: [11]int = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let used: [11]int = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for y in 0..m.sy {
+        for z in 0..m.sz {
+            for x in 0..m.sx {
+                let cell = voxel.index(x, y, z, m.sx, m.sz);
+                if m.cells[cell] == 0 { continue; }
+                let dx = f32(x) + 0.5 - mid;
+                let adx = if dx < 0 { 0 - dx } else { dx };
+                let slot = humanoidPart((f32(y - a[1]) + 0.5) / height, dx, adx <= half);
+                m.part[cell] = u8(slot + 1);
+                used[slot] = 1;
+            }
+        }
+    }
+    for s in 0..11 {
+        if used[s] == 0 { continue; }
+        let up = humanoidUp(s);
+        while up >= 0 && used[up] == 0 { up = humanoidUp(up); }
+        let pid = if up < 0 { 0 } else { ids[up] };
+        ids[s] = add(m, humanoidName(s), pid);
+    }
+    // Voxels were tagged slot + 1; turn the tags into part ids (or unassigned when a slot was empty).
+    for i in 0..m.sx * m.sy * m.sz {
+        if m.cells[i] != 0 { m.part[i] = u8(ids[int(m.part[i]) - 1]); }
+    }
+    for s in 0..11 {
+        if ids[s] != 0 { pivotAuto(m, ids[s]); }
+    }
+    model.touch(m);
+    return m.partCount;
+}
+
+/// Copy part `from`'s joint settings onto `to`, mirrored across the model's x middle
+/// (pivot x becomes `sx - x`; x and y/z limits swap sign as a left/right pair needs).
+pub fn mirrorJoint(m: &Model, from: int, to: int) {
+    m.parts[to].px = f32(m.sx) - m.parts[from].px;
+    m.parts[to].py = m.parts[from].py;
+    m.parts[to].pz = m.parts[from].pz;
+    m.parts[to].lx0 = m.parts[from].lx0;
+    m.parts[to].lx1 = m.parts[from].lx1;
+    m.parts[to].ly0 = 0 - m.parts[from].ly1;
+    m.parts[to].ly1 = 0 - m.parts[from].ly0;
+    m.parts[to].lz0 = 0 - m.parts[from].lz1;
+    m.parts[to].lz1 = 0 - m.parts[from].lz0;
+    model.touch(m);
+}

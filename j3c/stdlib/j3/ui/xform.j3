@@ -1,0 +1,432 @@
+/// 2D transforms for `.j3ui`: the stored function list of `transform` (and `translate` / `rotate` / `scale`), its composed
+/// matrix, the inverse for hit tests, and blending two lists. No Dom, no GL.
+///
+/// A list lives in `Css.paints` as `[n, record...]` (`n` at most `MAXF`), one `REC` floats per function:
+/// `[kind, a, b, c, d, e, f, pct]`. `XT` translate (`a`, `b`; `pct` bit 1 / 2: that one is a percentage of the border box; `pct` 4: `a`, `b`
+/// are px and `c`, `d` percentages, both added: what a blend between px and % leaves),
+/// `XR` rotate (`a` radians), `XS` scale (`a`, `b`), `XK` skew (`a`, `b` radians: x, y), `XM` matrix (`a` to `f`).
+/// The matrix maps `x' = a x + c y + e`, `y' = b x + d y + f`, the CSS `matrix(a, b, c, d, e, f)`.
+
+module j3.ui.xform;
+
+use j3.math.{ Vec2, abs, atan, atan2, cos, lerp, sin, sqrt, tan };
+use j3.ui.css.{ Css, P_ORIGIN, P_ROTATE, P_SCALE, P_TRANSFORM, P_TRANSLATE, V_XFORM };
+
+pub const XT: int = 0;
+pub const XR: int = 1;
+pub const XS: int = 2;
+pub const XK: int = 3;
+pub const XM: int = 4;
+
+/// Functions per list, floats per function, and floats of one list (`[n, records]`).
+pub const MAXF: int = 8;
+pub const REC: int = 8;
+pub const XN: int = 1 + MAXF * REC;
+/// Floats of a list of one function (`translate`, `rotate`, `scale`).
+pub const XI: int = 1 + REC;
+
+/// A composed transform of a box: `on` is false for the identity.
+pub struct Xf {
+    on: bool;
+    a: f32;
+    b: f32;
+    c: f32;
+    d: f32;
+    e: f32;
+    f: f32;
+}
+
+#[singleton]
+let FR: [8]f32;
+#[singleton]
+let TR: [8]f32;
+#[singleton]
+let RT: [33]f32;
+
+pub fn ident(): Xf {
+    return Xf { on: false, a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
+}
+
+/// `m` then `n` applied to the point (`n` is the inner transform): the matrix product `m * n`.
+pub fn mul(m: &Xf, n: &Xf): Xf {
+    return Xf {
+        on: true,
+        a: m.a * n.a + m.c * n.b, b: m.b * n.a + m.d * n.b,
+        c: m.a * n.c + m.c * n.d, d: m.b * n.c + m.d * n.d,
+        e: m.a * n.e + m.c * n.f + m.e, f: m.b * n.e + m.d * n.f + m.f,
+    };
+}
+
+/// The matrix of record `o` of the list data `a`, for a box of `w` by `h` (percentages).
+fn recMat(a: []f32, o: int, w: f32, h: f32): Xf {
+    let k = int(a[o]);
+    let m = ident();
+    if k == XT {
+        let pct = int(a[o + 7]);
+        m.e = a[o + 1];
+        m.f = a[o + 2];
+        if pct >= 4 {
+            // px and % together (a blend of unlike units): `a`, `b` px, `c`, `d` percent
+            m.e = m.e + a[o + 3] * w * 0.01;
+            m.f = m.f + a[o + 4] * h * 0.01;
+        } else {
+            if pct % 2 == 1 { m.e = m.e * w * 0.01; }
+            if (pct / 2) % 2 == 1 { m.f = m.f * h * 0.01; }
+        }
+    } else if k == XR {
+        let cs = cos(a[o + 1]);
+        let sn = sin(a[o + 1]);
+        m.a = cs;
+        m.b = sn;
+        m.c = 0.0 - sn;
+        m.d = cs;
+    } else if k == XS {
+        m.a = a[o + 1];
+        m.d = a[o + 2];
+    } else if k == XK {
+        m.c = tan(a[o + 1]);
+        m.b = tan(a[o + 2]);
+    } else {
+        m.a = a[o + 1];
+        m.b = a[o + 2];
+        m.c = a[o + 3];
+        m.d = a[o + 4];
+        m.e = a[o + 5];
+        m.f = a[o + 6];
+    }
+    return m;
+}
+
+/// The matrix of the list at `off` of `a`: its functions applied left to right, so `A B C` is `A * B * C` on the point.
+pub fn listMat(a: []f32, off: int, w: f32, h: f32): Xf {
+    let m = ident();
+    let n = int(a[off]);
+    for i in 0..n {
+        let r = recMat(a, off + 1 + i * REC, w, h);
+        m = mul(&m, &r);
+    }
+    return m;
+}
+
+fn offOf(css: &Css, st: int, p: int): int {
+    let v = css.get(st, p);
+    if v.kind != V_XFORM {
+        return -1;
+    }
+    return v.i;
+}
+
+/// The transform of style `st` for a border box of `w` by `h`, in box coordinates (origin at the box's top left): the origin
+/// shift, `translate`, `rotate`, `scale`, then the `transform` list. `on` is false when it comes out as the identity.
+pub fn of(css: &Css, st: int, w: f32, h: f32): Xf {
+    let t0 = offOf(css, st, P_TRANSLATE);
+    let t1 = offOf(css, st, P_ROTATE);
+    let t2 = offOf(css, st, P_SCALE);
+    let t3 = offOf(css, st, P_TRANSFORM);
+    if t0 < 0 && t1 < 0 && t2 < 0 && t3 < 0 {
+        return ident();
+    }
+    let a = css.paints.items;
+    let m = ident();
+    if t0 >= 0 { let q0 = listMat(a, t0, w, h); m = mul(&m, &q0); }
+    if t1 >= 0 { let q1 = listMat(a, t1, w, h); m = mul(&m, &q1); }
+    if t2 >= 0 { let q2 = listMat(a, t2, w, h); m = mul(&m, &q2); }
+    if t3 >= 0 { let q3 = listMat(a, t3, w, h); m = mul(&m, &q3); }
+    let ox = w * 0.5;
+    let oy = h * 0.5;
+    let oo = offOf(css, st, P_ORIGIN);
+    if oo >= 0 {
+        ox = a[oo];
+        oy = a[oo + 2];
+        if a[oo + 1] > 0.5 { ox = ox * w * 0.01; }
+        if a[oo + 3] > 0.5 { oy = oy * h * 0.01; }
+    }
+    // T(o) * m * T(-o)
+    m.e = m.e + ox - (m.a * ox + m.c * oy);
+    m.f = m.f + oy - (m.b * ox + m.d * oy);
+    m.on = m.a != 1.0 || m.b != 0.0 || m.c != 0.0 || m.d != 1.0 || m.e != 0.0 || m.f != 0.0;
+    return m;
+}
+
+/// Map the point `(px, py)` of the parent's space into the box whose top left is at `(x, y)` there: the inverse of `xf`.
+/// False (a singular matrix, such as `scale(0)`) when no point maps back, so the box cannot be hit.
+pub fn unmap(xf: &Xf, x: f32, y: f32, px: f32, py: f32, out: &Vec2): bool {
+    let det = xf.a * xf.d - xf.b * xf.c;
+    if abs(det) < 0.000001 {
+        return false;
+    }
+    let dx = px - x - xf.e;
+    let dy = py - y - xf.f;
+    out.x = x + (xf.d * dx - xf.c * dy) / det;
+    out.y = y + (xf.a * dy - xf.b * dx) / det;
+    return true;
+}
+
+// ---- blending ------------------------------------------------------------------------------------------------------
+
+/// Kind and pct of record `i` of the list at `o` in `a` (-1 past its end).
+fn kindAt(a: []f32, o: int, i: int): int {
+    if i >= int(a[o]) {
+        return -1;
+    }
+    return int(a[o + 1 + i * REC]);
+}
+
+/// The neutral record of kind `k` (what `none` stands for in a blend) into `out[q..]`.
+fn neutral(k: int, out: []f32, q: int) {
+    for z in 0..REC {
+        out[q + z] = 0.0;
+    }
+    out[q] = f32(k);
+    if k == XS {
+        out[q + 1] = 1.0;
+        out[q + 2] = 1.0;
+    }
+    if k == XM {
+        out[q + 1] = 1.0;
+        out[q + 4] = 1.0;
+    }
+}
+
+/// Copy record `i` of list `o` in `a` to `out[q..]`.
+fn copyRec(a: []f32, o: int, i: int, out: []f32, q: int) {
+    for z in 0..REC {
+        out[q + z] = a[o + 1 + i * REC + z];
+    }
+}
+
+/// Whether the lists at `fo` and `to` of `a` (`-1`: none) blend function by function: the same kinds in the same order, and
+/// `none` matches any list. Translate parts in different units (px against %) blend as px plus %.
+pub fn matching(a: []f32, fo: int, to: int): bool {
+    if fo < 0 || to < 0 {
+        return true;
+    }
+    let n = int(a[fo]);
+    if n != int(a[to]) {
+        return false;
+    }
+    for i in 0..n {
+        let p = fo + 1 + i * REC;
+        let q = to + 1 + i * REC;
+        if a[p] != a[q] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Blend the lists at `fo` and `to` of `a` (`-1`: none) at `e` function by function into `out` (`XN` floats, never `a`'s
+/// own region). The two must `matching`.
+fn mixList(a: []f32, fo: int, to: int, e: f32, out: []f32, q0: int) {
+    let n = 0;
+    if fo >= 0 { n = int(a[fo]); }
+    if to >= 0 { n = int(a[to]); }
+    out[q0] = f32(n);
+    for i in 0..n {
+        let q = q0 + 1 + i * REC;
+        let fr = FR[0..8];
+        let tr = TR[0..8];
+        if to >= 0 { copyRec(a, to, i, tr, 0); } else { neutral(int(a[fo + 1 + i * REC]), tr, 0); }
+        if fo >= 0 { copyRec(a, fo, i, fr, 0); } else { neutral(int(tr[0]), fr, 0); }
+        out[q] = fr[0];
+        for z in 1..7 {
+            out[q + z] = lerp(fr[z], tr[z], e);
+        }
+        // units: a zero end takes the other end's
+        let pf = int(fr[7]);
+        let pt = int(tr[7]);
+        let pc = pt;
+        if e < 0.5 { pc = pf; }
+        if int(fr[0]) == XT && (pf >= 4 || pt >= 4 || unitsDiffer(fr, tr)) {
+            // px and % at once: blend the px parts and the % parts apart
+            let x0 = splitT(fr);
+            let x1 = splitT(tr);
+            out[q + 1] = lerp(x0.px, x1.px, e);
+            out[q + 2] = lerp(x0.py, x1.py, e);
+            out[q + 3] = lerp(x0.cx, x1.cx, e);
+            out[q + 4] = lerp(x0.cy, x1.cy, e);
+            out[q + 5] = 0.0;
+            out[q + 6] = 0.0;
+            pc = 4;
+        } else if int(fr[0]) == XT {
+            pc = 0;
+            for part in 0..2 {
+                let bf = (pf / (1 + part)) % 2;
+                let bt = (pt / (1 + part)) % 2;
+                let bit = bt;
+                if fr[1 + part] != 0.0 && tr[1 + part] == 0.0 { bit = bf; }
+                if bf != bt && fr[1 + part] != 0.0 && tr[1 + part] != 0.0 { bit = bt; }
+                if bit == 1 { pc += 1 + part; }
+            }
+        }
+        out[q + 7] = f32(pc);
+    }
+}
+
+/// A translate record as px and percent parts of x and y.
+struct Parts {
+    px: f32;
+    py: f32;
+    cx: f32;
+    cy: f32;
+}
+
+fn splitT(r: []f32): Parts {
+    let u = int(r[7]);
+    if u >= 4 {
+        return Parts { px: r[1], py: r[2], cx: r[3], cy: r[4] };
+    }
+    let p = Parts { px: r[1], py: r[2], cx: 0.0, cy: 0.0 };
+    if u % 2 == 1 { p.px = 0.0; p.cx = r[1]; }
+    if (u / 2) % 2 == 1 { p.py = 0.0; p.cy = r[2]; }
+    return p;
+}
+
+/// Do translate records `x` and `y` give a part in px at one end and in % at the other (both non-zero)?
+fn unitsDiffer(x: []f32, y: []f32): bool {
+    let u = int(x[7]);
+    let v = int(y[7]);
+    for part in 0..2 {
+        let ub = (u / (1 + part)) % 2;
+        let vb = (v / (1 + part)) % 2;
+        if ub != vb && x[1 + part] != 0.0 && y[1 + part] != 0.0 {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The matrix `m` as the list `[1, matrix(...)]` into `out[q0..]`.
+fn putMat(m: &Xf, out: []f32, q0: int) {
+    out[q0] = 1.0;
+    let q = q0 + 1;
+    out[q] = f32(XM);
+    out[q + 1] = m.a;
+    out[q + 2] = m.b;
+    out[q + 3] = m.c;
+    out[q + 4] = m.d;
+    out[q + 5] = m.e;
+    out[q + 6] = m.f;
+    out[q + 7] = 0.0;
+}
+
+/// A 2D matrix as translate, rotation, scale and shear (CSS Transforms `unmatrix`).
+struct Dec {
+    tx: f32;
+    ty: f32;
+    rot: f32;
+    sx: f32;
+    sy: f32;
+    sh: f32;
+}
+
+fn decompose(m: &Xf): Dec {
+    // M = R * S * skewX: column 0 is sx * r0, column 1 is sx * tan * r0 + sy * r1 (r1 is r0 turned a quarter), so a
+    // reflection comes out as a negative sy
+    let sx = sqrt(m.a * m.a + m.b * m.b);
+    let r0x: f32 = 1.0;
+    let r0y: f32 = 0.0;
+    if sx != 0.0 { r0x = m.a / sx; r0y = m.b / sx; }
+    let k = r0x * m.c + r0y * m.d;
+    let sy = m.d * r0x - m.c * r0y;
+    let tn: f32 = 0.0;
+    if sx != 0.0 { tn = k / sx; }
+    return Dec { tx: m.e, ty: m.f, rot: atan2(r0y, r0x), sx: sx, sy: sy, sh: tn };
+}
+
+/// `m` taken apart and put back together (what a blend of unlike lists passes through); `m` again unless it is singular.
+pub fn roundTrip(m: &Xf): Xf {
+    let d = decompose(m);
+    let out = RT[0..1 + 4 * REC];
+    putDec(&d, out, 0);
+    return listMat(out, 0, 0.0, 0.0);
+}
+
+/// A decomposed transform as the list `[translate, rotate, scale, skewX]` into `out[q0..]`.
+fn putDec(d: &Dec, out: []f32, q0: int) {
+    out[q0] = 4.0;
+    let q = q0 + 1;
+    neutral(XT, out, q);
+    out[q + 1] = d.tx;
+    out[q + 2] = d.ty;
+    q += REC;
+    neutral(XR, out, q);
+    out[q + 1] = d.rot;
+    q += REC;
+    neutral(XS, out, q);
+    out[q + 1] = d.sx;
+    out[q + 2] = d.sy;
+    q += REC;
+    neutral(XK, out, q);
+    out[q + 1] = atan(d.sh);
+}
+
+fn hasPct(a: []f32, o: int): bool {
+    if o < 0 {
+        return false;
+    }
+    for i in 0..int(a[o]) {
+        if int(a[o + 1 + i * REC]) == XT && int(a[o + 8 + i * REC]) != 0 {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Blend the transform list at `fo` into the one at `to` (`-1`: none) at `e` into `out[q0..]` (`XN` floats, not part of `a`).
+/// Matching lists blend function by function; others blend as matrices (translate, rotation, scale and shear each).
+/// Lists with percentages that do not match jump at the middle (the box size is not known here).
+pub fn mix(a: []f32, fo: int, to: int, e: f32, out: []f32, q0: int) {
+    if matching(a, fo, to) {
+        mixList(a, fo, to, e, out, q0);
+        return;
+    }
+    if hasPct(a, fo) || hasPct(a, to) {
+        let o = to;
+        if e < 0.5 { o = fo; }
+        if o < 0 {
+            out[q0] = 0.0;
+            return;
+        }
+        for z in 0..1 + int(a[o]) * REC {
+            out[q0 + z] = a[o + z];
+        }
+        return;
+    }
+    let ma = ident();
+    let mb = ident();
+    if fo >= 0 { ma = listMat(a, fo, 0.0, 0.0); }
+    if to >= 0 { mb = listMat(a, to, 0.0, 0.0); }
+    let da = decompose(&ma);
+    let db = decompose(&mb);
+    // spin the short way
+    let dr = db.rot - da.rot;
+    let pi: f32 = 3.1415927;
+    if dr > pi { da.rot = da.rot + 2.0 * pi; }
+    if dr < 0.0 - pi { db.rot = db.rot + 2.0 * pi; }
+    let dm = Dec {
+        tx: lerp(da.tx, db.tx, e), ty: lerp(da.ty, db.ty, e), rot: lerp(da.rot, db.rot, e),
+        sx: lerp(da.sx, db.sx, e), sy: lerp(da.sy, db.sy, e), sh: lerp(da.sh, db.sh, e),
+    };
+    putDec(&dm, out, q0);
+}
+
+/// Whether the lists at `a` and `b` (`-1`: none) hold the same functions and numbers.
+pub fn same(p: []f32, a: int, b: int): bool {
+    if a < 0 || b < 0 {
+        return a == b;
+    }
+    if a == b {
+        return true;
+    }
+    let n = int(p[a]);
+    if n != int(p[b]) {
+        return false;
+    }
+    for z in 1..(1 + n * REC) {
+        if p[a + z] != p[b + z] {
+            return false;
+        }
+    }
+    return true;
+}

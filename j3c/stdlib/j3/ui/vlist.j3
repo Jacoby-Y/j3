@@ -1,0 +1,227 @@
+// Virtual lists at runtime (plan 023 stage 1): a `virtual` scroll box keeps only the rows near the viewport
+// alive. `VList` (`j3.ui.vstate`) is the per-list state the generated component owns; `step` runs once per frame in `update`
+// (before the rows are built), `finish` after. Math lives in `j3.ui.virt` (pure, tested alone); this module
+// is the part that reads the tree: it measures rows after layout, anchors and sticks the scroll offset, keeps
+// rows alive (`keep`, the focused row) and hides the ones that are off screen.
+//
+// Per frame, nothing here is O(rows) unless the list changed: measuring walks the live rows, and only a
+// changed list (`stale`) formats every key once (`Keyed` over all rows) to carry heights, the anchor and the
+// kept rows to their new indices.
+
+module j3.ui.vlist;
+
+use j3.math.{ max, min, mini };
+use j3.ui.css.{ BOX_CONTENT, P_BOX_SIZING };
+use j3.ui.dom;
+use j3.ui.dom.{ Dom, edgesOf, K_FREE, kwOf };
+use j3.ui.virt;
+use j3.ui.virt.{ Follow, Win };
+use j3.ui.vstate.{ keepRow, moved, VList };
+
+/// Frames `scrollToKey` keeps aiming before it gives up.
+const WANT_TRIES: int = 30;
+
+/// `style:` slot of a row's top-level elements used to hide a kept row that is off screen. The scroll box
+/// itself uses 6 and 7 for its spacers. Slot 8 is past the 8 (0..7) that markup can write, so it cannot clash.
+const HIDE_SLOT: int = 8;
+
+/// The rows of box `id` are runs of children that share a row id (`Node.gk`). Calls nothing: returns the
+/// ordinal of the row holding child `c`.
+fn ordinal(d: &Dom, id: int, c: int): int {
+    let k = d.nodes.items[id].first;
+    let ord = -1;
+    let g = -2;
+    while k >= 0 {
+        if d.nodes.items[k].kind != K_FREE && !d.nodes.items[k].ghost && d.nodes.items[k].gk != g {
+            g = d.nodes.items[k].gk;
+            ord += 1;
+        }
+        if k == c {
+            return ord;
+        }
+        k = d.nodes.items[k].next;
+    }
+    return -1;
+}
+
+/// Read the heights of the rows of last frame's window from the layout (a row is a run of children; its
+/// height is the distance to the next row's top, so margins and `gap` count; the last one adds the gap seen
+/// before). Skipped when no layout ran since the last measurement.
+fn measure(d: &Dom, id: int, v: &VList) {
+    if d.laid == v.laid {
+        return;
+    }
+    v.laid = d.laid;
+    let wn = v.hi - v.lo;
+    let k = d.nodes.items[id].first;
+    let ord = -1;
+    let g = -2;
+    let rs = -1;
+    let rl = -1;
+    while k >= 0 {
+        let nd = &d.nodes.items[k];
+        if nd.kind != K_FREE && !nd.ghost {
+            if nd.gk != g {
+                if rs >= 0 {
+                    close(d, v, ord, rs, rl, k);
+                }
+                g = nd.gk;
+                ord += 1;
+                rs = k;
+            }
+            rl = k;
+        }
+        k = nd.next;
+    }
+    if rs >= 0 {
+        close(d, v, ord, rs, rl, -1);
+    }
+}
+
+/// Row `ord` spans children `rs..rl`; `ns` starts the next row (-1: none).
+fn close(d: &Dom, v: &VList, ord: int, rs: int, rl: int, ns: int) {
+    if ord < v.nb || ord >= v.nb + v.hi - v.lo {
+        return;
+    }
+    let top = d.nodes.items[rs].y;
+    let own = d.nodes.items[rl].y + d.nodes.items[rl].h - top;
+    let hgt = own + v.gap;
+    if ns >= 0 && ord + 1 < v.nb + v.hi - v.lo {
+        hgt = d.nodes.items[ns].y - top;
+        v.gap = hgt - own;
+    }
+    v.tree.set(v.lo + ord - v.nb, max(hgt, 0.0));
+}
+
+/// The height of the box's visible area: its height without borders, and without its padding when it is `content-box`
+/// (the spacers are padding, so a content-box box measures its view plus millions of px of them).
+pub fn viewHeight(d: &Dom, id: int): f32 {
+    let n = &d.nodes.items[id];
+    if n.style < 0 {
+        return n.h; // not styled yet
+    }
+    let e = edgesOf(d, n.style, n.basisW);
+    let h = n.h - e.bt - e.bb;
+    if kwOf(d, n.style, P_BOX_SIZING) == BOX_CONTENT {
+        h -= e.pt + e.pb;
+    }
+    return h;
+}
+
+/// One frame of a virtual list inside scroll box `id` with `len` rows: measure, apply list changes, anchor
+/// or stick the scroll offset, pick the rows to build and set the spacers. The window rows are `v.at(0..v.cnt)`.
+pub fn step(d: &Dom, id: int, v: &VList, len: int): Win {
+    let node = &d.nodes.items[id];
+    d.vlistBind(id, v);
+    let viewH = viewHeight(d, id);
+    if viewH <= 0.0 {
+        viewH = d.vh;
+    }
+    let variable = v.rh <= 0.0;
+    if variable {
+        measure(d, id, v);
+    }
+    // the focused row, as an index of the list before this frame's change
+    let fidx = -1;
+    let f = d.focused();
+    if f >= 0 {
+        let c = f;
+        while c >= 0 && d.nodes.items[c].parent != id {
+            c = d.nodes.items[c].parent;
+        }
+        let o = if c >= 0 { ordinal(d, id, c) } else { -1 };
+        if o >= 0 && o < v.cnt {
+            fidx = v.at(o);
+        }
+    }
+    let anchor = v.anchor;
+    if v.fresh {
+        v.fresh = false;
+        let from = &v.all.from;
+        if variable {
+            v.tree.remap(from);
+        }
+        anchor = moved(from, anchor);
+        fidx = moved(from, fidx);
+    }
+    // px above the anchor row now, against where it was: the shift that keeps it in place
+    let shift: f32 = 0.0;
+    if anchor >= 0 {
+        shift = v.pre(anchor) - v.anchorTop;
+    }
+    let total = if variable { v.tree.total() } else { f32(len) * v.rh };
+    let end = max(0.0, total - viewH);
+    let fl = virt.follow(node.scrollY, v.lastY, shift, total, viewH, v.stick, v.stickOn);
+    if v.toEnd {
+        fl = Follow { y: end, stick: v.stickOn };
+        v.toEnd = false;
+    }
+    if v.want >= 0 {
+        // `scrollToKey`: aim at the row, again each frame until it is measured; given up when the list is hidden or never measures
+        v.wantN += 1;
+        if v.want >= len || node.disp == dom.DP_NONE || v.wantN > WANT_TRIES {
+            v.want = -1;
+        } else {
+            let top = v.pre(v.want);
+            let h = if variable { v.pre(v.want + 1) - top } else { v.rh };
+            let r0 = top - fl.y;
+            let delta = dom.fitDelta(v.wantBlock, r0, r0 + h, 0.0, viewH);
+            fl = Follow { y: max(0.0, min(end, fl.y + delta)), stick: false };
+            if !variable || v.tree.isKnown(v.want) { v.want = -1; }
+        }
+    }
+    v.stick = fl.stick;
+    node.scrollY = fl.y;
+    let w = if variable { virt.windowTree(&v.tree, fl.y, viewH, virt.OVERSCAN) } else { virt.window(len, v.rh, fl.y, viewH, virt.OVERSCAN) };
+    // rows that stay alive outside the window: `keep` keys and the focused row
+    v.ex.len = 0;
+    v.nb = 0;
+    for t in 0..v.keep.len {
+        keepRow(v, v.all.find(v.keep[t]), w);
+    }
+    keepRow(v, fidx, w);
+    v.lo = w.lo;
+    v.hi = w.hi;
+    v.cnt = w.hi - w.lo + v.ex.len;
+    for t in 0..v.ex.len {
+        if v.ex.items[t] < w.lo {
+            v.nb += 1;
+        }
+    }
+    // the next frame's anchor: the first visible row
+    v.anchor = if len > 0 { mini(v.rowAt(fl.y), len - 1) } else { -1 };
+    v.anchorTop = if v.anchor >= 0 { v.pre(v.anchor) } else { 0.0 };
+    v.lastY = fl.y;
+    v.atEnd = fl.y >= end - 1.0;
+    d.styleNum(id, 6, "padding-top", w.top);
+    d.styleNum(id, 7, "padding-bottom", w.bottom);
+    return w;
+}
+
+/// After the rows are built: kept rows outside the window are `display: none` (alive, not laid out or
+/// painted); rows that were hidden and are back in the window show again.
+pub fn finish(d: &Dom, id: int, v: &VList) {
+    if v.ex.len == 0 && !v.hid {
+        return;
+    }
+    let k = d.nodes.items[id].first;
+    let ord = -1;
+    let g = -2;
+    while k >= 0 {
+        let nd = &d.nodes.items[k];
+        if nd.kind != K_FREE && !nd.ghost {
+            if nd.gk != g {
+                g = nd.gk;
+                ord += 1;
+            }
+            let off = ord < v.nb || ord >= v.nb + v.hi - v.lo;
+            if off {
+                d.styleStr(k, HIDE_SLOT, "display", "none");
+            } else if nd.dyn >= 0 {
+                d.styleStr(k, HIDE_SLOT, "display", "");
+            }
+        }
+        k = nd.next;
+    }
+    v.hid = v.ex.len > 0;
+}

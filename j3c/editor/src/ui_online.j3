@@ -1,0 +1,401 @@
+// The Get Assets tab: search free CC0 assets online (Poly Haven, ambientCG, Kenney) and bring
+// the one you pick into the project. The host (`src/online.rs`) does the network work.
+
+module j3_editor.ui_online;
+
+use j3.game;
+use j3.game.{ Color, Texture, rgb };
+use j3.gfx;
+use j3.gfx.{ Orbit, Tex };
+use j3.io.printLn;
+use j3.math.{ Vec2, Vec3 };
+use j3.memory.{ Arena, scratch };
+use j3.scene3d;
+use j3.data.save;
+use j3.text.{ Text, same };
+use j3.ui.Ui;
+use j3_editor.console.say;
+use j3_editor.files.sceneTabPath;
+use j3_editor.history.deltaStack;
+use j3_editor.layout.{ consoleH, paneW, paneX };
+use j3_editor.shared.shared;
+use j3_editor.tabs.{ frontTab, growTabs, stash, unstash };
+use j3_editor.types.{ BOTTOM, HISTORY, MatEdit, ONLINE_TAB, TABS, TOP, Tab, World };
+use j3_editor.util.{ isOnline, newArena, optionAt, stem };
+use j3_editor.widgets.{ caption, fill, fitRight, outline, toolButton };
+
+const SOURCES: string = "any|polyhaven|ambientcg|kenney";
+const SOURCE_NAMES: string = "All sources|Poly Haven|ambientCG|Kenney";
+const KINDS: string = "any|model|material|sky";
+const KIND_NAMES: string = "Everything|Models|Materials|Skies";
+const CARD_W: f32 = 148;
+const CARD_H: f32 = 180;
+const THUMB: f32 = 128;
+const DETAIL_W: f32 = 300;
+/// Thumbnails decoded per frame, so a long pack list scrolls in without a stall.
+const LOADS_PER_FRAME: int = 4;
+
+/// Open the Get Assets tab, or switch to it. The first time it lists everything.
+pub fn openOnlineTab(w: &World) {
+    let g = shared();
+    stash(w);
+    let i = 0;
+    while i < w.tabCount {
+        if isOnline(w.tabs[i].path) {
+            unstash(w, i);
+            return;
+        }
+        i += 1;
+    }
+    growTabs(w);
+    let mem = newArena(w.mem, 64 * 1024);
+    w.tabs[w.tabCount] = Tab {
+        path: ONLINE_TAB,
+        mat: 0 as &MatEdit,
+        scene: scene3d.load("", mem),
+        cam: Orbit.create(Vec3.xyz(0, 0, 0), 0.7, 0.35, 5),
+        selected: 0,
+        undos: deltaStack(mem, HISTORY),
+        undoCount: 0,
+        redos: deltaStack(mem, HISTORY),
+        redoCount: 0,
+        dirty: false,
+        viewCam: 0,
+        savedCam: Orbit.create(Vec3.xyz(0, 0, 0), 0.7, 0.35, 5),
+        ortho: false,
+        axisView: false,
+        pane: g.focus,
+        front: false,
+        previewLock: 0,
+    };
+    w.tabCount += 1;
+    unstash(w, w.tabCount - 1);
+    if save.getInt(&w.online, "online.count", 0) == 0 && !w.onlineBusy { searchOnline(w); }
+}
+
+/// Ask the host to search; the results come back as an `online` event.
+pub fn searchOnline(w: &World) {
+    let t = Text.new(scratch(0));
+    t.pushStr("J3EDITOR FETCH ");
+    t.pushStr(w.onlineSource);
+    t.push(9);
+    t.pushStr(w.onlineKind);
+    t.push(9);
+    t.pushStr(w.onlineQuery.str());
+    printLn(t.str());
+    w.onlineBusy = true;
+    say(w, "Searching...");
+}
+
+/// Ask the host to download result `i` and add it to the project. A model becomes a reusable
+/// scene, placed in scene `into` unless that's empty; a Kenney pack comes back as its models.
+pub fn getOnline(w: &World, i: int, into: string) {
+    let t = Text.new(scratch(0));
+    t.pushStr("J3EDITOR GET ");
+    t.pushStr(onlineStr(w, i, "source"));
+    t.push(9);
+    t.pushStr(onlineStr(w, i, "id"));
+    t.push(9);
+    t.pushStr(into);
+    if same(onlineStr(w, i, "kind"), "model") { t.pushStr("\tscene"); }
+    printLn(t.str());
+    w.onlineBusy = true;
+    let msg = Text.new(scratch(1));
+    msg.pushStr("Downloading ");
+    msg.pushStr(onlineStr(w, i, "name"));
+    msg.pushStr("...");
+    say(w, msg.str());
+}
+
+/// Field `key` of result `i`.
+pub fn onlineStr(w: &World, i: int, key: string): string {
+    let k = Text.new(scratch(1));
+    k.pushStr("online.");
+    k.pushInt(i);
+    k.push(46);
+    k.pushStr(key);
+    return save.getStr(&w.online, k.str(), "");
+}
+
+/// Reread the host's results. Thumbnails load later, as their cards are drawn.
+pub fn loadOnline(w: &World) {
+    let i = 0;
+    while i < w.onlineThumbs.len {
+        gfx.freeTex(&w.onlineThumbs[i]);
+        i += 1;
+    }
+    w.onlineMem.destroy();
+    *w.onlineMem = Arena.create(64 * 1024);
+    w.online = save.load("target/j3-editor/online", w.onlineMem);
+    let n = save.getInt(&w.online, "online.count", 0);
+    if n < 0 { n = 0; }
+    w.onlineThumbs = w.onlineMem.alloc::<Tex>(n);
+    w.onlineTried = w.onlineMem.alloc::<bool>(n);
+    i = 0;
+    while i < n {
+        w.onlineThumbs[i] = Tex { id: 0, w: 0, h: 0 };
+        w.onlineTried[i] = false;
+        i += 1;
+    }
+    w.onlinePick = -1;
+    if n > 0 { w.onlinePick = 0; }
+}
+
+/// Result `i`'s thumbnail, loading it if `loads` allows another this frame.
+fn thumbAt(w: &World, i: int, loads: &int): Tex {
+    if i >= w.onlineThumbs.len { return Tex { id: 0, w: 0, h: 0 }; }
+    if !w.onlineTried[i] && *loads < LOADS_PER_FRAME {
+        w.onlineTried[i] = true;
+        *loads += 1;
+        let path = onlineStr(w, i, "thumb");
+        if path.len > 0 {
+            let tmp = Arena.create(512 * 1024);
+            let img = game.loadRgba(path, &tmp);
+            if img.pixels.len > 0 { w.onlineThumbs[i] = gfx.tex(img.pixels, img.w, img.h); }
+            tmp.destroy();
+        }
+    }
+    return w.onlineThumbs[i];
+}
+
+/// `tex` fit inside the `side` square at `(x, y)`, centered.
+fn drawFit(tex: Tex, x: f32, y: f32, side: f32) {
+    let big = tex.w;
+    if tex.h > big { big = tex.h; }
+    let s = side / f32(big);
+    let dw = f32(tex.w) * s;
+    let dh = f32(tex.h) * s;
+    let t = Texture { raw: int(tex.id) as ptr, w: tex.w, h: tex.h };
+    game.drawTextureAt(t, Vec2 { x: x + (side - dw) / 2, y: y + (side - dh) / 2 }, Vec2 { x: dw, y: dh });
+}
+
+fn kindLabel(kind: string): string {
+    if same(kind, "model") { return "Model"; }
+    if same(kind, "pack") { return "Model pack"; }
+    if same(kind, "material") { return "Material"; }
+    if same(kind, "sky") { return "Sky"; }
+    return kind;
+}
+
+fn sourceLabel(source: string): string {
+    let k = 1;
+    while k < 4 {
+        if same(source, optionAt(SOURCES, k)) { return optionAt(SOURCE_NAMES, k); }
+        k += 1;
+    }
+    return source;
+}
+
+fn text(w: &World, x: f32, y: f32, msg: string, color: Color) {
+    if w.font.raw == 0 { return; }
+    game.setColor(color);
+    game.drawText(w.font, Vec2 { x: x, y: y }, msg);
+}
+
+/// The Get Assets page over its pane, when that pane shows it.
+pub @j3ui onlinePage(ui: &Ui, w: &World) {
+    let tab = -1;
+    let i = 0;
+    while i < w.tabCount {
+        if isOnline(w.tabs[i].path) { tab = i; }
+        i += 1;
+    }
+    if tab < 0 { return; }
+    let pane = w.tabs[tab].pane;
+    if frontTab(w, pane) != tab { return; }
+    let win = game.windowSize();
+    let x0 = paneX(pane);
+    let y0 = TOP + TABS;
+    let wide = paneW(pane);
+    let tall = win.y - y0 - BOTTOM - consoleH();
+    let bg = rgb(30, 33, 40);
+    fill(x0, y0, wide, tall, bg);
+    let detail = DETAIL_W;
+    if wide < 620 { detail = 0; }
+    let left = x0 + 16;
+    let gridW = wide - 32 - detail;
+    let keepSpace = ui.space;
+    ui.space = 4;
+    ui.pushId(700000);
+
+    // The grid first: tall cards can hang over the header, which is drawn on top of them.
+    let gridTop = y0 + w.onlineHeaderH;
+    let loads = 0;
+    let n = save.getInt(&w.online, "online.count", 0);
+    ui.x = left;
+    ui.y = gridTop;
+    ui.w = gridW;
+    scroll(105, y0 + tall - gridTop) {
+        if n == 0 && !w.onlineBusy { caption(ui, "Nothing found. Try another word, source, or kind."); }
+        let cols = int((ui.w + 10) / (CARD_W + 10));
+        if cols < 1 { cols = 1; }
+        let at = 0;
+        while at < n {
+            let rowY = ui.y;
+            let c = 0;
+            while c < cols && at < n {
+                assetCard(ui, w, at, left + f32(c) * (CARD_W + 10), rowY, gridTop, &loads);
+                c += 1;
+                at += 1;
+            }
+            ui.x = left;
+            ui.y = rowY;
+            ui.w = gridW;
+            gap(CARD_H + 10);
+        }
+    }
+
+    fill(x0, y0, wide - detail, w.onlineHeaderH, bg);
+    ui.x = left;
+    ui.y = y0 + 12;
+    ui.w = gridW;
+    ui.labelBold("Get Assets");
+    caption(ui, "Free CC0 models, materials, and skies from Poly Haven, ambientCG, and Kenney.");
+    row() {
+        let k = 0;
+        while k < 4 {
+            ui.pushId(k);
+            if toolButton(ui, optionAt(SOURCE_NAMES, k), same(w.onlineSource, optionAt(SOURCES, k))) {
+                w.onlineSource = optionAt(SOURCES, k);
+                searchOnline(w);
+            }
+            ui.popId();
+            k += 1;
+        }
+    }
+    row() {
+        let j = 0;
+        while j < 4 {
+            ui.pushId(10 + j);
+            if toolButton(ui, optionAt(KIND_NAMES, j), same(w.onlineKind, optionAt(KINDS, j))) {
+                w.onlineKind = optionAt(KINDS, j);
+                searchOnline(w);
+            }
+            ui.popId();
+            j += 1;
+        }
+    }
+    row() {
+        button("Search") { searchOnline(w); }
+        field("chair, brick, town...", &w.onlineQuery);
+    }
+    if ui.focused("chair, brick, town...") && game.keyPressed(game.Key.Enter) { searchOnline(w); }
+    let pack = save.getStr(&w.online, "online.pack", "");
+    let status = Text.new(scratch(0));
+    if w.onlineBusy {
+        status.pushStr("Working...");
+    } else if pack.len > 0 {
+        status.pushInt(n);
+        status.pushStr(" models in ");
+        status.pushStr(pack);
+    } else {
+        status.pushInt(n);
+        status.pushStr(" results");
+    }
+    row() {
+        if pack.len > 0 { button("Back to results") { searchOnline(w); } }
+        caption(ui, status.str());
+    }
+    w.onlineHeaderH = ui.y + 4 - y0;
+
+    if detail > 0 { details(ui, w, x0 + wide - detail, y0, detail, tall); }
+    ui.popId();
+    ui.space = keepSpace;
+}
+
+/// Result `i` as a card at `(x, y)`: its thumbnail, name, and kind. A click picks it.
+pub @j3ui assetCard(ui: &Ui, w: &World, i: int, x: f32, y: f32, gridTop: f32, loads: &int) {
+    ui.pushId(1000 + i);
+    let keepH = ui.h;
+    ui.x = x;
+    ui.y = y;
+    ui.w = CARD_W;
+    ui.h = CARD_H;
+    let mouse = game.mousePos();
+    // A card hanging over the header doesn't take its clicks.
+    if ui.button(" ") && mouse.y >= gridTop { w.onlinePick = i; }
+    ui.h = keepH;
+    if ui.shown(y, CARD_H) {
+        if w.onlinePick == i { outline(x, y, CARD_W, CARD_H, rgb(110, 160, 240)); }
+        let tex = thumbAt(w, i, loads);
+        let tx = x + (CARD_W - THUMB) / 2;
+        if tex.id != 0 {
+            drawFit(tex, tx, y + 8, THUMB);
+        } else {
+            fill(tx, y + 8, THUMB, THUMB, rgb(44, 48, 58));
+            text(w, tx + 8, y + 8 + THUMB / 2 - 8, kindLabel(onlineStr(w, i, "kind")), rgb(120, 126, 140));
+        }
+        text(w, x + 8, y + THUMB + 16, fitRight(w, onlineStr(w, i, "name"), CARD_W - 16), rgb(232, 234, 240));
+        let sub = Text.new(scratch(1));
+        sub.pushStr(kindLabel(onlineStr(w, i, "kind")));
+        sub.pushStr(" · ");
+        sub.pushStr(sourceLabel(onlineStr(w, i, "source")));
+        text(w, x + 8, y + THUMB + 34, fitRight(w, sub.str(), CARD_W - 16), rgb(150, 156, 170));
+    }
+    popId();
+}
+
+/// The picked result, bigger, with what it is, who made it, and what to do with it.
+pub @j3ui details(ui: &Ui, w: &World, x: f32, y: f32, wide: f32, tall: f32) {
+    fill(x, y, wide, tall, rgb(36, 40, 48));
+    fill(x, y, 1, tall, rgb(54, 60, 72));
+    ui.x = x + 14;
+    ui.y = y + 14;
+    ui.w = wide - 28;
+    let p = w.onlinePick;
+    if p < 0 || p >= save.getInt(&w.online, "online.count", 0) {
+        caption(ui, "Pick an asset to see it here.");
+        return;
+    }
+    let side = ui.w;
+    if side > 272 { side = 272; }
+    let loads = 0;
+    let tex = thumbAt(w, p, &loads);
+    if tex.id != 0 {
+        fill(ui.x, ui.y, side, side, rgb(28, 30, 36));
+        drawFit(tex, ui.x, ui.y, side);
+        gap(side + 8);
+    }
+    let kind = onlineStr(w, p, "kind");
+    ui.labelBold(fitRight(w, onlineStr(w, p, "name"), ui.w));
+    let line = Text.new(scratch(0));
+    line.pushStr(kindLabel(kind));
+    line.pushStr(" from ");
+    line.pushStr(sourceLabel(onlineStr(w, p, "source")));
+    caption(ui, line.str());
+    let by = Text.new(scratch(0));
+    by.pushStr("By ");
+    by.pushStr(onlineStr(w, p, "author"));
+    caption(ui, fitRight(w, by.str(), ui.w));
+    caption(ui, "License: CC0, free for any use");
+    caption(ui, fitRight(w, onlineStr(w, p, "id"), ui.w));
+    gap(8);
+    if w.onlineBusy {
+        ui.buttonOff("Working...");
+    } else if same(kind, "model") {
+        button("Add to project") { getOnline(w, p, ""); }
+        let scene = sceneTabPath(w);
+        if !isOnline(scene) {
+            let label = Text.new(scratch(0));
+            label.pushStr("Place in ");
+            label.pushStr(stem(scene));
+            button(label.str()) { getOnline(w, p, scene); }
+        }
+        caption(ui, "Saved as a reusable scene under");
+        caption(ui, "assets/imported/.");
+    } else if same(kind, "pack") {
+        button("Open pack") { getOnline(w, p, ""); }
+        caption(ui, "Downloads the pack once, then");
+        caption(ui, "lists its models to pick from.");
+    } else if same(kind, "material") {
+        button("Make material") { getOnline(w, p, ""); }
+        caption(ui, "Writes assets/materials/<id>.j3mat;");
+        caption(ui, "drag it onto an object.");
+    } else if same(kind, "sky") {
+        button("Make sky image") { getOnline(w, p, ""); }
+        caption(ui, "Writes assets/skies/<id>.png; set it");
+        caption(ui, "as a builtin:sky mesh's texture.");
+    }
+    gap(6);
+    caption(ui, "Credited in assets/CREDITS.txt.");
+}

@@ -1,0 +1,372 @@
+/// TLS client over a `j3.net.tcp` connection, using the system OpenSSL 3 (`libssl.so.3`, loaded on
+/// first use, so a program that never calls `connect` does not need it). The server certificate is
+/// always checked against the system CA store (`SSL_CERT_FILE` / `SSL_CERT_DIR` override it) and
+/// against the host name; there is no switch to turn that off. TLS 1.2 or newer.
+/// On Android the APK carries its own `libssl.so` (`tools/android/build-openssl.sh`; apps may not
+/// load the system's) and the CA store is the system's certificate folder, read once.
+///
+///     let conn = tcp.dial("example.com", 443, 10000, &arena)?;
+///     let s = tls.connect(conn, "example.com")?;      // TlsError.BadCert, Handshake, NoLibrary
+///     s.writeAll(request); let n = s.read(buf); s.close();
+///
+/// Most code wants `j3.net.http`, which does this for `https://` URLs. Blocking: use a worker thread.
+
+module j3.net.tls;
+
+use j3.memory.Arena;
+use j3.net.tcp.Conn;
+use j3.netsys;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, cstr };
+use j3.thread.Mutex;
+
+/// Why a TLS call failed.
+pub enum TlsError {
+    /// `libssl.so.3` is not installed (Debian/Ubuntu: `apt install libssl3`).
+    NoLibrary,
+    /// The handshake failed (protocol mismatch, connection dropped). `lastError` says why.
+    Handshake,
+    /// The certificate is not trusted, expired, or for another host. `lastError` says why.
+    BadCert,
+    /// Any other failure.
+    Fail,
+}
+
+/// `read` result: no data within the connection's timeout.
+pub const TIMEOUT: int = 0 - 3;
+/// `read` result: the connection failed.
+pub const FAIL: int = 0 - 2;
+
+/// OpenSSL entry points, looked up once.
+struct Fns {
+    ok: bool;
+    initSsl: ptr;
+    clientMethod: ptr;
+    ctxNew: ptr;
+    ctxFree: ptr;
+    ctxDefaultPaths: ptr;
+    ctxSetVerify: ptr;
+    ctxCtrl: ptr;
+    ctxSetOptions: ptr;
+    sslNew: ptr;
+    sslFree: ptr;
+    setFd: ptr;
+    sslCtrl: ptr;
+    set1Host: ptr;
+    connect: ptr;
+    read: ptr;
+    write: ptr;
+    getError: ptr;
+    verifyResult: ptr;
+    shutdown: ptr;
+    errGet: ptr;
+    errString: ptr;
+    errClear: ptr;
+    certErrString: ptr;
+    storeNew: ptr;
+    storeLoad: ptr;
+    ctxSetStore: ptr;
+}
+
+#[singleton]
+let FNS: Fns;
+#[singleton]
+let TRIED: bool = false;
+#[singleton]
+let LOAD_LOCK: Mutex;
+/// CA store shared by every connection, when `netsys.caFiles` lists files (Android); else 0.
+#[singleton]
+let STORE: ptr;
+
+/// The last OpenSSL error message on this thread.
+#[singleton]
+#[thread]
+let LAST: [256]u8;
+
+fn sym(so: ptr, name: string): ptr {
+    let p = sys.dlsym(so, name);
+    if p as int == 0 {
+        FNS.ok = false;
+    }
+    return p;
+}
+
+/// Load libssl and its functions once (any thread). False when it is missing.
+fn load(): bool {
+    LOAD_LOCK.lock();
+    defer LOAD_LOCK.unlock();
+    if TRIED {
+        return FNS.ok;
+    }
+    TRIED = true;
+    let so = sys.dlopen("libssl.so.3");
+    if so as int == 0 {
+        so = sys.dlopen("libssl.so");
+    }
+    if so as int == 0 {
+        return false;
+    }
+    FNS.ok = true;
+    FNS.initSsl = sym(so, "OPENSSL_init_ssl");
+    FNS.clientMethod = sym(so, "TLS_client_method");
+    FNS.ctxNew = sym(so, "SSL_CTX_new");
+    FNS.ctxFree = sym(so, "SSL_CTX_free");
+    FNS.ctxDefaultPaths = sym(so, "SSL_CTX_set_default_verify_paths");
+    FNS.ctxSetVerify = sym(so, "SSL_CTX_set_verify");
+    FNS.ctxCtrl = sym(so, "SSL_CTX_ctrl");
+    FNS.ctxSetOptions = sym(so, "SSL_CTX_set_options");
+    FNS.sslNew = sym(so, "SSL_new");
+    FNS.sslFree = sym(so, "SSL_free");
+    FNS.setFd = sym(so, "SSL_set_fd");
+    FNS.sslCtrl = sym(so, "SSL_ctrl");
+    FNS.set1Host = sym(so, "SSL_set1_host");
+    FNS.connect = sym(so, "SSL_connect");
+    FNS.read = sym(so, "SSL_read");
+    FNS.write = sym(so, "SSL_write");
+    FNS.getError = sym(so, "SSL_get_error");
+    FNS.verifyResult = sym(so, "SSL_get_verify_result");
+    FNS.shutdown = sym(so, "SSL_shutdown");
+    // libcrypto symbols: dlsym on the libssl handle searches its dependencies too
+    FNS.errGet = sym(so, "ERR_get_error");
+    FNS.errString = sym(so, "ERR_error_string_n");
+    FNS.errClear = sym(so, "ERR_clear_error");
+    FNS.certErrString = sym(so, "X509_verify_cert_error_string");
+    FNS.storeNew = sym(so, "X509_STORE_new");
+    FNS.storeLoad = sym(so, "X509_STORE_load_file");
+    FNS.ctxSetStore = sym(so, "SSL_CTX_set1_cert_store");
+    if FNS.ok {
+        let init = FNS.initSsl as fn(u64, ptr): i32;
+        init(u64(0), 0);
+        loadCaFiles();
+    }
+    return FNS.ok;
+}
+
+/// Build `STORE` from the files `netsys.caFiles` lists (each a NUL-terminated path).
+fn loadCaFiles() {
+    let arena = Arena.create(65536);
+    defer arena.destroy();
+    let t = Text.new(&arena);
+    let n = netsys.caFiles(&t);
+    if n == 0 {
+        return;
+    }
+    let newStore = FNS.storeNew as fn(): ptr;
+    let loadFile = FNS.storeLoad as fn(ptr, ptr): i32;
+    STORE = newStore();
+    let s = t.str();
+    let at = 0;
+    for i in 0..s.len {
+        if s[i] == 0 {
+            loadFile(STORE, (s.ptr as int + at) as ptr);
+            at = i + 1;
+        }
+    }
+    let clear = FNS.errClear as fn();
+    clear();
+}
+
+/// Keep `msg` as this thread's `lastError`.
+fn setLast(msg: string) {
+    let n = msg.len;
+    if n > 255 {
+        n = 255;
+    }
+    for i in 0..n {
+        LAST[i] = msg[i];
+    }
+    LAST[n] = 0;
+}
+
+/// Keep OpenSSL's newest queued error (or `fallback` when the queue is empty) as `lastError`.
+fn takeError(fallback: string) {
+    let get = FNS.errGet as fn(): u64;
+    let code = get();
+    if code == u64(0) {
+        setLast(fallback);
+        return;
+    }
+    let str = FNS.errString as fn(u64, ptr, u64);
+    str(code, &LAST[0] as ptr, u64(256));
+    let clear = FNS.errClear as fn();
+    clear();
+}
+
+/// Append why the last failed TLS call on this thread failed (OpenSSL's words) to `t`.
+pub fn lastError(t: &Text) {
+    let i = 0;
+    while i < 256 && LAST[i] != 0 {
+        t.push(LAST[i]);
+        i += 1;
+    }
+}
+
+/// `SSL_VERIFY_PEER`.
+const VERIFY_PEER: int = 1;
+/// `SSL_CTRL_SET_MIN_PROTO_VERSION`, and `TLS1_2_VERSION`.
+const CTRL_MIN_PROTO: int = 123;
+const TLS1_2: int = 771;
+/// `SSL_CTRL_SET_TLSEXT_HOSTNAME` (what the `SSL_set_tlsext_host_name` macro sends).
+const CTRL_SNI: int = 55;
+/// `SSL_OP_IGNORE_UNEXPECTED_EOF`: a server that closes without `close_notify` ends the stream
+/// normally (HTTP framing still catches a cut body), as curl and browsers allow.
+const OP_IGNORE_EOF: int = 128;
+/// `SSL_get_error` codes.
+const ERR_ZERO_RETURN: int = 6;
+const ERR_SYSCALL: int = 5;
+/// `EAGAIN`: the socket timeout ran out.
+const EAGAIN: int = 11;
+
+/// An open TLS session. `close` it once; that also closes the TCP connection.
+pub struct Tls {
+    ssl: ptr;
+    ctx: ptr;
+    conn: Conn;
+
+    /// Read up to `buf.len` decrypted bytes: the count, 0 at the end, `TIMEOUT`, or `FAIL`.
+    fn read(this: &Tls, buf: []u8): int {
+        let n = buf.len;
+        if n > 1073741824 {
+            n = 1073741824;
+        }
+        let rd = FNS.read as fn(ptr, ptr, i32): i32;
+        let r = int(rd(this.ssl, buf.ptr as ptr, i32(n)));
+        if r > 0 {
+            return r;
+        }
+        let ge = FNS.getError as fn(ptr, i32): i32;
+        let e = int(ge(this.ssl, i32(r)));
+        if e == ERR_ZERO_RETURN {
+            return 0;
+        }
+        if e == ERR_SYSCALL && sys.errno() == EAGAIN {
+            return TIMEOUT;
+        }
+        takeError("TLS read failed");
+        return FAIL;
+    }
+
+    /// Write all of `data`. False when the connection failed or timed out.
+    fn writeAll(this: &Tls, data: []u8): bool {
+        let wr = FNS.write as fn(ptr, ptr, i32): i32;
+        let at = 0;
+        while at < data.len {
+            let chunk = data.len - at;
+            if chunk > 1073741824 {
+                chunk = 1073741824;
+            }
+            let r = int(wr(this.ssl, (data.ptr as int + at) as ptr, i32(chunk)));
+            if r <= 0 {
+                takeError("TLS write failed");
+                return false;
+            }
+            at += r;
+        }
+        return true;
+    }
+
+    /// Send `close_notify`, free the session, and close the TCP connection. Safe to call twice.
+    fn close(this: &Tls) {
+        if this.ssl as int != 0 {
+            let sd = FNS.shutdown as fn(ptr): i32;
+            sd(this.ssl);
+            let free = FNS.sslFree as fn(ptr);
+            free(this.ssl);
+            this.ssl = 0;
+        }
+        if this.ctx as int != 0 {
+            let freeCtx = FNS.ctxFree as fn(ptr);
+            freeCtx(this.ctx);
+            this.ctx = 0;
+        }
+        this.conn.close();
+    }
+}
+
+/// Run a TLS handshake over `conn` for server name `host` and check its certificate.
+/// On failure `conn` is closed. The connection's timeout covers the handshake.
+pub fn connect(conn: Conn, host: string): Result<Tls, TlsError> {
+    if !load() {
+        conn.close();
+        setLast("libssl not found");
+        return Result.Err(TlsError.NoLibrary);
+    }
+    // OpenSSL writes to the socket with plain write(): a closed peer must not kill the program
+    sys.ignoreSigpipe(true);
+    let method = FNS.clientMethod as fn(): ptr;
+    let ctxNew = FNS.ctxNew as fn(ptr): ptr;
+    // ponytail: one SSL_CTX per connection (loads the CA store each time, a few ms); share one under a lock if many requests/sec matter
+    let ctx = ctxNew(method());
+    if ctx as int == 0 {
+        takeError("SSL_CTX_new failed");
+        conn.close();
+        return Result.Err(TlsError.Fail);
+    }
+    let s = Tls { ssl: 0, ctx: ctx, conn: conn };
+    if STORE as int != 0 {
+        let setStore = FNS.ctxSetStore as fn(ptr, ptr);
+        setStore(ctx, STORE);
+    } else {
+        let paths = FNS.ctxDefaultPaths as fn(ptr): i32;
+        paths(ctx);
+    }
+    let verify = FNS.ctxSetVerify as fn(ptr, i32, ptr);
+    verify(ctx, i32(VERIFY_PEER), 0);
+    let ctrl = FNS.ctxCtrl as fn(ptr, i32, int, ptr): int;
+    ctrl(ctx, i32(CTRL_MIN_PROTO), TLS1_2, 0);
+    let opts = FNS.ctxSetOptions as fn(ptr, u64): u64;
+    opts(ctx, u64(OP_IGNORE_EOF));
+
+    let sslNew = FNS.sslNew as fn(ptr): ptr;
+    s.ssl = sslNew(ctx);
+    if s.ssl as int == 0 {
+        takeError("SSL_new failed");
+        s.close();
+        return Result.Err(TlsError.Fail);
+    }
+    let setFd = FNS.setFd as fn(ptr, i32): i32;
+    setFd(s.ssl, i32(conn.fd));
+    let sslCtrl = FNS.sslCtrl as fn(ptr, i32, int, cstr): int;
+    sslCtrl(s.ssl, i32(CTRL_SNI), 0, cstr(host));
+    let setHost = FNS.set1Host as fn(ptr, cstr): i32;
+    if setHost(s.ssl, cstr(host)) != 1 {
+        takeError("bad host name");
+        s.close();
+        return Result.Err(TlsError.Fail);
+    }
+    let hs = FNS.connect as fn(ptr): i32;
+    if hs(s.ssl) != 1 {
+        let vr = FNS.verifyResult as fn(ptr): int;
+        let code = vr(s.ssl);
+        if code != 0 {
+            let why = FNS.certErrString as fn(int): ptr;
+            setLast(cView(why(code)));
+            let clear = FNS.errClear as fn();
+            clear();
+            s.close();
+            return Result.Err(TlsError.BadCert);
+        }
+        takeError("TLS handshake failed");
+        s.close();
+        return Result.Err(TlsError.Handshake);
+    }
+    return Result.Ok(s);
+}
+
+/// The C string at `p` as a view (short OpenSSL messages).
+fn cView(p: ptr): string {
+    if p as int == 0 {
+        return "";
+    }
+    let n = 0;
+    while n < 255 {
+        let b = (p as int + n) as ptr as &u8;
+        if *b == 0 {
+            break;
+        }
+        n += 1;
+    }
+    let bytes: []u8 = @slice(p, n);
+    return bytes as string;
+}

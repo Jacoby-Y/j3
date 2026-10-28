@@ -1,0 +1,706 @@
+/// JSON (RFC 8259): `parse` bytes into a `Json` tree, read it with `get` / `at` / `path`, build one
+/// with `obj` / `arr` / `str` / `num` and `set` / `push`, and `write` it back out. The tree and
+/// its strings live on the arena you pass. Reading never fails: a missing key, an index past the
+/// end, or the wrong kind gives the shared null node, whose `asStr` is "" and `asNum` is 0.
+///
+///     let doc = json.parse(body, &arena)?;               // Result<&Json, JsonError>
+///     let text = doc.path("choices.0.message.content").asStr();
+///
+///     let msg = json.obj(&arena);
+///     msg.set("role", json.str("user", &arena));
+///     let out = json.stringify(msg, &arena);              // {"role":"user"}
+///
+/// Objects keep their keys in order; `get` is a linear scan. Numbers are `f64`.
+
+module j3.data.json;
+
+use j3.memory.{ Arena, List };
+use j3.result.Result;
+use j3.text.Text;
+
+use lib "c" as c {
+    fn strtod(s: ptr, end: ptr): f64;
+    // variadic in C; the emitter calls a binding of it with the variadic type
+    fn snprintf(buf: ptr, n: u64, fmt: cstr, digits: i32, x: f64): i32;
+}
+
+/// What a `Json` node holds.
+pub enum Kind {
+    Null,
+    Bool,
+    Num,
+    Str,
+    Arr,
+    Obj,
+}
+
+/// Why `parse` failed.
+pub struct JsonError {
+    /// Byte offset of the problem in the input.
+    at: int;
+    /// What was wrong.
+    msg: string;
+}
+
+/// One JSON value. Read the field that matches `kind`, or use the `as*` methods, which never fail.
+pub struct Json {
+    /// Which value this is.
+    kind: Kind;
+    /// `Bool` value.
+    b: bool;
+    /// `Num` value.
+    n: f64;
+    /// `Str` value.
+    s: string;
+    /// `Arr` elements, or `Obj` values (in key order).
+    items: List<&Json>;
+    /// `Obj` keys, parallel to `items`.
+    keys: List<string>;
+
+    /// The value under `key` in an object, or null.
+    fn get(this: &Json, key: string): &Json {
+        if this.kind == Kind.Obj {
+            // ponytail: linear key scan; fine for API replies, add an index if objects get big
+            for i in 0..this.keys.len {
+                if eq(this.keys.items[i], key) {
+                    return this.items.items[i];
+                }
+            }
+        }
+        return &NULL;
+    }
+
+    /// True when an object has `key`.
+    fn has(this: &Json, key: string): bool {
+        if this.kind == Kind.Obj {
+            for i in 0..this.keys.len {
+                if eq(this.keys.items[i], key) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Element `i` of an array (or the `i`th value of an object), or null.
+    fn at(this: &Json, i: int): &Json {
+        if (this.kind == Kind.Arr || this.kind == Kind.Obj) && i >= 0 && i < this.items.len {
+            return this.items.items[i];
+        }
+        return &NULL;
+    }
+
+    /// Elements of an array, entries of an object, else 0.
+    fn len(this: &Json): int {
+        if this.kind == Kind.Arr || this.kind == Kind.Obj {
+            return this.items.len;
+        }
+        return 0;
+    }
+
+    /// Walk dot-separated keys and array indexes: `"choices.0.message.content"`. Null when any step is missing.
+    fn path(this: &Json, p: string): &Json {
+        let cur = this;
+        let start = 0;
+        for i in 0..p.len + 1 {
+            if i == p.len || p[i] == 46 {
+                let part = p[start..i];
+                if cur.kind == Kind.Arr {
+                    cur = cur.at(index(part));
+                } else {
+                    cur = cur.get(part);
+                }
+                start = i + 1;
+            }
+        }
+        return cur;
+    }
+
+    /// The string, or "".
+    fn asStr(this: &Json): string {
+        if this.kind == Kind.Str {
+            return this.s;
+        }
+        return "";
+    }
+
+    /// The number, or 0.
+    fn asNum(this: &Json): f64 {
+        if this.kind == Kind.Num {
+            return this.n;
+        }
+        return 0.0;
+    }
+
+    /// The number cut to an `int`, or 0.
+    fn asInt(this: &Json): int {
+        if this.kind == Kind.Num {
+            return int(this.n);
+        }
+        return 0;
+    }
+
+    /// The bool, or false.
+    fn asBool(this: &Json): bool {
+        return this.kind == Kind.Bool && this.b;
+    }
+
+    /// True for `null` and for anything missing.
+    fn isNull(this: &Json): bool {
+        return this.kind == Kind.Null;
+    }
+
+    /// Set `key` in an object to `v`, replacing an existing value.
+    fn set(this: &Json, key: string, v: &Json) {
+        if this.kind != Kind.Obj {
+            return;
+        }
+        for i in 0..this.keys.len {
+            if eq(this.keys.items[i], key) {
+                this.items.items[i] = v;
+                return;
+            }
+        }
+        this.keys.push(key);
+        this.items.push(v);
+    }
+
+    /// Append `v` to an array.
+    fn push(this: &Json, v: &Json) {
+        if this.kind == Kind.Arr {
+            this.items.push(v);
+        }
+    }
+}
+
+/// The node every failed lookup returns. Read-only: never `set` or `push` on it.
+#[singleton]
+let NULL: Json;
+
+fn eq(a: string, b: string): bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A decimal array index, or -1.
+fn index(s: string): int {
+    if s.len == 0 {
+        return -1;
+    }
+    let n = 0;
+    for i in 0..s.len {
+        if s[i] < 48 || s[i] > 57 {
+            return -1;
+        }
+        n = n * 10 + int(s[i]) - 48;
+    }
+    return n;
+}
+
+fn node(k: Kind, arena: &Arena): &Json {
+    let j = &arena.alloc::<Json>(1)[0];
+    *j = Json { kind: k, b: false, n: 0.0, s: "", items: List<&Json>.new(arena), keys: List<string>.new(arena) };
+    return j;
+}
+
+/// A new empty object.
+pub fn obj(arena: &Arena): &Json {
+    return node(Kind.Obj, arena);
+}
+
+/// A new empty array.
+pub fn arr(arena: &Arena): &Json {
+    return node(Kind.Arr, arena);
+}
+
+/// A string value (`s` is not copied).
+pub fn str(s: string, arena: &Arena): &Json {
+    let j = node(Kind.Str, arena);
+    j.s = s;
+    return j;
+}
+
+/// A number value.
+pub fn num(n: f64, arena: &Arena): &Json {
+    let j = node(Kind.Num, arena);
+    j.n = n;
+    return j;
+}
+
+/// A bool value.
+pub fn boolean(b: bool, arena: &Arena): &Json {
+    let j = node(Kind.Bool, arena);
+    j.b = b;
+    return j;
+}
+
+/// A null value.
+pub fn null(arena: &Arena): &Json {
+    return node(Kind.Null, arena);
+}
+
+// ---------------------------------------------------------------- parse
+
+/// Deepest nesting `parse` accepts, so hostile input cannot overflow the stack.
+const MAX_DEPTH: int = 512;
+
+struct P {
+    src: []u8;
+    at: int;
+    arena: &Arena;
+    err: string;
+    errAt: int;
+    depth: int;
+
+    fn fail(this: &P, msg: string) {
+        if this.err.len == 0 {
+            this.err = msg;
+            this.errAt = this.at;
+        }
+    }
+
+    fn ws(this: &P) {
+        while this.at < this.src.len {
+            let b = this.src[this.at];
+            if b != 32 && b != 9 && b != 10 && b != 13 {
+                return;
+            }
+            this.at += 1;
+        }
+    }
+
+    fn peek(this: &P): int {
+        if this.at < this.src.len {
+            return int(this.src[this.at]);
+        }
+        return -1;
+    }
+
+    fn word(this: &P, w: string): bool {
+        if this.at + w.len > this.src.len {
+            return false;
+        }
+        for i in 0..w.len {
+            if this.src[this.at + i] != w[i] {
+                return false;
+            }
+        }
+        this.at += w.len;
+        return true;
+    }
+
+    fn value(this: &P): &Json {
+        this.ws();
+        let ch = this.peek();
+        if ch == 123 {
+            return this.object();
+        }
+        if ch == 91 {
+            return this.array();
+        }
+        if ch == 34 {
+            let s = this.string();
+            return str(s, this.arena);
+        }
+        if ch == 45 || (ch >= 48 && ch <= 57) {
+            return this.number();
+        }
+        if this.word("true") {
+            return boolean(true, this.arena);
+        }
+        if this.word("false") {
+            return boolean(false, this.arena);
+        }
+        if this.word("null") {
+            return null(this.arena);
+        }
+        if ch < 0 {
+            this.fail("unexpected end of input");
+        } else {
+            this.fail("expected a value");
+        }
+        return &NULL;
+    }
+
+    fn object(this: &P): &Json {
+        this.depth += 1;
+        if this.depth > MAX_DEPTH {
+            this.fail("nested too deep");
+            return &NULL;
+        }
+        this.at += 1;
+        let o = obj(this.arena);
+        this.ws();
+        if this.peek() == 125 {
+            this.at += 1;
+            this.depth -= 1;
+            return o;
+        }
+        while this.err.len == 0 {
+            this.ws();
+            if this.peek() != 34 {
+                this.fail("expected a string key");
+                break;
+            }
+            let k = this.string();
+            this.ws();
+            if this.peek() != 58 {
+                this.fail("expected `:`");
+                break;
+            }
+            this.at += 1;
+            let v = this.value();
+            if this.err.len > 0 {
+                break;
+            }
+            // RFC 8259 leaves duplicate keys open; the last one wins, like JavaScript
+            o.set(k, v);
+            this.ws();
+            let ch = this.peek();
+            if ch == 44 {
+                this.at += 1;
+            } else if ch == 125 {
+                this.at += 1;
+                break;
+            } else {
+                this.fail("expected `,` or `}`");
+            }
+        }
+        this.depth -= 1;
+        return o;
+    }
+
+    fn array(this: &P): &Json {
+        this.depth += 1;
+        if this.depth > MAX_DEPTH {
+            this.fail("nested too deep");
+            return &NULL;
+        }
+        this.at += 1;
+        let a = arr(this.arena);
+        this.ws();
+        if this.peek() == 93 {
+            this.at += 1;
+            this.depth -= 1;
+            return a;
+        }
+        while this.err.len == 0 {
+            let v = this.value();
+            if this.err.len > 0 {
+                break;
+            }
+            a.push(v);
+            this.ws();
+            let ch = this.peek();
+            if ch == 44 {
+                this.at += 1;
+            } else if ch == 93 {
+                this.at += 1;
+                break;
+            } else {
+                this.fail("expected `,` or `]`");
+            }
+        }
+        this.depth -= 1;
+        return a;
+    }
+
+    fn hex4(this: &P): int {
+        if this.at + 4 > this.src.len {
+            this.fail("short \\u escape");
+            return 0;
+        }
+        let v = 0;
+        for i in 0..4 {
+            let b = int(this.src[this.at + i]);
+            let d = -1;
+            if b >= 48 && b <= 57 {
+                d = b - 48;
+            } else if b >= 97 && b <= 102 {
+                d = b - 87;
+            } else if b >= 65 && b <= 70 {
+                d = b - 55;
+            }
+            if d < 0 {
+                this.fail("bad \\u escape");
+                return 0;
+            }
+            v = v * 16 + d;
+        }
+        this.at += 4;
+        return v;
+    }
+
+    /// A string starting at the opening quote, unescaped onto the arena.
+    fn string(this: &P): string {
+        this.at += 1;
+        let t = Text.new(this.arena);
+        while true {
+            if this.at >= this.src.len {
+                this.fail("unterminated string");
+                return "";
+            }
+            let b = this.src[this.at];
+            if b == 34 {
+                this.at += 1;
+                return t.str();
+            }
+            if b < 32 {
+                this.fail("control character in string");
+                return "";
+            }
+            if b != 92 {
+                t.push(b);
+                this.at += 1;
+                continue;
+            }
+            this.at += 1;
+            if this.at >= this.src.len {
+                this.fail("unterminated string");
+                return "";
+            }
+            let e = this.src[this.at];
+            this.at += 1;
+            if e == 34 || e == 92 || e == 47 {
+                t.push(e);
+            } else if e == 98 {
+                t.push(8);
+            } else if e == 102 {
+                t.push(12);
+            } else if e == 110 {
+                t.push(10);
+            } else if e == 114 {
+                t.push(13);
+            } else if e == 116 {
+                t.push(9);
+            } else if e == 117 {
+                let cp = this.hex4();
+                if cp >= 55296 && cp <= 56319 {
+                    // high surrogate: a low one must follow to make one code point
+                    if this.at + 1 < this.src.len && this.src[this.at] == 92 && this.src[this.at + 1] == 117 {
+                        let save = this.at;
+                        this.at += 2;
+                        let lo = this.hex4();
+                        if lo >= 56320 && lo <= 57343 {
+                            cp = 65536 + (cp - 55296) * 1024 + (lo - 56320);
+                        } else {
+                            this.at = save;
+                            cp = 65533;
+                        }
+                    } else {
+                        cp = 65533;
+                    }
+                } else if cp >= 56320 && cp <= 57343 {
+                    cp = 65533;
+                }
+                utf8(&t, cp);
+            } else {
+                this.at -= 1;
+                this.fail("bad escape");
+                return "";
+            }
+        }
+        return "";
+    }
+
+    fn digits(this: &P): int {
+        let n = 0;
+        while this.at < this.src.len && this.src[this.at] >= 48 && this.src[this.at] <= 57 {
+            this.at += 1;
+            n += 1;
+        }
+        return n;
+    }
+
+    fn number(this: &P): &Json {
+        let start = this.at;
+        if this.peek() == 45 {
+            this.at += 1;
+        }
+        if this.peek() == 48 {
+            this.at += 1;
+            let d = this.peek();
+            if d >= 48 && d <= 57 {
+                this.fail("leading zero");
+                return &NULL;
+            }
+        } else if this.digits() == 0 {
+            this.fail("expected a digit");
+            return &NULL;
+        }
+        if this.peek() == 46 {
+            this.at += 1;
+            if this.digits() == 0 {
+                this.fail("expected a digit after `.`");
+                return &NULL;
+            }
+        }
+        let ch = this.peek();
+        if ch == 101 || ch == 69 {
+            this.at += 1;
+            let s = this.peek();
+            if s == 43 || s == 45 {
+                this.at += 1;
+            }
+            if this.digits() == 0 {
+                this.fail("expected an exponent");
+                return &NULL;
+            }
+        }
+        // strtod rounds correctly; the grammar was checked above, so it reads exactly this span
+        let n = this.at - start;
+        let tmp: [64]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let buf = tmp[:];
+        if n + 1 > 64 {
+            buf = this.arena.alloc::<u8>(n + 1);
+        }
+        for i in 0..n {
+            buf[i] = this.src[start + i];
+        }
+        buf[n] = 0;
+        return num(c.strtod(buf.ptr as ptr, 0), this.arena);
+    }
+}
+
+/// Append code point `cp` as UTF-8.
+fn utf8(t: &Text, cp: int) {
+    if cp < 128 {
+        t.push(u8(cp));
+    } else if cp < 2048 {
+        t.push(u8(192 + cp / 64));
+        t.push(u8(128 + cp % 64));
+    } else if cp < 65536 {
+        t.push(u8(224 + cp / 4096));
+        t.push(u8(128 + (cp / 64) % 64));
+        t.push(u8(128 + cp % 64));
+    } else {
+        t.push(u8(240 + cp / 262144));
+        t.push(u8(128 + (cp / 4096) % 64));
+        t.push(u8(128 + (cp / 64) % 64));
+        t.push(u8(128 + cp % 64));
+    }
+}
+
+/// Parse one JSON document (surrounding whitespace allowed, nothing else after it).
+pub fn parse(src: []u8, arena: &Arena): Result<&Json, JsonError> {
+    let p = P { src: src, at: 0, arena: arena, err: "", errAt: 0, depth: 0 };
+    let v = p.value();
+    if p.err.len == 0 {
+        p.ws();
+        if p.at < src.len {
+            p.fail("extra input after the value");
+        }
+    }
+    if p.err.len > 0 {
+        return Result.Err(JsonError { at: p.errAt, msg: p.err });
+    }
+    return Result.Ok(v);
+}
+
+/// `parse` for a string.
+pub fn parseStr(src: string, arena: &Arena): Result<&Json, JsonError> {
+    return parse(src as []u8, arena);
+}
+
+// ---------------------------------------------------------------- write
+
+/// Append `s` as a JSON string literal (quotes and escapes included) to `t`.
+pub fn quote(s: string, t: &Text) {
+    let hex = "0123456789abcdef";
+    t.push(34);
+    for i in 0..s.len {
+        let b = s[i];
+        if b == 34 || b == 92 {
+            t.push(92);
+            t.push(b);
+        } else if b == 10 {
+            t.pushStr("\\n");
+        } else if b == 13 {
+            t.pushStr("\\r");
+        } else if b == 9 {
+            t.pushStr("\\t");
+        } else if b < 32 {
+            t.pushStr("\\u00");
+            t.push(hex[int(b) / 16]);
+            t.push(hex[int(b) % 16]);
+        } else {
+            t.push(b);
+        }
+    }
+    t.push(34);
+}
+
+/// Append `n` as a JSON number: integers as integers, others as the shortest digits that read back
+/// to the same `f64`. NaN and infinities are not JSON; they write `null`.
+pub fn writeNum(n: f64, t: &Text) {
+    // NaN and infinities are the values where n - n is not 0 (`!=` on a NaN is false here, so test `==`)
+    if !(n - n == 0.0) {
+        t.pushStr("null");
+        return;
+    }
+    if n == f64(int(n)) && n < 9007199254740992.0 && n > -9007199254740992.0 {
+        t.pushInt(int(n));
+        return;
+    }
+    let buf: [40]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let digits = 15;
+    while digits <= 17 {
+        // `%.*g` is what glibc gcvt prints; bionic (Android) has no gcvt
+        c.snprintf(&buf[0] as ptr, 40, "%.*g\0".ptr as cstr, i32(digits), n);
+        if c.strtod(&buf[0] as ptr, 0) == n {
+            break;
+        }
+        digits += 1;
+    }
+    let i = 0;
+    while i < 40 && buf[i] != 0 {
+        t.push(buf[i]);
+        i += 1;
+    }
+}
+
+/// Append `j` as compact JSON to `t`.
+pub fn write(j: &Json, t: &Text) {
+    match j.kind {
+        Kind.Null { t.pushStr("null"); }
+        Kind.Bool { t.pushStr(if j.b { "true" } else { "false" }); }
+        Kind.Num { writeNum(j.n, t); }
+        Kind.Str { quote(j.s, t); }
+        Kind.Arr {
+            t.push(91);
+            for i in 0..j.items.len {
+                if i > 0 {
+                    t.push(44);
+                }
+                write(j.items.items[i], t);
+            }
+            t.push(93);
+        }
+        Kind.Obj {
+            t.push(123);
+            for i in 0..j.items.len {
+                if i > 0 {
+                    t.push(44);
+                }
+                quote(j.keys.items[i], t);
+                t.push(58);
+                write(j.items.items[i], t);
+            }
+            t.push(125);
+        }
+    }
+}
+
+/// `j` as compact JSON, on `arena`.
+pub fn stringify(j: &Json, arena: &Arena): string {
+    let t = Text.new(arena);
+    write(j, &t);
+    return t.str();
+}

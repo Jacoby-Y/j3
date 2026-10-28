@@ -1,0 +1,282 @@
+// Separate process: these fresh DOM/font probes exceed game.FONT_SRC's 32-handle budget alongside text_test.
+// Tests for the text layout rules in j3.ui.dom (white-space, text-overflow, overflow-wrap) and for
+// j3.ui.textfit / j3.ui.textanim. Run from the repo root, headless (SDL_ttf measures; no window opens):
+//   SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout 60 j3c run j3c/stdlib/tests/text_test.j3
+// Panics on the first failed check.
+
+module text_css_test;
+
+use j3.game.{ selRectW, selRectX, textBidi, textCaretX, textIndexAt, textSelRects, Font, fontFallback, fontLine, fontShape, loadFont, textShaping, textWidth, tryLoadFont };
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.math.Vec2;
+use j3.sys.panic;
+use j3.text.{ Text, fmtBytes, fmtInt, same };
+use j3.ui.css.{ Css, CLIP_TEXT, P_BG_CLIP, P_OVERFLOW_WRAP, P_OVERFLOW_Y, P_STROKE_COLOR, P_STROKE_WIDTH, P_TEXT_SHADOW, V_SHADOW, WRAP_BREAK };
+use j3.ui.cssparse.parse;
+use j3.ui.dom.{ Dom, Frag };
+use j3.ui.textanim;
+use j3.ui.dom;
+use j3.ui.inputs;
+use j3.ui.textsel;
+use j3.ui.textfit;
+
+#[singleton]
+let FONTPATH: string;
+const SHEET: string = "@font-face { font-family: \"T\"; src: url(\"examples/big_ui_test/assets/font.ttf\"); } @font-face { font-family: \"S\"; src: url(\"examples/big_ui_test/assets/symbols.ttf\"); } .box { font-family: \"T\"; font-size: 16px; width: 100px; } .nw { white-space: nowrap; } .el { white-space: nowrap; text-overflow: ellipsis; overflow-y: hidden; } .elv { white-space: nowrap; text-overflow: ellipsis; } .bw { overflow-wrap: break-word; } .pl { white-space: pre-line; } .fb { font-family: \"T\", \"S\", sans-serif; } .fn { font-family: \"T\", sans-serif; font-size: 16px; width: 100px; } .fx { text-shadow: 1px 2px 3px #ff0000, 0 0 5px #00ff00; -webkit-text-stroke: 2px #0000ff; -webkit-background-clip: text; word-wrap: break-word; overflow: hidden; }";
+
+#[singleton]
+let CHECKS: int;
+
+fn ok(cond: bool, msg: string) {
+    CHECKS += 1;
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic(msg);
+    }
+}
+
+fn near(a: f32, b: f32, tol: f32, msg: string) {
+    let d = a - b;
+    if d < 0.0 { d = 0.0 - d; }
+    if d > tol { printLn(`{a} vs {b}`); }
+    ok(d <= tol, msg);
+}
+
+fn size(s: string): int {
+    return s.len;
+}
+
+fn bytes(s: string): []u8 {
+    return []u8 { ptr: s.ptr, len: s.len };
+}
+
+struct Built {
+    d: Dom;
+    id: int;
+}
+
+/// A fresh tree with one `.box` block of `cls` and `text`, laid out at `w` x 400. A new `Dom` each time:
+/// classes are only ever added to a reused node.
+fn block(mem: &Arena, css: &Css, cls: string, text: string, w: f32): Built {
+    let d = Dom.new(mem, css);
+    d.begin();
+    let id = d.open(0, d.tag("div"), 1);
+    d.cls(id, "box");
+    if cls.len > 0 {
+        d.cls(id, cls);
+    }
+    d.text(text);
+    d.close();
+    d.end();
+    d.layoutAt(w, 400.0);
+    return Built { d: d, id: id };
+}
+
+fn lines(b: &Built): int {
+    let n = 0;
+    let lastY: f32 = -1000.0;
+    let f = b.d.nodes.items[b.id].frag0;
+    while f >= 0 {
+        let y = b.d.frags.items[f].y;
+        if y - lastY > 0.5 || lastY - y > 0.5 {
+            n += 1;
+            lastY = y;
+        }
+        f = b.d.frags.items[f].next;
+    }
+    return n;
+}
+
+fn lastFrag(b: &Built): Frag {
+    let f = b.d.nodes.items[b.id].frag0;
+    while b.d.frags.items[f].next >= 0 {
+        f = b.d.frags.items[f].next;
+    }
+    return b.d.frags.items[f];
+}
+
+fn testTextCss(mem: &Arena, css: &Css) {
+    parse(css, ".pre { white-space: pre; } .pw { white-space: pre-wrap; } .clamp { line-clamp: 2; user-select: text; } .just { text-align: justify; user-select: text; } .justpre { text-align: justify; white-space: pre-line; } .hidden { visibility: hidden; } .visible { visibility: visible; } .clampSpan { line-clamp: 2; }", "textcss.css", 1);
+    ok(css.warns.len == 0, "new text properties parse");
+    let font = loadFont(FONTPATH, 16);
+    let lh = f32(fontLine(font));
+    let pre = block(mem, css, "pre", "  alpha  beta  \n\tñ\n", 400.0);
+    ok(lines(&pre) == 2, "pre keeps explicit lines without wrapping");
+    near(pre.d.nodes.items[pre.id].h, lh * 3.0, 0.01, "pre trailing newline retains blank final line");
+    let f = pre.d.nodes.items[pre.id].frag0;
+    let first = pre.d.frags.items[f];
+    near(first.x, 0.0, 0.01, "pre leading space starts at origin");
+    let lastX: f32 = 0.0;
+    let sawTab = false;
+    while f >= 0 {
+        let fr = pre.d.frags.items[f];
+        if fr.y == first.y { lastX = fr.x + fr.w; }
+        let tn = &pre.d.nodes.items[fr.node];
+        if fr.end == fr.start + 1 && tn.buf[fr.start] == 9 { near(fr.w, textWidth(font, bytes(" "), false) * 8.0, 0.01, "tab stops at eight spaces"); sawTab = true; }
+        f = fr.next;
+    }
+    near(lastX, textWidth(font, bytes("  alpha  beta  "), false), 0.01, "pre repeated and trailing spaces retain measured width");
+    ok(sawTab, "pre tab has shared fragment geometry");
+    pre.d.styleStr(pre.id, 0, "width", "40px"); pre.d.layoutAt(200.0, 400.0);
+    ok(lines(&pre) == 2, "pre never wraps after live resize");
+    pre.d.styleStr(pre.id, 1, "white-space", "pre-wrap"); pre.d.layoutAt(200.0, 400.0);
+    ok(lines(&pre) > 2, "live pre to pre-wrap invalidates geometry");
+    let pw = block(mem, css, "pw", "alpha  beta gamma delta\nñ", 400.0);
+    ok(lines(&pw) > 2, "pre-wrap preserves newline and wraps");
+    let natural = block(mem, css, "", "alpha beta gamma delta epsilon zeta", 400.0);
+    let cl = block(mem, css, "clamp", "alpha beta gamma delta epsilon zeta", 400.0);
+    ok(lines(&cl) == 2 && lines(&natural) > 2, "clamp limits lines");
+    near(cl.d.nodes.items[cl.id].h, lh * 2.0, 0.01, "clamp limits content height");
+    let cf = lastFrag(&cl);
+    ok(cf.ell >= 0.0 && cf.x + cf.w <= 100.01, "clamp adds fitting ellipsis");
+    let cn = cl.d.nodes.items[cl.id].first;
+    cl.d.nodes.items[cn].sa = 0; cl.d.nodes.items[cn].sb = cl.d.nodes.items[cn].tlen;
+    ok(textsel.selected(&cl.d).len == cf.end, "copy excludes clamped tail");
+    cl.d.clsIf(cl.id, "hidden", true); cl.d.layoutAt(400.0, 400.0);
+    ok(textsel.selected(&cl.d).len == 0, "copy excludes hidden selection immediately");
+    cl.d.clsIf(cl.id, "hidden", false); cl.d.styleStr(cl.id, 0, "line-clamp", "none"); cl.d.layoutAt(400.0, 400.0);
+    ok(lines(&cl) == lines(&natural) && lastFrag(&cl).ell < 0.0, "live clamp removal restores text");
+    cl.d.styleStr(cl.id, 0, "line-clamp", "1"); cl.d.layoutAt(400.0, 400.0);
+    ok(lines(&cl) == 1, "live clamp replacement invalidates fragments");
+    let warnings = css.warns.len;
+    parse(css, ".invalidClamp { line-clamp: 2; line-clamp: 0; line-clamp: -1; line-clamp: 1.5; line-clamp: 2px; }", "invalid.css", 1);
+    let invalid = block(mem, css, "invalidClamp", "alpha beta gamma delta epsilon", 400.0);
+    ok(lines(&invalid) == 2 && css.warns.len == warnings + 4, "clamp rejects zero negative fractional and dimension values");
+    css.warns.len = warnings;
+    let short = block(mem, css, "clamp", "alpha beta", 400.0);
+    ok(lastFrag(&short).ell < 0.0, "exact clamp content has no ellipsis");
+    let just = block(mem, css, "just", "aa bb cc dd ee ff gg hh ii jj k", 400.0);
+    let jf = just.d.nodes.items[just.id].frag0;
+    let jy = just.d.frags.items[jf].y;
+    let edge: f32 = 0.0;
+    while jf >= 0 && just.d.frags.items[jf].y == jy { edge = just.d.frags.items[jf].x + just.d.frags.items[jf].w; jf = just.d.frags.items[jf].next; }
+    near(edge, 100.0, 0.01, "justify reaches right edge on wrapped line");
+    let gapId = just.d.frags.items[just.d.nodes.items[just.id].frag0].next;
+    let gap = just.d.frags.items[gapId];
+    ok(gap.w > textWidth(font, bytes(" "), false), "justified space retains its full stretched fragment advance");
+    just.d.simInput(gap.x + gap.w * 0.75, gap.y + 5.0, false, 0.0); just.d.beginFrame(Vec2 { x: 400.0, y: 400.0 }); inputs.begin(&just.d);
+    just.d.simInput(gap.x + gap.w * 0.75, gap.y + 5.0, true, 0.0); just.d.beginFrame(Vec2 { x: 400.0, y: 400.0 }); inputs.begin(&just.d);
+    ok(just.d.selAo == gap.end, "justified gap pointer picking uses stretched geometry");
+    ok(lastFrag(&just).x + lastFrag(&just).w < 100.0, "justify final line stays natural");
+    let forced = block(mem, css, "justpre", "aa bb\ncc", 400.0);
+    let ff = forced.d.nodes.items[forced.id].frag0;
+    let fnx = forced.d.frags.items[forced.d.frags.items[ff].next].next;
+    near(forced.d.frags.items[fnx].x, textWidth(font, bytes("aa "), false), 0.01, "explicit newline line is not justified");
+    let single = block(mem, css, "just", "Supercalifragilisticexpialidocious tail", 400.0);
+    ok(lines(&single) == 2, "justify single overflowing word terminates without gap division");
+    let laid = cl.d.laid; let restyled = cl.d.restyled; let used = mem.used;
+    for k in 0..100 { cl.d.layoutAt(400.0, 400.0); }
+    ok(cl.d.laid == laid && cl.d.restyled == restyled && mem.used == used, "new text modes idle without layout/restyle/allocation");
+}
+
+fn testInlineWhitespace(mem: &Arena, css: &Css) {
+    let d = Dom.new(mem, css);
+    d.begin(); let owner = d.open(0, d.tag("div"), 1); d.cls(owner, "box");
+    let span = d.open(1, d.tag("span"), 1); d.cls(span, "pre"); d.text("alpha  beta gamma delta"); d.close(); d.close(); d.end(); d.layoutAt(400.0, 400.0);
+    let b = Built { d: d, id: owner };
+    ok(lines(&b) == 1 && lastFrag(&b).x + lastFrag(&b).w > 100.0, "inline whitespace override controls shared run");
+    b.d.styleStr(span, 0, "white-space", "pre-wrap"); b.d.layoutAt(400.0, 400.0);
+    ok(lines(&b) > 1, "inline whitespace override updates after live style change");
+}
+
+fn testVisibility(mem: &Arena, css: &Css) {
+    let d = Dom.new(mem, css);
+    d.begin();
+    let parent = d.open(0, d.tag("div"), 1); d.cls(parent, "hidden");
+    let hidden = d.open(1, d.tag("button"), 1); d.styleStr(hidden, 1, "display", "block"); d.styleNum(hidden, 2, "height", 20.0); d.text("hidden"); d.close();
+    let visible = d.open(2, d.tag("button"), 1); d.cls(visible, "visible"); d.styleStr(visible, 1, "display", "block"); d.styleNum(visible, 2, "height", 20.0); d.text("visible"); d.close();
+    d.close(); d.end(); d.layoutAt(400.0, 400.0);
+    ok(d.nodes.items[hidden].h > 0.0 && d.nodes.items[visible].y >= d.nodes.items[hidden].h, "hidden button retains layout");
+    ok(!dom.isFocusable(&d, hidden) && dom.isFocusable(&d, visible), "visibility inherits and visible child overrides");
+    d.simInput(5.0, 5.0, true, 0.0); d.beginFrame(Vec2 { x: 400.0, y: 400.0 });
+    ok(d.downHit != hidden && d.hover != hidden, "hidden control does not receive pointer hit");
+    d.simInput(5.0, d.absY(visible) + 5.0, false, 0.0); d.beginFrame(Vec2 { x: 400.0, y: 400.0 });
+    ok(d.hover == visible, "visible descendant is reachable through hidden ancestor");
+    d.focusNode(-1);
+    d.focusNode(hidden); ok(d.focus == -1, "hidden control rejects programmatic focus");
+    d.focusNode(visible); ok(d.focus == visible, "visible descendant accepts focus");
+    d.styleStr(visible, 0, "visibility", "hidden"); d.layoutAt(400.0, 400.0);
+    ok(d.focus == -1 && !dom.isFocusable(&d, visible), "live visibility change clears focus");
+    d.focus = hidden; d.kin.enter = true; inputs.begin(&d);
+    ok(d.focus == -1 && !d.clicked(hidden), "hidden stale focus cannot activate by keyboard");
+    d.clickNode = hidden; ok(!d.clicked(hidden), "hidden stale click cannot activate");
+    d.styleStr(visible, 0, "visibility", "visible"); d.layoutAt(200.0, 400.0);
+    ok(dom.isFocusable(&d, visible), "style toggle and resize restore visible control");
+    d.focusNode(visible); d.styleStr(visible, 0, "display", "none"); d.layoutAt(200.0, 400.0);
+    ok(d.focus == visible, "display none alone keeps focus (virtual lists keep the focused row hidden)");
+}
+
+fn frameFields(e: &Dom) {
+    e.beginFrame(Vec2 { x: 400.0, y: 400.0 });
+    inputs.begin(e);
+    let col = e.open(0, e.tag("div"), 1);
+    let p1 = e.open(0, e.tag("input"), 1); e.cls(p1, "box"); e.attrType(p1, "text"); e.attrText(p1, "a  b   c"); e.close();
+    let p2 = e.open(1, e.tag("input"), 1); e.cls(p2, "box"); e.cls(p2, "pre"); e.attrType(p2, "text"); e.attrText(p2, "a  b   c"); e.close();
+    let t1 = e.open(2, e.tag("input"), 1); e.cls(t1, "box"); e.attrType(t1, "textarea"); e.attrRows(t1, 3.0); e.attrText(t1, "a  b\nc  d"); e.close();
+    let t2 = e.open(3, e.tag("input"), 1); e.cls(t2, "box"); e.cls(t2, "pre"); e.attrType(t2, "textarea"); e.attrRows(t2, 3.0); e.attrText(t2, "a  b\nc  d"); e.close();
+    e.close();
+    e.layout(); e.endFrame();
+}
+
+/// Tab skips a hidden button, stops on its visible child; line-clamp counts the whole inline context; inputs ignore white-space.
+fn testTabClampInput(mem: &Arena, css: &Css) {
+    let d = Dom.new(mem, css);
+    d.begin();
+    let a = d.open(0, d.tag("button"), 1); d.styleStr(a, 1, "display", "block"); d.text("a"); d.close();
+    let wrap = d.open(1, d.tag("div"), 1); d.cls(wrap, "hidden");
+    let h = d.open(2, d.tag("button"), 1); d.styleStr(h, 1, "display", "block"); d.text("h"); d.close();
+    let v = d.open(3, d.tag("button"), 1); d.cls(v, "visible"); d.styleStr(v, 1, "display", "block"); d.text("v"); d.close();
+    d.close();
+    let z = d.open(4, d.tag("button"), 1); d.styleStr(z, 1, "display", "block"); d.text("z"); d.close();
+    d.end(); d.layoutAt(400.0, 400.0);
+    d.focusNode(a);
+    d.kin.tab = true; inputs.begin(&d); d.kin.tab = false;
+    ok(d.focus == v, "Tab skips the hidden button and stops on its visible child");
+    d.kin.tab = true; inputs.begin(&d); d.kin.tab = false;
+    ok(d.focus == z, "Tab goes on past the visible child");
+    d.kin.tab = true; d.kin.shift = true; inputs.begin(&d); d.kin.tab = false; d.kin.shift = false;
+    ok(d.focus == v, "Shift+Tab stops on the visible child, not the hidden sibling");
+
+    let font = loadFont(FONTPATH, 16);
+    let lh = f32(fontLine(font));
+    let m = Dom.new(mem, css);
+    m.begin(); let owner = m.open(0, m.tag("div"), 1); m.cls(owner, "box"); m.cls(owner, "clampSpan");
+    m.text("alpha beta gamma ");
+    let sp = m.open(1, m.tag("span"), 1); m.text("delta epsilon zeta "); m.close();
+    m.text("eta theta iota kappa lambda mu"); m.close(); m.end(); m.layoutAt(400.0, 400.0);
+    let mb = Built { d: m, id: owner };
+    ok(lines(&mb) == 2, "line-clamp counts lines across text and span runs of one block");
+    near(m.nodes.items[owner].h, lh * 2.0, 0.01, "multi-run clamp height is N lines");
+
+    let e = Dom.new(mem, css); e.setFrameMs(16.0); e.simInput(-5.0, -5.0, false, 0.0);
+    for k in 0..3 { frameFields(&e); }
+    let p1 = e.nodes.items[e.nodes.items[0].first].first; let p2 = e.nodes.items[p1].next; let t1 = e.nodes.items[p2].next; let t2 = e.nodes.items[t1].next;
+    near(e.nodes.items[p1].w, e.nodes.items[p2].w, 0.01, "white-space pre leaves an input's width alone");
+    near(e.nodes.items[t1].h, e.nodes.items[t2].h, 0.01, "white-space pre leaves a textarea's height alone");
+    e.focusNode(p1); e.simKeys("", "End"); frameFields(&e);
+    let c1 = e.caretRect(p1);
+    e.focusNode(p2); e.simKeys("", "End"); frameFields(&e);
+    let c2 = e.caretRect(p2);
+    ok(c1.x >= 0.0, "input caret is placed");
+    near(c2.x - e.absX(p2), c1.x - e.absX(p1), 0.01, "input caret x is the same with white-space pre");
+    e.focusNode(t1); e.simKeys("", "C+End"); frameFields(&e);
+    let d1 = e.caretRect(t1);
+    e.focusNode(t2); e.simKeys("", "C+End"); frameFields(&e);
+    let d2 = e.caretRect(t2);
+    ok(d1.y > 0.0 || d1.x > 0.0, "textarea caret is placed");
+    near(d2.y - e.absY(t2), d1.y - e.absY(t1), 0.01, "textarea caret y is the same with white-space pre");
+    near(d2.x - e.absX(t2), d1.x - e.absX(t1), 0.01, "textarea caret x is the same with white-space pre");
+}
+
+fn main() {
+    let mem = Arena.create(64 * 1024 * 1024);
+    let css = Css.new(&mem);
+    parse(&css, SHEET, "test.css", 1);
+    FONTPATH = css.fonts.items[0].path;
+    testTextCss(&mem, &css);
+    testVisibility(&mem, &css);
+    testInlineWhitespace(&mem, &css);
+    testTabClampInput(&mem, &css);
+    printLn(`text_css_test: {CHECKS} checks passed`);
+}

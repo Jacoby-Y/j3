@@ -1,0 +1,507 @@
+// Undo and redo as node deltas, plus copy and paste.
+
+module j3_editor.history;
+
+use j3.scene3d.editor.paste;
+use j3.scene3d.editor.uses;
+use j3.game;
+use j3.gfx.{ Mesh, Tex };
+use j3.math.Vec3;
+use j3.memory.{ Arena, scratch };
+use j3.scene3d;
+use j3.scene3d.{ Node, MESH, INSTANCE };
+use j3.data.save;
+use j3.text.same;
+use j3.ui;
+use j3_editor.console.say;
+use j3_editor.selection.{ addPick, isPicked, parentOf, select, setPrimary };
+use j3_editor.types.{ Delta, HISTORY, Snap, World };
+use j3_editor.util.own;
+
+pub fn emptySnap(mem: &Arena): Snap {
+    return Snap { nodes: mem.alloc::<Node>(0), len: 0, next: 1, data: save.empty(mem), selected: 0, picked: mem.alloc::<int>(0) };
+}
+
+pub fn deltaStack(mem: &Arena, count: int): []Delta {
+    let out = mem.alloc::<Delta>(count);
+    let i = 0;
+    while i < count {
+        out[i] = Delta {
+            changed: mem.alloc::<Node>(0), count: 0, order: mem.alloc::<int>(0), orderLen: 0,
+            reorder: false, next: 1, data: save.empty(mem), selected: 0, picked: mem.alloc::<int>(0),
+        };
+        i += 1;
+    }
+    return out;
+}
+
+/// Copy the scene's own objects into `dst`; `restore` rebuilds placed scenes from their files.
+pub fn capture(w: &World, dst: &Snap) {
+    scene3d.flushParams(&w.scene);
+    if dst.nodes.len < w.scene.len {
+        dst.nodes = w.mem.alloc::<Node>(w.scene.len * 2 + 16);
+    }
+    let n = 0;
+    let i = 0;
+    while i < w.scene.len {
+        if w.scene.nodes[i].owner == 0 {
+            dst.nodes[n] = w.scene.nodes[i];
+            n += 1;
+        }
+        i += 1;
+    }
+    dst.len = n;
+    dst.next = w.scene.nextId;
+    dst.data = w.scene.data;
+    dst.selected = w.selected;
+    dst.picked = keepPicks(w.mem, dst.picked, w.picked, w.pickedCount);
+    dst.pickedCount = w.pickedCount;
+}
+
+/// `src[0..count]` in `buf`, grown on `mem` when too small.
+fn keepPicks(mem: &Arena, buf: []int, src: []int, count: int): []int {
+    let out = buf;
+    if out.len < count { out = mem.alloc::<int>(count * 2 + 4); }
+    let i = 0;
+    while i < count { out[i] = src[i]; i += 1; }
+    return out;
+}
+
+/// Push onto a history stack, dropping the oldest entry at `HISTORY`. Returns the new count.
+/// Slots keep their buffers, so a long session reuses memory instead of growing.
+pub fn pushDelta(arena: &Arena, stack: []Delta, count: int, src: &Delta): int {
+    let n = count;
+    while n >= HISTORY && n > 0 {
+        let oldest = stack[0];
+        let i = 1;
+        while i < n {
+            stack[i - 1] = stack[i];
+            i += 1;
+        }
+        stack[n - 1] = oldest;
+        n -= 1;
+    }
+    let slot = &stack[n];
+    if slot.changed.len < src.count { slot.changed = arena.alloc::<Node>(src.count * 2 + 4); }
+    let c = 0;
+    while c < src.count {
+        slot.changed[c] = src.changed[c];
+        c += 1;
+    }
+    slot.count = src.count;
+    slot.reorder = src.reorder;
+    slot.orderLen = 0;
+    if src.reorder {
+        if slot.order.len < src.orderLen { slot.order = arena.alloc::<int>(src.orderLen * 2 + 4); }
+        c = 0;
+        while c < src.orderLen {
+            slot.order[c] = src.order[c];
+            c += 1;
+        }
+        slot.orderLen = src.orderLen;
+    }
+    slot.next = src.next;
+    slot.data = src.data;
+    slot.selected = src.selected;
+    slot.picked = keepPicks(arena, slot.picked, src.picked, src.pickedCount);
+    slot.pickedCount = src.pickedCount;
+    return n + 1;
+}
+
+/// Id to position in `s`, for `slotOf`.
+pub fn idTable(s: &Snap): []int {
+    let size = 16;
+    while size < s.len * 2 { size *= 2; }
+    let table = scratch(0).alloc::<int>(size);
+    let k = 0;
+    while k < size { table[k] = 0; k += 1; }
+    k = 0;
+    while k < s.len {
+        let h = copyBucket(s.nodes[k].id, size);
+        while table[h] != 0 { h += 1; if h == size { h = 0; } }
+        table[h] = k + 1;
+        k += 1;
+    }
+    return table;
+}
+
+/// Position of object `id` in `s`, or -1.
+pub fn slotOf(s: &Snap, table: []int, id: int): int {
+    let h = copyBucket(id, table.len);
+    while table[h] != 0 {
+        if s.nodes[table[h] - 1].id == id { return table[h] - 1; }
+        h += 1;
+        if h == table.len { h = 0; }
+    }
+    return -1;
+}
+
+/// Every saved field matches. GPU handles, bounds, and `missing` follow from the files.
+pub fn sameNode(a: Node, b: Node): bool {
+    return a.id == b.id && a.parent == b.parent && a.kind == b.kind && a.doubleSided == b.doubleSided
+        && a.collapsed == b.collapsed && a.fov == b.fov && a.near == b.near && a.far == b.far
+        && a.range == b.range && a.alpha == b.alpha && a.opacity == b.opacity && sameVec(a.position, b.position) && sameVec(a.rotation, b.rotation)
+        && sameVec(a.scale, b.scale) && sameVec(a.color, b.color) && sameVec(a.tint, b.tint) && same(a.name, b.name)
+        && same(a.asset, b.asset) && same(a.texture, b.texture) && same(a.script, b.script)
+        && same(a.scene, b.scene) && same(a.material, b.material) && same(a.effects, b.effects) && same(a.tags, b.tags) && same(a.note, b.note);
+}
+
+pub fn sameVec(a: Vec3, b: Vec3): bool { return a.x == b.x && a.y == b.y && a.z == b.z; }
+
+/// The step that turns `from` into `to`. Lives in the scratch arena until pushed.
+pub fn diffSnap(from: &Snap, to: &Snap): Delta {
+    let table = idTable(from);
+    let d = Delta {
+        changed: scratch(0).alloc::<Node>(to.len), count: 0, order: scratch(0).alloc::<int>(0),
+        orderLen: 0, reorder: from.len != to.len, next: to.next, data: to.data, selected: to.selected,
+        picked: to.picked, pickedCount: to.pickedCount,
+    };
+    let i = 0;
+    while i < to.len {
+        let n = to.nodes[i];
+        if !d.reorder && from.nodes[i].id != n.id { d.reorder = true; }
+        let at = slotOf(from, table, n.id);
+        if at < 0 || !sameNode(from.nodes[at], n) {
+            d.changed[d.count] = n;
+            d.count += 1;
+        }
+        i += 1;
+    }
+    if d.reorder {
+        d.order = scratch(0).alloc::<int>(to.len);
+        i = 0;
+        while i < to.len {
+            d.order[i] = to.nodes[i].id;
+            i += 1;
+        }
+        d.orderLen = to.len;
+    }
+    return d;
+}
+
+/// `now` with step `d` applied: the whole scene it leads to, in the scratch arena.
+pub fn applyDelta(now: &Snap, d: &Delta): Snap {
+    let size = now.len;
+    if d.reorder { size = d.orderLen; }
+    let out = Snap { nodes: scratch(0).alloc::<Node>(size), len: size, next: d.next, data: d.data, selected: d.selected, picked: d.picked, pickedCount: d.pickedCount };
+    let changed = Snap { nodes: d.changed, len: d.count, next: 0, data: d.data, selected: 0, picked: d.picked };
+    let table = idTable(now);
+    let i = 0;
+    if !d.reorder {
+        while i < now.len {
+            out.nodes[i] = now.nodes[i];
+            i += 1;
+        }
+        i = 0;
+        while i < d.count {
+            let at = slotOf(now, table, d.changed[i].id);
+            if at >= 0 { out.nodes[at] = d.changed[i]; }
+            i += 1;
+        }
+        return out;
+    }
+    let changedTable = idTable(&changed);
+    while i < size {
+        let id = d.order[i];
+        let fresh = slotOf(&changed, changedTable, id);
+        if fresh >= 0 { out.nodes[i] = d.changed[fresh]; }
+        else { out.nodes[i] = now.nodes[slotOf(now, table, id)]; }
+        i += 1;
+    }
+    return out;
+}
+
+/// Store the pending edit as an undo step: the difference back to `candidate`.
+pub fn finishUndo(w: &World) {
+    if !w.pendingUndo { return; }
+    w.pendingUndo = false;
+    capture(w, &w.spare);
+    let d = diffSnap(&w.spare, &w.candidate);
+    // An edit that ended where it began (a reverted color, say) leaves no step.
+    if d.count == 0 && !d.reorder && same(w.spare.data.bytes as string, w.candidate.data.bytes as string) { return; }
+    w.undoCount = pushDelta(w.scene.arena, w.undos, w.undoCount, &d);
+}
+
+pub fn restore(w: &World, s: &Snap) {
+    // Transfer GPU handles for nodes whose resource paths and kind did not change.
+    let old = scratch(0).alloc::<Node>(w.scene.len);
+    let tableSize = 16;
+    while tableSize < w.scene.len * 2 { tableSize *= 2; }
+    let oldSlots = scratch(0).alloc::<int>(tableSize);
+    let k = 0;
+    while k < tableSize { oldSlots[k] = 0; k += 1; }
+    k = 0;
+    let hadPlaced = false;
+    while k < w.scene.len {
+        old[k] = w.scene.nodes[k];
+        if old[k].kind == INSTANCE { hadPlaced = true; }
+        let h = copyBucket(old[k].id, tableSize);
+        while oldSlots[h] != 0 { h += 1; if h == tableSize { h = 0; } }
+        oldSlots[h] = k + 1;
+        k += 1;
+    }
+    if w.scene.nodes.len < s.len {
+        w.scene.nodes = w.scene.arena.alloc::<Node>(s.len + 16);
+    }
+    let i = 0;
+    while i < s.len {
+        w.scene.nodes[i] = s.nodes[i];
+        w.scene.nodes[i].gpu = Mesh {};
+        w.scene.nodes[i].image = Tex { id: 0, w: 0, h: 0 };
+        if w.scene.nodes[i].kind == INSTANCE { hadPlaced = true; }
+        let lookup = copyBucket(s.nodes[i].id, tableSize);
+        while oldSlots[lookup] != 0 && old[oldSlots[lookup] - 1].id != s.nodes[i].id {
+            lookup += 1;
+            if lookup == tableSize { lookup = 0; }
+        }
+        if oldSlots[lookup] != 0 {
+            let before = &old[oldSlots[lookup] - 1];
+            let now = &w.scene.nodes[i];
+            if before.kind == MESH && now.kind == MESH && same(before.asset, now.asset)
+                && same(before.texture, now.texture) {
+                now.gpu = before.gpu;
+                now.image = before.image;
+                now.boundLo = before.boundLo;
+                now.boundHi = before.boundHi;
+                before.gpu = Mesh {};
+                before.image = Tex { id: 0, w: 0, h: 0 };
+            }
+        }
+        i += 1;
+    }
+    w.scene.len = s.len;
+    w.worldsReady = false;
+    w.scene.nextId = s.next;
+    w.scene.data = s.data;
+    scene3d.relink(&w.scene);
+    // Placed objects' paths live in the arena `refresh` frees. Release their meshes first.
+    k = 0;
+    while k < old.len {
+        scene3d.unload(&old[k]);
+        k += 1;
+    }
+    i = 0;
+    while i < w.scene.len {
+        if w.scene.nodes[i].kind == MESH && w.scene.nodes[i].gpu.vao == 0 {
+            scene3d.reload(&w.scene, w.scene.nodes[i].id);
+        }
+        i += 1;
+    }
+    if hadPlaced { scene3d.refresh(&w.scene, w.path); }
+    select(w, s.selected);
+    let p = 0;
+    while p < s.pickedCount {
+        let id = s.picked[p];
+        if scene3d.index(&w.scene, id) >= 0 && !isPicked(w, id) { addPick(w, id); }
+        p += 1;
+    }
+    w.dirty = true;
+    w.editGesture = false;
+    w.dragging = false;
+    snapshot(w);
+}
+
+pub fn snapshot(w: &World) {
+    w.changedFrame = false;
+    // Undo, refresh, and loads change placed objects without it being an edit.
+    w.placedBeforeId = 0;
+    finishUndo(w);
+    capture(w, &w.candidate);
+    w.stale = false;
+}
+
+/// Record an edit: the first one of a frame or gesture saves the scene as it was for undo.
+pub fn modified(w: &World) {
+    if !w.changedFrame && !w.editGesture {
+        // `candidate` stays as the scene before this edit until `snapshot` records the step.
+        finishUndo(w);
+        // Undo brings back the whole selection as it was when the edit started.
+        w.candidate.picked = keepPicks(w.mem, w.candidate.picked, w.picked, w.pickedCount);
+        w.candidate.pickedCount = w.pickedCount;
+        w.pendingUndo = true;
+        w.redoCount = 0;
+        w.changedFrame = true;
+    }
+    if game.mouseDown(game.Mouse.Left) || ui.typing() { w.editGesture = true; }
+    w.dirty = true;
+    w.stale = true;
+    w.worldsReady = false;
+}
+
+/// Copy `id` and its descendants into `dst` on `mem`, parents before children, strings included.
+pub fn gather(w: &World, id: int, dst: &Snap, mem: &Arena) {
+    let one = mem.alloc::<int>(1);
+    one[0] = id;
+    gatherMany(w, one, dst, mem);
+}
+
+/// `gather` for several roots, none inside another. Parents still come before children.
+pub fn gatherMany(w: &World, roots: []int, dst: &Snap, mem: &Arena) {
+    dst.len = 0;
+    if roots.len == 0 || scene3d.index(&w.scene, roots[0]) < 0 { return; }
+    dst.nodes = mem.alloc::<Node>(w.scene.len);
+    let first = mem.alloc::<int>(w.scene.len);
+    let next = mem.alloc::<int>(w.scene.len);
+    let i = 0;
+    while i < w.scene.len { first[i] = -1; i += 1; }
+    i = w.scene.len - 1;
+    while i >= 0 {
+        let n = w.scene.nodes[i];
+        if n.owner == 0 && n.parent != 0 {
+            let parentSlot = scene3d.index(&w.scene, n.parent);
+            if parentSlot >= 0 {
+                next[i] = first[parentSlot];
+                first[parentSlot] = i;
+            }
+        }
+        i -= 1;
+    }
+    let r = 0;
+    while r < roots.len {
+        let root = scene3d.index(&w.scene, roots[r]);
+        if root >= 0 {
+            dst.nodes[dst.len] = w.scene.nodes[root];
+            dst.len += 1;
+        }
+        r += 1;
+    }
+    let k = 0;
+    while k < dst.len {
+        let atParent = scene3d.index(&w.scene, dst.nodes[k].id);
+        let child = first[atParent];
+        while child >= 0 {
+            dst.nodes[dst.len] = w.scene.nodes[child];
+            dst.len += 1;
+            child = next[child];
+        }
+        k += 1;
+    }
+    k = 0;
+    while k < dst.len {
+        ownStrings(mem, &dst.nodes[k]);
+        k += 1;
+    }
+    dst.data = save.empty(mem);
+    dst.data.bytes = own(mem, w.scene.data.bytes as string) as []u8;
+    dst.selected = roots[0];
+}
+
+pub fn copyBucket(id: int, size: int): int {
+    return id - (id / size) * size;
+}
+
+pub fn pathBucket(path: string, size: int): int {
+    let h = 0;
+    let i = 0;
+    while i < path.len {
+        h = h * 33 + int(path[i]);
+        h = h - (h / size) * size;
+        i += 1;
+    }
+    return h;
+}
+
+pub fn ownStrings(mem: &Arena, n: &Node) {
+    n.name = own(mem, n.name);
+    n.asset = own(mem, n.asset);
+    n.texture = own(mem, n.texture);
+    n.script = own(mem, n.script);
+    n.scene = own(mem, n.scene);
+    n.material = own(mem, n.material);
+    n.effects = own(mem, n.effects);
+    n.tags = own(mem, n.tags);
+    n.note = own(mem, n.note);
+}
+
+/// Add a copy of `src` under `parent` with fresh ids, and select it. Returns the new root id,
+/// or 0 when nothing was pasted. Placed scenes that contain this scene are left out.
+pub fn paste(w: &World, src: &Snap, parent: int): int {
+    if src.len == 0 { return 0; }
+    let mem = scratch(0);
+    // `ids[k]` is where `src.nodes[k]`'s children go; `from`/`to` list the objects made.
+    let ids = mem.alloc::<int>(src.len);
+    let from = mem.alloc::<int>(src.len);
+    let to = mem.alloc::<int>(src.len);
+    let tableSize = 16;
+    while tableSize < src.len * 2 { tableSize *= 2; }
+    let idTable = mem.alloc::<int>(tableSize);
+    let pathTable = mem.alloc::<int>(tableSize);
+    let pathKeys = mem.alloc::<string>(src.len);
+    let pathUses = mem.alloc::<bool>(src.len);
+    let clear = 0;
+    while clear < tableSize { idTable[clear] = 0; pathTable[clear] = 0; clear += 1; }
+    let pathCount = 0;
+    let made = 0;
+    let skipped = 0;
+    let nested = false;
+    let k = 0;
+    while k < src.len {
+        let n = src.nodes[k];
+        let under = parent;
+        if n.parent != 0 {
+            let parentHash = copyBucket(n.parent, tableSize);
+            while idTable[parentHash] != 0 && src.nodes[idTable[parentHash] - 1].id != n.parent {
+                parentHash += 1;
+                if parentHash == tableSize { parentHash = 0; }
+            }
+            if idTable[parentHash] != 0 { under = ids[idTable[parentHash] - 1]; }
+        }
+        ids[k] = under;
+        let cyclic = false;
+        if n.kind == INSTANCE {
+            let pathHash = pathBucket(n.scene, tableSize);
+            while pathTable[pathHash] != 0 && !same(pathKeys[pathTable[pathHash] - 1], n.scene) {
+                pathHash += 1;
+                if pathHash == tableSize { pathHash = 0; }
+            }
+            if pathTable[pathHash] == 0 {
+                pathKeys[pathCount] = n.scene;
+                pathUses[pathCount] = uses.uses(n.scene, w.path);
+                pathTable[pathHash] = pathCount + 1;
+                pathCount += 1;
+            }
+            cyclic = pathUses[pathTable[pathHash] - 1];
+        }
+        if cyclic {
+            skipped += 1;
+        } else {
+            let id = scene3d.add(&w.scene, n.kind, n.name, under);
+            ids[k] = id;
+            n.id = id;
+            n.parent = under;
+            n.gpu = Mesh {};
+            n.image = Tex { id: 0, w: 0, h: 0 };
+            ownStrings(w.scene.arena, &n);
+            let slot = scene3d.index(&w.scene, id);
+            w.scene.nodes[slot] = n;
+            scene3d.reload(&w.scene, id);
+            from[made] = src.nodes[k].id;
+            to[made] = id;
+            made += 1;
+            if n.kind == INSTANCE { nested = true; }
+        }
+        let idHash = copyBucket(src.nodes[k].id, tableSize);
+        while idTable[idHash] != 0 {
+            idHash += 1;
+            if idHash == tableSize { idHash = 0; }
+        }
+        idTable[idHash] = k + 1;
+        k += 1;
+    }
+    if skipped > 0 { say(w, "Left out a placed scene that contains this scene"); }
+    if made == 0 { return 0; }
+    let fromIds = []int { ptr: from.ptr, len: made };
+    let toIds = []int { ptr: to.ptr, len: made };
+    paste.copyParamsMany(&w.scene, &src.data, fromIds, toIds);
+    if nested { scene3d.refresh(&w.scene, w.path); }
+    modified(w);
+    // Select every pasted root, the first one shown in the inspector.
+    select(w, 0);
+    let root = 0;
+    while root < made {
+        if parentOf(w, to[root]) == parent { addPick(w, to[root]); }
+        root += 1;
+    }
+    setPrimary(w, to[0]);
+    return to[0];
+}

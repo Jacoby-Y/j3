@@ -1,0 +1,358 @@
+/// First-launch asset copy for Android: game files live inside the APK, where plain `open` cannot reach
+/// them, so they are copied to internal storage and the program `chdir`s there. After that every loader
+/// (raw `open`, SDL_ttf/image/mixer, scenes, saves) keeps using relative paths.
+///
+/// Portable and below `io`: only libc, no `j3.*` imports, so `sys_android.j3` can call it. The bytes come
+/// from a `Source` (Android binds it to SDL_RWFromFile, which reads APK assets; tests bind a directory).
+///
+/// Manifest, the APK asset `j3assets.txt`: line 1 is `j3assets 1 <stamp>` (stamp is an opaque token, no
+/// spaces); each later line is a relative path with `/` separators; blank lines are ignored. Absolute
+/// paths, `..` segments, empty segments and backslashes are rejected (logged, skipped).
+/// `<dest>/j3assets.stamp` holds the stamp of the last complete copy. It is written last, so an
+/// interrupted or partly failed copy is retried at the next launch. Every file goes to `<file>.tmp`
+/// first and is renamed over `<file>`. Files dropped from a newer manifest are not deleted.
+/// Main thread, before `main`; no window or `game` state is touched.
+
+module j3.apkassets;
+
+use lib "c" as c {
+    fn malloc(n: int): ptr;
+    fn realloc(p: ptr, n: int): ptr;
+    fn free(p: ptr);
+    fn open(path: ptr, flags: int, mode: int): int;
+    fn read(fd: int, buf: ptr, n: int): int;
+    fn write(fd: i32, buf: ptr, n: int): int;
+    fn close(fd: int): int;
+    fn rename(from: ptr, to: ptr): int;
+    fn unlink(path: ptr): int;
+    fn mkdir(path: ptr, mode: int): int;
+    fn chdir(path: ptr): int;
+}
+
+/// Where the manifest lives (an APK asset) and where the stamp is kept (under `dest`).
+pub const MANIFEST: string = "j3assets.txt";
+const STAMP_FILE: string = "j3assets.stamp";
+/// Longest relative path accepted (bytes).
+const MAX_REL: int = 700;
+/// Longest destination directory accepted (bytes).
+const MAX_DEST: int = 300;
+/// Streaming copy buffer: files of any size go through this much memory.
+const CHUNK: int = 65536;
+/// Largest manifest read (bytes).
+const MAX_MANIFEST: int = 8388608;
+const O_WRONLY: int = 1;
+const O_CREAT_TRUNC: int = 576;
+
+/// Byte source. `open(path)` takes a NUL-terminated relative path and returns a handle (0 = failed);
+/// `read(h, buf, n)` returns bytes read, 0 at the end, negative on error; `close(h)`; `size(h)` is the expected byte count (negative: unknown, the length check is skipped); `log(msg)` takes a NUL-terminated line; `ms()` is a millisecond clock.
+pub struct Source {
+    open: fn(ptr): ptr;
+    read: fn(ptr, ptr, int): int;
+    close: fn(ptr);
+    size: fn(ptr): int;
+    log: fn(ptr);
+    ms: fn(): int;
+}
+
+/// What `sync`/`boot` did.
+pub struct Report {
+    /// Manifest present and well formed (false: nothing was copied).
+    manifest: bool;
+    /// Stamp already matched, nothing copied.
+    upToDate: bool;
+    copied: int;
+    /// Files that could not be copied (the stamp is not written when this is above 0).
+    failed: int;
+    /// Manifest lines rejected as unsafe paths (the stamp is still written).
+    rejected: int;
+}
+
+fn say(src: Source, msg: string) {
+    let log = src.log;
+    let b = c.malloc(msg.len + 1);
+    let bytes: []u8 = @slice(b, msg.len + 1);
+    for i in 0..msg.len { bytes[i] = msg[i]; }
+    bytes[msg.len] = 0;
+    log(b);
+    c.free(b);
+}
+
+/// `a` + `b` + `d` + `e` as a NUL-terminated malloc'd buffer (the caller frees it).
+fn join4(a: string, b: string, d: string, e: string): []u8 {
+    let n = a.len + b.len + d.len + e.len;
+    let buf: []u8 = @slice(c.malloc(n + 1), n + 1);
+    let k = 0;
+    for i in 0..a.len { buf[k] = a[i]; k += 1; }
+    for i in 0..b.len { buf[k] = b[i]; k += 1; }
+    for i in 0..d.len { buf[k] = d[i]; k += 1; }
+    for i in 0..e.len { buf[k] = e[i]; k += 1; }
+    buf[n] = 0;
+    return buf;
+}
+
+/// True for a relative, `/`-separated path with no `..`, empty segment, backslash or NUL.
+pub fn safePath(p: string): bool {
+    if p.len == 0 || p.len > MAX_REL || p[0] == 47 || p[p.len - 1] == 47 {
+        return false;
+    }
+    // names this module owns: the stamp, and tmp files
+    let stampName = STAMP_FILE;
+    if p.len == stampName.len {
+        let same = true;
+        for i in 0..p.len { if p[i] != stampName[i] { same = false; } }
+        if same { return false; }
+    }
+    if p.len >= 4 && p[p.len - 4] == 46 && p[p.len - 3] == 116 && p[p.len - 2] == 109 && p[p.len - 1] == 112 {
+        return false;
+    }
+    let seg = 0;
+    for i in 0..p.len + 1 {
+        if i == p.len || p[i] == 47 {
+            if seg == 0 { return false; }
+            if seg == 2 && p[i - 1] == 46 && p[i - 2] == 46 { return false; }
+            seg = 0;
+        } else {
+            if p[i] == 92 || p[i] == 0 { return false; }
+            seg += 1;
+        }
+    }
+    return true;
+}
+
+/// Read a whole asset into a malloc'd buffer (caller frees `.ptr`). Empty slice when it is missing or unreadable.
+fn readAll(src: Source, path: string): []u8 {
+    let open = src.open;
+    let read = src.read;
+    let close = src.close;
+    let name = join4(path, "", "", "");
+    let h = open(name.ptr as ptr);
+    c.free(name.ptr as ptr);
+    let none: []u8 = @slice(0 as ptr, 0);
+    if h == 0 { return none; }
+    let cap = 4096;
+    let buf = c.malloc(cap);
+    let n = 0;
+    while true {
+        if n == cap {
+            if cap >= MAX_MANIFEST { break; }
+            cap = cap * 2;
+            buf = c.realloc(buf, cap);
+        }
+        let got = read(h, (buf as int + n) as ptr, cap - n);
+        if got <= 0 {
+            if got < 0 { n = -1; }
+            break;
+        }
+        n += got;
+    }
+    close(h);
+    if n < 0 || n >= MAX_MANIFEST {
+        c.free(buf);
+        return none;
+    }
+    return @slice(buf, n);
+}
+
+/// Write `data` to `full` through `full.tmp` and rename. False on any failure (the tmp file is removed).
+fn putAtomic(full: string, data: ptr, n: int): bool {
+    let tmp = join4(full, ".tmp", "", "");
+    let dst = join4(full, "", "", "");
+    let fd = c.open(tmp.ptr as ptr, O_WRONLY + O_CREAT_TRUNC, 420);
+    let ok = fd >= 0;
+    if ok {
+        ok = c.write(fd as i32, data, n) == n;
+        c.close(fd);
+    }
+    if ok { ok = c.rename(tmp.ptr as ptr, dst.ptr as ptr) == 0; }
+    if !ok { c.unlink(tmp.ptr as ptr); }
+    c.free(tmp.ptr as ptr);
+    c.free(dst.ptr as ptr);
+    return ok;
+}
+
+/// Make every parent directory of `full` (a NUL-terminated buffer) below its first `skip` bytes.
+fn mkParents(full: []u8, skip: int) {
+    for i in skip..full.len - 1 {
+        if full[i] == 47 {
+            full[i] = 0;
+            c.mkdir(full.ptr as ptr, 493);
+            full[i] = 47;
+        }
+    }
+}
+
+/// Stream one asset to `<dest>/<rel>` (tmp file, then rename). `buf` is the shared copy buffer.
+fn copyOne(src: Source, dest: string, rel: string, buf: ptr): bool {
+    let open = src.open;
+    let read = src.read;
+    let close = src.close;
+    let size = src.size;
+    let from = join4(rel, "", "", "");
+    let full = join4(dest, "/", rel, "");
+    let tmpPath = join4(dest, "/", rel, ".tmp");
+    mkParents(full, dest.len + 1);
+    let ok = false;
+    let h = open(from.ptr as ptr);
+    if h != 0 {
+        let fd = c.open(tmpPath.ptr as ptr, O_WRONLY + O_CREAT_TRUNC, 420);
+        if fd >= 0 {
+            ok = true;
+            let total = 0;
+            while true {
+                let got = read(h, buf, CHUNK);
+                if got < 0 { ok = false; }
+                if got <= 0 { break; }
+                if c.write(fd as i32, buf, got) != got { ok = false; break; }
+                total += got;
+            }
+            // SDL_RWread gives 0 for both EOF and error: a short copy must not be renamed into place
+            let want = size(h);
+            if ok && want >= 0 && total != want { ok = false; }
+            c.close(fd);
+        }
+        close(h);
+    }
+    if ok { ok = c.rename(tmpPath.ptr as ptr, full.ptr as ptr) == 0; }
+    if !ok { c.unlink(tmpPath.ptr as ptr); }
+    c.free(from.ptr as ptr);
+    c.free(full.ptr as ptr);
+    c.free(tmpPath.ptr as ptr);
+    return ok;
+}
+
+/// True when `<dest>/j3assets.stamp` holds exactly `stamp`.
+fn stampMatches(dest: string, stamp: string): bool {
+    let name = join4(dest, "/", STAMP_FILE, "");
+    let fd = c.open(name.ptr as ptr, 0, 0);
+    c.free(name.ptr as ptr);
+    if fd < 0 { return false; }
+    let buf = c.malloc(stamp.len + 1);
+    let got = c.read(fd, buf, stamp.len + 1);
+    c.close(fd);
+    let bytes: []u8 = @slice(buf, stamp.len + 1);
+    let same = got == stamp.len;
+    if same {
+        for i in 0..stamp.len { if bytes[i] != stamp[i] { same = false; } }
+    }
+    c.free(buf);
+    return same;
+}
+
+/// Copy the files listed in `manifest` from `src` into `dest` unless `dest` already holds the manifest's stamp.
+pub fn sync(manifest: string, src: Source, dest: string): Report {
+    let r = Report { manifest: false, upToDate: false, copied: 0, failed: 0, rejected: 0 };
+    let n = manifest.len;
+    let e = 0;
+    while e < n && manifest[e] != 10 { e += 1; }
+    // header: "j3assets 1 <stamp>"
+    let head: string = manifest[0..e];
+    if head.len > 0 && head[head.len - 1] == 13 { head = head[0..head.len - 1]; }
+    let pre = "j3assets 1 ";
+    let ok = head.len > pre.len && dest.len <= MAX_DEST;
+    if ok { for i in 0..pre.len { if head[i] != pre[i] { ok = false; } } }
+    let stamp: string = "";
+    if ok {
+        stamp = head[pre.len..head.len];
+        for i in 0..stamp.len { if stamp[i] == 32 || stamp[i] == 9 { ok = false; } }
+    }
+    if !ok {
+        say(src, "assets: bad manifest header (want `j3assets 1 <stamp>`), nothing copied");
+        return r;
+    }
+    r.manifest = true;
+    if stampMatches(dest, stamp) {
+        r.upToDate = true;
+        return r;
+    }
+    let buf = c.malloc(CHUNK);
+    let s = e + 1;
+    while s < n {
+        let t = s;
+        while t < n && manifest[t] != 10 { t += 1; }
+        let line: string = manifest[s..t];
+        if line.len > 0 && line[line.len - 1] == 13 { line = line[0..line.len - 1]; }
+        s = t + 1;
+        if line.len == 0 { continue; }
+        if !safePath(line) {
+            say(src, "assets: rejected unsafe path in manifest");
+            r.rejected += 1;
+        } else if copyOne(src, dest, line, buf) {
+            r.copied += 1;
+        } else {
+            let msg = join4("assets: failed to copy ", line, "", "");
+            say(src, msg as string);
+            c.free(msg.ptr as ptr);
+            r.failed += 1;
+        }
+    }
+    c.free(buf);
+    if r.failed == 0 {
+        let full = join4(dest, "/", STAMP_FILE, "");
+        let wrote = putAtomic(full[0..full.len - 1] as string, stamp.ptr as ptr, stamp.len);
+        c.free(full.ptr as ptr);
+        if !wrote { say(src, "assets: could not write stamp; will recopy next launch"); }
+    }
+    return r;
+}
+
+/// Android start-up step: sync the APK's assets into `dest`, then `chdir` there (also without a
+/// manifest or after failures, so saves still get a writable cwd). False when `chdir` failed.
+pub fn boot(src: Source, dest: string): bool {
+    let clock = src.ms;
+    let t0 = clock();
+    let m = readAll(src, MANIFEST);
+    if m.len == 0 {
+        say(src, "assets: no manifest, using internal storage as cwd");
+    } else {
+        let r = sync(m as string, src, dest);
+        c.free(m.ptr as ptr);
+        report(src, r, clock() - t0);
+    }
+    let d = join4(dest, "", "", "");
+    let ok = c.chdir(d.ptr as ptr) == 0;
+    c.free(d.ptr as ptr);
+    if !ok { say(src, "assets: chdir to internal storage failed"); }
+    return ok;
+}
+
+fn num(out: []u8, at: int, v: int): int {
+    let digits = 1;
+    let t = v / 10;
+    while t > 0 { digits += 1; t = t / 10; }
+    let x = v;
+    let i = digits;
+    while i > 0 {
+        i -= 1;
+        out[at + i] = (48 + x % 10) as u8;
+        x = x / 10;
+    }
+    return at + digits;
+}
+
+fn report(src: Source, r: Report, ms: int) {
+    let buf: []u8 = @slice(c.malloc(160), 160);
+    let k = 0;
+    let head = "assets: ";
+    if r.upToDate { head = "assets: up to date"; }
+    for i in 0..head.len { buf[k] = head[i]; k += 1; }
+    if !r.upToDate && r.manifest {
+        let a = "copied ";
+        for i in 0..a.len { buf[k] = a[i]; k += 1; }
+        k = num(buf, k, r.copied);
+        let b = ", failed ";
+        for i in 0..b.len { buf[k] = b[i]; k += 1; }
+        k = num(buf, k, r.failed);
+        let d = ", rejected ";
+        for i in 0..d.len { buf[k] = d[i]; k += 1; }
+        k = num(buf, k, r.rejected);
+    }
+    let tail = " in ";
+    for i in 0..tail.len { buf[k] = tail[i]; k += 1; }
+    k = num(buf, k, ms);
+    buf[k] = 109;
+    buf[k + 1] = 115;
+    buf[k + 2] = 0;
+    let log = src.log;
+    log(buf.ptr as ptr);
+    c.free(buf.ptr as ptr);
+}
