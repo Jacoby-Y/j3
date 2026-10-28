@@ -1,3 +1,0 @@
-# Gameplay/feature plans
-
-#### notes:
