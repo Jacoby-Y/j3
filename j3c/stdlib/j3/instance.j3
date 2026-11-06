@@ -1,0 +1,389 @@
+/// One running copy of a program, and messages from later copies to it (Linux: an abstract Unix socket named after
+/// `name` and the user id; nothing on disk, gone when the process ends, same user only). For a launcher bound in the
+/// compositor (Wayland has no global hotkeys): `jzero --toggle` finds the running copy, hands it its arguments and exits.
+///
+///     fn main() {
+///         if !instance.claim("jzero") { return; }      // another copy runs: it got our argv
+///         let app = App<W>.create(...);
+///         app.onMessage(fn(w: &W, args: []string) { ... });   // args[0] is the program, like `sys.arg`
+///         app.run();
+///     }
+///
+/// Request/reply, for a control CLI that needs an answer (`jzero ls`): the client calls `request`, which never claims the
+/// name, and blocks for the reply. The running copy gets a `Request` (`App.onRequest`, or `nextRequest` without `App`)
+/// and calls `reply` now or frames later; keep the handle (it is a copyable id) for a deferred answer.
+///
+///     match instance.request("jzero", ["jzero", "ls"], 2000) {     // timeoutMs <= 0 waits forever
+///         Option.Some(out) { printLn(out); }
+///         Option.None { printLn("jzero: not running"); }           // no copy, socket failure, or timeout
+///     }
+///     app.onRequest(fn(w: &W, req: Request) {
+///         if req.args()[1] == "ls" { req.reply("1 main"); }       // args()[0] is the sender's program
+///         else { w.waiters.push(req); }                            // replied later; check req.alive() meanwhile
+///     });
+///
+/// A request never fires `onMessage`. `reply` sends and closes; a second call, or a reply to a client that is gone
+/// (killed, Ctrl+C: `alive()` is false), does nothing. Replies have no size limit (the client grows its buffer).
+/// Without `App`: call `instance.next()` / `instance.nextRequest()` each frame. Main thread only (server side).
+/// ponytail: Linux only (other targets load `instance_other.j3`: `claim` is always true, nothing arrives, `request` is
+/// None); messages and request arguments over 64 KB are cut; at most 64 requests wait for a reply at once (more are
+/// closed unanswered, the client gets None); `reply` blocks the main thread until the client has read the text.
+
+module j3.instance;
+
+use j3.option.Option;
+use j3.sys;
+use j3.sys.{ POLLERR, POLLHUP, POLLIN };
+
+const SYS_read = 0;
+const SYS_write = 1;
+const SYS_close = 3;
+const SYS_socket = 41;
+const SYS_connect = 42;
+const SYS_bind = 49;
+const SYS_listen = 50;
+const SYS_accept4 = 288;
+const SYS_sendto = 44;
+const SYS_shutdown = 48;
+const MSG_NOSIGNAL = 16384;
+const SHUT_WR = 1;
+/// First byte of a request's payload (a message starts with its argv[0], never this byte).
+const REQ_MARK = 1;
+const MAX_REQ = 64;
+const SYS_getuid = 102;
+const AF_UNIX = 1;
+/// SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC
+const SOCK_FLAGS = 1 + 2048 + 524288;
+const MAX_MSG = 65536;
+const MAX_ARGS = 256;
+
+#[singleton]
+let FD: int = -1;
+#[singleton]
+let ADDR: [110]u8;
+#[singleton]
+let ADDR_LEN: int = 0;
+#[singleton]
+let BUF: [65536]u8;
+#[singleton]
+let ARGS: [256]string;
+#[singleton]
+let NARGS: int = 0;
+#[singleton]
+let DIGITS: [12]u8;
+/// Bytes of the connection `take` read last.
+#[singleton]
+let RBUF: [65536]u8;
+#[singleton]
+let RLEN: int = 0;
+/// A message `nextRequest` took while looking for requests, handed out by the next `next`.
+#[singleton]
+let PARKED: bool = false;
+// Request slots: 0 free, 1 waiting for `nextRequest`, 2 handed out (waiting for `reply`).
+#[singleton]
+let REQ_STATE: [64]int;
+#[singleton]
+let REQ_FD: [64]int;
+#[singleton]
+let REQ_GEN: [64]int;
+#[singleton]
+let REQ_SEQ: [64]int;
+#[singleton]
+let REQ_MEM: [64]ptr;
+#[singleton]
+let REQ_MEMLEN: [64]int;
+#[singleton]
+let REQ_ARGS: [64][]string;
+#[singleton]
+let SEQ: int = 0;
+
+/// A request from `instance.request` that expects an answer: a copyable handle, valid until `reply`.
+pub struct Request {
+    slot: int;
+    gen: int;
+
+    /// The client's arguments (`args()[0]` is its program). Valid until `reply`; empty after it.
+    fn args(this: Request): []string {
+        if !this.live() { return ARGS[0..0]; }
+        return REQ_ARGS[this.slot];
+    }
+
+    /// Send `text` as the answer and close the connection. A second call, or one after the client left, does nothing.
+    fn reply(this: Request, text: string) {
+        if !this.live() { return; }
+        let fd = REQ_FD[this.slot];
+        let m: u8 = u8(REQ_MARK);
+        if sendAll(fd, &m as ptr, 1) {
+            sendAll(fd, text.ptr as ptr, text.len);
+        }
+        @syscall(SYS_close, fd);
+        sys.munmap(REQ_MEM[this.slot], REQ_MEMLEN[this.slot]);
+        REQ_STATE[this.slot] = 0;
+        REQ_GEN[this.slot] += 1;
+    }
+
+    /// False once the client disconnected (killed, Ctrl+C, timed out) or the request was replied to.
+    fn alive(this: Request): bool {
+        if !this.live() { return false; }
+        // The client shut down its write side after sending; POLLHUP means it closed the socket entirely.
+        let pfd: [2]i32 = [i32(REQ_FD[this.slot]), 0];
+        if sys.pollFds(&pfd[0] as ptr, 1, 0) <= 0 { return true; }
+        let rev = (int(pfd[1]) / 65536) % 65536;
+        if rev < 0 { rev += 65536; }
+        return rev & (POLLHUP | POLLERR) == 0;
+    }
+
+    fn live(this: Request): bool {
+        return this.slot >= 0 && this.slot < MAX_REQ && REQ_STATE[this.slot] == 2 && REQ_GEN[this.slot] == this.gen;
+    }
+}
+
+/// Become the one copy named `name` and return true, or, when another copy already holds it, send it this process's
+/// arguments and return false (the caller exits). True also when sockets fail, so a broken setup still starts.
+pub fn claim(name: string): bool {
+    address(name);
+    let fd = @syscall(SYS_socket, AF_UNIX, SOCK_FLAGS, 0);
+    if fd < 0 {
+        return true;
+    }
+    if @syscall(SYS_bind, fd, &ADDR[0] as ptr, ADDR_LEN) >= 0 {
+        @syscall(SYS_listen, fd, 8);
+        FD = fd;
+        return true;
+    }
+    @syscall(SYS_close, fd);
+    // Taken: hand our argv over. A blocking socket so the write finishes before we exit.
+    let c = @syscall(SYS_socket, AF_UNIX, 1 + 524288, 0);
+    if c < 0 || @syscall(SYS_connect, c, &ADDR[0] as ptr, ADDR_LEN) < 0 {
+        // A stale name cannot happen with abstract sockets; a failed connect means a copy that does not listen.
+        return false;
+    }
+    for i in 0..sys.argCount() {
+        let a = sys.arg(i);
+        sendAll(c, a.ptr as ptr, a.len);
+        let z: u8 = 0;
+        sendAll(c, &z as ptr, 1);
+    }
+    @syscall(SYS_close, c);
+    return false;
+}
+
+/// Take one message from a later copy: true when `args()` now holds its arguments. Never blocks.
+pub fn next(): bool {
+    if PARKED {
+        PARKED = false;
+        return true;
+    }
+    while take() {
+        if !queueRequest() {
+            parkMessage();
+            PARKED = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Take one request from `instance.request`, or None when none is waiting. Never blocks.
+pub fn nextRequest(): Option<Request> {
+    while take() {
+        if !queueRequest() {
+            // ponytail: one parked message; a second one before `next` runs replaces it.
+            parkMessage();
+        }
+    }
+    let best = 0 - 1;
+    for i in 0..MAX_REQ {
+        if REQ_STATE[i] == 1 && (best < 0 || REQ_SEQ[i] < REQ_SEQ[best]) { best = i; }
+    }
+    if best < 0 { return Option.None; }
+    REQ_STATE[best] = 2;
+    return Option.Some(Request { slot: best, gen: REQ_GEN[best] });
+}
+
+/// Send `args` to the running copy named `name` and wait for its reply, at most `timeoutMs` (<= 0 waits forever).
+/// None when no copy runs, the socket fails, the copy closes without replying, or the time runs out. Never claims
+/// `name`, so a control command fails instead of starting the program.
+pub fn request(name: string, args: []string, timeoutMs: int): Option<string> {
+    address(name);
+    let c = @syscall(SYS_socket, AF_UNIX, 1 + 524288, 0);
+    if c < 0 { return Option.None; }
+    if @syscall(SYS_connect, c, &ADDR[0] as ptr, ADDR_LEN) < 0 {
+        @syscall(SYS_close, c);
+        return Option.None;
+    }
+    let m: u8 = u8(REQ_MARK);
+    let ok = sendAll(c, &m as ptr, 1);
+    for i in 0..args.len {
+        let z: u8 = 0;
+        ok = ok && sendAll(c, args[i].ptr as ptr, args[i].len) && sendAll(c, &z as ptr, 1);
+    }
+    @syscall(SYS_shutdown, c, SHUT_WR);
+    let deadline = sys.monotonicMs() + timeoutMs;
+    let cap = 65536;
+    let buf = sys.mmapAnon(cap);
+    let n = 0;
+    while ok {
+        let wait = 0 - 1;
+        if timeoutMs > 0 {
+            wait = deadline - sys.monotonicMs();
+            if wait <= 0 { ok = false; break; }
+        }
+        let pfd: [2]i32 = [i32(c), i32(POLLIN)];
+        if sys.pollFds(&pfd[0] as ptr, 1, wait) <= 0 { ok = false; break; }
+        if n == cap {
+            let bigger = sys.mmapAnon(cap * 2);
+            copyBytes(bigger, buf, n);
+            sys.munmap(buf, cap);
+            buf = bigger;
+            cap = cap * 2;
+        }
+        let r = @syscall(SYS_read, c, (buf as int + n) as ptr, cap - n);
+        if r == 0 { break; }
+        if r < 0 && sys.errno() != 4 { ok = false; break; }
+        if r > 0 { n += r; }
+    }
+    @syscall(SYS_close, c);
+    // The server marks a reply with a leading byte, so closing without one reads as None, not "".
+    if !ok || n == 0 {
+        sys.munmap(buf, cap);
+        return Option.None;
+    }
+    return Option.Some([]u8 { ptr: (buf as int + 1) as &u8, len: n - 1 } as string);
+}
+
+/// Accept one pending connection and read it to the end into `RBUF`. False when nothing waits.
+fn take(): bool {
+    if FD < 0 {
+        return false;
+    }
+    let c = @syscall(SYS_accept4, FD, 0, 0, 524288);
+    if c < 0 {
+        return false;
+    }
+    // The sender writes then closes or shuts down writing; read to the end (the accepted socket is blocking).
+    let n = 0;
+    while n < MAX_MSG {
+        let r = @syscall(SYS_read, c, &RBUF[n] as ptr, MAX_MSG - n);
+        if r <= 0 {
+            break;
+        }
+        n += r;
+    }
+    RLEN = n;
+    if n > 0 && RBUF[0] == u8(REQ_MARK) {
+        TAKEN_FD = c;
+    } else {
+        TAKEN_FD = 0 - 1;
+        @syscall(SYS_close, c);
+    }
+    return true;
+}
+
+#[singleton]
+let TAKEN_FD: int = -1;
+
+/// When the connection `take` read is a request, put it in a free slot (or close it when all are busy) and return true.
+fn queueRequest(): bool {
+    if TAKEN_FD < 0 { return false; }
+    let slot = 0 - 1;
+    for i in 0..MAX_REQ {
+        if slot < 0 && REQ_STATE[i] == 0 { slot = i; }
+    }
+    if slot < 0 {
+        @syscall(SYS_close, TAKEN_FD);
+        return true;
+    }
+    // One block per request: the argument bytes, then the string slices pointing into them.
+    let bytes = (RLEN + 7) / 8 * 8;
+    let len = bytes + MAX_ARGS * @sizeof(string);
+    let mem = sys.mmapAnon(len);
+    copyBytes(mem, &RBUF[1] as ptr, RLEN - 1);
+    let out: []string = @slice((mem as int + bytes) as ptr, MAX_ARGS);
+    let k = 0;
+    let s = 0;
+    for i in 0..RLEN - 1 {
+        if RBUF[i + 1] == 0 && k < MAX_ARGS {
+            out[k] = []u8 { ptr: (mem as int + s) as &u8, len: i - s } as string;
+            k += 1;
+            s = i + 1;
+        }
+    }
+    REQ_FD[slot] = TAKEN_FD;
+    REQ_MEM[slot] = mem;
+    REQ_MEMLEN[slot] = len;
+    REQ_ARGS[slot] = out[0..k];
+    REQ_SEQ[slot] = SEQ;
+    SEQ += 1;
+    REQ_STATE[slot] = 1;
+    return true;
+}
+
+/// Copy the message `take` read into `BUF` and split it into `ARGS`; sets `PARKED`.
+fn parkMessage() {
+    copyBytes(&BUF[0] as ptr, &RBUF[0] as ptr, RLEN);
+    let n = RLEN;
+    NARGS = 0;
+    let s = 0;
+    for i in 0..n {
+        if BUF[i] == 0 && NARGS < MAX_ARGS {
+            ARGS[NARGS] = []u8 { ptr: &BUF[s], len: i - s } as string;
+            NARGS += 1;
+            s = i + 1;
+        }
+    }
+    PARKED = true;
+}
+
+/// The arguments of the message `next` took (valid until the next `next`). `args()[0]` is the sender's program.
+pub fn args(): []string {
+    return ARGS[0..NARGS];
+}
+
+fn copyBytes(dst: ptr, src: ptr, n: int) {
+    let d: []u8 = @slice(dst, n);
+    let s: []u8 = @slice(src, n);
+    for i in 0..n { d[i] = s[i]; }
+}
+
+/// Write all `n` bytes to socket `fd`; false when the peer is gone (MSG_NOSIGNAL: no SIGPIPE).
+fn sendAll(fd: int, p: ptr, n: int): bool {
+    let done = 0;
+    while done < n {
+        let r = @syscall(SYS_sendto, fd, (p as int + done) as ptr, n - done, MSG_NOSIGNAL, 0, 0);
+        if r <= 0 {
+            if r < 0 && sys.errno() == 4 { continue; }
+            return false;
+        }
+        done += r;
+    }
+    return true;
+}
+
+/// `sockaddr_un` with an abstract name: family, NUL, `j3-<name>-<uid>`.
+fn address(name: string) {
+    ADDR[0] = u8(AF_UNIX);
+    ADDR[1] = 0;
+    ADDR[2] = 0;
+    let n = 3;
+    let pre = "j3-";
+    for i in 0..pre.len { ADDR[n] = pre[i]; n += 1; }
+    for i in 0..name.len {
+        if n < 90 { ADDR[n] = name[i]; n += 1; }
+    }
+    ADDR[n] = 45;
+    n += 1;
+    let uid = @syscall(SYS_getuid);
+    let k = 0;
+    while k == 0 || (uid > 0 && k < 12) {
+        DIGITS[k] = u8(48 + uid % 10);
+        uid = uid / 10;
+        k += 1;
+    }
+    while k > 0 {
+        k -= 1;
+        ADDR[n] = DIGITS[k];
+        n += 1;
+    }
+    ADDR_LEN = n;
+}

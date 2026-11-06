@@ -1,0 +1,508 @@
+/// ANSI/VT escape parser: the Paul Williams DEC VT500 state machine plus UTF-8 decoding in the ground
+/// state. Bytes go in with `feed(&parser, bytes, &sink)` (or `parser.feed(bytes, &sink)`) in any chunking (a sequence or a multibyte character may be
+/// split across calls); decoded events go to a `Sink`. `sgr` applies a CSI `m` to a `Style`, `strip` and
+/// `toRuns` turn a string with escapes into plain text and styled spans.
+/// Never allocates after `Parser.new`: params, intermediates and the OSC buffer are reused and capped.
+/// APC strings (`ESC _ ... ESC \\`, kitty graphics) go to `Sink.apc`, up to `MAX_APC` bytes.
+/// Dropped on purpose: DCS strings, SOS/PM strings, C1 controls (0x80-0x9f are UTF-8 bytes here).
+/// Any thread: no module state (a `Parser` is one value for one stream).
+
+module j3.term.ansi;
+
+use j3.memory.Arena;
+use j3.memory.List;
+use j3.term.Color;
+use j3.term.Style;
+use j3.term.pushUtf8;
+use j3.term.ATTR_BOLD;
+use j3.term.ATTR_DIM;
+use j3.term.ATTR_ITALIC;
+use j3.term.ATTR_UNDERLINE;
+use j3.term.ATTR_BLINK;
+use j3.term.ATTR_INVERSE;
+use j3.term.ATTR_HIDDEN;
+use j3.term.ATTR_STRIKE;
+use j3.text.Text;
+
+/// Most CSI parameters (and `:` sub-parameters) kept; the rest are dropped.
+pub const MAX_PARAMS = 32;
+/// Longest OSC payload kept in bytes; a longer one is discarded whole (`osc` is not called).
+pub const MAX_OSC = 4096;
+/// Longest APC payload kept in bytes (a kitty graphics chunk is at most 4096 bytes of data); a longer one is
+/// discarded whole.
+pub const MAX_APC = 8192;
+
+const GROUND = 0;
+const ESCAPE = 1;
+const ESC_INTER = 2;
+const CSI_ENTRY = 3;
+const CSI_PARAM = 4;
+const CSI_INTER = 5;
+const CSI_IGNORE = 6;
+const OSC_STRING = 7;
+const DCS_ENTRY = 8;
+const DCS_PARAM = 9;
+const DCS_INTER = 10;
+const DCS_PASS = 11;
+const DCS_IGNORE = 12;
+const SOS_PM_APC = 13;
+const APC_STRING = 14;
+
+const REPLACEMENT: i32 = 65533;
+
+// What `byte` reports; the operand is `Parser.out`. The parser itself is not generic (a generic fn
+// body is resolved in its caller's module), so `feed` is the one generic fn and dispatches on these.
+const ACT_NONE = 0;
+const ACT_PRINT = 1;
+const ACT_EXEC = 2;
+const ACT_CSI = 3;
+const ACT_ESC = 4;
+const ACT_OSC = 5;
+const ACT_APC = 6;
+
+/// What a parser reports. Methods are called in stream order, once per decoded item.
+pub trait Sink {
+    /// A printable code point (valid, or U+FFFD for bad UTF-8).
+    fn print(this: &Self, cp: i32);
+    /// A C0 control byte (0x00-0x1f) other than ESC: BEL, BS, HT, LF, CR, ...
+    fn exec(this: &Self, c0: u8);
+    /// A CSI sequence. `p` is valid only during the call.
+    fn csi(this: &Self, p: &Params, final: u8);
+    /// An ESC sequence (`ESC ( B` is inter `'('`, final `'B'`). `inter` packs up to 3 bytes, first in the low byte.
+    /// `ESC \` (ST) is not reported.
+    fn esc(this: &Self, inter: int, final: u8);
+    /// An OSC string without its number-terminator framing: `0;title`. Ended by BEL or ST. Valid only during the call.
+    fn osc(this: &Self, bytes: string);
+    /// An APC string (`ESC _ Gkeys;data ESC \\` is `Gkeys;data`). Valid only during the call. A sink with no use
+    /// for it has an empty one.
+    fn apc(this: &Self, bytes: string);
+}
+
+/// The parameters of one CSI. Flat storage: `38:2::1:2:3;4` is `38 2 -1 1 2 3 4` with a colon flag on
+/// elements 1..5. A group is a top-level parameter with its `:` sub-parameters. -1 means empty.
+pub struct Params {
+    v: []i32;
+    colon: []u8;
+    n: int;
+    /// Private marker `<`, `=`, `>` or `?` (0 none), as in `CSI ? 25 l`.
+    marker: u8;
+    /// Intermediate bytes, packed like `Sink.esc` (`CSI SP q` is `' '`).
+    inter: int;
+    ninter: int;
+    curok: bool;
+    bad: bool;
+
+    /// Number of top-level parameters (`CSI m` has 0, `CSI ; m` has 2).
+    fn count(this: &Params): int {
+        let g = 0;
+        for k in 0..this.n {
+            if this.colon[k] == 0 {
+                g += 1;
+            }
+        }
+        return g;
+    }
+
+    /// Flat index of group `i`, or -1.
+    fn start(this: &Params, i: int): int {
+        let g = -1;
+        for k in 0..this.n {
+            if this.colon[k] == 0 {
+                g += 1;
+                if g == i {
+                    return k;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /// Group `i`'s own value, or `def` when absent or empty. `CSI 5 ; H`: `param(1, 1)` is 1.
+    fn param(this: &Params, i: int, def: int): int {
+        let k = this.start(i);
+        if k < 0 || this.v[k] < 0 {
+            return def;
+        }
+        return int(this.v[k]);
+    }
+
+    /// How many `:` sub-parameters group `i` has (`38:5:9` has 2).
+    fn subCount(this: &Params, i: int): int {
+        let k = this.start(i);
+        if k < 0 {
+            return 0;
+        }
+        let e = k + 1;
+        while e < this.n && this.colon[e] != 0 {
+            e += 1;
+        }
+        return e - k - 1;
+    }
+
+    /// Sub-parameter `j` (1-based; 0 is `param`) of group `i`, or `def` when absent or empty.
+    fn sub(this: &Params, i: int, j: int, def: int): int {
+        let g = this.start(i);
+        if g < 0 || j < 0 || j > this.subCount(i) {
+            return def;
+        }
+        let k = g + j;
+        if this.v[k] < 0 {
+            return def;
+        }
+        return int(this.v[k]);
+    }
+}
+
+/// The parser state. Make one per byte stream with `Parser.new`.
+pub struct Parser {
+    state: int;
+    p: Params;
+    osc: []u8;
+    oscLen: int;
+    oscBad: bool;
+    apc: []u8;
+    cp: i32;
+    need: int;
+    min: i32;
+    /// What `byte` found (an `ACT_*`), its operand, and whether the same byte must be run again.
+    out: i32;
+    redo: bool;
+
+    /// A parser in the ground state; its buffers come from `arena` (about 12.5 KB).
+    fn new(arena: &Arena): Parser {
+        return Parser {
+            state: GROUND,
+            p: Params {
+                v: arena.alloc::<i32>(MAX_PARAMS),
+                colon: arena.alloc::<u8>(MAX_PARAMS),
+                n: 0,
+                marker: 0,
+                inter: 0,
+                ninter: 0,
+                curok: false,
+                bad: false,
+            },
+            osc: arena.alloc::<u8>(MAX_OSC),
+            oscLen: 0,
+            oscBad: false,
+            apc: arena.alloc::<u8>(MAX_APC),
+            cp: 0,
+            need: 0,
+            min: 0,
+            out: 0,
+            redo: false,
+        };
+    }
+
+    /// Back to ground, dropping a half-read sequence or character.
+    fn reset(this: &Parser) {
+        this.state = GROUND;
+        this.need = 0;
+        clear(this);
+    }
+}
+
+/// Parse `bytes`, calling `sink`. Any split of a stream gives the same calls as feeding it whole.
+/// A free fn so `S` is inferred: `parser.feed(bytes, &grid)` after `use j3.term.ansi.feed;`.
+pub fn feed<S: Sink>(p: &Parser, bytes: string, sink: &S): void {
+    for i in 0..bytes.len {
+        let b = bytes[i];
+        if p.state == GROUND && p.need == 0 && b >= 0x20 && b < 0x7f {
+            sink.print(i32(b));
+            continue;
+        }
+        let again = true;
+        while again {
+            let act = byte(p, b);
+            again = p.redo;
+            p.redo = false;
+            if act == ACT_PRINT {
+                sink.print(p.out);
+            } else if act == ACT_EXEC {
+                sink.exec(u8(p.out));
+            } else if act == ACT_CSI {
+                sink.csi(&p.p, u8(p.out));
+            } else if act == ACT_ESC {
+                sink.esc(p.p.inter, u8(p.out));
+            } else if act == ACT_OSC {
+                sink.osc((p.osc[0..p.oscLen]) as string);
+            } else if act == ACT_APC {
+                sink.apc((p.apc[0..p.oscLen]) as string);
+            }
+        }
+    }
+}
+
+fn clear(p: &Parser) {
+    p.p.n = 0;
+    p.p.marker = 0;
+    p.p.inter = 0;
+    p.p.ninter = 0;
+    p.p.curok = false;
+    p.p.bad = false;
+    p.oscLen = 0;
+    p.oscBad = false;
+}
+
+fn collect(p: &Parser, b: u8) {
+    if p.p.ninter < 3 {
+        p.p.inter |= int(b) << (8 * p.p.ninter);
+        p.p.ninter += 1;
+    } else {
+        p.p.bad = true;
+    }
+}
+
+/// Start a parameter (`colon`: joined to the previous one by `:`); dropped past `MAX_PARAMS`.
+fn newParam(p: &Parser, colon: bool) {
+    if p.p.n < MAX_PARAMS {
+        p.p.v[p.p.n] = -1;
+        p.p.colon[p.p.n] = if colon { 1 } else { 0 };
+        p.p.n += 1;
+        p.p.curok = true;
+    } else {
+        p.p.curok = false;
+    }
+}
+
+fn paramByte(p: &Parser, b: u8) {
+    if p.p.n == 0 {
+        newParam(p, false);
+    }
+    if b == 0x3b {
+        newParam(p, false);
+    } else if b == 0x3a {
+        newParam(p, true);
+    } else if p.p.curok {
+        let i = p.p.n - 1;
+        let cur = p.p.v[i];
+        if cur < 0 {
+            cur = 0;
+        }
+        cur = cur * 10 + i32(b - 0x30);
+        if cur > 65535 {
+            cur = 65535;
+        }
+        p.p.v[i] = cur;
+    }
+}
+
+fn emit(p: &Parser, act: int, out: i32): int {
+    p.out = out;
+    return act;
+}
+
+fn ground(p: &Parser, b: u8): int {
+    if p.need > 0 {
+        if (b & 0xc0) == 0x80 {
+            p.cp = (p.cp << 6) | i32(b & 0x3f);
+            p.need -= 1;
+            if p.need > 0 {
+                return ACT_NONE;
+            }
+            let c = p.cp;
+            if c < p.min || c > 1114111 || (c >= 55296 && c <= 57343) {
+                c = REPLACEMENT;
+            }
+            return emit(p, ACT_PRINT, c);
+        }
+        // Cut short: report one U+FFFD, then run this byte as the start of something new.
+        p.need = 0;
+        p.redo = true;
+        return emit(p, ACT_PRINT, REPLACEMENT);
+    }
+    if b < 0x20 {
+        if b == 0x1b {
+            clear(p);
+            p.state = ESCAPE;
+            return ACT_NONE;
+        }
+        return emit(p, ACT_EXEC, i32(b));
+    }
+    if b < 0x7f {
+        return emit(p, ACT_PRINT, i32(b));
+    }
+    if b == 0x7f {
+        return ACT_NONE;
+    }
+    if b >= 0xc2 && b <= 0xdf {
+        p.cp = i32(b & 0x1f);
+        p.need = 1;
+        p.min = 128;
+        return ACT_NONE;
+    }
+    if b >= 0xe0 && b <= 0xef {
+        p.cp = i32(b & 0x0f);
+        p.need = 2;
+        p.min = 2048;
+        return ACT_NONE;
+    }
+    if b >= 0xf0 && b <= 0xf4 {
+        p.cp = i32(b & 0x07);
+        p.need = 3;
+        p.min = 65536;
+        return ACT_NONE;
+    }
+    return emit(p, ACT_PRINT, REPLACEMENT);
+}
+
+fn escape(p: &Parser, b: u8): int {
+    if b < 0x30 {
+        collect(p, b);
+        p.state = ESC_INTER;
+        return ACT_NONE;
+    }
+    if p.state == ESCAPE {
+        if b == 0x50 {
+            p.state = DCS_ENTRY;
+            return ACT_NONE;
+        }
+        if b == 0x5b {
+            p.state = CSI_ENTRY;
+            return ACT_NONE;
+        }
+        if b == 0x5d {
+            p.state = OSC_STRING;
+            return ACT_NONE;
+        }
+        if b == 0x5f {
+            p.state = APC_STRING;
+            return ACT_NONE;
+        }
+        if b == 0x58 || b == 0x5e {
+            p.state = SOS_PM_APC;
+            return ACT_NONE;
+        }
+    }
+    p.state = GROUND;
+    if p.p.bad || (b == 0x5c && p.p.inter == 0) {
+        return ACT_NONE;
+    }
+    return emit(p, ACT_ESC, i32(b));
+}
+
+fn csi(p: &Parser, b: u8): int {
+    let st = p.state;
+    if b >= 0x40 {
+        p.state = GROUND;
+        if st != CSI_IGNORE && !p.p.bad {
+            return emit(p, ACT_CSI, i32(b));
+        }
+        return ACT_NONE;
+    }
+    if b >= 0x30 {
+        if st == CSI_INTER || st == CSI_IGNORE {
+            p.state = CSI_IGNORE;
+        } else if b <= 0x3b {
+            paramByte(p, b);
+            p.state = CSI_PARAM;
+        } else if st == CSI_ENTRY {
+            p.p.marker = b;
+            p.state = CSI_PARAM;
+        } else {
+            p.state = CSI_IGNORE;
+        }
+        return ACT_NONE;
+    }
+    if st != CSI_IGNORE {
+        collect(p, b);
+        p.state = CSI_INTER;
+    }
+    return ACT_NONE;
+}
+
+/// DCS and SOS/PM/APC: track the states, keep nothing.
+fn dcs(p: &Parser, b: u8) {
+    let st = p.state;
+    if st == SOS_PM_APC || st == DCS_PASS || st == DCS_IGNORE || b < 0x20 || b == 0x7f {
+        return;
+    }
+    if b >= 0x40 {
+        p.state = DCS_PASS;
+    } else if b >= 0x30 {
+        if st == DCS_INTER || b == 0x3a || (b >= 0x3c && st != DCS_ENTRY) {
+            p.state = DCS_IGNORE;
+        } else {
+            p.state = DCS_PARAM;
+        }
+    } else {
+        p.state = DCS_INTER;
+    }
+}
+
+/// Run one byte through the state machine and say what it completed (an `ACT_*`, operand in `p.out`).
+/// Sets `p.redo` when the same byte must be run again (it ended something and starts something else).
+fn byte(p: &Parser, b: u8): int {
+    let st = p.state;
+    if st == GROUND {
+        return ground(p, b);
+    }
+    if b == 0x18 || b == 0x1a {
+        p.state = GROUND;
+        return emit(p, ACT_EXEC, i32(b));
+    }
+    if b == 0x1b {
+        if st == OSC_STRING || st == APC_STRING {
+            // Report the string now, then run the ESC from ground (which clears the buffer after).
+            p.state = GROUND;
+            p.redo = true;
+            if p.oscBad {
+                return ACT_NONE;
+            }
+            return if st == APC_STRING { ACT_APC } else { ACT_OSC };
+        }
+        clear(p);
+        p.state = ESCAPE;
+        return ACT_NONE;
+    }
+    if st == APC_STRING {
+        // Bytes go to `apc` (length in `oscLen`); ESC ends it above, as ST.
+        if p.oscLen < MAX_APC {
+            p.apc[p.oscLen] = b;
+            p.oscLen += 1;
+        } else {
+            p.oscBad = true;
+        }
+        return ACT_NONE;
+    }
+    if st == OSC_STRING {
+        if b == 0x07 {
+            p.state = GROUND;
+            if p.oscBad {
+                return ACT_NONE;
+            }
+            return ACT_OSC;
+        }
+        if b >= 0x20 && b != 0x7f {
+            if p.oscLen < MAX_OSC {
+                p.osc[p.oscLen] = b;
+                p.oscLen += 1;
+            } else {
+                p.oscBad = true;
+            }
+        }
+        return ACT_NONE;
+    }
+    if b >= 0x80 {
+        if st < DCS_ENTRY {
+            // A character in the middle of a sequence ends it; the character prints.
+            p.state = GROUND;
+            p.redo = true;
+        }
+        return ACT_NONE;
+    }
+    if st >= DCS_ENTRY {
+        dcs(p, b);
+        return ACT_NONE;
+    }
+    if b < 0x20 {
+        return emit(p, ACT_EXEC, i32(b));
+    }
+    if b == 0x7f {
+        return ACT_NONE;
+    }
+    if st <= ESC_INTER {
+        return escape(p, b);
+    }
+    return csi(p, b);
+}

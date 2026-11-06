@@ -1,12 +1,12 @@
 # J3 roadmap
 
-Non-goals: no GC, borrow checker, traits, drop, capturing closures, or comptime interpreter in v1. Do not CFG-ify check, start a second parser, grow `j3c/src/stdlib/mod.rs`, or add libLLVM / crates.io.
+Non-goals: no GC, borrow checker, trait objects (`dyn`), drop, escaping closures, or comptime interpreter in v1. Do not CFG-ify check, start a second parser, grow `j3c/src/stdlib/mod.rs`, or add libLLVM / crates.io.
 
 `[emit] target` is one triple or an array (`sys.j3` / `sys_windows.j3` / `sys_macos.j3`). `build` writes one binary per triple; `run` uses the host triple.
 
 ## Shipped
 
-- **Language:** typed IR, LLVM (default) and C printers, `--fast`, `--release`. Short-circuit, if-expr arms, `defer`, `+=`, interpolation, wrapping ints, inclusive `..=`, default fields, `@j3ui`, scripts (`.j3s`, bytecode VM plus AOT).
+- **Language:** typed IR, LLVM (default) and C printers, `--fast`, `--release`. Short-circuit, if-expr arms, `defer`, `+=`, interpolation, wrapping ints, inclusive `..=`, default fields, `@j3ui`, scripts (`.j3s`, bytecode VM plus AOT). Small gaps (labels, `/=` `%=`, int `match`, block-scoped `let`, `0b` and bitwise ops), UFCS, closures (`closure(..)`, see `j3c doc lang`), generic fns, traits (`#[impl]`, `j3.cmp`, `j3.data.map`), atomics on more types with memory orders, `f16` storage, SIMD `vec4f`/`vec4i` (LLVM and C), the shader language (`#[shader]`, `@shader`, `j3c doc shaders`), and path deps (`[deps]`).
 - **Tooling:** `j3c lsp` (hover, goto, completion, signature help, outline, import quick-fix, format, cross-buffer diagnostics), `j3c fmt`, `j3c doc`, `j3c size`, the scene editor and MCP server.
 - **Runtime checks:** every check names itself as `file:line: reason` and exits 102; `panic` exits 101. Debug builds on x86-64 Linux install a crash handler, symbolized by `j3c run`.
 - **Threads (Linux):** `j3.thread` (pool, queue, mutex), `#[thread]` globals, `@atomic*`. See Multithreading.
@@ -17,11 +17,26 @@ Non-goals: no GC, borrow checker, traits, drop, capturing closures, or comptime 
 ## Left
 
 - **Scale:** one translation unit per `cc`, and mono re-walks the AST. Measure check vs emit vs clang before touching it.
-- **Rename and `j3.toml` deps.** Language tests stay `cargo test` plus a playable example until packages exist.
+- **Package deps.** Path deps (`[deps]`) shipped; still open: versions or a registry, a dep's assets, hot reload watching dep files.
 - **Ship a Windows binary:** mingw `clang` and SDL import libs. A missing lib stays a link error.
 - **Pack / install:** rpath and asset roots matter once there is a build to hand someone.
 - **Network follow-ups:** macOS and Windows for `j3.net.tcp`/`dns`/`tls` and `j3.proc` (stubs today), keep-alive and pooling, gzip, a non-blocking poll-style HTTP request for the frame thread, an HTTP server, WebSockets, `SSL_CTX` shared across requests, IP-literal certificate checks.
-- **Later:** Wasm, consoles, a J3 shader language, SIMD.
+- **Later:** Wasm, consoles.
+- **Idle frame skipping (plan 029 chunk 26):** `App` sleeps while a `.j3ui` UI is still (`App.idleSkip`, `J3_IDLE_SKIP`); left: skip the draw callback on safety ticks (they repaint unchanged frames), name more timers instead of the 250 ms tick, a per-`Dom` opt-out for apps that mix 3D and UI, check by hand in a real window (caret blink, hover, resize, drag).
+- **J3 shader language follow-ups:** the language, checker, GLSL emitter, `@shader(vs, fs)` and `j3c dump-glsl` shipped (`j3c doc shaders`), and the p2 shader is J3 (`game/p2shader.j3`); still open: port `post.j3`'s blur, bright and fx effects, which are GLSL strings, uniform blocks / std140, MRT, `textureGrad`, integer textures, `gl_FragDepth`, geometry/compute, LSP hover for shader types, `j3c fmt` of `#[..]` attributes (it prints `# [..]`), a clearer error when CPU code names a `#[uniform]` (it says unknown name).
+- **SIMD follow-ups:** `vec4f` / `vec4i` run on LLVM and C (the VM rejects them with a span); no lane masks or compares, no vector consts or global initializers, no wider vectors.
+
+## Later (UI rendering)
+
+From plan 029 phase C (measurements, plan since deleted). Idle skip shipped (chunk 26); the rest was skipped by user decision on 2026-11-01, since the non-DOM scenes are already sub-ms. Hotspot: `bench2d ui 1000` is 2001 draws, gpu ~5.9 ms, cpu ~5.9 ms (two draw calls per card; the batch breaks per card). Others: `paint-mixed` 0.44 ms, `big_ui_test` page 14 0.7 ms per frame.
+
+- **Retained instance ranges per stacking context** (`ui/dom/retain.j3`): rebuild a context's `p2` instances only when its style, layout, text or motion changed. The main CPU cost in the `ui 1000` hotspot.
+- **Partial GPU upload:** keep `p2`'s VBO and upload changed ranges with `glBufferSubData`; orphan when it grows. GLES 3.0 compatible. The GPU half of the `ui 1000` hotspot.
+- **Layer texture cache:** `beginLayer`, backdrop blur and big shadows render to a cached texture with an LRU cap. `big_ui_test` page 13 spends 0.2 ms in blur and 0.2 ms in layers.
+- **Damage regions:** persistent offscreen buffer, scissor to the changed rects, full redraw on resize or many rects.
+- **Specialized paint shaders:** split `p2` into rect, round rect, text, gradient and shadow variants in the J3 shader language, batching by variant without breaking paint order.
+- **SIMD in hot CPU loops:** instance transform and clip math, `p2TextRun` glyph positions, flex and grid sizing. Profile first.
+- **SDF text atlas:** one atlas per font for all sizes; check small-size text in the goldens before switching.
 
 ## Build speed
 
@@ -51,9 +66,11 @@ Out of scope: exceptions, unwinding, `defer` on panic.
 
 Not blockers; the games compile without any of this.
 
-- **Literals on the left of `+ - * /`.** An untyped left literal becomes `int` or `f64`, so `2 * far` fails where `far * 2` works. This costs ~37 `f32(0) -` sites and ~70 `f32(<number>)` casts. Fix: an untyped left literal takes the right operand's or the destination's type. Do not change the no-context default away from `f64`.
 - **Stdlib only:** `Vec2.xy` (mirror of `Vec3.xyz`).
-- **Not worth it yet:** int `match`, UFCS, `f16`, labeled break, block-scoping every `let`.
+- **`f16` follow-ups:** storage only; no arithmetic (convert with `f32(h)`), no interpolation, no `const` of type `f16`, not a `j3.gpu` vertex attribute (half attributes), not in `.j3s`.
+- **Generic fn follow-ups:** the return type is never inferred; methods of non-generic structs cannot infer their own type params (still `::<T>`); instance symbol names embed the type text, so two same-named types from different modules as `T` could collide when `T` is not in the signature.
+- **Trait follow-ups:** bodies are checked per instance, not once against the bounds (needs a placeholder type through lowering); `#[impl]` fns are found by `x.m()` in every module, not only where a trait with `m` is imported; a bound is a bare name (`T: Eq`, not `T: cmp.Eq`); `j3c fmt` spaces generics and attributes badly (`fn f < T >`, `# [impl]`); no `where`, default methods, supertraits, generic traits or `Default`/`Debug` traits. `Map` has no `free` (arena memory) and no closure `forEach`; a `Set` and `List.indexOf` (needs lazy generic-struct methods) are not written.
+- **UFCS follow-ups:** `j3c lsp` completion after `x.` does not list matching free fns yet (it needs the fns visible at the cursor and a first-parameter type test).
 
 ## Multithreading
 
@@ -63,14 +80,14 @@ Goal: let a game move CPU-heavy work (world meshing, generation, pathfinding, as
 
 `j3.thread` (`j3c doc threads` is the guide, `j3c doc recipes threads` a program, `speculative/13_threads.j3`, run on both backends): `spawn`/`join`, `Mutex`, `Cond`, `Queue<T>` (blocking and non-blocking), `Pool` (`submit`, non-blocking `trySubmit`, `pendingJobs`, `wait`, `parallelFor`, `shutdown`), `cores()`. A frame thread feeds the pool with `trySubmit` and drains a results `Queue` with `tryPop`, dropping results whose version stamp went stale; `j3c doc recipes threads` is that program. It is pthreads through `use lib "c"`; libc is always linked, so there is no raw `clone` path.
 
-Language: `#[thread]` on a module `let` (one copy per thread; `thread_local` in LLVM, `_Thread_local` in C) and `@atomicLoad` / `@atomicStore` / `@atomicAdd` / `@atomicCas` on an `int` through a pointer (sequentially consistent). The VM rejects atomics; `#[thread]` is ignored there since scripts run on the owner thread only.
+Language: `#[thread]` on a module `let` (one copy per thread; `thread_local` in LLVM, `_Thread_local` in C) and `@atomicLoad` / `@atomicStore` / `@atomicAdd` / `@atomicSub` / `@atomicExchange` / `@atomicCas` on `int`, `i32`, `u32`, `u64`, `bool`, `ptr` through a `&T`, with an optional memory order (`relaxed`, `acquire`, `release`, `acqrel`, `seqcst` default). The VM rejects atomics; `#[thread]` is ignored there since scripts run on the owner thread only.
 
 Stdlib: `memory.SCRATCH`, `text.cstrScratch`, and `sys.THREAD_NAME` are `#[thread]`. A panic on a named thread prints `[name] ` first. Every thread gets a crash stack, so a stack overflow in a worker still reaches the crash handler (its trace has addresses but not the thread name).
 
 ### Rules of the model
 
 1. **Share by handing off.** A worker owns the buffers it was given; the owner reads results only after a completion signal. Everything written before `unlock`, `signal`, `push`, or an atomic store is visible after the matching `lock`, `wait`, `pop`, or atomic load, and nothing else is ordered. Do not spin on a plain flag.
-2. **Static functions only.** The thread entry is a plain `fn(ptr)`; its state arrives as one `ptr` to a struct the spawner owns. No capturing closures.
+2. **Static functions only.** The thread entry is a plain `fn(ptr)`; its state arrives as one `ptr` to a struct the spawner owns. A capturing closure cannot be a job (`closure(..)` never converts to `fn(ptr)`); only helpers that finish before returning take one (`speculative/lang/closures.j3`).
 3. **One arena per thread.** `Arena` is not shared. `memory.scratch` is per thread; pool workers rewind it after each job.
 4. **Platform calls stay on the owner thread.** GL, SDL, window, audio, and file dialogs are main-thread only, as is all `j3.game`, `j3.gfx`, `j3.scene3d`, `j3.ui`, and `j3.app` state. Workers compute; the main thread uploads and draws.
 5. **Races are the user's to avoid.** No compiler enforcement. Byte-wise reads of data another thread is editing are tolerated only where a version stamp makes the result discardable.
@@ -84,7 +101,6 @@ Stdlib: `memory.SCRATCH`, `text.cstrScratch`, and `sys.THREAD_NAME` are `#[threa
 - **Hot reload:** `j3c run` swaps script code into a running game. Safe today because scripts never run on workers; keep it that way.
 - **Crash traces** do not name the thread (panics do).
 - **Older libc:** before glibc 2.34 pthreads live in `libpthread`; link it when the target is older.
-- **Atomics** are `int` only and have no relaxed or acquire/release forms.
 - **Job priority and cancel.** There is neither; `j3c doc threads` documents the workaround (few jobs in flight, urgent ones first; a per-job `@atomicStore` flag for cancel). Add a real cancel only if a game needs one.
 
 ### Out of scope

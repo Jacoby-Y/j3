@@ -119,6 +119,7 @@ pub(super) fn fill_struct_fields(cx: &mut IrCx, mods: &mut [ModData], i: usize) 
             seen.insert(f.name.name.clone(), ());
             let ty = resolve_field_ty(cx, &f.ty, &path, mods, i, &names)?;
             reject_arena_field(cx, &path, f.name.span, ty)?;
+            reject_closure(cx, &path, f.ty.span, ty, "a struct field")?;
             let fname = cx.intern_name(&f.name.name);
             let default = field_default(cx, &path, ty, &f.ty, &s.type_params, &f.default)?;
             fields.push(FieldDef {
@@ -370,6 +371,7 @@ pub(super) fn collect_enums(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Re
             try_catch: None,
             debug: e.debug,
             span: e.span,
+            ty_args: Vec::new(),
         });
         let ty = cx.ty_enum(id);
         mods[i].types.insert(e.name.name.clone(), ty);

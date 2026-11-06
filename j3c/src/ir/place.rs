@@ -68,6 +68,11 @@ pub enum Proj {
     Len,
     /// Tag of a tagged-union enum. Type is `i32`.
     EnumTag,
+    /// `.x .y .z .w` / `v[0..3]` of a `vec4f` / `vec4i`. `ty` is the lane type.
+    Lane {
+        lane: u8,
+        ty: Ty,
+    },
     /// Payload of a tagged-union variant.
     EnumPayload {
         variant: VariantId,

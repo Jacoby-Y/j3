@@ -1,11 +1,12 @@
 use super::*;
 
 impl<'a> G<'a> {
-    pub(super) fn new(all: &'a [Comp], files: &'a [SrcFile], theme_path: Option<&'a str>, c: &'a Comp, root: bool, slots: &'a Slots) -> G<'a> {
+    pub(super) fn new(all: &'a [Comp], files: &'a [SrcFile], theme_path: Option<&'a str>, icons: &'a [Icon], c: &'a Comp, root: bool, slots: &'a Slots) -> G<'a> {
         G {
             all,
             files,
             theme_path,
+            icons,
             c,
             src: &files[c.fi].text,
             fi: c.fi,
@@ -110,7 +111,7 @@ impl<'a> G<'a> {
     }
 
     /// A string expression from attribute or text parts: a literal, or a template.
-    pub(super) fn string(&mut self, m: Mode, parts: &[Part], at: Range) -> R<()> {
+    pub(super) fn string(&mut self, m: Mode, parts: &[Part], _at: Range) -> R<()> {
         if parts.iter().all(|p| matches!(p, Part::Lit(_))) {
             let mut s = String::new();
             for p in parts {
@@ -121,23 +122,28 @@ impl<'a> G<'a> {
             self.out(m).s(&lit(&s));
             return Ok(());
         }
-        self.out(m).s("`");
+        // One hole: a backtick template (`{s}` of a string is `s` itself, any length).
+        // Text around holes, or several holes: appended into a scratch `Text`, each hole its own
+        // template, so only one number or struct, never the whole string, has to fit a template buffer.
+        let single = parts.len() == 1;
+        if !single {
+            self.out(m).s("Text.scratch()");
+        }
         for p in parts {
             match p {
                 Part::Lit(l) => {
-                    if l.contains('`') || l.contains('\n') {
-                        return err(at.0, at.1, "text next to `{...}` can't hold a backtick");
-                    }
-                    self.out(m).s(l);
+                    self.out(m).s(&format!(".add({})", lit(l)));
                 }
                 Part::Hole(r) => {
-                    self.out(m).s("{");
+                    self.out(m).s(if single { "`{" } else { ".add(`{" });
                     self.rw(m, r.0, r.1, true, true, false)?;
-                    self.out(m).s("}");
+                    self.out(m).s(if single { "}`" } else { "}`)" });
                 }
             }
         }
-        self.out(m).s("`");
+        if !single {
+            self.out(m).s(".str()");
+        }
         Ok(())
     }
 
@@ -369,12 +375,12 @@ impl<'a> G<'a> {
     }
 
     pub fn accepted(tag: &str) -> Vec<&'static str> {
-        let mut v = vec!["id", "class", "class:name", "on:click", "on:mousedown", "on:mouseup", "on:mousemove", "on:wheel", "on:close", "on:contextmenu", "popover", "bind:tooltip", "closedby", "title", "left", "top", "panel", "panel-handle", "panel-resize", "menuitem", "tabindex", "aria-label", "aria-live", "aria-describedby", "aria-selected", "role", "focus-group", "nav-up", "nav-down", "nav-left", "nav-right", "transition:fade", "transition:fly", "transition:slide", "transition:scale", "in:fade", "in:fly", "in:slide", "in:scale", "out:fade", "out:fly", "out:slide", "out:scale", "fly-x", "fly-y", "scale-from", "slide-axis", "transition-easing", "animate:flip", "animate-easing", "anim-delay", "virtual", "row-height", "est-height", "stick-to-bottom", "keep", "bind:at-end", "grid", "on:edit", "draggable", "drag-data", "drag-id", "drag-ghost", "on:dragstart", "on:dragend", "on:dragenter", "on:dragleave", "on:dragover", "on:drop", "bind:this"];
+        let mut v = vec!["id", "class", "class:name", "on:click", "on:mousedown", "on:mousedown|stop", "on:mouseup", "on:mouseup|stop", "on:mousemove", "on:wheel", "on:wheel|stop", "on:close", "on:contextmenu", "on:contextmenu|stop", "popover", "bind:tooltip", "closedby", "title", "left", "top", "panel", "panel-handle", "panel-resize", "window-drag", "menuitem", "tabindex", "aria-label", "aria-live", "aria-describedby", "aria-selected", "role", "focus-group", "nav-up", "nav-down", "nav-left", "nav-right", "transition:fade", "transition:fly", "transition:slide", "transition:scale", "in:fade", "in:fly", "in:slide", "in:scale", "out:fade", "out:fly", "out:slide", "out:scale", "fly-x", "fly-y", "scale-from", "slide-axis", "transition-easing", "animate:flip", "animate-easing", "anim-delay", "virtual", "row-height", "est-height", "stick-to-bottom", "keep", "bind:at-end", "bind:scrollX", "bind:scrollY", "grid", "on:edit", "draggable", "drag-data", "drag-id", "drag-ghost", "on:dragstart", "on:dragend", "on:dragenter", "on:dragleave", "on:dragover", "on:drop", "bind:this"];
         match tag {
             "dialog" => v.extend(["modal", "autoselect"]),
             "label" => v.push("for"),
             "button" => v.extend(["disabled", "default"]),
-            "input" | "textarea" => v.extend(["disabled", "type", "min", "max", "step", "value", "high", "checked", "placeholder", "maxlength", "rows", "rich", "name", "bind:value", "bind:spans", "bind:high", "bind:checked", "bind:group", "on:input", "on:change", "on:submit", "on:trigger", "triggers"]),
+            "input" | "textarea" => v.extend(["disabled", "type", "min", "max", "step", "value", "high", "checked", "placeholder", "maxlength", "rows", "rich", "noprimary", "name", "bind:value", "bind:spans", "bind:high", "bind:checked", "bind:group", "on:input", "on:change", "on:submit", "on:trigger", "triggers"]),
             "select" => v.extend(["disabled", "multiple", "value", "placeholder", "bind:value", "on:input"]),
             "option" => v.extend(["disabled", "value"]),
             "canvas" => v.push("on:draw"),
@@ -382,9 +388,10 @@ impl<'a> G<'a> {
             "progress" => v.extend(["value", "max"]),
             "meter" => v.extend(["value", "min", "max", "low", "high", "optimum"]),
             "glyph" => v.extend(["action", "key", "pad"]),
+            "icon" => v.push("name"),
             "details" => v.extend(["open", "bind:open", "on:toggle"]),
             "svg" => v.push("viewBox"),
-            "path" => v.extend(["d", "fill", "stroke", "stroke-width"]),
+            "path" => v.extend(["d", "fill", "fill-rule", "stroke", "stroke-width"]),
             _ => {}
         }
         v

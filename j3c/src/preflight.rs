@@ -368,6 +368,12 @@ fn collect_string_locals(block: &Block, out: &mut HashMap<LocalId, Vec<u8>>) {
                 collect_string_locals(body, out);
             }
             StmtKind::Block(body) => collect_string_locals(body, out),
+            StmtKind::Switch { cases, default, .. } => {
+                for (_, b) in cases {
+                    collect_string_locals(b, out);
+                }
+                collect_string_locals(default, out);
+            }
             _ => {}
         }
     }
@@ -436,6 +442,12 @@ fn walk_stmt(stmt: &Stmt, visit: &mut dyn FnMut(&Rvalue)) {
             walk_block(body, visit);
         }
         StmtKind::Block(body) => walk_block(body, visit),
+        StmtKind::Switch { cases, default, .. } => {
+            for (_, b) in cases {
+                walk_block(b, visit);
+            }
+            walk_block(default, visit);
+        }
         _ => {}
     }
 }

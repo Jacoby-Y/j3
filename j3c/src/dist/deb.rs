@@ -26,7 +26,13 @@ pub(super) fn build(m: &Manifest, triple: &str, stage: &Path, exe: &Path, dist: 
 
     let icon = match &m.dist.icon {
         Some(rel) => install_icon(&m.root.join(rel), name, &root)?,
-        None => "applications-games".to_string(),
+        None => {
+            // No `[dist] icon`: the J3 logo.
+            for dir in ["pixmaps".to_string(), "icons/hicolor/256x256/apps".to_string()] {
+                write_bytes(&root.join("usr/share").join(dir).join(format!("{name}.png")), super::LOGO_PNG)?;
+            }
+            name.to_string()
+        }
     };
     write(&root.join("usr/share/applications").join(format!("{name}.desktop")), &desktop(m, &icon), 0o644)?;
 
@@ -34,7 +40,7 @@ pub(super) fn build(m: &Manifest, triple: &str, stage: &Path, exe: &Path, dist: 
     let arch = deb_arch(triple);
     let control = stage.join("control");
     let control_text = format!(
-        "Package: {pkg}\nVersion: {}\nArchitecture: {arch}\nMaintainer: {}\nInstalled-Size: {}\n{}Section: games\nPriority: optional\nDescription: {}\n",
+        "Package: {pkg}\nVersion: {}\nArchitecture: {arch}\nMaintainer: {}\nInstalled-Size: {}\n{}Section: {}\nPriority: optional\nDescription: {}\n",
         m.version,
         maintainer(m),
         (tree_size(&root) + 1023) / 1024,
@@ -42,9 +48,17 @@ pub(super) fn build(m: &Manifest, triple: &str, stage: &Path, exe: &Path, dist: 
             d if d.is_empty() => String::new(),
             d => format!("Depends: {d}\n"),
         },
+        m.dist.section,
         m.description.lines().next().unwrap_or(name),
     );
     write(&control.join("control"), &control_text, 0o644)?;
+    for (file, rel) in [("postinst", &m.dist.postinst), ("prerm", &m.dist.prerm)] {
+        if let Some(rel) = rel {
+            let src = m.root.join(rel);
+            let text = fs::read_to_string(&src).map_err(|e| format!("[dist] {file}: {}: {e}", src.display()))?;
+            write(&control.join(file), &text, 0o755)?;
+        }
+    }
 
     normalize_modes(&root)?;
     let control_tar = stage.join("control.tar.gz");
@@ -81,14 +95,32 @@ exec "$app/{program}" "$@"
     )
 }
 
+#[cfg(test)]
+pub(crate) fn desktop_for_test(m: &Manifest) -> String {
+    desktop(m, "icon")
+}
+
 fn desktop(m: &Manifest, icon: &str) -> String {
     let title = if m.dist.title.is_empty() { title_case(&m.name) } else { m.dist.title.clone() };
-    format!(
+    let mut s = format!(
         "[Desktop Entry]\nType=Application\nName={title}\nComment={}\nExec=/usr/bin/{name}\nIcon={icon}\nTerminal=false\nCategories={}\nStartupWMClass={name}\n",
         m.description.lines().next().unwrap_or(""),
         m.dist.categories,
         name = m.name,
-    )
+    );
+    if !m.dist.actions.is_empty() {
+        s.push_str("Actions=");
+        for a in &m.dist.actions {
+            s.push_str(&a.id);
+            s.push(';');
+        }
+        s.push('\n');
+        for a in &m.dist.actions {
+            let exec = if a.exec.is_empty() { String::new() } else { format!(" {}", a.exec) };
+            s.push_str(&format!("\n[Desktop Action {}]\nName={}\nExec=/usr/bin/{}{exec}\n", a.id, a.name, m.name));
+        }
+    }
+    s
 }
 
 /// Copy the icon into the theme folders; returns the desktop file's `Icon=` value.

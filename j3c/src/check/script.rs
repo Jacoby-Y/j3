@@ -62,6 +62,7 @@ pub fn prepare(files: &mut [ParsedFile]) -> Result<(), CheckError> {
                             ty: f.ty.clone(),
                             value: f.default.clone(),
                             thread: false,
+                            uniform: false,
                         }));
                     }
                 }
@@ -84,6 +85,7 @@ pub fn prepare(files: &mut [ParsedFile]) -> Result<(), CheckError> {
                         name: s.name.clone(),
                         ty,
                         embedded: false,
+                        flat: false,
                         default: Some(s.value.clone()),
                     });
                 }
@@ -125,7 +127,8 @@ pub fn prepare(files: &mut [ParsedFile]) -> Result<(), CheckError> {
                 Item::Enum(e) => {
                     take_name(&mut seen, &file.path, &e.name, &name)?;
                 }
-                Item::Use(_) | Item::UseLib(_) | Item::Let(_) => {}
+                // `extend` is rejected by the script parser
+                Item::Use(_) | Item::UseLib(_) | Item::Let(_) | Item::Trait(_) | Item::Extend(_) => {}
             }
         }
         let mut fields = props;
@@ -137,8 +140,10 @@ pub fn prepare(files: &mut [ParsedFile]) -> Result<(), CheckError> {
             vis_pub: true,
             debug: false,
             packed: false,
+            gpu: parse::GpuStruct::None,
             name: Ident { name, span },
             type_params: Vec::new(),
+            bounds: Vec::new(),
             fields,
             methods,
         };

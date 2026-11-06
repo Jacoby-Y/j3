@@ -28,6 +28,7 @@ const HIDDEN: &[&str] = &["game_headless.j3", "build_release.j3", "sys_windows.j
 /// Public so the runtime or editor can reach them, but not what a game calls.
 const INTERNAL: &[(&str, &str)] = &[
     ("j3.scene3d.editor.", "editor internals"),
+    ("j3.j2.", "the j2 front end; hosts use j3.j2 (`j3c doc j2`)"),
     ("j3.script", "VM behind `.j3s` scripts; games use `@script` (`j3c doc lang`)"),
     ("j3.gfx.urp.shaders", "GLSL for j3.gfx.urp.raytrace"),
 ];
@@ -51,14 +52,19 @@ usage: j3c doc [topic | module [item]] [--short]
     j3c doc lang               language
     j3c doc j3ui               `.j3ui` components (markup + CSS, compiled by j3c)
     j3c doc j3ui-immediate     `@j3ui` functions over the immediate-mode `j3.ui`
+    j3c doc icons [word]       `<icon name>` names (Bootstrap Icons + this project's icons/), filtered by a word
     j3c doc css                the CSS subset `.j3ui` supports, and how it differs from a browser
     j3c doc testing            run, capture, and diff headless (no window); goldens; HTML snapshot
     j3c doc editor             3D scene editor, scene files, scripts
     j3c doc urp                URP render passes (pass order, GL lifetime)
     j3c doc threads            threads and worker pools: rules, safe modules, mistakes
+    j3c doc term               terminals: emulator and TUI modules, restore hook, limits
     j3c doc i18n               translated text: locale files, t/tf, plurals, numbers, RTL, j3c check
     j3c doc ship               release builds, zips, and .deb installers with a menu entry and icon
-    j3c doc android            Android: APK builds, [android] keys, touch, running on a device";
+    j3c doc android            Android: APK builds, [android] keys, touch, running on a device
+    j3c doc steam              Steam: setup, achievements, cloud, Deck, depot upload, binding check
+    j3c doc shaders            shaders written in J3: #[shader] fns, @shader(vs, fs), j3c dump-glsl
+    j3c doc j2                 j2: scripts and mods the game loads at runtime (host API); `j2 lang` is the language";
 
 pub fn cmd(rest: &[String]) -> i32 {
     let mut args: Vec<&str> = Vec::new();
@@ -85,6 +91,8 @@ pub fn cmd(rest: &[String]) -> i32 {
             Ok(if short { toc(page, &text) } else { text })
         }
         [page, section] if guide(page).is_some() => guide_section(page, section),
+        ["icons"] | ["icon"] => Ok(icons_page("")),
+        ["icons", word] | ["icon", word] => Ok(icons_page(word)),
         ["recipes"] | ["recipe"] => Ok(crate::helptext::recipe_index()),
         ["recipes", name] | ["recipe", name] => crate::helptext::recipe(name),
         ["search", word] => search(word),
@@ -108,6 +116,36 @@ pub fn cmd(rest: &[String]) -> i32 {
     }
 }
 
+/// `<icon name>` names, packed into lines; `word` keeps the names that contain it.
+fn icons_page(word: &str) -> String {
+    use crate::ui::icons;
+    let own = icons::load_dir(std::path::Path::new("icons")).unwrap_or_default();
+    let mut out = String::from("<icon name=\"...\"> takes a Bootstrap Icons id (https://icons.getbootstrap.com, v1.11.3, MIT) or the\nname of an .svg in the project's icons/ folder (it wins over a Bootstrap name). 1em square, colored by\n`color`; size it with `font-size` or `width`/`height`. `j3c doc j3ui icons` has the details.\n");
+    let mut names: Vec<&str> = own.iter().map(|i| i.name.as_str()).collect();
+    if !names.is_empty() {
+        out.push_str(&format!("This project's icons/: {}\n", names.join(" ")));
+    }
+    names = icons::bootstrap().map(|(n, _)| n).filter(|n| n.contains(word)).collect();
+    if word.is_empty() {
+        out.push_str(&format!("\n{} Bootstrap names (`j3c doc icons <word>` filters):\n", names.len()));
+    } else {
+        out.push_str(&format!("\n{} Bootstrap names containing `{word}`:\n", names.len()));
+    }
+    let mut line = String::new();
+    for n in names {
+        if !line.is_empty() && line.len() + n.len() + 2 > 100 {
+            out.push_str(line.trim_end());
+            out.push('\n');
+            line.clear();
+        }
+        line.push_str(n);
+        line.push_str("  ");
+    }
+    out.push_str(line.trim_end());
+    out.push('\n');
+    out
+}
+
 /// Guide pages by name (and alias), so `cmd` and `search` share one list.
 const GUIDES: &[&[&str]] = &[
     &["lang"],
@@ -118,9 +156,13 @@ const GUIDES: &[&[&str]] = &[
     &["editor"],
     &["urp"],
     &["threads", "thread"],
+    &["term", "terminal", "tui"],
     &["i18n", "locale", "locales", "translation", "l10n"],
     &["ship", "dist", "deb", "package", "packaging", "release"],
     &["android", "apk"],
+    &["steam", "steamworks"],
+    &["j2", "mods", "modding"],
+    &["shaders", "shader", "glsl"],
 ];
 
 fn guide(name: &str) -> Option<String> {
@@ -134,8 +176,12 @@ fn guide(name: &str) -> Option<String> {
         "editor" => editor_page(),
         "urp" => urp_page(),
         "threads" => THREADS_PAGE.to_string(),
+        "term" => TERM_PAGE.to_string(),
         "i18n" => I18N_PAGE.to_string(),
         "ship" => SHIP_PAGE.to_string(),
+        "shaders" => SHADERS_PAGE.to_string(),
+        "steam" => STEAM_PAGE.to_string(),
+        "j2" => J2_PAGE.to_string(),
         _ => ANDROID_PAGE.to_string(),
     })
 }

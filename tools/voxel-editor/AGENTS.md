@@ -28,8 +28,8 @@ Traps: `;` splits commands but a `#` comment ends the line (so a script comment 
 and picking act on the unposed model, so `pose reset` before painting in the window; a `.j3voxel` made by
 hand needs the `size` line first; `export-mesh` is a static mesh (no parts, poses, overlays).
 
-Code notes: one module per file under `src/`, every edit goes through `model.apply` (so mirrored
+Code notes: one module per file under `src/` (big ones have part files in a folder beside them: `src/cmd/`, `src/model/`, ...), every edit goes through `model.apply` (so mirrored
 editing works for every tool), and `cmd.j3` is the single command language the CLI, the window's
 console, and agents share: add a feature there first (and its line in `helpText`, `editing()` and the
-README). Rig and overlay logic is in `src/rig.j3`, `src/overlay.j3`, `src/overlaypng.j3`. A name can be
+README). Rig and overlay logic is in `src/rig.j3` and `src/rig/`, `src/overlay.j3`, `src/overlaypng.j3`. A name can be
 declared once per function. Do not launch the window to check feel; the person running it does that.

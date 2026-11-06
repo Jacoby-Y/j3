@@ -1,0 +1,246 @@
+// Part of j3.steam: callback and call-result tables and the per-frame pump; the module doc and `use`s are in ../steam.j3.
+module j3.steam;
+
+/// Callback id of `SteamAPICallCompleted_t`: a call result is ready.
+const CB_CALL_COMPLETED: i32 = 703;
+/// Callback id of `GameOverlayActivated_t`.
+const CB_OVERLAY: i32 = 331;
+/// Size of the buffer a call result is read into at first; it grows when a result is bigger.
+const SCRATCH_START: int = 8192;
+
+struct CbRow {
+    id: i32;
+    f: fn(ptr, i32);
+}
+
+struct Pending {
+    call: u64;
+    f: fn(ptr, i32, bool, u64);
+    ctx: u64;
+}
+
+#[singleton]
+let CBS: []CbRow;
+#[singleton]
+let CB_N: int = 0;
+#[singleton]
+let PEND: []Pending;
+#[singleton]
+let PEND_N: int = 0;
+/// Hooks `onBeforeFrame` registered; they run at the top of every live `frame()`, before any callback is delivered.
+#[singleton]
+let PRE: []fn();
+#[singleton]
+let PRE_N: int = 0;
+#[singleton]
+let SCRATCH: ptr;
+#[singleton]
+let SCRATCH_CAP: int = 0;
+#[singleton]
+let OVERLAY: bool = false;
+/// Offsets from `layouts()`, read once by `layoutInit`.
+#[singleton]
+let OFF_CB_ID: int = 0;
+#[singleton]
+let OFF_CB_PARAM: int = 0;
+#[singleton]
+let OFF_CB_SIZE: int = 0;
+#[singleton]
+let OFF_DONE_CALL: int = 0;
+#[singleton]
+let OFF_DONE_ID: int = 0;
+#[singleton]
+let OFF_DONE_SIZE: int = 0;
+#[singleton]
+let MSG: ptr;
+/// ManualDispatch entry points, resolved once by `bindPump`; 0 until then.
+#[singleton]
+let F_RUN: ptr;
+#[singleton]
+let F_NEXT: ptr;
+#[singleton]
+let F_FREE: ptr;
+#[singleton]
+let F_GET: ptr;
+
+/// Register `f` to run for every callback with id `id` (a `k_iCallback` number from the SDK
+/// headers); `f` gets the struct's bytes and size, valid only during the call (read them with the
+/// `rd*` readers and `lay`). Several handlers per id all run, in registration order. Main thread only.
+pub fn onCallback(id: i32, f: fn(ptr, i32)) {
+    if CB_N >= CBS.len {
+        let fresh = arena().alloc::<CbRow>(CBS.len * 2 + 32);
+        for i in 0..CB_N {
+            fresh[i] = CBS[i];
+        }
+        CBS = fresh;
+    }
+    CBS[CB_N] = CbRow { id: id, f: f };
+    CB_N += 1;
+}
+
+/// Run `f(param, size, ioFailure, ctx)` when the call result for `call` (a `SteamAPICall_t` an SDK
+/// call returned) arrives. `param` and `size` are the result struct, valid only during the call.
+/// A `call` of 0 (`k_uAPICallInvalid`: the SDK call failed to start) runs `f` on the next `frame()`
+/// with `ioFailure` true, so callers handle failure on one path.
+pub fn await(call: u64, f: fn(ptr, i32, bool, u64), ctx: u64) {
+    if PEND_N >= PEND.len {
+        let fresh = arena().alloc::<Pending>(PEND.len * 2 + 16);
+        for i in 0..PEND_N {
+            fresh[i] = PEND[i];
+        }
+        PEND = fresh;
+    }
+    PEND[PEND_N] = Pending { call: call, f: f, ctx: ctx };
+    PEND_N += 1;
+}
+
+/// Run `f` at the start of every `frame()` while Steam is live or faked, before callbacks are delivered
+/// (Steam Input's `RunFrame` goes here). Several hooks run in registration order; the list lives for the process.
+/// Register once, from a part's init.
+pub fn onBeforeFrame(f: fn()) {
+    if PRE_N >= PRE.len {
+        let fresh = arena().alloc::<fn()>(PRE.len * 2 + 4);
+        for i in 0..PRE_N {
+            fresh[i] = PRE[i];
+        }
+        PRE = fresh;
+    }
+    PRE[PRE_N] = f;
+    PRE_N += 1;
+}
+
+fn layoutInit() {
+    OFF_CB_ID = lay("CallbackMsg_t", "iCallback");
+    OFF_CB_PARAM = lay("CallbackMsg_t", "pubParam");
+    OFF_CB_SIZE = lay("CallbackMsg_t", "cubParam");
+    OFF_DONE_CALL = lay("SteamAPICallCompleted_t", "hAsyncCall");
+    OFF_DONE_ID = lay("SteamAPICallCompleted_t", "iCallback");
+    OFF_DONE_SIZE = lay("SteamAPICallCompleted_t", "cubParam");
+    let msgSize = lay("CallbackMsg_t", SIZE);
+    MSG = arena().allocBytes(msgSize + 16);
+    SCRATCH = arena().allocBytes(SCRATCH_START);
+    SCRATCH_CAP = SCRATCH_START;
+}
+
+fn onOverlay(p: ptr, n: i32) {
+    OVERLAY = rdBool(p, lay("GameOverlayActivated_t", "bActive"));
+}
+
+/// True while the Steam overlay is open (from `GameOverlayActivated_t`); a game should pause on it.
+/// False when Steam is absent.
+pub fn overlayOpen(): bool {
+    return OVERLAY;
+}
+
+/// Run every handler registered for `id`. Unknown ids run nothing.
+fn deliver(id: i32, p: ptr, n: i32) {
+    let count = CB_N;
+    for i in 0..count {
+        if CBS[i].id == id {
+            let f = CBS[i].f;
+            f(p, n);
+        }
+    }
+}
+
+/// Hand a finished call result to its awaiter and drop the row. A result nobody awaits is dropped.
+fn deliverResult(call: u64, p: ptr, n: i32, failed: bool) {
+    for i in 0..PEND_N {
+        if PEND[i].call == call {
+            let row = PEND[i];
+            PEND_N -= 1;
+            PEND[i] = PEND[PEND_N];
+            let f = row.f;
+            f(p, n, failed, row.ctx);
+            return;
+        }
+    }
+}
+
+/// Run the handlers of calls that never started (handle 0) with `ioFailure` true.
+fn failInvalid() {
+    let budget = PEND_N;
+    let i = 0;
+    while i < PEND_N && budget > 0 {
+        if PEND[i].call == u64(0) {
+            let row = PEND[i];
+            PEND_N -= 1;
+            PEND[i] = PEND[PEND_N];
+            budget -= 1;
+            let f = row.f;
+            f(0 as ptr, 0, true, row.ctx);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Fetch call result `call` (callback id `id`, `size` bytes) from Steam into the scratch buffer and
+/// deliver it. The buffer grows when a result is bigger than it.
+fn fetchResult(pipe: i32, call: u64, id: i32, size: int) {
+    if size > SCRATCH_CAP {
+        SCRATCH_CAP = size * 2;
+        SCRATCH = arena().allocBytes(SCRATCH_CAP);
+    }
+    let failed: [1]u8 = [u8(0)];
+    let get = F_GET as fn(i32, u64, ptr, i32, i32, ptr): bool;
+    let ok = get(pipe, call, SCRATCH, i32(size), id, &failed[0] as ptr);
+    deliverResult(call, SCRATCH, i32(size), !ok || failed[0] != u8(0));
+}
+
+/// Look up the ManualDispatch functions once (at `init`); `unbindPump` (at `shutdown`) forgets them.
+fn bindPump() {
+    F_RUN = fnp("SteamAPI_ManualDispatch_RunFrame");
+    F_NEXT = fnp("SteamAPI_ManualDispatch_GetNextCallback");
+    F_FREE = fnp("SteamAPI_ManualDispatch_FreeLastCallback");
+    F_GET = fnp("SteamAPI_ManualDispatch_GetAPICallResult");
+}
+
+fn unbindPump() {
+    F_RUN = 0;
+    F_NEXT = 0;
+    F_FREE = 0;
+    F_GET = 0;
+}
+
+/// The real pump: RunFrame, then drain GetNextCallback. `FreeLastCallback` runs after every message.
+fn pumpReal() {
+    let pipe = PIPE;
+    let run = F_RUN as fn(i32);
+    let next = F_NEXT as fn(i32, ptr): bool;
+    let free = F_FREE as fn(i32);
+    run(pipe);
+    while next(pipe, MSG) {
+        let id = rdI32(MSG, OFF_CB_ID);
+        let param = rdPtr(MSG, OFF_CB_PARAM);
+        let size = rdI32(MSG, OFF_CB_SIZE);
+        if id == CB_CALL_COMPLETED {
+            let call = rdU64(param, OFF_DONE_CALL);
+            let rid = rdI32(param, OFF_DONE_ID);
+            let rsize = int(rdU32(param, OFF_DONE_SIZE));
+            // the completion message itself is only a ticket: read the result, then free the message
+            fetchResult(pipe, call, rid, rsize);
+        } else {
+            deliver(id, param, size);
+        }
+        free(pipe);
+    }
+}
+
+/// The per-frame pump: delivers callbacks and call results to their handlers. Call it once per
+/// frame from the main thread (`attach` does). With Steam absent it only fails awaited handle-0 calls;
+/// allocates nothing when no message arrives.
+pub fn frame() {
+    failInvalid();
+    if STATE == STATE_READY || STATE == STATE_FAKE {
+        for i in 0..PRE_N {
+            let f = PRE[i];
+            f();
+        }
+    }
+    if STATE == STATE_READY {
+        pumpReal();
+    } else if STATE == STATE_FAKE {
+        pumpFake();
+    }
+}

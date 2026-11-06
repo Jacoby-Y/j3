@@ -1,0 +1,122 @@
+// Tests for j3.data.map: growth, collisions, remove and reinsert, tombstones, string and Entity keys.
+//   timeout 60 j3c run j3c/stdlib/tests/map_test.j3
+// Panics on the first failed check.
+
+module map_test;
+
+use j3.cmp.{ Hash, combine, hashOf };
+use j3.data.map.Map;
+use j3.game.ecs.Entity;
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.sys.panic;
+
+/// Every key hashes the same: all probes collide.
+struct Bad {
+    n: int;
+    fn operator==(this: Bad, o: Bad): bool { return this.n == o.n; }
+    fn hash(this: Bad): u64 { return u64(7); }
+}
+
+/// Every key's home is the last slot, so runs wrap around the end of the table.
+struct Wrap {
+    n: int;
+    fn operator==(this: Wrap, o: Wrap): bool { return this.n == o.n; }
+    fn hash(this: Wrap): u64 { return u64(-1); }
+}
+
+fn ok(cond: bool, msg: string) {
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic("map_test");
+    }
+}
+
+fn getOr(m: &Map<int, int>, k: int): int {
+    match m.get(k) {
+        Option.Some(v) { return v; }
+        Option.None { return -1; }
+    }
+}
+
+fn main() {
+    let mem = Arena.create(1 << 20);
+    let m = Map<int, int>.new(&mem, 0);
+    ok(m.len == 0 && !m.has(1) && getOr(&m, 1) == -1, "empty");
+    for i in 0..1000 { m.put(i, i * 3); }
+    ok(m.len == 1000, "grow len");
+    for i in 0..1000 { ok(getOr(&m, i) == i * 3, "grow get"); }
+    m.put(5, 99);
+    ok(m.len == 1000 && getOr(&m, 5) == 99, "overwrite");
+    ok(m.getOr(5000, 7) == 7 && m.getOr(5, 7) == 99, "getOr");
+
+    // Remove half, then reinsert: tombstones are reused, nothing is lost.
+    for i in 0..1000 { if i % 2 == 0 { ok(m.remove(i), "remove"); } }
+    ok(!m.remove(0) && m.len == 500, "remove twice");
+    for i in 0..1000 { ok(m.has(i) == (i % 2 == 1), "after remove"); }
+    for i in 0..1000 { if i % 2 == 0 { m.put(i, -i); } }
+    ok(m.len == 1000 && getOr(&m, 4) == -4 && getOr(&m, 5) == 99, "reinsert");
+
+    // Many removes + inserts of fresh keys on a small table: tombstones count toward load, no endless probe.
+    let t = Map<int, int>.new(&mem, 4);
+    for round in 0..5000 {
+        t.put(round, round);
+        if round >= 3 { ok(t.remove(round - 3), "churn remove"); }
+        ok(t.find(round + 100000) < 0, "churn miss terminates");
+    }
+    ok(t.len == 3 && t.cap <= 32 && t.has(4999) && t.has(4997) && !t.has(4996), "churn state");
+
+    // Colliding keys.
+    let b = Map<Bad, int>.new(&mem, 0);
+    for i in 0..40 { b.put(Bad { n: i }, i); }
+    b.remove(Bad { n: 10 });
+    b.put(Bad { n: 41 }, 41);
+    ok(b.len == 40 && !b.has(Bad { n: 10 }) && b.getOr(Bad { n: 39 }, -1) == 39 && b.getOr(Bad { n: 41 }, -1) == 41, "colliding keys");
+    b.put(Bad { n: 10 }, 1010);
+    ok(b.getOr(Bad { n: 10 }, -1) == 1010 && b.len == 41, "colliding reinsert");
+
+    // Removing from the middle of wrapped, colliding runs keeps every other key reachable.
+    let w = Map<Wrap, int>.new(&mem, 0);
+    for i in 0..30 { w.put(Wrap { n: i }, i); }
+    for i in 0..30 { if i % 3 == 0 { ok(w.remove(Wrap { n: i }), "wrap remove"); } }
+    for i in 0..30 { ok(w.has(Wrap { n: i }) == (i % 3 != 0), "wrap survivors"); }
+    for i in 0..30 { if i % 3 == 0 { w.put(Wrap { n: i }, i + 100); } }
+    ok(w.len == 30 && w.getOr(Wrap { n: 9 }, -1) == 109 && w.getOr(Wrap { n: 10 }, -1) == 10, "wrap reinsert");
+
+    // Churn allocates nothing once the table has its size.
+    let lk = Arena.create(1 << 16);
+    let c = Map<int, int>.new(&lk, 8);
+    let before = lk.used;
+    for i in 0..100000 {
+        c.put(i, i);
+        ok(c.remove(i), "leak remove");
+    }
+    ok(lk.used == before && c.len == 0, "churn does not allocate");
+
+    // Strings.
+    let s = Map<string, int>.new(&mem, 0);
+    s.put("alpha", 1);
+    s.put("beta", 2);
+    s.put("alpha", 3);
+    ok(s.len == 2 && s.getOr("alpha", 0) == 3 && s.getOr("beta", 0) == 2 && !s.has("gamma"), "string keys");
+
+    // Entities.
+    let e = Map<Entity, int>.new(&mem, 0);
+    e.put(Entity { id: 1, gen: 0 }, 10);
+    e.put(Entity { id: 1, gen: 1 }, 11);
+    ok(e.len == 2 && e.getOr(Entity { id: 1, gen: 0 }, 0) == 10 && e.getOr(Entity { id: 1, gen: 1 }, 0) == 11, "entity keys");
+
+    // Iteration by slot, then clear.
+    let sum = 0;
+    let seen = 0;
+    for i in 0..m.cap {
+        if m.live(i) { sum += m.keyAt(i); seen += 1; }
+    }
+    ok(seen == 1000 && sum == 499500, "iterate");
+    m.clear();
+    ok(m.len == 0 && !m.has(5), "clear");
+    m.put(5, 1);
+    ok(getOr(&m, 5) == 1, "put after clear");
+    printLn("map_test ok");
+}

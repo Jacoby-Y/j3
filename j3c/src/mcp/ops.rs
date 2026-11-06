@@ -198,6 +198,11 @@ pub(super) fn check(root: &Path, args: &Json) -> Result<Answer, String> {
         let text = String::from_utf8_lossy(&out.stdout);
         match text.lines().rev().find_map(|l| json::parse(l).ok()) {
             Some(result) if result.get("ok").and_then(as_bool) == Some(true) => {
+                if let Some(Json::Arr(ws)) = result.get("warnings") {
+                    for w in ws {
+                        code_issue(w, "warning", &mut lines, &mut issues);
+                    }
+                }
                 // CSS lint lines (`warning: file:line:col: message [rule]`) ride along in `css`
                 // (`i18n` carries the `[i18n-missing]` ones the same way)
                 for key in ["css", "i18n"] {
@@ -210,23 +215,15 @@ pub(super) fn check(root: &Path, args: &Json) -> Result<Answer, String> {
                 }
             }
             Some(result) => {
-                errors += 1;
-                let message = result.get("message").and_then(Json::as_str).unwrap_or("does not compile").to_string();
-                let file = result.get("path").and_then(Json::as_str).unwrap_or("").to_string();
-                let line = result.get("line").and_then(Json::as_i64).unwrap_or(0);
-                lines.push(format!("{file}:{line}: error: {message}"));
-                if let Some(Json::Arr(notes)) = result.get("notes") {
-                    for n in notes.iter().filter_map(Json::as_str) { lines.push(format!("  note: {n}")); }
+                // `errors` holds every one; older binaries only had the top-level fields
+                let all = match result.get("errors") {
+                    Some(Json::Arr(es)) if !es.is_empty() => es.clone(),
+                    _ => vec![result.clone()],
+                };
+                for e in &all {
+                    errors += 1;
+                    code_issue(e, "error", &mut lines, &mut issues);
                 }
-                if let Some(Json::Arr(helps)) = result.get("helps") {
-                    for h in helps.iter().filter_map(Json::as_str) { lines.push(format!("  help: {h}")); }
-                }
-                issues.push(Json::obj(vec![
-                    ("severity", s("error")),
-                    ("file", Json::Str(file)),
-                    ("line", Json::Num(line as f64)),
-                    ("message", Json::Str(message)),
-                ]));
             }
             None => {
                 errors += 1;
@@ -252,6 +249,28 @@ pub(super) fn check(root: &Path, args: &Json) -> Result<Answer, String> {
     })
 }
 
+/// One `j3c check --json` diagnostic (`message`, `path`, `line`, `notes`, `helps`) into the reply.
+fn code_issue(d: &Json, severity: &str, lines: &mut Vec<String>, issues: &mut Vec<Json>) {
+    let message = d.get("message").and_then(Json::as_str).unwrap_or("does not compile").to_string();
+    let file = d.get("path").and_then(Json::as_str).unwrap_or("").to_string();
+    let line = d.get("line").and_then(Json::as_i64).unwrap_or(0);
+    lines.push(format!("{file}:{line}: {severity}: {message}"));
+    for key in ["notes", "helps"] {
+        if let Some(Json::Arr(xs)) = d.get(key) {
+            let tag = if key == "notes" { "note" } else { "help" };
+            for x in xs.iter().filter_map(Json::as_str) {
+                lines.push(format!("  {tag}: {x}"));
+            }
+        }
+    }
+    issues.push(Json::obj(vec![
+        ("severity", Json::Str(severity.to_string())),
+        ("file", Json::Str(file)),
+        ("line", Json::Num(line as f64)),
+        ("message", Json::Str(message)),
+    ]));
+}
+
 /// Build, run the game headless for some frames, and return its last frame and output.
 pub(super) fn play(root: &Path, args: &Json) -> Result<Answer, String> {
     let rel = scene_arg(root, args)?;
@@ -274,6 +293,7 @@ pub(super) fn play(root: &Path, args: &Json) -> Result<Answer, String> {
     let _ = fs::remove_file(&shot);
     let mut child = Command::new(&exe)
         .current_dir(root)
+        .envs(crate::dist::steam_dev_env(root))
         .env("J3_ROOT", root)
         .env("J3_SCENE", &rel)
         .env("J3_FRAMES", frames.to_string())

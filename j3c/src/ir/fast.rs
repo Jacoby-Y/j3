@@ -19,7 +19,7 @@ fn strip_block(block: &mut Block) {
     let mut out = Vec::new();
     for mut stmt in block.stmts.drain(..) {
         match &mut stmt.kind {
-            StmtKind::Abort(_) => continue,
+            StmtKind::Abort(..) => continue,
             StmtKind::If {
                 then_block,
                 else_block,
@@ -57,6 +57,13 @@ fn strip_block(block: &mut Block) {
                 strip_block(body);
                 out.push(stmt);
             }
+            StmtKind::Switch { cases, default, .. } => {
+                for (_, b) in cases.iter_mut() {
+                    strip_block(b);
+                }
+                strip_block(default);
+                out.push(stmt);
+            }
             _ => out.push(stmt),
         }
     }
@@ -64,5 +71,5 @@ fn strip_block(block: &mut Block) {
 }
 
 fn is_abort_only(block: &Block) -> bool {
-    block.stmts.len() == 1 && matches!(block.stmts[0].kind, StmtKind::Abort(_))
+    block.stmts.len() == 1 && matches!(block.stmts[0].kind, StmtKind::Abort(..))
 }

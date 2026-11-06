@@ -34,7 +34,7 @@ struct Source {
     css: String,
 }
 
-fn line_col(text: &str, at: usize) -> (usize, usize) {
+pub(crate) fn line_col(text: &str, at: usize) -> (usize, usize) {
     let at = at.min(text.len());
     let line = text[..at].matches('\n').count() + 1;
     let col = at - text[..at].rfind('\n').map_or(0, |i| i + 1) + 1;

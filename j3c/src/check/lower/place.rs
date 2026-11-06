@@ -102,6 +102,9 @@ impl<'a> Lower<'a> {
                 while self.cx.ref_inner(place.ty).is_some() {
                     place = self.b.deref(self.cx, place, expr.span);
                 }
+                if is_vec(self.cx, place.ty) {
+                    return self.vec_index_place(place, index, expr.span);
+                }
                 if matches!(self.cx.ty_kind(place.ty), TyKind::Slice { .. }) {
                     self.store_indirect = true;
                 }
@@ -155,11 +158,7 @@ impl<'a> Lower<'a> {
                                 }
                                 Ok(place)
                             }
-                            None => Err(CheckError::new(
-                                self.path,
-                                field.span,
-                                format!("no field `{}`", field.name),
-                            )),
+                            None => Err(crate::check::error::no_field(self.cx, self.path, field.span, sid, &field.name)),
                         }
                     }
                     TyKind::String | TyKind::Slice { .. } => match field.name.as_str() {
@@ -171,6 +170,7 @@ impl<'a> Lower<'a> {
                             format!("no field `.{other}`"),
                         )),
                     },
+                    TyKind::Vec(_) => self.vec_field_place(place, field),
                     _ => Err(CheckError::new(
                         self.path,
                         field.span,
@@ -244,7 +244,7 @@ impl<'a> Lower<'a> {
         self.b.push(crate::ir::stmt::Stmt {
             ty: self.cx.common.void,
             span,
-            kind: crate::ir::stmt::StmtKind::Abort(crate::ir::stmt::AbortKind::Index),
+            kind: crate::ir::stmt::StmtKind::Abort(crate::ir::stmt::AbortKind::Index, vec![index.clone(), len.clone()]),
         });
         let then_block = self.b.end_block(saved);
         self.b.push(crate::ir::stmt::Stmt {
@@ -281,7 +281,7 @@ impl<'a> Lower<'a> {
         self.b.push(crate::ir::stmt::Stmt {
             ty: self.cx.common.void,
             span,
-            kind: crate::ir::stmt::StmtKind::Abort(crate::ir::stmt::AbortKind::Slice),
+            kind: crate::ir::stmt::StmtKind::Abort(crate::ir::stmt::AbortKind::SliceOrder, vec![end.clone(), start.clone()]),
         });
         let then_block = self.b.end_block(saved);
         self.b.push(crate::ir::stmt::Stmt {
@@ -347,7 +347,7 @@ impl<'a> Lower<'a> {
         self.b.push(crate::ir::stmt::Stmt {
             ty: self.cx.common.void,
             span,
-            kind: crate::ir::stmt::StmtKind::Abort(crate::ir::stmt::AbortKind::Slice),
+            kind: crate::ir::stmt::StmtKind::Abort(crate::ir::stmt::AbortKind::Slice, vec![index.clone(), len.clone()]),
         });
         let then_block = self.b.end_block(saved);
         self.b.push(crate::ir::stmt::Stmt {

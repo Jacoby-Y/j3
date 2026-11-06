@@ -1,0 +1,339 @@
+// Tests for the j2 compiler and VM: a table of `source -> printed output` and `source -> error
+// text` (`chunk:line:col: message`), each run on a fresh `Vm`, plus a VM that keeps working after
+// errors and a bytecode listing.
+//   timeout 60 j3c run j3c/stdlib/tests/j2_vm_test.j3
+// Panics on the first failed check.
+
+module j2_vm_test;
+
+use j3.io.{ exists, printLn, readFile };
+use j3.j2;
+use j3.j2.{ Vm, Error, Args, Value, Limits };
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.{ Text, find };
+
+struct Case {
+    src: string;
+    want: string;
+}
+
+const OUT: [49]Case = [
+    Case { src: "print(1 + 2);", want: "3\n" },
+    Case { src: "print(7 / 2, 7.0 / 2, 7 % 3, -7 % 3, 2 * 3.5, 7 - 10);", want: "3 3.5 1 -1 7.0 -3\n" },
+    Case { src: "print(1e9, 0.5 + 0.25, 10 / 4.0, 7.5 % 2, 1.0);", want: "1000000000.0 0.75 2.5 1.5 1.0\n" },
+    Case { src: "print(1.5 % 0.0, 7.0 / 0, -7.5 % 2, 1 / 0.0 * 0.0);", want: "nan inf -1.5 nan\n" },
+    Case { src: "print(1 == 1.0, 3 < 2, \"a\" < \"b\", 2 >= 2, 1 != 2, 2 > 1.5, \"b\" <= \"a\");",
+        want: "true false true true true true false\n" },
+    Case { src: "print(9223372036854775807 + 1, (0 - 9223372036854775807 - 1) / -1, 5 % -1);",
+        want: "-9223372036854775808 -9223372036854775808 0\n" },
+    Case { src: "fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } print(fib(20));", want: "6765\n" },
+    Case { src: "let s = 0; let i = 0; while true { i += 1; if i > 10 { break; } if i % 2 == 0 { continue; } s += i; } print(s);",
+        want: "25\n" },
+    Case { src: "let s = 0; for i in 0..5 { s += i; } print(s); for i in 3..1 { print(\"no\"); }", want: "10\n" },
+    Case { src: "for i in 0..3 { for j in 0..3 { if j == 1 { continue; } if j == 2 { break; } print(i, j); } }",
+        want: "0 0\n1 0\n2 0\n" },
+    Case { src: "fn f() { let a = 1; let b = 2; { let c = a + b; return c * 10; } } print(f());", want: "30\n" },
+    Case { src: "fn g() {} fn h(a, b) { return b; } print(g(), h(1), h(1, 2, 3));", want: "nil nil 2\n" },
+    Case { src: "let a = 5; let b = -a; print(b, -2.5, !nil, !0);", want: "-5 -2.5 true false\n" },
+    Case { src: "const MAX = 3; let hp = 10; hp += MAX; hp -= 1; hp *= 2; hp /= 4; hp %= 4; print(hp);", want: "2\n" },
+    Case { src: "if 1 > 2 { print(1); } else if 0 { print(\"0 is true\"); } else { print(3); }", want: "0 is true\n" },
+    Case { src: "print(nil || 5, false && (1 / 0), 1 && 2, nil && 1, false || nil);", want: "5 false 2 nil nil\n" },
+    Case { src: "print(later()); fn later() { return first(); } fn first() { return 1; }", want: "1\n" },
+    Case { src: "let wave = 0; fn next() { wave += 1; } next(); next(); print(wave);", want: "2\n" },
+    Case { src: "fn outer() { fn fact(n) { if n <= 1 { return 1; } return n * fact(n - 1); } return fact(10); } print(outer());",
+        want: "3628800\n" },
+    Case { src: "fn d(n) { let a = 1; let b = 2; let c = 3; if n == 0 { return 0; } return d(n - 1) + a; } print(d(150));",
+        want: "150\n" },
+    // tables, arrays, strings
+    Case { src: "let p = { x: 1, y: 2 }; p.z = 3; p.z = nil; print(p.w, p); p[\"k\"] = true; print(p.k, p[\"x\"]);",
+        want: "nil {x: 1, y: 2}\ntrue 1\n" },
+    Case { src: "let t = { a: 1, b: 2, c: 3 }; t.b = nil; t.b = 4; for k, v in t { print(k, v); }", want: "a 1\nc 3\nb 4\n" },
+    Case { src: "let xs = [10, 20]; xs[2] = 30; print(xs, xs[0], xs[5], xs[1.0]); for v in xs { print(v); } for i, v in xs { print(i, v); }",
+        want: "[10, 20, 30] 10 nil 20\n10\n20\n30\n0 10\n1 20\n2 30\n" },
+    Case { src: "let t = { a: 1 }; t.a += 4; let xs = [1]; xs[0] *= 7; let m = { }; m[2.0] = \"two\"; print(t.a, xs[0], m[2]);",
+        want: "5 7 two\n" },
+    Case { src: "let n = \"slime\"; let hp = 3; print(`{n} has {hp} hp`); print(\"plain \" + n, \"a\" + 1, 2.5 + \"b\");",
+        want: "slime has 3 hp\nplain slime a1 2.5b\n" },
+    Case { src: "let p = { x: 1 }; print(`x={p.x} n={1 + 2} s={\"q\"} {[1, \"a\"]}`, ``, `{p}`);",
+        want: "x=1 n=3 s=q [1, \"a\"]  {x: 1}\n" },
+    Case { src: "print(\"ab\" == \"a\" + \"b\", \"x\" != \"x\");", want: "true false\n" },
+    Case { src: "fn m(n) { match n { 1 { return \"one\"; } \"two\" { return 2; } true { return \"t\"; } -3 { return \"m3\"; } _ { return \"other\"; } } } print(m(1), m(\"two\"), m(true), m(-3), m(9), m(1.0));",
+        want: "one 2 t m3 other one\n" },
+    Case { src: "match 5 { 1 { print(1); } } print(\"after\");", want: "after\n" },
+    Case { src: "let o = { n: 5, get: fn(this) { return this.n; }, plain: fn(x) { return x; } }; print(o.get(), o.plain(7));",
+        want: "5 7\n" },
+    Case { src: "fn twice(x) { return x * 2; } fn dup(s) { return s + s; } print((3).twice()); let t = { v: 1 }; fn val(u, k) { return u.v + k; } print(t.val(10), \"s\".dup());",
+        want: "6\n11 ss\n" },
+    Case { src: "let w = { pellets: 3, fire: fn(this, x) { let s = 0; for i in 0..this.pellets { s += x; } return s; } }; print(w.fire(2));",
+        want: "6\n" },
+    // closures
+    Case { src: "let counter = fn() { let n = 0; return fn() { n += 1; return n; }; }; let c1 = counter(); let c2 = counter(); c1(); c1(); print(c1(), c2());",
+        want: "3 1\n" },
+    Case { src: "fn every(n) { let count = 0; return fn() { count += 1; return count % n == 0; }; } let e = every(3); print(e(), e(), e(), e());",
+        want: "false false true false\n" },
+    Case { src: "let fs = []; for i in 0..3 { fs[i] = fn() { return i; }; } print(fs[0](), fs[1](), fs[2]());", want: "0 1 2\n" },
+    Case { src: "let gs = []; let j = 0; while j < 3 { let k = j * 10; gs[j] = fn() { return k; }; j += 1; } print(gs[0](), gs[2]());",
+        want: "0 20\n" },
+    Case { src: "let hs = []; for i, v in [5, 6, 7] { hs[i] = fn() { return v; }; } print(hs[0](), hs[2]());", want: "5 7\n" },
+    Case { src: "let hs = []; for i in 0..10 { hs[i] = fn() { return i; }; if i == 2 { break; } } print(hs[2](), hs[0]());",
+        want: "2 0\n" },
+    Case { src: "let hs = []; for i in 0..4 { if i % 2 == 0 { continue; } let k = i; hs[len0(hs)] = fn() { return k; }; } fn len0(a) { let n = 0; for x in a { n += 1; } return n; } print(hs[0](), hs[1]());",
+        want: "1 3\n" },
+    Case { src: "fn mk() { let v = 1; let get = fn() { return v; }; v = 5; return get; } print(mk()());", want: "5\n" },
+    Case { src: "fn a() { let x = 1; return fn() { return fn() { x += 1; return x; }; }; } let f = a()(); f(); print(f());",
+        want: "3\n" },
+    Case { src: "fn pair() { let n = 0; return { inc: fn() { n += 1; }, get: fn() { return n; } }; } let p = pair(); p.inc(); p.inc(); print(p.get());",
+        want: "2\n" },
+    Case { src: "{ let x = 1; let f = fn() { return x; }; x = 2; print(f()); }", want: "2\n" },
+    Case { src: "const ORBIT = 48;\nfn Turret(angle) {\n    return {\n        angle: angle,\n        level: 1,\n        bump: fn(this, dt) {\n            this.angle += dt;\n            match this.level {\n                1 { this.cool = 0.8; }\n                _ { this.cool = 0.3; }\n            }\n        },\n    };\n}\nlet ts = [Turret(0), Turret(1.5)];\nfor t in ts { t.bump(0.5); }\nts[1].level = 2;\nts[1].bump(0.5);\nprint(ts[0].angle, ts[1].angle, ts[0].cool, ts[1].cool, ORBIT);",
+        want: "0.5 2.5 0.8 0.3 48\n" },
+    Case { src: "fn nearest(xs, from) { let best = nil; let bestD = 1e9; for e in xs { let d = (e.x - from) * (e.x - from); if d < bestD { best = e; bestD = d; } } return best; } print(nearest([{ x: 1 }, { x: 5 }, { x: 9 }], 6).x, nearest([], 0));",
+        want: "5 nil\n" },
+    // compare-and-jump ops (constant and register operands, mixed types) and constant arithmetic
+    Case { src: "let x = 2.5; let n = 0; if x > 2 { n += 1; } if x >= 2.5 { n += 1; } if x < 3 { n += 1; } if x <= 2 { n += 100; } if 1 == 1.0 { n += 1; } if x != 2.5 { n += 100; } if \"a\" < \"b\" { n += 1; } let y = 3; if y > x { n += 1; } if y >= 3 { n += 1; } if 2 > y { n += 100; } print(n);",
+        want: "7\n" },
+    Case { src: "let a = 7; print(a / 2, a % 3, -7 / 2, -7 % 3, a / -1, a % -1, a * 3, a - -2, a + 0.5, 1.5 * 2, a / 2.0, \"s\" + 1, a % 2.5);",
+        want: "3 1 -3 -1 -7 0 21 9 7.5 3.0 3.5 s1 2.0\n" },
+    Case { src: "let i = 0; while i < 3 && true { i += 1; } let j = 0; while !(j >= 2) { j += 1; } let k = 0; while k != 4 { k += 1; if k == 2 { continue; } } print(i, j, k);",
+        want: "3 2 4\n" },
+    // raw strings: no escapes, newlines kept, `#`s let a `"` in
+    Case { src: "let fish = r\"\n |\\ /  o\n | >  ))\n |/ \\__/\n \";\nlet ls = split(fish, \"\\n\");\nprint(len(ls), ls[1], len(r\"\\\"), r#\"say \"hi\"\"#, r\"\\n\" == \"\\\\n\");",
+        want: "5  |\\ /  o 1 say \"hi\" true\n" },
+];
+
+const ERRS: [22]Case = [
+    Case { src: "let s = r#\"open\";", want: "t:1:9: unterminated raw string" },
+    Case { src: "print(7 / 0);", want: "t:1:9: division by zero" },
+    Case { src: "print(7 % 0);", want: "t:1:9: modulo by zero" },
+    Case { src: "let x = nil; x.y = 1;", want: "t:1:15: can't set field \"y\" of nil" },
+    Case { src: "let x = 5; x();", want: "t:1:13: can't call int" },
+    Case { src: "let n = nil; print(n.k);", want: "t:1:21: can't read field \"k\" of nil" },
+    Case { src: "let xs = [1];\nxs[3] = 1;", want: "t:2:3: array index 3 is out of range (len 1)" },
+    Case { src: "let xs = [1]; print(xs[\"a\"]);", want: "t:1:23: an array index must be an int, not string" },
+    Case { src: "print(1 + nil);", want: "t:1:9: can't use + on int and nil" },
+    Case { src: "undefinedThing(1);", want: "t:1:1: unknown name \"undefinedThing\"" },
+    Case { src: "const A = 1; A = 2;", want: "t:1:14: can't assign to const \"A\"" },
+    Case { src: "fn f() { break; }", want: "t:1:10: `break` outside a loop" },
+    Case { src: "let xs = [1]; xs.nope(1);", want: "t:1:22: no field \"nope\" and no function nope" },
+    Case { src: "fn r(n) { return r(n + 1); } r(0);", want: "t:1:19: stack overflow" },
+    Case { src: "for i in 0..1.5 { }", want: "t:1:1: a range needs ints, not float" },
+    Case { src: "for x in 5 { }", want: "t:1:1: can't loop over int" },
+    Case { src: "print(1 < \"a\");", want: "t:1:9: can't compare int and string" },
+    Case { src: "let = 1;", want: "t:1:5: expected a name after `let`, found `=`" },
+    Case { src: "let t = {};\nt[nil] = 1;", want: "t:2:2: a table key can't be nil" },
+    Case { src: "if 1 < \"a\" { }", want: "t:1:6: can't compare int and string" },
+    Case { src: "let x = \"s\"; if x > 1 { }", want: "t:1:19: can't compare int and string" },
+    Case { src: "let a = nil; print(a - 1);", want: "t:1:22: can't use - on nil and int" },
+];
+
+fn errText(e: Error, _mem: &Arena): string {
+    return e.message;
+}
+
+/// `print` into the `Text` at `vm.host`, so cases compare what a script printed.
+fn capture(vm: &Vm, args: Args): Value {
+    let t = vm.host as &Text;
+    t.pushStr(args.joined(" "));
+    t.push(10);
+    return j2.nil();
+}
+
+/// A VM with every lib and `print` captured into `out`.
+fn newVm(mem: &Arena, out: &Text): Vm {
+    let vm = Vm.new(mem, Limits { });
+    vm.openLibs(j2.LIB_ALL);
+    vm.bind("print", capture);
+    vm.host = out as ptr;
+    return vm;
+}
+
+fn same(got: string, want: string, src: string, what: string) {
+    if !(got == want) {
+        printLn(`source: {src}`);
+        printLn(`got  [{got}]`);
+        printLn(`want [{want}]`);
+        panic(what);
+    }
+}
+
+/// Run `c` and compare; with `stress` the GC collects at every safe point (`J3_J2_GC_STRESS`),
+/// and the output must be the same.
+fn runOut(mem: &Arena, c: Case, stress: bool) {
+    let out = Text.new(mem);
+    let vm = newVm(mem, &out);
+    vm.gcStress = stress;
+    match vm.loadString("t", c.src) {
+        Result.Ok(_) { same(out.str(), c.want, c.src, "printed output"); }
+        Result.Err(e) {
+            printLn(`source: {c.src}`);
+            printLn(errText(e, mem));
+            panic("unexpected script error");
+        }
+    }
+    vm.destroy();
+}
+
+fn runErr(mem: &Arena, c: Case, stress: bool) {
+    let out = Text.new(mem);
+    let vm = newVm(mem, &out);
+    vm.gcStress = stress;
+    match vm.loadString("t", c.src) {
+        Result.Ok(_) {
+            printLn(`source: {c.src}`);
+            panic("expected a script error");
+        }
+        Result.Err(e) { same(errText(e, mem), c.want, c.src, "error text"); }
+    }
+    vm.destroy();
+}
+
+/// Errors leave the VM usable: frames unwind, open upvalues close.
+fn testRecovery(mem: &Arena) {
+    let out = Text.new(mem);
+    let vm = newVm(mem, &out);
+    let ok = true;
+    match vm.loadString("a", "fn f(n) { let k = n; let g = fn() { return k; }; return g() / 0; } f(1);") {
+        Result.Ok(_) { ok = false; }
+        Result.Err(e) { same(errText(e, mem), "a:1:61: division by zero", "f", "first error"); }
+    }
+    if !ok { panic("expected an error"); }
+    if vm.nframes != 0 || vm.top != 0 || vm.open != 0 as ptr { panic("vm not unwound"); }
+    match vm.loadString("b", "fn r(n) { return r(n + 1); } r(0);") {
+        Result.Ok(_) { panic("expected stack overflow"); }
+        Result.Err(e) { same(errText(e, mem), "b:1:19: stack overflow", "r", "second error"); }
+    }
+    match vm.loadString("c", "print(\"still fine\", 6 * 7);") {
+        Result.Ok(_) { same(out.str(), "still fine 42\n", "c", "after errors"); }
+        Result.Err(e) {
+            printLn(errText(e, mem));
+            panic("vm broken after errors");
+        }
+    }
+    vm.destroy();
+}
+
+fn testDump(mem: &Arena) {
+    let out = Text.new(mem);
+    let vm = newVm(mem, &out);
+    match j2.compileChunk(&vm, "d", "let a = 1; fn f(this, x) { return this.v + x; } print(a.f(2));") {
+        Result.Ok(f) {
+            let t = Text.new(mem);
+            j2.dumpProto(&t, j2.closureOf(f).protoOf());
+            let s = t.str();
+            let wants: [8]string = ["fn main", "fn f params=2", " this\n", "METHOD", "GETFIELD", "; \"v\"", "SETENV", "RETURN"];
+            for want in wants {
+                if find(s, want) < 0 {
+                    printLn(s);
+                    printLn(`missing: {want}`);
+                    panic("dump");
+                }
+            }
+        }
+        Result.Err(e) {
+            printLn(errText(e, mem));
+            panic("compile");
+        }
+    }
+    vm.destroy();
+}
+
+fn scriptDir(): string {
+    if exists("examples/j2_script/j2-scripts/hello/main.j2") {
+        return "examples/j2_script/j2-scripts/";
+    }
+    return "../examples/j2_script/j2-scripts/";
+}
+
+/// The game's natives the example scripts read (`SCRIPTING.md`); the built-ins come from `openLibs`.
+const GAME_NAMES: [12]string = ["defineEnemy", "defineWeapon", "spawn", "shoot", "enemies", "player", "score",
+    "arena", "rgb", "drawText", "drawCircle", "drawRect"];
+
+/// The example scripts without `use` compile (running them needs the game's natives).
+fn testExamples(mem: &Arena) {
+    let names: [2]string = ["base", "hello"];
+    for name in names {
+        let path = Text.new(mem);
+        path.pushStr(scriptDir());
+        path.pushStr(name);
+        path.pushStr("/main.j2");
+        let src = "";
+        match readFile(path.str(), mem) {
+            Result.Ok(b) { src = b as string; }
+            Result.Err(_) { panic("can't read an example script"); }
+        }
+        let out = Text.new(mem);
+        let vm = newVm(mem, &out);
+        for g in GAME_NAMES { vm.bind(g, capture); } // names only: these scripts are compiled, not run
+        match j2.compileChunk(&vm, name, src) {
+            Result.Ok(_) { }
+            Result.Err(e) {
+                printLn(errText(e, mem));
+                panic("example script doesn't compile");
+            }
+        }
+        vm.destroy();
+    }
+}
+
+/// `head` + `unit` x n + `tail`.
+fn repeated(mem: &Arena, head: string, unit: string, n: int, tail: string): string {
+    let t = Text.new(mem);
+    t.pushStr(head);
+    for _ in 0..n { t.pushStr(unit); }
+    t.pushStr(tail);
+    return t.str();
+}
+
+/// Left-nested chains: a long one is a clean error (not a native stack overflow in the
+/// compiler), and one past 255 terms still compiles (the chain reuses one register).
+fn testLongChains() {
+    let mem = Arena.create(4 << 20);
+    let out = Text.new(&mem);
+    let vm = newVm(&mem, &out);
+    let deep: [3]string = [
+        repeated(&mem, "fn f() { return f; } let x = f", "()", 30000, ";"),
+        repeated(&mem, "let a = true; let x = a", " && a", 20000, ";"),
+        repeated(&mem, "let a = 1; let x = a", " + a", 20000, ";"),
+    ];
+    for src in deep {
+        match vm.loadString("t", src) {
+            Result.Ok(_) { panic("a 20000-term chain compiled"); }
+            Result.Err(e) {
+                let want = ": expression too deeply nested";
+                let m = e.message;
+                if m.len < want.len || !(m[0..4] == "t:1:") || !(m[m.len - want.len..m.len] == want) {
+                    printLn(m);
+                    panic("deep chain error");
+                }
+            }
+        }
+    }
+    let src = repeated(&mem, "let a = 1; let t = {}; t.a = t; t.n = 3; let x = a", " + a", 600, "; let y = t");
+    src = repeated(&mem, src, ".a", 600, ".n;");
+    src = repeated(&mem, src, "", 0, " let z = `{a}{a}` + a + a; print(x, y, z);");
+    match vm.loadString("u", src) {
+        Result.Ok(_) { same(out.str(), "601 3 1111\n", "600-term chains", "long chains"); }
+        Result.Err(e) {
+            printLn(e.message);
+            panic("a 600-term chain failed to compile");
+        }
+    }
+    vm.destroy();
+    mem.destroy();
+}
+
+fn main() {
+    testLongChains();
+    let mem = Arena.create(1 << 20);
+    for c in OUT { runOut(&mem, c, false); }
+    for c in ERRS { runErr(&mem, c, false); }
+    // the whole table again with a collection at every safe point: the same output
+    for c in OUT { runOut(&mem, c, true); }
+    for c in ERRS { runErr(&mem, c, true); }
+    testRecovery(&mem);
+    testDump(&mem);
+    testExamples(&mem);
+    printLn("j2_vm_test ok");
+}

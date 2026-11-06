@@ -1,0 +1,174 @@
+// The window: transport, tracks and mixer on the left, chord lane, arrangement, piano roll, and a
+// command console that runs the same commands as `composer run`.
+
+module composer.gui;
+
+use j3.app.App;
+use j3.game;
+use j3.game.{ Color, Font, Key, Mouse, rgb, rgba };
+use j3.io.{ exists, printLn };
+use j3.math.{ Vec2, floor };
+use j3.memory.{ Arena, scratch };
+use j3.sys;
+use j3.text.{ Text, same };
+use j3.ui.{ Theme, Ui, typing };
+use composer.cmd;
+use composer.format;
+use composer.mix;
+use composer.shot;
+use composer.song;
+use composer.song.Song;
+use composer.stream;
+use composer.stream.Player;
+use composer.synth;
+use composer.theory;
+use composer.util.{ cut, endsWith, pushNum };
+use composer.view;
+use composer.view.{ Cam, Rect, fill, rect, text };
+
+const TOP: f32 = 44;
+const LEFT: f32 = 250;
+const BOTTOM: f32 = 38;
+const KEYS: f32 = 48;
+const CHORD_H: f32 = 26;
+const RULER_H: f32 = 20;
+const ROW_H: f32 = 24;
+const VEL_H: f32 = 64;
+
+const NONE: int = 0;
+const MOVE: int = 1;
+const RESIZE: int = 2;
+const VEL: int = 3;
+const BARS: int = 4;
+const SEEK: int = 5;
+const PAN: int = 6;
+
+const SNAPS: [6]f32 = [1.0, 0.5, 0.25, 0.125, 0.3333333, 0.1666667];
+const SNAP_NAMES: [6]string = ["1", "1/2", "1/4", "1/8", "1/3", "1/6"];
+
+pub struct World {
+    mem: &Arena;
+    s: Song;
+    path: string;
+    font: Font;
+    player: Player;
+    cam: Cam;
+    sel: int;
+    snapAt: int;
+    /// Length of the next drawn note, in beats.
+    noteLen: f32;
+    /// Where play starts, in beats.
+    cursor: f32;
+    drag: int;
+    note: int;
+    grabBeat: f32;
+    grabPitch: int;
+    origBeat: f32;
+    origPitch: int;
+    origLen: f32;
+    lastMouse: Vec2;
+    chosen: int;
+    selA: int;
+    selB: int;
+    barGrab: int;
+    sliding: bool;
+    stale: bool;
+    console: Text;
+    log: Text;
+    status: Text;
+    closeWarned: bool;
+}
+
+fn snap(w: &World): f32 {
+    return SNAPS[w.snapAt];
+}
+
+fn say(w: &World, msg: string) {
+    w.status.clear();
+    w.status.pushStr(msg);
+}
+
+fn boot(mem: &Arena): World {
+    let given = sys.arg(1);
+    let w = World {
+        mem: mem, s: song.create(mem), path: if given.len > 0 { cmd.fileName(given, mem) } else { "songs/untitled.j3song" },
+        font: Font { raw: 0 }, player: stream.create(),
+        cam: Cam { left: -0.25, ppb: 40, top: 76, rowH: 14 },
+        sel: 0, snapAt: 2, noteLen: 0.5, cursor: 0, drag: NONE, note: -1, grabBeat: 0, grabPitch: 0,
+        origBeat: 0, origPitch: 0, origLen: 0, lastMouse: Vec2 { x: 0, y: 0 }, chosen: -1, selA: 0, selB: 0,
+        barGrab: 0, sliding: false, stale: true, console: Text.new(mem), log: Text.new(mem), status: Text.new(mem),
+        closeWarned: false,
+    };
+    let err = Text.new(mem);
+    if exists(w.path) {
+        if !format.load(w.path, &w.s, &err) {
+            printLn(err.str());
+            sys.exit(1);
+        }
+        say(&w, "Space plays. Click the roll to draw, drag to move, right-click deletes. F2 lists commands.");
+    } else {
+        say(&w, "New song. Type commands below (`help`), or add a track and draw.");
+    }
+    w.s.name = nameOf(w.path);
+    return w;
+}
+
+fn nameOf(path: string): string {
+    let start = 0;
+    let end = path.len;
+    for i in 0..path.len {
+        if path[i] == 47 { start = i + 1; end = path.len; }
+        if path[i] == 46 && i > start { end = i; }
+    }
+    return cut(path, start, end);
+}
+
+fn startup(w: &World) {
+    game.setMinSize(1000, 600);
+    game.holdClose(true);
+    w.font = game.tryLoadFont(shot.fontPath(), 14);
+    if w.font.raw == 0 { printLn("composer: could not load a UI font; set J3_COMPOSER_FONT to a .ttf file"); }
+    if w.s.trackCount > 0 {
+        let size = game.windowSize();
+        let r = rollRect(w, size);
+        shot.fitPitch(&w.s, w.sel, &w.cam, r.h);
+        fitTime(w, size);
+    }
+}
+
+fn draw(w: &World) {
+    let win = game.windowSize();
+    game.clearTo(view.bg());
+    let pos = if w.player.playing { heardBeat(w) } else { w.cursor };
+    // Follow the play position when it runs off the right edge.
+    if w.player.playing && w.drag == NONE {
+        let nr = notesRect(w, win);
+        let x = view.beatX(&w.cam, nr, pos);
+        if x > nr.x + nr.w - 40 || x < nr.x { w.cam.left = pos - 1; }
+    }
+    view.roll(&w.s, w.sel, &w.cam, rollRect(w, win), KEYS, w.font, snap(w), w.chosen);
+    view.velLane(&w.s, w.sel, &w.cam, velRect(w, win), KEYS, w.font, w.chosen);
+    view.arrange(&w.s, &w.cam, arrangeRect(w, win), ROW_H, w.font, w.sel);
+    view.chordLane(&w.s, &w.cam, chordRect(win), w.font, false, w.selA, w.selB);
+    view.ruler(&w.s, &w.cam, rulerRect(win), w.font, w.selA, w.selB);
+    fill(LEFT, TOP, KEYS, CHORD_H + RULER_H + arrangeH(w), rgb(30, 33, 41));
+    let lane = rect(timeX(), TOP, win.x - timeX(), win.y - BOTTOM - TOP);
+    view.playhead(&w.cam, lane, pos);
+    let ui = Ui.begin(w.font, 0, 0);
+    ui.theme = theme();
+    trackPanel(&ui, w, win);
+    topBar(&ui, w, win);
+    logCard(w, win);
+    let line = bottomBar(&ui, w, win);
+    console(w, line);
+}
+
+/// Open the window on the song named by the first argument (or a new one).
+pub fn run() {
+    let app = App<World>.createSized("Composer", 1440, 880, 256 * 1024 * 1024, boot);
+    app.useGl();
+    app.startup(startup);
+    app.always(input);
+    app.draw(draw);
+    app.run();
+}

@@ -99,7 +99,7 @@ pub fn prepare(m: &Manifest, opts: &EmitOpts, fast: bool) -> Result<Prepared, St
         opts.cc.out = Some(exe.clone());
         crate::cli::status("emitting");
         let started = Instant::now();
-        if emit::incr::enabled(&opts) {
+        if emit::incr::enabled(&opts) || emit::incr::thin_lto(&opts) {
             emit::compile_program(&prog.cx, &prog.modules, &opts)?;
             crate::cli::timing("emit + compile (per module)", started);
         } else if split_vm(&opts) {
@@ -208,6 +208,7 @@ pub(crate) fn launch(exe: &Path, root: &Path, args: &[String], envs: &[(&str, &P
         .env("J3_ROOT", &root)
         // a dev run lets F12 open the UI inspector (`j3.ui.inspect`); `J3_INSPECT=0` turns that off
         .env("J3_INSPECT", std::env::var("J3_INSPECT").unwrap_or_else(|_| "1".into()))
+        .envs(crate::dist::steam_dev_env(&root))
         .envs(envs.iter().copied())
         .stderr(Stdio::piped())
         .spawn()
@@ -217,7 +218,8 @@ pub(crate) fn launch(exe: &Path, root: &Path, args: &[String], envs: &[(&str, &P
     let pipe = child.stderr.take().expect("piped stderr");
     let crash = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let held = crash.clone();
-    std::thread::spawn(move || {
+    let shown_root = root.clone();
+    let reader = std::thread::spawn(move || {
         use std::io::BufRead;
         for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
             if line.starts_with("j3 crash:") || line.starts_with("j3 base:") || line.starts_with("j3 pc:") || line.starts_with("j3 at:") {
@@ -225,24 +227,32 @@ pub(crate) fn launch(exe: &Path, root: &Path, args: &[String], envs: &[(&str, &P
                 h.push_str(&line);
                 h.push('\n');
             } else {
-                eprintln!("{line}");
+                eprintln!("{}", emit::host::abort_context(&line, &shown_root).unwrap_or(line));
             }
         }
     });
-    CRASH.with(|c| *c.borrow_mut() = Some((crash, exe)));
+    CRASH.with(|c| *c.borrow_mut() = Some((crash, exe, reader)));
     Ok(child)
 }
 
 thread_local! {
     /// Held crash-report lines and the exe that wrote them, for the running child.
-    static CRASH: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Mutex<String>>, PathBuf)>> =
+    static CRASH: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Mutex<String>>, PathBuf, std::thread::JoinHandle<()>)>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Print the symbolized crash report of the child that just exited, if it wrote one.
 pub(crate) fn report_crash() {
-    std::thread::sleep(Duration::from_millis(50)); // let the reader thread drain the pipe
-    if let Some((held, exe)) = CRASH.with(|c| c.borrow_mut().take()) {
+    if let Some((held, exe, reader)) = CRASH.with(|c| c.borrow_mut().take()) {
+        // the child has exited, so the pipe closes once its output is read: wait for the reader to finish
+        // but a grandchild that kept stderr open must not hang us: give the reader about a second
+        for _ in 0..100 {
+            if reader.is_finished() {
+                let _ = reader.join();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let text = held.lock().unwrap().clone();
         if let Some(out) = emit::host::symbolize(&exe, &text) {
             eprint!("{out}");

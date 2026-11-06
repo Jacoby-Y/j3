@@ -1,0 +1,232 @@
+/// Modes, alt screen, cursor save/restore, resets, OSC (title, links) of `Grid`. Part of `j3.term.grid`.
+
+module j3.term.grid;
+
+fn setBit(modes: int, bit: int, on: bool): int {
+    return if on { modes | bit } else { modes & ~bit };
+}
+
+extend Grid {
+    fn snapshot(this: &Grid): Saved {
+        return Saved { x: this.cx, y: this.cy, pen: this.pen, origin: (this.modes & MODE_ORIGIN) != 0, pending: this.wrapPending, draw: this.drawG0 };
+    }
+
+    fn restore(this: &Grid, s: &Saved) {
+        this.cx = mx(0, mn(s.x, this.ncols - 1));
+        this.cy = mx(0, mn(s.y, this.nrows - 1));
+        this.pen = s.pen;
+        this.modes = setBit(this.modes, MODE_ORIGIN, s.origin);
+        this.wrapPending = s.pending;
+        this.drawG0 = s.draw;
+    }
+
+    /// DECSC: cursor, pen, origin mode, wrap flag, charset.
+    fn saveCursor(this: &Grid) {
+        this.saved = this.snapshot();
+    }
+
+    /// DECRC (home with a plain pen when nothing was saved).
+    fn restoreCursor(this: &Grid) {
+        let s = this.saved;
+        this.restore(&s);
+    }
+
+    /// Blank every row of the screen in `bufp()` with a plain style.
+    fn clearScreen(this: &Grid) {
+        let pen = this.pen;
+        this.pen = Style.plain();
+        for y in 0..this.nrows {
+            this.eraseRow(y, 0, this.ncols);
+        }
+        this.pen = pen;
+    }
+
+    /// Switch to the alt screen (`clear` blanks it first). No-op when already there.
+    fn enterAlt(this: &Grid, clear: bool) {
+        if this.isAlt {
+            return;
+        }
+        this.isAlt = true;
+        if clear {
+            this.clearScreen();
+        }
+        this.wrapPending = false;
+        this.markAllDirty();
+        this.syncKbd();
+    }
+
+    /// Back to the primary screen (`clear` blanks the alt screen first).
+    fn leaveAlt(this: &Grid, clear: bool) {
+        if !this.isAlt {
+            return;
+        }
+        if clear {
+            this.clearScreen();
+        }
+        this.isAlt = false;
+        this.markAllDirty();
+        this.syncKbd();
+    }
+
+    /// DECSET / DECRST (`CSI ? Pm h|l`), every parameter in turn.
+    fn setModes(this: &Grid, p: &Params, on: bool) {
+        for i in 0..p.count() {
+            let m = p.param(i, 0);
+            if m == 1 {
+                this.modes = setBit(this.modes, MODE_CURSOR_KEYS, on);
+            } else if m == 6 {
+                this.modes = setBit(this.modes, MODE_ORIGIN, on);
+                this.moveTo(0, 0);
+            } else if m == 7 {
+                this.modes = setBit(this.modes, MODE_WRAP, on);
+            } else if m == 25 {
+                this.modes = setBit(this.modes, MODE_CURSOR, on);
+            } else if m == 1000 {
+                this.modes = setBit(this.modes, MODE_MOUSE_CLICK, on);
+            } else if m == 1002 {
+                this.modes = setBit(this.modes, MODE_MOUSE_DRAG, on);
+            } else if m == 1003 {
+                this.modes = setBit(this.modes, MODE_MOUSE_MOVE, on);
+            } else if m == 1004 {
+                this.modes = setBit(this.modes, MODE_FOCUS, on);
+            } else if m == 1006 {
+                this.modes = setBit(this.modes, MODE_MOUSE_SGR, on);
+            } else if m == 2004 {
+                this.modes = setBit(this.modes, MODE_PASTE, on);
+            } else if m == 2026 {
+                this.modes = setBit(this.modes, MODE_SYNC, on);
+                this.syncAt = -1;
+            } else if m == 47 {
+                if on {
+                    this.enterAlt(false);
+                } else {
+                    this.leaveAlt(false);
+                }
+            } else if m == 1047 {
+                if on {
+                    this.enterAlt(true);
+                } else {
+                    this.leaveAlt(true);
+                }
+            } else if m == 1049 {
+                if on {
+                    if !this.isAlt {
+                        this.saved1049 = this.snapshot();
+                    }
+                    this.enterAlt(true);
+                } else if this.isAlt {
+                    this.leaveAlt(false);
+                    let s = this.saved1049;
+                    this.restore(&s);
+                }
+            }
+        }
+    }
+
+    /// DECRQM state of DEC private mode `m`: 1 set, 2 reset, 0 not recognized.
+    fn decMode(this: &Grid, m: int): int {
+        let bit = 0;
+        if m == 1 { bit = MODE_CURSOR_KEYS; }
+        else if m == 6 { bit = MODE_ORIGIN; }
+        else if m == 7 { bit = MODE_WRAP; }
+        else if m == 25 { bit = MODE_CURSOR; }
+        else if m == 1000 { bit = MODE_MOUSE_CLICK; }
+        else if m == 1002 { bit = MODE_MOUSE_DRAG; }
+        else if m == 1003 { bit = MODE_MOUSE_MOVE; }
+        else if m == 1004 { bit = MODE_FOCUS; }
+        else if m == 1006 { bit = MODE_MOUSE_SGR; }
+        else if m == 2004 { bit = MODE_PASTE; }
+        else if m == 2026 { bit = MODE_SYNC; }
+        else if m == 47 || m == 1047 || m == 1049 { return if this.isAlt { 1 } else { 2 }; }
+        else { return 0; }
+        return if (this.modes & bit) != 0 { 1 } else { 2 };
+    }
+
+    /// DECSTR: modes back to default (autowrap on, as xterm does in practice) except mouse, paste and focus
+    /// reporting; pen, region, charset and saved cursor reset. The screen and cursor position stay.
+    fn softReset(this: &Grid) {
+        let keep = this.modes & (MODE_MOUSE_ANY | MODE_MOUSE_SGR | MODE_PASTE | MODE_FOCUS | MODE_KITTY_MASK);
+        this.modes = keep | MODE_WRAP | MODE_CURSOR;
+        this.pen = Style.plain();
+        this.link = 0;
+        this.top = 0;
+        this.bot = this.nrows - 1;
+        this.drawG0 = false;
+        this.saved = homeSaved();
+        this.wrapPending = false;
+        this.cursorShape = 0;
+    }
+
+    /// RIS: everything back to power-on except the title: both screens blank, scrollback dropped, tabs default.
+    fn fullReset(this: &Grid) {
+        let wasAlt = this.isAlt;
+        this.isAlt = true;
+        this.clearScreen();
+        this.isAlt = false;
+        this.clearScreen();
+        if wasAlt {
+            this.markAllDirty();
+        }
+        this.sbCount = 0;
+        this.sbHead = 0;
+        this.softReset();
+        this.modes = MODE_WRAP | MODE_CURSOR;
+        for i in 0..16 {
+            this.kbd[i] = 0;
+        }
+        this.kbdPri = 0;
+        this.kbdAlt = 0;
+        this.kittyFreeAll();
+        this.saved1049 = homeSaved();
+        this.resetTabs();
+        this.cx = 0;
+        this.cy = 0;
+    }
+
+    /// Sink: `0;title`, `2;title`, `8;params;uri` (links); other OSC numbers are ignored.
+    fn osc(this: &Grid, bytes: string) {
+        let i = 0;
+        let num = 0;
+        while i < bytes.len && bytes[i] >= 0x30 && bytes[i] <= 0x39 && num < 100000 {
+            num = num * 10 + int(bytes[i] - 0x30);
+            i += 1;
+        }
+        if i >= bytes.len || bytes[i] != 0x3b {
+            return;
+        }
+        let rest = bytes[(i + 1)..bytes.len];
+        if num == 0 || num == 2 {
+            this.title.clear();
+            this.title.pushStr(rest[0..mn(rest.len, MAX_TITLE)]);
+        } else if num == 8 {
+            let k = 0;
+            while k < rest.len && rest[k] != 0x3b {
+                k += 1;
+            }
+            if k < rest.len {
+                this.link = this.linkId(rest[(k + 1)..rest.len]);
+            }
+        }
+    }
+
+    /// Id for `uri` in the link table (added when new); 0 for "" or when the table or URI is too big.
+    fn linkId(this: &Grid, uri: string): int {
+        if uri.len == 0 || uri.len > MAX_URI {
+            return 0;
+        }
+        for k in 0..this.links.len {
+            if this.links.items[k] == uri {
+                return k + 1;
+            }
+        }
+        if this.links.len >= MAX_LINKS {
+            return 0;
+        }
+        let buf = this.arena.alloc::<u8>(uri.len);
+        for k in 0..uri.len {
+            buf[k] = uri[k];
+        }
+        this.links.push(buf as string);
+        return this.links.len;
+    }
+}

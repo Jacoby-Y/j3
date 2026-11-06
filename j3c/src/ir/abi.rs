@@ -9,10 +9,11 @@ pub fn size(cx: &IrCx, ty: Ty) -> u64 {
         TyKind::Void => 0,
         TyKind::Bool => 1,
         TyKind::Int(int_ty) => int_ty.width_bytes(),
+        TyKind::Half => 2,
         TyKind::Float(FloatTy::F32) => 4,
         TyKind::Float(FloatTy::F64) => 8,
         TyKind::Ptr | TyKind::CStr | TyKind::Ref(_) | TyKind::Fn { .. } => 8,
-        TyKind::String | TyKind::Slice { .. } => 16,
+        TyKind::String | TyKind::Slice { .. } | TyKind::Vec(_) => 16,
         TyKind::Array { elem, len } => size(cx, *elem) * *len,
         TyKind::Struct(id) => {
             let def = cx.struct_def(*id);
@@ -66,10 +67,12 @@ pub fn align(cx: &IrCx, ty: Ty) -> u64 {
         TyKind::Void => 1,
         TyKind::Bool => 1,
         TyKind::Int(int_ty) => int_ty.width_bytes(),
+        TyKind::Half => 2,
         TyKind::Float(FloatTy::F32) => 4,
         TyKind::Float(FloatTy::F64) => 8,
         TyKind::Ptr | TyKind::CStr | TyKind::Ref(_) | TyKind::Fn { .. } => 8,
         TyKind::String | TyKind::Slice { .. } => 8,
+        TyKind::Vec(_) => 16,
         TyKind::Array { elem, .. } => align(cx, *elem),
         TyKind::Struct(id) => {
             let def = cx.struct_def(*id);

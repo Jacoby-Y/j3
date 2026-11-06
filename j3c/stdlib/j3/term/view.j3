@@ -1,0 +1,1071 @@
+/// The terminal emulator's front: paints a `j3.term.grid.Grid` with `j3.gfx.paint` and turns `j3.game` keys, text,
+/// paste and the mouse into the bytes a program on a pty expects. GL and main thread only (like all of `paint`). The
+/// caller owns the grid, the pty and the loop, so a terminal pane can sit in any app:
+///
+///     let v = View.new(&arena, font);              // cell size from the font's advance and line height
+///     // each frame:
+///     v.input(&grid, &out);                        // keys, text, paste, wheel -> bytes; then pty.write(out.bytes)
+///     v.draw(&grid, 0.0, 0.0);                     // all rows, bottom of scrollback unless scrolled
+///     // on window resize: cols = v.colsFor(width), rows = v.rowsFor(height)
+///
+/// Drawing: every glyph sits at `col * cellW`, whatever the font. ASCII goes out as one text run per same-style stretch
+/// only when the font's advance is exactly `cellW` for every printable character (checked once per font and cached;
+/// a ligature run is measured each time); otherwise, as for other characters, each glyph is placed in its own cell,
+/// wide ones across two. Bold cells use `bold` / `boldItalic` when set, else faux bold: the glyph drawn twice, 1px
+/// apart, with the advance unchanged (so a bold run never grows past its cells). Backgrounds merge into one rect
+/// per same-color run, bold also brightens palette colors 0 to 7, `dim` blends toward the background, underline and
+/// strike are lines. Block elements (U+2580-259F, shades as fg at 25/50/75% alpha), box drawing (U+2500-257F: light,
+/// heavy, double, dashed, diagonals; rounded corners come out square) and sextants (U+1FB00-1FB3B) are painted as
+/// rects that fill the whole cell, not taken from the font, so they join across rows at any `setLineHeight`;
+/// `builtinBoxes = false` draws them from the font instead. Italic uses `italic` (a font you load, such as the family's Italic file; without one italic looks
+/// upright), combining marks (`Cell.marks`) are drawn with their base character, and `ligatures` lets runs with
+/// symbol pairs shape (`->` in Fira Code). The cursor is a block, underline or bar (DECSCUSR) and shows only at
+/// the bottom of scrollback. It blinks when the app sets `blinkMs` (the View owns the timer: it hides the cursor
+/// every other `blinkMs` for the blinking DECSCUSR shapes 0, 1, 3, 5, restarts the phase visible on each key or text
+/// `input` sends, and asks `game.wakeAt` for the next edge so an idle-sleeping app wakes for it); 0, the default, is
+/// steady. The `blink` text attribute is not drawn. `input` repeats held keys itself (SDL sends no repeats here) and sends
+/// each printable character once, from `textTyped`; Ctrl and Alt combos come through the key path. Shift+PageUp/PageDown
+/// scroll, Ctrl+Shift+V pastes. There is no selection or copy. Kitty graphics placements (`j3.term.grid` keeps them) are
+/// drawn with the text, z < 0 under it; `draw` also tells the grid the cell size in pixels (`Grid.cellPxW`/`cellPxH`).
+/// Tell the program the pixel size too, or image tools refuse: `pty.resizePx(cols, rows, v.cellW, v.cellH)`.
+
+module j3.term.view;
+
+use j3.game;
+use j3.game.Font;
+use j3.game.Key;
+use j3.game.Mouse;
+use j3.gfx.paint;
+use j3.math;
+use j3.math.Vec2;
+use j3.memory.Arena;
+use j3.term.Cell;
+use j3.game.Color;
+use j3.game.Texture;
+use j3.game.TextMode;
+use j3.gfx.canvas.Canvas;
+use j3.gfx.canvas.Mode;
+use j3.term.grid.KPlace;
+use j3.term.Style;
+use j3.term.ATTR_BOLD;
+use j3.term.ATTR_DIM;
+use j3.term.ATTR_INVERSE;
+use j3.term.ATTR_ITALIC;
+use j3.term.ATTR_HIDDEN;
+use j3.term.ATTR_STRIKE;
+use j3.term.ATTR_UNDERLINE;
+use j3.term.COLOR_PALETTE;
+use j3.term.COLOR_RGB;
+use j3.term.paletteRgb;
+use j3.term.pushUtf8;
+use j3.term.grid.Grid;
+use j3.term.grid.MODE_MOUSE_ANY;
+use j3.term.grid.KITTY_ALL_AS_ESCAPES;
+use j3.term.grid.KITTY_EVENT_TYPES;
+use j3.term.grid.kittyFlags;
+use j3.term.decodeUtf8;
+use j3.term.input;
+use j3.text.Text;
+
+const DEF_FG = 13421772;
+const DEF_BG = 1580056;
+const REPEAT_DELAY = 400;
+const REPEAT_EVERY = 33;
+const WHEEL_LINES = 3;
+const MAX_TEX = 80;
+
+pub struct View {
+    font: Font;
+    /// Font for `ATTR_ITALIC` cells (same size as `font`); empty (`raw` 0) draws them with `font`.
+    italic: Font;
+    /// Fonts for `ATTR_BOLD` cells, and bold italic ones (same size as `font`). Bold italic falls back to `bold`, then
+    /// `italic` (faux bold), then `font`; bold falls back to faux bold on `font`. Empty (`raw` 0) means not loaded.
+    bold: Font;
+    boldItalic: Font;
+    /// Draw runs that hold two symbols in a row (`->`, `!=`, `===`) as one shaped string, so a font's ligatures form
+    /// (needs `game.textShaping()`; costs a cached raster per distinct run). Glyph positions stay on the cell grid
+    /// only for a monospace font whose ligatures keep the cell width, which coding fonts do.
+    ligatures: bool;
+    /// Paint block elements (U+2580-259F), box drawing (U+2500-257F) and sextants (U+1FB00-1FB3B) as shapes that fill
+    /// the whole cell, so neighbors join at any line height; false takes them from the font like other characters.
+    builtinBoxes: bool;
+    /// Cell size in pixels.
+    cellW: int;
+    cellH: int;
+    /// The font's line height, and how far glyphs sit below a cell's top (`setLineHeight` centers them).
+    fontH: int;
+    textDy: int;
+    /// Lines the view is scrolled back from the live screen (0 is the bottom).
+    scrollOff: int;
+    /// Where `draw` last put the top-left cell, for mouse coordinates.
+    ox: f32;
+    oy: f32;
+    started: bool;
+    pal: []int;
+    /// Default foreground, default background and cursor color, 0xRRGGBB. Set any time; the next `draw` uses them.
+    defaultFg: int;
+    defaultBg: int;
+    cursorColor: int;
+    run: Text;
+    /// Kitty graphics textures, keyed by image serial (`Grid.kittyImage`); made on first draw, freed when the grid
+    /// drops the image.
+    texSerial: []int;
+    texs: []Texture;
+    ntex: int;
+    /// Key table (parallel arrays): the `j3.game` key and what it sends (`KEY_*`, or minus a code point for Ctrl/Alt chars).
+    keys: []Key;
+    codes: []int;
+    nkeys: int;
+    repIdx: int;
+    repAt: int;
+    mouseDown: int;
+    /// The last frame drawn outside a synchronized update (`?2026`), shown again while `Grid.syncHeld`: `held`
+    /// holds `heldRows` rows of `heldCols` cells, plus the cursor as it was.
+    arena: &Arena;
+    held: []Cell;
+    heldCols: int;
+    heldRows: int;
+    heldCx: int;
+    heldCy: int;
+    heldCursor: bool;
+    heldShape: int;
+    /// Cursor blink half period in ms (on for `blinkMs`, off for `blinkMs`; 530 is xterm's); 0 never blinks.
+    blinkMs: int;
+    /// `game.ticks()` when the blink phase last restarted (on): set by `input` when it sends something, and `blinkReset`.
+    blinkT0: int;
+    /// Fonts already checked for an advance of exactly `cellW` on every ASCII character (`fitRaw`), 1 yes 2 no (`fitVal`).
+    fitRaw: []int;
+    fitVal: []int;
+    fitNext: int;
+
+    /// A view for `font`: the cell is one `M` wide and `fontLine` tall. Call after the window exists (the glyph sheet is
+    /// measured) and with the font loaded.
+    fn new(arena: &Arena, font: Font): View {
+        let w = int(game.textSize(font, "MMMMMMMMMM").x / 10.0 + 0.5);
+        let h = game.fontLine(font);
+        let v = View {
+            font: font, italic: Font { raw: 0 as ptr }, bold: Font { raw: 0 as ptr }, boldItalic: Font { raw: 0 as ptr }, ligatures: false, builtinBoxes: true, cellW: if w < 1 { 8 } else { w }, cellH: if h < 1 { 16 } else { h }, fontH: if h < 1 { 16 } else { h }, textDy: 0, scrollOff: 0,
+            ox: 0.0, oy: 0.0, started: false, pal: arena.alloc::<int>(256), defaultFg: DEF_FG, defaultBg: DEF_BG, cursorColor: DEF_FG, run: Text.new(arena),
+            texSerial: arena.alloc::<int>(MAX_TEX), texs: arena.alloc::<Texture>(MAX_TEX), ntex: 0,
+            keys: arena.alloc::<Key>(96), codes: arena.alloc::<int>(96), nkeys: 0, repIdx: -1, repAt: 0, mouseDown: -1,
+            arena: arena, held: arena.alloc::<Cell>(0), heldCols: 0, heldRows: 0, heldCx: 0, heldCy: 0, heldCursor: false, heldShape: 0, blinkMs: 0, blinkT0: 0,
+            fitRaw: arena.alloc::<int>(4), fitVal: arena.alloc::<int>(4), fitNext: 0,
+        };
+        initPalette(v.pal);
+        v.addKeys();
+        return v;
+    }
+
+    /// Switch to `font` in place: re-measure the cell like `new` (one `M` wide, `fontLine` tall, so a line height set
+    /// with `setLineHeight` resets to 100) and forget the per-font grid-fit checks. Palette, cursor color, the
+    /// `italic`/`bold`/`boldItalic` faces, `ligatures`, `builtinBoxes`, scroll, key and mouse state stay. Allocates
+    /// nothing, so a long-lived pane can call it on every zoom. Same rules as `new`: after the window exists, with
+    /// `font` loaded. Recompute `colsFor`/`rowsFor` and resize the grid and pty after.
+    fn setFont(this: &View, font: Font) {
+        let w = int(game.textSize(font, "MMMMMMMMMM").x / 10.0 + 0.5);
+        let h = game.fontLine(font);
+        this.font = font;
+        this.cellW = if w < 1 { 8 } else { w };
+        this.fontH = if h < 1 { 16 } else { h };
+        this.cellH = this.fontH;
+        this.textDy = 0;
+        // Fit depends on cellW too, so the italic/bold faces need rechecking as well.
+        for i in 0..4 {
+            this.fitRaw[i] = 0;
+            this.fitVal[i] = 0;
+        }
+    }
+
+    /// Show the cursor now and restart its blink phase (`input` does this for every key or text it sends).
+    fn blinkReset(this: &View) {
+        this.blinkT0 = game.ticks();
+    }
+
+    /// Whether a cursor of DECSCUSR `shape` is in its visible phase at `now` (ms). Steady shapes (2, 4, 6) and
+    /// `blinkMs` 0 are always on; otherwise the next edge is passed to `game.wakeAt`.
+    fn blinkOn(this: &View, shape: int, now: int): bool {
+        if this.blinkMs <= 0 || shape == 2 || shape == 4 || shape == 6 { return true; }
+        let k = (now - this.blinkT0) / this.blinkMs;
+        if k < 0 { k = 0; }
+        game.wakeAt(this.blinkT0 + (k + 1) * this.blinkMs);
+        return k % 2 == 0;
+    }
+
+    /// Cell height as `percent` of the font's line (100 is the default; below 100 is clamped to 100). Glyphs, the
+    /// cursor, underline and strike are centered in the taller cell, the extra space split evenly above and below.
+    /// Recompute `rowsFor` and resize the grid and pty after calling it.
+    fn setLineHeight(this: &View, percent: int) {
+        let p = if percent < 100 { 100 } else { percent };
+        this.cellH = (this.fontH * p + 50) / 100;
+        this.textDy = (this.cellH - this.fontH) / 2;
+    }
+
+    /// Columns that fit `width` pixels (at least 1).
+    fn colsFor(this: &View, width: f32): int {
+        let n = int(width) / this.cellW;
+        return if n < 1 { 1 } else { n };
+    }
+
+    /// Rows that fit `height` pixels (at least 1).
+    fn rowsFor(this: &View, height: f32): int {
+        let n = int(height) / this.cellH;
+        return if n < 1 { 1 } else { n };
+    }
+
+    /// Scroll back by `lines` (negative goes forward), clamped to the scrollback held.
+    fn scroll(this: &View, g: &Grid, lines: int) {
+        this.scrollOff = clampOff(this.scrollOff + lines, g);
+    }
+
+    /// Jump to the live screen (the example calls it when new output arrives).
+    fn snap(this: &View) {
+        this.scrollOff = 0;
+    }
+
+    fn off(this: &View, g: &Grid): int {
+        if g.altScreen() {
+            return 0;
+        }
+        return clampOff(this.scrollOff, g);
+    }
+
+    /// Paint the whole grid with its top-left corner at (`x`, `y`). While the program holds a synchronized update
+    /// (`Grid.syncHeld`) it paints the last complete frame instead (text and cursor; kitty images are left out).
+    fn draw(this: &View, g: &Grid, x: f32, y: f32) {
+        this.ox = x;
+        this.oy = y;
+        if g.syncHeld(game.ticks()) && this.heldRows > 0 {
+            this.drawHeld(x, y);
+            return;
+        }
+        let cols = g.cols();
+        let rows = g.rows();
+        let off = this.off(g);
+        if this.held.len < cols * rows {
+            this.held = this.arena.alloc::<Cell>(cols * rows);
+        }
+        this.heldCols = cols;
+        this.heldRows = rows;
+        this.heldCx = g.cursorX();
+        this.heldCy = g.cursorY();
+        this.heldCursor = off == 0 && g.cursorVisible();
+        this.heldShape = g.cursorShape;
+        paint.rect(Vec2 { x: x, y: y }, Vec2 { x: f32(cols * this.cellW), y: f32(rows * this.cellH) }, this.bgColor());
+        g.cellPxW = this.cellW;
+        g.cellPxH = this.cellH;
+        let pics = g.kittyPlacements();
+        if pics.len > 0 || this.ntex > 0 {
+            this.dropTextures(g);
+            this.drawImages(g, pics, x, y, off, true);
+        }
+        for r in 0..rows {
+            let cells = g.viewLine(off, r);
+            for c in 0..cells.len {
+                this.held[r * cols + c] = cells[c];
+            }
+            this.drawBg(cells, x, y + f32(r * this.cellH));
+            this.drawText(cells, x, y + f32(r * this.cellH));
+        }
+        if pics.len > 0 {
+            this.drawImages(g, pics, x, y, off, false);
+        }
+        if this.heldCursor && this.blinkOn(this.heldShape, game.ticks()) {
+            this.drawCursor(this.heldCx, this.heldCy, g.cell(this.heldCx, this.heldCy), this.heldShape, x, y);
+        }
+    }
+
+    /// The default background with `game.backgroundAlpha()` (a transparent window shows the desktop through it).
+    fn bgColor(this: &View): Color {
+        let c = colorOf(this.defaultBg);
+        c.a = u8(game.backgroundAlpha() * 255.0 + 0.5);
+        return c;
+    }
+
+        /// Kitty placements of the showing screen, `below` the text (z < 0) or over it, clipped to the grid.
+    fn drawImages(this: &View, g: &Grid, pics: []KPlace, x: f32, y: f32, off: int, below: bool) {
+        paint.pushClip(Vec2 { x: x, y: y }, Vec2 { x: f32(g.cols() * this.cellW), y: f32(g.rows() * this.cellH) });
+        for i in 0..pics.len {
+            let p = pics[i];
+            if p.alt != g.altScreen() || (p.z < 0) != below {
+                continue;
+            }
+            let top = p.row + off;
+            if top + p.rows <= 0 || top >= g.rows() {
+                continue;
+            }
+            let tex = this.texFor(g, p.serial);
+            if tex.raw == 0 {
+                continue;
+            }
+            let pos = Vec2 { x: x + f32(p.col * this.cellW + p.ox), y: y + f32(top * this.cellH + p.oy) };
+            paint.imageSrc(tex, Vec2 { x: f32(p.sx), y: f32(p.sy) }, Vec2 { x: f32(p.sw), y: f32(p.sh) }, pos, Vec2 { x: f32(p.dw), y: f32(p.dh) }, game.rgb(255, 255, 255));
+        }
+        paint.popClip();
+    }
+
+    /// The texture of image `serial`, uploaded on first use (empty when the grid no longer has it or the cache is full).
+    fn texFor(this: &View, g: &Grid, serial: int): Texture {
+        for i in 0..this.ntex {
+            if this.texSerial[i] == serial {
+                return this.texs[i];
+            }
+        }
+        let im = g.kittyImage(serial);
+        if im.w == 0 || this.ntex >= MAX_TEX {
+            return Texture {};
+        }
+        let t = game.textureFromCanvas(Canvas { pixels: im.px, w: i32(im.w), h: i32(im.h), mode: Mode.Smooth });
+        this.texSerial[this.ntex] = serial;
+        this.texs[this.ntex] = t;
+        this.ntex += 1;
+        return t;
+    }
+
+    /// Free textures of images the grid dropped.
+    fn dropTextures(this: &View, g: &Grid) {
+        let w = 0;
+        for i in 0..this.ntex {
+            if g.kittyHas(this.texSerial[i]) {
+                this.texSerial[w] = this.texSerial[i];
+                this.texs[w] = this.texs[i];
+                w += 1;
+            } else {
+                game.destroyTexture(this.texs[i]);
+            }
+        }
+        this.ntex = w;
+    }
+
+    fn drawBg(this: &View, cells: []Cell, x: f32, y: f32) {
+        let n = cells.len;
+        let i = 0;
+        while i < n {
+            let bg = this.bgOf(cells[i].style);
+            let j = i + 1;
+            while j < n && this.bgOf(cells[j].style) == bg {
+                j += 1;
+            }
+            if bg != this.defaultBg {
+                paint.rect(Vec2 { x: x + f32(i * this.cellW), y: y }, Vec2 { x: f32((j - i) * this.cellW), y: f32(this.cellH) }, colorOf(bg));
+            }
+            i = j;
+        }
+    }
+
+    fn drawText(this: &View, cells: []Cell, x: f32, y: f32) {
+        let n = cells.len;
+        let i = 0;
+        while i < n {
+            let c = cells[i];
+            if c.width == 0 || c.style.has(ATTR_HIDDEN) {
+                i += 1;
+                continue;
+            }
+            let fg = this.fgOf(c.style);
+            let span = if c.width == 2 { 2 } else { 1 };
+            if c.cp >= 128 || (c.cp > 0 && c.cp < 32) || c.marks != 0 {
+                // One glyph at its own column, so a fallback font's advance cannot shift the rest of the row.
+                if c.cp >= 128 || c.marks != 0 {
+                    this.glyphCell(c, x + f32(i * this.cellW), y, fg);
+                }
+                this.lines(c.style, fg, x + f32(i * this.cellW), y, span);
+                i += span;
+                continue;
+            }
+            // An ASCII stretch of one look: spaces and 32..126, width 1.
+            let j = i;
+            let bold = c.style.has(ATTR_BOLD);
+            let ital = c.style.has(ATTR_ITALIC);
+            let line = c.style.has(ATTR_UNDERLINE);
+            let strike = c.style.has(ATTR_STRIKE);
+            let blank = true;
+            this.run.clear();
+            while j < n {
+                let d = cells[j];
+                if d.width != 1 || d.cp >= 127 || (d.cp > 0 && d.cp < 32) || d.marks != 0 || d.style.has(ATTR_HIDDEN) {
+                    break;
+                }
+                if this.fgOf(d.style) != fg || d.style.has(ATTR_BOLD) != bold || d.style.has(ATTR_ITALIC) != ital || d.style.has(ATTR_UNDERLINE) != line || d.style.has(ATTR_STRIKE) != strike {
+                    break;
+                }
+                if d.cp > 32 {
+                    blank = false;
+                    this.run.push(u8(d.cp));
+                } else {
+                    this.run.push(32);
+                }
+                j += 1;
+            }
+            if !blank {
+                let p = Vec2 { x: x + f32(i * this.cellW), y: y + f32(this.textDy) };
+                if this.ligatures && symbolPair(this.run.str()) {
+                    let was = game.setTextMode(TextMode { tabular: false, letterSp: 0.0, wordSp: 0.0, shaped: true });
+                    let f = this.fontOf(bold, ital);
+                    let fits = math.abs(game.textSize(f, this.run.str()).x - f32((j - i) * this.cellW)) < 0.01;
+                    if fits {
+                        this.put(f, p, this.run.str(), colorOf(fg), this.faux(f, bold));
+                    }
+                    game.setTextMode(was);
+                    if !fits {
+                        this.textAt(p, this.run.str(), fg, bold, ital, j - i);
+                    }
+                } else {
+                    this.textAt(p, this.run.str(), fg, bold, ital, j - i);
+                }
+            }
+            this.lines(c.style, fg, x + f32(i * this.cellW), y, j - i);
+            i = j;
+        }
+    }
+
+    /// Underline and strike across `span` cells starting at `x`.
+    fn lines(this: &View, st: Style, fg: int, x: f32, y: f32, span: int) {
+        if st.has(ATTR_UNDERLINE) {
+            paint.rect(Vec2 { x: x, y: y + f32(this.textDy + this.fontH - 2) }, Vec2 { x: f32(span * this.cellW), y: 1.0 }, colorOf(fg));
+        }
+        if st.has(ATTR_STRIKE) {
+            paint.rect(Vec2 { x: x, y: y + f32(this.cellH / 2) }, Vec2 { x: f32(span * this.cellW), y: 1.0 }, colorOf(fg));
+        }
+    }
+
+    /// `msg` at `p` in the font for `bold` and `ital`. `cells` > 1 means `msg` is that many ASCII cells: drawn as one
+    /// run when the font's advance is exactly `cellW`, else one glyph per cell.
+    fn textAt(this: &View, p: Vec2, msg: string, color: int, bold: bool, ital: bool, cells: int) {
+        let f = this.fontOf(bold, ital);
+        let fb = this.faux(f, bold);
+        let c = colorOf(color);
+        if cells <= 1 || this.fitsGrid(f) {
+            this.put(f, p, msg, c, fb);
+            return;
+        }
+        for k in 0..cells {
+            if msg[k] != 32 {
+                this.put(f, Vec2 { x: p.x + f32(k * this.cellW), y: p.y }, msg[k..k + 1], c, fb);
+            }
+        }
+    }
+
+    fn fontOf(this: &View, bold: bool, ital: bool): Font {
+        if bold && ital && this.boldItalic.raw != 0 { return this.boldItalic; }
+        if bold && this.bold.raw != 0 { return this.bold; }
+        if ital && this.italic.raw != 0 { return this.italic; }
+        return this.font;
+    }
+
+    /// Whether `bold` text in `f` needs faux bold (`f` is not a loaded bold font).
+    fn faux(this: &View, f: Font, bold: bool): bool {
+        return bold && f.raw != this.bold.raw && f.raw != this.boldItalic.raw;
+    }
+
+    /// `msg` at `p`; faux bold draws it again 1px right, so the advance stays the font's.
+    fn put(this: &View, f: Font, p: Vec2, msg: string, c: Color, fauxBold: bool) {
+        paint.text(f, p, msg, c);
+        if fauxBold {
+            paint.text(f, Vec2 { x: p.x + 1.0, y: p.y }, msg, c);
+        }
+    }
+
+    /// True when every printable ASCII character of `f` advances exactly `cellW` (and a run of them `n * cellW`), so
+    /// a run can go out as one string. Checked once per font.
+    fn fitsGrid(this: &View, f: Font): bool {
+        let key = f.raw as int;
+        for i in 0..4 {
+            if this.fitRaw[i] == key && this.fitVal[i] != 0 {
+                return this.fitVal[i] == 1;
+            }
+        }
+        let ok = true;
+        let s = PRINTABLE;
+        for k in 0..95 {
+            if math.abs(game.textSize(f, s[k..k + 1]).x - f32(this.cellW)) > 0.01 {
+                ok = false;
+            }
+        }
+        if math.abs(game.textSize(f, s).x - f32(95 * this.cellW)) > 0.01 {
+            ok = false;
+        }
+        // ponytail: 4 slots round-robin; a View has at most four fonts.
+        let slot = this.fitNext % 4;
+        this.fitNext += 1;
+        this.fitRaw[slot] = key;
+        this.fitVal[slot] = if ok { 1 } else { 2 };
+        return ok;
+    }
+
+    /// Paint `cp` as a shape over the whole cell at (`x`, `y`) when it is a block, box-drawing or sextant character;
+    /// false for anything else (the caller draws the glyph).
+    fn boxCell(this: &View, cp: int, x: f32, y: f32, color: int): bool {
+        if !((cp >= 0x2500 && cp <= 0x259F) || (cp >= 0x1FB00 && cp <= 0x1FB3B)) {
+            return false;
+        }
+        // Integer edges: cells meet with no seam and no overlap.
+        let b = Box { x: int(math.floor(x + 0.5)), y: int(math.floor(y + 0.5)), w: this.cellW, h: this.cellH, c: colorOf(color) };
+        if cp >= 0x1FB00 {
+            // Sextants skip the patterns that already exist as blocks (empty, left half, right half, full).
+            let m = cp - 0x1FB00 + 1;
+            if m >= 21 { m += 1; }
+            if m >= 42 { m += 1; }
+            for i in 0..6 {
+                if (m >> i) & 1 != 0 {
+                    let cx = i % 2;
+                    let r = i / 2;
+                    b.fill(b.x + b.w * cx / 2, b.y + b.h * r / 3, b.x + b.w * (cx + 1) / 2, b.y + b.h * (r + 1) / 3);
+                }
+            }
+            return true;
+        }
+        if cp >= 0x2580 {
+            b.block(cp);
+            return true;
+        }
+        b.lines(cp);
+        return true;
+    }
+
+    /// Cell `c`'s character and its combining marks, drawn as one string with its top-left at (`x`, `y`).
+    fn glyphCell(this: &View, c: Cell, x: f32, y: f32, color: int) {
+        if this.builtinBoxes && c.marks == 0 && this.boxCell(int(c.cp), x, y, color) {
+            return;
+        }
+        this.run.clear();
+        pushUtf8(&this.run, c.cp);
+        if c.mark(0) != 0 {
+            pushUtf8(&this.run, c.mark(0));
+        }
+        if c.mark(1) != 0 {
+            pushUtf8(&this.run, c.mark(1));
+        }
+        this.textAt(Vec2 { x: x, y: y + f32(this.textDy) }, this.run.str(), color, c.style.has(ATTR_BOLD), c.style.has(ATTR_ITALIC), 1);
+    }
+
+    /// The frame kept by the last `draw` outside a synchronized update.
+    fn drawHeld(this: &View, x: f32, y: f32) {
+        let cols = this.heldCols;
+        paint.rect(Vec2 { x: x, y: y }, Vec2 { x: f32(cols * this.cellW), y: f32(this.heldRows * this.cellH) }, this.bgColor());
+        for r in 0..this.heldRows {
+            let cells = this.held[r * cols..(r + 1) * cols];
+            this.drawBg(cells, x, y + f32(r * this.cellH));
+            this.drawText(cells, x, y + f32(r * this.cellH));
+        }
+        if this.heldCursor && this.heldCx < cols && this.heldCy < this.heldRows && this.blinkOn(this.heldShape, game.ticks()) {
+            this.drawCursor(this.heldCx, this.heldCy, this.held[this.heldCy * cols + this.heldCx], this.heldShape, x, y);
+        }
+    }
+
+    /// The cursor at cell (`cx`, `cy`) over cell `c`, DECSCUSR `shape`.
+    fn drawCursor(this: &View, cx: int, cy: int, c: Cell, shape: int, x: f32, y: f32) {
+        let px = x + f32(cx * this.cellW);
+        // The cursor covers the font line, centered like the glyphs.
+        let py = y + f32(cy * this.cellH + this.textDy);
+        if shape == 3 || shape == 4 {
+            paint.rect(Vec2 { x: px, y: py + f32(this.fontH - 2) }, Vec2 { x: f32(this.cellW), y: 2.0 }, colorOf(this.cursorColor));
+        } else if shape == 5 || shape == 6 {
+            paint.rect(Vec2 { x: px, y: py }, Vec2 { x: 2.0, y: f32(this.fontH) }, colorOf(this.cursorColor));
+        } else {
+            let span = if c.width == 2 { 2 } else { 1 };
+            paint.rect(Vec2 { x: px, y: py }, Vec2 { x: f32(span * this.cellW), y: f32(this.fontH) }, colorOf(this.cursorColor));
+            if c.cp > 32 && !c.style.has(ATTR_HIDDEN) {
+                this.glyphCell(c, px, py - f32(this.textDy), this.defaultBg);
+            }
+        }
+    }
+
+    /// Effective background (inverse swaps it with the foreground), as 0xRRGGBB.
+    fn bgOf(this: &View, st: Style): int {
+        if st.has(ATTR_INVERSE) {
+            return this.rgbOf(st, true, this.defaultFg, st.has(ATTR_BOLD));
+        }
+        return this.rgbOf(st, false, this.defaultBg, false);
+    }
+
+    /// Effective foreground: inverse, bold-bright and dim applied.
+    fn fgOf(this: &View, st: Style): int {
+        let c = if st.has(ATTR_INVERSE) { this.rgbOf(st, false, this.defaultBg, false) } else { this.rgbOf(st, true, this.defaultFg, st.has(ATTR_BOLD)) };
+        if st.has(ATTR_DIM) {
+            return mix(c, this.bgOf(st));
+        }
+        return c;
+    }
+
+    fn rgbOf(this: &View, st: Style, fgSide: bool, def: int, boldBright: bool): int {
+        let c = if fgSide { st.fg } else { st.bg };
+        let k = c.kind();
+        if k == COLOR_PALETTE {
+            let n = c.index();
+            if boldBright && n < 8 {
+                n += 8;
+            }
+            return this.pal[n];
+        }
+        if k == COLOR_RGB {
+            return (c.r() << 16) | (c.g() << 8) | c.b();
+        }
+        return def;
+    }
+
+    /// Read this frame's keys, text, paste and mouse, and append what the program should receive to `out`
+    /// (the caller writes it to the pty and clears it). Resets the scroll to the bottom when something is sent.
+    fn input(this: &View, g: &Grid, out: &Text) {
+        if !this.started {
+            game.textInput(true);
+            this.started = true;
+        }
+        let n0 = out.len();
+        let shift = game.keyDown(Key.Shift);
+        let ctrl = game.keyDown(Key.Ctrl);
+        let alt = game.keyDown(Key.Alt);
+        let mods = (if shift { input.MOD_SHIFT } else { 0 }) | (if alt { input.MOD_ALT } else { 0 }) | (if ctrl { input.MOD_CTRL } else { 0 });
+        let modes = g.modes;
+        let sent = false;
+        if ctrl && shift && game.keyPressed(Key.V) {
+            input.encodePaste(game.clipboard(), modes, out);
+            this.repIdx = -1;
+        } else if shift && !ctrl && !alt && (game.keyPressed(Key.PageUp) || game.keyPressed(Key.PageDown)) {
+            let page = g.rows() - 1;
+            this.scroll(g, if game.keyPressed(Key.PageUp) { page } else { 0 - page });
+        } else {
+            // ponytail: typed text goes before this frame's keys ("ls" then Enter in one poll is "ls\r"); SDL keeps no
+            // order between the two, so a key pressed before text in the same frame (Backspace, then "a") comes after it.
+            if !ctrl && !alt {
+                let t = game.textTyped();
+                if (kittyFlags(modes) & KITTY_ALL_AS_ESCAPES) != 0 {
+                    // Kitty "all keys as escapes": each typed character becomes a key event.
+                    let i = 0;
+                    while i < t.len {
+                        let n = 0;
+                        let cp = decodeUtf8(t, i, &n);
+                        i += if n < 1 { 1 } else { n };
+                        if cp >= 32 && cp != 127 {
+                            input.encodeKey(input.KEY_CHAR, mods & input.MOD_SHIFT, cp, modes, out);
+                        }
+                    }
+                } else {
+                    for i in 0..t.len {
+                        // Printable only: control keys come through the key path.
+                        if t[i] >= 32 && t[i] != 127 {
+                            out.push(t[i]);
+                        }
+                    }
+                }
+            }
+            this.keyScan(g, mods, ctrl, alt, out);
+        }
+        this.wheelAndMouse(g, mods, out);
+        sent = out.len() > n0;
+        if sent {
+            this.scrollOff = 0;
+            this.blinkT0 = game.ticks();
+        }
+    }
+
+    /// Fire the key table for this frame: new presses, and the held key's repeats.
+    fn keyScan(this: &View, g: &Grid, mods: int, ctrl: bool, alt: bool, out: &Text) {
+        let now = game.ticks();
+        let heldOk = false;
+        let releases = (kittyFlags(g.modes) & KITTY_EVENT_TYPES) != 0;
+        for i in 0..this.nkeys {
+            let code = this.codes[i];
+            if releases && game.keyReleased(this.keys[i]) {
+                this.sendKey(code, mods, input.KEV_RELEASE, g, out);
+            }
+            // Letters and punctuation only count with Ctrl or Alt; plain ones arrive as text.
+            if code < 0 && !ctrl && !alt {
+                continue;
+            }
+            let k = this.keys[i];
+            let fire = false;
+            let ev = input.KEV_PRESS;
+            if game.keyPressed(k) {
+                fire = true;
+                this.repIdx = i;
+                this.repAt = now + REPEAT_DELAY;
+            } else if i == this.repIdx && game.keyDown(k) {
+                heldOk = true;
+                if now >= this.repAt {
+                    fire = true;
+                    ev = input.KEV_REPEAT;
+                    this.repAt = now + REPEAT_EVERY;
+                }
+            }
+            if fire {
+                this.sendKey(code, mods, ev, g, out);
+            }
+        }
+        if this.repIdx >= 0 && !heldOk && !game.keyDown(this.keys[this.repIdx]) {
+            this.repIdx = -1;
+        }
+    }
+
+    /// One key-table entry's event (`code` as in `codes`).
+    fn sendKey(this: &View, code: int, mods: int, ev: int, g: &Grid, out: &Text) {
+        if code < 0 {
+            let cp = i32(0 - code);
+            if mods & input.MOD_SHIFT != 0 && cp >= 97 && cp <= 122 {
+                cp = cp - 32;
+            }
+            input.encodeKeyEvent(input.KEY_CHAR, mods, cp, ev, g.modes, out);
+        } else {
+            input.encodeKeyEvent(code, mods, 0, ev, g.modes, out);
+        }
+    }
+
+    fn wheelAndMouse(this: &View, g: &Grid, mods: int, out: &Text) {
+        let wh = game.mouseWheel();
+        let m = game.mousePos();
+        let cx = clampi(int(m.x - this.ox) / this.cellW, 0, g.cols() - 1);
+        let cy = clampi(int(m.y - this.oy) / this.cellH, 0, g.rows() - 1);
+        let reporting = (g.modes & MODE_MOUSE_ANY) != 0;
+        if wh != 0.0 {
+            if reporting {
+                input.encodeMouse(if wh > 0.0 { input.MB_WHEEL_UP } else { input.MB_WHEEL_DOWN }, input.MA_WHEEL, cx, cy, mods, g.modes, out);
+            } else {
+                this.scroll(g, if wh > 0.0 { WHEEL_LINES } else { 0 - WHEEL_LINES });
+            }
+        }
+        if !reporting {
+            this.mouseDown = -1;
+            return;
+        }
+        // Buttons: press and release at the cell under the pointer (motion is not reported).
+        for b in 0..3 {
+            let btn = if b == 0 { Mouse.Left } else if b == 1 { Mouse.Middle } else { Mouse.Right };
+            let code = if b == 0 { input.MB_LEFT } else if b == 1 { input.MB_MIDDLE } else { input.MB_RIGHT };
+            if game.mousePressed(btn) {
+                input.encodeMouse(code, input.MA_PRESS, cx, cy, mods, g.modes, out);
+            }
+            if game.mouseReleased(btn) {
+                input.encodeMouse(code, input.MA_RELEASE, cx, cy, mods, g.modes, out);
+            }
+        }
+    }
+
+    /// Fill the key table: named keys first (positive `KEY_*`), then a-z and a few punctuation keys as minus the code
+    /// point (only read with Ctrl or Alt).
+    fn addKeys(this: &View) {
+        this.addKey(Key.Enter, input.KEY_ENTER);
+        this.addKey(Key.KpEnter, input.KEY_ENTER);
+        this.addKey(Key.Tab, input.KEY_TAB);
+        this.addKey(Key.Backspace, input.KEY_BACKSPACE);
+        this.addKey(Key.Escape, input.KEY_ESC);
+        this.addKey(Key.Up, input.KEY_UP);
+        this.addKey(Key.Down, input.KEY_DOWN);
+        this.addKey(Key.Left, input.KEY_LEFT);
+        this.addKey(Key.Right, input.KEY_RIGHT);
+        this.addKey(Key.Home, input.KEY_HOME);
+        this.addKey(Key.End, input.KEY_END);
+        this.addKey(Key.PageUp, input.KEY_PGUP);
+        this.addKey(Key.PageDown, input.KEY_PGDN);
+        this.addKey(Key.Insert, input.KEY_INSERT);
+        this.addKey(Key.Delete, input.KEY_DELETE);
+        this.addKey(Key.F1, input.KEY_F1);
+        this.addKey(Key.F2, input.KEY_F1 + 1);
+        this.addKey(Key.F3, input.KEY_F1 + 2);
+        this.addKey(Key.F4, input.KEY_F1 + 3);
+        this.addKey(Key.F5, input.KEY_F1 + 4);
+        this.addKey(Key.F6, input.KEY_F1 + 5);
+        this.addKey(Key.F7, input.KEY_F1 + 6);
+        this.addKey(Key.F8, input.KEY_F1 + 7);
+        this.addKey(Key.F9, input.KEY_F1 + 8);
+        this.addKey(Key.F10, input.KEY_F1 + 9);
+        this.addKey(Key.F11, input.KEY_F1 + 10);
+        this.addKey(Key.F12, input.KEY_F1 + 11);
+        this.addKey(Key.A, 0 - 97);
+        this.addKey(Key.B, 0 - 98);
+        this.addKey(Key.C, 0 - 99);
+        this.addKey(Key.D, 0 - 100);
+        this.addKey(Key.E, 0 - 101);
+        this.addKey(Key.F, 0 - 102);
+        this.addKey(Key.G, 0 - 103);
+        this.addKey(Key.H, 0 - 104);
+        this.addKey(Key.I, 0 - 105);
+        this.addKey(Key.J, 0 - 106);
+        this.addKey(Key.K, 0 - 107);
+        this.addKey(Key.L, 0 - 108);
+        this.addKey(Key.M, 0 - 109);
+        this.addKey(Key.N, 0 - 110);
+        this.addKey(Key.O, 0 - 111);
+        this.addKey(Key.P, 0 - 112);
+        this.addKey(Key.Q, 0 - 113);
+        this.addKey(Key.R, 0 - 114);
+        this.addKey(Key.S, 0 - 115);
+        this.addKey(Key.T, 0 - 116);
+        this.addKey(Key.U, 0 - 117);
+        this.addKey(Key.V, 0 - 118);
+        this.addKey(Key.W, 0 - 119);
+        this.addKey(Key.X, 0 - 120);
+        this.addKey(Key.Y, 0 - 121);
+        this.addKey(Key.Z, 0 - 122);
+        this.addKey(Key.Space, 0 - 32);
+        this.addKey(Key.LeftBracket, 0 - 91);
+        this.addKey(Key.RightBracket, 0 - 93);
+        this.addKey(Key.Backslash, 0 - 92);
+        this.addKey(Key.Num0, 0 - 48);
+        this.addKey(Key.Num1, 0 - 49);
+        this.addKey(Key.Num2, 0 - 50);
+        this.addKey(Key.Num3, 0 - 51);
+        this.addKey(Key.Num4, 0 - 52);
+        this.addKey(Key.Num5, 0 - 53);
+        this.addKey(Key.Num6, 0 - 54);
+        this.addKey(Key.Num7, 0 - 55);
+        this.addKey(Key.Num8, 0 - 56);
+        this.addKey(Key.Num9, 0 - 57);
+        this.addKey(Key.Period, 0 - 46);
+        this.addKey(Key.Comma, 0 - 44);
+        this.addKey(Key.Slash, 0 - 47);
+        this.addKey(Key.Minus, 0 - 45);
+    }
+
+    fn addKey(this: &View, k: Key, code: int) {
+        this.keys[this.nkeys] = k;
+        this.codes[this.nkeys] = code;
+        this.nkeys += 1;
+    }
+}
+
+/// Printable ASCII, 32 to 126 in order (`fitsGrid`).
+const PRINTABLE: string = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+
+/// Whether `s` has two ASCII symbols in a row (not letters, digits, space or `_`): where coding-font ligatures live.
+fn symbolPair(s: string): bool {
+    let prev = false;
+    for i in 0..s.len {
+        let b = s[i];
+        let sym = b > 32 && b < 127 && b != 95 && !(b >= 48 && b <= 57) && !(b >= 65 && b <= 90) && !(b >= 97 && b <= 122);
+        if sym && prev {
+            return true;
+        }
+        prev = sym;
+    }
+    return false;
+}
+
+fn clampOff(o: int, g: &Grid): int {
+    if o < 0 {
+        return 0;
+    }
+    let m = g.scrollbackLen();
+    return if o > m { m } else { o };
+}
+
+fn clampi(v: int, lo: int, hi: int): int {
+    if v < lo {
+        return lo;
+    }
+    return if v > hi { hi } else { v };
+}
+
+fn colorOf(rgbv: int): Color {
+    return game.rgb(u8((rgbv >> 16) & 255), u8((rgbv >> 8) & 255), u8(rgbv & 255));
+}
+
+/// 60% of `a` over `b`, per channel.
+fn mix(a: int, b: int): int {
+    let r = (((a >> 16) & 255) * 3 + ((b >> 16) & 255) * 2) / 5;
+    let g = (((a >> 8) & 255) * 3 + ((b >> 8) & 255) * 2) / 5;
+    let bl = ((a & 255) * 3 + (b & 255) * 2) / 5;
+    return (r << 16) | (g << 8) | bl;
+}
+
+
+/// Arms of U+2500-257F as decimal digits up, right, down, left: 0 none, 1 light, 2 heavy, 3 double. Dashed lines
+/// carry their solid arms (`dashes` says how many pieces); arcs are square corners; 0 for the diagonals.
+const BOX_ARMS: [128]int = [
+    101, 202, 1010, 2020, 101, 202, 1010, 2020, 101, 202, 1010, 2020, 110, 210, 120, 220,
+    11, 12, 21, 22, 1100, 1200, 2100, 2200, 1001, 1002, 2001, 2002, 1110, 1210, 2110, 1120,
+    2120, 2210, 1220, 2220, 1011, 1012, 2011, 1021, 2021, 2012, 1022, 2022, 111, 112, 211, 212,
+    121, 122, 221, 222, 1101, 1102, 1201, 1202, 2101, 2102, 2201, 2202, 1111, 1112, 1211, 1212,
+    2111, 1121, 2121, 2112, 2211, 1122, 1221, 2212, 1222, 2122, 2221, 2222, 101, 202, 1010, 2020,
+    303, 3030, 310, 130, 330, 13, 31, 33, 1300, 3100, 3300, 1003, 3001, 3003, 1310, 3130,
+    3330, 1013, 3031, 3033, 313, 131, 333, 1303, 3101, 3303, 1313, 3131, 3333, 110, 11, 1001,
+    1100, 0, 0, 0, 1, 1000, 100, 10, 2, 2000, 200, 20, 201, 1020, 102, 2010,
+];
+
+/// Quadrant blocks U+2596-259F as bits: 1 upper left, 2 upper right, 4 lower left, 8 lower right.
+const QUADS: [10]int = [4, 8, 1, 13, 9, 7, 11, 2, 6, 14];
+
+/// One cell's pixel box and color, for the built-in shapes.
+struct Box {
+    x: int;
+    y: int;
+    w: int;
+    h: int;
+    c: Color;
+
+    /// Fill [x0, x1) x [y0, y1).
+    fn fill(this: &Box, x0: int, y0: int, x1: int, y1: int) {
+        if x1 > x0 && y1 > y0 {
+            paint.rect(Vec2 { x: f32(x0), y: f32(y0) }, Vec2 { x: f32(x1 - x0), y: f32(y1 - y0) }, this.c);
+        }
+    }
+
+    /// U+2580-259F.
+    fn block(this: &Box, cp: int) {
+        let x = this.x;
+        let y = this.y;
+        let w = this.w;
+        let h = this.h;
+        let x1 = x + w;
+        let y1 = y + h;
+        if cp == 0x2580 {
+            this.fill(x, y, x1, y + h / 2);
+        } else if cp <= 0x2588 {
+            this.fill(x, y1 - (h * (cp - 0x2580) + 4) / 8, x1, y1);
+        } else if cp <= 0x258F {
+            this.fill(x, y, x + (w * (0x2590 - cp) + 4) / 8, y1);
+        } else if cp == 0x2590 {
+            this.fill(x + w / 2, y, x1, y1);
+        } else if cp <= 0x2593 {
+            let c = this.c;
+            this.c = Color { r: c.r, g: c.g, b: c.b, a: u8(int(c.a) * (cp - 0x2590) / 4) };
+            this.fill(x, y, x1, y1);
+            this.c = c;
+        } else if cp == 0x2594 {
+            this.fill(x, y, x1, y + (h + 4) / 8);
+        } else if cp == 0x2595 {
+            this.fill(x1 - (w + 4) / 8, y, x1, y1);
+        } else {
+            let q = QUADS[cp - 0x2596];
+            let mx = x + w / 2;
+            let my = y + h / 2;
+            if q & 1 != 0 { this.fill(x, y, mx, my); }
+            if q & 2 != 0 { this.fill(mx, y, x1, my); }
+            if q & 4 != 0 { this.fill(x, my, mx, y1); }
+            if q & 8 != 0 { this.fill(mx, my, x1, y1); }
+        }
+    }
+
+    /// U+2500-257F: each arm runs from the cell's center to its edge, centered, so neighbors join.
+    fn lines(this: &Box, cp: int) {
+        let t = this.w / 8;
+        if this.w % 8 >= 4 { t += 1; }
+        if t < 1 { t = 1; }
+        if cp >= 0x2571 && cp <= 0x2573 {
+            let a = Vec2 { x: f32(this.x), y: f32(this.y) };
+            let z = Vec2 { x: f32(this.x + this.w), y: f32(this.y + this.h) };
+            if cp != 0x2572 {
+                paint.line(Vec2 { x: a.x, y: z.y }, Vec2 { x: z.x, y: a.y }, f32(t), this.c);
+            }
+            if cp != 0x2571 {
+                paint.line(a, z, f32(t), this.c);
+            }
+            return;
+        }
+        let v = BOX_ARMS[cp - 0x2500];
+        let u = v / 1000;
+        let r = v / 100 % 10;
+        let d = v / 10 % 10;
+        let l = v % 10;
+        let x = this.x;
+        let y = this.y;
+        let x1 = x + this.w;
+        let y1 = y + this.h;
+        let mx = x + this.w / 2;
+        let my = y + this.h / 2;
+        // Double lines: two light lines with a light gap, at x b1 and b2 (vertical) and y h1 and h2 (horizontal).
+        let b1 = x + (this.w - 3 * t) / 2;
+        let b2 = b1 + 2 * t;
+        let h1 = y + (this.h - 3 * t) / 2;
+        let h2 = h1 + 2 * t;
+        let dash = dashes(cp);
+        if dash > 0 {
+            let k = if r == 2 || u == 2 { 2 * t } else { t };
+            for i in 0..dash {
+                if r > 0 {
+                    let gap = this.w / (2 * dash);
+                    let ly = y + (this.h - k) / 2;
+                    this.fill(x + this.w * i / dash, ly, x + this.w * (i + 1) / dash - (if gap < 1 { 1 } else { gap }), ly + k);
+                } else {
+                    let gap = this.h / (2 * dash);
+                    let lx = x + (this.w - k) / 2;
+                    this.fill(lx, y + this.h * i / dash, lx + k, y + this.h * (i + 1) / dash - (if gap < 1 { 1 } else { gap }));
+                }
+            }
+            return;
+        }
+        // The band the vertical arms take (vl..vr) and the horizontal ones (hl..hr), where the crossing arms meet.
+        let vw = maxArm(u, d);
+        let hw = maxArm(l, r);
+        let vl = mx;
+        let vr = mx;
+        if vw == 3 {
+            vl = b1;
+            vr = b2 + t;
+        } else if vw > 0 {
+            vl = x + (this.w - vw * t) / 2;
+            vr = vl + vw * t;
+        }
+        let hl = my;
+        let hr = my;
+        if hw == 3 {
+            hl = h1;
+            hr = h2 + t;
+        } else if hw > 0 {
+            hl = y + (this.h - hw * t) / 2;
+            hr = hl + hw * t;
+        }
+        // Single or heavy arms (a double crossing band stops them at its outer line).
+        if r == 1 || r == 2 {
+            let ly = y + (this.h - r * t) / 2;
+            this.fill(if vw == 3 { b2 } else { vl }, ly, x1, ly + r * t);
+        }
+        if l == 1 || l == 2 {
+            let ly = y + (this.h - l * t) / 2;
+            this.fill(x, ly, if vw == 3 { b1 + t } else { vr }, ly + l * t);
+        }
+        if u == 1 || u == 2 {
+            let lx = x + (this.w - u * t) / 2;
+            this.fill(lx, y, lx + u * t, if hw == 3 { h1 + t } else { hr });
+        }
+        if d == 1 || d == 2 {
+            let lx = x + (this.w - d * t) / 2;
+            this.fill(lx, if hw == 3 { h2 } else { hl }, lx + d * t, y1);
+        }
+        // Double arms: the line on a side with a crossing arm stops at that arm's near line, the other wraps to its far one.
+        if r == 3 {
+            this.fill(near(u, d, b2, b1, vl, mx), h1, x1, h1 + t);
+            this.fill(near(d, u, b2, b1, vl, mx), h2, x1, h2 + t);
+        }
+        if l == 3 {
+            this.fill(x, h1, near(u, d, b1 + t, b2 + t, vr, mx), h1 + t);
+            this.fill(x, h2, near(d, u, b1 + t, b2 + t, vr, mx), h2 + t);
+        }
+        if u == 3 {
+            this.fill(b1, y, b1 + t, near(l, r, h1 + t, h2 + t, hr, my));
+            this.fill(b2, y, b2 + t, near(r, l, h1 + t, h2 + t, hr, my));
+        }
+        if d == 3 {
+            this.fill(b1, near(l, r, h2, h1, hl, my), b1 + t, y1);
+            this.fill(b2, near(r, l, h2, h1, hl, my), b2 + t, y1);
+        }
+    }
+}
+
+/// Where a double arm's line ends at the center: at `inner` when the crossing arm on its own side (`side`) is double,
+/// at `outer` when only the other side (`other`) is, at `band` beside a single or heavy one, else at `mid`.
+fn near(side: int, other: int, inner: int, outer: int, band: int, mid: int): int {
+    if side == 3 { return inner; }
+    if side > 0 { return band; }
+    if other == 3 { return outer; }
+    if other > 0 { return band; }
+    return mid;
+}
+
+/// The widest arm of two: 3 (double) beats 2 (heavy) beats 1 (light).
+fn maxArm(a: int, b: int): int {
+    return if a > b { a } else { b };
+}
+
+/// How many pieces a dashed box-drawing line has, 0 for a solid one.
+fn dashes(cp: int): int {
+    if cp >= 0x2504 && cp <= 0x2507 { return 3; }
+    if cp >= 0x2508 && cp <= 0x250B { return 4; }
+    if cp >= 0x254C && cp <= 0x254F { return 2; }
+    return 0;
+}
+
+/// The 256 xterm colors as 0xRRGGBB.
+fn initPalette(p: []int) {
+    for i in 0..256 {
+        p[i] = paletteRgb(i);
+    }
+}

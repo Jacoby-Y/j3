@@ -188,9 +188,11 @@ fn dump_stmt(cx: &IrCx, body: &Body, stmt: &Stmt, indent: usize, out: &mut Strin
             }
             out.push_str(";\n");
         }
-        StmtKind::Break => out.push_str("break;\n"),
-        StmtKind::Continue => out.push_str("continue;\n"),
-        StmtKind::Abort(_) => out.push_str("abort;\n"),
+        StmtKind::Break(0) => out.push_str("break;\n"),
+        StmtKind::Continue(0) => out.push_str("continue;\n"),
+        StmtKind::Break(n) => out.push_str(&format!("break {n};\n")),
+        StmtKind::Continue(n) => out.push_str(&format!("continue {n};\n")),
+        StmtKind::Abort(..) => out.push_str("abort;\n"),
         StmtKind::Div0 => out.push_str("abort div0;\n"),
         StmtKind::Block(inner) => {
             out.push_str("{\n");
@@ -227,6 +229,24 @@ fn dump_stmt(cx: &IrCx, body: &Body, stmt: &Stmt, indent: usize, out: &mut Strin
                 }
             }
             out.push_str("`;\n");
+        }
+        StmtKind::Switch { scrut, cases, default } => {
+            out.push_str("switch ");
+            dump_operand(cx, body, scrut, out);
+            out.push_str(" {\n");
+            let arms = cases.iter().map(|(v, b)| (v.to_string(), b));
+            for (label, b) in arms.chain(std::iter::once(("_".to_string(), default))) {
+                write_indent(indent + 1, out);
+                out.push_str(&label);
+                out.push_str(" {\n");
+                for s in &b.stmts {
+                    dump_stmt(cx, body, s, indent + 2, out);
+                }
+                write_indent(indent + 1, out);
+                out.push_str("}\n");
+            }
+            write_indent(indent, out);
+            out.push_str("}\n");
         }
         StmtKind::If {
             cond,
@@ -282,6 +302,21 @@ fn dump_stmt(cx: &IrCx, body: &Body, stmt: &Stmt, indent: usize, out: &mut Strin
 
 fn dump_rvalue(cx: &IrCx, body: &Body, rvalue: &Rvalue, out: &mut String) {
     match &rvalue.kind {
+        RvalueKind::Simd { op, args } => {
+            out.push_str("simd.");
+            out.push_str(op.name());
+            if let crate::ir::simd::SimdOp::Shuffle(ix) = op {
+                let _ = write!(out, "<{}{}{}{}>", ix[0], ix[1], ix[2], ix[3]);
+            }
+            out.push('(');
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_operand(cx, body, arg, out);
+            }
+            out.push(')');
+        }
         RvalueKind::Use(op) => dump_operand(cx, body, op, out),
         RvalueKind::Ref { place } => {
             out.push('&');
@@ -318,8 +353,8 @@ fn dump_rvalue(cx: &IrCx, body: &Body, rvalue: &Rvalue, out: &mut String) {
             }
             out.push(')');
         }
-        RvalueKind::Atomic { op, args } => {
-            out.push_str(&format!("@{}(", op.name()));
+        RvalueKind::Atomic { op, order, args } => {
+            out.push_str(&format!("@{}.{}(", op.name(), order.name()));
             for (i, arg) in args.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
@@ -456,6 +491,9 @@ fn dump_place(cx: &IrCx, body: &Body, place: &Place, out: &mut String) {
             Proj::EnumTag => {
                 text = format!("{}.tag", text);
             }
+            Proj::Lane { lane, .. } => {
+                text = format!("{}.{}", text, crate::ir::simd::LANE_NAMES[*lane as usize]);
+            }
             Proj::EnumPayload { variant, .. } => {
                 text = format!("{}.u.v{}", text, variant.index);
             }
@@ -492,6 +530,8 @@ pub fn dump_ty(cx: &IrCx, ty: Ty, out: &mut String) {
         TyKind::Int(IntTy::U64) => out.push_str("u64"),
         TyKind::Float(FloatTy::F64) => out.push_str("float"),
         TyKind::Float(FloatTy::F32) => out.push_str("f32"),
+        TyKind::Half => out.push_str("f16"),
+        TyKind::Vec(v) => out.push_str(v.name()),
         TyKind::Ptr => out.push_str("ptr"),
         TyKind::CStr => out.push_str("cstr"),
         TyKind::String => out.push_str("string"),

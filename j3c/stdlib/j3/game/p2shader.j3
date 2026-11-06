@@ -1,0 +1,302 @@
+// Part of j3.game (the batched 2D painter's shader, written in J3; `j3c doc shaders`): vertex inputs, uniforms, and the
+// one program `P2_PROG` that `hudInit` (p2.j3) compiles. The `kind` ladder in `shade` mirrors the `P_*` kinds of p2.j3.
+module j3.game;
+
+/// The unit quad corner, one per vertex.
+#[vertex]
+struct P2Quad { q: Vec2; }
+
+/// One painted item, 64 bytes (the float layout `p2Push` writes): rect (x y w h), uv rect or gradient/shadow
+/// parameters, shape parameters, (border width or line radius, kind), then the two colors as RGBA bytes.
+#[vertex(instance)]
+struct P2Inst { rect: vec4f; uv: vec4f; p: vec4f; k: Vec2; c1: Rgba8; c2: Rgba8; }
+
+#[varying]
+struct P2V {
+    position: vec4;
+    uv: vec2;
+    pos: vec2;
+    #[flat] rect: vec4;
+    #[flat] g: vec4;
+    #[flat] p: vec4;
+    #[flat] k: vec2;
+    #[flat] c1: vec4;
+    #[flat] c2: vec4;
+}
+
+#[uniform] let uScreen: vec2;
+#[uniform] let uRA: vec3;
+#[uniform] let uRB: vec3;
+#[uniform] let uTex: sampler2D;
+#[uniform] let uRamp: sampler2D;
+#[uniform] let uShape: sampler2D;
+#[uniform] let uShapeInfo: vec4;
+#[uniform] let uClipN: vec4;
+#[uniform] let uMaskBox: vec4;
+#[uniform] let uMask: vec3;
+#[uniform] let uOrigin: vec2;
+
+#[shader(vertex)]
+fn p2Vs(q: P2Quad, i: P2Inst): P2V {
+    let m = if i.k.y > 1.5 { 1.0 } else { 0.0 };
+    let p = i.rect.xy - m + q.q * (i.rect.zw + 2.0 * m);
+    let r = vec2(@dot(uRA, vec3(p, 1.0)), @dot(uRB, vec3(p, 1.0)));
+    return P2V {
+        position: vec4(r.x / uScreen.x * 2.0 - 1.0, 1.0 - r.y / uScreen.y * 2.0, 0.0, 1.0),
+        uv: i.uv.xy + q.q * i.uv.zw,
+        pos: p,
+        rect: i.rect,
+        g: i.uv,
+        p: i.p,
+        k: i.k,
+        c1: i.c1,
+        c2: i.c2,
+    };
+}
+
+/// Coverage of a signed distance, one pixel wide.
+#[shader]
+fn cov(d: f32): f32 {
+    let w = @max(@fwidth(d), 0.0001);
+    return @clamp(0.5 - d / w, 0.0, 1.0);
+}
+
+#[shader]
+fn rbox(p: vec2, b: vec2, r: f32): f32 {
+    let q = @abs(p) - b + r;
+    return @min(@max(q.x, q.y), 0.0) + @length(@max(q, 0.0)) - r;
+}
+
+#[shader]
+fn erf2(x0: vec2): vec2 {
+    let s = @sign(x0);
+    let a = @abs(x0);
+    let x = 1.0 + (0.278393 + (0.230389 + 0.078108 * (a * a)) * a) * a;
+    let y = x * x;
+    return s - s / (y * y);
+}
+
+#[shader]
+fn gauss(x: f32, s: f32): f32 {
+    return @exp(-x * x / (2.0 * s * s)) / (2.50662827463 * s);
+}
+
+#[shader]
+fn shadowX(x: f32, y: f32, s: f32, r: f32, hs: vec2): f32 {
+    let delta = @min(hs.y - r - @abs(y), 0.0);
+    let curved = hs.x - r + @sqrt(@max(0.0, r * r - delta * delta));
+    let integral = 0.5 + 0.5 * erf2((x + vec2(-curved, curved)) * (0.70710678 / s));
+    return integral.y - integral.x;
+}
+
+#[shader]
+fn boxShadow(pt: vec2, hs: vec2, s: f32, r: f32): f32 {
+    let low = pt.y - hs.y;
+    let high = pt.y + hs.y;
+    let start = @clamp(-3.0 * s, low, high);
+    let end = @clamp(3.0 * s, low, high);
+    let dy = (end - start) / 4.0;
+    let y = start + dy * 0.5;
+    let v = 0.0;
+    for i in 0..4 {
+        v += shadowX(pt.x, pt.y - y, s, r, hs) * gauss(y, s) * dy;
+        y += dy;
+    }
+    return v;
+}
+
+/// The corner radius of the quadrant `l` is in (`r` is top-left, top-right, bottom-right, bottom-left).
+#[shader]
+fn quadR(l: vec2, r: vec4): f32 {
+    return if l.x < 0.0 { if l.y < 0.0 { r.x } else { r.w } } else { if l.y < 0.0 { r.y } else { r.z } };
+}
+
+/// The window-sized backdrop texture at this fragment.
+#[shader]
+fn backdrop(): vec4 {
+    return @texture(uTex, (@fragCoord().xy - uOrigin) / vec2(@textureSize(uTex, 0)));
+}
+
+#[shader]
+fn unpremul(c: vec4): vec3 {
+    return if c.a > 0.00001 { c.rgb / c.a } else { vec3(0.0) };
+}
+
+/// A gradient ramp row sampled at `t`.
+#[shader]
+fn ramp(t: f32, row: f32): vec4 {
+    return @texture(uRamp, vec2(@clamp(t, 0.0, 1.0) * 0.99609375 + 0.001953125, row));
+}
+
+/// Color of a rounded box (kinds 2, 6, 9, 10): fill, border, gradient, dashes. `a` gets the box coverage.
+#[shader]
+fn boxColor(v: P2V, kind: i32, l: vec2, h: vec2, a: &f32): vec4 {
+    let r = @min(quadR(l, v.p), @min(h.x, h.y));
+    a = cov(rbox(l, h, r));
+    let bw = v.k.x;
+    let fillc = v.c1;
+    if kind == 10 {
+        let bt = backdrop();
+        bt.rgb = unpremul(bt);
+        fillc *= bt;
+    }
+    let borc = v.c2;
+    if kind == 6 {
+        let t = 0.0;
+        if v.g.z < 0.5 {
+            let dir = vec2(@sin(v.g.x), -@cos(v.g.x));
+            t = @dot(l, dir) / @max(@abs(v.rect.z * dir.x) + @abs(v.rect.w * dir.y), 0.0001) + 0.5;
+        } else if v.g.z < 1.5 {
+            t = @length(l / (h * 1.41421356));
+        } else {
+            t = @fract(@atan(l.x, -l.y) * 0.15915494 - v.g.x * 0.15915494);
+        }
+        let g = ramp(t, (v.g.y + 0.5) / 64.0);
+        if v.g.w < 0.5 {
+            fillc = vec4(g.rgb, g.a * v.c1.a);
+        } else {
+            borc = vec4(g.rgb, g.a * v.c2.a);
+        }
+    }
+    let col = fillc;
+    if bw > 0.0 {
+        let hi = h - bw;
+        let ri = @clamp(r - bw, 0.0, @max(@min(hi.x, hi.y), 0.0));
+        let t = cov(rbox(l, hi, ri));
+        let bm = 1.0 - t;
+        if kind == 9 {
+            let hb = h - bw * 0.5;
+            let rc = @clamp(r - bw * 0.5, 0.0, @max(@min(hb.x, hb.y), 0.0));
+            let q = @abs(l) - (hb - rc);
+            let s = if q.x > 0.0 && q.y > 0.0 { rc * @atan(q.y, q.x) } else { if q.x > q.y { l.y } else { l.x } };
+            let per = @max(v.g.y, 1.0);
+            let u = (@fract(s / per) - 0.5) * per;
+            if v.g.x < 1.5 {
+                bm *= cov(@abs(u) - per * 0.3);
+            } else {
+                bm = cov(@length(vec2(u, rbox(l, hb, rc))) - bw * 0.5);
+            }
+        }
+        let ba = borc.a * bm;
+        let pm = vec4(borc.rgb * ba, ba) + vec4(fillc.rgb * fillc.a, fillc.a) * (1.0 - ba);
+        col = vec4(if pm.a > 0.0 { pm.rgb / pm.a } else { vec3(0.0) }, pm.a);
+    }
+    return col;
+}
+
+/// The item's own color by `kind`; coverage is folded into alpha.
+#[shader]
+fn shade(v: P2V): vec4 {
+    let kind = i32(v.k.y + 0.5);
+    if kind == 0 {
+        return v.c1;
+    }
+    if kind == 11 {
+        let tx = backdrop();
+        return vec4(unpremul(tx), tx.a) * v.c1;
+    }
+    if kind == 1 {
+        let tx = @texture(uTex, v.uv);
+        if v.k.x > 0.0 {
+            let ba = v.p.zw - v.p.xy;
+            let gs = @clamp(@dot(v.pos - v.p.xy, ba) / @max(@dot(ba, ba), 0.000001), 0.0, 1.0);
+            let g = @texture(uRamp, vec2(gs * 0.99609375 + 0.001953125, (v.k.x - 0.5) / 64.0));
+            return vec4(g.rgb, g.a * v.c1.a * tx.a);
+        }
+        return tx * v.c1;
+    }
+    let h = v.rect.zw * 0.5;
+    let l = v.pos - (v.rect.xy + h);
+    let a = 0.0;
+    let col = v.c1;
+    if kind == 2 || kind == 6 || kind == 9 || kind == 10 {
+        col = boxColor(v, kind, l, h, &a);
+    } else if kind == 3 {
+        a = cov(@length(l) - v.p.x);
+    } else if kind == 4 {
+        a = cov(@abs(@length(l) - (v.p.x - v.k.x * 0.5)) - v.k.x * 0.5);
+    } else if kind == 7 {
+        let s = @max(v.g.z, 0.25);
+        let r = @max(@min(quadR(l, v.p), @min(v.g.x, v.g.y)), 0.0);
+        a = @clamp(boxShadow(l, v.g.xy, s, r), 0.0, 1.0);
+    } else if kind == 8 {
+        let s = @max(v.g.z, 0.25);
+        let r = @min(quadR(l, v.p), @min(h.x, h.y));
+        let inside = cov(rbox(l, h, r));
+        let hs = @max(h - v.g.w, vec2(0.0));
+        let hole = boxShadow(l - v.g.xy, hs, s, @clamp(r - v.g.w, 0.0, @min(hs.x, hs.y)));
+        a = inside * (1.0 - @clamp(hole, 0.0, 1.0));
+    } else {
+        let pa = v.pos - v.p.xy;
+        let ba = v.p.zw - v.p.xy;
+        let t = @clamp(@dot(pa, ba) / @max(@dot(ba, ba), 0.000001), 0.0, 1.0);
+        a = cov(@length(pa - ba * t) - v.k.x);
+    }
+    return vec4(col.rgb, col.a * a);
+}
+
+/// Coverage of the polygon stored in row `base` of the shape texture (`n` points), even-odd or nonzero by `rule`.
+#[shader]
+fn shapeCov(p: vec2, base: i32, n: i32, rule: f32): f32 {
+    let md = 1000000000.0;
+    let wn = 0;
+    for i in 0..n - 1 {
+        let a = @texelFetch(uShape, ivec2(i, base), 0).xy;
+        let b = @texelFetch(uShape, ivec2(i + 1, base), 0).xy;
+        if a.x < -100000000.0 || b.x < -100000000.0 {
+            continue;
+        }
+        let pa = p - a;
+        let ba = b - a;
+        md = @min(md, @length(pa - ba * @clamp(@dot(pa, ba) / @max(@dot(ba, ba), 0.000001), 0.0, 1.0)));
+        let cr = ba.x * pa.y - ba.y * pa.x;
+        if a.y <= p.y {
+            if b.y > p.y && cr > 0.0 {
+                wn += 1;
+            }
+        } else if b.y <= p.y && cr < 0.0 {
+            wn -= 1;
+        }
+    }
+    let inside = if rule > 0.5 { (wn & 1) != 0 } else { wn != 0 };
+    return cov(if inside { -md } else { md });
+}
+
+/// The color with the shared clip and mask coverage multiplied into its alpha: up to two path shapes, four clip
+/// paths, one gradient mask. Multiplies one coverage at a time, in this order, so results match bit for bit.
+#[shader]
+fn masked(color: vec4, pos: vec2): vec4 {
+    let c = color;
+    if uShapeInfo.x > 0.5 {
+        c.a *= shapeCov(pos, 0, i32(uShapeInfo.x), uShapeInfo.y);
+    }
+    if uShapeInfo.z > 0.5 {
+        c.a *= shapeCov(pos, 1, i32(uShapeInfo.z), uShapeInfo.w);
+    }
+    for k in 0..4 {
+        if uClipN[k] < 0.5 {
+            break;
+        }
+        c.a *= shapeCov(pos, 2 + k, i32(uClipN[k]), 0.0);
+    }
+    if uMask.x > 0.5 {
+        let l = pos - (uMaskBox.xy + uMaskBox.zw * 0.5);
+        let t = 0.0;
+        if uMask.x < 1.5 {
+            let dir = vec2(@sin(uMask.z), -@cos(uMask.z));
+            t = @dot(l, dir) / @max(@abs(uMaskBox.z * dir.x) + @abs(uMaskBox.w * dir.y), 0.0001) + 0.5;
+        } else {
+            t = @length(l / (uMaskBox.zw * 0.70710678));
+        }
+        c.a *= ramp(t, (uMask.y + 0.5) / 64.0).a;
+    }
+    return c;
+}
+
+/// The fragment entry: the item's color (`shade`) with the shared clip and mask coverage.
+#[shader(fragment)]
+fn p2Fs(v: P2V): vec4 {
+    return masked(shade(v), v.pos);
+}
+
+const P2_PROG: Source = @shader(p2Vs, p2Fs);

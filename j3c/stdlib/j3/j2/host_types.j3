@@ -1,0 +1,211 @@
+// What a native sees: `Args` (its arguments, with getters that raise on a wrong type) and the
+// `Table` / `Array` views the host reads and builds script values through. Part of `j3.j2`.
+
+module j3.j2;
+
+/// A native's arguments (`fn spawn(vm: &Vm, args: Args): Value`). Index 0 is the first.
+/// A getter given the wrong type raises `chunk:line:col: spawn: argument 2 must be a number, got
+/// string` at the script's call and returns a zero value; the native's result is then dropped,
+/// so natives don't check types themselves (do the checks before side effects that matter).
+pub struct Args {
+    vm: &Vm;
+    base: int;
+    n: int;
+    /// Index of the running native in `Vm.natives`, for its name.
+    id: int;
+}
+
+extend Args {
+    fn count(this: Args): int { return this.n; }
+
+    /// Argument `i` as it is; nil past the end.
+    fn get(this: Args, i: int): Value {
+        if i < 0 || i >= this.n { return nilv(); }
+        return this.vm.stack[this.base + i];
+    }
+
+    /// `<name>: argument <i+1> must be <what>, got <type>` (the first one in a native counts).
+    fn wrong(this: Args, i: int, what: string) {
+        let vm = this.vm;
+        if vm.raised { return; }
+        let t = vm.errText();
+        t.pushStr(textOf(vm.natives[this.id].name));
+        t.pushStr(": argument ");
+        t.pushInt(i + 1);
+        t.pushStr(" must be ");
+        t.pushStr(what);
+        t.pushStr(", got ");
+        t.pushStr(typeName(this.get(i)));
+        vm.raised = true;
+    }
+
+    /// An int or float argument as a float.
+    fn num(this: Args, i: int): f64 {
+        let v = this.get(i);
+        if v.isNum() { return v.asNum(); }
+        this.wrong(i, "a number");
+        return 0.0;
+    }
+
+    /// An int argument; a float is truncated toward zero.
+    fn int(this: Args, i: int): int {
+        let v = this.get(i);
+        if v.tag == T_INT { return v.bits; }
+        if v.tag == T_FLOAT {
+            let x = v.f();
+            if x > -9223372036854775808.0 && x < 9223372036854775808.0 { return int(x); }
+        }
+        this.wrong(i, "an int");
+        return 0;
+    }
+
+    /// A string argument (a view into the heap, valid while the string is alive).
+    fn str(this: Args, i: int): string {
+        let v = this.get(i);
+        if v.tag == T_STR { return textOf(v); }
+        this.wrong(i, "a string");
+        return "";
+    }
+
+    fn table(this: Args, i: int): Table {
+        let v = this.get(i);
+        if v.tag != T_TABLE { this.wrong(i, "a table"); }
+        return Table { v: if v.tag == T_TABLE { v } else { nilv() } };
+    }
+
+    /// An array argument (as a value; `arrOf` reaches its items).
+    fn array(this: Args, i: int): Value {
+        let v = this.get(i);
+        if v.tag == T_ARRAY { return v; }
+        this.wrong(i, "an array");
+        return nilv();
+    }
+
+    /// A script fn or native (`fn` is a J3 keyword, hence the name).
+    fn func(this: Args, i: int): Value {
+        let v = this.get(i);
+        if v.tag == T_FN || v.tag == T_NATIVE { return v; }
+        this.wrong(i, "a function");
+        return nilv();
+    }
+
+    /// `num(i)`, or `d` when the argument is missing or nil.
+    fn numOr(this: Args, i: int, d: f64): f64 {
+        if this.get(i).isNil() { return d; }
+        return this.num(i);
+    }
+
+    fn intOr(this: Args, i: int, d: int): int {
+        if this.get(i).isNil() { return d; }
+        return this.int(i);
+    }
+
+    /// Every argument as `str()` writes it, `sep` between (what `print` shows). Valid until the
+    /// next `joined`.
+    fn joined(this: Args, sep: string): string {
+        let b = &this.vm.joinBuf;
+        b.clear();
+        for i in 0..this.n {
+            if i > 0 { b.pushStr(sep); }
+            fmtBuf(b, this.get(i));
+        }
+        return b.str();
+    }
+}
+
+/// The host's view of a script table. Made from any value: when it isn't a table, reads give
+/// nil and writes do nothing.
+pub struct Table {
+    v: Value;
+}
+
+extend Table {
+    fn value(this: Table): Value { return this.v; }
+
+    fn isTable(this: Table): bool { return this.v.tag == T_TABLE; }
+
+    fn count(this: Table): int {
+        if this.v.tag != T_TABLE { return 0; }
+        return tableOf(this.v).count();
+    }
+
+    /// Field `k`, nil when missing.
+    fn get(this: Table, k: string): Value {
+        if this.v.tag != T_TABLE { return nilv(); }
+        let t = tableOf(this.v);
+        let key = t.heap.lookupStr(k);
+        if key.isNil() { return nilv(); } // never interned: no table has it
+        return t.get(key);
+    }
+
+    /// `t.k = v` (nil removes it).
+    fn set(this: Table, k: string, v: Value) {
+        if this.v.tag != T_TABLE { return; }
+        let t = tableOf(this.v);
+        t.set(t.heap, t.heap.intern(k), v);
+    }
+
+    /// `set(k, v)` unless the field already has a value.
+    fn setDefault(this: Table, k: string, v: Value) {
+        if this.get(k).isNil() { this.set(k, v); }
+    }
+
+    /// Copy every field of `o` into this table (o's values win).
+    fn merge(this: Table, o: Table) {
+        if this.v.tag != T_TABLE || o.v.tag != T_TABLE { return; }
+        let t = tableOf(this.v);
+        let src = tableOf(o.v);
+        let i = src.next(0);
+        while i >= 0 {
+            let e = src.entries()[i];
+            t.set(t.heap, e.key, e.val);
+            i = src.next(i + 1);
+        }
+    }
+
+    /// Copy the fields `keys` of `o` that are set.
+    fn copyFields(this: Table, o: Table, keys: []string) {
+        for k in keys {
+            let v = o.get(k);
+            if !v.isNil() { this.set(k, v); }
+        }
+    }
+
+    /// Field `k` as a float, `d` when missing or not a number.
+    fn getNum(this: Table, k: string, d: f64): f64 {
+        let v = this.get(k);
+        if v.isNum() { return v.asNum(); }
+        return d;
+    }
+
+    /// Field `k` as a string, `d` when missing or not a string.
+    fn getStr(this: Table, k: string, d: string): string {
+        let v = this.get(k);
+        if v.tag == T_STR { return textOf(v); }
+        return d;
+    }
+}
+
+/// The host's view of a new script array (`vm.newArray`).
+pub struct Array {
+    heap: &Heap;
+    v: Value;
+}
+
+extend Array {
+    fn value(this: Array): Value { return this.v; }
+
+    fn count(this: Array): int { return arrOf(this.v).len; }
+
+    fn get(this: Array, i: int): Value { return arrOf(this.v).get(i); }
+
+    fn push(this: Array, x: Value) { arrOf(this.v).push(this.heap, x); }
+}
+
+extend Value {
+    /// This value as a table view (empty when it isn't a table).
+    fn asTable(this: Value): Table { return Table { v: if this.tag == T_TABLE { this } else { nilv() } }; }
+
+    /// A string's text, "" for anything else.
+    fn asStr(this: Value): string { return textOf(this); }
+}

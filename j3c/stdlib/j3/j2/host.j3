@@ -1,0 +1,196 @@
+// The host API: making a VM, binding natives, calling script functions, and holding values from
+// J3. Loading scripts is `load.j3`, the native argument and table views `host_types.j3`, the
+// built-in libs `lib.j3`. Part of `j3.j2`.
+//
+//     let vm = Vm.new(&mem, Limits { heapBytes: 32 << 20, stepsPerCall: 500000 });   // use j3.j2.{ Vm, Limits, .. }
+//     vm.openLibs(j2.LIB_ALL);
+//     vm.bind("spawn", spawn);              // fn spawn(vm: &Vm, args: Args): Value
+//     let exports = vm.loadString("hello", text)?;
+//     vm.call(exports.asTable().get("onTick"), [j2.num(dt)]);
+
+module j3.j2;
+
+/// What one VM may use. A field left out (or 0) takes the default shown.
+pub struct Limits {
+    /// Script heap cap; past it the running script stops with `out of script memory`.
+    heapBytes: int = 33554432;
+    /// Backward jumps and calls one host call (`call`, `loadString`, ...) may make, natives'
+    /// callbacks included; past it: `took too long (over N steps)`.
+    stepsPerCall: int = 10000000;
+    /// Script call depth; past it: `stack overflow`.
+    maxDepth: int = 200;
+}
+
+/// `vm.openLibs` bits; `|` them together.
+pub const LIB_BASE: int = 1;
+pub const LIB_MATH: int = 2;
+pub const LIB_STRING: int = 4;
+pub const LIB_ARRAY: int = 8;
+pub const LIB_ALL: int = 15;
+
+/// Chunk names a `use` chain can hold at once (`a` uses `b` uses `c` ...).
+const MAX_LOADING: int = 64;
+
+/// A string value (interned in `vm`'s heap; protected like `vm.newTable`).
+pub fn str(vm: &Vm, s: string): Value { return vm.protect(vm.heap.intern(s)); }
+
+/// The default `vm.resolver`: every `use` fails.
+fn noResolver(_ctx: ptr, vm: &Vm, name: string): Value {
+    let t = vm.errText();
+    t.pushStr("use ");
+    t.pushStr(name);
+    t.pushStr(": this host loads no other scripts (vm.resolver is not set)");
+    vm.raised = true;
+    return nilv();
+}
+
+/// Make `v` (a heap value) never collected.
+fn fix(v: Value): Value {
+    (v.obj() as &GcHeader).fixed = 1;
+    return v;
+}
+
+extend Vm {
+    /// A VM with an empty heap and no names bound (`openLibs` adds the built-ins). `mem` holds
+    /// only the heap header; everything else lives in the VM's own heap.
+    fn new(mem: &Arena, limits: Limits): Vm {
+        let hs = mem.alloc::<Heap>(1);
+        hs[0] = newHeap();
+        hs[0].limit = if limits.heapBytes > 0 { limits.heapBytes } else { 33554432 };
+        let h = &hs[0];
+        let vm = Vm {
+            heap: h,
+            stack: @slice(h.allocRaw(256 * @sizeof(Value)), 256),
+            top: 0,
+            frames: @slice(h.allocRaw(16 * @sizeof(Frame)), 16),
+            nframes: 0,
+            open: 0 as ptr,
+            globals: h.newTable(),
+            natives: @slice(h.allocRaw(16 * @sizeof(Native)), 16),
+            nnatives: 0,
+            host: 0 as ptr,
+            resolver: noResolver,
+            resolverCtx: 0 as ptr,
+            loading: @slice(h.allocRaw(MAX_LOADING * @sizeof(Value)), MAX_LOADING),
+            nloading: 0,
+            libs: 0,
+            maxDepth: if limits.maxDepth > 0 { limits.maxDepth } else { 200 },
+            stepsPerCall: if limits.stepsPerCall > 0 { limits.stepsPerCall } else { 10000000 },
+            memLimit: if limits.heapBytes > 0 { limits.heapBytes } else { 33554432 },
+            budget: 0,
+            callDepth: 0,
+            raised: false,
+            sb: newBuf(h),
+            joinBuf: newBuf(h),
+            errBuf: newBuf(h),
+            msgBuf: newBuf(h),
+            traceBuf: newBuf(h),
+            errFile: "",
+            err: Error { chunk: "", line: 0, col: 0, message: "", trace: "" },
+            located: false,
+            temps: @slice(0 as ptr, 0),
+            ntemps: 0,
+            gray: @slice(0 as ptr, 0),
+            ngray: 0,
+            gcPause: 0,
+            gcStress: sys.env("J3_J2_GC_STRESS") == "1",
+            nextGc: GC_MIN,
+            collections: 0,
+            rng: RNG_SEED,
+        };
+        return vm;
+    }
+
+    /// Make `f` the global `name` for every script loaded after this. Binding a name again
+    /// replaces it (built-ins too, `print` included), also for scripts already loaded.
+    fn bind(this: &Vm, name: string, f: fn(&Vm, Args): Value) {
+        let key = fix(this.heap.intern(name));
+        let old = this.global(key);
+        if old.tag == T_NATIVE {
+            this.natives[old.bits].f = f;
+            return;
+        }
+        tableOf(this.globals).set(this.heap, key, this.newNative(key, f));
+    }
+
+    /// A native fn value that is not a global (e.g. a field of the `math` table); `name` (a
+    /// fixed string) is what its argument errors say.
+    fn newNative(this: &Vm, name: Value, f: fn(&Vm, Args): Value): Value {
+        if this.nnatives == this.natives.len {
+            let n = this.natives.len * 2;
+            let next: []Native = @slice(this.heap.allocRaw(n * @sizeof(Native)), n);
+            for i in 0..this.nnatives { next[i] = this.natives[i]; }
+            this.heap.freeRaw(this.natives.ptr as ptr, this.natives.len * @sizeof(Native));
+            this.natives = next;
+        }
+        this.natives[this.nnatives] = Native { f: f, name: name };
+        this.nnatives += 1;
+        return Value { tag: T_NATIVE, bits: this.nnatives - 1 };
+    }
+
+    /// Like `bind`, but keeps a name the host already bound (how `openLibs` adds built-ins).
+    fn bindLib(this: &Vm, name: string, f: fn(&Vm, Args): Value) {
+        let key = this.heap.lookupStr(name);
+        if !key.isNil() && !this.global(key).isNil() { return; }
+        this.bind(name, f);
+    }
+
+    // ---- calling ----
+
+    /// `f(args)`: a script fn or a native. Re-entrant: a native may call back into script.
+    fn call(this: &Vm, f: Value, args: []Value): Result<Value, Error> {
+        return this.invoke(f, nilv(), false, args);
+    }
+
+    /// `f(self, args)` when `f` is a script fn whose first parameter is `this`, else `f(args)`.
+    fn callWithThis(this: &Vm, f: Value, self: Value, args: []Value): Result<Value, Error> {
+        return this.invoke(f, self, true, args);
+    }
+
+    /// Stop the running native with a script error at its caller's line, and return a value to
+    /// return from it: `return vm.raise("no such enemy");`. The first raise in a native counts;
+    /// after it `vm.call` gives that error back instead of running more script.
+    fn raise(this: &Vm, msg: string): Value {
+        if !this.raised {
+            this.errText().pushStr(msg);
+            this.raised = true;
+        }
+        return nilv();
+    }
+
+    // ---- holding values ----
+
+    /// Hold `v` across frames: it stays alive (a GC root) until `release`.
+    fn keep(this: &Vm, v: Value): Ref { return this.heap.keep(v); }
+
+    /// The kept value; nil for `none()` or a released `Ref`.
+    fn value(this: &Vm, r: Ref): Value { return this.heap.refValue(r); }
+
+    /// The kept value as a table (an empty view when it isn't one).
+    fn get(this: &Vm, r: Ref): Table { return Table { v: this.heap.refValue(r) }; }
+
+    /// Let go of `r`. Releasing `none()` or a `Ref` twice does nothing.
+    fn release(this: &Vm, r: Ref) { this.heap.releaseRef(r); }
+
+    /// Field `k` of the kept table as an `f32` (0 when missing or not a number).
+    fn getNum(this: &Vm, r: Ref, k: string): f32 { return f32(this.get(r).getNum(k, 0.0)); }
+
+    /// Set field `k` of the kept table to the float `x`.
+    fn setNum(this: &Vm, r: Ref, k: string, x: f32) { this.get(r).set(k, floatv(f64(x))); }
+
+    // ---- making values ----
+
+    /// A new empty table. It stays alive until the running native returns (outside a native:
+    /// until the next top-level call ends); store it or `keep` it to hold it longer.
+    fn newTable(this: &Vm): Table { return Table { v: this.protect(this.heap.newTable()) }; }
+
+    /// A new empty array with room for `n` values (`n` is only a hint). Protected like `newTable`.
+    fn newArray(this: &Vm, n: int): Array {
+        let room = if n < 0 || n > this.memLimit / @sizeof(Value) { 0 } else { n };
+        return Array { heap: this.heap, v: this.protect(this.heap.newArray(room)) };
+    }
+
+    /// `s` as a string that lives as long as the VM (so the host may keep it, e.g. as a name).
+    // ponytail: such strings are never freed; fine for names, not for per-frame text.
+    fn intern(this: &Vm, s: string): string { return textOf(fix(this.heap.intern(s))); }
+}

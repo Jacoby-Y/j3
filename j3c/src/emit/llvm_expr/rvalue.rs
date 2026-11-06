@@ -101,6 +101,11 @@ impl<'a> LlvmFn<'a> {
     pub(super) fn rvalue(&mut self, rv: &Rvalue) -> Result<(String, String), String> {
         let ll = ll_type(self.cx, rv.ty)?;
         match &rv.kind {
+            RvalueKind::Simd { op, args } => self.simd(rv, *op, args),
+            RvalueKind::Unary { op, arg } if matches!(self.cx.ty_kind(rv.ty), TyKind::Vec(_)) => {
+                let (a, _) = self.operand(arg)?;
+                Ok((self.vec_unary(rv.ty, *op, &a)?, ll))
+            }
             RvalueKind::Use(op) => self.operand(op),
             RvalueKind::Ref { place } => {
                 let (ptr, _) = self.place_ptr(place)?;
@@ -194,36 +199,47 @@ impl<'a> LlvmFn<'a> {
                 ));
                 Ok((v, "i64".to_string()))
             }
-            RvalueKind::Atomic { op, args } => {
+            RvalueKind::Atomic { op, order, args } => {
                 let (p, _) = self.operand(&args[0])?;
                 let mut vals = Vec::new();
                 for a in &args[1..] {
-                    vals.push(self.syscall_word(a)?);
+                    vals.push(self.operand(a)?.0);
                 }
+                // The pointee type; a bare `ptr` is an `int` cell.
+                let val_ty = self.cx.ref_inner(args[0].ty()).unwrap_or(self.cx.common.int);
+                let t = llvm_ty::ll_type(self.cx, val_ty)?;
+                let al = llvm_ty::align(self.cx, val_ty);
+                let o = order.llvm();
                 use crate::ir::op::AtomicOp;
                 match op {
                     AtomicOp::Load => {
                         let v = self.fresh();
-                        self.inst(&format!("{v} = load atomic i64, ptr {p} seq_cst, align 8"));
-                        Ok((v, "i64".to_string()))
+                        self.inst(&format!("{v} = load atomic {t}, ptr {p} {o}, align {al}"));
+                        Ok((v, t))
                     }
                     AtomicOp::Store => {
-                        self.inst(&format!("store atomic i64 {}, ptr {p} seq_cst, align 8", vals[0]));
+                        self.inst(&format!("store atomic {t} {}, ptr {p} {o}, align {al}", vals[0]));
                         Ok(("0".to_string(), "i64".to_string()))
                     }
-                    AtomicOp::Add => {
+                    AtomicOp::Add | AtomicOp::Sub | AtomicOp::Xchg => {
+                        let k = match op {
+                            AtomicOp::Add => "add",
+                            AtomicOp::Sub => "sub",
+                            _ => "xchg",
+                        };
                         let v = self.fresh();
-                        self.inst(&format!("{v} = atomicrmw add ptr {p}, i64 {} seq_cst", vals[0]));
-                        Ok((v, "i64".to_string()))
+                        self.inst(&format!("{v} = atomicrmw {k} ptr {p}, {t} {} {o}", vals[0]));
+                        Ok((v, t))
                     }
                     AtomicOp::Cas => {
                         let r = self.fresh();
+                        let f = order.cas_failure().llvm();
                         self.inst(&format!(
-                            "{r} = cmpxchg ptr {p}, i64 {}, i64 {} seq_cst seq_cst",
+                            "{r} = cmpxchg ptr {p}, {t} {}, {t} {} {o} {f}",
                             vals[0], vals[1]
                         ));
                         let ok = self.fresh();
-                        self.inst(&format!("{ok} = extractvalue {{ i64, i1 }} {r}, 1"));
+                        self.inst(&format!("{ok} = extractvalue {{ {t}, i1 }} {r}, 1"));
                         let z = self.fresh();
                         self.inst(&format!("{z} = zext i1 {ok} to i8"));
                         Ok((z, "i8".to_string()))
@@ -273,6 +289,12 @@ impl<'a> LlvmFn<'a> {
     }
 
     pub(super) fn cast(&mut self, from: Ty, to: Ty, v: &str, ft: &str, tt: &str) -> Result<String, String> {
+        if ft == tt && from == to {
+            return Ok(v.to_string());
+        }
+        if let Some(r) = self.half_cast(from, to, v, ft)? {
+            return Ok(r);
+        }
         if ft == tt {
             return Ok(v.to_string());
         }

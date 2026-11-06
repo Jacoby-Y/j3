@@ -19,6 +19,10 @@ use crate::ir::stmt::Stmt;
 use crate::ir::ty::Ty;
 use crate::span::Span;
 
+mod bodies;
+
+use bodies::*;
+
 pub struct PlaceSamples {
     pub cx: IrCx,
     pub module: Module,
@@ -248,137 +252,6 @@ pub fn place_samples() -> PlaceSamples {
     PlaceSamples { cx, module }
 }
 
-fn alloc_struct(cx: &mut IrCx, module: &[Name], name: &str, debug: bool) -> StructId {
-    let name = cx.intern_name(name);
-    cx.alloc_struct(StructDef {
-        module: module.to_vec(),
-        name,
-        doc: String::new(),
-        fields: Vec::new(),
-        packed: false,
-        debug,
-        span: Span::dummy(),
-        ty_args: Vec::new(),
-        script: None,
-    })
-}
-
-fn scale_body(
-    cx: &mut IrCx,
-    vec2_ref: Ty,
-    f32: Ty,
-    x_field: FieldId,
-    y_field: FieldId,
-    span: Span,
-) -> Body {
-    let mut b = BodyBuilder::new(cx.common.void);
-    let this = b.param(cx.intern_name("this"), vec2_ref, span);
-    let s = b.param(cx.intern_name("s"), f32, span);
-
-    let this_p = b.local_place(this, span);
-    let s_p = b.local_place(s, span);
-    let vec = b.deref(cx, this_p, span);
-    let x = b.field(cx, vec.clone(), x_field, span);
-    let y = b.field(cx, vec, y_field, span);
-
-    b.assign_op(span, x, BinOp::Mul, Operand::Copy(s_p.clone()));
-    b.assign_op(span, y, BinOp::Mul, Operand::Copy(s_p));
-    b.finish()
-}
-
-fn bump_body(cx: &mut IrCx, slice_int: Ty, int_ty: Ty, span: Span) -> Body {
-    let mut b = BodyBuilder::new(cx.common.void);
-    let xs = b.param(cx.intern_name("xs"), slice_int, span);
-    let i = b.param(cx.intern_name("i"), int_ty, span);
-
-    let xs_p = b.local_place(xs, span);
-    let i_p = b.local_place(i, span);
-    let elem = b.index(cx, xs_p, Operand::Copy(i_p), span);
-    b.assign_op(span, elem, BinOp::Add, Operand::int(span, int_ty, 1));
-    b.finish()
-}
-
-fn tick_body(
-    cx: &mut IrCx,
-    game_ref: Ty,
-    mem_field: FieldId,
-    running_field: FieldId,
-    checkpoint_id: FuncId,
-    checkpoint_ty: Ty,
-    int_ty: Ty,
-    bool_ty: Ty,
-    span: Span,
-) -> Body {
-    let mut b = BodyBuilder::new(cx.common.void);
-    let g = b.param(cx.intern_name("g"), game_ref, span);
-
-    let g_p = b.local_place(g, span);
-    let game = b.deref(cx, g_p, span);
-    let mem_ptr = b.field(cx, game.clone(), mem_field, span);
-    // `g.mem` is `&Arena`. Deref to the header, then take `&` for the method.
-    let header = b.deref(cx, mem_ptr, span);
-    let arena_ref_name = cx.intern_name("arena_ref");
-    let this_arg = b.ref_tmp(cx, arena_ref_name, header, span);
-
-    let call = Rvalue::call(
-        span,
-        int_ty,
-        Operand::fn_addr(span, checkpoint_ty, checkpoint_id),
-        vec![this_arg],
-    );
-    let frame = b.tmp(cx.intern_name("frame"), int_ty, span);
-    b.assign(span, b.local_place(frame, span), call);
-
-    let running = b.field(cx, game, running_field, span);
-    let false_val = Operand::Const(crate::ir::operand::Const {
-        ty: bool_ty,
-        span,
-        kind: crate::ir::operand::ConstKind::Bool(false),
-    });
-    b.assign(span, running, Rvalue::use_op(span, false_val));
-    b.finish()
-}
-
-fn checkpoint_body(cx: &mut IrCx, arena_ref: Ty, used_field: FieldId, span: Span) -> Body {
-    let mut b = BodyBuilder::new(cx.common.void);
-    let this = b.param(cx.intern_name("this"), arena_ref, span);
-    let header = b.deref(cx, b.local_place(this, span), span);
-    let used = b.field(cx, header, used_field, span);
-    b.return_op(span, Some(Operand::Copy(used)));
-    b.finish()
-}
-
-fn exit_block(cx: &IrCx, span: Span, code: u64) -> Block {
-    let nr = Operand::int(span, cx.common.int, 60);
-    let arg = Operand::int(span, cx.common.int, code);
-    let call = Rvalue::syscall(span, cx.common.int, nr, vec![arg]);
-    Block {
-        stmts: vec![Stmt::expr(span, cx.common.void, call)],
-    }
-}
-
-fn fail_if_ne(
-    b: &mut BodyBuilder,
-    cx: &mut IrCx,
-    span: Span,
-    lhs: Operand,
-    rhs: Operand,
-    tmp_name: &str,
-) {
-    let name = cx.intern_name(tmp_name);
-    let tmp = b.let_local(name, cx.common.bool, span);
-    b.assign(
-        span,
-        b.local_place(tmp, span),
-        Rvalue::binary(span, cx.common.bool, BinOp::Ne, lhs, rhs),
-    );
-    b.if_then(
-        span,
-        Operand::Copy(b.local_place(tmp, span)),
-        exit_block(cx, span, 1),
-    );
-}
-
 fn main_body(
     cx: &mut IrCx,
     arena_ty: Ty,
@@ -553,62 +426,4 @@ fn main_body(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ir::dump::dump_module;
-    use crate::ir::validate::validate_module;
-
-    #[test]
-    fn place_samples_validate() {
-        let samples = place_samples();
-        match validate_module(&samples.cx, &samples.module) {
-            Ok(()) => {}
-            Err(e) => panic!("{}", e.message),
-        }
-    }
-
-    #[test]
-    fn place_samples_dump_mentions_deref_and_assign_op() {
-        let samples = place_samples();
-        let dump = dump_module(&samples.cx, &samples.module);
-        assert!(dump.contains("(*this).x *= copy s"), "{dump}");
-        assert!(dump.contains("xs[copy i] += 1"), "{dump}");
-        assert!(dump.contains("&(*(*g).mem)"), "{dump}");
-        assert!(dump.contains("(*g).running = false"), "{dump}");
-    }
-
-    #[test]
-    fn emit_c_compiles_and_run_exits_zero() {
-        let samples = place_samples();
-        match validate_module(&samples.cx, &samples.module) {
-            Ok(()) => {}
-            Err(e) => panic!("{}", e.message),
-        }
-        let c = crate::emit::emit_c(&samples.cx, &samples.module).expect("emit c");
-        assert!(c.contains("j3_ir_samples_scale_"), "{c}");
-        assert!(c.contains("j3_sl_i64"), "{c}");
-        assert!(c.contains("j3_ir_samples_Vec2"), "{c}");
-        assert!(c.contains("int main(int argc, char **argv)"), "{c}");
-        let run = crate::emit::compile_and_run(&c).expect("cc");
-        assert_eq!(
-            run.status,
-            0,
-            "stderr {}",
-            String::from_utf8_lossy(&run.stderr)
-        );
-
-        let mut opts = crate::emit::EmitOpts::default();
-        opts.backend = crate::emit::Backend::Llvm;
-        if !crate::emit::clang_available(&opts.clang) {
-            opts.backend = crate::emit::Backend::C;
-        }
-        let ll_run = crate::emit::run_program(&samples.cx, std::slice::from_ref(&samples.module), &opts)
-            .expect("llvm run");
-        assert_eq!(
-            ll_run.status,
-            0,
-            "llvm stderr {}",
-            String::from_utf8_lossy(&ll_run.stderr)
-        );
-    }
-}
+mod tests;

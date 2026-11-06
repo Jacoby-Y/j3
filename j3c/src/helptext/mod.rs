@@ -42,16 +42,64 @@ pub fn recipes() -> Vec<Recipe> {
             files: vec![("j3.toml", PAINT_TOML.to_string()), ("src/main.j3", PAINT_MAIN.to_string())],
         },
         Recipe {
+            name: "audio",
+            what: "a PCM output stream: a sine tone queued per frame, playhead from queued()",
+            text: RECIPE_AUDIO,
+            files: vec![("j3.toml", PAINT_TOML.replace("painted", "tone").replace(", \"SDL2_ttf\"", "")), ("src/main.j3", AUDIO_MAIN.to_string())],
+        },
+        Recipe {
             name: "display",
             what: "a Video settings page: window mode, resolution, monitor, vsync, frame cap, saved",
             text: RECIPE_DISPLAY,
             files: vec![("j3.toml", PAINT_TOML.replace("painted", "videomenu")), ("src/main.j3", DISPLAY_MAIN.to_string())],
         },
         Recipe {
+            name: "hotkey",
+            what: "a global hotkey: F8 toggles pause while another app has focus (Linux X11)",
+            text: RECIPE_HOTKEY,
+            files: vec![("j3.toml", PAINT_TOML.replace("painted", "recorder").replace(", \"SDL2_ttf\"", "")), ("src/main.j3", HOTKEY_MAIN.to_string())],
+        },
+        Recipe {
+            name: "steam",
+            what: "Steam: init, attach, unlock an achievement, post a score, rich presence (no-op without Steam)",
+            text: RECIPE_STEAM,
+            files: vec![("j3.toml", PAINT_TOML.replace("painted", "spacerun").replace(", \"SDL2_ttf\"", "")), ("src/main.j3", STEAM_MAIN.to_string())],
+        },
+        Recipe {
+            name: "paste",
+            what: "Ctrl+V pastes an image, GIF, or file list from the clipboard (clipboardTypes/clipboardData)",
+            text: RECIPE_PASTE,
+            files: vec![("j3.toml", PAINT_TOML.replace("painted", "paster").replace(", \"SDL2_ttf\"", "")), ("src/main.j3", PASTE_MAIN.to_string())],
+        },
+        Recipe {
+            name: "dragout",
+            what: "drag a file out of the window into Discord, a browser, or a file manager (dragFiles, Linux X11)",
+            text: RECIPE_DRAGOUT,
+            files: vec![("j3.toml", PAINT_TOML.replace("painted", "dragger").replace(", \"SDL2_ttf\"", "")), ("src/main.j3", DRAGOUT_MAIN.to_string())],
+        },
+        Recipe {
             name: "components",
             what: "a `.j3ui` window: a component with a canvas and a button, styled with CSS",
             text: RECIPE_COMPONENTS,
             files: components_files("mygame"),
+        },
+        Recipe {
+            name: "ansi",
+            what: "colored process or build output in a `.j3ui` pane: AnsiLog turns escapes into styled spans",
+            text: RECIPE_ANSI,
+            files: ansi_files(),
+        },
+        Recipe {
+            name: "tui",
+            what: "a full-screen terminal program: Screen.open, draw a box and text, poll keys, q quits",
+            text: RECIPE_TUI,
+            files: vec![("j3.toml", "[package]\nname = \"tuidemo\"\nentry = \"src/main.j3\"\n".to_string()), ("src/main.j3", TUI_MAIN.to_string())],
+        },
+        Recipe {
+            name: "pty",
+            what: "run `ls --color=always` in a pty, read until eof, feed a Grid, print the screen as text",
+            text: RECIPE_PTY,
+            files: vec![("j3.toml", "[package]\nname = \"ptydemo\"\nentry = \"src/main.j3\"\n".to_string()), ("src/main.j3", PTY_MAIN.to_string())],
         },
         Recipe {
             name: "script",
@@ -61,6 +109,16 @@ pub fn recipes() -> Vec<Recipe> {
                 ("j3.toml", "[package]\nname = \"counters\"\nentry = \"src/main.j3\"\n".to_string()),
                 ("scripts/counter.j3s", SCRIPT_COUNTER.to_string()),
                 ("src/main.j3", SCRIPT_MAIN.to_string()),
+            ],
+        },
+        Recipe {
+            name: "j2",
+            what: "load a j2 mod at runtime: bind a native, call its fn, read a field, show an error",
+            text: RECIPE_J2,
+            files: vec![
+                ("j3.toml", "[package]\nname = \"modhost\"\nentry = \"src/main.j3\"\n".to_string()),
+                ("mods/hello.j2", J2_HELLO.to_string()),
+                ("src/main.j3", J2_MAIN.to_string()),
             ],
         },
         Recipe {
@@ -155,15 +213,50 @@ const COMPONENTS_STATE: &str = include_str!("recipes/components_state.j3");
 
 const COMPONENTS_MAIN: &str = include_str!("recipes/components_main.j3");
 
+fn ansi_files() -> Vec<(&'static str, String)> {
+    vec![
+        ("j3.toml", COMPONENTS_TOML.to_string()),
+        ("ui/Screen.j3ui", ANSI_SCREEN.to_string()),
+        ("ui/theme.css", COMPONENTS_THEME.to_string()),
+        ("src/main.j3", ANSI_MAIN.to_string()),
+    ]
+}
+
+const RECIPE_ANSI: &str = include_str!("recipes/ansi.md");
+
+const ANSI_SCREEN: &str = include_str!("recipes/ansi_Screen.j3ui");
+
+const ANSI_MAIN: &str = include_str!("recipes/ansi_main.j3");
+
 const RECIPE_PAINT: &str = include_str!("recipes/paint.md");
 
 const PAINT_TOML: &str = include_str!("recipes/paint.toml");
 
 const PAINT_MAIN: &str = include_str!("recipes/paint_main.j3");
 
+const RECIPE_AUDIO: &str = include_str!("recipes/audio.md");
+
+const AUDIO_MAIN: &str = include_str!("recipes/audio_main.j3");
+
 const RECIPE_DISPLAY: &str = include_str!("recipes/display.md");
 
 const DISPLAY_MAIN: &str = include_str!("recipes/display_main.j3");
+
+const RECIPE_HOTKEY: &str = include_str!("recipes/hotkey.md");
+
+const HOTKEY_MAIN: &str = include_str!("recipes/hotkey_main.j3");
+
+const RECIPE_STEAM: &str = include_str!("recipes/steam.md");
+
+const STEAM_MAIN: &str = include_str!("recipes/steam_main.j3");
+
+const RECIPE_PASTE: &str = include_str!("recipes/paste.md");
+
+const PASTE_MAIN: &str = include_str!("recipes/paste_main.j3");
+
+const RECIPE_DRAGOUT: &str = include_str!("recipes/dragout.md");
+
+const DRAGOUT_MAIN: &str = include_str!("recipes/dragout_main.j3");
 
 const RECIPE_CANVAS: &str = include_str!("recipes/canvas.md");
 
@@ -172,6 +265,14 @@ const CANVAS_MAIN: &str = include_str!("recipes/canvas_main.j3");
 const RECIPE_HTTP: &str = include_str!("recipes/http.md");
 
 const HTTP_MAIN: &str = include_str!("recipes/http_main.j3");
+
+const RECIPE_TUI: &str = include_str!("recipes/tui.md");
+
+const TUI_MAIN: &str = include_str!("recipes/tui_main.j3");
+
+const RECIPE_PTY: &str = include_str!("recipes/pty.md");
+
+const PTY_MAIN: &str = include_str!("recipes/pty_main.j3");
 
 const RECIPE_THREADS: &str = include_str!("recipes/threads.md");
 
@@ -182,6 +283,12 @@ const RECIPE_SCRIPT: &str = include_str!("recipes/script.md");
 const SCRIPT_COUNTER: &str = include_str!("recipes/script_counter.j3s");
 
 const SCRIPT_MAIN: &str = include_str!("recipes/script_main.j3");
+
+const RECIPE_J2: &str = include_str!("recipes/j2.md");
+
+const J2_HELLO: &str = include_str!("recipes/j2_hello.j2");
+
+const J2_MAIN: &str = include_str!("recipes/j2_main.j3");
 
 const RECIPE_MESHGEN: &str = include_str!("recipes/meshgen.md");
 

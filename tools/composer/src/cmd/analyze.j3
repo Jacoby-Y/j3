@@ -1,0 +1,336 @@
+// cmd: analyze (the ear) and its level, range and repeat checks.
+
+module composer.cmd;
+
+fn analyze(s: &Song, out: &Text) {
+    let c = blank();
+    let shown = 0;
+    let outKey = 0;
+    let clash = 0;
+    for i in 0..s.noteCount {
+        let n = &s.notes[i];
+        let tr = &s.tracks[n.track];
+        if tr.synth == synth.DRUMS { continue; }
+        let bar = barOf(s, n.beat);
+        let hasChord = chordOf(s, bar, &c);
+        let inK = theory.inKey(n.pitch % 12, s.key, s.minor) || (hasChord && theory.chordHas(&c, n.pitch % 12));
+        let onBeat = n.beat - floor(n.beat) < 0.01;
+        // A long note on a beat that is not in the chord is heard as a clash; passing notes are fine.
+        let clashes = hasChord && onBeat && n.len >= 1.0 && !theory.chordHas(&c, n.pitch % 12);
+        if !inK { outKey += 1; }
+        if clashes { clash += 1; }
+        if (!inK || clashes) && shown < 12 {
+            shown += 1;
+            out.pushStr("  ");
+            out.pushStr(tr.name);
+            out.pushStr(" bar ");
+            out.pushInt(bar);
+            out.push(58);
+            pushNum(out, n.beat - barStart(s, bar) + 1.0);
+            out.push(32);
+            theory.pushPitch(out, n.pitch, false);
+            if !inK { out.pushStr(" not in key"); }
+            if clashes {
+                out.pushStr(" against ");
+                out.pushStr(song.chordAt(s, bar - 1));
+            }
+            out.push(10);
+        }
+    }
+    out.pushStr("out of key (and not in the chord): ");
+    out.pushInt(outKey);
+    out.pushStr(", held non-chord tones on a beat: ");
+    out.pushInt(clash);
+    out.push(10);
+    // Same pitch twice at once on one track sounds like a phase smear.
+    let doubled = 0;
+    for i in 0..s.noteCount {
+        for j in i + 1..s.noteCount {
+            let x = &s.notes[i];
+            let y = &s.notes[j];
+            if x.track == y.track && x.pitch == y.pitch && x.beat < y.beat + y.len - 0.001 && y.beat < x.beat + x.len - 0.001 {
+                doubled += 1;
+                if doubled <= 12 {
+                    let later = if y.beat > x.beat { y } else { x };
+                    let lb = barOf(s, later.beat);
+                    out.pushStr("  ");
+                    out.pushStr(s.tracks[x.track].name);
+                    out.pushStr(" bar ");
+                    out.pushInt(lb);
+                    out.push(58);
+                    pushNum(out, f32(int((later.beat - barStart(s, lb) + 1.0) * 100.0)) / 100.0);
+                    out.push(32);
+                    theory.pushPitch(out, x.pitch, s.tracks[x.track].synth == synth.DRUMS);
+                    out.pushStr(" starts while the same pitch still sounds\n");
+                }
+            }
+        }
+        if i > 4000 { break; }
+    }
+    if doubled > 0 {
+        out.pushStr("overlapping same-pitch notes: ");
+        out.pushInt(doubled);
+        out.pushStr(" (shorten the first, or move the second)\n");
+    }
+    // The mix, one track's buffer, the reverb send and its wet line: six floats a frame.
+    let mem = Arena.create(mix.frames(s) * 24 + song.MAXNOTES * 16 + 1024 * 1024);
+    defer mem.destroy();
+    let st = Stats { peak: 0, rms: 0, hot: 0, seconds: 0, loud: 0 };
+    mix.render(s, &mem, &st);
+    mem.rewind(0);
+    out.pushStr("peak ");
+    pushNum(out, f32(int(st.peak * 100.0)) / 100.0);
+    out.pushStr(", rms ");
+    pushNum(out, f32(int(st.rms * 1000.0)) / 1000.0);
+    out.pushStr(", limited samples ");
+    out.pushInt(st.hot);
+    if st.hot > 1000 { out.pushStr(" (too loud: lower some track vol)"); }
+    if st.peak < 0.25 && s.noteCount > 0 { out.pushStr(" (quiet: raise track vol)"); }
+    out.push(10);
+    levels(s, &mem, out);
+    mem.rewind(0);
+    ranges(s, &mem, out);
+    mem.rewind(0);
+    repeats(s, &mem, out);
+}
+
+fn hasNotes(s: &Song, t: int): bool {
+    for i in 0..s.noteCount {
+        if s.notes[i].track == t { return true; }
+    }
+    return false;
+}
+
+fn avgPitch(s: &Song, t: int): f32 {
+    let sum = 0;
+    let count = 0;
+    for i in 0..s.noteCount {
+        if s.notes[i].track == t { sum += s.notes[i].pitch; count += 1; }
+    }
+    return if count > 0 { f32(sum) / f32(count) } else { 0 };
+}
+
+fn roundI(x: f32): int {
+    return int(floor(x + 0.5));
+}
+
+/// Each track rendered alone, measured while it sounds: a buried part shows here, not in the total.
+fn levels(s: &Song, mem: &Arena, out: &Text) {
+    let lv = mem.alloc::<f32>(song.MAXTRACKS);
+    let mark = mem.used;
+    let top = -1;
+    for t in 0..s.trackCount {
+        lv[t] = 0;
+        if !song.audible(s, t) || !hasNotes(s, t) { continue; }
+        mem.rewind(mark);
+        let st = Stats { peak: 0, rms: 0, hot: 0, seconds: 0, loud: 0 };
+        mix.renderOnly(s, mem, &st, t);
+        lv[t] = st.loud;
+        if top < 0 || lv[t] > lv[top] { top = t; }
+    }
+    if top < 0 { return; }
+    out.pushStr("levels while playing (dB, loudest 0):");
+    for k in 0..s.trackCount {
+        if lv[k] <= 0 { continue; }
+        out.push(32);
+        out.pushStr(s.tracks[k].name);
+        out.push(32);
+        out.pushInt(roundI(db(lv[k]) - db(lv[top])));
+    }
+    out.push(10);
+    for k2 in 0..s.trackCount {
+        let under = db(lv[top]) - db(lv[k2]);
+        if lv[k2] <= 0 || under < 12 { continue; }
+        out.pushStr("  ");
+        out.pushStr(s.tracks[k2].name);
+        out.pushStr(" is ");
+        out.pushInt(roundI(under));
+        out.pushStr(" dB under ");
+        out.pushStr(s.tracks[top].name);
+        out.pushStr(": raise its vol or lower the other\n");
+    }
+    // The melody is the highest part that is not drums or a pad; it wants to be on top of the mix.
+    let mel = -1;
+    let melPitch: f32 = 0;
+    for k3 in 0..s.trackCount {
+        let syn = s.tracks[k3].synth;
+        if lv[k3] <= 0 || syn == synth.DRUMS || syn == synth.PAD { continue; }
+        let p = avgPitch(s, k3);
+        if p > melPitch { mel = k3; melPitch = p; }
+    }
+    if mel < 0 || db(lv[top]) - db(lv[mel]) >= 12 { return; }
+    let other = -1;
+    for k4 in 0..s.trackCount {
+        // Bass carries more energy than it sounds loud, so it is not the yardstick.
+        if k4 == mel || lv[k4] <= 0 || s.tracks[k4].synth == synth.DRUMS || s.tracks[k4].synth == synth.BASS { continue; }
+        if other < 0 || lv[k4] > lv[other] { other = k4; }
+    }
+    if other >= 0 && db(lv[other]) - db(lv[mel]) > 3 {
+        out.pushStr("  the melody (");
+        out.pushStr(s.tracks[mel].name);
+        out.pushStr(", the highest part) sits ");
+        out.pushInt(roundI(db(lv[other]) - db(lv[mel])));
+        out.pushStr(" dB under ");
+        out.pushStr(s.tracks[other].name);
+        out.pushStr(": raise it or lower the other\n");
+    }
+}
+
+/// Parts that play at once in the same octave blur together; two low parts are mud.
+fn ranges(s: &Song, mem: &Arena, out: &Text) {
+    let w = song.MAXBARS + 1;
+    let occ = mem.alloc::<bool>(song.MAXTRACKS * w);
+    for i in 0..occ.len { occ[i] = false; }
+    for n in 0..s.noteCount {
+        let note = &s.notes[n];
+        let last = barOf(s, note.beat + note.len - 0.01);
+        if last > song.MAXBARS { last = song.MAXBARS; }
+        for b in barOf(s, note.beat)..=last { occ[note.track * w + b] = true; }
+    }
+    for i in 0..s.trackCount {
+        for j in i + 1..s.trackCount {
+            let x = &s.tracks[i];
+            let y = &s.tracks[j];
+            if x.synth == synth.DRUMS || y.synth == synth.DRUMS || !song.audible(s, i) || !song.audible(s, j) { continue; }
+            let shared = 0;
+            for b2 in 1..=s.bars {
+                if occ[i * w + b2] && occ[j * w + b2] { shared += 1; }
+            }
+            if shared == 0 { continue; }
+            let pi = avgPitch(s, i);
+            let pj = avgPitch(s, j);
+            let apart = x.pan - y.pan;
+            if apart < 0 { apart = 0 - apart; }
+            // Mud: move up the part that is not the bass. Same range: move the lower one down.
+            let mover = if x.synth == synth.BASS { y.name } else { x.name };
+            let lower = if pi < pj { x.name } else { y.name };
+            if pi < 50 && pj < 50 {
+                out.pushStr("  mud: ");
+                out.pushStr(x.name);
+                out.pushStr(" and ");
+                out.pushStr(y.name);
+                out.pushStr(" both sit below D3 in ");
+                out.pushInt(shared);
+                out.pushStr(" bars; move one up (`transpose ");
+                out.pushStr(mover);
+                out.pushStr(" 12`)\n");
+            } else if pi - pj < 2.5 && pj - pi < 2.5 && apart < 0.6 {
+                out.pushStr("  ");
+                out.pushStr(x.name);
+                out.pushStr(" and ");
+                out.pushStr(y.name);
+                out.pushStr(" share a range (around ");
+                theory.pushPitch(out, roundI((pi + pj) * 0.5), false);
+                out.pushStr(") in ");
+                out.pushInt(shared);
+                out.pushStr(" bars; move one an octave (`transpose ");
+                out.pushStr(lower);
+                out.pushStr(" -12`) or pan them apart\n");
+            }
+        }
+    }
+}
+
+/// Note ranges per track and bar in sorted order: `from[t * w + bar]` .. `to[t * w + bar]` index `ord`.
+struct BarIndex {
+    ord: []int;
+    from: []int;
+    to: []int;
+    w: int;
+}
+
+fn barIndex(s: &Song, mem: &Arena): BarIndex {
+    let w = song.MAXBARS + 2;
+    let x = BarIndex { ord: song.order(s, mem), from: mem.alloc::<int>(song.MAXTRACKS * w), to: mem.alloc::<int>(song.MAXTRACKS * w), w: w };
+    for i in 0..x.from.len {
+        x.from[i] = 0;
+        x.to[i] = 0;
+    }
+    for k in 0..x.ord.len {
+        let n = &s.notes[x.ord[k]];
+        let b = barOf(s, n.beat);
+        if b > song.MAXBARS { continue; }
+        let at = n.track * w + b;
+        if x.to[at] == 0 { x.from[at] = k; }
+        x.to[at] = k + 1;
+    }
+    return x;
+}
+
+/// Do bars `p` and `q` of track `t` hold the same notes (place in the bar, length, pitch)? Each note
+/// is looked up rather than compared in order: humanized hits that start together sort either way.
+fn sameBar(s: &Song, x: &BarIndex, t: int, p: int, q: int): bool {
+    let ip = t * x.w + p;
+    let iq = t * x.w + q;
+    let count = x.to[ip] - x.from[ip];
+    if count != x.to[iq] - x.from[iq] { return false; }
+    let shift = barStart(s, q) - barStart(s, p);
+    for k in 0..count {
+        let a = &s.notes[x.ord[x.from[ip] + k]];
+        let found = false;
+        for m in 0..count {
+            let b = &s.notes[x.ord[x.from[iq] + m]];
+            let d = b.beat - a.beat - shift;
+            let dl = b.len - a.len;
+            if !found && a.pitch == b.pitch && d < 0.05 && d > -0.05 && dl < 0.05 && dl > -0.05 { found = true; }
+        }
+        if !found { return false; }
+    }
+    return true;
+}
+
+const PERIODS: [3]int = [4, 8, 16];
+
+/// Parts that play one bar over and over, and songs that are one phrase played again.
+fn repeats(s: &Song, mem: &Arena, out: &Text) {
+    let x = barIndex(s, mem);
+    for t in 0..s.trackCount {
+        if !song.audible(s, t) { continue; }
+        let played = 0;
+        let kinds = 0;
+        for b in 1..=s.bars {
+            if x.to[t * x.w + b] == 0 { continue; }
+            played += 1;
+            let seen = false;
+            for b2 in 1..b {
+                if !seen && x.to[t * x.w + b2] > 0 && sameBar(s, &x, t, b2, b) { seen = true; }
+            }
+            if !seen { kinds += 1; }
+        }
+        if played < 8 || kinds > 2 { continue; }
+        let tr = &s.tracks[t];
+        out.pushStr("  ");
+        out.pushStr(tr.name);
+        out.pushStr(": ");
+        out.pushInt(played);
+        out.pushStr(" bars, ");
+        out.pushInt(kinds);
+        out.pushStr(if kinds == 1 { " pattern" } else { " patterns" });
+        if tr.synth == synth.DRUMS {
+            out.pushStr("; mark phrase ends with a fill (`beat ");
+            out.pushStr(tr.name);
+            out.pushStr(" snare ........x.x.xxxx bars=8`) and a crash on the next bar 1\n");
+        } else {
+            out.pushStr("; change the last bar of each phrase, or give each section its own line\n");
+        }
+    }
+    // The whole song as one phrase played again: say so once, not per track.
+    for pk in 0..3 {
+        let period = PERIODS[pk];
+        if s.bars < period * 2 || s.noteCount == 0 { continue; }
+        let again = true;
+        for t2 in 0..s.trackCount {
+            for b3 in period + 1..=s.bars {
+                if again && !sameBar(s, &x, t2, b3 - period, b3) { again = false; }
+            }
+        }
+        if again {
+            out.pushStr("form: bars 1-");
+            out.pushInt(period);
+            out.pushStr(" played ");
+            pushNum(out, f32(s.bars) / f32(period));
+            out.pushStr(" times with nothing changed; vary the repeats (a new lead line, another fill style, drum fills)\n");
+            return;
+        }
+    }
+}

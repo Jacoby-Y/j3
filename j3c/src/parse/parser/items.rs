@@ -16,7 +16,7 @@ impl<'a> Parser<'a> {
                 })
                 .collect()
         } else {
-            self.expect(TokenKind::Module, "expected `module`")?;
+            self.expect(TokenKind::Module, "expected `module`: a file starts with `module <name>;` (its file name, e.g. `module main;`)")?;
             let module = self.path()?;
             self.expect(TokenKind::Semi, "expected `;` after module path")?;
             module
@@ -47,6 +47,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
+        self.gpu_attr_site(&attrs)?;
         match self.cur().kind {
             TokenKind::Use => {
                 self.forbid_doc(&doc)?;
@@ -69,26 +70,63 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Fn => {
                 self.forbid_attrs(&attrs, "fn")?;
-                Ok(Item::Fn(self.fn_item(vis_pub, doc)?))
+                let mut f = self.fn_item(vis_pub, doc)?;
+                f.is_impl = attrs.impl_fn;
+                f.shader = attrs.shader;
+                Ok(Item::Fn(f))
+            }
+            TokenKind::Ident if self.at_trait_item() => {
+                self.forbid_attrs(&attrs, "trait")?;
+                Ok(Item::Trait(self.trait_item(vis_pub, doc)?))
+            }
+            TokenKind::Ident if self.at_extend_item() => {
+                self.forbid_attrs(&attrs, "extend")?;
+                // A doc before `extend` is a part file's header (`ui/dom/*.j3` style); it documents nothing, so drop it.
+                let _ = doc;
+                if vis_pub {
+                    return Err(self.err("`pub extend` is not valid; the methods are public like in a struct body"));
+                }
+                Ok(Item::Extend(self.extend_item()?))
             }
             TokenKind::At => {
                 self.forbid_attrs(&attrs, "@j3ui")?;
                 Ok(Item::Fn(self.j3ui_item(vis_pub, doc)?))
             }
             TokenKind::Struct => {
+                if attrs.impl_fn {
+                    return Err(self.err("`#[impl]` cannot sit on `struct`; it marks a free fn"));
+                }
                 if attrs.try_catch.is_some() {
                     return Err(self.err("`#[TryCatch]` cannot sit on `struct`"));
                 }
-                Ok(Item::Struct(self.struct_item(vis_pub, attrs.debug, doc)?))
+                let mut s = self.struct_item(vis_pub, attrs.debug, doc)?;
+                s.gpu = match (attrs.gpu_struct, attrs.shader) {
+                    (GpuStruct::None, Some(_)) => GpuStruct::Plain,
+                    (g, _) => g,
+                };
+                Ok(Item::Struct(s))
             }
-            TokenKind::Enum => Ok(Item::Enum(self.enum_item(vis_pub, attrs, doc)?)),
+            TokenKind::Enum => {
+                if attrs.impl_fn {
+                    return Err(self.err("`#[impl]` cannot sit on `enum`; it marks a free fn"));
+                }
+                Ok(Item::Enum(self.enum_item(vis_pub, attrs, doc)?))
+            }
             TokenKind::Let => {
+                if attrs.uniform {
+                    let mut l = self.mod_let_item(doc, false)?;
+                    if l.value.is_some() {
+                        return Err(ParseError::new(l.name.span, "a `#[uniform]` has no initializer; the CPU sets it by name"));
+                    }
+                    l.uniform = true;
+                    return Ok(Item::Let(l));
+                }
                 if !attrs.singleton {
                     return Err(self.err("module `let` needs `#[singleton]`"));
                 }
-                if attrs.debug || attrs.try_catch.is_some() {
+                if attrs.debug || attrs.try_catch.is_some() || attrs.impl_fn {
                     return Err(
-                        self.err("`#[singleton]` cannot mix with `#[Debug]` / `#[TryCatch]`")
+                        self.err("`#[singleton]` cannot mix with `#[Debug]` / `#[TryCatch]` / `#[impl]`")
                     );
                 }
                 if vis_pub {
@@ -105,92 +143,6 @@ impl<'a> Parser<'a> {
                 Err(self.err("expected `use`, `const`, `fn`, `struct`, or `let`"))
             }
         }
-    }
-
-    pub(super) fn take_doc(&mut self) -> String {
-        let mut lines = Vec::new();
-        while self.cur().kind == TokenKind::Doc {
-            lines.push(self.cur().text.clone());
-            let _ = self.bump();
-        }
-        lines.join("\n")
-    }
-
-    pub(super) fn forbid_doc(&self, doc: &str) -> Result<(), ParseError> {
-        if doc.is_empty() {
-            Ok(())
-        } else {
-            Err(self.err("doc comment must sit on a fn, struct, enum, const, let, field, or variant"))
-        }
-    }
-
-    pub(super) fn attrs(&mut self) -> Result<ItemAttrs, ParseError> {
-        let mut out = ItemAttrs {
-            debug: false,
-            try_catch: None,
-            singleton: false,
-            thread: false,
-        };
-        while self.cur().kind == TokenKind::Hash {
-            let _ = self.bump();
-            self.expect(TokenKind::LBracket, "expected `[` after `#`")?;
-            let name = self.ident()?;
-            match name.name.as_str() {
-                ATTR_DEBUG => {
-                    if self.cur().kind == TokenKind::LParen {
-                        return Err(ParseError::new(name.span, "`#[Debug]` takes no arguments"));
-                    }
-                    out.debug = true;
-                }
-                ATTR_SINGLETON => {
-                    if self.cur().kind == TokenKind::LParen {
-                        return Err(ParseError::new(
-                            name.span,
-                            "`#[singleton]` takes no arguments",
-                        ));
-                    }
-                    out.singleton = true;
-                }
-                ATTR_THREAD => {
-                    if self.cur().kind == TokenKind::LParen {
-                        return Err(ParseError::new(name.span, "`#[thread]` takes no arguments"));
-                    }
-                    out.thread = true;
-                }
-                ATTR_TRY_CATCH => {
-                    self.expect(TokenKind::LParen, "expected `(` after `#[TryCatch`")?;
-                    let success = self.ident()?;
-                    self.expect(TokenKind::Comma, "expected `,` in `#[TryCatch]`")?;
-                    let failure = self.ident()?;
-                    self.expect(TokenKind::RParen, "expected `)` after `#[TryCatch]`")?;
-                    out.try_catch = Some((success, failure));
-                }
-                other => {
-                    return Err(ParseError::new(
-                        name.span,
-                        format!("unknown attribute `#[{other}]`"),
-                    ));
-                }
-            }
-            self.expect(TokenKind::RBracket, "expected `]` after attribute")?;
-        }
-        Ok(out)
-    }
-
-    pub(super) fn forbid_attrs(&self, attrs: &ItemAttrs, what: &str) -> Result<(), ParseError> {
-        if attrs.debug {
-            return Err(self.err(&format!("`#[Debug]` cannot sit on `{what}`")));
-        }
-        if attrs.try_catch.is_some() {
-            return Err(self.err(&format!("`#[TryCatch]` cannot sit on `{what}`")));
-        }
-        if attrs.singleton {
-            return Err(self.err(&format!("`#[singleton]` cannot sit on `{what}`")));
-        }
-        if attrs.thread {
-            return Err(self.err(&format!("`#[thread]` cannot sit on `{what}`")));
-        }
-        Ok(())
     }
 
     pub(super) fn mod_let_item(&mut self, doc: String, thread: bool) -> Result<ModLetItem, ParseError> {
@@ -213,6 +165,7 @@ impl<'a> Parser<'a> {
             ty,
             value,
             thread,
+            uniform: false,
         })
     }
 
@@ -275,7 +228,7 @@ impl<'a> Parser<'a> {
         let start = self.cur().span;
         self.expect(TokenKind::Struct, "expected `struct`")?;
         let name = self.ident()?;
-        let type_params = self.type_params()?;
+        let (type_params, bounds) = self.type_params()?;
         if self.cur().kind == TokenKind::Semi {
             let _ = self.bump();
             return Ok(StructItem {
@@ -284,8 +237,10 @@ impl<'a> Parser<'a> {
                 vis_pub,
                 debug,
                 packed: false,
+                gpu: GpuStruct::None,
                 name,
                 type_params,
+                bounds,
                 fields: Vec::new(),
                 methods: Vec::new(),
             });
@@ -303,6 +258,7 @@ impl<'a> Parser<'a> {
                 methods.push(self.fn_item(false, fdoc)?);
                 continue;
             }
+            let flat = self.field_attrs()?;
             let embedded = if self.cur().kind == TokenKind::Use {
                 let _ = self.bump();
                 true
@@ -326,6 +282,7 @@ impl<'a> Parser<'a> {
                 name: fname,
                 ty: fty,
                 embedded,
+                flat,
                 default,
             });
         }
@@ -336,8 +293,10 @@ impl<'a> Parser<'a> {
             vis_pub,
             debug,
             packed: false,
+            gpu: GpuStruct::None,
             name,
             type_params,
+            bounds,
             fields,
             methods,
         })
@@ -347,22 +306,7 @@ impl<'a> Parser<'a> {
         let start = self.cur().span;
         self.expect(TokenKind::Enum, "expected `enum`")?;
         let name = self.ident()?;
-        let mut type_params = Vec::new();
-        if self.cur().kind == TokenKind::Lt {
-            let _ = self.bump();
-            loop {
-                type_params.push(self.ident()?);
-                if self.cur().kind == TokenKind::Comma {
-                    let _ = self.bump();
-                    if self.cur().kind == TokenKind::Gt {
-                        break;
-                    }
-                    continue;
-                }
-                break;
-            }
-            self.expect(TokenKind::Gt, "expected `>` after type parameters")?;
-        }
+        let (type_params, bounds) = self.type_params()?;
         self.expect(TokenKind::LBrace, "expected `{` after enum name")?;
         let mut variants = Vec::new();
         while self.cur().kind != TokenKind::RBrace && self.cur().kind != TokenKind::Eof {
@@ -399,6 +343,7 @@ impl<'a> Parser<'a> {
             try_catch: attrs.try_catch,
             name,
             type_params,
+            bounds,
             variants,
         })
     }
@@ -463,7 +408,7 @@ impl<'a> Parser<'a> {
         let start = self.cur().span;
         self.expect(TokenKind::Fn, "expected `fn`")?;
         let name = self.fn_name()?;
-        let type_params = self.type_params()?;
+        let (type_params, bounds) = self.type_params()?;
         let params = self.param_list()?;
         let mut ret = None;
         if self.cur().kind == TokenKind::Colon {
@@ -477,104 +422,12 @@ impl<'a> Parser<'a> {
             vis_pub,
             name,
             type_params,
+            bounds,
+            is_impl: false,
+            shader: None,
             params,
             ret,
             body,
         })
-    }
-
-    pub(super) fn type_params(&mut self) -> Result<Vec<Ident>, ParseError> {
-        if self.cur().kind != TokenKind::Lt {
-            return Ok(Vec::new());
-        }
-        let _ = self.bump();
-        let mut type_params = Vec::new();
-        loop {
-            type_params.push(self.ident()?);
-            if self.cur().kind == TokenKind::Comma {
-                let _ = self.bump();
-                if self.cur().kind == TokenKind::Gt {
-                    break;
-                }
-                continue;
-            }
-            break;
-        }
-        self.expect(TokenKind::Gt, "expected `>` after type parameters")?;
-        Ok(type_params)
-    }
-
-    pub(super) fn type_args(&mut self) -> Result<Vec<Type>, ParseError> {
-        self.expect(TokenKind::Lt, "expected `<`")?;
-        let mut args = Vec::new();
-        loop {
-            args.push(self.ty()?);
-            if self.cur().kind == TokenKind::Comma {
-                let _ = self.bump();
-                if self.cur().kind == TokenKind::Gt {
-                    break;
-                }
-                continue;
-            }
-            break;
-        }
-        self.expect(TokenKind::Gt, "expected `>` after type arguments")?;
-        Ok(args)
-    }
-
-    pub(super) fn fn_name(&mut self) -> Result<Ident, ParseError> {
-        if self.cur().kind == TokenKind::Operator {
-            let start = self.cur().span;
-            let _ = self.bump();
-            let op = match self.cur().kind {
-                TokenKind::Plus => "+",
-                TokenKind::Minus => "-",
-                TokenKind::Star => "*",
-                TokenKind::Slash => "/",
-                TokenKind::EqEq => "==",
-                TokenKind::Ne => "!=",
-                TokenKind::Lt => "<",
-                TokenKind::Le => "<=",
-                TokenKind::Gt => ">",
-                TokenKind::Ge => ">=",
-                _ => return Err(self.err("expected an operator after `operator`")),
-            };
-            let end = self.cur().span;
-            let _ = self.bump();
-            return Ok(Ident {
-                name: format!("operator{op}"),
-                span: join(start, end),
-            });
-        }
-        self.ident()
-    }
-
-    pub(super) fn param_list(&mut self) -> Result<Vec<Param>, ParseError> {
-        if self.cur().kind == TokenKind::Dot {
-            return Err(self.err("methods are declared inside the struct body (`struct T { fn name(this: &T, ...) { ... } }`), not as `fn T.name(`; see `j3c doc lang`"));
-        }
-        self.expect(TokenKind::LParen, "expected `(` after fn name")?;
-        let mut params = Vec::new();
-        if self.cur().kind != TokenKind::RParen {
-            loop {
-                let pname = self.ident()?;
-                self.expect(TokenKind::Colon, "expected `:` after parameter name")?;
-                let pty = self.ty()?;
-                params.push(Param {
-                    name: pname,
-                    ty: pty,
-                });
-                if self.cur().kind == TokenKind::Comma {
-                    let _ = self.bump();
-                    if self.cur().kind == TokenKind::RParen {
-                        break;
-                    }
-                    continue;
-                }
-                break;
-            }
-        }
-        self.expect(TokenKind::RParen, "expected `)` after parameters")?;
-        Ok(params)
     }
 }

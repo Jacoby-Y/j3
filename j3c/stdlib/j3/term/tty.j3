@@ -1,0 +1,144 @@
+/// The real terminal: is a descriptor a tty, how big is it, raw mode, and a bounded read. Linux (`ioctl` TCGETS, TCSETS,
+/// TIOCGWINSZ); on every other target `isTty` is false, `size` is `None` and `Raw.enter` is `Err`.
+///
+///     match tty.Raw.enter(0) {
+///         Result.Ok(r) { ...; r.leave(); }
+///         Result.Err(msg) { ... }
+///     }
+///
+/// `Raw.leave` is idempotent. A program that panics or exits while raw should restore it itself: `j3.term.screen` does that
+/// through `sys.onExit`. Any thread.
+
+module j3.term.tty;
+
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+
+const TCGETS: int = 0x5401;
+const TCSETS: int = 0x5402;
+const TIOCGWINSZ: int = 0x5413;
+/// `sizeof(struct termios)` in the kernel ABI is 36; the buffer is the 60 bytes glibc reserves, so no ioctl overruns it.
+const TERMIOS_LEN: int = 60;
+// Offsets into struct termios and flag values (Linux, asm-generic/termbits.h; the octal values written in hex).
+const OFF_IFLAG: int = 0;
+const OFF_OFLAG: int = 4;
+const OFF_CFLAG: int = 8;
+const OFF_LFLAG: int = 12;
+const OFF_CC: int = 17;
+const VTIME: int = 5;
+const VMIN: int = 6;
+// c_iflag
+const BRKINT: int = 0x2;
+const INPCK: int = 0x10;
+const ISTRIP: int = 0x20;
+const ICRNL: int = 0x100;
+const IXON: int = 0x400;
+// c_oflag
+const OPOST: int = 0x1;
+// c_cflag
+const CSIZE: int = 0x30;
+const CS8: int = 0x30;
+// c_lflag
+const ISIG: int = 0x1;
+const ICANON: int = 0x2;
+const ECHO: int = 0x8;
+const IEXTEN: int = 0x8000;
+
+/// A terminal size in cells.
+pub struct Size {
+    cols: int;
+    rows: int;
+}
+
+/// Whether `fd` is a terminal.
+pub fn isTty(fd: int): bool {
+    let t: [15]i32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return sys.ioctl(fd, TCGETS, &t[0] as ptr) >= 0;
+}
+
+/// Size of the terminal on `fd`; `None` when it is not one or reports 0 x 0.
+pub fn size(fd: int): Option<Size> {
+    let w: [4]u16 = [0, 0, 0, 0];
+    if sys.ioctl(fd, TIOCGWINSZ, &w[0] as ptr) < 0 || w[0] == 0 || w[1] == 0 {
+        return Option.None;
+    }
+    return Option.Some(Size { cols: int(w[1]), rows: int(w[0]) });
+}
+
+fn get32(t: []u8, off: int): int {
+    return int(t[off]) | (int(t[off + 1]) << 8) | (int(t[off + 2]) << 16) | (int(t[off + 3]) << 24);
+}
+
+fn put32(t: []u8, off: int, v: int) {
+    for i in 0..4 {
+        t[off + i] = u8((v >> (8 * i)) & 255);
+    }
+}
+
+/// A terminal put in raw mode (no line editing, echo, signals from keys, or output translation) until `leave`.
+pub struct Raw {
+    fd: int;
+    saved: [15]i32;
+    active: bool;
+
+    /// Save the settings of the terminal on `fd` and make it raw: bytes arrive as typed (Ctrl+C is a byte, not SIGINT),
+    /// `read` returns at once with at least one byte. `Err` with a reason when `fd` is not a terminal.
+    fn enter(fd: int): Result<Raw, string> {
+        let r = Raw { fd: fd, saved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], active: false };
+        if sys.ioctl(fd, TCGETS, &r.saved[0] as ptr) < 0 {
+            return Result.Err("not a terminal");
+        }
+        let t: [15]i32 = r.saved;
+        let tb: []u8 = @slice(&t[0] as ptr, TERMIOS_LEN);
+        put32(tb, OFF_IFLAG, get32(tb, OFF_IFLAG) & ~(BRKINT | INPCK | ISTRIP | ICRNL | IXON));
+        put32(tb, OFF_OFLAG, get32(tb, OFF_OFLAG) & ~OPOST);
+        put32(tb, OFF_CFLAG, (get32(tb, OFF_CFLAG) & ~CSIZE) | CS8);
+        put32(tb, OFF_LFLAG, get32(tb, OFF_LFLAG) & ~(ICANON | ECHO | ISIG | IEXTEN));
+        tb[OFF_CC + VMIN] = 1;
+        tb[OFF_CC + VTIME] = 0;
+        if sys.ioctl(fd, TCSETS, &t[0] as ptr) < 0 {
+            return Result.Err("cannot set raw mode");
+        }
+        r.active = true;
+        return Result.Ok(r);
+    }
+
+    /// Restore the saved settings. Safe to call twice (the second call does nothing).
+    fn leave(this: &Raw) {
+        if this.active {
+            this.active = false;
+            sys.ioctl(this.fd, TCSETS, &this.saved[0] as ptr);
+        }
+    }
+}
+
+/// Wait up to `ms` for input on `fd` and read what is there into `buf`: the byte count, 0 on timeout (or nothing read),
+/// -1 when the input has ended or failed.
+pub fn readFd(fd: int, buf: []u8, ms: int): int {
+    let pfd: [2]i32 = [i32(fd), i32(sys.POLLIN)];
+    let r = sys.pollFds(&pfd[0] as ptr, 1, ms);
+    if r < 0 {
+        return 0 - 1;
+    }
+    if r == 0 {
+        return 0;
+    }
+    let n = sys.read(fd, buf.ptr as ptr, buf.len);
+    if n == 0 {
+        return 0 - 1;
+    }
+    if n < 0 {
+        return if n == -4 || n == -11 { 0 } else { 0 - 1 };
+    }
+    return n;
+}
+
+/// Like `readFd` as a view of `buf` (empty on timeout, end or failure).
+pub fn readAvail(fd: int, buf: []u8, ms: int): string {
+    let n = readFd(fd, buf, ms);
+    if n <= 0 {
+        return "";
+    }
+    return buf[0..n] as string;
+}

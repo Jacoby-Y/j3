@@ -29,6 +29,7 @@ A component:
     <style> .x { display: flex; gap: 8px; } </style>
 
 - Everything inside `{}` and the script is real J3 (checked, AOT). Errors point at the `.j3ui` line.
+- Text and attribute values with holes (`<p>{text}</p>`, `title="{n} of {name}"`) have no length limit: a lone hole is the value, and text around holes is joined in a frame-scratch `Text` (one 512-byte template per hole, so only a single number or `#[Debug]` struct must fit). A keyed `{#each}` key is one template.
 - Handlers are statements, not closures: `on:click={state.buy(k)}`, loop variables are in scope.
   A handler may span lines (`on:click={` newline statements newline `}`); past two statements write a `fn` in the script and call it.
 - Prop defaults: `props { gap: int = 8; note: string = ""; }`. A use site may leave out a prop that has a default; one without
@@ -113,6 +114,11 @@ A component:
   ms and is instant under reduced motion. `d.scrollToKey(box, "key", block)` scrolls a `virtual` list to the row with that key even
   when it is not built (false for an unknown box or key); with measured rows it aims again each frame until the row is measured. The
   focus moved by a key (Tab, arrows) is scrolled into view (nearest) on the next frame.
+- `bind:scrollX={place}` / `bind:scrollY={place}` (an `f32`) on a scroll box tie its offset to a value every frame: a scroll by the user
+  (wheel, scrollbar, inertia) or `d.scrollTo` writes the place, and setting the place from code (a middle-drag pan, a playhead follow)
+  moves the box at once, clamped to its range, stopping any glide. Works on `overflow: hidden` too.
+- `on:wheel|stop={..}` runs like `on:wheel` and keeps the wheel over the element from scrolling it or any scroll box around it (a
+  wheel-zoom canvas inside an `overflow-y` list). Scroll boxes inside the element still take the wheel first.
 - Virtual lists. `<div class="list" virtual row-height={26}>{#each rows as r, i (r.id)}...{/each}</div>` keeps only the rows
   near the viewport alive (100k rows are about 60 nodes) and pads the box so the scroll bar is true. The element is the scroll
   box (give it a height and `overflow-y: auto`), holds exactly one keyed `{#each}` over a list (no `0..n`); `i` and the key are
@@ -147,7 +153,7 @@ A component:
   steady frame does no work (`J3_STEADY`) and a changed string updates. The view lives until the next frame starts (`App` rewinds the
   scratch arena at the top of every frame; a loop without `App` calls `j3.memory.rewindScratch()` itself, once per frame, before
   `render`). `value=` copies it too. Do not store it in a struct or keep it from an event handler, and do not give it to `bind:`.
-- Elements: div span p h1 h2 h3 h4 h5 h6 small header nav main section label button input textarea select option dl dt dd canvas dialog aside img svg path ul ol li a hr strong em b i pre code br progress meter details summary glyph.
+- Elements: div span p h1 h2 h3 h4 h5 h6 small header nav main section label button input textarea select option dl dt dd canvas dialog aside img svg path ul ol li a hr strong em b i pre code br progress meter details summary glyph icon.
 - `strong`/`b` are bold, `em`/`i` italic, `pre` keeps whitespace, `hr` is a 1px rule; lists have no markers (add `li::before { content: "• " }`), links are `<a on:click={...}>` (no `href` navigation).
 - Dynamic style. `class="slot r{rarity} {extra}"`: words with no `{}` are static, the rest are re-read when their text changes
   (a word added this way and also by `class:name` is dropped when the text changes; 8 classes per element). `style:prop`
@@ -192,6 +198,21 @@ A component:
   changes every frame allocates nothing once it fits), and `fn name_destroy(node: int)` once the element is gone (at the end of that
   update: the handle is already stale) or its component or row is destroyed. A keyed row that only moves is not remounted.
   `_update` and `_destroy` are optional; a missing or mistyped fn is a compile error at the `use:`. Only script fns, not dotted module functions.
+- Idle frames. `App` sleeps while the UI is still (`App.idleSkip(false)` turns it off): `Dom.endFrame` reports `Dom.idleMs()` to the loop, which waits in
+  `SDL_WaitEventTimeout` instead of updating, drawing and swapping. It wakes on any SDL event (input, resize, expose, focus, drop), on
+  `Dom.requestFrame` (any thread; it pushes an SDL user event), on any `j3.thread.Queue` push (a worker's result is drawn on the next
+  frame; workers need no UI calls), at `game.wakeAt(ms)`, when the caret next blinks, and on a 250 ms safety tick (40 ms under
+  `run --hot`) for timers the UI cannot name (toast expiry, a hover card's delay, style hot reload); a woken frame sees a 16 ms dt. Frames come
+  back to back while a transition, animation, inertia, ripple, fade-out, `<progress>`, tooltip, held button or key, the
+  inspector or fake input is live, and while a `<canvas>` body's draws change: each frame hashes what the canvas bodies queue
+  (`game.p2Watch`), and the loop stays awake until that holds still for 50 ms, so an animation drawn by hand from `game.ticks()` runs
+  at full rate with no wake calls and a still canvas sleeps. It sees `j3.gfx.paint` / `game.draw*` calls, not raw GL or `j3.gfx` 3D in a
+  canvas, nor a texture whose pixels change under the same draw (call `dom.requestFrame()` for those). It cannot see an animation
+  that has not started yet: a timer in app logic ("bot moves at `ticks() >= due`") calls `game.wakeAt(due)`. Any registered system
+  (`first`, `add`, `last`, `always`) keeps the loop awake; drawing outside the Dom with no system (3D in `draw`) needs `idleSkip(false)`.
+  A draw system that counts frames (autosave after N quiet frames) must call `dom.requestFrame()` until done. Tests and captures never
+  sleep: `J3_FRAMES`, `J3_SCREENSHOT`, `J3_CAPTURE`, `J3_FIXED_DT`, `J3_STEADY`, and the `offscreen` / `dummy` video drivers turn it off; `J3_IDLE_SKIP=1`
+  forces it on, `=0` off; `J3_IDLE_STATS=1` prints `idle: loops=N presented=N` at exit (`game.framesPresented()`).
 - Event payloads. `events { pick(slot: int); rename(name: string, n: int); close; }`, `emit pick(i)` (one argument per field,
   any J3 expression), and the parent writes `<Pad on:pick={state.slot = event.slot} />`: `event` is a struct of the payload in
   that handler only. Field types: int, bool, string, float, f32, f64, i32, u8. A plain event next to payload events is fine. Two
@@ -206,11 +227,17 @@ A component:
   the component that shows it. Errors: nothing above provides the name (the message gives the path from the root), `provide`
   and `inject` disagree on the type (compared as text), a component that has `state` as its own prop or `let` but did not
   `provide` it while a descendant injects it. Inject names cannot be passed by hand on a `<Component>`.
-- Attributes: `class`, `class:name={cond}`, `style:prop`, `on:click` `on:mousedown` `on:mouseup` `on:mousemove`
-  `on:wheel` `on:contextmenu` `on:close` `animate:flip` `animate-easing` (keyed row element, see Blocks) `draggable` `drag-data` `drag-id` `drag-ghost` `on:dragstart` `on:dragend` `on:dragenter` `on:dragleave` `on:dragover` `on:drop` (item drag and drop, below) `popover` `bind:tooltip` `closedby` `title` `left` `top` `panel` `panel-handle` `panel-resize` `menuitem` `tabindex` (`"0"`, `"-1"`, a positive integer or `={int}`) `id="x"` (static name, for `#x` selectors) `role` `aria-label` (any element); `dialog` takes `modal` and `autoselect`; `label` takes `for="id"` (a static string, below); `button` takes `disabled` and `default`; `input` takes `type` (checkbox, range, color, text, search, password; any other is a text box). A click on a `label`'s text (or `for="x"` naming the control with `id="x"`, found anywhere in the window, first one in tree order when ids repeat, with a one-time entry in `css.warns`) activates the first control inside it: a checkbox toggles, a button is clicked, a text box, range or select takes focus (a select does not open). The label's own `on:click` fires as well. Not when the click lands on a control already, on a disabled control, or after a drag. The label's text is the control's accessible name. Browsers also hover the control with the label; here only the label is `:hover`
-  `min` `max` `step` `value` `high` `checked` `name` `placeholder` `maxlength` `disabled`, `bind:value` / `bind:high` / `bind:checked` / `bind:group`
+- Bubbling: `on:click`, `on:mousedown`, `on:mouseup` and `on:contextmenu` fire on the element under the pointer AND on every
+  ancestor with the same handler (`<div on:mousedown={a = 1}><canvas /></div>` runs for a press on the canvas), each level with
+  its own `mouse` (local to it) and `button` in scope. `on:mousedown|stop` / `on:mouseup|stop` / `on:contextmenu|stop` run like the
+  plain handler and end the walk there (innermost first: ancestors above a `|stop` see nothing); `on:mousedown|stop={}` only stops (a HUD over a `<canvas>`). All levels run in the same
+  frame, in markup order (outer first), so when two levels write the same state the inner one wins; use `|stop` to keep the
+  outer one out. `on:mousemove` and `on:wheel` do not bubble (the element itself, or inline text inside it).
+- Attributes: `class`, `class:name={cond}`, `style:prop`, `on:click` `on:mousedown` `on:mouseup` (`|stop`, bubbling above) `on:mousemove`
+  `on:wheel` (`|stop`) `bind:scrollX` `bind:scrollY` `on:contextmenu` (`|stop`) `on:close` `animate:flip` `animate-easing` (keyed row element, see Blocks) `draggable` `drag-data` `drag-id` `drag-ghost` `on:dragstart` `on:dragend` `on:dragenter` `on:dragleave` `on:dragover` `on:drop` (item drag and drop, below) `popover` `bind:tooltip` `closedby` `title` `left` `top` `panel` `panel-handle` `panel-resize` `window-drag` `menuitem` `tabindex` (`"0"`, `"-1"`, a positive integer or `={int}`) `id="x"` (static name, for `#x` selectors) `role` `aria-label` (any element); `dialog` takes `modal` and `autoselect`; `label` takes `for="id"` (a static string, below); `button` takes `disabled` and `default`; `input` takes `type` (checkbox, range, color, text, search, password; any other is a text box). A click on a `label`'s text (or `for="x"` naming the control with `id="x"`, found anywhere in the window, first one in tree order when ids repeat, with a one-time entry in `css.warns`) activates the first control inside it: a checkbox toggles, a button is clicked, a text box, range or select takes focus (a select does not open). The label's own `on:click` fires as well. Not when the click lands on a control already, on a disabled control, or after a drag. The label's text is the control's accessible name. Browsers also hover the control with the label; here only the label is `:hover`
+  `min` `max` `step` `value` `high` `checked` `name` `placeholder` `maxlength` `disabled` `noprimary`, `bind:value` / `bind:high` / `bind:checked` / `bind:group`
   and `on:input` / `on:change` / `on:submit`; `select` takes `multiple` `value` `placeholder` `disabled` `bind:value` `on:input`;
-  `option` takes `value` `disabled`; `button` takes `disabled`; `textarea` is a void tag (`<textarea bind:value={s} rows="4" />`) taking `rows` `maxlength` `placeholder` `disabled` `rich` `triggers` `bind:value` `bind:spans` `on:input` `on:submit` `on:trigger`; `img` takes `src` `alt` `sprite` `frame` `fps`; `svg` takes
+  `option` takes `value` `disabled`; `button` takes `disabled`; `textarea` is a void tag (`<textarea bind:value={s} rows="4" />`) taking `rows` `maxlength` `placeholder` `disabled` `rich` `noprimary` `triggers` `bind:value` `bind:spans` `on:input` `on:submit` `on:trigger`; `img` takes `src` `alt` `sprite` `frame` `fps`; `svg` takes
   `viewBox`; `path` takes `d` `fill` `stroke` `stroke-width`. Anything else is a compile error naming the accepted list.
 - `<br>` (void, `<br>` or `<br/>`) forces a line break in inline content whatever `white-space` is; two in a row leave an empty line, a trailing one adds none, and static-selection copy gets a newline. It cannot go inside a text box (`<input>` and `<textarea>` take no content).
 - `<progress value={v} max={m}>` and `<meter value min max low high optimum>` are controls the runtime paints (inline-block, 160x8 by default; a `width` / `height` resizes them; no children). The element's own `background` and `border-radius` are the track (the
@@ -226,17 +253,23 @@ A component:
   selection, Home/End, Ctrl+arrows (words), Ctrl+A/C/X/V (any length), Ctrl+Z undo and Ctrl+Y / Ctrl+Shift+Z redo (typing and deleting runs are one step each, a paste, cut, caret move or selection edit starts a new one, a new edit clears redo, the last 100 steps or 4 MB of text are kept per box, each step being a copy of the text; a value set by the program is not a step and history is kept, so undo may bring older text back), Backspace/Delete, UTF-8 safe, placeholder; `search` adds a clear
   button and Escape clears; Enter fires `on:submit`. A double click selects a word, a triple click the line (all of a one-line box).
   `maxlength="n"` caps typing and pasting at n code points (a value set by the program is not cut). `type="password"` draws
-  one bullet per code point and neither copies nor cuts (the bound string is the real text). `<textarea>` is an `input` of type `textarea` underneath: a `textarea { }` rule, an `input { }` rule and `input[type="textarea"]` all match it. It wraps at spaces, Enter
+  one bullet per code point and neither copies nor cuts (the bound string is the real text). PRIMARY selection (X11/Wayland; text boxes and textareas, `rich` too):
+  when a selection settles (mouse up after a drag, double or triple click or Shift+click, Ctrl+A, a Shift+caret key) its text goes to PRIMARY
+  (`game.setPrimarySelection`), once, not every frame; a password box never sets it. A middle press on an enabled text box focuses it, puts the
+  caret at the click and inserts PRIMARY there like Ctrl+V (one undo step, `maxlength`, `on:input`, any length); a disabled box ignores it. Static
+  `user-select: text` sets PRIMARY the same way. `noprimary` on a box turns both off for it. `Dom.selection(id)` is the selection as a byte range
+  (`.lo`, `.hi`; equal when empty), `Dom.selectedText(id)` its text; `Dom.primary()` / `Dom.setPrimary(s)` read and write PRIMARY, and tests call
+  `Dom.simPrimary(s)` (keep it in the Dom; headless has none) with `Dom.simMiddle(down)` for the middle button. `<textarea>` is an `input` of type `textarea` underneath: a `textarea { }` rule, an `input { }` rule and `input[type="textarea"]` all match it. It wraps at spaces, Enter
   inserts a newline (Ctrl+Enter fires `on:submit`), Up/Down keep their column, PageUp/PageDown, Home/End go to the line (Ctrl: the text),
   the wheel and the caret scroll its own view; `rows` (default 3) sets its height, a `height` overrides it. IME: the composition
   string is drawn underlined at the caret and the IME is told where the caret is (window pixels; not corrected for `setVirtualSize`).
   `<textarea rich bind:value={s} bind:spans={sp}>` keeps styled spans beside its text: `sp` is a `[]Span` (`use j3.ui.spans.Span;`; `start` and `len` in bytes of the UTF-8
-  text, `kind` `SPAN_BOLD` `SPAN_ITALIC` `SPAN_LINK` `SPAN_MENTION` `SPAN_EMOJI`, `data` the id, emoji name or URL). Ctrl+B and Ctrl+I toggle bold and italic on the selection
+  text, `kind` `SPAN_BOLD` `SPAN_ITALIC` `SPAN_LINK` `SPAN_MENTION` `SPAN_EMOJI` `SPAN_COLOR`, `data` the id, emoji name, URL, or for `SPAN_COLOR` a `#rgb` / `#rrggbb` / CSS color name: syntax highlight, rebuilt by a tokenizer on change). Ctrl+B and Ctrl+I toggle bold and italic on the selection
   (each an undo step; undo restores spans). A mention or emoji is an atomic token: its text is the chip label, the caret skips it, Backspace and Delete remove it whole,
   a selection edge or click inside it snaps outward, and it wraps as one box (a chip: label plus 4 px each side on an `accent-color` tint; links are `accent-color` and
   underlined, italic has no slanted font and is drawn dimmed). Typing at the end of a bold or italic span extends it, typing at its start or after a link or token does not.
   `Dom.insertToken(id, lo, hi, label, kind, data)` swaps a text range (the typed `@ja`) for a token in one undo step, `Dom.caretRect(id)` is the focused box's caret in window px and
-  `Dom.caret(id)` its byte. Replacing the text from the program drops the old spans, so set the new ones in the same update (attribute order does not matter); a program that just echoes `sp` back never brings back stale spans. Copy and cut take plain text (labels
+  `Dom.caret(id)` its byte, `Dom.setSelection(id, lo, hi)` selects bytes `lo..hi` and scrolls the caret into view even unfocused (a find match). Replacing the text from the program drops the old spans, so set the new ones in the same update (attribute order does not matter); a program that just echoes `sp` back never brings back stale spans. Copy and cut take plain text (labels
   included), paste inserts plain text. A box without `rich` keeps no spans and pays nothing.
   Data grid (spreadsheet): a fixed `row-height` `virtual` box with `tabindex="0"`, `grid={g.sized(rows.len)}` and `on:edit={..}`, `g: &Grid` (`j3.ui.gridstate`, `Grid.new(mem, cols, rowH, colW)`). Rows are
   `<div style:width={g.total}>` of `{#each 0..g.cols as j}<div class:active={g.on(i, j)} style:width={g.w(j)}>..</div>`; `g.widths` is the one column source for the header and every row (`g.setWidth(j, px)`).
@@ -304,7 +337,7 @@ A component:
     `alt` counts), else the text of a button, menu entry, option or heading, else for a control the text of the `<label>` that
     wraps it, then `placeholder`, then `title`. An icon-only button needs `aria-label`; a control beside a label needs `<label for="id">` or wrapping. `display: none` and `visibility: hidden` elements are left out (a `display: none` one takes its content with it) and cannot take focus; `a11y.language()` is the document language (`j3.i18n.locale()`, not in `dump`, so goldens keep their text). Keyboard:
     Tab / Shift+Tab go over buttons, inputs, selects, `menuitem` and `tabindex="0"` elements in document order, except that elements with a positive `tabindex` come first in ascending order (ties in document order), as in HTML, and Shift+Tab goes the other way; both wrap; inside a modal dialog, or a `focus-group="trap"` holding the focus, the order is computed within it; from an element Tab skips (`tabindex="-1"`) it goes on to the next after it, and with no focus it starts at the first (Shift+Tab: the last) (`tabindex="-1"` is focusable by click and code but skipped by Tab and the pad; the pad moves geometrically and ignores `tabindex` values; a clickable `<div>` needs `tabindex="0"` and a `role` to be reachable); Enter / Space click a button, entry or
-    checkbox and open a select; arrows move a slider and a select; a modal dialog traps Tab. `domhtml.dumpA11y(d, path)`
+    checkbox and open a select; arrows move a slider and a select; a modal dialog traps Tab. While a text box, select or grid has focus the UI owns the keyboard: game code's `j3.game.keyDown` / `keyPressed` / `keyReleased` read false (until the frame after it blurs, so the Escape that leaves a box does not reach the game); `keyDownRaw` / `keyPressedRaw` see every key (a screenshot key), and `d.takeKeys = false` turns it off. `domhtml.dumpA11y(d, path)`
     writes the tree (`role "name" states actions=focus,click,set`, a password box shows `secret`, never its value) for goldens;
     `a11y.perform(d, id, A_FOCUS, A_CLICK or A_SET, num, text)` does an action between frames (what a platform bridge calls;
     a focus from it shows `:focus-visible`).
@@ -316,7 +349,7 @@ A component:
     for `type=password`); after `a11y.enable(d)`, `a11y.events` (focus, checked, expanded, selected, value, children, name; filled only
     by frames where something changed) and `a11y.liveChanges` (the text of changed live regions, polite or assertive; a region's first
     frame is silent) are drained once per frame; `a11y.inbox`/`post`/`drain` carry an action from another thread and wake an idle
-    loop (`Dom.requestFrame`, `Dom.wantsFrame`; `App` draws every frame today). Everything but `post` and `requestFrame` is main-thread.
+    loop (`Dom.requestFrame`, `Dom.wantsFrame`; see Idle frames). Everything but `post` and `requestFrame` is main-thread.
     Menu keys: in a `popover` the elements with `menuitem` (a bare attribute, focusable like a button) and every button, input or
     select are the entries. Down or Up on the trigger enters the menu, then Up/Down/Home/End move between entries (wrapping, disabled
     ones skipped), Enter or Space click one, Right on an entry that has a child of class `sub` opens it (it shows through the
@@ -373,6 +406,26 @@ A component:
   height, or full width at the bottom, keeping the floating size); dragging a docked handle floats it, and a grip on a docked
   panel resizes along the dock axis. The state lives with the element (a branch that removes the panel forgets it), and
   `d.panelDock(id)` reads the zone. Bring-to-front is not done: later siblings and `z-index` decide the order.
+- Client-side title bar (`window-drag`, `j3.ui.windrag`): with `app.undecorated()` (no system title bar), an element with
+  `window-drag` moves the window when dragged, through the window manager (`game.setDragRegions`), so Super+drag, edge snap
+  and tiling keep working; double-clicking it toggles maximize. Its focusable descendants (`button`, `input`, `select`, or any
+  element with `tabindex` / `menuitem`) stay clicks; a plain `<div on:click>` inside it drags instead, so give it `tabindex`.
+  The boxes come from the previous frame's layout and ignore clipping. Window calls are in `j3.game`
+  (`j3c doc j3.game setDecorated`): `minimizeWindow()`, `setMaximized(!windowMaximized())`, `closeWindow()` (runs `App`
+  shutdown callbacks like the WM close button). An undecorated window resizes from an invisible 6 px band on its edges
+  (`game.setResizeBorder`). Linux: X11, and Wayland through SDL's Wayland driver (`SDL_VIDEODRIVER=wayland`; SDL2 uses
+  XWayland on GNOME by default, where it is X11). Headless these are no-ops.
+
+      <script> use j3.game; </script>
+      <header class="bar" window-drag>
+          <span class="title">{title()}</span>
+          <div class="spacer"></div>
+          <button on:click={game.minimizeWindow()}><icon name="dash-lg" /></button>
+          <button on:click={game.setMaximized(!game.windowMaximized())}>
+              <icon name={if game.windowMaximized() { "fullscreen-exit" } else { "square" }} />
+          </button>
+          <button on:click={game.closeWindow()}><icon name="x-lg" /></button>
+      </header>
 - Item drag and drop (`j3.ui.drag`; `speculative/35_ui_drag`, `j3c/stdlib/tests/drag_test.j3`): inventory, hotbar and equip slots.
   `draggable` (or `draggable={bool}`) marks a source; a press that moves 4 px starts the drag (a press that does not is an
   ordinary click, and a drag is never followed by a click). `drag-data={string}` and `drag-id={int}` on the source are the payload.
@@ -400,7 +453,16 @@ A component:
   takes its natural size or keeps its aspect from one of width/height, and honors `object-fit` / `object-position`,
   `border-radius`, transforms and opacity. `<img sprite="4,2" frame={n}>` shows one cell of a 4x2 sheet; `fps="8"` plays it
   (negative plays backwards). `<svg viewBox="0 0 24 24"><path d="M2 2 L22 12 Z" fill="currentColor"/></svg>` draws SVG path
-  data (`M L H V Q T C S A Z`, relative forms, holes by winding; `fill` / `stroke` take `currentColor`, `accent` (the `accent-color`), a color, `none`); no groups, SVG transforms, gradients or external `.svg`.
+  data (`M L H V Q T C S A Z`, relative forms, holes by winding, or `fill-rule="evenodd"`; `fill` / `stroke` take `currentColor`, `accent` (the `accent-color`), a color, `none`); no groups, SVG transforms, gradients or external `.svg`.
+- Icons: `<icon name="trash" />`. Names are Bootstrap Icons ids (icons.getbootstrap.com, v1.11.3, MIT): if you know
+  them, just use them; otherwise `j3c doc icons` lists all 2050 and `j3c doc icons <word>` filters (`j3c doc icons arrow`).
+  An unknown name is a compile error that suggests close ones. Your own: drop `icons/<name>.svg` in the project (beside
+  `j3.toml`); it is read at build time and beats a Bootstrap name (shapes: path, circle, ellipse, rect, polygon, polyline,
+  `fill-rule`; no strokes, gradients, `<g transform>`). The box is inline-block, 1em square, `vertical-align: middle`, filled
+  with `color`, so `<button><icon name="floppy" /> Save</button>` needs no CSS; size it with `font-size` or `width`/`height`
+  (tag defaults lose to any author rule). A computed name takes its choices from the string literals in the expression:
+  `<icon name={if muted { "volume-mute" } else { "volume-up" }} />`; only the icons named in the project are compiled in.
+  `aria-label` names it for screen readers. No children.
   CSS adds `background-image: url()`, nine-slice `border-image: url(..) 12 fill / 12px`, `clip-path`, `mask-image` and
   `image-tint`: `j3c doc css`.
 - Post effects (`j3.gfx.post` behind `j3.gfx.paint`; page 14 of `examples/big_ui_test`). `backdrop-filter: blur()` for frosted
@@ -416,6 +478,8 @@ A component:
   text, animated gradients and border and shadow pulses are on the same page (`j3c doc css`, Motion and Text).
 - `<canvas on:draw={...} on:mousedown={...}>`: the game is one box in the layout. Inside `on:draw`
   the viewport is the box (`0,0` is its corner, `size` is in scope); `mouse` is canvas-local.
+  `on:mousedown` / `on:mouseup` fire for any button (on any element, bubbling to ancestors), with `button` in scope (0 left, 1 middle, 2 right);
+  only the left one focuses, clicks and sets `:active`.
   Children are a HUD over the game. A button on top swallows the click.
 
 CSS (scoped per component, plus the theme). Selectors `*` tag `.class` `tag.class` descendant, child `>`,

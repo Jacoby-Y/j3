@@ -2,6 +2,7 @@
 //! (`map`) that turns errors in the generated text back into `.j3ui` line:col.
 
 pub mod gen;
+pub mod icons;
 pub mod map;
 pub mod markup;
 pub mod pass;
@@ -49,11 +50,12 @@ pub struct BuildErr {
 
 /// Generate the `<package>.ui` module. The error is rendered against the `.j3ui` source.
 pub fn build(files: Vec<SrcFile>, package: &str, theme: Option<Theme>) -> Result<Generated, String> {
-    try_build(files, package, theme).map_err(|e| e.rendered)
+    try_build(files, package, theme, &[]).map_err(|e| e.rendered)
 }
 
-pub fn try_build(files: Vec<SrcFile>, package: &str, theme: Option<Theme>) -> Result<Generated, BuildErr> {
-    gen::generate(&files, package, theme.as_ref())
+/// `icons` are the project's own (`icons::load_dir`), found before the Bootstrap set.
+pub fn try_build(files: Vec<SrcFile>, package: &str, theme: Option<Theme>, icons: &[icons::Icon]) -> Result<Generated, BuildErr> {
+    gen::generate(&files, package, theme.as_ref(), icons)
         .map(|b| Generated { label: label(package), key: format!("{package}.ui"), text: b.text, map: SpanMap { segs: b.segs }, files: files_clone(&files), sections: b.sections })
         .map_err(|e| BuildErr { rendered: show(&files[e.file], &e.err), path: files[e.file].path.clone(), err: e.err })
 }
@@ -69,7 +71,11 @@ impl Generated {
     }
 
     /// An error in the generated text, moved to the `.j3ui` it came from.
-    pub fn remap(&self, mut e: CheckError) -> CheckError {
+    pub fn remap(&self, e: CheckError) -> CheckError {
+        e.map_all(&mut |e| self.remap_one(e))
+    }
+
+    fn remap_one(&self, mut e: CheckError) -> CheckError {
         if e.path != self.label {
             return e;
         }

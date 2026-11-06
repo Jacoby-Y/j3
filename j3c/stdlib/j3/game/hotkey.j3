@@ -1,0 +1,468 @@
+/// Global (system-wide) hotkeys: a key combo that fires while another app has focus, such as F8 to
+/// pause a recording. Linux X11 only, through `libX11.so.6` loaded on first `register` (`XGrabKey`
+/// on the root window, on a display connection of its own, so SDL's events are untouched).
+/// Main thread only. Poll `pressed()` from the frame loop; it reads the pending X events itself.
+///
+///     let hk = hotkey.register(Key.F8, hotkey.NONE)?;        // or hotkey.CTRL + hotkey.SHIFT
+///     // every frame:
+///     if hk.pressed() { togglePause(); }
+///     hk.unregister();                                        // optional; exit releases grabs too
+///
+/// - The grabbed combo goes to this app only: the focused app does not see it while it is
+///   registered. That is how `XGrabKey` works; pick a combo nobody else needs.
+/// - CapsLock and NumLock do not matter: every lock variant is grabbed.
+/// - `pressed` is true once per press. Holding the key does not repeat.
+/// - `Err(Taken)` when another client already grabs the combo (X `BadAccess`).
+/// - `Err(Unsupported)` on Wayland (no global grabs there; XWayland only sees keys while an X11
+///   window has focus), without `libX11`, and off Linux. `Err(NoDisplay)` with no X server or
+///   under `--headless` (`SDL_VIDEODRIVER=offscreen`/`dummy`), so tests never grab real keys.
+/// - The X server drops every grab when the process exits, so nothing is left behind on a crash.
+
+module j3.game.hotkey;
+
+use j3.game.Key;
+use j3.result.Result;
+use j3.sys;
+use j3.text.same;
+
+/// No modifier.
+pub const NONE: int = 0;
+/// Shift held.
+pub const SHIFT: int = 1;
+/// Ctrl held.
+pub const CTRL: int = 4;
+/// Alt held.
+pub const ALT: int = 8;
+/// Super (Windows key) held.
+pub const SUPER: int = 64;
+
+/// Why `register` failed.
+pub enum HotkeyError {
+    /// Wayland, no `libX11.so.6`, or not Linux.
+    Unsupported,
+    /// No X server (`DISPLAY` unset), or headless.
+    NoDisplay,
+    /// Another client already grabs this combo.
+    Taken,
+    /// The key has no key code on this keyboard.
+    UnknownKey,
+    /// More than `MAX` hotkeys at once.
+    Full,
+}
+
+/// Hotkeys registered at once.
+pub const MAX: int = 16;
+
+/// A registered combo. `Hotkey {}` is an empty handle that never fires.
+pub struct Hotkey {
+    /// Slot index + 1; 0 is the empty handle.
+    slot: int = 0;
+
+    /// True once for each press since the last call. False after `unregister`.
+    fn pressed(this: &Hotkey): bool {
+        if this.slot == 0 {
+            return false;
+        }
+        pump();
+        let s = &SLOTS[this.slot - 1];
+        if !s.used || s.count == 0 {
+            return false;
+        }
+        s.count -= 1;
+        return true;
+    }
+
+    /// Release the grab. The handle reads false afterwards.
+    fn unregister(this: &Hotkey) {
+        if this.slot == 0 {
+            return;
+        }
+        let s = &SLOTS[this.slot - 1];
+        if !s.used {
+            return;
+        }
+        grabAll(s.code, s.mods, false);
+        let sync = X.sync as fn(ptr, i32): i32;
+        sync(DPY, 0);
+        s.used = false;
+    }
+}
+
+struct Slot {
+    used: bool = false;
+    code: int = 0;
+    mods: int = 0;
+    held: bool = false;
+    count: int = 0;
+}
+
+struct Fns {
+    open: ptr;
+    root: ptr;
+    keysymToKeycode: ptr;
+    grab: ptr;
+    ungrab: ptr;
+    sync: ptr;
+    pending: ptr;
+    next: ptr;
+    setHandler: ptr;
+    modMap: ptr;
+    freeModMap: ptr;
+    autoRepeat: ptr;
+}
+
+#[singleton]
+let X: Fns;
+#[singleton]
+let DPY: ptr;
+#[singleton]
+let TRIED: bool = false;
+#[singleton]
+let NUMLOCK: int = 16;
+#[singleton]
+let SLOTS: [16]Slot;
+/// Set by `onXError` when a grab hits `BadAccess`.
+#[singleton]
+let DENIED: bool = false;
+/// One `XEvent` (192 bytes on LP64).
+#[singleton]
+let EV: [192]u8;
+
+const LOCK: int = 2;
+
+/// The SHIFT, CTRL, ALT and SUPER bits of an X modifier state (arithmetic: the code predates bitwise `&`).
+fn modBits(x: int): int {
+    let out = 0;
+    let bits: [4]int = [SHIFT, CTRL, ALT, SUPER];
+    for i in 0..4 {
+        if (x / bits[i]) % 2 == 1 {
+            out += bits[i];
+        }
+    }
+    return out;
+}
+
+/// Grab `key` + `mods` (`NONE`, or a sum such as `CTRL + SHIFT`) for the whole desktop.
+pub fn register(key: Key, mods: int): Result<Hotkey, HotkeyError> {
+    let v = sys.env("SDL_VIDEODRIVER");
+    if same(v, "offscreen") || same(v, "dummy") {
+        return Result.Err(HotkeyError.NoDisplay);
+    }
+    if sys.env("WAYLAND_DISPLAY").len > 0 {
+        return Result.Err(HotkeyError.Unsupported);
+    }
+    if sys.env("DISPLAY").len == 0 {
+        return Result.Err(HotkeyError.NoDisplay);
+    }
+    if !TRIED {
+        TRIED = true;
+        if !load() {
+            return Result.Err(HotkeyError.Unsupported);
+        }
+    }
+    if X.open as int == 0 {
+        return Result.Err(HotkeyError.Unsupported);
+    }
+    if DPY as int == 0 {
+        return Result.Err(HotkeyError.NoDisplay);
+    }
+    let toCode = X.keysymToKeycode as fn(ptr, u64): u8;
+    let code = int(toCode(DPY, u64(keysym(key))));
+    if code == 0 {
+        return Result.Err(HotkeyError.UnknownKey);
+    }
+    let m = modBits(mods);
+    let slot = 0 - 1;
+    for i in 0..MAX {
+        if SLOTS[i].used && SLOTS[i].code == code && SLOTS[i].mods == m {
+            return Result.Err(HotkeyError.Taken);
+        }
+        if slot < 0 && !SLOTS[i].used {
+            slot = i;
+        }
+    }
+    if slot < 0 {
+        return Result.Err(HotkeyError.Full);
+    }
+    // Xlib's default handler exits the process on BadAccess; catch it for just these calls
+    let setHandler = X.setHandler as fn(fn(ptr, ptr): i32): ptr;
+    let restore = X.setHandler as fn(ptr): ptr;
+    let sync = X.sync as fn(ptr, i32): i32;
+    DENIED = false;
+    let prev = setHandler(onXError);
+    grabAll(code, m, true);
+    sync(DPY, 0);
+    if DENIED {
+        grabAll(code, m, false);
+        sync(DPY, 0);
+    }
+    restore(prev);
+    if DENIED {
+        return Result.Err(HotkeyError.Taken);
+    }
+    SLOTS[slot] = Slot { used: true, code: code, mods: m, held: false, count: 0 };
+    return Result.Ok(Hotkey { slot: slot + 1 });
+}
+
+fn onXError(d: ptr, e: ptr): i32 {
+    // XErrorEvent.error_code is the byte at 32; BadAccess is 10
+    if rd8(e as int + 32) == 10 {
+        DENIED = true;
+    }
+    return 0;
+}
+
+/// `XGrabKey` (or `XUngrabKey`) for `mods` and each CapsLock/NumLock variant.
+fn grabAll(code: int, mods: int, on: bool) {
+    let rootOf = X.root as fn(ptr): u64;
+    let root = rootOf(DPY);
+    let locks: [4]int = [0, LOCK, NUMLOCK, LOCK + NUMLOCK];
+    for i in 0..4 {
+        let m = u32(mods + locks[i]);
+        if on {
+            // owner_events true, both modes GrabModeAsync (1)
+            let grab = X.grab as fn(ptr, i32, u32, u64, i32, i32, i32): i32;
+            grab(DPY, i32(code), m, root, 1, 1, 1);
+        } else {
+            let ungrab = X.ungrab as fn(ptr, i32, u32, u64): i32;
+            ungrab(DPY, i32(code), m, root);
+        }
+    }
+}
+
+/// Count presses from the X events waiting on our connection.
+fn pump() {
+    if DPY as int == 0 {
+        return;
+    }
+    let pending = X.pending as fn(ptr): i32;
+    let next = X.next as fn(ptr, ptr): i32;
+    while pending(DPY) > 0 {
+        next(DPY, &EV[0] as ptr);
+        // XKeyEvent: type at 0, state at 80, keycode at 84; KeyPress 2, KeyRelease 3
+        let ty = rd32(&EV[0] as int);
+        if ty != 2 && ty != 3 {
+            continue;
+        }
+        let state = modBits(rd32(&EV[0] as int + 80));
+        let code = rd32(&EV[0] as int + 84);
+        for i in 0..MAX {
+            let s = &SLOTS[i];
+            if !s.used || s.code != code {
+                continue;
+            }
+            if ty == 3 {
+                s.held = false;
+            } else if s.mods == state && !s.held {
+                s.held = true;
+                s.count += 1;
+            }
+        }
+    }
+}
+
+fn sym(so: ptr, name: string): ptr {
+    let p = sys.dlsym(so, name);
+    if p as int == 0 {
+        X.open = 0 as ptr;
+    }
+    return p;
+}
+
+/// Load libX11, open our own display connection, find the NumLock bit.
+fn load(): bool {
+    let so = sys.dlopen("libX11.so.6");
+    if so as int == 0 {
+        return false;
+    }
+    X.open = sys.dlsym(so, "XOpenDisplay");
+    if X.open as int == 0 {
+        return false;
+    }
+    X.root = sym(so, "XDefaultRootWindow");
+    X.keysymToKeycode = sym(so, "XKeysymToKeycode");
+    X.grab = sym(so, "XGrabKey");
+    X.ungrab = sym(so, "XUngrabKey");
+    X.sync = sym(so, "XSync");
+    X.pending = sym(so, "XPending");
+    X.next = sym(so, "XNextEvent");
+    X.setHandler = sym(so, "XSetErrorHandler");
+    X.modMap = sym(so, "XGetModifierMapping");
+    X.freeModMap = sym(so, "XFreeModifiermap");
+    X.autoRepeat = sym(so, "XkbSetDetectableAutoRepeat");
+    if X.open as int == 0 {
+        return false;
+    }
+    let open = X.open as fn(ptr): ptr;
+    DPY = open(0 as ptr);
+    if DPY as int == 0 {
+        return true;
+    }
+    // held keys send repeated KeyPress without the fake KeyRelease in between
+    let rep = X.autoRepeat as fn(ptr, i32, ptr): i32;
+    rep(DPY, 1, 0 as ptr);
+    findNumLock();
+    return true;
+}
+
+/// NumLock is usually Mod2 (16); ask the server which modifier holds the Num_Lock key.
+fn findNumLock() {
+    let toCode = X.keysymToKeycode as fn(ptr, u64): u8;
+    let nl = toCode(DPY, u64(0xff7f));
+    if nl == u8(0) {
+        return;
+    }
+    let getMap = X.modMap as fn(ptr): ptr;
+    let freeMap = X.freeModMap as fn(ptr): i32;
+    // XModifierKeymap { int max_keypermod; KeyCode *modifiermap; }: 8 rows of max_keypermod
+    let map = getMap(DPY);
+    if map as int == 0 {
+        return;
+    }
+    let per = rd32(map as int);
+    let codes = rd64(map as int + 8);
+    for m in 0..8 {
+        for k in 0..per {
+            if rd8(codes + m * per + k) == int(nl) {
+                NUMLOCK = 1 << m;
+            }
+        }
+    }
+    freeMap(map);
+}
+
+fn rd8(at: int): int {
+    let p = at as ptr as &u8;
+    return int(*p);
+}
+
+fn rd32(at: int): int {
+    let p = at as ptr as &i32;
+    return int(*p);
+}
+
+fn rd64(at: int): int {
+    let p = at as ptr as &int;
+    return *p;
+}
+
+/// X keysym of `key` (`keysymdef.h`).
+fn keysym(key: Key): int {
+    match key {
+        Key.Escape { return 0xff1b; }
+        Key.Left { return 0xff51; }
+        Key.Right { return 0xff53; }
+        Key.Up { return 0xff52; }
+        Key.Down { return 0xff54; }
+        Key.Space { return 0x20; }
+        Key.Enter { return 0xff0d; }
+        Key.Tab { return 0xff09; }
+        Key.Shift { return 0xffe1; }
+        Key.Ctrl { return 0xffe3; }
+        Key.Backspace { return 0xff08; }
+        Key.A { return 0x61; }
+        Key.B { return 0x62; }
+        Key.C { return 0x63; }
+        Key.D { return 0x64; }
+        Key.E { return 0x65; }
+        Key.F { return 0x66; }
+        Key.G { return 0x67; }
+        Key.H { return 0x68; }
+        Key.I { return 0x69; }
+        Key.J { return 0x6a; }
+        Key.K { return 0x6b; }
+        Key.L { return 0x6c; }
+        Key.M { return 0x6d; }
+        Key.N { return 0x6e; }
+        Key.O { return 0x6f; }
+        Key.P { return 0x70; }
+        Key.Q { return 0x71; }
+        Key.R { return 0x72; }
+        Key.S { return 0x73; }
+        Key.T { return 0x74; }
+        Key.U { return 0x75; }
+        Key.V { return 0x76; }
+        Key.W { return 0x77; }
+        Key.X { return 0x78; }
+        Key.Y { return 0x79; }
+        Key.Z { return 0x7a; }
+        Key.Num0 { return 0x30; }
+        Key.Num1 { return 0x31; }
+        Key.Num2 { return 0x32; }
+        Key.Num3 { return 0x33; }
+        Key.Num4 { return 0x34; }
+        Key.Num5 { return 0x35; }
+        Key.Num6 { return 0x36; }
+        Key.Num7 { return 0x37; }
+        Key.Num8 { return 0x38; }
+        Key.Num9 { return 0x39; }
+        Key.F1 { return 0xffbe; }
+        Key.F2 { return 0xffbf; }
+        Key.F3 { return 0xffc0; }
+        Key.F4 { return 0xffc1; }
+        Key.F5 { return 0xffc2; }
+        Key.F6 { return 0xffc3; }
+        Key.F7 { return 0xffc4; }
+        Key.F8 { return 0xffc5; }
+        Key.F9 { return 0xffc6; }
+        Key.F10 { return 0xffc7; }
+        Key.F11 { return 0xffc8; }
+        Key.F12 { return 0xffc9; }
+        Key.F13 { return 0xffca; }
+        Key.F14 { return 0xffcb; }
+        Key.F15 { return 0xffcc; }
+        Key.F16 { return 0xffcd; }
+        Key.F17 { return 0xffce; }
+        Key.F18 { return 0xffcf; }
+        Key.F19 { return 0xffd0; }
+        Key.F20 { return 0xffd1; }
+        Key.F21 { return 0xffd2; }
+        Key.F22 { return 0xffd3; }
+        Key.F23 { return 0xffd4; }
+        Key.F24 { return 0xffd5; }
+        Key.Delete { return 0xffff; }
+        Key.Home { return 0xff50; }
+        Key.End { return 0xff57; }
+        Key.Minus { return 0x2d; }
+        Key.Period { return 0x2e; }
+        Key.Alt { return 0xffe9; }
+        Key.PageUp { return 0xff55; }
+        Key.PageDown { return 0xff56; }
+        Key.Insert { return 0xff63; }
+        Key.PrintScreen { return 0xff61; }
+        Key.ScrollLock { return 0xff14; }
+        Key.Pause { return 0xff13; }
+        Key.CapsLock { return 0xffe5; }
+        Key.NumLock { return 0xff7f; }
+        Key.Menu { return 0xff67; }
+        Key.Super { return 0xffeb; }
+        Key.ShiftRight { return 0xffe2; }
+        Key.CtrlRight { return 0xffe4; }
+        Key.AltRight { return 0xffea; }
+        Key.Grave { return 0x60; }
+        Key.Equals { return 0x3d; }
+        Key.LeftBracket { return 0x5b; }
+        Key.RightBracket { return 0x5d; }
+        Key.Backslash { return 0x5c; }
+        Key.Semicolon { return 0x3b; }
+        Key.Apostrophe { return 0x27; }
+        Key.Comma { return 0x2c; }
+        Key.Slash { return 0x2f; }
+        Key.KpDivide { return 0xffaf; }
+        Key.KpMultiply { return 0xffaa; }
+        Key.KpMinus { return 0xffad; }
+        Key.KpPlus { return 0xffab; }
+        Key.KpEnter { return 0xff8d; }
+        Key.KpPeriod { return 0xffae; }
+        Key.Kp0 { return 0xffb0; }
+        Key.Kp1 { return 0xffb1; }
+        Key.Kp2 { return 0xffb2; }
+        Key.Kp3 { return 0xffb3; }
+        Key.Kp4 { return 0xffb4; }
+        Key.Kp5 { return 0xffb5; }
+        Key.Kp6 { return 0xffb6; }
+        Key.Kp7 { return 0xffb7; }
+        Key.Kp8 { return 0xffb8; }
+        Key.Kp9 { return 0xffb9; }
+    }
+}

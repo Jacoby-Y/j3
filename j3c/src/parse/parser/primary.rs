@@ -125,6 +125,7 @@ impl<'a> Parser<'a> {
     pub(super) fn primary(&mut self) -> Result<Expr, ParseError> {
         let tok = self.cur().clone();
         match tok.kind {
+            TokenKind::Fn => self.closure_lit(),
             TokenKind::Ident | TokenKind::This => {
                 let _ = self.bump();
                 if tok.text == "true" {
@@ -221,16 +222,25 @@ impl<'a> Parser<'a> {
                     }
                     n if crate::ir::op::AtomicOp::from_name(n).is_some() => {
                         let op = crate::ir::op::AtomicOp::from_name(n).unwrap();
-                        let args = self.args()?;
-                        if args.len() != op.values() + 1 {
-                            return Err(ParseError::new(
-                                name.span,
-                                format!("`@{}` takes a pointer and {} value(s)", op.name(), op.values()),
-                            ));
-                        }
+                        let mut args = self.args()?;
+                        let order = self.atomic_order(op, &mut args, name.span)?;
                         Ok(Expr {
                             span: join(start, self.prev_end(start)),
-                            kind: ExprKind::Atomic { op, args },
+                            kind: ExprKind::Atomic { op, order, args },
+                        })
+                    }
+                    n if INTRINSIC_CLOSURES.contains(&n) || INTRINSIC_SIMD.contains(&n) || INTRINSIC_GPU.contains(&n) => {
+                        let args = self.args()?;
+                        Ok(Expr {
+                            span: join(start, self.prev_end(start)),
+                            kind: ExprKind::Call {
+                                func: Box::new(Expr {
+                                    span: name.span,
+                                    kind: ExprKind::Name(Ident { name: format!("@{n}"), span: name.span }),
+                                }),
+                                type_args: Vec::new(),
+                                args,
+                            },
                         })
                     }
                     INTRINSIC_UI_CHOICE => {

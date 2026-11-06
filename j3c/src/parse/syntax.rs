@@ -9,10 +9,12 @@
 use crate::parse::token::{TokenKind, BOOL_LITS, KEYWORDS};
 
 mod rules;
+mod rules_tokens;
 mod tm;
 mod ui;
 
 use rules::*;
+use rules_tokens::*;
 pub use tm::*;
 pub use ui::*;
 
@@ -20,13 +22,37 @@ pub const ATTR_DEBUG: &str = "Debug";
 pub const ATTR_SINGLETON: &str = "singleton";
 pub const ATTR_TRY_CATCH: &str = "TryCatch";
 pub const ATTR_THREAD: &str = "thread";
-pub const ATTRIBUTES: &[&str] = &[ATTR_DEBUG, ATTR_SINGLETON, ATTR_TRY_CATCH, ATTR_THREAD];
+pub const ATTR_IMPL: &str = "impl";
+pub const ATTRIBUTES: &[&str] = &[ATTR_DEBUG, ATTR_SINGLETON, ATTR_TRY_CATCH, ATTR_THREAD, ATTR_IMPL, "shader", "vertex", "varying", "uniform", "flat"];
+/// Contextual item word: `trait Name { .. }`, only when an identifier follows.
+pub const ITEM_TRAIT: &str = "trait";
+/// Contextual item word: `extend Type { fn .. }`, only when an identifier follows.
+pub const ITEM_EXTEND: &str = "extend";
 
 pub const INTRINSIC_SYSCALL: &str = "syscall";
 pub const INTRINSIC_SIZEOF: &str = "sizeof";
 pub const INTRINSIC_UI_CHOICE: &str = "uiChoice";
 pub const INTRINSIC_SLICE: &str = "slice";
-pub const INTRINSIC_ATOMICS: &[&str] = &["atomicLoad", "atomicStore", "atomicAdd", "atomicCas"];
+pub const INTRINSIC_ATOMICS: &[&str] = &[
+    "atomicLoad",
+    "atomicStore",
+    "atomicAdd",
+    "atomicSub",
+    "atomicExchange",
+    "atomicCas",
+];
+/// Stdlib-only: pull a closure apart into a trampoline's `ptr` pair, or rebuild one (`speculative/lang/closures.j3`).
+pub const INTRINSIC_CLOSURES: &[&str] = &["closureFn", "closureCtx", "closureFrom"];
+/// `@vmin(a, b)` and friends on `vec4f` / `vec4i`; parsed as calls of the name `@vmin`, lowered in `check/lower/simd.rs`.
+pub const INTRINSIC_SIMD: &[&str] = &[
+    "vmin", "vmax", "vsqrt", "vabs", "vsum", "vshuffle", "vfloat", "vint", "vload", "vstore",
+];
+/// Memory-order words, the last argument of `@atomic*(..)` (`ir/op.rs` `AtomicOrder::name`).
+pub const ATOMIC_ORDERS: &[&str] = &["relaxed", "acquire", "release", "acqrel", "seqcst"];
+/// `@shader(vs, fs)` and the GLSL builtins shader fns call (`check/gpu/builtins.rs` has the rules); parsed as calls of `@name`.
+pub const INTRINSIC_GPU: &[&str] = &["shader", "discard", "fragCoord", "vertexId", "mix", "clamp", "dot", "cross", "length", "distance", "normalize", "min", "max", "abs", "sign", "floor", "ceil", "fract", "pow", "exp", "log", "sqrt", "sin", "cos", "tan", "atan", "step", "smoothstep", "mod", "fwidth", "dFdx", "dFdy", "texture", "textureLod", "texelFetch", "textureSize", "reflect", "refract", "transpose", "inverse"];
+/// Contextual type word: `closure(A): R`, only when followed by `(`.
+pub const TYPE_CLOSURE: &str = "closure";
 pub const INTRINSIC_J3UI: &str = "j3ui";
 pub const INTRINSIC_SCRIPT: &str = "script";
 pub const SCRIPT_PROPS: &str = "props";
@@ -41,7 +67,23 @@ pub const INTRINSICS: &[&str] = &[
     "atomicLoad",
     "atomicStore",
     "atomicAdd",
+    "atomicSub",
+    "atomicExchange",
     "atomicCas",
+    "closureFn",
+    "closureCtx",
+    "closureFrom",
+    "vmin",
+    "vmax",
+    "vsqrt",
+    "vabs",
+    "vsum",
+    "vshuffle",
+    "vfloat",
+    "vint",
+    "vload",
+    "vstore",
+    "shader", "discard", "fragCoord", "vertexId", "mix", "clamp", "dot", "cross", "length", "distance", "normalize", "min", "max", "abs", "sign", "floor", "ceil", "fract", "pow", "exp", "log", "sqrt", "sin", "cos", "tan", "atan", "step", "smoothstep", "mod", "fwidth", "dFdx", "dFdy", "texture", "textureLod", "texelFetch", "textureSize", "reflect", "refract", "transpose", "inverse",
 ];
 
 /// `@j3ui` widgets whose body is the call, then `end`.
@@ -88,8 +130,8 @@ pub fn is_j3ui_widget(name: &str) -> bool {
 
 /// Builtin type spellings. Checker must accept every name.
 pub const BUILTIN_TYPES: &[&str] = &[
-    "void", "bool", "int", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64",
-    "float", "ptr", "cstr", "string",
+    "void", "bool", "int", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f16", "f32", "f64",
+    "float", "ptr", "cstr", "string", "vec4f", "vec4i",
 ];
 
 const OPERATOR_KINDS: &[TokenKind] = &[
@@ -106,6 +148,13 @@ const OPERATOR_KINDS: &[TokenKind] = &[
     TokenKind::MinusEq,
     TokenKind::StarEq,
     TokenKind::SlashEq,
+    TokenKind::PercentEq,
+    TokenKind::AmpEq,
+    TokenKind::PipeEq,
+    TokenKind::CaretEq,
+    TokenKind::Pipe,
+    TokenKind::Caret,
+    TokenKind::Tilde,
     TokenKind::Dot,
     TokenKind::Question,
     TokenKind::Amp,
@@ -150,6 +199,9 @@ mod tests {
         for name in BUILTIN_TYPES {
             assert!(g.contains(name), "missing type {name}");
         }
+        assert!(g.contains(TYPE_CLOSURE), "missing closure type word");
+        assert!(g.contains(ITEM_TRAIT), "missing trait item word");
+        assert!(g.contains(ITEM_EXTEND), "missing extend item word");
         for k in OPERATOR_KINDS {
             let src = k.operator_src().expect("operator kind");
             let mut quoted = String::new();
@@ -188,21 +240,21 @@ mod tests {
 
     #[test]
     fn shipped_ui_grammar_is_dump_syntax() {
-        let shipped = include_str!("../../../editors/vscode/syntaxes/j3ui.tmLanguage.json");
+        let shipped = include_str!("../../../examples/editors/vscode/syntaxes/j3ui.tmLanguage.json");
         assert_eq!(
             ui_tm_grammar(),
             shipped,
-            "run `j3c dump-syntax --ui ../editors/vscode/syntaxes/j3ui.tmLanguage.json`"
+            "run `j3c dump-syntax --ui ../examples/editors/vscode/syntaxes/j3ui.tmLanguage.json`"
         );
     }
 
     #[test]
     fn shipped_grammar_is_dump_syntax() {
-        let shipped = include_str!("../../../editors/vscode/syntaxes/j3.tmLanguage.json");
+        let shipped = include_str!("../../../examples/editors/vscode/syntaxes/j3.tmLanguage.json");
         assert_eq!(
             tm_grammar(),
             shipped,
-            "run `j3c dump-syntax ../editors/vscode/syntaxes/j3.tmLanguage.json`"
+            "run `j3c dump-syntax ../examples/editors/vscode/syntaxes/j3.tmLanguage.json`"
         );
     }
 }

@@ -1,0 +1,195 @@
+// Tests for the j2 GC: a churn of 1M short-lived tables stays small, kept values survive and
+// released ones are freed (`vm.stats().liveObjects`), dead strings leave the intern table, closures and
+// protos survive collections, a native's temporaries survive callbacks that allocate, and the
+// heap cap counts only what is live. (The vm case table runs under stress mode in `j2_vm_test`.)
+//   timeout 120 j3c run j3c/stdlib/tests/j2_gc_test.j3
+// Panics on the first failed check.
+
+module j2_gc_test;
+
+use j3.io.printLn;
+use j3.j2;
+use j3.j2.{ Vm, Args, Value, Limits, Ref };
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+
+struct Host {
+    out: Text;
+    maxBytes: int;
+}
+
+fn hostOf(vm: &Vm): &Host { return vm.host as &Host; }
+
+fn capture(vm: &Vm, args: Args): Value {
+    let h = hostOf(vm);
+    h.out.pushStr(args.joined(" "));
+    h.out.push(10);
+    return j2.nil();
+}
+
+/// `probe()`: remember the largest heap size seen.
+fn probe(vm: &Vm, _args: Args): Value {
+    let h = hostOf(vm);
+    let b = vm.stats().bytes;
+    if b > h.maxBytes { h.maxBytes = b; }
+    return j2.nil();
+}
+
+/// `holder(f)`: a new table held only in this native's J3 local while `f` runs (and allocates);
+/// it must come back whole.
+fn holder(vm: &Vm, args: Args): Value {
+    let f = args.func(0);
+    let t = vm.newTable();
+    t.set("name", j2.str(vm, "held"));
+    let one: [1]Value = [j2.int(500)];
+    match vm.call(f, one[0..1]) {
+        Result.Ok(_) { }
+        Result.Err(_) { return vm.passOn(); }
+    }
+    let s = j2.str(vm, "made before more calls");
+    match vm.call(f, one[0..1]) {
+        Result.Ok(_) { }
+        Result.Err(_) { return vm.passOn(); }
+    }
+    t.set("note", s);
+    return t.value();
+}
+
+fn newVm(mem: &Arena, h: &Host, limits: Limits): Vm {
+    let vm = Vm.new(mem, limits);
+    vm.openLibs(j2.LIB_ALL);
+    vm.bind("print", capture);
+    vm.bind("probe", probe);
+    vm.bind("holder", holder);
+    vm.host = h as ptr;
+    return vm;
+}
+
+fn load(vm: &Vm, src: string): Value {
+    match vm.loadString("t", src) {
+        Result.Ok(t) { return t; }
+        Result.Err(e) {
+            printLn(e.message);
+            panic("unexpected script error");
+        }
+    }
+}
+
+fn check(got: string, want: string, what: string) {
+    if !(got == want) {
+        printLn(`got  [{got}]`);
+        printLn(`want [{want}]`);
+        panic(what);
+    }
+}
+
+/// 1M short-lived tables: the heap never holds more than 4 MB.
+fn testChurn(mem: &Arena) {
+    let h = Host { out: Text.new(mem), maxBytes: 0 };
+    let vm = newVm(mem, &h, Limits { });
+    load(&vm, "let keep = { n: 0 };\nfor i in 0..1000000 {\n    let t = { a: i, b: [i] };\n    keep.n += t.a - i + 1;\n    if i % 5000 == 0 { probe(); }\n}\nprint(keep.n);");
+    check(h.out.str(), "1000000\n", "churn result");
+    let st = vm.stats();
+    if h.maxBytes >= 4 << 20 || st.bytes >= 4 << 20 { panic(`churn heap too big: max {h.maxBytes}`); }
+    if st.collections < 10 { panic("churn never collected"); }
+    vm.destroy();
+}
+
+/// Kept values survive collections; released ones get freed.
+fn testKeep(mem: &Arena) {
+    let h = Host { out: Text.new(mem), maxBytes: 0 };
+    let vm = newVm(mem, &h, Limits { });
+    let ex = vm.keep(load(&vm, "pub fn make(n) { let xs = []; for i in 0..n { xs.push({ i: i, s: `item {i}` }); } return xs; }"));
+    vm.collect();
+    let base = vm.stats().liveObjects;
+    let one: [1]Value = [j2.int(1000)];
+    let r = j2.none();
+    match vm.call(vm.get(ex).get("make"), one[0..1]) {
+        Result.Ok(v) { r = vm.keep(v); }
+        Result.Err(e) {
+            printLn(e.message);
+            panic("make");
+        }
+    }
+    vm.collect();
+    let held = vm.stats().liveObjects;
+    if held < base + 2001 { panic(`kept values were freed: {held} vs {base}`); }
+    let xs = vm.value(r);
+    let last = j2.arrOf(xs).get(999);
+    if last.asTable().getNum("i", 0.0) != 999.0 || !(last.asTable().getStr("s", "") == "item 999") { panic("kept value changed"); }
+    vm.release(r);
+    vm.collect();
+    let after = vm.stats().liveObjects;
+    if after > base + 10 { panic(`released values not freed: {after} vs {base}`); }
+    // the module itself is still kept and works
+    match vm.call(vm.get(ex).get("make"), one[0..1]) {
+        Result.Ok(v) { if j2.arrOf(v).len != 1000 { panic("module after collect"); } }
+        Result.Err(e) {
+            printLn(e.message);
+            panic("make after collect");
+        }
+    }
+    vm.release(ex);
+    vm.destroy();
+}
+
+/// Dead strings leave the intern table; live ones (and new equal ones) still compare equal.
+fn testWeakStrings(mem: &Arena) {
+    let h = Host { out: Text.new(mem), maxBytes: 0 };
+    let vm = newVm(mem, &h, Limits { });
+    let ex = vm.keep(load(&vm, "pub let names = [];\nfor i in 0..20000 { let s = `tmp {i}`; if i % 1000 == 0 { names.push(s); } }\npub fn has(s) { for n in names { if n == s { return true; } } return false; }"));
+    vm.collect();
+    let n = vm.heap.strCount;
+    if n > 2000 { panic(`dead strings stay interned: {n}`); }
+    if vm.heap.lookupStr("tmp 5000").isNil() { panic("live string lost"); }
+    if !vm.heap.lookupStr("tmp 5001").isNil() { panic("dead string still found"); }
+    let one: [1]Value = [j2.str(&vm, "tmp 7000")];
+    match vm.call(vm.get(ex).get("has"), one[0..1]) {
+        Result.Ok(v) { if !v.truthy() { panic("re-interned string differs"); } }
+        Result.Err(e) {
+            printLn(e.message);
+            panic("has");
+        }
+    }
+    vm.destroy();
+}
+
+/// Closures, upvalues, protos and their constants survive collections at every safe point; a
+/// native's temporaries survive its callbacks.
+fn testStress(mem: &Arena) {
+    let h = Host { out: Text.new(mem), maxBytes: 0 };
+    let vm = newVm(mem, &h, Limits { });
+    vm.gcStress = true;
+    load(&vm, "fn counter() { let n = 0; return fn() { n += 1; return `n={n}`; }; }\nlet c = counter();\nlet junk = fn(k) { let a = []; for i in 0..k { a.push({ v: str(i) }); } return a; };\nlet t = holder(junk);\nc(); junk(100);\nprint(c(), t.name, t.note, len(t));");
+    check(h.out.str(), "n=2 held made before more calls 2\n", "stress output");
+    if vm.stats().collections < 100 { panic("stress mode didn't collect"); }
+    vm.destroy();
+}
+
+/// The heap cap counts live memory: garbage gets collected first, real growth stops the script,
+/// and the VM works again once the data is gone.
+fn testCap(mem: &Arena) {
+    let h = Host { out: Text.new(mem), maxBytes: 0 };
+    let vm = newVm(mem, &h, Limits { heapBytes: 2 << 20 });
+    load(&vm, "for i in 0..200000 { let t = { a: [i, i] }; } print(\"garbage is fine\");");
+    match vm.loadString("grow", "let xs = []; while true { xs.push({ a: 1 }); }") {
+        Result.Ok(_) { panic("expected out of script memory"); }
+        // the op that crosses the cap depends on when collections ran (stress mode differs)
+        Result.Err(e) { check(e.message[e.message.len - 20..e.message.len], "out of script memory", "cap"); }
+    }
+    load(&vm, "let ys = []; for i in 0..1000 { ys.push({ b: i }); } print(len(ys));");
+    check(h.out.str(), "garbage is fine\n1000\n", "after cap");
+    vm.destroy();
+}
+
+fn main() {
+    let mem = Arena.create(1 << 20);
+    testChurn(&mem);
+    testKeep(&mem);
+    testWeakStrings(&mem);
+    testStress(&mem);
+    testCap(&mem);
+    printLn("j2_gc_test ok");
+}

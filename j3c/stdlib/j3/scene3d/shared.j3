@@ -1,0 +1,270 @@
+// Part of j3.scene3d (the shared mesh cache: slots, unload, reload, rebuild, release); the module doc and `use`s are in ../scene3d.j3.
+module j3.scene3d;
+
+#[singleton]
+let SHARED: []Shared;
+
+#[singleton]
+let SHARED_LEN: int = 0;
+
+/// Open-addressing table from mesh/texture paths to `SHARED` index + 1.
+#[singleton]
+let SHARED_SLOTS: []int;
+
+/// Holds the cache's path strings, which must outlive any one scene's arena.
+#[singleton]
+let KEYS: Arena = Arena { ptr: 0, used: 0, cap: 0, head: 0 };
+
+/// A copy of `verts` that outlives the load.
+// ponytail: copies live in KEYS for good, so reloading a mesh file leaks its old copy.
+fn keepVerts(verts: []f32): []f32 {
+    if KEYS.ptr == 0 { KEYS = Arena.create(16 * 1024); }
+    let out = KEYS.alloc::<f32>(verts.len);
+    let i = 0;
+    while i < verts.len {
+        out[i] = verts[i];
+        i += 1;
+    }
+    return out;
+}
+
+fn keepKey(value: string): string {
+    if KEYS.ptr == 0 { KEYS = Arena.create(16 * 1024); }
+    let t = Text.new(&KEYS);
+    t.pushStr(value);
+    return t.str();
+}
+
+fn sharedHash(asset: string, texture: string, size: int): int {
+    let h = 0;
+    let i = 0;
+    while i < asset.len {
+        h = h * 33 + int(asset[i]);
+        h = h - (h / size) * size;
+        i += 1;
+    }
+    h = h * 33 + 255;
+    h = h - (h / size) * size;
+    i = 0;
+    while i < texture.len {
+        h = h * 33 + int(texture[i]);
+        h = h - (h / size) * size;
+        i += 1;
+    }
+    return h;
+}
+
+fn sharedSlot(asset: string, texture: string): int {
+    if SHARED_SLOTS.len == 0 { return -1; }
+    let h = sharedHash(asset, texture, SHARED_SLOTS.len);
+    while SHARED_SLOTS[h] != 0 {
+        let at = SHARED_SLOTS[h] - 1;
+        if same(SHARED[at].asset, asset) && same(SHARED[at].texture, texture) { return at; }
+        h = nextSlot(h, SHARED_SLOTS.len);
+    }
+    return -1;
+}
+
+fn reserveShared() {
+    if KEYS.ptr == 0 { KEYS = Arena.create(16 * 1024); }
+    if SHARED_LEN >= SHARED.len {
+        let size = if SHARED.len == 0 { 16 } else { SHARED.len * 2 };
+        let grown = KEYS.alloc::<Shared>(size);
+        let i = 0;
+        while i < SHARED_LEN { grown[i] = SHARED[i]; i += 1; }
+        SHARED = grown;
+    }
+    if (SHARED_LEN + 1) * 2 >= SHARED_SLOTS.len {
+        let slotSize = if SHARED_SLOTS.len == 0 { 32 } else { SHARED_SLOTS.len * 2 };
+        let table = KEYS.alloc::<int>(slotSize);
+        let slotIndex = 0;
+        while slotIndex < slotSize { table[slotIndex] = 0; slotIndex += 1; }
+        slotIndex = 0;
+        while slotIndex < SHARED_LEN {
+            let h = sharedHash(SHARED[slotIndex].asset, SHARED[slotIndex].texture, slotSize);
+            while table[h] != 0 { h = nextSlot(h, slotSize); }
+            table[h] = slotIndex + 1;
+            slotIndex += 1;
+        }
+        SHARED_SLOTS = table;
+    }
+}
+
+fn insertShared(entry: Shared) {
+    reserveShared();
+    let at = SHARED_LEN;
+    SHARED[at] = entry;
+    SHARED_LEN += 1;
+    let h = sharedHash(entry.asset, entry.texture, SHARED_SLOTS.len);
+    while SHARED_SLOTS[h] != 0 { h = nextSlot(h, SHARED_SLOTS.len); }
+    SHARED_SLOTS[h] = at + 1;
+}
+
+/// Uses of the cache entry holding `asset` + `texture`, or 0 when it isn't cached.
+pub fn sharedRefs(asset: string, texture: string): int {
+    let at = sharedSlot(asset, texture);
+    if at >= 0 { return SHARED[at].refs; }
+    return 0;
+}
+
+/// Give up a node's GPU mesh and texture, freeing them when no other node uses them.
+pub fn unload(n: &Node) {
+    if n.gpu.vao == 0 && n.image.id == 0 { return; }
+    let k = sharedSlot(n.asset, n.texture);
+    if k < 0 || SHARED[k].gpu.vao != n.gpu.vao || SHARED[k].image.id != n.image.id { k = 0; }
+    let shared = false;
+    while k < SHARED_LEN && !shared {
+        if SHARED[k].refs > 0 && SHARED[k].gpu.vao == n.gpu.vao && SHARED[k].image.id == n.image.id {
+            shared = true;
+            SHARED[k].refs -= 1;
+            if SHARED[k].refs == 0 {
+                gfx.free(&SHARED[k].gpu);
+                gfx.freeTex(&SHARED[k].image);
+            }
+        }
+        k += 1;
+    }
+    if !shared {
+        gfx.free(&n.gpu);
+        gfx.freeTex(&n.image);
+    }
+    n.gpu = Mesh {};
+    n.image = Tex { id: 0, w: 0, h: 0 };
+}
+
+/// Refresh one node's GPU resources after its asset path changes.
+pub fn reload(scene: &Scene, id: int) {
+    let i = index(scene, id);
+    if i < 0 { return; }
+    let n = &scene.nodes[i];
+    unload(n);
+    n.boundLo = Vec3.xyz(-0.5, -0.5, -0.5);
+    n.boundHi = Vec3.xyz(0.5, 0.5, 0.5);
+    if n.kind == MESH { n.missing = false; }
+    n.mat = 0;
+    if n.kind == MESH && n.material.len > 0 {
+        n.mat = materialSlot(n.material);
+        if !io.exists(n.material) { n.missing = true; }
+    }
+    if n.kind != MESH || n.asset.len == 0 { return; }
+    let cached = sharedSlot(n.asset, n.texture);
+    if cached >= 0 && SHARED[cached].refs > 0 {
+        // ponytail: a deleted file keeps drawing from the cache until the scene reloads; flag it now.
+        n.missing = n.missing || !exists(n.asset);
+        SHARED[cached].refs += 1;
+        n.gpu = SHARED[cached].gpu;
+        n.image = SHARED[cached].image;
+        n.boundLo = SHARED[cached].lo;
+        n.boundHi = SHARED[cached].hi;
+        return;
+    }
+    let scratch = Arena.create(1024 * 1024);
+    let verts = meshVerts(n.asset, &scratch);
+    if verts.len == 0 { n.missing = true; }
+    let kept = KEYS.alloc::<f32>(0);
+    if verts.len > 0 {
+        bounds(verts, &n.boundLo, &n.boundHi);
+        n.gpu = gfx.uploadUv(verts);
+        kept = keepVerts(verts);
+    }
+    if n.texture.len > 0 {
+        let rgba = loadImage(n.texture, &scratch);
+        if rgba.pixels.len > 0 {
+            n.image = gfx.tex(rgba.pixels, rgba.w, rgba.h);
+        } else if !exists(n.texture) {
+            // Only a gone file; without SDL2_image every texture fails to load.
+            n.missing = true;
+        }
+    }
+    scratch.destroy();
+    // A failed load isn't cached, so fixing the file and reloading picks it up.
+    if n.gpu.vao != 0 {
+        if cached >= 0 {
+            SHARED[cached].gpu = n.gpu;
+            SHARED[cached].image = n.image;
+            SHARED[cached].lo = n.boundLo;
+            SHARED[cached].hi = n.boundHi;
+            SHARED[cached].refs = 1;
+            SHARED[cached].verts = kept;
+        } else {
+            insertShared(Shared {
+                asset: keepKey(n.asset), texture: keepKey(n.texture),
+                gpu: n.gpu, image: n.image, verts: kept, lo: n.boundLo, hi: n.boundHi, refs: 1,
+            });
+        }
+    }
+}
+
+/// Re-read one mesh/texture pair and update every supplied live scene together. The caller
+/// supplies all scenes that can hold this cache entry; GPU ids stay stable for shared users.
+pub fn rebuild(asset: string, texture: string, scenes: []Scene): bool {
+    let slot = sharedSlot(asset, texture);
+    if slot < 0 || SHARED[slot].refs == 0 {
+        // A missing mesh is not cached; retry its nodes through the normal loader.
+        let loaded = false;
+        let s = 0;
+        while s < scenes.len {
+            let i = 0;
+            while i < scenes[s].len {
+                let n = &scenes[s].nodes[i];
+                if n.kind == MESH && same(n.asset, asset) && same(n.texture, texture) {
+                    reload(&scenes[s], n.id);
+                    if n.gpu.vao != 0 { loaded = true; }
+                }
+                i += 1;
+            }
+            s += 1;
+        }
+        return loaded;
+    }
+
+    let scratch = Arena.create(1024 * 1024);
+    let verts = meshVerts(asset, &scratch);
+    if verts.len == 0 { scratch.destroy(); return false; }
+    let lo = Vec3.xyz(0, 0, 0);
+    let hi = Vec3.xyz(0, 0, 0);
+    bounds(verts, &lo, &hi);
+    let rgba = loadImage(texture, &scratch);
+    if texture.len > 0 && rgba.pixels.len == 0 { scratch.destroy(); return false; }
+    gfx.updateUv(&SHARED[slot].gpu, verts);
+    SHARED[slot].verts = keepVerts(verts);
+    if texture.len > 0 {
+        if SHARED[slot].image.id == 0 {
+            SHARED[slot].image = gfx.tex(rgba.pixels, rgba.w, rgba.h);
+        } else {
+            gfx.updateTex(&SHARED[slot].image, rgba.pixels, rgba.w, rgba.h);
+        }
+    }
+    SHARED[slot].lo = lo;
+    SHARED[slot].hi = hi;
+    let sceneIndex = 0;
+    while sceneIndex < scenes.len {
+        let nodeIndex = 0;
+        while nodeIndex < scenes[sceneIndex].len {
+            let node = &scenes[sceneIndex].nodes[nodeIndex];
+            if node.kind == MESH && same(node.asset, asset) && same(node.texture, texture) {
+                if node.gpu.vao == SHARED[slot].gpu.vao {
+                    node.gpu = SHARED[slot].gpu;
+                    node.image = SHARED[slot].image;
+                    node.boundLo = lo;
+                    node.boundHi = hi;
+                } else if node.gpu.vao == 0 {
+                    reload(&scenes[sceneIndex], node.id);
+                }
+            }
+            nodeIndex += 1;
+        }
+        sceneIndex += 1;
+    }
+    scratch.destroy();
+    return true;
+}
+
+pub fn release(scene: &Scene) {
+    let i = 0;
+    while i < scene.len {
+        unload(&scene.nodes[i]);
+        i += 1;
+    }
+    if scene.placed as ptr != 0 { scene.placed.destroy(); }
+}

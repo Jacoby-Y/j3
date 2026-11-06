@@ -74,6 +74,8 @@ pub struct EnumDef {
     pub try_catch: Option<TryCatch>,
     pub debug: bool,
     pub span: Span,
+    /// Type arguments of a generic instance (empty otherwise); with `span`, its identity.
+    pub ty_args: Vec<crate::ir::ty::Ty>,
 }
 
 impl EnumDef {

@@ -18,10 +18,55 @@ use lib "kernel32" as k32 {
     fn GetLastError(): u32;
     fn LoadLibraryA(name: cstr): ptr;
     fn GetProcAddress(dll: ptr, name: cstr): ptr;
+    fn GetModuleFileNameA(hmod: int, buf: ptr, size: u32): u32;
+    fn GetEnvironmentVariableA(name: cstr, buf: ptr, size: u32): u32;
+    fn GetFileAttributesExA(name: ptr, level: u32, info: ptr): i32;
+    fn GetFileAttributesA(name: ptr): u32;
+    fn FindFirstFileA(name: ptr, data: ptr): int;
+    fn FindNextFileA(h: int, data: ptr): i32;
+    fn FindClose(h: int): i32;
+    fn CreateDirectoryA(name: ptr, sec: ptr): i32;
+    fn MoveFileExA(from: ptr, to: ptr, flags: u32): i32;
+    fn DeleteFileA(name: ptr): i32;
+    fn SetCurrentDirectoryA(name: ptr): i32;
+    fn GetCurrentProcessId(): u32;
+    fn GetConsoleProcessList(list: ptr, n: u32): u32;
 }
 
-/// Which OS layer this is, for code that must branch on it: 0 Linux, 1 Windows, 2 macOS, 3 Android.
+use lib "user32" as u32lib {
+    fn MessageBoxA(wnd: ptr, text: ptr, caption: ptr, kind: u32): i32;
+}
+
+/// Which OS layer this is, fixed at compile time by `[emit] target`: compare it with the
+/// `PLATFORM_*` names (`if sys.PLATFORM == sys.PLATFORM_ANDROID { ... }`); the other branch is dropped.
 pub const PLATFORM: int = 1;
+/// `PLATFORM` on Linux (desktop).
+pub const PLATFORM_LINUX: int = 0;
+/// `PLATFORM` on Windows.
+pub const PLATFORM_WINDOWS: int = 1;
+/// `PLATFORM` on macOS.
+pub const PLATFORM_MACOS: int = 2;
+/// `PLATFORM` on Android.
+pub const PLATFORM_ANDROID: int = 3;
+/// `PLATFORM` as a word for logs and paths: "linux", "windows", "macos", "android".
+pub const PLATFORM_NAME: string = "windows";
+/// `ARCH_*` names of the CPU the program is built for (`if sys.ARCH == sys.ARCH_AARCH64 { ... }`); the other branch is dropped.
+/// The compiler sets it from the target triple (the host when there is no target); the value written here is a placeholder.
+pub const ARCH: int = 0;
+/// `ARCH` on x86-64.
+pub const ARCH_X86_64: int = 0;
+/// `ARCH` on 64-bit ARM (arm64).
+pub const ARCH_AARCH64: int = 1;
+/// `ARCH` on 32-bit x86.
+pub const ARCH_X86: int = 2;
+/// `ARCH` on 32-bit ARM.
+pub const ARCH_ARM: int = 3;
+/// `ARCH` on RISC-V.
+pub const ARCH_RISCV: int = 4;
+/// `ARCH` on any other CPU.
+pub const ARCH_OTHER: int = 5;
+/// `ARCH` as a word for logs: "x86_64", "aarch64", "x86", "arm", "riscv", "other".
+pub const ARCH_NAME: string = "x86_64";
 /// Open for reading only.
 pub const O_RDONLY: int = 0;
 /// Open for writing only.
@@ -42,6 +87,12 @@ pub const WNOHANG: int = 1;
 pub const SIGTERM: int = 15;
 /// `kill` signal: stop now.
 pub const SIGKILL: int = 9;
+/// `open` flag: read and write.
+pub const O_RDWR: int = 2;
+/// `open` flag: a terminal device opened does not become the controlling terminal.
+pub const O_NOCTTY: int = 256;
+/// `kill` signal: the controlling terminal went away.
+pub const SIGHUP: int = 1;
 /// `pollFds` events: readable, writable; results add hang-up and error.
 pub const POLLIN: int = 1;
 pub const POLLOUT: int = 4;
@@ -139,6 +190,12 @@ pub fn openMode(path: ptr, flags: int, mode: int): int {
     } else if bit(flags, O_TRUNC) {
         disp = TRUNCATE_EXISTING;
     }
+    if access == GENERIC_READ && disp == OPEN_EXISTING {
+        let a = k32.GetFileAttributesA(path);
+        if a != u32(4294967295) && (int(a) / 16) % 2 == 1 {
+            return dirOpen(path);
+        }
+    }
     return k32.CreateFileA(path, access, FILE_SHARE, 0, disp, FILE_ATTRIBUTE_NORMAL, 0);
 }
 
@@ -160,6 +217,9 @@ pub fn read(fd: int, buf: ptr, n: int): int {
 pub fn close(fd: int): int {
     if fd == 0 || fd == 1 || fd == 2 {
         return 0;
+    }
+    if fd >= DIR_BASE {
+        return dirClose(fd);
     }
     if k32.CloseHandle(fd) == 0 {
         return 0 - 1;
@@ -190,8 +250,30 @@ pub fn munmap(p: ptr, len: int) {
     k32.VirtualFree(p, 0, MEM_RELEASE);
 }
 
+/// Run by `exit` (so by a panic and by the end of `main`) before the process ends. One slot, see `onExit`.
+#[singleton]
+let EXIT_HOOK: fn();
+
+/// Run `hook` just before the process exits, normally or by panic (Linux: a panic runs it before the message is printed).
+/// One slot: a later call replaces the earlier hook. The hook must be safe to run twice and may run in a forked child
+/// that calls `exit`, so check `getpid()`. `j3.term.screen` uses it to restore the terminal.
+pub fn onExit(hook: fn()) {
+    EXIT_HOOK = hook;
+}
+
+fn runExitHook() {
+    let hook = EXIT_HOOK;
+    if hook as ptr != 0 as ptr {
+        hook();
+    }
+}
+
+/// Not available here: 0.
+pub fn monotonicMs(): int { return 0; }
+
 /// Terminate the process with exit code `code`.
 pub fn exit(code: i32) {
+    runExitHook();
     k32.ExitProcess(code as u32);
 }
 
@@ -214,12 +296,51 @@ fn writeThreadName() {
     }
 }
 
-/// Print `msg` to stderr and exit with code 101.
+/// Print `msg` to stderr, show it in a message box when nobody sees the console, and exit with code 101.
 pub fn panic(msg: string) {
     writeThreadName();
     write(2, msg.ptr as ptr, msg.len);
     write(2, "\n".ptr as ptr, 1);
+    BOX_N = 0;
+    boxAdd(THREAD_NAME);
+    boxAdd(msg);
+    showPanicBox();
     exit(101);
+}
+
+/// The panic text for the message box, NUL-terminated by `showPanicBox`.
+#[singleton]
+#[thread]
+let BOX_TEXT: [2048]u8;
+#[singleton]
+#[thread]
+let BOX_N: int;
+
+fn boxAdd(s: string) {
+    for i in 0..s.len {
+        if BOX_N < 2047 {
+            BOX_TEXT[BOX_N] = s[i];
+            BOX_N += 1;
+        }
+    }
+}
+
+fn boxInt(n: int) {
+    if n >= 10 { boxInt(n / 10); }
+    if BOX_N < 2047 {
+        BOX_TEXT[BOX_N] = u8(48 + n % 10);
+        BOX_N += 1;
+    }
+}
+
+/// A double-clicked exe owns its console alone (it closes on exit) and a GUI exe has none: then show
+/// `BOX_TEXT` in a message box so the player can read it. Run from cmd or a terminal, stderr is enough.
+fn showPanicBox() {
+    let pids: [4]u32 = [0, 0, 0, 0];
+    if int(k32.GetConsoleProcessList(&pids[0] as ptr, u32(4))) > 1 { return; }
+    BOX_TEXT[BOX_N] = 0;
+    // MB_OK + MB_ICONERROR + MB_TOPMOST
+    u32lib.MessageBoxA(0 as ptr, &BOX_TEXT[0] as ptr, "Error\0".ptr as ptr, u32(0x40010));
 }
 
 /// Write `n` in decimal to stderr.
@@ -237,6 +358,14 @@ pub fn panicAt(file: string, line: int, msg: string) {
     write(2, ": ".ptr as ptr, 2);
     write(2, msg.ptr as ptr, msg.len);
     write(2, "\n".ptr as ptr, 1);
+    BOX_N = 0;
+    boxAdd(msg);
+    boxAdd("\n\n(");
+    boxAdd(file);
+    boxAdd(":");
+    boxInt(line);
+    boxAdd(")");
+    showPanicBox();
     exit(101);
 }
 
@@ -321,6 +450,12 @@ fn crashFilter(info: ptr): i32 {
         }
     }
     close(fd);
+    // ponytail: MessageBox from the filter; a stack overflow may not get one, crash.log still does.
+    BOX_N = 0;
+    boxAdd("The game crashed (exception ");
+    boxInt(rd(record) % 4294967296);
+    boxAdd(").\n\nDetails were saved to crash.log next to the game.");
+    showPanicBox();
     return 1;
 }
 
@@ -348,10 +483,242 @@ pub fn execve(path: ptr, argv: ptr, envp: ptr): int { return -1; }
 pub fn pipe(fds: []i32, flags: int): int { return -1; }
 /// Not on this target yet: -1.
 pub fn dup2(from: int, to: int): int { return -1; }
-/// Not on this target yet: -1.
-pub fn chdir(path: ptr): int { return -1; }
-/// Not on this target yet: false.
-pub fn canExec(path: ptr): bool { return false; }
+/// Change the working directory (`SetCurrentDirectoryA`): 0, or -1 on failure.
+pub fn chdir(path: ptr): int {
+    if k32.SetCurrentDirectoryA(path) == 0 {
+        return 0 - 1;
+    }
+    return 0;
+}
+/// Not on this target: -1.
+pub fn ioctl(fd: int, req: int, arg: ptr): int { return -1; }
+/// Not on this target: -1.
+pub fn setsid(): int { return -1; }
+/// True when `path` is a file (not a directory) that exists. Windows has no execute bit, so any file counts.
+pub fn canExec(path: ptr): bool {
+    let a = k32.GetFileAttributesA(path);
+    return a != u32(4294967295) && (int(a) / 16) % 2 == 0;
+}
+
+// Files and directories (`j3.io`): stat, rename, remove, mkdir and directory listing work.
+
+/// `statAt` dirfd meaning "relative to the working directory".
+pub const AT_FDCWD: int = -100;
+#[singleton]
+#[thread]
+let STAT_W: [9]u32;
+
+// Directory listing. `open` of a directory gives a pseudo fd (`DIR_BASE` + slot) that stands for a FindFirstFileA
+// search; `dirents` turns its entries into linux_dirent64 records and `statAt` resolves names against its path.
+// Eight directories can be open per thread.
+fn wb(p: ptr, off: int): u8 {
+    let b = (p as int + off) as ptr as &u8;
+    return *b;
+}
+
+const DIR_BASE: int = 1000000;
+const DIR_SLOTS: int = 8;
+const DIR_PATH_MAX: int = 520;
+const FIND_SIZE: int = 320;
+
+#[singleton]
+#[thread]
+let DIR_STATE: [8]int;
+#[singleton]
+#[thread]
+let DIR_HANDLE: [8]int;
+#[singleton]
+#[thread]
+let DIR_PATH: [4160]u8;
+#[singleton]
+#[thread]
+let DIR_FIND: [2560]u8;
+#[singleton]
+#[thread]
+let FULL_PATH: [1100]u8;
+
+fn dirOpen(path: ptr): int {
+    let n = 0;
+    while n < DIR_PATH_MAX - 4 && wb(path, n) != 0 {
+        n += 1;
+    }
+    if n >= DIR_PATH_MAX - 4 {
+        return 0 - 1;
+    }
+    for slot in 0..DIR_SLOTS {
+        if DIR_STATE[slot] == 0 {
+            let base = slot * DIR_PATH_MAX;
+            for k in 0..n {
+                DIR_PATH[base + k] = wb(path, k);
+            }
+            if n > 0 && DIR_PATH[base + n - 1] != 92 && DIR_PATH[base + n - 1] != 47 {
+                DIR_PATH[base + n] = 92;
+                n += 1;
+            }
+            DIR_PATH[base + n] = 42;
+            DIR_PATH[base + n + 1] = 0;
+            DIR_STATE[slot] = 1;
+            DIR_HANDLE[slot] = 0 - 1;
+            return DIR_BASE + slot;
+        }
+    }
+    return 0 - 1;
+}
+
+fn dirClose(fd: int): int {
+    let slot = fd - DIR_BASE;
+    if slot < 0 || slot >= DIR_SLOTS || DIR_STATE[slot] == 0 {
+        return 0 - 1;
+    }
+    if DIR_HANDLE[slot] != 0 - 1 {
+        k32.FindClose(DIR_HANDLE[slot]);
+    }
+    DIR_STATE[slot] = 0;
+    return 0;
+}
+
+/// Negative error for the last failed Win32 call, in the numbers `j3.io` knows: -2 not found, -17 exists,
+/// else minus the Win32 code.
+fn winErr(): int {
+    let e = errno();
+    if e == 2 || e == 3 {
+        return 0 - 2;
+    }
+    if e == 183 {
+        return 0 - 17;
+    }
+    if e <= 0 {
+        return 0 - 1;
+    }
+    return 0 - e;
+}
+
+/// `stat` of `path` (NUL-terminated) via `GetFileAttributesExA`. For a directory fd from `open`, `path` is a name
+/// inside it; otherwise `dir` is ignored (only `AT_FDCWD` or full paths work). Fills `out`: is-directory 1/0, size
+/// in bytes, mtime in unix seconds; a 4th slot, if present, gets is-symlink (always 0 here). 0, or a negative error.
+/// ponytail: GetFileAttributesExA never follows a reparse point, so this matches `lstatAt` for a link; follow
+/// with CreateFileA + GetFileInformationByHandle if that matters.
+pub fn statAt(dir: int, path: ptr, out: []int): int {
+    let r = lstatAt(dir, path, out);
+    if out.len > 3 {
+        out[3] = 0;
+    }
+    return r;
+}
+
+/// Like `statAt`, for the link itself: a 4th slot in `out`, if present, gets 1 for a reparse point (symlink or
+/// junction).
+pub fn lstatAt(dir: int, path: ptr, out: []int): int {
+    let target = path;
+    if dir >= DIR_BASE {
+        let slot = dir - DIR_BASE;
+        if slot >= DIR_SLOTS || DIR_STATE[slot] == 0 {
+            return 0 - 9;
+        }
+        let base = slot * DIR_PATH_MAX;
+        let n = 0;
+        while DIR_PATH[base + n] != 42 {
+            n += 1;
+        }
+        for k in 0..n {
+            FULL_PATH[k] = DIR_PATH[base + k];
+        }
+        let m = 0;
+        while n + m < 1090 && wb(path, m) != 0 {
+            FULL_PATH[n + m] = wb(path, m);
+            m += 1;
+        }
+        FULL_PATH[n + m] = 0;
+        target = &FULL_PATH[0] as ptr;
+    }
+    if k32.GetFileAttributesExA(target, u32(0), &STAT_W[0] as ptr) == 0 {
+        return winErr();
+    }
+    // WIN32_FILE_ATTRIBUTE_DATA: attributes @0, last write FILETIME (100 ns since 1601) @20/@24, size high @28, low @32
+    out[0] = if (int(STAT_W[0]) / 16) % 2 == 1 { 1 } else { 0 };
+    out[1] = int(STAT_W[7]) * 4294967296 + int(STAT_W[8]);
+    out[2] = (int(STAT_W[6]) * 4294967296 + int(STAT_W[5])) / 10000000 - 11644473600;
+    if out.len > 3 {
+        // FILE_ATTRIBUTE_REPARSE_POINT 0x400
+        out[3] = if (int(STAT_W[0]) / 1024) % 2 == 1 { 1 } else { 0 };
+    }
+    return 0;
+}
+
+/// Directory entries of a pseudo fd from `open`, as `linux_dirent64` records in `buf` (d_reclen u16 @16, d_name @19,
+/// NUL-terminated; no "." or ".."). Bytes written, 0 at the end, negative on error. Uses FindFirstFileA/FindNextFileA.
+pub fn dirents(fd: int, buf: []u8): int {
+    let slot = fd - DIR_BASE;
+    if slot < 0 || slot >= DIR_SLOTS || DIR_STATE[slot] == 0 {
+        return 0 - 9;
+    }
+    let data = &DIR_FIND[slot * FIND_SIZE] as ptr;
+    let used = 0;
+    while DIR_STATE[slot] != 3 {
+        if DIR_STATE[slot] == 1 {
+            let h = k32.FindFirstFileA(&DIR_PATH[slot * DIR_PATH_MAX] as ptr, data);
+            if h == 0 - 1 {
+                let e = winErr();
+                DIR_STATE[slot] = 3;
+                if e == 0 - 2 {
+                    return 0;
+                }
+                return e;
+            }
+            DIR_HANDLE[slot] = h;
+            DIR_STATE[slot] = 2;
+        }
+        // DIR_STATE 2: `data` holds an entry not yet written
+        let len = 0;
+        while wb(data, 44 + len) != 0 {
+            len += 1;
+        }
+        let dots = (len == 1 && wb(data, 44) == 46) || (len == 2 && wb(data, 44) == 46 && wb(data, 45) == 46);
+        if !dots {
+            let reclen = (19 + len + 1 + 7) / 8 * 8;
+            if used + reclen > buf.len {
+                if used == 0 {
+                    return 0 - 22;
+                }
+                return used;
+            }
+            for k in 0..reclen {
+                buf[used + k] = 0;
+            }
+            buf[used + 16] = u8(reclen % 256);
+            buf[used + 17] = u8(reclen / 256);
+            for k in 0..len {
+                buf[used + 19 + k] = wb(data, 44 + k);
+            }
+            used += reclen;
+        }
+        if k32.FindNextFileA(DIR_HANDLE[slot], data) == 0 {
+            DIR_STATE[slot] = 3;
+        }
+    }
+    return used;
+}
+/// Rename or move `from` to `to`, replacing `to` (`MoveFileExA` with REPLACE_EXISTING). 0, or a negative error.
+pub fn rename(from: ptr, to: ptr): int {
+    if k32.MoveFileExA(from, to, u32(1)) == 0 {
+        return winErr();
+    }
+    return 0;
+}
+/// Delete the file `path` (`DeleteFileA`). 0, or a negative error.
+pub fn unlink(path: ptr): int {
+    if k32.DeleteFileA(path) == 0 {
+        return winErr();
+    }
+    return 0;
+}
+/// Make the directory `path` (`CreateDirectoryA`; `mode` is ignored). 0, or a negative error (-17 when it exists).
+pub fn mkdir(path: ptr, mode: int): int {
+    if k32.CreateDirectoryA(path, 0) == 0 {
+        return winErr();
+    }
+    return 0;
+}
 /// Not on this target yet: -1.
 pub fn waitpid(pid: int, status: &i32, flags: int): int { return -1; }
 /// A `waitpid` status as a shell would show it: the exit code, or 128 + the signal that ended it.
@@ -366,7 +733,7 @@ pub fn exitCode(status: i32): int {
 /// Not on this target yet: -1.
 pub fn kill(pid: int, sig: int): int { return -1; }
 /// Not on this target yet: 0.
-pub fn getpid(): int { return 0; }
+pub fn getpid(): int { return int(k32.GetCurrentProcessId()); }
 /// Not on this target yet: -1.
 pub fn pollFds(fds: ptr, n: int, ms: int): int { return -1; }
 /// Not needed on this target.
@@ -391,8 +758,79 @@ let DL_NAME: [256]u8;
 /// No `envp` on Windows: 0.
 pub fn environ(): ptr { return 0; }
 
-/// Environment variable `name`, or "" when unset (Windows: not yet, always "").
-pub fn env(name: string): string { return ""; }
+/// One cached variable: its name and value, both in process-lifetime memory.
+struct EnvRow {
+    name: string;
+    value: string;
+}
+
+#[singleton]
+#[thread]
+let ENV_P: ptr;
+#[singleton]
+#[thread]
+let ENV_CAP: int = 0;
+#[singleton]
+#[thread]
+let ENV_N: int = 0;
+
+/// Environment variable `name`, or "" when unset (`GetEnvironmentVariableA`, asked twice so any length fits). The
+/// value is copied once into memory that is never freed, so the string stays valid for the whole process like on
+/// Linux. Each thread keeps its own cache, which grows without limit (page-backed). A value changed after the first
+/// read is not seen again.
+pub fn env(name: string): string {
+    let rows: []EnvRow = @slice(ENV_P, ENV_CAP);
+    for i in 0..ENV_N {
+        if rows[i].name.len == name.len {
+            let same = true;
+            for k in 0..name.len {
+                if rows[i].name[k] != name[k] {
+                    same = false;
+                    break;
+                }
+            }
+            if same {
+                return rows[i].value;
+            }
+        }
+    }
+    let need = int(k32.GetEnvironmentVariableA(cstrTmp(name), 0 as ptr, u32(0)));
+    if need <= 1 {
+        return "";
+    }
+    let block = mmapAnon(name.len + need);
+    if block as int == 0 {
+        return "";
+    }
+    let got = int(k32.GetEnvironmentVariableA(cstrTmp(name), (block as int + name.len) as ptr, u32(need)));
+    if got <= 0 || got >= need {
+        return "";
+    }
+    let nb: []u8 = @slice(block, name.len);
+    for k in 0..name.len {
+        nb[k] = name[k];
+    }
+    let vb: []u8 = @slice((block as int + name.len) as ptr, got);
+    let row = EnvRow { name: nb as string, value: vb as string };
+    if ENV_N >= ENV_CAP {
+        let cap = ENV_CAP * 2 + 16;
+        let fresh = mmapAnon(cap * @sizeof(EnvRow));
+        if fresh as int != 0 {
+            let moved: []EnvRow = @slice(fresh, cap);
+            for i in 0..ENV_N {
+                moved[i] = rows[i];
+            }
+            ENV_P = fresh;
+            ENV_CAP = cap;
+            rows = moved;
+        }
+    }
+    if ENV_N < ENV_CAP {
+        rows[ENV_N] = row;
+        ENV_N += 1;
+    }
+    return row.value;
+}
 
 /// The last failed call's error code (`GetLastError`).
 pub fn errno(): int {
@@ -407,4 +845,21 @@ pub fn dlopen(name: string): ptr {
 /// Address of `name` in a DLL from `dlopen`. 0 when missing.
 pub fn dlsym(handle: ptr, name: string): ptr {
     return k32.GetProcAddress(handle, cstrTmp(name));
+}
+
+#[singleton]
+let EXE_DIR: [1024]u8;
+
+/// Directory of the running executable, no trailing slash (`GetModuleFileNameA`). Valid until the
+/// next call; "" when it cannot be read.
+pub fn exeDir(): string {
+    let n = int(k32.GetModuleFileNameA(0, &EXE_DIR[0] as ptr, u32(1023)));
+    while n > 0 && EXE_DIR[n - 1] != 92 && EXE_DIR[n - 1] != 47 {
+        n -= 1;
+    }
+    if n <= 1 {
+        return "";
+    }
+    let bytes: []u8 = @slice(&EXE_DIR[0] as ptr, n - 1);
+    return bytes as string;
 }

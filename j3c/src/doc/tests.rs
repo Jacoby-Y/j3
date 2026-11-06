@@ -32,7 +32,7 @@ fn index_lists_tasks_modules_and_provenance() {
     assert!(text.contains("internal (not for games): "), "{text}");
     assert!(text.contains(" j3.scene3d.editor.paste "), "{text}");
     assert!(!text.contains("Main thread only"), "{text}");
-    assert!(text.len() < 16_000, "index grew to {} bytes", text.len());
+    assert!(text.len() < 17_400, "index grew to {} bytes", text.len());
 }
 
 #[test]
@@ -199,6 +199,7 @@ fn threads_guide_is_reachable_and_complete() {
 /// Every recipe's files make a program that `j3c check` accepts.
 #[test]
 fn recipes_check() {
+    let mut failed: Vec<String> = Vec::new();
     for r in crate::helptext::recipes() {
         if r.files.is_empty() {
             continue;
@@ -217,8 +218,11 @@ fn recipes_check() {
         };
         for t in targets {
             let code = crate::cli::run(["check".into(), t.display().to_string()]);
-            assert_eq!(code, 0, "recipe {} does not check", r.name);
+            if code != 0 {
+                failed.push(r.name.to_string());
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+    assert!(failed.is_empty(), "recipes that do not check: {:?}", failed);
 }

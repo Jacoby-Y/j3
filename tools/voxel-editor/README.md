@@ -90,6 +90,7 @@ color and an optional name. Anything unknown is ignored. A rig adds `part`, `vp`
 - **In the scene editor:** `export-mesh out.j3mesh [scale]` (or the *Export .j3mesh* button)
   writes a mesh the scene editor imports like any asset. Scale defaults to 0.1 units per voxel. It is the
   whole model at rest as one static mesh: parts, poses and overlays are not in it.
+- **As a dep:** `[deps] voxrig = "../tools/voxel-editor/runtime"`, then `use voxrig.j3voxel;` / `use voxrig.j3rig;` (`j3c help manifest`).
 - **A rigged model in a game:** `runtime/j3rig.j3` (see **Rigging** and **Overlays**).
 
 ## Agents: `vox run`
@@ -193,7 +194,7 @@ and `--view right`; a joint cross that sits off the limb in `--render` (leave jo
 
 **Animation:** a clip runs through saved poses spread evenly over its seconds (`loop` returns from the
 last pose to the first). `clip at walk 0.3` poses the model at 0.3 s, so a render of each time is a
-frame to review. A clip key may carry its own time, `clip walk 0.8 loop a@0 b@0.3 c@0.5` (seconds from the start; no times means evenly spread). In the window, the Rig tab shows a **timeline** under the view (drag its top edge to resize): pick or make a clip, Play (Space), drag the red playhead or a key, and edit the pose with the handles (click a joint to select it, drag a ring to turn it, drag the orange diamond on a wrist to reach with the arm); with Auto-key on the edit becomes a key at the playhead, otherwise press Set key. Drag the edges of the side panels to resize them. Up to 64 poses and 16 keys per clip. **In a game:** copy `runtime/j3rig.j3` beside `j3voxel.j3` (rename the modules as that
+frame to review. A clip key may carry its own time, `clip walk 0.8 loop a@0 b@0.3 c@0.5` (seconds from the start; no times means evenly spread). In the window, the Rig tab shows a **timeline** under the view (drag its top edge to resize): pick or make a clip, Play (Space), drag the red playhead or a key, and edit the pose with the handles (click a joint to select it, drag a ring to turn it, drag the orange diamond on a wrist to reach with the arm); with Auto-key on the edit becomes a key at the playhead, otherwise press Set key. Drag the edges of the side panels to resize them. Up to 64 poses and 16 keys per clip. **In a game:** copy `runtime/j3rig.j3` and its `runtime/j3rig/` folder (parts of the same module) beside `j3voxel.j3` (rename the modules as that
 file says): `j3rig.load` / `upload`, then each frame `sample` (or `pose`, `blend`, `setAngle` by part name)
 into an angles array and `j3rig.draw(&rig, Mat4.translate(...), angles, mats)`. Parts are meshed
 separately and turned about their joints, with no skinning, so a part never bends.
@@ -245,5 +246,5 @@ check, humanoid; `overlay.j3` overlay shells and painting; `overlaypng.j3` the P
 `cmd.j3` the command language;
 `mesh.j3` / `view.j3` / `shot.j3` triangles, the camera pass, and the hidden-window PNG renderer;
 `pick.j3` ray to voxel; `world.j3` `edit.j3` `files.j3` `panels.j3` `gui.j3` the window;
-`selftest.j3`; `runtime/j3voxel.j3` the game-side loader and `runtime/j3rig.j3` for rigs, clips and overlays. One rule of the language to know
+`selftest.j3`. Big modules (`model`, `rig`, `cmd`, `format`, `panels`, `runtime/j3rig`) keep their rest in a folder beside the file, `module` line repeated (`src/model/*.j3`, ...). `runtime/j3voxel.j3` the game-side loader and `runtime/j3rig.j3` for rigs, clips and overlays. One rule of the language to know
 when editing: a name may be declared once per function, even in sibling blocks.

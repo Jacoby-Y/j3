@@ -48,6 +48,41 @@ pub enum FloatTy {
     F64,
 }
 
+/// SIMD vector types: 4 lanes, 16 bytes, align 16. `vec4f` is 4 x f32, `vec4i` is 4 x i32.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum VecTy {
+    F32x4,
+    I32x4,
+}
+
+impl VecTy {
+    pub const LANES: u64 = 4;
+
+    /// Source spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            VecTy::F32x4 => "vec4f",
+            VecTy::I32x4 => "vec4i",
+        }
+    }
+
+    /// LLVM type.
+    pub fn llvm(self) -> &'static str {
+        match self {
+            VecTy::F32x4 => "<4 x float>",
+            VecTy::I32x4 => "<4 x i32>",
+        }
+    }
+
+    /// LLVM type of one lane.
+    pub fn lane_llvm(self) -> &'static str {
+        match self {
+            VecTy::F32x4 => "float",
+            VecTy::I32x4 => "i32",
+        }
+    }
+}
+
 /// Canonical type. Interned in [`crate::ir::cx::IrCx`].
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TyKind {
@@ -75,6 +110,10 @@ pub enum TyKind {
     },
     Struct(StructId),
     Enum(EnumId),
+    /// `f16`: storage only (2 bytes, align 2). Held as its IEEE-754 binary16 bits.
+    Half,
+    /// `vec4f` / `vec4i`. Lanes are `.x .y .z .w`.
+    Vec(VecTy),
 }
 
 impl TyKind {

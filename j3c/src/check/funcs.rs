@@ -8,7 +8,13 @@ pub(super) fn collect_funcs(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Re
 
     for it in &items {
         match it {
+            Item::Fn(f) if !f.type_params.is_empty() => {
+                register_generic_fn(&mut mods[i], &path, f)?;
+            }
             Item::Fn(f) => {
+                if mods[i].gen_fns.contains_key(&f.name.name) {
+                    return Err(CheckError::new(path, f.name.span, format!("duplicate fn `{}`", f.name.name)));
+                }
                 let existing = mods[i].funcs.clone();
                 let id = alloc_fn_mod(cx, &mut mods[i], &path, &names, &types, f, None, &existing)?;
                 mods[i].funcs.insert(f.name.name.clone(), id);
@@ -154,9 +160,21 @@ pub(crate) fn alloc_fn(
         params.push(resolve_type_g(cx, &p.ty, path, env)?);
     }
     let ret = match &f.ret {
-        Some(t) => resolve_type_g(cx, t, path, env)?,
+        Some(t) => {
+            let r = resolve_type_g(cx, t, path, env)?;
+            reject_closure(cx, path, t.span, r, "returned")?;
+            r
+        }
         None => cx.common.void,
     };
+    // A `.j3s` script cannot hold a closure (the VM has no fn values).
+    if method_of.is_some_and(|s| cx.struct_def(s).script.is_some())
+        && f.params.iter().zip(&params).any(|(_, p)| cx.closure_sig(*p).is_some())
+    {
+        let at = f.params.iter().zip(&params).find(|(_, p)| cx.closure_sig(**p).is_some()).map(|(p, _)| p.ty.span).unwrap();
+        return Err(CheckError::new(path, at, "closures are not supported in .j3s scripts")
+            .help("scripts run on the VM, which has no function values; move this code into a `.j3` module"));
+    }
     let ty = cx.ty_fn(params, ret);
     let vis = if f.vis_pub { Vis::Pub } else { Vis::Private };
     let fname = cx.intern_name(&f.name.name);

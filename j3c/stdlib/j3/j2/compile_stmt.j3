@@ -1,0 +1,379 @@
+// Statements: declarations, assignment, control flow, loops. Part of `j3.j2` (the compiler).
+//
+// Loops and captured variables: each iteration's variables are fresh. When a closure captured
+// one (known once the body is compiled), an `OP_CLOSE` at the end of the body (where `continue`
+// lands) closes it before the next iteration, and another at the exit (where `break` lands).
+
+module j3.j2;
+
+/// The arithmetic opcode of `+ - * / %` or `+= -= *= /= %=`, else -1.
+fn arithOp(tok: int): int {
+    let k = if tok >= lex.T_PLUS_EQ && tok <= lex.T_PERCENT_EQ { tok - (lex.T_PLUS_EQ - lex.T_PLUS) } else { tok };
+    if k == lex.T_PLUS { return OP_ADD; }
+    if k == lex.T_MINUS { return OP_SUB; }
+    if k == lex.T_STAR { return OP_MUL; }
+    if k == lex.T_SLASH { return OP_DIV; }
+    if k == lex.T_PERCENT { return OP_MOD; }
+    return -1;
+}
+
+extend Compiler {
+    fn stmt(this: &Compiler, n: int) {
+        let mark = this.fs().free;
+        if !this.stmtInner(n) { this.fs().free = mark; }
+    }
+
+    /// One statement; true when it keeps a register (a new local).
+    fn stmtInner(this: &Compiler, n: int): bool {
+        let nd = this.node(n);
+        let k = nd.kind;
+        if k == parse.N_LET {
+            let isConst = (nd.flags & parse.F_CONST) != 0;
+            if this.atTop() {
+                let t = this.alloc(n);
+                if nd.a >= 0 { this.exprTo(nd.a, t); } else { this.emitABC(n, OP_LOADNIL, t, 0, 0); }
+                this.setTop(n, nd.s, t);
+                return false;
+            }
+            let r = this.alloc(n);
+            if nd.a >= 0 { this.exprTo(nd.a, r); } else { this.emitABC(n, OP_LOADNIL, r, 0, 0); }
+            this.addLocal(nd.s, r, isConst);
+            return true;
+        }
+        if k == parse.N_FNDECL {
+            if this.atTop() { return false; } // hoisted by `mainFn`
+            let r = this.alloc(n);
+            this.addLocal(nd.s, r, false); // before the body, so it can call itself
+            let idx = this.function(n);
+            this.emitABx(n, OP_CLOSURE, r, idx);
+            return true;
+        }
+        if k == parse.N_USE {
+            return false; // top level only (the parser checks); resolved by `mainFn`
+        }
+        if k == parse.N_ASSIGN {
+            this.assign(n);
+        } else if k == parse.N_EXPR {
+            this.exprNew(nd.a);
+        } else if k == parse.N_BLOCK {
+            this.block(n);
+        } else if k == parse.N_IF {
+            this.ifStmt(n);
+        } else if k == parse.N_WHILE {
+            this.whileStmt(n);
+        } else if k == parse.N_FOR_RANGE {
+            this.forRange(n);
+        } else if k == parse.N_FOR_IN {
+            this.forIn(n);
+        } else if k == parse.N_BREAK || k == parse.N_CONTINUE {
+            let f = this.fs();
+            if f.loops.len == 0 {
+                this.failAt(n, if k == parse.N_BREAK { "`break` outside a loop" } else { "`continue` outside a loop" });
+                return false;
+            }
+            let pc = this.jump(n, OP_JMP, 0);
+            let g = this.fs();
+            g.jumps.push(PendingJump { pc: pc, loop: g.loops.len - 1, isBreak: k == parse.N_BREAK });
+        } else if k == parse.N_RETURN {
+            if nd.a >= 0 {
+                let r = this.exprAny(nd.a);
+                this.emitABC(n, OP_RETURN, r, 1, 0);
+            } else {
+                this.emitABC(n, OP_RETURN, 0, 0, 0);
+            }
+        } else if k == parse.N_MATCH {
+            this.matchStmt(n);
+        } else {
+            this.failAt(n, "not a statement");
+        }
+        return false;
+    }
+
+    /// The statements of block node `n` in the current scope.
+    fn blockBody(this: &Compiler, n: int) {
+        let count = this.node(n).count;
+        for i in 0..count {
+            if this.failed { return; }
+            this.stmt(this.ast.kid(n, i));
+        }
+    }
+
+    fn block(this: &Compiler, n: int) {
+        let s = this.openScope();
+        this.blockBody(n);
+        this.closeScope(n, s, true);
+    }
+
+    fn assign(this: &Compiler, n: int) {
+        let nd = this.node(n);
+        let op = nd.op;
+        let arith = arithOp(op);
+        let target = this.node(nd.a);
+        if target.kind == parse.N_NAME {
+            let r = this.resolve(nd.a, target.s);
+            if r.isConst {
+                this.failName(nd.a, "can't assign to const", target.s);
+                return;
+            }
+            if r.kind == R_GLOBAL {
+                this.failName(nd.a, if this.isGlobal(target.s) { "can't assign to the host's" } else { "unknown name" }, target.s);
+                return;
+            }
+            if r.kind == R_LOCAL {
+                if arith < 0 {
+                    this.exprTo(nd.b, r.idx);
+                } else {
+                    this.arithTo(n, arith, r.idx, r.idx, nd.b);
+                }
+                return;
+            }
+            let t = this.alloc(n);
+            if arith < 0 {
+                this.exprTo(nd.b, t);
+            } else {
+                this.name(nd.a, t);
+                this.arithTo(n, arith, t, t, nd.b);
+            }
+            if r.kind == R_UP {
+                this.emitABC(n, OP_SETUP, t, r.idx, 0);
+            } else if r.kind == R_PUB {
+                this.emitABx(n, OP_SETPUB, t, this.strConst(n, target.s));
+            } else {
+                this.emitABx(n, OP_SETENV, t, r.idx);
+            }
+            return;
+        }
+        let o = this.exprAny(target.a);
+        let key = -1;
+        if target.kind == parse.N_INDEX { key = this.exprAny(target.b); }
+        let v = 0;
+        if arith < 0 {
+            v = this.exprAny(nd.b);
+        } else {
+            v = this.alloc(n);
+            if key >= 0 { this.emitABC(nd.a, OP_GETINDEX, v, o, key); } else { this.getField(nd.a, v, o, target.s); }
+            this.arithTo(n, arith, v, v, nd.b);
+        }
+        if key >= 0 {
+            this.emitABC(nd.a, OP_SETINDEX, o, key, v);
+        } else {
+            this.setField(nd.a, o, target.s, v);
+        }
+    }
+
+    /// `R[dst] = R[o].name`.
+    fn getField(this: &Compiler, n: int, dst: int, o: int, name: string) {
+        let k = this.strConst(n, name);
+        if k <= 255 {
+            this.emitABC(n, OP_GETFIELD, dst, o, k);
+            return;
+        }
+        let t = this.alloc(n);
+        this.emitABx(n, OP_LOADK, t, k);
+        this.emitABC(n, OP_GETINDEX, dst, o, t);
+    }
+
+    /// `R[o].name = R[v]`.
+    fn setField(this: &Compiler, n: int, o: int, name: string, v: int) {
+        let k = this.strConst(n, name);
+        if k <= 255 {
+            this.emitABC(n, OP_SETFIELD, o, k, v);
+            return;
+        }
+        let t = this.alloc(n);
+        this.emitABx(n, OP_LOADK, t, k);
+        this.emitABC(n, OP_SETINDEX, o, t, v);
+    }
+
+    /// Test condition `cond` and jump when its truth is `when`; the jump's pc, to patch. A
+    /// comparison becomes one compare-and-jump op (`OP_TLT` .. + `OP_JMP`) with a literal right
+    /// side as a constant operand; anything else is computed and tested with `OP_JMPIF(NOT)`.
+    /// The jump carries node `at`'s position: a backward one that spends the step budget reports there.
+    fn condJump(this: &Compiler, cond: int, when: bool, at: int): int {
+        let nd = this.node(cond);
+        let mark = this.fs().free;
+        if nd.kind == parse.N_BINARY {
+            let op = nd.op;
+            let top = -1;
+            let want = when;
+            if op == lex.T_EQ || op == lex.T_NE {
+                top = OP_TEQ;
+                if op == lex.T_NE { want = !when; }
+            } else if op == lex.T_LT {
+                top = OP_TLT;
+            } else if op == lex.T_LE {
+                top = OP_TLE;
+            } else if op == lex.T_GT {
+                top = OP_TGT;
+            } else if op == lex.T_GE {
+                top = OP_TGE;
+            }
+            if top >= 0 {
+                let flag = if want { TEST_TRUE } else { 0 };
+                let x = this.exprAny(nd.a);
+                let k = this.rkConst(nd.b);
+                if k >= 0 {
+                    this.emitABC(cond, top, x, k, flag | TEST_K);
+                } else {
+                    let y = this.exprAny(nd.b);
+                    // two registers: `x > y` is `y < x`, as the value-producing ops do
+                    if top == OP_TGT {
+                        this.emitABC(cond, OP_TLT, y, x, flag);
+                    } else if top == OP_TGE {
+                        this.emitABC(cond, OP_TLE, y, x, flag);
+                    } else {
+                        this.emitABC(cond, top, x, y, flag);
+                    }
+                }
+                this.fs().free = mark;
+                return this.jump(at, OP_JMP, 0);
+            }
+        }
+        let c = this.exprAny(cond);
+        this.fs().free = mark;
+        return this.jump(at, if when { OP_JMPIF } else { OP_JMPIFNOT }, c);
+    }
+
+    fn ifStmt(this: &Compiler, n: int) {
+        let nd = this.node(n);
+        let skip = this.condJump(nd.a, false, n);
+        this.block(nd.b);
+        if nd.c >= 0 {
+            let over = this.jump(n, OP_JMP, 0);
+            this.patch(skip, this.here());
+            if this.node(nd.c).kind == parse.N_IF { this.ifStmt(nd.c); } else { this.block(nd.c); }
+            this.patch(over, this.here());
+        } else {
+            this.patch(skip, this.here());
+        }
+    }
+
+    /// Start a loop whose per-iteration variables begin at register `level`.
+    fn openLoop(this: &Compiler, level: int): int {
+        let f = this.fs();
+        f.loops.push(LoopInfo { level: level, captured: false });
+        return f.loops.len - 1;
+    }
+
+    /// End loop `li`: point its `continue`s at `cont` and its `break`s at `exit`.
+    fn closeLoop(this: &Compiler, li: int, cont: int, exit: int) {
+        let f = this.fs();
+        let i = 0;
+        while i < f.jumps.len {
+            let j = f.jumps.items[i];
+            if j.loop == li {
+                this.patch(j.pc, if j.isBreak { exit } else { cont });
+                f.jumps.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+        f.loops.len = li;
+    }
+
+    fn loopCaptured(this: &Compiler, li: int): bool { return this.fs().loops.items[li].captured; }
+
+    /// The condition sits after the body (entered by one jump), so an iteration dispatches one
+    /// compare-and-jump back instead of a test, a jump out and a jump back.
+    fn whileStmt(this: &Compiler, n: int) {
+        let nd = this.node(n);
+        let mark = this.fs().free;
+        let enter = this.jump(n, OP_JMP, 0);
+        let body = this.here();
+        let li = this.openLoop(mark);
+        let s = this.openScope();
+        this.blockBody(nd.b);
+        this.closeScope(nd.b, s, false);
+        let cont = this.here();
+        let captured = this.loopCaptured(li);
+        if captured { this.emitABC(nd.b, OP_CLOSE, mark, 0, 0); }
+        this.patch(enter, this.here());
+        this.patch(this.condJump(nd.a, true, n), body);
+        let exit = this.here();
+        if captured { this.emitABC(nd.b, OP_CLOSE, mark, 0, 0); }
+        this.closeLoop(li, cont, exit);
+    }
+
+    /// `for v in a..b`: counter, limit, then the variable.
+    fn forRange(this: &Compiler, n: int) {
+        let nd = this.node(n);
+        let base = this.alloc(n);
+        this.alloc(n);
+        this.exprTo(nd.a, base);
+        this.exprTo(nd.b, base + 1);
+        let v = this.alloc(n);
+        let prep = this.jump(n, OP_FORPREP, base);
+        let body = this.here();
+        let li = this.openLoop(v);
+        let s = this.openScope();
+        this.addLocal(nd.s, v, false);
+        this.blockBody(nd.c);
+        this.closeScope(nd.c, s, false);
+        let cont = this.here();
+        let captured = this.loopCaptured(li);
+        if captured { this.emitABC(nd.c, OP_CLOSE, v, 0, 0); }
+        this.jumpBack(n, OP_FORLOOP, base, body);
+        let exit = this.here();
+        if captured { this.emitABC(nd.c, OP_CLOSE, v, 0, 0); }
+        this.patch(prep, exit);
+        this.closeLoop(li, cont, exit);
+    }
+
+    /// `for v in xs` / `for i, v in xs` / `for k, v in t`: iterable, position, key, value.
+    fn forIn(this: &Compiler, n: int) {
+        let nd = this.node(n);
+        let base = this.alloc(n);
+        this.exprTo(nd.a, base);
+        this.alloc(n);
+        let kreg = this.alloc(n);
+        let vreg = this.alloc(n);
+        let prep = this.jump(n, OP_FORINPREP, base);
+        let body = this.here();
+        let li = this.openLoop(kreg);
+        let s = this.openScope();
+        if nd.count == 2 {
+            this.addLocal(this.node(this.ast.kid(n, 0)).s, kreg, false);
+            this.addLocal(this.node(this.ast.kid(n, 1)).s, vreg, false);
+        } else if nd.count == 1 {
+            this.addLocal(this.node(this.ast.kid(n, 0)).s, vreg, false);
+        }
+        this.blockBody(nd.c);
+        this.closeScope(nd.c, s, false);
+        let cont = this.here();
+        let captured = this.loopCaptured(li);
+        if captured { this.emitABC(nd.c, OP_CLOSE, kreg, 0, 0); }
+        this.jumpBack(n, OP_FORINNEXT, base, body);
+        let exit = this.here();
+        if captured { this.emitABC(nd.c, OP_CLOSE, kreg, 0, 0); }
+        this.patch(prep, cont);
+        this.closeLoop(li, cont, exit);
+    }
+
+    /// Arms test `subject == pattern` in order; `_` takes the rest.
+    fn matchStmt(this: &Compiler, n: int) {
+        let nd = this.node(n);
+        let subj = this.exprAny(nd.a);
+        let ends = List<int>.new(this.mem);
+        for i in 0..nd.count {
+            let arm = this.ast.kid(n, i);
+            let an = this.node(arm);
+            if an.a < 0 {
+                this.block(an.b);
+                break;
+            }
+            let mark = this.fs().free;
+            let k = this.rkConst(an.a);
+            if k >= 0 {
+                this.emitABC(arm, OP_TEQ, subj, k, TEST_K);
+            } else {
+                this.emitABC(arm, OP_TEQ, subj, this.exprAny(an.a), 0);
+            }
+            this.fs().free = mark;
+            let next = this.jump(arm, OP_JMP, 0);
+            this.block(an.b);
+            ends.push(this.jump(arm, OP_JMP, 0));
+            this.patch(next, this.here());
+        }
+        for i in 0..ends.len { this.patch(ends.items[i], this.here()); }
+    }
+}

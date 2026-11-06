@@ -30,6 +30,10 @@ impl Diagnostic {
         }
     }
 
+    pub fn warning(path: impl Into<String>, span: Span, message: impl Into<String>) -> Diagnostic {
+        Diagnostic { level: Level::Warning, ..Diagnostic::error(path, span, message) }
+    }
+
     pub fn note(mut self, msg: impl Into<String>) -> Diagnostic {
         self.notes.push(msg.into());
         self
@@ -117,13 +121,14 @@ fn render(
     out
 }
 
-/// Closest identifier. Distance 1, or 2 when the name is long enough.
+/// Closest identifier. Distance 1, or 2 when the name is longer than 4.
 pub fn did_you_mean(name: &str, candidates: &[String]) -> Option<String> {
     if name.is_empty() || candidates.is_empty() {
         return None;
     }
-    let max = if name.len() <= 2 { 1 } else { 2 };
-    let mut best: Option<(usize, &str)> = None;
+    let max = if name.len() <= 4 { 1 } else { 2 };
+    // On a tie, a candidate sharing the name's first letters wins (`y` -> `yy`, not `x`).
+    let mut best: Option<((usize, bool), &str)> = None;
     for c in candidates {
         if c == name {
             continue;
@@ -132,8 +137,9 @@ pub fn did_you_mean(name: &str, candidates: &[String]) -> Option<String> {
         if d == 0 || d > max {
             continue;
         }
-        if best.map(|(bd, _)| d < bd).unwrap_or(true) {
-            best = Some((d, c.as_str()));
+        let key = (d, !(c.starts_with(name) || name.starts_with(c.as_str())));
+        if best.map(|(bk, _)| key < bk).unwrap_or(true) {
+            best = Some((key, c.as_str()));
         }
     }
     best.map(|(_, s)| s.to_string())
@@ -145,6 +151,8 @@ fn edit_distance(a: &str, b: &str) -> usize {
     if a.len().abs_diff(b.len()) > 2 {
         return 3;
     }
+    // Levenshtein plus adjacent swaps (`grwo` -> `grow` is one edit)
+    let mut prev2: Vec<usize> = vec![0; b.len() + 1];
     let mut prev: Vec<usize> = (0..=b.len()).collect();
     let mut cur = vec![0; b.len() + 1];
     for (i, ca) in a.iter().enumerate() {
@@ -152,7 +160,11 @@ fn edit_distance(a: &str, b: &str) -> usize {
         for (j, cb) in b.iter().enumerate() {
             let cost = if ca == cb { 0 } else { 1 };
             cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+            if i > 0 && j > 0 && *ca == b[j - 1] && a[i - 1] == *cb {
+                cur[j + 1] = cur[j + 1].min(prev2[j - 1] + 1);
+            }
         }
+        std::mem::swap(&mut prev2, &mut prev);
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
@@ -184,5 +196,6 @@ mod tests {
         assert_eq!(did_you_mean("statr", &names).as_deref(), Some("start"));
         assert_eq!(did_you_mean("stp", &names).as_deref(), Some("step"));
         assert_eq!(did_you_mean("zzzz", &names), None);
+        assert_eq!(did_you_mean("stpe", &names).as_deref(), Some("step"));
     }
 }

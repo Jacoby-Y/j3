@@ -191,6 +191,7 @@ impl<'a> Lower<'a> {
                 (first.ty(), elems.len() as u64)
             }
         };
+        reject_closure(self.cx, self.path, span, elem_ty, "an array element")?;
         let ty = self.cx.ty_array(elem_ty, len);
         let mut fields = Vec::new();
         for e in elems {
@@ -276,6 +277,7 @@ impl<'a> Lower<'a> {
             "u16" => self.cx.common.u16,
             "u32" => self.cx.common.u32,
             "u64" => self.cx.common.u64,
+            "f16" => self.cx.common.f16,
             "f32" => self.cx.common.f32,
             "f64" | "float" => self.cx.common.float,
             _ => return None,

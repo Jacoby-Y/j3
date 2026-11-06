@@ -3,6 +3,7 @@
 //! Pipeline: parse → typecheck → typed IR → emit (LLVM default, C optional).
 
 pub mod android_run;
+pub mod appconfig;
 pub mod check;
 pub mod cli;
 pub mod preflight;
@@ -38,3 +39,4 @@ pub mod scenefile;
 pub mod span;
 pub mod ui;
 pub mod stdlib;
+pub mod steamcheck;

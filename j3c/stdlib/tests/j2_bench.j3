@@ -1,0 +1,171 @@
+// j2 benchmarks (plan 032 chunk 12). Timing only: not wired into cargo tests. Run optimized:
+//   timeout 300 j3c run --opt 2 j3c/stdlib/tests/j2_bench.j3
+// Each line is the best of `RUNS` runs. Linux (reads the clock with a raw syscall).
+
+module j2_bench;
+
+use j3.io.printLn;
+use j3.j2;
+use j3.j2.{ Vm, Value, Limits };
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+
+const RUNS: int = 5;
+
+/// Nanoseconds on the monotonic clock (`clock_gettime`, Linux x86-64).
+fn nowNs(): int {
+    let ts: [2]int = [0, 0];
+    @syscall(228, 1, &ts[0] as ptr);
+    return ts[0] * 1000000000 + ts[1];
+}
+
+const SRC: [14]string = [
+    "pub fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }",
+    "pub fn fields(n) {",
+    "    let p = { x: 0, y: 0, vx: 1, vy: 2 };",
+    "    for i in 0..n { p.x = p.x + p.vx; p.y += p.vy; }",
+    "    return p.x + p.y;",
+    "}",
+    "pub fn loop(n) { let s = 0; let i = 0; while i < n { if i % 3 == 0 { s += i; } i += 1; } return s; }",
+    "pub fn strings(n) {",
+    "    let parts = [];",
+    "    for i in 0..n { parts.push(`item {i}`); }",
+    "    return len(join(parts, \",\"));",
+    "}",
+    "pub fn update(this, dt) { this.x += this.vx * dt; this.t += dt; }",
+    "pub fn enemy(i) { return { x: i, vx: 2, t: 0 }; }",
+];
+
+fn load(vm: &Vm, name: string, src: string): Value {
+    match vm.loadString(name, src) {
+        Result.Ok(t) { return t; }
+        Result.Err(e) {
+            printLn(e.message);
+            panic("load");
+        }
+    }
+}
+
+fn call1(vm: &Vm, f: Value, x: int): Value {
+    let one: [1]Value = [j2.int(x)];
+    match vm.call(f, one[0..1]) {
+        Result.Ok(v) { return v; }
+        Result.Err(e) {
+            printLn(e.message);
+            panic("call");
+        }
+    }
+}
+
+/// Best-of-RUNS ns for `f(arg)`; checks the result against `want`.
+fn bench(vm: &Vm, exp: Value, name: string, arg: int, want: int): int {
+    let f = exp.asTable().get(name);
+    let best = 0;
+    for r in 0..RUNS {
+        let t0 = nowNs();
+        let v = call1(vm, f, arg);
+        let dt = nowNs() - t0;
+        if v.bits != want { panic(name); }
+        if r == 0 || dt < best { best = dt; }
+    }
+    return best;
+}
+
+/// Print `label  12.345 ms` (a backtick string can't be returned: it lives in this frame).
+fn report(label: string, ns: int, per: int) {
+    let t = ns / 1000;
+    let frac = t % 1000;
+    let pad = if frac < 10 { "00" } else if frac < 100 { "0" } else { "" };
+    if per > 0 {
+        printLn(`{label} {t / 1000}.{pad}{frac} ms ({ns / per} ns each)`);
+    } else {
+        printLn(`{label} {t / 1000}.{pad}{frac} ms`);
+    }
+}
+
+/// A 2000-line script: 200 functions of 10 lines (locals, arithmetic, branches, fields, calls).
+fn genScript(t: &Text) {
+    for i in 0..200 {
+        t.pushStr("fn f");
+        t.pushInt(i);
+        t.pushStr("(a, b) {\n");
+        t.pushStr("    let x = a * 2 + b;\n");
+        t.pushStr("    let p = { x: x, y: b, name: \"thing\" };\n");
+        t.pushStr("    if p.x > 10 { p.y = p.y - 1; } else { p.y += 3; }\n");
+        t.pushStr("    for k in 0..4 { x += k * p.y; }\n");
+        t.pushStr("    let s = `v={x} y={p.y}`;\n");
+        t.pushStr("    while x > 100 { x = x / 2; }\n");
+        t.pushStr("    if x == ");
+        t.pushInt(i);
+        t.pushStr(" { return f");
+        t.pushInt(if i > 0 { i - 1 } else { 0 });
+        t.pushStr("(x, b); }\n");
+        t.pushStr("    return [x, s, p];\n");
+        t.pushStr("}\n");
+    }
+}
+
+fn main() {
+    let mem = Arena.create(4 << 20);
+    let vm = Vm.new(&mem, Limits { heapBytes: 256 << 20, stepsPerCall: 1 << 40 });
+    vm.openLibs(j2.LIB_ALL);
+    let st = Text.new(&mem);
+    for i in 0..SRC.len {
+        st.pushStr(SRC[i]);
+        st.push(10);
+    }
+    let exp = load(&vm, "bench", st.str());
+
+    report("fib(30)", bench(&vm, exp, "fib", 30, 832040), 0);
+    report("1M loop, table fields", bench(&vm, exp, "fields", 1000000, 3000000), 0);
+    report("1M while loop, % and if", bench(&vm, exp, "loop", 1000000, 166666833333), 0);
+    report("100k template strings + join", bench(&vm, exp, "strings", 100000, 1088889), 0);
+
+    // the per-enemy hook: 10k callWithThis from J3 over 100 tables
+    let enemies = mem.alloc::<Value>(100);
+    let mk = exp.asTable().get("enemy");
+    for i in 0..100 {
+        enemies[i] = call1(&vm, mk, i);
+        vm.keep(enemies[i]);
+    }
+    let upd = exp.asTable().get("update");
+    let dt: [1]Value = [j2.num(0.016)];
+    let best = 0;
+    for r in 0..RUNS {
+        let t0 = nowNs();
+        for i in 0..10000 {
+            match vm.callWithThis(upd, enemies[i % 100], dt[0..1]) {
+                Result.Ok(_) { }
+                Result.Err(e) {
+                    printLn(e.message);
+                    panic("update");
+                }
+            }
+        }
+        let d = nowNs() - t0;
+        if r == 0 || d < best { best = d; }
+    }
+    report("10k callWithThis", best, 10000);
+
+    // compile time of a generated 2000-line script (no run)
+    let t = Text.new(&mem);
+    genScript(&t);
+    let src = t.str();
+    let cbest = 0;
+    for r in 0..RUNS {
+        let t0 = nowNs();
+        match j2.compileChunk(&vm, "gen", src) {
+            Result.Ok(_) { }
+            Result.Err(e) {
+                printLn(e.message);
+                panic("compile");
+            }
+        }
+        let d = nowNs() - t0;
+        if r == 0 || d < cbest { cbest = d; }
+    }
+    report("compile 2000 lines", cbest, 0);
+    printLn("j2_bench ok");
+}

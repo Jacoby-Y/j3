@@ -25,7 +25,7 @@ impl<'a> Parser<'a> {
             TokenKind::Struct => Ok(Item::Struct(self.struct_item(vis_pub, false, doc)?)),
             TokenKind::Enum => Ok(Item::Enum(self.enum_item(
                 vis_pub,
-                ItemAttrs { debug: false, try_catch: None, singleton: false, thread: false },
+                ItemAttrs { debug: false, try_catch: None, singleton: false, thread: false, impl_fn: false, shader: None, gpu_struct: GpuStruct::None, uniform: false, flat: false },
                 doc,
             )?)),
             TokenKind::Ident if !vis_pub && self.cur().text == SCRIPT_PROPS => {
@@ -35,6 +35,12 @@ impl<'a> Parser<'a> {
             TokenKind::Ident if !vis_pub && self.cur().text == SCRIPT_SHARED => {
                 self.forbid_doc(&doc)?;
                 Ok(Item::Shared(self.script_block(SCRIPT_SHARED)?))
+            }
+            TokenKind::Ident if self.at_extend_item() => {
+                Err(self.err("scripts can't use `extend`; put the methods in the struct body"))
+            }
+            TokenKind::Ident if self.at_trait_item() => {
+                Err(self.err("traits live in .j3 modules; scripts cannot declare them"))
             }
             TokenKind::Let if !vis_pub => {
                 self.forbid_doc(&doc)?;
@@ -72,6 +78,7 @@ impl<'a> Parser<'a> {
                 name,
                 ty,
                 embedded: false,
+                flat: false,
                 default,
             });
         }
@@ -135,6 +142,9 @@ impl<'a> Parser<'a> {
             vis_pub,
             name,
             type_params: Vec::new(),
+            bounds: Vec::new(),
+            is_impl: false,
+            shader: None,
             params,
             ret: None,
             body,

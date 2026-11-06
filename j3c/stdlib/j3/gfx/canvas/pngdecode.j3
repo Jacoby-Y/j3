@@ -1,0 +1,219 @@
+// Part of j3.gfx.canvas (PNG reader: decodePng, loadPng).
+
+module j3.gfx.canvas;
+
+/// Decode an 8-bit, non-interlaced PNG (gray, RGB, palette, gray+alpha, RGBA) to RGBA8.
+/// Returns a canvas with `w == 0` when the bytes are not one of those. The Rust side
+/// (`j3c/src/png.rs` `decode`) is the same algorithm; fix both together.
+// ponytail: CRC and Adler aren't checked; 16-bit, interlaced, and low-bit-depth PNGs give w == 0.
+pub fn decodePng(bytes :[] u8, arena : &Arena) : Canvas {
+    // Only the pixels land in `arena`; the zlib stream and raw rows are freed here.
+    let tmp = Arena.create(65536);
+    let c = decodeWith(bytes, arena, &tmp);
+    tmp.destroy();
+    return c;
+}
+
+fn decodeWith(bytes :[] u8, arena : &Arena, tmp : &Arena) : Canvas {
+    let fail = Canvas {
+        pixels : arena.alloc::< u8 >(0), w : 0, h : 0, mode : Mode.Pixel
+    };
+    if bytes.len < 8 || bytes[0] != 137 || bytes[1] != 80 || bytes[2] != 78 || bytes[3] != 71 {
+        return fail;
+    }
+    // First pass: header, palette, transparency, and the total IDAT size.
+    let at = 8;
+    let w = 0;
+    let h = 0;
+    let depth = 0;
+    let ctype = 0;
+    let interlace = 0;
+    let plte = 0;
+    let plteLen = 0;
+    let trns = 0;
+    let trnsLen = 0;
+    let zlen = 0;
+    while at + 12 <= bytes.len {
+        let len = be32at(bytes, at);
+        if len < 0 || at + 12 + len > bytes.len {
+            return fail;
+        }
+        let d = at + 8;
+        if isType(bytes, at + 4, 73, 72, 68, 82) && len == 13 {
+            w = be32at(bytes, d);
+            h = be32at(bytes, d + 4);
+            depth = int(bytes[d + 8]);
+            ctype = int(bytes[d + 9]);
+            interlace = int(bytes[d + 12]);
+        } else if isType(bytes, at + 4, 80, 76, 84, 69) {
+            plte = d;
+            plteLen = len;
+        } else if isType(bytes, at + 4, 116, 82, 78, 83) {
+            trns = d;
+            trnsLen = len;
+        } else if isType(bytes, at + 4, 73, 68, 65, 84) {
+            zlen += len;
+        } else if isType(bytes, at + 4, 73, 69, 78, 68) {
+            break;
+        }
+        at += 12 + len;
+    }
+    let ch = 0;
+    if ctype == 0 || ctype == 3 {
+        ch = 1;
+    } else if ctype == 2 {
+        ch = 3;
+    } else if ctype == 4 {
+        ch = 2;
+    } else if ctype == 6 {
+        ch = 4;
+    }
+    if ch == 0 || depth != 8 || interlace != 0 || w < 1 || h < 1 || w * h > 268435455 || zlen < 2 {
+        return fail;
+    }
+    // Second pass: the IDAT data joined into one zlib stream.
+    let z = tmp.alloc::< u8 >(zlen);
+    let zi = 0;
+    at = 8;
+    while at + 12 <= bytes.len {
+        let size = be32at(bytes, at);
+        if isType(bytes, at + 4, 73, 68, 65, 84) {
+            let k = 0;
+            while k < size {
+                z[zi + k] = bytes[at + 8 + k];
+                k += 1;
+            }
+            zi += size;
+        } else if isType(bytes, at + 4, 73, 69, 78, 68) {
+            break;
+        }
+        at += 12 + size;
+    }
+    let row = w * ch;
+    let raw = tmp.alloc::< u8 >(h *(row + 1));
+    if !inflate(z, raw, tmp) {
+        return fail;
+    }
+    // Undo the row filters in place.
+    let y = 0;
+    while y < h {
+        let base = y *(row + 1);
+        let f = int(raw[base]);
+        if f > 4 {
+            return fail;
+        }
+        let i = 0;
+        while i < row {
+            let a = 0;
+            let b = 0;
+            let c = 0;
+            if i >= ch {
+                a = int(raw[base + 1 + i -ch]);
+            }
+            if y > 0 {
+                b = int(raw[base -row + i]);
+                if i >= ch {
+                    c = int(raw[base -row + i -ch]);
+                }
+            }
+            let pred = 0;
+            if f == 1 {
+                pred = a;
+            } else if f == 2 {
+                pred = b;
+            } else if f == 3 {
+                pred =(a + b) / 2;
+            } else if f == 4 {
+                let p = a + b -c;
+                let pa = absi(p -a);
+                let pb = absi(p -b);
+                let pc = absi(p -c);
+                if pa <= pb && pa <= pc {
+                    pred = a;
+                } else if pb <= pc {
+                    pred = b;
+                } else {
+                    pred = c;
+                }
+            }
+            let v = int(raw[base + 1 + i]) + pred;
+            if v >= 256 {
+                v -= 256;
+            }
+            raw[base + 1 + i] = u8(v);
+            i += 1;
+        }
+        y += 1;
+    }
+    // Expand to RGBA.
+    let out = Canvas.create(arena, i32(w), i32(h), Mode.Pixel);
+    let px = out.pixels;
+    y = 0;
+    while y < h {
+        let x = 0;
+        while x < w {
+            let s = y *(row + 1) + 1 + x * ch;
+            let o =(y * w + x) *4;
+            if ctype == 0 {
+                px[o] = raw[s];
+                px[o + 1] = raw[s];
+                px[o + 2] = raw[s];
+                px[o + 3] = 255;
+            } else if ctype == 2 {
+                px[o] = raw[s];
+                px[o + 1] = raw[s + 1];
+                px[o + 2] = raw[s + 2];
+                px[o + 3] = 255;
+            } else if ctype == 3 {
+                let idx = int(raw[s]);
+                if idx * 3 + 3 > plteLen {
+                    return fail;
+                }
+                px[o] = bytes[plte + idx * 3];
+                px[o + 1] = bytes[plte + idx * 3 + 1];
+                px[o + 2] = bytes[plte + idx * 3 + 2];
+                px[o + 3] = 255;
+                if idx < trnsLen {
+                    px[o + 3] = bytes[trns + idx];
+                }
+            } else if ctype == 4 {
+                px[o] = raw[s];
+                px[o + 1] = raw[s];
+                px[o + 2] = raw[s];
+                px[o + 3] = raw[s + 1];
+            } else {
+                px[o] = raw[s];
+                px[o + 1] = raw[s + 1];
+                px[o + 2] = raw[s + 2];
+                px[o + 3] = raw[s + 3];
+            }
+            x += 1;
+        }
+        y += 1;
+    }
+    return out;
+}
+
+/// `decodePng` of a file; `w == 0` when it is missing or unsupported.
+pub fn loadPng(path : string, arena : &Arena) : Canvas {
+    let tmp = Arena.create(65536);
+    let c = Canvas {
+        pixels : arena.alloc::< u8 >(0), w : 0, h : 0, mode : Mode.Pixel
+    };
+    match readFile(path, &tmp) {
+        Result.Ok(bytes) {
+            c = decodeWith(bytes, arena, &tmp);
+        }
+        Result.Err(e) {}
+    }
+    tmp.destroy();
+    return c;
+}
+
+fn be32at(b :[] u8, i : int) : int {
+    return int(b[i]) *16777216 + int(b[i + 1]) *65536 + int(b[i + 2]) *256 + int(b[i + 3]);
+}
+
+fn isType(b :[] u8, i : int, c0 : int, c1 : int, c2 : int, c3 : int) : bool {
+    return int(b[i]) == c0 && int(b[i + 1]) == c1 && int(b[i + 2]) == c2 && int(b[i + 3]) == c3;
+}

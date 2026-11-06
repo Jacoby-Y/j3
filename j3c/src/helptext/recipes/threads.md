@@ -7,7 +7,7 @@ primitive.
 The idea: hand work over, do not share it.
 - A job is a plain `fn(ptr)` plus one `ptr` to a struct main owns. Put everything the job needs
   in that struct: its input, the buffer it alone writes, and the `&Queue` its result goes to.
-  There are no closures. The struct must outlive the job (here: slots in an arena).
+  A closure cannot be a job. The struct must outlive the job (here: slots in an arena).
 - A worker writes only what it was given. Main reads a result only after it comes back through
   the results `Queue` (or after `pool.wait()`). Nothing else orders threads; never spin on a
   plain flag. `@atomicAdd` / `@atomicLoad` are for counters and cancel flags.
@@ -26,5 +26,7 @@ The idea: hand work over, do not share it.
 - `memory.scratch` is per thread and a worker rewinds it after every job, so copy results into
   the struct main gave you. One `Arena` is never shared between threads.
 - Results arrive in any order. If they feed saves or replays, reduce in a fixed order
-  (`pool.parallelFor(n, f, ctx)` splits `0..n` for you; have `f` write `out[i]`).
+  (`pool.parallelForEach(n, fn(lo, hi) { .. })` splits `0..n` for you and waits; write `out[i]`.
+  The closure captures locals; `pool.parallelFor(n, f, ctx)` is the same with a plain `fn` and a ctx struct.
+  Both: one thread at a time, never from inside a pool job).
 - Call `pool.shutdown()` before destroying the arena the pool lives in.

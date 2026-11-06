@@ -1,0 +1,240 @@
+// Part of j3.game (2D painter: instance push, ramps, flush); the module doc and `use`s are in ../game.j3.
+module j3.game;
+
+/// Queue one 2D instance in view-local logical pixels. `kind`: 0 flat color, 1 `tex` sampled
+/// through `u0 v0 du dv` and tinted by `c1`, 2 rounded rect (`p0..p3` radii tl tr br bl,
+/// `bw` border width, `c2` border color), 3 circle (`p0` radius), 4 ring (`p0` outer radius,
+/// `bw` width), 5 line (`p0 p1` to `p2 p3`, `bw` radius; the rect is its bounds), 6 gradient
+/// rounded rect (kind 2, plus `u0 v0 du dv` = angle, ramp row, type 0 linear 1 radial 2 conic,
+/// flag 1 for the gradient on the border), 7 outer box shadow (`u0 v0` half size of the box, `du`
+/// sigma; the rect is the grown quad), 8 inset shadow (`u0 v0` offset, `du` sigma, `dv` spread),
+/// 9 dashed or dotted border (`u0` 1 dashed 2 dotted, `v0` period). Shapes are antialiased in the
+/// shader. Kind 10 is a rounded framebuffer texture sampled in physical screen coordinates.
+/// Batches until the texture or clip changes; `p2Flush` draws them.
+/// `j3.gfx.paint` is the public face of this.
+pub fn p2Push(
+    kind: int, x: f32, y: f32, w: f32, h: f32, u0: f32, v0: f32, du: f32, dv: f32,
+    c1: Color, c2: Color, p0: f32, p1: f32, p2: f32, p3: f32, bw: f32, tex: u32,
+) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    if !HUD.ready {
+        if !platform.gl {
+            panic("j3.gfx.paint needs GL: call app.useGl() and link \"GL\"");
+        }
+        hudInit();
+    }
+    if P2.clipOn {
+        if x + w < P2.cx0 || y + h < P2.cy0 || x > P2.cx1 || y > P2.cy1 {
+            return;
+        }
+    }
+    if kind == P2_TEX || kind == 10 || kind == 11 {
+        if tex == 0 {
+            return;
+        }
+        if P2.n > 0 && P2.tex != 0 && P2.tex != tex {
+            p2Flush();
+        }
+        P2.tex = tex;
+    }
+    if P2.n >= P2.cap {
+        let grown = libc.realloc(P2.buf, P2.cap * 2 * 64);
+        if grown == 0 {
+            panic("hud buffer");
+        }
+        P2.buf = grown;
+        P2.cap = P2.cap * 2;
+    }
+    uiCount(kind, w, h);
+    let o = P2.n * P2_STRIDE;
+    let f = []f32 { ptr: P2.buf as &f32, len: P2.cap * P2_STRIDE };
+    let k = []u32 { ptr: P2.buf as &u32, len: P2.cap * P2_STRIDE };
+    f[o] = x;
+    f[o + 1] = y;
+    f[o + 2] = w;
+    f[o + 3] = h;
+    f[o + 4] = u0;
+    f[o + 5] = v0;
+    f[o + 6] = du;
+    f[o + 7] = dv;
+    f[o + 8] = p0;
+    f[o + 9] = p1;
+    f[o + 10] = p2;
+    f[o + 11] = p3;
+    f[o + 12] = bw;
+    f[o + 13] = f32(kind);
+    k[o + 14] = p2Pack(c1);
+    k[o + 15] = p2Pack(c2);
+    P2.n += 1;
+    if P2_WATCH { p2Fold(k, o, tex); }
+}
+
+/// Fold the instance at `o` (and the rotation and clip it is drawn under) into `P2_SUM` (FNV-1a over words).
+fn p2Fold(k: []u32, o: int, tex: u32) {
+    let h = P2_SUM ^ u64(tex);
+    for i in 0..P2_STRIDE {
+        h = (h ^ u64(k[o + i])) * 1099511628211;
+    }
+    if P2.rotOn {
+        h = (h ^ u64(int(P2.ra * 4096.0) + int(P2.rb * 4096.0) * 3 + int(P2.rc * 4096.0) * 5 + int(P2.rd * 4096.0) * 7)) * 1099511628211;
+        h = (h ^ u64(int(P2.rx * 64.0) * 31 + int(P2.ry * 64.0))) * 1099511628211;
+    }
+    if P2.clipOn {
+        h = (h ^ u64(int(P2.cx0 + P2.cy0 * 8191.0) + int(P2.cx1 * 31.0 + P2.cy1 * 131071.0))) * 1099511628211;
+    }
+    P2_SUM = h + 1;
+}
+
+/// Start (`true`) or stop folding every queued instance into a running hash (`p2Watched`). `Dom` watches `<canvas>` bodies, so
+/// an idle-sleeping app keeps drawing while a canvas's output changes (hand-drawn animation) and sleeps once it holds still.
+pub fn p2Watch(on: bool) {
+    P2_WATCH = on;
+}
+
+/// The hash of the instances queued while watched since the last call, and reset it (0: none).
+pub fn p2Watched(): u64 {
+    let h = P2_SUM;
+    P2_SUM = 0;
+    return h;
+}
+
+/// Write one baked color ramp (`RAMP_W` RGBA8 texels, straight alpha) into ramp atlas row `row`.
+/// Queued draws go out first, since the row may be one they still sample.
+pub fn p2RampRow(row: int, texels: ptr) {
+    if row < 0 || row >= RAMP_ROWS {
+        return;
+    }
+    if !HUD.ready {
+        if !platform.gl {
+            panic("j3.gfx.paint needs GL: call app.useGl() and link \"GL\"");
+        }
+        hudInit();
+    }
+    p2Flush();
+    let bind = HUD.bindTexture as fn(u32, u32);
+    bind(GL_TEXTURE_2D, HUD.ramp);
+    let update = HUD.texSubImage2D as fn(u32, i32, i32, i32, i32, i32, u32, u32, ptr);
+    update(GL_TEXTURE_2D, 0, 0, i32(row), i32(RAMP_W), 1, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+}
+
+/// Draw everything queued and restore the GL state `j3.gfx` expects (depth test and culling on,
+/// blending and scissor off). Cheap when nothing is queued. Call it before raw GL; `j3.gfx`,
+/// `present`, `readWindow`, and texture deletion or update already do.
+pub fn p2Flush() {
+    if P2.n == 0 {
+        return;
+    }
+    let n = P2.n;
+    P2.n = 0;
+    if platform.win_w < 1 || platform.win_h < 1 {
+        return;
+    }
+    profZone(uiZone());
+    profDraw(2);
+    UI_NOW[UI_FLUSHES] += 1;
+    let fb = fbRect();
+    let us = platform.ui_scale * fb.s;
+    let dx = 0;
+    let dy = 0;
+    let dw = fb.w;
+    let dh = fb.h;
+    let sw = f32(fb.w) / us;
+    let sh = f32(fb.h) / us;
+    if P2.depth > 0 {
+        dx = int(P2.vx * us + 0.5);
+        dy = int(P2.vy * us + 0.5);
+        dw = int(P2.vw * us + 0.5);
+        dh = int(P2.vh * us + 0.5);
+        sw = P2.vw;
+        sh = P2.vh;
+    }
+    let vp = HUD.viewport as fn(i32, i32, i32, i32);
+    let base = fbBase(fb);
+    vp(i32(fb.x + dx), i32(base + fb.h - dy - dh), i32(dw), i32(dh));
+    let en = HUD.enable as fn(u32);
+    let dis = HUD.disable as fn(u32);
+    dis(GL_DEPTH_TEST);
+    dis(GL_CULL_FACE);
+    en(GL_BLEND);
+    let blend = HUD.blendSeparate as fn(u32, u32, u32, u32);
+    blend(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, 1, GL_ONE_MINUS_SRC_ALPHA);
+    if P2.clipOn {
+        let x0 = int(P2.cx0 * us + 0.5);
+        let y0 = int(P2.cy0 * us + 0.5);
+        let x1 = int(P2.cx1 * us + 0.5);
+        let y1 = int(P2.cy1 * us + 0.5);
+        if x0 < 0 { x0 = 0; }
+        if y0 < 0 { y0 = 0; }
+        if x1 > dw { x1 = dw; }
+        if y1 > dh { y1 = dh; }
+        if x1 < x0 { x1 = x0; }
+        if y1 < y0 { y1 = y0; }
+        let sc = HUD.scissor as fn(i32, i32, i32, i32);
+        en(GL_SCISSOR_TEST);
+        sc(i32(fb.x + dx + x0), i32(base + fb.h - dy - y1), i32(x1 - x0), i32(y1 - y0));
+    }
+    let useProg = HUD.useProgram as fn(u32);
+    useProg(HUD.prog);
+    let u2 = HUD.uniform2f as fn(i32, f32, f32);
+    u2(HUD.uScreen, sw, sh);
+    u2(HUD.uOrigin, f32(fb.x), f32(base));
+    let u3 = HUD.uniform3f as fn(i32, f32, f32, f32);
+    if P2.rotOn {
+        u3(HUD.uRA, P2.ra, P2.rc, P2.rx);
+        u3(HUD.uRB, P2.rb, P2.rd, P2.ry);
+    } else {
+        u3(HUD.uRA, 1.0, 0.0, 0.0);
+        u3(HUD.uRB, 0.0, 1.0, 0.0);
+    }
+    let u4 = HUD.uniform4f as fn(i32, f32, f32, f32, f32);
+    u4(HUD.uShapeInfo, f32(P2.sn0), P2.sr0, f32(P2.sn1), P2.sr1);
+    if P2.ckn > 0 || HUD.ckLive {
+        u4(HUD.uClipN, f32(P2.ck0), f32(P2.ck1), f32(P2.ck2), f32(P2.ck3));
+        HUD.ckLive = P2.ckn > 0;
+    }
+    u3(HUD.uMask, f32(P2.mk), P2.mrow, P2.mang);
+    u4(HUD.uMaskBox, P2.mx, P2.my, P2.mw, P2.mh);
+    let active = HUD.activeTexture as fn(u32);
+    let bind = HUD.bindTexture as fn(u32, u32);
+    active(0x84C2);
+    bind(GL_TEXTURE_2D, HUD.shapes);
+    let update = HUD.texSubImage2D as fn(u32, i32, i32, i32, i32, i32, u32, u32, ptr);
+    if P2.sn0 > 0 {
+        update(GL_TEXTURE_2D, 0, 0, 0, i32(P2.sn0), 1, 0x8227, GL_FLOAT, P2.sh0);
+    }
+    if P2.sn1 > 0 {
+        update(GL_TEXTURE_2D, 0, 0, 1, i32(P2.sn1), 1, 0x8227, GL_FLOAT, P2.sh1);
+    }
+    for k in 0..P2.ckn {
+        let c = if k == 0 { P2.ck0 } else if k == 1 { P2.ck1 } else if k == 2 { P2.ck2 } else { P2.ck3 };
+        if c > 0 {
+            update(GL_TEXTURE_2D, 0, 0, i32(2 + k), i32(c), 1, 0x8227, GL_FLOAT, (P2.ckp as int + k * 512) as ptr);
+        }
+    }
+    active(0x84C1);
+    bind(GL_TEXTURE_2D, HUD.ramp);
+    active(0x84C0);
+    if P2.tex != 0 {
+        bind(GL_TEXTURE_2D, P2.tex);
+    } else {
+        bind(GL_TEXTURE_2D, HUD.white);
+    }
+    P2.tex = 0;
+    let bindVa = HUD.bindVertexArray as fn(u32);
+    bindVa(HUD.vao);
+    let bindBuf = HUD.bindBuffer as fn(u32, u32);
+    bindBuf(GL_ARRAY_BUFFER, HUD.vbo);
+    let data = HUD.bufferData as fn(u32, int, ptr, u32);
+    data(GL_ARRAY_BUFFER, n * 64, P2.buf, GL_STREAM_DRAW);
+    let draw = HUD.drawInstanced as fn(u32, i32, i32, i32);
+    draw(GL_TRIANGLE_STRIP, 0, 4, i32(n));
+    bindVa(0);
+    if P2.clipOn {
+        dis(GL_SCISSOR_TEST);
+    }
+    dis(GL_BLEND);
+    en(GL_CULL_FACE);
+    en(GL_DEPTH_TEST);
+}

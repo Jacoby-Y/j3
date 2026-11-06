@@ -1,0 +1,281 @@
+// Expressions. `exprTo(n, dst)` leaves the value in register `dst` and frees its temporaries;
+// `exprAny(n)` returns a register holding it (a local's own register when `n` is one).
+// Part of `j3.j2` (the compiler).
+//
+// A value built in steps (table, array, call, `&&`/`||`) is built in a fresh register and then
+// moved when `dst` is a named local, so `xs = [xs]` or `a = b && a` reads the old value.
+
+module j3.j2;
+
+/// Deepest expression the compiler recurses into before it stops with an error instead of
+/// overflowing the host's native stack (about 3 native frames per level).
+const MAX_EXPR_DEPTH: int = 1000;
+
+extend Compiler {
+    fn exprAny(this: &Compiler, n: int): int {
+        let nd = this.node(n);
+        if nd.kind == parse.N_NAME {
+            let r = this.resolve(n, nd.s);
+            if r.kind == R_LOCAL { return r.idx; }
+        }
+        return this.exprNew(n);
+    }
+
+    fn exprNew(this: &Compiler, n: int): int {
+        let r = this.alloc(n);
+        this.exprTo(n, r);
+        return r;
+    }
+
+    fn exprTo(this: &Compiler, n: int, dst: int) {
+        if n < 0 || this.failed { return; }
+        if this.exprDepth >= MAX_EXPR_DEPTH {
+            this.failAt(n, "expression too deeply nested");
+            return;
+        }
+        this.exprDepth += 1;
+        let mark = this.fs().free;
+        this.exprInner(n, dst);
+        this.fs().free = mark;
+        this.exprDepth -= 1;
+    }
+
+    /// `dst` itself when it is the newest temporary, else a fresh one (the caller moves it).
+    fn buildReg(this: &Compiler, n: int, dst: int): int {
+        if dst == this.fs().free - 1 && !this.isLocalReg(dst) { return dst; }
+        return this.alloc(n);
+    }
+
+    /// The register holding left operand `a` of an op whose result goes to `dst`: `dst` itself
+    /// when it is the newest temporary, so a left-nested chain (`a + b + c`, `t.a.b.c`) needs one
+    /// register, not one per term; else `exprAny`.
+    fn leftInto(this: &Compiler, a: int, dst: int): int {
+        if this.node(a).kind != parse.N_NAME && dst == this.fs().free - 1 && !this.isLocalReg(dst) {
+            this.exprTo(a, dst);
+            return dst;
+        }
+        return this.exprAny(a);
+    }
+
+    fn moveTo(this: &Compiler, n: int, dst: int, r: int) {
+        if r != dst { this.emitABC(n, OP_MOVE, dst, r, 0); }
+    }
+
+    /// The constant index of literal node `n` (a number, a negated number, or a string) when it
+    /// fits an 8-bit operand, else -1 (the caller loads it into a register instead).
+    fn rkConst(this: &Compiler, n: int): int {
+        let nd = this.node(n);
+        let k = -1;
+        if nd.kind == parse.N_INT {
+            k = this.constOf(n, intv(nd.i));
+        } else if nd.kind == parse.N_FLOAT {
+            k = this.constOf(n, floatv(nd.f));
+        } else if nd.kind == parse.N_STR {
+            k = this.strConst(n, nd.s);
+        } else if nd.kind == parse.N_UNARY && nd.op == lex.T_MINUS {
+            let a = this.node(nd.a);
+            if a.kind == parse.N_INT { k = this.constOf(n, intv(0 - a.i)); }
+            if a.kind == parse.N_FLOAT { k = this.constOf(n, floatv(0.0 - a.f)); }
+        }
+        return if k <= 255 { k } else { -1 };
+    }
+
+    /// `R[dst] = R[x] op rhs` for arithmetic opcode `op`, with a literal `rhs` as a constant operand.
+    fn arithTo(this: &Compiler, n: int, op: int, dst: int, x: int, rhs: int) {
+        let k = this.rkConst(rhs);
+        if k >= 0 {
+            this.emitABC(n, op + (OP_ADDK - OP_ADD), dst, x, k);
+        } else {
+            this.emitABC(n, op, dst, x, this.exprAny(rhs));
+        }
+    }
+
+    fn loadConst(this: &Compiler, n: int, dst: int, v: Value) {
+        this.emitABx(n, OP_LOADK, dst, this.constOf(n, v));
+    }
+
+    fn exprInner(this: &Compiler, n: int, dst: int) {
+        let nd = this.node(n);
+        let k = nd.kind;
+        if k == parse.N_NIL {
+            this.emitABC(n, OP_LOADNIL, dst, 0, 0);
+        } else if k == parse.N_TRUE || k == parse.N_FALSE {
+            this.emitABC(n, OP_LOADBOOL, dst, if k == parse.N_TRUE { 1 } else { 0 }, 0);
+        } else if k == parse.N_INT {
+            this.loadConst(n, dst, intv(nd.i));
+        } else if k == parse.N_FLOAT {
+            this.loadConst(n, dst, floatv(nd.f));
+        } else if k == parse.N_STR {
+            this.loadConst(n, dst, this.heap.intern(nd.s));
+        } else if k == parse.N_NAME {
+            this.name(n, dst);
+        } else if k == parse.N_UNARY {
+            let a = this.node(nd.a);
+            if nd.op == lex.T_MINUS && a.kind == parse.N_INT {
+                this.loadConst(n, dst, intv(0 - a.i));
+            } else if nd.op == lex.T_MINUS && a.kind == parse.N_FLOAT {
+                this.loadConst(n, dst, floatv(0.0 - a.f));
+            } else {
+                let r = this.exprAny(nd.a);
+                this.emitABC(n, if nd.op == lex.T_MINUS { OP_UNM } else { OP_NOT }, dst, r, 0);
+            }
+        } else if k == parse.N_BINARY {
+            this.binary(n, dst);
+        } else if k == parse.N_TPL {
+            this.template(n, dst);
+        } else if k == parse.N_FIELD {
+            let o = this.leftInto(nd.a, dst);
+            this.getField(n, dst, o, nd.s);
+        } else if k == parse.N_INDEX {
+            let o = this.leftInto(nd.a, dst);
+            let i = this.exprAny(nd.b);
+            this.emitABC(n, OP_GETINDEX, dst, o, i);
+        } else if k == parse.N_CALL {
+            this.call(n, dst);
+        } else if k == parse.N_TABLE {
+            let t = this.buildReg(n, dst);
+            this.emitABC(n, OP_NEWTABLE, t, 0, 0);
+            for i in 0..nd.count {
+                let pair = this.ast.kid(n, i);
+                let mark = this.fs().free;
+                let v = this.exprAny(this.node(pair).a);
+                this.setField(pair, t, this.node(pair).s, v);
+                this.fs().free = mark;
+            }
+            this.moveTo(n, dst, t);
+        } else if k == parse.N_ARRAY {
+            let t = this.buildReg(n, dst);
+            this.emitABC(n, OP_NEWARRAY, t, if nd.count > 255 { 255 } else { nd.count }, 0);
+            for i in 0..nd.count {
+                let mark = this.fs().free;
+                let v = this.exprAny(this.ast.kid(n, i));
+                this.emitABC(n, OP_APPEND, t, v, 0);
+                this.fs().free = mark;
+            }
+            this.moveTo(n, dst, t);
+        } else if k == parse.N_FN {
+            let idx = this.function(n);
+            this.emitABx(n, OP_CLOSURE, dst, idx);
+        } else {
+            this.failAt(n, "not an expression");
+        }
+    }
+
+    /// Did the host bind `s` (so `OP_GETGLOBAL` finds it)?
+    fn isGlobal(this: &Compiler, s: string): bool {
+        let key = this.heap.lookupStr(s);
+        return !key.isNil() && !this.vm.global(key).isNil();
+    }
+
+    /// Read a name into `dst`.
+    fn name(this: &Compiler, n: int, dst: int) {
+        let s = this.node(n).s;
+        let r = this.resolve(n, s);
+        if r.kind == R_LOCAL {
+            this.moveTo(n, dst, r.idx);
+        } else if r.kind == R_UP {
+            this.emitABC(n, OP_GETUP, dst, r.idx, 0);
+        } else if r.kind == R_ENV {
+            this.emitABx(n, OP_GETENV, dst, r.idx);
+        } else if r.kind == R_PUB {
+            this.emitABx(n, OP_GETPUB, dst, this.strConst(n, s));
+        } else if this.isGlobal(s) {
+            this.emitABx(n, OP_GETGLOBAL, dst, this.strConst(n, s));
+        } else {
+            this.failName(n, "unknown name", s);
+        }
+    }
+
+    fn binary(this: &Compiler, n: int, dst: int) {
+        let nd = this.node(n);
+        let op = nd.op;
+        if op == lex.T_AND || op == lex.T_OR {
+            // the left value when it decides (falsy for `&&`, truthy for `||`), else the right one
+            let t = this.buildReg(n, dst);
+            this.exprTo(nd.a, t);
+            let done = this.jump(n, if op == lex.T_AND { OP_JMPIFNOT } else { OP_JMPIF }, t);
+            this.exprTo(nd.b, t);
+            this.patch(done, this.here());
+            this.moveTo(n, dst, t);
+            return;
+        }
+        let x = this.leftInto(nd.a, dst);
+        let arith = arithOp(op);
+        if arith >= 0 {
+            this.arithTo(n, arith, dst, x, nd.b);
+            return;
+        }
+        let y = this.exprAny(nd.b);
+        if op == lex.T_EQ {
+            this.emitABC(n, OP_EQ, dst, x, y);
+        } else if op == lex.T_NE {
+            this.emitABC(n, OP_NE, dst, x, y);
+        } else if op == lex.T_LT {
+            this.emitABC(n, OP_LT, dst, x, y);
+        } else if op == lex.T_LE {
+            this.emitABC(n, OP_LE, dst, x, y);
+        } else if op == lex.T_GT {
+            this.emitABC(n, OP_LT, dst, y, x);
+        } else if op == lex.T_GE {
+            this.emitABC(n, OP_LE, dst, y, x);
+        } else {
+            this.failAt(n, "unknown operator");
+        }
+    }
+
+    /// `` `text{expr}text` ``: the pieces in consecutive registers, then one `OP_CONCAT`.
+    fn template(this: &Compiler, n: int, dst: int) {
+        let nd = this.node(n);
+        let first = this.fs().free;
+        let count = 0;
+        for i in 0..nd.count {
+            let part = this.ast.kid(n, i);
+            let pn = this.node(part);
+            if pn.kind == parse.N_STR && pn.s.len == 0 { continue; }
+            let r = this.alloc(part);
+            this.exprTo(part, r);
+            count += 1;
+        }
+        if count == 0 {
+            this.loadConst(n, dst, this.heap.intern(""));
+        } else if count > 255 {
+            this.failAt(n, "too many parts in one string");
+        } else {
+            this.emitABC(n, OP_CONCAT, dst, first, count);
+        }
+    }
+
+    /// `f(args)` or `recv.name(args)` with the result in `dst`.
+    fn call(this: &Compiler, n: int, dst: int) {
+        let nd = this.node(n);
+        let callee = this.node(nd.a);
+        let base = this.buildReg(n, dst);
+        let isMethod = callee.kind == parse.N_FIELD;
+        if isMethod {
+            this.exprTo(callee.a, this.alloc(n));
+        } else {
+            this.exprTo(nd.a, base);
+        }
+        for i in 0..nd.count { this.exprTo(this.ast.kid(n, i), this.alloc(n)); }
+        let nargs = nd.count + if isMethod { 1 } else { 0 };
+        if nargs > 255 {
+            this.failAt(n, "too many arguments");
+            return;
+        }
+        if isMethod {
+            let slot = this.envSlots.getOr(callee.s, -1);
+            let kind = FALLBACK_GLOBAL;
+            if slot >= 0 {
+                kind = FALLBACK_ENV;
+            } else if this.pubNames.getOr(callee.s, -1) >= 0 {
+                kind = FALLBACK_PUB;
+            }
+            this.emitABC(n, OP_METHOD, base, nargs, 0);
+            this.emitABx(n, OP_EXTRA, kind, this.strConst(n, callee.s));
+            this.emitABx(n, OP_EXTRA, 0, if slot >= 0 { slot } else { 0 });
+        } else {
+            this.emitABC(n, OP_CALL, base, nargs, 0);
+        }
+        this.moveTo(n, dst, base);
+    }
+}

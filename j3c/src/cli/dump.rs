@@ -1,10 +1,19 @@
 use super::*;
 
 pub(super) fn dump_syntax(rest: &[String]) -> i32 {
-    let ui = rest.first().is_some_and(|a| a == "--ui");
-    let rest = if ui { &rest[1..] } else { rest };
+    const USAGE: &str = "usage: j3c dump-syntax [--ui] [file]";
+    if rest.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        println!("  --ui   print the .j3ui grammar instead; no file prints to stdout");
+        return 0;
+    }
+    if let Some(bad) = rest.iter().find(|a| a.starts_with('-') && a.as_str() != "--ui") {
+        eprintln!("j3c dump-syntax: unknown flag `{bad}`; {USAGE}");
+        return 1;
+    }
+    let ui = rest.iter().any(|a| a == "--ui");
     let text = if ui { crate::parse::syntax::ui_tm_grammar() } else { crate::parse::syntax::tm_grammar() };
-    match rest.first() {
+    match rest.iter().find(|a| !a.starts_with('-')) {
         None => {
             print!("{text}");
             0

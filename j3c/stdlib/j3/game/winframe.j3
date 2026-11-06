@@ -1,0 +1,369 @@
+// Part of j3.game (client-side title bar: decorations, minimize/close, hit testing, resize band); the module doc and `use`s are in ../game.j3.
+module j3.game;
+
+/// What a point of an undecorated window does when pressed (`setWindowHitTest`). `Drag` moves the
+/// window, the `Resize*` edges resize it, `Normal` is an ordinary click for the app.
+pub enum WindowHit {
+    Normal,
+    Drag,
+    ResizeTop,
+    ResizeTopRight,
+    ResizeRight,
+    ResizeBottomRight,
+    ResizeBottom,
+    ResizeBottomLeft,
+    ResizeLeft,
+    ResizeTopLeft,
+}
+
+/// A rectangle in UI coordinates (what `mousePos` and a `.j3ui` layout use) for `setDragRegions`.
+pub struct WinRect {
+    x: f32;
+    y: f32;
+    w: f32;
+    h: f32;
+}
+
+const SDL_WINDOW_BORDERLESS: u32 = 0x10;
+const SDL_WINDOW_MINIMIZED: u32 = 0x40;
+const SDL_WINDOW_RESIZABLE_F: u32 = 0x20;
+// SDL_HitTestResult
+const HT_NORMAL: i32 = 0;
+const HT_DRAG: i32 = 1;
+const HT_TOPLEFT: i32 = 2;
+const HT_TOP: i32 = 3;
+const HT_TOPRIGHT: i32 = 4;
+const HT_RIGHT: i32 = 5;
+const HT_BOTTOMRIGHT: i32 = 6;
+const HT_BOTTOM: i32 = 7;
+const HT_BOTTOMLEFT: i32 = 8;
+const HT_LEFT: i32 = 9;
+/// Two presses on a drag area this close in time (ms) and space (points) toggle maximize.
+const DOUBLE_MS: u32 = 400;
+const DOUBLE_PX: i32 = 4;
+// ponytail: fixed region tables; 32 is plenty for a title bar, raise if a layout needs more
+const MAX_REGIONS: int = 32;
+
+#[singleton]
+let UNDECORATED: bool = false;
+#[singleton]
+let HIT_INSTALLED: bool = false;
+#[singleton]
+let RESIZE_PX: int = 6;
+#[singleton]
+let HIT_FN: ptr = 0;
+#[singleton]
+let DRAG_R: [32]WinRect;
+#[singleton]
+let DRAG_N: int = 0;
+#[singleton]
+let NODRAG_R: [32]WinRect;
+#[singleton]
+let NODRAG_N: int = 0;
+#[singleton]
+let LAST_DRAG_MS: u32 = 0;
+#[singleton]
+let LAST_DRAG_X: i32 = 0;
+#[singleton]
+let LAST_DRAG_Y: i32 = 0;
+#[singleton]
+let TOGGLE_MAX: bool = false;
+#[singleton]
+let CLOSE_PENDING: bool = false;
+/// System cursor id the resize band wants this frame (0 none); `applyCursor` lets it win.
+#[singleton]
+let EDGE_CURSOR: int = 0;
+
+/// Show (`true`, the default) or hide the system title bar and border. Undecorated, the window stays
+/// resizable, movable and maximizable: an invisible band of `setResizeBorder` px along its edges resizes
+/// it, and `setDragRegions` (or `window-drag` in `.j3ui`) says what moves it. Before the window exists
+/// it only records, so it opens that way (`App.undecorated`). Windowed mode only; headless a no-op.
+/// Linux: X11 and Wayland (SDL's Wayland driver, e.g. `SDL_VIDEODRIVER=wayland`; SDL2 picks X11/XWayland
+/// on GNOME by default). On Wayland the compositor must allow client-side decorations (GNOME does).
+pub fn setDecorated(on: bool) {
+    UNDECORATED = !on;
+    if platform.window == 0 { return; }
+    sdl.SDL_SetWindowBordered(platform.window, if on { 1 } else { 0 });
+    if !on { installHitTest(); }
+}
+
+/// The window has an alpha channel the compositor blends with the desktop (`setTransparent`).
+#[singleton]
+let TRANSPARENT: bool = false;
+/// `setBackgroundAlpha`, 0..1.
+#[singleton]
+let BG_ALPHA: f32 = 1.0;
+
+/// Ask for a window whose pixels' alpha shows the desktop through (a compositor is needed; without one it looks
+/// opaque). Call before the GL window opens (`App.transparent`); OpenGL windows only. X11: an ARGB (depth 32)
+/// visual (`SDL_VIDEO_X11_WINDOW_VISUALID`); Wayland/EGL: an RGBA8 config with transparency allowed. The frame is
+/// premultiplied alpha, which normal blending over a cleared buffer already produces; see `setBackgroundAlpha`.
+pub fn setTransparent(on: bool) {
+    if platform.window != 0 { return; }
+    TRANSPARENT = on;
+}
+
+/// Whether the window was asked to be see-through (`setTransparent`).
+pub fn transparent(): bool {
+    return TRANSPARENT;
+}
+
+/// How opaque the background is in a transparent window, 0..1 (default 1): `clearTo` multiplies its alpha by it
+/// (premultiplied, so the desktop shows through at `1 - a`), and backgrounds that ask (`j3.term.view` default
+/// background) draw with it. Text and everything else drawn opaque stay opaque. No effect on an opaque window.
+pub fn setBackgroundAlpha(a: f32) {
+    BG_ALPHA = if a < 0.0 { 0.0 } else if a > 1.0 { 1.0 } else { a };
+}
+
+/// The background alpha in effect: `setBackgroundAlpha` in a transparent window, else 1.
+pub fn backgroundAlpha(): f32 {
+    return if TRANSPARENT { BG_ALPHA } else { 1.0 };
+}
+
+/// Before a transparent GL window is created: alpha bits, and on X11 a depth-32 TrueColor visual for the window.
+fn transparentHints() {
+    sdl.SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
+    sdl.SDL_SetHint(soCstr("SDL_VIDEO_EGL_ALLOW_TRANSPARENCY"), cstr("1"));
+    if env("DISPLAY").len == 0 { return; }
+    let so = dlopen("libX11.so.6");
+    if so as int == 0 { return; }
+    let openP = dlsym(so, "XOpenDisplay");
+    let screenP = dlsym(so, "XDefaultScreen");
+    let matchP = dlsym(so, "XMatchVisualInfo");
+    let closeP = dlsym(so, "XCloseDisplay");
+    if openP as int == 0 || screenP as int == 0 || matchP as int == 0 || closeP as int == 0 { return; }
+    let openFn = openP as fn(ptr): ptr;
+    let screenFn = screenP as fn(ptr): i32;
+    let matchFn = matchP as fn(ptr, i32, i32, i32, ptr): i32;
+    let closeFn = closeP as fn(ptr): i32;
+    let dpy = openFn(0 as ptr);
+    if dpy as int == 0 { return; }
+    // XVisualInfo is 64 bytes; visualid is the second word. TrueColor = 4.
+    let vi: [8]u64 = [0, 0, 0, 0, 0, 0, 0, 0];
+    if matchFn(dpy, screenFn(dpy), 32, 4, &vi[0] as ptr) != 0 {
+        let t = Text.scratch();
+        t.pushInt(int(vi[1]));
+        sdl.SDL_SetHint(soCstr("SDL_VIDEO_X11_WINDOW_VISUALID"), cstr(t.str()));
+    }
+    closeFn(dpy);
+}
+
+/// The window class the desktop groups the window by: X11 `WM_CLASS` (instance and class both `name`) and the
+/// Wayland `app_id`, which a `.desktop` file's `StartupWMClass` matches (a terminal's `--class`). Call before the
+/// window opens (`App.windowClass`); later calls change nothing. Wins over the `SDL_VIDEO_*_WMCLASS` the `.deb`
+/// launcher exports.
+pub fn setWindowClass(name: string) {
+    if platform.window != 0 { return; }
+    // SDL_HINT_OVERRIDE (2): beats the environment.
+    sdl.SDL_SetHintWithPriority(soCstr("SDL_VIDEO_X11_WMCLASS"), cstr(name), 2);
+    sdl.SDL_SetHintWithPriority(soCstr("SDL_VIDEO_WAYLAND_WMCLASS"), cstr(name), 2);
+}
+
+/// `SDL_WINDOW_BORDERLESS` for a window created undecorated.
+fn decorFlag(): u32 {
+    return if UNDECORATED && WIN_MODE == 0 { SDL_WINDOW_BORDERLESS } else { 0 };
+}
+
+/// Called once the window exists: hook the hit test when anything asked for it before.
+fn frameInit() {
+    if UNDECORATED || HIT_FN != 0 || DRAG_N > 0 { installHitTest(); }
+}
+
+/// Minimize (iconify) the window.
+pub fn minimizeWindow() {
+    if platform.window != 0 { sdl.SDL_MinimizeWindow(platform.window); }
+}
+
+/// Show a window hidden with `hideWindow` (it comes back to the taskbar). For a drop-down "quick
+/// terminal" on a global hotkey (`j3.game.hotkey`):
+///
+///     if hk.pressed() {
+///         if game.windowShown() && game.windowFocused() { game.hideWindow(); }
+///         else { game.showWindow(); game.raiseWindow(); }
+///     }
+pub fn showWindow() {
+    if platform.window != 0 { sdl.SDL_ShowWindow(platform.window); }
+}
+
+/// Hide the window: it leaves the screen and the taskbar; the loop keeps running.
+pub fn hideWindow() {
+    if platform.window != 0 { sdl.SDL_HideWindow(platform.window); }
+}
+
+/// Bring the window to the front with keyboard focus, restoring it first when minimized. The window
+/// manager may still refuse focus (focus-stealing prevention); X11 window managers usually allow it.
+pub fn raiseWindow() {
+    if platform.window == 0 { return; }
+    if (sdl.SDL_GetWindowFlags(platform.window) & SDL_WINDOW_MINIMIZED) != 0 {
+        sdl.SDL_RestoreWindow(platform.window);
+    }
+    sdl.SDL_RaiseWindow(platform.window);
+}
+
+/// False after `hideWindow` (and headless before the window exists); true when shown, also minimized.
+pub fn windowShown(): bool {
+    if platform.window == 0 { return false; }
+    return (sdl.SDL_GetWindowFlags(platform.window) & SDL_WINDOW_HIDDEN) == 0;
+}
+
+/// Whether the window is maximized now, also after a maximize by the window manager (shortcut, snap,
+/// double-click). For a maximize/restore button: `setMaximized(!windowMaximized())`.
+pub fn windowMaximized(): bool {
+    if platform.window == 0 { return false; }
+    return (sdl.SDL_GetWindowFlags(platform.window) & SDL_WINDOW_MAXIMIZED) != 0;
+}
+
+/// Close the window the way the window manager's close button does: quit (`App` shutdown callbacks
+/// run), or only `closeRequested` under `holdClose`. Takes effect at the next `poll`.
+pub fn closeWindow() {
+    CLOSE_PENDING = true;
+}
+
+/// Width in points of the invisible resize band along the edges of an undecorated window (default 6;
+/// 0 turns it off). Not active while maximized, fullscreen or not resizable.
+pub fn setResizeBorder(px: int) {
+    RESIZE_PX = if px < 0 { 0 } else { px };
+}
+
+/// Areas (UI coordinates) that move the window when dragged. Replaces the last set; set it every frame
+/// from layout. Double-clicking one toggles maximize. At most 32 (more are ignored).
+pub fn setDragRegions(rects: []WinRect) {
+    DRAG_N = capRegions(rects);
+    for i in 0..DRAG_N { DRAG_R[i] = rects[i]; }
+    if DRAG_N > 0 { installHitTest(); }
+}
+
+/// Areas inside the drag regions that stay ordinary clicks (the title bar's buttons). Set every frame.
+pub fn setNoDragRegions(rects: []WinRect) {
+    NODRAG_N = capRegions(rects);
+    for i in 0..NODRAG_N { NODRAG_R[i] = rects[i]; }
+}
+
+fn capRegions(rects: []WinRect): int {
+    return if rects.len > MAX_REGIONS { MAX_REGIONS } else { rects.len };
+}
+
+/// Decide yourself what a press does: `f(x, y)` gets the point in UI coordinates and replaces the drag
+/// regions (the resize band still comes first). SDL calls it from inside the event pump (`poll`) on the
+/// main thread, on X11 and Wayland only for a left-button press: it may read any game state, but must
+/// not call SDL window functions (no `setMaximized` there). On Windows it runs on every mouse move.
+pub fn setWindowHitTest(f: fn(int, int): WindowHit) {
+    HIT_FN = f as ptr;
+    installHitTest();
+}
+
+fn installHitTest() {
+    if HIT_INSTALLED || platform.window == 0 { return; }
+    HIT_INSTALLED = sdl.SDL_SetWindowHitTest(platform.window, hitTestCb, 0 as ptr) == 0;
+}
+
+/// SDL's hit-test callback. `pt` is an `SDL_Point` in window points.
+fn hitTestCb(win: ptr, pt: ptr, data: ptr): i32 {
+    let p: []i32 = []i32 { ptr: pt as &i32, len: 2 };
+    let rc = hitAt(p[0], p[1]);
+    // X11 and Wayland never pass a press on a drag area to the app (the window manager takes it), so
+    // the native title bar's double-click to maximize is ours. Linux only: Windows asks on every move
+    // and does the double-click itself.
+    if rc == HT_DRAG && PLATFORM == 0 {
+        let now = sdl.SDL_GetTicks();
+        if LAST_DRAG_MS != 0 && now - LAST_DRAG_MS < DOUBLE_MS && absI(p[0] - LAST_DRAG_X) <= DOUBLE_PX && absI(p[1] - LAST_DRAG_Y) <= DOUBLE_PX {
+            LAST_DRAG_MS = 0;
+            TOGGLE_MAX = true;
+            return HT_NORMAL;
+        }
+        LAST_DRAG_MS = now;
+        LAST_DRAG_X = p[0];
+        LAST_DRAG_Y = p[1];
+    }
+    return rc;
+}
+
+fn absI(v: i32): i32 {
+    return if v < 0 { -v } else { v };
+}
+
+/// The hit at window point (x, y): resize band, then the custom fn, then no-drag and drag regions.
+fn hitAt(x: i32, y: i32): i32 {
+    let e = edgeAt(x, y);
+    if e != HT_NORMAL { return e; }
+    let u = physToUi(f32(x) * PHYS, f32(y) * PHYS);
+    if HIT_FN != 0 {
+        let f = HIT_FN as fn(int, int): WindowHit;
+        return hitCode(f(int(u.x), int(u.y)));
+    }
+    for i in 0..NODRAG_N {
+        if inRect(&NODRAG_R[i], u) { return HT_NORMAL; }
+    }
+    for i in 0..DRAG_N {
+        if inRect(&DRAG_R[i], u) { return HT_DRAG; }
+    }
+    return HT_NORMAL;
+}
+
+fn inRect(r: &WinRect, p: Vec2): bool {
+    return p.x >= r.x && p.y >= r.y && p.x < r.x + r.w && p.y < r.y + r.h;
+}
+
+/// The resize edge under window point (x, y) of an undecorated, resizable, restored window.
+fn edgeAt(x: i32, y: i32): i32 {
+    if !UNDECORATED || RESIZE_PX == 0 || platform.window == 0 { return HT_NORMAL; }
+    let fl = sdl.SDL_GetWindowFlags(platform.window);
+    if (fl & SDL_WINDOW_RESIZABLE_F) == 0 || (fl & SDL_WINDOW_MAXIMIZED) != 0 || (fl & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0 { return HT_NORMAL; }
+    let w: i32 = 0;
+    let h: i32 = 0;
+    sdl.SDL_GetWindowSize(platform.window, &w as ptr, &h as ptr);
+    let b = i32(RESIZE_PX);
+    // corners get a wider grab, like native frames
+    let c = b * 2;
+    let top = y < b;
+    let bottom = y >= h - b;
+    let left = x < b;
+    let right = x >= w - b;
+    if (top && x < c) || (left && y < c) { return HT_TOPLEFT; }
+    if (top && x >= w - c) || (right && y < c) { return HT_TOPRIGHT; }
+    if (bottom && x < c) || (left && y >= h - c) { return HT_BOTTOMLEFT; }
+    if (bottom && x >= w - c) || (right && y >= h - c) { return HT_BOTTOMRIGHT; }
+    if top { return HT_TOP; }
+    if bottom { return HT_BOTTOM; }
+    if left { return HT_LEFT; }
+    if right { return HT_RIGHT; }
+    return HT_NORMAL;
+}
+
+fn hitCode(h: WindowHit): i32 {
+    match h {
+        WindowHit.Normal { return HT_NORMAL; }
+        WindowHit.Drag { return HT_DRAG; }
+        WindowHit.ResizeTop { return HT_TOP; }
+        WindowHit.ResizeTopRight { return HT_TOPRIGHT; }
+        WindowHit.ResizeRight { return HT_RIGHT; }
+        WindowHit.ResizeBottomRight { return HT_BOTTOMRIGHT; }
+        WindowHit.ResizeBottom { return HT_BOTTOM; }
+        WindowHit.ResizeBottomLeft { return HT_BOTTOMLEFT; }
+        WindowHit.ResizeLeft { return HT_LEFT; }
+        WindowHit.ResizeTopLeft { return HT_TOPLEFT; }
+    }
+}
+
+/// After the event pump: a queued close or double-click maximize, and the resize band's cursor.
+fn frameStep() {
+    if CLOSE_PENDING {
+        CLOSE_PENDING = false;
+        closeRequest();
+    }
+    if TOGGLE_MAX {
+        TOGGLE_MAX = false;
+        setMaximized(!windowMaximized());
+    }
+    EDGE_CURSOR = 0;
+    if !UNDECORATED || platform.window == 0 || sdl.SDL_GetMouseFocus() != platform.window { return; }
+    let x: i32 = 0;
+    let y: i32 = 0;
+    sdl.SDL_GetMouseState(&x as ptr, &y as ptr);
+    let e = edgeAt(x, y);
+    // SDL_SystemCursor: 5 NWSE, 6 NESW, 7 WE, 8 NS
+    if e == HT_TOPLEFT || e == HT_BOTTOMRIGHT { EDGE_CURSOR = 5; }
+    if e == HT_TOPRIGHT || e == HT_BOTTOMLEFT { EDGE_CURSOR = 6; }
+    if e == HT_LEFT || e == HT_RIGHT { EDGE_CURSOR = 7; }
+    if e == HT_TOP || e == HT_BOTTOM { EDGE_CURSOR = 8; }
+}

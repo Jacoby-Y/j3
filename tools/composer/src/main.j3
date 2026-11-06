@@ -1,0 +1,194 @@
+// Composer: a window for people, and `composer run` for agents and scripts. See README.md.
+
+module composer;
+
+use j3.io.{ exists, printLn, readFile };
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, same };
+use composer.cmd;
+use composer.format;
+use composer.gui;
+use composer.mix;
+use composer.mix.Stats;
+use composer.selftest;
+use composer.song;
+use composer.song.Song;
+use composer.shot;
+use composer.util.{ cut, parseI, startsWith };
+
+fn usage() {
+    printLn("composer: a small DAW with a built-in synth");
+    printLn("  composer [FILE.j3song]            open the window");
+    printLn("  composer run FILE [COMMAND...] [options]");
+    printLn("      load FILE (a new song if it does not exist), run each COMMAND (several per argument");
+    printLn("      with ;), save FILE when it changed, then print info");
+    printLn("      --script F    also run the commands in file F (one per line)");
+    printLn("      --wav P       write the song as a 16-bit stereo WAV");
+    printLn("      --loop        with --wav: exactly bars*meter beats, the tails folded onto the start");
+    printLn("      --render P    write a PNG: --view arrange|roll:TRACK|chords (default arrange) --size WxH");
+    printLn("      --no-save     do not write FILE        --out F   save to F instead");
+    printLn("  composer selftest");
+    printLn("  composer help     this text; `composer run x help` lists the commands");
+    printLn("Files are .j3song text (see README.md). A bare name gets .j3song.");
+}
+
+fn readText(path: string, mem: &Arena, out: &Text): string {
+    match readFile(path, mem) {
+        Result.Ok(bytes) { return bytes as string; }
+        Result.Err(_) {
+            out.pushStr("error: cannot read ");
+            out.pushStr(path);
+            out.push(10);
+            return "";
+        }
+    }
+}
+
+/// "songs/demo.j3song" -> "demo".
+fn nameOf(path: string): string {
+    let start = 0;
+    let end = path.len;
+    for i in 0..path.len {
+        if path[i] == 47 { start = i + 1; end = path.len; }
+        if path[i] == 46 && i > start { end = i; }
+    }
+    return cut(path, start, end);
+}
+
+/// `composer run`: a batch of commands, optional WAV and picture, and the result as text.
+fn runBatch(): int {
+    let mem = Arena.create(256 * 1024 * 1024);
+    let out = Text.new(&mem);
+    let s = song.create(&mem);
+    let path = cmd.fileName(sys.arg(2), &mem);
+    if path.len == 0 {
+        printLn("error: composer run wants a file: composer run songs/x.j3song \"chords Am F C G\"");
+        return 2;
+    }
+    let target = path;
+    let save = true;
+    let ok = true;
+    let wavTo = "";
+    let loop = false;
+    let renderTo = "";
+    let view = "arrange";
+    let size = "";
+    let batch = Text.new(&mem);
+    let err = Text.new(&mem);
+    if exists(path) {
+        if !format.load(path, &s, &err) {
+            printLn(err.str());
+            return 1;
+        }
+    } else {
+        out.pushStr("(new song ");
+        out.pushStr(path);
+        out.pushStr(")\n");
+    }
+    s.name = nameOf(path);
+    let i = 3;
+    while i < sys.argCount() && ok {
+        let a = sys.arg(i);
+        i += 1;
+        if same(a, "--no-save") { save = false; }
+        else if same(a, "--loop") { loop = true; }
+        else if same(a, "--wav") { wavTo = sys.arg(i); i += 1; }
+        else if same(a, "--render") { renderTo = sys.arg(i); i += 1; }
+        else if same(a, "--view") { view = sys.arg(i); i += 1; }
+        else if same(a, "--size") { size = sys.arg(i); i += 1; }
+        else if same(a, "--out") { target = cmd.fileName(sys.arg(i), &mem); i += 1; }
+        else if same(a, "--script") {
+            let text = readText(sys.arg(i), &mem, &out);
+            i += 1;
+            if text.len == 0 { ok = false; }
+            batch.pushStr(text);
+            batch.push(10);
+        }
+        else if startsWith(a, "--") {
+            out.pushStr("error: unknown option ");
+            out.pushStr(a);
+            out.pushStr(" (`composer help`)\n");
+            ok = false;
+        }
+        else { batch.pushStr(a); batch.push(10); }
+    }
+    if ok { ok = cmd.runAll(&s, batch.str(), &out); }
+    let changed = s.dirty || !same(target, path);
+    if ok && changed && save {
+        if format.save(target, &s, &err) {
+            out.pushStr("saved ");
+            out.pushStr(target);
+            out.push(10);
+        } else {
+            out.pushStr("error: ");
+            out.pushStr(err.str());
+            out.push(10);
+            ok = false;
+        }
+    } else if !ok && s.dirty && save {
+        out.pushStr("(not saved: the batch failed; fix the command and run it again)\n");
+    }
+    if ok && wavTo.len > 0 {
+        let st = Stats { peak: 0, rms: 0, hot: 0, seconds: 0, loud: 0 };
+        let buf = if loop { mix.renderLoop(&s, &mem, &st) } else { mix.render(&s, &mem, &st) };
+        if mix.writeWav(wavTo, buf, &mem) {
+            out.pushStr("wrote ");
+            out.pushStr(wavTo);
+            out.pushStr(" (peak ");
+            out.pushInt(int(st.peak * 100.0));
+            out.pushStr("%)\n");
+        } else {
+            out.pushStr("error: cannot write ");
+            out.pushStr(wavTo);
+            out.push(10);
+            ok = false;
+        }
+    }
+    if ok && renderTo.len > 0 {
+        ok = renderPng(&s, renderTo, view, size, &out);
+    }
+    if ok { cmd.run(&s, "info", &out); }
+    printLn(out.str());
+    return if ok { 0 } else { 1 };
+}
+
+fn renderPng(s: &Song, to: string, viewName: string, size: string, out: &Text): bool {
+    let w = 1400;
+    let h = 700;
+    if size.len > 0 {
+        let x = 0;
+        while x < size.len && size[x] != 120 { x += 1; }
+        if !parseI(cut(size, 0, x), &w) || !parseI(cut(size, x + 1, size.len), &h) || w < 200 || h < 150 || w > 4096 || h > 4096 {
+            out.pushStr("error: --size is WxH, like 1400x700\n");
+            return false;
+        }
+    }
+    let err = Text.new(s.mem);
+    if !shot.render(s, to, viewName, w, h, &err) {
+        out.pushStr("error: ");
+        out.pushStr(err.str());
+        out.push(10);
+        return false;
+    }
+    out.pushStr("rendered ");
+    out.pushStr(to);
+    out.push(10);
+    return true;
+}
+
+fn main() {
+    let first = sys.arg(1);
+    if same(first, "help") || same(first, "--help") || same(first, "-h") {
+        usage();
+        sys.exit(0);
+    }
+    if same(first, "selftest") {
+        sys.exit(i32(selftest.selftest()));
+    }
+    if same(first, "run") {
+        sys.exit(i32(runBatch()));
+    }
+    gui.run();
+}

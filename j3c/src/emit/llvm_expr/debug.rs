@@ -116,10 +116,16 @@ impl DebugOut {
                 };
                 let line = file.line(func.span.start).max(1) as u32;
                 let sp = dbg.alloc();
-                let name = ll_md_str(cx.name_str(func.name));
-                let link = ll_md_str(&c_expr::func_c_name(cx, func));
+                // The J3 name (`game.update`, `Player.hit`), and no linkageName: `addr2line -f`
+                // (crash traces) and debuggers then show it instead of the mangled C symbol.
+                let owner = match func.method_of {
+                    Some(sid) => cx.name_str(cx.struct_def(sid).name).to_string(),
+                    None => func.module.iter().map(|n| cx.name_str(*n)).collect::<Vec<_>>().join("."),
+                };
+                let short = cx.name_str(func.name);
+                let name = ll_md_str(&if owner.is_empty() { short.to_string() } else { format!("{owner}.{short}") });
                 dbg.body.push_str(&format!(
-                    "!{sp} = distinct !DISubprogram(name: \"{name}\", linkageName: \"{link}\", scope: !{file_md}, file: !{file_md}, line: {line}, type: !{subty}, scopeLine: {line}, flags: DIFlagPrototyped, spFlags: DISPFlagDefinition, unit: !{cu}, retainedNodes: !{empty})\n"
+                    "!{sp} = distinct !DISubprogram(name: \"{name}\", scope: !{file_md}, file: !{file_md}, line: {line}, type: !{subty}, scopeLine: {line}, flags: DIFlagPrototyped, spFlags: DISPFlagDefinition, unit: !{cu}, retainedNodes: !{empty})\n"
                 ));
                 dbg.subs.insert(func.id, sp);
             }
@@ -196,6 +202,18 @@ impl DebugOut {
                 };
                 self.basic(id, name, int_ty.bits(), enc);
             }
+            TyKind::Vec(v) => {
+                // 4 lanes of the lane type, as a vector-flagged array.
+                let lane = if v == crate::ir::ty::VecTy::F32x4 { cx.common.f32 } else { cx.common.i32 };
+                let base = self.di_type(cx, lane);
+                let sub = self.alloc();
+                self.body.push_str(&format!("!{sub} = !DISubrange(count: 4)\n"));
+                let elems = self.md_list(&[sub]);
+                self.body.push_str(&format!(
+                    "!{id} = !DICompositeType(tag: DW_TAG_array_type, baseType: !{base}, size: 128, align: 128, flags: DIFlagVector, elements: !{elems})\n"
+                ));
+            }
+            TyKind::Half => self.basic(id, "f16", 16, 4),
             TyKind::Float(FloatTy::F32) => self.basic(id, "f32", 32, 4),
             TyKind::Float(FloatTy::F64) => self.basic(id, "float", 64, 4),
             TyKind::Ptr | TyKind::CStr | TyKind::Fn { .. } => {

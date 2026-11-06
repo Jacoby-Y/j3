@@ -1,0 +1,276 @@
+// Part of j3.ui.dom (beginFrame, layout, endFrame, flip, preferences, transitions); the module doc and `use`s are in ../dom.j3. `Dom` methods in an `extend Dom` block.
+module j3.ui.dom;
+
+/// How long a `<canvas>` whose draws changed keeps the loop awake after they stop changing (`Dom.canvasLive`).
+const CANVAS_HOLD_MS: f32 = 50.0;
+
+extend Dom {
+    /// Fixed clock step in ms per `beginFrame` (tests, `J3_FIXED_DT`); 0 follows `game.ticks()`.
+    fn setFrameMs(this: &Dom, ms: f32) {
+        this.fixedMs = ms;
+    }
+
+    /// The UI clock in ms: the same `now` that animations, transitions and `dt()` use, so it follows
+    /// `setFrameMs` / `J3_FIXED_DT` (and is deterministic in goldens). Advances once per `beginFrame`.
+    fn timeMs(this: &Dom): f32 {
+        return this.now;
+    }
+
+    /// Something is moving without input: a transition or animation, a flip, wheel inertia, or a visible indeterminate `<progress>`
+    /// (not under reduced motion). A host that drew only on change would keep drawing while this holds; `App` draws every frame today.
+    fn isLive(this: &Dom): bool {
+        return this.animating > 0 || this.flipLive > 0 || this.coasting > 0 || this.gaugeSeen > 0 || this.gaugeLive > 0 || this.snapPend > 0;
+    }
+
+    /// Start a frame: advance the clock, snapshot the mouse, find the hit target in last frame's
+    /// layout (hover, active, click, wheel scroll), then `begin()` the build.
+    fn beginFrame(this: &Dom, size: Vec2) {
+        game.profUiStart();
+        this.frame += 1;
+        this.gaugeSeen = this.gaugeLive;
+        this.gaugeLive = 0;
+        this.focusWas = this.focus;
+        if this.gdead.len > 0 {
+            this.reclaimGroups();
+        }
+        this.vw = size.x;
+        this.vh = size.y;
+        let fx = this.fixedMs;
+        if fx <= 0.0 {
+            // J3_FIXED_DT makes captures repeatable
+            fx = game.fixedDt() * 1000.0;
+        }
+        if fx > 0.0 {
+            this.now = this.now + fx;
+        } else {
+            this.now = f32(game.ticks());
+        }
+        this.pmx = this.mx;
+        this.pmy = this.my;
+        // the real button of the last frame, also when the inspector held it back from the app
+        this.prevDown = if this.inspMasked { this.inspDown } else { this.down };
+        this.inspMasked = false;
+        this.dtMs = this.now - this.prevNow;
+        if game.idleWoke() && this.dtMs > 16.0 { this.dtMs = 16.0; }
+        this.prevNow = this.now;
+        this.prevR = this.rdown;
+        this.prevM = this.mdown;
+        if this.simOn {
+            this.rdown = this.simR;
+            this.mdown = this.simM;
+            this.mx = this.simX;
+            this.my = this.simY;
+            this.down = this.simDown;
+            this.wheelV = this.simWheel;
+            this.simWheel = 0.0;
+        } else {
+            let p = game.mousePos();
+            this.mx = p.x;
+            this.my = p.y;
+            this.down = game.mouseDown(Mouse.Left);
+            this.rdown = game.mouseDown(Mouse.Right);
+            this.mdown = game.mouseDown(Mouse.Middle);
+            this.wheelV = game.mouseWheel();
+        }
+        this.moved = this.mx != this.pmx || this.my != this.pmy;
+        if this.simOn || this.simKOn {
+            this.kin = if this.simKOn { this.simK } else { KeyIn {} };
+            this.simKOn = false;
+        } else {
+            this.kin = keys.poll(&this.kbd, this.now);
+        }
+        if (this.inspHot || this.insp) && this.kin.f12 {
+            this.insp = !this.insp;
+            this.inspPrev = this.down;
+            dropPress(this);
+        }
+        if this.insp {
+            // the inspector takes the pointer and keys (`j3.ui.inspect.input` reads them); the app sees an idle frame
+            this.inspMasked = true;
+            this.inspIn = this.kin;
+            this.inspWheel = this.wheelV;
+            this.inspDown = this.down;
+            this.kin = KeyIn {};
+            this.wheelV = 0.0;
+            this.down = false;
+            this.rdown = false;
+            this.mdown = false;
+        }
+        if this.reveal >= 0 {
+            // a key moved the focus: keep it on screen (last frame's layout)
+            let r = this.reveal;
+            this.reveal = -1;
+            if r == this.focus { intoView(this, r, SC_NEAREST, SC_NEAREST, false); }
+        }
+        inputEvents(this);
+        this.begin();
+    }
+
+    /// After the build walk: removes unvisited root children, resolves styles, lays out in the
+    /// `beginFrame` size, and rewinds the paint walk. Nothing runs when nothing changed.
+    fn layout(this: &Dom) {
+        game.profUiMark(game.UI_BUILD);
+        this.end();
+        this.layoutAt(this.vw, this.vh);
+        if this.snapDirty { resnap(this); }
+        this.base = 0;
+        this.scale = SLOT_UNIT;
+        this.psp = 0;
+        this.pgsp = 0;
+        this.pst[0] = 0;
+        this.pcu[0] = -1;
+        this.ptarget[0] = -1;
+        this.pz[0] = 0;
+        this.hidden = 0;
+        game.profUiMark(game.UI_LAYOUT);
+    }
+
+    /// After the paint walk: drops ghosts whose fade-out has finished.
+    fn endFrame(this: &Dom) {
+        game.profUiMark(game.UI_PAINT);
+        let sum = game.p2Watched();
+        if sum != this.canvasSum { this.canvasAt = this.now; }
+        this.canvasSum = sum;
+        // A time, not a frame count: frames closer than the clock's 1 ms step (no vsync) draw the same thing mid-animation.
+        this.canvasLive = this.now - this.canvasAt < CANVAS_HOLD_MS;
+        game.idleReport(this.idleMs());
+        if this.rip.n > 0 {
+            ripple.prune(&this.rip, this.now, -1);
+        }
+        if this.ghosts > 0 {
+            for i in 0..this.nodes.len {
+                let n = &this.nodes.items[i];
+                if n.kind == K_ELEM && n.ghost && n.pe == 0 && this.now - n.ghostT0 >= this.trns.items[n.trn].outMs {
+                    dropNode(this, i);
+                }
+            }
+        }
+    }
+
+    /// Give element `id` `animate:flip={ms}` with timing function `ease` (a `Css.eases` index): when a
+    /// layout puts it somewhere else, it paints from the old place and glides to the new one.
+    fn flip(this: &Dom, id: int, ms: f32, ease: int) {
+        id = this.resolve(id);
+        if id == STALE { return; }
+        let n = &this.nodes.items[id];
+        if n.flip < 0 {
+            n.flip = this.flips.len;
+            this.flips.push(Flip { node: id, ms: ms, ease: ease, seen: false, x: 0.0, y: 0.0, ox: 0.0, oy: 0.0, ox0: 0.0, oy0: 0.0, t0: 0.0 });
+        }
+        let f = &this.flips.items[n.flip];
+        f.ms = ms;
+        f.ease = ease;
+    }
+
+    /// `prefers-reduced-motion: reduce` holds (the program's setting, default off; `J3_REDUCED_MOTION=1` starts it on). Re-tests
+    /// `@media` once; the built-in motion (flip, enter / leave transitions, ripple, smooth wheel scroll) stops. CSS `transition` /
+    /// `animation` keep running unless the stylesheet turns them off under the media query.
+    fn setReducedMotion(this: &Dom, on: bool) {
+        this.setPrefs(on, this.css.dark);
+    }
+
+    /// `prefers-color-scheme: dark` holds when `dark` (default light; `J3_COLOR_SCHEME=dark` starts dark). Re-tests `@media` once.
+    fn setColorScheme(this: &Dom, dark: bool) {
+        this.setPrefs(this.css.reduced, dark);
+    }
+
+    /// `pointer: coarse` and `hover: none` hold when `touch` (default on Android; `J3_POINTER=coarse|fine` overrides). Re-tests `@media` once.
+    fn setTouch(this: &Dom, touch: bool) {
+        if this.css.setTouch(touch) && this.nodes.len > 0 {
+            markStyle(this, 0);
+        }
+    }
+
+    fn reducedMotion(this: &Dom): bool { return this.css.reduced; }
+
+    fn darkScheme(this: &Dom): bool { return this.css.dark; }
+
+    fn setPrefs(this: &Dom, reduced: bool, dark: bool) {
+        let was = this.css.reduced;
+        if this.css.setPrefs(reduced, dark) && this.nodes.len > 0 {
+            markStyle(this, 0);
+        }
+        if reduced && !was {
+            // motion in flight ends now: leaving ghosts, ripples, flips and wheel inertia
+            for i in 0..this.nodes.len {
+                let n = &this.nodes.items[i];
+                if n.kind == K_ELEM && n.ghost && n.trn >= 0 {
+                    n.ghostT0 = this.now - this.trns.items[n.trn].outMs;
+                }
+                n.velX = 0.0;
+                n.velY = 0.0;
+            }
+            for i in 0..this.flips.len {
+                let f = &this.flips.items[i];
+                f.ox0 = 0.0;
+                f.oy0 = 0.0;
+                f.ox = 0.0;
+                f.oy = 0.0;
+            }
+            this.flipLive = 0;
+            this.coasting = 0;
+            this.rip.n = 0;
+        }
+    }
+
+    /// The paint offset of an `animate:flip` flight on `id` (0 when none): its box and subtree are drawn this far from the layout position.
+    fn flipDx(this: &Dom, id: int): f32 {
+        id = this.resolve(id);
+        if id == STALE { return 0.0; }
+        let f = this.nodes.items[id].flip;
+        return if f >= 0 { this.flips.items[f].ox } else { 0.0 };
+    }
+
+    fn flipDy(this: &Dom, id: int): f32 {
+        id = this.resolve(id);
+        if id == STALE { return 0.0; }
+        let f = this.nodes.items[id].flip;
+        return if f >= 0 { this.flips.items[f].oy } else { 0.0 };
+    }
+
+    /// Give element `id` enter / leave transitions (`Trans`; kind 0 is none): it plays `inK` when created this frame,
+    /// and stays as a ghost (in the tree, no input) playing `outK` when its `{#if}` branch is left or its keyed row removed.
+    fn trans(this: &Dom, id: int, inK: int, inMs: f32, outK: int, outMs: f32, ease: int, fx: f32, fy: f32, sf: f32, axis: int) {
+        id = this.resolve(id);
+        if id == STALE { return; }
+        let n = &this.nodes.items[id];
+        if inMs <= 0.0 { inK = 0; }
+        if outMs <= 0.0 { outK = 0; }
+        if n.trn < 0 {
+            n.trn = this.trns.len;
+            this.trns.push(Trans { node: id, inK: 0, inMs: 0.0, outK: 0, outMs: 0.0, ease: 0, fx: 0.0, fy: 0.0, sf: 0.0, axis: 0, sliding: false });
+            if inK != 0 && n.born == this.frame {
+                n.fadeT0 = this.now;
+            }
+        }
+        let t = &this.trns.items[n.trn];
+        t.inK = inK;
+        t.inMs = inMs;
+        t.outK = outK;
+        t.outMs = outMs;
+        t.ease = ease;
+        t.fx = fx;
+        t.fy = fy;
+        t.sf = sf;
+        t.axis = axis;
+    }
+
+    /// The kind, shown amount, fly offset and scale of the transition running on `id` (see `Trans`; for tests and hit testing).
+    fn trKind(this: &Dom, id: int): int { id = this.resolve(id); if id == STALE { return -1; } return transKind(this, id); }
+
+    fn trAmt(this: &Dom, id: int): f32 { id = this.resolve(id); if id == STALE { return 0.0; } return transAmt(this, id); }
+
+    fn trDx(this: &Dom, id: int): f32 { id = this.resolve(id); if id == STALE { return 0.0; } return transDx(this, id); }
+
+    fn trDy(this: &Dom, id: int): f32 { id = this.resolve(id); if id == STALE { return 0.0; } return transDy(this, id); }
+
+    fn trScale(this: &Dom, id: int): f32 { id = this.resolve(id); if id == STALE { return 0.0; } return transScale(this, id); }
+
+    /// `transition:fade={ms}` on `id`: `trans` with a linear fade both ways.
+    fn fade(this: &Dom, id: int, ms: f32) {
+        id = this.resolve(id);
+        if id == STALE { return; }
+        this.trans(id, 1, ms, 1, ms, -1, 0.0, 0.0, 0.5, 0);
+    }
+}
+

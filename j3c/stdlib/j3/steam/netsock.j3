@@ -1,0 +1,366 @@
+// Part of j3.steam: ISteamNetworkingSockets, peer-to-peer connections between Steam users. Sending, receiving
+// and poll groups are in netsockmsg.j3, the in-process loopback for fake mode in netsockfake.j3. The module doc
+// and `use`s are in ../steam.j3.
+//
+// The usual flow. The server calls `listenP2P(port)`; a client calls `connectP2P(serverId, port)`. Both sides
+// get `onConnStatus(conn, oldState, info)` as the connection changes state:
+//   * server, `info.state == NET_STATE_CONNECTING` and `info.listenSocket != 0`: call `acceptConn(conn)`;
+//   * `NET_STATE_CONNECTED`: send and receive (`sendConn`, `receiveConn`, or a poll group);
+//   * `NET_STATE_CLOSED_BY_PEER` or `NET_STATE_PROBLEM_LOCALLY`: call `closeConn(conn, ...)` (the handle stays
+//     valid until you do).
+// Everything here is main-thread only. Handles are `u32`; 0 is never a valid one.
+module j3.steam;
+
+/// `closeConn` reason: a generic application close. Reasons from `CONN_APP_MIN` to `CONN_APP_MAX` are yours.
+pub const CONN_APP_GENERIC: i32 = 1000;
+/// Lowest application close reason.
+pub const CONN_APP_MIN: i32 = 1000;
+/// Highest application close reason.
+pub const CONN_APP_MAX: i32 = 1999;
+/// `EResult`: the connection is not in a state that allows this (closed by the peer, say).
+pub const NET_INVALID_STATE: i32 = 11;
+
+const CB_CONN_STATUS: i32 = 1221;
+const CB_AUTH_STATUS: i32 = 1222;
+const SKB_NUM: int = 0;
+const SKB_NAME: int = 8;
+const SKB_RT: int = 144;
+const SKB_AUTH: int = 400;
+const SKB_INFO: int = 664;
+const SKB_SIZE: int = 1408;
+
+// Indexes into `SOFF`.
+const SO_CS_HCONN: int = 0;
+const SO_CS_INFO: int = 1;
+const SO_CS_OLD: int = 2;
+const SO_CS_SIZE: int = 3;
+const SO_AU_AVAIL: int = 4;
+const SO_AU_MSG: int = 5;
+const SO_AU_SIZE: int = 6;
+const SO_M_CONN: int = 7;
+const SO_M_CUD: int = 8;
+const SO_RT_STATE: int = 9;
+const SO_RT_PING: int = 10;
+const SO_RT_QL: int = 11;
+const SO_RT_QR: int = 12;
+const SO_RT_OPP: int = 13;
+const SO_RT_OBP: int = 14;
+const SO_RT_IPP: int = 15;
+const SO_RT_IBP: int = 16;
+const SO_RT_SEND: int = 17;
+const SO_RT_PU: int = 18;
+const SO_RT_PR: int = 19;
+const SO_RT_SU: int = 20;
+const SO_RT_QT: int = 21;
+const SO_COUNT: int = 22;
+
+#[singleton]
+let SOFF: []int;
+#[singleton]
+let SKBUF: ptr;
+#[singleton]
+let H_CSTAT: ptr;
+#[singleton]
+let H_AUTH: ptr;
+
+/// What `sendConn` did.
+pub struct SendResult {
+    /// `EResult`: `NET_OK` when queued.
+    result: i32;
+    /// The message number Steam gave it; 0 when it was not queued.
+    msgNum: i64;
+}
+
+fn sk(): ptr {
+    return iface("SteamNetworkingSockets");
+}
+
+fn sset(i: int, name: string, field: string) {
+    SOFF[i] = lay(name, field);
+}
+
+fn so(i: int): int {
+    if SOFF.len == 0 {
+        sockOffsets();
+    }
+    return SOFF[i];
+}
+
+/// The scratch block for names, numbers and structs read from Steam; made on first use, so every call is safe before `init`.
+fn skb(): ptr {
+    if SKBUF as int == 0 {
+        SKBUF = arena().allocBytes(SKB_SIZE);
+    }
+    return SKBUF;
+}
+
+fn sockOffsets() {
+    netIdInit();
+    SOFF = arena().alloc::<int>(SO_COUNT);
+    let cs = "SteamNetConnectionStatusChangedCallback_t";
+    sset(SO_CS_HCONN, cs, "hConn");
+    sset(SO_CS_INFO, cs, "info");
+    sset(SO_CS_OLD, cs, "eOldState");
+    sset(SO_CS_SIZE, cs, SIZE);
+    let au = "SteamNetAuthenticationStatus_t";
+    sset(SO_AU_AVAIL, au, "eAvail");
+    sset(SO_AU_MSG, au, "debugMsg");
+    sset(SO_AU_SIZE, au, SIZE);
+    sset(SO_M_CONN, "SteamNetworkingMessage_t", "conn");
+    sset(SO_M_CUD, "SteamNetworkingMessage_t", "connUserData");
+    let rt = "SteamNetConnectionRealTimeStatus_t";
+    sset(SO_RT_STATE, rt, "eState");
+    sset(SO_RT_PING, rt, "nPing");
+    sset(SO_RT_QL, rt, "flConnectionQualityLocal");
+    sset(SO_RT_QR, rt, "flConnectionQualityRemote");
+    sset(SO_RT_OPP, rt, "flOutPacketsPerSec");
+    sset(SO_RT_OBP, rt, "flOutBytesPerSec");
+    sset(SO_RT_IPP, rt, "flInPacketsPerSec");
+    sset(SO_RT_IBP, rt, "flInBytesPerSec");
+    sset(SO_RT_SEND, rt, "nSendRateBytesPerSecond");
+    sset(SO_RT_PU, rt, "cbPendingUnreliable");
+    sset(SO_RT_PR, rt, "cbPendingReliable");
+    sset(SO_RT_SU, rt, "cbSentUnackedReliable");
+    sset(SO_RT_QT, rt, "usecQueueTime");
+}
+
+/// Called once from `netInit`: callbacks and shutdown hook.
+fn sockInit() {
+    sockOffsets();
+    onCallback(CB_CONN_STATUS, onConnStatusCb);
+    onCallback(CB_AUTH_STATUS, onAuthCb);
+    onShutdown(sockDown);
+}
+
+fn sockDown() {
+    skReset();
+}
+
+/// Run `f(conn, oldState, info)` whenever a connection changes state (`info.state` is the new one). `info`
+/// also says who (`peer`), which listen socket it came in on (`listenSocket`, 0 for one you opened) and why it
+/// ended (`endReason`, `endDebug`; strings on the frame scratch arena). One handler: setting again replaces it.
+pub fn onConnStatus(f: fn(u32, i32, ConnInfo)) {
+    H_CSTAT = f as ptr;
+}
+
+/// Run `f(avail, debug)` when the networking login state changes (see `AuthStatus`). One handler.
+pub fn onAuthStatus(f: fn(i32, string)) {
+    H_AUTH = f as ptr;
+}
+
+fn onConnStatusCb(p: ptr, n: i32) {
+    if H_CSTAT as int != 0 {
+        let c = decodeConn((p as int + so(SO_CS_INFO)) as ptr);
+        let f = H_CSTAT as fn(u32, i32, ConnInfo);
+        f(rdU32(p, so(SO_CS_HCONN)), rdI32(p, so(SO_CS_OLD)), c);
+    }
+}
+
+fn onAuthCb(p: ptr, n: i32) {
+    if H_AUTH as int != 0 {
+        let f = H_AUTH as fn(i32, string);
+        f(rdI32(p, so(SO_AU_AVAIL)), fromFixed((p as int + so(SO_AU_MSG)) as ptr, 256));
+    }
+}
+
+/// Start listening for P2P connections on `virtualPort` (any number you and the client agree on). Returns the
+/// listen socket handle, or 0 when it failed or Steam is absent. Connections arrive through `onConnStatus`.
+pub fn listenP2P(virtualPort: i32): u32 {
+    if fake() {
+        return skListen(virtualPort);
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P") as fn(ptr, i32, i32, ptr): u32;
+    return f(sk(), virtualPort, i32(0), 0 as ptr);
+}
+
+/// Stop listening and close the connections that came in through `sock`. True when it worked. False when Steam is absent.
+pub fn closeListen(sock: u32): bool {
+    if fake() {
+        return skCloseListen(sock);
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_CloseListenSocket") as fn(ptr, u32): bool;
+    return f(sk(), sock);
+}
+
+/// Connect to Steam user `to`, who listens on `virtualPort`. Returns the connection handle at once (state
+/// `NET_STATE_CONNECTING`); 0 when Steam is absent or `to` is 0. Watch `onConnStatus` for `NET_STATE_CONNECTED`.
+pub fn connectP2P(to: u64, virtualPort: i32): u32 {
+    if to == u64(0) {
+        return u32(0);
+    }
+    if fake() {
+        return skConnect(to, virtualPort);
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_ConnectP2P") as fn(ptr, ptr, i32, i32, ptr): u32;
+    return f(sk(), idPut(1, to), virtualPort, i32(0), 0 as ptr);
+}
+
+/// Accept a connection that arrived on your listen socket. Returns an `EResult` (`NET_OK` on success);
+/// 0 when Steam is absent.
+pub fn acceptConn(conn: u32): i32 {
+    if fake() {
+        return skAccept(conn);
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_AcceptConnection") as fn(ptr, u32): i32;
+    return f(sk(), conn);
+}
+
+/// Close a connection. `reason` is yours to pick from `CONN_APP_MIN` to `CONN_APP_MAX` (anything else is sent as
+/// `CONN_APP_GENERIC`), `debug` a short text the other side reads in `info.endDebug`. With `linger` the
+/// queued messages are still sent first. The handle is dead after this. True when it existed. False when Steam is absent.
+pub fn closeConn(conn: u32, reason: i32, debug: string, linger: bool): bool {
+    if reason < CONN_APP_MIN || reason > CONN_APP_MAX {
+        reason = CONN_APP_GENERIC;
+    }
+    if fake() {
+        return skClose(conn, reason, debug);
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_CloseConnection") as fn(ptr, u32, i32, ptr, bool): bool;
+    return f(sk(), conn, reason, cs(debug, 1), linger);
+}
+
+/// Attach a number of your own to a connection (a player index, say); messages from it carry it as `connData`.
+/// True when it worked.
+pub fn setConnData(conn: u32, data: i64): bool {
+    if fake() {
+        return skSetData(conn, data);
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_SetConnectionUserData") as fn(ptr, u32, i64): bool;
+    return f(sk(), conn, data);
+}
+
+/// The number set with `setConnData`; -1 when the connection is unknown (Steam's default too), 0 when Steam is absent.
+pub fn connData(conn: u32): i64 {
+    if fake() {
+        return skData(conn);
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_GetConnectionUserData") as fn(ptr, u32): i64;
+    return f(sk(), conn);
+}
+
+/// Give a connection a name for logs (up to 127 bytes).
+pub fn setConnName(conn: u32, name: string) {
+    if fake() {
+        skSetName(conn, name);
+        return;
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_SetConnectionName") as fn(ptr, u32, ptr);
+    f(sk(), conn, cs(name, 0));
+}
+
+/// The name set with `setConnName`, or "" (a copy on the frame scratch arena).
+pub fn connName(conn: u32): string {
+    if fake() {
+        return skName(conn);
+    }
+    if !ready() {
+        return "";
+    }
+    let b = (skb() as int + SKB_NAME) as ptr;
+    zeroBytes(b, 128);
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_GetConnectionName") as fn(ptr, u32, ptr, i32): bool;
+    if !f(sk(), conn, b, i32(128)) {
+        return "";
+    }
+    return fromFixed(b, 128);
+}
+
+/// Who a connection is with and how it stands (strings on the frame scratch arena). All zero (state
+/// `NET_STATE_NONE`) for an unknown handle or when Steam is absent.
+pub fn connInfo(conn: u32): ConnInfo {
+    if fake() {
+        return skInfo(conn);
+    }
+    let b = (skb() as int + SKB_INFO) as ptr;
+    if ready() {
+        zeroBytes(b, no(N_CI_SIZE));
+        let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_GetConnectionInfo") as fn(ptr, u32, ptr): bool;
+        if !f(sk(), conn, b) {
+            zeroBytes(b, no(N_CI_SIZE));
+        }
+    } else {
+        zeroBytes(b, no(N_CI_SIZE));
+    }
+    return decodeConn(b);
+}
+
+/// Ping, quality and queue sizes of a connection. All zero (ping -1) for an unknown handle or when Steam is absent.
+/// In fake mode: ping 0, quality 1.0, the rest 0.
+pub fn connStatus(conn: u32): ConnStatus {
+    if fake() {
+        return skStatus(conn);
+    }
+    let b = (skb() as int + SKB_RT) as ptr;
+    zeroBytes(b, 128);
+    wrI32(b, so(SO_RT_PING), i32(-1));
+    if ready() {
+        let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_GetConnectionRealTimeStatus") as fn(ptr, u32, ptr, i32, ptr): i32;
+        if f(sk(), conn, b, i32(0), 0 as ptr) != NET_OK {
+            zeroBytes(b, 128);
+            wrI32(b, so(SO_RT_PING), i32(-1));
+        }
+    }
+    return ConnStatus {
+        state: rdI32(b, so(SO_RT_STATE)),
+        ping: rdI32(b, so(SO_RT_PING)),
+        qualityLocal: rdF32(b, so(SO_RT_QL)),
+        qualityRemote: rdF32(b, so(SO_RT_QR)),
+        outPacketsPerSec: rdF32(b, so(SO_RT_OPP)),
+        outBytesPerSec: rdF32(b, so(SO_RT_OBP)),
+        inPacketsPerSec: rdF32(b, so(SO_RT_IPP)),
+        inBytesPerSec: rdF32(b, so(SO_RT_IBP)),
+        sendRateBytesPerSec: rdI32(b, so(SO_RT_SEND)),
+        pendingUnreliable: rdI32(b, so(SO_RT_PU)),
+        pendingReliable: rdI32(b, so(SO_RT_PR)),
+        sentUnackedReliable: rdI32(b, so(SO_RT_SU)),
+        queueTime: i64(rdU64(b, so(SO_RT_QT)))
+    };
+}
+
+/// Your own SteamID64 as the networking stack sees it; 0 when Steam is absent or it is not ready yet.
+/// In fake mode `FAKE_USER`.
+pub fn myIdentity(): u64 {
+    if fake() {
+        return FAKE_USER;
+    }
+    if !ready() {
+        return u64(0);
+    }
+    let p = idPut(1, u64(0));
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_GetIdentity") as fn(ptr, ptr): bool;
+    if !f(sk(), p) {
+        return u64(0);
+    }
+    return idGet(p);
+}
+
+/// Start the networking login (done by Steam on its own, but this lets you ask early). Returns a `RELAY_*`
+/// availability value; `onAuthStatus` reports changes. `RELAY_UNKNOWN` when Steam is absent.
+pub fn initAuth(): i32 {
+    if fake() {
+        fakeLog("initAuth");
+        let b = netCbBuf();
+        wrI32(b, so(SO_AU_AVAIL), RELAY_CURRENT);
+        wrU8(b, so(SO_AU_MSG), u8(79));
+        wrU8(b, so(SO_AU_MSG) + 1, u8(75));
+        fakeCallback(CB_AUTH_STATUS, @slice(b, so(SO_AU_SIZE)));
+        return RELAY_CURRENT;
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_InitAuthentication") as fn(ptr): i32;
+    return f(sk());
+}
+
+/// The networking login state now. `avail` is `RELAY_UNKNOWN` when Steam is absent; fake mode says `RELAY_CURRENT`.
+pub fn authStatus(): AuthStatus {
+    if fake() {
+        return AuthStatus { avail: RELAY_CURRENT, debug: "OK" };
+    }
+    if !ready() {
+        return AuthStatus { avail: RELAY_UNKNOWN, debug: "" };
+    }
+    let b = (skb() as int + SKB_AUTH) as ptr;
+    zeroBytes(b, 264);
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_GetAuthenticationStatus") as fn(ptr, ptr): i32;
+    let a = f(sk(), b);
+    return AuthStatus { avail: a, debug: fromFixed((b as int + so(SO_AU_MSG)) as ptr, 256) };
+}

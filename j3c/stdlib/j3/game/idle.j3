@@ -1,0 +1,132 @@
+// Part of j3.game (sleeping through idle frames for a UI app); the module doc and `use`s are in ../game.j3.
+module j3.game;
+
+/// `idleReport(ms)` for "nothing is due": sleep until an event (the loop's cap still wakes it).
+pub const IDLE_FOREVER: int = 1000000;
+/// Longest sleep (ms): a safety net for timers the UI cannot name (toast expiry, a hover card's delay, `domhot`'s 250 ms file poll).
+const IDLE_CAP_MS: int = 250;
+/// The cap under `j3c run --hot`, whose restart check (`hotPoll`) counts frames.
+const IDLE_CAP_HOT_MS: int = 40;
+/// SDL_USEREVENT: what `idleWake` pushes.
+const IDLE_USER_EVENT: u32 = 0x8000;
+/// Frame time (ms) the first frame after a sleep sees, so motion does not jump by the time spent asleep.
+const IDLE_WAKE_DT_MS: u32 = 16;
+
+/// A `Dom` frame has ended (a UI app is hosted).
+#[singleton]
+let IDLE_HOSTED: bool;
+/// The last `Dom` frame's `idleReport`: ms until a frame is next needed (0: now).
+#[singleton]
+let IDLE_MS: int;
+/// 1 sleeping is allowed, -1 not, 0 not read yet (`idleSkipAllowed`).
+#[singleton]
+let IDLE_MODE: int;
+/// The event that ended a sleep, kept for the next `poll` (it would lose it otherwise: `poll` clears per-frame input first).
+#[singleton]
+let IDLE_EV: SDL_Event;
+#[singleton]
+let IDLE_HELD: bool;
+/// The loop slept since the last `idleWoke` call.
+#[singleton]
+let IDLE_WOKE: bool;
+
+/// 1 while an `idleWake` event is queued and not yet seen by `idleWait`, so a busy worker pushes one, not thousands.
+#[singleton]
+let IDLE_PENDING: int;
+
+/// `wakeAt` time in `ticks()` ms (0: none).
+#[singleton]
+let IDLE_WAKE_AT: int;
+
+/// Wake the idle loop by `ms` (a `ticks()` time), e.g. the next cursor blink edge or an app-logic timer ("bot plays at
+/// `ticks() >= due`"); canvas animation and `j3.thread.Queue` results wake it by themselves. The earliest pending call wins; it
+/// covers the next sleep only, so call it again each frame you still need it. While set it also replaces the 250 ms
+/// safety tick for that sleep. No effect when the loop is not sleeping.
+pub fn wakeAt(ms: int) {
+    if IDLE_WAKE_AT <= 0 || ms < IDLE_WAKE_AT { IDLE_WAKE_AT = if ms < 1 { 1 } else { ms }; }
+}
+
+/// `sleepMs` shortened to end at `wakeAtMs` (0: none) seen at `nowMs`; 0 when that time has come. Pure.
+pub fn idleClampWake(sleepMs: int, wakeAtMs: int, nowMs: int): int {
+    if sleepMs <= 0 || wakeAtMs <= 0 { return sleepMs; }
+    let left = wakeAtMs - nowMs;
+    if left <= 0 { return 0; }
+    return if left < sleepMs { left } else { sleepMs };
+}
+
+/// Called by `Dom.endFrame`: this frame was a UI frame and the next is due in `ms` (0: now).
+pub fn idleReport(ms: int) {
+    IDLE_HOSTED = true;
+    IDLE_MS = ms;
+}
+
+/// Wake a sleeping loop from any thread (`Dom.requestFrame`, `j3.thread.Queue` pushes through `j3.wake`). A no-op without a
+/// window; wakes already queued are merged into one.
+pub fn idleWake() {
+    if platform.window == 0 { return; }
+    if !@atomicCas(&IDLE_PENDING, 0, 1) { return; }
+    let ev = SDL_Event { ty: IDLE_USER_EVENT, timestamp: 0, windowID: 0, win_event: 0, pad1: 0, pad2: 0, pad3: 0, data1: 0, data2: 0, motion_y: 0, xrel: 0, yrel: 0, motion_pad: 0, tail2: 0, tail3: 0 };
+    sdl.SDL_PushEvent(&ev as ptr);
+}
+
+/// How long the loop may sleep, in ms (0: run a frame now). Pure, so a test can drive it with a fake state.
+pub fn idleSleepMs(hosted: bool, allowed: bool, reportMs: int, capMs: int): int {
+    if !hosted || !allowed || reportMs <= 0 { return 0; }
+    if reportMs < capMs { return reportMs; }
+    return capMs;
+}
+
+/// Sleeping through idle frames is on: `J3_IDLE_SKIP=1` forces it, `=0` forbids it; otherwise on unless the run is a
+/// test or capture (`J3_FRAMES`, `J3_SCREENSHOT`, `J3_CAPTURE`, `J3_FIXED_DT`, `J3_STEADY`) or headless (`offscreen` / `dummy`
+/// video driver), where frame counts must hold.
+pub fn idleSkipAllowed(): bool {
+    if IDLE_MODE == 0 {
+        let force = env("J3_IDLE_SKIP");
+        let drv = env("SDL_VIDEODRIVER");
+        IDLE_MODE = 1;
+        if force.len == 1 && force[0] == 49 { return true; }
+        if force.len == 1 && force[0] == 48 { IDLE_MODE = -1; }
+        if env("J3_FRAMES").len > 0 || env("J3_SCREENSHOT").len > 0 || env("J3_CAPTURE").len > 0 { IDLE_MODE = -1; }
+        if env("J3_FIXED_DT").len > 0 || env("J3_STEADY").len > 0 { IDLE_MODE = -1; }
+        if same(drv, "offscreen") || same(drv, "dummy") { IDLE_MODE = -1; }
+    }
+    return IDLE_MODE > 0;
+}
+
+/// Frames shown so far (`present` calls).
+pub fn framesPresented(): int {
+    return PRESENTED;
+}
+
+/// If the last UI frame said nothing is due, sleep in `SDL_WaitEventTimeout` until an event, the due time, or the cap, and
+/// return true; the caller then runs a frame. False: run a frame now. The waking event waits in `IDLE_EV` for `poll`.
+pub fn idleWait(): bool {
+    // Thread hand-offs wake the loop from here on (set here, so an app that never sleeps never gets the events).
+    wake.setHook(idleWake);
+    // A wake pushed before this sees its event in the queue; one pushed after pushes a new one.
+    @atomicStore(&IDLE_PENDING, 0);
+    let cap = IDLE_CAP_MS;
+    if env("J3_HOT_QUIT").len > 0 { cap = IDLE_CAP_HOT_MS; }
+    let now = int(sdl.SDL_GetTicks());
+    // A named wake time stands in for the safety tick, so a 500 ms blink is 2 frames a second, not 4.
+    if IDLE_WAKE_AT > now && IDLE_WAKE_AT - now > cap { cap = IDLE_WAKE_AT - now; }
+    let ms = idleSleepMs(IDLE_HOSTED, idleSkipAllowed(), IDLE_MS, cap);
+    if ms > 0 && IDLE_WAKE_AT > 0 {
+        ms = idleClampWake(ms, IDLE_WAKE_AT, now);
+        // Spent by this sleep, or due now (the frame about to run is the wake).
+        IDLE_WAKE_AT = 0;
+    }
+    if ms == 0 { return false; }
+    IDLE_MS = 0;
+    IDLE_WOKE = true;
+    if sdl.SDL_WaitEventTimeout(&IDLE_EV as ptr, i32(ms)) != 0 { IDLE_HELD = true; }
+    platform.last_ms = sdl.SDL_GetTicks() - IDLE_WAKE_DT_MS;
+    return true;
+}
+
+/// True once after a sleep: the UI clamps the first frame's dt to one frame (`Dom.beginFrame`).
+pub fn idleWoke(): bool {
+    let w = IDLE_WOKE;
+    IDLE_WOKE = false;
+    return w;
+}

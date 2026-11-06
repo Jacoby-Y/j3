@@ -1,0 +1,203 @@
+// The garbage collector: non-incremental mark-sweep over `Heap.objects`. Part of `j3.j2`.
+//
+// When: `Vm.memFull` (the one safe point, right after an op that allocated stored its result)
+// collects once the heap has grown by its live size since the last collection (at least
+// 256 KB), on every call with `J3_J2_GC_STRESS=1` (read once by `Vm.new`), and before it reports
+// `out of script memory`. Never while compiling (`gcPause`): constants and protos are reachable
+// only from the compiler's arena lists then. An allocation anywhere else never collects.
+//
+// Roots: the stack below `top` (slots above it are dead and get nil'd so they can't dangle
+// later), frames' closures, open upvalues, globals, natives' names, `keep` slots, the loading
+// stack, and natives' temporaries (`protect`). Objects with `fixed` set are never freed. The
+// intern table is weak: dead strings leave it before the sweep frees them.
+// ponytail: the pause grows with the live heap; go incremental if a game measures over 1 ms.
+
+module j3.j2;
+
+/// Collect at least this much past the live size.
+const GC_MIN: int = 262144;
+
+/// Heap numbers for tests and tools (`vm.stats()`).
+pub struct Stats {
+    /// GC objects alive (or not yet swept).
+    liveObjects: int;
+    /// Bytes in use (what `Limits.heapBytes` caps).
+    bytes: int;
+    /// Collections so far.
+    collections: int;
+}
+
+extend Vm {
+    /// Heap counters for a debug HUD: live objects, bytes in use, collections so far.
+    fn stats(this: &Vm): Stats {
+        return Stats { liveObjects: this.heap.liveObjects, bytes: this.heap.bytes, collections: this.collections };
+    }
+
+    /// Keep `v` alive until the running native returns (or, outside any native, until the
+    /// current top-level `call`/`loadString` ends). `newTable`, `newArray` and `j2.str` do this
+    /// for you; use it for a value a native holds in a J3 local across `vm.call` that nothing in
+    /// script reaches, e.g. a call's result. Returns `v`.
+    fn protect(this: &Vm, v: Value): Value {
+        if v.tag < T_STR || v.tag > T_FN { return v; }
+        if this.ntemps == this.temps.len {
+            let n = if this.temps.len == 0 { 32 } else { this.temps.len * 2 };
+            let next: []Value = @slice(this.heap.allocRaw(n * @sizeof(Value)), n);
+            for i in 0..this.ntemps { next[i] = this.temps[i]; }
+            if this.temps.len > 0 { this.heap.freeRaw(this.temps.ptr as ptr, this.temps.len * @sizeof(Value)); }
+            this.temps = next;
+        }
+        this.temps[this.ntemps] = v;
+        this.ntemps += 1;
+        return v;
+    }
+
+    /// Run a full collection now.
+    fn collect(this: &Vm) {
+        this.markRoots();
+        this.drainGray();
+        this.dropDeadStrings();
+        this.sweep();
+        this.collections += 1;
+        let live = this.heap.bytes;
+        this.nextGc = live + if live > GC_MIN { live } else { GC_MIN };
+    }
+
+    fn markRoots(this: &Vm) {
+        for i in 0..this.top { this.markValue(this.stack[i]); }
+        // dead slots above `top` may point at objects this sweep frees; a later frame must not find them
+        for i in this.top..this.stack.len { this.stack[i] = nilv(); }
+        for i in 0..this.nframes { this.markObj(this.frames[i].cl); }
+        let u = this.open;
+        while u != 0 as ptr {
+            this.markObj(u);
+            u = (u as &Upval).next;
+        }
+        this.markValue(this.globals);
+        for i in 0..this.nnatives { this.markValue(this.natives[i].name); }
+        let ks = this.heap.keeps;
+        for i in 0..ks.len {
+            if ks[i].used { this.markValue(ks[i].v); }
+        }
+        for i in 0..this.nloading { this.markValue(this.loading[i]); }
+        for i in 0..this.ntemps { this.markValue(this.temps[i]); }
+    }
+
+    fn markValue(this: &Vm, v: Value) {
+        if v.tag >= T_STR && v.tag <= T_FN { this.markObj(v.obj()); }
+    }
+
+    /// Mark `p` and queue it for its children (strings have none).
+    fn markObj(this: &Vm, p: ptr) {
+        if p == 0 as ptr { return; }
+        let h = p as &GcHeader;
+        if h.mark != 0 { return; }
+        h.mark = 1;
+        if h.kind == OBJ_STR { return; }
+        if this.ngray == this.gray.len {
+            let n = if this.gray.len == 0 { 256 } else { this.gray.len * 2 };
+            let next: []int = @slice(this.heap.allocRaw(n * 8), n);
+            for i in 0..this.ngray { next[i] = this.gray[i]; }
+            if this.gray.len > 0 { this.heap.freeRaw(this.gray.ptr as ptr, this.gray.len * 8); }
+            this.gray = next;
+        }
+        this.gray[this.ngray] = p as int;
+        this.ngray += 1;
+    }
+
+    /// Mark the children of every queued object (a work list, so deep nesting can't overflow the J3 stack).
+    fn drainGray(this: &Vm) {
+        while this.ngray > 0 {
+            this.ngray -= 1;
+            let p = this.gray[this.ngray] as ptr;
+            let kind = (p as &GcHeader).kind;
+            if kind == OBJ_TABLE {
+                let t = p as &Tbl;
+                let es = t.entries();
+                for i in 0..t.used {
+                    if es[i].key.tag != T_DEAD {
+                        this.markValue(es[i].key);
+                        this.markValue(es[i].val);
+                    }
+                }
+            } else if kind == OBJ_ARRAY {
+                let xs = (p as &Arr).values();
+                for i in 0..xs.len { this.markValue(xs[i]); }
+            } else if kind == OBJ_FN {
+                let cl = p as &Closure;
+                this.markObj(cl.proto);
+                this.markValue(cl.env);
+                let ups = cl.upsOf();
+                for i in 0..ups.len { this.markObj(ups[i] as ptr); }
+            } else if kind == OBJ_PROTO {
+                let pr = p as &Proto;
+                let ks = pr.constsOf();
+                for i in 0..ks.len { this.markValue(ks[i]); }
+                let ps = pr.protosOf();
+                for i in 0..ps.len { this.markObj(ps[i] as ptr); }
+                this.markValue(pr.name);
+                this.markValue(pr.chunk);
+                this.markValue(pr.file);
+            } else if kind == OBJ_UPVAL {
+                let u = p as &Upval;
+                if u.idx < 0 { this.markValue(u.v); } // an open one's value is on the stack
+            }
+        }
+    }
+
+    /// The weak intern table: forget unmarked strings (the sweep frees them). Linear probing
+    /// without tombstones, so after clearing the dead slots every live entry is placed again,
+    /// scanning from an empty slot so no cluster wraps past the start of the scan.
+    fn dropDeadStrings(this: &Vm) {
+        let h = this.heap;
+        let s = h.strs;
+        if s.len == 0 { return; }
+        for i in 0..s.len {
+            if s[i] != 0 {
+                let g = s[i] as ptr as &GcHeader;
+                if g.mark == 0 && g.fixed == 0 {
+                    s[i] = 0;
+                    h.strCount -= 1;
+                }
+            }
+        }
+        let mask = s.len - 1;
+        let start = 0;
+        while s[start] != 0 { start += 1; } // load stays under 3/4, so there is one
+        for k in 1..s.len + 1 {
+            let i = (start + k) & mask;
+            if s[i] != 0 {
+                let p = s[i];
+                s[i] = 0;
+                let j = (p as ptr as &Str).hash & mask;
+                while s[j] != 0 { j = (j + 1) & mask; }
+                s[j] = p;
+            }
+        }
+    }
+
+    /// Free every unmarked, unfixed object; clear the marks of the rest.
+    fn sweep(this: &Vm) {
+        let h = this.heap;
+        let prev = 0 as ptr;
+        let p = h.objects;
+        while p != 0 as ptr {
+            let g = p as &GcHeader;
+            let next = g.next;
+            if g.mark != 0 || g.fixed != 0 {
+                g.mark = 0;
+                prev = p;
+            } else {
+                if prev == 0 as ptr { h.objects = next; } else { (prev as &GcHeader).next = next; }
+                if g.kind == OBJ_TABLE {
+                    (p as &Tbl).freeParts(h);
+                } else if g.kind == OBJ_ARRAY {
+                    (p as &Arr).freeParts(h);
+                } else if g.kind == OBJ_PROTO {
+                    (p as &Proto).freeParts(h);
+                }
+                h.freeObject(p);
+            }
+            p = next;
+        }
+    }
+}

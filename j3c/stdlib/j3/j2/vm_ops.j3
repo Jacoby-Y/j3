@@ -1,0 +1,311 @@
+// Operators, field and index access for the dispatch loop. Each returns false with the error
+// pending (`vm.errText`) on bad operands; the loop adds the position. Part of `j3.j2`.
+
+module j3.j2;
+
+/// The source text of arithmetic opcode `op`.
+fn opSymbol(op: int): string {
+    match op {
+        OP_ADD { return "+"; }
+        OP_SUB { return "-"; }
+        OP_MUL { return "*"; }
+        OP_DIV { return "/"; }
+        OP_MOD { return "%"; }
+        OP_LT { return "<"; }
+        _ { return "<="; }
+    }
+}
+
+/// Float remainder with the sign of `x`, like C's `fmod` (libm isn't linked everywhere).
+// ponytail: past 2^53 quotients the remainder is lost to rounding and comes out 0; port a
+// bit-exact fmod if a script ever needs huge float remainders.
+fn fmodf(x: f64, y: f64): f64 {
+    if !(x - x == 0.0) || y == 0.0 || !(y == y) {
+        let z = 0.0;
+        return z / z; // NaN
+    }
+    if !(y - y == 0.0) { return x; }
+    let q = x / y;
+    if q >= 9007199254740992.0 || q <= -9007199254740992.0 { return 0.0; }
+    return x - f64(int(q)) * y;
+}
+
+extend Vm {
+    /// `can't use <op> on <type> and <type>`.
+    fn badOperands(this: &Vm, op: int, x: Value, y: Value): bool {
+        let t = this.errText();
+        t.pushStr("can't use ");
+        t.pushStr(opSymbol(op));
+        t.pushStr(" on ");
+        t.pushStr(typeName(x));
+        t.pushStr(" and ");
+        t.pushStr(typeName(y));
+        return false;
+    }
+
+    /// `x op y` for `+ - * / %` into `out`. Ints wrap; int `/ 0` and `% 0` are errors; a float
+    /// operand makes the result a float; `+` with a string joins the `str()` texts.
+    fn arith(this: &Vm, op: int, x: Value, y: Value, out: &Value): bool {
+        if x.tag == T_INT && y.tag == T_INT {
+            let a = x.bits;
+            let b = y.bits;
+            match op {
+                OP_ADD { out.bits = a + b; }
+                OP_SUB { out.bits = a - b; }
+                OP_MUL { out.bits = a * b; }
+                OP_DIV {
+                    if b == 0 { return this.fail("division by zero"); }
+                    // -1 apart: the most negative int / -1 traps in hardware; it wraps here
+                    out.bits = if b == -1 { 0 - a } else { a / b };
+                }
+                _ {
+                    if b == 0 { return this.fail("modulo by zero"); }
+                    out.bits = if b == -1 { 0 } else { a % b };
+                }
+            }
+            out.tag = T_INT;
+            return true;
+        }
+        if x.isNum() && y.isNum() {
+            let a = x.asNum();
+            let b = y.asNum();
+            let r = 0.0;
+            match op {
+                OP_ADD { r = a + b; }
+                OP_SUB { r = a - b; }
+                OP_MUL { r = a * b; }
+                OP_DIV { r = a / b; }
+                _ { r = fmodf(a, b); }
+            }
+            out.tag = T_FLOAT;
+            out.bits = bitsOf(r);
+            return true;
+        }
+        if op == OP_ADD && (x.tag == T_STR || y.tag == T_STR) {
+            this.sb.clear();
+            fmtBuf(&this.sb, x);
+            fmtBuf(&this.sb, y);
+            let s = this.bufStr(&this.sb);
+            if s.isNil() { return false; }
+            out.tag = s.tag;
+            out.bits = s.bits;
+            return !this.memFull();
+        }
+        return this.badOperands(op, x, y);
+    }
+
+    /// `x < y` (`le`: `<=`) for two numbers or two strings (byte order).
+    fn less(this: &Vm, op: int, x: Value, y: Value, out: &bool): bool {
+        if x.tag == T_INT && y.tag == T_INT {
+            *out = if op == OP_LT { x.bits < y.bits } else { x.bits <= y.bits };
+            return true;
+        }
+        if x.isNum() && y.isNum() {
+            *out = if op == OP_LT { x.asNum() < y.asNum() } else { x.asNum() <= y.asNum() };
+            return true;
+        }
+        if x.tag == T_STR && y.tag == T_STR {
+            let c = compareBytes(textOf(x), textOf(y));
+            *out = if op == OP_LT { c < 0 } else { c <= 0 };
+            return true;
+        }
+        let t = this.errText();
+        t.pushStr("can't compare ");
+        t.pushStr(typeName(x));
+        t.pushStr(" and ");
+        t.pushStr(typeName(y));
+        return false;
+    }
+
+    /// `-x`.
+    fn negate(this: &Vm, x: Value, out: &Value): bool {
+        if x.tag == T_INT {
+            *out = intv(0 - x.bits);
+            return true;
+        }
+        if x.tag == T_FLOAT {
+            *out = floatv(0.0 - x.f());
+            return true;
+        }
+        let t = this.errText();
+        t.pushStr("can't negate ");
+        t.pushStr(typeName(x));
+        return false;
+    }
+
+    /// `str(xs[0]) + .. + str(xs[n-1])` as an interned string; nil with the error pending.
+    fn concat(this: &Vm, xs: []Value): Value {
+        this.sb.clear();
+        for i in 0..xs.len { fmtBuf(&this.sb, xs[i]); }
+        return this.bufStr(&this.sb);
+    }
+
+    /// `s` as a script string: the one way ops and natives make one from script input. Its bytes
+    /// are charged to the step budget, and a new copy must fit under `Limits.heapBytes` (after a
+    /// collection), so one op can't overshoot the cap. Nil with `took too long` or `out of script
+    /// memory` pending (a native then sets `raised`, see `strOut`). It may collect: call it only
+    /// where every live value is reachable (registers, arguments, `protect`ed).
+    fn makeStr(this: &Vm, s: string): Value {
+        if !this.charge(s.len) { return nilv(); }
+        let old = this.heap.lookupStr(s);
+        if !old.isNil() { return old; }
+        let need = @sizeof(Str) + s.len;
+        if this.heap.bytes + need > this.memLimit && this.gcPause == 0 { this.collect(); }
+        if this.heap.bytes + need > this.memLimit {
+            this.fail("out of script memory");
+            return nilv();
+        }
+        return this.heap.intern(s);
+    }
+
+    /// `makeStr` of what `b` holds, then `b` cleared (a big block goes back). A `b` that hit
+    /// the cap is `out of script memory`.
+    fn bufStr(this: &Vm, b: &Buf): Value {
+        let v = nilv();
+        if b.full {
+            this.fail("out of script memory");
+        } else {
+            v = this.makeStr(b.str());
+        }
+        b.clear();
+        return v;
+    }
+
+    /// `makeStr` from a native: nil with the native failed.
+    fn strOut(this: &Vm, s: string): Value {
+        let v = this.makeStr(s);
+        if v.isNil() { this.raised = true; }
+        return v;
+    }
+
+    /// `bufStr` from a native.
+    fn bufOut(this: &Vm, b: &Buf): Value {
+        let v = this.bufStr(b);
+        if v.isNil() { this.raised = true; }
+        return v;
+    }
+
+    /// `o.name`: a table's field (nil when missing).
+    fn getField(this: &Vm, o: Value, name: Value, out: &Value): bool {
+        if o.tag == T_TABLE {
+            *out = tableOf(o).get(name);
+            return true;
+        }
+        let t = this.errText();
+        t.pushStr("can't read field \"");
+        t.pushStr(textOf(name));
+        t.pushStr("\" of ");
+        t.pushStr(typeName(o));
+        return false;
+    }
+
+    /// `o.name = v`; nil removes the field.
+    fn setField(this: &Vm, o: Value, name: Value, v: Value): bool {
+        if o.tag == T_TABLE {
+            tableOf(o).set(this.heap, name, v);
+            return true;
+        }
+        let t = this.errText();
+        t.pushStr("can't set field \"");
+        t.pushStr(textOf(name));
+        t.pushStr("\" of ");
+        t.pushStr(typeName(o));
+        return false;
+    }
+
+    /// An array index from `k` (an int, or a float holding one) into `out`.
+    fn arrayIndex(this: &Vm, k: Value, out: &int): bool {
+        let key = keyOf(k);
+        if key.tag == T_INT {
+            *out = key.bits;
+            return true;
+        }
+        let t = this.errText();
+        t.pushStr("an array index must be an int, not ");
+        t.pushStr(typeName(k));
+        return false;
+    }
+
+    /// `o[k]`: an array element (nil out of range) or a table field.
+    fn getIndex(this: &Vm, o: Value, k: Value, out: &Value): bool {
+        if o.tag == T_TABLE {
+            *out = tableOf(o).get(k);
+            return true;
+        }
+        if o.tag == T_ARRAY {
+            let i = 0;
+            if !this.arrayIndex(k, &i) { return false; }
+            *out = arrOf(o).get(i);
+            return true;
+        }
+        let t = this.errText();
+        t.pushStr("can't index ");
+        t.pushStr(typeName(o));
+        return false;
+    }
+
+    /// `o[k] = v`. An array takes indices up to its length (that one appends).
+    fn setIndex(this: &Vm, o: Value, k: Value, v: Value): bool {
+        if o.tag == T_TABLE {
+            if !tableOf(o).set(this.heap, k, v) {
+                let t = this.errText();
+                t.pushStr("a table key can't be ");
+                t.pushStr(if k.tag == T_NIL { "nil" } else { "NaN" });
+                return false;
+            }
+            return true;
+        }
+        if o.tag == T_ARRAY {
+            let i = 0;
+            if !this.arrayIndex(k, &i) { return false; }
+            let a = arrOf(o);
+            if !a.set(this.heap, i, v) {
+                let t = this.errText();
+                t.pushStr("array index ");
+                t.pushInt(i);
+                t.pushStr(" is out of range (len ");
+                t.pushInt(a.len);
+                t.pushStr(")");
+                return false;
+            }
+            return true;
+        }
+        let t = this.errText();
+        t.pushStr("can't index ");
+        t.pushStr(typeName(o));
+        return false;
+    }
+
+    /// A host global by name, nil when missing.
+    fn global(this: &Vm, name: Value): Value {
+        return tableOf(this.globals).get(name);
+    }
+
+    /// `unknown name "x"`.
+    fn unknownName(this: &Vm, name: Value): bool {
+        let t = this.errText();
+        t.pushStr("unknown name \"");
+        t.pushStr(textOf(name));
+        t.pushStr("\"");
+        return false;
+    }
+
+    /// `no field "f" and no function f` (a method call with nothing to call).
+    fn noMethod(this: &Vm, name: Value): bool {
+        let t = this.errText();
+        t.pushStr("no field \"");
+        t.pushStr(textOf(name));
+        t.pushStr("\" and no function ");
+        t.pushStr(textOf(name));
+        return false;
+    }
+}
+
+/// Byte order of two strings: negative, 0 or positive.
+fn compareBytes(a: string, b: string): int {
+    let n = if a.len < b.len { a.len } else { b.len };
+    for i in 0..n {
+        if a[i] != b[i] { return int(a[i]) - int(b[i]); }
+    }
+    return a.len - b.len;
+}

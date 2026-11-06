@@ -8,6 +8,8 @@ pub struct CheckError {
     pub message: String,
     pub notes: Vec<String>,
     pub helps: Vec<String>,
+    /// Further independent errors (other function bodies), rendered after this one.
+    pub more: Vec<CheckError>,
 }
 
 impl CheckError {
@@ -18,6 +20,7 @@ impl CheckError {
             message: message.into(),
             notes: Vec::new(),
             helps: Vec::new(),
+            more: Vec::new(),
         }
     }
 
@@ -36,6 +39,31 @@ impl CheckError {
     }
 
     pub fn render(&self, sources: &[(String, String)]) -> String {
+        let mut out = self.render_one(sources);
+        for e in &self.more {
+            out.push('\n');
+            out.push_str(&e.render_one(sources));
+        }
+        if !self.more.is_empty() {
+            out.push_str(&format!("\nerror: {} errors\n", self.more.len() + 1));
+        }
+        out
+    }
+
+    /// This error and its follow-ups, in order.
+    pub fn all(&self) -> impl Iterator<Item = &CheckError> {
+        std::iter::once(self).chain(self.more.iter())
+    }
+
+    /// Applies `f` to this error and every follow-up.
+    pub fn map_all(mut self, f: &mut dyn FnMut(CheckError) -> CheckError) -> CheckError {
+        let more = std::mem::take(&mut self.more);
+        let mut e = f(self);
+        e.more = more.into_iter().map(|m| f(m)).collect();
+        e
+    }
+
+    fn render_one(&self, sources: &[(String, String)]) -> String {
         Diagnostic {
             level: Level::Error,
             path: self.path.clone(),
@@ -45,6 +73,18 @@ impl CheckError {
             helps: self.helps.clone(),
         }
         .render(sources)
+    }
+}
+
+/// `no field `y` on `P``, with a near name or the list of fields.
+pub(crate) fn no_field(cx: &crate::ir::cx::IrCx, path: &str, span: Span, sid: crate::ir::ids::StructId, name: &str) -> CheckError {
+    let def = cx.struct_def(sid);
+    let fields: Vec<String> = def.fields.iter().map(|f| cx.name_str(f.name).to_string()).collect();
+    let e = CheckError::new(path, span, format!("no field `{name}` on `{}`", cx.name_str(def.name)));
+    match suggest(name, &fields) {
+        Some(s) => e.help(format!("did you mean `{s}`?")),
+        None if fields.is_empty() => e.note(format!("`{}` has no fields", cx.name_str(def.name))),
+        None => e.note(format!("`{}` has {}", cx.name_str(def.name), fields.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", "))),
     }
 }
 

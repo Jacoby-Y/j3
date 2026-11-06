@@ -29,15 +29,16 @@ fn check_json_on_bad_file() {
     assert!(json.contains("\"ok\":false"), "{json}");
     assert!(json.contains("\"line\":2"), "{json}");
     assert!(json.contains("noSuch") || json.contains("unknown"), "{json}");
+    assert!(json.contains("\"errors\":[{"), "{json}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn check_json_carries_i18n_warnings_and_strict_fails_on_them() {
     let w = vec!["warning: a.j3:1:1: key `x` is not in locales/en.txt [i18n-missing]".to_string()];
-    let j = check_json("src/main.j3", &[], &w);
+    let j = check_json("src/main.j3", &[], &w, &[]);
     assert_eq!(j, "{\"ok\":true,\"entry\":\"src/main.j3\",\"i18n\":[\"warning: a.j3:1:1: key `x` is not in locales/en.txt [i18n-missing]\"]}");
-    assert_eq!(check_json("e", &[], &[]), "{\"ok\":true,\"entry\":\"e\"}");
+    assert_eq!(check_json("e", &[], &[], &[]), "{\"ok\":true,\"entry\":\"e\"}");
     let dir = std::env::temp_dir().join(format!("j3-check-i18n-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).unwrap();

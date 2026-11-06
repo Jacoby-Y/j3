@@ -31,6 +31,7 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
     out.push_str("#include <string.h>\n");
     out.push_str("void _exit(int);\n");
     out.push_str("#define J3_FAIL(m) (fputs(\"runtime check failed: \" m \"\\n\", stderr), _exit(102))\n");
+    out.push_str("#define J3_FAILV(m, a, b) (fprintf(stderr, \"runtime check failed: \" m \"\\n\", a, b), _exit(102))\n");
     if syscall {
         out.push_str("#include <unistd.h>\n\n");
         out.push_str("static int64_t j3_syscall(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a3, int64_t a4, int64_t a5) {\n");
@@ -184,8 +185,19 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
     out.push_str(&format!("    {entry}();\n"));
     out.push_str("    return 0;\n");
     out.push_str("}\n");
+    // vector typedefs and helpers go right after the includes, only when a vector type is named
+    if c_expr::uses_vectors(&out) {
+        let at = out.find("void _exit(int);\n").unwrap_or(0);
+        out.insert_str(at, c_expr::SIMD_PRELUDE);
+    }
+
+    if c_expr::uses_half(&out) {
+        let at = out.find("void _exit(int);\n").unwrap_or(0);
+        out.insert_str(at, c_expr::HALF_PRELUDE);
+    }
+
     // ponytail: text scan for fmod; flag it in the printer if this grows
-    if out.contains("__builtin_fmod") {
+    if out.contains("__builtin_fmod") || out.contains("__builtin_sqrtf") {
         out.push_str("/* use lib \"m\" */\n");
     }
 

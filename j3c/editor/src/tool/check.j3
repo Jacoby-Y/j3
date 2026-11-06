@@ -1,0 +1,207 @@
+// tool: scene rules, z-fighting pairs, per-object checks.
+
+module j3_editor.tool;
+
+// ---- check ----
+
+fn issue(out: &Text, error: bool, id: int, message: string) {
+    out.pushStr("issue\t");
+    out.pushStr(if error { "error" } else { "warning" });
+    out.push(9);
+    out.pushInt(id);
+    out.push(9);
+    out.pushStr(message);
+    out.push(10);
+}
+
+fn missing(what: string, n: Node, file: string, scene: &Scene, out: &Text) {
+    let t = Text.new(scratch(0));
+    t.pushStr(pathOf(scene, n.id, scratch(0)));
+    t.pushStr(": ");
+    t.pushStr(what);
+    t.pushStr(" file ");
+    t.pushStr(file);
+    t.pushStr(" does not exist");
+    issue(out, true, n.id, t.str());
+}
+
+/// Problems an agent (or a person) would want fixed before playing: broken links between
+/// objects, missing files, placement cycles, and scripts that don't exist.
+/// `part`: other scenes place this one and the game never starts in it, so no camera is fine.
+fn check(scene: &Scene, catalog: &Save, path: string, part: bool, out: &Text) {
+    let cameras = 0;
+    let i = 0;
+    while i < scene.len {
+        let n = scene.nodes[i];
+        i += 1;
+        if !isOwn(n) { continue; }
+        let where = pathOf(scene, n.id, scratch(0));
+        if n.kind == CAMERA { cameras += 1; }
+        if n.parent != 0 && scene3d.index(scene, n.parent) < 0 {
+            let t = Text.new(scratch(0));
+            t.pushStr(where);
+            t.pushStr(": parent #");
+            t.pushInt(n.parent);
+            t.pushStr(" does not exist");
+            issue(out, true, n.id, t.str());
+        }
+        if n.kind == MESH {
+            if n.asset.len == 0 {
+                let t2 = Text.new(scratch(0));
+                t2.pushStr(where);
+                t2.pushStr(": mesh has no asset");
+                issue(out, false, n.id, t2.str());
+            } else if !scene3d.isBuiltin(n.asset) && !fileExists(n.asset) {
+                missing("mesh", n, n.asset, scene, out);
+            }
+            if n.texture.len > 0 && !scene3d.isBuiltin(n.texture) && !fileExists(n.texture) {
+                missing("texture", n, n.texture, scene, out);
+            }
+            if n.material.len > 0 && !fileExists(n.material) { missing("material", n, n.material, scene, out); }
+        }
+        if n.kind == CAMERA && n.effects.len > 0 {
+            let from = 0;
+            while from < n.effects.len {
+                let to = from;
+                while to < n.effects.len && n.effects[to] != 124 { to += 1; }
+                let one = cut(n.effects, from, to);
+                if one.len > 0 && !fileExists(one) { missing("effect", n, one, scene, out); }
+                from = to + 1;
+            }
+        }
+        if n.kind == INSTANCE {
+            if n.scene.len == 0 {
+                let t3 = Text.new(scratch(0));
+                t3.pushStr(where);
+                t3.pushStr(": instance places no scene");
+                issue(out, true, n.id, t3.str());
+            } else if !fileExists(n.scene) {
+                missing("scene", n, n.scene, scene, out);
+            } else if same(n.scene, path) || uses.uses(n.scene, path) {
+                let t4 = Text.new(scratch(0));
+                t4.pushStr(where);
+                t4.pushStr(": placing ");
+                t4.pushStr(n.scene);
+                t4.pushStr(" makes a cycle back to this scene");
+                issue(out, true, n.id, t4.str());
+            }
+        }
+        if n.script.len > 0 {
+            let b = scriptAt(catalog, n.script);
+            if b < 0 {
+                let t5 = Text.new(scratch(0));
+                t5.pushStr(where);
+                t5.pushStr(": no script at ");
+                t5.pushStr(n.script);
+                issue(out, true, n.id, t5.str());
+            } else {
+                checkObjects(scene, catalog, b, n, where, out);
+            }
+        }
+        let r = n.rotation;
+        let turn = max(max(abs(r.x), abs(r.y)), abs(r.z));
+        if turn > 12.6 {
+            // Two full turns: almost surely a value in the wrong unit (radians where degrees go).
+            let t7 = Text.new(scratch(0));
+            t7.pushStr(where);
+            t7.pushStr(": rotation ");
+            pushVec(&t7, degrees(r));
+            t7.pushStr(" degrees is over two full turns; was a radian value written as degrees?");
+            issue(out, false, n.id, t7.str());
+        }
+        if siblingsNamed(scene, n.parent, n.name) > 1 {
+            let t6 = Text.new(scratch(0));
+            t6.pushStr(where);
+            t6.pushStr(": a sibling has the same name, so only #id reaches it; this is #");
+            t6.pushInt(n.id);
+            issue(out, false, n.id, t6.str());
+        }
+    }
+    if cameras == 0 && !part { issue(out, false, 0, "the scene has no camera; the game falls back to a default view"); }
+    coplanar(scene, out);
+    let heads = scratch(0).alloc::<int>(scene.len);
+    let members = scratch(0).alloc::<int>(scene.len);
+    let unbatched = 0;
+    let looks = groupLooks(scene, heads, members, &unbatched);
+    if looks > LOOKS_WARN { looksIssue(looks, out); }
+}
+
+// ---- coplanar faces (z-fighting) ----
+
+/// Pairs `coplanar` names before it only counts the rest.
+const COPLANAR_REPORT: int = 40;
+
+/// Warn about pairs of objects with overlapping faces on one plane. The game and the editor
+/// view pull the smaller of each pair forward on their own (`scene3d.flushUpdate`), so this
+/// is for fixing the scene at the source; `decal` objects are left out.
+fn coplanar(scene: &Scene, out: &Text) {
+    let g = newGeo();
+    let transforms = scratch(0).alloc::<Mat4>(scene.len);
+    scene3d.worlds(scene, transforms);
+    let meshes = scratch(0).alloc::<[]f32>(scene.len);
+    let i = 0;
+    while i < scene.len {
+        let n = scene.nodes[i];
+        meshes[i] = []f32 { ptr: 0 as &f32, len: 0 };
+        if isOwn(n) && solid(n) && !scene3d.hasTag(n, "decal") { meshes[i] = geoVerts(&g, n.asset); }
+        i += 1;
+    }
+    let a = scratch(0).alloc::<int>(COPLANAR_REPORT);
+    let b = scratch(0).alloc::<int>(COPLANAR_REPORT);
+    let at = scratch(0).alloc::<Vec3>(COPLANAR_REPORT);
+    let gave = false;
+    let found = scene3d.flushScan(scene, transforms, meshes, a, b, at, &gave);
+    let k = 0;
+    while k < found && k < COPLANAR_REPORT {
+        let na = scene.nodes[a[k]];
+        let nb = scene.nodes[b[k]];
+        let t = Text.new(scratch(0));
+        t.pushStr(pathOf(scene, na.id, scratch(0)));
+        t.pushStr(" and ");
+        t.pushStr(pathOf(scene, nb.id, scratch(0)));
+        t.pushStr(" have overlapping faces on one plane (z-fighting) near ");
+        pushVec(&t, at[k]);
+        t.pushStr("; the smaller is pulled forward in the renderer, but move one to fix it for good");
+        issue(out, false, na.id, t.str());
+        k += 1;
+    }
+    if found > COPLANAR_REPORT {
+        let more = Text.new(scratch(0));
+        more.pushInt(found - COPLANAR_REPORT);
+        more.pushStr(" more coplanar pairs not listed");
+        issue(out, false, 0, more.str());
+    }
+    if gave { issue(out, false, 0, "coplanar check skipped some objects or pairs: scene too large to compare every pair"); }
+}
+
+fn checkObjects(scene: &Scene, catalog: &Save, b: int, n: Node, where: string, out: &Text) {
+    let count = save.getInt(catalog, catKey(b, -1, "count"), 0);
+    let j = 0;
+    while j < count {
+        if same(save.getStr(catalog, catKey(b, j, "type"), ""), "object") {
+            let field = save.getStr(catalog, catKey(b, j, "name"), "");
+            let target = scene3d.object(scene, n.id, field);
+            if target != 0 && scene3d.index(scene, target) < 0 {
+                let t = Text.new(scratch(0));
+                t.pushStr(where);
+                t.pushStr(": field ");
+                t.pushStr(field);
+                t.pushStr(" points at #");
+                t.pushInt(target);
+                t.pushStr(", which does not exist");
+                issue(out, true, n.id, t.str());
+            }
+        }
+        j += 1;
+    }
+}
+
+fn siblingsNamed(scene: &Scene, parent: int, name: string): int {
+    let count = 0;
+    let i = 0;
+    while i < scene.len {
+        if isOwn(scene.nodes[i]) && scene.nodes[i].parent == parent && same(scene.nodes[i].name, name) { count += 1; }
+        i += 1;
+    }
+    return count;
+}

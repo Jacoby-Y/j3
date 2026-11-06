@@ -1,0 +1,354 @@
+/// `resize` and storage growth of `Grid`. Part of `j3.term.grid`.
+
+module j3.term.grid;
+
+/// A copy of `old` (`oc` x `or` physical) in storage of `nc` x `nr`.
+fn growBuf(a: &Arena, old: &Buf, oc: int, or: int, nc: int, nr: int): Buf {
+    let nb = newBuf(a, nc, nr);
+    for p in 0..or {
+        for x in 0..oc {
+            nb.cells[p * nc + x] = old.cells[p * oc + x];
+        }
+        nb.ridx[p] = old.ridx[p];
+        nb.dirty[p] = old.dirty[p];
+        nb.wrap[p] = old.wrap[p];
+    }
+    return nb;
+}
+
+extend Grid {
+    /// Make room for `c` x `r`. No-op within the limits. Grows geometrically (each dimension to
+    /// `max(requested, current limit * 2)`), so n one-column resizes cost O(log n) copies. The old blocks stay in
+    /// the arena: total leaked memory is at most about the size of the final storage (a geometric sum), and
+    /// `reserves` counts the growths.
+    fn reserve(this: &Grid, c: int, r: int) {
+        if c <= this.maxCols && r <= this.maxRows {
+            return;
+        }
+        let nc = if c > this.maxCols { mx(c, this.maxCols * 2) } else { this.maxCols };
+        let nr = if r > this.maxRows { mx(r, this.maxRows * 2) } else { this.maxRows };
+        this.reserves += 1;
+        let a = this.arena;
+        this.pri = growBuf(a, &this.pri, this.maxCols, this.maxRows, nc, nr);
+        this.altb = growBuf(a, &this.altb, this.maxCols, this.maxRows, nc, nr);
+        let tabs = a.alloc::<u8>(nc);
+        for x in 0..this.maxCols {
+            tabs[x] = this.tabs[x];
+        }
+        this.tabs = tabs;
+        let sb = a.alloc::<Cell>(this.sbCap * nc);
+        for slot in 0..this.sbCap {
+            for x in 0..this.sbLens[slot] {
+                sb[slot * nc + x] = this.sb[slot * this.maxCols + x];
+            }
+        }
+        this.sb = sb;
+        this.maxCols = nc;
+        this.maxRows = nr;
+    }
+
+    /// Change the size. A column change reflows the primary screen and scrollback (`reflow`); the alt screen, and
+    /// both screens on a row-only change, are cut or padded blank, with rows added or cut at the bottom, except that
+    /// shrinking the primary screen under a cursor that would fall off pushes the top rows into scrollback so the
+    /// cursor line stays. The cursor and saved cursors are clamped, the scroll region is reset to the whole screen,
+    /// and every row is marked dirty. Allocates past the storage limits and when reflow scratch must grow.
+    fn resize(this: &Grid, cols: int, rows: int) {
+        let c = mx(cols, 1);
+        let r = mx(rows, 1);
+        let oc = this.ncols;
+        let or = this.nrows;
+        if c == oc && r == or {
+            return;
+        }
+        this.reserve(c, r);
+        let pend = false;
+        let flow = c != oc;
+        if flow {
+            pend = this.reflow(c, r);
+        } else if r < or && !this.isAlt && this.cy >= r {
+            let k = this.cy - r + 1;
+            this.scrollRegion(0, or - 1, k, true, true);
+            this.cy -= k;
+        }
+        let blank = Cell.blank(Style.plain());
+        for pass in 0..2 {
+            if flow && pass == 0 {
+                continue;
+            }
+            let b = if pass == 0 { &this.pri } else { &this.altb };
+            for y in 0..r {
+                let s = b.ridx[y] * this.maxCols;
+                let from = if y >= or { 0 } else if c > oc { oc } else { c };
+                for x in from..c {
+                    b.cells[s + x] = blank;
+                }
+                if c < oc && y < or && b.cells[s + c - 1].width == 2 {
+                    b.cells[s + c - 1] = blank;
+                }
+                if y >= or {
+                    b.wrap[b.ridx[y]] = 0;
+                }
+            }
+        }
+        for x in oc..c {
+            this.tabs[x] = if x % 8 == 0 { 1 } else { 0 };
+        }
+        this.ncols = c;
+        this.nrows = r;
+        this.top = 0;
+        this.bot = r - 1;
+        this.cx = mn(this.cx, c - 1);
+        this.cy = mn(this.cy, r - 1);
+        this.wrapPending = pend && !this.isAlt;
+        this.saved.x = mn(this.saved.x, c - 1);
+        this.saved.y = mn(this.saved.y, r - 1);
+        this.saved1049.x = mn(this.saved1049.x, c - 1);
+        this.saved1049.y = mn(this.saved1049.y, r - 1);
+        this.markAllDirty();
+    }
+
+    /// The primary screen's physical line `i` of scrollback-then-screen (screen rows `oc` wide), and whether it wraps.
+    fn rfPhys(this: &Grid, i: int, oc: int, wrap: &bool): []Cell {
+        if i < this.sbCount {
+            let slot = (this.sbHead + i) % this.sbCap;
+            *wrap = this.sbWrap[slot] != 0;
+            let s = slot * this.maxCols;
+            return this.sb[s..s + this.sbLens[slot]];
+        }
+        let p = this.pri.ridx[i - this.sbCount];
+        *wrap = this.pri.wrap[p] != 0;
+        return this.pri.cells[p * this.maxCols..p * this.maxCols + oc];
+    }
+
+    /// Rewrap the primary screen and scrollback to `c` columns and `r` rows (storage already reserved; `ncols` and
+    /// `nrows` still the old size). Wrapped rows join into logical lines (trailing blanks trimmed), which split again
+    /// at `c`; a wide character that does not fit moves to the next row. The row the old screen started on stays the
+    /// top unless the cursor line would fall off the bottom, then rows go to scrollback; rows past the bottom are
+    /// dropped. Sets the primary cursor and returns whether it sits in the deferred-wrap state.
+    /// ponytail: copies all of scrollback per resize (O(lines x cols)); keep a dirty range if window drags get slow.
+    fn reflow(this: &Grid, c: int, r: int): bool {
+        let oc = this.ncols;
+        let or = this.nrows;
+        let curX = if this.isAlt { this.saved1049.x } else { this.cx };
+        let curY = if this.isAlt { this.saved1049.y } else { this.cy };
+        let curPend = if this.isAlt { this.saved1049.pending } else { this.wrapPending };
+        // Screen rows past the cursor that hold nothing are not content.
+        let last = or - 1;
+        while last > curY && rowEmpty(this.pri.cells, this.pri.ridx[last] * this.maxCols, oc) && this.pri.wrap[this.pri.ridx[last]] == 0 {
+            last -= 1;
+        }
+        let nPhys = this.sbCount + last + 1;
+        let need = this.sbCount * this.maxCols + (last + 1) * oc;
+        if this.rfCells.len < need {
+            this.rfCells = this.arena.alloc::<Cell>(mx(need, this.rfCells.len * 2));
+        }
+        if this.rfStart.len < nPhys + 1 {
+            let k = mx(nPhys + 1, this.rfStart.len * 2);
+            this.rfStart = this.arena.alloc::<int>(k);
+            this.rfLen = this.arena.alloc::<int>(k);
+        }
+        if this.rfRow.len < c {
+            this.rfRow = this.arena.alloc::<Cell>(this.maxCols);
+        }
+        // Gather logical lines.
+        let n = 0;
+        let nl = 0;
+        let open = false;
+        let curLine = 0;
+        let curOff = 0;
+        let scrLine = 0;
+        let scrOff = 0;
+        let wrap = false;
+        let wnext = false;
+        for i in 0..nPhys {
+            let cells = this.rfPhys(i, oc, &wrap);
+            if !open {
+                this.rfStart[nl] = n;
+                open = true;
+            }
+            let seg = n - this.rfStart[nl];
+            if i == this.sbCount {
+                scrLine = nl;
+                scrOff = seg;
+            }
+            if i == this.sbCount + curY {
+                curLine = nl;
+                curOff = seg + curX + (if curPend { 1 } else { 0 });
+            }
+            let len = cells.len;
+            // The blank a wide character left when it wrapped early is not content.
+            if wrap && len > 0 && i + 1 < nPhys && cells[len - 1].cp == 0 && cells[len - 1].width == 1 {
+                let nx = this.rfPhys(i + 1, oc, &wnext);
+                if nx.len > 0 && nx[0].width == 2 {
+                    len -= 1;
+                }
+            }
+            for x in 0..len {
+                this.rfCells[n + x] = cells[x];
+            }
+            n += len;
+            if !wrap || i == nPhys - 1 {
+                let st = this.rfStart[nl];
+                let e = n;
+                while e > st && plainBlank(this.rfCells[e - 1]) {
+                    e -= 1;
+                }
+                if nl == curLine && i >= this.sbCount + curY && e < st + curOff {
+                    e = mn(n, st + curOff);
+                }
+                n = e;
+                this.rfLen[nl] = n - st;
+                nl += 1;
+                open = false;
+            }
+        }
+        // Count rows, and find the cursor and the old screen top in them.
+        let total = 0;
+        let kRow = 0;
+        let kc = 0;
+        let sRow = 0;
+        let pr = 0;
+        let pc = 0;
+        for li in 0..nl {
+            if li == curLine {
+                this.layLine(li, c, curOff, &pr, &pc, -1, 0, 0);
+                kRow = total + pr;
+                kc = pc;
+            }
+            if li == scrLine {
+                this.layLine(li, c, scrOff, &pr, &pc, -1, 0, 0);
+                sRow = total + pr;
+            }
+            total += this.layLine(li, c, -1, &pr, &pc, -1, 0, 0);
+        }
+        let top = sRow;
+        if kRow - top >= r {
+            top = kRow - r + 1;
+        }
+        if kRow < top {
+            top = kRow;
+        }
+        // Lay out for real: rows above `top` to scrollback, then the screen.
+        this.sbHead = 0;
+        this.sbCount = 0;
+        let blank = Cell.blank(Style.plain());
+        for y in 0..r {
+            let p = this.pri.ridx[y];
+            for x in 0..c {
+                this.pri.cells[p * this.maxCols + x] = blank;
+            }
+            this.pri.wrap[p] = 0;
+        }
+        let base = 0;
+        for li in 0..nl {
+            base += this.layLine(li, c, -1, &pr, &pc, base, top, r);
+        }
+        let y = kRow - top;
+        let pend = kc >= c;
+        let x = if pend { c - 1 } else { kc };
+        if this.isAlt {
+            this.saved1049.x = x;
+            this.saved1049.y = y;
+            this.saved1049.pending = pend;
+        } else {
+            this.cx = x;
+            this.cy = y;
+        }
+        return pend;
+    }
+
+    /// Split logical line `li` into rows of `c` cells; returns the row count. The cell at offset `probe` (or the end,
+    /// when `probe` is past it) lands at row `*pr`, column `*pc` (`c` at the end of a full row). With `base >= 0`, row
+    /// `base + k` is written: to scrollback below `top`, to screen row `base + k - top` below `top + r`.
+    fn layLine(this: &Grid, li: int, c: int, probe: int, pr: &int, pc: &int, base: int, top: int, r: int): int {
+        let s = this.rfStart[li];
+        let n = this.rfLen[li];
+        let blank = Cell.blank(Style.plain());
+        let row = 0;
+        let col = 0;
+        let k = 0;
+        while k < n {
+            if k == probe {
+                *pr = row;
+                *pc = col;
+            }
+            let cell = this.rfCells[s + k];
+            let w = if cell.width == 2 { 2 } else { 1 };
+            let used = w;
+            if cell.width == 0 {
+                cell = blank;
+            } else if w == 2 && c < 2 {
+                cell = blank;
+                w = 1;
+            }
+            if col + w > c {
+                this.rfEmit(base, row, col, true, top, r);
+                row += 1;
+                col = 0;
+                continue;
+            }
+            if base >= 0 {
+                this.rfRow[col] = cell;
+                if w == 2 {
+                    this.rfRow[col + 1] = if k + 1 < n { this.rfCells[s + k + 1] } else { Cell { cp: 0, style: cell.style, width: 0, link: cell.link, marks: 0 } };
+                }
+            }
+            col += w;
+            k += used;
+        }
+        if probe >= n {
+            *pr = row;
+            *pc = col;
+        }
+        this.rfEmit(base, row, col, false, top, r);
+        return row + 1;
+    }
+
+    /// Write `rfRow[0..w]` (padded blank) as output row `base + row` (see `layLine`); a no-op for `base < 0`.
+    fn rfEmit(this: &Grid, base: int, row: int, w: int, wrap: bool, top: int, r: int) {
+        if base < 0 {
+            return;
+        }
+        let g = base + row;
+        if g < top {
+            if this.sbCap == 0 {
+                return;
+            }
+            let slot = 0;
+            if this.sbCount < this.sbCap {
+                slot = (this.sbHead + this.sbCount) % this.sbCap;
+                this.sbCount += 1;
+            } else {
+                slot = this.sbHead;
+                this.sbHead = (this.sbHead + 1) % this.sbCap;
+            }
+            let to = slot * this.maxCols;
+            for x in 0..w {
+                this.sb[to + x] = this.rfRow[x];
+            }
+            this.sbLens[slot] = w;
+            this.sbWrap[slot] = if wrap { 1 } else { 0 };
+        } else if g - top < r {
+            let p = this.pri.ridx[g - top];
+            let to = p * this.maxCols;
+            for x in 0..w {
+                this.pri.cells[to + x] = this.rfRow[x];
+            }
+            this.pri.wrap[p] = if wrap { 1 } else { 0 };
+        }
+    }
+}
+
+fn plainBlank(c: Cell): bool {
+    return c.cp == 0 && c.width == 1 && c.link == 0 && c.style == Style.plain();
+}
+
+/// Whether the `n` cells at `s` are all plain blanks.
+fn rowEmpty(cells: []Cell, s: int, n: int): bool {
+    for x in 0..n {
+        if !plainBlank(cells[s + x]) {
+            return false;
+        }
+    }
+    return true;
+}

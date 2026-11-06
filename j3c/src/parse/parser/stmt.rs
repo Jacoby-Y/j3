@@ -79,17 +79,28 @@ impl<'a> Parser<'a> {
                 }))
             }
             TokenKind::Defer => Ok(Stmt::Defer(self.defer_stmt()?)),
-            TokenKind::Break => {
-                let span = self.cur().span;
-                let _ = self.bump();
-                self.expect(TokenKind::Semi, "expected `;` after break")?;
-                Ok(Stmt::Break(span))
+            TokenKind::Label => {
+                let start = self.cur().span;
+                let label = self.label_ident();
+                self.expect(TokenKind::Colon, "expected `:` after a loop label")?;
+                if !matches!(self.cur().kind, TokenKind::While | TokenKind::For) {
+                    return Err(self.err("a label goes on a `while` or `for` loop"));
+                }
+                let body = self.stmt()?;
+                Ok(Stmt::Labeled(LabeledStmt {
+                    span: join(start, stmt_span(&body)),
+                    label,
+                    body: Box::new(body),
+                }))
             }
-            TokenKind::Continue => {
-                let span = self.cur().span;
+            TokenKind::Break | TokenKind::Continue => {
+                let is_break = self.cur().kind == TokenKind::Break;
+                let start = self.cur().span;
                 let _ = self.bump();
-                self.expect(TokenKind::Semi, "expected `;` after continue")?;
-                Ok(Stmt::Continue(span))
+                let label = if self.cur().kind == TokenKind::Label { Some(self.label_ident()) } else { None };
+                self.expect(TokenKind::Semi, "expected `;` after break or continue")?;
+                let span = join(start, self.prev_end(start));
+                Ok(if is_break { Stmt::Break(span, label) } else { Stmt::Continue(span, label) })
             }
             _ => {
                 let start = self.cur().span;
@@ -108,16 +119,20 @@ impl<'a> Parser<'a> {
                     TokenKind::PlusEq
                     | TokenKind::MinusEq
                     | TokenKind::StarEq
-                    | TokenKind::SlashEq => {
-                        let kind = self.cur().kind;
-                        if kind == TokenKind::SlashEq {
-                            return Err(self.err("`/=` not in this subset"));
-                        }
-                        let op = match kind {
+                    | TokenKind::SlashEq
+                    | TokenKind::PercentEq
+                    | TokenKind::AmpEq
+                    | TokenKind::PipeEq
+                    | TokenKind::CaretEq => {
+                        let op = match self.cur().kind {
                             TokenKind::PlusEq => BinOp::Add,
                             TokenKind::MinusEq => BinOp::Sub,
                             TokenKind::StarEq => BinOp::Mul,
-                            _ => BinOp::Add,
+                            TokenKind::SlashEq => BinOp::Div,
+                            TokenKind::AmpEq => BinOp::BitAnd,
+                            TokenKind::PipeEq => BinOp::BitOr,
+                            TokenKind::CaretEq => BinOp::BitXor,
+                            _ => BinOp::Rem,
                         };
                         let _ = self.bump();
                         let value = self.expr()?;
@@ -162,6 +177,12 @@ impl<'a> Parser<'a> {
             then_block,
             else_block,
         })
+    }
+
+    /// The current `'name` token as an `Ident` named `name`.
+    fn label_ident(&mut self) -> Ident {
+        let tok = self.bump().clone();
+        Ident { name: tok.text[1..].to_string(), span: tok.span }
     }
 
     pub(super) fn while_stmt(&mut self) -> Result<WhileStmt, ParseError> {
@@ -239,6 +260,24 @@ impl<'a> Parser<'a> {
 
     pub(super) fn match_arm(&mut self) -> Result<MatchArm, ParseError> {
         let start = self.cur().span;
+        if matches!(self.cur().kind, TokenKind::Int | TokenKind::Minus) {
+            let neg = self.cur().kind == TokenKind::Minus;
+            if neg {
+                let _ = self.bump();
+            }
+            let lit = self.cur().clone();
+            self.expect(TokenKind::Int, "expected an integer match arm")?;
+            let n = parse_int(&lit.text).map_err(|m| ParseError::new(lit.span, m))?;
+            let mut value = Expr { span: join(start, lit.span), kind: ExprKind::Int(n) };
+            if neg {
+                value = Expr {
+                    span: value.span,
+                    kind: ExprKind::Unary { op: UnaryOp::Neg, expr: Box::new(value) },
+                };
+            }
+            let body = self.block()?;
+            return Ok(MatchArm { span: join(start, body.span), value: Some(value), path: Vec::new(), payload: None, body });
+        }
         let path = self.path()?;
         let mut payload = None;
         if self.cur().kind == TokenKind::LParen {
@@ -249,6 +288,7 @@ impl<'a> Parser<'a> {
         let body = self.block()?;
         Ok(MatchArm {
             span: join(start, body.span),
+            value: None,
             path,
             payload,
             body,
@@ -365,6 +405,9 @@ impl<'a> Parser<'a> {
             });
         }
         let name = self.ident()?;
+        if name.name == "closure" && self.cur().kind == TokenKind::LParen {
+            return self.closure_type(name.span);
+        }
         if self.cur().kind == TokenKind::Lt {
             let _ = self.bump();
             let mut args = Vec::new();

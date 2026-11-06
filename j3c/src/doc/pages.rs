@@ -8,12 +8,21 @@ pub(super) const TESTING_PAGE: &str = include_str!("pages/testing.md");
 /// `j3c doc threads`: the long-form guide. `j3.thread`'s own header stays short because the
 /// module index prints it.
 pub(super) const THREADS_PAGE: &str = include_str!("pages/threads.md");
+/// `j3c doc term`: the `j3.term` stack (emulator and TUI directions, restore hook, limits).
+pub(super) const TERM_PAGE: &str = include_str!("pages/term.md");
 pub(super) const I18N_PAGE: &str = include_str!("pages/i18n.md");
 /// `j3c doc ship`: release builds and `[dist] build_outputs` (`src/dist.rs`, `src/dist/deb.rs`).
 pub(super) const SHIP_PAGE: &str = include_str!("pages/ship.md");
+/// `j3c doc shaders`: shader fns, `#[vertex]`/`#[varying]`/`#[uniform]`, `@shader`, `j3c dump-glsl` (`src/check/gpu/`).
+pub(super) const SHADERS_PAGE: &str = include_str!("pages/shaders.md");
 /// `j3c doc android`: APK builds, `[android]` keys, running on a device, and the limits (`src/dist/apk.rs`,
 /// `src/android_run.rs`, `src/emit/android.rs`, `tools/android/build-sdl.sh`).
 pub(super) const ANDROID_PAGE: &str = include_str!("pages/android.md");
+/// `j3c doc j2`: j2 runtime scripts, host side; its `Language` section is `j3c doc j2 lang` (`stdlib/j3/j2*`).
+pub(super) const J2_PAGE: &str = include_str!("pages/j2.md");
+/// `j3c doc steam`: `j3.steam` setup, every API area, shipping a depot, the binding checker (`stdlib/j3/steam/`,
+/// `src/dist/steam.rs`, `src/steamcheck/`).
+pub(super) const STEAM_PAGE: &str = include_str!("pages/steam.md");
 
 /// `j3c doc urp`: the URP guide, embedded so it matches this j3c build.
 pub(super) fn urp_page() -> String {
@@ -38,9 +47,9 @@ pub(super) fn lang_page() -> String {
     format!(
         "`j3c doc lang` — the language
 
-`int` is i64. `float` is f64. Gameplay math uses `f32`. A number with no context is `int`, or `f64` when it has a dot. `let` is mutable. A local's type is inferred when you omit it.
+`int` is i64. `float` is f64. Gameplay math uses `f32`. A number with no context is `int`, or `f64` when it has a dot. `let` is mutable. A local's type is inferred when you omit it. A `let` ends with its block: a sibling block can reuse the name, but shadowing a name still in scope is an error.
 
-A number literal takes the other operand's type: with `far: f32`, `2 * far` and `far * 0.5` are `f32`. A variable never converts: with `n: int`, `far * n` is a type error; write `far * f32(n)`. `f32(x)`, `int(x)`, and friends convert explicitly.
+A number literal takes the other operand's type, on either side: with `far: f32`, `2 * far`, `(2 + 1) * far` and `far * 0.5` are `f32`. With no typed operand it takes the destination's (`let h: f32 = 1.5 + 2;`); int-only literal math folds as `int` first, so `let q: f32 = 7 / 2;` is `3`. A float literal never becomes an int. A variable never converts: with `n: int`, `far * n` is a type error; write `far * f32(n)`. `f32(x)`, `int(x)`, and friends convert explicitly.
 
 `const NAME = value` is a module constant. The value is an int expression (`+ - * / %`), a float, a bool (`true`, `false`, or `!` of one), or a string. `-1.5` is the float it looks like.
 `const NAME: [N]T = [a, b, c];` is a read-only table in static data (ints, floats, bools, strings, structs of those; nested `[2][2]int` works on the LLVM backend only, like any nested array global). It needs its type; a wrong length is a compile error. `NAME[i]` is bounds-checked, `NAME.len`, `for x in NAME`, `NAME[a..b]` and passing it as a `[]T` all work. `NAME[i] = v`, `NAME[i].f = v`, `+=` and `&NAME[i]` are compile errors. A `[]T` made from it is not read-only: a callee that writes through the slice changes the table (it is ordinary module data), so keep such callees read-only. It is private to its module (not importable with `use`).
@@ -51,13 +60,21 @@ One file is one module. `use j3.io.printLn` brings in one name. `use j3.memory.{
 
 `for i in 0..n` stops before `n`. `for i in 0..=n` includes `n`. `for n in xs` walks a slice or an array. The index name ends when the loop ends.
 
-`match` lists every variant. Write `Enum.Name`, not a bare name. `_` is the rest. `defer` runs at the end of its block, including on `return`. `break` and `continue` stay in the loop.
+`match` lists every variant. Write `Enum.Name`, not a bare name. No `_` arm on an enum. A `match` on an integer takes int literals or int `const`s as arms and needs `_` (`match op {{ 0 {{ }} -1 {{ }} OP_ADD {{ }} _ {{ }} }}`); a repeated value is an error, and it compiles to a `switch`. `match` is a statement, not a value. `defer` runs at the end of its block, including on `return`. `break` and `continue` act on the innermost loop. A label names an outer one: `'rows: for r in 0..h {{ for x in xs {{ if x == 0 {{ continue 'rows; }} }} }}` (`break 'rows;` too; labels go on `while` and `for`). The `defer`s between run first, innermost first. An unknown label, or one whose loop has ended, is a compile error.
 
-A backtick string `hello {{name}}` fills the hole. A struct in a hole needs `#[Debug]`.
+A backtick string `hello {{name}}` fills the hole. A struct in a hole needs `#[Debug]`. The result lives in the calling function's stack frame and holds at most 512 bytes; past that the program stops (exit 102, \"string interpolation overflowed its buffer\"). A hole alone, `{{s}}` with `s: string`, is `s` itself and has no limit. For longer text build a `j3.text.Text` (`Text.scratch().add(\"n = \").add(`{{n}}`).add(`{{s}}`).str()` lasts until the next frame).
 
-`+=` `-=` `*=` write the place once (no `/=` or `%=` yet). `%` is the remainder and truncates like C: `-7 % 3 == -1`; `math.wrapi(-7, 3) == 2` wraps an index. Integer overflow wraps. Divide or `%` by zero aborts. `--fast` strips that abort and the bounds-check aborts.
+`+=` `-=` `*=` `/=` `%=` write the place once. `%` is the remainder and truncates like C: `-7 % 3 == -1`; `math.wrapi(-7, 3) == 2` wraps an index. `<<` and `>>` shift integers (`1 << 20` works in a `const`; `>>` keeps the sign of a signed type; the amount is taken mod the bit width). `&` `|` `^` and unary `~` work on integers of one type (`x & 0xff` types the literal; `0b1010` too); `&=` `|=` `^=` exist. Tightest first: unary `- ! ~ &x`, `* / %`, `+ -`, `<< >>`, `&`, `^`, `|`, comparisons, `&&`, `||`, so unlike C `x & MASK == 0` is `(x & MASK) == 0`. `~` on an unsigned type keeps its width (`~u8(0) == 255`). `< <= > >=` take numbers; a `string` has no order (a compile error): compare bytes in a loop. `==` / `!=` on strings compare length then bytes (no allocation). Scripts (`.j3s`) have `& | ^ ~` but not shifts. `s as []u8` and `bytes as string` reinterpret without copying (`child.write(\"q\" as []u8)`). Integer overflow wraps. Divide or `%` by zero aborts. `--fast` strips that abort and the bounds-check aborts. A failed check prints the values (`index out of bounds: index 5, len 3`) and, in a dev build on x86-64 Linux, the `called from:` functions. A function with a return type must end every path in `return` (or `panic(..)`, or `while true` with no `break`): one that can run off its end is a compile error.
 
 `operator+` is a method. `this` is the receiver. `.` follows a pointer, and works on any value, not just a variable: `f().x`, `(a + b).x`, `xs[a..b].len`, `make().inner.field` (the value is held in a temporary, so you cannot assign to it). A method `this: &T` takes the address at the call. A field may end with `= value`. A struct literal that omits the field uses that value.
+
+`extend T {{ fn m(this: &T) {{ .. }} }}` adds methods to a struct declared in the same module, from any file of it: the main file or a part file (`ui/dom.j3` + `ui/dom/*.j3` saying `module j3.ui.dom;`), so a big type's methods need no wrappers. Exactly as if written in the struct body (no `pub`: methods are public). A generic struct: `extend Box<T> {{ .. }}`, parameters named as in the struct. Errors: no such struct, a type of another module (`methods of Dom go in module j3.ui.dom`), an enum (use a free fn), a method already there, other parameter names. Not in `.j3s`. Example: `speculative/lang/extend.j3`.
+
+UFCS: `x.f(args)` calls a free `f(x, args)` when the type has no method `f` (the method wins). `f` must be visible by bare name (declared here or `use m.{{ f }}`); its first parameter takes the receiver, or `&T` (the call takes the address). Works on primitives, slices and strings too: `far.abs()`.
+
+Generic free fns: `fn first<T>(xs: []T): T`, `pub fn maxOf<T>(a: T, b: T): T`, `fn swap<T>(a: &T, b: &T)`. `T` is inferred from the arguments (a bare number takes the other argument's type, else `int`/`float`; a closure literal's written types count), or written `first::<int>(xs)`; `xs.first()` works through UFCS. Each distinct set of types is compiled once for the whole program, and the body is checked per instance, so `a > b` is allowed on whatever `T` is used with it. An error inside a body names the call that instantiated it. Write the return type (it is not inferred), and a `T` seen only in the return type needs `::<..>`. Not callable from `.j3s` scripts. Example: `speculative/lang/generic_fns.j3`.
+
+Traits: a bound on a type parameter, `fn contains<T: Eq>(xs: []T, x: T): bool`, `struct Map<K: Hash + Eq, V>`, `fn join<U: Ord>(..)` on a method. `trait Hash {{ fn hash(this: Self): u64; }}` is a list of signatures: `Self` is the type being checked, the first parameter is `this: Self` or `this: &Self`, and there are no bodies, `where`, generic traits or supertraits. A type satisfies a trait by having the methods (no `impl Trait for T`). For a type you cannot edit write `#[impl] fn hash(x: int): u64 {{ .. }}`: a free fn found by `x.hash()`, one per (name, type), allowed in the trait's module or the type's module (the orphan rule); an own method wins. `==`/`<` bounds are met by built-in types too (numbers, `bool`, `string` and `ptr` for `operator==`, numbers for `operator<`). The call or the `Map<K, V>` mention is checked, and the error names the type, the trait and the missing signature. Bodies are still checked per instance, so a method outside the bounds works until an instance lacks it. A plain fn (UFCS) does not satisfy a bound. Methods of a generic struct are lowered with each instance, so only a method's own `<U: Trait>` takes a bound. Import traits like fns: `use j3.cmp.Eq;`. Without `operator!=`, `a != b` is `!(a == b)`; without `operator>`, `<=`, `>=` they use `operator<` (`a > b` is `b < a`, `a <= b` is `!(b < a)`); `Ord` assumes a total order (with NaN fields define `<=`/`>=` yourself); an explicit operator wins, and no `operator==` is still an error. Not in `.j3s` scripts (no `trait`, and `x.m()` there does not find `#[impl]` fns). Stdlib: `j3.cmp` (`Eq` `Ord` `Hash`, hashes for primitives and `string`, `hashOf` `contains` `minOf`) and `j3.data.map` (`Map<K, V>`). Example: `speculative/lang/traits.j3`.
 
 Methods live inside the struct body; there is no `fn Type.name(` outside it:
 
@@ -79,9 +96,15 @@ Methods live inside the struct body; there is no `fn Type.name(` outside it:
 
 Threads are `j3.thread`: hand a worker a struct only it writes, then read the result after a signal (`j3c doc recipes threads`, `j3c doc threads`). `#[thread]` and `@atomic*` are the language side.
 
-`use lib \"SDL2\" as sdl {{ fn SDL_Init(flags: u32): i32; }}` declares C functions. `@syscall`, `@sizeof`, and `@slice` are compiler calls. `@atomicLoad(p)`, `@atomicStore(p, v)`, `@atomicAdd(p, v)` (returns the old value) and `@atomicCas(p, old, new)` (returns whether it swapped) work on an `int` through a pointer. `@j3ui` is `j3c doc j3ui`.
+`use lib \"SDL2\" as sdl {{ fn SDL_Init(flags: u32): i32; }}` declares C functions. `@syscall`, `@sizeof`, and `@slice` are compiler calls. `@atomicLoad(p)`, `@atomicStore(p, v)`, `@atomicAdd(p, v)` / `@atomicSub(p, v)` / `@atomicExchange(p, v)` (return the old value) and `@atomicCas(p, old, new)` (returns whether it swapped) work through a `&T` for `int`, `i32`, `u32`, `u64`, `bool` and `ptr` (no add or sub on the last two); a last argument picks the order: `relaxed`, `acquire`, `release`, `acqrel`, `seqcst` (default). `j3c doc threads` says which. `@j3ui` is `j3c doc j3ui`.\n\n\
+`f16` (storage only, 2 bytes, align 2; LLVM, C, not `.j3s`): hold it in locals, fields, arrays, `List<f16>`, params. `f16(x)` from a float or int rounds to nearest even (overflow is infinity, NaN stays NaN); `f32(h)` / `f64(h)` are exact; an untyped literal stored in an `f16` rounds at compile time. `+ - * / < ==`, `-h`, `+=`, and interpolation are errors: write `f16(f32(a) + f32(b))`. Bit-identical on both backends. Example: `speculative/lang/f16.j3`.
 
-No traits, capturing closures, GC, or borrow checker.
+SIMD (LLVM and C backends, not `.j3s` scripts): `vec4f` (4 x f32) and `vec4i` (4 x i32), 16 bytes, align 16, passed by value. `vec4f(x, y, z, w)` or `vec4f(x)` splats. Lanes `.x .y .z .w` and `v[0..3]` (a constant index) read and write: `v.x = 1.0`, `arr[2].y += 3.0`. `+ - * /` work lane-wise between two vectors or with a scalar of the lane type; `vec4i` also has `& | ^ ~ << >>` (shifts mask the amount to 0..31) and its `/` aborts on a zero lane. `==` and `<` are errors (no masks yet). `@vmin(a, b)` / `@vmax(a, b)` (`a < b ? a : b`: a NaN or a tie gives `b`), `@vsqrt`, `@vabs`, `@vsum(a)` (fixed order `(x + y) + (z + w)`), `@vshuffle(a, i0, i1, i2, i3)`, `@vfloat(vec4i)`, `@vint(vec4f)` (truncates, saturates, NaN is 0), `@vload(xs, i)` / `@vstore(xs, i, v)` on `[]f32` / `[]i32` (bounds-checked, unaligned). Results are bit-identical on both backends at every opt level. An enum payload may hold a vector (the enum is then 16-aligned). `j3.math`: `Vec3.toVec4f(w)` and `vec3FromVec4f(v)`. Not yet: vector consts and global initializers, `.j3s` scripts (a compile error). Example: `speculative/lang/simd.j3`.
+
+Closures
+    `fn(a: int): int {{ return a + k; }}` captures the variables it names by address, so a write inside is visible after. Its type is `closure(int): int`, legal only as a parameter or a `let`: it points into the creating function's stack, so it cannot be a field, global, array element, generic argument, return type, `&` target, or cast. Types may be left out where a `closure(..)` or `fn(..)` type is expected: `apply(fn(x) {{ return x + k; }}, 3)`. A named `fn` converts to a closure; a closure never converts to a plain `fn(..)` or `ptr` (`thread.spawn` still takes `fn(ptr)` plus a struct). A literal that captures nothing may stand for a plain `fn`. `return` leaves the closure, `break` and `continue` cannot cross it, and a name it uses cannot be redeclared inside. Not in `.j3s` scripts. Example: `speculative/lang/closures.j3`.
+
+No `dyn` traits, escaping closures (heap environments), GC, or borrow checker.
 
 Scripts
     A `.j3s` file is a script: J3 with the same checker, and no `module` line (its path names it). Each value of a script is one instance with its own props and state.

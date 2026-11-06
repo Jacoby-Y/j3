@@ -1,0 +1,365 @@
+/// ANSI-colored text for `.j3ui`: `AnsiLog` turns a byte stream (build log, process output) into lines of
+/// `Seg`s, each carrying the CSS values for `style:` slots, so a component draws them with the usual
+/// `{#each}` and `<span style:color="{s.fg}">`. Convert once on `append`, never per frame.
+/// Only SGR is kept (colors, bold, dim, italic, underline, strike, inverse, hidden); cursor moves, clears,
+/// OSC and other escapes are dropped. Pure data, no GL; the parser is `j3.term.ansi`. `j3c doc recipes ansi`.
+
+module j3.ui.ansi;
+
+use j3.memory.Arena;
+use j3.memory.List;
+use j3.term.Color;
+use j3.term.Style;
+use j3.term.ATTR_BOLD;
+use j3.term.ATTR_DIM;
+use j3.term.ATTR_ITALIC;
+use j3.term.ATTR_UNDERLINE;
+use j3.term.ATTR_INVERSE;
+use j3.term.ATTR_HIDDEN;
+use j3.term.ATTR_STRIKE;
+use j3.term.COLOR_PALETTE;
+use j3.term.COLOR_RGB;
+use j3.term.paletteRgb;
+use j3.term.pushUtf8;
+use j3.term.ansi.Params;
+use j3.term.ansi.Parser;
+use j3.term.ansi.sgr;
+use j3.term.ansi.feed;
+use j3.text.Text;
+
+fn resolve(c: Color, def: int): int {
+    if c.kind() == COLOR_PALETTE {
+        return paletteRgb(c.index());
+    }
+    if c.kind() == COLOR_RGB {
+        return (c.r() << 16) | (c.g() << 8) | c.b();
+    }
+    return def;
+}
+
+fn mix(a: int, b: int): int {
+    let r = (((a >> 16) & 255) + ((b >> 16) & 255)) / 2;
+    let g = (((a >> 8) & 255) + ((b >> 8) & 255)) / 2;
+    let bl = ((a & 255) + (b & 255)) / 2;
+    return (r << 16) | (g << 8) | bl;
+}
+
+fn hexDigit(n: int): u8 {
+    if n < 10 {
+        return u8(48 + n);
+    }
+    return u8(87 + n);
+}
+
+/// `#rrggbb` allocated from `arena`.
+pub fn hex(rgb: int, arena: &Arena): string {
+    let b = arena.alloc::<u8>(7);
+    b[0] = 35;
+    for i in 0..6 {
+        b[1 + i] = hexDigit((rgb >> (20 - 4 * i)) & 15);
+    }
+    return b as string;
+}
+
+/// Rough bytes one `Seg` costs in the arena (struct plus `#rrggbb` strings), for the garbage estimate.
+const SEG_COST = 160;
+
+/// An arena whose address never changes: its own header lives in its first chunk, so a log can be copied by
+/// value and swap arenas later. Free it through a copy (`let a = p[0]; a.destroy()`), as `destroy` does.
+fn stable(a: Arena): []Arena {
+    let h = a;
+    let slot = h.alloc::<Arena>(1);
+    slot[0] = h;
+    return slot;
+}
+
+fn dup(s: string, arena: &Arena): string {
+    if s.len == 0 {
+        return s;
+    }
+    let b = arena.alloc::<u8>(s.len);
+    for i in 0..s.len {
+        b[i] = s[i];
+    }
+    return b as string;
+}
+
+/// A run of text with one look. Empty `fg`, `bg`, `weight`, `slant`, `deco` mean "inherit": an empty
+/// `style:` value clears the override, so the pane's own CSS shows through.
+pub struct Seg {
+    text: string;
+    /// `style:color`: `#rrggbb`, or empty.
+    fg: string;
+    /// `style:background`: `#rrggbb`, or empty.
+    bg: string;
+    /// `style:font-weight`: `bold` or empty.
+    weight: string;
+    /// `style:font-style`: `italic` or empty.
+    slant: string;
+    /// `style:text-decoration-line`: `underline`, `line-through`, both, or empty.
+    deco: string;
+}
+
+/// One output line: `AnsiLog.segs[first..first + count]`.
+pub struct Line {
+    first: int;
+    count: int;
+}
+
+/// Styled lines built incrementally from bytes (split anywhere, escapes too). The log owns its memory:
+/// with `maxLines > 0` only the newest `maxLines` lines are kept, and the live lines (minus text a CR wiped)
+/// are copied into a fresh arena and the old one unmapped once as many lines again have been dropped, so
+/// memory stays bounded and `append` stays O(appended bytes) amortized. Call `destroy` when done.
+/// Read through `count()` and `line(i)`; `segs`/`lines` also hold dropped lines until the next compaction.
+pub struct AnsiLog {
+    /// Parser buffers (small, never swapped, so a split escape survives a compaction).
+    keep: []Arena;
+    /// Segs, lines and text; replaced by `compact`.
+    arena: []Arena;
+    parser: Parser;
+    segs: List<Seg>;
+    lines: List<Line>;
+    /// Index in `lines` of the oldest kept line.
+    head: int;
+    maxLines: int;
+    /// Rough bytes allocated in `arena`, and the part of it that is wiped or dropped.
+    bytes: int;
+    garbage: int;
+    cur: Text;
+    style: Style;
+    curStyle: Style;
+    hasCur: bool;
+    cr: bool;
+    col: int;
+    /// What default colors mean to inverse and dim (0xRRGGBB): the pane's text and background.
+    defFg: int;
+    defBg: int;
+
+    /// An empty log; `defFg`/`defBg` are the pane's colors, used only where a default color has to become a real
+    /// one. `maxLines` is how many lines to keep (0 = all).
+    fn new(defFg: int, defBg: int, maxLines: int): AnsiLog {
+        let keep = stable(Arena.create(4096));
+        let arena = stable(Arena.create(65536));
+        let l = AnsiLog {
+            keep: keep,
+            arena: arena,
+            parser: Parser.new(&keep[0]),
+            segs: List<Seg>.new(&arena[0]),
+            lines: List<Line>.new(&arena[0]),
+            head: 0,
+            maxLines: maxLines,
+            bytes: 0,
+            garbage: 0,
+            cur: Text.new(&arena[0]),
+            style: Style.plain(),
+            curStyle: Style.plain(),
+            hasCur: false,
+            cr: false,
+            col: 0,
+            defFg: defFg,
+            defBg: defBg,
+        };
+        l.lines.push(Line { first: 0, count: 0 });
+        return l;
+    }
+
+    /// Free all memory. The log is unusable afterwards.
+    fn destroy(this: &AnsiLog) {
+        let a = this.arena[0];
+        let k = this.keep[0];
+        a.destroy();
+        k.destroy();
+    }
+
+    /// Drop every line (the open style stays), reclaiming memory.
+    fn clear(this: &AnsiLog) {
+        this.cur.clear();
+        this.hasCur = false;
+        this.cr = false;
+        this.head = this.lines.len;
+        this.lines.push(Line { first: this.segs.len, count: 0 });
+        this.head = this.lines.len - 1;
+        this.compact();
+    }
+
+    /// Number of kept lines (the last may still be open).
+    fn count(this: &AnsiLog): int {
+        return this.lines.len - this.head;
+    }
+
+    /// Feed more output. Text and styles show up in `line` at once, including a line with no LF yet.
+    /// A CR followed by text overwrites the line (a progress bar keeps its last frame).
+    fn append(this: &AnsiLog, s: string) {
+        feed(&this.parser, s, this);
+        this.closeSeg();
+        if this.maxLines > 0 && this.count() > this.maxLines {
+            this.head = this.lines.len - this.maxLines;
+        }
+        let over = this.maxLines > 0 && this.head >= this.maxLines;
+        if over || (this.garbage > 65536 && this.garbage * 2 > this.bytes) {
+            this.compact();
+        }
+    }
+
+    /// Copy the kept lines into a fresh arena and unmap the old one.
+    fn compact(this: &AnsiLog) {
+        let old = this.arena[0];
+        let fresh = stable(Arena.create(65536));
+        let segs = List<Seg>.new(&fresh[0]);
+        let lines = List<Line>.new(&fresh[0]);
+        let bytes = 0;
+        for i in this.head..this.lines.len {
+            let ln = this.lines.items[i];
+            lines.push(Line { first: segs.len, count: ln.count });
+            for j in ln.first..ln.first + ln.count {
+                let sg = this.segs.items[j];
+                let t = Seg { text: dup(sg.text, &fresh[0]), fg: dup(sg.fg, &fresh[0]), bg: dup(sg.bg, &fresh[0]), weight: sg.weight, slant: sg.slant, deco: sg.deco };
+                bytes += SEG_COST + t.text.len;
+                segs.push(t);
+            }
+        }
+        this.arena = fresh;
+        this.segs = segs;
+        this.lines = lines;
+        this.head = 0;
+        this.bytes = bytes;
+        this.garbage = 0;
+        this.cur = Text.new(&fresh[0]);
+        old.destroy();
+    }
+
+    /// Size of the newest memory chunk; the log's total is under twice that.
+    fn memCap(this: &AnsiLog): int {
+        return this.arena[0].cap;
+    }
+
+    fn closeSeg(this: &AnsiLog) {
+        if !this.hasCur {
+            return;
+        }
+        this.hasCur = false;
+        let n = this.cur.len();
+        if n == 0 {
+            return;
+        }
+        let st = this.curStyle;
+        let inv = st.has(ATTR_INVERSE);
+        let fg = resolve(st.fg, this.defFg);
+        let bg = resolve(st.bg, this.defBg);
+        let hasFg = st.fg.kind() != 0;
+        let hasBg = st.bg.kind() != 0;
+        if inv {
+            let t = fg;
+            fg = bg;
+            bg = t;
+            hasFg = true;
+            hasBg = true;
+        }
+        if st.has(ATTR_DIM) {
+            fg = mix(fg, bg);
+            hasFg = true;
+        }
+        let seg = Seg { text: this.copy(), fg: "", bg: "", weight: "", slant: "", deco: "" };
+        if st.has(ATTR_HIDDEN) {
+            seg.fg = hex(bg, &this.arena[0]);
+        } else if hasFg {
+            seg.fg = hex(fg, &this.arena[0]);
+        }
+        if hasBg {
+            seg.bg = hex(bg, &this.arena[0]);
+        }
+        if st.has(ATTR_BOLD) {
+            seg.weight = "bold";
+        }
+        if st.has(ATTR_ITALIC) {
+            seg.slant = "italic";
+        }
+        if st.has(ATTR_UNDERLINE) && st.has(ATTR_STRIKE) {
+            seg.deco = "underline line-through";
+        } else if st.has(ATTR_UNDERLINE) {
+            seg.deco = "underline";
+        } else if st.has(ATTR_STRIKE) {
+            seg.deco = "line-through";
+        }
+        this.segs.push(seg);
+        this.bytes += SEG_COST + n;
+        this.lines.items[this.lines.len - 1].count += 1;
+        this.cur.clear();
+    }
+
+    fn copy(this: &AnsiLog): string {
+        let n = this.cur.len();
+        let b = this.arena[0].alloc::<u8>(n);
+        for i in 0..n {
+            b[i] = this.cur.bytes[i];
+        }
+        return b as string;
+    }
+
+    fn newLine(this: &AnsiLog) {
+        this.closeSeg();
+        this.lines.push(Line { first: this.segs.len, count: 0 });
+        this.col = 0;
+        this.cr = false;
+    }
+
+    /// Start of a segment: close the open one when the style changed; a pending CR wipes the line first.
+    fn begin(this: &AnsiLog) {
+        if this.cr {
+            this.cr = false;
+            this.cur.clear();
+            this.hasCur = false;
+            let ln = this.lines.items[this.lines.len - 1];
+            for k in ln.first..this.segs.len {
+                this.garbage += SEG_COST + this.segs.items[k].text.len;
+            }
+            this.segs.len = ln.first;
+            this.lines.items[this.lines.len - 1].count = 0;
+            this.col = 0;
+        }
+        if this.hasCur && !(this.curStyle == this.style) {
+            this.closeSeg();
+        }
+        if !this.hasCur {
+            this.curStyle = this.style;
+            this.hasCur = true;
+        }
+    }
+
+    fn print(this: &AnsiLog, cp: i32) {
+        this.begin();
+        this.col += 1;
+        pushUtf8(&this.cur, cp);
+    }
+
+    fn exec(this: &AnsiLog, c0: u8) {
+        if c0 == 10 {
+            this.newLine();
+        } else if c0 == 13 {
+            this.cr = true;
+        } else if c0 == 9 {
+            let n = 8 - this.col % 8;
+            for i in 0..n {
+                this.print(32);
+            }
+        }
+    }
+
+    fn csi(this: &AnsiLog, p: &Params, final: u8) {
+        if final == 0x6d && p.marker == 0 && p.inter == 0 {
+            this.style = sgr(this.style, p);
+        }
+    }
+
+    fn esc(this: &AnsiLog, inter: int, final: u8) {}
+
+    fn apc(this: &AnsiLog, bytes: string) {}
+
+    fn osc(this: &AnsiLog, bytes: string) {}
+
+    /// The segs of line `i`, for `{#each log.line(i) as s}`.
+    fn line(this: &AnsiLog, i: int): []Seg {
+        let ln = this.lines.items[this.head + i];
+        return this.segs.items[ln.first..ln.first + ln.count];
+    }
+}

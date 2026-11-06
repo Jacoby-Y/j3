@@ -20,9 +20,134 @@ fn drainEvents() {
         tail2: 0,
         tail3: 0,
     };
+    if IDLE_HELD {
+        IDLE_HELD = false;
+        handleEvent(&IDLE_EV);
+    }
     while sdl.SDL_PollEvent(&ev as ptr) != 0 {
         handleEvent(&ev);
     }
+    applySim();
+}
+
+/// Feed the fake input queued by `simKey` / `simText` / `simPreedit` / `simDrop` into this poll, after SDL's events.
+fn applySim() {
+    for i in 0..SIM_KQ_LEN {
+        let sc = SIM_KQ[i] / 2;
+        if SIM_KQ[i] % 2 == 1 {
+            // held already: an auto-repeat, not a new press
+            if SIM_HELD[sc] == 0 { keyDownEv[sc] = 1; }
+            SIM_HELD[sc] = 1;
+        } else {
+            if SIM_HELD[sc] != 0 { keyUpEv[sc] = 1; }
+            SIM_HELD[sc] = 0;
+        }
+    }
+    SIM_KQ_LEN = 0;
+    // ponytail: integer wheel like SDL's; fractions dropped
+    platform.wheel = platform.wheel + i32(SIM_WHEEL);
+    SIM_WHEEL = 0;
+    if SIM_TEXT_LEN > 0 {
+        // what does not fit this poll's 32 bytes comes on the next (whole UTF-8 sequences only)
+        let n = 0;
+        while n < SIM_TEXT_LEN {
+            let b = SIM_TEXT[n];
+            let len = if b < 0x80 { 1 } else if b >= 0xF0 { 4 } else if b >= 0xE0 { 3 } else { 2 };
+            if typedLen + len > 32 { break; }
+            for j in 0..len {
+                if n + j < SIM_TEXT_LEN { typed[typedLen] = SIM_TEXT[n + j]; typedLen += 1; }
+            }
+            n += len;
+        }
+        if n > SIM_TEXT_LEN { n = SIM_TEXT_LEN; }
+        for j in n..SIM_TEXT_LEN { SIM_TEXT[j - n] = SIM_TEXT[j]; }
+        SIM_TEXT_LEN -= n;
+        if SIM_TEXT_LEN > 0 { idleWake(); }
+        composingLen = 0;
+    }
+    if SIM_PRE_ON {
+        SIM_PRE_ON = false;
+        for j in 0..SIM_PRE_LEN { composing[j] = SIM_PRE[j]; }
+        composingLen = SIM_PRE_LEN;
+        composingAt = SIM_PRE_AT;
+    }
+    if SIM_DROP_LEN >= 0 {
+        for j in 0..SIM_DROP_LEN { dropped[j] = SIM_DROP[j]; }
+        droppedLen = SIM_DROP_LEN;
+        SIM_DROP_LEN = -1;
+    }
+}
+
+/// Fake a key going down (`down`) or up, as if SDL sent it: on the next `poll`, `keyPressed` / `keyPressedRaw` (down)
+/// or `keyReleased` (up) is true for one frame, and `keyDown` holds in between. A down while it is already held is an
+/// auto-repeat (no new press). Wakes an idle-sleeping loop. Headless tests and agents: `--headless` runs see it like a
+/// real key. Shift/Ctrl/Alt/Super are the left keys. 64 queued at most per poll (more are dropped).
+pub fn simKey(key: Key, down: bool) {
+    if SIM_KQ_LEN < 64 {
+        SIM_KQ[SIM_KQ_LEN] = scancode(key) * 2 + (if down { 1 } else { 0 });
+        SIM_KQ_LEN += 1;
+    }
+    idleWake();
+}
+
+/// Fake typed text, as if from `SDL_TEXTINPUT`: it shows in `textTyped` on the next `poll` (32 bytes per poll, the
+/// rest on the polls after), whether or not `textInput` is on. Ends a `simPreedit` composition. Up to 1024 bytes queued.
+pub fn simText(s: string) {
+    for i in 0..s.len {
+        if SIM_TEXT_LEN < 1024 { SIM_TEXT[SIM_TEXT_LEN] = s[i]; SIM_TEXT_LEN += 1; }
+    }
+    idleWake();
+}
+
+/// Fake an IME composition, as if from `SDL_TEXTEDITING`: `textComposing` is `s` (31 bytes at most) and
+/// `textComposingCaret` is `caret` (a byte offset) from the next `poll` until another composition, `simText` or `""`.
+pub fn simPreedit(s: string, caret: int) {
+    let n = if s.len < 31 { s.len } else { 31 };
+    for i in 0..n { SIM_PRE[i] = s[i]; }
+    SIM_PRE_LEN = n;
+    SIM_PRE_AT = if caret < 0 { 0 } else if caret > n { n } else { caret };
+    SIM_PRE_ON = true;
+    idleWake();
+}
+
+/// Fake a file dropped on the window, as if from `SDL_DROPFILE`: `droppedFile` is `path` (1023 bytes at most) on the next `poll`.
+pub fn simDrop(path: string) {
+    let n = if path.len < 1023 { path.len } else { 1023 };
+    for i in 0..n { SIM_DROP[i] = path[i]; }
+    SIM_DROP_LEN = n;
+    idleWake();
+}
+
+/// Fake the cursor moving to (`x`, `y`) in window pixels, as SDL reports them: `mousePos` then reads it through the
+/// same `setVirtualSize` / DPI mapping as a real cursor. Once called, it replaces the real cursor for the rest of the run.
+/// `mouseDelta` does not move.
+pub fn simMouse(x: f32, y: f32) {
+    SIM_MOUSE_ON = true;
+    SIM_MX = i32(x);
+    SIM_MY = i32(y);
+    idleWake();
+}
+
+/// Fake `btn` going down (`down`) or up at the `simMouse` position, as if SDL sent it: on the next `poll`
+/// `mousePressed` (down) or `mouseReleased` (up) is true for one frame, `mouseDown` holds in between. A down and an up
+/// in one frame still give each its own frame, like a real quick click.
+pub fn simButton(btn: Mouse, down: bool) {
+    let b: u8 = if btn == Mouse.Left { 0 } else if btn == Mouse.Middle { 1 } else { 2 };
+    let bit: u32 = if b == 0 { 1 } else if b == 1 { 2 } else { 4 };
+    if down { SIM_BTNS = SIM_BTNS | bit; } else { SIM_BTNS = SIM_BTNS - (SIM_BTNS & bit); }
+    if btnQLen == 16 { dropEdges(1); }
+    btnQ[btnQLen] = b;
+    btnQDown[btnQLen] = if down { 1 } else { 0 };
+    btnQX[btnQLen] = SIM_MX;
+    btnQY[btnQLen] = SIM_MY;
+    btnQLen += 1;
+    idleWake();
+}
+
+/// Fake wheel motion: `mouseWheel` is `dy` (whole notches, up is positive) on the next `poll`.
+pub fn simWheel(dy: f32) {
+    SIM_WHEEL = SIM_WHEEL + dy;
+    idleWake();
 }
 
 /// What closing the window does: ask the game under `holdClose`, else quit. Android's Back key lands here too.
@@ -56,12 +181,26 @@ fn handleEvent(ev: &SDL_Event) {
         platform.mouse_dx = platform.mouse_dx + ev.xrel;
         platform.mouse_dy = platform.mouse_dy + ev.yrel;
     }
-    if ev.ty == SDL_MOUSEBUTTONDOWN {
+    if ev.ty == SDL_MOUSEBUTTONDOWN || ev.ty == SDL_MOUSEBUTTONUP {
+        // SDL_MouseButtonEvent: button byte at 16, x and y (i32) where `data2` and `motion_y` sit
         let bview: []u8 = []u8 { ptr: ev as ptr as &u8, len: 56 };
         let btn = bview[16];
-        if btn == 1 { tapMask = withButton(tapMask, Mouse.Left, 1); }
-        if btn == 2 { tapMask = withButton(tapMask, Mouse.Middle, 2); }
-        if btn == 3 { tapMask = withButton(tapMask, Mouse.Right, 4); }
+        if btn >= 1 && btn <= 3 {
+            // ponytail: 16 kept; when full the oldest goes (only a stalled frame gets there)
+            if btnQLen == 16 { dropEdges(1); }
+            btnQ[btnQLen] = btn - 1;
+            btnQDown[btnQLen] = if ev.ty == SDL_MOUSEBUTTONDOWN { 1 } else { 0 };
+            btnQX[btnQLen] = ev.data2;
+            btnQY[btnQLen] = ev.motion_y;
+            btnQLen += 1;
+        }
+    }
+    if ev.ty == SDL_KEYDOWN || ev.ty == SDL_KEYUP {
+        let ke = ev as ptr as &SDL_KeyEvent;
+        let sc = int(ke.scancode);
+        if sc >= 0 && sc < 512 {
+            if ev.ty == SDL_KEYUP { keyUpEv[sc] = 1; } else if ke.repeat == 0 { keyDownEv[sc] = 1; }
+        }
     }
     if ev.ty == SDL_MOUSEWHEEL {
         platform.wheel = platform.wheel + ev.data2;
@@ -75,6 +214,9 @@ fn handleEvent(ev: &SDL_Event) {
             composing[composingLen] = ebytes[12 + composingLen];
             composingLen += 1;
         }
+        // `start` (i32 after text[32]): the caret, in code points; kept as bytes
+        let st = int(ebytes[44]) | (int(ebytes[45]) << 8);
+        composingAt = utf8Bytes(composingLen, st);
     }
     if ev.ty == SDL_TEXTINPUT {
         composingLen = 0;
@@ -113,25 +255,26 @@ fn clearBars() {
 /// Snapshot input, drain events, and return dt in seconds.
 pub fn poll(): f32 {
     snapshotInput();
+    if keysFreeAtPoll {
+        keyTake = false;
+        keysFreeAtPoll = false;
+    }
     platform.wheel = 0;
     platform.mouse_dx = 0;
     platform.mouse_dy = 0;
     typedLen = 0;
     droppedLen = 0;
+    let k = 0;
+    while k < 512 { keyDownEv[k] = 0; keyUpEv[k] = 0; k += 1; }
     closeAsked = false;
-    tapMask = 0;
     touchFrame();
     drainEvents();
+    dragStep();
+    frameStep();
     ensurePads();
     // No GL while backgrounded: on Android the surface is gone.
     if VIRT_W > 0 && platform.gl && !BACKGROUNDED { clearBars(); }
-    // ponytail: a down and up in one pump (touch-to-mouse taps, `adb shell input tap`) is down
-    // this frame and up the next; a release + re-press in one pump while held stays one hold.
-    let held = sdl.SDL_GetMouseState(0, 0);
-    if mouseBit(tapMask, Mouse.Left) { held = withButton(held, Mouse.Left, 1); }
-    if mouseBit(tapMask, Mouse.Middle) { held = withButton(held, Mouse.Middle, 2); }
-    if mouseBit(tapMask, Mouse.Right) { held = withButton(held, Mouse.Right, 4); }
-    platform.mouse = held;
+    platform.mouse = takeEdges();
     platform.pad_bits = padMask(0);
     let now = sdl.SDL_GetTicks();
     let ms = now - platform.last_ms;
@@ -143,13 +286,56 @@ pub fn poll(): f32 {
     return f32(ms) / 1000.0;
 }
 
+/// The button mask for this frame. Queued presses and releases replay in order, at most one per
+/// button per frame, so a quick click (down and up in one pump) or a re-press while held still
+/// gives every press and release its own frame; the rest wait for the next. With nothing queued
+/// it is SDL's live state (catches an up SDL never sent, e.g. released outside the window).
+fn takeEdges(): u32 {
+    edgeOn = false;
+    if btnQLen == 0 {
+        return sdl.SDL_GetMouseState(0, 0) | SIM_BTNS;
+    }
+    let held = platform.mouse;
+    let seen: u32 = 0;
+    let n = 0;
+    while n < btnQLen {
+        let b = int(btnQ[n]);
+        let bit: u32 = if b == 0 { 1 } else if b == 1 { 2 } else { 4 };
+        let btn = if b == 0 { Mouse.Left } else if b == 1 { Mouse.Middle } else { Mouse.Right };
+        if mouseBit(seen, btn) { break; }
+        seen = seen + bit;
+        let on = mouseBit(held, btn);
+        if btnQDown[n] != 0 && !on { held = held + bit; }
+        if btnQDown[n] == 0 && on { held = held - bit; }
+        edgeOn = true;
+        edgeX = btnQX[n];
+        edgeY = btnQY[n];
+        n += 1;
+    }
+    dropEdges(n);
+    return held;
+}
+
+/// Drop the oldest `n` queued button edges.
+fn dropEdges(n: int) {
+    let i = n;
+    while i < btnQLen {
+        btnQ[i - n] = btnQ[i];
+        btnQDown[i - n] = btnQDown[i];
+        btnQX[i - n] = btnQX[i];
+        btnQY[i - n] = btnQY[i];
+        i += 1;
+    }
+    btnQLen -= n;
+}
+
 /// Copy current keys/mouse/pad into the previous-frame buffers.
 fn snapshotInput() {
     if platform.keys != 0 {
         let keys: []u8 = []u8 { ptr: platform.keys as &u8, len: 512 };
         let i = 0;
         while i < 512 {
-            prevKeys[i] = keys[i];
+            prevKeys[i] = keys[i] | SIM_HELD[i];
             i += 1;
         }
     }
@@ -193,14 +379,42 @@ pub fn requestQuit() {
     platform.quit = true;
 }
 
-/// True on the frame `key` went down.
+/// True on the frame `key` went down. False while a UI text box has the keyboard (`keysTaken`).
 pub fn keyPressed(key: Key): bool {
-    return keyDown(key) && !keyWasDown(key);
+    return !keyTake && keyPressedRaw(key);
 }
 
-/// True on the frame `key` went up.
+/// True on the frame `key` went up. False while a UI text box has the keyboard (`keysTaken`).
 pub fn keyReleased(key: Key): bool {
-    return !keyDown(key) && keyWasDown(key);
+    return !keyTake && ((!keyDownRaw(key) && keyWasDown(key)) || keyEv(false, key));
+}
+
+/// `keyPressed` even while a UI text box has the keyboard: for keys the game keeps (a screenshot key, quit).
+pub fn keyPressedRaw(key: Key): bool {
+    return (keyDownRaw(key) && !keyWasDown(key)) || keyEv(true, key);
+}
+
+/// `key` (either side) has an edge in this frame's events (`keyDownEv` / `keyUpEv`).
+fn keyEv(down: bool, key: Key): bool {
+    if down { return keyDownEv[scancode(key)] != 0 || keyDownEv[rightScancode(key)] != 0; }
+    return keyUpEv[scancode(key)] != 0 || keyUpEv[rightScancode(key)] != 0;
+}
+
+/// The UI owns the keyboard (`j3.ui.dom` sets this while a text box, select or grid has focus):
+/// `keyDown`, `keyPressed` and `keyReleased` read false until `takeKeys(false)` and the next `poll`.
+/// `keyDownRaw` / `keyPressedRaw` still see every key.
+pub fn takeKeys(on: bool) {
+    if on {
+        keyTake = true;
+        keysFreeAtPoll = false;
+    } else if keyTake {
+        keysFreeAtPoll = true;
+    }
+}
+
+/// Whether a UI text box has the keyboard (`takeKeys`).
+pub fn keysTaken(): bool {
+    return keyTake;
 }
 
 /// Whether `key` was down on the previous poll.
@@ -264,12 +478,6 @@ fn mouseBit(bits: u32, btn: Mouse): bool {
     return right - (right / 2) * 2 != 0;
 }
 
-/// `bits` with `btn` (state mask value `bit`) set.
-fn withButton(bits: u32, btn: Mouse, bit: u32): u32 {
-    if mouseBit(bits, btn) { return bits; }
-    return bits + bit;
-}
-
 /// Start or stop SDL text input. Characters land in `textTyped` on the next `poll`.
 pub fn textInput(on: bool) {
     composingLen = 0;
@@ -278,6 +486,23 @@ pub fn textInput(on: bool) {
     } else {
         sdl.SDL_StopTextInput();
     }
+}
+
+/// Byte offset of the IME caret inside `textComposing` (0 when there is no composition).
+pub fn textComposingCaret(): int {
+    return if composingLen == 0 { 0 } else { composingAt };
+}
+
+/// Byte length of the first `cps` code points of `composing[0..n]`.
+fn utf8Bytes(n: int, cps: int): int {
+    let i = 0;
+    let k = 0;
+    while i < n && k < cps {
+        i += 1;
+        while i < n && (composing[i] & 0xC0) == 0x80 { i += 1; }
+        k += 1;
+    }
+    return i;
 }
 
 /// UTF-8 text entered since the previous `poll`. Empty when text input is off.
@@ -318,6 +543,59 @@ pub fn clipboard(): string {
     copyC(text, clip as &u8, n + 1);
     sdl.SDL_free(text);
     return []u8 { ptr: clip as &u8, len: n } as string;
+}
+
+/// Text of the PRIMARY selection (X11/Wayland: the last text selected anywhere, pasted with a middle
+/// click), or empty. Empty when SDL is older than 2.26 or the platform has none. A view of the buffer
+/// `clipboard()` also uses; the next call of either replaces it.
+pub fn primarySelection(): string {
+    if !primaryLoad() {
+        return "";
+    }
+    let get = primaryGet as fn(): ptr;
+    let text = get();
+    if text == 0 {
+        return "";
+    }
+    let n = int(libc.strlen(text as cstr));
+    if n + 1 > clipCap {
+        clipCap = n + 1;
+        clip = libc.realloc(clip, clipCap);
+    }
+    copyC(text, clip as &u8, n + 1);
+    sdl.SDL_free(text);
+    return []u8 { ptr: clip as &u8, len: n } as string;
+}
+
+/// Put `s` on the PRIMARY selection (call it when a selection ends, the way Linux terminals copy on
+/// select). Does nothing when SDL is older than 2.26 or the platform has none.
+pub fn setPrimarySelection(s: string) {
+    if !primaryLoad() {
+        return;
+    }
+    let buf = libc.malloc(s.len + 1);
+    let to: []u8 = []u8 { ptr: buf as &u8, len: s.len + 1 };
+    for i in 0..s.len {
+        to[i] = s[i];
+    }
+    to[s.len] = 0;
+    let set = primarySet as fn(cstr): i32;
+    set(buf as cstr);
+    libc.free(buf);
+}
+
+/// Look up SDL_Get/SetPrimarySelectionText (SDL 2.26+) once; false when missing.
+fn primaryLoad(): bool {
+    if primaryTried == 0 {
+        primaryTried = 1;
+        // ponytail: Linux and Android sonames only; other platforms have no PRIMARY selection.
+        let h = sdl.SDL_LoadObject(soCstr(if PLATFORM == 3 { "libSDL2.so" } else { "libSDL2-2.0.so.0" }));
+        if h != 0 {
+            primaryGet = sdl.SDL_LoadFunction(h, soCstr("SDL_GetPrimarySelectionText"));
+            primarySet = sdl.SDL_LoadFunction(h, soCstr("SDL_SetPrimarySelectionText"));
+        }
+    }
+    return primaryGet != 0 && primarySet != 0;
 }
 
 /// System mouse cursor shapes (SDL's numbering).
@@ -374,18 +652,29 @@ fn copyC(src: ptr, dst: &u8, cap: int): int {
     return n;
 }
 
-/// True while `key` is held.
+/// True while `key` is held. False while a UI text box has the keyboard (`keysTaken`).
 pub fn keyDown(key: Key): bool {
+    return !keyTake && keyDownRaw(key);
+}
+
+/// `keyDown` even while a UI text box has the keyboard.
+pub fn keyDownRaw(key: Key): bool {
     let keys: []u8 = []u8 { ptr: platform.keys as &u8, len: 512 };
-    return keys[scancode(key)] != 0 || keys[rightScancode(key)] != 0;
+    return keys[scancode(key)] != 0 || keys[rightScancode(key)] != 0 || SIM_HELD[scancode(key)] != 0;
 }
 
 /// Cursor position in window pixels, or in virtual pixels under `setVirtualSize` (outside
-/// `0..w` / `0..h` over the bars).
+/// `0..w` / `0..h` over the bars). On a frame a button went down or up it is where that happened,
+/// not where the cursor is now, so a click made while moving hits what was under it.
 pub fn mousePos(): Vec2 {
     let x: i32 = 0;
     let y: i32 = 0;
     sdl.SDL_GetMouseState(&x as ptr, &y as ptr);
+    if SIM_MOUSE_ON { x = SIM_MX; y = SIM_MY; }
+    if edgeOn && !platform.captured {
+        x = edgeX;
+        y = edgeY;
+    }
     return physToUi(f32(x) * PHYS, f32(y) * PHYS);
 }
 

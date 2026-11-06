@@ -1,0 +1,149 @@
+/// Hash map `Map<K, V>` (`Map<string, int>.new(&arena, 16)`): open addressing, linear probing, power-of-two capacity,
+/// load at most 3/4. `remove` shifts the following entries back (no tombstones), so add/remove churn allocates nothing. `K` needs `Hash` and `Eq`
+/// (`j3c doc j3.cmp`): ints, floats, bools, `string`, `Entity`. Memory comes from the arena you pass
+/// (like `List`): growth abandons the old buffers, `clear` keeps them, and rewinding the arena frees all.
+/// Iterate by slot: `for i in 0..m.cap { if m.live(i) { m.keyAt(i); m.valAt(i); } }` (order is unspecified;
+/// do not `put` or `remove` while iterating). Not shared across threads (same as `List`).
+/// Do not use NaN float keys: `NaN == NaN` is false, so each `put` adds a new slot and `get` never finds it.
+
+module j3.data.map;
+
+use j3.cmp.{ Eq, Hash };
+use j3.memory.Arena;
+use j3.option.Option;
+
+/// Slot states in `state`.
+const EMPTY: u8 = 0;
+const FULL: u8 = 1;
+
+pub struct Map<K: Hash + Eq, V> {
+    /// Keys by slot (meaningful where `state` is full).
+    keys: []K;
+    /// Values by slot.
+    vals: []V;
+    /// 0 empty, 1 full.
+    state: []u8;
+    /// Slot count, a power of two.
+    cap: int;
+    /// Live entries.
+    len: int;
+    arena: &Arena;
+
+    /// Empty map with room for about `cap` entries before the first growth (at least 8 slots).
+    fn new(arena: &Arena, cap: int): Map<K, V> {
+        let n = 8;
+        while n * 3 < cap * 4 { n *= 2; }
+        let m = Map<K, V> {
+            keys: arena.alloc::<K>(n),
+            vals: arena.alloc::<V>(n),
+            state: arena.alloc::<u8>(n),
+            cap: n,
+            len: 0,
+            arena: arena,
+        };
+        for i in 0..n { m.state[i] = EMPTY; }
+        return m;
+    }
+
+    /// Slot holding `k`, or -1.
+    fn find(this: &Map<K, V>, k: K): int {
+        let i = int(k.hash() & u64(this.cap - 1));
+        while this.state[i] != EMPTY {
+            if this.keys[i] == k { return i; }
+            i = (i + 1) & (this.cap - 1);
+        }
+        return -1;
+    }
+
+    /// The value for `k`, or `None`.
+    fn get(this: &Map<K, V>, k: K): Option<V> {
+        let i = this.find(k);
+        if i < 0 { return Option.None; }
+        return Option.Some(this.vals[i]);
+    }
+
+    /// The value for `k`, or `d`.
+    fn getOr(this: &Map<K, V>, k: K, d: V): V {
+        let i = this.find(k);
+        if i < 0 { return d; }
+        return this.vals[i];
+    }
+
+    /// True when `k` is present.
+    fn has(this: &Map<K, V>, k: K): bool { return this.find(k) >= 0; }
+
+    /// Set `k` to `v`, adding it if absent.
+    fn put(this: &Map<K, V>, k: K, v: V) {
+        let i = this.find(k);
+        if i >= 0 {
+            this.vals[i] = v;
+            return;
+        }
+        if (this.len + 1) * 4 > this.cap * 3 { this.rehash(this.cap * 2); }
+        i = int(k.hash() & u64(this.cap - 1));
+        while this.state[i] == FULL { i = (i + 1) & (this.cap - 1); }
+        this.state[i] = FULL;
+        this.keys[i] = k;
+        this.vals[i] = v;
+        this.len += 1;
+    }
+
+    /// Remove `k`; false when it was not there. Later entries of the probe run move back to fill the hole.
+    fn remove(this: &Map<K, V>, k: K): bool {
+        let i = this.find(k);
+        if i < 0 { return false; }
+        let mask = this.cap - 1;
+        let j = i;
+        while true {
+            j = (j + 1) & mask;
+            if this.state[j] == EMPTY { break; }
+            let h = int(this.keys[j].hash() & u64(mask));
+            // Entry j may move into hole i unless its home lies cyclically in (i, j].
+            let stays = if i <= j { i < h && h <= j } else { i < h || h <= j };
+            if !stays {
+                this.keys[i] = this.keys[j];
+                this.vals[i] = this.vals[j];
+                i = j;
+            }
+        }
+        this.state[i] = EMPTY;
+        this.len -= 1;
+        return true;
+    }
+
+    /// Drop every entry, keeping the slots.
+    fn clear(this: &Map<K, V>) {
+        for i in 0..this.cap { this.state[i] = EMPTY; }
+        this.len = 0;
+    }
+
+    /// True when slot `i` (0..cap) holds an entry.
+    fn live(this: &Map<K, V>, i: int): bool { return this.state[i] == FULL; }
+
+    /// Key in live slot `i`.
+    fn keyAt(this: &Map<K, V>, i: int): K { return this.keys[i]; }
+
+    /// Value in live slot `i`.
+    fn valAt(this: &Map<K, V>, i: int): V { return this.vals[i]; }
+
+    /// Move every entry into `n` fresh slots (`n` a power of two, above the entry count): only called to grow.
+    fn rehash(this: &Map<K, V>, n: int) {
+        let ok = this.keys;
+        let ov = this.vals;
+        let os = this.state;
+        let oc = this.cap;
+        this.keys = this.arena.alloc::<K>(n);
+        this.vals = this.arena.alloc::<V>(n);
+        this.state = this.arena.alloc::<u8>(n);
+        this.cap = n;
+        for i in 0..n { this.state[i] = EMPTY; }
+        for s in 0..oc {
+            if os[s] != FULL { continue; }
+            let i = int(ok[s].hash() & u64(n - 1));
+            while this.state[i] != EMPTY { i = (i + 1) & (n - 1); }
+            this.state[i] = FULL;
+            this.keys[i] = ok[s];
+            this.vals[i] = ov[s];
+        }
+    }
+}

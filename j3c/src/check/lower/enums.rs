@@ -249,17 +249,35 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let def = self.cx.enum_def(enum_id);
+        let ename = self.cx.name_str(def.name);
+        let mut missing = Vec::new();
         for i in 0..n {
             if full[i] {
                 continue;
             }
+            let vname = self.cx.name_str(def.variants[i].name);
             if let Some(eid) = nested_enum[i] {
-                let need = self.cx.enum_def(eid).variants.len();
-                if nested[i].len() == need {
+                let inner = self.cx.enum_def(eid);
+                if nested[i].len() == inner.variants.len() {
+                    continue;
+                }
+                if !nested[i].is_empty() {
+                    let iname = self.cx.name_str(inner.name);
+                    for (k, v) in inner.variants.iter().enumerate() {
+                        if !nested[i].contains(&(k as u32)) {
+                            missing.push(format!("`{ename}.{vname}({iname}.{})`", self.cx.name_str(v.name)));
+                        }
+                    }
                     continue;
                 }
             }
-            return Err(CheckError::new(self.path, span, "match is not exhaustive"));
+            let payload = if def.variants[i].payload.is_some() { "(_)" } else { "" };
+            missing.push(format!("`{ename}.{vname}{payload}`"));
+        }
+        if !missing.is_empty() {
+            return Err(CheckError::new(self.path, span, format!("match is not exhaustive: missing {}", missing.join(", ")))
+                .help("add an arm for each (enum matches take no `_` arm)"));
         }
         Ok(())
     }
@@ -304,7 +322,7 @@ impl<'a> Lower<'a> {
         let saved_aliases = self.aliases.clone();
         let saved = self.b.begin_block();
         if let Some(Pat::Bind(n)) = &arm.payload {
-            if self.locals.contains_key(&n.name) || self.aliases.contains_key(&n.name) {
+            if self.is_declared(&n.name) || self.aliases.contains_key(&n.name) {
                 return Err(CheckError::new(
                     self.path,
                     n.span,
@@ -340,6 +358,9 @@ impl<'a> Lower<'a> {
 
     pub(super) fn lower_match(&mut self, s: &parse::MatchStmt) -> Result<(), CheckError> {
         let op = self.operand(&s.expr, None)?;
+        if let TyKind::Int(int_ty) = *self.cx.ty_kind(op.ty()) {
+            return self.lower_int_match(s, op, int_ty);
+        }
         let enum_id = self.enum_id_of(op.ty(), s.span, "match")?;
         self.check_exhaustive(enum_id, &s.arms, s.span)?;
         let scrut = self.materialize(op, s.span);
@@ -365,6 +386,90 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// `match n { 1 { } -2 { } LIMIT { } _ { } }`: arms are int literals or int `const`s, `_` is
+    /// required, and the whole thing is one `Switch`.
+    fn lower_int_match(
+        &mut self,
+        s: &parse::MatchStmt,
+        scrut: Operand,
+        int_ty: crate::ir::ty::IntTy,
+    ) -> Result<(), CheckError> {
+        let (lo, hi) = match (int_ty.is_signed(), int_ty.bits()) {
+            (true, b) => (-(1i128 << (b - 1)), (1i128 << (b - 1)) - 1),
+            (false, b) => (0, (1i128 << b) - 1),
+        };
+        let mut cases: Vec<(u64, crate::ir::body::Block)> = Vec::new();
+        let mut seen: HashMap<i64, ()> = HashMap::new();
+        let mut default = None;
+        for arm in &s.arms {
+            if arm.payload.is_some() {
+                return Err(CheckError::new(self.path, arm.span, "an integer match arm has no payload"));
+            }
+            if arm.value.is_none() && arm.path.len() == 1 && arm.path[0].name == "_" {
+                if default.is_some() {
+                    return Err(CheckError::new(self.path, arm.span, "duplicate `_` arm"));
+                }
+                default = Some(self.int_arm_block(&arm.body)?);
+                continue;
+            }
+            let expr = match &arm.value {
+                Some(e) => e.clone(),
+                None => {
+                    let mut e = Expr { span: arm.path[0].span, kind: ExprKind::Name(arm.path[0].clone()) };
+                    for seg in &arm.path[1..] {
+                        e = Expr { span: seg.span, kind: ExprKind::Field { base: Box::new(e), field: seg.clone() } };
+                    }
+                    e
+                }
+            };
+            let v = match self.fold_int(&expr) {
+                Some(v) => v,
+                None => {
+                    return Err(CheckError::new(
+                        self.path,
+                        expr.span,
+                        "an integer match arm is an int literal or an int `const`",
+                    ))
+                }
+            };
+            if (v as i128) < lo || (v as i128) > hi {
+                let mut ty = String::new();
+                dump_ty(self.cx, scrut.ty(), &mut ty);
+                return Err(CheckError::new(self.path, expr.span, format!("match arm `{v}` does not fit `{ty}`")));
+            }
+            if seen.insert(v, ()).is_some() {
+                return Err(CheckError::new(self.path, expr.span, format!("duplicate match arm `{v}`")));
+            }
+            cases.push((v as u64, self.int_arm_block(&arm.body)?));
+        }
+        let default = match default {
+            Some(b) => b,
+            None => {
+                return Err(CheckError::new(self.path, s.span, "a `match` on an integer needs a `_` arm")
+                    .help("integers can't be listed exhaustively; add `_ { }`"))
+            }
+        };
+        self.b.push(crate::ir::stmt::Stmt {
+            ty: self.cx.common.void,
+            span: s.span,
+            kind: crate::ir::stmt::StmtKind::Switch { scrut, cases, default },
+        });
+        Ok(())
+    }
+
+    fn int_arm_block(&mut self, body: &parse::Block) -> Result<crate::ir::body::Block, CheckError> {
+        let saved_locals = self.locals.clone();
+        let saved_aliases = self.aliases.clone();
+        let saved = self.b.begin_block();
+        for stmt in &body.stmts {
+            self.stmt(stmt)?;
+        }
+        let block = self.b.end_block(saved);
+        self.locals = saved_locals;
+        self.aliases = saved_aliases;
+        Ok(block)
     }
 
     pub(super) fn question(&mut self, span: Span, inner: &Expr) -> Result<Rvalue, CheckError> {

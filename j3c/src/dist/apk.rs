@@ -58,8 +58,10 @@ fn build_in(m: &Manifest, libs: &[(String, PathBuf)], include: &[String], t: &To
         return Err(format!("apk: SDL's Java sources are missing ({}): run tools/android/build-sdl.sh", sdl_java.display()));
     }
     let act_dir = gen.join(pkg.replace('.', "/"));
-    write(&act_dir.join("J3Activity.java"), &activity_java(pkg))?;
-    let mut sources = vec![act_dir.join("J3Activity.java")];
+    let service = m.android.foreground_service.as_deref();
+    write(&act_dir.join("J3Activity.java"), &activity_java(pkg, service.is_some()))?;
+    write(&act_dir.join("J3Service.java"), &service_java(pkg, service))?;
+    let mut sources = vec![act_dir.join("J3Activity.java"), act_dir.join("J3Service.java")];
     let mut sdl: Vec<PathBuf> = list(&sdl_java)?.into_iter().filter(|p| p.extension().is_some_and(|e| e == "java")).collect();
     sdl.sort();
     sources.extend(sdl);
@@ -87,7 +89,13 @@ fn build_in(m: &Manifest, libs: &[(String, PathBuf)], include: &[String], t: &To
             eprintln!("j3c: dist: the APK icon must be a .png; {rel} is left out");
             false
         }
-        None => false,
+        None => {
+            // No `[dist] icon`: the J3 logo.
+            let to = res.join("mipmap/ic_launcher.png");
+            mkdir(to.parent().expect("res dir"))?;
+            fs::write(&to, super::LOGO_PNG).map_err(|e| format!("write {}: {e}", to.display()))?;
+            true
+        }
     };
     let manifest = stage.join("AndroidManifest.xml");
     write(&manifest, &manifest_xml(m, code, icon))?;
@@ -301,6 +309,7 @@ fn manifest_xml(m: &Manifest, code: u32, icon: bool) -> String {
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />{service_perms}
     <application android:label="{label}"{icon}
         android:allowBackup="true"
         android:extractNativeLibs="true"
@@ -319,7 +328,7 @@ fn manifest_xml(m: &Manifest, code: u32, icon: bool) -> String {
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity>{service}
     </application>
 </manifest>
 "#,
@@ -329,16 +338,34 @@ fn manifest_xml(m: &Manifest, code: u32, icon: bool) -> String {
         label = xml_escape(&label),
         icon = if icon { "\n        android:icon=\"@mipmap/ic_launcher\"" } else { "" },
         orient = m.android.orientation,
+        service_perms = match m.android.foreground_service.as_deref() {
+            None => String::new(),
+            Some(t) => {
+                // connectedDevice needs one of its listed permissions on Android 14+; CHANGE_NETWORK_STATE is a normal one.
+                let (perm, extra) = if t == "dataSync" { ("DATA_SYNC", "") } else { ("CONNECTED_DEVICE", "\n    <uses-permission android:name=\"android.permission.CHANGE_NETWORK_STATE\" />") };
+                format!("\n    <uses-permission android:name=\"android.permission.FOREGROUND_SERVICE\" />\n    <uses-permission android:name=\"android.permission.FOREGROUND_SERVICE_{perm}\" />\n    <uses-permission android:name=\"android.permission.WAKE_LOCK\" />{extra}")
+            }
+        },
+        service = match m.android.foreground_service.as_deref() {
+            None => String::new(),
+            Some(t) => format!("\n        <service android:name=\".J3Service\" android:exported=\"false\" android:foregroundServiceType=\"{t}\" />"),
+        },
     )
 }
 
-/// The activity: SDL's, with our library list, and `J3_NATIVE_LIB_DIR` set before SDL starts `main`
-/// (where `[android] native_libs` land; the one app folder Android lets a program be run from).
-fn activity_java(pkg: &str) -> String {
+/// The activity (`apk/J3Activity.java`): SDL's, with our library list, `J3_NATIVE_LIB_DIR`, and the
+/// methods `j3.android` calls (vibrate, notifications, keepAlive).
+fn activity_java(pkg: &str, service: bool) -> String {
     let libs = SDL_LIBS.iter().chain(&["main"]).map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ");
-    format!(
-        "package {pkg};\n\npublic class J3Activity extends org.libsdl.app.SDLActivity {{\n    @Override\n    protected String[] getLibraries() {{\n        return new String[] {{ {libs} }};\n    }}\n\n    @Override\n    protected void onCreate(android.os.Bundle saved) {{\n        try {{\n            android.system.Os.setenv(\"J3_NATIVE_LIB_DIR\", getApplicationInfo().nativeLibraryDir, true);\n        }} catch (Exception e) {{\n        }}\n        super.onCreate(saved);\n    }}\n}}\n"
-    )
+    include_str!("apk/J3Activity.java").replace("@PKG@", pkg).replace("@LIBS@", &libs).replace("@HAS_SERVICE@", if service { "true" } else { "false" })
+}
+
+/// `J3Service` (`apk/J3Service.java`), the foreground service of `[android] foreground_service`.
+/// Always compiled; declared in the manifest only when that key is set.
+fn service_java(pkg: &str, kind: Option<&str>) -> String {
+    // ServiceInfo.FOREGROUND_SERVICE_TYPE_*: dataSync 1, connectedDevice 16.
+    let ty = if kind == Some("dataSync") { "1" } else { "16" };
+    include_str!("apk/J3Service.java").replace("@PKG@", pkg).replace("@FGS_TYPE@", ty)
 }
 
 /// Files under the `include` entries as `(path relative to the project, absolute path)`, sorted.
@@ -467,7 +494,15 @@ mod tests {
             assert!(x.contains(want), "missing {want}:\n{x}");
         }
         assert!(!manifest_xml(&m, 1, false).contains("android:icon"));
-        let j = activity_java("com.j3.my_game");
+        assert!(x.contains("android.permission.POST_NOTIFICATIONS") && !x.contains("J3Service"));
+        let fg = manifest("[android]\nforeground_service = \"connectedDevice\"\n");
+        let x = manifest_xml(&fg, 1, true);
+        for want in ["FOREGROUND_SERVICE_CONNECTED_DEVICE", "CHANGE_NETWORK_STATE", "WAKE_LOCK", "android:name=\".J3Service\"", "foregroundServiceType=\"connectedDevice\""] {
+            assert!(x.contains(want), "missing {want}:\n{x}");
+        }
+        assert!(service_java("com.j3.my_game", Some("dataSync")).contains("startForeground(ID, n, 1)"));
+        let j = activity_java("com.j3.my_game", false);
+        assert!(j.contains("HAS_SERVICE = false") && !j.contains("@PKG@") && !j.contains("@LIBS@"));
         assert!(j.starts_with("package com.j3.my_game;"));
         assert!(j.contains("extends org.libsdl.app.SDLActivity"));
         assert!(j.contains("\"SDL2\", \"SDL2_image\", \"SDL2_mixer\", \"SDL2_ttf\", \"main\""));

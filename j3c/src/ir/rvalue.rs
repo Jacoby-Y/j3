@@ -1,7 +1,7 @@
 //! Rvalues: something that produces a value. Always has a `ty`.
 
 use crate::ir::ids::VariantId;
-use crate::ir::op::{AtomicOp, BinOp, UnaryOp};
+use crate::ir::op::{AtomicOp, AtomicOrder, BinOp, UnaryOp};
 use crate::ir::operand::Operand;
 use crate::ir::place::Place;
 use crate::ir::ty::Ty;
@@ -39,10 +39,16 @@ pub enum RvalueKind {
         nr: Operand,
         args: Vec<Operand>,
     },
-    /// `@atomicLoad(p)` and friends: `args[0]` is the pointer, the rest are `int` values.
-    /// Type is `int`, or `bool` for `Cas`.
+    /// `@atomicLoad(p)` and friends: `args[0]` is a `&T`, the rest are `T` values.
+    /// Type is `T` (`int` for `Store`, `bool` for `Cas`).
     Atomic {
         op: AtomicOp,
+        order: AtomicOrder,
+        args: Vec<Operand>,
+    },
+    /// `vec4f` / `vec4i` op that is not an operator (`ir/simd.rs`).
+    Simd {
+        op: crate::ir::simd::SimdOp,
         args: Vec<Operand>,
     },
     Aggregate {
@@ -109,11 +115,19 @@ impl Rvalue {
         }
     }
 
-    pub fn atomic(span: Span, ty: Ty, op: AtomicOp, args: Vec<Operand>) -> Rvalue {
+    pub fn atomic(span: Span, ty: Ty, op: AtomicOp, order: AtomicOrder, args: Vec<Operand>) -> Rvalue {
         Rvalue {
             ty,
             span,
-            kind: RvalueKind::Atomic { op, args },
+            kind: RvalueKind::Atomic { op, order, args },
+        }
+    }
+
+    pub fn simd(span: Span, ty: Ty, op: crate::ir::simd::SimdOp, args: Vec<Operand>) -> Rvalue {
+        Rvalue {
+            ty,
+            span,
+            kind: RvalueKind::Simd { op, args },
         }
     }
 

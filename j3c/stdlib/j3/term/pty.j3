@@ -1,0 +1,383 @@
+/// A program on a pseudo-terminal: `spawn` runs `argv` with the slave side as its controlling terminal (stdin, stdout,
+/// stderr), and the `Pty` is the master side. Feed `tryRead` into a `j3.term.grid.Grid`, send keys with `write`, call
+/// `resize` when the view changes (the kernel sends the program `SIGWINCH`).
+///
+///     match pty.spawn(argv, "", env, 80, 24, &arena) {
+///         Result.Ok(p) { ... p.tryRead(buf) ... }
+///         Result.Err(e) { ... }                      // NotFound, ExecFailed, Fail
+///     }
+///
+/// The program gets `TERM=xterm-256color` and `COLORTERM=truecolor` (they override the inherited values; so does any
+/// `K=V` in `env`). Nothing here blocks: `tryRead` polls, `write` queues and flushes what fits. The caller must end the child
+/// (`close`, then `wait` or `tryWait` until it is `Some`) or it stays a zombie.
+/// Linux only: on every other target `spawn` returns `ProcError.Fail`. Main thread or a worker, one `Pty` per thread.
+
+module j3.term.pty;
+
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.proc;
+use j3.proc.ProcError;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use j3.sys.{ O_CLOEXEC, O_NOCTTY, O_RDWR, POLLOUT, SIGHUP, SIGKILL, WNOHANG };
+
+const TIOCSPTLCK: int = 0x40045431;
+const TIOCGPTN: int = 0x80045430;
+const TIOCSWINSZ: int = 0x5414;
+const TIOCSCTTY: int = 0x540E;
+const EINTR: int = 4;
+/// Most bytes `write` queues before it refuses more.
+pub const MAX_PENDING: int = 1048576;
+
+/// The master side of a pty and the program on the other side.
+pub struct Pty {
+    /// Master file descriptor (-1 once closed).
+    fd: int;
+    /// The program's process id.
+    pid: int;
+    /// True once a read saw the end (the program closed its side); everything it wrote has been returned by then.
+    eof: bool = false;
+    /// Set once `tryWait` saw it end (its code then in `code`).
+    done: bool = false;
+    code: int = 0;
+    /// Output `write` queued (from `off`) and not yet taken by the terminal.
+    pend: Text;
+    off: int = 0;
+
+    /// Send `data` to the program: queued, then flushed at once as far as the terminal has room (never blocks).
+    /// The rest goes out from `flush`/`tryRead`. False (nothing queued) when the Pty is closed or `MAX_PENDING`
+    /// bytes are already waiting, so the caller knows input is being dropped.
+    fn write(this: &Pty, data: []u8): bool {
+        if this.fd < 0 || this.pend.bytes.len - this.off + data.len > MAX_PENDING {
+            return false;
+        }
+        this.pend.pushBytes(data);
+        this.flush();
+        return true;
+    }
+
+    /// Bytes queued by `write` that the terminal has not taken yet.
+    fn pending(this: &Pty): int {
+        return this.pend.bytes.len - this.off;
+    }
+
+    /// Push queued output as far as the terminal has room. False when the program is gone (the queue is dropped).
+    fn flush(this: &Pty): bool {
+        while this.fd >= 0 && this.off < this.pend.bytes.len {
+            let pfd: [2]i32 = [i32(this.fd), i32(POLLOUT)];
+            if sys.pollFds(&pfd[0] as ptr, 1, 0) <= 0 {
+                return true;
+            }
+            let chunk = this.pend.bytes.len - this.off;
+            if chunk > 1024 {
+                chunk = 1024;
+            }
+            let n = sys.write(this.fd, (this.pend.bytes.ptr as int + this.off) as ptr, chunk);
+            if n == 0 - EINTR {
+                continue;
+            }
+            if n <= 0 {
+                this.pend.clear();
+                this.off = 0;
+                return false;
+            }
+            this.off += n;
+        }
+        if this.off >= this.pend.bytes.len {
+            this.pend.clear();
+            this.off = 0;
+        }
+        return true;
+    }
+
+    /// Read what the program wrote into `buf` without blocking: a view of `buf` (empty when nothing is waiting).
+    /// Also flushes queued output. At the end `eof` becomes true (Linux reports it as EIO on the master) and the view is empty.
+    fn tryRead(this: &Pty, buf: []u8): string {
+        if this.fd < 0 || this.eof {
+            return "";
+        }
+        this.flush();
+        match proc.tryReadFd(this.fd, buf) {
+            Option.None { return ""; }
+            Option.Some(n) {
+                if n > 0 {
+                    return buf[0..n] as string;
+                }
+                if n != 0 - EINTR {
+                    this.eof = true;
+                }
+                return "";
+            }
+        }
+        return "";
+    }
+
+    /// Tell the terminal its size in cells; the program gets `SIGWINCH`. False when it failed.
+    fn resize(this: &Pty, cols: int, rows: int): bool {
+        return setSizePx(this.fd, cols, rows, 0, 0);
+    }
+
+    /// `resize` that also reports the window in pixels (`cols * cellW` by `rows * cellH`), which image tools
+    /// (`kitty +kitten icat`) need: call it with `View.cellW` / `cellH`.
+    fn resizePx(this: &Pty, cols: int, rows: int, cellW: int, cellH: int): bool {
+        return setSizePx(this.fd, cols, rows, cellW, cellH);
+    }
+
+    /// Its exit code (128 + signal when killed) if it has ended, `None` while it runs. Does not block.
+    fn tryWait(this: &Pty): Option<int> {
+        if !this.done {
+            let status: i32 = 0;
+            let r = sys.waitpid(this.pid, &status, WNOHANG);
+            if r == 0 {
+                return Option.None;
+            }
+            this.done = true;
+            this.code = if r < 0 { -1 } else { sys.exitCode(status) };
+        }
+        return Option.Some(this.code);
+    }
+
+    /// Block until it ends and return its exit code. Closes the master first (the program gets `SIGHUP`); a program that
+    /// ignores it gets 500 ms, then `SIGKILL`, so this cannot hang.
+    fn wait(this: &Pty): int {
+        this.close();
+        if !this.done {
+            this.kill(SIGHUP);
+            for i in 0..10 {
+                match this.tryWait() {
+                    Option.Some(c) { return c; }
+                    Option.None { }
+                }
+                sys.pollFds(0 as ptr, 0, 50);
+            }
+            this.kill(SIGKILL);
+            let status: i32 = 0;
+            this.done = true;
+            this.code = if sys.waitpid(this.pid, &status, 0) < 0 { -1 } else { sys.exitCode(status) };
+        }
+        return this.code;
+    }
+
+    /// Send it signal `sig` (`sys.SIGTERM`, `sys.SIGKILL`, ...).
+    fn kill(this: &Pty, sig: int) {
+        if !this.done {
+            sys.kill(this.pid, sig);
+        }
+    }
+
+    /// Close the master (the kernel hangs up the terminal, so a shell exits) and reap the child if it already ended.
+    /// A program that ignores the hang-up stays a zombie until `wait`/`tryWait` is called: call it again later.
+    fn close(this: &Pty) {
+        if this.fd >= 0 {
+            sys.close(this.fd);
+            this.fd = -1;
+            this.eof = true;
+        }
+        this.tryWait();
+    }
+}
+
+/// Start `argv` (program name first, looked up on `PATH`) on a new pty of `cols` x `rows` cells, with `cwd` as its working
+/// directory ("" keeps this one) and `env` (`"K=V"` strings) added to or replacing the inherited environment.
+pub fn spawn(argv: []string, cwd: string, env: []string, cols: int, rows: int, arena: &Arena): Result<Pty, ProcError> {
+    if sys.PLATFORM != sys.PLATFORM_LINUX || argv.len == 0 {
+        return Result.Err(if argv.len == 0 { ProcError.NotFound } else { ProcError.Fail });
+    }
+    let path = proc.findProgram(argv[0], arena);
+    if path.len == 0 {
+        return Result.Err(ProcError.NotFound);
+    }
+    let master = sys.open("/dev/ptmx\0".ptr as ptr, O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if master < 0 {
+        return Result.Err(ProcError.Fail);
+    }
+    let zero: i32 = 0;
+    let num: i32 = 0;
+    if sys.ioctl(master, TIOCSPTLCK, &zero as ptr) < 0 || sys.ioctl(master, TIOCGPTN, &num as ptr) < 0 || !setSize(master, cols, rows) {
+        sys.close(master);
+        return Result.Err(ProcError.Fail);
+    }
+    // everything the child touches is built before fork: it must not allocate
+    let slave = `/dev/pts/{int(num)}`;
+    let cslave = proc.cString(slave, arena);
+    let cpath = proc.cString(path, arena);
+    let cargv = arena.alloc::<int>(argv.len + 1);
+    for i in 0..argv.len {
+        cargv[i] = proc.cString(argv[i], arena).ptr as int;
+    }
+    cargv[argv.len] = 0;
+    let ccwd = if cwd.len > 0 { proc.cString(cwd, arena).ptr as int } else { 0 };
+    let envp = buildEnv(env, arena);
+    let pexec = arena.alloc::<i32>(2);
+    if sys.pipe(pexec, O_CLOEXEC) < 0 {
+        sys.close(master);
+        return Result.Err(ProcError.Fail);
+    }
+    sys.ignoreSigpipe(true);
+    let pid = sys.fork();
+    if pid < 0 {
+        sys.close(master);
+        sys.close(int(pexec[0]));
+        sys.close(int(pexec[1]));
+        return Result.Err(ProcError.Fail);
+    }
+    if pid == 0 {
+        // child: raw calls only. A new session first, so opening the slave makes it the controlling terminal
+        let e = 0;
+        sys.setsid();
+        let sfd = sys.open(cslave.ptr as ptr, O_RDWR);
+        if sfd < 0 {
+            e = 0 - sfd;
+        } else {
+            sys.ioctl(sfd, TIOCSCTTY, 0 as ptr);
+            sys.dup2(sfd, 0);
+            sys.dup2(sfd, 1);
+            sys.dup2(sfd, 2);
+            if sfd > 2 {
+                sys.close(sfd);
+            }
+            sys.ignoreSigpipe(false);
+            if ccwd != 0 && sys.chdir(ccwd as ptr) < 0 {
+                e = sys.errno();
+            } else {
+                e = 0 - sys.execve(cpath.ptr as ptr, cargv.ptr as ptr, envp);
+            }
+        }
+        let sent: i32 = i32(e);
+        sys.write(int(pexec[1]), &sent as ptr, 4);
+        sys.exit(127);
+    }
+    sys.close(int(pexec[1]));
+    // the exec pipe closes (read 0) when execve succeeds; otherwise the child sent its errno
+    let code: i32 = 0;
+    let got = sys.read(int(pexec[0]), &code as ptr, 4);
+    sys.close(int(pexec[0]));
+    if got == 4 {
+        sys.close(master);
+        let status: i32 = 0;
+        sys.waitpid(pid, &status, 0);
+        // ENOENT 2, ENOTDIR 20
+        if code == 2 || code == 20 {
+            return Result.Err(ProcError.NotFound);
+        }
+        return Result.Err(ProcError.ExecFailed);
+    }
+    return Result.Ok(Pty { fd: master, pid: pid, pend: Text.new(arena) });
+}
+
+/// `TIOCSWINSZ`: struct winsize { u16 rows, cols, xpixel, ypixel }.
+fn setSize(fd: int, cols: int, rows: int): bool {
+    return setSizePx(fd, cols, rows, 0, 0);
+}
+
+fn setSizePx(fd: int, cols: int, rows: int, cw: int, ch: int): bool {
+    if fd < 0 {
+        return false;
+    }
+    let xp = clampDim(cols) * cw;
+    let yp = clampDim(rows) * ch;
+    let ws: [4]u16 = [u16(clampDim(rows)), u16(clampDim(cols)), u16(if xp > 65535 { 65535 } else { xp }), u16(if yp > 65535 { 65535 } else { yp })];
+    return sys.ioctl(fd, TIOCSWINSZ, &ws[0] as ptr) >= 0;
+}
+
+fn clampDim(n: int): int {
+    if n < 1 {
+        return 1;
+    }
+    if n > 65535 {
+        return 65535;
+    }
+    return n;
+}
+
+/// Length of the `NAME` part of `NAME=value` (the whole string without a `=`).
+fn keyLen(s: string): int {
+    for i in 0..s.len {
+        if s[i] == 61 {
+            return i;
+        }
+    }
+    return s.len;
+}
+
+fn sameKey(a: string, b: string): bool {
+    let n = keyLen(a);
+    if n != keyLen(b) {
+        return false;
+    }
+    for i in 0..n {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The NUL-terminated C string at `p`, as a view without the NUL.
+fn cview(p: int): string {
+    let n = 0;
+    while true {
+        let byte = ((p + n) as ptr) as &u8;
+        if *byte == 0 {
+            break;
+        }
+        n += 1;
+    }
+    let bytes: []u8 = @slice(p as ptr, n);
+    return bytes as string;
+}
+
+/// An `envp` array: the inherited environment minus every name in the overrides, then the overrides (the last one
+/// wins when a name repeats). The overrides are `TERM`, `COLORTERM`, then `extra`.
+fn buildEnv(extra: []string, arena: &Arena): ptr {
+    let over = arena.alloc::<string>(extra.len + 2);
+    over[0] = "TERM=xterm-256color";
+    over[1] = "COLORTERM=truecolor";
+    for i in 0..extra.len {
+        over[i + 2] = extra[i];
+    }
+    let ep = sys.environ();
+    let inherited = 0;
+    if ep as int != 0 {
+        while true {
+            let slot = (ep as int + inherited * 8) as ptr as &int;
+            if *slot == 0 {
+                break;
+            }
+            inherited += 1;
+        }
+    }
+    let envp = arena.alloc::<int>(inherited + over.len + 1);
+    let n = 0;
+    for i in 0..inherited {
+        let slot = (ep as int + i * 8) as ptr as &int;
+        let p = *slot;
+        let name = cview(p);
+        let hit = false;
+        for j in 0..over.len {
+            if sameKey(name, over[j]) {
+                hit = true;
+            }
+        }
+        if !hit {
+            envp[n] = p;
+            n += 1;
+        }
+    }
+    for j in 0..over.len {
+        let later = false;
+        for k in j + 1..over.len {
+            if sameKey(over[j], over[k]) {
+                later = true;
+            }
+        }
+        if !later {
+            envp[n] = proc.cString(over[j], arena).ptr as int;
+            n += 1;
+        }
+    }
+    envp[n] = 0;
+    return envp.ptr as ptr;
+}

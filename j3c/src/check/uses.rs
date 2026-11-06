@@ -77,6 +77,7 @@ pub(super) fn resolve_all_uses(mods: &mut [ModData], phase: UsePhase) -> Result<
                     for (k, v) in consts {
                         mods[i].consts.insert(k, v);
                     }
+                    mods[i].gen_mods.insert(alias.clone(), mod_key.clone());
                     mods[i].mod_ns.insert(alias.clone(), exported.clone());
                     mods[i].lib_ns.insert(alias, exported);
                 }
@@ -123,6 +124,12 @@ pub(super) fn resolve_all_uses(mods: &mut [ModData], phase: UsePhase) -> Result<
                     }
                 }
                 UsePhase::Vals => {
+                    if mods[src_i].traits.contains_key(&name) {
+                        continue; // imported by `bind_traits`
+                    }
+                    if import_generic_fn(mods, i, src_i, &name, &mod_key, u.span)? {
+                        continue;
+                    }
                     if let Some(&id) = mods[src_i].funcs.get(&name) {
                         if !mods[src_i].exports.contains(&name) {
                             return Err(CheckError::new(
@@ -195,11 +202,12 @@ pub(super) fn resolve_all_uses(mods: &mut [ModData], phase: UsePhase) -> Result<
                         mods[i].consts.insert(name, c);
                         continue;
                     }
-                    return Err(CheckError::new(
-                        path,
-                        u.span,
-                        format!("`{mod_key}` has no `{name}`"),
-                    ));
+                    let mut e = CheckError::new(path, u.span, format!("`{mod_key}` has no `{name}`"));
+                    let cands: Vec<String> = mods[src_i].exports.iter().cloned().collect();
+                    if let Some(s) = super::error::suggest(&name, &cands) {
+                        e = e.help(format!("did you mean `{s}`?"));
+                    }
+                    return Err(e);
                 }
             }
         }

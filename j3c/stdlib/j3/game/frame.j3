@@ -1,5 +1,11 @@
-// Part of j3.game (env, capture, present, frame stats and profiling); the module doc and `use`s are in ../game.j3.
+// Part of j3.game (env, capture, screenshot, present); the module doc and `use`s are in ../game.j3.
 module j3.game;
+
+/// Width and height `readWindow` reads, in window pixels (the whole window, bars included, whatever the
+/// virtual size). `out` needs `w * h * 4` bytes.
+pub fn windowPixels(): Vec2 {
+    return Vec2 { x: f32(platform.win_w), y: f32(platform.win_h) };
+}
 
 /// Copy the frame drawn so far (before `present`) into `out` as RGBA8, top row first:
 /// window pixels wide and tall (the bars too under `setVirtualSize`), 4 bytes a pixel. False when it could not be read.
@@ -155,7 +161,7 @@ fn framesWanted(): int {
 }
 
 fn applyCursor() {
-    let k = cursorWant;
+    let k = if EDGE_CURSOR > 0 { EDGE_CURSOR } else { cursorWant };
     cursorWant = 0;
     if k == cursorShown { return; }
     if cursors[k] == 0 { cursors[k] = sdl.SDL_CreateSystemCursor(i32(k)); }
@@ -227,16 +233,25 @@ fn glCheck() {
 #[singleton]
 let GL_LAST: int;
 
-/// Show the frame. F3 toggles the profiler overlay. `j3c run --frames N --screenshot FILE`
+/// Show the frame. F3 toggles the profiler overlay, F4 the UI cost breakdown (`J3_F4=1` starts it open). `j3c run --frames N --screenshot FILE`
 /// sets `J3_FRAMES` and `J3_SCREENSHOT`: frame N is saved to FILE before it is shown, then
 /// quit is requested, and a `J3STATS` line of the run's averages is printed.
 pub fn present() {
-    if PRESENTED == 0 { STOP_AT = framesWanted(); }
+    if PRESENTED == 0 {
+        STOP_AT = framesWanted();
+        // `J3_F4=1` opens the UI cost overlay from the start (screenshots).
+        PROF.uiShown = env("J3_F4").len > 0;
+    }
     PRESENTED += 1;
     let last = STOP_AT > 0 && PRESENTED == STOP_AT;
-    if keyPressed(Key.F3) { PROF.shown = !PROF.shown; }
+    if keyPressedRaw(Key.F3) { PROF.shown = !PROF.shown; }
+    if keyPressedRaw(Key.F4) { PROF.uiShown = !PROF.uiShown; }
+    profUiEnd();
     if PROF.shown { profOverlay(); }
+    if PROF.uiShown { uiOverlay(); }
     p2Flush();
+    // The overlays' own draws are not the app's.
+    uiClear();
     if GL_CHECK >= 0 && platform.gl { glCheck(); }
     profEnd();
     applyCursor();
@@ -268,364 +283,4 @@ pub fn present() {
     }
     LAST_PRESENT = PROF.swapped;
     if last { requestQuit(); }
-}
-
-// ---- Frame profiler: counters from `j3.gfx`, GPU timer queries, the F3 overlay, `J3STATS`.
-
-/// GPU time spent in the shadow pass.
-pub const ZONE_SHADOW: int = 0;
-/// GPU time spent in camera passes.
-pub const ZONE_CAMERA: int = 1;
-/// GPU time spent drawing the 2D HUD over GL.
-pub const ZONE_UI: int = 2;
-/// Timed GPU spans one frame can hold; later spans go untimed.
-const PROF_SPANS: int = 8;
-/// Query frames in flight. Occupied slots are skipped until their results are ready.
-const PROF_RING: int = 4;
-/// Frame times the F3 graph shows.
-const PROF_HISTORY: int = 120;
-const GL_TIME_ELAPSED: u32 = 0x88BF;
-const GL_QUERY_RESULT: u32 = 0x8866;
-const GL_QUERY_RESULT_AVAILABLE: u32 = 0x8867;
-const GL_RENDERER: u32 = 0x1F01;
-
-/// One frame's numbers, or averages of them. Times are milliseconds.
-pub struct FrameStats {
-    /// Draw calls through `j3.gfx`; an instanced draw counts once.
-    draws: int = 0;
-    /// Triangles those draws submitted.
-    tris: int = 0;
-    /// Present to present.
-    frameMs: f32 = 0;
-    /// CPU time from the last swap to this present (excludes waiting on vsync).
-    cpuMs: f32 = 0;
-    /// CPU time inside `scene3d.draw`.
-    sceneMs: f32 = 0;
-    /// GPU time of the shadow pass; -1 when no fresh GPU sample is available.
-    shadowMs: f32 = 0;
-    /// GPU time of the camera passes; -1 when no fresh GPU sample is available.
-    cameraMs: f32 = 0;
-    /// GPU time of the HUD; -1 when no fresh GPU sample is available.
-    uiMs: f32 = 0;
-}
-
-/// Profiler state.
-struct Prof {
-    /// The frame being counted.
-    now: FrameStats;
-    /// The last finished frame.
-    last: FrameStats;
-    /// Running average of recent frames.
-    avg: FrameStats;
-    /// Totals after warm-up, for `J3STATS`.
-    sum: FrameStats;
-    summed: int;
-    gpuSummed: int = 0;
-    /// `micros` at the last present and just after the last swap.
-    presentAt: int;
-    swapped: int;
-    /// Open GPU zone, or -1.
-    zone: int;
-    /// Timer queries: 0 untried, 1 working, -1 unavailable.
-    gpu: int;
-    shown: bool;
-    font: Font;
-    genQueries: ptr;
-    beginQuery: ptr;
-    endQuery: ptr;
-    queryInt: ptr;
-    query64: ptr;
-    finish: ptr;
-}
-
-#[singleton]
-let PROF: Prof = Prof {
-    now: FrameStats {}, last: FrameStats {}, avg: FrameStats {}, sum: FrameStats {}, summed: 0,
-    presentAt: 0, swapped: 0, zone: -1, gpu: 0, shown: false, font: Font { raw: 0 },
-    genQueries: 0, beginQuery: 0, endQuery: 0, queryInt: 0, query64: 0, finish: 0,
-};
-/// Query ids, `PROF_SPANS` per ring slot.
-#[singleton]
-let PROF_Q: [32]u32;
-/// Zone of each query.
-#[singleton]
-let PROF_QZONE: [32]int;
-/// Spans used in each ring slot.
-#[singleton]
-let PROF_QN: [4]int;
-/// Frame owning each query slot; unread frames must never be overwritten.
-#[singleton]
-let PROF_QFRAME: [4]int;
-/// Recent frame times for the graph.
-#[singleton]
-let PROF_HIST: [120]f32;
-
-/// Most recently completed frame, without smoothing. GPU timings arrive asynchronously.
-pub fn lastFrameStats(): FrameStats { return PROF.last; }
-
-/// Averages over the last second or so of frames.
-pub fn frameStats(): FrameStats {
-    return PROF.avg;
-}
-
-/// Count one draw call of `tris` triangles. `j3.gfx` calls this.
-pub fn profDraw(tris: int) {
-    PROF.now.draws += 1;
-    PROF.now.tris += tris;
-}
-
-/// Draw calls counted so far in the frame being built (tests compare it before and after a paint).
-pub fn drawsNow(): int {
-    return PROF.now.draws;
-}
-
-/// Add `us` microseconds of CPU time to `sceneMs`. `j3.scene3d.draw` calls this.
-pub fn profScene(us: int) {
-    PROF.now.sceneMs += f32(us) / 1000;
-}
-
-/// Load the timer-query entry points once. False when the context has none.
-fn profGpu(): bool {
-    if PROF.gpu == 0 {
-        // ES has no GL_TIME_ELAPSED (only the EXT_disjoint_timer_query forms): no GPU timing there.
-        if isGles() { PROF.gpu = -1; return false; }
-        PROF.genQueries = glProc("glGenQueries");
-        PROF.beginQuery = glProc("glBeginQuery");
-        PROF.endQuery = glProc("glEndQuery");
-        PROF.queryInt = glProc("glGetQueryObjectiv");
-        PROF.query64 = glProc("glGetQueryObjectui64v");
-        PROF.gpu = -1;
-        if PROF.genQueries != 0 && PROF.beginQuery != 0 && PROF.endQuery != 0 && PROF.queryInt != 0 && PROF.query64 != 0 {
-            let gen = PROF.genQueries as fn(i32, ptr);
-            gen(32, &PROF_Q[0] as ptr);
-            PROF.gpu = 1;
-        }
-    }
-    return PROF.gpu > 0;
-}
-
-/// Time GPU work as zone `z` (`ZONE_*`) until the next zone or `present`; -1 stops timing.
-/// A zone started twice in a frame (two camera views) adds up.
-pub fn profZone(z: int) {
-    if !platform.gl || z == PROF.zone || !profGpu() { return; }
-    let slot = PRESENTED % PROF_RING;
-    if PROF.zone >= 0 {
-        let end = PROF.endQuery as fn(u32);
-        end(GL_TIME_ELAPSED);
-    }
-    PROF.zone = -1;
-    let n = PROF_QN[slot];
-    if z < 0 || n >= PROF_SPANS { return; }
-    if n > 0 && PROF_QFRAME[slot] != PRESENTED { return; }
-    PROF_QFRAME[slot] = PRESENTED;
-    let begin = PROF.beginQuery as fn(u32, u32);
-    begin(GL_TIME_ELAPSED, PROF_Q[slot * PROF_SPANS + n]);
-    PROF_QZONE[slot * PROF_SPANS + n] = z;
-    PROF_QN[slot] = n + 1;
-    PROF.zone = z;
-}
-
-/// Read the oldest available frame without waiting or discarding pending queries.
-/// A negative time means no fresh GPU result this frame, never a repeated old sample.
-fn profReadGpu() {
-    let n = &PROF.now;
-    n.shadowMs = -1;
-    n.cameraMs = -1;
-    n.uiMs = -1;
-    if !platform.gl || PROF.gpu != 1 { return; }
-    let slot = -1;
-    let scan = 0;
-    while scan < PROF_RING {
-        if PROF_QN[scan] > 0 {
-            if slot < 0 { slot = scan; }
-            else if PROF_QFRAME[scan] < PROF_QFRAME[slot] { slot = scan; }
-        }
-        scan += 1;
-    }
-    if slot < 0 { return; }
-    // A later query completing also completes the earlier queries in this frame.
-    let ready: [1]i32 = [0];
-    let avail = PROF.queryInt as fn(u32, u32, ptr);
-    avail(PROF_Q[slot * PROF_SPANS + PROF_QN[slot] - 1], GL_QUERY_RESULT_AVAILABLE, &ready[0] as ptr);
-    if ready[0] == 0 { return; }
-    let ms: [3]f32 = [0, 0, 0];
-    let k = 0;
-    while k < PROF_QN[slot] {
-        let ns: [1]int = [0];
-        let read = PROF.query64 as fn(u32, u32, ptr);
-        read(PROF_Q[slot * PROF_SPANS + k], GL_QUERY_RESULT, &ns[0] as ptr);
-        ms[PROF_QZONE[slot * PROF_SPANS + k]] += f32(ns[0]) / 1000000;
-        k += 1;
-    }
-    PROF_QN[slot] = 0;
-    n.shadowMs = ms[0];
-    n.cameraMs = ms[1];
-    n.uiMs = ms[2];
-}
-
-/// `a` moved 5% toward `b`.
-fn ease(a: f32, b: f32): f32 {
-    return a + (b - a) * 0.05;
-}
-
-/// Close the frame: stop GPU timing, take its times, and fold it into the averages.
-fn profEnd() {
-    profZone(-1);
-    profReadGpu();
-    let t = micros();
-    let n = &PROF.now;
-    if PROF.presentAt > 0 {
-        n.frameMs = f32(t - PROF.presentAt) / 1000;
-        n.cpuMs = f32(t - PROF.swapped) / 1000;
-    }
-    PROF.presentAt = t;
-    PROF_HIST[PRESENTED % PROF_HISTORY] = n.frameMs;
-    let a = &PROF.avg;
-    if PRESENTED <= 2 {
-        PROF.avg = PROF.now;
-    } else {
-        a.draws = int(ease(f32(a.draws), f32(n.draws)) + 0.5);
-        a.tris = int(ease(f32(a.tris), f32(n.tris)) + 0.5);
-        a.frameMs = ease(a.frameMs, n.frameMs);
-        a.cpuMs = ease(a.cpuMs, n.cpuMs);
-        a.sceneMs = ease(a.sceneMs, n.sceneMs);
-        if n.shadowMs >= 0 {
-            a.shadowMs = if a.shadowMs < 0 { n.shadowMs } else { ease(a.shadowMs, n.shadowMs) };
-            a.cameraMs = if a.cameraMs < 0 { n.cameraMs } else { ease(a.cameraMs, n.cameraMs) };
-            a.uiMs = if a.uiMs < 0 { n.uiMs } else { ease(a.uiMs, n.uiMs) };
-        }
-    }
-    // `J3STATS` skips the first tenth of a `--frames` run: shader compiles and uploads land there.
-    if STOP_AT > 0 && PRESENTED > STOP_AT / 10 {
-        let s = &PROF.sum;
-        s.draws += n.draws;
-        s.tris += n.tris;
-        s.frameMs += n.frameMs;
-        s.cpuMs += n.cpuMs;
-        s.sceneMs += n.sceneMs;
-        if n.shadowMs >= 0 {
-            s.shadowMs += n.shadowMs;
-            s.cameraMs += n.cameraMs;
-            s.uiMs += n.uiMs;
-            PROF.gpuSummed += 1;
-        }
-        PROF.summed += 1;
-    }
-    PROF.last = PROF.now;
-    PROF.now = FrameStats {};
-}
-
-/// `v` with one decimal, or `-` when negative (not measured).
-fn pushMs(t: &Text, v: f32) {
-    if v < 0 {
-        t.push(45);
-        return;
-    }
-    let tenths = int(v * 10 + 0.5);
-    t.pushInt(tenths / 10);
-    t.push(46);
-    t.pushInt(tenths % 10);
-}
-
-/// Print `J3STATS` with the run's averages, for `j3c run --frames` and MCP `play`.
-fn profReport() {
-    let k = PROF.summed;
-    if k < 1 { return; }
-    let s = PROF.sum;
-    let f = f32(k);
-    let t = Text.new(scratch(1));
-    t.pushStr("J3STATS frames=");
-    t.pushInt(k);
-    t.pushStr(" fps=");
-    t.pushInt(if s.frameMs > 0 { int(f * 1000 / s.frameMs + 0.5) } else { 0 });
-    t.pushStr(" frame=");
-    pushMs(&t, s.frameMs / f);
-    t.pushStr(" cpu=");
-    pushMs(&t, s.cpuMs / f);
-    t.pushStr(" scene=");
-    pushMs(&t, s.sceneMs / f);
-    t.pushStr(" draws=");
-    t.pushInt(s.draws / k);
-    t.pushStr(" tris=");
-    t.pushInt(s.tris / k);
-    t.pushStr(" shadow=");
-    pushMs(&t, if PROF.gpuSummed > 0 { s.shadowMs / f32(PROF.gpuSummed) } else { -1 });
-    t.pushStr(" camera=");
-    pushMs(&t, if PROF.gpuSummed > 0 { s.cameraMs / f32(PROF.gpuSummed) } else { -1 });
-    t.pushStr(" ui=");
-    pushMs(&t, if PROF.gpuSummed > 0 { s.uiMs / f32(PROF.gpuSummed) } else { -1 });
-    if platform.gl {
-        let get = glProc("glGetString") as fn(u32): cstr;
-        let name = get(GL_RENDERER);
-        if name != 0 {
-            t.pushStr(" gl=");
-            t.pushStr([]u8 { ptr: name as &u8, len: libc.strlen(name) } as string);
-        }
-    }
-    printLn(t.str());
-}
-
-/// Draw the F3 overlay in the top-right corner: averages and a frame-time graph.
-fn profOverlay() {
-    let keep = platform.color;
-    let a = PROF.avg;
-    let font = PROF.font;
-    let line: f32 = 18;
-    if font.raw != 0 {
-        let size = textSize(font, "Ag");
-        line = size.y + 2;
-    }
-    let rows: f32 = if font.raw != 0 { 4 } else { 0 };
-    let w: f32 = f32(PROF_HISTORY * 2 + 16);
-    let ws = windowSize();
-    let x = ws.x - w - 8;
-    let y: f32 = 8;
-    let graph: f32 = 70;
-    setColor(rgba(8, 8, 12, 200));
-    drawRect(Vec2 { x: x, y: y }, Vec2 { x: w, y: rows * line + graph + 16 });
-    if font.raw != 0 {
-        setColor(rgb(220, 230, 210));
-        let t = Text.new(scratch(1));
-        t.pushStr("fps ");
-        t.pushInt(if a.frameMs > 0 { int(1000 / a.frameMs + 0.5) } else { 0 });
-        t.pushStr("   frame ");
-        pushMs(&t, a.frameMs);
-        t.pushStr(" ms");
-        drawTextBytes(font, Vec2 { x: x + 8, y: y + 6 }, t.bytes);
-        t.clear();
-        t.pushStr("cpu ");
-        pushMs(&t, a.cpuMs);
-        t.pushStr("   scene ");
-        pushMs(&t, a.sceneMs);
-        drawTextBytes(font, Vec2 { x: x + 8, y: y + 6 + line }, t.bytes);
-        t.clear();
-        t.pushStr("gpu shadow ");
-        pushMs(&t, a.shadowMs);
-        t.pushStr("  cam ");
-        pushMs(&t, a.cameraMs);
-        t.pushStr("  ui ");
-        pushMs(&t, a.uiMs);
-        drawTextBytes(font, Vec2 { x: x + 8, y: y + 6 + line * 2 }, t.bytes);
-        t.clear();
-        t.pushStr("draws ");
-        t.pushInt(a.draws);
-        t.pushStr("   tris ");
-        t.pushInt(a.tris);
-        drawTextBytes(font, Vec2 { x: x + 8, y: y + 6 + line * 3 }, t.bytes);
-    }
-    // One bar per frame, 2 px per ms, oldest on the left; the line marks 60 fps.
-    let base = y + 8 + rows * line + graph;
-    let i = 0;
-    while i < PROF_HISTORY {
-        let ms = PROF_HIST[(PRESENTED + 1 + i) % PROF_HISTORY];
-        let h = clamp(ms * 2, 0, graph);
-        if ms <= 16.7 { setColor(rgb(90, 200, 110)); }
-        else if ms <= 33.4 { setColor(rgb(230, 190, 70)); }
-        else { setColor(rgb(230, 80, 70)); }
-        drawRect(Vec2 { x: x + 8 + f32(i * 2), y: base - h }, Vec2 { x: 2, y: h });
-        i += 1;
-    }
-    setColor(rgba(255, 255, 255, 120));
-    drawRect(Vec2 { x: x + 8, y: base - 33.4 }, Vec2 { x: f32(PROF_HISTORY * 2), y: 1 });
-    platform.color = keep;
 }

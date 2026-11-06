@@ -9,6 +9,9 @@ impl<'a> LlvmFn<'a> {
         l: &str,
         r: &str,
     ) -> Result<String, String> {
+        if matches!(self.cx.ty_kind(result_ty), TyKind::Vec(_)) {
+            return self.vec_binop(result_ty, op, l, r);
+        }
         let ll = ll_type(self.cx, result_ty)?;
         let v = self.fresh();
         if matches!(
@@ -17,7 +20,7 @@ impl<'a> LlvmFn<'a> {
         ) {
             let (ipred, fpred) = match op {
                 BinOp::Eq => ("eq", "oeq"),
-                BinOp::Ne => ("ne", "one"),
+                BinOp::Ne => ("ne", "une"),
                 BinOp::Lt => ("slt", "olt"),
                 BinOp::Le => ("sle", "ole"),
                 BinOp::Gt => ("sgt", "ogt"),
@@ -103,6 +106,19 @@ impl<'a> LlvmFn<'a> {
                         }
                     }
                     _ => unreachable!(),
+                };
+                // a shift by the width or more is poison in LLVM: mask the amount, like C and Rust release
+                let masked;
+                let r = if matches!(op, BinOp::Shl | BinOp::Shr) {
+                    let bits = match self.cx.ty_kind(ty) {
+                        TyKind::Int(i) => i.bits(),
+                        _ => 64,
+                    };
+                    masked = self.fresh();
+                    self.inst(&format!("{masked} = and {ll} {r}, {}", bits - 1));
+                    masked.as_str()
+                } else {
+                    r
                 };
                 let v = self.fresh();
                 self.inst(&format!("{v} = {inst} {ll} {l}, {r}"));

@@ -1,0 +1,264 @@
+// Bytecode: opcodes, instruction encoding, and the function objects (`Proto`, `Closure`,
+// `Upval`). Part of `j3.j2`.
+//
+// A register machine modeled on Lua 5.4. An instruction is 32 bits: `op:8 a:8 b:8 c:8`, or
+// `op:8 a:8 bx:16` (jumps use `sbx = bx - 32768`, relative to the next instruction). `R[x]` is
+// register x of the running frame, `K[x]` constant x of its proto, `U[x]` its upvalue x, `E[x]`
+// slot x of the module env (private top-level names; E[0] is the exports table, which holds the
+// `pub` ones).
+
+module j3.j2;
+
+const OBJ_PROTO: u8 = 4;
+const OBJ_FN: u8 = 5;
+const OBJ_UPVAL: u8 = 6;
+
+const OP_MOVE: int = 0;       // R[a] = R[b]
+const OP_LOADK: int = 1;      // R[a] = K[bx]
+const OP_LOADNIL: int = 2;    // R[a] = nil
+const OP_LOADBOOL: int = 3;   // R[a] = b != 0
+const OP_GETUP: int = 4;      // R[a] = U[b]
+const OP_SETUP: int = 5;      // U[b] = R[a]
+const OP_GETENV: int = 6;     // R[a] = E[bx]
+const OP_SETENV: int = 7;     // E[bx] = R[a]
+const OP_GETGLOBAL: int = 8;  // R[a] = the host global named K[bx] (error when missing)
+const OP_NEWTABLE: int = 9;   // R[a] = {}
+const OP_NEWARRAY: int = 10;  // R[a] = [] with room for b
+const OP_APPEND: int = 11;    // push R[b] onto array R[a]
+const OP_GETFIELD: int = 12;  // R[a] = R[b].K[c]
+const OP_SETFIELD: int = 13;  // R[a].K[b] = R[c]
+const OP_GETINDEX: int = 14;  // R[a] = R[b][R[c]]
+const OP_SETINDEX: int = 15;  // R[a][R[b]] = R[c]
+const OP_ADD: int = 16;       // R[a] = R[b] + R[c]
+const OP_SUB: int = 17;
+const OP_MUL: int = 18;
+const OP_DIV: int = 19;
+const OP_MOD: int = 20;
+const OP_EQ: int = 21;        // R[a] = R[b] == R[c]
+const OP_NE: int = 22;
+const OP_LT: int = 23;        // R[a] = R[b] < R[c] (`>` swaps the operands)
+const OP_LE: int = 24;
+const OP_UNM: int = 25;       // R[a] = -R[b]
+const OP_NOT: int = 26;       // R[a] = !R[b]
+const OP_CONCAT: int = 27;    // R[a] = str(R[b]) + ... + str(R[b + c - 1])
+const OP_JMP: int = 28;       // pc += sbx
+const OP_JMPIF: int = 29;     // if R[a] is truthy, pc += sbx
+const OP_JMPIFNOT: int = 30;  // if R[a] is falsy, pc += sbx
+const OP_CALL: int = 31;      // R[a] = R[a](R[a+1] .. R[a+b])
+/// `R[a+1].name(R[a+2] .. R[a+b])`, followed by two `OP_EXTRA` words: (a: fallback kind, bx:
+/// name constant) and (bx: env slot for `FALLBACK_ENV`). Passes the receiver as `this` only to a
+/// script fn whose first parameter is `this`; with no such field, calls the fallback `name(recv, ..)`.
+const OP_METHOD: int = 32;
+const OP_EXTRA: int = 33;
+const OP_RETURN: int = 34;    // return R[a] (nil when b is 0)
+const OP_CLOSURE: int = 35;   // R[a] = a closure of child proto bx
+const OP_CLOSE: int = 36;     // close the open upvalues at R[a] and above
+const OP_FORPREP: int = 37;   // range loop: counter R[a], limit R[a+1], variable R[a+2]; skip by sbx when empty
+const OP_FORLOOP: int = 38;   // counter += 1; while below the limit, set the variable and jump back by sbx
+const OP_FORINPREP: int = 39; // for-in: iterable R[a], position R[a+1]; check the type, jump by sbx to OP_FORINNEXT
+const OP_FORINNEXT: int = 40; // next key/index into R[a+2] and value into R[a+3], and jump back by sbx; else fall out
+const OP_GETPUB: int = 41;    // R[a] = exports[K[bx]] (a `pub` name; the exports table is E[0])
+const OP_SETPUB: int = 42;    // exports[K[bx]] = R[a]
+/// `R[a] = R[b] op K[c]`: arithmetic with a constant right operand (`i + 1`, `x * 0.5`).
+const OP_ADDK: int = 43;
+const OP_SUBK: int = 44;
+const OP_MULK: int = 45;
+const OP_DIVK: int = 46;
+const OP_MODK: int = 47;
+/// Compare and jump: `x op y` where x is `R[a]` and y is `K[b]` when `c & TEST_K`, else `R[b]`.
+/// When the result equals `c & TEST_TRUE`, take the `OP_JMP` that always follows; otherwise skip
+/// it. (`x != y` is `OP_TEQ` expecting false; `x > y` / `x >= y` with two registers swap into
+/// `OP_TLT` / `OP_TLE`, so `OP_TGT` / `OP_TGE` only appear with a constant y.)
+const OP_TEQ: int = 48;
+const OP_TLT: int = 49;
+const OP_TLE: int = 50;
+const OP_TGT: int = 51;
+const OP_TGE: int = 52;
+const OP_COUNT: int = 53;
+
+/// `c` bits of the compare-and-jump ops.
+const TEST_TRUE: int = 1;
+const TEST_K: int = 2;
+
+/// Where a method call's fallback `f(recv, ..)` finds `f`.
+const FALLBACK_NONE: int = 0;
+const FALLBACK_ENV: int = 1;
+const FALLBACK_GLOBAL: int = 2;
+const FALLBACK_PUB: int = 3;
+
+const OP_NAMES: [53]string = ["MOVE", "LOADK", "LOADNIL", "LOADBOOL", "GETUP", "SETUP", "GETENV", "SETENV",
+    "GETGLOBAL", "NEWTABLE", "NEWARRAY", "APPEND", "GETFIELD", "SETFIELD", "GETINDEX", "SETINDEX", "ADD", "SUB",
+    "MUL", "DIV", "MOD", "EQ", "NE", "LT", "LE", "UNM", "NOT", "CONCAT", "JMP", "JMPIF", "JMPIFNOT", "CALL",
+    "METHOD", "EXTRA", "RETURN", "CLOSURE", "CLOSE", "FORPREP", "FORLOOP", "FORINPREP", "FORINNEXT",
+    "GETPUB", "SETPUB", "ADDK", "SUBK", "MULK", "DIVK", "MODK", "TEQ", "TLT", "TLE", "TGT", "TGE"];
+
+/// The name of opcode `op`, for listings.
+fn opName(op: int): string {
+    if op < 0 || op >= OP_COUNT { return "?"; }
+    return OP_NAMES[op];
+}
+
+fn insABC(op: int, a: int, b: int, c: int): int { return op | (a << 8) | (b << 16) | (c << 24); }
+fn insABx(op: int, a: int, bx: int): int { return op | (a << 8) | (bx << 16); }
+
+/// Largest `bx`, and the `sbx` range around 0.
+const MAX_BX: int = 65535;
+const SBX_BIAS: int = 32768;
+
+/// A compiled function: code, constants, child protos, upvalue descriptors, and a `line << 32 |
+/// col` per instruction. Made at load time; every buffer is in the j2 heap.
+pub struct Proto {
+    h: GcHeader;
+    code: ptr;
+    ncode: int;
+    lines: ptr;
+    consts: ptr;
+    nconsts: int;
+    /// Child proto addresses.
+    protos: ptr;
+    nprotos: int;
+    /// Per upvalue: `idx << 1 | 1` for the enclosing frame's register `idx`, `idx << 1` for its upvalue `idx`.
+    ups: ptr;
+    nups: int;
+    nparams: int;
+    maxStack: int;
+    /// `parse.F_THIS` when the first parameter is `this`.
+    flags: int;
+    /// The function's name (a string, or nil for a literal), its chunk's name, and the file
+    /// errors name (the path for `loadFile`, else the chunk name). Both are fixed strings.
+    name: Value;
+    chunk: Value;
+    file: Value;
+
+    fn codeOf(this: &Proto): []u32 { return @slice(this.code, this.ncode); }
+    fn constsOf(this: &Proto): []Value { return @slice(this.consts, this.nconsts); }
+    fn protosOf(this: &Proto): []int { return @slice(this.protos, this.nprotos); }
+    fn upsOf(this: &Proto): []int { return @slice(this.ups, this.nups); }
+    fn linesOf(this: &Proto): []int { return @slice(this.lines, this.ncode); }
+
+    /// Give back the owned buffers (the sweep calls this before `freeObject`).
+    fn freeParts(this: &Proto, h: &Heap) {
+        if this.ncode > 0 {
+            h.freeRaw(this.code, this.ncode * 4);
+            h.freeRaw(this.lines, this.ncode * 8);
+        }
+        if this.nconsts > 0 { h.freeRaw(this.consts, this.nconsts * @sizeof(Value)); }
+        if this.nprotos > 0 { h.freeRaw(this.protos, this.nprotos * 8); }
+        if this.nups > 0 { h.freeRaw(this.ups, this.nups * 8); }
+        this.ncode = 0;
+        this.nconsts = 0;
+        this.nprotos = 0;
+        this.nups = 0;
+    }
+}
+
+/// A script function value (`T_FN`): a proto, the module env it reads top-level names from (an
+/// array), and `nups` upvalue addresses right after this header.
+pub struct Closure {
+    h: GcHeader;
+    proto: ptr;
+    env: Value;
+    nups: int;
+
+    fn protoOf(this: &Closure): &Proto { return this.proto as &Proto; }
+    fn upsOf(this: &Closure): []int { return @slice((this as ptr as int + @sizeof(Closure)) as ptr, this.nups); }
+}
+
+/// A captured variable. Open (`idx >= 0`): it is stack slot `idx` (an index, so the stack can
+/// move). Closed (`idx == -1`): the value is in `v`. Open ones are linked on `Vm.open`, highest
+/// `idx` first.
+pub struct Upval {
+    h: GcHeader;
+    idx: int;
+    v: Value;
+    next: ptr;
+}
+
+/// The `Closure` of a `T_FN` value.
+pub fn closureOf(v: Value): &Closure { return v.obj() as &Closure; }
+
+extend Heap {
+    /// A closure of `p` over `env` with room for `p.nups` upvalues (all 0 until filled).
+    fn newClosure(this: &Heap, p: &Proto, env: Value): Value {
+        let o = this.newObject(OBJ_FN, @sizeof(Closure) + p.nups * 8);
+        let cl = o as &Closure;
+        cl.proto = p as ptr;
+        cl.env = env;
+        cl.nups = p.nups;
+        return objv(T_FN, o);
+    }
+}
+
+/// A growable byte buffer in the j2 heap: what the VM builds strings, `print` output and error
+/// text in, so running a script never allocates in a J3 arena. Same methods as `Text`, so
+/// `fmtAt` writes into either.
+pub struct Buf {
+    heap: &Heap;
+    p: ptr;
+    len: int;
+    cap: int;
+    /// Growing would pass the heap cap (or the OS refused): later pushes are dropped. Whoever
+    /// builds a script value from the bytes checks it (`Vm.bufStr`).
+    full: bool;
+
+    fn push(this: &Buf, b: u8) {
+        if this.len == this.cap {
+            if this.full { return; }
+            let n = if this.cap == 0 { 64 } else { this.cap * 2 };
+            let q = if n > this.heap.limit { 0 as ptr } else { this.heap.tryAllocRaw(n) };
+            if q == 0 as ptr {
+                this.full = true;
+                return;
+            }
+            let dst: []u8 = @slice(q, n);
+            let src: []u8 = @slice(this.p, this.len);
+            for i in 0..this.len { dst[i] = src[i]; }
+            if this.cap > 0 { this.heap.freeRaw(this.p, this.cap); }
+            this.p = q;
+            this.cap = n;
+        }
+        let all: []u8 = @slice(this.p, this.cap);
+        all[this.len] = b;
+        this.len += 1;
+    }
+
+    fn pushStr(this: &Buf, s: string) {
+        for i in 0..s.len { this.push(s[i]); }
+    }
+
+    fn pushInt(this: &Buf, n: int) {
+        if n < 0 {
+            this.push(45);
+            if n == -9223372036854775807 - 1 {
+                this.pushStr("9223372036854775808");
+                return;
+            }
+            this.pushInt(0 - n);
+            return;
+        }
+        if n >= 10 { this.pushInt(n / 10); }
+        this.push(u8(48 + n % 10));
+    }
+
+    /// The bytes so far (a view; valid until the next push or clear).
+    fn str(this: &Buf): string {
+        let b: []u8 = @slice(this.p, this.len);
+        return b as string;
+    }
+
+    /// Empty it; a block over 64 KB goes back to the heap so one big string doesn't stay counted.
+    fn clear(this: &Buf) {
+        this.len = 0;
+        this.full = false;
+        if this.cap > BUF_KEEP {
+            this.heap.freeRaw(this.p, this.cap);
+            this.p = 0 as ptr;
+            this.cap = 0;
+        }
+    }
+}
+
+/// The biggest block a cleared `Buf` keeps.
+const BUF_KEEP: int = 65536;
+
+pub fn newBuf(h: &Heap): Buf { return Buf { heap: h, p: 0 as ptr, len: 0, cap: 0, full: false }; }

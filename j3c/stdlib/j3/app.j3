@@ -7,6 +7,7 @@
 ///   (counts since the end of frame a, all `.j3ui` roots, `App.mem` growth), quits, and after the normal
 ///   teardown exits 1 when any is non-zero or the run ended before frame b, else 0.
 /// - `J3_HOT_QUIT` / `J3_HOT_WIN` / `J3_HOT_STATE` (file paths set by `j3c run --hot`): see `App.hot`.
+/// - `J3_IDLE_SKIP=1|0` forces idle frame skipping on or off (`App.idleSkip`; off by default in tests); `J3_IDLE_STATS=1` prints the frame count at exit.
 /// - `J3_FIXED_DT=0.016` makes every frame's dt that many seconds instead of measured time,
 ///   so captures repeat exactly.
 
@@ -16,105 +17,16 @@ use j3.data.save;
 use j3.data.save.Save;
 use j3.game;
 use j3.game.display;
+use j3.game.splash;
+use j3.gfx.canvas;
+use j3.appconfig;
+use j3.instance;
+use j3.instance.Request;
 use j3.io;
 use j3.io.printLn;
+use j3.option.Option;
 use j3.memory.{ Arena, rewindScratch, scratch, frameHook, laidTotal, restyledTotal };
 use j3.sys.exit;
-
-/// Process heap. Created the first time `heap` runs.
-#[singleton]
-let HEAP: Arena = Arena { ptr: 0, used: 0, cap: 0, head: 0 };
-
-/// Default process-heap size, in bytes.
-const DEFAULT_CAP: int = 2 * 1024 * 1024;
-/// Scratch arena size, in bytes.
-const SCRATCH_CAP: int = 256 * 1024;
-/// Fixed step length in seconds (60 Hz).
-const TICK: f32 = 0.016666668;
-/// Frame delta is clamped to this many seconds.
-const MAX_FRAME: f32 = 0.25;
-/// Most fixed steps one frame may run.
-const MAX_STEPS: int = 8;
-
-/// Frames seen by `hotPoll`.
-#[singleton]
-let HOT_TICK: int = 0;
-
-/// For a program with its own main loop (no `App.run`) under `j3c run --hot`: call it once per frame. True when
-/// j3c wants a restart, so save what you want kept to `hotStatePath()` (`j3.data.save`) and leave the loop. It
-/// looks at the disk every 8th call and is always false outside a hot run. Without it such a program is killed
-/// 3 s after a rebuild (no state, no window position). `App.run` does this for you.
-pub fn hotPoll(): bool {
-    if !HOT_READ {
-        HOT_QUIT = game.env("J3_HOT_QUIT");
-        HOT_READ = true;
-    }
-    if HOT_QUIT.len == 0 { return false; }
-    HOT_TICK += 1;
-    if HOT_TICK % 8 != 1 { return false; }
-    return io.exists(HOT_QUIT);
-}
-
-/// `J3_HOT_QUIT` as read by the first `hotPoll` call.
-#[singleton]
-let HOT_QUIT: string;
-#[singleton]
-let HOT_READ: bool = false;
-
-/// Last key of every file a hot restart writes. The files are written in place (the sys layer has no rename), so a
-/// kill mid-write leaves one without it; `hotRead` then treats the file as absent.
-fn hotStore(sv: &Save, path: string) {
-    save.putInt(sv, "hot.end", 1);
-    save.store(sv, path);
-}
-
-fn hotComplete(path: string, mem: &Arena): bool {
-    if !io.exists(path) { return false; }
-    let sv = save.load(path, mem);
-    if save.getInt(&sv, "hot.end", 0) == 1 { return true; }
-    printLn(`j3: hot restart file {path} is incomplete; starting fresh`);
-    return false;
-}
-
-/// Where a hot restart's state goes (read it back at start if the file exists); empty outside `j3c run --hot`.
-pub fn hotStatePath(): string {
-    return game.env("J3_HOT_STATE");
-}
-
-/// Lazily creates the process heap and scratch arena, then returns a pointer to HEAP.
-fn heap(cap: int): &Arena {
-    if HEAP.ptr == 0 {
-        HEAP = Arena.create(cap);
-        scratch(SCRATCH_CAP);
-    }
-    return &HEAP;
-}
-
-/// `J3_STEADY=a:b` as {a, b}; {0, 0} when unset or malformed (malformed warns).
-fn steadyRange(): []int {
-    let v = game.env("J3_STEADY");
-    let r = scratch(SCRATCH_CAP).alloc::<int>(2);
-    r[0] = 0;
-    r[1] = 0;
-    if v.len == 0 { return r; }
-    let k = 0;
-    let part = 0;
-    let ok = true;
-    let digits = 0;
-    while k < v.len {
-        let c = v[k];
-        if c == 58 && part == 0 && digits > 0 { part = 1; digits = 0; }
-        else if c >= 48 && c <= 57 { r[part] = r[part] * 10 + int(c) - 48; digits += 1; }
-        else { ok = false; }
-        k += 1;
-    }
-    if !ok || part != 1 || digits == 0 || r[1] <= r[0] {
-        printLn("j3: J3_STEADY wants a:b with a < b (frame numbers, 1-based); ignored");
-        r[0] = 0;
-        r[1] = 0;
-    }
-    return r;
-}
 
 /// Fixed-timestep app runner over a user world `W`, with staged system lists.
 pub struct App<W> {
@@ -177,6 +89,16 @@ pub struct App<W> {
     /// `App.hot` hooks (one slot each, empty when unset).
     hot_save: []fn(&W, &Save);
     hot_load: []fn(&W, &Save);
+    /// `onMessage`: arguments from a later copy of the program (`j3.instance.claim`).
+    on_msg: []fn(&W, []string);
+    /// `onRequest`: requests from `j3.instance.request` that expect a reply.
+    on_req: []fn(&W, Request);
+    /// Show the startup splash in `run` (`App.splash`).
+    splash_on: bool;
+    /// Sleep through idle frames when a `.j3ui` `Dom` is hosted, nothing moves and no system is registered (`App.idleSkip`, default on).
+    idle_on: bool;
+    /// Image paths shown after the J3 logo (`App.splashCard`).
+    splash_cards: []string;
 
     /// Boots `W` on the default heap and returns an empty system schedule.
     fn create(title: string, width: int, height: int, boot: fn(&Arena): W): App<W> {
@@ -213,6 +135,11 @@ pub struct App<W> {
             scale: 1,
             hot_save: mem.alloc::<fn(&W, &Save)>(0),
             hot_load: mem.alloc::<fn(&W, &Save)>(0),
+            on_msg: mem.alloc::<fn(&W, []string)>(0),
+            on_req: mem.alloc::<fn(&W, Request)>(0),
+            splash_on: false,
+            idle_on: true,
+            splash_cards: mem.alloc::<string>(0),
         };
     }
 
@@ -257,7 +184,35 @@ pub struct App<W> {
             scale: 1,
             hot_save: mem.alloc::<fn(&W, &Save)>(0),
             hot_load: mem.alloc::<fn(&W, &Save)>(0),
+            on_msg: mem.alloc::<fn(&W, []string)>(0),
+            on_req: mem.alloc::<fn(&W, Request)>(0),
+            splash_on: false,
+            idle_on: true,
+            splash_cards: mem.alloc::<string>(0),
         };
+    }
+
+    /// Shows the startup splash (`j3.game.splash`; same as `[splash] enabled = true`): `run` opens the window, shows the J3 logo while
+    /// the startups run, then any `splashCard`s. Put heavy loading in a `startup`, not in `boot` (which
+    /// runs before the window exists), and call `splash.tick()` between long steps to keep it moving.
+    fn splash(this: &App<W>): &App<W> {
+        this.splash_on = true;
+        return this;
+    }
+
+    /// Adds an image (studio logo, publisher, ...) shown after the J3 logo and the `[splash] cards`; implies `splash`.
+    fn splashCard(this: &App<W>, path: string): &App<W> {
+        let n = this.splash_cards.len;
+        let fresh = this.mem.alloc::<string>(n + 1);
+        let i = 0;
+        while i < n {
+            fresh[i] = this.splash_cards[i];
+            i += 1;
+        }
+        fresh[n] = path;
+        this.splash_cards = fresh;
+        this.splash_on = true;
+        return this;
     }
 
     /// Asks for a high-DPI drawable on the next `run` (needs `useGl`): layout stays in logical pixels
@@ -274,9 +229,43 @@ pub struct App<W> {
         return this;
     }
 
+    /// Opens the window with no system title bar or border (`game.setDecorated(false)`), for an app
+    /// that draws its own (`window-drag` in `.j3ui`). Still resizable from its edges and movable.
+    fn undecorated(this: &App<W>): &App<W> {
+        // before the window exists this only records, so the first frame is already undecorated
+        game.setDecorated(false);
+        return this;
+    }
+
+    /// Sets the window class (X11 `WM_CLASS`, Wayland `app_id`) the window opens with, so the desktop groups it
+    /// under a `.desktop` file whose `StartupWMClass` is `name` (`game.setWindowClass`).
+    fn windowClass(this: &App<W>, name: string): &App<W> {
+        game.setWindowClass(name);
+        return this;
+    }
+
+    /// Opens a see-through window (needs `useGl` and a compositor): pixels' alpha shows the desktop
+    /// (`game.setTransparent`). Clear with `game.setBackgroundAlpha(a)` set, or draw backgrounds with alpha;
+    /// text and opaque drawing stay opaque.
+    fn transparent(this: &App<W>): &App<W> {
+        game.setTransparent(true);
+        return this;
+    }
+
     /// Enables OpenGL window init on the next `run`.
     fn useGl(this: &App<W>): &App<W> {
         this.gl = true;
+        return this;
+    }
+
+    /// A `.j3ui` app (a `Dom` rendering from a draw system) sleeps while nothing moves or arrives: no update, draw or swap until an input
+    /// event, `Dom.requestFrame`, a `j3.thread.Queue` push (any thread), a UI timer (caret blink), `game.wakeAt(ms)` (timers in app
+    /// logic) or a 250 ms safety tick. Motion keeps it awake by itself: CSS transitions and animations, and a `<canvas>` whose draws
+    /// change from frame to frame (hand-drawn animation from `game.ticks()`, until it holds still for 50 ms; `j3c doc j3ui`, Idle frames). Default on; An app with any
+    /// `first` / `add` / `last` / `always` system never sleeps; `false` is for visuals drawn outside the Dom with no system (3D in `draw`). Tests and captures never sleep
+    /// (`j3c doc testing`).
+    fn idleSkip(this: &App<W>, on: bool): &App<W> {
+        this.idle_on = on;
         return this;
     }
 
@@ -453,6 +442,22 @@ pub struct App<W> {
         return this;
     }
 
+    /// Call `cb` with the arguments of each later copy of the program (its `args[0]` is the program), once per message,
+    /// before the frame's systems. Needs `j3.instance.claim(name)` to have returned true in `main`.
+    fn onMessage(this: &App<W>, cb: fn(&W, []string)): &App<W> {
+        this.on_msg = this.mem.alloc::<fn(&W, []string)>(1);
+        this.on_msg[0] = cb;
+        return this;
+    }
+
+    /// Call `cb` with each request from `j3.instance.request` (once each, before the frame's systems). Reply with
+    /// `req.reply(text)` now, or keep `req` and reply on a later frame. Needs `j3.instance.claim(name)` in `main`.
+    fn onRequest(this: &App<W>, cb: fn(&W, Request)): &App<W> {
+        this.on_req = this.mem.alloc::<fn(&W, Request)>(1);
+        this.on_req[0] = cb;
+        return this;
+    }
+
     /// Opens the window, runs startups, then loops always/fixed/draw until quit.
     fn run(this: &App<W>) {
         let hot_quit = game.env("J3_HOT_QUIT");
@@ -475,6 +480,10 @@ pub struct App<W> {
         } else {
             game.init(this.title, this.width, this.height);
         }
+        // `[dist] icon` when it is a PNG that loads, else the J3 logo.
+        let icon = canvas.loadPng(appconfig.ICON, this.mem);
+        if icon.w < 1 { icon = splash.logoIcon(this.mem); }
+        game.setWindowIcon(icon);
         game.setResizable(this.resizable);
         game.setMinSize(this.min_w, this.min_h);
         if video.len > 0 { display.apply(&saved); }
@@ -482,6 +491,9 @@ pub struct App<W> {
             let wv = save.load(hot_win, this.mem);
             game.setWindowPos(save.getInt(&wv, "window.x", 0), save.getInt(&wv, "window.y", 0));
         }
+        // A hot restart comes back without the splash.
+        let show_splash = !hot_pos && (splash.forced() || ((this.splash_on || splash.configured()) && splash.wanted()));
+        if show_splash { splash.begin(); }
         let i = 0;
         while i < this.n_start {
             let cb_start = this.startups[i];
@@ -493,6 +505,7 @@ pub struct App<W> {
             let cb_hot = this.hot_load[0];
             cb_hot(&this.world, &hv);
         }
+        if show_splash { splash.finish(this.splash_cards); }
         let acc: f32 = 0;
         let sr = steadyRange();
         let st_a = sr[0];
@@ -503,7 +516,12 @@ pub struct App<W> {
         let frame = 0;
         let st_rc = 0;
         let st_done = false;
+        let loops = 0;
+        let idle_stats = game.env("J3_IDLE_STATS").len > 0;
         while true {
+            // Idle UI: sleep for an event or the next UI timer (`game.idleWait`), then run a frame as usual.
+            if idleAllowed(this.idle_on, this.n_first + this.n_update + this.n_last + this.n_always) { game.idleWait(); }
+            loops += 1;
             rewindScratch();
             frameHook();
             let dt = game.poll();
@@ -521,6 +539,24 @@ pub struct App<W> {
             // `j3c run --hot` asks for a restart by creating this file; looked for every 8th frame.
             if hotPoll() {
                 break;
+            }
+            if this.on_msg.len > 0 {
+                while instance.next() {
+                    let cb_msg = this.on_msg[0];
+                    cb_msg(&this.world, instance.args());
+                }
+            }
+            if this.on_req.len > 0 {
+                let more = true;
+                while more {
+                    match instance.nextRequest() {
+                        Option.Some(req) {
+                            let cb_req = this.on_req[0];
+                            cb_req(&this.world, req);
+                        }
+                        Option.None { more = false; }
+                    }
+                }
             }
             i = 0;
             while i < this.n_always {
@@ -607,6 +643,7 @@ pub struct App<W> {
                 hotStore(&ov, hot_state);
             }
         }
+        if idle_stats { printLn(`idle: loops={loops} presented={game.framesPresented()}`); }
         this.in_down = true;
         i = 0;
         while i < this.n_down {

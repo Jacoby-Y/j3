@@ -16,6 +16,8 @@ pub fn ll_type(cx: &IrCx, ty: Ty) -> Result<String, String> {
         TyKind::Float(FloatTy::F32) => Ok("float".to_string()),
         TyKind::Float(FloatTy::F64) => Ok("double".to_string()),
         TyKind::Ptr | TyKind::CStr | TyKind::Ref(_) | TyKind::Fn { .. } => Ok("ptr".to_string()),
+        TyKind::Half => Ok("i16".to_string()),
+        TyKind::Vec(v) => Ok(v.llvm().to_string()),
         TyKind::String | TyKind::Slice { .. } => Ok("%j3_string".to_string()),
         TyKind::Array { elem, len } => Ok(format!("[{len} x {}]", ll_type(cx, *elem)?)),
         TyKind::Struct(id) => Ok(format!("%{}", struct_name(cx, *id))),

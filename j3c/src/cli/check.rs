@@ -3,18 +3,23 @@ use super::*;
 pub(super) fn check_cmd(rest: &[String]) -> i32 {
     let mut json = false;
     let mut strict = false;
+    let mut autofix = false;
     let mut path = None;
     for a in rest {
         if a == "--json" {
             json = true;
+        } else if a == "--autofix" || a == "--fix" {
+            autofix = true;
         } else if a == "--strict" {
             strict = true;
+        } else if a == "--host" {
+            crate::project::HOST.store(true, std::sync::atomic::Ordering::Relaxed);
         } else if a == "--help" || a == "-h" {
-            println!("usage: j3c check [--json] [--strict] [path]\n\ntypechecks the project, then reports missing libraries and files, and (with [ui]) CSS lint\nwarnings for theme.css and every component <style> (`j3c doc css`, Lint).\n  --json    one JSON object: ok/entry (and css / i18n arrays of warnings) or the error\n  --strict  exit 1 when the CSS lint or i18n check finds anything (default: warnings only)\nAlso warns `file:line:col: message [i18n-missing]` when a `t(\"key\")`/`tf` key is not in the default locale or a locale has a key the default lacks (`j3c doc i18n`).\nSilence: /* j3-lint-ignore rule */ before a line, or [ui] lint = false / lint-off = [\"rule\"] in j3.toml.");
+            println!("usage: j3c check [--json] [--strict] [--autofix] [--host] [path]\n\ntypechecks the project, then reports missing libraries and files, and (with [ui]) CSS lint\nwarnings for theme.css and every component <style> (`j3c doc css`, Lint).\n  --json    one JSON object: ok/entry (and warnings / css / i18n arrays) or errors[] (the first one's fields also at the top level)\n  --autofix remove unused imports in place, re-check, and put the files back if that breaks the build\n  --strict  exit 1 on any warning: code (unused locals and imports, unreachable code), CSS lint, i18n (default: warnings only)\n  --host    ignore [emit] target and check for this machine (a host build of an Android package)\nAlso warns `file:line:col: message [i18n-missing]` when a `t(\"key\")`/`tf` key is not in the default locale or a locale has a key the default lacks (`j3c doc i18n`).\nSilence: /* j3-lint-ignore rule */ before a line, or [ui] lint = false / lint-off = [\"rule\"] in j3.toml.");
             return 0;
         } else if a.starts_with('-') {
             eprintln!("j3c: unknown flag `{a}`");
-            eprintln!("  = help: `j3c check [--json] [--strict] [path]`");
+            eprintln!("  = help: `j3c check [--json] [--strict] [--autofix] [path]`");
             return 1;
         } else if path.is_none() {
             path = Some(a.as_str());
@@ -24,7 +29,18 @@ pub(super) fn check_cmd(rest: &[String]) -> i32 {
         }
     }
     let t_check = std::time::Instant::now();
-    let res = compile_user(path);
+    let mut res = compile_user(path);
+    if autofix {
+        if let Ok((prog, _)) = &res {
+            if !prog.fixes.is_empty() {
+                let (msg, again) = autofix_run(prog, path);
+                eprintln!("{msg}");
+                if let Some(r) = again {
+                    res = r;
+                }
+            }
+        }
+    }
     timing("check total", t_check);
     match res {
         Ok((prog, manifest)) => {
@@ -50,15 +66,31 @@ pub(super) fn check_cmd(rest: &[String]) -> i32 {
                 None => Vec::new(),
             };
             let i18n = manifest.as_ref().map(|m| crate::i18n::lint(&m.root)).unwrap_or_default();
+            let code = prog.rendered_warnings();
             if json {
-                println!("{}", check_json(&entry, &css, &i18n));
+                let warns: Vec<String> = code.iter().map(|w| diag_json(w, "warning")).collect();
+                println!("{}", check_json(&entry, &css, &i18n, &warns));
             } else {
+                for w in &code {
+                    eprintln!("{w}");
+                }
                 for w in css.iter().chain(&i18n) {
                     println!("{w}");
                 }
-                println!("checked {entry}");
+                let n = code.len();
+                match n {
+                    0 => println!("checked {entry}"),
+                    1 => println!("checked {entry} (1 warning)"),
+                    _ => println!("checked {entry} ({n} warnings)"),
+                }
+                let k = prog.fixes.len();
+                if k > 0 {
+                    let arg = path.map(|p| format!(" {p}")).unwrap_or_default();
+                    let what = if k == 1 { "the unused import".to_string() } else { format!("unused imports on {k} `use` lines") };
+                    println!("help: run `j3c check --autofix{arg}` to remove {what}");
+                }
             }
-            if strict && !(css.is_empty() && i18n.is_empty()) { 1 } else { 0 }
+            if strict && !(css.is_empty() && i18n.is_empty() && code.is_empty()) { 1 } else { 0 }
         }
         Err(e) => {
             if json {
@@ -71,10 +103,45 @@ pub(super) fn check_cmd(rest: &[String]) -> i32 {
     }
 }
 
-/// The `check --json` line for a project that typechecks; `css` and `i18n` are the warning arrays (omitted when empty).
-pub(super) fn check_json(entry: &str, css: &[String], i18n: &[String]) -> String {
+/// Applies `prog.fixes`, then checks again. When the edited sources no longer typecheck, every
+/// file is written back as it was. Returns the line to print and the new result (None: reverted).
+fn autofix_run(
+    prog: &compile::Program,
+    path: Option<&str>,
+) -> (String, Option<Result<(compile::Program, Option<Manifest>), String>>) {
+    let mut by_file: Vec<(String, Vec<&crate::check::lint::Fix>)> = Vec::new();
+    for f in &prog.fixes {
+        match by_file.iter_mut().find(|(p, _)| *p == f.path) {
+            Some((_, v)) => v.push(f),
+            None => by_file.push((f.path.clone(), vec![f])),
+        }
+    }
+    let mut saved: Vec<(String, String)> = Vec::new();
+    for (file, fixes) in &by_file {
+        let Ok(src) = std::fs::read_to_string(file) else { continue };
+        let new = crate::check::lint::apply_fixes(&src, fixes);
+        if std::fs::write(file, &new).is_ok() {
+            saved.push((file.clone(), src));
+        }
+    }
+    let again = compile_user(path);
+    if let Err(e) = &again {
+        for (file, src) in &saved {
+            let _ = std::fs::write(file, src);
+        }
+        return (format!("autofix: reverted, the edited code did not check:\n{e}"), None);
+    }
+    let n = prog.fixes.len();
+    let files = saved.len();
+    (format!("autofix: removed unused imports ({n} `use` line{}, {files} file{})", if n == 1 { "" } else { "s" }, if files == 1 { "" } else { "s" }), Some(again))
+}
+
+/// The `check --json` line for a project that typechecks; `css` and `i18n` are the warning arrays
+/// (strings), `warnings` the code warnings (objects from `diag_json`); each omitted when empty.
+pub(super) fn check_json(entry: &str, css: &[String], i18n: &[String], warnings: &[String]) -> String {
     let arr = |key: &str, v: &[String]| if v.is_empty() { String::new() } else { format!(",\"{key}\":[{}]", v.iter().map(|w| json_str(w)).collect::<Vec<_>>().join(",")) };
-    format!("{{\"ok\":true,\"entry\":{}{}{}}}", json_str(entry), arr("css", css), arr("i18n", i18n))
+    let warns = if warnings.is_empty() { String::new() } else { format!(",\"warnings\":[{}]", warnings.join(",")) };
+    format!("{{\"ok\":true,\"entry\":{}{}{}{warns}}}", json_str(entry), arr("css", css), arr("i18n", i18n))
 }
 
 pub(super) fn json_str(s: &str) -> String {
@@ -94,7 +161,37 @@ pub(super) fn json_str(s: &str) -> String {
     out
 }
 
+/// The `check --json` line for a failure: the first error's fields at the top level (older readers),
+/// and every error in `errors`.
 pub(super) fn json_err(text: &str) -> String {
+    let blocks = split_blocks(text, "error:");
+    let blocks: Vec<&str> = blocks.into_iter().filter(|b| !is_count_line(b)).collect();
+    let errors: Vec<String> = if blocks.is_empty() { vec![diag_json(text, "error")] } else { blocks.iter().map(|b| diag_json(b, "error")).collect() };
+    let first = errors[0].trim_start_matches('{').trim_end_matches('}');
+    format!("{{\"ok\":false,{first},\"errors\":[{}]}}", errors.join(","))
+}
+
+/// The `error: N errors` summary line under several errors.
+fn is_count_line(block: &str) -> bool {
+    let t = block.trim();
+    t.lines().count() == 1 && t.strip_prefix("error:").is_some_and(|r| r.trim().ends_with(" errors"))
+}
+
+/// Rendered diagnostics, one block per `head` line (`error:` / `warning:` at the start of a line).
+fn split_blocks<'a>(text: &'a str, head: &str) -> Vec<&'a str> {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with(head) {
+            starts.push(at);
+        }
+        at += line.len();
+    }
+    starts.iter().enumerate().map(|(i, &s)| &text[s..starts.get(i + 1).copied().unwrap_or(text.len())]).collect()
+}
+
+/// One rendered diagnostic as `{"severity","message","path","line","column","notes","helps"}`.
+pub(super) fn diag_json(text: &str, severity: &str) -> String {
     let mut message = String::new();
     let mut path = String::new();
     let mut line = 0usize;
@@ -103,7 +200,7 @@ pub(super) fn json_err(text: &str) -> String {
     let mut helps = Vec::new();
     for raw in text.lines() {
         let t = raw.trim();
-        if let Some(rest) = t.strip_prefix("error:") {
+        if let Some(rest) = t.strip_prefix("error:").or_else(|| t.strip_prefix("warning:")) {
             if message.is_empty() {
                 message = rest.trim().to_string();
             }
@@ -128,7 +225,8 @@ pub(super) fn json_err(text: &str) -> String {
     let notes = json_list(&notes);
     let helps = json_list(&helps);
     format!(
-        "{{\"ok\":false,\"message\":{},\"path\":{},\"line\":{line},\"column\":{column},\"notes\":{notes},\"helps\":{helps}}}",
+        "{{\"severity\":{},\"message\":{},\"path\":{},\"line\":{line},\"column\":{column},\"notes\":{notes},\"helps\":{helps}}}",
+        json_str(severity),
         json_str(&message),
         json_str(&path),
     )
@@ -153,6 +251,18 @@ pub(super) fn split_loc(s: &str) -> Option<(String, usize, usize)> {
 }
 
 pub(super) fn fmt_cmd(rest: &[String]) -> i32 {
+    const USAGE: &str = "usage: j3c fmt [--write | --check] [path]";
+    if rest.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        println!("  path         a `.j3` / `.j3s` file, or a directory (default: the current one)");
+        println!("  -w, --write  rewrite the files that change");
+        println!("  --check      exit 1 if formatting would change a file");
+        return 0;
+    }
+    if let Some(bad) = rest.iter().find(|a| a.starts_with('-') && !matches!(a.as_str(), "--write" | "-w" | "--check")) {
+        eprintln!("j3c fmt: unknown flag `{bad}`; {USAGE}");
+        return 1;
+    }
     let mut write = false;
     let mut check = false;
     let mut path = None;

@@ -1,0 +1,425 @@
+// Part of j3.game (clipboard types and bytes: images, GIFs, file lists); the module doc and `use`s are in ../game.j3.
+module j3.game;
+
+/// MIME types the system clipboard offers right now, in the owner's order (such as "image/png",
+/// "image/gif", "text/uri-list", "text/plain"). X11's UTF8_STRING, STRING and TEXT show up once
+/// as "text/plain". Empty when the clipboard is empty, can't be read, or headless.
+/// Main thread only. A view of a buffer that the next call replaces.
+///
+/// X11 reads the CLIPBOARD selection on a display connection of its own (`libX11.so.6`).
+/// Wayland without `DISPLAY` asks `wl-paste` (the `wl-clipboard` package); empty when it is missing.
+/// An owner that doesn't answer within about 1 s gives empty, so the frame never hangs.
+pub fn clipboardTypes(): []string {
+    CB_NTYPES = 0;
+    CB_NAMESLEN = 0;
+    if !clipUsable() {
+        return clipTypeView();
+    }
+    if clipX11() {
+        if !xConvert(CB_ATOM_TARGETS) {
+            return clipTypeView();
+        }
+        // format 32 items are longs (8 bytes) in Xlib
+        for i in 0..CB_LEN / 8 {
+            let a = rd64(CB_BUF as int + i * 8);
+            let getName = CB.getAtomName as fn(ptr, u64): ptr;
+            let name = getName(CB_DPY, u64(a));
+            if name as int == 0 {
+                continue;
+            }
+            let s = []u8 { ptr: name as &u8, len: int(libc.strlen(name as cstr)) } as string;
+            if same(s, "UTF8_STRING") || same(s, "STRING") || same(s, "TEXT") {
+                addType("text/plain");
+            } else if find(s, "/") >= 0 {
+                addType(s);
+            }
+            let xfree = CB.free as fn(ptr): i32;
+            xfree(name);
+        }
+        return clipTypeView();
+    }
+    let argv: [4]string = ["timeout", "1", "wl-paste", "--list-types"];
+    if wlRun(argv[:]) {
+        let out = []u8 { ptr: CB_BUF as &u8, len: CB_LEN } as string;
+        let at = 0;
+        for i in 0..out.len + 1 {
+            if i == out.len || out[i] == u8(10) {
+                if i > at {
+                    addType(out[at..i]);
+                }
+                at = i + 1;
+            }
+        }
+    }
+    return clipTypeView();
+}
+
+/// Bytes the clipboard owner gives for `mime` ("text/plain" also takes X11's UTF8_STRING and
+/// STRING), or empty when that type isn't offered or the read fails or times out (about 1 s with
+/// no answer). Large data (browsers send big images and GIFs with X11 INCR) is read in full.
+/// Main thread only. A view of a buffer that the next call replaces.
+///
+///     if game.keyPressed(Key.V) && game.keyDown(Key.Ctrl) {
+///         let png = game.clipboardData("image/png");
+///         if png.len > 0 { io.writeFile("pasted.png", png); }
+///     }
+pub fn clipboardData(mime: string): []u8 {
+    CB_LEN = 0;
+    if !clipUsable() || mime.len == 0 {
+        return clipDataView();
+    }
+    if clipX11() {
+        let intern = CB.intern as fn(ptr, cstr, i32): u64;
+        if same(mime, "text/plain") {
+            let names: [3]string = ["UTF8_STRING", "text/plain;charset=utf-8", "STRING"];
+            for i in 0..3 {
+                if xConvert(int(intern(CB_DPY, cstr(names[i]), 0))) && CB_LEN > 0 {
+                    return clipDataView();
+                }
+                if CB_LATE {
+                    CB_LEN = 0;
+                    return clipDataView();
+                }
+            }
+        }
+        if !xConvert(int(intern(CB_DPY, cstr(mime), 0))) {
+            CB_LEN = 0;
+        }
+        return clipDataView();
+    }
+    // ponytail: 3 s cap for the whole copy so a slow 50 MB GIF still fits; X11 instead times out per chunk
+    let argv: [6]string = ["timeout", "3", "wl-paste", "--no-newline", "--type", mime];
+    if !wlRun(argv[:]) {
+        CB_LEN = 0;
+    }
+    return clipDataView();
+}
+
+fn clipTypeView(): []string {
+    return []string { ptr: &CB_TYPES[0], len: CB_NTYPES };
+}
+
+fn clipDataView(): []u8 {
+    if CB_LEN == 0 {
+        return []u8 { ptr: &CB_EMPTY[0], len: 0 };
+    }
+    return []u8 { ptr: CB_BUF as &u8, len: CB_LEN };
+}
+
+/// Not headless and on a desktop with a display.
+fn clipUsable(): bool {
+    let v = env("SDL_VIDEODRIVER");
+    if same(v, "offscreen") || same(v, "dummy") {
+        return false;
+    }
+    return env("DISPLAY").len > 0 || env("WAYLAND_DISPLAY").len > 0;
+}
+
+/// Add `s` to the type list once (names copied into `CB_NAMES`; full lists are cut, not grown).
+fn addType(s: string) {
+    for i in 0..CB_NTYPES {
+        if same(CB_TYPES[i], s) {
+            return;
+        }
+    }
+    if CB_NTYPES == 64 || CB_NAMESLEN + s.len > 4096 {
+        return;
+    }
+    for i in 0..s.len {
+        CB_NAMES[CB_NAMESLEN + i] = s[i];
+    }
+    CB_TYPES[CB_NTYPES] = []u8 { ptr: &CB_NAMES[CB_NAMESLEN], len: s.len } as string;
+    CB_NAMESLEN += s.len;
+    CB_NTYPES += 1;
+}
+
+/// Make room for `n` bytes in `CB_BUF`.
+fn cbReserve(n: int) {
+    if n > CB_CAP {
+        let c = CB_CAP * 2;
+        if c < n {
+            c = n;
+        }
+        CB_BUF = libc.realloc(CB_BUF, c);
+        CB_CAP = c;
+    }
+}
+
+/// Run `argv` (a `wl-paste` call) and keep its stdout in `CB_BUF`. False when it fails.
+fn wlRun(argv: []string): bool {
+    CB_LEN = 0;
+    let arena = Arena.create(1 << 16);
+    let ok = false;
+    match proc.run(argv, "", &arena) {
+        Result.Ok(o) {
+            if o.code == 0 {
+                cbReserve(o.out.len);
+                for i in 0..o.out.len {
+                    let p = (CB_BUF as int + i) as ptr as &u8;
+                    *p = o.out[i];
+                }
+                CB_LEN = o.out.len;
+                ok = true;
+            }
+        }
+        Result.Err(e) {}
+    }
+    arena.destroy();
+    return ok;
+}
+
+/// X11 is up: libX11 loaded, our connection and requestor window open.
+fn clipX11(): bool {
+    if env("DISPLAY").len == 0 {
+        return false;
+    }
+    if !CB_TRIED {
+        CB_TRIED = true;
+        xLoad();
+    }
+    return CB_DPY as int != 0;
+}
+
+fn xSym(so: ptr, name: string): ptr {
+    let p = dlsym(so, name);
+    if p as int == 0 {
+        CB_OK = false;
+    }
+    return p;
+}
+
+fn xLoad() {
+    let so = dlopen("libX11.so.6");
+    if so as int == 0 {
+        return;
+    }
+    CB_OK = true;
+    CB.open = xSym(so, "XOpenDisplay");
+    CB.root = xSym(so, "XDefaultRootWindow");
+    CB.createWin = xSym(so, "XCreateSimpleWindow");
+    CB.selectInput = xSym(so, "XSelectInput");
+    CB.intern = xSym(so, "XInternAtom");
+    CB.getAtomName = xSym(so, "XGetAtomName");
+    CB.owner = xSym(so, "XGetSelectionOwner");
+    CB.convert = xSym(so, "XConvertSelection");
+    CB.getProp = xSym(so, "XGetWindowProperty");
+    CB.delProp = xSym(so, "XDeleteProperty");
+    CB.pending = xSym(so, "XPending");
+    CB.next = xSym(so, "XNextEvent");
+    CB.flush = xSym(so, "XFlush");
+    CB.free = xSym(so, "XFree");
+    if !CB_OK {
+        return;
+    }
+    let open = CB.open as fn(ptr): ptr;
+    let dpy = open(0 as ptr);
+    if dpy as int == 0 {
+        return;
+    }
+    let rootOf = CB.root as fn(ptr): u64;
+    let create = CB.createWin as fn(ptr, u64, i32, i32, u32, u32, u32, u64, u64): u64;
+    CB_WIN = int(create(dpy, rootOf(dpy), 0, 0, 1, 1, 0, 0, 0));
+    // PropertyChangeMask, for INCR chunks
+    let sel = CB.selectInput as fn(ptr, u64, i64): i32;
+    sel(dpy, u64(CB_WIN), i64(1 << 22));
+    let intern = CB.intern as fn(ptr, cstr, i32): u64;
+    // J3_CLIP_SELECTION: tests read a private selection so they never take the desktop clipboard
+    let selName = env("J3_CLIP_SELECTION");
+    if selName.len == 0 {
+        selName = "CLIPBOARD";
+    }
+    CB_ATOM_CLIPBOARD = int(intern(dpy, cstr(selName), 0));
+    CB_ATOM_TARGETS = int(intern(dpy, cstr("TARGETS"), 0));
+    CB_ATOM_INCR = int(intern(dpy, cstr("INCR"), 0));
+    CB_ATOM_PROP = int(intern(dpy, cstr("J3_CLIP"), 0));
+    CB_DPY = dpy;
+}
+
+/// Ask the CLIPBOARD owner for `target` and read the answer (INCR too) into `CB_BUF`/`CB_LEN`.
+/// False when nobody owns the clipboard, the owner refuses, or it goes quiet for 1 s.
+fn xConvert(target: int): bool {
+    CB_LEN = 0;
+    CB_LATE = false;
+    let owner = CB.owner as fn(ptr, u64): u64;
+    if target == 0 || owner(CB_DPY, u64(CB_ATOM_CLIPBOARD)) == u64(0) {
+        return false;
+    }
+    xDrain();
+    let convert = CB.convert as fn(ptr, u64, u64, u64, u64, u64): i32;
+    convert(CB_DPY, u64(CB_ATOM_CLIPBOARD), u64(target), u64(CB_ATOM_PROP), u64(CB_WIN), u64(0));
+    let flush = CB.flush as fn(ptr): i32;
+    flush(CB_DPY);
+    // SelectionNotify (31): property at 56, None (0) when refused
+    if !xWait(31) {
+        return false;
+    }
+    if rd64(&CB_EV[0] as int + 56) == 0 {
+        return false;
+    }
+    let ty = xReadProp(true);
+    if ty != CB_ATOM_INCR {
+        return ty != 0 || CB_LEN > 0;
+    }
+    // INCR: the owner writes chunks as we delete the property; an empty chunk ends it
+    CB_LEN = 0;
+    while true {
+        if !xWaitNewValue() {
+            CB_LEN = 0;
+            return false;
+        }
+        let before = CB_LEN;
+        xReadProp(false);
+        if CB_LEN == before {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Read our property (all of it), delete it, and append its bytes to `CB_BUF` unless `fresh` resets
+/// first. Returns the property type atom (0 when there was none).
+fn xReadProp(fresh: bool): int {
+    let get = CB.getProp as fn(ptr, u64, u64, i64, i64, i32, u64, &u64, &i32, &u64, &u64, &ptr): i32;
+    let ty: u64 = u64(0);
+    let format: i32 = 0;
+    let items: u64 = u64(0);
+    let after: u64 = u64(0);
+    let data: ptr = 0 as ptr;
+    // length is in 32-bit units: up to 1 GB in one read
+    if get(CB_DPY, u64(CB_WIN), u64(CB_ATOM_PROP), i64(0), i64(1 << 28), 1, u64(0), &ty, &format, &items, &after, &data) != 0 {
+        return 0;
+    }
+    if fresh {
+        CB_LEN = 0;
+    }
+    if data as int != 0 {
+        let unit = 1;
+        if format == 16 {
+            unit = 2;
+        } else if format == 32 {
+            unit = 8;
+        }
+        let n = int(items) * unit;
+        cbReserve(CB_LEN + n);
+        let src: []u8 = []u8 { ptr: data as &u8, len: n };
+        for i in 0..n {
+            let p = (CB_BUF as int + CB_LEN + i) as ptr as &u8;
+            *p = src[i];
+        }
+        CB_LEN += n;
+        let xfree = CB.free as fn(ptr): i32;
+        xfree(data);
+    }
+    return int(ty);
+}
+
+/// Drop events left over from an earlier, abandoned transfer.
+fn xDrain() {
+    let pending = CB.pending as fn(ptr): i32;
+    let next = CB.next as fn(ptr, ptr): i32;
+    while pending(CB_DPY) > 0 {
+        next(CB_DPY, &CB_EV[0] as ptr);
+    }
+}
+
+/// Wait up to 1 s for an event of type `kind` into `CB_EV`.
+fn xWait(kind: int): bool {
+    let pending = CB.pending as fn(ptr): i32;
+    let next = CB.next as fn(ptr, ptr): i32;
+    let until = int(sdl.SDL_GetTicks()) + 1000;
+    while int(sdl.SDL_GetTicks()) < until {
+        if pending(CB_DPY) == 0 {
+            // the owner may be this app's own SDL window: let SDL answer the request
+            sdl.SDL_PumpEvents();
+            sdl.SDL_Delay(u32(1));
+            continue;
+        }
+        next(CB_DPY, &CB_EV[0] as ptr);
+        if rd32(&CB_EV[0] as int) == kind {
+            return true;
+        }
+    }
+    CB_LATE = true;
+    return false;
+}
+
+/// Wait for PropertyNotify (28) NewValue (state 0 at 56) on our property (atom at 40).
+fn xWaitNewValue(): bool {
+    while xWait(28) {
+        if rd64(&CB_EV[0] as int + 40) == CB_ATOM_PROP && rd32(&CB_EV[0] as int + 56) == 0 {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn rd32(at: int): int {
+    let p = at as ptr as &i32;
+    return int(*p);
+}
+
+fn rd64(at: int): int {
+    let p = at as ptr as &int;
+    return *p;
+}
+
+/// The libX11 calls clipboard reading uses.
+struct ClipFns {
+    open: ptr;
+    root: ptr;
+    createWin: ptr;
+    selectInput: ptr;
+    intern: ptr;
+    getAtomName: ptr;
+    owner: ptr;
+    convert: ptr;
+    getProp: ptr;
+    delProp: ptr;
+    pending: ptr;
+    next: ptr;
+    flush: ptr;
+    free: ptr;
+}
+
+#[singleton]
+let CB: ClipFns;
+#[singleton]
+let CB_OK: bool = false;
+#[singleton]
+let CB_TRIED: bool = false;
+#[singleton]
+let CB_DPY: ptr = 0;
+#[singleton]
+let CB_WIN: int = 0;
+#[singleton]
+let CB_ATOM_CLIPBOARD: int = 0;
+#[singleton]
+let CB_ATOM_TARGETS: int = 0;
+#[singleton]
+let CB_ATOM_INCR: int = 0;
+#[singleton]
+let CB_ATOM_PROP: int = 0;
+/// The last `xConvert` gave up waiting on the owner.
+#[singleton]
+let CB_LATE: bool = false;
+/// One `XEvent` (192 bytes on LP64).
+#[singleton]
+let CB_EV: [192]u8;
+/// Last `clipboardData` bytes (malloc'd, grown to fit).
+#[singleton]
+let CB_BUF: ptr = 0;
+#[singleton]
+let CB_CAP: int = 0;
+#[singleton]
+let CB_LEN: int = 0;
+#[singleton]
+let CB_EMPTY: [1]u8;
+/// Last `clipboardTypes` list; names live in `CB_NAMES`.
+#[singleton]
+let CB_TYPES: [64]string;
+#[singleton]
+let CB_NTYPES: int = 0;
+#[singleton]
+let CB_NAMES: [4096]u8;
+#[singleton]
+let CB_NAMESLEN: int = 0;

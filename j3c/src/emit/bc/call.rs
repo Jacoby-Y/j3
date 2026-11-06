@@ -33,7 +33,7 @@ impl<'a> Codegen<'a> {
                 return Err("`@syscall` isn't supported in scripts".to_string())
             }
             RvalueKind::Atomic { .. } => {
-                return Err("atomics aren't supported in scripts".to_string())
+                return Err("`@atomic*` isn't supported in scripts (the VM runs on one thread)".to_string())
             }
             RvalueKind::Interpolate { .. } => {
                 return Err("interpolate must be lowered before bytecode".to_string())

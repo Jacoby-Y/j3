@@ -1,0 +1,162 @@
+// Built-in libs, the table in `SCRIPTING.md`: `vm.openLibs(LIB_BASE | ...)` binds their names as
+// natives. A name the host bound already stays the host's (bind before or after, the host wins).
+// LIB_BASE is here (`print len type str int float error`), LIB_ARRAY in `lib_array.j3`,
+// LIB_STRING in `lib_text.j3`, LIB_MATH (`math` table, `rand`) in `lib_math.j3`. Part of `j3.j2`.
+//
+// A native that holds a value across `vm.call` keeps it alive with `vm.protect` (the new arrays
+// of `map`/`filter`/`sort`); a callback's error goes up as it is (`passOn`).
+
+module j3.j2;
+
+/// Where `pick` / `rand` start before `vm.seed`.
+const RNG_SEED: int = 88172645463325252;
+
+extend Vm {
+    /// Bind the built-ins of the `LIB_*` bits in `libs`. Open them before loading scripts: a
+    /// script's names are checked when it loads.
+    fn openLibs(this: &Vm, libs: int) {
+        this.libs |= libs;
+        if (libs & LIB_BASE) != 0 {
+            this.bindLib("print", libPrint);
+            this.bindLib("error", libError);
+            this.bindLib("len", libLen);
+            this.bindLib("type", libType);
+            this.bindLib("str", libStr);
+            this.bindLib("int", libInt);
+            this.bindLib("float", libFloat);
+        }
+        if (libs & LIB_ARRAY) != 0 { this.openArrayLib(); }
+        if (libs & LIB_STRING) != 0 { this.openTextLib(); }
+        if (libs & LIB_MATH) != 0 { this.openMathLib(); }
+    }
+
+    /// Restart the `pick` / `rand` sequence: the same seed gives the same values (replays).
+    fn seed(this: &Vm, n: int) { this.rng = n; }
+
+    /// The next 64 random bits (splitmix64; the VM's own state, apart from `j3.rand`).
+    fn nextRand(this: &Vm): u64 {
+        this.rng = this.rng + -7046029254386353131;
+        return cmp.mix(u64(this.rng));
+    }
+
+    /// A random float in [0, 1).
+    fn randUnit(this: &Vm): f64 {
+        return f64(this.nextRand() >> u64(11)) / 9007199254740992.0;
+    }
+
+    /// The global `name` = `v` unless the host set it already (how `math` is added).
+    fn setLibGlobal(this: &Vm, name: string, v: Value) {
+        let key = fix(this.heap.intern(name));
+        if !this.global(key).isNil() { return; }
+        tableOf(this.globals).set(this.heap, key, v);
+    }
+
+    /// Fail the running native with the error a `vm.call` it made just returned (message,
+    /// position and trace stay the callback's). Returns nil to return.
+    fn passOn(this: &Vm): Value {
+        this.raised = true;
+        return nilv();
+    }
+}
+
+/// `print(a, b, ...)`: the `str()` texts on one line of stdout.
+fn libPrint(vm: &Vm, args: Args): Value {
+    let s = args.joined(" ");
+    if !vm.chargeNative(s.len) { return nilv(); }
+    io.printLn(s);
+    return nilv();
+}
+
+/// `error(a, ...)`: stop the script with the `str()` texts as the message.
+fn libError(vm: &Vm, args: Args): Value {
+    return vm.raise(args.joined(" "));
+}
+
+/// `len(x)`: elements of an array, bytes of a string, fields of a table.
+fn libLen(_vm: &Vm, args: Args): Value {
+    let v = args.get(0);
+    if v.tag == T_ARRAY { return intv(arrOf(v).len); }
+    if v.tag == T_STR { return intv(strOf(v).len); }
+    if v.tag == T_TABLE { return intv(tableOf(v).count()); }
+    args.wrong(0, "an array, string or table");
+    return nilv();
+}
+
+/// `type(x)`: `"nil" "bool" "int" "float" "string" "array" "table" "fn"`.
+fn libType(vm: &Vm, args: Args): Value {
+    return vm.heap.intern(typeName(args.get(0)));
+}
+
+/// `str(x)`: the text `print` shows.
+fn libStr(vm: &Vm, args: Args): Value {
+    let v = args.get(0);
+    if v.tag == T_STR { return v; }
+    vm.sb.clear();
+    fmtBuf(&vm.sb, v);
+    return vm.bufOut(&vm.sb);
+}
+
+/// `s` as a number: an int when it is all digits (with a sign), else a float through `strtod`;
+/// false when it is neither (surrounding spaces are fine).
+fn parseNum(vm: &Vm, text: string, out: &Value): bool {
+    let s = trimSpace(text);
+    if s.len == 0 { return false; }
+    let neg = s[0] == 45;
+    let i = if neg || s[0] == 43 { 1 } else { 0 };
+    let n = 0;
+    let digits = i < s.len;
+    while i < s.len && digits {
+        let d = int(s[i]) - 48;
+        if d < 0 || d > 9 || n > (9223372036854775807 - d) / 10 { digits = false; } else { n = n * 10 + d; }
+        i += 1;
+    }
+    if digits {
+        *out = intv(if neg { 0 - n } else { n });
+        return true;
+    }
+    vm.sb.clear();
+    vm.sb.pushStr(s);
+    vm.sb.push(0);
+    let start = vm.sb.p;
+    let end = start;
+    let x = libc.strtod(start, &end as ptr);
+    if end as int != start as int + s.len { return false; }
+    *out = floatv(x);
+    return true;
+}
+
+/// `int(x)`: a float truncated toward zero, a string parsed (nil when it isn't a number).
+fn libInt(vm: &Vm, args: Args): Value {
+    let v = args.get(0);
+    if v.tag == T_STR {
+        let r = nilv();
+        if !parseNum(vm, textOf(v), &r) { return nilv(); }
+        v = r;
+    }
+    if v.tag == T_INT { return v; }
+    if v.tag == T_FLOAT {
+        let x = v.f();
+        if x > -9223372036854775808.0 && x < 9223372036854775808.0 { return intv(int(x)); }
+        let t = vm.errText();
+        t.pushStr("int: ");
+        fmtBuf(t, v);
+        t.pushStr(" doesn't fit in an int");
+        vm.raised = true;
+        return nilv();
+    }
+    args.wrong(0, "a number or string");
+    return nilv();
+}
+
+/// `float(x)`: an int as a float, a string parsed (nil when it isn't a number).
+fn libFloat(vm: &Vm, args: Args): Value {
+    let v = args.get(0);
+    if v.tag == T_STR {
+        let r = nilv();
+        if !parseNum(vm, textOf(v), &r) { return nilv(); }
+        v = r;
+    }
+    if v.isNum() { return floatv(v.asNum()); }
+    args.wrong(0, "a number or string");
+    return nilv();
+}

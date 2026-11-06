@@ -1,0 +1,311 @@
+// Part of j3.steam: ISteamNetworkingMessages, connectionless peer-to-peer messages between Steam users.
+// Identities, buffers and connection info are in netid.j3, the in-memory network for fake mode in netfake.j3,
+// relay access in netutil.j3. The module doc and `use`s are in ../steam.j3.
+module j3.steam;
+
+/// `EResult` for a send that worked.
+pub const NET_OK: i32 = 1;
+/// `EResult`: no session with that user (it ended and `NET_SEND_AUTO_RESTART_BROKEN_SESSION` was not set).
+pub const NET_NO_CONNECTION: i32 = 3;
+/// `EResult`: bad argument (user 0).
+pub const NET_INVALID_PARAM: i32 = 8;
+/// `EResult`: message over `NET_MAX_MESSAGE`.
+pub const NET_LIMIT_EXCEEDED: i32 = 25;
+
+/// Largest message `netSend` takes: 512 KiB.
+pub const NET_MAX_MESSAGE: int = 524288;
+
+/// Send flag: unreliable, may Nagle-delay.
+pub const SEND_UNRELIABLE: i32 = 0;
+/// Send flag: do not delay to batch (Nagle off).
+pub const SEND_NO_NAGLE: i32 = 1;
+/// Send flag: unreliable and no Nagle delay.
+pub const SEND_UNRELIABLE_NO_NAGLE: i32 = 1;
+/// Send flag: send now or drop if the link is not ready.
+pub const SEND_NO_DELAY: i32 = 4;
+/// Send flag: unreliable, no Nagle, drop if not ready.
+pub const SEND_UNRELIABLE_NO_DELAY: i32 = 5;
+/// Send flag: reliable, in order.
+pub const SEND_RELIABLE: i32 = 8;
+/// Send flag: reliable and no Nagle delay.
+pub const SEND_RELIABLE_NO_NAGLE: i32 = 9;
+/// Send flag: open a new session when the old one broke.
+pub const SEND_AUTO_RESTART_BROKEN_SESSION: i32 = 32;
+
+/// Connection state: no session.
+pub const NET_STATE_NONE: i32 = 0;
+/// Connection state: opening.
+pub const NET_STATE_CONNECTING: i32 = 1;
+/// Connection state: looking for a route.
+pub const NET_STATE_FINDING_ROUTE: i32 = 2;
+/// Connection state: connected, messages flow.
+pub const NET_STATE_CONNECTED: i32 = 3;
+/// Connection state: the other side ended it.
+pub const NET_STATE_CLOSED_BY_PEER: i32 = 4;
+/// Connection state: a local problem ended it.
+pub const NET_STATE_PROBLEM_LOCALLY: i32 = 5;
+
+/// Where a session stands, from `netSessionInfo`. Strings are on the frame scratch arena (valid until the next frame).
+pub struct NetInfo {
+    /// `NET_STATE_*`.
+    state: i32;
+    /// Why it ended (`k_ESteamNetConnectionEnd_*`), 0 while alive.
+    endReason: i32;
+    /// Text from the side that ended it, or "".
+    endDebug: string;
+    /// Round trip time in milliseconds; -1 when unknown.
+    ping: i32;
+}
+
+const CB_NET_REQUEST: i32 = 1251;
+const CB_NET_FAILED: i32 = 1252;
+const MSG_CAP0: int = 64;
+const MSG_CAP_MAX: int = 65536;
+
+#[singleton]
+let H_NREQ: ptr;
+#[singleton]
+let H_NFAIL: ptr;
+#[singleton]
+let MSGS: ptr;
+#[singleton]
+let MSGS_CAP: int = 0;
+#[singleton]
+let IN_RECV: bool = false;
+#[singleton]
+let REL_MODE: int = 0;
+
+fn nm(): ptr {
+    return iface("SteamNetworkingMessages");
+}
+
+/// Run `f(from)` when a user sends you a message for the first time (or after the session ended) and the
+/// session waits for you. Call `netAccept(from)` inside to let their messages in; do nothing to ignore them.
+/// One handler: setting again replaces it.
+pub fn onNetRequest(f: fn(u64)) {
+    H_NREQ = f as ptr;
+}
+
+/// Run `f(peer, endReason, debug)` when a session broke (the user went away, no route). `endReason` is
+/// `k_ESteamNetConnectionEnd_*`; `debug` lives on the frame scratch arena. One handler: setting again replaces it.
+pub fn onNetFailed(f: fn(u64, i32, string)) {
+    H_NFAIL = f as ptr;
+}
+
+fn onNetRequestCb(p: ptr, n: i32) {
+    if H_NREQ as int != 0 {
+        let from = idGet((p as int + no(N_RQ_ID)) as ptr);
+        if from != u64(0) {
+            let f = H_NREQ as fn(u64);
+            f(from);
+        }
+    }
+}
+
+fn onNetFailedCb(p: ptr, n: i32) {
+    if H_NFAIL as int != 0 {
+        let c = decodeConn((p as int + no(N_FL_INFO)) as ptr);
+        if c.peer != u64(0) {
+            let f = H_NFAIL as fn(u64, i32, string);
+            f(c.peer, c.endReason, c.endDebug);
+        }
+    }
+}
+
+/// Called once from `registerParts`.
+fn netInit() {
+    netIdInit();
+    onCallback(CB_NET_REQUEST, onNetRequestCb);
+    onCallback(CB_NET_FAILED, onNetFailedCb);
+    onCallback(CB_RELAY, onRelayCb);
+    onShutdown(netDown);
+    sockInit();
+}
+
+fn netDown() {
+    IN_RECV = false;
+    nfReset();
+    skReset();
+}
+
+/// Send `data` to Steam user `to` on `channel` (any number; the receiver reads the same one), and return an
+/// `EResult`: `NET_OK` when queued. The first send opens a session; the other side sees `onNetRequest`
+/// and must `netAccept`. `flags` are the `SEND_*` values added together. Over `NET_MAX_MESSAGE` bytes is
+/// refused (`NET_LIMIT_EXCEEDED`, one line on stderr). 0 when Steam is absent. `data` is copied.
+pub fn netSend(to: u64, data: []u8, flags: i32, channel: i32): i32 {
+    if !on() {
+        return 0;
+    }
+    if to == u64(0) {
+        return NET_INVALID_PARAM;
+    }
+    if data.len > NET_MAX_MESSAGE {
+        eprintOnce(`steam: netSend refused a message over {NET_MAX_MESSAGE} bytes`);
+        return NET_LIMIT_EXCEEDED;
+    }
+    if fake() {
+        return nfSend(to, data, flags, channel);
+    }
+    let send = method("SteamNetworkingMessages", "SteamAPI_ISteamNetworkingMessages_SendMessageToUser") as fn(ptr, ptr, ptr, u32, i32, i32): i32;
+    return send(nm(), idPut(0, to), data.ptr as ptr, u32(data.len), flags, channel);
+}
+
+/// Take up to `max` messages waiting on `channel` and call `f(from, data, channel, msgNum, ctx)` for each,
+/// in arrival order; returns how many came. `data` is a view that is valid only inside `f`: copy what you
+/// keep. Every message is released after `f`, also when `f` is null (that drops them). Call `netReceive`
+/// each frame; no allocation after the first call. Do not call it from inside `f`: the nested call returns 0.
+/// Messages from a session you have not accepted wait (see `onNetRequest`). 0 when Steam is absent.
+pub fn netReceive(channel: i32, f: fn(u64, []u8, i32, i64, u64), ctx: u64, max: int): int {
+    max = recvBegin(max);
+    if max == 0 {
+        return 0;
+    }
+    let n = 0;
+    if fake() {
+        n = nfReceive(channel, f, ctx, max);
+    } else {
+        n = realReceive(channel, f, ctx, max);
+    }
+    IN_RECV = false;
+    return n;
+}
+
+/// Start of every receive call (messages and sockets share one pointer array, so they share one guard):
+/// the clamped `max`, or 0 when there is nothing to do (Steam absent, `max` under 1, or called from inside a
+/// receive handler, which is reported once). When it returns more than 0 the caller must set `IN_RECV` false at the end.
+fn recvBegin(max: int): int {
+    if !on() || max <= 0 {
+        return 0;
+    }
+    if IN_RECV {
+        eprintOnce("steam: a receive function was called from a receive handler; ignored");
+        return 0;
+    }
+    IN_RECV = true;
+    if max > MSG_CAP_MAX {
+        max = MSG_CAP_MAX;
+    }
+    return max;
+}
+
+/// The shared array of message pointers, big enough for `max`; allocated once and grown by doubling.
+fn msgArray(max: int): ptr {
+    if MSGS_CAP < max {
+        let cap = MSG_CAP0;
+        if MSGS_CAP > cap {
+            cap = MSGS_CAP;
+        }
+        while cap < max {
+            cap = cap * 2;
+        }
+        MSGS = arena().allocBytes(cap * 8);
+        MSGS_CAP = cap;
+    }
+    return MSGS;
+}
+
+/// What a receive call returned, made safe: negative is logged once and counts as 0, over `max` is cut to `max`.
+fn recvCount(name: string, n: int, max: int): int {
+    if n < 0 {
+        eprintOnce(`steam: {name} returned {n}; treated as no messages`);
+        return 0;
+    }
+    if n > max {
+        return max;
+    }
+    return n;
+}
+
+/// The payload of message `m` as a view (valid until it is released).
+fn msgView(m: ptr): []u8 {
+    return @slice(rdPtr(m, no(N_M_DATA)), int(rdI32(m, no(N_M_CB))));
+}
+
+fn realReceive(channel: i32, f: fn(u64, []u8, i32, i64, u64), ctx: u64, max: int): int {
+    let out = msgArray(max);
+    let recv = method("SteamNetworkingMessages", "SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel") as fn(ptr, i32, ptr, i32): i32;
+    let n = recvCount("ReceiveMessagesOnChannel", int(recv(nm(), channel, out, i32(max))), max);
+    let handler = f as ptr;
+    for i in 0..n {
+        let m = rdPtr(out, i * 8);
+        if handler as int != 0 && m as int != 0 {
+            f(idGet((m as int + no(N_M_PEER)) as ptr), msgView(m), channel, i64(rdU64(m, no(N_M_NUM))), ctx);
+        }
+        releaseMsg(m);
+    }
+    return n;
+}
+
+/// `SteamNetworkingMessage_t::Release`: the flat helper when the library exports it, else the message's own release function.
+fn releaseMsg(m: ptr) {
+    if m as int == 0 {
+        return;
+    }
+    if REL_MODE == 0 {
+        REL_MODE = 2;
+        if hasFn("SteamAPI_SteamNetworkingMessage_t_Release") {
+            REL_MODE = 1;
+        }
+    }
+    if REL_MODE == 1 {
+        let rel = fnp("SteamAPI_SteamNetworkingMessage_t_Release") as fn(ptr);
+        rel(m);
+        return;
+    }
+    let own = rdPtr(m, no(N_M_REL));
+    if own as int != 0 {
+        let rel = own as fn(ptr);
+        rel(m);
+    }
+}
+
+/// Let `user` message you (answer to `onNetRequest`). True when there was a request to accept. False when Steam is absent.
+pub fn netAccept(user: u64): bool {
+    if fake() {
+        return nfAccept(user);
+    }
+    let f = method("SteamNetworkingMessages", "SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser") as fn(ptr, ptr): bool;
+    return f(nm(), idPut(0, user));
+}
+
+/// End the whole session with `user` and drop what is queued from them. True when a session existed.
+pub fn netClose(user: u64): bool {
+    if fake() {
+        return nfClose(user);
+    }
+    let f = method("SteamNetworkingMessages", "SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser") as fn(ptr, ptr): bool;
+    return f(nm(), idPut(0, user));
+}
+
+/// Drop `user`'s messages on one `channel` and stop sending on it; the session stays. True when it worked.
+pub fn netCloseChannel(user: u64, channel: i32): bool {
+    if fake() {
+        return nfCloseChannel(user, channel);
+    }
+    let f = method("SteamNetworkingMessages", "SteamAPI_ISteamNetworkingMessages_CloseChannelWithUser") as fn(ptr, ptr, i32): bool;
+    return f(nm(), idPut(0, user), channel);
+}
+
+/// `NET_STATE_*` of the session with `user` (`NET_STATE_NONE` when there is none or Steam is absent).
+pub fn netSessionState(user: u64): i32 {
+    return netSessionInfo(user).state;
+}
+
+/// State, end reason and ping of the session with `user`; all zero (ping -1) when there is none.
+pub fn netSessionInfo(user: u64): NetInfo {
+    if fake() {
+        return nfInfo(user);
+    }
+    if !ready() {
+        return NetInfo { state: NET_STATE_NONE, endReason: i32(0), endDebug: "", ping: i32(-1) };
+    }
+    netIdInit();
+    let info = (NB as int + NB_INFO) as ptr;
+    let rt = (NB as int + NB_RT) as ptr;
+    zeroBytes(info, no(N_CI_SIZE));
+    zeroBytes(rt, 256);
+    let f = method("SteamNetworkingMessages", "SteamAPI_ISteamNetworkingMessages_GetSessionConnectionInfo") as fn(ptr, ptr, ptr, ptr): i32;
+    let st = f(nm(), idPut(0, user), info, rt);
+    let c = decodeConn(info);
+    return NetInfo { state: st, endReason: c.endReason, endDebug: c.endDebug, ping: rdI32(rt, no(N_RT_PING)) };
+}

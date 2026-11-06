@@ -1,0 +1,230 @@
+// Tests for the j2 host API: natives (`bind`, `Args`, rebinding), calls from J3 and from natives
+// (re-entrant two levels deep, errors unwinding through both), `callWithThis`, `keep`/`release`,
+// and the `Table` / `Array` views.
+//   timeout 60 j3c run j3c/stdlib/tests/j2_host_test.j3
+// Panics on the first failed check.
+
+module j2_host_test;
+
+use j3.io.printLn;
+use j3.j2;
+use j3.j2.{ Vm, Error, Args, Value, Limits, Ref, Table };
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+
+struct Host {
+    out: Text;
+    count: int;
+    lastErr: Text;
+}
+
+fn host(vm: &Vm): &Host { return vm.host as &Host; }
+
+fn capture(vm: &Vm, args: Args): Value {
+    let h = host(vm);
+    h.out.pushStr(args.joined(" "));
+    h.out.push(10);
+    return j2.nil();
+}
+
+fn quiet(_vm: &Vm, _args: Args): Value { return j2.nil(); }
+
+/// `bump(n)`: adds `n` (default 1) to the host's counter and returns it.
+fn bump(vm: &Vm, args: Args): Value {
+    let h = host(vm);
+    h.count += args.intOr(0, 1);
+    return j2.int(h.count);
+}
+
+/// `apply(f, x)`: calls the script fn `f(x)` and returns what it gave; a script error inside
+/// is raised again here, so it unwinds through this native too.
+fn apply(vm: &Vm, args: Args): Value {
+    let f = args.func(0);
+    let one: [1]Value = [args.get(1)];
+    match vm.call(f, one[0..1]) {
+        Result.Ok(v) { return v; }
+        Result.Err(e) {
+            let h = host(vm);
+            h.lastErr.clear();
+            h.lastErr.pushStr(e.message);
+            return vm.raise(e.message);
+        }
+    }
+}
+
+/// `spawn(kind, x, y)`: checks its argument types through the getters only.
+fn spawn(vm: &Vm, args: Args): Value {
+    let kind = args.str(0);
+    let x = args.num(1);
+    let y = args.num(2);
+    let t = vm.newTable();
+    t.set("kind", j2.str(vm, kind));
+    t.set("x", j2.num(x));
+    t.set("y", j2.num(y));
+    return t.value();
+}
+
+/// `recurse()`: calls itself through `vm.call` forever (stopped by the nesting limit).
+fn recurse(vm: &Vm, _args: Args): Value {
+    let none: []Value = @slice(0 as ptr, 0);
+    match vm.call(vm.global(j2.str(vm, "recurse")), none) {
+        Result.Ok(v) { return v; }
+        Result.Err(e) { return vm.raise(e.message); }
+    }
+}
+
+fn check(got: string, want: string, what: string) {
+    if !(got == want) {
+        printLn(`got  [{got}]`);
+        printLn(`want [{want}]`);
+        panic(what);
+    }
+}
+
+fn newVm(mem: &Arena, h: &Host): Vm {
+    let vm = Vm.new(mem, Limits { });
+    vm.openLibs(j2.LIB_ALL);
+    vm.bind("print", capture);
+    vm.bind("bump", bump);
+    vm.bind("apply", apply);
+    vm.bind("spawn", spawn);
+    vm.bind("recurse", recurse);
+    vm.host = h as ptr;
+    return vm;
+}
+
+fn load(vm: &Vm, name: string, src: string): Value {
+    match vm.loadString(name, src) {
+        Result.Ok(t) { return t; }
+        Result.Err(e) {
+            printLn(e.message);
+            panic("unexpected load error");
+        }
+    }
+}
+
+fn loadErr(vm: &Vm, name: string, src: string): string {
+    match vm.loadString(name, src) {
+        Result.Ok(_) { panic("expected a load error"); }
+        Result.Err(e) { return e.message; }
+    }
+}
+
+fn unwound(vm: &Vm) {
+    if vm.nframes != 0 || vm.top != 0 || vm.open != 0 as ptr || vm.callDepth != 0 || vm.raised {
+        printLn(`frames {vm.nframes} top {vm.top} depth {vm.callDepth}`);
+        panic("vm not unwound");
+    }
+}
+
+fn main() {
+    let mem = Arena.create(1 << 20);
+    let h = Host { out: Text.new(&mem), count: 0, lastErr: Text.new(&mem) };
+    let vm = newVm(&mem, &h);
+
+    // a native counter, its default argument, and its result back in script
+    load(&vm, "c", "bump(); bump(); print(bump(5));");
+    check(h.out.str(), "7\n", "counter");
+    if h.count != 7 { panic("count"); }
+
+    // native -> script -> native -> script
+    h.out.clear();
+    load(&vm, "r", "fn inner(x) { return apply(fn(y) { return y * 2; }, x) + 1; }\nprint(apply(inner, 5));");
+    check(h.out.str(), "11\n", "re-entrant");
+    unwound(&vm);
+
+    // an error two levels down unwinds through both natives, with an open upvalue in the middle
+    let msg = loadErr(&vm, "u", "fn deep(x) { return x / 0; }\nfn mid(x) { let k = x; let g = fn() { return k; }; return apply(deep, g()); }\napply(mid, 1);");
+    check(h.lastErr.str(), "u:2:64: u:1:23: division by zero", "inner error as the outer native saw it");
+    check(msg, "u:3:6: u:2:64: u:1:23: division by zero", "error through two natives");
+    unwound(&vm);
+    load(&vm, "after", "print(apply(fn(v) { return v + 1; }, 1));");
+    unwound(&vm);
+
+    // a wrong argument type, at the caller's line
+    check(loadErr(&vm, "s", "let e = spawn(\"bat\", 1, 2);\nspawn(\"bat\", \"x\", 2);"),
+        "s:2:6: spawn: argument 2 must be a number, got string", "wrong type");
+    check(loadErr(&vm, "s2", "spawn(\"bat\", 1);"), "s2:1:6: spawn: argument 3 must be a number, got nil",
+        "missing argument");
+    check(loadErr(&vm, "s3", "apply(1, 2);"), "s3:1:6: apply: argument 1 must be a function, got int",
+        "not a function");
+    unwound(&vm);
+
+    // natives recursing through vm.call stop with stack overflow, not a J3 crash
+    check(loadErr(&vm, "rr", "recurse();"), "rr:1:8: stack overflow", "native recursion");
+    unwound(&vm);
+
+    // calling script fns from J3: call, callWithThis, pub table access
+    h.out.clear();
+    let exp = load(&vm, "m", "pub let hp = 3;\npub fn hit(this, d) { this.hp -= d; return this.hp; }\npub fn add(a, b) { return a + b; }");
+    let t = exp.asTable();
+    let two: [2]Value = [j2.int(2), j2.int(5)];
+    match vm.call(t.get("add"), two[0..2]) {
+        Result.Ok(v) { if v.bits != 7 { panic("add"); } }
+        Result.Err(e) { printLn(e.message); panic("call"); }
+    }
+    let self = vm.newTable();
+    self.set("hp", j2.int(10));
+    match vm.callWithThis(t.get("hit"), self.value(), two[0..1]) {
+        Result.Ok(v) { if v.bits != 8 || self.getNum("hp", 0.0) != 8.0 { panic("callWithThis"); } }
+        Result.Err(e) { printLn(e.message); panic("callWithThis"); }
+    }
+    // without a `this` parameter the self value is not passed
+    match vm.callWithThis(t.get("add"), self.value(), two[0..2]) {
+        Result.Ok(v) { if v.bits != 7 { panic("callWithThis no this"); } }
+        Result.Err(e) { printLn(e.message); panic("callWithThis no this"); }
+    }
+
+    // keep / get / release, getNum / setNum, table helpers
+    let r = vm.keep(self.value());
+    vm.setNum(r, "x", 1.5);
+    if vm.getNum(r, "x") != 1.5 || vm.getNum(r, "hp") != 8.0 || vm.getNum(r, "nope") != 0.0 { panic("getNum"); }
+    let kind = vm.newTable();
+    kind.set("r", j2.int(14));
+    kind.set("speed", j2.int(60));
+    kind.set("name", j2.str(&vm, "grunt"));
+    let e = vm.newTable();
+    e.copyFields(kind, ["r", "speed", "missing"]);
+    e.setDefault("r", j2.int(99));
+    e.setDefault("touch", j2.int(10));
+    if e.count() != 3 || e.getNum("r", 0.0) != 14.0 || e.getNum("touch", 0.0) != 10.0 { panic("copyFields"); }
+    e.merge(kind);
+    check(e.getStr("name", "?"), "grunt", "merge");
+    check(e.getStr("r", "?"), "?", "getStr default");
+    e.set("speed", j2.nil());
+    if !e.get("speed").isNil() || e.count() != 3 { panic("set nil"); }
+    check(j2.str(&vm, "abc").asStr(), "abc", "asStr");
+    if !j2.int(1).asTable().get("x").isNil() { panic("asTable of an int"); }
+    let arr = vm.newArray(2);
+    arr.push(j2.int(1));
+    arr.push(e.value());
+    if arr.count() != 2 || arr.get(0).bits != 1 { panic("array"); }
+    let name = vm.intern("weapon");
+    check(name, "weapon", "intern");
+    vm.release(r);
+    vm.release(r); // a second release does nothing
+    if !vm.value(r).isNil() || vm.get(r).isTable() { panic("released ref"); }
+    let r2 = vm.keep(arr.value());
+    if vm.value(r).tag != j2.T_NIL || vm.value(r2).tag != j2.T_ARRAY { panic("reused slot"); }
+    vm.release(j2.none());
+
+    // rebinding replaces, for scripts loaded before too
+    h.out.clear();
+    let p2 = load(&vm, "rb", "pub fn say(x) { print(x); }");
+    let one: [1]Value = [j2.int(1)];
+    vm.bind("print", quiet);
+    match vm.call(p2.asTable().get("say"), one[0..1]) {
+        Result.Ok(_) { check(h.out.str(), "", "rebound print"); }
+        Result.Err(_) { panic("rebound call"); }
+    }
+    vm.bind("print", capture);
+    match vm.call(p2.asTable().get("say"), one[0..1]) {
+        Result.Ok(_) { check(h.out.str(), "1\n", "rebound back"); }
+        Result.Err(_) { panic("rebound call"); }
+    }
+    unwound(&vm);
+    vm.destroy();
+    printLn("j2_host_test ok");
+}

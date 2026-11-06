@@ -68,6 +68,12 @@ pub(super) fn fold_const_bin(
         parse::BinOp::Mul => crate::ir::op::BinOp::Mul,
         parse::BinOp::Div => crate::ir::op::BinOp::Div,
         parse::BinOp::Rem => crate::ir::op::BinOp::Rem,
+        // amount masked to 0..63, as the backends mask it to the type's width
+        parse::BinOp::Shl => return Ok(Some(a.wrapping_shl(b as u32))),
+        parse::BinOp::Shr => return Ok(Some(a.wrapping_shr(b as u32))),
+        parse::BinOp::BitAnd => return Ok(Some(a & b)),
+        parse::BinOp::BitOr => return Ok(Some(a | b)),
+        parse::BinOp::BitXor => return Ok(Some(a ^ b)),
         _ => return Ok(None),
     };
     match crate::ir::wrap::fold_bin(ir_op, a, b) {
@@ -115,6 +121,7 @@ pub(super) fn collect_globals(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> 
                     ty: ty.clone(),
                     value: Some(c.value.clone()),
                     thread: false,
+                    uniform: false,
                 },
                 true,
             ));
@@ -134,6 +141,10 @@ pub(super) fn collect_globals(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> 
         let ty = resolve_type(cx, &l.ty, &path, &types)?;
         if readonly && !matches!(cx.ty_kind(ty), TyKind::Array { .. }) {
             return Err(CheckError::new(path.clone(), l.ty.span, "array const needs an array type `[N]T`"));
+        }
+        if l.value.is_some() && matches!(cx.ty_kind(ty), TyKind::Vec(_)) {
+            return Err(CheckError::new(path.clone(), l.name.span, "a vec4f/vec4i global cannot have an initializer yet")
+                .help("declare it without a value (it starts as zeros) and assign it at startup"));
         }
         let init = match &l.value {
             Some(v) => {
@@ -479,6 +490,13 @@ pub(super) fn eval_const(
             }
         }
         parse::ExprKind::Unary {
+            op: parse::UnaryOp::BitNot,
+            expr: inner,
+        } => match eval_const(inner, consts, cx, path)?.kind {
+            ConstPayload::Int(n) => Ok(ConstVal { ty: cx.common.int, kind: ConstPayload::Int(!n) }),
+            _ => Err(CheckError::new(path, expr.span, "`~` in a const initializer needs an integer")),
+        },
+        parse::ExprKind::Unary {
             op: parse::UnaryOp::Not,
             expr: inner,
         } => {
@@ -494,6 +512,12 @@ pub(super) fn eval_const(
                     "const initializer must be a bool",
                 )),
             }
+        }
+        parse::ExprKind::Call { func, .. }
+            if matches!(&func.kind, parse::ExprKind::Name(n) if n.name == "vec4f" || n.name == "vec4i") =>
+        {
+            Err(CheckError::new(path, expr.span, "a vec4f/vec4i const is not supported yet")
+                .help("build the vector in a function, or keep the four lanes as separate consts"))
         }
         _ => Err(CheckError::new(
             path,
@@ -542,6 +566,10 @@ pub(super) fn eval_int(
             op: parse::UnaryOp::Neg,
             expr,
         } => Ok(eval_int(expr, consts, path)?.wrapping_neg()),
+        parse::ExprKind::Unary {
+            op: parse::UnaryOp::BitNot,
+            expr,
+        } => Ok(!eval_int(expr, consts, path)?),
         _ => Err(CheckError::new(
             path,
             expr.span,

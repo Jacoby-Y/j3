@@ -1,0 +1,345 @@
+// Part of j3.steam: the in-process loopback behind ISteamNetworkingSockets in fake mode. `listenP2P` registers a
+// port for FAKE_USER. `connectP2P` makes a pair of connections (two handles). If someone listens on that port
+// the far end is the server's connection (peer FAKE_USER, waits for `acceptConn`); otherwise the far end is a
+// silent friend that accepts at once and drops what you send (`fakeNetEcho(true)` sends it back). Handles count
+// up from 1 per kind (listen sockets, connections, poll groups) and are never reused until shutdown.
+// Messages wait in one bounded queue (drop oldest, like the messages inbox). The module doc and `use`s are in ../steam.j3.
+module j3.steam;
+
+/// Messages the fake connection queue keeps; when it is full the oldest is dropped (with a line on stderr).
+const SK_CAP: int = 128;
+const SK_TEXT: int = 128;
+/// `k_ESteamNetConnectionEnd_Misc_Timeout`: what a connect to nobody ends with.
+const SK_TIMEOUT: i32 = 5003;
+
+struct SkConn {
+    id: u32;
+    peer: u64;
+    other: u32;
+    state: i32;
+    listen: u32;
+    group: u32;
+    udata: i64;
+    reason: i32;
+    dbg: ptr;
+    name: ptr;
+}
+
+struct SkMsg {
+    conn: u32;
+    num: int;
+    buf: ptr;
+    cap: int;
+    len: int;
+}
+
+/// A message staged for delivery: its bytes are at `off` in `SK_OUT`.
+struct SkOut {
+    conn: u32;
+    from: u64;
+    udata: i64;
+    num: int;
+    off: int;
+    len: int;
+}
+
+struct SkListen {
+    id: u32;
+    port: i32;
+}
+
+#[singleton]
+let SKC: []SkConn;
+#[singleton]
+let SKC_N: int = 0;
+#[singleton]
+let SKL: []SkListen;
+#[singleton]
+let SKL_N: int = 0;
+#[singleton]
+let SKG: []u32;
+#[singleton]
+let SKG_N: int = 0;
+#[singleton]
+let SKQ: []SkMsg;
+#[singleton]
+let SKQ_N: int = 0;
+#[singleton]
+let SK_NEXT_L: int = 0;
+#[singleton]
+let SK_NEXT_C: int = 0;
+#[singleton]
+let SK_NEXT_G: int = 0;
+#[singleton]
+let SK_NUM: int = 0;
+#[singleton]
+let SK_OUT: ptr;
+#[singleton]
+let SK_OUT_CAP: int = 0;
+#[singleton]
+let SK_META: []SkOut;
+
+/// Forget every fake connection, listen socket, poll group and queued message (shutdown). Buffers stay for reuse.
+fn skReset() {
+    for i in 0..SKC_N {
+        SKC[i].id = u32(0);
+    }
+    SKC_N = 0;
+    SKL_N = 0;
+    SKG_N = 0;
+    SKQ_N = 0;
+    SK_NEXT_L = 0;
+    SK_NEXT_C = 0;
+    SK_NEXT_G = 0;
+    SK_NUM = 0;
+}
+
+// ponytail: handles are found by scanning; fine for the handful of connections a dev run has, index by handle if it ever matters.
+fn skFind(id: u32): int {
+    if id == u32(0) {
+        return -1;
+    }
+    for i in 0..SKC_N {
+        if SKC[i].id == id {
+            return i;
+        }
+    }
+    return -1;
+}
+
+fn skAdd(peer: u64, other: u32, listen: u32, state: i32): int {
+    let at = -1;
+    for i in 0..SKC_N {
+        if SKC[i].id == u32(0) {
+            at = i;
+            break;
+        }
+    }
+    if at < 0 {
+        if SKC.len == 0 {
+            SKC = arena().alloc::<SkConn>(16);
+        }
+        if SKC_N >= SKC.len {
+            SKC = grown(SKC, SKC_N);
+        }
+        at = SKC_N;
+        SKC_N += 1;
+    }
+    if SKC[at].dbg as int == 0 {
+        SKC[at].dbg = arena().allocBytes(SK_TEXT);
+        SKC[at].name = arena().allocBytes(SK_TEXT);
+    }
+    SK_NEXT_C += 1;
+    SKC[at].id = u32(SK_NEXT_C);
+    SKC[at].peer = peer;
+    SKC[at].other = other;
+    SKC[at].state = state;
+    SKC[at].listen = listen;
+    SKC[at].group = u32(0);
+    SKC[at].udata = i64(-1);
+    SKC[at].reason = i32(0);
+    wrU8(SKC[at].dbg, 0, u8(0));
+    wrU8(SKC[at].name, 0, u8(0));
+    return at;
+}
+
+fn skPutText(p: ptr, s: string) {
+    let n = s.len;
+    if n > SK_TEXT - 1 {
+        n = SK_TEXT - 1;
+    }
+    for k in 0..n {
+        wrU8(p, k, s[k]);
+    }
+    wrU8(p, n, u8(0));
+}
+
+/// Fill the `SteamNetConnectionInfo_t` at `p` from connection slot `i`.
+fn skFill(p: ptr, i: int) {
+    writeConn(p, SKC[i].peer, SKC[i].state, SKC[i].reason, fromFixed(SKC[i].dbg, SK_TEXT));
+    wrU64(p, no(N_CI_UDATA), u64(SKC[i].udata));
+    wrU32(p, no(N_CI_LISTEN), SKC[i].listen);
+}
+
+/// Queue callback 1221 for connection slot `i`, which just left state `old`.
+fn skFire(i: int, old: i32) {
+    let b = netCbBuf();
+    skFill((b as int + so(SO_CS_INFO)) as ptr, i);
+    wrU32(b, so(SO_CS_HCONN), SKC[i].id);
+    wrI32(b, so(SO_CS_OLD), old);
+    fakeCallback(CB_CONN_STATUS, @slice(b, so(SO_CS_SIZE)));
+}
+
+fn skListen(port: i32): u32 {
+    for i in 0..SKL_N {
+        if SKL[i].port == port {
+            eprintOnce(`steam: listenP2P: virtual port {port} is already listening`);
+            return u32(0);
+        }
+    }
+    if SKL.len == 0 {
+        SKL = arena().alloc::<SkListen>(8);
+    }
+    if SKL_N >= SKL.len {
+        SKL = grown(SKL, SKL_N);
+    }
+    SK_NEXT_L += 1;
+    SKL[SKL_N] = SkListen { id: u32(SK_NEXT_L), port: port };
+    SKL_N += 1;
+    fakeLog(`listenP2P port {port} -> socket {SK_NEXT_L}`);
+    return u32(SK_NEXT_L);
+}
+
+fn skCloseListen(sock: u32): bool {
+    let at = -1;
+    for i in 0..SKL_N {
+        if SKL[i].id == sock {
+            at = i;
+        }
+    }
+    if at < 0 {
+        return false;
+    }
+    SKL[at] = SKL[SKL_N - 1];
+    SKL_N -= 1;
+    fakeLog(`closeListen {sock}`);
+    for i in 0..SKC_N {
+        if SKC[i].id != u32(0) && SKC[i].listen == sock {
+            skDrop(i, CONN_APP_GENERIC, "listen socket closed");
+        }
+    }
+    return true;
+}
+
+fn skConnect(to: u64, port: i32): u32 {
+    let lsock = u32(0);
+    for i in 0..SKL_N {
+        if SKL[i].port == port {
+            lsock = SKL[i].id;
+        }
+    }
+    let c = skAdd(to, u32(0), u32(0), NET_STATE_CONNECTING);
+    let cid = SKC[c].id;
+    fakeLog(`connectP2P to {to} port {port} -> connection {cid}`);
+    skFire(c, NET_STATE_NONE);
+    if lsock != u32(0) {
+        let s = skAdd(FAKE_USER, cid, lsock, NET_STATE_CONNECTING);
+        SKC[c].other = SKC[s].id;
+        skFire(s, NET_STATE_NONE);
+    } else if to == FAKE_USER {
+        // nobody listens: the connect times out
+        SKC[c].state = NET_STATE_PROBLEM_LOCALLY;
+        SKC[c].reason = SK_TIMEOUT;
+        skPutText(SKC[c].dbg, "no listener on that port");
+        skFire(c, NET_STATE_CONNECTING);
+    } else {
+        SKC[c].state = NET_STATE_CONNECTED;
+        skFire(c, NET_STATE_CONNECTING);
+    }
+    return cid;
+}
+
+fn skAccept(h: u32): i32 {
+    let s = skFind(h);
+    if s < 0 {
+        return NET_INVALID_PARAM;
+    }
+    if SKC[s].state != NET_STATE_CONNECTING || SKC[s].listen == u32(0) {
+        return NET_INVALID_STATE;
+    }
+    fakeLog(`acceptConn {h}`);
+    SKC[s].state = NET_STATE_CONNECTED;
+    skFire(s, NET_STATE_CONNECTING);
+    let c = skFind(SKC[s].other);
+    if c >= 0 {
+        SKC[c].state = NET_STATE_CONNECTED;
+        skFire(c, NET_STATE_CONNECTING);
+    }
+    return NET_OK;
+}
+
+/// Remove connection slot `i`: its queued messages go, the far end (if any) is told it was closed by the peer.
+fn skDrop(i: int, reason: i32, debug: string) {
+    let id = SKC[i].id;
+    let j = 0;
+    while j < SKQ_N {
+        if SKQ[j].conn == id {
+            skTake(j);
+        } else {
+            j += 1;
+        }
+    }
+    let o = skFind(SKC[i].other);
+    SKC[i].id = u32(0);
+    if o >= 0 {
+        let old = SKC[o].state;
+        SKC[o].other = u32(0);
+        if old == NET_STATE_CONNECTED || old == NET_STATE_CONNECTING {
+            SKC[o].state = NET_STATE_CLOSED_BY_PEER;
+            SKC[o].reason = reason;
+            skPutText(SKC[o].dbg, debug);
+            skFire(o, old);
+        }
+    }
+}
+
+fn skClose(h: u32, reason: i32, debug: string): bool {
+    let i = skFind(h);
+    if i < 0 {
+        return false;
+    }
+    fakeLog(`closeConn {h} ({reason})`);
+    skDrop(i, reason, debug);
+    return true;
+}
+
+fn skSetData(h: u32, data: i64): bool {
+    let i = skFind(h);
+    if i < 0 {
+        return false;
+    }
+    SKC[i].udata = data;
+    return true;
+}
+
+fn skData(h: u32): i64 {
+    let i = skFind(h);
+    if i < 0 {
+        return i64(-1);
+    }
+    return SKC[i].udata;
+}
+
+fn skSetName(h: u32, name: string) {
+    let i = skFind(h);
+    if i >= 0 {
+        skPutText(SKC[i].name, name);
+    }
+}
+
+fn skName(h: u32): string {
+    let i = skFind(h);
+    if i < 0 {
+        return "";
+    }
+    return fromFixed(SKC[i].name, SK_TEXT);
+}
+
+fn skInfo(h: u32): ConnInfo {
+    let b = (skb() as int + SKB_INFO) as ptr;
+    let i = skFind(h);
+    if i < 0 {
+        zeroBytes(b, no(N_CI_SIZE));
+    } else {
+        skFill(b, i);
+    }
+    return decodeConn(b);
+}
+
+fn skStatus(h: u32): ConnStatus {
+    let i = skFind(h);
+    if i < 0 {
+        return ConnStatus { state: NET_STATE_NONE, ping: i32(-1), qualityLocal: 0.0, qualityRemote: 0.0, outPacketsPerSec: 0.0, outBytesPerSec: 0.0, inPacketsPerSec: 0.0, inBytesPerSec: 0.0, sendRateBytesPerSec: i32(0), pendingUnreliable: i32(0), pendingReliable: i32(0), sentUnackedReliable: i32(0), queueTime: i64(0) };
+    }
+    return ConnStatus { state: SKC[i].state, ping: i32(0), qualityLocal: 1.0, qualityRemote: 1.0, outPacketsPerSec: 0.0, outBytesPerSec: 0.0, inPacketsPerSec: 0.0, inBytesPerSec: 0.0, sendRateBytesPerSec: i32(0), pendingUnreliable: i32(0), pendingReliable: i32(0), sentUnackedReliable: i32(0), queueTime: i64(0) };
+}

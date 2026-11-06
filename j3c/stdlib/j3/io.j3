@@ -1,8 +1,9 @@
 module j3.io;
 
-use j3.memory.Arena;
+use j3.memory.{ Arena, List };
 use j3.result.Result;
-use j3.sys.{ close, lseek, open, openMode, read, write, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_END, SEEK_SET };
+use j3.sys;
+use j3.sys.{ close, lseek, open, openMode, read, write, AT_FDCWD, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_END, SEEK_SET };
 use j3.text.cstr;
 
 /// Why a file call failed.
@@ -43,6 +44,17 @@ pub fn readFile(path: string, arena: &Arena): Result<[]u8, IoError> {
     return Result.Ok(buf);
 }
 
+/// `sys.openMode` with a string path: a file descriptor, negative on failure. `mode` (e.g. 420,
+/// `0644`) only matters with `O_CREAT`.
+pub fn openPath(path: string, flags: int, mode: int): int {
+    return openMode(cstr(path) as ptr, flags, mode);
+}
+
+/// True when the file at `path` exists and may be executed (`sys.canExec` with a string path).
+pub fn canExec(path: string): bool {
+    return sys.canExec(cstr(path) as ptr);
+}
+
 /// True when `path` can be opened for reading.
 pub fn exists(path: string): bool {
     let fd = open(cstr(path) as ptr, O_RDONLY);
@@ -65,4 +77,159 @@ pub fn writeFile(path: string, data: []u8): Result<int, IoError> {
         return Result.Err(IoError.Other);
     }
     return Result.Ok(got);
+}
+
+// Directories and file metadata. Linux (raw syscalls); other targets return `Other`. Safe on a
+// worker thread: the path buffers are per thread.
+
+/// One file or directory, from `listDir` or `stat`.
+pub struct DirEntry {
+    /// Base name, no path.
+    name: string;
+    isDir: bool;
+    /// Bytes.
+    size: int;
+    /// Last modified, unix seconds.
+    mtime: int;
+    /// The entry itself is a symlink (`isDir`/`size`/`mtime` still describe its target, except from `lstat`).
+    isLink: bool;
+}
+
+/// `getdents64` records for `listDir`, and the second path of `rename`.
+#[singleton]
+#[thread]
+let IO_BUF: [4096]u8;
+
+fn errOf(r: int): IoError {
+    // -ENOENT, -ENOTDIR
+    if r == -2 || r == -20 {
+        return IoError.NotFound;
+    }
+    return IoError.Other;
+}
+
+/// Entries in `path` (no "." / ".."), names allocated in `mem`. Symlinks are followed for
+/// `isDir`/`size`/`mtime` (`isLink` says the entry is one; a dangling link gets the link's own
+/// fields); an entry that vanishes while listing is skipped. Not sorted.
+pub fn listDir(path: string, mem: &Arena): Result<[]DirEntry, IoError> {
+    let fd = open(cstr(path) as ptr, O_RDONLY);
+    if fd < 0 {
+        return Result.Err(errOf(0 - sys.errno()));
+    }
+    let out = List<DirEntry>.new(mem);
+    let info: [4]int = [0, 0, 0, 0];
+    let link: [4]int = [0, 0, 0, 0];
+    while true {
+        let n = sys.dirents(fd, IO_BUF[:]);
+        if n < 0 {
+            close(fd);
+            return Result.Err(errOf(n));
+        }
+        if n == 0 {
+            break;
+        }
+        let at = 0;
+        while at < n {
+            let rec = &IO_BUF[at] as int;
+            let rp = (rec + 16) as ptr as &u16;
+            let reclen = int(*rp);
+            let name = rec + 19;
+            at += reclen;
+            let len = 0;
+            while true {
+                let b = (name + len) as ptr as &u8;
+                if *b == 0 {
+                    break;
+                }
+                len += 1;
+            }
+            let raw: []u8 = @slice(name as ptr, len);
+            if (len == 1 && raw[0] == 46) || (len == 2 && raw[0] == 46 && raw[1] == 46) {
+                continue;
+            }
+            if sys.lstatAt(fd, name as ptr, link[:]) < 0 {
+                continue;
+            }
+            // a dangling link keeps the link's own fields
+            if link[3] == 0 || sys.statAt(fd, name as ptr, info[:]) < 0 {
+                info[0] = link[0];
+                info[1] = link[1];
+                info[2] = link[2];
+            }
+            let copy = mem.alloc::<u8>(len);
+            for i in 0..len {
+                copy[i] = raw[i];
+            }
+            out.push(DirEntry { name: copy as string, isDir: info[0] == 1, size: info[1], mtime: info[2], isLink: link[3] == 1 });
+        }
+    }
+    close(fd);
+    return Result.Ok(out.items[0..out.len]);
+}
+
+/// `listDir`'s fields for one path, following symlinks (`isLink` false). `name` is `path` itself (not copied).
+pub fn stat(path: string): Result<DirEntry, IoError> {
+    return statWith(path, false);
+}
+
+/// Like `stat`, but for a symlink the link itself: `isLink` true, `size` the length of its target
+/// path, `isDir` false. A dangling link succeeds.
+pub fn lstat(path: string): Result<DirEntry, IoError> {
+    return statWith(path, true);
+}
+
+fn statWith(path: string, noFollow: bool): Result<DirEntry, IoError> {
+    let info: [4]int = [0, 0, 0, 0];
+    let r = if noFollow { sys.lstatAt(AT_FDCWD, cstr(path) as ptr, info[:]) } else { sys.statAt(AT_FDCWD, cstr(path) as ptr, info[:]) };
+    if r < 0 {
+        return Result.Err(errOf(r));
+    }
+    return Result.Ok(DirEntry { name: path, isDir: info[0] == 1, size: info[1], mtime: info[2], isLink: info[3] == 1 });
+}
+
+/// Rename or move `from` to `to`, replacing `to` (rename(2): atomic, same filesystem only).
+pub fn rename(from: string, to: string): Result<bool, IoError> {
+    if to.len + 1 > IO_BUF.len {
+        return Result.Err(IoError.Other);
+    }
+    for i in 0..to.len {
+        IO_BUF[i] = to[i];
+    }
+    IO_BUF[to.len] = 0;
+    let r = sys.rename(cstr(from) as ptr, &IO_BUF[0] as ptr);
+    if r < 0 {
+        return Result.Err(errOf(r));
+    }
+    return Result.Ok(true);
+}
+
+/// Delete the file `path` (unlink(2); not a directory).
+pub fn remove(path: string): Result<bool, IoError> {
+    let r = sys.unlink(cstr(path) as ptr);
+    if r < 0 {
+        return Result.Err(errOf(r));
+    }
+    return Result.Ok(true);
+}
+
+/// Make directory `path` and its missing parents (mkdir -p, mode 0755). Ok when it already is one.
+/// Splits on `/`, and on Windows on `\` too (`C:\Users\x/Game` works; the drive `C:` is skipped).
+pub fn makeDirs(path: string): Result<bool, IoError> {
+    let info: [3]int = [0, 0, 0];
+    for i in 1..path.len + 1 {
+        // one mkdir per prefix that ends a name: not at `//`, and on Windows not at the drive `C:`
+        if (i == path.len || isSep(path[i])) && !isSep(path[i - 1]) && !(sys.PLATFORM == sys.PLATFORM_WINDOWS && path[i - 1] == 58) {
+            let r = sys.mkdir(cstr(path[0..i]) as ptr, 493);
+            // an existing dir can fail with EEXIST, or EPERM/EACCES where its parent is not ours
+            if r < 0 && (sys.statAt(AT_FDCWD, cstr(path[0..i]) as ptr, info[:]) < 0 || info[0] != 1) {
+                return Result.Err(errOf(r));
+            }
+        }
+    }
+    return Result.Ok(true);
+}
+
+/// `/`, and on Windows `\` too.
+fn isSep(b: u8): bool {
+    return b == 47 || (sys.PLATFORM == sys.PLATFORM_WINDOWS && b == 92);
 }

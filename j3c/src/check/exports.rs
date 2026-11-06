@@ -111,7 +111,9 @@ pub(super) fn share_methods(mods: &mut [ModData]) {
 pub(super) fn collect_exports(mods: &mut [ModData], i: usize) {
     for it in &mods[i].ast.items {
         let (name, vis_pub) = match it {
+            Item::Fn(f) if f.is_impl => continue,
             Item::Fn(f) => (&f.name.name, f.vis_pub),
+            Item::Trait(t) => (&t.name.name, t.vis_pub),
             Item::Struct(s) => (&s.name.name, s.vis_pub),
             Item::Enum(e) => (&e.name.name, e.vis_pub),
             Item::Const(c) => (&c.name.name, c.vis_pub),

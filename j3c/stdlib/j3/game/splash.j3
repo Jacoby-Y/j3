@@ -1,0 +1,277 @@
+/// Startup splash: the J3 voxel logo, then the game's own cards (images), shown while the game
+/// loads. Turned on by `[splash] enabled = true` in j3.toml (`j3c help manifest`) or `App.splash()`;
+/// `App.run` calls `begin` right after the window opens, runs its startups, then `finish`. Loading
+/// code can call `tick()` between steps to keep the logo moving. A key, click or tap skips the
+/// current card (`[splash] skippable`). Only release builds show it: a dev build (`j3c run`)
+/// skips it unless `j3c run --splash` (`J3_SPLASH=1`). Also off under `--frames/--screenshot`,
+/// `--headless`, `J3_CAPTURE`, and `J3_NO_SPLASH=1`, so tests and goldens never see it.
+///
+/// The logo: a 1-wide, 6-tall column where each row piles that row's cells on one spot (the 3's
+/// under the J's). It sweeps left dropping the J and carrying the 3, whose cells hide under a J cell
+/// of their row, then sweeps right dropping the 3. Main thread only.
+
+module j3.game.splash;
+
+use j3.appconfig;
+use j3.build;
+use j3.game;
+use j3.game.{ Color, Key, Mouse, Texture };
+use j3.gfx.canvas;
+use j3.gfx.canvas.{ Canvas, Mode };
+use j3.math;
+use j3.math.Vec2;
+use j3.memory.Arena;
+use j3.text;
+
+/// Glyphs, 4x6 cells, row-major: `#` is a cell.
+const J_ROWS: string = "..##...#...#...##..#.##.";
+const T_ROWS: string = "###....#.##....#...####.";
+/// The 3 starts this many cells right of the J's left edge.
+const T_X: f32 = 4.6;
+/// Column x at the start and the two sweep ends, in cells.
+const START: f32 = 3.8;
+const LEFT: f32 = 0;
+const RIGHT: f32 = 7.6;
+
+/// Logo timeline, ms: still column, left sweep, pause, right sweep, hold, fade out.
+const T_HOLD: int = 400;
+const T_SWEEP: int = 550;
+const T_GAP: int = 150;
+const T_REST: int = 900;
+const FADE: int = 300;
+const LOGO_LEN: int = T_HOLD + T_SWEEP + T_GAP + T_SWEEP + T_REST + FADE;
+
+/// Whether `begin` ran and `finish` has not.
+#[singleton]
+let ON: bool = false;
+/// Milliseconds of the current stage shown so far.
+#[singleton]
+let CLOCK: int = 0;
+/// `game.micros()` at the last advance, less the part of a millisecond not yet added to CLOCK.
+#[singleton]
+let LAST: int = 0;
+
+/// `[splash] enabled` of j3.toml.
+pub fn configured(): bool {
+    return appconfig.SPLASH;
+}
+
+/// `j3c run --splash` (`J3_SPLASH=1`): show it in this run even in a dev build or with `[splash]` off.
+pub fn forced(): bool {
+    return game.env("J3_SPLASH").len > 0;
+}
+
+/// False in dev builds and where a splash would get in the way: frame-count runs, captures,
+/// offscreen video, `J3_NO_SPLASH`.
+pub fn wanted(): bool {
+    let drv = game.env("SDL_VIDEODRIVER");
+    return !build.DEV && game.env("J3_FRAMES").len == 0 && game.env("J3_SCREENSHOT").len == 0
+        && game.env("J3_CAPTURE").len == 0 && game.env("J3_NO_SPLASH").len == 0
+        && !text.same(drv, "offscreen") && !text.same(drv, "dummy");
+}
+
+/// Show the first frame. Call right after the window opens.
+pub fn begin() {
+    ON = true;
+    CLOCK = 0;
+    LAST = game.micros();
+    game.poll();
+    frame(appconfig.LOGO, Texture {}, 1);
+}
+
+/// Draw the next logo frame if one is due. Call between loading steps so the logo keeps moving;
+/// a no-op when no splash is showing. Never runs the logo past its hold.
+pub fn tick() {
+    if !ON || game.micros() - LAST < 16000 { return; }
+    game.poll();
+    advance();
+    if CLOCK > LOGO_LEN - FADE { CLOCK = LOGO_LEN - FADE; }
+    frame(appconfig.LOGO, Texture {}, 1);
+}
+
+/// Play the rest of the logo (unless `[splash] logo = false`), then the `[splash] cards`, then
+/// `extra` (image paths; a missing one is skipped). Returns when done, or early when the window closes.
+pub fn finish(extra: []string) {
+    if !ON { return; }
+    ON = false;
+    if appconfig.LOGO && !stage(LOGO_LEN, true, Texture {}) { return; }
+    let list = appconfig.CARDS;
+    let a = 0;
+    while a < list.len {
+        let b = a;
+        while b < list.len && list[b] != 10 { b += 1; }
+        if !card(list[a..b]) { return; }
+        a = b + 1;
+    }
+    let i = 0;
+    while i < extra.len {
+        if !card(extra[i]) { return; }
+        i += 1;
+    }
+}
+
+/// Show one card; false when quit was requested.
+fn card(path: string): bool {
+    let tex = game.tryLoadTexture(path);
+    if tex.raw == 0 { return true; }
+    CLOCK = 0;
+    let more = stage(appconfig.CARD_MS, false, tex);
+    game.destroyTexture(tex);
+    return more;
+}
+
+/// Run one stage to its end; false when quit was requested.
+fn stage(len: int, logo: bool, tex: Texture): bool {
+    LAST = game.micros();
+    while CLOCK < len {
+        game.poll();
+        if game.quitRequested() { return false; }
+        let skip = appconfig.SKIPPABLE && (game.keyPressed(Key.Escape) || game.keyPressed(Key.Space)
+            || game.keyPressed(Key.Enter) || game.mousePressed(Mouse.Left));
+        if skip && CLOCK < len - FADE { CLOCK = len - FADE; }
+        advance();
+        let a = math.clamp(f32(len - CLOCK) / f32(FADE), 0, 1);
+        if !logo { a = math.min(a, math.clamp(f32(CLOCK) / f32(FADE), 0, 1)); }
+        let start = game.micros();
+        frame(logo, tex, a);
+        // ~60 fps without vsync, so the splash does not spin a core
+        game.delayMs(16 - (game.micros() - start) / 1000);
+    }
+    return true;
+}
+
+/// Move CLOCK by real time, at most 50 ms a frame so a long loading step does not skip the animation.
+/// Microsecond clock: a sub-millisecond frame carries its time to the next one instead of being lost
+/// or rounded up (`SDL_GetTicks` is 1 ms, so a fast loop read 0 and used to fake 16 ms).
+fn advance() {
+    let now = game.micros();
+    let d = (now - LAST) / 1000;
+    if d > 50 {
+        CLOCK += 50;
+        LAST = now;
+        return;
+    }
+    CLOCK += d;
+    LAST += d * 1000;
+}
+
+/// `[splash] theme`: dark (default) or light.
+fn bg(): Color {
+    if appconfig.LIGHT { return game.rgb(250, 250, 250); }
+    return game.rgb(22, 24, 29);
+}
+
+fn ink(): Color {
+    if appconfig.LIGHT { return game.rgb(22, 24, 29); }
+    return game.rgb(242, 243, 245);
+}
+
+/// Clear, draw the logo or the card at opacity `a`, present. With no logo and no card yet
+/// (`logo = false` while loading), just the background.
+fn frame(logo: bool, tex: Texture, a: f32) {
+    let ws = game.windowSize();
+    game.clearTo(bg());
+    if logo {
+        drawLogo(ws, CLOCK);
+    } else if tex.raw != 0 {
+        // `[splash] card_size`: the card fits in this fraction of the window (default 0.35).
+        let k = appconfig.CARD_SIZE;
+        let s = math.min(ws.x * k / f32(tex.w), ws.y * k / f32(tex.h));
+        let size = Vec2 { x: f32(tex.w) * s, y: f32(tex.h) * s };
+        game.drawTextureAt(tex, Vec2 { x: (ws.x - size.x) / 2, y: (ws.y - size.y) / 2 }, size);
+    }
+    if a < 1 {
+        let c = bg();
+        game.setColor(game.rgba(c.r, c.g, c.b, u8((1 - a) * 255)));
+        game.drawRect(Vec2 { x: 0, y: 0 }, ws);
+    }
+    game.present();
+}
+
+fn ease(t: f32): f32 {
+    let u = math.clamp(t, 0, 1);
+    if u < 0.5 { return 2 * u * u; }
+    let v = -2 * u + 2;
+    return 1 - v * v / 2;
+}
+
+/// The 3's cells in row `y` hide under this J cell while the column sweeps left: the row's
+/// leftmost, except row 4, whose leftmost is the hook's tip.
+fn hideX(y: int): f32 {
+    if y == 4 { return 3; }
+    let rows = J_ROWS;
+    let x = 0;
+    while rows[y * 4 + x] != 35 { x += 1; }
+    return f32(x);
+}
+
+fn drawLogo(ws: Vec2, el: int) {
+    // About 20 px cells at 720p: the logo is ~170 px wide, not the whole window.
+    let u = math.max(4, math.floor(math.min(ws.x, ws.y) / 36));
+    let ox = ws.x / 2 - 4.3 * u;
+    let oy = ws.y / 2 - 3 * u;
+    let colL = START + (LEFT - START) * ease(f32(el - T_HOLD) / f32(T_SWEEP));
+    let colR = LEFT + (RIGHT - LEFT) * ease(f32(el - T_HOLD - T_SWEEP - T_GAP) / f32(T_SWEEP));
+    let jr = J_ROWS;
+    let tr = T_ROWS;
+    // The 3 first: it lies under the J.
+    let i = 0;
+    while i < 24 {
+        if tr[i] == 35 {
+            let y = i / 4;
+            let tx = math.max(math.min(START, math.max(hideX(y), colL)), math.min(T_X + f32(i % 4), colR));
+            cell(ox + tx * u, oy + f32(y) * u, u, game.rgb(255, 107, 53));
+        }
+        i += 1;
+    }
+    i = 0;
+    while i < 24 {
+        if jr[i] == 35 {
+            let jx = math.min(START, math.max(f32(i % 4), colL));
+            cell(ox + jx * u, oy + f32(i / 4) * u, u, ink());
+        }
+        i += 1;
+    }
+}
+
+/// One voxel: a darker side offset down-right, then the face.
+fn cell(x: f32, y: f32, u: f32, face: Color) {
+    let s = Vec2 { x: u * 0.86, y: u * 0.86 };
+    game.setColor(game.rgb(201, 74, 31));
+    game.drawRect(Vec2 { x: x + u * 0.18, y: y + u * 0.18 }, s);
+    game.setColor(face);
+    game.drawRect(Vec2 { x: x, y: y }, s);
+}
+
+/// The J3 logo as a 120x120 icon (the repo's `logo.svg`): the default window icon.
+pub fn logoIcon(mem: &Arena): Canvas {
+    let c = Canvas.create(mem, 120, 120, Mode.Smooth);
+    let bgc = canvas.rgb(22, 24, 29);
+    // Rounded square, radius 26.
+    c.fillRect(26, 0, 68, 120, bgc);
+    c.fillRect(0, 26, 120, 68, bgc);
+    c.fillCircle(26, 26, 26, bgc);
+    c.fillCircle(94, 26, 26, bgc);
+    c.fillCircle(26, 94, 26, bgc);
+    c.fillCircle(94, 94, 26, bgc);
+    let jr = J_ROWS;
+    let tr = T_ROWS;
+    let i = 0;
+    while i < 24 {
+        if tr[i] == 35 { iconCell(&c, T_X + f32(i % 4), i / 4, 255, 107, 53); }
+        i += 1;
+    }
+    i = 0;
+    while i < 24 {
+        if jr[i] == 35 { iconCell(&c, f32(i % 4), i / 4, 242, 243, 245); }
+        i += 1;
+    }
+    return c;
+}
+
+fn iconCell(c: &Canvas, x: f32, y: int, r: u8, g: u8, b: u8) {
+    let px = i32(16.5 + x * 10);
+    let py = i32(29 + y * 10);
+    c.fillRect(px + 2, py + 2, 9, 9, canvas.rgb(201, 74, 31));
+    c.fillRect(px, py, 9, 9, canvas.rgb(r, g, b));
+}

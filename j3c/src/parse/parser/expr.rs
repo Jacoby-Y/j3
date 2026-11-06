@@ -65,7 +65,7 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn expr_rel(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.expr_add()?;
+        let mut lhs = self.expr_bitor()?;
         loop {
             let op = match self.cur().kind {
                 TokenKind::Lt => BinOp::Lt,
@@ -74,6 +74,32 @@ impl<'a> Parser<'a> {
                 TokenKind::Ge => BinOp::Ge,
                 _ => break,
             };
+            let _ = self.bump();
+            let rhs = self.expr_bitor()?;
+            let span = join(lhs.span, rhs.span);
+            lhs = Expr {
+                span,
+                kind: ExprKind::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// `<<` / `>>`: two touching `<` / `>` tokens (the lexer keeps them apart for generics).
+    pub(super) fn expr_shift(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.expr_add()?;
+        loop {
+            let (a, b) = (self.cur(), self.look(1));
+            let op = match (a.kind, b.kind) {
+                (TokenKind::Lt, TokenKind::Lt) if a.span.end == b.span.start => BinOp::Shl,
+                (TokenKind::Gt, TokenKind::Gt) if a.span.end == b.span.start => BinOp::Shr,
+                _ => break,
+            };
+            let _ = self.bump();
             let _ = self.bump();
             let rhs = self.expr_add()?;
             let span = join(lhs.span, rhs.span);
@@ -185,6 +211,17 @@ impl<'a> Parser<'a> {
                     span: join(start, expr.span),
                     kind: ExprKind::Unary {
                         op: UnaryOp::Deref,
+                        expr: Box::new(expr),
+                    },
+                })
+            }
+            TokenKind::Tilde => {
+                let _ = self.bump();
+                let expr = self.unary()?;
+                Ok(Expr {
+                    span: join(start, expr.span),
+                    kind: ExprKind::Unary {
+                        op: UnaryOp::BitNot,
                         expr: Box::new(expr),
                     },
                 })

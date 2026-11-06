@@ -1,0 +1,483 @@
+/// Terminal input codec, both directions, pure (no OS calls).
+///
+/// Decode (a TUI reading a raw tty): `Decoder.feed(bytes, nowMs)` appends bytes, then call `next(nowMs, &ev)` until it
+/// returns false. `ev` is one reused `Event` (check `ev.kind`): `EV_KEY` (`key`, `mods`, `cp` for `KEY_CHAR`),
+/// `EV_PASTE` (`text`, a view valid until the next `next` call), `EV_MOUSE` (`x`, `y` 0-based, `button`, `action`,
+/// `mods`), `EV_FOCUS` (`on`). Resize is not an event here (the screen polls the size).
+/// An incomplete sequence at the end of the buffer is held; `next` releases it only when `nowMs - lastFeedMs >=
+/// escTimeoutMs` (default 25): a lone ESC comes out as `KEY_ESC`, a truncated sequence as ESC plus its bytes as keys,
+/// a truncated UTF-8 character as U+FFFD. ESC followed by a key in the same read is Alt+key. Unknown or malformed
+/// sequences are consumed and dropped, so the stream never stalls. Bracketed paste is held until its end marker
+/// (which may be split across feeds) or `pasteTimeoutMs` of silence, then delivered as collected; content is verbatim, capped at `MAX_PASTE` (the excess is dropped).
+/// Choices: 0x7f is `KEY_BACKSPACE`, 0x08 is Backspace+Ctrl, 0x0d is `KEY_ENTER`, 0x0a is Ctrl+J (`KEY_CHAR` 'j'),
+/// 0x00 is Ctrl+Space. `KEY_*` are plain ints (`KEY_F1 + n - 1` is Fn), `MOD_*` bits are xterm's param-1 bits.
+/// Allocation: only the buffers inside `Decoder` (reused; they grow with the largest paste).
+///
+/// Encode (an emulator sending keys to the pty): `encodeKey`, `encodePaste`, `encodeMouse` append to a `Text`
+/// following the grid's mode bits (`j3.term.grid.MODE_*`: app cursor keys, bracketed paste, mouse, SGR).
+/// Any thread: a `Decoder` is one value for one stream; nothing is shared.
+
+module j3.term.input;
+
+use j3.memory.Arena;
+use j3.term.grid.MODE_CURSOR_KEYS;
+use j3.term.grid.MODE_PASTE;
+use j3.term.grid.MODE_MOUSE_ANY;
+use j3.term.grid.MODE_MOUSE_DRAG;
+use j3.term.grid.MODE_MOUSE_MOVE;
+use j3.term.grid.MODE_MOUSE_SGR;
+use j3.term.grid.MODE_KITTY_MASK;
+use j3.term.grid.KITTY_ALL_AS_ESCAPES;
+use j3.term.grid.KITTY_ALTERNATE_KEYS;
+use j3.term.grid.KITTY_EVENT_TYPES;
+use j3.term.grid.KITTY_TEXT;
+use j3.term.grid.kittyFlags;
+use j3.term.decodeUtf8;
+use j3.term.pushUtf8;
+use j3.text.Text;
+
+pub const KEY_NONE = 0;
+/// A character: `Event.cp` is its code point.
+pub const KEY_CHAR = 1;
+pub const KEY_ENTER = 2;
+pub const KEY_TAB = 3;
+pub const KEY_BACKSPACE = 4;
+pub const KEY_ESC = 5;
+pub const KEY_UP = 6;
+pub const KEY_DOWN = 7;
+pub const KEY_LEFT = 8;
+pub const KEY_RIGHT = 9;
+pub const KEY_HOME = 10;
+pub const KEY_END = 11;
+pub const KEY_PGUP = 12;
+pub const KEY_PGDN = 13;
+pub const KEY_INSERT = 14;
+pub const KEY_DELETE = 15;
+/// `KEY_F1 + n - 1` is Fn, n in 1..=12.
+pub const KEY_F1 = 16;
+pub const KEY_F12 = 27;
+
+pub const MOD_SHIFT = 1;
+pub const MOD_ALT = 2;
+pub const MOD_CTRL = 4;
+
+pub const EV_KEY = 1;
+pub const EV_PASTE = 2;
+pub const EV_MOUSE = 3;
+pub const EV_FOCUS = 4;
+
+/// `Event.button` (and `encodeMouse`'s): 0..2 buttons, `MB_NONE` motion with no button, then wheels.
+pub const MB_LEFT = 0;
+pub const MB_MIDDLE = 1;
+pub const MB_RIGHT = 2;
+pub const MB_NONE = 3;
+pub const MB_WHEEL_UP = 4;
+pub const MB_WHEEL_DOWN = 5;
+pub const MB_WHEEL_LEFT = 6;
+pub const MB_WHEEL_RIGHT = 7;
+
+/// `Event.action`.
+pub const MA_PRESS = 0;
+pub const MA_RELEASE = 1;
+pub const MA_MOVE = 2;
+pub const MA_WHEEL = 3;
+
+/// Longest paste kept, in bytes.
+pub const MAX_PASTE = 8388608;
+
+const ESC: u8 = 27;
+const FFFD: i32 = 65533;
+
+/// One decoded input event; which fields mean something depends on `kind`.
+pub struct Event {
+    kind: int = 0;
+    key: int = 0;
+    mods: int = 0;
+    cp: i32 = 0;
+    /// `EV_PASTE`: the pasted bytes, valid until the next `Decoder.next` call.
+    text: string = "";
+    x: int = 0;
+    y: int = 0;
+    button: int = 0;
+    action: int = 0;
+    /// `EV_FOCUS`: gained (true) or lost.
+    on: bool = false;
+}
+
+pub struct Decoder {
+    buf: Text;
+    pos: int;
+    paste: Text;
+    inPaste: bool;
+    /// `nowMs` of the last `feed`.
+    lastFeedMs: int;
+    /// How long an incomplete sequence is held before it is released as keys.
+    escTimeoutMs: int;
+    /// How long an open bracketed paste may go without bytes before it is delivered as is (default 1000).
+    pasteTimeoutMs: int;
+
+    fn new(arena: &Arena): Decoder {
+        return Decoder {
+            buf: Text.new(arena),
+            pos: 0,
+            paste: Text.new(arena),
+            inPaste: false,
+            lastFeedMs: 0,
+            escTimeoutMs: 25,
+            pasteTimeoutMs: 1000,
+        };
+    }
+
+    /// Append input bytes read at time `nowMs` (any monotonic millisecond clock).
+    fn feed(this: &Decoder, bytes: []u8, nowMs: int) {
+        if this.pos >= this.buf.len() {
+            this.buf.clear();
+            this.pos = 0;
+        }
+        this.buf.pushBytes(bytes);
+        this.lastFeedMs = nowMs;
+    }
+
+    /// The next event into `out`; false when more bytes (or the timeout) are needed.
+    fn next(this: &Decoder, nowMs: int, out: &Event): bool {
+        while true {
+            let have = this.buf.len() - this.pos;
+            if this.inPaste {
+                if have > 0 && this.pasteStep(out) {
+                    return true;
+                }
+                if nowMs - this.lastFeedMs < this.pasteTimeoutMs {
+                    return false;
+                }
+                // Unterminated paste: deliver what came (with any held marker prefix) and leave paste mode.
+                this.takePaste(this.buf.len());
+                this.pos = this.buf.len();
+                this.inPaste = false;
+                *out = Event {};
+                out.kind = EV_PASTE;
+                out.text = this.paste.str();
+                return true;
+            }
+            if have <= 0 {
+                return false;
+            }
+            *out = Event {};
+            let n = this.parseAt(this.pos, out);
+            if n == 0 {
+                if nowMs - this.lastFeedMs < this.escTimeoutMs {
+                    return false;
+                }
+                // Timed out: release one byte as a key and carry on with the rest.
+                let b = this.buf.bytes[this.pos];
+                this.pos += 1;
+                out.kind = EV_KEY;
+                if b == ESC {
+                    out.key = KEY_ESC;
+                } else {
+                    out.key = KEY_CHAR;
+                    out.cp = FFFD;
+                }
+                return true;
+            }
+            this.pos += n;
+            if out.kind != 0 {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // In paste: copy bytes up to a possible end marker; true when a paste event is ready.
+    fn pasteStep(this: &Decoder, out: &Event): bool {
+        let end = this.buf.len();
+        let i = this.pos;
+        while i < end {
+            let b = this.buf.bytes[i];
+            if b != ESC {
+                i += 1;
+                continue;
+            }
+            let rest = end - i;
+            let m = markerMatch(this.buf.bytes[i..end]);
+            if m == 6 {
+                this.takePaste(i);
+                this.pos = i + 6;
+                this.inPaste = false;
+                *out = Event {};
+                out.kind = EV_PASTE;
+                out.text = this.paste.str();
+                return true;
+            }
+            if m == rest {
+                // A proper prefix of the marker at the end: wait for the rest.
+                this.takePaste(i);
+                this.pos = i;
+                return false;
+            }
+            i += 1;
+        }
+        this.takePaste(end);
+        this.pos = end;
+        return false;
+    }
+
+    // Move buf[pos..upto] into the paste text (dropped past MAX_PASTE).
+    fn takePaste(this: &Decoder, upto: int) {
+        let room = MAX_PASTE - this.paste.len();
+        let n = upto - this.pos;
+        if n > room {
+            n = room;
+        }
+        if n > 0 {
+            this.paste.pushBytes(this.buf.bytes[this.pos..this.pos + n]);
+        }
+    }
+
+    // Parse one item at byte index `p`: bytes consumed with `out` filled (kind 0 = dropped), 0 = incomplete.
+    fn parseAt(this: &Decoder, p: int, out: &Event): int {
+        let end = this.buf.len();
+        let b = this.buf.bytes[p];
+        if b != ESC {
+            return this.plain(p, out);
+        }
+        if p + 1 >= end {
+            return 0;
+        }
+        let c = this.buf.bytes[p + 1];
+        if c == 91 {
+            return this.csi(p, out);
+        }
+        if c == 79 {
+            if p + 2 >= end {
+                return 0;
+            }
+            let f = this.buf.bytes[p + 2];
+            let k = finalKey(f);
+            if k != KEY_NONE {
+                out.kind = EV_KEY;
+                out.key = k;
+            }
+            return 3;
+        }
+        // ESC then a key: Alt+key (also ESC ESC [ A and so on).
+        let n = this.parseAt(p + 1, out);
+        if n == 0 {
+            return 0;
+        }
+        if out.kind == EV_KEY {
+            out.mods |= MOD_ALT;
+        }
+        return n + 1;
+    }
+
+    // A non-ESC byte: control, ASCII or UTF-8.
+    fn plain(this: &Decoder, p: int, out: &Event): int {
+        let b = this.buf.bytes[p];
+        out.kind = EV_KEY;
+        if b < 32 || b == 127 {
+            controlKey(b, out);
+            return 1;
+        }
+        out.key = KEY_CHAR;
+        if b < 128 {
+            out.cp = i32(b);
+            return 1;
+        }
+        let n = 0;
+        let cp = decodeUtf8(this.buf.str(), p, &n);
+        if n == 0 {
+            return 0;
+        }
+        out.cp = cp;
+        return n;
+    }
+
+    // ESC [ ... at p.
+    fn csi(this: &Decoder, p: int, out: &Event): int {
+        let end = this.buf.len();
+        let i = p + 2;
+        let ps = [0, 0, 0, 0, 0, 0, 0, 0];
+        let np = 0;
+        let cur = 0;
+        let have = false;
+        let marker: u8 = 0;
+        if i < end {
+            let m = this.buf.bytes[i];
+            if m >= 60 && m <= 63 {
+                marker = m;
+                i += 1;
+            }
+        }
+        while true {
+            if i >= end {
+                return 0;
+            }
+            let c = this.buf.bytes[i];
+            if c >= 48 && c <= 57 {
+                if cur < 100000 {
+                    cur = cur * 10 + int(c - 48);
+                }
+                have = true;
+            } else if c == 59 || c == 58 {
+                if np < 8 {
+                    ps[np] = cur;
+                    np += 1;
+                }
+                cur = 0;
+                have = false;
+            } else if c >= 32 && c <= 47 {
+                // Intermediate bytes: no key uses them; drop the sequence.
+            } else {
+                break;
+            }
+            i += 1;
+        }
+        let f = this.buf.bytes[i];
+        if np < 8 && (have || np > 0) {
+            ps[np] = cur;
+            np += 1;
+        }
+        let used = i - p + 1;
+        if f < 64 || f > 126 {
+            // Malformed: a control byte ended it. Drop what came before, keep the byte.
+            return i - p;
+        }
+        let mods = 0;
+        if np >= 2 && ps[1] > 1 {
+            mods = (ps[1] - 1) & 7;
+        }
+        if marker == 60 && (f == 77 || f == 109) && np >= 3 {
+            mouseEvent(ps[0], ps[1], ps[2], f == 109, out);
+            return used;
+        }
+        if marker != 0 {
+            return used;
+        }
+        if f == 73 || f == 79 {
+            out.kind = EV_FOCUS;
+            out.on = f == 73;
+        } else if f == 90 {
+            out.kind = EV_KEY;
+            out.key = KEY_TAB;
+            out.mods = MOD_SHIFT;
+        } else if f == 126 {
+            let k = tildeKey(if np > 0 { ps[0] } else { 0 });
+            if np > 0 && ps[0] == 200 {
+                this.inPaste = true;
+                this.paste.clear();
+            } else if k != KEY_NONE {
+                out.kind = EV_KEY;
+                out.key = k;
+                out.mods = mods;
+            }
+        } else {
+            let k = finalKey(f);
+            if k != KEY_NONE {
+                out.kind = EV_KEY;
+                out.key = k;
+                out.mods = mods;
+            }
+        }
+        return used;
+    }
+}
+
+// The paste end marker `ESC [ 2 0 1 ~`.
+const MARK: [6]int = [27, 91, 50, 48, 49, 126];
+
+// How many bytes of the end marker the slice starts with (6 = all of it).
+fn markerMatch(s: []u8): int {
+    let n = 0;
+    while n < 6 && n < s.len && int(s[n]) == MARK[n] {
+        n += 1;
+    }
+    return n;
+}
+
+fn controlKey(b: u8, out: &Event) {
+    out.key = KEY_CHAR;
+    if b == 127 {
+        out.key = KEY_BACKSPACE;
+    } else if b == 13 {
+        out.key = KEY_ENTER;
+    } else if b == 9 {
+        out.key = KEY_TAB;
+    } else if b == 8 {
+        out.key = KEY_BACKSPACE;
+        out.mods = MOD_CTRL;
+    } else if b == 0 {
+        out.cp = 32;
+        out.mods = MOD_CTRL;
+    } else if b <= 26 {
+        out.cp = i32(b) + 96;
+        out.mods = MOD_CTRL;
+    } else {
+        // 0x1c..0x1f (0x1b is handled by the caller): Ctrl+\ ] ^ _
+        out.cp = i32(b) + 64;
+        out.mods = MOD_CTRL;
+    }
+}
+
+// Final byte of `CSI A`, `SS3 A`: arrows, Home, End, F1-F4 (`P..S`); KEY_NONE otherwise.
+fn finalKey(f: u8): int {
+    if f == 65 { return KEY_UP; }
+    if f == 66 { return KEY_DOWN; }
+    if f == 67 { return KEY_RIGHT; }
+    if f == 68 { return KEY_LEFT; }
+    if f == 72 { return KEY_HOME; }
+    if f == 70 { return KEY_END; }
+    if f >= 80 && f <= 83 { return KEY_F1 + int(f - 80); }
+    return KEY_NONE;
+}
+
+// The final byte of an arrow, Home or End key.
+fn keyFinal(key: int): u8 {
+    if key == KEY_UP { return 65; }
+    if key == KEY_DOWN { return 66; }
+    if key == KEY_RIGHT { return 67; }
+    if key == KEY_LEFT { return 68; }
+    if key == KEY_HOME { return 72; }
+    return 70;
+}
+
+// `CSI n ~` codes.
+fn tildeKey(n: int): int {
+    if n == 1 || n == 7 { return KEY_HOME; }
+    if n == 4 || n == 8 { return KEY_END; }
+    if n == 2 { return KEY_INSERT; }
+    if n == 3 { return KEY_DELETE; }
+    if n == 5 { return KEY_PGUP; }
+    if n == 6 { return KEY_PGDN; }
+    if n >= 11 && n <= 15 { return KEY_F1 + n - 11; }
+    if n >= 17 && n <= 21 { return KEY_F1 + 5 + n - 17; }
+    if n == 23 || n == 24 { return KEY_F1 + 10 + n - 23; }
+    return KEY_NONE;
+}
+
+// `CSI n ~` code of F1..F12 (0 for F1-F4, which use SS3).
+const F_TILDE: [12]int = [0, 0, 0, 0, 15, 17, 18, 19, 20, 21, 23, 24];
+
+// The `~` code of a key (0 when it has none).
+fn tildeCode(key: int): int {
+    if key == KEY_INSERT { return 2; }
+    if key == KEY_DELETE { return 3; }
+    if key == KEY_PGUP { return 5; }
+    if key == KEY_PGDN { return 6; }
+    if key >= KEY_F1 && key <= KEY_F12 { return F_TILDE[key - KEY_F1]; }
+    return 0;
+}
+
+// SGR mouse: `b` is the button code, `x`/`y` 1-based.
+fn mouseEvent(b: int, x: int, y: int, release: bool, out: &Event) {
+    out.kind = EV_MOUSE;
+    out.x = if x > 0 { x - 1 } else { 0 };
+    out.y = if y > 0 { y - 1 } else { 0 };
+    out.mods = (if (b & 4) != 0 { MOD_SHIFT } else { 0 }) | (if (b & 8) != 0 { MOD_ALT } else { 0 }) | (if (b & 16) != 0 { MOD_CTRL } else { 0 });
+    if (b & 64) != 0 {
+        out.action = MA_WHEEL;
+        out.button = MB_WHEEL_UP + (b & 3);
+    } else {
+        out.button = b & 3;
+        out.action = if release { MA_RELEASE } else if (b & 32) != 0 { MA_MOVE } else { MA_PRESS };
+    }
+}

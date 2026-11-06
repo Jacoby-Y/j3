@@ -1,0 +1,363 @@
+// The VM: register stack, call frames, upvalues, errors and limits, and the entry that calls a
+// function from J3 (`invoke`). The dispatch loop is `vm_exec.j3`, operators and indexing `vm_ops.j3`. Part of `j3.j2`.
+//
+// Nothing here is global: a native may call back into the VM (`callValue` runs a nested
+// `execute` that stops at its own frame), and two `Vm`s never share state. Everything the VM
+// allocates while running comes from its `Heap`.
+
+module j3.j2;
+
+/// A script error. `chunk` is the name the script was loaded under (a fixed string: it stays
+/// valid). `message` is the whole text, `file:line:col: what` when the error has a position, and
+/// `trace` is up to 8 lines `at fn name (chunk:line)`, innermost first. Those two are views into
+/// the VM, valid until its next error: copy them (into a `j3.text.Text`) to keep them longer.
+pub struct Error {
+    chunk: string;
+    line: int;
+    col: int;
+    message: string;
+    trace: string;
+}
+
+/// One active script call. `ret` is the stack slot its result goes to.
+pub struct Frame {
+    cl: ptr;
+    pc: int;
+    base: int;
+    ret: int;
+}
+
+/// Lines in `Error.trace`.
+const TRACE_FRAMES: int = 8;
+
+/// Host calls nested through natives (native -> script -> native ...), each a J3 call of
+/// `execute`; deeper is `stack overflow` so a native recursing through `vm.call` can't exhaust
+/// the J3 stack whatever `Limits.maxDepth` says.
+const MAX_HOST_NESTING: int = 100;
+
+/// A function the host bound with `vm.bind`; a `T_NATIVE` value's `bits` is its index in `Vm.natives`.
+pub struct Native {
+    f: fn(&Vm, Args): Value;
+    /// The bound name (a fixed string), for argument errors.
+    name: Value;
+}
+
+pub struct Vm {
+    /// Stable address (allocated once from the host's arena), so `Buf`s can point at it.
+    heap: &Heap;
+    /// Registers of every frame; `stack.len` is the capacity. Frames and open upvalues hold
+    /// indices, so growing it moves nothing that matters.
+    stack: []Value;
+    /// First free slot above the running frame's registers.
+    top: int;
+    frames: []Frame;
+    nframes: int;
+    /// Open upvalues, highest stack index first.
+    open: ptr;
+    /// Host names (natives and values) a script reads with `OP_GETGLOBAL` and the dot fallback.
+    globals: Value;
+    natives: []Native;
+    nnatives: int;
+    /// The host's own pointer; natives read it back (`vm.host as &World`).
+    host: ptr;
+    /// How `use name;` finds a script: returns its exports table, or `vm.raise`s.
+    resolver: fn(ptr, &Vm, string): Value;
+    resolverCtx: ptr;
+    /// Chunk names being loaded, outermost first (for `use` cycles).
+    loading: []Value;
+    nloading: int;
+    /// `LIB_*` bits already opened.
+    libs: int;
+    /// Limits (`Limits`, defaults filled in).
+    maxDepth: int;
+    stepsPerCall: int;
+    memLimit: int;
+    /// Steps left in the current host call (backward jumps and calls count).
+    budget: int;
+    /// Host calls (`call`, `loadString`, ...) in progress, nested through natives.
+    callDepth: int;
+    /// A native (or the resolver) called `vm.raise`; the error text is pending.
+    raised: bool;
+    /// Scratch for strings built at runtime (`+`, templates) and `args.joined`.
+    sb: Buf;
+    joinBuf: Buf;
+    /// The pending error: what went wrong, then the full message and trace built from it.
+    errBuf: Buf;
+    msgBuf: Buf;
+    traceBuf: Buf;
+    errFile: string;
+    err: Error;
+    /// `err` already has its position (set by the innermost frame that failed).
+    located: bool;
+    /// GC (`gc.j3`): natives' temporaries (`protect`), the mark work list, compiles running
+    /// (no collection then), collect at every safe point, the size that triggers the next one.
+    temps: []Value;
+    ntemps: int;
+    gray: []int;
+    ngray: int;
+    gcPause: int;
+    gcStress: bool;
+    nextGc: int;
+    collections: int;
+    /// `pick` / `rand` state (`vm.seed`).
+    rng: int;
+}
+
+extend Vm {
+    /// Give back all script memory. The VM is unusable after this.
+    fn destroy(this: &Vm) { this.heap.destroy(); }
+
+    // ---- errors ----
+
+    /// Start a new error message; append to the returned buffer, then return false.
+    fn errText(this: &Vm): &Buf {
+        this.errBuf.clear();
+        this.located = false;
+        return &this.errBuf;
+    }
+
+    /// An error with message `msg`; always false.
+    fn fail(this: &Vm, msg: string): bool {
+        this.errText().pushStr(msg);
+        return false;
+    }
+
+    /// Give the pending error the position of frame `fi`'s instruction before `pc`, and the trace
+    /// from there down (once: an error from a nested call keeps its own). Always false.
+    fn failAt(this: &Vm, fi: int, pc: int): bool {
+        if this.located { return false; }
+        this.located = true;
+        let p = (this.frames[fi].cl as &Closure).protoOf();
+        let at = p.linesOf()[if pc > 0 { pc - 1 } else { 0 }];
+        this.err.line = at >> 32;
+        this.err.col = at & 0xffffffff;
+        this.err.chunk = textOf(p.chunk);
+        this.errFile = textOf(p.file);
+        let t = &this.traceBuf;
+        t.clear();
+        let j = fi;
+        while j >= 0 && fi - j < TRACE_FRAMES {
+            let q = (this.frames[j].cl as &Closure).protoOf();
+            let qpc = if j == fi { pc } else { this.frames[j].pc };
+            if j != fi { t.push(10); }
+            t.pushStr("at fn ");
+            t.pushStr(if q.name.tag == T_STR { textOf(q.name) } else { "(anonymous)" });
+            t.pushStr(" (");
+            t.pushStr(textOf(q.chunk));
+            t.push(58);
+            t.pushInt(q.linesOf()[if qpc > 0 { qpc - 1 } else { 0 }] >> 32);
+            t.push(41);
+            j -= 1;
+        }
+        return false;
+    }
+
+    /// The pending error as a value (its strings are views; see `Error`).
+    fn error(this: &Vm): Error {
+        if !this.located {
+            this.err.chunk = "";
+            this.err.line = 0;
+            this.err.col = 0;
+            this.errFile = "";
+            this.traceBuf.clear();
+        }
+        let m = &this.msgBuf;
+        m.clear();
+        if this.err.line > 0 {
+            m.pushStr(this.errFile);
+            m.push(58);
+            m.pushInt(this.err.line);
+            m.push(58);
+            m.pushInt(this.err.col);
+            m.pushStr(": ");
+        }
+        m.pushStr(this.errBuf.str());
+        this.err.message = m.str();
+        this.err.trace = this.traceBuf.str();
+        return this.err;
+    }
+
+    /// Charge `n` units of native work (bytes read or built, values moved) to the step budget,
+    /// 256 per step, so `stepsPerCall` bounds what natives do too. False with `took too long`
+    /// pending; a native then sets `raised` (`chargeNative`).
+    fn charge(this: &Vm, n: int): bool {
+        this.budget -= n >> 8;
+        return this.budget >= 0 || this.tooLong();
+    }
+
+    /// `charge` from inside a native: false with the native failed.
+    fn chargeNative(this: &Vm, n: int): bool {
+        if this.charge(n) { return true; }
+        this.raised = true;
+        return false;
+    }
+
+    /// Out of steps: `took too long (over N steps)`. Always false.
+    fn tooLong(this: &Vm): bool {
+        let t = this.errText();
+        t.pushStr("took too long (over ");
+        t.pushInt(this.stepsPerCall);
+        t.pushStr(" steps)");
+        return false;
+    }
+
+    /// True (with `out of script memory` pending) when the heap is past `Limits.heapBytes`. Called
+    /// right after an op that allocated stored its result (an op that allocated nothing never
+    /// fails here, so code that doesn't allocate keeps running at the cap), so every live value is reachable: the
+    /// place where a collection (chunk D) runs before giving up.
+    fn memFull(this: &Vm): bool {
+        let b = this.heap.bytes;
+        if this.gcPause == 0 && (this.gcStress || b > this.nextGc || b > this.memLimit) { this.collect(); }
+        if this.heap.bytes <= this.memLimit { return false; }
+        this.fail("out of script memory");
+        return true;
+    }
+
+    // ---- stack and frames ----
+
+    /// Room for slots below `n`.
+    fn ensureStack(this: &Vm, n: int) {
+        if n <= this.stack.len { return; }
+        let cap = this.stack.len * 2;
+        if cap < n { cap = n; }
+        let next: []Value = @slice(this.heap.allocRaw(cap * @sizeof(Value)), cap);
+        for i in 0..this.stack.len { next[i] = this.stack[i]; }
+        this.heap.freeRaw(this.stack.ptr as ptr, this.stack.len * @sizeof(Value));
+        this.stack = next;
+    }
+
+    /// Push a frame for closure `f` whose arguments are `nargs` slots at `argBase`; its result
+    /// goes to `ret`. False past `maxDepth` (`stack overflow`), the step budget, or the heap cap.
+    fn pushFrame(this: &Vm, f: Value, argBase: int, nargs: int, ret: int): bool {
+        if this.nframes >= this.maxDepth { return this.fail("stack overflow"); }
+        this.budget -= 1;
+        if this.budget < 0 { return this.tooLong(); }
+        let cl = closureOf(f);
+        let p = cl.protoOf();
+        let before = this.heap.bytes;
+        this.ensureStack(argBase + p.maxStack + 1);
+        // missing parameters are nil. The other registers are written before they are read, and a
+        // stale value there is safe: the stack starts zeroed (nil), and every collection nils the
+        // slots above `top`, so a slot holds either nil or an object that is still alive.
+        for i in nargs..p.nparams { this.stack[argBase + i] = nilv(); }
+        if this.nframes == this.frames.len {
+            let n = this.frames.len * 2;
+            let next: []Frame = @slice(this.heap.allocRaw(n * @sizeof(Frame)), n);
+            for i in 0..this.frames.len { next[i] = this.frames[i]; }
+            this.heap.freeRaw(this.frames.ptr as ptr, this.frames.len * @sizeof(Frame));
+            this.frames = next;
+        }
+        this.frames[this.nframes] = Frame { cl: cl as ptr, pc: 0, base: argBase, ret: ret };
+        this.nframes += 1;
+        this.top = argBase + p.maxStack;
+        if this.heap.bytes > before && this.memFull() {
+            this.nframes -= 1;
+            return false;
+        }
+        return true;
+    }
+
+    /// Call `f` with `nargs` arguments at `argBase`, result to `ret`. A closure gets a frame (the
+    /// caller then runs it); a native runs now. False with the error pending.
+    fn callAt(this: &Vm, f: Value, argBase: int, nargs: int, ret: int): bool {
+        if f.tag == T_FN { return this.pushFrame(f, argBase, nargs, ret); }
+        if f.tag == T_NATIVE { return this.callNative(f.bits, argBase, nargs, ret); }
+        let t = this.errText();
+        t.pushStr("can't call ");
+        t.pushStr(typeName(f));
+        return false;
+    }
+
+    /// Run native `id` on `stack[argBase..argBase+nargs]`. It fails when it called `vm.raise`
+    /// (an argument getter does that on a wrong type); its return value is dropped then.
+    fn callNative(this: &Vm, id: int, argBase: int, nargs: int, ret: int): bool {
+        let nat = this.natives[id];
+        let outer = this.raised;
+        this.raised = false;
+        let before = this.heap.bytes;
+        let mark = this.ntemps;
+        let f = nat.f;
+        let r = f(this, Args { vm: this, base: argBase, n: nargs, id: id });
+        let failed = this.raised;
+        this.raised = outer;
+        this.ntemps = mark;
+        if failed { return false; }
+        this.stack[ret] = r;
+        return this.heap.bytes <= before || !this.memFull();
+    }
+
+    /// Call `f(args)` from J3 (or from a native) and run it to the end. With `withThis`, a script
+    /// fn whose first parameter is `this` gets `self` before `args`. Re-entrant. On an error the
+    /// frames, open upvalues and `top` go back to how they were.
+    fn invoke(this: &Vm, f: Value, self: Value, withThis: bool, args: []Value): Result<Value, Error> {
+        if this.callDepth == 0 {
+            this.raised = false;
+            this.budget = this.stepsPerCall;
+        }
+        // a native that already raised gets its own error back instead of running more script
+        if this.raised { return Result.Err(this.error()); }
+        if this.callDepth >= MAX_HOST_NESTING {
+            this.fail("stack overflow");
+            return Result.Err(this.error());
+        }
+        let savedFrames = this.nframes;
+        let savedTop = this.top;
+        let at = this.top;
+        let pass = withThis && f.tag == T_FN && (closureOf(f).protoOf().flags & parse.F_THIS) != 0;
+        let n = args.len + if pass { 1 } else { 0 };
+        this.ensureStack(at + 1 + n);
+        this.stack[at] = f;
+        if pass { this.stack[at + 1] = self; }
+        let first = at + 1 + n - args.len;
+        for i in 0..args.len { this.stack[first + i] = args[i]; }
+        this.top = at + 1 + n;
+        this.callDepth += 1;
+        let ok = this.callAt(f, at + 1, n, at);
+        if ok && f.tag == T_FN { ok = execute(this, savedFrames); }
+        this.callDepth -= 1;
+        // the host's own temporaries (`protect` outside a native) last until its call ends
+        if this.callDepth == 0 { this.ntemps = 0; }
+        if !ok {
+            this.closeUps(at);
+            this.nframes = savedFrames;
+            this.top = savedTop;
+            return Result.Err(this.error());
+        }
+        this.top = savedTop;
+        return Result.Ok(this.stack[at]);
+    }
+
+    /// `f(args)`; see `invoke`.
+    fn callValue(this: &Vm, f: Value, args: []Value): Result<Value, Error> {
+        return this.invoke(f, nilv(), false, args);
+    }
+
+    // ---- upvalues ----
+
+    /// The open upvalue for stack slot `idx`, made if there is none yet.
+    fn findUp(this: &Vm, idx: int): ptr {
+        let prev = 0 as ptr;
+        let u = this.open;
+        while u != 0 as ptr && (u as &Upval).idx > idx {
+            prev = u;
+            u = (u as &Upval).next;
+        }
+        if u != 0 as ptr && (u as &Upval).idx == idx { return u; }
+        let n = this.heap.newObject(OBJ_UPVAL, @sizeof(Upval));
+        let nu = n as &Upval;
+        nu.idx = idx;
+        nu.next = u;
+        if prev == 0 as ptr { this.open = n; } else { (prev as &Upval).next = n; }
+        return n;
+    }
+
+    /// Close every open upvalue at stack slot `level` or above: it keeps the current value.
+    fn closeUps(this: &Vm, level: int) {
+        while this.open != 0 as ptr && (this.open as &Upval).idx >= level {
+            let u = this.open as &Upval;
+            u.v = this.stack[u.idx];
+            u.idx = -1;
+            this.open = u.next;
+        }
+    }
+}

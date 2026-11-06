@@ -1,0 +1,227 @@
+// Tests for j3.term.tty and j3.term.screen. The Screen draws to a pipe; the bytes `flush` writes are replayed into a
+// second Grid and must equal the Screen's back buffer after every frame (cells, styles, widths). Also: diff size,
+// clipping, wide characters over narrow ones and back, resize, the bottom-right cell, raw mode failing on a pipe, and the
+// exit hook (a forked child opens a Screen and panics; the tty restore sequences must reach the pipe).
+//   timeout 60 j3c run j3c/stdlib/tests/term_screen_test.j3
+// Panics on the first failed check.
+
+module term_screen_test;
+
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.memory.List;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.sys.panic;
+use j3.term.ATTR_BOLD;
+use j3.term.ATTR_DIM;
+use j3.term.ATTR_ITALIC;
+use j3.term.ATTR_UNDERLINE;
+use j3.term.Cell;
+use j3.term.Color;
+use j3.term.Style;
+use j3.term.ansi.Parser;
+use j3.term.ansi.feed;
+use j3.term.grid.Grid;
+use j3.term.input.Event;
+use j3.term.screen;
+use j3.term.screen.Screen;
+use j3.term.tty;
+use j3.term.tty.Raw;
+use j3.text.Text;
+use j3.text.contains;
+
+fn ok(cond: bool, msg: string) {
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic(msg);
+    }
+}
+
+fn st(fg: Color, bg: Color, attr: int): Style {
+    return Style { fg: fg, bg: bg, attr: u16(attr) };
+}
+
+/// Everything waiting in the pipe, appended to `out`.
+fn drain(fd: int, out: &Text, buf: []u8) {
+    while true {
+        let n = tty.readFd(fd, buf, 0);
+        if n <= 0 {
+            break;
+        }
+        out.pushBytes(buf[0..n]);
+    }
+}
+
+fn openOrDie(fd: int, cols: int, rows: int, a: &Arena): Screen {
+    match Screen.openFds(-1, fd, cols, rows, a) {
+        Result.Ok(v) { return v; }
+        Result.Err(_) { panic("open failed"); }
+    }
+    return openOrDie(fd, cols, rows, a);
+}
+
+fn norm(cp: i32): i32 {
+    return if cp == 0 { 32 } else { cp };
+}
+
+/// Feed the pipe into the replay grid and assert it matches the screen's back buffer cell for cell.
+fn verify(s: &Screen, g: &Grid, p: &Parser, rd: int, buf: []u8, a: &Arena, what: string) {
+    let t = Text.new(a);
+    drain(rd, &t, buf);
+    p.feed(t.str(), g);
+    ok(g.cols() == s.cols() && g.rows() == s.rows(), `{what}: size`);
+    ok(g.scrollbackLen() == 0, `{what}: nothing scrolled`);
+    for y in 0..s.rows() {
+        for x in 0..s.cols() {
+            let want = s.cell(x, y);
+            let got = g.cell(x, y);
+            if want.width != got.width || got.style != want.style || (want.width != 0 && norm(want.cp) != norm(got.cp)) {
+                printLn(`{what}: cell {x},{y} want cp {want.cp} w {int(want.width)} got cp {got.cp} w {int(got.width)}`);
+                panic("replay differs from the back buffer");
+            }
+        }
+    }
+}
+
+fn main() {
+    let a = Arena.create(4194304);
+    let buf = a.alloc::<u8>(65536);
+    let fds: [2]i32 = [0, 0];
+    ok(sys.pipe(fds[:], 0) == 0, "pipe");
+    let rd = int(fds[0]);
+    let wr = int(fds[1]);
+
+    // tty on a pipe: not a terminal, no size, raw mode refuses, a read times out
+    ok(!tty.isTty(rd), "pipe is not a tty");
+    match tty.size(wr) {
+        Option.Some(_) { panic("pipe has a size"); }
+        Option.None { }
+    }
+    match Raw.enter(rd) {
+        Result.Ok(_) { panic("raw mode on a pipe"); }
+        Result.Err(_) { }
+    }
+    ok(tty.readFd(rd, buf, 10) == 0, "empty pipe times out");
+
+    let s = openOrDie(wr, 40, 12, &a);
+    let g = Grid.new(&a, 40, 12, 0);
+    let p = Parser.new(&a);
+    let d = Style.plain();
+    let red = st(Color.palette(1), Color.default(), ATTR_BOLD);
+    let blue = st(Color.rgb(10, 20, 30), Color.palette(4), ATTR_UNDERLINE | ATTR_ITALIC);
+    let dim = st(Color.palette(200), Color.palette(9), ATTR_DIM);
+
+    // frame 1: styles, box, wide chars, fill, clip, bottom-right
+    s.put(2, 1, "hello world", red);
+    s.put(14, 1, "blue text", blue);
+    s.put(0, 3, "dim and 256", dim);
+    ok(s.put(1, 5, "日本語x", d) == 7, "CJK width");
+    s.box(20, 4, 12, 5, red);
+    s.fill(21, 5, 10, 3, 46, blue);
+    s.clipPush(5, 9, 4, 2);
+    s.put(0, 9, "abcdefghij", d);
+    s.put(7, 10, "日本", d);
+    s.clipPop();
+    ok(s.cell(4, 9).cp == 0 && s.cell(5, 9).cp == 102 && s.cell(8, 9).cp == 105 && s.cell(9, 9).cp == 0, "clip drew columns 5..8");
+    ok(s.cell(7, 10).cp == 0x65E5 && s.cell(8, 10).width == 0 && s.cell(9, 10).cp == 0, "wide cut by the clip dropped");
+    s.put(39, 11, "Z", red);
+    s.setCursor(3, 2, true);
+    ok(s.flush(), "flush 1");
+    let full = s.lastBytes;
+    verify(&s, &g, &p, rd, buf, &a, "frame 1");
+    ok(g.cursorVisible() && g.cursorX() == 3 && g.cursorY() == 2, "cursor shown at 3,2");
+
+    // frame 2: one word changes, far less than a full redraw
+    s.put(8, 1, "WORLD", red);
+    ok(s.flush(), "flush 2");
+    ok(s.lastBytes > 0 && s.lastBytes < 64, `one word diff is small ({s.lastBytes} bytes)`);
+    ok(s.lastBytes * 4 < full, "diff is much smaller than the full redraw");
+    verify(&s, &g, &p, rd, buf, &a, "frame 2");
+
+    // frame 3: nothing changed writes nothing
+    ok(s.flush() && s.lastBytes == 0, "idle flush writes nothing");
+
+    // frame 4: attributes turn off (bold/underline must not stay on), colors back to default
+    s.put(2, 1, "hello", d);
+    s.put(14, 1, "BLUE", st(Color.palette(2), Color.default(), 0));
+    s.setCursor(0, 0, false);
+    ok(s.flush(), "flush 4");
+    verify(&s, &g, &p, rd, buf, &a, "frame 4");
+    ok(!g.cursorVisible(), "cursor hidden");
+
+    // frame 5: a wide char over two narrow ones, a narrow one over half a wide one, wide over wide, wide at an edge
+    s.put(0, 7, "abcdef", d);
+    s.flush();
+    verify(&s, &g, &p, rd, buf, &a, "frame 5a");
+    s.put(1, 7, "日", red);
+    s.put(4, 7, "本", d);
+    s.put(5, 7, "q", d);
+    s.flush();
+    verify(&s, &g, &p, rd, buf, &a, "frame 5b");
+    s.put(1, 7, "xy", d);
+    s.put(2, 5, "本", blue);
+    s.put(38, 3, "日", d);
+    ok(s.cell(38, 3).cp == 0x65E5, "wide fits in the last two columns");
+    s.put(39, 3, "日", d);
+    ok(s.cell(39, 3).cp == 0, "wide in the last column is dropped");
+    s.flush();
+    verify(&s, &g, &p, rd, buf, &a, "frame 5c");
+
+    // frame 6: resize down and back up
+    s.resize(30, 8);
+    g.resize(30, 8);
+    s.put(0, 0, "small", red);
+    s.put(29, 7, "R", blue);
+    s.box(0, 1, 30, 7, d);
+    s.flush();
+    verify(&s, &g, &p, rd, buf, &a, "frame 6 small");
+    s.resize(40, 12);
+    g.resize(40, 12);
+    s.put(5, 5, "big again", dim);
+    s.flush();
+    verify(&s, &g, &p, rd, buf, &a, "frame 6 big");
+
+    // frame 7: every cell changes, then clear
+    for y in 0..12 {
+        s.fill(0, y, 40, 1, i32(33 + y), st(Color.palette(y), Color.palette(15 - y), y & 3));
+    }
+    s.flush();
+    verify(&s, &g, &p, rd, buf, &a, "frame 7");
+    s.clear();
+    s.flush();
+    verify(&s, &g, &p, rd, buf, &a, "frame 7 clear");
+
+    // poll with no input (pipe stdin of a closed fd): returns without events
+    let ev = List<Event>.new(&a);
+    ok(s.poll(0, &ev) == 0, "no events");
+
+    s.close();
+    s.close();
+    let t = Text.new(&a);
+    drain(rd, &t, buf);
+    ok(contains(t.str(), "[?1049l") && contains(t.str(), "[?25h"), "close restores the screen");
+
+    // exit hook: a child opens a Screen and panics; its restore sequences reach the pipe
+    let fds2: [2]i32 = [0, 0];
+    ok(sys.pipe(fds2[:], 0) == 0, "pipe 2");
+    let pid = sys.fork();
+    if pid == 0 {
+        let c = Arena.create(65536);
+        match Screen.openFds(-1, int(fds2[1]), 10, 4, &c) {
+            Result.Ok(_) { }
+            Result.Err(_) { sys.exit(2); }
+        }
+        panic("expected panic in the exit hook test");
+    }
+    ok(pid > 0, "fork");
+    let status: i32 = 0;
+    sys.waitpid(pid, &status, 0);
+    ok(sys.exitCode(status) == 101, "child panicked");
+    let t2 = Text.new(&a);
+    drain(int(fds2[0]), &t2, buf);
+    ok(contains(t2.str(), "[?1049h"), "child entered the alt screen");
+    ok(contains(t2.str(), "[?1049l") && contains(t2.str(), "[?25h") && contains(t2.str(), "[?2004l"), "panic ran the restore");
+    printLn("term_screen_test ok");
+}

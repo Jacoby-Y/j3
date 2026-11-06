@@ -25,6 +25,8 @@ mod binop;
 mod debug;
 mod interp;
 mod rvalue;
+mod half;
+mod simd;
 mod stmt;
 
 pub(super) use debug::*;
@@ -154,9 +156,18 @@ impl<'a> LlvmFn<'a> {
     }
 
     fn exit_abort(&mut self, kind: AbortKind) {
+        self.exit_abort_vals(kind, &[]);
+    }
+
+    /// `vals` are two `i64` SSA values shown in the message (`AbortKind::detail`), or none.
+    fn exit_abort_vals(&mut self, kind: AbortKind, vals: &[String]) {
         if self.terminated {
             return;
         }
+        let (a, b) = match vals {
+            [a, b] if !kind.detail()[0].is_empty() => (a.clone(), b.clone()),
+            _ => ("0".to_string(), "0".to_string()),
+        };
         if let Some(files) = self.abort_files.as_mut() {
             let at = match files.iter().position(|f| *f == self.file) {
                 Some(i) => i,
@@ -166,7 +177,24 @@ impl<'a> LlvmFn<'a> {
                 }
             };
             let packed = (at as u64) << 40 | (self.line as u64) << 8 | kind.code();
-            self.inst(&format!("call void @j3_abort(i64 {packed})"));
+            self.inst(&format!("call void @j3_abort(i64 {packed}, i64 {a}, i64 {b})"));
+            self.inst("unreachable");
+            self.terminated = true;
+            return;
+        }
+        let [da, db] = kind.detail();
+        if !da.is_empty() && !vals.is_empty() {
+            let fmt = format!("{}:{}: {}{da}%lld{db}%lld\n\0", self.file.replace('%', "%%"), self.line, kind.message());
+            let p = self.bytes_global(fmt.as_bytes());
+            let buf = self.fresh();
+            self.inst(&format!("{buf} = alloca [512 x i8], align 1"));
+            let n = self.fresh();
+            self.inst(&format!("{n} = call i32 (ptr, i64, ptr, ...) @snprintf(ptr {buf}, i64 512, ptr {p}, i64 {a}, i64 {b})"));
+            let n64 = self.fresh();
+            self.inst(&format!("{n64} = sext i32 {n} to i64"));
+            let w = self.fresh();
+            self.inst(&format!("{w} = call i64 @write(i32 2, ptr {buf}, i64 {n64})"));
+            self.inst("call void @_exit(i32 102)");
             self.inst("unreachable");
             self.terminated = true;
             return;
@@ -379,13 +407,26 @@ impl<'a> LlvmFn<'a> {
     }
 
     fn emit_defers_through(&mut self, stop_at_loop: bool) -> Result<(), String> {
+        self.emit_defers(if stop_at_loop { Some(0) } else { None })
+    }
+
+    /// Defers of every frame out to (and including) the loop `depth` levels out.
+    fn emit_defers_to_loop(&mut self, depth: u32) -> Result<(), String> {
+        self.emit_defers(Some(depth))
+    }
+
+    fn emit_defers(&mut self, loop_depth: Option<u32>) -> Result<(), String> {
         let mut blocks = Vec::new();
+        let mut loops = 0;
         for frame in self.frames.iter().rev() {
             for b in frame.blocks.iter().rev() {
                 blocks.push(b.clone());
             }
-            if stop_at_loop && frame.is_loop {
-                break;
+            if frame.is_loop {
+                if loop_depth == Some(loops) {
+                    break;
+                }
+                loops += 1;
             }
         }
         for b in blocks {
@@ -396,9 +437,9 @@ impl<'a> LlvmFn<'a> {
         Ok(())
     }
 
-    fn loop_target(&self, cont: bool) -> Result<String, String> {
-        for frame in self.frames.iter().rev() {
-            if frame.is_loop {
+    fn loop_target(&self, cont: bool, depth: u32) -> Result<String, String> {
+        for frame in self.frames.iter().rev().filter(|f| f.is_loop).skip(depth as usize) {
+            {
                 let lab = if cont { &frame.cont } else { &frame.brk };
                 return lab
                     .clone()

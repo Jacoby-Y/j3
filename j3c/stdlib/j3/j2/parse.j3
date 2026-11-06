@@ -1,0 +1,243 @@
+/// The j2 parser: tokens to an AST by recursive descent. Errors are values with the text
+/// `file:line:col: expected X, found Y`; nothing here panics on any input, and nesting deeper
+/// than `MAX_DEPTH` is an error rather than a native stack overflow.
+///
+/// The AST is flat: `Ast.nodes` holds every `Node`, children are node numbers (`a`, `b`, `c`,
+/// -1 for none) or a run of `Ast.kids` (`first`, `count`; read with `ast.kid(n, i)`). Every node
+/// has the `line:col` of its token: the first one of a statement or literal, the operator of a
+/// unary or binary expression, the `.` of a field, the `[` of an index, the `(` of a call.
+/// `print` writes an AST back as source that parses to the same tree.
+///
+/// Shapes (fields not named are unused):
+///   N_CHUNK kids: top-level statements
+///   N_BLOCK kids: statements
+///   N_LET   s: name, a: value or -1, flags: F_PUB, F_CONST (a const always has a value)
+///   N_FNDECL / N_FN  s: name ("" for a literal), kids: N_NAME params, b: N_BLOCK body,
+///           flags: F_PUB (decl), F_THIS (first param is `this`)
+///   N_USE   s: script name
+///   N_ASSIGN op: T_ASSIGN or T_PLUS_EQ.., a: target (N_NAME, N_FIELD or N_INDEX), b: value
+///   N_EXPR  a: expression
+///   N_IF    a: condition, b: N_BLOCK, c: else (N_BLOCK, N_IF) or -1
+///   N_WHILE a: condition, b: N_BLOCK
+///   N_FOR_RANGE  s: variable, a: from, b: to (exclusive), c: N_BLOCK
+///   N_FOR_IN     kids: one N_NAME (value) or two (key or index, value), a: iterable, c: N_BLOCK
+///   N_BREAK, N_CONTINUE
+///   N_RETURN a: value or -1
+///   N_MATCH a: subject, kids: N_ARM (at least one)
+///   N_ARM   a: pattern (N_INT, N_FLOAT, N_STR, N_TRUE, N_FALSE, N_NIL) or -1 for `_`, b: N_BLOCK
+///   N_NIL N_TRUE N_FALSE; N_INT i; N_FLOAT f; N_STR s (escapes applied); N_NAME s
+///   N_TPL   kids: N_STR text, expr, N_STR text, ..., N_STR text (odd kids are the holes)
+///   N_UNARY op: T_MINUS or T_NOT, a
+///   N_BINARY op: T_PLUS .. T_OR (T_AND, T_OR short-circuit), a, b
+///   N_FIELD a: object, s: name
+///   N_INDEX a: object, b: index
+///   N_CALL  a: callee (an N_FIELD callee is a method call: `this` and the dot fallback), kids: args
+///   N_TABLE kids: N_PAIR (s: key, a: value, flags: F_QUOTED when the key was written as a string)
+///   N_ARRAY kids: elements
+
+module j3.j2.parse;
+
+use j3.j2.lex;
+use j3.j2.lex.{ Token, SyntaxError };
+use j3.memory.{ Arena, List };
+use j3.result.Result;
+use j3.text.Text;
+
+pub const N_CHUNK: int = 1;
+pub const N_BLOCK: int = 2;
+pub const N_LET: int = 3;
+pub const N_FNDECL: int = 4;
+pub const N_USE: int = 5;
+pub const N_ASSIGN: int = 6;
+pub const N_EXPR: int = 7;
+pub const N_IF: int = 8;
+pub const N_WHILE: int = 9;
+pub const N_FOR_RANGE: int = 10;
+pub const N_FOR_IN: int = 11;
+pub const N_BREAK: int = 12;
+pub const N_CONTINUE: int = 13;
+pub const N_RETURN: int = 14;
+pub const N_MATCH: int = 15;
+pub const N_ARM: int = 16;
+pub const N_NIL: int = 20;
+pub const N_TRUE: int = 21;
+pub const N_FALSE: int = 22;
+pub const N_INT: int = 23;
+pub const N_FLOAT: int = 24;
+pub const N_STR: int = 25;
+pub const N_NAME: int = 26;
+pub const N_TPL: int = 27;
+pub const N_UNARY: int = 28;
+pub const N_BINARY: int = 29;
+pub const N_FIELD: int = 30;
+pub const N_INDEX: int = 31;
+pub const N_CALL: int = 32;
+pub const N_TABLE: int = 33;
+pub const N_PAIR: int = 34;
+pub const N_ARRAY: int = 35;
+pub const N_FN: int = 36;
+
+pub const F_PUB: int = 1;
+pub const F_CONST: int = 2;
+pub const F_THIS: int = 4;
+pub const F_QUOTED: int = 8;
+
+/// Statements and expressions nested deeper than this are an error.
+pub const MAX_DEPTH: int = 200;
+
+pub struct Node {
+    kind: int;
+    op: int;
+    line: int;
+    col: int;
+    a: int;
+    b: int;
+    c: int;
+    first: int;
+    count: int;
+    flags: int;
+    i: int;
+    f: f64;
+    s: string;
+}
+
+pub struct Ast {
+    file: string;
+    nodes: List<Node>;
+    kids: List<int>;
+    /// The N_CHUNK.
+    root: int;
+
+    fn node(this: &Ast, n: int): &Node { return &this.nodes.items[n]; }
+
+    /// Child `i` of node `n`'s kid list.
+    fn kid(this: &Ast, n: int, i: int): int { return this.kids.items[this.nodes.items[n].first + i]; }
+}
+
+struct Parser {
+    file: string;
+    src: string;
+    mem: &Arena;
+    toks: []Token;
+    at: int;
+    ast: Ast;
+    /// Kid lists under construction, popped into `ast.kids` when done.
+    stack: List<int>;
+    depth: int;
+    failed: bool;
+    err: SyntaxError;
+}
+
+/// Parse `src` (named `file` in errors) into an AST on `mem`.
+pub fn parse(file: string, src: string, mem: &Arena): Result<Ast, SyntaxError> {
+    let toks = lex.lex(file, src, mem)?;
+    let p = Parser {
+        file: file,
+        src: src,
+        mem: mem,
+        toks: toks,
+        at: 0,
+        ast: Ast { file: file, nodes: List<Node>.new(mem), kids: List<int>.new(mem), root: -1 },
+        stack: List<int>.new(mem),
+        depth: 0,
+        failed: false,
+        err: SyntaxError { file: file, line: 0, col: 0, msg: "", text: "" },
+    };
+    let root = p.node(N_CHUNK, p.tok());
+    let mark = p.stack.len;
+    while !p.failed && p.tok().kind != lex.T_EOF {
+        p.stack.push(p.statement(true));
+    }
+    p.closeKids(root, mark);
+    if p.failed {
+        return Result.Err(p.err);
+    }
+    p.ast.root = root;
+    return Result.Ok(p.ast);
+}
+
+extend Parser {
+    fn tok(this: &Parser): Token { return this.toks[this.at]; }
+
+    fn peekKind(this: &Parser, k: int): int {
+        let i = this.at + k;
+        if i >= this.toks.len { i = this.toks.len - 1; }
+        return this.toks[i].kind;
+    }
+
+    /// Step past the current token (never past EOF).
+    fn bump(this: &Parser): Token {
+        let t = this.toks[this.at];
+        if t.kind != lex.T_EOF { this.at += 1; }
+        return t;
+    }
+
+    fn accept(this: &Parser, kind: int): bool {
+        if this.tok().kind == kind {
+            this.bump();
+            return true;
+        }
+        return false;
+    }
+
+    /// Stop with `msg` at `tok`. Only the first error counts.
+    fn failAt(this: &Parser, tok: Token, msg: string) {
+        if this.failed { return; }
+        this.failed = true;
+        this.err = lex.syntaxError(this.mem, this.file, tok.line, tok.col, msg);
+    }
+
+    /// `expected <what>, found <current token>`.
+    fn expected(this: &Parser, what: string) {
+        let t = Text.new(this.mem);
+        t.pushStr("expected ");
+        t.pushStr(what);
+        t.pushStr(", found ");
+        lex.describe(&t, this.src, this.tok());
+        this.failAt(this.tok(), t.str());
+    }
+
+    /// Step past a `kind` token (written `what` in the error) or fail.
+    fn expect(this: &Parser, kind: int, what: string): Token {
+        let t = this.tok();
+        if t.kind != kind {
+            this.expected(what);
+            return t;
+        }
+        return this.bump();
+    }
+
+    fn node(this: &Parser, kind: int, at: Token): int {
+        this.ast.nodes.push(Node { kind: kind, op: 0, line: at.line, col: at.col, a: -1, b: -1, c: -1,
+            first: 0, count: 0, flags: 0, i: 0, f: 0.0, s: "" });
+        return this.ast.nodes.len - 1;
+    }
+
+    fn n(this: &Parser, i: int): &Node { return &this.ast.nodes.items[i]; }
+
+    /// Move `stack[mark..]` into node `n`'s kid list.
+    fn closeKids(this: &Parser, n: int, mark: int) {
+        let first = this.ast.kids.len;
+        for i in mark..this.stack.len { this.ast.kids.push(this.stack.items[i]); }
+        let nd = this.n(n);
+        nd.first = first;
+        nd.count = this.stack.len - mark;
+        this.stack.len = mark;
+    }
+
+    /// Count one level of nesting; false (and an error) past `MAX_DEPTH`.
+    fn enter(this: &Parser): bool {
+        this.depth += 1;
+        if this.depth > MAX_DEPTH {
+            this.failAt(this.tok(), "too deeply nested");
+            return false;
+        }
+        return true;
+    }
+
+    fn name(this: &Parser, what: string): string {
+        let t = this.expect(lex.T_NAME, what);
+        if this.failed { return ""; }
+        return this.src[t.s..t.e];
+    }
+}

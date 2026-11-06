@@ -13,7 +13,13 @@ impl<'a> Lower<'a> {
             return Ok(self.num_from_int(expr.span, v, expected));
         }
         if let ExprKind::Float(v) = expr.kind {
-            return Ok(self.num_from_float(expr.span, v, expected));
+            let op = self.num_from_float(expr.span, v, expected);
+            if let Some(want) = expected {
+                if op.ty() != want {
+                    return Err(self.mismatch(expr.span, "type mismatch", op.ty(), want));
+                }
+            }
+            return Ok(op);
         }
         if let Ok(place) = self.try_place(expr) {
             if self.is_script_value(place.ty) {
@@ -92,6 +98,9 @@ impl<'a> Lower<'a> {
                 if let Some(&id) = self.funcs.get(&n.name) {
                     let fty = self.cx.func(id).ty;
                     if let Some(want) = expected {
+                        if let Some(rv) = self.fn_to_closure(expr.span, id, want)? {
+                            return Ok(rv);
+                        }
                         if want != fty {
                             return Err(CheckError::new(
                                 self.path,
@@ -217,13 +226,21 @@ impl<'a> Lower<'a> {
                 args,
             } => self.call(expr.span, func, type_args, args, expected),
             ExprKind::Syscall { args } => self.syscall(expr.span, args),
-            ExprKind::Atomic { op, args } => self.atomic(expr.span, *op, args),
+            ExprKind::Atomic { op, order, args } => self.atomic(expr.span, *op, *order, args),
             ExprKind::Cast { expr: inner, ty } => {
                 let to = self.resolve_ty(ty)?;
                 let from = self.operand(inner, None)?;
+                if self.cx.closure_sig(from.ty()).is_some() || self.cx.closure_sig(to).is_some() {
+                    return Err(CheckError::new(self.path, expr.span, "a closure cannot be cast")
+                        .help("a closure carries its captures; pass it to a `closure(..)` parameter instead of converting it"));
+                }
+                self.half_cast(expr.span, to, &from)?;
                 Ok(Rvalue::cast(expr.span, to, from))
             }
-            ExprKind::Binary { op, lhs, rhs } => self.binary(expr.span, *op, lhs, rhs, expected),
+            ExprKind::Binary { op, lhs, rhs } => {
+                let rv = self.binary(expr.span, *op, lhs, rhs, expected)?;
+                self.half_guard(expr.span, rv)
+            }
             ExprKind::If {
                 cond,
                 then_expr,
@@ -262,21 +279,44 @@ impl<'a> Lower<'a> {
             }
             ExprKind::Unary { op, expr: inner } => match op {
                 parse::UnaryOp::Neg => {
+                    if let (ExprKind::Float(v), Some(t)) = (&inner.kind, expected) {
+                        if self.is_half(t) {
+                            return Ok(Rvalue::use_op(expr.span, self.half_const(expr.span, -*v)));
+                        }
+                    }
                     let arg = self.operand(inner, expected)?;
-                    if !is_numeric(self.cx, arg.ty()) {
+                    if self.is_half(arg.ty()) {
+                        return Err(self.half_error(expr.span, "unary `-`"));
+                    }
+                    if !is_numeric(self.cx, arg.ty()) && !is_vec(self.cx, arg.ty()) {
                         return Err(CheckError::new(
                             self.path,
                             expr.span,
                             "unary `-` needs a number",
                         ));
                     }
-                    Ok(Rvalue {
+                    self.half_guard(expr.span, Rvalue {
                         ty: arg.ty(),
                         span: expr.span,
                         kind: RvalueKind::Unary {
                             op: UnaryOp::Neg,
                             arg,
                         },
+                    })
+                }
+                parse::UnaryOp::BitNot => {
+                    let arg = self.operand(inner, expected)?;
+                    if !is_int(self.cx, arg.ty()) && arg.ty() != self.cx.common.vec4i {
+                        return Err(CheckError::new(
+                            self.path,
+                            expr.span,
+                            "unary `~` takes an integer; use `!` for bools",
+                        ));
+                    }
+                    Ok(Rvalue {
+                        ty: arg.ty(),
+                        span: expr.span,
+                        kind: RvalueKind::Unary { op: UnaryOp::BitNot, arg },
                     })
                 }
                 parse::UnaryOp::Not => {
@@ -302,6 +342,7 @@ impl<'a> Lower<'a> {
                     }
                     // ponytail: `&` of a spilled temp acts like `&local` (the language does not stop a local's address escaping either).
                     let place = self.place(inner)?;
+                    reject_closure(self.cx, self.path, expr.span, place.ty, "borrowed with `&`")?;
                     if !place.access.take_ref || !place.access.assign {
                         return Err(CheckError::new(
                             self.path,
@@ -325,6 +366,7 @@ impl<'a> Lower<'a> {
                 "a script type is not a value",
             )),
             ExprKind::ScriptLit { path, fields } => self.script_lit(expr.span, path, fields),
+            ExprKind::Closure(lit) => self.closure_lit(expr.span, lit, expected),
         }
     }
 
@@ -397,164 +439,5 @@ impl<'a> Lower<'a> {
             span,
             Rvalue::binary(span, self.cx.common.bool, BinOp::And, lhs, rhs),
         )
-    }
-
-    pub(super) fn interpolate(&mut self, span: Span, parts: &[InterpPart]) -> Result<Rvalue, CheckError> {
-        if let Some(bytes) = self.fold_interp(parts) {
-            return Ok(Rvalue::use_op(
-                span,
-                Operand::bytes(span, self.cx.common.string, &bytes),
-            ));
-        }
-        let mut ir_parts = Vec::new();
-        for part in parts {
-            match part {
-                InterpPart::Lit(b) => {
-                    ir_parts.push(crate::ir::rvalue::InterpPart::Lit(b.clone()));
-                }
-                InterpPart::Expr(e) => {
-                    let op = self.operand(e, None)?;
-                    if !self.interp_ok(op.ty()) {
-                        return Err(CheckError::new(
-                            self.path,
-                            e.span,
-                            "this value cannot appear in interpolate (need primitive, string, or #[Debug])",
-                        ));
-                    }
-                    ir_parts.push(crate::ir::rvalue::InterpPart::Value(op));
-                }
-            }
-        }
-        let cap = crate::ir::wrap::INTERP_CAP;
-        let buf_ty = self.cx.ty_array(self.cx.common.u8, cap);
-        let buf_n = self.fresh("ibuf");
-        let buf_id = self.b.tmp(buf_n, buf_ty, span);
-        let buf = self.b.local_place(buf_id, span);
-        let used_n = self.fresh("in");
-        let used_id = self.b.tmp(used_n, self.cx.common.int, span);
-        let used = self.b.local_place(used_id, span);
-        self.b.assign(
-            span,
-            used.clone(),
-            Rvalue::use_op(span, Operand::int(span, self.cx.common.int, 0)),
-        );
-        self.b.push(crate::ir::stmt::Stmt {
-            ty: self.cx.common.void,
-            span,
-            kind: crate::ir::stmt::StmtKind::InterpFill {
-                buf: buf.clone(),
-                used: used.clone(),
-                parts: ir_parts,
-            },
-        });
-        let start = self.b.index(
-            self.cx,
-            buf,
-            Operand::int(span, self.cx.common.int, 0),
-            span,
-        );
-        let ptr_ty = self.cx.ty_ref(self.cx.common.u8);
-        let ptr_n = self.fresh("iptr");
-        let ptr_id = self.b.tmp(ptr_n, ptr_ty, span);
-        let ptr_place = self.b.local_place(ptr_id, span);
-        self.b.assign(span, ptr_place.clone(), Rvalue::ref_place(span, ptr_ty, start));
-        Ok(Rvalue::aggregate(
-            span,
-            self.cx.common.string,
-            vec![Operand::Copy(ptr_place), Operand::Copy(used)],
-        ))
-    }
-
-    pub(super) fn fold_interp(&self, parts: &[InterpPart]) -> Option<Vec<u8>> {
-        let mut out = Vec::new();
-        for part in parts {
-            match part {
-                InterpPart::Lit(b) => out.extend(b),
-                InterpPart::Expr(e) => match self.fold_interp_expr(e) {
-                    Some(b) => out.extend(b),
-                    None => return None,
-                },
-            }
-        }
-        Some(out)
-    }
-
-    pub(super) fn fold_interp_expr(&self, expr: &Expr) -> Option<Vec<u8>> {
-        if let Some(v) = self.fold_int(expr) {
-            return Some(v.to_string().into_bytes());
-        }
-        match &expr.kind {
-            ExprKind::String(b) => Some(b.clone()),
-            ExprKind::Bool(v) => Some(if *v {
-                b"true".to_vec()
-            } else {
-                b"false".to_vec()
-            }),
-            ExprKind::Name(n) => match self.consts.get(&n.name) {
-                Some(ConstVal {
-                    kind: ConstPayload::String(b),
-                    ..
-                }) => Some(b.clone()),
-                Some(ConstVal {
-                    kind: ConstPayload::Int(v),
-                    ..
-                }) => Some(v.to_string().into_bytes()),
-                Some(ConstVal {
-                    kind: ConstPayload::Float(v),
-                    ..
-                }) => Some(v.to_string().into_bytes()),
-                Some(ConstVal {
-                    kind: ConstPayload::Bool(v),
-                    ..
-                }) => Some(if *v { b"true".to_vec() } else { b"false".to_vec() }),
-                None => None,
-            },
-            _ => None,
-        }
-    }
-
-    pub(super) fn interp_ok(&self, ty: Ty) -> bool {
-        if ty == self.cx.common.string || ty == self.cx.common.bool {
-            return true;
-        }
-        if is_int(self.cx, ty) || is_float(self.cx, ty) {
-            return true;
-        }
-        match self.cx.ty_kind(ty) {
-            TyKind::Struct(id) => self.cx.struct_def(*id).debug,
-            _ => false,
-        }
-    }
-
-    pub(super) fn text_to_string(
-        &mut self,
-        span: Span,
-        place: &Place,
-        want: Ty,
-    ) -> Result<Option<Operand>, CheckError> {
-        if want != self.cx.common.string {
-            return Ok(None);
-        }
-        let sid = match self.cx.ty_kind(place.ty) {
-            TyKind::Struct(id) => *id,
-            _ => return Ok(None),
-        };
-        if self.cx.name_str(self.cx.struct_def(sid).name) != "Text" {
-            return Ok(None);
-        }
-        let path = match field_path(self.cx, sid, "bytes") {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        let mut p = place.clone();
-        for fid in path {
-            p = self.b.field(self.cx, p, fid, span);
-        }
-        let rv = Rvalue::cast(span, want, Operand::Copy(p));
-        let n = self.fresh("txt");
-        let id = self.b.tmp(n, want, span);
-        let out = self.b.local_place(id, span);
-        self.b.assign(span, out.clone(), rv);
-        Ok(Some(Operand::Copy(out)))
     }
 }

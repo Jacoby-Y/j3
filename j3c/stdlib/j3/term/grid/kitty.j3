@@ -1,0 +1,572 @@
+/// Kitty graphics protocol of `Grid` (the `ansi.Sink` method `apc`): `ESC _ G keys;base64 ESC \`.
+/// Transmit (`a=t`, `a=T`, `a=q`) direct in chunks (`m=1`), from a file (`t=f`) or a temp file (`t=t`, removed after),
+/// as RGB (`f=24`), RGBA (`f=32`) or PNG (`f=100`), zlib-compressed RGB/RGBA (`o=z`); put (`a=p`) with a source rect
+/// (`x y w h`), cell box (`c r`), cell offset (`X Y`), `z`, `C=1` (cursor stays); delete (`a=d`, `d=a A i I n N c C`).
+/// Replies (`OK`, `ENOENT:...`) go to `reply` when the command named `i` or `I`, quieted by `q`.
+/// Placements are anchored to cells: `KPlace.row` is the screen row of the top (negative once it scrolled into
+/// scrollback) and moves with full-screen scrolls; `View.draw` paints them. Images live in their own arenas and are
+/// freed on delete. The cell size in pixels (`cellPxW`/`cellPxH`, set by the host) sizes placements without `c`/`r`.
+/// ponytail: no shared memory (`t=s`), animation frames, Unicode placeholders, relative placements; partial scroll
+/// regions and resize do not move placements; at most `MAX_IMAGES` images (the oldest is dropped).
+/// Part of `j3.term.grid`.
+
+module j3.term.grid;
+
+/// Most images kept per grid; a new one past this drops the oldest and its placements.
+pub const MAX_IMAGES = 64;
+/// Largest image side in pixels.
+pub const MAX_IMAGE_SIDE = 10000;
+
+/// One transmitted image: RGBA8 pixels in its own arena. `serial` is unique per grid (texture caches key on it).
+pub struct KImage {
+    id: int;
+    num: int;
+    serial: int;
+    w: int;
+    h: int;
+    px: []u8;
+    /// Its own arena (the header sits in the grid's arena: 32 bytes per image, never reused).
+    mem: &Arena;
+}
+
+/// One placement: image `serial`, its cell box (`col`, `row` on the screen it was put on, `cols` x `rows`), the
+/// source rect in image pixels, the drawn size and offset in pixels, and the z order (below text when negative).
+pub struct KPlace {
+    serial: int;
+    pid: int;
+    row: int;
+    col: int;
+    cols: int;
+    rows: int;
+    sx: int;
+    sy: int;
+    sw: int;
+    sh: int;
+    ox: int;
+    oy: int;
+    dw: int;
+    dh: int;
+    z: int;
+    alt: bool;
+}
+
+/// The keys of one graphics command (kitty's letters in the comments).
+struct KCmd {
+    act: u8 = 116;    // a (t)
+    fmt: int = 32;    // f
+    med: u8 = 100;    // t (d)
+    comp: u8 = 0;     // o
+    more: int = 0;    // m
+    id: int = 0;      // i
+    num: int = 0;     // I
+    pid: int = 0;     // p
+    quiet: int = 0;   // q
+    sw: int = 0;      // s
+    sh: int = 0;      // v
+    cols: int = 0;    // c
+    rows: int = 0;    // r
+    x: int = 0;
+    y: int = 0;
+    w: int = 0;
+    h: int = 0;
+    ox: int = 0;      // X
+    oy: int = 0;      // Y
+    z: int = 0;
+    stay: int = 0;    // C
+    del: u8 = 97;     // d (a)
+    size: int = 0;    // S
+    off: int = 0;     // O
+}
+
+fn parseKeys(ctl: string): KCmd {
+    let c = KCmd {};
+    let i = 0;
+    while i < ctl.len {
+        let k = ctl[i];
+        let j = i + 1;
+        if j >= ctl.len || ctl[j] != 61 {
+            while i < ctl.len && ctl[i] != 44 { i += 1; }
+            i += 1;
+            continue;
+        }
+        j += 1;
+        let e = j;
+        while e < ctl.len && ctl[e] != 44 { e += 1; }
+        let v = ctl[j..e];
+        let ch: u8 = if v.len > 0 { v[0] } else { 0 };
+        let n = toInt(v);
+        if k == 97 { c.act = ch; }
+        else if k == 102 { c.fmt = n; }
+        else if k == 116 { c.med = ch; }
+        else if k == 111 { c.comp = ch; }
+        else if k == 109 { c.more = n; }
+        else if k == 105 { c.id = n; }
+        else if k == 73 { c.num = n; }
+        else if k == 112 { c.pid = n; }
+        else if k == 113 { c.quiet = n; }
+        else if k == 115 { c.sw = n; }
+        else if k == 118 { c.sh = n; }
+        else if k == 99 { c.cols = n; }
+        else if k == 114 { c.rows = n; }
+        else if k == 120 { c.x = n; }
+        else if k == 121 { c.y = n; }
+        else if k == 119 { c.w = n; }
+        else if k == 104 { c.h = n; }
+        else if k == 88 { c.ox = n; }
+        else if k == 89 { c.oy = n; }
+        else if k == 122 { c.z = n; }
+        else if k == 67 { c.stay = n; }
+        else if k == 100 { c.del = ch; }
+        else if k == 83 { c.size = n; }
+        else if k == 79 { c.off = n; }
+        i = e + 1;
+    }
+    return c;
+}
+
+/// Decimal with an optional leading `-`; garbage stops it. Capped well inside `int`.
+fn toInt(v: string): int {
+    let neg = v.len > 0 && v[0] == 45;
+    let n = 0;
+    for i in (if neg { 1 } else { 0 })..v.len {
+        let d = int(v[i]) - 48;
+        if d < 0 || d > 9 || n > 100000000000 {
+            break;
+        }
+        n = n * 10 + d;
+    }
+    return if neg { 0 - n } else { n };
+}
+
+fn b64(c: u8): int {
+    if c >= 65 && c <= 90 { return int(c) - 65; }
+    if c >= 97 && c <= 122 { return int(c) - 71; }
+    if c >= 48 && c <= 57 { return int(c) + 4; }
+    if c == 43 { return 62; }
+    if c == 47 { return 63; }
+    return -1;
+}
+
+extend Grid {
+    /// Sink: an APC string. Only kitty graphics (`G...`) is read.
+    fn apc(this: &Grid, bytes: string) {
+        if bytes.len == 0 || bytes[0] != 71 {
+            return;
+        }
+        let semi = 1;
+        while semi < bytes.len && bytes[semi] != 59 { semi += 1; }
+        let data = if semi < bytes.len { bytes[(semi + 1)..bytes.len] } else { bytes[0..0] };
+        let c = parseKeys(bytes[1..semi]);
+        if this.kLoading {
+            // A continuation chunk: only `m` (and `q`) count, the rest came with the first.
+            this.kAppend(data);
+            if c.quiet != 0 {
+                this.kPend.quiet = c.quiet;
+            }
+            if c.more == 0 {
+                this.kLoading = false;
+                let p = this.kPend;
+                this.kFinish(&p);
+            }
+            return;
+        }
+        if c.act == 116 || c.act == 84 || c.act == 113 {
+            this.kStart();
+            this.kAppend(data);
+            if c.more != 0 && c.med == 100 {
+                this.kPend = c;
+                this.kLoading = true;
+                return;
+            }
+            this.kFinish(&c);
+        } else if c.act == 112 {
+            let k = this.kFind(c.id, c.num);
+            if k < 0 {
+                this.kReply(&c, "ENOENT:no such image", true);
+                return;
+            }
+            this.kPlace(k, &c);
+            this.kReply(&c, "OK", false);
+        } else if c.act == 100 {
+            this.kDelete(&c);
+        }
+    }
+
+    /// A fresh load buffer in `kmem` (its old blocks unmapped).
+    fn kStart(this: &Grid) {
+        this.kmem.destroy();
+        *this.kmem = Arena.create(65536);
+        this.kbuf = this.kmem.alloc::<u8>(65536);
+        this.kn = 0;
+        this.kBad = false;
+    }
+
+    /// Base64-decode `data` onto the load buffer.
+    fn kAppend(this: &Grid, data: string) {
+        let acc = 0;
+        let bits = 0;
+        for i in 0..data.len {
+            let v = b64(data[i]);
+            if v < 0 {
+                continue;
+            }
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                if this.kn >= this.kbuf.len {
+                    if this.kbuf.len >= 400000000 {
+                        this.kBad = true;
+                        return;
+                    }
+                    let more = this.kmem.alloc::<u8>(this.kbuf.len * 2);
+                    for k in 0..this.kn { more[k] = this.kbuf[k]; }
+                    this.kbuf = more;
+                }
+                this.kbuf[this.kn] = u8((acc >> bits) & 255);
+                this.kn += 1;
+            }
+        }
+    }
+
+    /// The transfer is complete: read, decode and store (or just check, for `a=q`) the image, then place it for `a=T`.
+    fn kFinish(this: &Grid, c: &KCmd) {
+        if this.kBad {
+            this.kReply(c, "EFBIG:image too large", true);
+            return;
+        }
+        let bytes = this.kbuf[0..this.kn];
+        if c.med == 102 || c.med == 116 {
+            let path = bytes as string;
+            match readFile(path, this.kmem) {
+                Result.Ok(b) {
+                    bytes = b;
+                }
+                Result.Err(_e) {
+                    this.kReply(c, "EBADF:cannot read file", true);
+                    return;
+                }
+            }
+            if c.med == 116 && find(path, "tty-graphics-protocol") >= 0 {
+                io.remove(path);
+            }
+            let lo = mx(0, mn(c.off, bytes.len));
+            let hi = if c.size > 0 { mn(bytes.len, lo + c.size) } else { bytes.len };
+            bytes = bytes[lo..hi];
+        } else if c.med != 100 {
+            this.kReply(c, "EINVAL:transmission medium not supported", true);
+            return;
+        }
+        let bpp = if c.fmt == 24 { 3 } else { 4 };
+        if c.comp == 122 {
+            if c.fmt == 100 || c.sw < 1 || c.sh < 1 || c.sw > MAX_IMAGE_SIDE || c.sh > MAX_IMAGE_SIDE {
+                this.kReply(c, "EINVAL:bad compressed image", true);
+                return;
+            }
+            let out = this.kmem.alloc::<u8>(c.sw * c.sh * bpp);
+            if !inflate(bytes, out, this.kmem) {
+                this.kReply(c, "EINVAL:bad zlib data", true);
+                return;
+            }
+            bytes = out;
+        }
+        let img = KImage { id: c.id, num: c.num, serial: 0, w: 0, h: 0, px: bytes[0..0], mem: this.newArena() };
+        if c.fmt == 100 {
+            let cv = decodePng(bytes, img.mem);
+            img.w = int(cv.w);
+            img.h = int(cv.h);
+            img.px = cv.pixels;
+            if img.w == 0 {
+                img.mem.destroy();
+                this.kReply(c, "EBADPNG:cannot decode PNG", true);
+                return;
+            }
+        } else if c.fmt == 24 || c.fmt == 32 {
+            if c.sw < 1 || c.sh < 1 || c.sw > MAX_IMAGE_SIDE || c.sh > MAX_IMAGE_SIDE || bytes.len < c.sw * c.sh * bpp {
+                img.mem.destroy();
+                this.kReply(c, "ENODATA:size and data do not match", true);
+                return;
+            }
+            img.w = c.sw;
+            img.h = c.sh;
+            img.px = img.mem.alloc::<u8>(c.sw * c.sh * 4);
+            for k in 0..(c.sw * c.sh) {
+                img.px[k * 4] = bytes[k * bpp];
+                img.px[k * 4 + 1] = bytes[k * bpp + 1];
+                img.px[k * 4 + 2] = bytes[k * bpp + 2];
+                img.px[k * 4 + 3] = if bpp == 4 { bytes[k * bpp + 3] } else { 255 };
+            }
+        } else {
+            img.mem.destroy();
+            this.kReply(c, "EINVAL:unknown format", true);
+            return;
+        }
+        this.kmem.destroy();
+        if c.act == 113 {
+            img.mem.destroy();
+            this.kReply(c, "OK", false);
+            return;
+        }
+        if img.id == 0 && img.num != 0 {
+            this.kNextId += 1;
+            img.id = 1000000000 + this.kNextId;
+        }
+        if img.id != 0 {
+            let old = this.kFind(img.id, 0);
+            if old >= 0 {
+                this.kDropImage(old);
+            }
+        }
+        if this.kimgs.len >= MAX_IMAGES {
+            this.kDropImage(0);
+        }
+        this.kSerial += 1;
+        img.serial = this.kSerial;
+        this.kimgs.push(img);
+        let reply = KCmd { id: img.id, num: c.num, pid: c.pid, quiet: c.quiet };
+        if c.act == 84 {
+            this.kPlace(this.kimgs.len - 1, c);
+        }
+        if c.id != 0 || c.num != 0 {
+            this.kReply(&reply, "OK", false);
+        }
+    }
+
+    /// `ESC _ G i=..[,I=..][,p=..];msg ESC \` when the command named an image and `q` allows it.
+    fn kReply(this: &Grid, c: &KCmd, msg: string, err: bool) {
+        if (c.id == 0 && c.num == 0) || c.quiet >= 2 || (!err && c.quiet >= 1) {
+            return;
+        }
+        this.reply.push(0x1b);
+        this.reply.add("_G");
+        let comma = false;
+        if c.id != 0 {
+            this.reply.add("i=");
+            this.reply.pushInt(c.id);
+            comma = true;
+        }
+        if c.num != 0 {
+            if comma { this.reply.push(44); }
+            this.reply.add("I=");
+            this.reply.pushInt(c.num);
+            comma = true;
+        }
+        if c.pid != 0 {
+            this.reply.add(",p=");
+            this.reply.pushInt(c.pid);
+        }
+        this.reply.push(59);
+        this.reply.add(msg);
+        this.reply.push(0x1b);
+        this.reply.push(0x5c);
+    }
+
+    /// Index in `kimgs` of image `id`, else the newest with number `num` (0 skips that test); -1 when none.
+    fn kFind(this: &Grid, id: int, num: int): int {
+        let k = this.kimgs.len - 1;
+        while k >= 0 {
+            let im = this.kimgs.items[k];
+            if (id != 0 && im.id == id) || (id == 0 && num != 0 && im.num == num) {
+                return k;
+            }
+            k -= 1;
+        }
+        return -1;
+    }
+
+    /// Free image `k` and its placements.
+    fn kDropImage(this: &Grid, k: int) {
+        let serial = this.kimgs.items[k].serial;
+        let w = 0;
+        for i in 0..this.kplaces.len {
+            if this.kplaces.items[i].serial != serial {
+                this.kplaces.items[w] = this.kplaces.items[i];
+                w += 1;
+            }
+        }
+        this.kplaces.len = w;
+        this.kimgs.items[k].mem.destroy();
+        this.kimgs.remove(k);
+    }
+
+    /// Put image `k` at the cursor, then move the cursor past it unless `C=1`.
+    fn kPlace(this: &Grid, k: int, c: &KCmd) {
+        let im = this.kimgs.items[k];
+        let cw = mx(1, this.cellPxW);
+        let ch = mx(1, this.cellPxH);
+        let sx = mx(0, mn(c.x, im.w - 1));
+        let sy = mx(0, mn(c.y, im.h - 1));
+        let sw = if c.w > 0 { mn(c.w, im.w - sx) } else { im.w - sx };
+        let sh = if c.h > 0 { mn(c.h, im.h - sy) } else { im.h - sy };
+        let ox = mx(0, mn(c.ox, cw - 1));
+        let oy = mx(0, mn(c.oy, ch - 1));
+        let dw = sw;
+        let dh = sh;
+        if c.cols > 0 && c.rows > 0 {
+            dw = c.cols * cw - ox;
+            dh = c.rows * ch - oy;
+        } else if c.cols > 0 {
+            dw = c.cols * cw - ox;
+            dh = dw * sh / mx(1, sw);
+        } else if c.rows > 0 {
+            dh = c.rows * ch - oy;
+            dw = dh * sw / mx(1, sh);
+        }
+        let cols = if c.cols > 0 { c.cols } else { (ox + dw + cw - 1) / cw };
+        let rows = if c.rows > 0 { c.rows } else { (oy + dh + ch - 1) / ch };
+        if c.pid != 0 {
+            let w = 0;
+            for i in 0..this.kplaces.len {
+                let p = this.kplaces.items[i];
+                if !(p.serial == im.serial && p.pid == c.pid) {
+                    this.kplaces.items[w] = p;
+                    w += 1;
+                }
+            }
+            this.kplaces.len = w;
+        }
+        this.kplaces.push(KPlace {
+            serial: im.serial, pid: c.pid, row: this.cy, col: this.cx, cols: mx(1, cols), rows: mx(1, rows),
+            sx: sx, sy: sy, sw: sw, sh: sh, ox: ox, oy: oy, dw: dw, dh: dh, z: c.z, alt: this.isAlt,
+        });
+        this.touch(this.cy);
+        if c.stay == 0 {
+            for i in 1..mx(1, rows) {
+                this.index();
+            }
+            this.cx = mn(this.cx + cols, this.ncols - 1);
+            this.wrapPending = false;
+        }
+    }
+
+    /// `a=d`: placements by `d` (`a` all on this screen, `i` by id and `p`, `n` by number, `c` at the cursor); the
+    /// uppercase letter also frees images left with no placement.
+    fn kDelete(this: &Grid, c: &KCmd) {
+        let d = c.del;
+        let lower = if d >= 65 && d <= 90 { d + 32 } else { d };
+        let serial = -1;
+        if lower == 105 || lower == 110 {
+            let k = if lower == 105 { this.kFind(c.id, 0) } else { this.kFind(0, c.num) };
+            if k < 0 {
+                return;
+            }
+            serial = this.kimgs.items[k].serial;
+        }
+        let w = 0;
+        for i in 0..this.kplaces.len {
+            let p = this.kplaces.items[i];
+            let hit = false;
+            if lower == 97 {
+                hit = p.alt == this.isAlt;
+            } else if lower == 105 || lower == 110 {
+                hit = p.serial == serial && (c.pid == 0 || p.pid == c.pid);
+            } else if lower == 99 {
+                hit = p.alt == this.isAlt && this.cx >= p.col && this.cx < p.col + p.cols && this.cy >= p.row && this.cy < p.row + p.rows;
+            }
+            if !hit {
+                this.kplaces.items[w] = p;
+                w += 1;
+            }
+        }
+        this.kplaces.len = w;
+        if d >= 65 && d <= 90 {
+            this.kFreeUnplaced();
+        }
+        this.markAllDirty();
+    }
+
+    /// Drop images no placement shows.
+    fn kFreeUnplaced(this: &Grid) {
+        let k = this.kimgs.len - 1;
+        while k >= 0 {
+            let s = this.kimgs.items[k].serial;
+            let used = false;
+            for i in 0..this.kplaces.len {
+                if this.kplaces.items[i].serial == s {
+                    used = true;
+                }
+            }
+            if !used {
+                this.kDropImage(k);
+            }
+            k -= 1;
+        }
+    }
+
+    /// A full-screen scroll of `n` rows (`up`) on the showing screen: its placements move with the text; those
+    /// past the scrollback (or off the bottom) go.
+    fn kScroll(this: &Grid, n: int, up: bool) {
+        if this.kplaces.len == 0 {
+            return;
+        }
+        let keep = if this.isAlt { 0 } else { this.sbCount };
+        let w = 0;
+        for i in 0..this.kplaces.len {
+            let p = this.kplaces.items[i];
+            if p.alt == this.isAlt {
+                p.row = if up { p.row - n } else { p.row + n };
+            }
+            if p.row + p.rows > 0 - keep && p.row < this.nrows {
+                this.kplaces.items[w] = p;
+                w += 1;
+            }
+        }
+        this.kplaces.len = w;
+    }
+
+    /// ED 2 (`all` false: placements on the screen) and ED 3 / RIS (`all`: every one of this screen).
+    fn kClear(this: &Grid, all: bool) {
+        let w = 0;
+        for i in 0..this.kplaces.len {
+            let p = this.kplaces.items[i];
+            let gone = p.alt == this.isAlt && (all || (p.row + p.rows > 0 && p.row < this.nrows));
+            if !gone {
+                this.kplaces.items[w] = p;
+                w += 1;
+            }
+        }
+        this.kplaces.len = w;
+    }
+
+    /// Every placement (both screens): `View.draw` shows those with `alt == altScreen()`.
+    fn kittyPlacements(this: &Grid): []KPlace {
+        return this.kplaces.items[0..this.kplaces.len];
+    }
+
+    /// The image with `serial`, or null when it was deleted (check `w > 0`).
+    fn kittyImage(this: &Grid, serial: int): KImage {
+        for i in 0..this.kimgs.len {
+            if this.kimgs.items[i].serial == serial {
+                return this.kimgs.items[i];
+            }
+        }
+        return KImage { id: 0, num: 0, serial: 0, w: 0, h: 0, px: this.kbuf[0..0], mem: this.kmem };
+    }
+
+    /// A fresh arena whose header lives in the grid's arena (an `Arena` is never stored by value).
+    fn newArena(this: &Grid): &Arena {
+        let slot = this.arena.alloc::<Arena>(1);
+        slot[0] = Arena.create(65536);
+        return &slot[0];
+    }
+
+    /// Whether an image with `serial` is still held (a texture cache drops the others).
+    fn kittyHas(this: &Grid, serial: int): bool {
+        for i in 0..this.kimgs.len {
+            if this.kimgs.items[i].serial == serial {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Free every image (RIS, or a host closing the grid; the arenas are mmapped, not in the grid's arena).
+    fn kittyFreeAll(this: &Grid) {
+        while this.kimgs.len > 0 {
+            this.kDropImage(this.kimgs.len - 1);
+        }
+        this.kplaces.len = 0;
+        this.kLoading = false;
+        this.kmem.destroy();
+    }
+}

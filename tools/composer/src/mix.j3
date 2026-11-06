@@ -1,0 +1,275 @@
+// Render the whole song to a stereo buffer, measure it, and write it as a WAV file.
+
+module composer.mix;
+
+use j3.io;
+use j3.math.{ floor, sqrt };
+use j3.memory.Arena;
+use j3.rand.Rng;
+use j3.result.Result;
+use composer.song;
+use composer.song.Song;
+use composer.synth;
+
+pub const RATE: int = 44100;
+/// Master gain before the soft limit.
+const MASTER: f32 = 0.8;
+
+pub struct Stats {
+    peak: f32;
+    rms: f32;
+    /// Samples the limiter had to squash (above 0.9 before it).
+    hot: int;
+    seconds: f32;
+    /// RMS over the samples that sound (above -60 dB): how loud it is while it plays.
+    loud: f32;
+}
+
+/// Seconds past the last note for release tails, and for the reverb when a track sends to it.
+fn tailSeconds(s: &Song): f32 {
+    for t in 0..s.trackCount {
+        if s.tracks[t].reverb > 0 { return 3.2; }
+    }
+    return 1.6;
+}
+
+/// Frames for the whole song plus its release tails.
+pub fn frames(s: &Song): int {
+    return int((song.lengthBeats(s) * song.secondsPerBeat(s) + tailSeconds(s)) * f32(RATE));
+}
+
+/// Frames in `bars * meter` beats: a loop's length.
+pub fn loopFrames(s: &Song): int {
+    return int(f32(s.bars * s.meter) * song.secondsPerBeat(s) * f32(RATE));
+}
+
+/// Every audible note mixed into stereo, interleaved, limited to -1..1. `hot` counts squashed samples.
+pub fn render(s: &Song, mem: &Arena, st: &Stats): []f32 {
+    return mixdown(s, mem, st, -1, false);
+}
+
+/// `render` with only track `only` (all audible tracks when -1).
+pub fn renderOnly(s: &Song, mem: &Arena, st: &Stats, only: int): []f32 {
+    return mixdown(s, mem, st, only, false);
+}
+
+/// `render` cut at exactly `bars * meter` beats, with everything that rings past the end (release
+/// and reverb tails) added back onto the start, so the file loops without a gap or click.
+pub fn renderLoop(s: &Song, mem: &Arena, st: &Stats): []f32 {
+    return mixdown(s, mem, st, -1, true);
+}
+
+/// Swing moves the off-beat 8th from 0.5 to `swing` inside each beat and stretches the rest of the
+/// beat to fit; stored positions stay on the grid.
+fn swung(s: &Song, beat: f32): f32 {
+    if s.swing == 0.5 { return beat; }
+    let b = floor(beat);
+    let f = beat - b;
+    if f < 0.5 { return b + f * s.swing * 2.0; }
+    return b + s.swing + (f - 0.5) * (1.0 - s.swing) * 2.0;
+}
+
+/// Soft clip `x` with gain from `drive`, scaled so a half-level signal keeps its level.
+fn saturate(x: f32, drive: f32): f32 {
+    let g = 1.0 + drive * 6.0;
+    let u = x * g;
+    let a = if u < 0 { 0 - u } else { u };
+    return u / (1.0 + a) * (1.0 + g * 0.5) / g;
+}
+
+fn mixdown(s: &Song, mem: &Arena, st: &Stats, only: int, loop: bool): []f32 {
+    let n = frames(s);
+    let out = mem.alloc::<f32>(n * 2);
+    for i in 0..n * 2 { out[i] = 0; }
+    let spb = song.secondsPerBeat(s);
+    let fx = false;
+    let wet = false;
+    for t in 0..s.trackCount {
+        if s.tracks[t].reverb > 0 || s.tracks[t].drive > 0 { fx = true; }
+        if s.tracks[t].reverb > 0 { wet = true; }
+    }
+    // A track with effects renders alone into `buf`, then goes into `out` and the reverb send.
+    let buf = if fx { mem.alloc::<f32>(n * 2) } else { out };
+    let send = if wet { mem.alloc::<f32>(n) } else { out };
+    if wet { for i in 0..n { send[i] = 0; } }
+    for t in 0..s.trackCount {
+        if !song.audible(s, t) || (only >= 0 && t != only) { continue; }
+        let tr = &s.tracks[t];
+        let alone = tr.reverb > 0 || tr.drive > 0;
+        let dst = if alone { buf } else { out };
+        if alone { for i in 0..n * 2 { buf[i] = 0; } }
+        // Constant-power-ish pan: both sides 0.71 in the middle.
+        let gl = tr.vol * sqrt((1.0 - tr.pan) * 0.5);
+        let gr = tr.vol * sqrt((1.0 + tr.pan) * 0.5);
+        for i in 0..s.noteCount {
+            let note = &s.notes[i];
+            if note.track != t { continue; }
+            let at = int(swung(s, note.beat) * spb * f32(RATE));
+            synth.voice(dst, RATE, at, note.len * spb, note.pitch, note.vel, tr.synth, tr.tone, gl, gr, i);
+        }
+        if !alone { continue; }
+        for i in 0..n * 2 {
+            let v = if tr.drive > 0 { saturate(buf[i], tr.drive) } else { buf[i] };
+            out[i] += v;
+            if tr.reverb > 0 { send[i / 2] += v * tr.reverb * 0.5; }
+        }
+    }
+    if wet { reverb(send, out, mem); }
+    if s.noise > 0 && only < 0 { hiss(out, loopFrames(s), s.noise); }
+    if loop {
+        // Fold the tail onto the start, as many times round as it takes.
+        let span = loopFrames(s);
+        for i in span * 2..n * 2 { out[i % (span * 2)] += out[i]; }
+        n = span;
+    }
+    let peak: f32 = 0;
+    let sum: f32 = 0;
+    let hot = 0;
+    let lsum: f32 = 0;
+    let lcount = 0;
+    for i in 0..n * 2 {
+        let x = out[i] * MASTER;
+        let a = if x < 0 { 0 - x } else { x };
+        if a > 0.9 {
+            // Soft knee from 0.9 up to 1.0.
+            hot += 1;
+            let over = a - 0.9;
+            a = 0.9 + 0.1 * over / (over + 0.1);
+            x = if x < 0 { 0 - a } else { a };
+        }
+        out[i] = x;
+        if a > peak { peak = a; }
+        sum += x * x;
+        if a > 0.001 {
+            lsum += x * x;
+            lcount += 1;
+        }
+    }
+    st.peak = peak;
+    st.rms = sqrt(sum / f32(n * 2));
+    st.hot = hot;
+    st.seconds = f32(n) / f32(RATE);
+    st.loud = if lcount > 0 { sqrt(lsum / f32(lcount)) } else { 0 };
+    return out[0..n * 2];
+}
+
+/// Comb filter lengths in samples at 44.1 kHz (Freeverb's), and the allpasses after them. The right
+/// side uses each one 23 samples longer, so the tail is wide.
+const COMBS: [4]int = [1116, 1277, 1422, 1617];
+const ALLPASS: [2]int = [556, 341];
+const SPREAD: int = 23;
+
+/// A Schroeder reverb: the mono send through four damped combs in parallel, then two allpasses in
+/// series, per side, added into `out`.
+// ponytail: one room size for every song; add `song room=` when a song needs another space.
+fn reverb(send: []f32, out: []f32, mem: &Arena) {
+    let n = send.len;
+    let wet = mem.alloc::<f32>(n);
+    for side in 0..2 {
+        for i in 0..n { wet[i] = 0; }
+        for c in 0..4 {
+            let len = COMBS[c] + side * SPREAD;
+            let line = mem.alloc::<f32>(len);
+            for k in 0..len { line[k] = 0; }
+            let damp: f32 = 0;
+            let at = 0;
+            for i in 0..n {
+                let y = line[at];
+                damp = y * 0.6 + damp * 0.4;
+                line[at] = send[i] + damp * 0.84;
+                at += 1;
+                if at == len { at = 0; }
+                wet[i] += y * 0.25;
+            }
+        }
+        for p in 0..2 {
+            let plen = ALLPASS[p] + side * SPREAD;
+            let pline = mem.alloc::<f32>(plen);
+            for k in 0..plen { pline[k] = 0; }
+            let pat = 0;
+            for i in 0..n {
+                let b = pline[pat];
+                let x = wet[i];
+                pline[pat] = x + b * 0.5;
+                wet[i] = b - x;
+                pat += 1;
+                if pat == plen { pat = 0; }
+            }
+        }
+        for i in 0..n { out[i * 2 + side] += wet[i]; }
+    }
+}
+
+/// Tape hiss (noise with the lows taken out) and a sparse vinyl crackle over the first `len`
+/// frames. A fixed seed, so the same song always hisses the same.
+fn hiss(out: []f32, len: int, amount: f32) {
+    let rng = Rng.new(4242);
+    let lp: f32 = 0;
+    let crackle: f32 = 0;
+    let end = if len * 2 < out.len { len } else { out.len / 2 };
+    for i in 0..end {
+        let x = rng.floatRange(-1, 1);
+        lp += 0.2 * (x - lp);
+        if rng.unit() < 0.0003 { crackle = rng.floatRange(-1, 1); }
+        let h = (x - lp) * 0.012 * amount + crackle * 0.05 * amount;
+        crackle *= 0.6;
+        out[i * 2] += h;
+        out[i * 2 + 1] += h;
+    }
+}
+
+/// 16-bit samples, interleaved.
+pub fn toI16(buf: []f32, mem: &Arena): []i16 {
+    let o = mem.alloc::<i16>(buf.len);
+    for i in 0..buf.len {
+        let x = buf[i];
+        if x > 1.0 { x = 1.0; }
+        if x < -1.0 { x = -1.0; }
+        o[i] = i16(int(x * 32767.0));
+    }
+    return o;
+}
+
+fn put16(b: []u8, at: int, v: int) {
+    let u = ((v % 65536) + 65536) % 65536;
+    b[at] = u8(u % 256);
+    b[at + 1] = u8(u / 256);
+}
+
+fn put32(b: []u8, at: int, v: int) {
+    put16(b, at, v % 65536);
+    put16(b, at + 2, v / 65536);
+}
+
+fn tag(b: []u8, at: int, s: string) {
+    for i in 0..4 { b[at + i] = s[i]; }
+}
+
+/// A 16-bit stereo WAV file of `buf`.
+pub fn wavBytes(buf: []f32, mem: &Arena): []u8 {
+    let pcm = toI16(buf, mem);
+    let data = pcm.len * 2;
+    let b = mem.alloc::<u8>(44 + data);
+    tag(b, 0, "RIFF");
+    put32(b, 4, 36 + data);
+    tag(b, 8, "WAVE");
+    tag(b, 12, "fmt ");
+    put32(b, 16, 16);
+    put16(b, 20, 1);
+    put16(b, 22, 2);
+    put32(b, 24, RATE);
+    put32(b, 28, RATE * 4);
+    put16(b, 32, 4);
+    put16(b, 34, 16);
+    tag(b, 36, "data");
+    put32(b, 40, data);
+    for i in 0..pcm.len { put16(b, 44 + i * 2, int(pcm[i])); }
+    return b;
+}
+
+pub fn writeWav(path: string, buf: []f32, mem: &Arena): bool {
+    match io.writeFile(path, wavBytes(buf, mem)) {
+        Result.Ok(_) { return true; }
+        Result.Err(_) { return false; }
+    }
+}

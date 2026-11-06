@@ -1,0 +1,166 @@
+// Tests for j3.steam without Steam: absent no-ops, fake mode, callback and call-result delivery,
+// both pack layouts. Run from j3c/:
+//   timeout 120 target/release/j3c run stdlib/tests/steam_test.j3
+// Panics on the first failed check.
+
+module steam_test;
+
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.steam;
+use j3.steam.Status;
+use j3.sys;
+use j3.sys.panic;
+
+#[singleton]
+let CHECKS: int;
+#[singleton]
+let GOT_CTX: u64;
+#[singleton]
+let GOT_FAIL: bool;
+#[singleton]
+let GOT_VAL: u32;
+#[singleton]
+let GOT_N: int;
+#[singleton]
+let SECOND: int;
+
+fn ok(cond: bool, msg: string) {
+    CHECKS += 1;
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic(msg);
+    }
+}
+
+fn onResult(p: ptr, n: i32, failed: bool, ctx: u64) {
+    GOT_N += 1;
+    GOT_CTX = ctx;
+    GOT_FAIL = failed;
+    if !failed {
+        GOT_VAL = steam.rdU32(p, 4);
+    }
+}
+
+fn onOther(p: ptr, n: i32) {
+    SECOND += 1;
+}
+
+fn layouts() {
+    let mem = Arena.create(4096);
+    let buf = mem.alloc::<u8>(64);
+    let p = &buf[0] as ptr;
+    for variant in 0..2 {
+        let large = variant == 1;
+        for i in 0..64 {
+            buf[i] = u8(0);
+        }
+        let oId = steam.layAt("CallbackMsg_t", "iCallback", large);
+        let oPtr = steam.layAt("CallbackMsg_t", "pubParam", large);
+        let oSz = steam.layAt("CallbackMsg_t", "cubParam", large);
+        steam.wrI32(p, steam.layAt("CallbackMsg_t", "hSteamUser", large), 77);
+        steam.wrI32(p, oId, 0 - 5);
+        steam.wrPtr(p, oPtr, 0x123456789 as ptr);
+        steam.wrI32(p, oSz, 4096);
+        ok(steam.rdI32(p, 0) == 77, "msg user");
+        ok(steam.rdI32(p, oId) == 0 - 5, "msg id");
+        ok(steam.rdPtr(p, oPtr) as int == 0x123456789, "msg ptr");
+        ok(steam.rdI32(p, oSz) == 4096, "msg size");
+        let size = steam.layAt("CallbackMsg_t", steam.SIZE, large);
+        ok(size == (if large { 24 } else { 20 }), "msg total size");
+        let oCall = steam.layAt("SteamAPICallCompleted_t", "hAsyncCall", large);
+        let oCb = steam.layAt("SteamAPICallCompleted_t", "iCallback", large);
+        let oCub = steam.layAt("SteamAPICallCompleted_t", "cubParam", large);
+        steam.wrU64(p, oCall, u64(0x1122334455667788));
+        steam.wrI32(p, oCb, 1102);
+        steam.wrU32(p, oCub, u32(40));
+        ok(steam.rdU64(p, oCall) == u64(0x1122334455667788), "done call");
+        ok(steam.rdI32(p, oCb) == 1102, "done id");
+        ok(steam.rdU32(p, oCub) == u32(40), "done size");
+        // unaligned: an f32 and a u64 at odd offsets
+        steam.wrF32(p, 33, 1.5);
+        ok(steam.rdF32(p, 33) == 1.5, "f32 unaligned");
+        steam.wrU64(p, 41, u64(9876543210));
+        ok(steam.rdU64(p, 41) == u64(9876543210), "u64 unaligned");
+        steam.wrBool(p, 50, true);
+        ok(steam.rdBool(p, 50) && !steam.rdBool(p, 51), "bool");
+    }
+    ok(!steam.packLarge(), "linux is pack 4");
+}
+
+fn main() {
+    // no library, no init
+    ok(!steam.on(), "off before init");
+    ok(steam.status() == Status.Absent, "absent before init");
+    ok(!steam.overlayOpen(), "overlay false before init");
+    steam.frame();
+    steam.shutdown();
+    ok(steam.init(u32(0)) == Status.Absent || steam.status() != Status.Fake, "init without lib is not fake");
+    if steam.on() {
+        // a real Steam on this machine: the rest of the test is for the no-Steam case
+        steam.shutdown();
+    }
+    steam.shutdown();
+    steam.shutdown();
+    ok(!steam.on(), "off after shutdown");
+    steam.await(u64(0), onResult, u64(1));
+    steam.frame();
+    ok(GOT_N == 1 && GOT_FAIL && GOT_CTX == u64(1), "invalid call fails even with Steam absent");
+    GOT_N = 0;
+
+    layouts();
+    ok(steam.callbackId("UserStatsStored_t") == 1102 && steam.callbackId("LobbyCreated_t") == 513 && steam.callbackId("NoSuch_t") == 0, "callback id table");
+
+    // each distinct warning is kept, past any fixed list size, and a repeat is not counted again
+    let w0 = steam.warned();
+    for i in 0..30 {
+        steam.layAt("NoSuch_t", `f{i}`, false);
+    }
+    ok(steam.warned() == w0 + 30, "30 distinct warnings counted");
+    steam.layAt("NoSuch_t", "f3", false);
+    ok(steam.warned() == w0 + 30, "repeat warning not reprinted");
+
+    // fake mode
+    ok(steam.initFake(u32(480)) == Status.Fake, "fake init");
+    ok(steam.on() && steam.fake(), "fake on");
+    steam.onCallback(331, onOther);
+    let data: [1]u8 = [u8(1)];
+    steam.fakeCallback(331, data[0..1]);
+    ok(!steam.overlayOpen(), "not delivered before frame");
+    steam.frame();
+    ok(steam.overlayOpen(), "overlay open after callback");
+    ok(SECOND == 1, "second handler for the same id ran");
+    data[0] = u8(0);
+    steam.fakeCallback(331, data[0..1]);
+    steam.fakeCallback(99999, data[0..1]);
+    steam.frame();
+    ok(!steam.overlayOpen(), "overlay closed; unknown id dropped");
+
+    // call result round trip
+    let call = steam.fakeCall();
+    ok(call != u64(0), "fake call handle");
+    steam.await(call, onResult, u64(0xABCDEF012345));
+    let mem = Arena.create(4096);
+    let res = mem.alloc::<u8>(8);
+    steam.wrU32(&res[0] as ptr, 4, u32(321));
+    steam.fakeResult(call, 1100, res[0..8]);
+    steam.frame();
+    ok(GOT_N == 1 && !GOT_FAIL && GOT_VAL == u32(321) && GOT_CTX == u64(0xABCDEF012345), "result reached its handler with ctx");
+    steam.fakeResult(call, 1100, res[0..8]);
+    steam.frame();
+    ok(GOT_N == 1, "result for a finished call is dropped");
+
+    // failed call and invalid handle
+    let c2 = steam.fakeCall();
+    steam.await(c2, onResult, u64(7));
+    steam.fakeFail(c2);
+    steam.frame();
+    ok(GOT_N == 2 && GOT_FAIL && GOT_CTX == u64(7), "io failure delivered");
+    steam.await(u64(0), onResult, u64(9));
+    steam.frame();
+    ok(GOT_N == 3 && GOT_FAIL && GOT_CTX == u64(9), "invalid handle fails on the next frame");
+
+    steam.shutdown();
+    ok(!steam.on() && !steam.overlayOpen(), "off after fake shutdown");
+    printLn("steam_test ok");
+}

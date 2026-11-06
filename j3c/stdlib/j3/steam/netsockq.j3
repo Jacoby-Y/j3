@@ -1,0 +1,162 @@
+// Part of j3.steam: the fake connection queue, send, receive and poll groups (state is in netsockfake.j3).
+// The module doc and `use`s are in ../steam.j3.
+module j3.steam;
+
+fn skGroupNew(): u32 {
+    if SKG.len == 0 {
+        SKG = arena().alloc::<u32>(8);
+    }
+    if SKG_N >= SKG.len {
+        SKG = grown(SKG, SKG_N);
+    }
+    SK_NEXT_G += 1;
+    SKG[SKG_N] = u32(SK_NEXT_G);
+    SKG_N += 1;
+    return u32(SK_NEXT_G);
+}
+
+fn skGroupHas(g: u32): bool {
+    for i in 0..SKG_N {
+        if SKG[i] == g {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn skGroupDestroy(g: u32): bool {
+    let at = -1;
+    for i in 0..SKG_N {
+        if SKG[i] == g {
+            at = i;
+        }
+    }
+    if at < 0 {
+        return false;
+    }
+    SKG[at] = SKG[SKG_N - 1];
+    SKG_N -= 1;
+    for i in 0..SKC_N {
+        if SKC[i].id != u32(0) && SKC[i].group == g {
+            SKC[i].group = u32(0);
+        }
+    }
+    return true;
+}
+
+fn skSetGroup(h: u32, g: u32): bool {
+    let i = skFind(h);
+    if i < 0 || (g != u32(0) && !skGroupHas(g)) {
+        return false;
+    }
+    SKC[i].group = g;
+    return true;
+}
+
+/// Remove queue entry `i`, keeping its buffer past the end for reuse.
+fn skTake(i: int) {
+    let m = SKQ[i];
+    for j in i..SKQ_N - 1 {
+        SKQ[j] = SKQ[j + 1];
+    }
+    SKQ[SKQ_N - 1] = m;
+    SKQ_N -= 1;
+}
+
+fn skPush(conn: u32, data: []u8) {
+    if SKQ.len == 0 {
+        SKQ = arena().alloc::<SkMsg>(SK_CAP);
+    }
+    if SKQ_N >= SK_CAP {
+        fakeLog("connection queue full, dropped the oldest message");
+        skTake(0);
+    }
+    let m = &SKQ[SKQ_N];
+    if m.cap < data.len {
+        m.buf = arena().allocBytes(data.len * 2 + 64);
+        m.cap = data.len * 2 + 64;
+    }
+    for i in 0..data.len {
+        wrU8(m.buf, i, data[i]);
+    }
+    m.conn = conn;
+    m.num = SK_NUM;
+    m.len = data.len;
+    SKQ_N += 1;
+}
+
+fn skSend(h: u32, data: []u8): SendResult {
+    let i = skFind(h);
+    if i < 0 {
+        return SendResult { result: NET_INVALID_PARAM, msgNum: i64(0) };
+    }
+    if SKC[i].state != NET_STATE_CONNECTED && SKC[i].state != NET_STATE_CONNECTING {
+        return SendResult { result: NET_INVALID_STATE, msgNum: i64(0) };
+    }
+    SK_NUM += 1;
+    fakeLog(`sendConn {data.len} bytes on {h}`);
+    if SKC[i].other != u32(0) {
+        skPush(SKC[i].other, data);
+    } else if NF_ECHO {
+        skPush(h, data);
+    }
+    return SendResult { result: NET_OK, msgNum: i64(SK_NUM) };
+}
+
+/// Can queued messages of connection slot `i` be read through `h` (a connection, or a group)?
+fn skReadable(i: int, h: u32, group: bool): bool {
+    if SKC[i].state == NET_STATE_CONNECTING {
+        return false;
+    }
+    if group {
+        return h != u32(0) && SKC[i].group == h && skGroupHas(h);
+    }
+    return SKC[i].id == h && SKC[i].group == u32(0);
+}
+
+fn skReceive(h: u32, group: bool, f: fn(u32, u64, []u8, i64, i64, u64), ctx: u64, max: int): int {
+    // phase 1: stage matching messages in SK_OUT, so the handler may send or close freely
+    let need = max;
+    if need > SKQ_N {
+        need = SKQ_N;
+    }
+    if SK_META.len < need {
+        SK_META = arena().alloc::<SkOut>(need * 2);
+    }
+    let n = 0;
+    let used = 0;
+    let q = 0;
+    while q < SKQ_N && n < max {
+        let m = SKQ[q];
+        let c = skFind(m.conn);
+        if c >= 0 && skReadable(c, h, group) {
+            if used + m.len > SK_OUT_CAP {
+                let cap = (used + m.len) * 2 + 256;
+                let fresh = arena().allocBytes(cap);
+                for k in 0..used {
+                    wrU8(fresh, k, rdU8(SK_OUT, k));
+                }
+                SK_OUT = fresh;
+                SK_OUT_CAP = cap;
+            }
+            for k in 0..m.len {
+                wrU8(SK_OUT, used + k, rdU8(m.buf, k));
+            }
+            SK_META[n] = SkOut { conn: m.conn, from: SKC[c].peer, udata: SKC[c].udata, num: m.num, off: used, len: m.len };
+            used += m.len;
+            n += 1;
+            skTake(q);
+        } else {
+            q += 1;
+        }
+    }
+    // phase 2: hand them out (a null handler drops them)
+    if f as int != 0 {
+        for k in 0..n {
+            let o = SK_META[k];
+            let bytes: []u8 = @slice((SK_OUT as int + o.off) as ptr, o.len);
+            f(o.conn, o.from, bytes, i64(o.num), o.udata, ctx);
+        }
+    }
+    return n;
+}

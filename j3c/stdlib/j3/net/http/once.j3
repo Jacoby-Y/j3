@@ -1,0 +1,194 @@
+// Part of j3.net.http: one request on a fresh connection and reply-line helpers; the module doc and `use`s are in ../http.j3.
+module j3.net.http;
+
+/// One request on a fresh connection, without redirects.
+fn once(u: &Url, method: string, headers: &List<Header>, body: []u8, timeoutMs: int, arena: &Arena): Result<Stream, HttpError> {
+    let conn = Conn {};
+    match tcp.dial(u.host, u.port, timeoutMs, arena) {
+        Result.Ok(c) { conn = c; }
+        Result.Err(e) {
+            match e {
+                TcpError.Resolve { return Result.Err(HttpError.Resolve); }
+                TcpError.Timeout { return Result.Err(HttpError.Timeout); }
+                TcpError.Refused { return Result.Err(HttpError.Connect); }
+                TcpError.Fail { return Result.Err(HttpError.Connect); }
+            }
+        }
+    }
+    let s = Stream {
+        status: 0,
+        headers: List<Header>.new(arena),
+        url: "",
+        https: u.https,
+        plain: conn,
+        secure: Tls { ssl: 0, ctx: 0, conn: Conn {} },
+        buf: arena.alloc::<u8>(BUF),
+        lo: 0,
+        hi: 0,
+        mode: BODY_CLOSE,
+        left: 0,
+        done: false,
+        failed: HttpError.Protocol,
+        broken: false,
+    };
+    if u.https {
+        match tls.connect(conn, u.host) {
+            Result.Ok(t) { s.secure = t; }
+            Result.Err(_) { return Result.Err(HttpError.Tls); }
+        }
+    }
+
+    let t = Text.new(arena);
+    t.pushStr(method);
+    t.push(32);
+    if u.path[0] != 47 {
+        t.push(47);
+    }
+    t.pushStr(u.path);
+    t.pushStr(" HTTP/1.1\r\nHost: ");
+    pushHost(&t, u);
+    t.pushStr("\r\n");
+    if findHeader(headers, "user-agent").len == 0 {
+        t.pushStr("User-Agent: j3\r\n");
+    }
+    if findHeader(headers, "accept").len == 0 {
+        t.pushStr("Accept: */*\r\n");
+    }
+    for i in 0..headers.len {
+        let h = headers.items[i];
+        if same(h.name, "host") || same(h.name, "content-length") || same(h.name, "connection") || same(h.name, "transfer-encoding") {
+            continue;
+        }
+        t.pushStr(h.name);
+        t.pushStr(": ");
+        t.pushStr(h.value);
+        t.pushStr("\r\n");
+    }
+    let sendsBody = body.len > 0 || same(method, "POST") || same(method, "PUT") || same(method, "PATCH");
+    if sendsBody {
+        t.pushStr("Content-Length: ");
+        t.pushInt(body.len);
+        t.pushStr("\r\n");
+    }
+    t.pushStr("Connection: close\r\n\r\n");
+    if !s.send(t.bytes) || (body.len > 0 && !s.send(body)) {
+        s.close();
+        return Result.Err(HttpError.Timeout);
+    }
+
+    // status line and headers; 1xx replies (103 Early Hints) are skipped
+    let line = Text.new(arena);
+    while true {
+        if !s.rawLine(&line) {
+            let why = if s.broken { s.failed } else { HttpError.Protocol };
+            s.close();
+            return Result.Err(why);
+        }
+        let st = statusOf(line.str());
+        if st < 0 {
+            s.close();
+            return Result.Err(HttpError.Protocol);
+        }
+        s.status = st;
+        s.headers = List<Header>.new(arena);
+        while true {
+            if !s.rawLine(&line) {
+                s.close();
+                return Result.Err(HttpError.Protocol);
+            }
+            if line.len() == 0 {
+                break;
+            }
+            let raw = line.str();
+            let colon = -1;
+            for i in 0..raw.len {
+                if raw[i] == 58 {
+                    colon = i;
+                    break;
+                }
+            }
+            if colon <= 0 {
+                s.close();
+                return Result.Err(HttpError.Protocol);
+            }
+            let keep = Text.new(arena);
+            keep.pushStr(raw);
+            let all = keep.str();
+            s.headers.push(Header { name: all[0..colon], value: trim(all[colon + 1..all.len]) });
+        }
+        if st >= 200 || st < 100 {
+            break;
+        }
+    }
+
+    let te = s.header("transfer-encoding");
+    let cl = s.header("content-length");
+    if same(method, "HEAD") || s.status == 204 || s.status == 304 {
+        s.done = true;
+    } else if te.len > 0 && endsWithChunked(te) {
+        s.mode = BODY_CHUNKED;
+    } else if cl.len > 0 {
+        let n = decimal(cl);
+        if n < 0 {
+            s.close();
+            return Result.Err(HttpError.Protocol);
+        }
+        s.mode = BODY_LENGTH;
+        s.left = n;
+        if n == 0 {
+            s.done = true;
+        }
+    }
+    return Result.Ok(s);
+}
+
+/// The code in an `HTTP/1.x NNN reason` line, or -1.
+fn statusOf(line: string): int {
+    if line.len < 12 || !startsWith(line, "HTTP/1.") || line[8] != 32 {
+        return -1;
+    }
+    let n = 0;
+    for i in 9..12 {
+        if line[i] < 48 || line[i] > 57 {
+            return -1;
+        }
+        n = n * 10 + int(line[i]) - 48;
+    }
+    if line.len > 12 && line[12] != 32 {
+        return -1;
+    }
+    return n;
+}
+
+fn trim(s: string): string {
+    let a = 0;
+    let b = s.len;
+    while a < b && (s[a] == 32 || s[a] == 9) {
+        a += 1;
+    }
+    while b > a && (s[b - 1] == 32 || s[b - 1] == 9) {
+        b -= 1;
+    }
+    return s[a..b];
+}
+
+/// A non-negative decimal, or -1.
+fn decimal(s: string): int {
+    if s.len == 0 || s.len > 18 {
+        return -1;
+    }
+    let n = 0;
+    for i in 0..s.len {
+        if s[i] < 48 || s[i] > 57 {
+            return -1;
+        }
+        n = n * 10 + int(s[i]) - 48;
+    }
+    return n;
+}
+
+/// `Transfer-Encoding` whose last coding is `chunked`.
+fn endsWithChunked(te: string): bool {
+    let t = trim(te);
+    return t.len >= 7 && same(t[t.len - 7..t.len], "chunked");
+}

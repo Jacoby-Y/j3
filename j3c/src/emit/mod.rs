@@ -4,9 +4,11 @@ mod c;
 pub mod bc;
 mod c_expr;
 mod c_ty;
+pub(crate) use c_expr::func_c_name;
 pub(crate) mod android;
 pub(crate) mod host;
 pub(crate) mod incr;
+pub mod glsl;
 mod llvm;
 mod llvm_crash;
 mod llvm_expr;
@@ -20,6 +22,7 @@ pub use host::{
 };
 pub use llvm::{emit_llvm, emit_llvm_part, Part};
 pub use opts::{Backend, EmitOpts};
+pub(crate) use c_expr::stable_ty;
 
 use crate::ir::body::Block;
 use crate::ir::cx::IrCx;
@@ -151,6 +154,9 @@ fn stmt_has_syscall(stmt: &Stmt) -> bool {
                 || else_block.as_ref().map(block_has_syscall).unwrap_or(false)
         }
         StmtKind::While { body, .. } | StmtKind::ForRange { body, .. } => block_has_syscall(body),
+        StmtKind::Switch { cases, default, .. } => {
+            cases.iter().any(|(_, b)| block_has_syscall(b)) || block_has_syscall(default)
+        }
         _ => false,
     }
 }

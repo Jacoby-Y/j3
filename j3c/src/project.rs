@@ -2,6 +2,15 @@
 
 use std::path::{Path, PathBuf};
 
+mod deps;
+mod steam;
+mod toml;
+pub use deps::Dep;
+pub use steam::Steam;
+pub(crate) use steam::{parse_glibc, resolve_path};
+pub(crate) use toml::{toml_doc, toml_list, toml_str};
+use toml::{parse_toml, TomlVal};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub root: PathBuf,
@@ -16,8 +25,12 @@ pub struct Manifest {
     pub link: Link,
     pub dist: Dist,
     pub android: Android,
+    /// `[steam]` (`build_outputs = ["steam"]`, dev env).
+    pub steam: Steam,
     /// `[ui]`: present when the project has `.j3ui` components.
     pub ui: Option<Ui>,
+    /// `[dependencies]`, transitive and flat (`j3c help manifest`).
+    pub deps: Vec<Dep>,
 }
 
 /// `[ui]`: `dir` holds `*.j3ui`; `theme` is one global CSS file.
@@ -47,6 +60,22 @@ pub struct Dist {
     pub maintainer: String,
     /// Extra `.deb` Depends, after the ones `[link] libs` imply.
     pub depends: Vec<String>,
+    /// `.deb` Section, default `games`.
+    pub section: String,
+    /// `.deb` maintainer scripts (project-relative), copied into the control archive with mode 0755.
+    pub postinst: Option<String>,
+    pub prerm: Option<String>,
+    /// `[dist.actions] id = { name = "New Island", exec = "--new-island" }`: `.desktop` actions (the dock or
+    /// launcher menu), in file order. `exec` is the program's arguments.
+    pub actions: Vec<DesktopAction>,
+}
+
+/// One `[dist.actions]` entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DesktopAction {
+    pub id: String,
+    pub name: String,
+    pub exec: String,
 }
 
 /// `[android]`: used by `build_outputs = ["apk"]`.
@@ -58,7 +87,13 @@ pub struct Android {
     pub orientation: String,
     /// `native_libs = "dir"`: `dir/<abi>/lib*.so` ship beside `libmain.so` (helper programs, prebuilt libs).
     pub native_libs: Option<String>,
+    /// `foreground_service = "connectedDevice"` (or `"dataSync"`): declares `J3Service`, which
+    /// `j3.android.service.keepAlive` starts. None: no service, keepAlive does nothing.
+    pub foreground_service: Option<String>,
 }
+
+/// Accepted `[android] foreground_service` values (Android's `foregroundServiceType` names).
+pub const SERVICE_TYPES: [&str; 2] = ["connectedDevice", "dataSync"];
 
 /// Accepted `[android] orientation` values (Android's `screenOrientation` names).
 pub const ORIENTATIONS: [&str; 6] = ["landscape", "portrait", "sensorLandscape", "sensorPortrait", "fullSensor", "unspecified"];
@@ -108,10 +143,13 @@ pub enum Output {
     Deb,
     /// Signed debug APK from the Android triples in `[emit] target` (`dist/apk.rs`).
     Apk,
+    /// Steam depot content + `app_build_<id>.vdf` (`dist/steam.rs`).
+    Steam,
 }
 
 impl Output {
-    pub const ALL: [(&'static str, Output); 3] = [("zip", Output::Zip), ("deb", Output::Deb), ("apk", Output::Apk)];
+    pub const ALL: [(&'static str, Output); 4] =
+        [("zip", Output::Zip), ("deb", Output::Deb), ("apk", Output::Apk), ("steam", Output::Steam)];
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,7 +192,7 @@ impl Default for Cc {
     fn default() -> Cc {
         Cc {
             std: "c11".to_string(),
-            opt: "0".to_string(),
+            opt: "1".to_string(),
             fast: false,
         }
     }
@@ -197,7 +235,11 @@ impl Manifest {
             .parent()
             .ok_or_else(|| format!("{} has no parent", toml_path.display()))?
             .to_path_buf();
-        parse_manifest(&text, root)
+        let mut m = parse_manifest(&text, root)?;
+        if HOST.load(std::sync::atomic::Ordering::Relaxed) {
+            m.emit.targets.clear();
+        }
+        Ok(m)
     }
 
     pub fn src_dir(&self) -> PathBuf {
@@ -255,6 +297,10 @@ pub fn target_slug(target: &str) -> String {
 /// `j3c run --file`: a `.j3` path is that one file, even inside a project.
 /// A `.j3s` path is always that script (`pub fn main`), not the project above it.
 pub static FILE_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--host` (run, check): `Manifest::load` drops `[emit] target`, so an Android package builds for
+/// this machine in place. Everything else in j3.toml stays as written.
+pub static HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn resolve(path: &Path) -> Result<Input, String> {
     if path.extension().and_then(|e| e.to_str()) == Some("j3s") {
@@ -367,6 +413,7 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
         emit.targets = match v {
             TomlVal::List(xs) => xs.clone(),
             TomlVal::Str(s) => vec![s.clone()],
+            TomlVal::Map(_) => return Err("j3.toml: emit.target must be a string or an array".to_string()),
         };
         if emit.targets.iter().any(|s| s.is_empty()) {
             return Err("j3.toml: emit.target has an empty triple".to_string());
@@ -410,6 +457,7 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
     }
     let mut dist = Dist {
         categories: "Game;".to_string(),
+        section: "games".to_string(),
         ..Dist::default()
     };
     if let Some(v) = tbl.get("dist", "build_outputs") {
@@ -439,7 +487,29 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
         dist.categories = c;
     }
     dist.maintainer = dist_str("maintainer").unwrap_or_default();
-    let mut android = Android { package: default_java_package(&name), orientation: "landscape".into(), native_libs: None };
+    if let Some(sec) = dist_str("section") {
+        dist.section = sec;
+    }
+    dist.postinst = dist_str("postinst");
+    dist.prerm = dist_str("prerm");
+    for (s, id, v) in &tbl.vals {
+        if s != "dist.actions" {
+            continue;
+        }
+        let TomlVal::Map(kv) = v else {
+            return Err(format!("j3.toml: dist.actions.{id} must be `{{ name = \"...\", exec = \"...\" }}`"));
+        };
+        if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(format!("j3.toml: dist.actions.{id}: an action id is letters, digits and `-`"));
+        }
+        let get = |k: &str| kv.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        let Some(name) = get("name") else {
+            return Err(format!("j3.toml: dist.actions.{id} needs `name`"));
+        };
+        dist.actions.retain(|a| a.id != *id);
+        dist.actions.push(DesktopAction { id: id.clone(), name, exec: get("exec").unwrap_or_default() });
+    }
+    let mut android = Android { package: default_java_package(&name), orientation: "landscape".into(), native_libs: None, foreground_service: None };
     if let Some(p) = tbl.get("android", "package").and_then(TomlVal::as_str) {
         if !check_java_package(p) {
             return Err(format!("j3.toml: android.package: `{p}` is not a Java package (like com.example.game: 2+ dot-separated segments, each starting with a letter)"));
@@ -453,6 +523,12 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
         android.orientation = o.to_string();
     }
     android.native_libs = tbl.get("android", "native_libs").and_then(TomlVal::as_str).map(str::to_string);
+    if let Some(t) = tbl.get("android", "foreground_service").and_then(TomlVal::as_str) {
+        if !SERVICE_TYPES.contains(&t) {
+            return Err(format!("j3.toml: android.foreground_service: unknown `{t}` (have {})", SERVICE_TYPES.join(", ")));
+        }
+        android.foreground_service = Some(t.to_string());
+    }
     let version = tbl.get("package", "version").and_then(TomlVal::as_str).unwrap_or("0.1.0").to_string();
     let description = match tbl.get("package", "description").and_then(TomlVal::as_str) {
         Some(d) => d.to_string(),
@@ -476,6 +552,8 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
     } else {
         None
     };
+    let steam = steam::parse(&tbl, &root, &name, &version)?;
+    let deps = deps::resolve(&root, &tbl, &name)?;
     Ok(Manifest {
         root,
         name,
@@ -487,365 +565,11 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
         link,
         dist,
         android,
+        steam,
         ui,
+        deps,
     })
 }
 
-#[derive(Clone, Debug)]
-enum TomlVal {
-    Str(String),
-    List(Vec<String>),
-}
-
-impl TomlVal {
-    fn as_str(&self) -> Option<&str> {
-        match self {
-            TomlVal::Str(s) => Some(s),
-            TomlVal::List(_) => None,
-        }
-    }
-
-    fn as_list(&self, key: &str) -> Result<Vec<String>, String> {
-        match self {
-            TomlVal::List(v) => Ok(v.clone()),
-            TomlVal::Str(_) => Err(format!("j3.toml: `{key}` must be an array")),
-        }
-    }
-}
-
-struct TomlTable {
-    vals: Vec<(String, String, TomlVal)>,
-    /// `[section]` headers with their line numbers, in file order (a header with no keys still counts).
-    heads: Vec<(String, usize)>,
-    lines: Vec<usize>,
-}
-
-impl TomlTable {
-    fn get(&self, section: &str, key: &str) -> Option<&TomlVal> {
-        self.vals
-            .iter()
-            .rev()
-            .find(|(s, k, _)| s == section && k == key)
-            .map(|(_, _, v)| v)
-    }
-}
-
-fn parse_toml(text: &str) -> Result<TomlTable, String> {
-    let mut section = String::new();
-    let (mut vals, mut heads, mut lines) = (Vec::new(), Vec::new(), Vec::new());
-    for (i, raw) in text.lines().enumerate() {
-        let line_no = i + 1;
-        let line = strip_comment(raw).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(name) = parse_section(line) {
-            heads.push((name.clone(), line_no));
-            section = name;
-            continue;
-        }
-        if section.is_empty() {
-            return Err(format!("j3.toml:{line_no}: key outside a section"));
-        }
-        let (key, val) = parse_key_val(line, line_no)?;
-        vals.push((section.clone(), key, val));
-        lines.push(line_no);
-    }
-    Ok(TomlTable { vals, heads, lines })
-}
-
-fn strip_comment(line: &str) -> &str {
-    let mut in_str = false;
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' if in_str => {
-                in_str = false;
-                i += 1;
-            }
-            b'"' => {
-                in_str = true;
-                i += 1;
-            }
-            b'\\' if in_str => i += 2,
-            b'#' if !in_str => return &line[..i],
-            _ => i += 1,
-        }
-    }
-    line
-}
-
-fn parse_section(line: &str) -> Option<String> {
-    let s = line.strip_prefix('[')?.strip_suffix(']')?;
-    if s.is_empty() || s.contains('[') || s.contains(']') || s.contains(' ') {
-        return None;
-    }
-    Some(s.to_string())
-}
-
-fn parse_key_val(line: &str, line_no: usize) -> Result<(String, TomlVal), String> {
-    let eq = line
-        .find('=')
-        .ok_or_else(|| format!("j3.toml:{line_no}: expected `key = value`"))?;
-    let key = line[..eq].trim();
-    if key.is_empty() || !is_ident(key) {
-        return Err(format!("j3.toml:{line_no}: bad key"));
-    }
-    let rhs = line[eq + 1..].trim();
-    let val = if rhs.starts_with('[') {
-        TomlVal::List(parse_string_array(rhs, line_no)?)
-    } else if rhs.starts_with('"') {
-        TomlVal::Str(parse_string(rhs, line_no)?)
-    } else if is_bare(rhs) {
-        TomlVal::Str(rhs.to_string())
-    } else {
-        TomlVal::Str(parse_string(rhs, line_no)?)
-    };
-    Ok((key.to_string(), val))
-}
-
-fn is_bare(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-}
-
-fn is_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphabetic() && first != '_' {
-        return false;
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-fn parse_string(s: &str, line_no: usize) -> Result<String, String> {
-    let inner = s
-        .strip_prefix('"')
-        .and_then(|t| t.strip_suffix('"'))
-        .ok_or_else(|| format!("j3.toml:{line_no}: expected a \"string\""))?;
-    Ok(inner.to_string())
-}
-
-fn parse_string_array(s: &str, line_no: usize) -> Result<Vec<String>, String> {
-    let inner = s
-        .strip_prefix('[')
-        .and_then(|t| t.strip_suffix(']'))
-        .ok_or_else(|| format!("j3.toml:{line_no}: expected an array"))?;
-    let inner = inner.trim();
-    if inner.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_str = false;
-    for ch in inner.chars() {
-        if ch == '"' {
-            in_str = !in_str;
-            cur.push(ch);
-            continue;
-        }
-        if ch == ',' && !in_str {
-            let part = cur.trim();
-            if !part.is_empty() {
-                out.push(parse_string(part, line_no)?);
-            }
-            cur.clear();
-            continue;
-        }
-        cur.push(ch);
-    }
-    let part = cur.trim();
-    if !part.is_empty() {
-        out.push(parse_string(part, line_no)?);
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_bounce_shaped_toml() {
-        let text = r#"
-# comment
-[package]
-name = "bounce"
-entry = "src/main.j3"
-
-[cc]
-std = "c11"
-opt = "0"
-
-[link]
-libs = ["SDL2"]
-search = []
-files = []
-flags = ["-lm"]
-"#;
-        let tmp = std::env::temp_dir().join("j3_toml_parse_test");
-        let _ = std::fs::create_dir_all(tmp.join("src"));
-        std::fs::write(tmp.join("src/main.j3"), "module t;\nfn main() {}\n").unwrap();
-        let m = parse_manifest(text, tmp.clone()).expect("parse");
-        assert_eq!(m.name, "bounce");
-        assert_eq!(m.entry, tmp.join("src/main.j3"));
-        assert_eq!(m.cc.std, "c11");
-        assert_eq!(m.cc.opt, "0");
-        assert_eq!(m.link.libs, vec!["SDL2".to_string()]);
-        assert!(m.link.search.is_empty());
-        assert_eq!(m.link.flags, vec!["-lm".to_string()]);
-        assert_eq!(m.emit.backend, "llvm");
-        assert_eq!(m.emit.opt, "0");
-    }
-
-    #[test]
-    fn parse_emit_section_bare_tokens() {
-        let text = r#"
-[package]
-name = "emitme"
-entry = "src/main.j3"
-
-[emit]
-backend = llvm
-opt = 2
-debug = true
-fast = false
-cpu = native
-flags = ["-mavx2"]
-"#;
-        let tmp = std::env::temp_dir().join("j3_toml_emit_test");
-        let _ = std::fs::create_dir_all(tmp.join("src"));
-        std::fs::write(tmp.join("src/main.j3"), "module t;\nfn main() {}\n").unwrap();
-        let m = parse_manifest(text, tmp).expect("parse");
-        assert_eq!(m.emit.backend, "llvm");
-        assert_eq!(m.emit.opt, "2");
-        assert!(m.emit.debug);
-        assert!(!m.emit.fast);
-        assert_eq!(m.emit.cpu, "native");
-        assert_eq!(m.emit.flags, vec!["-mavx2".to_string()]);
-        assert!(m.emit.targets.is_empty());
-    }
-
-    #[test]
-    fn parse_target_array_and_string() {
-        let tmp = std::env::temp_dir().join("j3_toml_targets_test");
-        let _ = std::fs::create_dir_all(tmp.join("src"));
-        std::fs::write(tmp.join("src/main.j3"), "module t;\nfn main() {}\n").unwrap();
-        let many = r#"
-[package]
-name = "multi"
-entry = "src/main.j3"
-[emit]
-target = ["x86_64-pc-linux-gnu", "x86_64-pc-windows-gnu", "arm64-apple-darwin"]
-"#;
-        let m = parse_manifest(many, tmp.clone()).expect("array");
-        assert_eq!(
-            m.emit.targets,
-            vec![
-                "x86_64-pc-linux-gnu".to_string(),
-                "x86_64-pc-windows-gnu".to_string(),
-                "arm64-apple-darwin".to_string(),
-            ]
-        );
-        assert_eq!(m.emit.primary(), "x86_64-pc-linux-gnu");
-        assert_eq!(
-            m.out_path_for("x86_64-pc-windows-gnu"),
-            tmp.join("target").join("x86_64-pc-windows-gnu").join("multi")
-        );
-        let one = r#"
-[package]
-name = "multi"
-entry = "src/main.j3"
-[emit]
-target = "x86_64-pc-windows-gnu"
-"#;
-        let m = parse_manifest(one, tmp).expect("string");
-        assert_eq!(m.emit.targets, vec!["x86_64-pc-windows-gnu".to_string()]);
-        assert_eq!(m.emit.primary(), "x86_64-pc-windows-gnu");
-        assert!(m.out_path().ends_with("multi"));
-    }
-
-    #[test]
-    fn script_path_is_the_file_not_the_project() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/fps-shooter");
-        match resolve(&root).expect("project") {
-            Input::Project(m) => assert!(
-                m.entry.ends_with("src/main.j3"),
-                "{}",
-                m.entry.display()
-            ),
-            Input::File(_) | Input::Hello => panic!("expected the game project"),
-        }
-        let script = root.join("tools/arena.j3s");
-        match resolve(&script).expect("script") {
-            Input::File(p) => assert_eq!(p, script),
-            Input::Project(_) | Input::Hello => panic!("expected the script file"),
-        }
-    }
-
-    #[test]
-    fn dist_build_outputs() {
-        let dir = std::env::temp_dir().join(format!("j3-dist-toml-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/main.j3"), "").unwrap();
-        let m = |t: &str| parse_manifest(&format!("[package]\nname = \"g\"\n{t}"), dir.clone());
-        let a = m("[dist]\nbuild_outputs = [\"deb\", \"zip\", \"deb\"]\nicon = \"i.png\"\n").unwrap();
-        assert_eq!(a.dist.outputs, [Output::Deb, Output::Zip]);
-        assert_eq!(a.dist.icon.as_deref(), Some("i.png"));
-        assert_eq!(a.dist.categories, "Game;");
-        assert_eq!((a.version.as_str(), a.description.as_str()), ("0.1.0", "g, made with j3"));
-        assert_eq!(m("[dist]\nzip = true\n").unwrap().dist.outputs, [Output::Zip]);
-        assert!(m("[dist]\nbuild_outputs = [\"msi\"]\n").unwrap_err().contains("zip, deb"));
-        // `apk` without an Android triple only fails where it is built (dist/apk.rs)
-        assert_eq!(m("[dist]\nbuild_outputs = [\"apk\"]\n").unwrap().dist.outputs, [Output::Apk]);
-        let ok = m("[emit]\ntarget = [\"aarch64-linux-android\"]\n[dist]\nbuild_outputs = [\"apk\"]\n").unwrap();
-        assert_eq!(ok.dist.outputs, [Output::Apk]);
-        assert_eq!(ok.android, Android { package: "com.j3.g".into(), orientation: "landscape".into(), native_libs: None });
-        let a = m("[android]\norientation = \"sensorPortrait\"\npackage = \"org.me.game\"\n").unwrap();
-        assert_eq!((a.android.package.as_str(), a.android.orientation.as_str()), ("org.me.game", "sensorPortrait"));
-        assert_eq!(m("[android]\nnative_libs = \"android/libs\"\n").unwrap().android.native_libs.as_deref(), Some("android/libs"));
-        assert!(m("[android]\norientation = \"flip\"\n").unwrap_err().contains("android.orientation"));
-        assert!(m("[android]\npackage = \"1bad.x\"\n").unwrap_err().contains("android.package"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn java_package_defaults_are_valid() {
-        assert_eq!(default_java_package("My-Game"), "com.j3.my_game");
-        assert_eq!(default_java_package("3d-demo"), "com.j3.app3d_demo");
-        assert_eq!(default_java_package("_x"), "com.j3.app_x");
-        assert_eq!(default_java_package("new"), "com.j3.new_");
-        assert_eq!(default_java_package("é"), "com.j3.app");
-        assert!(check_java_package(&default_java_package("desk-app")));
-        assert!(!check_java_package("single"));
-    }
-
-    #[test]
-    fn missing_name_is_error() {
-        let err = parse_manifest("[link]\nlibs = [\"x\"]\n", PathBuf::from("/")).unwrap_err();
-        assert!(err.contains("package"), "{err}");
-    }
-}
-
-/// One `[section] key = "value"` from TOML text (used for the user config).
-pub(crate) fn toml_str(text: &str, section: &str, key: &str) -> Option<String> {
-    parse_toml(text).ok()?.get(section, key)?.as_str().map(str::to_string)
-}
-
-/// Section headers (with lines) and string/number entries `(section, key, value, line)` of TOML text, for
-/// `j3c golden`. Errors read `j3.toml:LINE: ...`; the caller renames the file.
-pub(crate) fn toml_doc(text: &str) -> Result<(Vec<(String, usize)>, Vec<(String, String, String, usize)>), String> {
-    let t = parse_toml(text)?;
-    let mut out = Vec::new();
-    for ((s, k, v), line) in t.vals.into_iter().zip(t.lines) {
-        match v {
-            TomlVal::Str(v) => out.push((s, k, v, line)),
-            TomlVal::List(_) => return Err(format!("j3.toml:{line}: `{k}` must be a string or number")),
-        }
-    }
-    Ok((t.heads, out))
-}
+mod tests;

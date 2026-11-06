@@ -1,0 +1,220 @@
+// Expressions by precedence, loosest first: `||`, `&&`, comparisons, `+ -`, `* / %`, unary
+// `- !`, then postfix `.name`, `[i]`, `(args)` on a primary. Binary operators are left
+// associative. Part of `j3.j2.parse`.
+
+module j3.j2.parse;
+
+/// Binding power of a binary operator token, 0 when `k` is not one.
+pub fn binaryPrec(k: int): int {
+    if k == lex.T_OR { return 1; }
+    if k == lex.T_AND { return 2; }
+    if k >= lex.T_EQ && k <= lex.T_GE && k != lex.T_NOT { return 3; }
+    if k == lex.T_PLUS || k == lex.T_MINUS { return 4; }
+    if k == lex.T_STAR || k == lex.T_SLASH || k == lex.T_PERCENT { return 5; }
+    return 0;
+}
+
+/// Unary operators bind tighter than every binary one.
+pub const PREC_UNARY: int = 6;
+/// Postfix operators and primaries.
+pub const PREC_POSTFIX: int = 7;
+
+extend Parser {
+    fn expr(this: &Parser): int {
+        if !this.enter() { return -1; }
+        let n = this.binary(1);
+        this.depth -= 1;
+        return n;
+    }
+
+    /// Operators of binding power `min` and up.
+    fn binary(this: &Parser, min: int): int {
+        let left = this.unary();
+        while !this.failed {
+            let t = this.tok();
+            let prec = binaryPrec(t.kind);
+            if prec == 0 || prec < min { break; }
+            this.bump();
+            let right = this.binary(prec + 1);
+            let n = this.node(N_BINARY, t);
+            let nd = this.n(n);
+            nd.op = t.kind;
+            nd.a = left;
+            nd.b = right;
+            left = n;
+        }
+        return left;
+    }
+
+    fn unary(this: &Parser): int {
+        let t = this.tok();
+        if t.kind == lex.T_MINUS || t.kind == lex.T_NOT {
+            if !this.enter() { return -1; }
+            this.bump();
+            let a = this.unary();
+            this.depth -= 1;
+            let n = this.node(N_UNARY, t);
+            this.n(n).op = t.kind;
+            this.n(n).a = a;
+            return n;
+        }
+        return this.postfix();
+    }
+
+    fn postfix(this: &Parser): int {
+        let e = this.primary();
+        while !this.failed {
+            let t = this.tok();
+            if t.kind == lex.T_DOT {
+                this.bump();
+                let name = this.name("a field name after `.`");
+                let n = this.node(N_FIELD, t);
+                this.n(n).a = e;
+                this.n(n).s = name;
+                e = n;
+            } else if t.kind == lex.T_LBRACK {
+                this.bump();
+                let i = this.expr();
+                this.expect(lex.T_RBRACK, "`]`");
+                let n = this.node(N_INDEX, t);
+                this.n(n).a = e;
+                this.n(n).b = i;
+                e = n;
+            } else if t.kind == lex.T_LPAREN {
+                this.bump();
+                let n = this.node(N_CALL, t);
+                this.n(n).a = e;
+                let mark = this.stack.len;
+                this.list(lex.T_RPAREN, "`,` or `)`");
+                this.closeKids(n, mark);
+                e = n;
+            } else {
+                break;
+            }
+        }
+        return e;
+    }
+
+    /// Comma-separated expressions onto the stack up to `close` (a trailing comma is fine).
+    fn list(this: &Parser, close: int, what: string) {
+        while !this.failed && this.tok().kind != close {
+            this.stack.push(this.expr());
+            if !this.accept(lex.T_COMMA) { break; }
+        }
+        this.expect(close, what);
+    }
+
+    fn primary(this: &Parser): int {
+        let t = this.tok();
+        let k = t.kind;
+        if k == lex.K_NIL || k == lex.K_TRUE || k == lex.K_FALSE {
+            this.bump();
+            return this.node(if k == lex.K_NIL { N_NIL } else if k == lex.K_TRUE { N_TRUE } else { N_FALSE }, t);
+        }
+        if k == lex.T_INT {
+            this.bump();
+            let n = this.node(N_INT, t);
+            this.n(n).i = t.i;
+            return n;
+        }
+        if k == lex.T_FLOAT {
+            this.bump();
+            let n = this.node(N_FLOAT, t);
+            this.n(n).f = t.f;
+            return n;
+        }
+        if k == lex.T_STR {
+            this.bump();
+            return this.text(t);
+        }
+        if k == lex.T_TPL_HEAD { return this.template(); }
+        if k == lex.T_NAME {
+            this.bump();
+            let n = this.node(N_NAME, t);
+            this.n(n).s = this.src[t.s..t.e];
+            return n;
+        }
+        if k == lex.T_LPAREN {
+            this.bump();
+            let e = this.expr();
+            this.expect(lex.T_RPAREN, "`)`");
+            return e;
+        }
+        if k == lex.T_LBRACK {
+            this.bump();
+            let n = this.node(N_ARRAY, t);
+            let mark = this.stack.len;
+            this.list(lex.T_RBRACK, "`,` or `]`");
+            this.closeKids(n, mark);
+            return n;
+        }
+        if k == lex.T_LBRACE { return this.table(); }
+        if k == lex.K_FN {
+            this.bump();
+            return this.fnRest(t);
+        }
+        this.expected("an expression");
+        return -1;
+    }
+
+    /// An N_STR with the decoded text of string token `t`.
+    fn text(this: &Parser, t: Token): int {
+        let n = this.node(N_STR, t);
+        this.n(n).s = lex.strText(this.src, t, this.mem);
+        return n;
+    }
+
+    /// `` `text{expr}text{expr}text` `` from its TPL_HEAD.
+    fn template(this: &Parser): int {
+        let head = this.bump();
+        let n = this.node(N_TPL, head);
+        let mark = this.stack.len;
+        this.stack.push(this.text(head));
+        while !this.failed {
+            this.stack.push(this.expr());
+            let t = this.tok();
+            if t.kind == lex.T_TPL_MID {
+                this.bump();
+                this.stack.push(this.text(t));
+            } else if t.kind == lex.T_TPL_TAIL {
+                this.bump();
+                this.stack.push(this.text(t));
+                break;
+            } else {
+                this.expected("`}` to close the `{` in the string");
+            }
+        }
+        this.closeKids(n, mark);
+        return n;
+    }
+
+    /// `{ name: value, "key": value, }`.
+    fn table(this: &Parser): int {
+        let open = this.bump();
+        let n = this.node(N_TABLE, open);
+        let mark = this.stack.len;
+        while !this.failed && this.tok().kind != lex.T_RBRACE {
+            let kt = this.tok();
+            let p = this.node(N_PAIR, kt);
+            if kt.kind == lex.T_NAME {
+                this.bump();
+                this.n(p).s = this.src[kt.s..kt.e];
+            } else if kt.kind == lex.T_STR {
+                this.bump();
+                this.n(p).s = lex.strText(this.src, kt, this.mem);
+                this.n(p).flags = F_QUOTED;
+            } else {
+                this.expected("a field name or `}`");
+                break;
+            }
+            this.expect(lex.T_COLON, "`:`");
+            let v = this.expr();
+            this.n(p).a = v;
+            this.stack.push(p);
+            if !this.accept(lex.T_COMMA) { break; }
+        }
+        this.expect(lex.T_RBRACE, "`,` or `}`");
+        this.closeKids(n, mark);
+        return n;
+    }
+}

@@ -1,0 +1,555 @@
+// The compiler: AST to register bytecode (`code.j3`). This file holds the state, scopes, name
+// resolution and emit helpers, and the entry; statements are in `compile_stmt.j3`, expressions in
+// `compile_expr.j3`. Part of `j3.j2`.
+//
+// Names resolve at compile time, innermost first: a local (a register), an upvalue (a local of
+// an enclosing fn, captured), a top-level name of the chunk (a slot in the module env; all are
+// declared before anything compiles, so order doesn't matter and top-level fns are hoisted),
+// a `pub` one (a field of the exports table, E[0], so other scripts see every write), then a host
+// global (looked up by name at run time; a name the host never bound is a load error).
+// Registers: locals stay in the register they were given until their block ends; temporaries
+// above them are freed after each statement.
+// Compile-time lists live on a scratch arena; the finished `Proto`s are copied into the heap.
+
+module j3.j2;
+
+/// Registers per function (`a` is 8 bits, and a for-in uses 4 from its base).
+const MAX_REGS: int = 250;
+
+const R_LOCAL: int = 0;
+const R_UP: int = 1;
+const R_ENV: int = 2;
+const R_GLOBAL: int = 3;
+/// A `pub` top-level name: a field of the exports table (E[0]).
+const R_PUB: int = 4;
+
+struct Local {
+    name: string;
+    reg: int;
+    isConst: bool;
+    captured: bool;
+}
+
+struct UpDesc {
+    name: string;
+    /// `idx << 1 | 1` for a register of the enclosing fn, `idx << 1` for its upvalue.
+    desc: int;
+    isConst: bool;
+}
+
+struct LoopInfo {
+    /// First register of the loop's per-iteration variables; captured ones at or above it are closed each iteration.
+    level: int;
+    captured: bool;
+}
+
+struct PendingJump {
+    pc: int;
+    loop: int;
+    isBreak: bool;
+}
+
+struct Scope {
+    nlocals: int;
+    level: int;
+}
+
+/// Where a name lives.
+struct Res {
+    kind: int;
+    idx: int;
+    isConst: bool;
+}
+
+struct FnState {
+    code: List<int>;
+    lines: List<int>;
+    consts: List<Value>;
+    protos: List<int>;
+    ups: List<UpDesc>;
+    locals: List<Local>;
+    loops: List<LoopInfo>;
+    jumps: List<PendingJump>;
+    free: int;
+    maxStack: int;
+    nparams: int;
+    flags: int;
+    /// Block nesting; 0 is the function's own body.
+    depth: int;
+    name: string;
+}
+
+/// A `use name;`: env slot `slot` starts as the exports table `v`.
+struct UseInit {
+    slot: int;
+    v: Value;
+}
+
+struct Compiler {
+    vm: &Vm;
+    heap: &Heap;
+    mem: &Arena;
+    ast: &Ast;
+    file: string;
+    chunk: Value;
+    fileName: Value;
+    /// Functions being compiled, outermost (the chunk) first.
+    fns: List<FnState>;
+    envSlots: Map<string, int>;
+    envConst: List<bool>;
+    /// `pub` top-level names -> 1 when const.
+    pubNames: Map<string, int>;
+    uses: List<UseInit>;
+    /// Expressions being compiled inside each other (left-nested chains such as `f()()()` or
+    /// `a && a && a` recurse here without the parser's nesting count); capped at `MAX_EXPR_DEPTH`.
+    exprDepth: int;
+    failed: bool;
+    err: SyntaxError;
+}
+
+/// Compile `src` (chunk `name`, also the file name in errors) to a function that runs its top
+/// level over a new module env. `vm.loadString` is compile + run; this is for tests and tools.
+pub fn compileChunk(vm: &Vm, name: string, src: string): Result<Value, Error> {
+    return compileModule(vm, name, name, src);
+}
+
+/// Compile chunk `name` read from `file`. `use`s are resolved here (through `vm.resolver`).
+fn compileModule(vm: &Vm, name: string, file: string, src: string): Result<Value, Error> {
+    let mem = Arena.create(64 << 10);
+    // no GC while compiling: constants and protos are reachable only from the arena lists.
+    // ponytail: this covers `use`d scripts' top levels run by the resolver too; root the
+    // compiler's lists instead if a game's modules churn memory while loading.
+    vm.gcPause += 1;
+    let r = compileIn(vm, name, file, src, &mem);
+    vm.gcPause -= 1;
+    mem.destroy();
+    // the chunk's closure, protected, is now the only new root: a safe point (out of the pause)
+    match r {
+        Result.Ok(f) {
+            vm.protect(f);
+            if vm.memFull() { return Result.Err(vm.error()); }
+        }
+        Result.Err(_) { }
+    }
+    return r;
+}
+
+fn compileIn(vm: &Vm, name: string, file: string, src: string, mem: &Arena): Result<Value, Error> {
+    // fixed: errors hand these names to the host, and they must outlive the protos
+    let chunk = fix(vm.heap.intern(name));
+    let fileName = fix(vm.heap.intern(file));
+    let ast = Ast { file: file, nodes: List<Node>.new(mem), kids: List<int>.new(mem), root: -1 };
+    match parse.parse(file, src, mem) {
+        Result.Ok(a) { ast = a; }
+        Result.Err(e) { return Result.Err(vm.syntaxError(e, chunk, fileName)); }
+    }
+    let c = Compiler {
+        vm: vm,
+        heap: vm.heap,
+        mem: mem,
+        ast: &ast,
+        file: file,
+        chunk: chunk,
+        fileName: fileName,
+        fns: List<FnState>.new(mem),
+        envSlots: Map<string, int>.new(mem, 64),
+        envConst: List<bool>.new(mem),
+        pubNames: Map<string, int>.new(mem, 64),
+        uses: List<UseInit>.new(mem),
+        exprDepth: 0,
+        failed: false,
+        err: SyntaxError { file: file, line: 0, col: 0, msg: "", text: "" },
+    };
+    c.envConst.push(true); // E[0]: the exports table
+    let p = c.mainFn();
+    if c.failed { return Result.Err(vm.syntaxError(c.err, chunk, fileName)); }
+    if sys.env("J3_J2_DUMP") == "1" {
+        let t = Text.new(mem);
+        dumpProto(&t, p);
+        io.printLn(t.str());
+    }
+    let env = vm.heap.newArray(c.envConst.len);
+    let ea = arrOf(env);
+    ea.push(vm.heap, vm.heap.newTable());
+    for i in 1..c.envConst.len { ea.push(vm.heap, nilv()); }
+    return Result.Ok(vm.heap.newClosure(p, env));
+}
+
+extend Vm {
+    /// A lex, parse or compile error of chunk `chunk` as an `Error` (its text copied into the VM).
+    fn syntaxError(this: &Vm, e: SyntaxError, chunk: Value, file: Value): Error {
+        this.errText().pushStr(e.msg);
+        this.located = true;
+        this.err.chunk = textOf(chunk);
+        this.errFile = textOf(file);
+        this.err.line = e.line;
+        this.err.col = e.col;
+        this.traceBuf.clear();
+        return this.error();
+    }
+}
+
+fn newFnState(mem: &Arena, name: string): FnState {
+    return FnState {
+        code: List<int>.new(mem),
+        lines: List<int>.new(mem),
+        consts: List<Value>.new(mem),
+        protos: List<int>.new(mem),
+        ups: List<UpDesc>.new(mem),
+        locals: List<Local>.new(mem),
+        loops: List<LoopInfo>.new(mem),
+        jumps: List<PendingJump>.new(mem),
+        free: 0,
+        maxStack: 0,
+        nparams: 0,
+        flags: 0,
+        depth: 0,
+        name: name,
+    };
+}
+
+extend Compiler {
+    fn fs(this: &Compiler): &FnState { return &this.fns.items[this.fns.len - 1]; }
+
+    fn node(this: &Compiler, n: int): &Node { return this.ast.node(n); }
+
+    /// Stop with `msg` at node `n`. Only the first error counts.
+    fn failAt(this: &Compiler, n: int, msg: string) {
+        if this.failed { return; }
+        this.failed = true;
+        let nd = this.node(n);
+        this.err = lex.syntaxError(this.mem, this.file, nd.line, nd.col, msg);
+    }
+
+    /// `msg "name"`.
+    fn failName(this: &Compiler, n: int, msg: string, name: string) {
+        let t = Text.new(this.mem);
+        t.pushStr(msg);
+        t.pushStr(" \"");
+        t.pushStr(name);
+        t.pushStr("\"");
+        this.failAt(n, t.str());
+    }
+
+    // ---- emitting ----
+
+    /// Append instruction `ins` with the position of node `n`; its index.
+    fn emit(this: &Compiler, n: int, ins: int): int {
+        let f = this.fs();
+        let nd = this.node(n);
+        f.code.push(ins);
+        f.lines.push((nd.line << 32) | nd.col);
+        return f.code.len - 1;
+    }
+
+    fn emitABC(this: &Compiler, n: int, op: int, a: int, b: int, c: int): int {
+        return this.emit(n, insABC(op, a, b, c));
+    }
+
+    fn emitABx(this: &Compiler, n: int, op: int, a: int, bx: int): int {
+        return this.emit(n, insABx(op, a, bx));
+    }
+
+    /// The index the next instruction gets.
+    fn here(this: &Compiler): int { return this.fs().code.len; }
+
+    /// A jump-type instruction to patch later.
+    fn jump(this: &Compiler, n: int, op: int, a: int): int {
+        return this.emitABx(n, op, a, SBX_BIAS);
+    }
+
+    /// Point the jump at `pc` to `target`.
+    fn patch(this: &Compiler, pc: int, target: int) {
+        let sbx = target - (pc + 1);
+        if sbx < 0 - SBX_BIAS || sbx > MAX_BX - SBX_BIAS {
+            this.failAt(this.ast.root, "function too big (a jump is too long)");
+            return;
+        }
+        let code = &this.fs().code;
+        code.items[pc] = (code.items[pc] & 0xffff) | ((sbx + SBX_BIAS) << 16);
+    }
+
+    /// A jump emitted now to an earlier `target`.
+    fn jumpBack(this: &Compiler, n: int, op: int, a: int, target: int) {
+        this.patch(this.jump(n, op, a), target);
+    }
+
+    // ---- registers and constants ----
+
+    fn alloc(this: &Compiler, n: int): int {
+        let f = this.fs();
+        f.free += 1;
+        if f.free > f.maxStack { f.maxStack = f.free; }
+        if f.free > MAX_REGS {
+            this.failAt(n, "function needs too many registers (simplify the expression or split the function)");
+            f.free = MAX_REGS;
+        }
+        return f.free - 1;
+    }
+
+    /// Constant `v` of the running function (shared when already there).
+    // ponytail: a linear scan per constant; a value-keyed map if a 2000-line function shows up in profiles.
+    fn constOf(this: &Compiler, n: int, v: Value): int {
+        let ks = &this.fs().consts;
+        for i in 0..ks.len {
+            if same(ks.items[i], v) { return i; }
+        }
+        ks.push(v);
+        if ks.len > MAX_BX + 1 { this.failAt(n, "function has too many constants"); }
+        return ks.len - 1;
+    }
+
+    fn strConst(this: &Compiler, n: int, s: string): int { return this.constOf(n, this.heap.intern(s)); }
+
+    // ---- scopes and names ----
+
+    fn openScope(this: &Compiler): Scope {
+        let f = this.fs();
+        f.depth += 1;
+        return Scope { nlocals: f.locals.len, level: f.free };
+    }
+
+    /// End a block: its locals go out of scope; captured ones are closed when `close`.
+    fn closeScope(this: &Compiler, n: int, s: Scope, close: bool) {
+        let f = this.fs();
+        let captured = false;
+        for i in s.nlocals..f.locals.len {
+            if f.locals.items[i].captured { captured = true; }
+        }
+        if captured && close { this.emitABC(n, OP_CLOSE, s.level, 0, 0); }
+        let g = this.fs();
+        g.locals.len = s.nlocals;
+        g.free = s.level;
+        g.depth -= 1;
+    }
+
+    fn addLocal(this: &Compiler, name: string, reg: int, isConst: bool) {
+        this.fs().locals.push(Local { name: name, reg: reg, isConst: isConst, captured: false });
+    }
+
+    /// Is register `r` a named local of the running function?
+    fn isLocalReg(this: &Compiler, r: int): bool {
+        let ls = &this.fs().locals;
+        for i in 0..ls.len {
+            if ls.items[i].reg == r { return true; }
+        }
+        return false;
+    }
+
+    /// Index in function `fi`'s locals of the innermost `name`, or -1.
+    fn findLocal(this: &Compiler, fi: int, name: string): int {
+        let ls = &this.fns.items[fi].locals;
+        let i = ls.len - 1;
+        while i >= 0 {
+            if ls.items[i].name == name { return i; }
+            i -= 1;
+        }
+        return -1;
+    }
+
+    /// Upvalue index of `name` in function `fi`, added if needed, or -1 when no enclosing
+    /// function has it.
+    fn resolveUp(this: &Compiler, n: int, fi: int, name: string): int {
+        if fi == 0 { return -1; }
+        {
+            let ups = &this.fns.items[fi].ups;
+            for i in 0..ups.len {
+                if ups.items[i].name == name { return i; }
+            }
+        }
+        let pf = fi - 1;
+        let li = this.findLocal(pf, name);
+        let desc = 0;
+        let isConst = false;
+        if li >= 0 {
+            let parent = &this.fns.items[pf];
+            let l = &parent.locals.items[li];
+            l.captured = true;
+            isConst = l.isConst;
+            desc = (l.reg << 1) | 1;
+            for j in 0..parent.loops.len {
+                if parent.loops.items[j].level <= l.reg { parent.loops.items[j].captured = true; }
+            }
+        } else {
+            let u = this.resolveUp(n, pf, name);
+            if u < 0 { return -1; }
+            desc = u << 1;
+            isConst = this.fns.items[pf].ups.items[u].isConst;
+        }
+        let mine = &this.fns.items[fi].ups;
+        mine.push(UpDesc { name: name, desc: desc, isConst: isConst });
+        if mine.len > 255 { this.failAt(n, "function captures too many variables"); }
+        return mine.len - 1;
+    }
+
+    fn resolve(this: &Compiler, n: int, name: string): Res {
+        let fi = this.fns.len - 1;
+        let li = this.findLocal(fi, name);
+        if li >= 0 {
+            let l = this.fns.items[fi].locals.items[li];
+            return Res { kind: R_LOCAL, idx: l.reg, isConst: l.isConst };
+        }
+        let u = this.resolveUp(n, fi, name);
+        if u >= 0 {
+            return Res { kind: R_UP, idx: u, isConst: this.fns.items[fi].ups.items[u].isConst };
+        }
+        let slot = this.envSlots.getOr(name, -1);
+        if slot >= 0 {
+            return Res { kind: R_ENV, idx: slot, isConst: this.envConst.items[slot] };
+        }
+        let pc = this.pubNames.getOr(name, -1);
+        if pc >= 0 {
+            return Res { kind: R_PUB, idx: -1, isConst: pc == 1 };
+        }
+        // a host global (read by name at run time) or, when the host bound nothing by that name, unknown
+        return Res { kind: R_GLOBAL, idx: -1, isConst: false };
+    }
+
+    /// The env slot of top-level `name`, made if new.
+    fn envSlot(this: &Compiler, name: string, isConst: bool): int {
+        let slot = this.envSlots.getOr(name, -1);
+        if slot >= 0 {
+            if isConst { this.envConst.items[slot] = true; }
+            return slot;
+        }
+        this.envSlots.put(name, this.envConst.len);
+        this.envConst.push(isConst);
+        if this.envConst.len > MAX_BX + 1 { this.failAt(this.ast.root, "too many top-level names"); }
+        return this.envConst.len - 1;
+    }
+
+    /// Statements at the top level of the chunk (not inside a function or block) declare env slots.
+    fn atTop(this: &Compiler): bool { return this.fns.len == 1 && this.fs().depth == 0; }
+
+    // ---- functions ----
+
+    /// Store register `t` into top-level `name` (a `pub` field or an env slot).
+    fn setTop(this: &Compiler, n: int, name: string, t: int) {
+        if this.pubNames.getOr(name, -1) >= 0 {
+            this.emitABx(n, OP_SETPUB, t, this.strConst(n, name));
+        } else {
+            this.emitABx(n, OP_SETENV, t, this.envSlots.getOr(name, 0));
+        }
+    }
+
+    /// The chunk's top level as a function: declare every top-level name (`pub` ones in the
+    /// exports table, `use` ones resolved now), create the top-level fns first (hoisting), then
+    /// run the other statements in order.
+    fn mainFn(this: &Compiler): &Proto {
+        this.fns.push(newFnState(this.mem, "main"));
+        let root = this.ast.root;
+        let count = this.node(root).count;
+        for i in 0..count {
+            let k = this.ast.kid(root, i);
+            let nd = this.node(k);
+            let isConst = (nd.flags & parse.F_CONST) != 0;
+            if (nd.kind == parse.N_LET || nd.kind == parse.N_FNDECL) && (nd.flags & parse.F_PUB) != 0 {
+                this.pubNames.put(nd.s, if isConst { 1 } else { 0 });
+            } else if nd.kind == parse.N_LET || nd.kind == parse.N_FNDECL {
+                this.envSlot(nd.s, isConst);
+            } else if nd.kind == parse.N_USE && !this.failed {
+                let v = nilv();
+                if this.vm.useModule(nd.s, &v) {
+                    this.uses.push(UseInit { slot: this.envSlot(nd.s, true), v: v });
+                } else {
+                    this.failAt(k, this.vm.errBuf.str());
+                }
+            }
+        }
+        for i in 0..this.uses.len {
+            let u = this.uses.items[i];
+            let t = this.alloc(root);
+            this.loadConst(root, t, u.v);
+            this.emitABx(root, OP_SETENV, t, u.slot);
+            this.fs().free = t;
+        }
+        for i in 0..count {
+            let k = this.ast.kid(root, i);
+            if this.node(k).kind == parse.N_FNDECL {
+                let idx = this.function(k);
+                let t = this.alloc(k);
+                this.emitABx(k, OP_CLOSURE, t, idx);
+                this.setTop(k, this.node(k).s, t);
+                this.fs().free = t;
+            }
+        }
+        for i in 0..count {
+            if this.failed { break; }
+            this.stmt(this.ast.kid(root, i));
+        }
+        this.emitABC(root, OP_RETURN, 0, 0, 0);
+        let p = this.finish();
+        this.fns.len -= 1;
+        return p;
+    }
+
+    /// Compile function node `n` (N_FN or N_FNDECL) as a child of the running function; the
+    /// child's index for `OP_CLOSURE`.
+    fn function(this: &Compiler, n: int): int {
+        let nd = this.node(n);
+        this.fns.push(newFnState(this.mem, nd.s));
+        let f = this.fs();
+        f.flags = nd.flags & parse.F_THIS;
+        f.nparams = nd.count;
+        for i in 0..nd.count {
+            let pn = this.ast.kid(n, i);
+            this.addLocal(this.node(pn).s, this.alloc(pn), false);
+        }
+        let body = nd.b;
+        if body >= 0 {
+            let bc = this.node(body).count;
+            for i in 0..bc {
+                if this.failed { break; }
+                this.stmt(this.ast.kid(body, i));
+            }
+        }
+        this.emitABC(if body >= 0 { body } else { n }, OP_RETURN, 0, 0, 0);
+        let p = this.finish();
+        this.fns.len -= 1;
+        let parent = this.fs();
+        parent.protos.push(p as ptr as int);
+        if parent.protos.len > MAX_BX + 1 { this.failAt(n, "too many functions in one function"); }
+        return parent.protos.len - 1;
+    }
+
+    /// Copy the running function's lists into a heap `Proto`.
+    fn finish(this: &Compiler): &Proto {
+        let f = this.fs();
+        let h = this.heap;
+        let p = h.newObject(OBJ_PROTO, @sizeof(Proto)) as &Proto;
+        p.ncode = f.code.len;
+        p.code = h.allocRaw(f.code.len * 4);
+        p.lines = h.allocRaw(f.code.len * 8);
+        let code = p.codeOf();
+        let lines = p.linesOf();
+        for i in 0..f.code.len {
+            code[i] = u32(f.code.items[i]);
+            lines[i] = f.lines.items[i];
+        }
+        p.nconsts = f.consts.len;
+        if p.nconsts > 0 {
+            p.consts = h.allocRaw(p.nconsts * @sizeof(Value));
+            let ks = p.constsOf();
+            for i in 0..p.nconsts { ks[i] = f.consts.items[i]; }
+        }
+        p.nprotos = f.protos.len;
+        if p.nprotos > 0 {
+            p.protos = h.allocRaw(p.nprotos * 8);
+            let ps = p.protosOf();
+            for i in 0..p.nprotos { ps[i] = f.protos.items[i]; }
+        }
+        p.nups = f.ups.len;
+        if p.nups > 0 {
+            p.ups = h.allocRaw(p.nups * 8);
+            let us = p.upsOf();
+            for i in 0..p.nups { us[i] = f.ups.items[i].desc; }
+        }
+        p.nparams = f.nparams;
+        p.maxStack = f.maxStack;
+        p.flags = f.flags;
+        p.name = if f.name.len > 0 { h.intern(f.name) } else { nilv() };
+        p.chunk = this.chunk;
+        p.file = this.fileName;
+        return p;
+    }
+}

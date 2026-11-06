@@ -73,6 +73,7 @@ pub(super) fn build_for_play(root: &Path, host: &Path) -> Result<(PathBuf, Optio
 pub(super) fn spawn_game(root: &Path, exe: &Path, scene: &str) -> Result<Child, String> {
     let mut process = Command::new(exe)
         .current_dir(root)
+        .envs(crate::dist::steam_dev_env(root))
         .env("J3_ROOT", root)
         .env("J3_SCENE", scene)
         .stdout(Stdio::piped())

@@ -120,6 +120,13 @@ impl BodyBuilder {
         place.project(Proj::Ptr, ptr_ty, access, span)
     }
 
+    /// Lane `lane` (0..3) of a vector place; the lane is writable when the vector is.
+    pub fn vec_lane(&self, cx: &IrCx, place: Place, lane: u8, span: Span) -> Place {
+        let ty = cx.vec_lane(place.ty).expect("lane of non-vector");
+        let access = place.access;
+        place.project(Proj::Lane { lane, ty }, ty, access, span)
+    }
+
     pub fn enum_tag(&self, cx: &IrCx, place: Place, span: Span) -> Place {
         let access = place.access;
         place.project(Proj::EnumTag, cx.common.i32, access, span)

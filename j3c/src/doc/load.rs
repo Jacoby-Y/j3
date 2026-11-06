@@ -128,6 +128,9 @@ pub(super) fn open_module(parts: &[&str]) -> Result<Option<Module>, String> {
     let Some(m) = here() else { return Ok(None) };
     let owned: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
     let mut tries = vec![crate::compile::join_mod(&m.src_dir(), &owned)];
+    if let Some(d) = m.deps.iter().find(|d| owned.len() > 1 && owned[0] == d.name) {
+        tries.insert(0, crate::compile::join_mod(&d.root, &owned[1..]));
+    }
     if owned.len() > 1 && owned[0] == m.name {
         tries.push(crate::compile::join_mod(&m.src_dir(), &owned[1..]));
     }
@@ -190,5 +193,12 @@ pub(super) fn collect_j3(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Strin
 }
 
 pub(super) fn parse_file(path: &Path, src: &str) -> Result<File, String> {
-    parse::parse(src, FileId(1)).map_err(|e| parse::format_error(&path.display().to_string(), src, &e))
+    let shown = path.display().to_string();
+    let mut file = parse::parse(src, FileId(1)).map_err(|e| parse::format_error(&shown, src, &e))?;
+    // `extend T { .. }` blocks (often in part files) are listed under their struct
+    let key = file.module_key();
+    parse::extend::merge(&mut file.items, &key, &|_| None).map_err(|e| {
+        crate::diag::Diagnostic::error(&shown, e.span, &e.message).render(&[(shown.clone(), src.to_string())])
+    })?;
+    Ok(file)
 }

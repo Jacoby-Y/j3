@@ -1,13 +1,29 @@
 use super::*;
 
+mod cycles;
+mod paths;
+mod scripts;
+
+pub use scripts::script_paths;
+pub(super) use cycles::check_import_cycles;
+pub(super) use paths::{same_path, source_exists};
+pub(crate) use paths::join_mod;
+pub(super) use scripts::script_module_parts;
+
 pub(super) struct Loader {
     pub(super) files: Vec<ParsedFile>,
     pub(super) loaded: HashSet<String>,
     pub(super) next_file: u32,
     pub(super) game: GameBackend,
     pub(super) os: OsKind,
+    /// Index of `j3.sys.ARCH_*` for the target.
+    pub(super) arch: usize,
     pub(super) src_dir: Option<PathBuf>,
     pub(super) package: Option<String>,
+    /// `[package] version`, patched into `j3.build.VERSION`.
+    pub(super) version: Option<String>,
+    /// `[dependencies]` of the project, flat (`project::deps`): `use <name>.a;` is `<root>/a.j3`.
+    pub(super) deps: Vec<crate::project::Dep>,
     pub(super) script_root: PathBuf,
     pub(super) overlays: Vec<(PathBuf, String)>,
     /// Scene files scanned for attached scripts (once, on first need).
@@ -17,6 +33,15 @@ pub(super) struct Loader {
     pub(super) ui_gen: Option<crate::ui::Generated>,
     /// The last generation error, with its position (the LSP reads it).
     pub(super) ui_err: Option<crate::ui::BuildErr>,
+}
+
+/// One file a wave will parse: a module's main file, or one of its parts (`part_of`).
+struct Planned {
+    key: String,
+    path: String,
+    text: String,
+    id: FileId,
+    part_of: Option<String>,
 }
 
 pub(super) struct UiCfg {
@@ -50,9 +75,32 @@ impl Loader {
         let key = self.files.last().map(|f| f.ast.module_key()).unwrap_or_default();
         for part in crate::stdlib::parts(&path.with_extension("")) {
             let text = self.read_text(&part)?;
+            if other_module(&text, &key) {
+                continue;
+            }
             self.parse_inner(part.display().to_string(), text, Some(&key))?;
         }
         Ok(())
+    }
+
+    /// The `j3.sys` files carry a placeholder `ARCH` and `ARCH_NAME`; the target's own go in (same line count).
+    /// `j3.build` gets the package's `NAME` and `VERSION` the same way.
+    fn with_arch(&self, path: &Path, src: &str) -> String {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if matches!(name.as_str(), "build.j3" | "build_release.j3") && src.contains("module j3.build;") {
+            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+            let v = esc(self.version.as_deref().unwrap_or("0.0.0"));
+            let n = esc(self.package.as_deref().unwrap_or(""));
+            return src
+                .replacen("pub const VERSION: string = \"0.0.0\";", &format!("pub const VERSION: string = \"{v}\";"), 1)
+                .replacen("pub const NAME: string = \"\";", &format!("pub const NAME: string = \"{n}\";"), 1);
+        }
+        if !matches!(name.as_str(), "sys.j3" | "sys_windows.j3" | "sys_macos.j3" | "sys_android.j3") {
+            return src.to_string();
+        }
+        const NAMES: [&str; 6] = ["x86_64", "aarch64", "x86", "arm", "riscv", "other"];
+        src.replacen("pub const ARCH: int = 0;", &format!("pub const ARCH: int = {};", self.arch), 1)
+            .replacen("pub const ARCH_NAME: string = \"x86_64\";", &format!("pub const ARCH_NAME: string = \"{}\";", NAMES[self.arch]), 1)
     }
 
     fn read_text(&self, path: &Path) -> Result<String, String> {
@@ -62,12 +110,13 @@ impl Loader {
             }
         }
         if let Some(src) = crate::stdlib::embedded(path) {
-            return Ok(src.to_string());
+            return Ok(self.with_arch(path, src));
         }
         if builtin_hello(path) {
             return Ok(HELLO_SRC.to_string());
         }
-        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
+        let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        Ok(self.with_arch(path, &text))
     }
 
     fn parse_text(&mut self, path: String, text: String) -> Result<(), String> {
@@ -84,7 +133,7 @@ impl Loader {
         ));
         let file_id = FileId(self.next_file);
         self.next_file += 1;
-        let ast = match if path.ends_with(".j3s") {
+        let parsed = if path.ends_with(".j3s") {
             let rel = Path::new(&path)
                 .strip_prefix(&self.script_root)
                 .map_err(|_| {
@@ -98,7 +147,20 @@ impl Loader {
             parse::parse_script(&text, file_id, &parts)
         } else {
             parse::parse(&text, file_id)
-        } {
+        };
+        self.finish_parse(path, text, file_id, parsed, part_of)
+    }
+
+    /// Keep a parsed file: errors rendered against the source, a repeated module dropped.
+    fn finish_parse(
+        &mut self,
+        path: String,
+        text: String,
+        file_id: FileId,
+        parsed: Result<parse::File, parse::ParseError>,
+        part_of: Option<&str>,
+    ) -> Result<(), String> {
+        let ast = match parsed {
             Ok(f) => f,
             Err(e) => {
                 if let Some(g) = self.ui_gen.as_ref().filter(|g| g.label == path) {
@@ -139,6 +201,11 @@ impl Loader {
             let text = crate::i18n::config_module(&self.script_root);
             return self.parse_text(crate::i18n::LABEL.to_string(), text);
         }
+        if key == crate::appconfig::MODULE {
+            // `[splash]` and `[dist] icon`, baked in the same way
+            let text = crate::appconfig::config_module(&self.script_root);
+            return self.parse_text(crate::appconfig::LABEL.to_string(), text);
+        }
         if self.ui_cfg.as_ref().is_some_and(|u| format!("{}.ui", u.package) == key) {
             return self.load_ui();
         }
@@ -150,77 +217,143 @@ impl Loader {
                 path.display()
             ));
         }
-        self.load_path(&path)
+        self.load_path(&path)?;
+        self.dep_module_line(&key, &path.display().to_string())
     }
 
-    fn module_path(&self, parts: &[String]) -> PathBuf {
-        if parts.len() == 2 && parts[0] == "j3" && parts[1] == "game" {
-            let name = match self.game {
-                GameBackend::Sdl => "game.j3",
-                GameBackend::Headless => "game_headless.j3",
-            };
-            return stdlib_dir().join("j3").join(name);
-        }
-        if parts.len() == 2 && parts[0] == "j3" && parts[1] == "build" {
-            // `--release` swaps in the file with `RELEASE = true`, `DEV = false`
-            let release = crate::cli::RELEASE.load(std::sync::atomic::Ordering::Relaxed);
-            return stdlib_dir().join("j3").join(if release { "build_release.j3" } else { "build.j3" });
-        }
-        if parts.len() == 2 && parts[0] == "j3" && parts[1] == "sys" {
-            let name = match self.os {
-                OsKind::Linux => "sys.j3",
-                OsKind::Windows => "sys_windows.j3",
-                OsKind::Macos => "sys_macos.j3",
-                OsKind::Android => "sys_android.j3",
-            };
-            return stdlib_dir().join("j3").join(name);
-        }
-        if parts.len() == 2 && parts[0] == "j3" && parts[1] == "threadsys" {
-            let name = match self.os {
-                OsKind::Windows => "threadsys_windows.j3",
-                OsKind::Android => "threadsys_android.j3",
-                OsKind::Linux | OsKind::Macos => "threadsys.j3",
-            };
-            return stdlib_dir().join("j3").join(name);
-        }
-        if parts.len() == 2 && parts[0] == "j3" && parts[1] == "netsys" {
-            let name = match self.os {
-                OsKind::Linux => "netsys.j3",
-                OsKind::Windows => "netsys_windows.j3",
-                OsKind::Macos => "netsys_macos.j3",
-                OsKind::Android => "netsys_android.j3",
-            };
-            return stdlib_dir().join("j3").join(name);
-        }
-        if let Some(path) = self.project_module(parts) {
-            return path;
-        }
-        module_file(parts)
-    }
-
-    fn project_module(&self, parts: &[String]) -> Option<PathBuf> {
-        let src = self.src_dir.as_ref()?;
-        if parts.first().map(|s| s.as_str()) == Some("j3") {
-            return None;
-        }
-        let direct = join_mod(src, parts);
-        if direct.is_file() {
-            return Some(direct);
-        }
-        if let Some(pkg) = &self.package {
-            if parts.first() == Some(pkg) && parts.len() > 1 {
-                let stripped = join_mod(src, &parts[1..]);
-                if stripped.is_file() {
-                    return Some(stripped);
-                }
-            }
-        }
-        None
-    }
-
+    /// Breadth-first over `self.files`. Each wave plans the plain module loads of every file
+    /// not yet scanned (paths, parts and `FileId`s in the order the serial walk would use),
+    /// parses them in parallel, then keeps them in that order. A file whose imports need
+    /// anything else (scripts, generated modules, an unresolved path) flushes the plan and
+    /// goes through `imports_of`, which also produces the errors.
     pub(super) fn load_imports(&mut self) -> Result<(), String> {
         let mut i = 0;
         while i < self.files.len() {
+            let end = self.files.len();
+            let mut plan: Vec<Planned> = Vec::new();
+            let mut planned: HashSet<String> = HashSet::new();
+            while i < end {
+                match self.plan_imports(i, &planned, self.next_file + plan.len() as u32) {
+                    Some(more) => {
+                        for p in &more {
+                            if p.part_of.is_none() {
+                                planned.insert(p.key.clone());
+                            }
+                        }
+                        plan.extend(more);
+                        i += 1;
+                    }
+                    None => break,
+                }
+            }
+            self.commit_plan(plan)?;
+            if i < end {
+                self.imports_of(i)?;
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// The plain module loads of file `i`, or None when the file needs the serial path.
+    fn plan_imports(&self, i: usize, planned: &HashSet<String>, first_id: u32) -> Option<Vec<Planned>> {
+        if !script_deps::find(&self.files[i].ast).is_empty() {
+            return None;
+        }
+        let mut out: Vec<Planned> = Vec::new();
+        let mut keys: HashSet<String> = HashSet::new();
+        for it in &self.files[i].ast.items {
+            let parse::Item::Use(u) = it else { continue };
+            let path: Vec<String> = u.path.iter().map(|p| p.name.clone()).collect();
+            let joined = path.join(".");
+            if joined == scene_scripts::MODULE || joined == crate::i18n::MODULE || joined == crate::appconfig::MODULE {
+                return None;
+            }
+            let target: &[String] = if u.names.is_some() || source_exists(&self.module_path(&path)) {
+                &path
+            } else if path.len() >= 2 {
+                &path[..path.len() - 1]
+            } else {
+                return None;
+            };
+            let key = target.join(".");
+            if self.loaded.contains(&key) || planned.contains(&key) || keys.contains(&key) {
+                continue;
+            }
+            if key == scene_scripts::MODULE
+                || key == crate::i18n::MODULE
+                || key == crate::appconfig::MODULE
+                || self.ui_cfg.as_ref().is_some_and(|c| format!("{}.ui", c.package) == key)
+            {
+                return None;
+            }
+            let file = self.module_path(target);
+            if !source_exists(&file) || file.to_string_lossy().ends_with(".j3s") {
+                return None;
+            }
+            let text = self.read_text(&file).ok()?;
+            out.push(Planned { key: key.clone(), path: file.display().to_string(), text, id: FileId(first_id + out.len() as u32), part_of: None });
+            for part in crate::stdlib::parts(&file.with_extension("")) {
+                let text = self.read_text(&part).ok()?;
+                if other_module(&text, &key) {
+                    continue;
+                }
+                out.push(Planned { key: key.clone(), path: part.display().to_string(), text, id: FileId(first_id + out.len() as u32), part_of: Some(key.clone()) });
+            }
+            keys.insert(key);
+        }
+        Some(out)
+    }
+
+    /// Parse the plan on all cores, then keep the files in plan order (first error wins).
+    fn commit_plan(&mut self, plan: Vec<Planned>) -> Result<(), String> {
+        if plan.is_empty() {
+            return Ok(());
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results: Vec<std::sync::Mutex<Option<Result<parse::File, parse::ParseError>>>> =
+            plan.iter().map(|_| std::sync::Mutex::new(None)).collect();
+        let width = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(plan.len());
+        std::thread::scope(|scope| {
+            for _ in 0..width {
+                scope.spawn(|| loop {
+                    let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(p) = plan.get(n) else { break };
+                    *results[n].lock().unwrap() = Some(parse::parse(&p.text, p.id));
+                });
+            }
+        });
+        self.next_file += plan.len() as u32;
+        // A part follows its main file; it is kept only when the main file was.
+        let mut main_kept: Option<String> = None;
+        for (p, res) in plan.into_iter().zip(results) {
+            let parsed = res.into_inner().unwrap().expect("every planned file is parsed");
+            match &p.part_of {
+                None => {
+                    crate::phase::detail(&format!(
+                        "file {}: {}",
+                        self.files.len() + 1,
+                        Path::new(&p.path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+                    ));
+                    let before = self.files.len();
+                    let (key, shown) = (p.key.clone(), p.path.clone());
+                    self.finish_parse(p.path, p.text, p.id, parsed, None)?;
+                    self.dep_module_line(&key, &shown)?;
+                    main_kept = (self.files.len() > before).then(|| self.files[before].ast.module_key());
+                }
+                Some(_) => {
+                    if let Some(key) = main_kept.clone() {
+                        self.finish_parse(p.path, p.text, p.id, parsed, Some(&key))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The serial walk for one file: every `use`, then its scripts.
+    fn imports_of(&mut self, i: usize) -> Result<(), String> {
+        {
             let uses: Vec<(Vec<String>, Option<Vec<String>>)> = self.files[i]
                 .ast
                 .items
@@ -239,7 +372,7 @@ impl Loader {
             for (path, names) in uses {
                 if path.join(".") == scene_scripts::MODULE {
                     self.load_registry()?;
-                } else if path.join(".") == crate::i18n::MODULE {
+                } else if path.join(".") == crate::i18n::MODULE || path.join(".") == crate::appconfig::MODULE {
                     self.load_module(&path)?;
                 } else if names.is_some() {
                     self.load_module(&path)?;
@@ -255,7 +388,6 @@ impl Loader {
             for script in scripts {
                 self.load_script(&script.path, i, script.span)?;
             }
-            i += 1;
         }
         Ok(())
     }
@@ -277,8 +409,10 @@ impl Loader {
         if files.is_empty() {
             return Err(format!("cannot find module `{}.ui`: no .j3ui files in {}", cfg.package, dir.display()));
         }
+        // a project's own icons override Bootstrap names
+        let icons = crate::ui::icons::load_dir(&cfg.root.join("icons"))?;
         let package = cfg.package.clone();
-        let g = crate::ui::try_build(files, &package, theme).map_err(|e| {
+        let g = crate::ui::try_build(files, &package, theme, &icons).map_err(|e| {
             let r = e.rendered.clone();
             self.ui_err = Some(e);
             r
@@ -298,224 +432,16 @@ impl Loader {
         let text = scene_scripts::registry(&self.script_root, scan)?;
         self.parse_text(scene_scripts::LABEL.to_string(), text)
     }
-
-    /// When a scene attaches scripts, they and the registry join the program.
-    pub(super) fn load_scene_scripts(&mut self) -> Result<(), String> {
-        let root = self.script_root.clone();
-        let scan = self.scene_scan.get_or_insert_with(|| scene_scripts::scan(&root));
-        if scan.attachments.is_empty() {
-            return Ok(());
-        }
-        self.load_registry()?;
-        self.load_imports()
-    }
-
-    fn load_script(
-        &mut self,
-        rel: &str,
-        source: usize,
-        span: crate::span::Span,
-    ) -> Result<(), String> {
-        let parts = script_module_parts(rel)?;
-        let key = parts.join(".");
-        if self.loaded.contains(&key) {
-            return Ok(());
-        }
-        let path = self.script_root.join(rel);
-        if !path.is_file() && !self.overlays.iter().any(|(p, _)| same_path(p, &path)) {
-            let source_file = &self.files[source];
-            let mut error = crate::check::CheckError::new(
-                &source_file.path,
-                span,
-                format!("no script at {rel}"),
-            );
-            if let Some(suggested) =
-                crate::diag::did_you_mean(rel, &script_paths(&self.script_root))
-            {
-                error = error.help(format!("did you mean `{suggested}`?"));
-            }
-            return Err(error.render(&[(source_file.path.clone(), source_file.src.clone())]));
-        }
-        self.load_path(&path)
-    }
 }
 
-/// Every `.j3s` under `root` (skipping `target/` and `.git/`), relative, `/`-separated.
-pub fn script_paths(root: &Path) -> Vec<String> {
-    fn visit(root: &Path, dir: &Path, out: &mut Vec<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && !path.is_symlink() {
-                let name = entry.file_name();
-                if name != ".git" && name != "target" {
-                    visit(root, &path, out);
-                }
-            } else if path.extension().and_then(|s| s.to_str()) == Some("j3s") {
-                if let Ok(rel) = path.strip_prefix(root) {
-                    out.push(
-                        rel.to_string_lossy()
-                            .replace(std::path::MAIN_SEPARATOR, "/"),
-                    );
-                }
-            }
+/// A file in a parts folder whose `module` line names another module is its own module, so it
+/// is not parsed as a part. No such line (or an odd one): the parser decides.
+fn other_module(text: &str, key: &str) -> bool {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("module ") {
+            return rest.strip_suffix(';').is_some_and(|name| name.trim() != key);
         }
     }
-    let mut out = Vec::new();
-    visit(root, root, &mut out);
-    out.sort();
-    out
-}
-
-pub(super) fn script_module_parts(rel: &str) -> Result<Vec<String>, String> {
-    let path = Path::new(rel);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-    {
-        return Err(format!(
-            "script path must be relative to the project root: {rel}"
-        ));
-    }
-    let Some(stem) = rel.strip_suffix(".j3s") else {
-        return Err(format!("script path must end in `.j3s`: {rel}"));
-    };
-    let mut parts = vec!["script".to_string()];
-    for part in stem.split('/') {
-        if part.is_empty()
-            || !part
-                .bytes()
-                .enumerate()
-                .all(|(i, b)| b.is_ascii_alphabetic() || b == b'_' || (i > 0 && b.is_ascii_digit()))
-        {
-            return Err(format!(
-                "script path has an invalid module component: {rel}"
-            ));
-        }
-        parts.push(part.to_string());
-    }
-    Ok(parts)
-}
-
-pub(super) fn check_import_cycles(files: &[ParsedFile]) -> Result<(), String> {
-    let keys: Vec<String> = files.iter().map(|f| f.ast.module_key()).collect();
-    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
-    for f in files {
-        let from = f.ast.module_key();
-        for it in &f.ast.items {
-            if let parse::Item::Use(u) = it {
-                if let Some(to) = use_mod_key(u, &keys) {
-                    if to != from {
-                        graph.entry(from.clone()).or_default().push(to);
-                    }
-                }
-            }
-        }
-        for script in script_deps::find(&f.ast) {
-            let to = script_module_parts(&script.path)?.join(".");
-            if to != from {
-                graph.entry(from.clone()).or_default().push(to);
-            }
-        }
-    }
-    let mut done = HashSet::new();
-    for start in &keys {
-        if let Some(cycle) = cycle_from(&graph, start, &mut done) {
-            return Err(format!("import cycle: {}", cycle.join(" -> ")));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn use_mod_key(u: &parse::UseItem, loaded: &[String]) -> Option<String> {
-    let parts: Vec<String> = u.path.iter().map(|p| p.name.clone()).collect();
-    if u.names.is_some() {
-        let k = parts.join(".");
-        if loaded.iter().any(|x| x == &k) {
-            return Some(k);
-        }
-        return None;
-    }
-    let as_mod = parts.join(".");
-    if loaded.iter().any(|k| k == &as_mod) {
-        return Some(as_mod);
-    }
-    if parts.len() >= 2 {
-        let k = parts[..parts.len() - 1].join(".");
-        if loaded.iter().any(|x| x == &k) {
-            return Some(k);
-        }
-    }
-    None
-}
-
-pub(super) fn cycle_from(
-    graph: &HashMap<String, Vec<String>>,
-    start: &str,
-    done: &mut HashSet<String>,
-) -> Option<Vec<String>> {
-    fn dfs(
-        graph: &HashMap<String, Vec<String>>,
-        node: &str,
-        stack: &mut Vec<String>,
-        on_stack: &mut HashSet<String>,
-        done: &mut HashSet<String>,
-    ) -> Option<Vec<String>> {
-        if on_stack.contains(node) {
-            let i = stack.iter().position(|s| s == node)?;
-            let mut c = stack[i..].to_vec();
-            c.push(node.to_string());
-            return Some(c);
-        }
-        if done.contains(node) {
-            return None;
-        }
-        stack.push(node.to_string());
-        on_stack.insert(node.to_string());
-        if let Some(nexts) = graph.get(node) {
-            for n in nexts {
-                if let Some(c) = dfs(graph, n, stack, on_stack, done) {
-                    return Some(c);
-                }
-            }
-        }
-        on_stack.remove(node);
-        stack.pop();
-        done.insert(node.to_string());
-        None
-    }
-    dfs(graph, start, &mut Vec::new(), &mut HashSet::new(), done)
-}
-
-pub(super) fn source_exists(path: &Path) -> bool {
-    crate::stdlib::embedded(path).is_some() || builtin_hello(path) || path.is_file()
-}
-
-pub(super) fn module_file(parts: &[String]) -> PathBuf {
-    join_mod(&stdlib_dir(), parts)
-}
-
-pub(super) fn same_path(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => a.as_os_str() == b.as_os_str(),
-    }
-}
-
-pub(crate) fn join_mod(root: &Path, parts: &[String]) -> PathBuf {
-    let mut p = root.to_path_buf();
-    for (i, part) in parts.iter().enumerate() {
-        if i + 1 == parts.len() {
-            p.push(format!("{part}.j3"));
-        } else {
-            p.push(part);
-        }
-    }
-    p
+    false
 }

@@ -162,6 +162,17 @@ pub(super) fn render_item(out: &mut String, cx: &Cx, item: &Item) -> usize {
             out.push('\n');
             1
         }
+        Item::Trait(t) if t.vis_pub && cx.filter.top(&t.name.name) => {
+            out.push_str(&format!("trait {}\n", t.name.name));
+            push_doc(out, &t.doc, "    ");
+            for m in &t.methods {
+                let ps: Vec<String> = m.params.iter().map(|p| format!("{}: {}", p.name.name, ty_str(&p.ty))).collect();
+                let ret = m.ret.as_ref().map(|r| format!(": {}", ty_str(r))).unwrap_or_default();
+                out.push_str(&format!("    fn {}({}){}\n", m.name.name, ps.join(", "), ret));
+            }
+            cx.at(out, t.span, "    ");
+            1
+        }
         Item::Struct(s) if s.vis_pub => render_struct(out, cx, s),
         Item::Enum(e) if e.vis_pub => render_enum(out, cx, e),
         _ => 0,
@@ -180,7 +191,7 @@ pub(super) fn render_struct(out: &mut String, cx: &Cx, s: &StructItem) -> usize 
     if !whole && fields.is_empty() && methods.is_empty() {
         return 0;
     }
-    let owner = format!("{}{}", name, type_params(&s.type_params));
+    let owner = format!("{}{}", name, type_params(&s.type_params, &s.bounds));
     out.push_str("struct ");
     out.push_str(&owner);
     out.push('\n');
@@ -224,7 +235,7 @@ pub(super) fn render_enum(out: &mut String, cx: &Cx, e: &EnumItem) -> usize {
     }
     out.push_str("enum ");
     out.push_str(name);
-    out.push_str(&type_params(&e.type_params));
+    out.push_str(&type_params(&e.type_params, &e.bounds));
     out.push('\n');
     if whole {
         push_doc(out, &e.doc, "    ");
@@ -262,6 +273,10 @@ pub(super) fn short_view(m: &Module) -> String {
         match item {
             Item::Fn(f) if f.vis_pub && shown(&f.name.name) => fns.push(f.name.name.clone()),
             Item::Const(c) if c.vis_pub && shown(&c.name.name) => consts.push(c.name.name.clone()),
+            Item::Trait(t) if t.vis_pub => {
+                let names: Vec<String> = t.methods.iter().map(|m| format!("{}()", m.name.name)).collect();
+                types.push_str(&wrap(&format!("trait {}", t.name.name), &names));
+            }
             Item::Struct(s) if s.vis_pub => {
                 let mut names: Vec<String> = s.fields.iter().map(|f| f.name.name.clone()).collect();
                 names.extend(s.methods.iter().map(|f| format!("{}()", f.name.name)));
@@ -307,13 +322,16 @@ pub(super) fn wrap(label: &str, names: &[String]) -> String {
 
 pub(super) fn push_fn(out: &mut String, f: &FnItem, owner: Option<&str>, indent: &str) {
     out.push_str(indent);
+    if f.is_impl {
+        out.push_str("#[impl] ");
+    }
     out.push_str("fn ");
     if let Some(owner) = owner {
         out.push_str(owner);
         out.push('.');
     }
     out.push_str(&f.name.name);
-    out.push_str(&type_params(&f.type_params));
+    out.push_str(&type_params(&f.type_params, &f.bounds));
     out.push('(');
     for (i, p) in f.params.iter().enumerate() {
         if i > 0 {
@@ -333,7 +351,7 @@ pub(super) fn push_fn(out: &mut String, f: &FnItem, owner: Option<&str>, indent:
     push_doc(out, &f.doc, &doc_indent);
 }
 
-pub(super) fn type_params(ps: &[Ident]) -> String {
+pub(super) fn type_params(ps: &[Ident], bounds: &[Vec<Ident>]) -> String {
     if ps.is_empty() {
         return String::new();
     }
@@ -343,6 +361,10 @@ pub(super) fn type_params(ps: &[Ident]) -> String {
             s.push_str(", ");
         }
         s.push_str(&p.name);
+        if let Some(b) = bounds.get(i).filter(|b| !b.is_empty()) {
+            let names: Vec<&str> = b.iter().map(|n| n.name.as_str()).collect();
+            s.push_str(&format!(": {}", names.join(" + ")));
+        }
     }
     s.push('>');
     s
@@ -358,11 +380,12 @@ pub(super) fn ty_str(t: &Type) -> String {
         TypeKind::Ref(inner) => format!("&{}", ty_str(inner)),
         TypeKind::Array { len, elem } => format!("[{len}]{}", ty_str(elem)),
         TypeKind::Slice(elem) => format!("[]{}", ty_str(elem)),
-        TypeKind::Fn { params, ret } => {
+        TypeKind::Fn { params, ret } | TypeKind::Closure { params, ret } => {
+            let word = if matches!(t.kind, TypeKind::Fn { .. }) { "fn" } else { "closure" };
             let params: Vec<String> = params.iter().map(ty_str).collect();
             match ret {
-                Some(r) => format!("fn({}): {}", params.join(", "), ty_str(r)),
-                None => format!("fn({})", params.join(", ")),
+                Some(r) => format!("{word}({}): {}", params.join(", "), ty_str(r)),
+                None => format!("{word}({})", params.join(", ")),
             }
         }
     }

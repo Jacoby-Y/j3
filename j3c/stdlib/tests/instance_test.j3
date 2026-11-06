@@ -1,0 +1,135 @@
+// Tests for j3.instance request/reply: ping, deferred reply, 1 MB reply, timeout, a client killed before the reply,
+// plain claim messages beside requests, and no running copy. Linux. Forks: the parent serves, the child asks.
+//   timeout 60 j3c run j3c/stdlib/tests/instance_test.j3
+
+module instance_test;
+
+use j3.instance;
+use j3.instance.Request;
+use j3.io.printLn;
+use j3.option.Option;
+use j3.sys;
+use j3.sys.panic;
+
+const BIG = 1048576;
+
+#[singleton]
+let NAME: string;
+
+fn ok(cond: bool, msg: string) {
+    if !cond { printLn(`instance_test: FAIL {msg}`); sys.exit(1); }
+}
+
+fn ask(cmd: string, ms: int): Option<string> {
+    return instance.request(NAME, ["client", cmd], ms);
+}
+
+fn got(r: Option<string>, want: string): bool {
+    match r {
+        Option.Some(s) { return s == want; }
+        Option.None { return false; }
+    }
+    return false;
+}
+
+fn isNone(r: Option<string>): bool {
+    match r {
+        Option.Some(s) { return false; }
+        Option.None { return true; }
+    }
+    return true;
+}
+
+fn sleepMs(ms: int) {
+    let t = sys.monotonicMs() + ms;
+    while (sys.monotonicMs() < t) { }
+}
+
+fn client() {
+    ok(got(ask("ping", 1000), "pong"), "ping");
+    ok(got(ask("defer", 2000), "late"), "deferred reply");
+    match ask("big", 5000) {
+        Option.Some(s) {
+            ok(s.len == BIG, "big length");
+            let good = true;
+            for i in 0..BIG { if s[i] != u8(97 + i % 26) { good = false; } }
+            ok(good, "big bytes");
+        }
+        Option.None { ok(false, "big"); }
+    }
+    let t0 = sys.monotonicMs();
+    ok(isNone(ask("never", 200)), "timeout gives None");
+    let dt = sys.monotonicMs() - t0;
+    ok(dt >= 190 && dt < 600, `timeout took {dt} ms`);
+    // A client killed while waiting: the server sees alive() go false and keeps serving.
+    let pid = sys.fork();
+    if pid == 0 {
+        ask("dead", 0);
+        sys.exit(0);
+    }
+    sleepMs(100);
+    sys.kill(pid, sys.SIGKILL);
+    let st: i32 = 0;
+    sys.waitpid(pid, &st, 0);
+    ok(got(ask("deadseen", 2000), "yes"), "server saw the dead client");
+    // The old path: a second copy's claim hands its argv over as a message, not a request.
+    ok(!instance.claim(NAME), "claim forwards");
+    ok(got(ask("msgseen", 2000), "yes"), "message arrived");
+    ask("quit", 1000);
+    sys.exit(0);
+}
+
+fn main() {
+    NAME = `itest-{sys.getpid()}`;
+    ok(isNone(instance.request(NAME, ["client", "ping"], 200)), "no copy running");
+    ok(instance.claim(NAME), "claim");
+    let pid = sys.fork();
+    if pid == 0 { client(); }
+    let waiting = Request { slot: 0 - 1, gen: 0 };
+    let waitFrames = 0;
+    let dead = Request { slot: 0 - 1, gen: 0 };
+    let msgSeen = false;
+    let quit = false;
+    let big = "";
+    let frames = 0;
+    while !quit {
+        frames += 1;
+        ok(frames < 20000, "server ran too long");
+        while instance.next() {
+            // the forwarded claim: argv[0] is the test program, no "client"
+            msgSeen = instance.args().len > 0 && instance.args()[0] != "client";
+        }
+        let more = true;
+        while more {
+            match instance.nextRequest() {
+                Option.Some(req) {
+                    let cmd = req.args()[1];
+                    if cmd == "ping" { req.reply("pong"); req.reply("twice is a no-op"); }
+                    else if cmd == "defer" { waiting = req; waitFrames = 0; }
+                    else if cmd == "dead" { dead = req; }
+                    else if cmd == "never" { }
+                    else if cmd == "deadseen" { req.reply(if !dead.alive() { "yes" } else { "no" }); }
+                    else if cmd == "msgseen" { req.reply(if msgSeen { "yes" } else { "no" }); }
+                    else if cmd == "quit" { req.reply(""); quit = true; }
+                    else if cmd == "big" {
+                        let b: []u8 = @slice(sys.mmapAnon(BIG), BIG);
+                        for i in 0..BIG { b[i] = u8(97 + i % 26); }
+                        req.reply(b as string);
+                    }
+                }
+                Option.None { more = false; }
+            }
+        }
+        if waiting.alive() {
+            waitFrames += 1;
+            if waitFrames == 30 { waiting.reply("late"); ok(!waiting.alive(), "replied is not alive"); }
+        }
+        sleepMs(2);
+    }
+    let st: i32 = 0;
+    sys.waitpid(pid, &st, 0);
+    ok(sys.exitCode(st) == 0, "client checks");
+    dead.reply("nobody hears this");
+    ok(!dead.alive(), "dead stays dead");
+    printLn("instance_test ok");
+}

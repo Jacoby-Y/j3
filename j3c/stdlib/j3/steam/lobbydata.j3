@@ -1,0 +1,359 @@
+// Part of j3.steam: lobby data, member data, the lobby game server, chat messages, invites and the cold-start lobby id.
+// The module doc and `use`s are in ../steam.j3. Strings that come from C are copies on the frame scratch arena, valid until
+// the next `frame()`; fake-mode strings stay valid until the entry changes or `shutdown`.
+module j3.steam;
+
+/// Longest lobby data or member data key, in bytes (`k_nMaxLobbyKeyLength`).
+pub const LOBBY_KEY_MAX: int = 255;
+/// Longest lobby data value, in bytes, a bit under `k_cubChatMetadataMax` (8192).
+pub const LOBBY_VALUE_MAX: int = 8191;
+/// Longest chat message, in bytes.
+pub const CHAT_MAX: int = 4096;
+/// Chat entry type of an ordinary message (`k_EChatEntryTypeChatMsg`).
+pub const CHAT_MSG: int = 1;
+
+const LKEY_BUF: int = 256;
+const LVAL_BUF: int = 8192;
+
+#[singleton]
+let LBUF: ptr;
+
+/// One lobby data entry.
+pub struct LobbyKv {
+    /// The key; "" when the index was out of range.
+    key: string;
+    /// The value.
+    value: string;
+}
+
+/// A lobby's game server.
+pub struct LobbyServer {
+    /// False when the lobby has no server set (the other fields are then 0).
+    ok: bool;
+    /// IPv4 address as a host-order number (a.b.c.d is a<<24 | b<<16 | c<<8 | d).
+    ip: u32;
+    /// Port.
+    port: int;
+    /// The server's SteamID, 0 if none.
+    server: u64;
+}
+
+/// A chat message read with `lobbyMsg`.
+pub struct LobbyMsg {
+    /// Who sent it; 0 when there is no such message.
+    user: u64;
+    /// Bytes copied into the caller's buffer (the message is cut to the buffer if it is longer). 0 for none.
+    len: int;
+    /// Chat entry type (`CHAT_MSG` for ordinary messages).
+    kind: int;
+}
+
+/// One block: 8192 bytes of value text, then 256 for a key and 16 for out-params.
+fn lbuf(): ptr {
+    if LBUF as int == 0 {
+        LBUF = arena().allocBytes(LVAL_BUF + LKEY_BUF + 16);
+    }
+    return LBUF;
+}
+
+fn lkeyBuf(): ptr {
+    return (lbuf() as int + LVAL_BUF) as ptr;
+}
+
+/// `s` as a C string in the lobby value buffer; 0 (and a log line) when over `LOBBY_VALUE_MAX`.
+fn lvalC(s: string): ptr {
+    if s.len > LOBBY_VALUE_MAX {
+        eprintOnce(`steam: lobby value of {s.len} bytes is over the {LOBBY_VALUE_MAX} byte limit; call refused`);
+        return 0;
+    }
+    let b = lbuf();
+    for i in 0..s.len {
+        wrU8(b, i, s[i]);
+    }
+    wrU8(b, s.len, u8(0));
+    return b;
+}
+
+/// `key` as a C string (slot 0), 0 when over `LOBBY_KEY_MAX`.
+fn lkeyC(key: string): ptr {
+    if key.len > LOBBY_KEY_MAX {
+        eprintOnce(`steam: lobby key of {key.len} bytes is over the {LOBBY_KEY_MAX} byte limit; call refused`);
+        return 0;
+    }
+    return cs(key, 0);
+}
+
+fn keyOk(key: string): bool {
+    return key.len > 0 && key.len <= LOBBY_KEY_MAX;
+}
+
+// ---- lobby data ----
+
+/// Lobby data `key` of `lobby`; "" when unset, unknown, or Steam is absent. Works for a lobby you are in, or one you
+/// got from a search.
+pub fn lobbyData(lobby: u64, key: string): string {
+    if fake() {
+        let k = flKvFind(lobby, u64(0), key);
+        if k < 0 {
+            return "";
+        }
+        return FKVS[k].value;
+    }
+    let k = lkeyC(key);
+    if k as int == 0 {
+        return "";
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_GetLobbyData") as fn(ptr, u64, ptr): ptr;
+    return fromC(m(mm(), lobby, k));
+}
+
+/// Set lobby data `key` to `value` (owner only; key up to 255 bytes, value up to 8191). Members get `onLobbyData`.
+/// False when you are not the owner, the key is empty or a limit is passed, or Steam is absent.
+pub fn setLobbyData(lobby: u64, key: string, value: string): bool {
+    if fake() {
+        let at = flFind(lobby);
+        if at < 0 || FLOBS[at].owner != FAKE_USER || !keyOk(key) || value.len > LOBBY_VALUE_MAX {
+            return false;
+        }
+        flKvSet(lobby, u64(0), key, value);
+        flFireData(lobby, lobby, true);
+        return true;
+    }
+    let k = lkeyC(key);
+    if k as int == 0 {
+        return false;
+    }
+    let v = lvalC(value);
+    if v as int == 0 {
+        return false;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_SetLobbyData") as fn(ptr, u64, ptr, ptr): bool;
+    return m(mm(), lobby, k, v);
+}
+
+/// Remove lobby data `key` (owner only). False when it is not set, you are not the owner, or Steam is absent.
+pub fn deleteLobbyData(lobby: u64, key: string): bool {
+    if fake() {
+        let at = flFind(lobby);
+        if at < 0 || FLOBS[at].owner != FAKE_USER || !flKvDel(lobby, key) {
+            return false;
+        }
+        flFireData(lobby, lobby, true);
+        return true;
+    }
+    let k = lkeyC(key);
+    if k as int == 0 {
+        return false;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_DeleteLobbyData") as fn(ptr, u64, ptr): bool;
+    return m(mm(), lobby, k);
+}
+
+/// How many lobby data entries `lobby` has. 0 when unknown or Steam is absent.
+pub fn lobbyDataCount(lobby: u64): int {
+    if fake() {
+        return flKvCount(lobby);
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_GetLobbyDataCount") as fn(ptr, u64): i32;
+    return int(m(mm(), lobby));
+}
+
+/// Lobby data entry number `i` (below `lobbyDataCount`). The key is "" when `i` is out of range or Steam is absent.
+pub fn lobbyDataAt(lobby: u64, i: int): LobbyKv {
+    if i < 0 {
+        return LobbyKv { key: "", value: "" };
+    }
+    if fake() {
+        let k = flKvAt(lobby, i);
+        if k < 0 {
+            return LobbyKv { key: "", value: "" };
+        }
+        return LobbyKv { key: FKVS[k].key, value: FKVS[k].value };
+    }
+    let kb = lkeyBuf();
+    let vb = lbuf();
+    wrU8(kb, 0, u8(0));
+    wrU8(vb, 0, u8(0));
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_GetLobbyDataByIndex") as fn(ptr, u64, i32, ptr, i32, ptr, i32): bool;
+    if !m(mm(), lobby, i32(i), kb, i32(LKEY_BUF), vb, i32(LVAL_BUF)) {
+        return LobbyKv { key: "", value: "" };
+    }
+    return LobbyKv { key: fromFixed(kb, LKEY_BUF - 1), value: fromFixed(vb, LVAL_BUF - 1) };
+}
+
+/// Member data `key` that `user` set in `lobby`; "" when unset or Steam is absent.
+pub fn memberData(lobby: u64, user: u64, key: string): string {
+    if fake() {
+        let k = flKvFind(lobby, user, key);
+        if user == u64(0) || k < 0 {
+            return "";
+        }
+        return FKVS[k].value;
+    }
+    let k = lkeyC(key);
+    if k as int == 0 {
+        return "";
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_GetLobbyMemberData") as fn(ptr, u64, u64, ptr): ptr;
+    return fromC(m(mm(), lobby, user, k));
+}
+
+/// Set your own member data `key` in `lobby` (you must be in it); everyone gets `onLobbyData` with your id as `member`.
+/// A bad key, a value over 8191 bytes, or a lobby you are not in is logged once and skipped.
+pub fn setMemberData(lobby: u64, key: string, value: string) {
+    if fake() {
+        if !flIsMember(lobby, FAKE_USER) || !keyOk(key) || value.len > LOBBY_VALUE_MAX {
+            eprintOnce("steam: setMemberData refused (not in the lobby, bad key, or value too long)");
+            return;
+        }
+        flKvSet(lobby, FAKE_USER, key, value);
+        flFireData(lobby, FAKE_USER, true);
+        return;
+    }
+    let k = lkeyC(key);
+    let v = lvalC(value);
+    if k as int == 0 || v as int == 0 {
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_SetLobbyMemberData") as fn(ptr, u64, ptr, ptr);
+    m(mm(), lobby, k, v);
+}
+
+/// Ask Steam for the current data of a lobby you are not in (from a search). `onLobbyData` fires when it arrives.
+/// False when the request could not start or Steam is absent. Fake mode answers on the next frame.
+pub fn refreshLobby(lobby: u64): bool {
+    if fake() {
+        if flFind(lobby) < 0 {
+            return false;
+        }
+        flFireData(lobby, lobby, true);
+        return true;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_RequestLobbyData") as fn(ptr, u64): bool;
+    return m(mm(), lobby);
+}
+
+/// Link `dependent` to `lobby` (owner only) so the two lobbies are kept together by Steam. False otherwise.
+pub fn setLinkedLobby(lobby: u64, dependent: u64): bool {
+    if fake() {
+        let at = flFind(lobby);
+        if at < 0 || FLOBS[at].owner != FAKE_USER || flFind(dependent) < 0 {
+            return false;
+        }
+        FLOBS[at].linked = dependent;
+        return true;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_SetLinkedLobby") as fn(ptr, u64, u64): bool;
+    return m(mm(), lobby, dependent);
+}
+
+// ---- game server ----
+
+/// Tell the lobby's members which game server to join (owner only): IPv4 `ip` (a.b.c.d as a<<24 | b<<16 | c<<8 | d), `port`,
+/// and the server's SteamID (0 for a plain IP game). Members get `onLobbyServer`. Does nothing for a non-owner.
+pub fn setLobbyServer(lobby: u64, ip: u32, port: int, server: u64) {
+    if fake() {
+        let at = flFind(lobby);
+        if at < 0 || FLOBS[at].owner != FAKE_USER || port < 0 || port > 65535 {
+            return;
+        }
+        FLOBS[at].hasServer = true;
+        FLOBS[at].ip = ip;
+        FLOBS[at].port = port;
+        FLOBS[at].server = server;
+        fakeLog(`lobby {lobby}: server {ip}:{port}`);
+        flFireServer(at);
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_SetLobbyGameServer") as fn(ptr, u64, u32, u16, u64);
+    m(mm(), lobby, ip, u16(port & 65535), server);
+}
+
+/// The game server set for `lobby`; `ok` is false when none is set or Steam is absent.
+pub fn lobbyServer(lobby: u64): LobbyServer {
+    let none = LobbyServer { ok: false, ip: u32(0), port: 0, server: u64(0) };
+    if fake() {
+        let at = flFind(lobby);
+        if at < 0 || !FLOBS[at].hasServer {
+            return none;
+        }
+        return LobbyServer { ok: true, ip: FLOBS[at].ip, port: FLOBS[at].port, server: FLOBS[at].server };
+    }
+    let out = outCell();
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_GetLobbyGameServer") as fn(ptr, u64, ptr, ptr, ptr): bool;
+    if !m(mm(), lobby, out, (out as int + 4) as ptr, (out as int + 8) as ptr) {
+        return none;
+    }
+    let port = int(rdU8(out, 4)) + int(rdU8(out, 5)) * 256;
+    return LobbyServer { ok: true, ip: rdU32(out, 0), port: port, server: rdU64(out, 8) };
+}
+
+// ---- chat ----
+
+/// Send `data` (up to 4096 bytes, any bytes) to everyone in `lobby`, you included (`onLobbyMsg` fires for each).
+/// False when you are not in the lobby, `data` is empty or over 4096 bytes (logged), or Steam is absent.
+pub fn sendLobbyMsg(lobby: u64, data: []u8): bool {
+    if data.len == 0 || data.len > CHAT_MAX {
+        eprintOnce(`steam: sendLobbyMsg refused: {data.len} bytes (1 to {CHAT_MAX} allowed)`);
+        return false;
+    }
+    if fake() {
+        if !flIsMember(lobby, FAKE_USER) {
+            return false;
+        }
+        flMsgAdd(lobby, FAKE_USER, data);
+        return true;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_SendLobbyChatMsg") as fn(ptr, u64, ptr, i32): bool;
+    return m(mm(), lobby, data.ptr as ptr, i32(data.len));
+}
+
+/// Read chat message `chatId` (from `onLobbyMsg`) into `out`. The bytes are raw, not text with a NUL: use `len`.
+/// A message longer than `out` is cut to it. `len` is 0 and `user` 0 when there is no such message or Steam is absent.
+pub fn lobbyMsg(lobby: u64, chatId: int, out: []u8): LobbyMsg {
+    let none = LobbyMsg { user: u64(0), len: 0, kind: 0 };
+    if fake() {
+        let k = flMsgFind(lobby, chatId);
+        if k < 0 {
+            return none;
+        }
+        let n = FMSGS[k].data.len;
+        if out.len < n {
+            n = out.len;
+        }
+        for i in 0..n {
+            out[i] = FMSGS[k].data[i];
+        }
+        return LobbyMsg { user: FMSGS[k].user, len: n, kind: FMSGS[k].kind };
+    }
+    let cell = outCell();
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_GetLobbyChatEntry") as fn(ptr, u64, i32, ptr, ptr, i32, ptr): i32;
+    let n = int(m(mm(), lobby, i32(chatId), cell, out.ptr as ptr, i32(out.len), (cell as int + 8) as ptr));
+    if n <= 0 {
+        return none;
+    }
+    return LobbyMsg { user: rdU64(cell, 0), len: n, kind: int(rdI32(cell, 8)) };
+}
+
+// ---- invites and cold start ----
+
+/// Invite `user` to `lobby` (you must be in it). The user gets `onLobbyInvite`. False when it could not be sent or Steam is absent.
+pub fn inviteToLobby(lobby: u64, user: u64): bool {
+    if fake() {
+        fakeLog(`inviteToLobby {lobby} {user}`);
+        return flFind(lobby) >= 0 && flIsMember(lobby, FAKE_USER) && user != u64(0);
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_InviteUserToLobby") as fn(ptr, u64, u64): bool;
+    return m(mm(), lobby, user);
+}
+
+/// Open the Steam overlay's friend picker to invite friends to `lobby`. Does nothing when Steam is absent.
+pub fn overlayInvite(lobby: u64) {
+    if fake() {
+        fakeLog(`overlayInvite {lobby}`);
+        return;
+    }
+    let f = method("SteamFriends", "SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog") as fn(ptr, u64);
+    f(fr(), lobby);
+}
+

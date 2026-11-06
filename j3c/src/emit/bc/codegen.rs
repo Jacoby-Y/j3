@@ -105,6 +105,13 @@ pub(super) fn walk_block(block: &Block, f: &mut dyn FnMut(&Place, bool)) {
                 walk_operand(cond, f);
                 walk_block(body, f);
             }
+            StmtKind::Switch { scrut, cases, default } => {
+                walk_operand(scrut, f);
+                for (_, b) in cases {
+                    walk_block(b, f);
+                }
+                walk_block(default, f);
+            }
             StmtKind::Return { value } => {
                 if let Some(op) = value {
                     walk_operand(op, f);
@@ -125,7 +132,7 @@ pub(super) fn walk_block(block: &Block, f: &mut dyn FnMut(&Place, bool)) {
                     }
                 }
             }
-            StmtKind::Break | StmtKind::Continue | StmtKind::Abort(_) | StmtKind::Div0 => {}
+            StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Abort(..) | StmtKind::Div0 => {}
         }
     }
 }
@@ -152,7 +159,7 @@ pub(super) fn walk_rvalue(rv: &Rvalue, f: &mut dyn FnMut(&Place, bool)) {
                 walk_operand(arg, f);
             }
         }
-        RvalueKind::Atomic { args, .. } => {
+        RvalueKind::Atomic { args, .. } | RvalueKind::Simd { args, .. } => {
             for arg in args {
                 walk_operand(arg, f);
             }
@@ -238,6 +245,12 @@ impl<'a> Codegen<'a> {
     }
 
     pub(super) fn emit(mut self) -> Result<BcFunction, String> {
+        if let Some(v) = self.body.locals.iter().find_map(|l| match self.cx.ty_kind(l.ty) {
+            crate::ir::ty::TyKind::Vec(v) => Some(*v),
+            _ => None,
+        }) {
+            return Err(format!("{} is not supported in scripts yet", v.name()));
+        }
         self.block(&self.body.block)?;
         if !matches!(
             self.code.last().map(|i| i.op),
@@ -404,6 +417,7 @@ impl<'a> Codegen<'a> {
         };
         for proj in projs {
             match proj {
+                Proj::Lane { .. } => return Err("vec4f is not supported in scripts yet".to_string()),
                 Proj::Deref => {
                     let dst = self.reg();
                     self.push(Instr::new(Op::Ld64, dst, at.base, NO_REG, at.offset));

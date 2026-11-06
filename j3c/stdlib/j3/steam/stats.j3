@@ -1,0 +1,291 @@
+// Part of j3.steam: ISteamUserStats achievements, stats, global percentages and shared helpers; the module doc and `use`s are in ../steam.j3.
+module j3.steam;
+
+/// `EResult` OK.
+const RESULT_OK: i32 = 1;
+const CB_STATS_STORED: i32 = 1102;
+const CB_GLOBAL_PERCENTS: i32 = 1110;
+/// Bytes in the scratch block: 16 bytes for out-params, then a 64 byte entry buffer.
+const SB_SIZE: int = 80;
+const SB_OUT: int = 0;
+const SB_ENTRY: int = 16;
+/// The one local user in fake mode.
+pub const FAKE_USER: u64 = 76561197960265729;
+
+#[singleton]
+let SB: ptr;
+#[singleton]
+let OFF_STORED_RESULT: int = 0;
+#[singleton]
+let OFF_PCT_RESULT: int = 0;
+#[singleton]
+let OFF_PCT_GAME: int = 0;
+#[singleton]
+let OFF_STORED_GAME: int = 0;
+#[singleton]
+let PCT_SIZE: int = 0;
+#[singleton]
+let STORED_SIZE: int = 0;
+/// A stat or achievement changed since the last successful `store`.
+#[singleton]
+let DIRTY: bool = false;
+#[singleton]
+let PCT_READY: bool = false;
+
+/// One in-flight request: the game's handler (as a pointer, cast back by the part that owns it) and ctx.
+struct Req {
+    used: bool;
+    f: ptr;
+    ctx: u64;
+}
+
+#[singleton]
+let REQS: []Req;
+#[singleton]
+let REQ_N: int = 0;
+
+/// `old` copied into a slice twice as long (plus a little); only the first `used` items matter.
+fn grown<T>(old: []T, used: int): []T {
+    let fresh = arena().alloc::<T>(old.len * 2 + 16);
+    for i in 0..used {
+        fresh[i] = old[i];
+    }
+    return fresh;
+}
+
+/// Park handler `f` and `ctx`; the returned slot goes to `await` as its ctx and `reqTake` gets it back.
+fn reqNew(f: ptr, ctx: u64): u64 {
+    for i in 0..REQ_N {
+        if !REQS[i].used {
+            REQS[i] = Req { used: true, f: f, ctx: ctx };
+            return u64(i);
+        }
+    }
+    if REQ_N >= REQS.len {
+        REQS = grown(REQS, REQ_N);
+    }
+    REQS[REQ_N] = Req { used: true, f: f, ctx: ctx };
+    REQ_N += 1;
+    return u64(REQ_N - 1);
+}
+
+/// The request in `slot`, freed. `used` is false for a slot that is already free (cleared at shutdown).
+fn reqTake(slot: u64): Req {
+    let i = int(slot);
+    if i < 0 || i >= REQ_N || !REQS[i].used {
+        return Req { used: false, f: 0, ctx: u64(0) };
+    }
+    let r = REQS[i];
+    REQS[i].used = false;
+    return r;
+}
+
+fn sb(): ptr {
+    if SB as int == 0 {
+        SB = arena().allocBytes(SB_SIZE);
+    }
+    return SB;
+}
+
+/// The out-param cell (16 bytes), zeroed.
+fn outCell(): ptr {
+    let p = (sb() as int + SB_OUT) as ptr;
+    wrU64(p, 0, u64(0));
+    wrU64(p, 8, u64(0));
+    return p;
+}
+
+/// A copy of `s` that lives for the process (fake tables).
+fn keep(s: string): string {
+    let t = Text.new(arena());
+    t.pushStr(s);
+    return t.str();
+}
+
+fn us(): ptr {
+    return iface("SteamUserStats");
+}
+
+// ---- fake state ----
+
+struct FAch {
+    name: string;
+    done: bool;
+}
+
+struct FStat {
+    name: string;
+    isFloat: bool;
+    i: i32;
+    f: f32;
+    acc: f64;
+    span: f64;
+}
+
+#[singleton]
+let FACH: []FAch;
+#[singleton]
+let FACH_N: int = 0;
+#[singleton]
+let FSTATS: []FStat;
+#[singleton]
+let FSTAT_N: int = 0;
+#[singleton]
+let FSTORES: int = 0;
+
+fn fachFind(name: string, make: bool): int {
+    for i in 0..FACH_N {
+        if same(FACH[i].name, name) {
+            return i;
+        }
+    }
+    if !make {
+        return 0 - 1;
+    }
+    if FACH_N >= FACH.len {
+        FACH = grown(FACH, FACH_N);
+    }
+    FACH[FACH_N] = FAch { name: keep(name), done: false };
+    FACH_N += 1;
+    return FACH_N - 1;
+}
+
+fn fstatFind(name: string, isFloat: bool, make: bool): int {
+    for i in 0..FSTAT_N {
+        if same(FSTATS[i].name, name) {
+            if FSTATS[i].isFloat != isFloat {
+                return 0 - 1;
+            }
+            return i;
+        }
+    }
+    if !make {
+        return 0 - 1;
+    }
+    if FSTAT_N >= FSTATS.len {
+        FSTATS = grown(FSTATS, FSTAT_N);
+    }
+    FSTATS[FSTAT_N] = FStat { name: keep(name), isFloat: isFloat, i: 0, f: 0.0, acc: 0.0, span: 0.0 };
+    FSTAT_N += 1;
+    return FSTAT_N - 1;
+}
+
+/// Fake: how many times `store` ran (survives shutdown, for tests).
+pub fn fakeStores(): int {
+    return FSTORES;
+}
+
+// ---- achievements ----
+
+/// Unlock achievement `name`. Returns true when Steam took it; false when Steam is absent, the name is
+/// unknown or over 128 bytes, or stats are not loaded. Call `store` at a checkpoint to save it.
+pub fn unlock(name: string): bool {
+    if fake() {
+        fakeLog(`unlock {name}`);
+        FACH[fachFind(name, true)].done = true;
+        DIRTY = true;
+        return true;
+    }
+    let n = cs(name, 0);
+    if n as int == 0 {
+        return false;
+    }
+    let f = method("SteamUserStats", "SteamAPI_ISteamUserStats_SetAchievement") as fn(ptr, ptr): bool;
+    if f(us(), n) {
+        DIRTY = true;
+        return true;
+    }
+    return false;
+}
+
+/// Lock achievement `name` again (testing). Returns false when Steam is absent or refuses.
+pub fn clear(name: string): bool {
+    if fake() {
+        fakeLog(`clear {name}`);
+        FACH[fachFind(name, true)].done = false;
+        DIRTY = true;
+        return true;
+    }
+    let n = cs(name, 0);
+    if n as int == 0 {
+        return false;
+    }
+    let f = method("SteamUserStats", "SteamAPI_ISteamUserStats_ClearAchievement") as fn(ptr, ptr): bool;
+    if f(us(), n) {
+        DIRTY = true;
+        return true;
+    }
+    return false;
+}
+
+/// True when achievement `name` is unlocked. False when Steam is absent or the name is unknown.
+pub fn unlocked(name: string): bool {
+    if fake() {
+        let at = fachFind(name, false);
+        return at >= 0 && FACH[at].done;
+    }
+    let n = cs(name, 0);
+    if n as int == 0 {
+        return false;
+    }
+    let out = outCell();
+    let f = method("SteamUserStats", "SteamAPI_ISteamUserStats_GetAchievement") as fn(ptr, ptr, ptr): bool;
+    return f(us(), n, out) && rdBool(out, 0);
+}
+
+/// Show a progress popup `cur` of `max` for achievement `name` (does not unlock). False when Steam is absent.
+pub fn indicate(name: string, cur: u32, max: u32): bool {
+    if fake() {
+        fachFind(name, true);
+        fakeLog(`indicate {name} {cur}/{max}`);
+        return true;
+    }
+    let n = cs(name, 0);
+    if n as int == 0 {
+        return false;
+    }
+    let f = method("SteamUserStats", "SteamAPI_ISteamUserStats_IndicateAchievementProgress") as fn(ptr, ptr, u32, u32): bool;
+    return f(us(), n, cur, max);
+}
+
+/// How many achievements the game defines. 0 when Steam is absent. Fake: those touched so far.
+pub fn achievementCount(): u32 {
+    if fake() {
+        return u32(FACH_N);
+    }
+    let f = method("SteamUserStats", "SteamAPI_ISteamUserStats_GetNumAchievements") as fn(ptr): u32;
+    return f(us());
+}
+
+/// API name of achievement number `i` (0-based), or "". The text is valid until the next frame.
+pub fn achievementName(i: u32): string {
+    if fake() {
+        if int(i) < FACH_N {
+            return FACH[int(i)].name;
+        }
+        return "";
+    }
+    let f = method("SteamUserStats", "SteamAPI_ISteamUserStats_GetAchievementName") as fn(ptr, u32): ptr;
+    return fromC(f(us(), i));
+}
+
+/// Display text of achievement `name`: `key` is "name", "desc" or "hidden" ("1" when hidden). "" when
+/// Steam is absent or the key is unknown. The text is valid until the next frame.
+pub fn achievementAttr(name: string, key: string): string {
+    if fake() {
+        if same(key, "name") {
+            return name;
+        }
+        if same(key, "hidden") {
+            return "0";
+        }
+        return "";
+    }
+    let n = cs(name, 0);
+    let k = cs(key, 1);
+    if n as int == 0 || k as int == 0 {
+        return "";
+    }
+    let f = method("SteamUserStats", "SteamAPI_ISteamUserStats_GetAchievementDisplayAttribute") as fn(ptr, ptr, ptr): ptr;
+    return fromC(f(us(), n, k));
+}

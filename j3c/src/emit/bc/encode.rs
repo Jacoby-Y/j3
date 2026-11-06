@@ -214,6 +214,7 @@ pub(super) fn dump_instr(ins: &Instr, f: &BcFunction) -> String {
         Op::Mov
         | Op::Neg
         | Op::Not
+        | Op::Bnot
         | Op::Fneg
         | Op::Dneg
         | Op::Sext8

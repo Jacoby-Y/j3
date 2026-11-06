@@ -51,18 +51,24 @@ impl<'a> LlvmFn<'a> {
                     self.term("ret void");
                 }
             },
-            StmtKind::Break => {
-                self.emit_defers_through(true)?;
-                let lab = self.loop_target(false)?;
+            StmtKind::Break(n) | StmtKind::Continue(n) => {
+                self.emit_defers_to_loop(*n)?;
+                let lab = self.loop_target(matches!(stmt.kind, StmtKind::Continue(_)), *n)?;
                 self.term(&format!("br label %{lab}"));
             }
-            StmtKind::Continue => {
-                self.emit_defers_through(true)?;
-                let lab = self.loop_target(true)?;
-                self.term(&format!("br label %{lab}"));
-            }
-            StmtKind::Abort(k) => {
-                self.exit_abort(*k);
+            StmtKind::Abort(k, vals) => {
+                let mut vs = Vec::new();
+                for v in vals {
+                    let (val, ll) = self.operand(v)?;
+                    vs.push(if ll == "i64" {
+                        val
+                    } else {
+                        let w = self.fresh();
+                        self.inst(&format!("{w} = sext {ll} {val} to i64"));
+                        w
+                    });
+                }
+                self.exit_abort_vals(*k, &vs);
             }
             StmtKind::Div0 => {
                 self.exit_abort(AbortKind::Div0);
@@ -101,6 +107,30 @@ impl<'a> LlvmFn<'a> {
                     }
                 }
                 self.block(&j);
+            }
+            StmtKind::Switch { scrut, cases, default } => {
+                let (v, ty) = self.operand(scrut)?;
+                let def = self.label();
+                let end = self.label();
+                let mut sw = format!("switch {ty} {v}, label %{def} [");
+                let mut labels = Vec::new();
+                for (k, _) in cases {
+                    let lab = self.label();
+                    let k = self.const_bits(scrut.ty(), &crate::ir::operand::ConstKind::Int(*k))?;
+                    sw.push_str(&format!(" {ty} {k}, label %{lab}"));
+                    labels.push(lab);
+                }
+                sw.push_str(" ]");
+                self.term(&sw);
+                let arms = cases.iter().map(|(_, b)| b).zip(labels).chain(std::iter::once((default, def)));
+                for (b, lab) in arms {
+                    self.block(&lab);
+                    self.emit_block(b, false)?;
+                    if !self.terminated {
+                        self.term(&format!("br label %{end}"));
+                    }
+                }
+                self.block(&end);
             }
             StmtKind::While { cond, body } => {
                 let hdr = self.label();
@@ -239,6 +269,12 @@ impl<'a> LlvmFn<'a> {
                     ));
                     ptr = n;
                     ty = self.cx.common.int;
+                }
+                Proj::Lane { lane, ty: lane_ty } => {
+                    let n = self.fresh();
+                    self.inst(&format!("{n} = getelementptr i8, ptr {ptr}, i64 {}", *lane as u64 * 4));
+                    ptr = n;
+                    ty = *lane_ty;
                 }
                 Proj::EnumTag => {
                     let n = self.fresh();

@@ -5,12 +5,10 @@ module j3.game.path;
 
 use j3.memory.{ Arena, scratch };
 
-/// Most cells `search` will expand. Larger maps return an empty path.
-const MAX_CELLS: int = 4096;
-
 /// 4-connected A* from `(x0, y0)` to `(x1, y1)`.
 /// A cell is walkable when its byte is in `a..=b`.
 /// Returns scratch indices `y * w + x` from start to goal, or empty.
+/// No size cap; scratch use is 40 bytes per grid cell (2.6 MB at 256x256), reused after `rewindScratch`.
 pub fn search(
     cells: []u8,
     w: int,
@@ -24,111 +22,168 @@ pub fn search(
 ): []int {
     let n = w * h;
     let empty = scratch(1).alloc::<int>(0);
-    if w <= 0 || h <= 0 || n > MAX_CELLS || n > cells.len {
+    if w <= 0 || h <= 0 || n > cells.len {
         return []int { ptr: empty.ptr, len: 0 };
     }
     if !walkable(cells, w, h, x0, y0, a, b) || !walkable(cells, w, h, x1, y1, a, b) {
         return []int { ptr: empty.ptr, len: 0 };
     }
+    // ponytail: dense per-cell arrays (O(w*h) scratch and init); a hash of visited cells if maps get huge.
     let mem = scratch(1);
-    let g = mem.alloc::<int>(n);
-    let parent = mem.alloc::<int>(n);
-    let open = mem.alloc::<int>(n);
-    let inOpen = mem.alloc::<u8>(n);
-    let closed = mem.alloc::<u8>(n);
+    let s = Search {
+        cells: cells, w: w, h: h, a: a, b: b, x1: x1, y1: y1,
+        g: mem.alloc::<int>(n),
+        f: mem.alloc::<int>(n),
+        parent: mem.alloc::<int>(n),
+        heap: mem.alloc::<int>(n),
+        pos: mem.alloc::<int>(n),
+        nheap: 0,
+    };
     let i = 0;
     while i < n {
-        g[i] = 1073741824;
-        parent[i] = 0 - 1;
-        inOpen[i] = 0;
-        closed[i] = 0;
+        s.g[i] = 1073741824;
+        s.pos[i] = NEW;
         i += 1;
     }
     let start = y0 * w + x0;
     let goal = y1 * w + x1;
-    g[start] = 0;
-    open[0] = start;
-    inOpen[start] = 1;
-    let nopen = 1;
-    while nopen > 0 {
-        let best = 0;
-        let bi = 1;
-        while bi < nopen {
-            if fscore(g, open[bi], w, x1, y1) < fscore(g, open[best], w, x1, y1) {
-                best = bi;
-            }
-            bi += 1;
-        }
-        let cur = open[best];
-        nopen = nopen - 1;
-        open[best] = open[nopen];
-        inOpen[cur] = 0;
-        closed[cur] = 1;
+    s.g[start] = 0;
+    s.f[start] = s.dist(start);
+    s.parent[start] = 0 - 1;
+    s.push(start);
+    while s.nheap > 0 {
+        let cur = s.pop();
         if cur == goal {
-            return rebuild(parent, start, goal);
+            return rebuild(s.parent, start, goal, n);
         }
         let cx = cur - (cur / w) * w;
         let cy = cur / w;
-        nopen = consider(cells, w, h, a, b, g, parent, open, inOpen, closed, nopen, cur, cx + 1, cy);
-        nopen = consider(cells, w, h, a, b, g, parent, open, inOpen, closed, nopen, cur, cx - 1, cy);
-        nopen = consider(cells, w, h, a, b, g, parent, open, inOpen, closed, nopen, cur, cx, cy + 1);
-        nopen = consider(cells, w, h, a, b, g, parent, open, inOpen, closed, nopen, cur, cx, cy - 1);
+        s.consider(cur, cx + 1, cy);
+        s.consider(cur, cx - 1, cy);
+        s.consider(cur, cx, cy + 1);
+        s.consider(cur, cx, cy - 1);
     }
-    let none = mem.alloc::<int>(0);
-    return []int { ptr: none.ptr, len: 0 };
+    return []int { ptr: empty.ptr, len: 0 };
 }
 
-/// Manhattan distance plus `g`, used to pick the next open cell.
-fn fscore(g: []int, cell: int, w: int, x1: int, y1: int): int {
-    let x = cell - (cell / w) * w;
-    let y = cell / w;
-    let dx = x - x1;
-    let dy = y - y1;
-    if dx < 0 {
-        dx = 0 - dx;
-    }
-    if dy < 0 {
-        dy = 0 - dy;
-    }
-    return g[cell] + dx + dy;
+/// `pos` of a cell never reached.
+const NEW: int = 0 - 1;
+/// `pos` of an expanded cell.
+const CLOSED: int = 0 - 2;
+
+/// One search's state: per-cell `g`, `f = g + dist`, `parent`, heap slot `pos`, and a binary min-heap of open cells.
+struct Search {
+    cells: []u8;
+    w: int;
+    h: int;
+    a: u8;
+    b: u8;
+    x1: int;
+    y1: int;
+    g: []int;
+    f: []int;
+    parent: []int;
+    heap: []int;
+    pos: []int;
+    nheap: int;
 }
 
-/// Relax the edge from `cur` into `(x, y)` when that step is cheaper.
-fn consider(
-    cells: []u8,
-    w: int,
-    h: int,
-    a: u8,
-    b: u8,
-    g: []int,
-    parent: []int,
-    open: []int,
-    inOpen: []u8,
-    closed: []u8,
-    nopen: int,
-    cur: int,
-    x: int,
-    y: int,
-): int {
-    if !walkable(cells, w, h, x, y, a, b) {
-        return nopen;
+extend Search {
+    /// Manhattan distance from `cell` to the goal.
+    fn dist(this: &Search, cell: int): int {
+        let dx = cell - (cell / this.w) * this.w - this.x1;
+        let dy = cell / this.w - this.y1;
+        if dx < 0 {
+            dx = 0 - dx;
+        }
+        if dy < 0 {
+            dy = 0 - dy;
+        }
+        return dx + dy;
     }
-    let next = y * w + x;
-    if closed[next] != 0 {
-        return nopen;
+
+    /// True when `p` should come out of the heap before `q`: lower f, then higher g (deeper first).
+    fn before(this: &Search, p: int, q: int): bool {
+        if this.f[p] != this.f[q] {
+            return this.f[p] < this.f[q];
+        }
+        return this.g[p] > this.g[q];
     }
-    let cost = g[cur] + 1;
-    if cost >= g[next] {
-        return nopen;
+
+    fn place(this: &Search, i: int, cell: int) {
+        this.heap[i] = cell;
+        this.pos[cell] = i;
     }
-    g[next] = cost;
-    parent[next] = cur;
-    if inOpen[next] == 0 {
-        open[nopen] = next;
-        inOpen[next] = 1;
-        return nopen + 1;
+
+    /// Move the cell at heap slot `i` toward the root while it beats its parent.
+    fn up(this: &Search, i: int) {
+        let cell = this.heap[i];
+        while i > 0 {
+            let p = (i - 1) / 2;
+            if !this.before(cell, this.heap[p]) {
+                break;
+            }
+            this.place(i, this.heap[p]);
+            i = p;
+        }
+        this.place(i, cell);
     }
-    return nopen;
+
+    fn push(this: &Search, cell: int) {
+        this.heap[this.nheap] = cell;
+        this.nheap += 1;
+        this.up(this.nheap - 1);
+    }
+
+    /// Remove and return the best open cell, marking it closed.
+    fn pop(this: &Search): int {
+        let top = this.heap[0];
+        this.pos[top] = CLOSED;
+        this.nheap = this.nheap - 1;
+        if this.nheap > 0 {
+            let cell = this.heap[this.nheap];
+            let i = 0;
+            while true {
+                let c = i * 2 + 1;
+                if c >= this.nheap {
+                    break;
+                }
+                if c + 1 < this.nheap && this.before(this.heap[c + 1], this.heap[c]) {
+                    c += 1;
+                }
+                if !this.before(this.heap[c], cell) {
+                    break;
+                }
+                this.place(i, this.heap[c]);
+                i = c;
+            }
+            this.place(i, cell);
+        }
+        return top;
+    }
+
+    /// Relax the edge from `cur` into `(x, y)` when that step is cheaper.
+    fn consider(this: &Search, cur: int, x: int, y: int) {
+        if !walkable(this.cells, this.w, this.h, x, y, this.a, this.b) {
+            return;
+        }
+        let next = y * this.w + x;
+        if this.pos[next] == CLOSED {
+            return;
+        }
+        let cost = this.g[cur] + 1;
+        if cost >= this.g[next] {
+            return;
+        }
+        this.g[next] = cost;
+        this.f[next] = cost + this.dist(next);
+        this.parent[next] = cur;
+        if this.pos[next] == NEW {
+            this.push(next);
+        } else {
+            this.up(this.pos[next]);
+        }
+    }
 }
 
 /// True when `(x, y)` is inside the grid and its byte is in `a..=b`.
@@ -141,10 +196,10 @@ fn walkable(cells: []u8, w: int, h: int, x: int, y: int, a: u8, b: u8): bool {
 }
 
 /// Walk parents from `goal` back to `start` and reverse into a scratch path.
-fn rebuild(parent: []int, start: int, goal: int): []int {
+fn rebuild(parent: []int, start: int, goal: int, n: int): []int {
     let count = 0;
     let cur = goal;
-    while cur != start && count < MAX_CELLS {
+    while cur != start && count < n {
         count += 1;
         cur = parent[cur];
         if cur < 0 {

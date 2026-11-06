@@ -1,0 +1,204 @@
+// Tests for the j2 parser (`j3.j2.parse`): the example scripts parse and round-trip through
+// `print` and a reparse, AST shapes for the tricky spots, and exact error text for bad input.
+//   timeout 60 j3c run j3c/stdlib/tests/j2_parse_test.j3   (from the repo root or j3c/)
+// Panics on the first failed check.
+
+module j2_parse_test;
+
+use j3.io.{ exists, printLn, readFile };
+use j3.j2.lex;
+use j3.j2.parse;
+use j3.j2.parse.{ Ast, Node };
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+
+fn ok(cond: bool, msg: string) {
+    if !cond {
+        panic(msg);
+    }
+}
+
+fn parseOk(file: string, src: string, mem: &Arena): Ast {
+    match parse.parse(file, src, mem) {
+        Result.Ok(ast) { return ast; }
+        Result.Err(e) {
+            printLn(e.text);
+            panic("unexpected parse error");
+        }
+    }
+    return parseOk(file, "", mem);
+}
+
+/// print(parse(src)) reparses and prints the same text again.
+fn roundTrip(file: string, src: string, mem: &Arena): string {
+    let a = parseOk(file, src, mem);
+    let p1 = parse.print(&a, mem);
+    let b = parseOk(file, p1, mem);
+    let p2 = parse.print(&b, mem);
+    if !(p1 == p2) {
+        printLn("---- first print");
+        printLn(p1);
+        printLn("---- second print");
+        printLn(p2);
+        panic("round trip differs");
+    }
+    ok(a.nodes.len == b.nodes.len, "round trip keeps the node count");
+    return p1;
+}
+
+fn bad(src: string, want: string, mem: &Arena) {
+    match parse.parse("bad.j2", src, mem) {
+        Result.Ok(_) {
+            printLn(`no error for: {src}`);
+            panic("expected a parse error");
+        }
+        Result.Err(e) {
+            if !(e.text == want) {
+                printLn(`source [{src}]`);
+                printLn(`got  [{e.text}]`);
+                printLn(`want [{want}]`);
+                panic("parse error text");
+            }
+        }
+    }
+}
+
+fn scriptDir(): string {
+    if exists("examples/j2_script/j2-scripts/hello/main.j2") {
+        return "examples/j2_script/j2-scripts/";
+    }
+    return "../examples/j2_script/j2-scripts/";
+}
+
+fn testScripts(mem: &Arena) {
+    let names: [4]string = ["base", "hello", "slimes", "turrets"];
+    for i in 0..names.len {
+        let path = Text.new(mem);
+        path.pushStr(scriptDir());
+        path.pushStr(names[i]);
+        path.pushStr("/main.j2");
+        match readFile(path.str(), mem) {
+            Result.Ok(bytes) { roundTrip(path.str(), bytes as string, mem); }
+            Result.Err(_) {
+                printLn(path.str());
+                panic("cannot read example script");
+            }
+        }
+    }
+}
+
+fn first(a: &Ast): &Node { return a.node(a.kid(a.root, 0)); }
+
+fn testShapes(mem: &Arena) {
+    // precedence: 1 + 2 * 3 == 7 && !x || y
+    let a = parseOk("t", "let v = 1 + 2 * 3 == 7 && !x || y;", mem);
+    let let0 = first(&a);
+    ok(let0.kind == parse.N_LET && let0.s == "v", "let");
+    let or = a.node(let0.a);
+    ok(or.kind == parse.N_BINARY && or.op == lex.T_OR, "|| loosest");
+    let and = a.node(or.a);
+    ok(and.op == lex.T_AND, "&& under ||");
+    let eq = a.node(and.a);
+    ok(eq.op == lex.T_EQ && a.node(eq.a).op == lex.T_PLUS, "== over +");
+    ok(a.node(a.node(eq.a).b).op == lex.T_STAR, "* binds tighter");
+    ok(a.node(and.b).kind == parse.N_UNARY && a.node(and.b).op == lex.T_NOT, "unary !");
+    ok(eq.line == 1 && eq.col == 19, "binary position is the operator");
+    eqText(roundTrip("t", "let v = (1 + 2) * -(3 - 4) - (5 - 6);", mem), "let v = (1 + 2) * -(3 - 4) - (5 - 6);\n", "parens kept where needed");
+    eqText(roundTrip("t", "let v = ((a.b)[1])(2);", mem), "let v = a.b[1](2);\n", "postfix needs none");
+
+    // methods, this, templates
+    let m = parseOk("t", "let t = { pos: fn(this, a) { return this.x; }, \"a b\": 1, };\nt.pos(1);", mem);
+    let tbl = a2(&m, first(&m).a);
+    ok(tbl.kind == parse.N_TABLE && tbl.count == 2, "table pairs");
+    let pos = m.node(m.kid(first(&m).a, 0));
+    ok(pos.s == "pos" && m.node(pos.a).kind == parse.N_FN, "fn field");
+    ok((m.node(pos.a).flags & parse.F_THIS) != 0, "this flag");
+    ok((m.node(m.kid(first(&m).a, 1)).flags & parse.F_QUOTED) != 0, "quoted key");
+    let call = m.node(m.node(m.kid(m.root, 1)).a);
+    ok(call.kind == parse.N_CALL && m.node(call.a).kind == parse.N_FIELD && call.count == 1, "method call");
+
+    let tp = parseOk("t", "print(`a {x.y(z, `in {n}`)} b {1}`);", mem);
+    let tn = tp.node(tp.kid(first(&tp).a, 0));
+    ok(tn.kind == parse.N_TPL && tn.count == 5, "template parts");
+    ok(tp.node(tp.kid(tp.kid(first(&tp).a, 0), 0)).s == "a ", "template head text");
+    roundTrip("t", "print(`a {x.y(z, `in {n}`)} b {1} \\{ \\` c`);", mem);
+
+    // statements
+    let src = "use base;\npub const A = 1;\npub fn f(a, b) {\n    for i in 0..3 { continue; }\n    for k, v in t { break; }\n    for v in xs {}\n    while a < b { a += 1; }\n    match a { 1 {} -2 {} \"s\" {} true {} nil {} 2.5 {} _ { return; } }\n    if a {} else if b {} else {}\n    {}\n    return a;\n}\nlet half = fn(v) { return v / 2; };\nx.y[1] = nil;\n";
+    let s = parseOk("t", src, mem);
+    ok(s.node(s.kid(s.root, 0)).kind == parse.N_USE, "use");
+    let c = s.node(s.kid(s.root, 1));
+    ok(c.kind == parse.N_LET && c.flags == parse.F_PUB | parse.F_CONST, "pub const");
+    let f = s.node(s.kid(s.root, 2));
+    ok(f.kind == parse.N_FNDECL && f.s == "f" && f.count == 2 && (f.flags & parse.F_PUB) != 0, "pub fn");
+    let body = s.node(f.b);
+    ok(s.node(s.kid(f.b, 0)).kind == parse.N_FOR_RANGE && s.node(s.kid(f.b, 0)).s == "i", "range for");
+    ok(s.node(s.kid(f.b, 1)).kind == parse.N_FOR_IN && s.node(s.kid(f.b, 1)).count == 2, "for k, v");
+    ok(s.node(s.kid(f.b, 2)).count == 1, "for v");
+    let mt = s.node(s.kid(f.b, 4));
+    ok(mt.kind == parse.N_MATCH && mt.count == 7, "match arms");
+    ok(s.node(s.node(s.kid(s.kid(f.b, 4), 1)).a).i == -2, "negative pattern");
+    ok(s.node(s.kid(s.kid(f.b, 4), 6)).a == -1, "_ arm");
+    ok(body.count == 8, "fn body statements");
+    let asg = s.node(s.kid(s.root, 4));
+    ok(asg.kind == parse.N_ASSIGN && asg.op == lex.T_ASSIGN && s.node(asg.a).kind == parse.N_INDEX, "index assign");
+    roundTrip("t", src, mem);
+    roundTrip("t", "({a: 1}).b();\n({}).c = 1;\nlet e = 1e300 + 0.1 + 3.0 + 0x10;", mem);
+}
+
+fn a2(a: &Ast, n: int): &Node { return a.node(n); }
+
+fn eqText(got: string, want: string, what: string) {
+    if !(got == want) {
+        printLn(`{what}: got [{got}] want [{want}]`);
+        panic(what);
+    }
+}
+
+fn testErrors(mem: &Arena) {
+    bad("fn f() {\n    let x = 1;\n", "bad.j2:3:1: expected `}`, found end of file", mem);
+    bad("let = 3;", "bad.j2:1:5: expected a name after `let`, found `=`", mem);
+    bad("match x {\n}", "bad.j2:2:1: expected a match arm, found `}`", mem);
+    bad("let a = 1;\nelse { }", "bad.j2:2:1: `else` without `if`", mem);
+    bad("let a = 1\nlet b = 2;", "bad.j2:2:1: expected `;`, found `let`", mem);
+    bad("f(1, 2;", "bad.j2:1:7: expected `,` or `)`, found `;`", mem);
+    bad("let t = { a 1 };", "bad.j2:1:13: expected `:`, found `1`", mem);
+    bad("1 + 2 = 3;", "bad.j2:1:1: can only assign to a name, a field or an index", mem);
+    bad("fn f() { pub let x = 1; }", "bad.j2:1:10: `pub` is only allowed at the top level", mem);
+    bad("fn f() { use a; }", "bad.j2:1:10: `use` is only allowed at the top level", mem);
+    bad("const C;", "bad.j2:1:8: expected `=`, found `;`", mem);
+    bad("print(`a {} b`);", "bad.j2:1:11: expected an expression, found `}`", mem);
+    bad("match x { y {} }", "bad.j2:1:11: expected a match pattern (a number, string, `true`, `false`, `nil` or `_`), found `y`", mem);
+    bad("for i, v in 0..3 {}", "bad.j2:1:14: a range loop takes one variable", mem);
+    bad("x = \"oops;", "bad.j2:1:5: unterminated string", mem);
+    bad("let s = `a\nb\n{c d}`;", "bad.j2:3:4: expected `}` to close the `{` in the string, found `d`", mem);
+    // deep nesting is an error, not a crash
+    let deep = Text.new(mem);
+    deep.pushStr("let x = ");
+    for i in 0..5000 { deep.push(40); }
+    bad(deep.str(), "bad.j2:1:208: too deeply nested", mem);
+    let deepIf = Text.new(mem);
+    for i in 0..5000 { deepIf.pushStr("if a {"); }
+    match parse.parse("bad.j2", deepIf.str(), mem) {
+        Result.Ok(_) { panic("deep blocks parsed"); }
+        Result.Err(e) { ok(e.msg == "too deeply nested", "deep blocks"); }
+    }
+    // every prefix of a real script fails cleanly or parses
+    let src = "pub fn f(a) { let t = {x: [1, `s{a.b(2)}`], y: fn(this) { return -this.x; }}; match a { 1 { } _ { } } for k, v in t { t[k] = nil; } }";
+    for n in 0..src.len {
+        match parse.parse("cut.j2", src[0..n], mem) {
+            Result.Ok(_) { }
+            Result.Err(_) { }
+        }
+    }
+}
+
+fn main() {
+    let mem = Arena.create(1 << 22);
+    testScripts(&mem);
+    testShapes(&mem);
+    testErrors(&mem);
+    printLn("j2_parse_test ok");
+}

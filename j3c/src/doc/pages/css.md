@@ -317,7 +317,7 @@ Text
                                            `bottom` element is one box (its parts of different sizes keep one baseline, a nested raise moves within it).
                                            A shifted element's text, background box, text selection and hover follow it. Snaps in a
                                            transition (no blending). Not on table cells (there are none). An atomic inline box is one of those tags:
-                                           `display: inline-block` is not a value here (the parser warns `invalid value for 'display'`); a bare number
+                                           `display: inline-block` is not a value here (the parser warns `invalid value 'inline-block' for 'display'`); a bare number
                                            such as `vertical-align: 5` warns the same way and is dropped
   box-decoration-break: slice | clone     not inherited; what a wrapped inline element's line pieces get. `slice` (default) splits one box over the lines;
                                            `clone` gives every piece its own padding, border, radius, shadow and background (see Inline boxes below)

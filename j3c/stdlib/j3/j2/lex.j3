@@ -1,0 +1,684 @@
+/// The j2 lexer: source text to tokens with line:col (1-based; col counts bytes). `//` comments,
+/// numbers (`42`, `0xff`, `1_000`, `2.5`, `1e9`), `"..."` strings (one line) and backtick
+/// strings (may span lines) with `{expr}` holes. A backtick string with holes becomes
+/// `TPL_HEAD` text, the hole's tokens, then `TPL_MID` text ... and `TPL_TAIL` text, so holes can
+/// hold anything, braces and other strings included. Errors are values, never panics.
+
+module j3.j2.lex;
+
+use j3.memory.{ Arena, List };
+use j3.result.Result;
+use j3.text.Text;
+
+use lib "c" as c {
+    fn strtod(s: ptr, end: ptr): f64;
+    // variadic in C; the emitter calls a binding of it with the variadic type (as `j3.data.json` does)
+    fn snprintf(buf: ptr, n: u64, fmt: cstr, digits: i32, x: f64): i32;
+}
+
+pub const T_EOF: int = 0;
+pub const T_NAME: int = 1;
+pub const T_INT: int = 2;
+pub const T_FLOAT: int = 3;
+/// A string with no holes; `s..e` is the raw text between the quotes.
+pub const T_STR: int = 4;
+/// Backtick text up to the first `{` of a hole.
+pub const T_TPL_HEAD: int = 5;
+/// Text between two holes.
+pub const T_TPL_MID: int = 6;
+/// Text after the last hole, up to the closing backtick.
+pub const T_TPL_TAIL: int = 7;
+
+pub const T_LPAREN: int = 10;
+pub const T_RPAREN: int = 11;
+pub const T_LBRACE: int = 12;
+pub const T_RBRACE: int = 13;
+pub const T_LBRACK: int = 14;
+pub const T_RBRACK: int = 15;
+pub const T_COMMA: int = 16;
+pub const T_SEMI: int = 17;
+pub const T_COLON: int = 18;
+pub const T_DOT: int = 19;
+pub const T_DOTDOT: int = 20;
+pub const T_ASSIGN: int = 21;
+pub const T_EQ: int = 22;
+pub const T_NOT: int = 23;
+pub const T_NE: int = 24;
+pub const T_LT: int = 25;
+pub const T_LE: int = 26;
+pub const T_GT: int = 27;
+pub const T_GE: int = 28;
+pub const T_PLUS: int = 29;
+pub const T_MINUS: int = 30;
+pub const T_STAR: int = 31;
+pub const T_SLASH: int = 32;
+pub const T_PERCENT: int = 33;
+pub const T_AND: int = 34;
+pub const T_OR: int = 35;
+pub const T_PLUS_EQ: int = 36;
+pub const T_MINUS_EQ: int = 37;
+pub const T_STAR_EQ: int = 38;
+pub const T_SLASH_EQ: int = 39;
+pub const T_PERCENT_EQ: int = 40;
+
+pub const K_LET: int = 50;
+pub const K_CONST: int = 51;
+pub const K_FN: int = 52;
+pub const K_RETURN: int = 53;
+pub const K_IF: int = 54;
+pub const K_ELSE: int = 55;
+pub const K_WHILE: int = 56;
+pub const K_FOR: int = 57;
+pub const K_IN: int = 58;
+pub const K_BREAK: int = 59;
+pub const K_CONTINUE: int = 60;
+pub const K_MATCH: int = 61;
+pub const K_PUB: int = 62;
+pub const K_USE: int = 63;
+pub const K_NIL: int = 64;
+pub const K_TRUE: int = 65;
+pub const K_FALSE: int = 66;
+
+const KEYWORDS: [17]string = ["let", "const", "fn", "return", "if", "else", "while", "for", "in", "break",
+    "continue", "match", "pub", "use", "nil", "true", "false"];
+
+pub struct Token {
+    kind: int;
+    /// Source byte range: the whole token, or a string's text without its delimiters.
+    s: int;
+    e: int;
+    line: int;
+    col: int;
+    /// `T_INT` value.
+    i: int;
+    /// `T_FLOAT` value.
+    f: f64;
+}
+
+/// A lex or parse error. `text` is the full `file:line:col: message` line.
+pub struct SyntaxError {
+    file: string;
+    line: int;
+    col: int;
+    msg: string;
+    text: string;
+}
+
+/// An error at `line:col` of `file`, text on `mem`.
+pub fn syntaxError(mem: &Arena, file: string, line: int, col: int, msg: string): SyntaxError {
+    let t = Text.new(mem);
+    t.pushStr(file);
+    t.push(58);
+    t.pushInt(line);
+    t.push(58);
+    t.pushInt(col);
+    t.pushStr(": ");
+    t.pushStr(msg);
+    let s = t.str();
+    return SyntaxError { file: file, line: line, col: col, msg: s[s.len - msg.len..s.len], text: s };
+}
+
+/// An open backtick string waiting for its hole's `}`.
+struct Hole {
+    depth: int;
+    line: int;
+    col: int;
+}
+
+struct Lexer {
+    file: string;
+    src: string;
+    mem: &Arena;
+    at: int;
+    line: int;
+    /// Byte offset where the current line starts.
+    lineAt: int;
+    toks: List<Token>;
+    holes: List<Hole>;
+    failed: bool;
+    err: SyntaxError;
+}
+
+/// Tokens of `src`, ending with one `T_EOF`. `file` names the source in error text.
+pub fn lex(file: string, src: string, mem: &Arena): Result<[]Token, SyntaxError> {
+    let lx = Lexer {
+        file: file,
+        src: src,
+        mem: mem,
+        at: 0,
+        line: 1,
+        lineAt: 0,
+        toks: List<Token>.new(mem),
+        holes: List<Hole>.new(mem),
+        failed: false,
+        err: SyntaxError { file: file, line: 0, col: 0, msg: "", text: "" },
+    };
+    lx.run();
+    if lx.failed {
+        return Result.Err(lx.err);
+    }
+    return Result.Ok(lx.toks.items[0..lx.toks.len]);
+}
+
+fn isDigit(c: u8): bool { return c >= 48 && c <= 57; }
+
+fn isNameStart(c: u8): bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95; }
+
+fn isHex(c: u8): bool { return isDigit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70); }
+
+extend Lexer {
+    fn peekAt(this: &Lexer, k: int): u8 {
+        if this.at + k < this.src.len { return this.src[this.at + k]; }
+        return 0;
+    }
+
+    fn fail(this: &Lexer, line: int, col: int, msg: string) {
+        if this.failed { return; }
+        this.failed = true;
+        this.err = syntaxError(this.mem, this.file, line, col, msg);
+    }
+
+    fn add(this: &Lexer, kind: int, s: int, e: int, line: int, col: int) {
+        this.toks.push(Token { kind: kind, s: s, e: e, line: line, col: col, i: 0, f: 0.0 });
+    }
+
+    fn run(this: &Lexer) {
+        while !this.failed {
+            this.skipSpace();
+            let line = this.line;
+            let col = this.at - this.lineAt + 1;
+            if this.at >= this.src.len {
+                if this.holes.len > 0 {
+                    let h = this.holes.items[this.holes.len - 1];
+                    this.fail(h.line, h.col, "unterminated string");
+                    return;
+                }
+                this.add(T_EOF, this.at, this.at, line, col);
+                return;
+            }
+            let ch = this.src[this.at];
+            if ch == 114 && this.rawStart() {
+                this.raw(line, col);
+            } else if isNameStart(ch) {
+                this.name(line, col);
+            } else if isDigit(ch) {
+                this.number(line, col);
+            } else if ch == 34 {
+                this.quoted(line, col);
+            } else if ch == 96 {
+                this.at += 1;
+                this.tplText(line, col, true, line, col);
+            } else if ch == 125 && this.holes.len > 0 && this.holes.items[this.holes.len - 1].depth == 0 {
+                let h = this.holes.items[this.holes.len - 1];
+                this.holes.len -= 1;
+                this.at += 1;
+                this.tplText(line, col, false, h.line, h.col);
+            } else {
+                this.punct(ch, line, col);
+            }
+        }
+    }
+
+    fn skipSpace(this: &Lexer) {
+        while this.at < this.src.len {
+            let ch = this.src[this.at];
+            if ch == 10 {
+                this.at += 1;
+                this.line += 1;
+                this.lineAt = this.at;
+            } else if ch == 32 || ch == 9 || ch == 13 {
+                this.at += 1;
+            } else if ch == 47 && this.peekAt(1) == 47 {
+                while this.at < this.src.len && this.src[this.at] != 10 { this.at += 1; }
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn name(this: &Lexer, line: int, col: int) {
+        let s = this.at;
+        while this.at < this.src.len && (isNameStart(this.src[this.at]) || isDigit(this.src[this.at])) {
+            this.at += 1;
+        }
+        let word = this.src[s..this.at];
+        let kind = T_NAME;
+        for k in 0..KEYWORDS.len {
+            if word == KEYWORDS[k] { kind = K_LET + k; }
+        }
+        this.add(kind, s, this.at, line, col);
+    }
+
+    fn number(this: &Lexer, line: int, col: int) {
+        let s = this.at;
+        if this.src[s] == 48 && (this.peekAt(1) == 120 || this.peekAt(1) == 88) {
+            this.at += 2;
+            let n = 0;
+            let digits = 0;
+            while this.at < this.src.len && (isHex(this.src[this.at]) || this.src[this.at] == 95) {
+                let c = this.src[this.at];
+                this.at += 1;
+                if c == 95 { continue; }
+                if n > (9223372036854775807 >> 4) {
+                    this.fail(line, col, "number too big");
+                    return;
+                }
+                let d = if isDigit(c) { int(c) - 48 } else if c >= 97 { int(c) - 87 } else { int(c) - 55 };
+                n = n * 16 + d;
+                digits += 1;
+            }
+            if digits == 0 {
+                this.fail(line, col, "expected hex digits after `0x`");
+                return;
+            }
+            this.addNum(T_INT, s, line, col, n, 0.0);
+            return;
+        }
+        let isFloat = false;
+        this.digits();
+        if this.peekAt(0) == 46 && isDigit(this.peekAt(1)) {
+            isFloat = true;
+            this.at += 1;
+            this.digits();
+        }
+        let ec = this.peekAt(0);
+        if ec == 101 || ec == 69 {
+            let k = 1;
+            if this.peekAt(1) == 43 || this.peekAt(1) == 45 { k = 2; }
+            if !isDigit(this.peekAt(k)) {
+                this.fail(this.line, this.at - this.lineAt + 1, "expected digits after the exponent");
+                return;
+            }
+            isFloat = true;
+            this.at += k;
+            this.digits();
+        }
+        // digits without `_`, for the value
+        let buf: [64]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let n = 0;
+        for i in s..this.at {
+            if this.src[i] != 95 {
+                if n == 63 {
+                    this.fail(line, col, "number too long");
+                    return;
+                }
+                buf[n] = this.src[i];
+                n += 1;
+            }
+        }
+        if isFloat {
+            let f = c.strtod(&buf[0] as ptr, 0 as ptr);
+            if !(f - f == 0.0) {
+                this.fail(line, col, "number too big");
+                return;
+            }
+            this.addNum(T_FLOAT, s, line, col, 0, f);
+            return;
+        }
+        let v = 0;
+        for i in 0..n {
+            let d = int(buf[i]) - 48;
+            if v > (9223372036854775807 - d) / 10 {
+                this.fail(line, col, "number too big");
+                return;
+            }
+            v = v * 10 + d;
+        }
+        this.addNum(T_INT, s, line, col, v, 0.0);
+    }
+
+    fn digits(this: &Lexer) {
+        while this.at < this.src.len && (isDigit(this.src[this.at]) || this.src[this.at] == 95) {
+            this.at += 1;
+        }
+    }
+
+    fn addNum(this: &Lexer, kind: int, s: int, line: int, col: int, i: int, f: f64) {
+        this.toks.push(Token { kind: kind, s: s, e: this.at, line: line, col: col, i: i, f: f });
+    }
+
+    /// Check the escape at `at` (the byte after a backslash) and step over it.
+    fn escape(this: &Lexer): bool {
+        let line = this.line;
+        let col = this.at - this.lineAt;
+        if this.at >= this.src.len { return true; }
+        let ch = this.src[this.at];
+        let n = escLen(this.src, this.at);
+        if n == 0 {
+            let t = Text.new(this.mem);
+            t.pushStr("unknown escape `\\");
+            if ch >= 32 && ch < 127 { t.push(ch); }
+            t.pushStr("`");
+            this.fail(line, col, t.str());
+            return false;
+        }
+        this.at += n;
+        return true;
+    }
+
+    /// `r"` or `r#...#"` at `at`: a raw string opens here.
+    fn rawStart(this: &Lexer): bool {
+        let k = 1;
+        while this.peekAt(k) == 35 { k += 1; }
+        return this.peekAt(k) == 34;
+    }
+
+    /// `r"..."` / `r#"..."#`: no escapes, may span lines, ends at `"` plus as many `#` as opened it.
+    /// A T_STR token with `i = 1`, so the parser takes its bytes as they are.
+    fn raw(this: &Lexer, line: int, col: int) {
+        this.at += 1;
+        let hashes = 0;
+        while this.src[this.at] == 35 { hashes += 1; this.at += 1; }
+        this.at += 1;
+        let s = this.at;
+        while this.at < this.src.len {
+            let ch = this.src[this.at];
+            if ch == 34 {
+                let k = 0;
+                while k < hashes && this.peekAt(1 + k) == 35 { k += 1; }
+                if k == hashes {
+                    this.add(T_STR, s, this.at, line, col);
+                    this.toks.items[this.toks.len - 1].i = 1;
+                    this.at += 1 + hashes;
+                    return;
+                }
+            }
+            this.at += 1;
+            if ch == 10 {
+                this.line += 1;
+                this.lineAt = this.at;
+            }
+        }
+        this.fail(line, col, "unterminated raw string");
+    }
+
+    fn quoted(this: &Lexer, line: int, col: int) {
+        this.at += 1;
+        let s = this.at;
+        while this.at < this.src.len {
+            let ch = this.src[this.at];
+            if ch == 34 {
+                this.add(T_STR, s, this.at, line, col);
+                this.at += 1;
+                return;
+            }
+            if ch == 10 { break; }
+            this.at += 1;
+            if ch == 92 && !this.escape() { return; }
+        }
+        this.fail(line, col, "unterminated string");
+    }
+
+    /// Backtick text from `at` to the closing backtick (a string or `TPL_TAIL`) or a hole's `{`
+    /// (`TPL_HEAD` or `TPL_MID`). `fresh`: the text right after the opening backtick.
+    /// `openLine:openCol` is that backtick, for an unterminated error.
+    fn tplText(this: &Lexer, line: int, col: int, fresh: bool, openLine: int, openCol: int) {
+        let s = this.at;
+        while this.at < this.src.len {
+            let ch = this.src[this.at];
+            if ch == 96 {
+                this.add(if fresh { T_STR } else { T_TPL_TAIL }, s, this.at, line, col);
+                this.at += 1;
+                return;
+            }
+            if ch == 123 {
+                this.add(if fresh { T_TPL_HEAD } else { T_TPL_MID }, s, this.at, line, col);
+                this.at += 1;
+                this.holes.push(Hole { depth: 0, line: openLine, col: openCol });
+                return;
+            }
+            this.at += 1;
+            if ch == 10 {
+                this.line += 1;
+                this.lineAt = this.at;
+            } else if ch == 92 && !this.escape() {
+                return;
+            }
+        }
+        this.fail(openLine, openCol, "unterminated string");
+    }
+
+    fn punct(this: &Lexer, ch: u8, line: int, col: int) {
+        let n = this.peekAt(1);
+        let kind = -1;
+        let len = 1;
+        if ch == 40 { kind = T_LPAREN; }
+        else if ch == 41 { kind = T_RPAREN; }
+        else if ch == 123 { kind = T_LBRACE; }
+        else if ch == 125 { kind = T_RBRACE; }
+        else if ch == 91 { kind = T_LBRACK; }
+        else if ch == 93 { kind = T_RBRACK; }
+        else if ch == 44 { kind = T_COMMA; }
+        else if ch == 59 { kind = T_SEMI; }
+        else if ch == 58 { kind = T_COLON; }
+        else if ch == 46 { kind = if n == 46 { T_DOTDOT } else { T_DOT }; }
+        else if ch == 61 { kind = if n == 61 { T_EQ } else { T_ASSIGN }; }
+        else if ch == 33 { kind = if n == 61 { T_NE } else { T_NOT }; }
+        else if ch == 60 { kind = if n == 61 { T_LE } else { T_LT }; }
+        else if ch == 62 { kind = if n == 61 { T_GE } else { T_GT }; }
+        else if ch == 43 { kind = if n == 61 { T_PLUS_EQ } else { T_PLUS }; }
+        else if ch == 45 { kind = if n == 61 { T_MINUS_EQ } else { T_MINUS }; }
+        else if ch == 42 { kind = if n == 61 { T_STAR_EQ } else { T_STAR }; }
+        else if ch == 47 { kind = if n == 61 { T_SLASH_EQ } else { T_SLASH }; }
+        else if ch == 37 { kind = if n == 61 { T_PERCENT_EQ } else { T_PERCENT }; }
+        else if ch == 38 && n == 38 { kind = T_AND; }
+        else if ch == 124 && n == 124 { kind = T_OR; }
+        if kind == T_DOTDOT || kind == T_EQ || kind == T_NE || kind == T_LE || kind == T_GE || kind == T_AND
+            || kind == T_OR || (kind >= T_PLUS_EQ && kind <= T_PERCENT_EQ) {
+            len = 2;
+        }
+        if kind < 0 {
+            let t = Text.new(this.mem);
+            if ch >= 33 && ch < 127 {
+                t.pushStr("unexpected character `");
+                t.push(ch);
+                t.pushStr("`");
+            } else {
+                t.pushStr("unexpected byte ");
+                t.pushInt(int(ch));
+            }
+            this.fail(line, col, t.str());
+            return;
+        }
+        if this.holes.len > 0 {
+            let h = &this.holes.items[this.holes.len - 1];
+            if kind == T_LBRACE { h.depth += 1; }
+            if kind == T_RBRACE { h.depth -= 1; }
+        }
+        this.add(kind, this.at, this.at + len, line, col);
+        this.at += len;
+    }
+}
+
+/// The byte an escape letter stands for, or 255 when `ch` is not one.
+fn escaped(ch: u8): u8 {
+    if ch == 110 { return 10; }
+    if ch == 116 { return 9; }
+    if ch == 114 { return 13; }
+    if ch == 48 { return 0; }
+    if ch == 101 { return 27; }
+    if ch == 92 || ch == 34 || ch == 39 || ch == 96 || ch == 123 || ch == 125 { return ch; }
+    return 255;
+}
+
+fn hexVal(c: u8): int {
+    if c <= 57 { return int(c) - 48; }
+    if c >= 97 { return int(c) - 87; }
+    return int(c) - 55;
+}
+
+/// How many bytes the escape at `raw[i]` (the byte after `\`) spans, or 0 when it is not one:
+/// a letter from `escaped`, `xHH` (one byte), or `u{H..}` (a code point, 1-6 hex, written as UTF-8).
+fn escLen(raw: string, i: int): int {
+    if i >= raw.len { return 0; }
+    let ch = raw[i];
+    if ch == 120 {
+        if i + 2 < raw.len && isHex(raw[i + 1]) && isHex(raw[i + 2]) { return 3; }
+        return 0;
+    }
+    if ch == 117 {
+        if i + 1 >= raw.len || raw[i + 1] != 123 { return 0; }
+        let j = i + 2;
+        let v = 0;
+        while j < raw.len && isHex(raw[j]) && j - i - 2 < 6 {
+            v = v * 16 + hexVal(raw[j]);
+            j += 1;
+        }
+        if j == i + 2 || j >= raw.len || raw[j] != 125 || v > 0x10ffff { return 0; }
+        return j + 1 - i;
+    }
+    if escaped(ch) == 255 { return 0; }
+    return 1;
+}
+
+/// The text of a string token's raw range with escapes applied (a slice of `src` when it has none).
+/// A T_STR token's bytes: as written for a raw string (`i == 1`), else `decode`d.
+pub fn strText(src: string, tok: Token, mem: &Arena): string {
+    if tok.i == 1 { return src[tok.s..tok.e]; }
+    return decode(src, tok.s, tok.e, mem);
+}
+
+pub fn decode(src: string, s: int, e: int, mem: &Arena): string {
+    let raw = src[s..e];
+    let plain = true;
+    for i in 0..raw.len {
+        if raw[i] == 92 { plain = false; }
+    }
+    if plain { return raw; }
+    let out = mem.alloc::<u8>(raw.len);
+    let n = 0;
+    let i = 0;
+    while i < raw.len {
+        let ch = raw[i];
+        if ch == 92 && i + 1 < raw.len {
+            let len = escLen(raw, i + 1);
+            let k = raw[i + 1];
+            if k == 120 || k == 117 {
+                let v = 0;
+                let from = if k == 117 { i + 3 } else { i + 2 };
+                let to = if k == 117 { i + len } else { i + 1 + len };
+                for j in from..to {
+                    v = v * 16 + hexVal(raw[j]);
+                }
+                if k == 120 || v < 0x80 {
+                    out[n] = u8(v);
+                    n += 1;
+                } else if v < 0x800 {
+                    out[n] = u8(0xc0 | (v >> 6));
+                    out[n + 1] = u8(0x80 | (v & 63));
+                    n += 2;
+                } else if v < 0x10000 {
+                    out[n] = u8(0xe0 | (v >> 12));
+                    out[n + 1] = u8(0x80 | ((v >> 6) & 63));
+                    out[n + 2] = u8(0x80 | (v & 63));
+                    n += 3;
+                } else {
+                    out[n] = u8(0xf0 | (v >> 18));
+                    out[n + 1] = u8(0x80 | ((v >> 12) & 63));
+                    out[n + 2] = u8(0x80 | ((v >> 6) & 63));
+                    out[n + 3] = u8(0x80 | (v & 63));
+                    n += 4;
+                }
+                i += 1 + len;
+                continue;
+            }
+            ch = escaped(k);
+            i += 1;
+        }
+        out[n] = ch;
+        n += 1;
+        i += 1;
+    }
+    return out[0..n] as string;
+}
+
+/// `s` in double quotes, escaped so the lexer reads it back as the same bytes. Into a `Text` or
+/// any sink with `push` and `pushStr`.
+pub fn quote<W>(t: &W, s: string) {
+    t.push(34);
+    for i in 0..s.len {
+        let e = escapeFor(s[i], 34);
+        if e.len == 0 { t.push(s[i]); } else { t.pushStr(e); }
+    }
+    t.push(34);
+}
+
+/// Append `s` with `\`, `close` and control bytes escaped; in backtick text (`close` is a
+/// backtick) `{` is escaped too.
+pub fn escapeInto(t: &Text, s: string, close: u8) {
+    for i in 0..s.len {
+        let e = escapeFor(s[i], close);
+        if e.len == 0 { t.push(s[i]); } else { t.pushStr(e); }
+    }
+}
+
+/// How byte `c` is written inside a string closed by `close`: "" when as itself.
+pub fn escapeFor(c: u8, close: u8): string {
+    if c == 92 { return "\\\\"; }
+    if c == 34 && close == 34 { return "\\\""; }
+    if c == 96 && close == 96 { return "\\`"; }
+    if c == 123 && close == 96 { return "\\{"; }
+    if c == 10 { return "\\n"; }
+    if c == 9 { return "\\t"; }
+    if c == 13 { return "\\r"; }
+    if c == 0 { return "\\0"; }
+    if c == 27 { return "\\e"; }
+    return "";
+}
+
+/// A float as `str()` writes it: the shortest digits that read back, always with a `.` or an
+/// exponent (so the lexer reads a float again), `nan`, `inf`, `-inf`.
+pub fn fmtFloat<W>(t: &W, x: f64) {
+    if !(x == x) {
+        t.pushStr("nan");
+        return;
+    }
+    if !(x - x == 0.0) {
+        t.pushStr(if x > 0.0 { "inf" } else { "-inf" });
+        return;
+    }
+    if x < 9007199254740992.0 && x > -9007199254740992.0 && x == f64(int(x)) {
+        t.pushInt(int(x));
+        t.pushStr(".0");
+        return;
+    }
+    // the fewest of 15-17 significant digits that read back as `x` (`%.*g`; bionic has no gcvt)
+    let buf: [40]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let digits = 15;
+    while digits <= 17 {
+        c.snprintf(&buf[0] as ptr, 40, "%.*g\0".ptr as cstr, i32(digits), x);
+        if c.strtod(&buf[0] as ptr, 0 as ptr) == x { break; }
+        digits += 1;
+    }
+    let dot = false;
+    let i = 0;
+    while i < 40 && buf[i] != 0 {
+        if buf[i] == 46 || buf[i] == 101 { dot = true; }
+        t.push(buf[i]);
+        i += 1;
+    }
+    if !dot { t.pushStr(".0"); }
+}
+
+/// How an error names `tok`: `end of file`, or its source text in backticks (cut at 24 bytes).
+pub fn describe(t: &Text, src: string, tok: Token) {
+    if tok.kind == T_EOF {
+        t.pushStr("end of file");
+        return;
+    }
+    let s = tok.s;
+    let e = tok.e;
+    if tok.kind == T_TPL_MID || tok.kind == T_TPL_TAIL {
+        // the `}` that closed a hole
+        t.pushStr("`}`");
+        return;
+    }
+    if tok.kind == T_STR || tok.kind == T_TPL_HEAD {
+        t.pushStr("a string");
+        return;
+    }
+    if e - s > 24 { e = s + 24; }
+    t.push(96);
+    t.pushStr(src[s..e]);
+    t.push(96);
+}

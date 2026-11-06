@@ -1,0 +1,164 @@
+// Live playback: the song is rendered whole, then queued to an SDL audio device a little ahead of
+// the play position each frame. No audio-thread callback, so no J3 runs off the main thread.
+
+module composer.stream;
+
+use j3.memory.Arena;
+use composer.mix;
+use composer.mix.Stats;
+use composer.song;
+use composer.song.Song;
+use composer.synth;
+
+use lib "SDL2" as sdla {
+    fn SDL_OpenAudioDevice(device: ptr, iscapture: i32, desired: ptr, obtained: ptr, changes: i32): u32;
+    fn SDL_QueueAudio(dev: u32, data: ptr, len: u32): i32;
+    fn SDL_GetQueuedAudioSize(dev: u32): u32;
+    fn SDL_ClearQueuedAudio(dev: u32);
+    fn SDL_PauseAudioDevice(dev: u32, pause: i32);
+    fn SDL_InitSubSystem(flags: u32): i32;
+}
+
+/// Rendered songs live here, rewound for each render.
+#[singleton]
+let AUDIO: Arena = Arena { ptr: 0, used: 0, cap: 0, head: 0 };
+
+fn audioMem(): &Arena {
+    if AUDIO.ptr == 0 { AUDIO = Arena.create(160 * 1024 * 1024); }
+    return &AUDIO;
+}
+
+/// Seconds queued ahead of what is heard.
+const AHEAD: f32 = 0.12;
+
+pub struct Player {
+    mem: &Arena;
+    dev: u32;
+    pcm: []i16;
+    frames: int;
+    /// Next frame to queue.
+    at: int;
+    playing: bool;
+    loop: bool;
+    /// Loop range in frames.
+    from: int;
+    to: int;
+    /// Frames queued since `start`, and where that started, for the play position.
+    sent: int;
+    origin: int;
+    stats: Stats;
+}
+
+pub fn create(): Player {
+    return Player {
+        mem: audioMem(), dev: 0, pcm: []i16 { ptr: 0 as &i16, len: 0 }, frames: 0, at: 0,
+        playing: false, loop: false, from: 0, to: 0, sent: 0, origin: 0,
+        stats: Stats { peak: 0, rms: 0, hot: 0, seconds: 0, loud: 0 },
+    };
+}
+
+fn open(p: &Player): bool {
+    if p.dev != 0 { return true; }
+    sdla.SDL_InitSubSystem(16);
+    // SDL_AudioSpec: freq i32, format u16, channels u8, silence u8, samples u16, pad u16, size u32,
+    // callback ptr, userdata ptr. A null callback means we push with SDL_QueueAudio.
+    let spec = p.mem.alloc::<u8>(32);
+    for i in 0..32 { spec[i] = 0; }
+    spec[0] = u8(mix.RATE % 256);
+    spec[1] = u8(mix.RATE / 256);
+    spec[4] = 16;
+    spec[5] = 128;
+    spec[6] = 2;
+    spec[8] = 0;
+    spec[9] = 4;
+    p.dev = sdla.SDL_OpenAudioDevice(0 as ptr, 0, spec.ptr as ptr, 0 as ptr, 0);
+    if p.dev == 0 { return false; }
+    sdla.SDL_PauseAudioDevice(p.dev, 0);
+    return true;
+}
+
+/// Render the song again (after an edit, or before playing).
+pub fn load(p: &Player, s: &Song) {
+    p.mem.rewind(0);
+    let buf = mix.render(s, p.mem, &p.stats);
+    p.pcm = mix.toI16(buf, p.mem);
+    p.frames = p.pcm.len / 2;
+    if p.to <= 0 || p.to > p.frames { p.to = p.frames; }
+}
+
+/// The frame being heard now.
+pub fn position(p: &Player): int {
+    if !p.playing || p.dev == 0 { return p.at; }
+    let queued = int(sdla.SDL_GetQueuedAudioSize(p.dev)) / 4;
+    let heard = p.origin + p.sent - queued;
+    if p.loop && p.to > p.from {
+        let span = p.to - p.from;
+        if heard >= p.to { heard = p.from + (heard - p.to) % span; }
+    }
+    return heard;
+}
+
+/// Start at frame `frame`. False when there is no audio device.
+pub fn play(p: &Player, frame: int): bool {
+    if !open(p) { return false; }
+    sdla.SDL_ClearQueuedAudio(p.dev);
+    p.at = frame;
+    if p.at < 0 { p.at = 0; }
+    p.origin = p.at;
+    p.sent = 0;
+    p.playing = true;
+    return true;
+}
+
+pub fn stop(p: &Player) {
+    if p.playing { p.at = position(p); }
+    p.playing = false;
+    if p.dev != 0 { sdla.SDL_ClearQueuedAudio(p.dev); }
+}
+
+/// Keep `AHEAD` seconds queued. Call every frame.
+pub fn pump(p: &Player) {
+    if !p.playing || p.dev == 0 { return; }
+    let want = int(AHEAD * f32(mix.RATE));
+    let queued = int(sdla.SDL_GetQueuedAudioSize(p.dev)) / 4;
+    let end = if p.loop { p.to } else { p.frames };
+    while queued < want {
+        if p.at >= end {
+            if !p.loop {
+                if queued == 0 { p.playing = false; p.at = 0; }
+                return;
+            }
+            p.at = p.from;
+        }
+        let n = want - queued;
+        if n > end - p.at { n = end - p.at; }
+        if n <= 0 { return; }
+        let chunk = p.pcm[p.at * 2..(p.at + n) * 2];
+        sdla.SDL_QueueAudio(p.dev, chunk.ptr as ptr, u32(n * 4));
+        p.at += n;
+        p.sent += n;
+        queued += n;
+    }
+}
+
+/// Re-render after an edit and carry on from where the ear is.
+pub fn refresh(p: &Player, s: &Song) {
+    let was = p.playing;
+    let pos = position(p);
+    stop(p);
+    load(p, s);
+    if was { play(p, pos); }
+}
+
+/// Play one short note now (for clicks in the roll), replacing whatever was queued.
+pub fn preview(p: &Player, pitch: int, kind: int, tone: f32, vol: f32) {
+    if !open(p) { return; }
+    let mark = p.mem.checkpoint();
+    let buf = p.mem.alloc::<f32>(int(0.6 * f32(mix.RATE)) * 2);
+    for i in 0..buf.len { buf[i] = 0; }
+    synth.voice(buf, mix.RATE, 0, 0.25, pitch, 100, kind, tone, vol * 0.7, vol * 0.7, 0);
+    let pcm = mix.toI16(buf, p.mem);
+    sdla.SDL_ClearQueuedAudio(p.dev);
+    sdla.SDL_QueueAudio(p.dev, pcm.ptr as ptr, u32(pcm.len * 2));
+    p.mem.rewind(mark);
+}

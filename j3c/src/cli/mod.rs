@@ -12,11 +12,13 @@ use crate::project::{self, Input, Manifest};
 mod build;
 mod check;
 mod dump;
+mod glsl;
 mod runner;
 
 pub(crate) use build::*;
 use check::*;
 use dump::*;
+use glsl::dump_glsl;
 pub(crate) use runner::*;
 
 const VERSION: &str = "0.0.1";
@@ -35,6 +37,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
     FAST.store(false, std::sync::atomic::Ordering::Relaxed);
     RELEASE.store(false, std::sync::atomic::Ordering::Relaxed);
     crate::project::FILE_ONLY.store(false, std::sync::atomic::Ordering::Relaxed);
+    crate::project::HOST.store(false, std::sync::atomic::Ordering::Relaxed);
 
     let cmd = args[0].as_str();
     let rest = &args[1..];
@@ -50,6 +53,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
         "dump-ir" => dispatch(rest, dump_ir_hello, dump_ir_samples, dump_ir_path, false),
         "dump-c" => dispatch(rest, dump_c_hello, dump_c_samples, dump_c_path, false),
         "dump-llvm" => dispatch(rest, dump_ll_hello, dump_ll_samples, dump_ll_path, false),
+        "dump-glsl" => dump_glsl(rest),
         "dump-bc" => match rest.first() {
             Some(path) => dump_bc_path(path),
             None => { eprintln!("usage: j3c dump-bc <file.j3s>"); 1 }
@@ -82,9 +86,11 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
             0
         }
         "run" if rest.iter().any(|a| a == "--help" || a == "-h") => {
-            println!("usage: j3c run [path | file.j3 | tool.j3s] [--frames N] [--screenshot F.png] [--headless] [--hot] [--file]");
+            println!("usage: j3c run [path | file.j3 | tool.j3s] [--frames N] [--screenshot F.png] [--headless] [--hot] [--file] [--host] [--splash]");
             println!("  --hot       rebuild and restart on .j3/.j3ui/.j3s edits; the old run stays up if the build fails (`j3c doc j3ui`).");
             println!("  --headless  offscreen video, silent audio: no window. Agents always pass it (`j3c doc testing`).");
+            println!("  --host      ignore [emit] target: build and run an Android package for this machine, in place (`j3c doc testing`).");
+            println!("  --splash    show the startup splash in a dev run (`j3c doc ship`); same as J3_SPLASH=1");
             println!("  --frames N  stop an App after N frames; --screenshot saves the last one (relative to your cwd).");
             0
         }
@@ -126,12 +132,20 @@ fn editor_tool(args: &[String]) -> i32 {
         Some("render") => crate::scene::render_cmd(rest),
         Some("gen") => crate::gen::cmd(rest),
         Some("imgdiff") => crate::imgdiff::cmd(rest),
+        Some("steam-check") => crate::steamcheck::cmd(rest),
+        Some("--help" | "-h") => {
+            println!("usage: j3c -e <tool> ...  (or --editor)");
+            println!("  scene|render|gen|mcp|android|script-props   scene editor tools and the MCP server (`j3c -e scene --help`)");
+            println!("  imgdiff a.png b.png [--tol N] [--max N] [--out d.png]   pixel diff for goldens");
+            println!("  steam-check --sdk DIR [--no-compile] [--no-windows]   verify j3.steam against the Steamworks SDK");
+            0
+        }
         Some("mcp") => crate::mcp::cmd(rest),
         Some("android") => crate::android_run::cmd(rest),
         Some("script-props") => script_props_cmd(rest),
         other => {
             if let Some(o) = other { eprintln!("j3c -e: unknown editor tool `{o}`"); }
-            eprintln!("usage: j3c -e scene|render|gen|imgdiff|mcp|android|script-props ...  (or --editor)");
+            eprintln!("usage: j3c -e scene|render|gen|imgdiff|steam-check|mcp|android|script-props ...  (or --editor)");
             1
         }
     }
@@ -278,6 +292,8 @@ fn take_run_flags(rest: &[String]) -> Result<Vec<String>, String> {
             }
             "--hot" => HOT.store(true, std::sync::atomic::Ordering::Relaxed),
             "--file" => crate::project::FILE_ONLY.store(true, std::sync::atomic::Ordering::Relaxed),
+            "--host" => crate::project::HOST.store(true, std::sync::atomic::Ordering::Relaxed),
+            "--splash" => std::env::set_var("J3_SPLASH", "1"),
             "--headless" => {
                 std::env::set_var("SDL_VIDEODRIVER", "offscreen");
                 std::env::set_var("SDL_AUDIODRIVER", "dummy");
@@ -320,6 +336,7 @@ fn print_help() {
     println!("    doc testing      headless run, screenshots, goldens, imgdiff");
     println!("    golden <dir> [names] [--bless]  headless goldens of a project: states in <dir>/golden.toml (`doc testing`)");
     println!("    -e imgdiff a.png b.png [--tol N] [--max N] [--out d.png]  pixel diff for goldens (exit 1 = differs)");
+    println!("    -e steam-check --sdk DIR  verify j3.steam against the Steamworks SDK: symbols, calls, layouts, ids (exit 1 = mismatch)");
     println!("    build [path]     emit, compile, write `target/<name>`");
     println!("    run [path]       emit, compile, execute");
     println!("    run --frames N [--screenshot F.png] [--headless]  stop an App after N frames;");
@@ -334,6 +351,7 @@ fn print_help() {
     println!("    dump-ir samples  print hand-built place-IR samples");
     println!("    dump-c [path]    print C from the program");
     println!("    dump-llvm [path] print LLVM IR from the program");
+    println!("    dump-glsl [path] [--es]  print the GLSL of each `@shader(vs, fs)` (`j3c doc shaders`)");
     println!("    dump-ui <file.j3ui|dir> print the J3 generated from .j3ui components");
     println!("    dump-bc <file.j3s> print script bytecode");
     println!("    dump-syntax [--ui] [f]  print TextMate grammar (lexer/parser names; --ui for .j3ui)");

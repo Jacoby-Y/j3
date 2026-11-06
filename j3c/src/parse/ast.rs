@@ -24,7 +24,10 @@ pub enum Item {
     Const(ConstItem),
     Fn(FnItem),
     Struct(StructItem),
+    /// `extend T { fn .. }`: methods of `T` written outside its body; merged by `parse::extend::merge`.
+    Extend(ExtendItem),
     Enum(EnumItem),
+    Trait(TraitItem),
     Let(ModLetItem),
     Props(ScriptBlockItem),
     Shared(ScriptBlockItem),
@@ -54,6 +57,27 @@ pub struct ModLetItem {
     pub value: Option<Expr>,
     /// `#[thread]`: one copy per thread.
     pub thread: bool,
+    /// `#[uniform] let name: vec2;`: a shader uniform, removed before checking (`check/gpu/`).
+    pub uniform: bool,
+}
+
+/// `#[shader]` fn kinds (`j3c doc shaders`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GpuStage {
+    /// `#[shader]`: a helper callable from entries.
+    Helper,
+    Vertex,
+    Fragment,
+}
+
+/// Struct kinds that exist for shaders: `#[vertex]`, `#[vertex(instance)]`, `#[varying]`, `#[shader]`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GpuStruct {
+    None,
+    Vertex,
+    VertexInstance,
+    Varying,
+    Plain,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +89,8 @@ pub struct EnumItem {
     pub try_catch: Option<(Ident, Ident)>,
     pub name: Ident,
     pub type_params: Vec<Ident>,
+    /// `T: A + B`, same index as `type_params`.
+    pub bounds: Vec<Vec<Ident>>,
     pub variants: Vec<VariantItem>,
 }
 
@@ -100,9 +126,20 @@ pub struct StructItem {
     pub vis_pub: bool,
     pub debug: bool,
     pub packed: bool,
+    pub gpu: GpuStruct,
     pub name: Ident,
     pub type_params: Vec<Ident>,
+    pub bounds: Vec<Vec<Ident>>,
     pub fields: Vec<FieldItem>,
+    pub methods: Vec<FnItem>,
+}
+
+/// `extend Box<T> { methods }`: more methods of a struct declared in the same module.
+#[derive(Clone, Debug)]
+pub struct ExtendItem {
+    pub span: Span,
+    pub name: Ident,
+    pub type_params: Vec<Ident>,
     pub methods: Vec<FnItem>,
 }
 
@@ -113,6 +150,8 @@ pub struct FieldItem {
     pub name: Ident,
     pub ty: Type,
     pub embedded: bool,
+    /// `#[flat] name: vec4;` on a `#[varying]` struct: no interpolation.
+    pub flat: bool,
     /// `name: Type = 0`. A literal, checked later. Absent means the field is required.
     pub default: Option<Expr>,
 }
@@ -142,9 +181,32 @@ pub struct FnItem {
     pub vis_pub: bool,
     pub name: Ident,
     pub type_params: Vec<Ident>,
+    pub bounds: Vec<Vec<Ident>>,
+    /// `#[impl]`: a free fn that gives a type a trait's method (`speculative/lang/traits.j3`).
+    pub is_impl: bool,
+    /// `#[shader]` / `#[shader(vertex)]` / `#[shader(fragment)]`: GPU code, never lowered for the CPU.
+    pub shader: Option<GpuStage>,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: Block,
+}
+
+/// `trait Name { fn m(this: Self): T; }`: a list of signatures a type must have.
+#[derive(Clone, Debug)]
+pub struct TraitItem {
+    pub span: Span,
+    pub doc: String,
+    pub vis_pub: bool,
+    pub name: Ident,
+    pub methods: Vec<TraitMethod>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TraitMethod {
+    pub span: Span,
+    pub name: Ident,
+    pub params: Vec<Param>,
+    pub ret: Option<Type>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,8 +235,11 @@ pub enum Stmt {
     UseLocal(UseLocalStmt),
     Match(MatchStmt),
     Defer(DeferStmt),
-    Break(Span),
-    Continue(Span),
+    /// `'outer: while ...` / `'outer: for ...`.
+    Labeled(LabeledStmt),
+    /// `break;` or `break 'outer;` (the label without its quote).
+    Break(Span, Option<Ident>),
+    Continue(Span, Option<Ident>),
     Block(Block),
 }
 
@@ -184,6 +249,14 @@ pub struct IfStmt {
     pub cond: Expr,
     pub then_block: Block,
     pub else_block: Option<Block>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LabeledStmt {
+    pub span: Span,
+    pub label: Ident,
+    /// A `While`, `For` or `ForEach`.
+    pub body: Box<Stmt>,
 }
 
 #[derive(Clone, Debug)]
@@ -229,6 +302,8 @@ pub struct MatchStmt {
 #[derive(Clone, Debug)]
 pub struct MatchArm {
     pub span: Span,
+    /// An integer arm (`3`, `-1`) has an empty `path` and the literal here.
+    pub value: Option<Expr>,
     pub path: Vec<Ident>,
     pub payload: Option<Pat>,
     pub body: Block,
@@ -303,6 +378,11 @@ pub enum TypeKind {
         params: Vec<Type>,
         ret: Option<Box<Type>>,
     },
+    /// `closure(A, B): R`: a capturing function value; a param or `let` type only.
+    Closure {
+        params: Vec<Type>,
+        ret: Option<Box<Type>>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -356,9 +436,11 @@ pub enum ExprKind {
     Syscall {
         args: Vec<Expr>,
     },
-    /// `@atomicLoad(p)`, `@atomicStore(p, v)`, `@atomicAdd(p, v)`, `@atomicCas(p, old, new)`.
+    /// `@atomicLoad(p)`, `@atomicStore(p, v)`, `@atomicAdd(p, v)`, `@atomicCas(p, old, new)`, each with
+    /// an optional trailing order word (`acquire`); `order` is already validated for `op`.
     Atomic {
         op: crate::ir::op::AtomicOp,
+        order: crate::ir::op::AtomicOrder,
         args: Vec<Expr>,
     },
     /// The type of a project-local `.j3s` file.
@@ -399,6 +481,22 @@ pub enum ExprKind {
     Question {
         expr: Box<Expr>,
     },
+    /// `fn(a: int, b): T { body }`, a closure literal.
+    Closure(Box<ClosureLit>),
+}
+
+#[derive(Clone, Debug)]
+pub struct ClosureLit {
+    pub params: Vec<ClosureParam>,
+    pub ret: Option<Type>,
+    pub body: Block,
+}
+
+/// A closure parameter; the type may be left out when the expected type gives it.
+#[derive(Clone, Debug)]
+pub struct ClosureParam {
+    pub name: Ident,
+    pub ty: Option<Type>,
 }
 
 #[derive(Clone, Debug)]
@@ -414,6 +512,11 @@ pub enum BinOp {
     Mul,
     Div,
     Rem,
+    Shl,
+    Shr,
+    BitAnd,
+    BitOr,
+    BitXor,
     Eq,
     Ne,
     Lt,
@@ -427,6 +530,7 @@ pub enum BinOp {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UnaryOp {
     Neg,
+    BitNot,
     Ref,
     Deref,
     Not,

@@ -14,9 +14,13 @@ Pick a tool
 -----------
     run one thing in the background   spawn(&t, name, f, arg), later join(&t)
     many jobs on a few workers        Pool.create(&arena, workers, queueCap), then submit / trySubmit
-    the same work over 0..n           pool.parallelFor(n, f, ctx)   (f writes out[i]; it waits)
+    the same work over 0..n           pool.parallelForEach(n, fn(lo, hi) { .. })   (writes out[i]; it waits)
+                                      body runs on several workers at once: write out[i] or use atomics for
+                                      anything else captured. One thread at a time; never from inside a pool
+                                      job (deadlock on the shared pending count, shared ranges overwritten).
+                                      lower level: pool.parallelFor(n, f, ctx) with a fn and a ctx struct
     results back to a frame loop      a second Queue<T>: workers push, main tryPops
-    a counter or cancel flag          @atomicAdd / @atomicLoad / @atomicStore / @atomicCas on an int
+    a counter or cancel flag          @atomicAdd / @atomicLoad / @atomicStore / @atomicCas on an int, i32, u32, u64, bool, ptr
     anything bigger that is shared    a Mutex around it (better: hand it over instead)
     one value per thread              #[singleton] #[thread] let X: T;   (memory.scratch is one)
 
@@ -30,6 +34,8 @@ These can wait on other threads, so keep them to loaders, tools, and shutdown:
                              submit, wait, parallelFor, push, pop, join, lock.
 Size every Queue for the worst case. A full results queue blocks the worker in push until main
 drains it; a full job queue is what trySubmit reports.
+A push wakes an `App` sleeping between idle frames (`App.idleSkip`), so main tryPops the result on
+the next frame; workers make no UI calls.
 
 
 The rules
@@ -43,7 +49,7 @@ The rules
    returns.
    Never spin on a plain flag: the compiler may hoist the load. Use @atomicLoad or a Queue.
 3. A job is a plain fn(ptr) plus ONE ptr to a struct the spawner owns and keeps alive until the
-   job has finished. There are no capturing closures. Put what the job needs in that struct: its
+   job has finished. A closure cannot be a job (it points into the creator's stack and has no `fn(ptr)` form). Put what the job needs in that struct: its
    input, the slice it alone writes, an index, a &Queue to send the result to.
 4. One Arena per thread. Two threads allocating from one Arena race. A worker allocates from its
    own arena or from memory.scratch, which is per thread and which a pool worker rewinds after
@@ -56,7 +62,7 @@ The rules
    (see "Shared data that keeps changing" below). Reading it live is allowed only when the worker
    survives torn data.
 7. Scheduling is nondeterministic: jobs start in order and finish in any order. Anything that
-   feeds saves, replays, or netcode reduces results in a fixed order. parallelFor writing out[i]
+   feeds saves, replays, or netcode reduces results in a fixed order. parallelForEach / parallelFor writing out[i]
    and then summing in index order is deterministic.
 8. A Thread, Mutex, Cond, and Queue must not move or be copied once in use. Keep one in a let (or
    an arena slot, as Pool does) and pass &.
@@ -144,6 +150,22 @@ does this.
 Language side
 -------------
 #[thread] on a module let gives every thread its own copy (a worker's copy starts at the
-initializer). @atomicLoad(p), @atomicStore(p, v), @atomicAdd(p, v) (returns the old value), and
-@atomicCas(p, old, new) (returns whether it swapped) work on an int through a pointer and are
-sequentially consistent. Atomics are not supported in .j3s scripts.
+initializer).
+
+Atomics
+-------
+@atomicLoad(p), @atomicStore(p, v), @atomicAdd(p, v), @atomicSub(p, v), @atomicExchange(p, v) (the
+last three return the old value) and @atomicCas(p, old, new) (returns whether it swapped) work
+through a &T for int, i32, u32, u64, bool and ptr (bool and ptr: no add or sub). The type is the
+pointee's; i32 and u32 are 4-byte operations. The last argument is the memory order, default seqcst:
+
+    seqcst    one global order. Use when unsure; it is the default.
+    acquire   on a load or cas: what the writer did before its release is visible after this.
+    release   on a store or cas: publishes everything written before it. Pair with acquire.
+    acqrel    on add, sub, exchange, cas: both of the above in one step (a refcount drop).
+    relaxed   atomic but orders nothing: counters and stats nobody uses to hand over data.
+
+Load takes relaxed, acquire, seqcst; store takes relaxed, release, seqcst; the rest take any.
+A bad order is a compile error. Handoff: the writer sets data, then @atomicStore(&flag, 1, release);
+the reader spins on @atomicLoad(&flag, acquire) == 0, then reads data. A cas uses the given order on
+success and the strongest load order not above it on failure. Atomics are not supported in .j3s scripts.

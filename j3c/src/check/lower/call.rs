@@ -23,6 +23,15 @@ impl<'a> Lower<'a> {
         }
         match &func.kind {
             ExprKind::Name(n) => {
+                if let Some(simd) = n.name.strip_prefix('@').filter(|s| parse::syntax::INTRINSIC_SIMD.contains(s)) {
+                    return self.simd_intrinsic(span, simd, args);
+                }
+                if n.name.starts_with('@') {
+                    return self.closure_intrinsic(span, n, args, expected);
+                }
+                if simd::VEC_CTORS.contains(&n.name.as_str()) {
+                    return self.vec_ctor(span, &n.name, args);
+                }
                 if let Some(sid) = self.script_sid {
                     if let Some(id) = self.methods.get(&(sid.0, n.name.clone())).copied() {
                         let this = self.locals["this"];
@@ -33,11 +42,15 @@ impl<'a> Lower<'a> {
                 if args.len() == 1 {
                     if let Some(to) = self.conv_ty(&n.name) {
                         let from = self.operand(&args[0], None)?;
+                        self.half_cast(span, to, &from)?;
                         return Ok(Rvalue::cast(span, to, from));
                     }
                 }
                 if let Some(id) = self.funcs.get(&n.name).copied() {
                     return self.call_id(span, id, None, args);
+                }
+                if let Some(m) = self.generic_named(&n.name) {
+                    return self.call_generic(span, &m, &n.name, type_args, None, args);
                 }
                 if let Some(place) = self.aliases.get(&n.name).cloned() {
                     return self.call_fn_op(span, Operand::Copy(place), args);
@@ -57,12 +70,21 @@ impl<'a> Lower<'a> {
                     {
                         let id = match ns.get(&field.name).copied() {
                             Some(id) => id,
+                            None if self.generic_in_alias(&n.name, &field.name).is_some() => {
+                                let m = self.generic_in_alias(&n.name, &field.name).unwrap();
+                                return self.call_generic(span, &m, &field.name, type_args, None, args);
+                            }
                             None => {
-                                return Err(CheckError::new(
+                                let mut e = CheckError::new(
                                     self.path,
                                     field.span,
                                     format!("`{}` has no `{}`", n.name, field.name),
-                                ));
+                                );
+                                let cands: Vec<String> = ns.keys().cloned().collect();
+                                if let Some(s) = crate::check::error::suggest(&field.name, &cands) {
+                                    e = e.help(format!("did you mean `{}.{s}`?", n.name));
+                                }
+                                return Err(e);
                             }
                         };
                         return self.call_id(span, id, None, args);
@@ -85,13 +107,33 @@ impl<'a> Lower<'a> {
                     recv_ty = inner;
                 }
                 let sid = match self.cx.ty_kind(recv_ty) {
-                    TyKind::Struct(id) => *id,
-                    _ => {
-                        return Err(CheckError::new(
+                    TyKind::Struct(id) => Some(*id),
+                    _ => None,
+                };
+                if let Some(id) = self.ufcs_target(sid, &field.name, recv.ty) {
+                    return self.call_id(span, id, Some(recv), args);
+                }
+                let has_method = sid.is_some_and(|s| {
+                    let key = (s.0, field.name.clone());
+                    self.methods.contains_key(&key) || self.method_temps.contains_key(&key)
+                });
+                if !has_method {
+                    if let Some(id) = self.impl_target(recv.ty, &field.name) {
+                        return self.call_id(span, id, Some(recv), args);
+                    }
+                    if let Some(m) = self.generic_named(&field.name) {
+                        return self.call_generic(span, &m, &field.name, type_args, Some(recv), args);
+                    }
+                }
+                let sid = match sid {
+                    Some(sid) => sid,
+                    None => {
+                        let e = CheckError::new(
                             self.path,
                             field.span,
                             format!("no method `{}`", field.name),
-                        ));
+                        );
+                        return Err(self.ufcs_hint(e, &field.name));
                     }
                 };
                 let targs = self.resolve_type_args(type_args)?;
@@ -99,7 +141,9 @@ impl<'a> Lower<'a> {
                     let id = self.scene_script_find(targs[0], field.span)?;
                     return self.call_id(span, id, Some(recv), args);
                 }
-                let id = self.lookup_method(sid, &field.name, targs, field.span)?;
+                let id = self
+                    .lookup_method(sid, &field.name, targs, field.span)
+                    .map_err(|e| self.ufcs_hint(e, &field.name))?;
                 self.call_id(span, id, Some(recv), args)
             }
             _ => Err(CheckError::new(
@@ -181,11 +225,15 @@ impl<'a> Lower<'a> {
             arg_i = 1;
         }
         if params.len() - arg_i != args.len() {
+            let name = self.cx.name_str(self.cx.func(id).name).to_string();
+            let shown: Vec<String> = params[arg_i..].iter().map(|t| self.ty_str(*t)).collect();
+            let ret_s = if ret == self.cx.common.void { String::new() } else { format!(": {}", self.ty_str(ret)) };
             return Err(CheckError::new(
                 self.path,
                 span,
-                format!("takes {} args, got {}", params.len() - arg_i, args.len()),
-            ));
+                format!("`{name}` takes {} args, got {}", params.len() - arg_i, args.len()),
+            )
+            .note(format!("fn {name}({}){ret_s}", shown.join(", "))));
         }
         for (i, arg) in args.iter().enumerate() {
             ops.push(self.operand(arg, Some(params[arg_i + i]))?);
@@ -204,6 +252,9 @@ impl<'a> Lower<'a> {
         func: Operand,
         args: &[Expr],
     ) -> Result<Rvalue, CheckError> {
+        if self.cx.closure_sig(func.ty()).is_some() {
+            return self.call_closure(span, func, args);
+        }
         let (params, ret) = match self.cx.fn_sig(func.ty()) {
             Some(s) => (s.0.clone(), s.1),
             None => {
@@ -224,34 +275,47 @@ impl<'a> Lower<'a> {
         Ok(Rvalue::call(span, ret, func, ops))
     }
 
+    /// How a receiver of type `have` becomes a first parameter of type `want` (methods and UFCS).
+    pub(super) fn this_adjust(&self, have: Ty, want: Ty) -> Option<ThisAdjust> {
+        if have == want {
+            Some(ThisAdjust::Same)
+        } else if self.cx.ref_inner(want) == Some(have) {
+            Some(ThisAdjust::TakeRef)
+        } else if self.cx.ref_inner(have) == Some(want) {
+            Some(ThisAdjust::Deref)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn auto_this(&mut self, span: Span, recv: Place, want: Ty) -> Result<Operand, CheckError> {
-        if recv.ty == want {
-            return Ok(Operand::Copy(recv));
-        }
-        if self.cx.ref_inner(want) == Some(recv.ty) {
-            if !recv.access.take_ref {
-                return Err(CheckError::new(
-                    self.path,
-                    span,
-                    "cannot take `&` of this receiver",
-                ));
+        match self.this_adjust(recv.ty, want) {
+            Some(ThisAdjust::Same) => Ok(Operand::Copy(recv)),
+            Some(ThisAdjust::TakeRef) => {
+                if !recv.access.take_ref {
+                    return Err(CheckError::new(
+                        self.path,
+                        span,
+                        "cannot take `&` of this receiver",
+                    ));
+                }
+                let rv = Rvalue::ref_place(span, want, recv);
+                let n = self.fresh("this");
+                let id = self.b.tmp(n, want, span);
+                let place = self.b.local_place(id, span);
+                self.b.assign(span, place.clone(), rv);
+                Ok(Operand::Copy(place))
             }
-            let rv = Rvalue::ref_place(span, want, recv);
-            let n = self.fresh("this");
-            let id = self.b.tmp(n, want, span);
-            let place = self.b.local_place(id, span);
-            self.b.assign(span, place.clone(), rv);
-            return Ok(Operand::Copy(place));
+            Some(ThisAdjust::Deref) => {
+                let deref = self.b.deref(self.cx, recv, span);
+                Ok(Operand::Copy(deref))
+            }
+            None => Err(CheckError::new(
+                self.path,
+                span,
+                "method receiver type mismatch",
+            )),
         }
-        if self.cx.ref_inner(recv.ty) == Some(want) {
-            let deref = self.b.deref(self.cx, recv, span);
-            return Ok(Operand::Copy(deref));
-        }
-        Err(CheckError::new(
-            self.path,
-            span,
-            "method receiver type mismatch",
-        ))
     }
 
     pub(super) fn receiver_place(&mut self, expr: &Expr) -> Result<Place, CheckError> {
@@ -284,19 +348,37 @@ impl<'a> Lower<'a> {
         &mut self,
         span: Span,
         op: crate::ir::op::AtomicOp,
+        order: crate::ir::op::AtomicOrder,
         args: &[Expr],
     ) -> Result<Rvalue, CheckError> {
+        use crate::ir::op::AtomicOp;
         let int_ty = self.cx.common.int;
         let mut ops = vec![self.operand(&args[0], None)?];
-        for a in &args[1..] {
-            ops.push(self.operand(a, Some(int_ty))?);
-        }
-        let ty = if op == crate::ir::op::AtomicOp::Cas {
-            self.cx.common.bool
-        } else {
-            int_ty
+        // A `&T` atomics work on T; a bare `ptr` keeps the old meaning, an `int` cell.
+        let val_ty = self.cx.ref_inner(ops[0].ty()).unwrap_or(int_ty);
+        let ok = match self.cx.ty_kind(val_ty) {
+            TyKind::Int(crate::ir::IntTy::I64 | crate::ir::IntTy::I32 | crate::ir::IntTy::U32 | crate::ir::IntTy::U64) => true,
+            TyKind::Bool | TyKind::Ptr => !matches!(op, AtomicOp::Add | AtomicOp::Sub),
+            _ => false,
         };
-        Ok(Rvalue::atomic(span, ty, op, ops))
+        if !ok {
+            let what = crate::ir::dump::ty_string(self.cx, val_ty);
+            return Err(CheckError::new(
+                self.path,
+                args[0].span,
+                format!("`@{}` cannot work on `{what}`", op.name()),
+            )
+            .help("use a `&int`, `&i32`, `&u32` or `&u64`; `bool` and `ptr` take load, store, exchange and cas only"));
+        }
+        for a in &args[1..] {
+            ops.push(self.operand(a, Some(val_ty))?);
+        }
+        let ty = match op {
+            AtomicOp::Cas => self.cx.common.bool,
+            AtomicOp::Store => int_ty,
+            _ => val_ty,
+        };
+        Ok(Rvalue::atomic(span, ty, op, order, ops))
     }
 
     pub(super) fn lookup_method(
@@ -346,6 +428,7 @@ impl<'a> Lower<'a> {
                 ),
             ));
         }
+        self.check_call_bounds(span, &format!("`{name}`"), &temp.type_params, &temp.bounds, &type_args)?;
         let mut subst = HashMap::new();
         for (pname, ty) in &self.cx.struct_def(sid).ty_args {
             subst.insert(pname.clone(), *ty);
@@ -356,17 +439,25 @@ impl<'a> Lower<'a> {
         let id = {
             let mut types = self.types.clone();
             let struct_name = self.cx.name_str(self.cx.struct_def(sid).name).to_string();
+            let mut enum_temps = self.enum_temps.clone();
+            let mut struct_temps = self.struct_temps.clone();
             if let Some(env) = self.struct_temp_env.get(&struct_name) {
-                for (k, v) in env {
+                for (k, v) in &env.types {
                     types.entry(k.clone()).or_insert(*v);
+                }
+                for (k, v) in &env.enum_temps {
+                    enum_temps.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                for (k, v) in &env.struct_temps {
+                    struct_temps.entry(k.clone()).or_insert_with(|| v.clone());
                 }
             }
             let mut env = GenEnv {
                 types: &types,
                 subst: &subst,
-                enum_temps: self.enum_temps,
+                enum_temps: &enum_temps,
                 enum_insts: self.enum_insts,
-                struct_temps: self.struct_temps,
+                struct_temps: &struct_temps,
                 struct_temp_env: self.struct_temp_env,
                 struct_insts: self.struct_insts,
                 methods: self.methods,

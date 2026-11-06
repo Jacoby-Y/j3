@@ -32,6 +32,20 @@ enum OsKind {
     Android,
 }
 
+/// The CPU a target triple names, as the index of `j3.sys.ARCH_*` (empty: the host).
+fn arch_kind(target: &str) -> usize {
+    let t = if target.is_empty() { std::env::consts::ARCH } else { target };
+    let t = t.split('-').next().unwrap_or("");
+    match t {
+        "x86_64" | "amd64" => 0,
+        "aarch64" | "arm64" | "arm64e" => 1,
+        "i386" | "i486" | "i586" | "i686" | "x86" => 2,
+        t if t.starts_with("arm") || t.starts_with("thumb") => 3,
+        t if t.starts_with("riscv") => 4,
+        _ => 5,
+    }
+}
+
 fn os_kind(target: &str) -> OsKind {
     use crate::emit::host::{target_os, TargetOs};
     if target.is_empty() {
@@ -171,8 +185,11 @@ fn load_and_check_with(
         next_file: 1,
         game,
         os: os_kind(target),
+        arch: arch_kind(target),
         src_dir: project.map(|m| m.src_dir()),
         package: project.map(|m| m.name.clone()),
+        version: project.map(|m| m.version.clone()),
+        deps: project.map(|m| m.deps.clone()).unwrap_or_default(),
         script_root,
         overlays,
         scene_scan: None,
@@ -271,8 +288,11 @@ pub fn analyze_ui(
         next_file: 1,
         game: GameBackend::Sdl,
         os: os_kind(&target),
+        arch: arch_kind(&target),
         src_dir: project.as_ref().map(|m| m.src_dir()),
         package: project.as_ref().map(|m| m.name.clone()),
+        version: project.as_ref().map(|m| m.version.clone()),
+        deps: project.as_ref().map(|m| m.deps.clone()).unwrap_or_default(),
         script_root: project
             .as_ref()
             .map(|m| m.root.clone())

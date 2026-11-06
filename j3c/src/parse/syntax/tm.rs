@@ -12,6 +12,7 @@ pub(super) const TOP_INCLUDES: &[&str] = &[
     "interpolate",
     "attributes",
     "intrinsics",
+    "atomic-orders",
     "module-decl",
     "use-lib",
     "use-decl",
@@ -21,6 +22,7 @@ pub(super) const TOP_INCLUDES: &[&str] = &[
     "let-decl",
     "script-block",
     "keywords",
+    "labels",
     "types",
     "constants-bool",
     "numbers",
@@ -57,6 +59,8 @@ pub fn tm_grammar() -> String {
     sep(&mut out);
     repo_intrinsics(&mut out);
     sep(&mut out);
+    repo_atomic_orders(&mut out);
+    sep(&mut out);
     repo_module_decl(&mut out);
     sep(&mut out);
     repo_use_lib(&mut out);
@@ -74,6 +78,8 @@ pub fn tm_grammar() -> String {
     repo_script_block(&mut out);
     sep(&mut out);
     repo_keywords(&mut out);
+    sep(&mut out);
+    repo_labels(&mut out);
     sep(&mut out);
     repo_types(&mut out);
     sep(&mut out);
@@ -240,10 +246,7 @@ pub(super) fn match_captures(out: &mut String, indent: usize, pat: &str, caps: &
 }
 
 pub(super) fn op_alts() -> String {
-    let mut ops: Vec<&str> = OPERATOR_KINDS
-        .iter()
-        .filter_map(|k| k.operator_src())
-        .collect();
+    let mut ops: Vec<&str> = crate::parse::token::OVERLOADABLE.to_vec();
     ops.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
     let mut pat = String::new();
     for (i, op) in ops.iter().enumerate() {

@@ -1,9 +1,8 @@
-//! Shrink the PNGs `j3.gfx.canvas` writes (stored, unfiltered DEFLATE) before handing them to an
-//! agent: per-row filters plus fixed-Huffman LZ77, which takes a flat-shaded render from
-//! megabytes to tens of kilobytes. Also PNG decoding (for baking textures at import) and
+//! Shrink the PNGs `j3.gfx.canvas` writes (unfiltered rows, fixed-Huffman LZ77) further before
+//! handing them to an agent: per-row filters plus the same LZ77. Also PNG decoding (for baking textures at import) and
 //! base64 for MCP image content. No crates.
 
-/// `png` recompressed, or `None` when it isn't an 8-bit RGBA, stored-block PNG like
+/// `png` recompressed, or `None` when it isn't an 8-bit RGBA, non-interlaced PNG like
 /// `Canvas.savePng` writes (then use it as is).
 pub fn compact(png: &[u8]) -> Option<Vec<u8>> {
     if png.len() < 8 || &png[..8] != b"\x89PNG\r\n\x1a\n" { return None; }

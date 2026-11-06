@@ -1,0 +1,372 @@
+// Part of j3.steam: the in-memory matchmaking server used in fake mode (lobbies, members, data, chat, search filters).
+// Deterministic: lobbies get ids in creation order, members keep join order, the owner passes to the oldest member.
+// Strings and chat bytes live in their own arena, rewound at shutdown. The module doc and `use`s are in ../steam.j3.
+module j3.steam;
+
+/// First fake lobby id is this plus 1 (a real lobby SteamID looks like this).
+const FL_BASE: u64 = 109775241000000000;
+/// Most members a lobby can have (Steam's limit).
+const FL_MAX: int = 250;
+const FL_FAR: int = 1099511627776;
+
+struct FLobby {
+    id: u64;
+    kind: int;
+    max: int;
+    owner: u64;
+    joinable: bool;
+    hasServer: bool;
+    ip: u32;
+    port: int;
+    server: u64;
+    linked: u64;
+}
+
+struct FMem {
+    lobby: u64;
+    user: u64;
+}
+
+/// Lobby data (`user` 0) or one member's data.
+struct FKv {
+    lobby: u64;
+    user: u64;
+    key: string;
+    value: string;
+}
+
+struct FMsg {
+    lobby: u64;
+    user: u64;
+    kind: int;
+    id: int;
+    data: []u8;
+}
+
+/// One search filter: kind 0 string, 1 number, 2 near value.
+struct FFilt {
+    kind: int;
+    key: string;
+    sv: string;
+    nv: int;
+    cmp: int;
+}
+
+#[singleton]
+let FLOBS: []FLobby;
+#[singleton]
+let FLOB_N: int = 0;
+#[singleton]
+let FMEMS: []FMem;
+#[singleton]
+let FMEM_N: int = 0;
+#[singleton]
+let FKVS: []FKv;
+#[singleton]
+let FKV_N: int = 0;
+#[singleton]
+let FMSGS: []FMsg;
+#[singleton]
+let FMSG_N: int = 0;
+#[singleton]
+let FFILTS: []FFilt;
+#[singleton]
+let FFILT_N: int = 0;
+#[singleton]
+let FFOUND: []u64;
+#[singleton]
+let FFOUND_N: int = 0;
+#[singleton]
+let FSCORE: []int;
+#[singleton]
+let FSEQ: int = 0;
+#[singleton]
+let F_SLOTS: int = 0;
+#[singleton]
+let F_COUNT: int = 0;
+#[singleton]
+let LA: Arena;
+#[singleton]
+let LA_UP: bool = false;
+
+fn la(): &Arena {
+    if !LA_UP {
+        LA = Arena.create(16384);
+        LA_UP = true;
+    }
+    return &LA;
+}
+
+fn lkeep(s: string): string {
+    let t = Text.new(la());
+    t.pushStr(s);
+    return t.str();
+}
+
+fn flReset() {
+    FLOB_N = 0;
+    FMEM_N = 0;
+    FKV_N = 0;
+    FMSG_N = 0;
+    FFILT_N = 0;
+    FFOUND_N = 0;
+    FSEQ = 0;
+    F_SLOTS = 0;
+    F_COUNT = 0;
+    if LA_UP {
+        la().rewind(0);
+    }
+}
+
+fn flFind(lobby: u64): int {
+    for i in 0..FLOB_N {
+        if FLOBS[i].id == lobby {
+            return i;
+        }
+    }
+    return 0 - 1;
+}
+
+fn flIsMember(lobby: u64, user: u64): bool {
+    for i in 0..FMEM_N {
+        if FMEMS[i].lobby == lobby && FMEMS[i].user == user {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn flMemberCount(lobby: u64): int {
+    let n = 0;
+    for i in 0..FMEM_N {
+        if FMEMS[i].lobby == lobby {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// Member `k` of `lobby` in join order, 0 when out of range.
+fn flMemberAt(lobby: u64, k: int): u64 {
+    let n = 0;
+    for i in 0..FMEM_N {
+        if FMEMS[i].lobby == lobby {
+            if n == k {
+                return FMEMS[i].user;
+            }
+            n += 1;
+        }
+    }
+    return u64(0);
+}
+
+fn flAddMember(lobby: u64, user: u64) {
+    if FMEM_N >= FMEMS.len {
+        FMEMS = grown(FMEMS, FMEM_N);
+    }
+    FMEMS[FMEM_N] = FMem { lobby: lobby, user: user };
+    FMEM_N += 1;
+}
+
+/// Drop `user` from `lobby`'s members (order of the rest kept) and that member's data.
+fn flRemoveMember(lobby: u64, user: u64) {
+    let o = 0;
+    for i in 0..FMEM_N {
+        if !(FMEMS[i].lobby == lobby && FMEMS[i].user == user) {
+            FMEMS[o] = FMEMS[i];
+            o += 1;
+        }
+    }
+    FMEM_N = o;
+    o = 0;
+    for i in 0..FKV_N {
+        if !(FKVS[i].lobby == lobby && FKVS[i].user == user) {
+            FKVS[o] = FKVS[i];
+            o += 1;
+        }
+    }
+    FKV_N = o;
+}
+
+/// Remove lobby `idx` and everything stored for it.
+fn flDropLobby(idx: int) {
+    let id = FLOBS[idx].id;
+    for i in idx..FLOB_N - 1 {
+        FLOBS[i] = FLOBS[i + 1];
+    }
+    FLOB_N -= 1;
+    let o = 0;
+    for i in 0..FMEM_N {
+        if FMEMS[i].lobby != id {
+            FMEMS[o] = FMEMS[i];
+            o += 1;
+        }
+    }
+    FMEM_N = o;
+    o = 0;
+    for i in 0..FKV_N {
+        if FKVS[i].lobby != id {
+            FKVS[o] = FKVS[i];
+            o += 1;
+        }
+    }
+    FKV_N = o;
+    o = 0;
+    for i in 0..FMSG_N {
+        if FMSGS[i].lobby != id {
+            FMSGS[o] = FMSGS[i];
+            o += 1;
+        }
+    }
+    FMSG_N = o;
+}
+
+/// Make a lobby owned by the local fake user; 0 for a bad type or member limit.
+fn flCreate(kind: int, max: int): u64 {
+    if kind < 0 || kind > 3 || max < 1 || max > FL_MAX {
+        return u64(0);
+    }
+    FSEQ += 1;
+    let id = u64(FSEQ) + FL_BASE;
+    if FLOB_N >= FLOBS.len {
+        FLOBS = grown(FLOBS, FLOB_N);
+    }
+    FLOBS[FLOB_N] = FLobby { id: id, kind: kind, max: max, owner: FAKE_USER, joinable: true, hasServer: false, ip: u32(0), port: 0, server: u64(0), linked: u64(0) };
+    FLOB_N += 1;
+    flAddMember(id, FAKE_USER);
+    return id;
+}
+
+/// Add `user` and answer with the `EChatRoomEnterResponse` Steam would give. `notify` fires the members callback.
+fn flJoin(lobby: u64, user: u64, notify: bool): int {
+    let at = flFind(lobby);
+    if at < 0 {
+        return ENTER_DOESNT_EXIST;
+    }
+    if flIsMember(lobby, user) {
+        return ENTER_SUCCESS;
+    }
+    if !FLOBS[at].joinable {
+        return ENTER_NOT_ALLOWED;
+    }
+    if flMemberCount(lobby) >= FLOBS[at].max {
+        return ENTER_FULL;
+    }
+    flAddMember(lobby, user);
+    if notify {
+        flFireMembers(lobby, user, user, LOBBY_ENTERED);
+    }
+    return ENTER_SUCCESS;
+}
+
+/// Remove `user`; an empty lobby disappears, the owner's seat passes to the oldest member. `change` is sent when non-zero.
+fn flLeave(lobby: u64, user: u64, change: u32): bool {
+    let at = flFind(lobby);
+    if at < 0 || !flIsMember(lobby, user) {
+        return false;
+    }
+    flRemoveMember(lobby, user);
+    if flMemberCount(lobby) == 0 {
+        flDropLobby(at);
+        return true;
+    }
+    if FLOBS[at].owner == user {
+        FLOBS[at].owner = flMemberAt(lobby, 0);
+    }
+    if change != u32(0) {
+        flFireMembers(lobby, user, user, change);
+    }
+    return true;
+}
+
+// ---- data ----
+
+fn flKvFind(lobby: u64, user: u64, key: string): int {
+    for i in 0..FKV_N {
+        if FKVS[i].lobby == lobby && FKVS[i].user == user && same(FKVS[i].key, key) {
+            return i;
+        }
+    }
+    return 0 - 1;
+}
+
+fn flKvSet(lobby: u64, user: u64, key: string, value: string) {
+    let at = flKvFind(lobby, user, key);
+    if at >= 0 {
+        FKVS[at].value = lkeep(value);
+        return;
+    }
+    if FKV_N >= FKVS.len {
+        FKVS = grown(FKVS, FKV_N);
+    }
+    FKVS[FKV_N] = FKv { lobby: lobby, user: user, key: lkeep(key), value: lkeep(value) };
+    FKV_N += 1;
+}
+
+fn flKvDel(lobby: u64, key: string): bool {
+    let at = flKvFind(lobby, u64(0), key);
+    if at < 0 {
+        return false;
+    }
+    for i in at..FKV_N - 1 {
+        FKVS[i] = FKVS[i + 1];
+    }
+    FKV_N -= 1;
+    return true;
+}
+
+fn flKvCount(lobby: u64): int {
+    let n = 0;
+    for i in 0..FKV_N {
+        if FKVS[i].lobby == lobby && FKVS[i].user == u64(0) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// Index in `FKVS` of lobby data entry `k` (insertion order), or -1.
+fn flKvAt(lobby: u64, k: int): int {
+    let n = 0;
+    for i in 0..FKV_N {
+        if FKVS[i].lobby == lobby && FKVS[i].user == u64(0) {
+            if n == k {
+                return i;
+            }
+            n += 1;
+        }
+    }
+    return 0 - 1;
+}
+
+// ---- chat ----
+
+/// Store a message and return its chat id (0, 1, 2 ... per lobby).
+fn flMsgAdd(lobby: u64, user: u64, data: []u8): int {
+    let id = 0;
+    for i in 0..FMSG_N {
+        if FMSGS[i].lobby == lobby {
+            id += 1;
+        }
+    }
+    let copy = la().alloc::<u8>(data.len);
+    for i in 0..data.len {
+        copy[i] = data[i];
+    }
+    if FMSG_N >= FMSGS.len {
+        FMSGS = grown(FMSGS, FMSG_N);
+    }
+    FMSGS[FMSG_N] = FMsg { lobby: lobby, user: user, kind: CHAT_MSG, id: id, data: copy };
+    FMSG_N += 1;
+    flFireMsg(lobby, user, id);
+    return id;
+}
+
+fn flMsgFind(lobby: u64, id: int): int {
+    for i in 0..FMSG_N {
+        if FMSGS[i].lobby == lobby && FMSGS[i].id == id {
+            return i;
+        }
+    }
+    return 0 - 1;
+}

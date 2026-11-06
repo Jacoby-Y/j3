@@ -8,16 +8,19 @@
 
 mod ast;
 mod error;
+pub mod extend;
 pub(crate) mod lex;
 mod parser;
 pub mod syntax;
 mod token;
+pub mod flow;
+pub mod walk;
 
 pub use ast::{
-    AssignOpStmt, AssignStmt, BinOp, Block, ConstItem, EnumItem, Expr, ExprKind, FieldItem, File,
-    FnItem, ForEachStmt, Ident, InterpPart, Item, LetStmt, LibFnDecl, MatchArm, MatchStmt,
+    AssignOpStmt, AssignStmt, BinOp, Block, ClosureLit, ClosureParam, ConstItem, EnumItem, Expr, ExprKind, ExtendItem, FieldItem, File,
+    FnItem, ForEachStmt, GpuStage, GpuStruct, IfStmt, Ident, InterpPart, Item, LetStmt, LibFnDecl, MatchArm, MatchStmt,
     ModLetItem, Param, Pat, ReturnStmt, ScriptBlockItem, ScriptLetItem, Stmt, StructItem, Type,
-    TypeKind, UnaryOp, UseItem, UseLibItem, UseLocalStmt, VariantItem,
+    TraitItem, TraitMethod, TypeKind, UnaryOp, UseItem, UseLibItem, UseLocalStmt, VariantItem,
 };
 pub use error::ParseError;
 pub use token::{keyword, Token, TokenKind};
@@ -127,7 +130,9 @@ fn main() {
         let src = include_str!("../../stdlib/j3/game.j3");
         let f = parse_ok(src);
         assert_eq!(f.module_key(), "j3.game");
-        assert!(f.items.iter().any(|i| matches!(i, Item::Let(_))));
+        // the singletons live in a part file
+        let state = parse_ok(include_str!("../../stdlib/j3/game/state.j3"));
+        assert!(state.items.iter().any(|i| matches!(i, Item::Let(_))));
         assert!(f.items.iter().any(|i| matches!(i, Item::UseLib(_))));
     }
 
@@ -147,7 +152,10 @@ fn main() {
         let f = parse_ok(src);
         assert_eq!(f.module_key(), "j3.math");
         assert!(f.items.iter().any(|i| matches!(i, Item::UseLib(_))));
-        assert!(f.items.iter().any(|i| matches!(i, Item::Struct(_))));
+        // the structs live in the part files (math/vec.j3)
+        let v = parse_ok(include_str!("../../stdlib/j3/math/vec.j3"));
+        assert_eq!(v.module_key(), "j3.math");
+        assert!(v.items.iter().any(|i| matches!(i, Item::Struct(_))));
     }
 
     #[test]

@@ -82,38 +82,120 @@ impl UnaryOp {
     }
 }
 
-/// `@atomicLoad` / `@atomicStore` / `@atomicAdd` / `@atomicCas` on an `int`, sequentially consistent.
+/// `@atomicLoad` / `@atomicStore` / `@atomicAdd` / `@atomicSub` / `@atomicExchange` / `@atomicCas`
+/// on `int`, `i32`, `u32`, `u64`, `bool` or `ptr` (add and sub: integers only), through a `&T`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum AtomicOp {
     Load,
     Store,
     Add,
+    Sub,
+    Xchg,
     Cas,
 }
 
 impl AtomicOp {
+    const ALL: [AtomicOp; 6] = [
+        AtomicOp::Load,
+        AtomicOp::Store,
+        AtomicOp::Add,
+        AtomicOp::Sub,
+        AtomicOp::Xchg,
+        AtomicOp::Cas,
+    ];
+
     /// Name after the `@`.
     pub fn name(self) -> &'static str {
         match self {
             AtomicOp::Load => "atomicLoad",
             AtomicOp::Store => "atomicStore",
             AtomicOp::Add => "atomicAdd",
+            AtomicOp::Sub => "atomicSub",
+            AtomicOp::Xchg => "atomicExchange",
             AtomicOp::Cas => "atomicCas",
         }
     }
 
     pub fn from_name(s: &str) -> Option<AtomicOp> {
-        [AtomicOp::Load, AtomicOp::Store, AtomicOp::Add, AtomicOp::Cas]
+        Self::ALL.into_iter().find(|o| o.name() == s)
+    }
+
+    /// Operands: the pointer, then this many values of the pointee type.
+    pub fn values(self) -> usize {
+        match self {
+            AtomicOp::Load => 0,
+            AtomicOp::Store | AtomicOp::Add | AtomicOp::Sub | AtomicOp::Xchg => 1,
+            AtomicOp::Cas => 2,
+        }
+    }
+
+    /// Orders this op accepts (the C11 rule: a load cannot release, a store cannot acquire).
+    pub fn orders(self) -> &'static [AtomicOrder] {
+        use AtomicOrder::*;
+        match self {
+            AtomicOp::Load => &[Relaxed, Acquire, SeqCst],
+            AtomicOp::Store => &[Relaxed, Release, SeqCst],
+            _ => &[Relaxed, Acquire, Release, AcqRel, SeqCst],
+        }
+    }
+}
+
+/// Memory order of an atomic op. Default `SeqCst`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AtomicOrder {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}
+
+impl AtomicOrder {
+    /// The spelling in source.
+    pub fn name(self) -> &'static str {
+        match self {
+            AtomicOrder::Relaxed => "relaxed",
+            AtomicOrder::Acquire => "acquire",
+            AtomicOrder::Release => "release",
+            AtomicOrder::AcqRel => "acqrel",
+            AtomicOrder::SeqCst => "seqcst",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<AtomicOrder> {
+        [AtomicOrder::Relaxed, AtomicOrder::Acquire, AtomicOrder::Release, AtomicOrder::AcqRel, AtomicOrder::SeqCst]
             .into_iter()
             .find(|o| o.name() == s)
     }
 
-    /// Operands: the pointer, then this many `int` values.
-    pub fn values(self) -> usize {
+    /// LLVM keyword.
+    pub fn llvm(self) -> &'static str {
         match self {
-            AtomicOp::Load => 0,
-            AtomicOp::Store | AtomicOp::Add => 1,
-            AtomicOp::Cas => 2,
+            AtomicOrder::Relaxed => "monotonic",
+            AtomicOrder::Acquire => "acquire",
+            AtomicOrder::Release => "release",
+            AtomicOrder::AcqRel => "acq_rel",
+            AtomicOrder::SeqCst => "seq_cst",
+        }
+    }
+
+    /// C11 `__ATOMIC_*` constant.
+    pub fn c11(self) -> &'static str {
+        match self {
+            AtomicOrder::Relaxed => "__ATOMIC_RELAXED",
+            AtomicOrder::Acquire => "__ATOMIC_ACQUIRE",
+            AtomicOrder::Release => "__ATOMIC_RELEASE",
+            AtomicOrder::AcqRel => "__ATOMIC_ACQ_REL",
+            AtomicOrder::SeqCst => "__ATOMIC_SEQ_CST",
+        }
+    }
+
+    /// Order for the failure path of a compare-exchange: no release part, no stronger than `self`.
+    pub fn cas_failure(self) -> AtomicOrder {
+        match self {
+            AtomicOrder::Relaxed | AtomicOrder::Release => AtomicOrder::Relaxed,
+            AtomicOrder::Acquire | AtomicOrder::AcqRel => AtomicOrder::Acquire,
+            AtomicOrder::SeqCst => AtomicOrder::SeqCst,
         }
     }
 }

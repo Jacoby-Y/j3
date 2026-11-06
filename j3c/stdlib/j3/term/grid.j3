@@ -1,0 +1,456 @@
+/// The terminal screen model: an xterm-256color-style cell grid that implements `ansi.Sink`, so
+/// `parser.feed(bytes, &grid)` (after `use j3.term.ansi.feed;`) is the whole emulator core.
+///
+/// Model: rows x cols `Cell`s, a cursor with xterm's deferred wrap, a pen `Style`, scroll region, tab stops, modes,
+/// a primary and an alt buffer, a scrollback ring (primary only), per-row dirty bits, title, OSC 8 link table.
+/// Replies to DSR/DA queries are appended to `reply`; the host writes `reply.str()` to the pty, then `reply.clear()`.
+/// Rows are stored through a row-index permutation, so a scroll rotates a few ints and blanks one row: no copying
+/// the screen and no allocation per line.
+/// Resize reflows the primary screen and scrollback: rows that wrapped by printing past the last column (`wrapped`) are
+/// joined and split again at the new width (the alt screen is cut or padded).
+/// Not implemented on purpose: 132-column mode (?3), DECALN, DECSED/DECSEL, SO/SI and G1-G3
+/// (only G0 with the DEC line-drawing set), LNM (CSI 20 h), more than 2 combining marks per cell or marks outside the BMP
+/// (dropped),
+/// mouse encodings other than SGR, DCS. APC is kitty graphics only (`grid/kitty.j3`).
+/// Any thread: a `Grid` is one value for one screen; nothing is shared.
+/// Memory: all storage comes from the arena given to `new`; growing past the limits (see `withLimits`) or
+/// resizing abandons the old blocks in the arena (like `List`), so keep resizes rare.
+///
+/// Coordinates are 0-based and `(x, y)` is column, row. Rows of the visible screen are `0..rows()`; the virtual
+/// line list for scrollback is `0..lineCount()` with line 0 the oldest scrollback line.
+
+module j3.term.grid;
+
+use j3.memory.Arena;
+use j3.memory.List;
+use j3.term.Cell;
+use j3.term.Color;
+use j3.term.pushUtf8;
+use j3.term.COLOR_PALETTE;
+use j3.term.COLOR_RGB;
+use j3.term.Style;
+use j3.term.ansi.Params;
+use j3.term.ansi.sgr;
+use j3.term.width.cpWidth;
+use j3.text.Text;
+use j3.text.find;
+use j3.io.readFile;
+use j3.io;
+use j3.result.Result;
+use j3.gfx.canvas.decodePng;
+use j3.gfx.canvas.inflate;
+
+/// `Grid.modes` bits (`Grid.mode(bit)` reads one).
+pub const MODE_WRAP = 1;
+pub const MODE_ORIGIN = 2;
+pub const MODE_INSERT = 4;
+/// `?1`: the host should send application cursor keys (`ESC O A`).
+pub const MODE_CURSOR_KEYS = 8;
+/// `ESC =` / `ESC >`: application keypad.
+pub const MODE_KEYPAD = 16;
+/// `?25`.
+pub const MODE_CURSOR = 32;
+/// `?2004`.
+pub const MODE_PASTE = 64;
+/// `?1000`, `?1002`, `?1003`: report clicks / drags / all motion. `?1006`: encode as SGR.
+pub const MODE_MOUSE_CLICK = 128;
+pub const MODE_MOUSE_DRAG = 256;
+pub const MODE_MOUSE_MOVE = 512;
+pub const MODE_MOUSE_SGR = 1024;
+/// `?1004`.
+pub const MODE_FOCUS = 2048;
+/// `?2026` synchronized output: the program is mid-frame, keep showing the last whole one (`syncHeld`).
+pub const MODE_SYNC = 4096;
+/// Longest a `?2026 h` holds the screen before `syncHeld` lets go by itself (ms).
+pub const SYNC_TIMEOUT_MS = 150;
+/// The mouse tracking bits together.
+pub const MODE_MOUSE_ANY = 128 + 256 + 512;
+/// Kitty keyboard protocol flags (`CSI > flags u` and friends) live in `modes` bits 16..20: read them with
+/// `kittyFlags(modes)`. `KITTY_*` are those flag bits.
+pub const MODE_KITTY_SHIFT = 16;
+pub const MODE_KITTY_MASK = 31 << 16;
+pub const KITTY_DISAMBIGUATE = 1;
+pub const KITTY_EVENT_TYPES = 2;
+pub const KITTY_ALTERNATE_KEYS = 4;
+pub const KITTY_ALL_AS_ESCAPES = 8;
+pub const KITTY_TEXT = 16;
+
+/// The kitty keyboard flags inside a `Grid.modes` value (0 when the program pushed none).
+pub fn kittyFlags(modes: int): int {
+    return (modes >> MODE_KITTY_SHIFT) & 31;
+}
+
+/// Most distinct OSC 8 URIs kept (link ids `1..=MAX_LINKS`); later new ones print unlinked.
+pub const MAX_LINKS = 1024;
+/// Longest URI kept in bytes; a longer link prints unlinked.
+pub const MAX_URI = 2048;
+/// Title bytes kept.
+pub const MAX_TITLE = 256;
+
+/// One buffer's storage: `cells` is `maxRows` physical rows of `maxCols` cells; logical row `y` is physical row
+/// `ridx[y]`. `dirty` and `wrap` (the row continues on the next: printing wrapped past its end) are per physical row.
+/// `tmp` is scratch for rotations.
+pub struct Buf {
+    cells: []Cell;
+    ridx: []int;
+    dirty: []u8;
+    wrap: []u8;
+    tmp: []int;
+}
+
+/// DECSC / DECRC state (also what ?1049 keeps).
+pub struct Saved {
+    x: int;
+    y: int;
+    pen: Style;
+    origin: bool;
+    pending: bool;
+    draw: bool;
+}
+
+pub struct Grid {
+    /// Current size. Use `cols()` / `rows()`.
+    ncols: int;
+    nrows: int;
+    /// Storage limits; `resize` within them does not allocate.
+    maxCols: int;
+    maxRows: int;
+    pri: Buf;
+    altb: Buf;
+    isAlt: bool;
+    /// Cursor and the deferred-wrap flag: after a print in the last column the cursor stays there with this set.
+    cx: int;
+    cy: int;
+    wrapPending: bool;
+    /// The style new cells get (`ansi.sgr` edits it) and the active OSC 8 link id (0 none).
+    pen: Style;
+    link: int;
+    /// Scroll region rows, inclusive.
+    top: int;
+    bot: int;
+    /// `tabs[x]` is 1 at a tab stop.
+    tabs: []u8;
+    modes: int;
+    saved: Saved;
+    saved1049: Saved;
+    /// G0 is the DEC line-drawing set.
+    drawG0: bool;
+    /// For REP.
+    lastCp: i32;
+    /// Kitty keyboard flag stacks, 8 entries per screen (`[0..8)` primary, `[8..16)` alt); the top is at
+    /// `kbdPri` / `kbdAlt` and is mirrored into `modes` (see `kittyFlags`).
+    kbd: []int;
+    kbdPri: int;
+    kbdAlt: int;
+    /// `ticks` ms of the first `syncHeld` call after `?2026 h` (-1: not seen yet).
+    syncAt: int;
+    /// DECSCUSR value 0..6 (0 and 1 blinking block, 2 steady block, 3/4 underline, 5/6 bar).
+    cursorShape: int;
+    /// How many times storage has grown past its limits (see `reserve`).
+    reserves: int;
+    /// BELs seen; the host compares with its last value.
+    bells: int;
+    /// Scrollback ring: `sbCap` slots of `maxCols` cells; slot `(sbHead + i) % sbCap` is line `i`, oldest first.
+    sb: []Cell;
+    sbLens: []int;
+    /// Per scrollback slot: the line continues on the next (see `Buf.wrap`).
+    sbWrap: []u8;
+    sbHead: int;
+    sbCount: int;
+    sbCap: int;
+    /// Bytes for the host to write to the child (DSR, DA). Drain with `reply.str()` then `reply.clear()`.
+    reply: Text;
+    /// OSC 0 / 2.
+    title: Text;
+    /// OSC 8 URIs; `Cell.link` n is `links.items[n - 1]`.
+    links: List<string>;
+    arena: &Arena;
+    /// Kitty graphics (`grid/kitty.j3`): images, placements, the chunked transfer in progress, the cell size in
+    /// pixels that sizes placements (the host sets `cellPxW`/`cellPxH`; `View.draw` does).
+    kimgs: List<KImage>;
+    kplaces: List<KPlace>;
+    kSerial: int;
+    kNextId: int;
+    kLoading: bool;
+    kBad: bool;
+    kPend: KCmd;
+    kmem: &Arena;
+    kbuf: []u8;
+    kn: int;
+    cellPxW: int;
+    cellPxH: int;
+    /// Reflow scratch (`resize/reflow`): logical lines' cells, their starts and lengths, one output row. Grown on
+    /// demand; old blocks stay in the arena.
+    rfCells: []Cell;
+    rfStart: []int;
+    rfLen: []int;
+    rfRow: []Cell;
+
+    /// A cleared `cols` x `rows` screen with room for `scrollback` lines. Storage limits are
+    /// `max(cols, 200)` x `max(rows, 60)` (about 20 bytes per cell, committed as touched).
+    fn new(arena: &Arena, cols: int, rows: int, scrollback: int): Grid {
+        let c = if cols < 1 { 1 } else { cols };
+        let r = if rows < 1 { 1 } else { rows };
+        return Grid.withLimits(arena, c, r, scrollback, if c > 200 { c } else { 200 }, if r > 60 { r } else { 60 });
+    }
+
+    /// Like `new` with explicit storage limits for `resize` (`maxCols >= cols`, `maxRows >= rows`).
+    /// `maxCols` also sets the scrollback stride, so size it to the widest window you expect.
+    fn withLimits(arena: &Arena, cols: int, rows: int, scrollback: int, maxCols: int, maxRows: int): Grid {
+        let sbCap = if scrollback < 0 { 0 } else { scrollback };
+        let g = Grid {
+            ncols: cols,
+            nrows: rows,
+            maxCols: maxCols,
+            maxRows: maxRows,
+            pri: newBuf(arena, maxCols, maxRows),
+            altb: newBuf(arena, maxCols, maxRows),
+            isAlt: false,
+            cx: 0,
+            cy: 0,
+            wrapPending: false,
+            pen: Style.plain(),
+            link: 0,
+            top: 0,
+            bot: rows - 1,
+            tabs: arena.alloc::<u8>(maxCols),
+            modes: MODE_WRAP | MODE_CURSOR,
+            saved: homeSaved(),
+            saved1049: homeSaved(),
+            drawG0: false,
+            lastCp: 32,
+            kbd: arena.alloc::<int>(16),
+            kbdPri: 0,
+            kbdAlt: 0,
+            cursorShape: 0,
+            syncAt: -1,
+            bells: 0,
+            reserves: 0,
+            sb: arena.alloc::<Cell>(sbCap * maxCols),
+            sbLens: arena.alloc::<int>(sbCap),
+            sbWrap: arena.alloc::<u8>(sbCap),
+            sbHead: 0,
+            sbCount: 0,
+            sbCap: sbCap,
+            reply: Text.new(arena),
+            title: Text.new(arena),
+            links: List<string>.new(arena),
+            arena: arena,
+            kimgs: List<KImage>.new(arena),
+            kplaces: List<KPlace>.new(arena),
+            kSerial: 0,
+            kNextId: 0,
+            kLoading: false,
+            kBad: false,
+            kPend: KCmd {},
+            kmem: emptyArena(arena),
+            kbuf: arena.alloc::<u8>(0),
+            kn: 0,
+            cellPxW: 8,
+            cellPxH: 16,
+            rfCells: arena.alloc::<Cell>(0),
+            rfStart: arena.alloc::<int>(0),
+            rfLen: arena.alloc::<int>(0),
+            rfRow: arena.alloc::<Cell>(0),
+        };
+        g.resetTabs();
+        return g;
+    }
+
+    /// Columns.
+    fn cols(this: &Grid): int {
+        return this.ncols;
+    }
+
+    /// Rows of the visible screen.
+    fn rows(this: &Grid): int {
+        return this.nrows;
+    }
+
+    /// Whether mode bit `m` (`MODE_*`) is on.
+    fn mode(this: &Grid, m: int): bool {
+        return (this.modes & m) != 0;
+    }
+
+    fn cursorX(this: &Grid): int {
+        return this.cx;
+    }
+
+    fn cursorY(this: &Grid): int {
+        return this.cy;
+    }
+
+    fn cursorVisible(this: &Grid): bool {
+        return (this.modes & MODE_CURSOR) != 0;
+    }
+
+    /// Whether a synchronized update (`?2026 h`) is in progress at `nowMs` (any clock in ms, e.g. `game.ticks()`):
+    /// the host should keep showing its last frame. The hold starts at the first call after `?2026 h` and ends at
+    /// `?2026 l` or after `SYNC_TIMEOUT_MS`, which clears the mode so a crashed program cannot freeze the screen.
+    fn syncHeld(this: &Grid, nowMs: int): bool {
+        if (this.modes & MODE_SYNC) == 0 {
+            return false;
+        }
+        if this.syncAt < 0 {
+            this.syncAt = nowMs;
+        }
+        if nowMs - this.syncAt >= SYNC_TIMEOUT_MS {
+            this.modes &= ~MODE_SYNC;
+            return false;
+        }
+        return true;
+    }
+
+    /// Whether the alt screen is showing.
+    fn altScreen(this: &Grid): bool {
+        return this.isAlt;
+    }
+
+    /// The cell at column `x`, row `y` of the visible screen (a blank cell when out of range).
+    fn cell(this: &Grid, x: int, y: int): Cell {
+        if x < 0 || y < 0 || x >= this.ncols || y >= this.nrows {
+            return Cell.blank(Style.plain());
+        }
+        let b = this.bufp();
+        return b.cells[b.ridx[y] * this.maxCols + x];
+    }
+
+    /// Row `y` of the visible screen as `cols()` cells, in place (valid until the next scroll, resize or print).
+    /// The cheap path for a renderer; empty when `y` is out of range.
+    fn rowCells(this: &Grid, y: int): []Cell {
+        let b = this.bufp();
+        if y < 0 || y >= this.nrows {
+            return b.cells[0..0];
+        }
+        let s = b.ridx[y] * this.maxCols;
+        return b.cells[s..s + this.ncols];
+    }
+
+    /// Scrollback lines held (0 on a grid made with 0 scrollback).
+    fn scrollbackLen(this: &Grid): int {
+        return this.sbCount;
+    }
+
+    /// Scrollback plus screen rows: the size of the virtual line list.
+    fn lineCount(this: &Grid): int {
+        return this.sbCount + this.nrows;
+    }
+
+    /// Virtual line `i`: `0..scrollbackLen()` is scrollback, oldest first (its length is the width it had when it
+    /// scrolled off, which may differ from `cols()` after a resize), then the screen rows. Empty when out of range.
+    fn line(this: &Grid, i: int): []Cell {
+        if i < 0 || i >= this.sbCount + this.nrows {
+            return this.pri.cells[0..0];
+        }
+        if i >= this.sbCount {
+            return this.rowCells(i - this.sbCount);
+        }
+        let slot = (this.sbHead + i) % this.sbCap;
+        let s = slot * this.maxCols;
+        return this.sb[s..s + this.sbLens[slot]];
+    }
+
+    /// Whether virtual line `i` (see `line`) wrapped into line `i + 1` by printing past its end, so a copy should join
+    /// them without a newline. False when out of range.
+    fn wrapped(this: &Grid, i: int): bool {
+        if i < 0 || i >= this.sbCount + this.nrows {
+            return false;
+        }
+        if i >= this.sbCount {
+            let b = this.bufp();
+            return b.wrap[b.ridx[i - this.sbCount]] != 0;
+        }
+        return this.sbWrap[(this.sbHead + i) % this.sbCap] != 0;
+    }
+
+    /// Row `y` of a viewport scrolled back `off` lines from the live screen (`off` 0 is `rowCells(y)`; `off` is
+    /// clamped to `0..scrollbackLen()`). The primary screen only: on the alt screen there is no scrollback, so
+    /// it is `rowCells(y)`.
+    fn viewLine(this: &Grid, off: int, y: int): []Cell {
+        let o = off;
+        if this.isAlt || o < 0 {
+            o = 0;
+        }
+        if o > this.sbCount {
+            o = this.sbCount;
+        }
+        return this.line(this.sbCount - o + y);
+    }
+
+    /// Whether logical row `y` changed since `clearDirty`. A scroll marks the whole region.
+    fn isDirty(this: &Grid, y: int): bool {
+        if y < 0 || y >= this.nrows {
+            return false;
+        }
+        let b = this.bufp();
+        return b.dirty[b.ridx[y]] != 0;
+    }
+
+    /// Whether any row is dirty.
+    fn anyDirty(this: &Grid): bool {
+        let b = this.bufp();
+        for y in 0..this.nrows {
+            if b.dirty[b.ridx[y]] != 0 {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Mark every row dirty (a renderer after it lost its target, a switch of view offset).
+    fn markAllDirty(this: &Grid) {
+        for p in 0..this.maxRows {
+            this.pri.dirty[p] = 1;
+            this.altb.dirty[p] = 1;
+        }
+    }
+
+    /// Clear the dirty bits (both buffers).
+    fn clearDirty(this: &Grid) {
+        for p in 0..this.maxRows {
+            this.pri.dirty[p] = 0;
+            this.altb.dirty[p] = 0;
+        }
+    }
+
+    /// The URI of link id `id` (a `Cell.link`), or "" for 0 or an unknown id.
+    fn linkUri(this: &Grid, id: int): string {
+        if id < 1 || id > this.links.len {
+            return "";
+        }
+        return this.links.items[id - 1];
+    }
+}
+
+fn newBuf(arena: &Arena, maxCols: int, maxRows: int): Buf {
+    let b = Buf {
+        cells: arena.alloc::<Cell>(maxCols * maxRows),
+        ridx: arena.alloc::<int>(maxRows),
+        dirty: arena.alloc::<u8>(maxRows),
+        wrap: arena.alloc::<u8>(maxRows),
+        tmp: arena.alloc::<int>(maxRows),
+    };
+    let blank = Cell.blank(Style.plain());
+    for i in 0..b.cells.len {
+        b.cells[i] = blank;
+    }
+    for p in 0..maxRows {
+        b.ridx[p] = p;
+        b.dirty[p] = 1;
+    }
+    return b;
+}
+
+/// An empty arena header in `arena` (the kitty load buffer; `kStart` fills it).
+fn emptyArena(arena: &Arena): &Arena {
+    let slot = arena.alloc::<Arena>(1);
+    slot[0].ptr = 0;
+    slot[0].used = 0;
+    slot[0].cap = 0;
+    slot[0].head = 0;
+    return &slot[0];
+}
+
+fn homeSaved(): Saved {
+    return Saved { x: 0, y: 0, pen: Style.plain(), origin: false, pending: false, draw: false };
+}

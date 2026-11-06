@@ -24,6 +24,11 @@ pub fn find(file: &File) -> Vec<ScriptRef> {
                     block(&method.body, &mut out);
                 }
             }
+            Item::Extend(e) => {
+                for method in &e.methods {
+                    block(&method.body, &mut out);
+                }
+            }
             Item::Let(l) => {
                 if let Some(value) = &l.value {
                     expr(value, &mut out);
@@ -37,7 +42,7 @@ pub fn find(file: &File) -> Vec<ScriptRef> {
                 }
             }
             Item::State(s) => expr(&s.value, &mut out),
-            Item::Use(_) | Item::UseLib(_) | Item::Enum(_) => {}
+            Item::Use(_) | Item::UseLib(_) | Item::Enum(_) | Item::Trait(_) => {}
         }
     }
     out
@@ -89,7 +94,8 @@ fn block(b: &Block, out: &mut Vec<ScriptRef>) {
             }
             Stmt::Defer(s) => block(&s.body, out),
             Stmt::Block(b) => block(b, out),
-            Stmt::UseLocal(_) | Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Labeled(s) => block(&Block { span: s.span, stmts: vec![(*s.body).clone()] }, out),
+            Stmt::UseLocal(_) | Stmt::Break(..) | Stmt::Continue(..) => {}
         }
     }
 }
@@ -144,6 +150,7 @@ fn expr(e: &Expr, out: &mut Vec<ScriptRef>) {
                 expr(arg, out);
             }
         }
+        ExprKind::Closure(c) => block(&c.body, out),
         ExprKind::UiChoice { value, index, .. } => {
             expr(value, out);
             expr(index, out);

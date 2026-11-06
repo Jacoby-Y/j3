@@ -1,0 +1,188 @@
+// Part of j3.scene3d (ray picking: bounds hit, triangle hit, the pick BVH cache); the module doc and `use`s are in ../scene3d.j3.
+module j3.scene3d;
+
+/// World-space AABB hit for a mesh's loaded vertex bounds.
+pub fn hit(scene: &Scene, id: int, ray: Ray, reach: f32): RayHit {
+    let at = index(scene, id);
+    if at < 0 { return RayHit { ok: false, t: 0 }; }
+    return hitModel(scene.nodes[at], world(scene, id), ray, reach);
+}
+
+/// Hit test with an already computed transform at node slot `at`. Meshes are tested
+/// against their triangles (both sides); a mesh with no loaded vertices and a sky never
+/// hit. Other nodes use their bounds box.
+pub fn hitWith(scene: &Scene, transforms: []Mat4, at: int, ray: Ray, reach: f32): RayHit {
+    let none = RayHit { ok: false, t: 0 };
+    if at < 0 || at >= scene.len { return none; }
+    let n = scene.nodes[at];
+    if n.kind != MESH { return hitModel(n, transforms[at], ray, reach); }
+    // The box only rules meshes out; being inside it isn't a hit.
+    let box = hitModel(n, transforms[at], ray, reach);
+    if !box.ok { return none; }
+    let verts = traceVerts(n);
+    if verts.len < 36 { return none; }
+    return hitTriangles(verts, transforms[at], ray, reach);
+}
+
+/// Nearest crossing of `ray` with the triangles of `verts` (12 floats a vertex) placed by
+/// `model`, within `reach`. Meshes past `PICK_BVH` triangles are searched through a BVH
+/// built on first use and kept.
+pub fn hitTriangles(verts: []f32, model: Mat4, ray: Ray, reach: f32): RayHit {
+    // In the mesh's own space; the direction isn't renormalized, so t stays in world units.
+    let inv = model.affineInverse();
+    let o = inv.transformPoint(ray.origin);
+    let d = inv.transformPoint(ray.origin + ray.dir) - o;
+    let best = reach;
+    let tris = verts.len / 36;
+    if tris <= PICK_BVH {
+        let t = 0;
+        while t < tris {
+            best = hitTriangle(verts, t, o, d, best);
+            t += 1;
+        }
+        return RayHit { ok: best < reach, t: best };
+    }
+    let b = pickTree(verts);
+    let stack = scratch(0).alloc::<int>(b.count);
+    let top = 1;
+    stack[0] = 0;
+    while top > 0 {
+        top -= 1;
+        let at = stack[top] * bvh.NODE_FLOATS;
+        let lo = Vec3.xyz(b.nodes[at], b.nodes[at + 1], b.nodes[at + 2]);
+        let hi = Vec3.xyz(b.nodes[at + 4], b.nodes[at + 5], b.nodes[at + 6]);
+        let box = gfx.rayAabb(o, d, lo, hi, best);
+        if !box.ok { continue; }
+        let first = int(b.nodes[at + 3]);
+        let count = int(b.nodes[at + 7]);
+        if count == 0 {
+            stack[top] = first;
+            stack[top + 1] = first + 1;
+            top += 2;
+        }
+        let k = 0;
+        while k < count {
+            best = hitTriangle(verts, b.order[first + k], o, d, best);
+            k += 1;
+        }
+    }
+    return RayHit { ok: best < reach, t: best };
+}
+
+/// `best`, or the distance to triangle `t` of `verts` along `o + d * t` when that is nearer.
+fn hitTriangle(verts: []f32, t: int, o: Vec3, d: Vec3, best: f32): f32 {
+    let v = t * 36;
+    let a = Vec3.xyz(verts[v], verts[v + 1], verts[v + 2]);
+    let e1 = Vec3.xyz(verts[v + 12], verts[v + 13], verts[v + 14]) - a;
+    let e2 = Vec3.xyz(verts[v + 24], verts[v + 25], verts[v + 26]) - a;
+    let p = d.cross(e2);
+    let det = e1.dot(p);
+    if det < 0.0000001 && det > -0.0000001 { return best; }
+    let s = o - a;
+    let u = s.dot(p) / det;
+    if u < 0 || u > 1 { return best; }
+    let q = s.cross(e1);
+    let w = d.dot(q) / det;
+    if w < 0 || u + w > 1 { return best; }
+    let hit = e2.dot(q) / det;
+    if hit > 0 && hit < best { return hit; }
+    return best;
+}
+
+/// Triangles past which `hitTriangles` searches a BVH instead of every triangle.
+const PICK_BVH: int = 256;
+/// Meshes whose picking BVH is kept at once.
+const PICK_SLOTS: int = 16;
+
+/// A kept picking BVH. `at`, `len`, and `probe` (a sample of the floats) name the vertices:
+/// the pointer alone isn't enough, since scratch memory is reused for other meshes.
+struct PickTree {
+    at: ptr;
+    len: int;
+    probe: f32;
+    tree: Bvh;
+}
+
+#[singleton]
+let PICKS: Arena = Arena { ptr: 0, used: 0, cap: 0, head: 0 };
+#[singleton]
+let PICK_TREES: ptr = 0;
+#[singleton]
+let PICK_NEXT: int = 0;
+
+fn probeOf(verts: []f32): f32 {
+    let n = verts.len;
+    return verts[0] + verts[n / 2] * 3.1 + verts[n - 1] * 7.3 + verts[n / 3] * 11.7 + verts[(n * 2) / 3] * 13.9;
+}
+
+/// The BVH over `verts`' triangles, from the kept ones or built now.
+// ponytail: past PICK_SLOTS meshes, all kept trees are dropped and rebuilt as needed.
+fn pickTree(verts: []f32): &Bvh {
+    let probe = probeOf(verts);
+    let trees = []PickTree { ptr: PICK_TREES as &PickTree, len: PICK_NEXT };
+    let k = 0;
+    while k < PICK_NEXT {
+        let kept = &trees[k];
+        if kept.at == verts.ptr as ptr && kept.len == verts.len && kept.probe == probe { return &kept.tree; }
+        k += 1;
+    }
+    if PICK_TREES == 0 || PICK_NEXT == PICK_SLOTS {
+        if PICK_TREES != 0 { PICKS.destroy(); }
+        PICKS = Arena.create(1024 * 1024);
+        let slots = PICKS.alloc::<PickTree>(PICK_SLOTS);
+        PICK_TREES = slots.ptr as ptr;
+        PICK_NEXT = 0;
+    }
+    trees = []PickTree { ptr: PICK_TREES as &PickTree, len: PICK_SLOTS };
+    let t = &trees[PICK_NEXT];
+    PICK_NEXT += 1;
+    let n = verts.len / 36;
+    let corners = PICKS.alloc::<f32>(n * 9);
+    let i = 0;
+    while i < n {
+        let c = 0;
+        while c < 3 {
+            corners[i * 9 + c * 3] = verts[i * 36 + c * 12];
+            corners[i * 9 + c * 3 + 1] = verts[i * 36 + c * 12 + 1];
+            corners[i * 9 + c * 3 + 2] = verts[i * 36 + c * 12 + 2];
+            c += 1;
+        }
+        i += 1;
+    }
+    t.tree = bvh.build(corners, n, &PICKS);
+    t.at = verts.ptr as ptr;
+    t.len = verts.len;
+    t.probe = probe;
+    return &t.tree;
+}
+
+fn hitModel(n: Node, model: Mat4, ray: Ray, reach: f32): RayHit {
+    let lo = Vec3.xyz(1000000, 1000000, 1000000);
+    let hi = Vec3.xyz(-1000000, -1000000, -1000000);
+    let x = 0;
+    while x < 2 {
+        let y = 0;
+        while y < 2 {
+            let z = 0;
+            while z < 2 {
+                let px = n.boundLo.x;
+                let py = n.boundLo.y;
+                let pz = n.boundLo.z;
+                if x == 1 { px = n.boundHi.x; }
+                if y == 1 { py = n.boundHi.y; }
+                if z == 1 { pz = n.boundHi.z; }
+                let point = model.transformPoint(Vec3.xyz(px, py, pz));
+                if point.x < lo.x { lo.x = point.x; }
+                if point.y < lo.y { lo.y = point.y; }
+                if point.z < lo.z { lo.z = point.z; }
+                if point.x > hi.x { hi.x = point.x; }
+                if point.y > hi.y { hi.y = point.y; }
+                if point.z > hi.z { hi.z = point.z; }
+                z += 1;
+            }
+            y += 1;
+        }
+        x += 1;
+    }
+    return gfx.rayAabb(ray.origin, ray.dir, lo, hi, reach);
+}

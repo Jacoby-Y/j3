@@ -52,6 +52,24 @@ impl<'a> Codegen<'a> {
                     self.patch(fail, here);
                 }
             }
+            StmtKind::Switch { scrut, cases, default } => {
+                // A compare chain: the VM has no jump table.
+                let v = self.operand(scrut)?;
+                let mut ends = Vec::new();
+                for (k, b) in cases {
+                    let k = self.operand(&Operand::int(stmt.span, scrut.ty(), *k))?;
+                    let next = self.push(Instr::new(Op::JnEq, NO_REG, v, k, 0));
+                    self.block(b)?;
+                    ends.push(self.push(Instr::new(Op::Jmp, NO_REG, NO_REG, NO_REG, 0)));
+                    let here = self.here();
+                    self.patch(next, here);
+                }
+                self.block(default)?;
+                let here = self.here();
+                for at in ends {
+                    self.patch(at, here);
+                }
+            }
             StmtKind::While { cond, body } => {
                 let header = self.here();
                 let exit = self.jump_false(cond, false)?;
@@ -138,16 +156,17 @@ impl<'a> Codegen<'a> {
                     }
                 }
             }
-            StmtKind::Break | StmtKind::Continue => {
-                let depth = self
+            StmtKind::Break(n) | StmtKind::Continue(n) => {
+                let target = self
                     .loops
-                    .last()
-                    .ok_or_else(|| "break/continue outside a loop".to_string())?
-                    .scope_depth;
+                    .len()
+                    .checked_sub(1 + *n as usize)
+                    .ok_or_else(|| "break/continue outside a loop".to_string())?;
+                let depth = self.loops[target].scope_depth;
                 self.unwind_to(depth)?;
                 let at = self.push(Instr::new(Op::Jmp, NO_REG, NO_REG, NO_REG, 0));
-                let fixes = self.loops.last_mut().expect("loop");
-                if matches!(stmt.kind, StmtKind::Break) {
+                let fixes = &mut self.loops[target];
+                if matches!(stmt.kind, StmtKind::Break(_)) {
                     fixes.breaks.push(at);
                 } else {
                     fixes.continues.push(at);
@@ -164,7 +183,7 @@ impl<'a> Codegen<'a> {
                     self.aggregate_into(dst, rvalue)?;
                 }
             }
-            StmtKind::Abort(_) => {
+            StmtKind::Abort(..) => {
                 self.push(Instr::new(Op::Abort, NO_REG, NO_REG, NO_REG, 0));
             }
             StmtKind::Div0 => {
@@ -192,7 +211,8 @@ impl<'a> Codegen<'a> {
             RvalueKind::Call { func, args } => self.call(NO_REG, rv.ty, func, args),
             RvalueKind::Use(_) => Ok(()),
             RvalueKind::Syscall { .. } => Err("`@syscall` isn't supported in scripts".to_string()),
-            RvalueKind::Atomic { .. } => Err("atomics aren't supported in scripts".to_string()),
+            RvalueKind::Atomic { .. } => Err("`@atomic*` isn't supported in scripts (the VM runs on one thread)".to_string()),
+            RvalueKind::Simd { .. } => Err("vec4f is not supported in scripts yet".to_string()),
             _ => Err("unsupported void expression".to_string()),
         }
     }
@@ -242,7 +262,8 @@ impl<'a> Codegen<'a> {
                         self.extend(dst, c);
                     }
                     (UnaryOp::BitNot, _) => {
-                        return Err("bit operators aren't supported in scripts".to_string())
+                        self.push(Instr::new(Op::Bnot, dst, a, NO_REG, 0));
+                        self.extend(dst, c);
                     }
                 }
             }
@@ -255,8 +276,9 @@ impl<'a> Codegen<'a> {
                 return Err("`@syscall` isn't supported in scripts".to_string())
             }
             RvalueKind::Atomic { .. } => {
-                return Err("atomics aren't supported in scripts".to_string())
+                return Err("`@atomic*` isn't supported in scripts (the VM runs on one thread)".to_string())
             }
+            RvalueKind::Simd { .. } => return Err("vec4f is not supported in scripts yet".to_string()),
             RvalueKind::Aggregate { .. } | RvalueKind::Enum { .. } => {
                 return Err("aggregate value in a scalar slot".to_string())
             }
@@ -309,12 +331,12 @@ impl<'a> Codegen<'a> {
                     BinOp::Ge => (if signed { Op::Les } else { Op::Leu }, true, true),
                     BinOp::And => (Op::Land, false, false),
                     BinOp::Or => (Op::Lor, false, false),
-                    BinOp::BitAnd
-                    | BinOp::BitOr
-                    | BinOp::BitXor
-                    | BinOp::Shl
+                    BinOp::BitAnd => (Op::Band, false, false),
+                    BinOp::BitOr => (Op::Bor, false, false),
+                    BinOp::BitXor => (Op::Bxor, false, false),
+                    BinOp::Shl
                     | BinOp::Shr => {
-                        return Err("bit operators aren't supported in scripts".to_string())
+                        return Err("shifts aren't supported in scripts".to_string())
                     }
                 }
             }

@@ -1,0 +1,207 @@
+// Tests for the j2 heap (`j3.j2`): table insert/delete/reinsert churn with order kept, intern
+// identity, array growth, keep handles, key normalization, and `str()` text of every type.
+//   timeout 60 j3c run j3c/stdlib/tests/j2_heap_test.j3
+// Panics on the first failed check.
+
+module j2_heap_test;
+
+use j3.io.printLn;
+use j3.j2;
+use j3.j2.{ Heap, Value, Tbl, Arr };
+use j3.memory.Arena;
+use j3.sys.panic;
+use j3.text.Text;
+
+fn ok(cond: bool, msg: string) {
+    if !cond {
+        panic(msg);
+    }
+}
+
+fn str(h: &Heap, mem: &Arena, v: Value): string {
+    let t = Text.new(mem);
+    j2.fmtValue(&t, v);
+    return t.str();
+}
+
+fn eqs(got: string, want: string, what: string) {
+    if !(got == want) {
+        printLn(`{what}: got [{got}] want [{want}]`);
+        panic(what);
+    }
+}
+
+fn testIntern(h: &Heap) {
+    let a = h.intern("hello");
+    let b = h.intern("hel" );
+    let c = h.intern("hello");
+    ok(j2.same(a, c), "same text interns to one object");
+    ok(!j2.same(a, b), "different text, different object");
+    ok(j2.textOf(a) == "hello", "bytes kept");
+    ok(h.lookupStr("hello").tag == j2.T_STR, "lookup finds interned");
+    ok(h.lookupStr("nope").isNil(), "lookup misses without interning");
+    // many strings force the intern table to grow; identity must survive
+    let mem = Arena.create(1 << 16);
+    let first = h.intern("k0");
+    for i in 0..5000 {
+        let t = Text.new(&mem);
+        t.pushStr("k");
+        t.pushInt(i);
+        h.intern(t.str());
+    }
+    ok(j2.same(first, h.intern("k0")), "identity after growth");
+    ok(j2.same(h.intern("k4999"), h.lookupStr("k4999")), "late string found");
+    let empty = h.intern("");
+    ok(j2.same(empty, h.intern("")), "empty string interns");
+    mem.destroy();
+}
+
+fn testChurn(h: &Heap) {
+    let tv = h.newTable();
+    let t = j2.tableOf(tv);
+    let n = 100000;
+    for i in 0..n { ok(t.set(h, j2.intv(i), j2.intv(i * 2)), "set"); }
+    ok(t.count() == n, "count after insert");
+    // delete the even keys
+    for i in 0..n / 2 { t.set(h, j2.intv(i * 2), j2.nilv()); }
+    ok(t.count() == n / 2, "count after delete");
+    ok(t.get(j2.intv(4)).isNil(), "deleted key is nil");
+    ok(t.get(j2.intv(5)).bits == 10, "kept key");
+    // reinsert them: they go to the end, in the new order
+    for i in 0..n / 2 { t.set(h, j2.intv(i * 2), j2.intv(-1)); }
+    ok(t.count() == n, "count after reinsert");
+    let es = t.entries();
+    let i = t.next(0);
+    let k = 0;
+    while i >= 0 {
+        let want = if k < n / 2 { k * 2 + 1 } else { (k - n / 2) * 2 };
+        ok(es[i].key.bits == want, "insertion order after churn");
+        k += 1;
+        i = t.next(i + 1);
+    }
+    ok(k == n, "walk count");
+    // repeated delete/reinsert of one key must not grow the table forever
+    let small = j2.tableOf(h.newTable());
+    let key = h.intern("x");
+    small.set(h, h.intern("a"), j2.intv(1));
+    for j in 0..100000 {
+        small.set(h, key, j2.intv(j));
+        small.set(h, key, j2.nilv());
+    }
+    ok(small.cap <= 8, "tombstones are reclaimed");
+    ok(small.count() == 1, "churned table count");
+}
+
+fn testKeys(h: &Heap, mem: &Arena) {
+    let t = j2.tableOf(h.newTable());
+    t.set(h, j2.floatv(2.0), h.intern("two"));
+    ok(j2.same(t.get(j2.intv(2)), h.intern("two")), "2.0 and 2 are one key");
+    t.set(h, j2.floatv(-0.0), j2.intv(7));
+    ok(t.get(j2.intv(0)).bits == 7, "-0.0 is key 0");
+    t.set(h, j2.floatv(2.5), j2.intv(9));
+    ok(t.get(j2.floatv(2.5)).bits == 9, "float key");
+    ok(!t.set(h, j2.nilv(), j2.intv(1)), "nil key rejected");
+    let nan = j2.floatv(0.0 / zero());
+    ok(!t.set(h, nan, j2.intv(1)), "NaN key rejected");
+    ok(t.get(nan).isNil(), "NaN get misses");
+    t.set(h, j2.boolv(true), j2.intv(3));
+    ok(t.get(j2.boolv(true)).bits == 3 && t.get(j2.boolv(false)).isNil(), "bool keys");
+    let other = h.newTable();
+    t.set(h, other, j2.intv(4));
+    ok(t.get(other).bits == 4 && t.get(h.newTable()).isNil(), "table keys by identity");
+    // string keys made separately land on one entry
+    let mem2 = Text.new(mem);
+    mem2.pushStr("na");
+    mem2.pushStr("me");
+    t.set(h, h.intern("name"), j2.intv(1));
+    t.set(h, h.intern(mem2.str()), j2.intv(2));
+    ok(t.get(h.intern("name")).bits == 2, "built string is the same key");
+    ok(j2.equals(j2.intv(2), j2.floatv(2.0)), "2 == 2.0");
+    ok(!j2.equals(j2.intv(2), h.intern("2")), "2 != \"2\"");
+    ok(!j2.nilv().truthy() && !j2.boolv(false).truthy(), "nil and false are false");
+    ok(j2.intv(0).truthy() && h.intern("").truthy(), "0 and \"\" are true");
+}
+
+fn zero(): f64 { return 0.0; }
+
+fn testArray(h: &Heap) {
+    let a = j2.arrOf(h.newArray(0));
+    for i in 0..1000 { a.push(h, j2.intv(i)); }
+    ok(a.len == 1000 && a.cap >= 1000, "array growth");
+    ok(a.get(999).bits == 999 && a.get(1000).isNil() && a.get(-1).isNil(), "array get");
+    ok(a.set(h, 1000, j2.intv(5)), "set at len appends");
+    ok(a.len == 1001, "append via set");
+    ok(!a.set(h, 1002, j2.intv(5)), "set past len fails");
+    ok(!a.set(h, -1, j2.intv(5)), "set negative fails");
+    ok(a.insert(h, 0, j2.intv(-1)) && a.get(0).bits == -1 && a.get(1).bits == 0, "insert front");
+    ok(a.remove(0).bits == -1 && a.get(0).bits == 0, "remove front");
+    ok(a.pop().bits == 5 && a.len == 1000, "pop");
+    let e = j2.arrOf(h.newArray(3));
+    ok(e.len == 0 && e.pop().isNil() && e.remove(0).isNil(), "empty array");
+}
+
+fn testKeep(h: &Heap) {
+    let v = h.intern("kept");
+    let r = h.keep(v);
+    ok(j2.same(h.refValue(r), v), "kept value");
+    h.releaseRef(r);
+    ok(h.refValue(r).isNil(), "released ref reads nil");
+    let r2 = h.keep(j2.intv(3));
+    ok(h.refValue(r).isNil(), "stale ref stays nil after its slot is reused");
+    ok(h.refValue(r2).bits == 3, "new ref");
+    h.releaseRef(r);
+    ok(h.refValue(r2).bits == 3, "double release of a stale ref is harmless");
+    h.releaseRef(j2.none());
+    ok(h.refValue(j2.none()).isNil(), "none");
+    for i in 0..100 { h.keep(j2.intv(i)); }
+    ok(h.refValue(r2).bits == 3, "ref survives slot growth");
+}
+
+fn testStr(h: &Heap, mem: &Arena) {
+    eqs(str(h, mem, j2.nilv()), "nil", "nil");
+    eqs(str(h, mem, j2.boolv(true)), "true", "true");
+    eqs(str(h, mem, j2.intv(-42)), "-42", "int");
+    eqs(str(h, mem, j2.floatv(3.0)), "3.0", "float integral");
+    eqs(str(h, mem, j2.floatv(3.5)), "3.5", "float");
+    eqs(str(h, mem, j2.floatv(0.1)), "0.1", "float shortest");
+    eqs(str(h, mem, j2.floatv(100000000000000000000.0)), "1e+20", "float big");
+    eqs(str(h, mem, j2.floatv(1.0 / zero())), "inf", "inf");
+    eqs(str(h, mem, h.intern("hi")), "hi", "string");
+    let a = h.newArray(0);
+    j2.arrOf(a).push(h, j2.intv(1));
+    j2.arrOf(a).push(h, h.intern("x\"y"));
+    eqs(str(h, mem, a), "[1, \"x\\\"y\"]", "array");
+    let t = h.newTable();
+    j2.tableOf(t).set(h, h.intern("x"), j2.intv(1));
+    j2.tableOf(t).set(h, h.intern("a b"), j2.floatv(2.0));
+    j2.tableOf(t).set(h, j2.intv(7), a);
+    eqs(str(h, mem, t), "{x: 1, \"a b\": 2.0, 7: [1, \"x\\\"y\"]}", "table");
+    // depth: top + 2 levels shown, deeper cut; a table that holds itself stops too
+    let l1 = h.newTable();
+    let l2 = h.newTable();
+    let l3 = h.newTable();
+    j2.tableOf(l1).set(h, h.intern("b"), l2);
+    j2.tableOf(l2).set(h, h.intern("c"), l3);
+    j2.tableOf(l3).set(h, h.intern("d"), j2.intv(1));
+    let top = h.newTable();
+    j2.tableOf(top).set(h, h.intern("a"), l1);
+    eqs(str(h, mem, top), "{a: {b: {c: {...}}}}", "depth cut");
+    j2.tableOf(l3).set(h, h.intern("self"), l3);
+    eqs(str(h, mem, l3), "{d: 1, self: {d: 1, self: {d: 1, self: {...}}}}", "cycle cut");
+    eqs(str(h, mem, h.newTable()), "{}", "empty table");
+    eqs(j2.typeName(a), "array", "typeName");
+}
+
+fn main() {
+    let mem = Arena.create(1 << 20);
+    let h = j2.newHeap();
+    testIntern(&h);
+    testChurn(&h);
+    testKeys(&h, &mem);
+    testArray(&h);
+    testKeep(&h);
+    testStr(&h, &mem);
+    ok(h.bytes > 0 && h.liveObjects > 0, "bytes and objects tracked");
+    h.destroy();
+    printLn("j2_heap_test ok");
+}

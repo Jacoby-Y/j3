@@ -1,0 +1,173 @@
+// Tests for j2 errors and limits: the error's chunk/line/col/message and its trace, script
+// `error(msg)`, the step budget (`while true {}` stops within 100 ms), `maxDepth`, `heapBytes`,
+// and a VM that keeps working after each of them.
+//   timeout 60 j3c run j3c/stdlib/tests/j2_limits_test.j3
+// Panics on the first failed check.
+
+module j2_limits_test;
+
+use j3.io.printLn;
+use j3.j2;
+use j3.j2.{ Vm, Error, Args, Value, Limits };
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys.{ panic, monotonicMs };
+
+fn quiet(_vm: &Vm, _args: Args): Value { return j2.nil(); }
+
+fn check(got: string, want: string, what: string) {
+    if !(got == want) {
+        printLn(`got  [{got}]`);
+        printLn(`want [{want}]`);
+        panic(what);
+    }
+}
+
+fn newVm(mem: &Arena, limits: Limits): Vm {
+    let vm = Vm.new(mem, limits);
+    vm.openLibs(j2.LIB_ALL);
+    vm.bind("print", quiet);
+    return vm;
+}
+
+fn loadErr(vm: &Vm, name: string, src: string): Error {
+    match vm.loadString(name, src) {
+        Result.Ok(_) { panic("expected an error"); }
+        Result.Err(e) { return e; }
+    }
+}
+
+/// The VM is clean and the next call works.
+fn usable(vm: &Vm, what: string) {
+    if vm.nframes != 0 || vm.top != 0 || vm.open != 0 as ptr || vm.callDepth != 0 { panic(what); }
+    match vm.loadString("ok", "fn f(n) { if n < 2 { return n; } return f(n - 1) + f(n - 2); } let x = f(15);") {
+        Result.Ok(_) { }
+        Result.Err(e) {
+            printLn(e.message);
+            panic(what);
+        }
+    }
+}
+
+fn main() {
+    let mem = Arena.create(1 << 20);
+    let vm = newVm(&mem, Limits { stepsPerCall: 500000, maxDepth: 50 });
+
+    // position, chunk and trace (innermost first, one line per frame)
+    let e = loadErr(&vm, "tr", "fn a(x) { return b(x) + 1; }\nfn b(x) {\n    return c(x);\n}\nfn c(x) { return x.y.z; }\na(nil);");
+    check(e.message, "tr:5:19: can't read field \"y\" of nil", "message");
+    check(e.chunk, "tr", "chunk");
+    if e.line != 5 || e.col != 19 { panic("line:col"); }
+    check(e.trace, "at fn c (tr:5)\nat fn b (tr:3)\nat fn a (tr:1)\nat fn main (tr:6)", "trace");
+    usable(&vm, "after a field error");
+
+    // the trace stops at 8 frames; anonymous fns are named so
+    e = loadErr(&vm, "deep", "fn r(n) { if n == 0 { return (fn() { return 1 / 0; })(); } return r(n - 1); }\nr(20);");
+    check(e.trace, "at fn (anonymous) (deep:1)\nat fn r (deep:1)\nat fn r (deep:1)\nat fn r (deep:1)\nat fn r (deep:1)\nat fn r (deep:1)\nat fn r (deep:1)\nat fn r (deep:1)",
+        "trace cut at 8");
+
+    // error(msg)
+    e = loadErr(&vm, "er", "fn hurt(hp) { if hp < 0 { error(\"hp is\", hp); } }\nhurt(-2);");
+    check(e.message, "er:1:32: hp is -2", "error()");
+    usable(&vm, "after error()");
+
+    // the step budget: an endless loop returns, quickly, with its own message
+    let t0 = monotonicMs();
+    e = loadErr(&vm, "inf", "let i = 0;\nwhile true { i += 1; }");
+    let took = monotonicMs() - t0;
+    check(e.message, "inf:2:1: took too long (over 500000 steps)", "steps");
+    if took > 100 {
+        printLn(`while true took {took} ms`);
+        panic("step budget too slow");
+    }
+    e = loadErr(&vm, "inf2", "fn spin() { for i in 0..1000000000 { } }\nspin();");
+    check(e.message, "inf2:1:13: took too long (over 500000 steps)", "range loop steps");
+    e = loadErr(&vm, "inf3", "fn f(n) { return f(n) + g(n); }\nfn g(n) { if n > 0 { return g(n - 1) + g(n - 1); } return 0; }\ng(40);");
+    check(e.message, "inf3:2:30: took too long (over 500000 steps)", "call steps");
+    usable(&vm, "after the step budget");
+
+    // maxDepth
+    e = loadErr(&vm, "so", "fn r(n) { return r(n + 1); }\nr(0);");
+    check(e.message, "so:1:19: stack overflow", "stack overflow");
+    usable(&vm, "after stack overflow");
+
+    // heapBytes: the allocating op fails, the heap stays usable for code that doesn't allocate
+    let mem2 = Arena.create(1 << 16);
+    let small = newVm(&mem2, Limits { heapBytes: 1 << 20 });
+    let poke = j2.nil();
+    match small.loadString("p", "let t = { a: 1 };\npub fn poke() { t.a = t.a + 1; return t.a; }") {
+        Result.Ok(x) { poke = x.asTable().get("poke"); small.keep(poke); } // kept: a GC root
+        Result.Err(_) { panic("load poke"); }
+    }
+    e = loadErr(&small, "mem", "let t = [];\nlet i = 0;\nwhile true { t[i] = { a: i, b: \"x\" + i }; i += 1; }");
+    // which op on line 3 hits the cap depends on the allocation pattern; the line and text don't
+    let m = e.message;
+    let tail = ": out of script memory";
+    if m.len < 6 + tail.len || !(m[0..6] == "mem:3:") || !(m[m.len - tail.len..m.len] == tail) {
+        printLn(e.message);
+        panic("out of memory");
+    }
+    if small.heap.bytes > 3 << 20 { panic("allocated far past the cap"); }
+    if small.nframes != 0 || small.top != 0 || small.callDepth != 0 { panic("not unwound after out of memory"); }
+    match small.call(small.global(j2.str(&small, "print")), @slice(0 as ptr, 0)) {
+        Result.Ok(_) { }
+        Result.Err(err) {
+            printLn(err.message);
+            panic("vm unusable after out of memory");
+        }
+    }
+    match small.call(poke, @slice(0 as ptr, 0)) {
+        Result.Ok(v) { if v.bits != 2 { panic("poke"); } }
+        Result.Err(err) {
+            printLn(err.message);
+            panic("code that doesn't allocate fails after out of memory");
+        }
+    }
+    small.destroy();
+
+    // natives' own work counts against the step budget: an O(n*m) search, O(n) inserts
+    let slow: [3]string = [
+        "let a = \"a\";\nfor i in 0..16 { a = a + a; }\nlet p = a + \"b\";\nlet r = contains(a + a, p);",
+        "let a = \"a\";\nfor i in 0..16 { a = a + a; }\nlet p = a + \"b\";\nlet r = split(a + a, p);",
+        "let a = [];\nfor i in 0..1000000 { insert(a, 0, i); }",
+    ];
+    for src in slow {
+        let t1 = monotonicMs();
+        e = loadErr(&vm, "slow", src);
+        let ms = monotonicMs() - t1;
+        let m2 = e.message;
+        let want = ": took too long (over 500000 steps)";
+        if !(m2[m2.len - want.len..m2.len] == want) || ms > 1000 {
+            printLn(`{m2} ({ms} ms)`);
+            panic("native work not charged");
+        }
+    }
+    usable(&vm, "after a charged native");
+
+    // one string op can't pass the cap (the copy is checked first, the build buffer is bounded and
+    // given back), and text far bigger than the heap from shared arrays stops early
+    let mem3 = Arena.create(1 << 16);
+    let tiny = newVm(&mem3, Limits { heapBytes: 1 << 20 });
+    let big: [2]string = [
+        "let s = \"ab\";\nfor i in 0..60 { s = s + s; }",
+        "let a = [];\nfor i in 0..1000 { push(a, i); }\nlet b = [];\nfor i in 0..1000 { push(b, a); }\nlet s = str([b, b, b]);",
+    ];
+    for src in big {
+        let t2 = monotonicMs();
+        e = loadErr(&tiny, "big", src);
+        let ms2 = monotonicMs() - t2;
+        if !(e.message[e.message.len - tail.len..e.message.len] == tail) || ms2 > 1000 {
+            printLn(`{e.message} ({ms2} ms)`);
+            panic("string past the cap");
+        }
+        if tiny.heap.bytes > 1 << 20 {
+            printLn(`heap bytes {tiny.heap.bytes}`);
+            panic("a string op overshot the cap");
+        }
+        usable(&tiny, "after a string past the cap");
+    }
+    tiny.destroy();
+
+    vm.destroy();
+    printLn("j2_limits_test ok");
+}

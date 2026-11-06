@@ -116,6 +116,13 @@ pub(crate) fn print_error(e: &str) {
     print_fail(e);
 }
 
+/// Code warnings to stderr (the program still builds and runs).
+pub(super) fn print_warnings(prog: &compile::Program) {
+    for w in prog.rendered_warnings() {
+        eprintln!("{w}");
+    }
+}
+
 pub(super) fn print_fail(e: &str) {
     if let Ok(mut last) = crate::config::LAST_ERR.lock() {
         *last = e.to_string();
@@ -181,11 +188,14 @@ pub(super) fn run_loaded(
     extra_cwd: Option<PathBuf>,
     args: &[String],
 ) -> i32 {
+    if let Ok((p, _)) = &prog {
+        print_warnings(p);
+    }
     match prog {
         Ok((prog, manifest)) => match emit_opts(&manifest) {
             Ok(mut opts) => {
                 if emit::host::target_os(&opts.target) == emit::host::TargetOs::Android {
-                    print_fail("this is an Android target, which can't run on this machine; build an apk to run it on a device or emulator");
+                    print_fail("this is an Android target, which can't run on this machine; build an apk to run it on a device or emulator, or `j3c run --host` for a host build of the same source");
                     return 1;
                 }
                 if let Some(m) = &manifest { crate::gen::before_build(&m.root); }

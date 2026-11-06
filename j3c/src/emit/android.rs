@@ -168,7 +168,7 @@ pub(crate) fn lib_name(name: &str) -> &str {
 /// Fails with one line, before anything is built, when the NDK or the SDL cache is missing.
 pub(crate) fn ready(triple: &str) -> Result<(), String> {
     if ndk().is_none() {
-        return Err("no Android NDK found: set ANDROID_NDK_HOME or ANDROID_NDK_ROOT, or install one under $ANDROID_HOME/ndk (see Prerequisites in plans/028-android.md)".into());
+        return Err("no Android NDK found: set ANDROID_NDK_HOME or ANDROID_NDK_ROOT, or install one under $ANDROID_HOME/ndk (see `j3c doc android`)".into());
     }
     let abi = abi(triple).ok_or_else(|| format!("unsupported Android target `{triple}` (use aarch64-linux-android or x86_64-linux-android)"))?;
     let ok = sdl_dir(triple).map(|d| d.join("libSDL2.so").is_file()).unwrap_or(false);

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::intern::{Name, Names};
 use crate::ir::entity::{EnumDef, Func, GlobalDef, StructDef};
 use crate::ir::ids::{EnumId, FieldId, FuncId, GlobalId, StructId};
-use crate::ir::ty::{FloatTy, IntTy, Ty, TyKind};
+use crate::ir::ty::{FloatTy, IntTy, Ty, TyKind, VecTy};
 use crate::span::FileId;
 
 /// Builtin types interned once in [`IrCx::new`].
@@ -30,6 +30,9 @@ pub struct CommonTys {
     pub ptr: Ty,
     pub cstr: Ty,
     pub string: Ty,
+    pub vec4f: Ty,
+    pub vec4i: Ty,
+    pub f16: Ty,
 }
 
 pub struct SourceFile {
@@ -66,6 +69,12 @@ pub struct IrCx {
     pub common: CommonTys,
     pub files: Vec<SourceFile>,
     file_index: HashMap<FileId, usize>,
+    pub(crate) closures: crate::ir::closure::ClosureTables,
+    /// Where each generic free-fn instance was first called (span, instantiation depth).
+    pub(crate) inst_sites: HashMap<FuncId, (crate::span::Span, u32)>,
+    /// Generic struct/enum instances made since the last drain, whose type parameters have
+    /// trait bounds to check (`check/traits.rs`).
+    pub(crate) bound_queue: Vec<crate::check::BoundSite>,
 }
 
 impl IrCx {
@@ -80,6 +89,9 @@ impl IrCx {
             globals: Vec::new(),
             files: Vec::new(),
             file_index: HashMap::new(),
+            closures: Default::default(),
+            inst_sites: HashMap::new(),
+            bound_queue: Vec::new(),
             common: CommonTys {
                 void: Ty(0),
                 bool: Ty(0),
@@ -98,6 +110,9 @@ impl IrCx {
                 ptr: Ty(0),
                 cstr: Ty(0),
                 string: Ty(0),
+                vec4f: Ty(0),
+                vec4i: Ty(0),
+                f16: Ty(0),
             },
         };
 
@@ -116,6 +131,9 @@ impl IrCx {
         let ptr = cx.intern_ty(TyKind::Ptr);
         let cstr = cx.intern_ty(TyKind::CStr);
         let string = cx.intern_ty(TyKind::String);
+        let vec4f = cx.intern_ty(TyKind::Vec(VecTy::F32x4));
+        let vec4i = cx.intern_ty(TyKind::Vec(VecTy::I32x4));
+        let f16 = cx.intern_ty(TyKind::Half);
 
         cx.common = CommonTys {
             void,
@@ -135,6 +153,9 @@ impl IrCx {
             ptr,
             cstr,
             string,
+            vec4f,
+            vec4i,
+            f16,
         };
 
         cx
@@ -157,6 +178,9 @@ impl IrCx {
             "ptr" => Some(self.common.ptr),
             "cstr" => Some(self.common.cstr),
             "string" => Some(self.common.string),
+            "vec4f" => Some(self.common.vec4f),
+            "vec4i" => Some(self.common.vec4i),
+            "f16" => Some(self.common.f16),
             _ => None,
         }
     }
@@ -288,6 +312,15 @@ impl IrCx {
     pub fn ref_inner(&self, ty: Ty) -> Option<Ty> {
         match self.ty_kind(ty) {
             TyKind::Ref(inner) => Some(*inner),
+            _ => None,
+        }
+    }
+
+    /// Lane type of a `vec4f` / `vec4i`.
+    pub fn vec_lane(&self, ty: Ty) -> Option<Ty> {
+        match self.ty_kind(ty) {
+            TyKind::Vec(VecTy::F32x4) => Some(self.common.f32),
+            TyKind::Vec(VecTy::I32x4) => Some(self.common.i32),
             _ => None,
         }
     }

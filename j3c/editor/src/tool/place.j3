@@ -1,0 +1,347 @@
+// tool: ground, ontop and scatter placement.
+
+module j3_editor.tool;
+
+// ---- placement: ground, ontop, scatter ----
+
+/// Mesh vertices read for this request, by asset, so each file loads once.
+struct Geo {
+    assets: []string;
+    verts: [][]f32;
+    count: int;
+}
+
+fn newGeo(): Geo {
+    return Geo { assets: scratch(0).alloc::<string>(64), verts: scratch(0).alloc::<[]f32>(64), count: 0 };
+}
+
+fn geoVerts(g: &Geo, asset: string): []f32 {
+    let i = 0;
+    while i < g.count {
+        if same(g.assets[i], asset) { return g.verts[i]; }
+        i += 1;
+    }
+    let v = scene3d.assetVerts(asset, scratch(0));
+    if g.count < g.assets.len {
+        g.assets[g.count] = asset;
+        g.verts[g.count] = v;
+        g.count += 1;
+    }
+    return v;
+}
+
+/// Whether `id` is `root` or inside it.
+fn inside(scene: &Scene, id: int, root: int): bool {
+    let at = id;
+    let steps = 0;
+    while at != 0 && steps <= scene.len {
+        if at == root { return true; }
+        let slot = scene3d.index(scene, at);
+        if slot < 0 { return false; }
+        at = scene.nodes[slot].parent;
+        steps += 1;
+    }
+    return false;
+}
+
+fn solid(n: Node): bool { return n.kind == MESH && n.asset.len > 0 && !scene3d.isSky(n); }
+
+/// World box of the meshes in `root`'s subtree. With none (a group, an instance), a point at
+/// its origin. False when the box is only that point.
+fn worldBox(scene: &Scene, g: &Geo, root: int, lo: &Vec3, hi: &Vec3): bool {
+    let any = false;
+    let i = 0;
+    while i < scene.len {
+        let n = scene.nodes[i];
+        i += 1;
+        if !solid(n) || !inside(scene, n.id, root) { continue; }
+        let verts = geoVerts(g, n.asset);
+        if verts.len < 36 { continue; }
+        let m = scene3d.world(scene, n.id);
+        let v = 0;
+        while v + 2 < verts.len {
+            let q = m.transformPoint(Vec3.xyz(verts[v], verts[v + 1], verts[v + 2]));
+            if !any {
+                *lo = q;
+                *hi = q;
+                any = true;
+            }
+            if q.x < lo.x { lo.x = q.x; }
+            if q.y < lo.y { lo.y = q.y; }
+            if q.z < lo.z { lo.z = q.z; }
+            if q.x > hi.x { hi.x = q.x; }
+            if q.y > hi.y { hi.y = q.y; }
+            if q.z > hi.z { hi.z = q.z; }
+            v += 12;
+        }
+    }
+    if !any {
+        let o = scene3d.world(scene, root).transformPoint(Vec3.zero());
+        *lo = o;
+        *hi = o;
+    }
+    return any;
+}
+
+/// Highest mesh surface straight below `(x, fromY, z)`, leaving out `skip`'s subtree and,
+/// when `only` isn't 0, anything outside `only`'s. `found` is false when nothing is there.
+// ponytail: tests every triangle of every mesh; a scene BVH (j3.gfx.bvh) if scenes get big.
+fn surfaceBelow(scene: &Scene, g: &Geo, x: f32, fromY: f32, z: f32, skip: int, only: int, found: &bool): f32 {
+    let ray = Ray { origin: Vec3.xyz(x, fromY, z), dir: Vec3.xyz(0, -1, 0) };
+    let best: f32 = 0;
+    *found = false;
+    let i = 0;
+    while i < scene.len {
+        let n = scene.nodes[i];
+        i += 1;
+        if !solid(n) || inside(scene, n.id, skip) { continue; }
+        if only != 0 && !inside(scene, n.id, only) { continue; }
+        let verts = geoVerts(g, n.asset);
+        let hit = scene3d.hitTriangles(verts, scene3d.world(scene, n.id), ray, 10000);
+        if hit.ok && (!*found || fromY - hit.t > best) {
+            best = fromY - hit.t;
+            *found = true;
+        }
+    }
+    return best;
+}
+
+/// Move `id` by `delta` in world space, whatever its parent's transform.
+fn moveWorld(scene: &Scene, id: int, delta: Vec3) {
+    let at = scene3d.index(scene, id);
+    let parent = scene.nodes[at].parent;
+    if parent == 0 {
+        scene.nodes[at].position = scene.nodes[at].position + delta;
+        return;
+    }
+    let inv = scene3d.world(scene, parent).affineInverse();
+    scene.nodes[at].position = scene.nodes[at].position + (inv.transformPoint(delta) - inv.transformPoint(Vec3.zero()));
+}
+
+/// Drop (or lift) `id` so its lowest point rests on what is under it: the highest surface
+/// under its middle and four points around it, or y 0 when there's nothing. `only` limits
+/// the surfaces to one object's subtree. False (with an `err`) when `only` isn't under it.
+fn settle(scene: &Scene, g: &Geo, id: int, skip: int, only: int, out: &Text): bool {
+    let lo = Vec3.zero();
+    let hi = Vec3.zero();
+    worldBox(scene, g, id, &lo, &hi);
+    let c = (lo + hi) * 0.5;
+    let rx = (hi.x - lo.x) * 0.3;
+    let rz = (hi.z - lo.z) * 0.3;
+    let top: f32 = 0;
+    let any = false;
+    let k = 0;
+    while k < 5 {
+        let x = c.x;
+        let z = c.z;
+        if k == 1 { x = c.x - rx; z = c.z - rz; }
+        if k == 2 { x = c.x + rx; z = c.z - rz; }
+        if k == 3 { x = c.x - rx; z = c.z + rz; }
+        if k == 4 { x = c.x + rx; z = c.z + rz; }
+        let hit = false;
+        let y = surfaceBelow(scene, g, x, c.y + 0.001, z, skip, only, &hit);
+        if hit && (!any || y > top) {
+            top = y;
+            any = true;
+        }
+        k += 1;
+    }
+    if !any {
+        if only != 0 {
+            fail(out, "nothing of that object is under this one");
+            return false;
+        }
+        top = 0;
+    }
+    moveWorld(scene, id, Vec3.xyz(0, top - lo.y, 0));
+    return true;
+}
+
+/// `ground <object> [on=<object>]`: rest it on whatever is below (or on one object).
+fn groundOp(scene: &Scene, args: []string, out: &Text): Outcome {
+    if args.len < 2 { return failed(out, "ground needs an object"); }
+    let at = resolve(scene, args[1], out);
+    if at < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+    let id = scene.nodes[at].id;
+    let only = 0;
+    let k = 2;
+    while k < args.len {
+        let eq = keyEnd(args[k]);
+        if same(cut(args[k], 0, eq), "on") {
+            let t = resolve(scene, cut(args[k], eq + 1, args[k].len), out);
+            if t < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+            only = scene.nodes[t].id;
+        } else {
+            return bad(out, args[k], "on=<object>");
+        }
+        k += 1;
+    }
+    let g = newGeo();
+    if !settle(scene, &g, id, id, only, out) { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+    return done(out, pathOf(scene, id, scratch(0)), id);
+}
+
+/// `ontop <object> <target>`: center it over the target and rest it on the target's top.
+fn ontopOp(scene: &Scene, args: []string, out: &Text): Outcome {
+    if args.len < 3 { return failed(out, "ontop needs an object and the object to put it on"); }
+    let at = resolve(scene, args[1], out);
+    if at < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+    let tat = resolve(scene, args[2], out);
+    if tat < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+    let id = scene.nodes[at].id;
+    let target = scene.nodes[tat].id;
+    if inside(scene, target, id) { return failed(out, "can't put an object on top of itself or its child"); }
+    let g = newGeo();
+    let lo = Vec3.zero();
+    let hi = Vec3.zero();
+    let tlo = Vec3.zero();
+    let thi = Vec3.zero();
+    worldBox(scene, &g, id, &lo, &hi);
+    worldBox(scene, &g, target, &tlo, &thi);
+    let c = (lo + hi) * 0.5;
+    let tc = (tlo + thi) * 0.5;
+    // Over the target's middle, just above its top; then down onto its surface.
+    moveWorld(scene, id, Vec3.xyz(tc.x - c.x, thi.y + 0.001 - lo.y, tc.z - c.z));
+    if !settle(scene, &g, id, id, target, out) {
+        // No surface under the middle (a ring, say): rest on its box.
+        out.clear();
+    }
+    let t = Text.new(scratch(0));
+    t.pushStr(pathOf(scene, id, scratch(0)));
+    t.pushStr(" on ");
+    t.pushStr(pathOf(scene, target, scratch(0)));
+    return done(out, t.str(), id);
+}
+
+/// `scatter <what> area=x0,z0,x1,z1 [count=10] [seed=1] [scale=lo,hi] [yaw=true]
+/// [spacing=0] [parent=P] [name=Base] [ground=true]`: copies of a shape (cube, sphere, ...),
+/// a mesh asset, or a scene file (placed as instances) at random spots in the area (in the
+/// parent's space), under a new group. The same seed gives the same layout.
+fn scatterOp(scene: &Scene, args: []string, out: &Text): Outcome {
+    if args.len < 2 { return failed(out, "scatter needs what to place: a shape, a mesh file, or a .j3scene"); }
+    let what = args[1];
+    let mesh = "";
+    let kind = kindOf(what, &mesh);
+    let file = "";
+    if kind != MESH || mesh.len == 0 {
+        if endsWithText(what, ".j3scene") { kind = INSTANCE; file = what; }
+        else if endsWithText(what, ".j3mesh") || scene3d.isBuiltin(what) { kind = MESH; mesh = what; }
+        else { return bad(out, "what", "a shape (cube, sphere, cylinder, ...), a .j3mesh or builtin: asset, or a .j3scene"); }
+    }
+    if kind == INSTANCE && !fileExists(file) { return failed(out, "that scene file does not exist"); }
+    if kind == MESH && !scene3d.isBuiltin(mesh) && !fileExists(mesh) { return failed(out, "that mesh file does not exist"); }
+    let count = 10;
+    let seed = 1;
+    let area = Vec3.zero();
+    let areaHi = Vec3.zero();
+    let haveArea = false;
+    let scaleLo: f32 = 1;
+    let scaleHi: f32 = 1;
+    let yaw = true;
+    let spacing: f32 = 0;
+    let parent = 0;
+    let base = "";
+    let onGround = true;
+    let k = 2;
+    while k < args.len {
+        let eq = keyEnd(args[k]);
+        let key = cut(args[k], 0, eq);
+        let value = cut(args[k], eq + 1, args[k].len);
+        let nums = scratch(0).alloc::<f32>(4);
+        let got = numbers(value, nums);
+        if eq == args[k].len { return bad(out, args[k], "key=value"); }
+        if same(key, "count") {
+            if got != 1 || nums[0] < 1 || nums[0] > 2000 { return bad(out, key, "a whole number from 1 to 2000"); }
+            count = int(nums[0]);
+        } else if same(key, "seed") {
+            if got != 1 { return bad(out, key, "a whole number"); }
+            seed = int(nums[0]);
+        } else if same(key, "area") {
+            if got != 4 { return bad(out, key, "x0,z0,x1,z1"); }
+            area = Vec3.xyz(nums[0], 0, nums[1]);
+            areaHi = Vec3.xyz(nums[2], 0, nums[3]);
+            haveArea = true;
+        } else if same(key, "scale") {
+            if got == 1 { scaleLo = nums[0]; scaleHi = nums[0]; }
+            else if got == 2 { scaleLo = nums[0]; scaleHi = nums[1]; }
+            else { return bad(out, key, "a number or lo,hi"); }
+        } else if same(key, "spacing") {
+            if got != 1 { return bad(out, key, "a distance"); }
+            spacing = nums[0];
+        } else if same(key, "yaw") || same(key, "ground") {
+            let f = false;
+            if !parseBool(value, &f) { return bad(out, key, "true or false"); }
+            if same(key, "yaw") { yaw = f; } else { onGround = f; }
+        } else if same(key, "parent") {
+            if value.len > 0 {
+                let ps = resolve(scene, value, out);
+                if ps < 0 { return Outcome { changed: false, reload: 0, focus: 0, ok: false }; }
+                parent = scene.nodes[ps].id;
+            }
+        } else if same(key, "name") {
+            base = value;
+        } else {
+            return bad(out, key, "one of count, area, seed, scale, yaw, spacing, parent, name, ground");
+        }
+        k += 1;
+    }
+    if !haveArea { return failed(out, "scatter needs area=x0,z0,x1,z1 (in the parent's space)"); }
+    if base.len == 0 {
+        if kind == INSTANCE { base = capitalized(stemOf(file)); } else { base = capitalized(stemOf(mesh)); }
+    }
+    let group = scene3d.add(scene, GROUP, uniqueIn(scene, "Scatter"), parent);
+    let rng = Rng.new(seed);
+    let spots = scratch(0).alloc::<Vec3>(count);
+    let made = 0;
+    while made < count {
+        // Up to 30 tries for a spot `spacing` clear of the others; then take the last one.
+        let p = Vec3.zero();
+        let tries = 0;
+        let clear = false;
+        while tries < 30 && !clear {
+            p = Vec3.xyz(rng.floatRange(min(area.x, areaHi.x), max(area.x, areaHi.x)), 0,
+                rng.floatRange(min(area.z, areaHi.z), max(area.z, areaHi.z)));
+            clear = true;
+            let j = 0;
+            while j < made && spacing > 0 {
+                let d = spots[j] - p;
+                if d.x * d.x + d.z * d.z < spacing * spacing { clear = false; }
+                j += 1;
+            }
+            tries += 1;
+        }
+        spots[made] = p;
+        let id = scene3d.add(scene, kind, uniqueIn(scene, base), group);
+        let at = scene3d.index(scene, id);
+        if kind == MESH { scene.nodes[at].asset = own(scene.arena, mesh); }
+        if kind == INSTANCE { scene.nodes[at].scene = own(scene.arena, file); }
+        let s = rng.floatRange(scaleLo, scaleHi);
+        scene.nodes[at].scale = Vec3.xyz(s, s, s);
+        if yaw { scene.nodes[at].rotation = Vec3.xyz(0, rng.floatRange(0, PI * 2), 0); }
+        scene.nodes[at].position = p;
+        made += 1;
+    }
+    if onGround {
+        let g = newGeo();
+        let i = 0;
+        while i < scene.len {
+            let n = scene.nodes[i];
+            i += 1;
+            if n.parent == group { settle(scene, &g, n.id, group, 0, out); }
+        }
+    }
+    let t = out;
+    t.pushStr("added\t");
+    t.pushInt(group);
+    t.push(9);
+    t.pushStr(pathOf(scene, group, scratch(0)));
+    t.push(10);
+    let msg = Text.new(scratch(0));
+    msg.pushStr("scattered ");
+    msg.pushInt(count);
+    msg.push(32);
+    msg.pushStr(base);
+    msg.pushStr(" under ");
+    msg.pushStr(pathOf(scene, group, scratch(0)));
+    return done(out, msg.str(), group);
+}

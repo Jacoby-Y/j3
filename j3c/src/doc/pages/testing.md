@@ -18,6 +18,10 @@ handshake; tests print from the `App.hot` load hook to see state survive (`j3c d
 
 Without `--headless` or those variables a run opens a real window. Any game run needs one of them.
 
+An Android package (`[emit] target` has an Android triple) runs on the host with `--host`: `j3c check --host`,
+`j3c run --host --headless --frames 60 --screenshot shot.png`. It ignores `[emit] target` only and builds in place
+(`j3c doc android`).
+
 `--frames N` (and `J3_CAPTURE=...:N`) runs exactly N frames: the game's `draw` is called N times and
 `j3.game.frameCount()` reaches N. The `J3STATS frames=` line counts N minus 3, because the first three
 frames are warm-up and left out of its averages.
@@ -90,6 +94,11 @@ first (the first frames lay everything out and a few frames after a state change
 set a fixed state before measuring. A malformed value prints a warning and is ignored. `examples/desk-app/golden.toml`
 uses it as a `[[check]]`; `speculative/29_ui_steady` shows both outcomes (`STEADY_CHURN=1` changes a value every frame: rc 1).
 
+Idle frame skipping (`App` sleeps while a `.j3ui` UI is still; `j3c doc j3ui`, Idle frames) is off in every test mode above and under the
+`offscreen` / `dummy` video drivers, so frame counts hold. To test it headless, force it: `J3_IDLE_SKIP=1 J3_IDLE_STATS=1 timeout -s TERM 2 target/app`
+prints `idle: loops=N presented=N` at exit (SIGTERM quits cleanly); idle `examples/desk-app` shows ~29 frames in 2 s instead of ~18000.
+`j3c/stdlib/tests/idle_test.j3` checks the decision and `Dom.idleMs` with a fake clock.
+
 UI inspector (`j3.ui.inspect`, the devtools of a `.j3ui` app). `root.dom.setInspector(true)` turns it on; with `J3_INSPECT=1` F12
 toggles it as well (`j3c run` sets that for you, `J3_INSPECT=0` turns it off; a built binary needs it set by hand). The element under the pointer gets margin / border / padding / content bands and a `tag.class#id  W x H` label;
 a click pins an element (Escape unpins, Up / Down walk to the parent / first child, Left / Right to the siblings) and a side panel
@@ -115,6 +124,17 @@ at that frame, with no window changes needed, and `inspect.text(&root.dom, id)` 
                                    fake keyboard for the next frame: typed text and key names (Left Right
                                    Up Down Home End Backspace Delete Enter Escape Tab Space a c v x, `S+`
                                    Shift, `C+` Ctrl). `examples/big_ui_test/src/sim.j3` scripts both from `UI_SIM`.
+                                   These reach the Dom only; code reading `j3.game` (a canvas game, `j3.term.view`) needs:
+    game.simKey(Key.Enter, true)   fake SDL input on the next `poll`, seen by `keyPressed`/`keyDown`/`keyReleased`
+    game.simText("ls")             (`simKey(k, false)` releases), `textTyped`, `textComposing` + `textComposingCaret`
+    game.simPreedit("にほ", 3)       and `droppedFile`; wakes an idle-sleeping loop. Works under `--headless`
+    game.simDrop("/tmp/a.png")     (`j3c/stdlib/tests/sim_input_test.j3` types `ls` Enter into a pty).
+    game.simMouse(100, 100)        fake cursor in window pixels (as SDL reports them); `mousePos` maps it through
+                                   `setVirtualSize` like a real one, and it replaces the real cursor from then on
+    game.simButton(Mouse.Left, true)   `mousePressed` true for one frame on the next `poll`, `mouseDown` until
+                                   `simButton(.., false)` (then `mouseReleased` one frame); a down+up in one frame
+                                   still gives each its own frame
+    game.simWheel(-1)              `mouseWheel` on the next `poll` (whole notches). `mouseDelta` does not move.
     use j3.ui.testkit;            a script of fake input, one call per frame from your draw hook (`f` = your frame number):
                                    testkit.clickText(d, f, 3, "Size")     press on frames 3..5, check on 6
                                    testkit.clickTextIn(d, f, 8, "dialog", "Rename")   text inside a tag
@@ -134,3 +154,7 @@ at that frame, with no window changes needed, and `inspect.text(&root.dom, id)` 
 
 Scenes only (no game code): `j3c -e render --view iso --out shot.png`. More: `j3c doc recipes check`.
 Speed: the J3STATS line has fps, frame, draws; measure release builds (`j3c build --release`).
+UI speed: F3 shows frame time, F4 shows where UI time goes (CPU: build, style, layout, paint, effect setup;
+GPU: paint batches, `backdrop-filter` blur, `filter`/blend layers; instances and their area in screens).
+`J3_F4=1` starts it open for a screenshot, and a run that painted UI also prints a `J3UISTATS` line with the
+same numbers (GPU slots are -1 without timer queries, e.g. on GLES).

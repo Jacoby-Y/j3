@@ -1,0 +1,350 @@
+// Part of j3.steam: ISteamRemoteStorage, the Steam Cloud file API; the module doc and `use`s are in ../steam.j3.
+// Games that only need their save folder synced can use Auto-Cloud (set up on the partner site) and skip this.
+module j3.steam;
+
+const CB_WRITE_DONE: i32 = 1331;
+const CB_READ_DONE: i32 = 1332;
+/// Steam's limit for one cloud file, bytes (100 MiB).
+const CLOUD_MAX: int = 104857600;
+
+/// Where an async read delivers: the caller's arena, and (fake mode) the bytes to hand over.
+struct RRead {
+    arena: &Arena;
+    data: []u8;
+}
+
+#[singleton]
+let RR: []RRead;
+#[singleton]
+let OFF_W_RESULT: int = 0;
+#[singleton]
+let OFF_R_HANDLE: int = 0;
+#[singleton]
+let OFF_R_RESULT: int = 0;
+#[singleton]
+let OFF_R_OFFSET: int = 0;
+#[singleton]
+let OFF_R_COUNT: int = 0;
+#[singleton]
+let R_SIZE: int = 0;
+
+fn rs(): ptr {
+    return iface("SteamRemoteStorage");
+}
+
+/// True when the user and the game both have Steam Cloud on. False when Steam is absent; true in fake mode.
+pub fn cloudOn(): bool {
+    if fake() {
+        return FC_APP_ON;
+    }
+    let a = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_IsCloudEnabledForAccount") as fn(ptr): bool;
+    let b = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_IsCloudEnabledForApp") as fn(ptr): bool;
+    return a(rs()) && b(rs());
+}
+
+/// Turn cloud sync for this game on or off for the user (a settings toggle). Does nothing when Steam is absent.
+pub fn cloudSetApp(on: bool) {
+    if fake() {
+        FC_APP_ON = on;
+        fakeLog(`cloudSetApp {on}`);
+        return;
+    }
+    let f = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_SetCloudEnabledForApp") as fn(ptr, bool);
+    f(rs(), on);
+}
+
+/// Write `data` as cloud file `name`. False when Steam is absent, cloud is off, `name` is over 1023 bytes, or
+/// `data` is over 100 MiB (Steam's limit; refused with a log). Wrap many writes in `cloudBatch`.
+pub fn cloudWrite(name: string, data: []u8): bool {
+    if data.len > CLOUD_MAX {
+        eprintOnce(`steam: cloud file {name} is {data.len} bytes; the limit is {CLOUD_MAX}`);
+        return false;
+    }
+    if fake() {
+        if !FC_APP_ON {
+            return false;
+        }
+        fakeLog(`cloudWrite {name} {data.len} bytes`);
+        fcPut(name, data);
+        return true;
+    }
+    let k = cs(name, 0);
+    if k as int == 0 {
+        return false;
+    }
+    let f = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_FileWrite") as fn(ptr, ptr, ptr, i32): bool;
+    return f(rs(), k, data.ptr as ptr, i32(data.len));
+}
+
+/// Bytes of cloud file `name`, allocated from `mem`. An empty slice when the file is missing, empty, or unreadable;
+/// use `cloudExists` to tell an empty file from a missing one. If the file shrinks between the size check and the read,
+/// only the bytes read come back.
+pub fn cloudRead(name: string, mem: &Arena): []u8 {
+    let empty = mem.alloc::<u8>(0);
+    if fake() {
+        let at = fcFind(name);
+        if at < 0 {
+            return empty;
+        }
+        let out = mem.alloc::<u8>(FC[at].data.len);
+        for i in 0..out.len {
+            out[i] = FC[at].data[i];
+        }
+        return out;
+    }
+    let k = cs(name, 0);
+    let n = cloudSize(name);
+    if k as int == 0 || n <= i32(0) {
+        return empty;
+    }
+    let buf = mem.alloc::<u8>(int(n));
+    let f = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_FileRead") as fn(ptr, ptr, ptr, i32): i32;
+    let got = int(f(rs(), k, buf.ptr as ptr, n));
+    if got <= 0 {
+        return empty;
+    }
+    return buf[0..got];
+}
+
+/// True when cloud file `name` exists (even with 0 bytes). False when Steam is absent.
+pub fn cloudExists(name: string): bool {
+    if fake() {
+        return fcFind(name) >= 0;
+    }
+    let k = cs(name, 0);
+    if k as int == 0 {
+        return false;
+    }
+    let f = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_FileExists") as fn(ptr, ptr): bool;
+    return f(rs(), k);
+}
+
+/// True when cloud file `name` will be synced to Steam (it exists and was not forgotten). False when Steam is absent.
+pub fn cloudPersisted(name: string): bool {
+    if fake() {
+        let at = fcFind(name);
+        return at >= 0 && FC[at].persisted;
+    }
+    let k = cs(name, 0);
+    if k as int == 0 {
+        return false;
+    }
+    let f = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_FilePersisted") as fn(ptr, ptr): bool;
+    return f(rs(), k);
+}
+
+/// Delete cloud file `name` here and in the cloud. False when it is missing or Steam is absent.
+pub fn cloudDelete(name: string): bool {
+    if fake() {
+        let at = fcFind(name);
+        if at < 0 {
+            return false;
+        }
+        fakeLog(`cloudDelete {name}`);
+        fcRemove(at);
+        return true;
+    }
+    let k = cs(name, 0);
+    if k as int == 0 {
+        return false;
+    }
+    let f = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_FileDelete") as fn(ptr, ptr): bool;
+    return f(rs(), k);
+}
+
+/// Stop syncing cloud file `name` but leave it on Steam's servers. False when it is missing or Steam is absent.
+pub fn cloudForget(name: string): bool {
+    if fake() {
+        let at = fcFind(name);
+        if at < 0 {
+            return false;
+        }
+        fakeLog(`cloudForget {name}`);
+        FC[at].persisted = false;
+        return true;
+    }
+    let k = cs(name, 0);
+    if k as int == 0 {
+        return false;
+    }
+    let f = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_FileForget") as fn(ptr, ptr): bool;
+    return f(rs(), k);
+}
+
+/// Size in bytes of cloud file `name`. 0 when it is missing or empty, or Steam is absent.
+pub fn cloudSize(name: string): i32 {
+    if fake() {
+        let at = fcFind(name);
+        if at < 0 {
+            return i32(0);
+        }
+        return i32(FC[at].data.len);
+    }
+    let k = cs(name, 0);
+    if k as int == 0 {
+        return i32(0);
+    }
+    let f = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_GetFileSize") as fn(ptr, ptr): i32;
+    return f(rs(), k);
+}
+
+/// Last write time of cloud file `name`, unix seconds (whole seconds: two writes within one second look equal).
+/// 0 when it is missing or Steam is absent. Fake mode uses a clock that starts at 1700000000 and adds 10 per write.
+pub fn cloudTime(name: string): i64 {
+    if fake() {
+        let at = fcFind(name);
+        if at < 0 {
+            return i64(0);
+        }
+        return FC[at].time;
+    }
+    let k = cs(name, 0);
+    if k as int == 0 {
+        return i64(0);
+    }
+    let f = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_GetFileTimestamp") as fn(ptr, ptr): i64;
+    return f(rs(), k);
+}
+
+/// Start (`true`) or end (`false`) a write batch: Steam syncs the files written in between as one set, so a
+/// crash cannot leave half of them. Do not leave one open. Does nothing when Steam is absent.
+pub fn cloudBatch(on: bool) {
+    if fake() {
+        fakeLog(`cloudBatch {on}`);
+        return;
+    }
+    if on {
+        let f = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_BeginFileWriteBatch") as fn(ptr): bool;
+        f(rs());
+        return;
+    }
+    let f = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_EndFileWriteBatch") as fn(ptr): bool;
+    f(rs());
+}
+
+fn onWriteDone(p: ptr, n: i32, failed: bool, ctx: u64) {
+    let r = reqTake(ctx);
+    if !r.used {
+        return;
+    }
+    let f = r.f as fn(bool, u64);
+    f(!failed && rdI32(p, OFF_W_RESULT) == RESULT_OK, r.ctx);
+}
+
+/// Write `data` as cloud file `name` in the background; `f(ok, ctx)` runs on a later frame. `data` is read by Steam
+/// until `f` runs, so keep it alive until then. `ok` is false on failure, over 100 MiB, or when Steam is absent
+/// (`f` then runs on the next `frame()`).
+pub fn cloudWriteAsync(name: string, data: []u8, f: fn(bool, u64), ctx: u64) {
+    let slot = reqNew(f as ptr, ctx);
+    let k = cs(name, 0);
+    if data.len > CLOUD_MAX || k as int == 0 {
+        eprintOnce(`steam: cloudWriteAsync refused for {name} ({data.len} bytes)`);
+        await(u64(0), onWriteDone, slot);
+        return;
+    }
+    if fake() {
+        fakeLog(`cloudWriteAsync {name} {data.len} bytes`);
+        let call = fakeCall();
+        await(call, onWriteDone, slot);
+        let p = fbuf();
+        if FC_APP_ON {
+            fcPut(name, data);
+            wrI32(p, OFF_W_RESULT, RESULT_OK);
+        } else {
+            wrI32(p, OFF_W_RESULT, i32(2));
+        }
+        let bytes: []u8 = @slice(p, 4);
+        fakeResult(call, CB_WRITE_DONE, bytes);
+        return;
+    }
+    let w = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_FileWriteAsync") as fn(ptr, ptr, ptr, u32): u64;
+    await(w(rs(), k, data.ptr as ptr, u32(data.len)), onWriteDone, slot);
+}
+
+fn onReadDone(p: ptr, n: i32, failed: bool, ctx: u64) {
+    let r = reqTake(ctx);
+    if !r.used {
+        return;
+    }
+    let f = r.f as fn([]u8, bool, u64);
+    let rr = RR[int(ctx)];
+    let empty = rr.arena.alloc::<u8>(0);
+    if failed || rdI32(p, OFF_R_RESULT) != RESULT_OK {
+        f(empty, false, r.ctx);
+        return;
+    }
+    if fake() {
+        f(rr.data, true, r.ctx);
+        return;
+    }
+    let count = int(rdU32(p, OFF_R_COUNT));
+    let buf = rr.arena.alloc::<u8>(count);
+    let done = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_FileReadAsyncComplete") as fn(ptr, u64, ptr, u32): bool;
+    if count == 0 || !done(rs(), rdU64(p, OFF_R_HANDLE), buf.ptr as ptr, u32(count)) {
+        f(empty, false, r.ctx);
+        return;
+    }
+    f(buf, true, r.ctx);
+}
+
+/// Read `len` bytes of cloud file `name` from `offset` in the background. `f(data, ok, ctx)` runs on a later frame
+/// with `data` allocated from `mem` (keep the arena alive until then); `ok` is false for a missing file, a failed
+/// read, a zero `len`, or when Steam is absent (`f` then runs on the next `frame()` with empty data).
+pub fn cloudReadAsync(name: string, offset: u32, len: u32, mem: &Arena, f: fn([]u8, bool, u64), ctx: u64) {
+    let slot = reqNew(f as ptr, ctx);
+    if int(slot) >= RR.len {
+        let fresh = arena().alloc::<RRead>(RR.len * 2 + 16);
+        for i in 0..RR.len {
+            fresh[i] = RR[i];
+        }
+        RR = fresh;
+    }
+    RR[int(slot)] = RRead { arena: mem, data: mem.alloc::<u8>(0) };
+    let k = cs(name, 0);
+    if k as int == 0 || len == u32(0) {
+        await(u64(0), onReadDone, slot);
+        return;
+    }
+    if fake() {
+        fakeLog(`cloudReadAsync {name} {offset}+{len}`);
+        let call = fakeCall();
+        await(call, onReadDone, slot);
+        let p = fbuf();
+        let at = fcFind(name);
+        if at < 0 || int(offset) > FC[at].data.len {
+            wrI32(p, OFF_R_RESULT, i32(9));
+        } else {
+            let end = int(offset) + int(len);
+            if end > FC[at].data.len {
+                end = FC[at].data.len;
+            }
+            RR[int(slot)].data = fcCopyTo(mem, FC[at].data[int(offset)..end]);
+            wrI32(p, OFF_R_RESULT, RESULT_OK);
+            wrU32(p, OFF_R_OFFSET, offset);
+            wrU32(p, OFF_R_COUNT, u32(end - int(offset)));
+        }
+        let bytes: []u8 = @slice(p, R_SIZE);
+        fakeResult(call, CB_READ_DONE, bytes);
+        return;
+    }
+    let g = method("SteamRemoteStorage", "SteamAPI_ISteamRemoteStorage_FileReadAsync") as fn(ptr, ptr, u32, u32): u64;
+    await(g(rs(), k, offset, len), onReadDone, slot);
+}
+
+fn fcCopyTo(a: &Arena, data: []u8): []u8 {
+    let out = a.alloc::<u8>(data.len);
+    for i in 0..data.len {
+        out[i] = data[i];
+    }
+    return out;
+}
+
+fn cloudInit() {
+    OFF_W_RESULT = lay("RemoteStorageFileWriteAsyncComplete_t", "eResult");
+    OFF_R_HANDLE = lay("RemoteStorageFileReadAsyncComplete_t", "hFileReadAsync");
+    OFF_R_RESULT = lay("RemoteStorageFileReadAsyncComplete_t", "eResult");
+    OFF_R_OFFSET = lay("RemoteStorageFileReadAsyncComplete_t", "nOffset");
+    OFF_R_COUNT = lay("RemoteStorageFileReadAsyncComplete_t", "cubRead");
+    R_SIZE = lay("RemoteStorageFileReadAsyncComplete_t", SIZE);
+    onShutdown(cloudDown);
+}

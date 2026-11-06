@@ -1,0 +1,191 @@
+// Tables (`Tbl`; the host's view is `Table` in `host_types.j3`): string, number, bool or object keys to values, iterated in insertion order.
+//
+// Entries live in an array in the order they were added; a hash index (open addressing, linear
+// probing, twice the entry capacity so load stays under 1/2) maps keys to entry numbers. A delete
+// marks the entry dead and leaves its index slot in place as the tombstone, so order holds and
+// probes keep working. When the entry array fills, live entries are packed to the front in order
+// and the index is rebuilt (at the same size when at least half were dead, else doubled): deletes
+// never leak, and churn costs amortized O(1). Re-adding a deleted key puts it at the end.
+// Keys go through `keyOf` (2.0 is 2; nil and NaN can't be keys). Part of `j3.j2`.
+
+module j3.j2;
+
+pub struct Entry {
+    key: Value;
+    val: Value;
+}
+
+pub struct Tbl {
+    h: GcHeader;
+    /// `cap` entries; the first `used` were handed out, `live` of them not dead.
+    ents: ptr;
+    /// `2 * cap` i32 slots: 0 empty, else entry number + 1.
+    idx: ptr;
+    cap: int;
+    used: int;
+    live: int;
+    /// The heap it lives in, so the host's `Table` wrapper (made from a bare `Value`) can intern keys.
+    heap: &Heap;
+}
+
+/// The `Tbl` of a `T_TABLE` value.
+pub fn tableOf(v: Value): &Tbl { return v.obj() as &Tbl; }
+
+/// Hash of a normalized key.
+fn keyHash(k: Value): int {
+    if k.tag == T_STR { return strOf(k).hash; }
+    if k.tag == T_BOOL { return k.bits; }
+    return int(cmp.mix(u64(k.bits)));
+}
+
+extend Heap {
+    /// A new empty table.
+    fn newTable(this: &Heap): Value {
+        let p = this.newObject(OBJ_TABLE, @sizeof(Tbl));
+        (p as &Tbl).heap = this;
+        return objv(T_TABLE, p);
+    }
+}
+
+extend Tbl {
+    /// Number of fields.
+    fn count(this: &Tbl): int { return this.live; }
+
+    fn entries(this: &Tbl): []Entry { return @slice(this.ents, this.cap); }
+
+    fn index(this: &Tbl): []i32 { return @slice(this.idx, this.cap * 2); }
+
+    /// Entry number holding normalized key `k`, or -1.
+    fn find(this: &Tbl, k: Value): int {
+        if this.cap == 0 || k.tag == T_NIL { return -1; }
+        let ix = this.index();
+        let es = this.entries();
+        let mask = ix.len - 1;
+        let i = keyHash(k) & mask;
+        while ix[i] != 0 {
+            let e = int(ix[i]) - 1;
+            if same(es[e].key, k) { return e; }
+            i = (i + 1) & mask;
+        }
+        return -1;
+    }
+
+    /// Entry number of string key `k` (a `T_STR`, so no `keyOf`), or -1: the field access fast path.
+    fn findStr(this: &Tbl, k: Value): int {
+        if this.cap == 0 { return -1; }
+        let ix = this.index();
+        let es = this.entries();
+        let mask = ix.len - 1;
+        let i = strOf(k).hash & mask;
+        while ix[i] != 0 {
+            let e = int(ix[i]) - 1;
+            if es[e].key.bits == k.bits && es[e].key.tag == T_STR { return e; }
+            i = (i + 1) & mask;
+        }
+        return -1;
+    }
+
+    /// `t[k]`, nil when missing.
+    fn get(this: &Tbl, k: Value): Value {
+        let e = this.find(keyOf(k));
+        if e < 0 { return nilv(); }
+        return this.entries()[e].val;
+    }
+
+    /// `t[k] = v`; a nil `v` removes the field. False when `k` can't be a key (nil or NaN).
+    fn set(this: &Tbl, h: &Heap, k: Value, v: Value): bool {
+        let key = keyOf(k);
+        if key.tag == T_NIL { return false; }
+        let e = this.find(key);
+        if e >= 0 {
+            let es = this.entries();
+            if v.tag == T_NIL {
+                es[e].key = Value { tag: T_DEAD, bits: 0 };
+                es[e].val = nilv();
+                this.live -= 1;
+            } else {
+                es[e].val = v;
+            }
+            return true;
+        }
+        if v.tag == T_NIL { return true; }
+        if this.used == this.cap { this.rebuild(h); }
+        let n = this.used;
+        let es = this.entries();
+        es[n].key = key;
+        es[n].val = v;
+        this.used += 1;
+        this.live += 1;
+        this.place(key, n);
+        return true;
+    }
+
+    /// Point the index at entry `n` for `key` (not already present).
+    fn place(this: &Tbl, key: Value, n: int) {
+        let ix = this.index();
+        let mask = ix.len - 1;
+        let i = keyHash(key) & mask;
+        while ix[i] != 0 { i = (i + 1) & mask; }
+        ix[i] = i32(n + 1);
+    }
+
+    /// Make room for one more entry: pack live entries in order, and double the capacity unless
+    /// at least half were dead. The index is rebuilt, which drops every tombstone.
+    fn rebuild(this: &Tbl, h: &Heap) {
+        let ncap = this.cap;
+        if ncap == 0 { ncap = 4; } else if this.live * 2 >= this.cap { ncap = this.cap * 2; }
+        let old = this.entries();
+        let es: []Entry = old;
+        if ncap != this.cap {
+            es = @slice(h.allocRaw(ncap * @sizeof(Entry)), ncap);
+        }
+        let n = 0;
+        for i in 0..this.used {
+            if old[i].key.tag != T_DEAD {
+                es[n] = old[i];
+                n += 1;
+            }
+        }
+        for i in n..ncap {
+            es[i].key = nilv();
+            es[i].val = nilv();
+        }
+        if ncap != this.cap && this.cap > 0 {
+            h.freeRaw(this.ents, this.cap * @sizeof(Entry));
+        }
+        if this.cap > 0 {
+            h.freeRaw(this.idx, this.cap * 2 * 4);
+        }
+        this.ents = es.ptr as ptr;
+        this.idx = h.allocRaw(ncap * 2 * 4);
+        this.cap = ncap;
+        this.used = n;
+        this.live = n;
+        for i in 0..n { this.place(es[i].key, i); }
+    }
+
+    /// The first live entry at or after entry number `i`, or -1. Walk a table with
+    /// `let i = t.next(0); while i >= 0 { ..t.entries()[i].. ; i = t.next(i + 1); }`.
+    /// Setting existing fields (nil included) while walking is fine; adding new ones may pack the
+    /// entries and is not.
+    fn next(this: &Tbl, i: int): int {
+        let es = this.entries();
+        let j = if i < 0 { 0 } else { i };
+        while j < this.used {
+            if es[j].key.tag != T_DEAD { return j; }
+            j += 1;
+        }
+        return -1;
+    }
+
+    /// Give back the entry and index buffers (the sweep calls this before `freeObject`).
+    fn freeParts(this: &Tbl, h: &Heap) {
+        if this.cap > 0 {
+            h.freeRaw(this.ents, this.cap * @sizeof(Entry));
+            h.freeRaw(this.idx, this.cap * 2 * 4);
+        }
+        this.cap = 0;
+        this.used = 0;
+        this.live = 0;
+    }
+}

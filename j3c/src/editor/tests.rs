@@ -9,10 +9,15 @@ use super::*;
 #[test]
 fn frontend_embeds_every_source() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("editor/src");
-    for e in fs::read_dir(dir).unwrap().flatten() {
-        let name = e.file_name().into_string().unwrap();
-        if name.ends_with(".j3") {
-            assert!(FRONTEND.iter().any(|(n, _)| *n == name), "{name} is missing from FRONTEND");
+    let mut todo = vec![dir.clone()];
+    while let Some(d) = todo.pop() {
+        for e in fs::read_dir(d).unwrap().flatten() {
+            let path = e.path();
+            if path.is_dir() { todo.push(path); continue; }
+            let name = path.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/");
+            if name.ends_with(".j3") {
+                assert!(FRONTEND.iter().any(|(n, _)| *n == name), "{name} is missing from FRONTEND");
+            }
         }
     }
 }

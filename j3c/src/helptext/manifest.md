@@ -9,7 +9,7 @@ j3.toml
 [emit]
     backend  llvm (default) or c
     opt      0, 1, 2, 3, s, or z. LLVM default is 2
-    incremental  at opt 0, reuse one object per module. Default true.
+    incremental  at opt 0 and 1, reuse one object per module. Default true.
              "all" does it at every opt (faster rebuilds, no
              cross-module inlining). --release ignores it
     debug    debug info. Default true, unless [cc] fast is set
@@ -39,14 +39,60 @@ j3.toml
                     from ~/.local/share/<name> (so relative saves work), a
                     menu entry, the icon. Depends come from the libraries
                     the program loads. Needs `tar`, not dpkg
+             steam  target/dist/steam/: content/<os>/ (the zip folder plus
+                    libsteam_api.so or steam_api64.dll from [steam] sdk) and
+                    scripts/app_build_<appid>.vdf with the steamcmd line in
+                    README.txt. Linux and Windows x86_64 only; never uploads
     zip      true: same as build_outputs = ["zip"]
     include  files and folders to ship. Default: whichever of
              assets, scripts, scenes, locales exist
-    icon     .png (square 256 or 512 looks best) or .svg for the menu
+    icon     .png (square 256 or 512 looks best) or .svg for the menu, and (PNG
+             only) the window icon of an App. Default: the J3 logo
     title    menu name. Default: the package name, title-cased
     categories  .desktop Categories. Default Game;
     maintainer  Name <email>. Default $DEBFULLNAME/$DEBEMAIL, else git
     depends  extra .deb packages, after the ones found
+
+[steam]
+    app_id   numeric app id. Required for build_outputs "steam". A dev run
+             (`j3c run`) sets SteamAppId and SteamGameId from it
+    sdk      unzipped Steamworks SDK root (~ and project-relative ok). Dev runs
+             set J3_STEAM_LIB to its libsteam_api.so; "steam" copies the libs
+    depot_linux, depot_windows  depot ids; each needed when that OS is built
+    branch   set the build live on this branch (not "default"). Default: none
+    runtime_libs  folder of .so files copied beside the Linux exe (libs built in
+             the sniper SDK container); libssl.so.3 and SDL add-ons load from there first
+    glibc_max  highest GLIBC the Linux build may need; warns above it. Default 2.31
+    desc     build description. Default "<name> <version>"
+
+[splash]
+    enabled  true shows a startup splash in App.run: the J3 logo animates as
+             soon as the window opens, while the startup systems load. Default
+             false (App.splash() turns it on from code too)
+    logo     false leaves the J3 logo out (cards only). Default true
+    cards    images shown after the logo, in order, e.g. ["assets/studio.png"]
+             (App.splashCard adds more). A missing one is skipped
+    card_time  seconds per card, fades included. Default 1.8
+    card_size  a card fits in this fraction of the window (0.05 to 1). Default 0.35
+    theme    dark or light background. Default dark
+    skippable  false ignores the key / click / tap that skips a card. Default true
+             Release builds only: `j3c run --splash` shows it in dev. Never shown
+             under --frames, --screenshot, --headless, J3_CAPTURE, a hot restart,
+             or J3_NO_SPLASH=1 (`j3c doc j3.game.splash`)
+
+[dependencies]
+    name = { path = "dir" }   another package (or a folder of .j3 modules), relative to
+             this j3.toml; `name = "dir"` is the same. `use name.a.b;` loads
+             <dir>/src/a/b.j3 when <dir> has a j3.toml and a src/, else <dir>/a/b.j3;
+             its first line must be `module name.a.b;` (what the package's own files
+             say). The dep's [package] name must equal the key; its [dependencies]
+             are used too (relative to it). Only imported modules are compiled, for
+             this package's target: not the dep's main, [link], or anything else in
+             its j3.toml. Errors point at the dep's file:line. Manifest errors:
+             missing path, a cycle, a name that is `j3`, this package, or a module of
+             src/, one name with two paths. A dep's assets are not found for you.
+             Example: android/j3.toml with `jzero = { path = ".." }`, then
+             `use jzero.remote.proto;`
 
 [ui]
     dir      folder of .j3ui components. Default ui. All of them become

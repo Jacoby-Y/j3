@@ -5,6 +5,7 @@
 //! `[N]T` → `[]T`, match, `?`), not as source text.
 
 mod error;
+pub(crate) mod gpu;
 mod lower;
 pub(crate) mod script;
 
@@ -29,19 +30,29 @@ use crate::parse::{
 };
 use crate::span::{FileId, Span};
 
+mod closure_ty;
 mod consteval;
 mod exports;
+mod extend;
+pub mod lint;
 mod funcs;
+mod generic_fn;
 mod infer;
 mod resolve;
+mod traits;
 mod types;
 mod uses;
 
+use closure_ty::*;
 use consteval::*;
 use exports::*;
+use extend::merge_extends;
 use funcs::*;
+use generic_fn::*;
 use infer::*;
 use resolve::*;
+pub(crate) use traits::{BoundReq, BoundSite, TraitEnv};
+use traits::*;
 use types::*;
 use uses::*;
 
@@ -60,6 +71,25 @@ pub struct Program {
     /// Every `const`, including private ones, so hover can show `///`.
     pub const_docs: Vec<Export>,
     pub script_aliases: Vec<ScriptAlias>,
+    /// Shader programs emitted by `@shader(vs, fs)` (`j3c dump-glsl`).
+    pub shaders: Vec<gpu::ShaderProgram>,
+    /// Code warnings on the user's modules (`lint.rs`): unused locals and imports, unreachable code.
+    pub warnings: Vec<crate::diag::Diagnostic>,
+    /// Edits that remove what `warnings` names, where that is safe (unused imports): `check --autofix`.
+    pub fixes: Vec<lint::Fix>,
+}
+
+impl Program {
+    /// Each warning rendered against its source, one block per warning.
+    pub fn rendered_warnings(&self) -> Vec<String> {
+        self.warnings
+            .iter()
+            .map(|w| {
+                let src = self.cx.file(w.span.file).map(|f| f.src.clone()).unwrap_or_default();
+                w.render(&[(w.path.clone(), src)])
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -119,14 +149,41 @@ pub(crate) struct ModData {
     enum_temps: HashMap<String, parse::EnumItem>,
     insts: HashMap<(String, Vec<Ty>), crate::ir::ids::EnumId>,
     struct_temps: HashMap<String, parse::StructItem>,
-    struct_temp_env: HashMap<String, HashMap<String, Ty>>,
+    struct_temp_env: HashMap<String, DeclEnv>,
     struct_insts: HashMap<(String, Vec<Ty>), StructId>,
     method_temps: HashMap<(u32, String), parse::FnItem>,
     method_insts: HashMap<(u32, String, Vec<Ty>), FuncId>,
     fn_substs: HashMap<FuncId, HashMap<String, Ty>>,
     pending_mono: Vec<(FuncId, parse::FnItem, HashMap<String, Ty>)>,
+    /// `fn name<T>(..)` declared here (see `generic_fn.rs`), by name.
+    gen_fns: HashMap<String, parse::FnItem>,
+    /// Generic fns callable by bare name (own and imported) → defining module key.
+    gen_names: HashMap<String, String>,
+    /// `use a.b` alias → module key, for `b.name(..)` calls of its generic fns.
+    gen_mods: HashMap<String, String>,
+    /// Instances of generic free fns by (`module::name`, type args), shared by every module.
+    fn_insts: HashMap<(String, Vec<Ty>), FuncId>,
     globals: HashMap<String, GlobalId>,
     exports: HashSet<String>,
+    /// Traits callable by bare name (own and imported) → `module::Name` (`traits.rs`).
+    traits: HashMap<String, String>,
+    /// `#[impl]` fns by their unique symbol name → the method name they implement.
+    impl_names: HashMap<String, String>,
+}
+
+/// What a generic struct's declaring module can see: its types and generic templates.
+/// Instance signatures resolve here, not in the module that names the instance.
+#[derive(Clone)]
+pub(crate) struct DeclEnv {
+    pub types: HashMap<String, Ty>,
+    pub enum_temps: HashMap<String, parse::EnumItem>,
+    pub struct_temps: HashMap<String, parse::StructItem>,
+}
+
+impl DeclEnv {
+    pub(crate) fn of(m: &ModData) -> DeclEnv {
+        DeclEnv { types: m.types.clone(), enum_temps: m.enum_temps.clone(), struct_temps: m.struct_temps.clone() }
+    }
 }
 
 pub(crate) struct GenEnv<'a> {
@@ -135,7 +192,7 @@ pub(crate) struct GenEnv<'a> {
     pub enum_temps: &'a HashMap<String, parse::EnumItem>,
     pub enum_insts: &'a mut HashMap<(String, Vec<Ty>), EnumId>,
     pub struct_temps: &'a HashMap<String, parse::StructItem>,
-    pub struct_temp_env: &'a HashMap<String, HashMap<String, Ty>>,
+    pub struct_temp_env: &'a HashMap<String, DeclEnv>,
     pub struct_insts: &'a mut HashMap<(String, Vec<Ty>), StructId>,
     pub methods: &'a mut HashMap<(u32, String), FuncId>,
     pub method_temps: &'a mut HashMap<(u32, String), parse::FnItem>,
@@ -157,24 +214,32 @@ pub fn check_files_lib(files: Vec<ParsedFile>) -> Result<Program, CheckError> {
 }
 
 fn check_files_cfg(files: Vec<ParsedFile>, require_main: bool) -> Result<Program, CheckError> {
-    // An error carries its module's path; for a span in a part file it names that file instead.
-    let mut seen = HashSet::new();
-    let part_paths: Vec<(FileId, String)> = files
+    // An error carries the path of the module being checked; its span may sit in another file
+    // (a part file, or a generic method instantiated from a caller), so name the span's file.
+    let file_paths: Vec<(FileId, String)> = files
         .iter()
-        .filter(|f| !f.ast.is_script && !seen.insert(f.ast.module_key()))
+        .filter(|f| !f.ast.is_script)
         .map(|f| (f.file_id, f.path.clone()))
         .collect();
-    check_files_inner(files, require_main).map_err(|mut e| {
-        if let Some((_, path)) = part_paths.iter().find(|(id, _)| *id == e.span.file) {
-            e.path = path.clone();
-        }
-        e
+    check_files_inner(files, require_main).map_err(|e| {
+        e.map_all(&mut |mut e| {
+            gpu::explain_gone(&mut e);
+            if e.span.is_dummy() {
+                return e;
+            }
+            if let Some((_, path)) = file_paths.iter().find(|(id, _)| *id == e.span.file) {
+                e.path = path.clone();
+            }
+            e
+        })
     })
 }
 
 fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Program, CheckError> {
     let t_all = std::time::Instant::now();
+    let (warnings, fixes) = lint::lint(&files);
     script::prepare(&mut files)?;
+    let shaders = gpu::prepare(&mut files)?;
     let mut cx = IrCx::new();
     let _ = cx.ty_ref(cx.common.u8);
 
@@ -219,17 +284,28 @@ fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<P
             method_insts: HashMap::new(),
             fn_substs: HashMap::new(),
             pending_mono: Vec::new(),
+            gen_fns: HashMap::new(),
+            gen_names: HashMap::new(),
+            gen_mods: HashMap::new(),
+            fn_insts: HashMap::new(),
             globals: HashMap::new(),
             exports: HashSet::new(),
+            traits: HashMap::new(),
+            impl_names: HashMap::new(),
         });
     }
 
+    merge_extends(&mut mods)?;
     crate::cli::timing("  check: setup", t_all);
     crate::phase::detail("collecting names, types, functions");
     let t = std::time::Instant::now();
     for i in 0..mods.len() {
+        collect_traits(&mut mods, i)?;
+    }
+    for i in 0..mods.len() {
         collect_exports(&mut mods, i);
     }
+    bind_traits(&mut mods)?;
     for i in 0..mods.len() {
         collect_struct_names(&mut cx, &mut mods, i)?;
     }
@@ -238,12 +314,12 @@ fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<P
         collect_enums(&mut cx, &mut mods, i)?;
     }
     resolve_all_uses(&mut mods, UsePhase::Types)?;
-    let mut def_env: HashMap<String, HashMap<String, Ty>> = HashMap::new();
+    let mut def_env: HashMap<String, DeclEnv> = HashMap::new();
     for m in &mods {
         for it in &m.ast.items {
             if let Item::Struct(s) = it {
                 if !s.type_params.is_empty() {
-                    def_env.insert(s.name.name.clone(), m.types.clone());
+                    def_env.insert(s.name.name.clone(), DeclEnv::of(m));
                 }
             }
         }
@@ -271,6 +347,7 @@ fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<P
     }
 
     crate::cli::timing("  check: collect", t);
+    let traits = build_env(&mut cx, &mods)?;
     let main_id = match find_main(&mods) {
         Ok(id) => id,
         Err(_) if !require_main => dummy_main(&mut cx),
@@ -289,10 +366,27 @@ fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<P
     crate::cli::timing("  check: infer rets", t);
 
     let t = std::time::Instant::now();
-    let shared = lower::shared(&mods);
+    {
+        let (mut all, mut temps) = (HashMap::new(), HashMap::new());
+        for m in &mods {
+            all.extend(m.methods.iter().map(|(k, v)| (k.clone(), *v)));
+            temps.extend(m.method_temps.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        // Instances made while collecting signatures (`fn f(m: Map<K, V>)`) could not be checked before.
+        lower::drain_bounds(&mut cx, &traits, &all, &temps, None)?;
+    }
+    let shared = lower::shared(&mods, traits);
+    // Function bodies are independent: an error in one is kept and the rest are still checked.
+    let mut errs: Vec<CheckError> = Vec::new();
     for i in 0..mods.len() {
         crate::phase::detail(&format!("lower {}/{} {}", i + 1, mods.len(), mods[i].key));
-        lower::lower_module(&mut cx, &mut mods, i, main_id, &shared)?;
+        lower::lower_module(&mut cx, &mut mods, i, main_id, &shared, &mut errs)?;
+        if errs.len() >= MAX_ERRORS {
+            break;
+        }
+    }
+    if let Some(e) = gather_errors(errs) {
+        return Err(e);
     }
     crate::cli::timing("  check: lower", t);
 
@@ -343,7 +437,25 @@ fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<P
         exports,
         const_docs,
         script_aliases,
+        shaders,
+        warnings,
+        fixes,
     })
+}
+
+/// Errors reported in one run; past this the rest are usually follow-ons.
+const MAX_ERRORS: usize = 20;
+
+/// The first error, with the others (deduplicated: generic instances repeat one) as follow-ups.
+fn gather_errors(errs: Vec<CheckError>) -> Option<CheckError> {
+    let mut seen = HashSet::new();
+    let mut uniq = errs
+        .into_iter()
+        .filter(|e| seen.insert((e.path.clone(), e.span.file, e.span.start, e.span.end, e.message.clone())))
+        .take(MAX_ERRORS);
+    let mut first = uniq.next()?;
+    first.more = uniq.collect();
+    Some(first)
 }
 
 /// Key for const `name` of the module `use`d as `alias`. Idents never hold `.`, so it can't collide.
@@ -385,6 +497,23 @@ pub(crate) fn field_path(
     None
 }
 
+/// An untyped number: a literal, `-` of one, or `+ - * / %` of two (`(2 + 1)`). It takes the
+/// other operand's type, or the destination's when both sides are untyped.
+pub(crate) fn bare_num(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Int(_) | ExprKind::Float(_) => true,
+        ExprKind::Unary { op, expr: inner } if *op == parse::UnaryOp::Neg => bare_num(inner),
+        ExprKind::Binary { op, lhs, rhs } => {
+            matches!(
+                op,
+                parse::BinOp::Add | parse::BinOp::Sub | parse::BinOp::Mul | parse::BinOp::Div | parse::BinOp::Rem
+            ) && bare_num(lhs)
+                && bare_num(rhs)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn is_int(cx: &IrCx, ty: Ty) -> bool {
     matches!(cx.ty_kind(ty), TyKind::Int(_))
 }
@@ -398,92 +527,4 @@ pub(crate) fn is_numeric(cx: &IrCx, ty: Ty) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generic_struct_instances_are_shared_across_modules() {
-        let sources = [
-            ("container", r#"
-module container;
-pub struct Box<T> {
-    value: T;
-    fn get(this: &Box<T>): T { return this.value; }
-}
-pub struct Item { value: int; }
-"#),
-            ("factory", r#"
-module factory;
-use container.{ Box, Item };
-pub fn make(): Box<Item> { return Box<Item> { value: Item { value: 42 } }; }
-"#),
-            ("consumer", r#"
-module consumer;
-use container.{ Box, Item };
-use factory.make;
-struct World { item: Box<Item>; }
-fn main() {
-    let world = World { item: make() };
-    let item = world.item.get();
-}
-"#),
-        ];
-        let files = sources.iter().enumerate().map(|(i, (name, src))| {
-            let file_id = FileId(i as u32 + 1);
-            ParsedFile {
-                path: format!("{name}.j3"),
-                src: src.to_string(),
-                ast: parse::parse(src, file_id).expect("parse cross-module generic"),
-                file_id,
-            }
-        }).collect();
-        let prog = check_files(files).expect("share generic instances across modules");
-        assert_eq!(prog.cx.structs().iter().filter(|s| !s.ty_args.is_empty()).count(), 1);
-    }
-
-    #[test]
-    fn omitted_returns_use_instantiated_parameter_types() {
-        let src = r#"
-module test;
-
-struct Box<T> { value: T; }
-
-fn clear(box: &Box<int>) { box.value = 0; }
-fn value(box: &Box<int>) { return box.value; }
-fn identity(box: &Box<int>) { return box; }
-
-struct Reader {
-    fn read(this: &Reader, box: &Box<int>) { return box.value; }
-}
-
-fn main() {
-    let box = Box<int> { value: 42 };
-    let reader = Reader {};
-    let n = value(&box);
-    let m = reader.read(&box);
-    let alias = identity(&box);
-    clear(alias);
-}
-"#;
-        let file_id = FileId(1);
-        let ast = parse::parse(src, file_id).expect("parse generic parameters");
-        let prog = check_files(vec![ParsedFile {
-            path: "test.j3".to_string(),
-            src: src.to_string(),
-            ast,
-            file_id,
-        }])
-        .expect("infer returns with generic parameters");
-        for id in &prog.modules[0].funcs {
-            let f = prog.cx.func(*id);
-            let name = prog.cx.name_str(f.name);
-            let (params, ret) = prog.cx.fn_sig(f.ty).expect("function signature");
-            match name {
-                "clear" => assert_eq!(ret, prog.cx.common.void),
-                "value" | "read" => assert_eq!(ret, prog.cx.common.int),
-                "identity" => assert_eq!(ret, params[0]),
-                _ => {}
-            }
-        }
-    }
-}
+mod tests;

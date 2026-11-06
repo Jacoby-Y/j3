@@ -1,0 +1,235 @@
+// Part of j3.game (baked text cache and text mode); the module doc and `use`s are in ../game.j3.
+module j3.game;
+
+/// Slots in the `drawText` bake cache.
+const TEXT_SLOTS: int = 256;
+/// Longest string the bake cache will keep. Longer text is rasterized and dropped.
+const TEXT_CAP: int = 128;
+
+/// One cached rasterization: font, color, and bytes identify the texture.
+struct TextSlot {
+    /// False until a bake is stored here.
+    live: bool;
+    /// `Font.raw` this slot was baked with.
+    font: ptr;
+    /// Red channel baked into the glyphs.
+    r: u8;
+    /// Green channel baked into the glyphs.
+    g: u8;
+    /// Blue channel baked into the glyphs.
+    b: u8;
+    /// Alpha channel baked into the glyphs.
+    a: u8;
+    /// Stored byte count, always `<= TEXT_CAP`.
+    len: int;
+    /// Copy of the UTF-8 bytes. Scratch strings die at the next frame.
+    bytes: [128]u8;
+    /// GPU texture. Owned by the cache until the slot is reused. Zero when the slot only stores a size.
+    tex: Texture;
+    /// True once `tw` / `th` are known.
+    sized: bool;
+    /// Measured width in pixels.
+    tw: i32;
+    /// Measured height in pixels.
+    th: i32;
+    /// `frameCount` of the last hit, for eviction.
+    used: int;
+    /// True when this raster was emboldened.
+    bold: bool;
+}
+
+/// When true, measure and draw use `TTF_STYLE_BOLD`.
+#[singleton]
+let textBold: bool = false;
+
+/// Typographic options for the measure and draw calls (`textWidth`, `p2Text`, the caret and hit-test helpers). The default
+/// (all off) is what app code gets; the `.j3ui` runtime sets it from the style of the element it is measuring or painting
+/// (`j3.ui.dom.enterText`) and puts the previous value back after. Each field is read in one place: `textWidthPlain`
+/// (measure), `atlasDraw` (glyph pen) and `p2TextRun` (runs cut at digits or code points).
+pub struct TextMode {
+    /// `font-variant-numeric: tabular-nums`: every ASCII digit has the widest digit's advance, centred in it.
+    tabular: bool;
+    /// `letter-spacing`: extra px after every glyph (code point), the last of a run included, as a browser adds it. Ignored in shaped
+    /// (complex script, right to left) runs, which a browser does not space either.
+    letterSp: f32;
+    /// `word-spacing`: extra px after every U+0020 (on top of `letterSp`).
+    wordSp: f32;
+    /// ASCII is rastered whole like other text instead of drawn from the glyph atlas, so SDL_ttf's shaping applies
+    /// (ligatures such as `->` in Fira Code, when `textShaping()`). Costs a cached raster per distinct string.
+    shaped: bool;
+}
+
+#[singleton]
+let TM: TextMode;
+
+/// Make `m` the text mode and return the one it replaced, so a caller can restore it. Not thread safe, like all of `j3.game` text.
+pub fn setTextMode(m: TextMode): TextMode {
+    let prev = TM;
+    TM = m;
+    return prev;
+}
+
+/// Cross-frame text cache. Scratch is rewound every frame, so this cannot live there.
+#[singleton]
+let textCache: [256]TextSlot;
+
+/// True when slot `slot` holds `msg`.
+fn textSame(slot: int, msg: []u8): bool {
+    if textCache[slot].len != msg.len {
+        return false;
+    }
+    let i = 0;
+    while i < msg.len {
+        if textCache[slot].bytes[i] != msg[i] {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+/// True when slot `slot` matches `font`, the current draw color, and `msg`.
+fn textHit(slot: int, font: ptr, msg: []u8): bool {
+    if !textCache[slot].live {
+        return false;
+    }
+    if textCache[slot].tex.raw == 0 {
+        return false;
+    }
+    if textCache[slot].font != font {
+        return false;
+    }
+    if textCache[slot].r != platform.color.r {
+        return false;
+    }
+    if textCache[slot].g != platform.color.g {
+        return false;
+    }
+    if textCache[slot].b != platform.color.b {
+        return false;
+    }
+    if textCache[slot].a != platform.color.a {
+        return false;
+    }
+    if textCache[slot].bold != textBold {
+        return false;
+    }
+    return textSame(slot, msg);
+}
+
+/// Index of a matching slot, or `-1`.
+fn textFind(font: ptr, msg: []u8): int {
+    let i = 0;
+    while i < TEXT_SLOTS {
+        if textHit(i, font, msg) {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+/// Empty slot, or the least recently used one.
+fn textVictim(): int {
+    let i = 0;
+    let best = 0;
+    let oldest = textCache[0].used;
+    while i < TEXT_SLOTS {
+        if !textCache[i].live {
+            return i;
+        }
+        if textCache[i].used < oldest {
+            best = i;
+            oldest = textCache[i].used;
+        }
+        i += 1;
+    }
+    return best;
+}
+
+/// Store `tex` in `slot`, dropping whatever texture was there.
+fn textRemember(slot: int, font: Font, msg: []u8, tex: Texture) {
+    if textCache[slot].live {
+        destroyTexture(textCache[slot].tex);
+    }
+    textCache[slot].live = true;
+    textCache[slot].font = font.raw;
+    textCache[slot].r = platform.color.r;
+    textCache[slot].g = platform.color.g;
+    textCache[slot].b = platform.color.b;
+    textCache[slot].a = platform.color.a;
+    textCache[slot].len = msg.len;
+    let i = 0;
+    while i < msg.len {
+        textCache[slot].bytes[i] = msg[i];
+        i += 1;
+    }
+    textCache[slot].tex = tex;
+    textCache[slot].sized = true;
+    textCache[slot].tw = tex.w;
+    textCache[slot].th = tex.h;
+    textCache[slot].used = frameCount();
+    textCache[slot].bold = textBold;
+}
+
+/// Slot that already measured `msg` for `font`, ignoring color. `-1` when none.
+fn textFindSized(font: ptr, msg: []u8): int {
+    let i = 0;
+    while i < TEXT_SLOTS {
+        if textCache[i].live && textCache[i].sized && textCache[i].font == font && textCache[i].bold == textBold {
+            if textSame(i, msg) {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+/// Remember a measurement. Reuses a slot with the same bytes when one exists.
+fn textRememberSize(font: Font, msg: []u8, w: i32, h: i32) {
+    let have = textFindSized(font.raw, msg);
+    if have >= 0 {
+        textCache[have].tw = w;
+        textCache[have].th = h;
+        textCache[have].used = frameCount();
+        return;
+    }
+    let slot = textVictim();
+    if textCache[slot].live {
+        destroyTexture(textCache[slot].tex);
+    }
+    textCache[slot].live = true;
+    textCache[slot].font = font.raw;
+    textCache[slot].r = 0;
+    textCache[slot].g = 0;
+    textCache[slot].b = 0;
+    textCache[slot].a = 0;
+    textCache[slot].len = msg.len;
+    let i = 0;
+    while i < msg.len {
+        textCache[slot].bytes[i] = msg[i];
+        i += 1;
+    }
+    textCache[slot].tex = Texture { raw: 0, w: 0, h: 0 };
+    textCache[slot].sized = true;
+    textCache[slot].tw = w;
+    textCache[slot].th = h;
+    textCache[slot].used = frameCount();
+    textCache[slot].bold = textBold;
+}
+
+/// Drop cached rasters for `font`.
+fn textDropFont(font: ptr) {
+    let i = 0;
+    while i < TEXT_SLOTS {
+        if textCache[i].live {
+            if textCache[i].font == font {
+                destroyTexture(textCache[i].tex);
+                textCache[i].live = false;
+                textCache[i].tex = Texture { raw: 0, w: 0, h: 0 };
+            }
+        }
+        i += 1;
+    }
+}

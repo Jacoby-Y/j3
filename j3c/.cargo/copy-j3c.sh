@@ -30,6 +30,8 @@ for a in "$@"; do
   prev=$a
 done
 
+# J3C_NO_INSTALL=1 builds without touching ~/.bin/j3c.
+[ -z "$J3C_NO_INSTALL" ] || exit 0
 [ -n "$is_j3c" ] && [ -n "$is_bin" ] && [ -z "$is_test" ] || exit 0
 [ -n "$out" ] || out="$out_dir/j3c$extra"
 [ -n "$out" ] && [ -f "$out" ] || exit 0

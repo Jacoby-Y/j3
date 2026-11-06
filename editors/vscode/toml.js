@@ -71,12 +71,12 @@ const SCHEMA = {
     },
   },
   dist: {
-    doc: "Packaging. `build_outputs = [\"zip\", \"deb\"]` makes `build --release` write them per target to `target/dist/`.",
+    doc: "Packaging. `build_outputs = [\"zip\", \"deb\"]` makes `build --release` write them per target to `target/dist/`. Menu actions: `[dist.actions]` with `id = { name = \"New Island\", exec = \"--new-island\" }`.",
     keys: {
       build_outputs: {
-        doc: "What `build --release` writes to `target/dist/`: `zip` (program, `include`, Windows DLLs), `deb` (Linux: installs to `/opt/<name>` with a launcher, menu entry, and icon), and `apk` (Android, needs an Android triple in `[emit] target`; `j3c doc android`).",
+        doc: "What `build --release` writes to `target/dist/`: `zip` (program, `include`, Windows DLLs), `deb` (Linux: installs to `/opt/<name>` with a launcher, menu entry, and icon), and `apk` (Android, needs an Android triple in `[emit] target`; `j3c doc android`), and `steam` (Steam depot content + `app_build_<id>.vdf`, needs `[steam]`).",
         list: true,
-        suggest: ['"zip"', '"deb"', '"apk"'],
+        suggest: ['"zip"', '"deb"', '"apk"', '"steam"'],
       },
       icon: { doc: "`.png` (square 256 or 512) or `.svg` for the `.deb` menu entry.", suggest: ['"assets/icon.png"'] },
       title: { doc: "Menu name. Default: the package name, title-cased." },
@@ -94,6 +94,19 @@ const SCHEMA = {
       },
     },
   },
+  steam: {
+    doc: "Steamworks (`build_outputs = [\"steam\"]`). A dev run with `app_id` sets `SteamAppId` and, with `sdk`, `J3_STEAM_LIB`.",
+    keys: {
+      app_id: { doc: "Numeric Steam app id. Required for the `steam` output; dev runs set `SteamAppId`/`SteamGameId` from it (no steam_appid.txt).", suggest: ['"480"'] },
+      sdk: { doc: "Unzipped Steamworks SDK root (`~` and project-relative paths work). Holds `redistributable_bin/` with `libsteam_api.so` and `steam_api64.dll`.", suggest: ['"~/steamworks_sdk"'] },
+      depot_linux: { doc: "Depot id for the Linux build. Required when a Linux target is built.", suggest: ['"481"'] },
+      depot_windows: { doc: "Depot id for the Windows build. Required when a Windows target is built.", suggest: ['"482"'] },
+      branch: { doc: "Branch the upload is set live on. Empty: nothing goes live. Not `default` (steamcmd usually refuses).", suggest: ['"beta"'] },
+      runtime_libs: { doc: "Folder of `.so` files (built inside the Steam sniper SDK: libssl.so.3, SDL2 add-ons) copied beside the Linux exe. J3 opens libssl.so.3 and the SDL add-ons from the exe folder first.", suggest: ['"steam/libs"'] },
+      glibc_max: { doc: "Highest GLIBC version the Linux build may need; the steam output warns above it. Default `2.31` (sniper).", suggest: ['"2.31"'] },
+      desc: { doc: "Build description shown on Steam. Default `<name> <version>`." },
+    },
+  },
   android: {
     doc: "Android APK (`build_outputs = [\"apk\"]`, `j3c doc android`).",
     keys: {
@@ -104,6 +117,11 @@ const SCHEMA = {
       },
       native_libs: { doc: "Folder of `<abi>/lib<name>.so` files shipped in the APK beside libmain.so (helper programs, prebuilt libs). At runtime they are in `J3_NATIVE_LIB_DIR`; run a program there with `j3.proc`.", suggest: ['"android/libs"'] },
     },
+  },
+  dependencies: {
+    doc: "Path dependencies: `name = { path = \"../dir\" }` (relative to this file). `use name.a.b;` loads `<dir>/src/a/b.j3` (a package) or `<dir>/a/b.j3`, which says `module name.a.b;`. Only imported modules are compiled, for this package's target.",
+    free: true,
+    keys: {},
   },
   ui: {
     doc: "`.j3ui` components. Every file in `dir` and its subfolders compiles to one module, `<package>.ui`.",
@@ -290,7 +308,7 @@ function diagnostics(doc) {
     if (!spec) {
       continue;
     }
-    if (!spec.keys[key]) {
+    if (!spec.keys[key] && !spec.free) {
       out.push(warn(i, col(0), col(key.length), `unknown key \`${key}\` in [${section}]`));
       continue;
     }
@@ -304,7 +322,7 @@ function diagnostics(doc) {
       sawName = true;
     }
     const field = spec.keys[key];
-    if (field.values && !valueOk(raw, field)) {
+    if (field && field.values && !valueOk(raw, field)) {
       out.push(
         warn(i, col(eq + 1), col(text.length), `\`${key}\` must be ${field.values.join(", ")}`)
       );

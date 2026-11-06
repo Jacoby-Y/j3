@@ -1,0 +1,400 @@
+// Part of j3.steam: ISteamMatchmaking lobbies: create, search with filters, join, leave, members, owner, handlers.
+// Lobby data, chat, game server and invites are in lobbydata.j3; fake mode is lobbyfake.j3 and lobbysearch.j3.
+// The module doc and `use`s are in ../steam.j3.
+//
+// Lobby and user ids are u64 SteamIDs. Every call is main thread only. When Steam is absent calls return false,
+// 0 or "" and call results run their handler on the next `frame()` with `ok` false. Handlers (`onLobbyData` and
+// the rest) hold ONE function each: setting again replaces it.
+module j3.steam;
+
+/// `createLobby` type: only invited users can join, and it never shows in a search.
+pub const LOBBY_PRIVATE: int = 0;
+/// `createLobby` type: friends can join and it shows to them.
+pub const LOBBY_FRIENDS_ONLY: int = 1;
+/// `createLobby` type: anyone can find and join it.
+pub const LOBBY_PUBLIC: int = 2;
+/// `createLobby` type: like public, but hidden from searches.
+pub const LOBBY_INVISIBLE: int = 3;
+
+/// Filter comparison: the lobby's value is at most the filter value.
+pub const CMP_EQUAL_OR_LESS: int = 0 - 2;
+/// Filter comparison: the lobby's value is below the filter value.
+pub const CMP_LESS: int = 0 - 1;
+/// Filter comparison: equal.
+pub const CMP_EQUAL: int = 0;
+/// Filter comparison: above.
+pub const CMP_GREATER: int = 1;
+/// Filter comparison: at least.
+pub const CMP_EQUAL_OR_GREATER: int = 2;
+/// Filter comparison: different (a lobby without the key passes).
+pub const CMP_NOT_EQUAL: int = 3;
+
+/// `filterDistance`: same region only.
+pub const DISTANCE_CLOSE: int = 0;
+/// `filterDistance`: the default, close and nearby regions.
+pub const DISTANCE_DEFAULT: int = 1;
+/// `filterDistance`: far regions too.
+pub const DISTANCE_FAR: int = 2;
+/// `filterDistance`: everywhere.
+pub const DISTANCE_WORLDWIDE: int = 3;
+
+/// `joinLobby` response: joined.
+pub const ENTER_SUCCESS: int = 1;
+/// `joinLobby` response: the lobby is gone.
+pub const ENTER_DOESNT_EXIST: int = 2;
+/// `joinLobby` response: joining is closed or you are not allowed.
+pub const ENTER_NOT_ALLOWED: int = 3;
+/// `joinLobby` response: the lobby is full.
+pub const ENTER_FULL: int = 4;
+/// `joinLobby` response: some other error, or Steam is absent.
+pub const ENTER_ERROR: int = 5;
+/// `joinLobby` response: you are banned from it.
+pub const ENTER_BANNED: int = 6;
+/// `joinLobby` response: your account is limited.
+pub const ENTER_LIMITED: int = 7;
+/// `joinLobby` response: a member blocked you.
+pub const ENTER_MEMBER_BLOCKED_YOU: int = 10;
+/// `joinLobby` response: you blocked a member.
+pub const ENTER_YOU_BLOCKED_MEMBER: int = 11;
+
+/// `onLobbyMembers` change bit: the user entered.
+pub const LOBBY_ENTERED: u32 = 1;
+/// `onLobbyMembers` change bit: the user left.
+pub const LOBBY_LEFT: u32 = 2;
+/// `onLobbyMembers` change bit: the user dropped off.
+pub const LOBBY_DISCONNECTED: u32 = 4;
+/// `onLobbyMembers` change bit: the user was kicked.
+pub const LOBBY_KICKED: u32 = 8;
+/// `onLobbyMembers` change bit: the user was banned.
+pub const LOBBY_BANNED: u32 = 16;
+
+fn mm(): ptr {
+    return iface("SteamMatchmaking");
+}
+
+// ---- create ----
+
+fn onLobbyCreated(p: ptr, n: i32, failed: bool, ctx: u64) {
+    let r = reqTake(ctx);
+    if !r.used {
+        return;
+    }
+    let f = r.f as fn(u64, bool, u64);
+    if failed || rdI32(p, lo(O_CR_RESULT)) != RESULT_OK {
+        f(u64(0), false, r.ctx);
+        return;
+    }
+    f(rdU64(p, lo(O_CR_LOBBY)), true, r.ctx);
+}
+
+/// Make a lobby of `kind` (`LOBBY_PRIVATE`, `LOBBY_FRIENDS_ONLY`, `LOBBY_PUBLIC`, `LOBBY_INVISIBLE`) for up to
+/// `maxMembers` (1 to 250) members; you are the owner and first member. `f(lobby, ok, ctx)` runs on a later frame;
+/// `ok` is false (and `lobby` 0) on failure, a bad `kind` or `maxMembers`, or when Steam is absent.
+pub fn createLobby(kind: int, maxMembers: int, f: fn(u64, bool, u64), ctx: u64) {
+    let slot = reqNew(f as ptr, ctx);
+    if fake() {
+        fakeLog(`createLobby type {kind} max {maxMembers}`);
+        let call = fakeCall();
+        await(call, onLobbyCreated, slot);
+        let p = fbuf();
+        let id = flCreate(kind, maxMembers);
+        if id == u64(0) {
+            wrI32(p, lo(O_CR_RESULT), i32(2));
+        } else {
+            wrI32(p, lo(O_CR_RESULT), RESULT_OK);
+            wrU64(p, lo(O_CR_LOBBY), id);
+        }
+        let bytes: []u8 = @slice(p, lo(O_CR_SIZE));
+        fakeResult(call, CB_LOBBY_CREATED, bytes);
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_CreateLobby") as fn(ptr, i32, i32): u64;
+    await(m(mm(), i32(kind), i32(maxMembers)), onLobbyCreated, slot);
+}
+
+// ---- search ----
+
+fn onLobbyList(p: ptr, n: i32, failed: bool, ctx: u64) {
+    let r = reqTake(ctx);
+    if !r.used {
+        return;
+    }
+    let f = r.f as fn(int, bool, u64);
+    if failed {
+        f(0, false, r.ctx);
+        return;
+    }
+    f(int(rdU32(p, lo(O_LS_COUNT))), true, r.ctx);
+}
+
+/// Ask for the lobbies that pass the filters set since the last search (the filters are then cleared).
+/// `f(count, ok, ctx)` runs on a later frame; read the ids with `lobbyAt(0..count)` before the next search.
+/// `ok` is false on failure or when Steam is absent. Public and friends-only lobbies show up.
+pub fn findLobbies(f: fn(int, bool, u64), ctx: u64) {
+    let slot = reqNew(f as ptr, ctx);
+    if fake() {
+        flSearch();
+        fakeLog(`findLobbies: {FFOUND_N} found`);
+        let call = fakeCall();
+        await(call, onLobbyList, slot);
+        let p = fbuf();
+        wrU32(p, lo(O_LS_COUNT), u32(FFOUND_N));
+        let bytes: []u8 = @slice(p, lo(O_LS_SIZE));
+        fakeResult(call, CB_LOBBY_LIST, bytes);
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_RequestLobbyList") as fn(ptr): u64;
+    await(m(mm()), onLobbyList, slot);
+}
+
+/// Lobby number `i` of the last search (below the `count` `findLobbies` gave). 0 when out of range or Steam is absent.
+pub fn lobbyAt(i: int): u64 {
+    if i < 0 {
+        return u64(0);
+    }
+    if fake() {
+        if i >= FFOUND_N {
+            return u64(0);
+        }
+        return FFOUND[i];
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_GetLobbyByIndex") as fn(ptr, i32): u64;
+    return m(mm(), i32(i));
+}
+
+/// Search filter for the next `findLobbies`: lobby data `key` compared with `value` by `cmp` (`CMP_EQUAL`, ...).
+/// Text over 1023 bytes is refused.
+pub fn filterString(key: string, value: string, cmp: int) {
+    if fake() {
+        flAddFilter(0, key, value, 0, cmp);
+        return;
+    }
+    let k = cs(key, 0);
+    let v = cs(value, 1);
+    if k as int == 0 || v as int == 0 {
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_AddRequestLobbyListStringFilter") as fn(ptr, ptr, ptr, i32);
+    m(mm(), k, v, i32(cmp));
+}
+
+/// Search filter for the next `findLobbies`: lobby data `key` read as a whole number, compared with `value` by `cmp`.
+pub fn filterNumber(key: string, value: int, cmp: int) {
+    if fake() {
+        flAddFilter(1, key, "", value, cmp);
+        return;
+    }
+    let k = cs(key, 0);
+    if k as int == 0 {
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_AddRequestLobbyListNumericalFilter") as fn(ptr, ptr, i32, i32);
+    m(mm(), k, i32(value), i32(cmp));
+}
+
+/// Search filter for the next `findLobbies`: sort by how near lobby data `key` (a number) is to `value`.
+pub fn filterNear(key: string, value: int) {
+    if fake() {
+        flAddFilter(2, key, "", value, CMP_EQUAL);
+        return;
+    }
+    let k = cs(key, 0);
+    if k as int == 0 {
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_AddRequestLobbyListNearValueFilter") as fn(ptr, ptr, i32);
+    m(mm(), k, i32(value));
+}
+
+/// Search filter for the next `findLobbies`: only lobbies with at least `n` free slots.
+pub fn filterSlots(n: int) {
+    if fake() {
+        F_SLOTS = n;
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_AddRequestLobbyListFilterSlotsAvailable") as fn(ptr, i32);
+    m(mm(), i32(n));
+}
+
+/// Search filter for the next `findLobbies`: how far to look (`DISTANCE_CLOSE` to `DISTANCE_WORLDWIDE`).
+/// Fake mode has one region, so it changes nothing there.
+pub fn filterDistance(d: int) {
+    if fake() {
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_AddRequestLobbyListDistanceFilter") as fn(ptr, i32);
+    m(mm(), i32(d));
+}
+
+/// Search filter for the next `findLobbies`: at most `n` results.
+pub fn filterCount(n: int) {
+    if fake() {
+        F_COUNT = n;
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_AddRequestLobbyListResultCountFilter") as fn(ptr, i32);
+    m(mm(), i32(n));
+}
+
+/// Search filter for the next `findLobbies`: only lobbies the members of `lobby` could all join.
+/// Fake mode has no block lists, so it changes nothing there.
+pub fn filterCompatible(lobby: u64) {
+    if fake() {
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_AddRequestLobbyListCompatibleMembersFilter") as fn(ptr, u64);
+    m(mm(), lobby);
+}
+
+// ---- join and leave ----
+
+fn onLobbyEnter(p: ptr, n: i32, failed: bool, ctx: u64) {
+    let r = reqTake(ctx);
+    if !r.used {
+        return;
+    }
+    let f = r.f as fn(u64, int, bool, u64);
+    if failed {
+        f(u64(0), ENTER_ERROR, false, r.ctx);
+        return;
+    }
+    f(rdU64(p, lo(O_EN_LOBBY)), int(rdU32(p, lo(O_EN_RESP))), rdBool(p, lo(O_EN_LOCKED)), r.ctx);
+}
+
+/// Join `lobby`. `f(lobby, response, locked, ctx)` runs on a later frame; `response` is `ENTER_SUCCESS` or the reason
+/// it failed (`ENTER_FULL`, `ENTER_DOESNT_EXIST`, ...), `locked` says the lobby is closed to others. Steam absent: `ENTER_ERROR`.
+pub fn joinLobby(lobby: u64, f: fn(u64, int, bool, u64), ctx: u64) {
+    let slot = reqNew(f as ptr, ctx);
+    if fake() {
+        fakeLog(`joinLobby {lobby}`);
+        let call = fakeCall();
+        await(call, onLobbyEnter, slot);
+        let resp = flJoin(lobby, FAKE_USER, false);
+        let at = flFind(lobby);
+        let p = fbuf();
+        wrU64(p, lo(O_EN_LOBBY), lobby);
+        wrBool(p, lo(O_EN_LOCKED), at >= 0 && !FLOBS[at].joinable);
+        wrU32(p, lo(O_EN_RESP), u32(resp));
+        let bytes: []u8 = @slice(p, lo(O_EN_SIZE));
+        fakeResult(call, CB_LOBBY_ENTER, bytes);
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_JoinLobby") as fn(ptr, u64): u64;
+    await(m(mm(), lobby), onLobbyEnter, slot);
+}
+
+/// Leave `lobby`. The owner's seat passes to another member. Does nothing when Steam is absent.
+pub fn leaveLobby(lobby: u64) {
+    if fake() {
+        fakeLog(`leaveLobby {lobby}`);
+        flLeave(lobby, FAKE_USER, u32(0));
+        return;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_LeaveLobby") as fn(ptr, u64);
+    m(mm(), lobby);
+}
+
+// ---- members and settings ----
+
+/// How many members `lobby` has (you included once you joined). 0 for an unknown lobby or when Steam is absent.
+pub fn memberCount(lobby: u64): int {
+    if fake() {
+        return flMemberCount(lobby);
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_GetNumLobbyMembers") as fn(ptr, u64): i32;
+    return int(m(mm(), lobby));
+}
+
+/// Member number `i` of `lobby`, in join order. 0 when out of range or Steam is absent. Only works for lobbies you are in.
+pub fn memberAt(lobby: u64, i: int): u64 {
+    if i < 0 {
+        return u64(0);
+    }
+    if fake() {
+        return flMemberAt(lobby, i);
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex") as fn(ptr, u64, i32): u64;
+    return m(mm(), lobby, i32(i));
+}
+
+/// The member limit of `lobby`; 0 when unknown or Steam is absent.
+pub fn memberLimit(lobby: u64): int {
+    if fake() {
+        let at = flFind(lobby);
+        if at < 0 {
+            return 0;
+        }
+        return FLOBS[at].max;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_GetLobbyMemberLimit") as fn(ptr, u64): i32;
+    return int(m(mm(), lobby));
+}
+
+/// Change the member limit (owner only, 1 to 250, not below the current member count). False otherwise.
+pub fn setMemberLimit(lobby: u64, max: int): bool {
+    if fake() {
+        let at = flFind(lobby);
+        if at < 0 || FLOBS[at].owner != FAKE_USER || max < 1 || max > FL_MAX || max < flMemberCount(lobby) {
+            return false;
+        }
+        FLOBS[at].max = max;
+        return true;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_SetLobbyMemberLimit") as fn(ptr, u64, i32): bool;
+    return m(mm(), lobby, i32(max));
+}
+
+/// The owner of `lobby`; 0 when unknown or Steam is absent.
+pub fn lobbyOwner(lobby: u64): u64 {
+    if fake() {
+        let at = flFind(lobby);
+        if at < 0 {
+            return u64(0);
+        }
+        return FLOBS[at].owner;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_GetLobbyOwner") as fn(ptr, u64): u64;
+    return m(mm(), lobby);
+}
+
+/// Hand the lobby to member `user` (owner only). False otherwise.
+pub fn setLobbyOwner(lobby: u64, user: u64): bool {
+    if fake() {
+        let at = flFind(lobby);
+        if at < 0 || FLOBS[at].owner != FAKE_USER || !flIsMember(lobby, user) {
+            return false;
+        }
+        FLOBS[at].owner = user;
+        return true;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_SetLobbyOwner") as fn(ptr, u64, u64): bool;
+    return m(mm(), lobby, user);
+}
+
+/// Change the lobby type (owner only; `LOBBY_PRIVATE` to `LOBBY_INVISIBLE`). False otherwise.
+pub fn setLobbyType(lobby: u64, kind: int): bool {
+    if fake() {
+        let at = flFind(lobby);
+        if at < 0 || FLOBS[at].owner != FAKE_USER || kind < 0 || kind > 3 {
+            return false;
+        }
+        FLOBS[at].kind = kind;
+        return true;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_SetLobbyType") as fn(ptr, u64, i32): bool;
+    return m(mm(), lobby, i32(kind));
+}
+
+/// Open or close `lobby` to new members (owner only). A closed lobby refuses everyone, invited or not. False otherwise.
+pub fn setJoinable(lobby: u64, on: bool): bool {
+    if fake() {
+        let at = flFind(lobby);
+        if at < 0 || FLOBS[at].owner != FAKE_USER {
+            return false;
+        }
+        FLOBS[at].joinable = on;
+        return true;
+    }
+    let m = method("SteamMatchmaking", "SteamAPI_ISteamMatchmaking_SetLobbyJoinable") as fn(ptr, u64, bool): bool;
+    return m(mm(), lobby, on);
+}

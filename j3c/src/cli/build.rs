@@ -70,26 +70,80 @@ pub(super) fn size_cmd(rest: &[String]) -> i32 {
         println!("no symbols (stripped): build without --release to see code per module");
         return 0;
     }
+    // A symbol cannot be split back into module and name (both can hold `_`), so each one is
+    // looked up in the program that the same sources make.
+    let owners = match compile_user(path) {
+        Ok((prog, _)) => symbol_owners(&prog),
+        Err(e) => {
+            print_fail(&e);
+            return 1;
+        }
+    };
     let mut groups: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     for (size, name) in &funcs {
-        let mut parts = name.split('_').skip(1);
-        let first = parts.next().unwrap_or("");
-        let key = if first == "j3" { format!("j3.{}", parts.next().unwrap_or("")) } else { first.to_string() };
-        *groups.entry(key).or_default() += size;
+        let module = owners.get(name).map_or("(not in these sources)", |(m, _)| m.as_str());
+        *groups.entry(module.to_string()).or_default() += size;
     }
     let mut groups: Vec<_> = groups.into_iter().collect();
     groups.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("code per module (stdlib is j3.*; names are approximate):");
+    println!("code per module (stdlib modules are j3.*):");
     for (name, size) in groups.iter().take(12) {
         println!("  {size:>9}  {name}");
     }
     funcs.sort_by(|a, b| b.0.cmp(&a.0));
     println!("biggest functions:");
     for (size, name) in funcs.iter().take(15) {
-        let short = name.rsplit_once('_').map(|(a, _)| a).unwrap_or(name);
-        println!("  {size:>9}  {}", short.trim_start_matches("j3_"));
+        let shown = match owners.get(name) {
+            Some((m, label)) => format!("{m}.{label}"),
+            None => name.clone(),
+        };
+        println!("  {size:>9}  {shown}");
     }
     0
+}
+
+/// Linker symbol -> (module, function label) for every function in `prog`, named with the
+/// same `emit::func_c_name` the C and LLVM emitters use. Methods are labelled `Struct.name`.
+pub(super) fn symbol_owners(prog: &compile::Program) -> std::collections::HashMap<String, (String, String)> {
+    let cx = &prog.cx;
+    cx.funcs()
+        .iter()
+        .map(|f| {
+            let module = f.module.iter().map(|p| cx.name_str(*p)).collect::<Vec<_>>().join(".");
+            let name = cx.name_str(f.name);
+            let label = match f.method_of {
+                Some(sid) => format!("{}.{name}", cx.name_str(cx.struct_def(sid).name)),
+                None => name.to_string(),
+            };
+            (emit::func_c_name(cx, f), (module, label))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn size_names_a_function_by_its_module_even_when_both_have_underscores() {
+        let dir = std::env::temp_dir().join(format!("j3-size-owners-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.j3");
+        std::fs::write(
+            &file,
+            "module closure_trace;\n\nfn more_value(x: int): int {\n    return x * 2;\n}\n\nfn main() {\n    more_value(2);\n}\n",
+        )
+        .unwrap();
+        let prog = compile::compile_path(&file).expect("check");
+        let owners = symbol_owners(&prog);
+        let _ = std::fs::remove_dir_all(&dir);
+        let hit = owners
+            .iter()
+            .find(|(sym, _)| sym.starts_with("j3_closure_trace_more_value_"))
+            .unwrap_or_else(|| panic!("no symbol for more_value in {owners:?}"));
+        assert_eq!(hit.1, &("closure_trace".to_string(), "more_value".to_string()));
+    }
 }
 
 pub(super) fn build_cwd() -> i32 {
@@ -279,6 +333,9 @@ pub(super) fn build_samples_err() -> i32 {
 }
 
 pub(super) fn build_loaded(prog: Result<(compile::Program, Option<Manifest>), String>) -> i32 {
+    if let Ok((p, _)) = &prog {
+        print_warnings(p);
+    }
     if !crate::config::compilation_tracking() {
         return build_inner(prog);
     }
@@ -425,6 +482,10 @@ pub(super) fn exit_reason(code: i32) -> String {
 
 pub(super) fn report_run(result: emit::RunResult) -> i32 {
     print!("{}", String::from_utf8_lossy(&result.stdout));
+    if result.status == 0 && !result.stderr.is_empty() {
+        // a clean exit still shows what the program wrote to stderr (logs, fake-mode lines)
+        eprint!("{}", String::from_utf8_lossy(&result.stderr));
+    }
     if result.status != 0 {
         eprintln!("j3c: program exited {}{}", result.status, exit_reason(result.status));
         let err = String::from_utf8_lossy(&result.stderr);

@@ -4,6 +4,8 @@ use crate::span::Span;
 pub enum TokenKind {
     Eof,
     Ident,
+    /// `'outer`, a loop label; `text` keeps the quote.
+    Label,
     Int,
     Float,
     String,
@@ -65,10 +67,20 @@ pub enum TokenKind {
     Slash,
     SlashEq,
     Percent,
+    PercentEq,
+    Pipe,
+    PipeEq,
+    Caret,
+    CaretEq,
+    Tilde,
+    AmpEq,
     Interpolate,
     /// `///` line. `text` is the body, without the slashes or one leading space.
     Doc,
 }
+
+/// Operators a user `fn operator<op>` can overload. Parser error text and the highlighter share it.
+pub const OVERLOADABLE: &[&str] = &["+", "-", "*", "/", "==", "!=", "<", "<=", ">", ">="];
 
 /// Lexer keyword table. Highlighter (`dump-syntax`) iterates this; do not fork a second list.
 pub const KEYWORDS: &[(&str, TokenKind)] = &[
@@ -163,7 +175,11 @@ impl TokenKind {
             | TokenKind::PlusEq
             | TokenKind::MinusEq
             | TokenKind::StarEq
-            | TokenKind::SlashEq => Some("keyword.operator.assignment.j3"),
+            | TokenKind::SlashEq
+            | TokenKind::PercentEq
+            | TokenKind::AmpEq
+            | TokenKind::PipeEq
+            | TokenKind::CaretEq => Some("keyword.operator.assignment.j3"),
             TokenKind::EqEq
             | TokenKind::Ne
             | TokenKind::Lt
@@ -185,7 +201,10 @@ impl TokenKind {
             | TokenKind::DotDot
             | TokenKind::DotDotEq
             | TokenKind::Question
-            | TokenKind::Amp => Some("keyword.operator.j3"),
+            | TokenKind::Amp
+            | TokenKind::Pipe
+            | TokenKind::Caret
+            | TokenKind::Tilde => Some("keyword.operator.j3"),
             _ => None,
         }
     }
@@ -198,6 +217,12 @@ impl TokenKind {
             TokenKind::DotDotEq => Some("..="),
             TokenKind::Question => Some("?"),
             TokenKind::Amp => Some("&"),
+            TokenKind::AmpEq => Some("&="),
+            TokenKind::Pipe => Some("|"),
+            TokenKind::PipeEq => Some("|="),
+            TokenKind::Caret => Some("^"),
+            TokenKind::CaretEq => Some("^="),
+            TokenKind::Tilde => Some("~"),
             TokenKind::Eq => Some("="),
             TokenKind::EqEq => Some("=="),
             TokenKind::Ne => Some("!="),
@@ -217,6 +242,7 @@ impl TokenKind {
             TokenKind::Slash => Some("/"),
             TokenKind::SlashEq => Some("/="),
             TokenKind::Percent => Some("%"),
+            TokenKind::PercentEq => Some("%="),
             _ => None,
         }
     }

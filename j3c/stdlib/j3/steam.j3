@@ -1,0 +1,217 @@
+/// Steamworks for a game: achievements, stats, overlay state and the rest of the Steam API through the
+/// flat C library (`libsteam_api.so`, `steam_api64.dll`), loaded with `sys.dlopen` when the game starts.
+/// Nothing links against Valve code, and a machine without Steam runs the same binary: every call
+/// then does nothing and returns false, 0 or "". `steam.on()` says whether Steam is live.
+///
+///     let st = steam.init(480);                    // your app id; 480 is Valve's Spacewar test app
+///     if st == steam.Status.Restart { sys.exit(0); }   // Steam relaunches the game: exit now
+///     attach(&app);                                // `use j3.steam.game.attach;` pumps callbacks every frame, shuts down at exit
+///
+/// The library is looked up in `$J3_STEAM_LIB` (a full path), then next to the executable, then by its
+/// plain name (the system search path). Android never loads it. Put `steam_appid.txt` with the app id in
+/// the project folder for a dev run; a release build started from Steam does not need it.
+///
+/// Dev fake: in a dev build, `J3_STEAM_FAKE=1` (or `initFake`) runs with no Steam at all: parts keep their
+/// state in memory and print `steam(fake): ...` lines to stderr, and `fakeCallback` / `fakeResult` deliver
+/// callbacks and call results through the same path real ones take. Release builds ignore it.
+///
+/// What links SDL: nothing in `j3.steam` itself. A console program that uses only `j3.steam` links libc and
+/// dlopens the Steam library (checked with `ldd`: no libSDL2). `j3.steam.game` (`attach`, the `App` hooks and the
+/// screenshot capture hook) imports `j3.app` and `j3.game`, so a program that uses it links SDL2 like any game.
+/// Without it, call `frame()` each frame and `shutdown()` at exit, and `setCapture` if you want hooked screenshots.
+///
+/// Main thread only: call everything from the thread that runs the frame loop.
+///
+/// Adding a subsystem (the seam every part uses): add its accessor rows to `buildAccessors` (fns.j3), its
+/// struct fields to `buildLayouts` (pack.j3), call `onCallback` for its callback ids from `registerParts`
+/// below, take a method with `method("SteamUserStats", "SteamAPI_ISteamUserStats_X")` and cast it to
+/// the right `fn` type, start async calls with `await(call, handler, ctx)`, add fake behaviour behind
+/// `fake()`, and register end-of-run work with `onShutdown`.
+
+module j3.steam;
+
+use j3.build;
+use j3.io;
+use j3.io.IoError;
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, same, scratchText };
+
+/// How `init` ended.
+pub enum Status {
+    /// No Steam: the library is missing, Steam is not running, or this is Android. Calls do nothing.
+    Absent,
+    /// Steam is live.
+    Ready,
+    /// Release build started outside Steam: Steam will relaunch the game through the client. Exit now.
+    Restart,
+    /// Fake mode (dev builds only), see the module doc.
+    Fake,
+}
+
+const STATE_ABSENT: int = 0;
+const STATE_READY: int = 1;
+const STATE_RESTART: int = 2;
+const STATE_FAKE: int = 3;
+
+#[singleton]
+let STATE: int = 0;
+#[singleton]
+let PIPE: i32 = 0;
+#[singleton]
+let SET_UP: bool = false;
+#[singleton]
+let DOWNS: []fn();
+#[singleton]
+let DOWN_N: int = 0;
+
+/// Where every part registers its callbacks, once (the first `init`). One line per part.
+fn registerParts() {
+    onCallback(CB_OVERLAY, onOverlay);
+    statsInit();
+    socialInit();
+    appsInit();
+    cloudInit();
+    inputInit2();
+    lobbyInit();
+    netInit();
+}
+
+fn setUp() {
+    if SET_UP {
+        return;
+    }
+    SET_UP = true;
+    layoutInit();
+    registerParts();
+}
+
+fn ready(): bool {
+    return STATE == STATE_READY;
+}
+
+/// How Steam stands now: `Absent` before `init` and after `shutdown`.
+pub fn status(): Status {
+    if STATE == STATE_READY {
+        return Status.Ready;
+    }
+    if STATE == STATE_RESTART {
+        return Status.Restart;
+    }
+    if STATE == STATE_FAKE {
+        return Status.Fake;
+    }
+    return Status.Absent;
+}
+
+/// True when Steam is live or faked: calls do real (or in-memory) work.
+pub fn on(): bool {
+    return STATE == STATE_READY || STATE == STATE_FAKE;
+}
+
+/// Start Steam for app `appId`. In a release build with a non-zero `appId`, a game not started by
+/// Steam gets `Restart`: exit at once and Steam launches it properly. Otherwise `Ready`, or `Absent`
+/// when the library is missing or Steam is not running (the reason goes to stderr). Dev builds with
+/// `J3_STEAM_FAKE=1` get `Fake`. Calling it again returns the current status.
+pub fn init(appId: u32): Status {
+    if STATE != STATE_ABSENT {
+        return status();
+    }
+    if build.DEV && same(sys.env("J3_STEAM_FAKE"), "1") {
+        return initFake(appId);
+    }
+    if !loadLib() {
+        return Status.Absent;
+    }
+    if build.RELEASE && appId != u32(0) {
+        let restart = fnp("SteamAPI_RestartAppIfNecessary") as fn(u32): bool;
+        if restart(appId) {
+            STATE = STATE_RESTART;
+            return Status.Restart;
+        }
+    }
+    if !startSteam() {
+        return Status.Absent;
+    }
+    setUp();
+    bindPump();
+    let manual = fnp("SteamAPI_ManualDispatch_Init") as fn();
+    manual();
+    let pipe = fnp("SteamAPI_GetHSteamPipe") as fn(): i32;
+    PIPE = pipe();
+    STATE = STATE_READY;
+    return Status.Ready;
+}
+
+/// `SteamAPI_InitFlat` (SDK 1.59+; older SDKs only have the header-inline `SteamAPI_Init`). Prints why on failure.
+fn startSteam(): bool {
+    if !hasFn("SteamAPI_InitFlat") {
+        eprint("steam: this libsteam_api has no SteamAPI_InitFlat; ship the one from SDK 1.59 or newer");
+        return false;
+    }
+    {
+        let msg = arena().allocBytes(1024);
+        wrU8(msg, 0, u8(0));
+        let initFlat = fnp("SteamAPI_InitFlat") as fn(ptr): i32;
+        let r = initFlat(msg);
+        if r == 0 {
+            return true;
+        }
+        let n = 0;
+        while n < 1023 && rdU8(msg, n) != u8(0) {
+            n += 1;
+        }
+        let bytes: []u8 = @slice(msg, n);
+        eprint(`steam: init failed ({r}): {bytes as string}`);
+        return false;
+    }
+}
+
+/// Fake mode, dev builds only (`Absent` in release): see the module doc. For tests.
+pub fn initFake(appId: u32): Status {
+    if !build.DEV || STATE != STATE_ABSENT {
+        return status();
+    }
+    setUp();
+    STATE = STATE_FAKE;
+    FAKE_APP = appId;
+    fakeLog(`init app {appId}`);
+    return Status.Fake;
+}
+
+/// Run `f` first thing in `shutdown`, while Steam is still live (e.g. store stats). Runs once per
+/// `init`, in registration order; the list lives for the process.
+pub fn onShutdown(f: fn()) {
+    if DOWN_N >= DOWNS.len {
+        let fresh = arena().alloc::<fn()>(DOWNS.len * 2 + 4);
+        for i in 0..DOWN_N {
+            fresh[i] = DOWNS[i];
+        }
+        DOWNS = fresh;
+    }
+    DOWNS[DOWN_N] = f;
+    DOWN_N += 1;
+}
+
+/// Run the shutdown hooks, pump once more, and close Steam. Safe to call twice or without `init`.
+pub fn shutdown() {
+    if STATE != STATE_READY && STATE != STATE_FAKE {
+        STATE = STATE_ABSENT;
+        return;
+    }
+    for i in 0..DOWN_N {
+        let f = DOWNS[i];
+        f();
+    }
+    frame();
+    if STATE == STATE_READY {
+        let down = fnp("SteamAPI_Shutdown") as fn();
+        down();
+    }
+    STATE = STATE_ABSENT;
+    unbindPump();
+    PEND_N = 0;
+    OVERLAY = false;
+    fakeReset();
+}

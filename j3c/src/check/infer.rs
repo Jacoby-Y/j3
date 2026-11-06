@@ -15,7 +15,7 @@ pub(super) fn infer_omitted_rets(cx: &mut IrCx, mods: &mut [ModData], i: usize) 
     let mut pending: Vec<(FuncId, FnItem)> = Vec::new();
     for it in &items {
         match it {
-            Item::Fn(f) if f.ret.is_none() => {
+            Item::Fn(f) if f.ret.is_none() && f.type_params.is_empty() => {
                 pending.push((mods[i].funcs[&f.name.name], f.clone()));
             }
             Item::Struct(s) => {
@@ -159,6 +159,10 @@ pub(super) fn collect_return_tys(
                 )?;
             }
             parse::Stmt::UseLocal(_) => {}
+            parse::Stmt::Labeled(s) => {
+                let b = parse::Block { span: s.span, stmts: vec![(*s.body).clone()] };
+                collect_return_tys(&b, cx, locals, types, funcs, methods, lib_ns, consts, path, seen)?;
+            }
             parse::Stmt::Match(s) => {
                 for arm in &s.arms {
                     collect_return_tys(
@@ -188,6 +192,11 @@ pub(super) fn peek_ty(
             path,
             expr.span,
             "script type is not available here",
+        )),
+        ExprKind::Closure(_) => Err(CheckError::new(
+            path,
+            expr.span,
+            "a closure's type is not known here; give the `let` or parameter a `closure(..)` type",
         )),
         ExprKind::Int(_) => Ok(cx.common.int),
         ExprKind::Float(_) => Ok(cx.common.float),
@@ -231,11 +240,7 @@ pub(super) fn peek_ty(
             match cx.ty_kind(base_ty) {
                 TyKind::Struct(id) => match field_path(cx, *id, &field.name) {
                     Some(p) => Ok(cx.field_def(*p.last().unwrap()).ty),
-                    None => Err(CheckError::new(
-                        path,
-                        field.span,
-                        format!("no field `{}`", field.name),
-                    )),
+                    None => Err(super::error::no_field(cx, path, field.span, *id, &field.name)),
                 },
                 TyKind::Array { .. } if field.name == "len" => Ok(cx.common.int),
                 TyKind::String | TyKind::Slice { .. } => match field.name.as_str() {
@@ -258,6 +263,37 @@ pub(super) fn peek_ty(
         }
         ExprKind::Call { func, args, .. } => {
             if let ExprKind::Name(n) = &func.kind {
+                if let Some(t) = cx.builtin_named(&n.name).filter(|t| matches!(cx.ty_kind(*t), TyKind::Vec(_))) {
+                    return Ok(t);
+                }
+                if let Some(name) = n.name.strip_prefix('@').filter(|s| parse::syntax::INTRINSIC_SIMD.contains(s)) {
+                    let arg_ty = |cx: &IrCx, i: usize| -> Result<Ty, CheckError> {
+                        let a = args.get(i).ok_or_else(|| CheckError::new(path, expr.span, format!("`@{name}` is missing an argument")))?;
+                        peek_ty(cx, a, locals, types, funcs, methods, lib_ns, consts, path)
+                    };
+                    return match name {
+                        "vsqrt" | "vfloat" => Ok(cx.common.vec4f),
+                        "vint" => Ok(cx.common.vec4i),
+                        "vstore" => Ok(cx.common.void),
+                        "vsum" => {
+                            let t = arg_ty(cx, 0)?;
+                            cx.vec_lane(t).ok_or_else(|| CheckError::new(path, expr.span, "`@vsum` takes a vector"))
+                        }
+                        "vload" => {
+                            let t = arg_ty(cx, 0)?;
+                            let mut t = t;
+                            while let Some(inner) = cx.ref_inner(t) {
+                                t = inner;
+                            }
+                            match cx.elem_ty(t) {
+                                Some(e) if e == cx.common.f32 => Ok(cx.common.vec4f),
+                                Some(e) if e == cx.common.i32 => Ok(cx.common.vec4i),
+                                _ => Err(CheckError::new(path, expr.span, "`@vload` takes an `[]f32` or `[]i32`")),
+                            }
+                        }
+                        _ => arg_ty(cx, 0),
+                    };
+                }
                 if args.len() == 1 {
                     if let Some(t) = conv_ty_name(cx, &n.name) {
                         return Ok(t);
@@ -287,14 +323,33 @@ pub(super) fn peek_ty(
                 | parse::BinOp::Sub
                 | parse::BinOp::Mul
                 | parse::BinOp::Div
-                | parse::BinOp::Rem => {
+                | parse::BinOp::Rem
+                | parse::BinOp::Shl
+                | parse::BinOp::Shr
+                | parse::BinOp::BitAnd
+                | parse::BinOp::BitOr
+                | parse::BinOp::BitXor => {
                     if let Some(id) = find_operator(cx, lt, *op, methods) {
                         return match cx.fn_sig(cx.func(id).ty) {
                             Some((_, ret)) => Ok(ret),
                             None => Err(CheckError::new(path, expr.span, "not a function")),
                         };
                     }
-                    let _ = rhs;
+                    if matches!(cx.ty_kind(lt), TyKind::Vec(_)) {
+                        return Ok(lt);
+                    }
+                    if !crate::check::bare_num(rhs) && (lt == cx.common.f32 || lt == cx.common.i32 || crate::check::bare_num(lhs)) {
+                        let rt = peek_ty(cx, rhs, locals, types, funcs, methods, lib_ns, consts, path)?;
+                        if matches!(cx.ty_kind(rt), TyKind::Vec(_)) {
+                            return Ok(rt);
+                        }
+                    }
+                    if crate::check::bare_num(lhs) && !crate::check::bare_num(rhs) {
+                        let rt = peek_ty(cx, rhs, locals, types, funcs, methods, lib_ns, consts, path)?;
+                        if is_float(cx, rt) || matches!(cx.ty_kind(rt), TyKind::Int(_)) {
+                            return Ok(rt);
+                        }
+                    }
                     if is_float(cx, lt) {
                         Ok(lt)
                     } else {
@@ -304,7 +359,7 @@ pub(super) fn peek_ty(
             }
         }
         ExprKind::Unary { op, expr: inner } => match op {
-            parse::UnaryOp::Neg => peek_ty(
+            parse::UnaryOp::Neg | parse::UnaryOp::BitNot => peek_ty(
                 cx, inner, locals, types, funcs, methods, lib_ns, consts, path,
             ),
             parse::UnaryOp::Not => Ok(cx.common.bool),
@@ -346,11 +401,17 @@ pub(super) fn peek_ty(
             }
         }
         ExprKind::Syscall { .. } => Ok(cx.common.int),
-        ExprKind::Atomic { op, .. } => Ok(if *op == crate::ir::op::AtomicOp::Cas {
-            cx.common.bool
-        } else {
-            cx.common.int
-        }),
+        ExprKind::Atomic { op, args, .. } => {
+            use crate::ir::op::AtomicOp;
+            Ok(match op {
+                AtomicOp::Cas => cx.common.bool,
+                AtomicOp::Store => cx.common.int,
+                _ => {
+                    let p = peek_ty(cx, &args[0], locals, types, funcs, methods, lib_ns, consts, path)?;
+                    cx.ref_inner(p).unwrap_or(cx.common.int)
+                }
+            })
+        }
         ExprKind::SizeOf(_) => Ok(cx.common.int),
         ExprKind::UiChoice { .. } => Ok(cx.common.bool),
         ExprKind::SliceFrom { .. } => Err(CheckError::new(
@@ -442,6 +503,7 @@ pub(super) fn conv_ty_name(cx: &IrCx, name: &str) -> Option<Ty> {
         "u16" => cx.common.u16,
         "u32" => cx.common.u32,
         "u64" => cx.common.u64,
+        "f16" => cx.common.f16,
         "f32" => cx.common.f32,
         "f64" | "float" => cx.common.float,
         _ => return None,

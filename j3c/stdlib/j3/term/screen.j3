@@ -1,0 +1,319 @@
+/// A full-screen terminal UI front: raw mode, the alternate screen, a back buffer the app draws into, and a `flush`
+/// that sends only what changed. Linux (on other targets `open` is `Err`).
+///
+///     match screen.Screen.open(&arena) {
+///         Result.Ok(s) {
+///             s.put(2, 1, "hello", style);  s.box(0, 0, 20, 5, style);
+///             s.flush();                    // one write: only cells that differ from the last frame
+///             s.poll(50, &events);          // keys, paste, mouse, focus, and EV_RESIZE
+///             s.close();
+///         }
+///         Result.Err(msg) { ... }
+///     }
+///
+/// Drawing never touches the terminal: `put`, `fill`, `box`, `clear` edit the back buffer (clipped to the screen and the
+/// `clipPush` rect), `flush` diffs it against what the terminal shows. After a resize or the first frame the whole screen
+/// is redrawn. `openFds(inFd, outFd, cols, rows, arena)` runs on pipes (no raw mode unless `inFd` is a tty): the bytes
+/// `flush` writes replay into a `j3.term.grid.Grid` to the same screen, which is how the tests check it.
+///
+/// Exit safety: `open` registers a restore with `sys.onExit`, so the tty is put back (cursor, alt screen, paste/mouse
+/// modes, cooked mode) when the program exits, returns from `main` or panics (the panic message prints after). One real
+/// Screen at a time: a second `open` takes over the registration. Limits: only the exit paths are covered, a fatal
+/// signal (SIGTERM, SIGHUP, SIGKILL) skips the restore, and Ctrl+C arrives as a key because raw mode turns ISIG off.
+/// Resizes are noticed when `poll` runs, so a blocking `poll(ms)` can take up to `ms` to report one. Main thread.
+
+module j3.term.screen;
+
+use j3.memory.Arena;
+use j3.memory.List;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.term.Cell;
+use j3.term.Color;
+use j3.term.COLOR_DEFAULT;
+use j3.term.COLOR_PALETTE;
+use j3.term.Style;
+use j3.term.decodeUtf8;
+use j3.term.pushUtf8;
+use j3.term.input.Decoder;
+use j3.term.input.Event;
+use j3.term.input.EV_PASTE;
+use j3.term.tty;
+use j3.term.tty.Raw;
+use j3.term.width.cpWidth;
+use j3.text.Text;
+
+/// `Event.kind` of a resize seen by `poll`: `x` is the new column count, `y` the rows. (`j3.term.input` uses 1 to 4.)
+pub const EV_RESIZE = 5;
+const MAX_CLIPS = 16;
+const EINTR = 4;
+const EAGAIN = 11;
+
+/// What the exit hook needs to put the terminal back (a copy, so it does not depend on where the `Screen` lives).
+struct Restore {
+    active: bool;
+    outFd: int;
+    pid: int;
+    mouse: bool;
+    raw: Raw;
+}
+
+#[singleton]
+let ACTIVE: Restore;
+
+fn writeAll(fd: int, p: ptr, n: int): bool {
+    let off = 0;
+    while off < n {
+        let r = sys.write(fd, (p as int + off) as ptr, n - off);
+        if r == 0 - EINTR {
+            continue;
+        }
+        if r == 0 - EAGAIN {
+            let pfd: [2]i32 = [i32(fd), i32(sys.POLLOUT)];
+            if sys.pollFds(&pfd[0] as ptr, 1, 1000) <= 0 {
+                return false;
+            }
+            continue;
+        }
+        if r <= 0 {
+            return false;
+        }
+        off += r;
+    }
+    return true;
+}
+
+/// Write ESC followed by `s` (which holds no ESC).
+fn escOut(fd: int, s: string) {
+    let e: [1]u8 = [27];
+    writeAll(fd, &e[0] as ptr, 1);
+    writeAll(fd, s.ptr as ptr, s.len);
+}
+
+/// Undo what `open` and `enableMouse` did, in reverse. Idempotent; a forked child that exits does nothing.
+fn restoreActive() {
+    if !ACTIVE.active || ACTIVE.pid != sys.getpid() {
+        return;
+    }
+    ACTIVE.active = false;
+    let fd = ACTIVE.outFd;
+    if ACTIVE.mouse {
+        escOut(fd, "[?1006l");
+        escOut(fd, "[?1002l");
+        escOut(fd, "[?1000l");
+    }
+    escOut(fd, "[?2004l");
+    escOut(fd, "[0m");
+    escOut(fd, "[?25h");
+    escOut(fd, "[?1049l");
+    ACTIVE.raw.leave();
+}
+
+fn exitHook() {
+    restoreActive();
+}
+
+pub struct Screen {
+    inFd: int;
+    outFd: int;
+    ncols: int;
+    nrows: int;
+    /// Cells allocated per buffer (a resize within it does not allocate).
+    cap: int;
+    /// What the terminal shows, and what the app drew.
+    front: []Cell;
+    back: []Cell;
+    /// Redraw everything on the next flush.
+    full: bool;
+    /// Clip rect `[cx0, cx1) x [cy0, cy1)` and the saved rects under it.
+    cx0: int;
+    cy0: int;
+    cx1: int;
+    cy1: int;
+    clips: []int;
+    nclips: int;
+    /// Where the app wants the cursor.
+    curX: int;
+    curY: int;
+    curVis: bool;
+    /// What the terminal is known to be doing: pen, cursor position (when `posKnown`), cursor visibility.
+    pen: Style;
+    posX: int;
+    posY: int;
+    posKnown: bool;
+    termVis: bool;
+    mouse: bool;
+    closed: bool;
+    /// Input ended (EOF on `inFd`).
+    eof: bool;
+    /// An event was held back (after a paste); the next `poll` does not wait.
+    backlog: bool;
+    isTty: bool;
+    out: Text;
+    dec: Decoder;
+    inBuf: []u8;
+    /// Bytes the last `flush` wrote.
+    lastBytes: int;
+    arena: &Arena;
+
+    /// The real terminal: stdin and stdout, at the terminal's size (80x24 when it cannot say).
+    fn open(arena: &Arena): Result<Screen, string> {
+        let cols = 80;
+        let rows = 24;
+        match tty.size(1) {
+            Option.Some(sz) { cols = sz.cols; rows = sz.rows; }
+            Option.None { }
+        }
+        return Screen.openFds(0, 1, cols, rows, arena);
+    }
+
+    /// Read keys from `inFd`, write frames to `outFd`, `cols` x `rows` cells. Raw mode only when `inFd` is a tty.
+    /// `Err` when raw mode fails or the target has no terminal support.
+    fn openFds(inFd: int, outFd: int, cols: int, rows: int, arena: &Arena): Result<Screen, string> {
+        if sys.PLATFORM != sys.PLATFORM_LINUX {
+            return Result.Err("terminal UI needs Linux");
+        }
+        let c = if cols < 1 { 1 } else { cols };
+        let r = if rows < 1 { 1 } else { rows };
+        let blank = Cell.blank(Style.plain());
+        let s = Screen {
+            inFd: inFd, outFd: outFd, ncols: c, nrows: r, cap: c * r,
+            front: arena.alloc::<Cell>(c * r), back: arena.alloc::<Cell>(c * r),
+            full: true, cx0: 0, cy0: 0, cx1: c, cy1: r, clips: arena.alloc::<int>(MAX_CLIPS * 4), nclips: 0,
+            curX: 0, curY: 0, curVis: false,
+            pen: Style.plain(), posX: 0, posY: 0, posKnown: false, termVis: false,
+            mouse: false, closed: false, eof: false, backlog: false, isTty: false,
+            out: Text.new(arena), dec: Decoder.new(arena), inBuf: arena.alloc::<u8>(4096),
+            lastBytes: 0, arena: arena,
+        };
+        for i in 0..c * r {
+            s.front[i] = blank;
+            s.back[i] = blank;
+        }
+        let raw = Raw { fd: inFd, saved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], active: false };
+        if tty.isTty(inFd) {
+            match Raw.enter(inFd) {
+                Result.Ok(rw) { raw = rw; s.isTty = true; }
+                Result.Err(msg) { return Result.Err(msg); }
+            }
+        }
+        restoreActive();
+        ACTIVE.active = true;
+        ACTIVE.outFd = outFd;
+        ACTIVE.pid = sys.getpid();
+        ACTIVE.mouse = false;
+        ACTIVE.raw = raw;
+        sys.onExit(exitHook);
+        escOut(outFd, "[?1049h");
+        escOut(outFd, "[?25l");
+        escOut(outFd, "[?2004h");
+        return Result.Ok(s);
+    }
+
+    /// Report mouse clicks, drags and wheel (SGR encoding) as `EV_MOUSE` events. Undone by `close`.
+    fn enableMouse(this: &Screen) {
+        if this.closed || this.mouse {
+            return;
+        }
+        this.mouse = true;
+        ACTIVE.mouse = true;
+        escOut(this.outFd, "[?1000h");
+        escOut(this.outFd, "[?1002h");
+        escOut(this.outFd, "[?1006h");
+    }
+
+    /// Put the terminal back: mouse and paste modes off, cursor shown, main screen, cooked mode. Idempotent.
+    fn close(this: &Screen) {
+        if this.closed {
+            return;
+        }
+        this.closed = true;
+        restoreActive();
+    }
+
+    fn cols(this: &Screen): int {
+        return this.ncols;
+    }
+
+    fn rows(this: &Screen): int {
+        return this.nrows;
+    }
+
+    /// The cell the app drew at `(x, y)` (blank outside the screen).
+    fn cell(this: &Screen, x: int, y: int): Cell {
+        if x < 0 || y < 0 || x >= this.ncols || y >= this.nrows {
+            return Cell.blank(Style.plain());
+        }
+        return this.back[y * this.ncols + x];
+    }
+
+    /// Change the screen size: both buffers blank, the clip reset, the next flush a full redraw. `poll` calls it when
+    /// the terminal's size changed; call it directly for pipes. Storage grows only past the largest size so far.
+    fn resize(this: &Screen, cols: int, rows: int) {
+        let c = if cols < 1 { 1 } else { cols };
+        let r = if rows < 1 { 1 } else { rows };
+        if c * r > this.cap {
+            this.cap = c * r;
+            this.front = this.arena.alloc::<Cell>(this.cap);
+            this.back = this.arena.alloc::<Cell>(this.cap);
+        }
+        this.ncols = c;
+        this.nrows = r;
+        let blank = Cell.blank(Style.plain());
+        for i in 0..c * r {
+            this.front[i] = blank;
+            this.back[i] = blank;
+        }
+        this.cx0 = 0;
+        this.cy0 = 0;
+        this.cx1 = c;
+        this.cy1 = r;
+        this.nclips = 0;
+        this.full = true;
+        this.posKnown = false;
+    }
+
+    /// Wait up to `ms` for input and append events to `events` (cleared first): keys, paste (its `text` is valid until
+    /// the next `poll`, and a paste is the last event of its call), mouse, focus, and `EV_RESIZE` when the terminal's
+    /// size changed (the screen is already resized; redraw before `flush`). Returns the event count. Input at
+    /// end-of-file sets `eof`.
+    fn poll(this: &Screen, ms: int, events: &List<Event>): int {
+        events.len = 0;
+        let wait = ms;
+        if this.backlog {
+            this.backlog = false;
+            wait = 0;
+        }
+        match tty.size(this.outFd) {
+            Option.Some(sz) {
+                if sz.cols != this.ncols || sz.rows != this.nrows {
+                    this.resize(sz.cols, sz.rows);
+                    events.push(Event { kind: EV_RESIZE, x: sz.cols, y: sz.rows });
+                    wait = 0;
+                }
+            }
+            Option.None { }
+        }
+        if !this.eof {
+            let n = tty.readFd(this.inFd, this.inBuf, wait);
+            let now = sys.monotonicMs();
+            if n < 0 {
+                this.eof = true;
+            }
+            if n > 0 {
+                this.dec.feed(this.inBuf[0..n], now);
+            }
+        }
+        let ev = Event {};
+        let now = sys.monotonicMs();
+        while this.dec.next(now, &ev) {
+            events.push(ev);
+            if ev.kind == EV_PASTE {
+                this.backlog = true;
+                break;
+            }
+        }
+        return events.len;
+    }
+}

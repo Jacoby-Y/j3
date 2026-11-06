@@ -1,0 +1,155 @@
+// Part of j3.ui.a11y; Actions and the action inbox. The module doc and `use`s are in ../a11y.j3.
+module j3.ui.a11y;
+
+/// Whether a modal dialog is open and `id` is not in it (or an overlay above it).
+fn inert(d: &Dom, id: int): bool {
+    return !dom.allowedByModal(d, id);
+}
+
+/// `A_*` bits: what a user can do to `id` (0 for a disabled, hidden or inert node).
+pub fn actions(d: &Dom, id: int): int {
+    id = d.resolve(id);
+    if id == STALE { return 0; }
+    if !isFocusable(d, id) || inert(d, id) {
+        return 0;
+    }
+    let n = &d.nodes.items[id];
+    let a = A_FOCUS;
+    if dom.isField(d, id) || typeIs(d, id, d.vRange) {
+        a += A_SET;
+    } else {
+        a += A_CLICK;
+    }
+    return a;
+}
+
+/// Do `act` to `id` on the next frame (call between frames): focus it, activate it (focus and Enter, which
+/// clicks a button, flips a checkbox, opens a select), or set a slider to `num` / a text box to `text`.
+/// False when it is not offered (`actions`).
+pub fn perform(d: &Dom, id: int, act: int, num: f32, text: string): bool {
+    id = d.resolve(id);
+    if id == STALE || (actions(d, id) / act) % 2 == 0 {
+        return false;
+    }
+    let n = &d.nodes.items[id];
+    if act == A_FOCUS {
+        // a screen reader moves focus like the keyboard: the ring shows (`:focus-visible`)
+        d.setKeyboard(true);
+        d.focusNode(id);
+    } else if act == A_CLICK {
+        d.setKeyboard(true);
+        d.focusNode(id);
+        d.simKeys("", "Enter");
+    } else if typeIs(d, id, d.vRange) {
+        dom.aNote(d, dom.EV_VALUE, id);
+        n.value = num;
+        if num < n.attrMin { n.value = n.attrMin; }
+        if num > n.attrMax { n.value = n.attrMax; }
+        n.chg = d.frame + 1;
+    } else {
+        let e = &d.eds.items[d.claim(id)];
+        e.set(text);
+        n.sval = e.str();
+        n.chg = d.frame + 1;
+        dom.aNote(d, dom.EV_VALUE, id);
+    }
+    return true;
+}
+
+/// Actions posted by another thread (the AT bridge) for the main thread to `drain`. `post` is the only call that is safe off the main thread.
+pub struct Inbox {
+    m: Mutex;
+    d: &Dom;
+    n: int;
+    cap: int;
+    ids: []int;
+    acts: []int;
+    nums: []f32;
+    lens: []int;
+    texts: []u8;
+    /// Called (main thread, lock not held) before each action runs; see `onAction`.
+    hook: fn(ptr);
+    harg: ptr;
+}
+
+fn noHook(p: ptr) {}
+
+/// Run `f(arg)` before each action `drain` performs (the inbox is unlocked, so `f` may `post`). For a bridge that mirrors its queue, and tests.
+pub fn onAction(ib: &Inbox, f: fn(ptr), arg: ptr) {
+    ib.hook = f;
+    ib.harg = arg;
+}
+
+const INBOX_TEXT: int = 256;
+
+/// An inbox for `cap` pending actions, in `mem` (which must outlive the bridge thread).
+pub fn inbox(mem: &Arena, d: &Dom, cap: int): &Inbox {
+    // the arena does not align: a mutex (a futex word) on an odd address aborts the process
+    mem.allocBytes((8 - mem.used % 8) % 8);
+    let slot = mem.alloc::<Inbox>(1);
+    slot[0] = Inbox {
+        m: Mutex {},
+        d: d,
+        n: 0,
+        cap: cap,
+        ids: mem.alloc::<int>(cap),
+        acts: mem.alloc::<int>(cap),
+        nums: mem.alloc::<f32>(cap),
+        lens: mem.alloc::<int>(cap),
+        texts: mem.alloc::<u8>(cap * INBOX_TEXT),
+        hook: noHook,
+        harg: 0 as ptr,
+    };
+    return &slot[0];
+}
+
+/// Queue `perform(d, h, act, num, text)` (text cut at 256 bytes) and wake the loop (`Dom.requestFrame`). Any thread. False when full.
+pub fn post(ib: &Inbox, h: int, act: int, num: f32, text: string): bool {
+    ib.m.lock();
+    if ib.n >= ib.cap {
+        ib.m.unlock();
+        return false;
+    }
+    let k = ib.n;
+    let len = if text.len > INBOX_TEXT { INBOX_TEXT } else { text.len };
+    ib.ids[k] = h;
+    ib.acts[k] = act;
+    ib.nums[k] = num;
+    ib.lens[k] = len;
+    for i in 0..len {
+        ib.texts[k * INBOX_TEXT + i] = text[i];
+    }
+    ib.n = k + 1;
+    ib.m.unlock();
+    ib.d.requestFrame();
+    return true;
+}
+
+/// Run the posted actions in order (main thread, between frames; `mem` holds the text copies). How many were taken.
+/// The queue is copied out and unlocked first, so an action (or `onAction` hook) can post and the poster is never blocked while they run.
+pub fn drain(ib: &Inbox, mem: &Arena): int {
+    ib.m.lock();
+    let n = ib.n;
+    let ids = mem.alloc::<int>(n);
+    let acts = mem.alloc::<int>(n);
+    let nums = mem.alloc::<f32>(n);
+    let texts = mem.alloc::<string>(n);
+    for k in 0..n {
+        let txt = Text.new(mem);
+        for i in 0..ib.lens[k] {
+            txt.push(ib.texts[k * INBOX_TEXT + i]);
+        }
+        ids[k] = ib.ids[k];
+        acts[k] = ib.acts[k];
+        nums[k] = ib.nums[k];
+        texts[k] = txt.str();
+    }
+    ib.n = 0;
+    ib.m.unlock();
+    for k in 0..n {
+        let f = ib.hook;
+        f(ib.harg);
+        perform(ib.d, ids[k], acts[k], nums[k], texts[k]);
+    }
+    return n;
+}

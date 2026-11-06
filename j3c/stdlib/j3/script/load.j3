@@ -1,0 +1,217 @@
+// Part of j3.script (Vm script loading, linking, parsing, hot reload); the module doc and `use`s are in ../script.j3. `Vm` methods in an `extend Vm` block.
+module j3.script;
+
+extend Vm {
+    /// Load `target/j3s/<script>.j3sb` for a script path like `scripts/door.j3s`, once.
+    fn loadScript(this: &Vm, script: string): int {
+        for i in 0..this.loaded {
+            if same(this.modules[i].path, script) { return i; }
+        }
+        let text = this.bytecodePath(script);
+        return this.load(text);
+    }
+
+    fn bytecodePath(this: &Vm, script: string): string {
+        let prefix = "target/j3s/";
+        let stem = script.len;
+        if stem > 4 && same(script[stem - 4..stem], ".j3s") { stem -= 4; }
+        let bytes = this.arena.alloc::<u8>(prefix.len + stem + 5);
+        copyBytes(bytes.ptr as int, prefix.ptr as int, prefix.len);
+        copyBytes(bytes.ptr as int + prefix.len, script.ptr as int, stem);
+        let tail = ".j3sb";
+        copyBytes(bytes.ptr as int + prefix.len + stem, tail.ptr as int, 5);
+        return bytes as string;
+    }
+
+    /// Read a compiled script, and the scripts it calls into. The path is relative to the
+    /// working directory (`J3_ROOT` under `j3c run`).
+    fn load(this: &Vm, path: string): int {
+        if this.loaded >= this.modules.len { panic("script: module table full"); }
+        let m = this.parse(readFile(this.arena, path), path);
+        for i in 0..this.loaded {
+            if same(this.modules[i].path, m.path) { return i; }
+        }
+        let id = this.loaded;
+        this.modules[id] = m;
+        this.loaded += 1;
+        this.link(id, this.arena.alloc::<Global>(0));
+        return id;
+    }
+
+    /// Resolve a module's shared values, constants, and local calls to addresses. Globals
+    /// whose key is in `keep` keep their current data (a live swap).
+    fn link(this: &Vm, id: int, keep: []Global) {
+        let m = &this.modules[id];
+        for g in 0..m.globals.len {
+            for k in 0..keep.len {
+                if keep[k].key == m.globals[g].key && keep[k].size == m.globals[g].size {
+                    m.globals[g].data = keep[k].data;
+                }
+            }
+        }
+        for f in 0..m.functions.len {
+            let fun = &m.functions[f];
+            fun.owner = id;
+            for pc in 0..fun.code.len {
+                let ins = &fun.code[pc];
+                if ins.op == GLOBAL {
+                    ins.op = CONST;
+                    ins.imm = m.globals[ins.imm as int].data as int as u64;
+                } else if ins.op == STR || ins.op == APP_LIT {
+                    let constant = m.constants[ins.imm as int];
+                    ins.imm = constant.ptr as int as u64;
+                    ins.b = constant.len as u32;
+                }
+            }
+            for c in 0..fun.calls.len {
+                let site = &fun.calls[c];
+                if site.kind == CALL_LOCAL {
+                    site.target = &m.functions[site.index as int] as ptr;
+                    site.linked = true;
+                } else if site.kind == CALL_NATIVE {
+                    let t = this.thunk(site.key);
+                    if t >= 0 {
+                        site.thunk = this.thunkSlots[t].call;
+                        site.linked = true;
+                    }
+                }
+            }
+            this.addFunction(fun);
+        }
+    }
+
+    fn parse(this: &Vm, file: []u8, path: string): Module {
+        let r = Reader { base: file.ptr as int, at: file.ptr as int, end: file.ptr as int + file.len };
+        if file.len < 8 || !same(file[0..4] as string, "J3SB") { panic("script: not a .j3sb file"); }
+        r.at += 4;
+        if r.u16() as int != VERSION { panic("script: bytecode version differs; rerun j3c"); }
+        r.u16();
+        let layoutHash = r.u64();
+        let signatureHash = r.u64();
+        let name = r.text();
+        let scriptPath = r.text();
+        let instanceSize = r.u32() as int;
+        let propCount = r.u32() as int;
+        let fields = this.arena.alloc::<Field>(r.u32() as int);
+        for i in 0..fields.len {
+            fields[i] = Field { name: r.text(), offset: r.u32() as int, size: r.u32() as int,
+                                defaultBytes: r.bytes(), defaultConst: r.u32() as int };
+        }
+        let globals = this.arena.alloc::<Global>(r.u32() as int);
+        let inits = this.arena.alloc::<[]u8>(globals.len);
+        let initConsts = this.arena.alloc::<int>(globals.len);
+        for i in 0..globals.len {
+            let key = r.u64();
+            let globalName = r.text();
+            let size = r.u32() as int;
+            inits[i] = r.bytes();
+            initConsts[i] = r.u32() as int;
+            let data = alignedAlloc(this.arena, size);
+            clearBytes(data as int, size);
+            copyBytes(data as int, inits[i].ptr as int, inits[i].len);
+            globals[i] = Global { key: key, name: globalName, data: data, size: size };
+        }
+        let constants = this.arena.alloc::<[]u8>(r.u32() as int);
+        for i in 0..constants.len { constants[i] = r.bytes(); }
+        for i in 0..globals.len {
+            if initConsts[i] != NO_REG as int {
+                st64(globals[i].data as int, constants[initConsts[i]].ptr as int as u64);
+            }
+        }
+        let natives = this.arena.alloc::<Native>(r.u32() as int);
+        for i in 0..natives.len { natives[i] = Native { key: r.u64(), name: r.text() }; }
+        let deps = r.u32() as int;
+        for i in 0..deps { this.loadScript(r.text()); }
+        let functions = this.arena.alloc::<Function>(r.u32() as int);
+        for i in 0..functions.len { functions[i] = this.readFunction(&r); }
+        return Module { name: name, path: scriptPath, layoutHash: layoutHash,
+            signatureHash: signatureHash, instanceSize: instanceSize, propCount: propCount,
+            fields: fields, globals: globals, constants: constants, natives: natives,
+            functions: functions };
+    }
+
+    fn readFunction(this: &Vm, r: &Reader): Function {
+        let key = r.u64();
+        let name = r.text();
+        let signature = r.text();
+        let public = r.u32() != 0;
+        let frameSize = r.u32() as int;
+        let regs = r.u32() as int;
+        let retSize = r.u32() as int;
+        let retAggregate = r.u32() != 0;
+        let params = this.arena.alloc::<Param>(r.u32() as int);
+        for i in 0..params.len {
+            params[i] = Param { reg: r.u32(), offset: r.u32(), size: r.u32(), load: r.u32() };
+        }
+        let calls = this.arena.alloc::<CallSite>(r.u32() as int);
+        for i in 0..calls.len {
+            let kind = r.u32();
+            let callKey = r.u64();
+            let index = r.u32();
+            let callRet = r.u32() as int;
+            let retLoad = r.u32();
+            let aggregate = r.u32() != 0;
+            let args = this.arena.alloc::<CallArg>(r.u32() as int);
+            let argBytes = 0;
+            for j in 0..args.len {
+                args[j] = CallArg { reg: r.u32(), size: r.u32(), aggregate: r.u32() };
+                argBytes += (args[j].size as int + 7) / 8 * 8;
+            }
+            calls[i] = CallSite { kind: kind, key: callKey, index: index, retSize: callRet,
+                retLoad: retLoad, retAggregate: aggregate, args: args,
+                argBytes: argBytes + (callRet + 7) / 8 * 8 + 8, target: 0 as ptr,
+                thunk: missingThunk, linked: false };
+        }
+        let count = r.u32() as int;
+        r.at = r.base + (r.at - r.base + 7) / 8 * 8;
+        let code: []Instr = @slice(alignedAlloc(this.arena, count * INSTR_BYTES), count);
+        if r.at + count * INSTR_BYTES > r.end { panic("script: truncated bytecode"); }
+        copyBytes(code.ptr as int, r.at, count * INSTR_BYTES);
+        r.at += count * INSTR_BYTES;
+        return Function { key: key, name: name, signature: signature, public: public, owner: 0,
+            frameSize: frameSize, regs: regs, retSize: retSize, retAggregate: retAggregate,
+            params: params, calls: calls, code: code };
+    }
+
+    /// Reload every module whose `.j3sb` changed and kept its layout. Instances and
+    /// `shared` values stay. A module whose layout changed keeps its old code; `j3c run`
+    /// relaunches the program for that.
+    fn reload(this: &Vm) {
+        let count = this.loaded;
+        for i in 0..count {
+            let old = this.modules[i];
+            let file = readFile(this.arena, this.bytecodePath(old.path));
+            let fresh = this.parse(file, old.path);
+            if fresh.layoutHash != old.layoutHash {
+                printLn(`script: {old.path} changed layout; restart to use it`);
+                continue;
+            }
+            this.modules[i] = fresh;
+            clearWords(this.fnSlots.ptr as int, TABLE_SLOTS * @sizeof(FnSlot));
+            for m in 0..this.loaded {
+                let owner = &this.modules[m];
+                for f in 0..owner.functions.len { this.addFunction(&owner.functions[f]); }
+            }
+            this.link(i, old.globals);
+        }
+        for m in 0..this.loaded {
+            let each = &this.modules[m];
+            for f in 0..each.functions.len {
+                for c in 0..each.functions[f].calls.len {
+                    if each.functions[f].calls[c].kind == CALL_SCRIPT {
+                        each.functions[f].calls[c].linked = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check `target/j3s/reload` (j3c bumps it after writing new bytecode) and reload.
+    fn poll(this: &Vm) {
+        if this.loaded == 0 { return; }
+        let stamp = readStamp("target/j3s/reload");
+        if stamp == this.reloadStamp { return; }
+        this.reloadStamp = stamp;
+        this.reload();
+    }
+}

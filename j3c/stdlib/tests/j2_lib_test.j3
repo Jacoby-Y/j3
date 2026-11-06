@@ -1,0 +1,205 @@
+// Tests for the j2 built-in libs (`SCRIPTING.md`'s table): one case per function, wrong-argument
+// errors, callbacks that allocate (run with a collection at every safe point), callback errors,
+// `sort` with a comparator that lies, and the seeded `pick` / `rand` sequence.
+//   timeout 120 j3c run j3c/stdlib/tests/j2_lib_test.j3
+// Panics on the first failed check.
+
+module j2_lib_test;
+
+use j3.io.printLn;
+use j3.j2;
+use j3.j2.{ Vm, Args, Value, Limits };
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+
+struct Case {
+    src: string;
+    want: string;
+}
+
+const OUT: [38]Case = [
+    Case { src: "print(len([1, 2, 3]), len(\"héllo\"), len({ a: 1, b: 2 }), len([]));", want: "3 6 2 0\n" },
+    Case { src: "print(type(nil), type(true), type(1), type(1.5), type(\"s\"), type([]), type({}), type(print), type(fn() {}));",
+        want: "nil bool int float string array table fn fn\n" },
+    Case { src: "print(str(1) + str(2.5) + str(nil), str([1, \"a\"]), str(\"x\") == \"x\");", want: "12.5nil [1, \"a\"] true\n" },
+    Case { src: "print(int(3.9), int(-3.9), int(\"42\"), int(\" -7 \"), int(\"2.5\"), int(\"x\"), int(5));", want: "3 -3 42 -7 2 nil 5\n" },
+    Case { src: "print(float(2), float(\"1.5\"), float(\"1e3\"), float(\"no\"), 7 / float(2));", want: "2.0 1.5 1000.0 nil 3.5\n" },
+    Case { src: "let xs = [1]; push(xs, 2); xs.push(3); print(xs);", want: "[1, 2, 3]\n" },
+    Case { src: "let xs = [1, 2]; print(pop(xs), xs.pop(), xs.pop(), xs);", want: "2 1 nil []\n" },
+    Case { src: "let xs = [1, 3]; insert(xs, 1, 2); xs.insert(3, 4); xs.insert(0, 0); print(xs);", want: "[0, 1, 2, 3, 4]\n" },
+    Case { src: "let xs = [5, 6, 7]; print(remove(xs, 1), str(xs), xs.remove(0), xs);", want: "6 [5, 7] 5 [7]\n" },
+    Case { src: "print(pick([]), pick([9]), type(pick([1, 2, 3])));", want: "nil 9 int\n" },
+    Case { src: "print(map([1, 2, 3], fn(x) { return x * 10; }), [\"a\"].map(upper), map([], str));", want: "[10, 20, 30] [\"A\"] []\n" },
+    Case { src: "print(filter([1, 2, 3, 4], fn(x) { return x % 2 == 0; }), filter([1], fn(x) { return false; }));", want: "[2, 4] []\n" },
+    Case { src: "print(find([1, 5, 8], fn(x) { return x > 3; }), find([1], fn(x) { return x > 3; }));", want: "5 nil\n" },
+    Case { src: "let xs = [3, 1, 2, -5, 1.5]; sort(xs); print(xs); let ys = [\"b\", \"a\", \"c\"]; ys.sort(); print(ys);",
+        want: "[-5, 1, 1.5, 2, 3]\n[\"a\", \"b\", \"c\"]\n" },
+    Case { src: "let es = [{ n: \"a\", hp: 3 }, { n: \"b\", hp: 1 }, { n: \"c\", hp: 3 }, { n: \"d\", hp: 0 }]; sort(es, fn(x, y) { return x.hp > y.hp; }); print(map(es, fn(e) { return e.n; }));",
+        want: "[\"a\", \"c\", \"b\", \"d\"]\n" },
+    Case { src: "let xs = []; for i in 0..200 { xs.push((i * 7919) % 200); } sort(xs); let ok = true; for i in 0..200 { if xs[i] != i { ok = false; } } print(ok, len(xs));",
+        want: "true 200\n" },
+    Case { src: "let xs = [5, 3, 9, 1, 4]; sort(xs, fn(a, b) { return true; }); print(len(xs)); sort(xs, fn(a, b) { return nil; }); print(len(xs));",
+        want: "5\n5\n" },
+    Case { src: "print(join([1, \"a\", 2.5], \", \"), join([], \"-\"), [\"x\", \"y\"].join(\"\"), join([1, 2]));", want: "1, a, 2.5  xy 12\n" },
+    Case { src: "let t = { b: 1, a: 2 }; t.c = 3; t.b = nil; print(keys(t), keys({}));", want: "[\"a\", \"c\"] []\n" },
+    Case { src: "let t = { a: 1, n: nil }; print(has(t, \"a\"), has(t, \"n\"), t.has(\"zz\"));", want: "true false false\n" },
+    Case { src: "print(upper(\"abZ1é\"), \"MiX\".lower());", want: "ABZ1é mix\n" },
+    Case { src: "print(`[{trim(\"  hi there \\n\")}]`, `[{trim(\"\")}]`);", want: "[hi there] []\n" },
+    Case { src: "print(split(\"a,,b\", \",\"), split(\"abc\", \"--\"), \"x--y--\".split(\"--\"));", want: "[\"a\", \"\", \"b\"] [\"abc\"] [\"x\", \"y\", \"\"]\n" },
+    Case { src: "print(contains(\"slime king\", \"me k\"), \"abc\".contains(\"\"), contains(\"ab\", \"abc\"));", want: "true true false\n" },
+    Case { src: "print(slice(\"hello\", 1, 3), slice(\"hello\", 2), slice(\"hi\", -5, 99), `[{slice(\"hi\", 3)}]`, `[{slice(\"abc\", 2, 1)}]`);",
+        want: "el llo hi [] []\n" },
+    Case { src: "print(math.pi > 3.14, math.sqrt(16), math.abs(-3), math.abs(-2.5), math.floor(2.7), math.ceil(2.1), math.floor(-0.5));",
+        want: "true 4.0 3 2.5 2 3 -1\n" },
+    Case { src: "print(math.sin(0), math.cos(0), math.tan(0), math.atan2(0, 1));", want: "0.0 1.0 0.0 0.0\n" },
+    Case { src: "print(math.min(3, 1.5, 2), math.max(1, 7, 2), math.min(4));", want: "1.5 7 4\n" },
+    Case { src: "print(math.clamp(5, 0, 1), math.clamp(-2, 0, 1), math.clamp(0.5, 0, 1), math.lerp(0, 10, 0.25));", want: "1 0 0.5 2.5\n" },
+    Case { src: "let r = rand(2, 3); let m = math.random(-1, 0); print(r >= 2 && r < 3, m >= -1 && m < 0, type(r));", want: "true true float\n" },
+    Case { src: "error(\"never\" + \"!\") ; print(1);", want: "" },
+    // callbacks that allocate, nested natives, closures over the result arrays
+    Case { src: "let ys = map([3, 1, 2], fn(x) { let t = { v: x, s: `#{x}`, junk: [x, x, x] }; return t; }); sort(ys, fn(a, b) { let tmp = [a.s, b.s, { k: a.v }]; return tmp[2].k < b.v; }); print(map(ys, fn(y) { return y.s; }));",
+        want: "[\"#1\", \"#2\", \"#3\"]\n" },
+    Case { src: "let words = split(\"the quick brown fox\", \" \"); let big = map(words, fn(w) { return upper(w) + \"!\"; }); print(join(filter(big, fn(w) { return len(w) > 4; }), \"_\"), find(words, fn(w) { return contains(w, \"ow\"); }));",
+        want: "QUICK!_BROWN! brown\n" },
+    Case { src: "let xs = [1, 2, 3, 4]; print(map(xs, fn(x) { xs.pop(); return x; }));", want: "[1, 2]\n" },
+    // a callback that drops the element from the array and allocates: filter/find keep it alive
+    Case { src: "let a = [{ x: 1 }, { x: 2 }, { x: 3 }]; let r = filter(a, fn(v) { remove(a, 0); v = 0; let z = { q: 1 }; return true; }); let junk = []; for i in 0..50 { push(junk, { y: i }); } let f = find([{ x: 7 }], fn(v) { v = 0; let z = { q: 1 }; return true; }); push(junk, { y: 1 }); print(r[0].x, len(r), f.x);",
+        want: "1 2 7\n" },
+    Case { src: "let xs = [4, 3, 2, 1]; sort(xs, fn(a, b) { xs.push(9); return a < b; }); print(xs);", want: "[1, 2, 3, 4]\n" },
+    Case { src: "fn deep(n) { if n == 0 { return [0]; } return map(deep(n - 1), fn(x) { return x + 1; }); } print(deep(20));", want: "[20]\n" },
+    Case { src: "let t = { a: 1 }; let u = {}; u[1] = 2; print(has(t, 1), keys(u));", want: "false [1]\n" },
+];
+
+const ERRS: [20]Case = [
+    Case { src: "len(5);", want: "t:1:4: len: argument 1 must be an array, string or table, got int" },
+    Case { src: "int(true);", want: "t:1:4: int: argument 1 must be a number or string, got bool" },
+    Case { src: "int(1e300);", want: "t:1:4: int: 1e+300 doesn't fit in an int" },
+    Case { src: "float([]);", want: "t:1:6: float: argument 1 must be a number or string, got array" },
+    Case { src: "push(\"s\", 1);", want: "t:1:5: push: argument 1 must be an array, got string" },
+    Case { src: "insert([1], 5, 0);", want: "t:1:7: insert: index 5 is out of range (0 to 1)" },
+    Case { src: "remove([], 0);", want: "t:1:7: remove: index 0 is out of range (0 to -1)" },
+    Case { src: "map([1], 5);", want: "t:1:4: map: argument 2 must be a function, got int" },
+    Case { src: "map([1, 2], fn(x) { return x / 0; });", want: "t:1:30: division by zero" },
+    Case { src: "filter([1], fn(x) { error(\"bad\", x); });", want: "t:1:26: bad 1" },
+    Case { src: "sort([1, \"a\", 2]);", want: "t:1:5: can't compare string and int" },
+    Case { src: "sort([3, 1], fn(a, b) { return a.x < 1; });", want: "t:1:33: can't read field \"x\" of int" },
+    Case { src: "sort([1], 3);", want: "t:1:5: sort: argument 2 must be a function, got int" },
+    Case { src: "keys([]);", want: "t:1:5: keys: argument 1 must be a table, got array" },
+    Case { src: "upper(1);", want: "t:1:6: upper: argument 1 must be a string, got int" },
+    Case { src: "split(\"a\", \"\");", want: "t:1:6: split: the separator can't be empty" },
+    Case { src: "slice(\"a\", \"b\");", want: "t:1:6: slice: argument 2 must be an int, got string" },
+    Case { src: "math.sqrt(\"4\");", want: "t:1:10: math.sqrt: argument 1 must be a number, got string" },
+    Case { src: "math.max();", want: "t:1:9: math.max: argument 1 must be a number, got nil" },
+    Case { src: "rand(1);", want: "t:1:5: rand: argument 2 must be a number, got nil" },
+];
+
+fn capture(vm: &Vm, args: Args): Value {
+    let t = vm.host as &Text;
+    t.pushStr(args.joined(" "));
+    t.push(10);
+    return j2.nil();
+}
+
+fn newVm(mem: &Arena, out: &Text, stress: bool): Vm {
+    let vm = Vm.new(mem, Limits { });
+    vm.openLibs(j2.LIB_ALL);
+    vm.bind("print", capture);
+    vm.host = out as ptr;
+    vm.gcStress = stress;
+    return vm;
+}
+
+fn same(got: string, want: string, src: string, what: string) {
+    if !(got == want) {
+        printLn(`source: {src}`);
+        printLn(`got  [{got}]`);
+        printLn(`want [{want}]`);
+        panic(what);
+    }
+}
+
+fn runOut(mem: &Arena, c: Case, stress: bool) {
+    let out = Text.new(mem);
+    let vm = newVm(mem, &out, stress);
+    match vm.loadString("t", c.src) {
+        Result.Ok(_) { same(out.str(), c.want, c.src, "printed output"); }
+        Result.Err(e) {
+            // `error(..)` cases print nothing and stop
+            if c.want.len > 0 {
+                printLn(`source: {c.src}`);
+                printLn(e.message);
+                panic("unexpected script error");
+            }
+            same(e.message, "t:1:6: never!", c.src, "error()");
+        }
+    }
+    vm.destroy();
+}
+
+fn runErr(mem: &Arena, c: Case, stress: bool) {
+    let out = Text.new(mem);
+    let vm = newVm(mem, &out, stress);
+    match vm.loadString("t", c.src) {
+        Result.Ok(_) {
+            printLn(`source: {c.src}`);
+            panic("expected a script error");
+        }
+        Result.Err(e) { same(e.message, c.want, c.src, "error text"); }
+    }
+    // the VM still works
+    match vm.loadString("u", "print(len([1]));") {
+        Result.Ok(_) { }
+        Result.Err(e) {
+            printLn(e.message);
+            panic("vm broken after a lib error");
+        }
+    }
+    if vm.nframes != 0 || vm.top != 0 || vm.callDepth != 0 { panic("not unwound"); }
+    vm.destroy();
+}
+
+/// `pick` / `rand` / `math.random` replay from `vm.seed`, whatever else ran.
+fn testSeed(mem: &Arena) {
+    let src = "pub fn roll() { let xs = []; for i in 0..8 { xs.push(pick([1, 2, 3, 4, 5, 6])); xs.push(int(rand(0, 100))); xs.push(int(math.random(0, 100))); } return str(xs); }";
+    let got: [3]string = ["", "", ""];
+    for k in 0..3 {
+        let out = Text.new(mem);
+        let vm = newVm(mem, &out, false);
+        if k == 2 { vm.seed(99); } else { vm.seed(7); }
+        match vm.loadString("r", src) {
+            Result.Ok(ex) {
+                match vm.call(ex.asTable().get("roll"), j2.noArgs()) {
+                    Result.Ok(v) {
+                        let t = Text.new(mem);
+                        t.pushStr(v.asStr());
+                        got[k] = t.str();
+                    }
+                    Result.Err(e) {
+                        printLn(e.message);
+                        panic("roll");
+                    }
+                }
+            }
+            Result.Err(e) {
+                printLn(e.message);
+                panic("roll load");
+            }
+        }
+        vm.destroy();
+    }
+    same(got[0], got[1], "seed 7", "same seed, same rolls");
+    if got[0] == got[2] { panic("different seeds gave the same rolls"); }
+}
+
+fn main() {
+    let mem = Arena.create(1 << 20);
+    for c in OUT { runOut(&mem, c, false); }
+    for c in ERRS { runErr(&mem, c, false); }
+    // collections at every safe point: callbacks that allocate must not lose natives' temporaries
+    for c in OUT { runOut(&mem, c, true); }
+    for c in ERRS { runErr(&mem, c, true); }
+    testSeed(&mem);
+    printLn("j2_lib_test ok");
+}

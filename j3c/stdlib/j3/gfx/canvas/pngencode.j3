@@ -1,0 +1,256 @@
+// Part of j3.gfx.canvas (PNG writer: savePng, fixed-Huffman DEFLATE, CRC).
+
+module j3.gfx.canvas;
+
+extend Canvas {
+    /// Export RGBA8 PNG: unfiltered rows, one fixed-Huffman DEFLATE block with greedy LZ77, so a
+    /// flat-shaded picture is tens of kilobytes instead of `w * h * 4` bytes.
+    fn savePng(this : Canvas, path : string, arena : &Arena) : Result < int, IoError > {
+        let row = int(this.w) *4 + 1;
+        let raw = row *int(this.h);
+        let work = Arena.create(raw *3 + 32768 *8 + 4096);
+        let data = work.alloc::< u8 >(raw);
+        let y = 0;
+        while y < int(this.h) {
+            data[y *row] = 0;
+            let x = 0;
+            while x < row -1 {
+                data[y *row + 1 + x] = this.pixels[y *(row -1) + x];
+                x += 1;
+            }
+            y += 1;
+        }
+        let z = work.alloc::< u8 >(raw + raw / 8 + 64);
+        let zn = deflateFixed(data, z, &work);
+        let zlen = 2 + zn + 4;
+        let out = arena.alloc::< u8 >(57 + zlen);
+        out[0] = 137;
+        out[1] = 80;
+        out[2] = 78;
+        out[3] = 71;
+        out[4] = 13;
+        out[5] = 10;
+        out[6] = 26;
+        out[7] = 10;
+        be32(out, 8, u32(13));
+        chunkType(out, 12, 73, 72, 68, 82);
+        be32(out, 16, u32(this.w));
+        be32(out, 20, u32(this.h));
+        out[24] = 8;
+        out[25] = 6;
+        out[26] = 0;
+        out[27] = 0;
+        out[28] = 0;
+        be32(out, 29, crc(out, 12, 17));
+        be32(out, 33, u32(zlen));
+        chunkType(out, 37, 73, 68, 65, 84);
+        let at = 41;
+        out[at] = 120;
+        out[at + 1] = 1;
+        at += 2;
+        let i = 0;
+        while i < zn {
+            out[at + i] = z[i];
+            i += 1;
+        }
+        at += zn;
+        work.destroy();
+        let a : u32 = 1;
+        let b : u32 = 0;
+        let k = 0;
+        while k < raw {
+            let value : u8 = 0;
+            let col = k -(k / row) *row;
+            if col > 0 {
+                value = this.pixels[(k / row) *int(this.w) *4 + col -1];
+            }
+            a = a + u32(value);
+            if a >= u32(65521) {
+                a -= u32(65521);
+            }
+            b = b + a;
+            if b >= u32(65521) {
+                b -= u32(65521);
+            }
+            k += 1;
+        }
+        be32(out, at, b *u32(65536) + a);
+        at += 4;
+        be32(out, at, crc(out, 37, zlen + 4));
+        at += 4;
+        be32(out, at, u32(0));
+        at += 4;
+        chunkType(out, at, 73, 69, 78, 68);
+        at += 4;
+        be32(out, at, crc(out, at -4, 4));
+        match writeFile(path, out) {
+            Result.Ok(written) {
+                return Result.Ok(written);
+            }
+            Result.Err(e) {
+                return Result.Err(e);
+            }
+        }
+    }
+}
+
+/// LSB-first bit writer for DEFLATE. Shifts are multiplies: the code predates bitwise operators.
+struct BitOut {
+    out :[] u8;
+    at : int;
+    acc : int;
+    n : int;
+    fn put(this : &BitOut, v : int, len : int) {
+        this.acc += v *POW2[this.n];
+        this.n += len;
+        while this.n >= 8 {
+            this.out[this.at] = u8(this.acc -(this.acc / 256) *256);
+            this.at += 1;
+            this.acc = this.acc / 256;
+            this.n -= 8;
+        }
+    }
+    /// A Huffman code, which DEFLATE stores most significant bit first.
+    fn code(this : &BitOut, c : int, len : int) {
+        let r = 0;
+        let v = c;
+        let k = 0;
+        while k < len {
+            r = r *2 + v -(v / 2) *2;
+            v = v / 2;
+            k += 1;
+        }
+        this.put(r, len);
+    }
+    fn literal(this : &BitOut, sym : int) {
+        if sym < 144 {
+            this.code(48 + sym, 8);
+        } else if sym < 256 {
+            this.code(400 + sym -144, 9);
+        } else if sym < 280 {
+            this.code(sym -256, 7);
+        } else {
+            this.code(192 + sym -280, 8);
+        }
+    }
+}
+
+
+fn hash3(d :[] u8, i : int) : int {
+    return(int(d[i]) *1024 + int(d[i + 1]) *32 + int(d[i + 2])) -((int(d[i]) *1024 + int(d[i + 1]) *32 + int(d[i + 2])) / 32768) *32768;
+}
+
+/// `data` as one fixed-Huffman DEFLATE block (no zlib header) into `z`; returns its length. `z`
+/// holds `data.len + data.len / 8 + 64`: a literal is at most 9 bits. Same as `src/png.rs`
+/// `deflate_fixed` minus the row filters.
+// ponytail: one hash candidate per position, no filters; hash chains or Sub/Up rows would shave more.
+fn deflateFixed(data :[] u8, z :[] u8, work : &Arena) : int {
+    let bits = BitOut {
+        out : z, at : 0, acc : 0, n : 0
+    };
+    bits.put(1, 1);
+    bits.put(1, 2);
+    let head = work.alloc::< int >(32768);
+    let h = 0;
+    while h < 32768 {
+        head[h] = -1;
+        h += 1;
+    }
+    let i = 0;
+    while i < data.len {
+        let best = 0;
+        let dist = 0;
+        if i + 3 <= data.len {
+            let hi = hash3(data, i);
+            let cand = head[hi];
+            head[hi] = i;
+            if cand >= 0 && i -cand <= 32768 {
+                let max = data.len -i;
+                if max > 258 {
+                    max = 258;
+                }
+                let l = 0;
+                while l < max && data[cand + l] == data[i + l] {
+                    l += 1;
+                }
+                if l >= 3 {
+                    best = l;
+                    dist = i -cand;
+                }
+            }
+        }
+        if best == 0 {
+            bits.literal(int(data[i]));
+            i += 1;
+            continue;
+        }
+        let li = 28;
+        while LEN_BASE[li] > best {
+            li -= 1;
+        }
+        bits.literal(257 + li);
+        bits.put(best -LEN_BASE[li], LEN_EXTRA[li]);
+        let di = 29;
+        while DIST_BASE[di] > dist {
+            di -= 1;
+        }
+        bits.code(di, 5);
+        bits.put(dist -DIST_BASE[di], DIST_EXTRA[di]);
+        // Index the skipped positions so later matches can find them.
+        let k = i + 1;
+        while k < i + best && k + 3 <= data.len {
+            head[hash3(data, k)] = k;
+            k += 1;
+        }
+        i += best;
+    }
+    bits.literal(256);
+    if bits.n > 0 {
+        bits.put(0, 8 -bits.n);
+    }
+    return bits.at;
+}
+
+fn be32(out :[] u8, i : int, value : u32) {
+    out[i] = u8(value / u32(16777216));
+    out[i + 1] = u8((value / u32(65536)) -(value / u32(16777216)) *u32(256));
+    out[i + 2] = u8((value / u32(256)) -(value / u32(65536)) *u32(256));
+    out[i + 3] = u8(value -(value / u32(256)) *u32(256));
+}
+
+fn chunkType(out :[] u8, i : int, a : u8, b : u8, c : u8, d : u8) {
+    out[i] = a;
+    out[i + 1] = b;
+    out[i + 2] = c;
+    out[i + 3] = d;
+}
+
+fn crc(bytes :[] u8, start : int, len : int) : u32 {
+    let value : u32 = u32(0xffffffff);
+    let i = start;
+    while i < start + len {
+        let low = value -(value / u32(256)) *u32(256);
+        let index = int(xor32(low, u32(bytes[i])));
+        value = xor32(value / u32(256), CRC_TABLE[index]);
+        i += 1;
+    }
+    return xor32(value, u32(0xffffffff));
+}
+
+fn xor32(a : u32, b : u32) : u32 {
+    let left = a;
+    let right = b;
+    let power : u32 = 1;
+    let value : u32 = 0;
+    let n = 0;
+    while n < 8 {
+        let al = left -(left / u32(16)) *u32(16);
+        let bl = right -(right / u32(16)) *u32(16);
+        value += u32(XOR4[int(al *u32(16) + bl)]) *power;
+        left = left / u32(16);
+        right = right / u32(16);
+        power *= u32(16);
+        n += 1;
+    }
+    return value;
+}

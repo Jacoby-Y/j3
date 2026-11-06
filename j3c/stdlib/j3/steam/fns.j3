@@ -1,0 +1,320 @@
+// Part of j3.steam: finding the Steam library, symbol lookup, interface accessors; the module doc and `use`s are in ../steam.j3.
+module j3.steam;
+
+#[singleton]
+let ARENA: Arena;
+#[singleton]
+let ARENA_UP: bool = false;
+/// Handle from `sys.dlopen`; 0 when the library is not loaded (absent, fake, or not yet tried).
+#[singleton]
+let LIB: ptr;
+#[singleton]
+let LIB_TRIED: bool = false;
+#[singleton]
+let ERR_SEEN: []string;
+#[singleton]
+let ERR_N: int = 0;
+
+/// Memory for tables and buffers that live as long as the process (grown in blocks, never freed).
+fn arena(): &Arena {
+    if !ARENA_UP {
+        ARENA = Arena.create(65536);
+        ARENA_UP = true;
+    }
+    return &ARENA;
+}
+
+/// Print `msg` and a newline to stderr.
+fn eprint(msg: string) {
+    sys.write(2, msg.ptr as ptr, msg.len);
+    sys.write(2, "\n".ptr as ptr, 1);
+}
+
+/// `eprint` unless `msg` was printed before (a missing symbol is reported once, not per call).
+/// The seen list grows without limit, so each distinct message prints exactly once.
+fn eprintOnce(msg: string) {
+    for i in 0..ERR_N {
+        if same(ERR_SEEN[i], msg) {
+            return;
+        }
+    }
+    // the text lives in a temp buffer: keep a copy
+    let t = Text.new(arena());
+    t.pushStr(msg);
+    if ERR_N >= ERR_SEEN.len {
+        let fresh = arena().alloc::<string>(ERR_SEEN.len * 2 + 16);
+        for i in 0..ERR_N {
+            fresh[i] = ERR_SEEN[i];
+        }
+        ERR_SEEN = fresh;
+    }
+    ERR_SEEN[ERR_N] = t.str();
+    ERR_N += 1;
+    eprint(msg);
+}
+
+/// How many distinct warnings `j3.steam` has printed so far (for tests).
+pub fn warned(): int {
+    return ERR_N;
+}
+
+/// Library file name for this platform.
+fn libName(): string {
+    if sys.PLATFORM == sys.PLATFORM_WINDOWS {
+        return "steam_api64.dll";
+    }
+    if sys.PLATFORM == sys.PLATFORM_MACOS {
+        return "libsteam_api.dylib";
+    }
+    return "libsteam_api.so";
+}
+
+/// Load the Steam library once: `$J3_STEAM_LIB`, then next to the executable, then the plain name.
+/// Android never loads it. True when it is loaded.
+fn loadLib(): bool {
+    if LIB_TRIED {
+        return LIB as int != 0;
+    }
+    LIB_TRIED = true;
+    if sys.PLATFORM == sys.PLATFORM_ANDROID {
+        return false;
+    }
+    let forced = sys.env("J3_STEAM_LIB");
+    if forced.len > 0 {
+        LIB = sys.dlopen(forced);
+    }
+    if LIB as int == 0 {
+        let dir = sys.exeDir();
+        if dir.len > 0 {
+            let t = Text.new(arena());
+            t.pushStr(dir);
+            t.pushStr("/");
+            t.pushStr(libName());
+            LIB = sys.dlopen(t.str());
+        }
+    }
+    if LIB as int == 0 {
+        LIB = sys.dlopen(libName());
+    }
+    return LIB as int != 0;
+}
+
+/// Target of every call whose symbol is missing: ignores its arguments and returns 0.
+fn stub(): int {
+    return 0;
+}
+
+/// One cached `dlsym` result.
+struct SymRow {
+    name: string;
+    p: ptr;
+}
+
+#[singleton]
+let SYMS: []SymRow;
+#[singleton]
+let SYM_N: int = 0;
+
+fn hash(s: string): int {
+    let h = 5381;
+    for i in 0..s.len {
+        h = (h * 33 + int(s[i])) % 1000000007;
+    }
+    return h;
+}
+
+/// Slot of `name` in `rows` (open addressing), or the empty slot where it belongs.
+fn slotOf(rows: []SymRow, name: string): int {
+    let i = hash(name) % rows.len;
+    while rows[i].name.len > 0 && !same(rows[i].name, name) {
+        i = (i + 1) % rows.len;
+    }
+    return i;
+}
+
+fn symGrow() {
+    let old = SYMS;
+    let cap = 128;
+    if old.len > 0 {
+        cap = old.len * 2;
+    }
+    let fresh = arena().alloc::<SymRow>(cap);
+    for i in 0..cap {
+        fresh[i] = SymRow { name: "", p: 0 };
+    }
+    for i in 0..old.len {
+        if old[i].name.len > 0 {
+            fresh[slotOf(fresh, old[i].name)] = old[i];
+        }
+    }
+    SYMS = fresh;
+}
+
+/// The only way to get a function pointer from the library. Never 0: when Steam is not loaded or
+/// the symbol is missing (the first miss prints a line to stderr) it is `stub`, which ignores its
+/// arguments and returns 0, so casting the result to any `fn` type and calling it is always safe.
+/// `name` must be a string literal (the binding checker lists every `"SteamAPI_..."` literal).
+fn fnp(name: string): ptr {
+    if LIB as int == 0 {
+        return stubPtr();
+    }
+    if (SYM_N + 1) * 2 > SYMS.len {
+        symGrow();
+    }
+    let at = slotOf(SYMS, name);
+    if SYMS[at].name.len == 0 {
+        let p = sys.dlsym(LIB, name);
+        if p as int == 0 {
+            eprintOnce(`steam: symbol {name} not found in {libName()}; that call does nothing`);
+        }
+        SYMS[at] = SymRow { name: name, p: p };
+        SYM_N += 1;
+    }
+    if SYMS[at].p as int == 0 {
+        return stubPtr();
+    }
+    return SYMS[at].p;
+}
+
+fn stubPtr(): ptr {
+    let f: fn(): int = stub;
+    return f as ptr;
+}
+
+/// True when the library exports `name` (no message when it does not).
+fn hasFn(name: string): bool {
+    return LIB as int != 0 && sys.dlsym(LIB, name) as int != 0;
+}
+
+#[singleton]
+let ACCS: []string;
+#[singleton]
+let ACC_N: int = 0;
+
+fn addAccessor(row: string) {
+    if ACC_N >= ACCS.len {
+        let fresh = arena().alloc::<string>(ACCS.len * 2 + 16);
+        for i in 0..ACC_N {
+            fresh[i] = ACCS[i];
+        }
+        ACCS = fresh;
+    }
+    ACCS[ACC_N] = row;
+    ACC_N += 1;
+}
+
+/// Versioned accessors, newest first, built on first use. `iface("SteamUserStats")` calls the first
+/// row of the form `SteamAPI_SteamUserStats_vNNN` that the library exports. A new SDK: add its row
+/// above the old one. A part that needs an interface adds its rows here (checked against the header
+/// by `steam-check`).
+fn buildAccessors() {
+    addAccessor("SteamAPI_SteamTimeline_v004");
+    addAccessor("SteamAPI_SteamUserStats_v013");
+    addAccessor("SteamAPI_SteamUserStats_v012");
+    addAccessor("SteamAPI_SteamUser_v023");
+    addAccessor("SteamAPI_SteamUser_v021");
+    addAccessor("SteamAPI_SteamFriends_v018");
+    addAccessor("SteamAPI_SteamFriends_v017");
+    addAccessor("SteamAPI_SteamUtils_v011");
+    addAccessor("SteamAPI_SteamUtils_v010");
+    addAccessor("SteamAPI_SteamApps_v009");
+    addAccessor("SteamAPI_SteamApps_v008");
+    addAccessor("SteamAPI_SteamRemoteStorage_v016");
+    addAccessor("SteamAPI_SteamMatchmaking_v009");
+    addAccessor("SteamAPI_SteamInput_v007");
+    addAccessor("SteamAPI_SteamInput_v006");
+    addAccessor("SteamAPI_SteamInput_v005");
+    addAccessor("SteamAPI_SteamInput_v001");
+    addAccessor("SteamAPI_SteamScreenshots_v003");
+    addAccessor("SteamAPI_SteamNetworkingMessages_SteamAPI_v002");
+    addAccessor("SteamAPI_SteamNetworkingSockets_SteamAPI_v013");
+    addAccessor("SteamAPI_SteamNetworkingSockets_SteamAPI_v012");
+    addAccessor("SteamAPI_SteamNetworkingSockets_SteamAPI_v011");
+    addAccessor("SteamAPI_SteamNetworkingSockets_SteamAPI_v009");
+    addAccessor("SteamAPI_SteamNetworkingUtils_SteamAPI_v004");
+    addAccessor("SteamAPI_SteamNetworkingUtils_SteamAPI_v003");
+}
+
+/// One cached interface pointer.
+struct IfaceRow {
+    name: string;
+    p: ptr;
+}
+
+#[singleton]
+let IFACES: []IfaceRow;
+#[singleton]
+let IFACE_N: int = 0;
+
+/// `SteamAPI_<name>_v` (or `SteamAPI_<name>_SteamAPI_v`, the networking interfaces) is the start of `row`.
+fn rowIs(row: string, name: string): bool {
+    let pre = "SteamAPI_";
+    if row.len < pre.len + name.len + 2 || !same(row[0..pre.len], pre) {
+        return false;
+    }
+    if !same(row[pre.len..pre.len + name.len], name) {
+        return false;
+    }
+    let at = pre.len + name.len;
+    if row[at] == 95 && row[at + 1] == 118 {
+        return true;
+    }
+    let mid = "_SteamAPI_v";
+    return row.len > at + mid.len && same(row[at..at + mid.len], mid);
+}
+
+/// The interface object for `name` (`"SteamUserStats"`), as `self` for `SteamAPI_ISteamUserStats_*`
+/// calls. 0 unless Steam is `Ready`; a miss is cached too (and reported once).
+fn iface(name: string): ptr {
+    if !ready() {
+        return 0;
+    }
+    for i in 0..IFACE_N {
+        if same(IFACES[i].name, name) {
+            return IFACES[i].p;
+        }
+    }
+    if ACC_N == 0 {
+        buildAccessors();
+    }
+    for i in 0..ACC_N {
+        if rowIs(ACCS[i], name) && hasFn(ACCS[i]) {
+            let get = fnp(ACCS[i]) as fn(): ptr;
+            let p = get();
+            if p as int != 0 {
+                if IFACE_N >= IFACES.len {
+                    let fresh = arena().alloc::<IfaceRow>(IFACES.len * 2 + 8);
+                    for k in 0..IFACE_N {
+                        fresh[k] = IFACES[k];
+                    }
+                    IFACES = fresh;
+                }
+                IFACES[IFACE_N] = IfaceRow { name: name, p: p };
+                IFACE_N += 1;
+                return p;
+            }
+        }
+    }
+    if IFACE_N >= IFACES.len {
+        let fresh = arena().alloc::<IfaceRow>(IFACES.len * 2 + 8);
+        for k in 0..IFACE_N {
+            fresh[k] = IFACES[k];
+        }
+        IFACES = fresh;
+    }
+    // remember the miss (p = 0) so later calls skip the lookup and the message
+    IFACES[IFACE_N] = IfaceRow { name: name, p: 0 };
+    IFACE_N += 1;
+    eprintOnce(`steam: no accessor for interface {name}; its calls do nothing`);
+    return 0;
+}
+
+/// Method `symbol` (`"SteamAPI_ISteamUserStats_SetAchievement"`) of interface `name`, or `stub` when
+/// Steam is not `Ready`, the interface has no accessor, or the symbol is missing. Call it with the
+/// interface object as first argument: `fnp`'s rules apply (cast to the right `fn` type, then call).
+fn method(name: string, symbol: string): ptr {
+    if iface(name) as int == 0 {
+        return stubPtr();
+    }
+    return fnp(symbol);
+}

@@ -1,0 +1,452 @@
+// The dispatch loop. Part of `j3.j2`.
+
+module j3.j2;
+
+/// Run frames until the frame count drops back to `stop` (the frames below belong to whoever
+/// called: the host, or a native that called back into script). The finished call's result is in
+/// its `ret` slot. False with the error pending and positioned; the caller unwinds.
+// Ints take inline fast paths; everything else (floats, strings, errors) goes through `vm_ops.j3`.
+fn execute(vm: &Vm, stop: int): bool {
+    while true {
+        // (re)load the running frame: after a call, a return, or a stack that moved
+        let fi = vm.nframes - 1;
+        let cl = vm.frames[fi].cl as &Closure;
+        let p = cl.protoOf();
+        let code = p.codeOf();
+        let ks = p.constsOf();
+        let ups = cl.upsOf();
+        let env = arrOf(cl.env).values();
+        let base = vm.frames[fi].base;
+        let pc = vm.frames[fi].pc;
+        let st = vm.stack;
+        while true {
+            let ins = int(code[pc]);
+            pc += 1;
+            let op = ins & 255;
+            let a = base + ((ins >> 8) & 255);
+            let b = (ins >> 16) & 255;
+            let c = (ins >> 24) & 255;
+            match op {
+                OP_MOVE { st[a] = st[base + b]; }
+                OP_LOADK { st[a] = ks[ins >> 16]; }
+                OP_LOADNIL { st[a] = nilv(); }
+                OP_LOADBOOL { st[a] = boolv(b != 0); }
+                OP_GETUP {
+                    let u = ups[b] as ptr as &Upval;
+                    st[a] = if u.idx >= 0 { st[u.idx] } else { u.v };
+                }
+                OP_SETUP {
+                    let u = ups[b] as ptr as &Upval;
+                    if u.idx >= 0 { st[u.idx] = st[a]; } else { u.v = st[a]; }
+                }
+                OP_GETENV { st[a] = env[ins >> 16]; }
+                OP_SETENV { env[ins >> 16] = st[a]; }
+                OP_GETGLOBAL {
+                    let g = vm.global(ks[ins >> 16]);
+                    if g.isNil() {
+                        vm.unknownName(ks[ins >> 16]);
+                        return vm.failAt(fi, pc);
+                    }
+                    st[a] = g;
+                }
+                OP_GETPUB { st[a] = tableOf(env[0]).get(ks[ins >> 16]); }
+                OP_SETPUB {
+                    let before = vm.heap.bytes;
+                    tableOf(env[0]).set(vm.heap, ks[ins >> 16], st[a]);
+                    if vm.heap.bytes > before && vm.memFull() { return vm.failAt(fi, pc); }
+                }
+                OP_NEWTABLE {
+                    st[a] = vm.heap.newTable();
+                    if vm.memFull() { return vm.failAt(fi, pc); }
+                }
+                OP_NEWARRAY {
+                    st[a] = vm.heap.newArray(b);
+                    if vm.memFull() { return vm.failAt(fi, pc); }
+                }
+                OP_APPEND {
+                    let before = vm.heap.bytes;
+                    arrOf(st[a]).push(vm.heap, st[base + b]);
+                    if vm.heap.bytes > before && vm.memFull() { return vm.failAt(fi, pc); }
+                }
+                OP_GETFIELD {
+                    let o = st[base + b];
+                    if o.tag == T_TABLE {
+                        let tb = tableOf(o);
+                        let e = tb.findStr(ks[c]);
+                        st[a] = if e >= 0 { tb.entries()[e].val } else { nilv() };
+                    } else if !vm.getField(o, ks[c], &st[a]) {
+                        return vm.failAt(fi, pc);
+                    }
+                }
+                OP_SETFIELD {
+                    // fast path: overwrite a field that exists with a non-nil value (no allocation)
+                    let o = st[a];
+                    let v = st[base + c];
+                    if o.tag == T_TABLE && v.tag != T_NIL {
+                        let tb = tableOf(o);
+                        let e = tb.findStr(ks[b]);
+                        if e >= 0 {
+                            tb.entries()[e].val = v;
+                            continue;
+                        }
+                    }
+                    let before = vm.heap.bytes;
+                    if !vm.setField(st[a], ks[b], st[base + c]) || (vm.heap.bytes > before && vm.memFull()) {
+                        return vm.failAt(fi, pc);
+                    }
+                }
+                OP_GETINDEX {
+                    if !vm.getIndex(st[base + b], st[base + c], &st[a]) { return vm.failAt(fi, pc); }
+                }
+                OP_SETINDEX {
+                    let before = vm.heap.bytes;
+                    if !vm.setIndex(st[a], st[base + b], st[base + c]) || (vm.heap.bytes > before && vm.memFull()) {
+                        return vm.failAt(fi, pc);
+                    }
+                }
+                OP_ADD {
+                    let x = st[base + b];
+                    let y = st[base + c];
+                    if x.tag == T_INT && y.tag == T_INT {
+                        st[a] = intv(x.bits + y.bits);
+                    } else if !vm.arith(op, x, y, &st[a]) {
+                        return vm.failAt(fi, pc);
+                    }
+                }
+                OP_SUB {
+                    let x = st[base + b];
+                    let y = st[base + c];
+                    if x.tag == T_INT && y.tag == T_INT {
+                        st[a] = intv(x.bits - y.bits);
+                    } else if !vm.arith(op, x, y, &st[a]) {
+                        return vm.failAt(fi, pc);
+                    }
+                }
+                OP_MUL {
+                    let x = st[base + b];
+                    let y = st[base + c];
+                    if x.tag == T_INT && y.tag == T_INT {
+                        st[a] = intv(x.bits * y.bits);
+                    } else if !vm.arith(op, x, y, &st[a]) {
+                        return vm.failAt(fi, pc);
+                    }
+                }
+                OP_DIV {
+                    if !vm.arith(op, st[base + b], st[base + c], &st[a]) { return vm.failAt(fi, pc); }
+                }
+                OP_MOD {
+                    if !vm.arith(op, st[base + b], st[base + c], &st[a]) { return vm.failAt(fi, pc); }
+                }
+                OP_ADDK {
+                    let x = st[base + b];
+                    let y = ks[c];
+                    if x.tag == T_INT && y.tag == T_INT {
+                        st[a] = intv(x.bits + y.bits);
+                    } else if !vm.arith(OP_ADD, x, y, &st[a]) {
+                        return vm.failAt(fi, pc);
+                    }
+                }
+                OP_SUBK {
+                    let x = st[base + b];
+                    let y = ks[c];
+                    if x.tag == T_INT && y.tag == T_INT {
+                        st[a] = intv(x.bits - y.bits);
+                    } else if !vm.arith(OP_SUB, x, y, &st[a]) {
+                        return vm.failAt(fi, pc);
+                    }
+                }
+                OP_MULK {
+                    let x = st[base + b];
+                    let y = ks[c];
+                    if x.tag == T_INT && y.tag == T_INT {
+                        st[a] = intv(x.bits * y.bits);
+                    } else if !vm.arith(OP_MUL, x, y, &st[a]) {
+                        return vm.failAt(fi, pc);
+                    }
+                }
+                OP_DIVK {
+                    let x = st[base + b];
+                    let y = ks[c];
+                    // a positive int divisor can't trap; 0 and -1 take `arith`'s checked path
+                    if x.tag == T_INT && y.tag == T_INT && y.bits > 0 {
+                        st[a] = intv(x.bits / y.bits);
+                    } else if !vm.arith(OP_DIV, x, y, &st[a]) {
+                        return vm.failAt(fi, pc);
+                    }
+                }
+                OP_MODK {
+                    let x = st[base + b];
+                    let y = ks[c];
+                    if x.tag == T_INT && y.tag == T_INT && y.bits > 0 {
+                        st[a] = intv(x.bits % y.bits);
+                    } else if !vm.arith(OP_MOD, x, y, &st[a]) {
+                        return vm.failAt(fi, pc);
+                    }
+                }
+                OP_TEQ {
+                    let y = if (c & TEST_K) != 0 { ks[b] } else { st[base + b] };
+                    pc = vm.testJump(code, pc, equals(st[a], y) == ((c & TEST_TRUE) != 0));
+                    if pc < 0 { return vm.failAt(fi, -pc); }
+                }
+                OP_TLT {
+                    let x = st[a];
+                    let y = if (c & TEST_K) != 0 { ks[b] } else { st[base + b] };
+                    let r = false;
+                    if x.tag == T_INT && y.tag == T_INT {
+                        r = x.bits < y.bits;
+                    } else if !vm.less(OP_LT, x, y, &r) {
+                        return vm.failAt(fi, pc);
+                    }
+                    pc = vm.testJump(code, pc, r == ((c & TEST_TRUE) != 0));
+                    if pc < 0 { return vm.failAt(fi, -pc); }
+                }
+                OP_TLE {
+                    let x = st[a];
+                    let y = if (c & TEST_K) != 0 { ks[b] } else { st[base + b] };
+                    let r = false;
+                    if x.tag == T_INT && y.tag == T_INT {
+                        r = x.bits <= y.bits;
+                    } else if !vm.less(OP_LE, x, y, &r) {
+                        return vm.failAt(fi, pc);
+                    }
+                    pc = vm.testJump(code, pc, r == ((c & TEST_TRUE) != 0));
+                    if pc < 0 { return vm.failAt(fi, -pc); }
+                }
+                OP_TGT {
+                    // only with a constant y: `x > K` is `K < x`
+                    let x = st[a];
+                    let y = ks[b];
+                    let r = false;
+                    if x.tag == T_INT && y.tag == T_INT {
+                        r = y.bits < x.bits;
+                    } else if !vm.less(OP_LT, y, x, &r) {
+                        return vm.failAt(fi, pc);
+                    }
+                    pc = vm.testJump(code, pc, r == ((c & TEST_TRUE) != 0));
+                    if pc < 0 { return vm.failAt(fi, -pc); }
+                }
+                OP_TGE {
+                    let x = st[a];
+                    let y = ks[b];
+                    let r = false;
+                    if x.tag == T_INT && y.tag == T_INT {
+                        r = y.bits <= x.bits;
+                    } else if !vm.less(OP_LE, y, x, &r) {
+                        return vm.failAt(fi, pc);
+                    }
+                    pc = vm.testJump(code, pc, r == ((c & TEST_TRUE) != 0));
+                    if pc < 0 { return vm.failAt(fi, -pc); }
+                }
+                OP_EQ { st[a] = boolv(equals(st[base + b], st[base + c])); }
+                OP_NE { st[a] = boolv(!equals(st[base + b], st[base + c])); }
+                OP_LT {
+                    let r = false;
+                    if !vm.less(op, st[base + b], st[base + c], &r) { return vm.failAt(fi, pc); }
+                    st[a] = boolv(r);
+                }
+                OP_LE {
+                    let r = false;
+                    if !vm.less(op, st[base + b], st[base + c], &r) { return vm.failAt(fi, pc); }
+                    st[a] = boolv(r);
+                }
+                OP_UNM {
+                    if !vm.negate(st[base + b], &st[a]) { return vm.failAt(fi, pc); }
+                }
+                OP_NOT { st[a] = boolv(!st[base + b].truthy()); }
+                OP_CONCAT {
+                    let s = vm.concat(st[base + b..base + b + c]);
+                    if s.isNil() { return vm.failAt(fi, pc); }
+                    st[a] = s;
+                    if vm.memFull() { return vm.failAt(fi, pc); }
+                }
+                OP_JMP {
+                    let off = (ins >> 16) - SBX_BIAS;
+                    // a loop's back edge: one step of the budget
+                    if off < 0 && !vm.step() { return vm.failAt(fi, pc); }
+                    pc += off;
+                }
+                OP_JMPIF {
+                    if st[a].truthy() {
+                        let off = (ins >> 16) - SBX_BIAS;
+                        // a `while` condition at the bottom jumps back: one step of the budget
+                        if off < 0 && !vm.step() { return vm.failAt(fi, pc); }
+                        pc += off;
+                    }
+                }
+                OP_JMPIFNOT {
+                    if !st[a].truthy() {
+                        let off = (ins >> 16) - SBX_BIAS;
+                        if off < 0 && !vm.step() { return vm.failAt(fi, pc); }
+                        pc += off;
+                    }
+                }
+                OP_CALL {
+                    let f = st[a];
+                    vm.frames[fi].pc = pc;
+                    if !vm.callAt(f, a + 1, b, a) { return vm.failAt(fi, pc); }
+                    if f.tag == T_FN { break; }
+                    st = vm.stack;
+                }
+                OP_METHOD {
+                    let x1 = int(code[pc]);
+                    let x2 = int(code[pc + 1]);
+                    pc += 2;
+                    let name = ks[x1 >> 16];
+                    let recv = st[a + 1];
+                    let f = nilv();
+                    if recv.tag == T_TABLE { f = tableOf(recv).get(name); }
+                    let argBase = a + 1;
+                    let n = b;
+                    if !f.isNil() {
+                        // a field: `this` only for a script fn that asks for it
+                        if !(f.tag == T_FN && (closureOf(f).protoOf().flags & parse.F_THIS) != 0) {
+                            argBase = a + 2;
+                            n = b - 1;
+                        }
+                    } else {
+                        let kind = (x1 >> 8) & 255;
+                        if kind == FALLBACK_ENV {
+                            f = env[x2 >> 16];
+                        } else if kind == FALLBACK_GLOBAL {
+                            f = vm.global(name);
+                        } else if kind == FALLBACK_PUB {
+                            f = tableOf(env[0]).get(name);
+                        }
+                        if f.isNil() {
+                            vm.noMethod(name);
+                            return vm.failAt(fi, pc);
+                        }
+                    }
+                    st[a] = f;
+                    vm.frames[fi].pc = pc;
+                    if !vm.callAt(f, argBase, n, a) { return vm.failAt(fi, pc); }
+                    if f.tag == T_FN { break; }
+                    st = vm.stack;
+                }
+                OP_RETURN {
+                    let v = if b != 0 { st[a] } else { nilv() };
+                    if vm.open != 0 as ptr { vm.closeUps(base); }
+                    vm.stack[vm.frames[fi].ret] = v;
+                    vm.nframes -= 1;
+                    if vm.nframes == stop { return true; }
+                    let caller = vm.frames[vm.nframes - 1];
+                    vm.top = caller.base + (caller.cl as &Closure).protoOf().maxStack;
+                    break;
+                }
+                OP_CLOSURE {
+                    let child = p.protosOf()[ins >> 16] as ptr as &Proto;
+                    let f = vm.heap.newClosure(child, cl.env);
+                    let dst = closureOf(f).upsOf();
+                    let descs = child.upsOf();
+                    for i in 0..descs.len {
+                        let d = descs[i];
+                        if (d & 1) != 0 {
+                            dst[i] = vm.findUp(base + (d >> 1)) as int;
+                        } else {
+                            dst[i] = ups[d >> 1];
+                        }
+                    }
+                    st[a] = f;
+                    if vm.memFull() { return vm.failAt(fi, pc); }
+                }
+                OP_CLOSE { vm.closeUps(a); }
+                OP_FORPREP {
+                    let from = st[a];
+                    let to = st[a + 1];
+                    if from.tag != T_INT || to.tag != T_INT {
+                        let t = vm.errText();
+                        t.pushStr("a range needs ints, not ");
+                        t.pushStr(typeName(if from.tag != T_INT { from } else { to }));
+                        return vm.failAt(fi, pc);
+                    }
+                    if from.bits >= to.bits {
+                        pc += (ins >> 16) - SBX_BIAS;
+                    } else {
+                        st[a + 2] = from;
+                    }
+                }
+                OP_FORLOOP {
+                    let i = st[a].bits + 1;
+                    if i < st[a + 1].bits {
+                        vm.budget -= 1;
+                        if vm.budget < 0 {
+                            vm.tooLong();
+                            return vm.failAt(fi, pc);
+                        }
+                        st[a] = intv(i);
+                        st[a + 2] = intv(i);
+                        pc += (ins >> 16) - SBX_BIAS;
+                    }
+                }
+                OP_FORINPREP {
+                    let it = st[a];
+                    if it.tag != T_ARRAY && it.tag != T_TABLE {
+                        let t = vm.errText();
+                        t.pushStr("can't loop over ");
+                        t.pushStr(typeName(it));
+                        return vm.failAt(fi, pc);
+                    }
+                    st[a + 1] = intv(0);
+                    pc += (ins >> 16) - SBX_BIAS;
+                }
+                OP_FORINNEXT {
+                    let it = st[a];
+                    let pos = st[a + 1].bits;
+                    if it.tag == T_ARRAY {
+                        let arr = arrOf(it);
+                        if pos < arr.len {
+                            vm.budget -= 1;
+                            if vm.budget < 0 {
+                                vm.tooLong();
+                                return vm.failAt(fi, pc);
+                            }
+                            st[a + 2] = intv(pos);
+                            st[a + 3] = arr.values()[pos];
+                            st[a + 1] = intv(pos + 1);
+                            pc += (ins >> 16) - SBX_BIAS;
+                        }
+                    } else {
+                        let tb = tableOf(it);
+                        let e = tb.next(pos);
+                        if e >= 0 {
+                            vm.budget -= 1;
+                            if vm.budget < 0 {
+                                vm.tooLong();
+                                return vm.failAt(fi, pc);
+                            }
+                            let ent = tb.entries()[e];
+                            st[a + 2] = ent.key;
+                            st[a + 3] = ent.val;
+                            st[a + 1] = intv(e + 1);
+                            pc += (ins >> 16) - SBX_BIAS;
+                        }
+                    }
+                }
+                _ {
+                    vm.fail("bad instruction");
+                    return vm.failAt(fi, pc);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+extend Vm {
+    /// One step of the budget (a backward jump); false with `took too long` pending when spent.
+    fn step(this: &Vm): bool {
+        this.budget -= 1;
+        if this.budget < 0 { return this.tooLong(); }
+        return true;
+    }
+
+    /// After a compare-and-jump at `pc - 1`: take the `OP_JMP` at `pc` when `take`, else skip
+    /// it. The next pc, or `-(pc + 1)` with the error pending when a backward jump spent the
+    /// budget (so the error is positioned at that `OP_JMP`, which has the loop's position).
+    fn testJump(this: &Vm, code: []u32, pc: int, take: bool): int {
+        if !take { return pc + 1; }
+        let off = (int(code[pc]) >> 16) - SBX_BIAS;
+        if off < 0 && !this.step() { return 0 - (pc + 1); }
+        return pc + 1 + off;
+    }
+}

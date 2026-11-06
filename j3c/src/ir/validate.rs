@@ -11,6 +11,10 @@ use crate::ir::rvalue::{Rvalue, RvalueKind};
 use crate::ir::stmt::{Stmt, StmtKind};
 use crate::ir::ty::{Ty, TyKind};
 
+mod places;
+
+use places::validate_place;
+
 pub struct ValidateError {
     pub message: String,
 }
@@ -75,7 +79,7 @@ fn validate_body(cx: &IrCx, fn_ty: Ty, body: &Body) -> Result<(), ValidateError>
         }
     }
 
-    validate_block(cx, body, &body.block, ret, false)
+    validate_block(cx, body, &body.block, ret, 0)
 }
 
 fn validate_block(
@@ -83,7 +87,7 @@ fn validate_block(
     body: &Body,
     block: &Block,
     ret: Ty,
-    in_loop: bool,
+    in_loop: u32,
 ) -> Result<(), ValidateError> {
     for stmt in &block.stmts {
         validate_stmt(cx, body, stmt, ret, in_loop)?;
@@ -96,7 +100,7 @@ fn validate_stmt(
     body: &Body,
     stmt: &Stmt,
     ret: Ty,
-    in_loop: bool,
+    in_loop: u32,
 ) -> Result<(), ValidateError> {
     if stmt.ty != cx.common.void {
         return Err(ValidateError::new(
@@ -158,9 +162,14 @@ fn validate_stmt(
                 }
             }
         },
-        StmtKind::Abort(_) | StmtKind::Div0 => {}
-        StmtKind::Break | StmtKind::Continue => {
-            if !in_loop {
+        StmtKind::Abort(_, vals) => {
+            for v in vals {
+                validate_operand(cx, body, v)?;
+            }
+        }
+        StmtKind::Div0 => {}
+        StmtKind::Break(n) | StmtKind::Continue(n) => {
+            if *n >= in_loop {
                 return Err(ValidateError::new(
                     "break/continue outside a loop".to_string(),
                 ));
@@ -186,12 +195,26 @@ fn validate_stmt(
                 validate_block(cx, body, else_block, ret, in_loop)?;
             }
         }
+        StmtKind::Switch { scrut, cases, default } => {
+            validate_operand(cx, body, scrut)?;
+            if !matches!(cx.ty_kind(scrut.ty()), crate::ir::ty::TyKind::Int(_)) {
+                return Err(ValidateError::new("switch on a non-integer".to_string()));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for (v, b) in cases {
+                if !seen.insert(*v) {
+                    return Err(ValidateError::new(format!("duplicate switch case {v}")));
+                }
+                validate_block(cx, body, b, ret, in_loop)?;
+            }
+            validate_block(cx, body, default, ret, in_loop)?;
+        }
         StmtKind::While { cond, body: inner } => {
             validate_operand(cx, body, cond)?;
             if cond.ty() != cx.common.bool {
                 return Err(ValidateError::new("while cond is not bool".to_string()));
             }
-            validate_block(cx, body, inner, ret, true)?;
+            validate_block(cx, body, inner, ret, in_loop + 1)?;
         }
         StmtKind::ForRange {
             index,
@@ -208,7 +231,7 @@ fn validate_stmt(
             if index.ty != cx.common.int || end.ty() != cx.common.int {
                 return Err(ValidateError::new("for range is not int".to_string()));
             }
-            validate_block(cx, body, inner, ret, true)?;
+            validate_block(cx, body, inner, ret, in_loop + 1)?;
         }
         StmtKind::InterpFill { buf, used, parts } => {
             validate_place(cx, body, buf)?;
@@ -286,8 +309,8 @@ fn validate_rvalue(cx: &IrCx, body: &Body, rvalue: &Rvalue) -> Result<(), Valida
                     for (i, arg) in args.iter().enumerate() {
                         if arg.ty() != params[i] {
                             return Err(ValidateError::new(format!(
-                                "call arg {} type mismatch",
-                                i
+                                "internal: call argument {} type mismatch (the checker should have caught this; please report it)",
+                                i + 1
                             )));
                         }
                     }
@@ -309,7 +332,28 @@ fn validate_rvalue(cx: &IrCx, body: &Body, rvalue: &Rvalue) -> Result<(), Valida
                 return Err(ValidateError::new("@syscall type must be int".to_string()));
             }
         }
-        RvalueKind::Atomic { op, args } => {
+        RvalueKind::Simd { op, args } => {
+            use crate::ir::simd::SimdOp;
+            for arg in args {
+                validate_operand(cx, body, arg)?;
+            }
+            let want = match op {
+                SimdOp::Build => 4,
+                SimdOp::Min | SimdOp::Max | SimdOp::Store => 2,
+                _ => 1,
+            };
+            if args.len() != want {
+                return Err(ValidateError::new(format!("simd.{} operand count", op.name())));
+            }
+            let result_is_vec = !matches!(op, SimdOp::Sum | SimdOp::Store);
+            if result_is_vec != matches!(cx.ty_kind(rvalue.ty), TyKind::Vec(_)) {
+                return Err(ValidateError::new(format!("simd.{} result type", op.name())));
+            }
+        }
+        RvalueKind::Atomic { op, order, args } => {
+            if !op.orders().contains(order) {
+                return Err(ValidateError::new("@atomic order not valid for op".to_string()));
+            }
             if args.len() != op.values() + 1 {
                 return Err(ValidateError::new("@atomic operand count".to_string()));
             }
@@ -370,213 +414,6 @@ fn validate_operand(cx: &IrCx, body: &Body, operand: &Operand) -> Result<(), Val
             Ok(())
         }
     }
-}
-
-fn validate_place(cx: &IrCx, body: &Body, place: &Place) -> Result<(), ValidateError> {
-    let (mut ty, access0) = match place.root {
-        PlaceRoot::Local(id) => {
-            let decl = local(body, id)?;
-            (decl.ty, decl.access)
-        }
-        PlaceRoot::Global(id) => {
-            let g = cx.global(id);
-            (g.ty, if g.readonly { Access::read_only_view() } else { Access::let_binding() })
-        }
-    };
-
-    for proj in &place.proj {
-        match proj {
-            Proj::Deref => match cx.ref_inner(ty) {
-                Some(inner) => {
-                    ty = inner;
-                }
-                None => {
-                    return Err(ValidateError::new(
-                        "Deref projection on non-ref type".to_string(),
-                    ));
-                }
-            },
-            Proj::Field {
-                field,
-                ty: field_ty,
-            } => match cx.ty_kind(ty) {
-                TyKind::Struct(sid) => {
-                    if field.struct_id != *sid {
-                        return Err(ValidateError::new(
-                            "field id does not match struct".to_string(),
-                        ));
-                    }
-                    let def = cx.field_def(*field);
-                    if def.ty != *field_ty {
-                        return Err(ValidateError::new(
-                            "field projection ty != field def".to_string(),
-                        ));
-                    }
-                    ty = def.ty;
-                }
-                _ => {
-                    return Err(ValidateError::new(
-                        "field projection on non-struct".to_string(),
-                    ));
-                }
-            },
-            Proj::Index { index, ty: elem_ty } => {
-                validate_operand(cx, body, index)?;
-                if index.ty() != cx.common.int {
-                    return Err(ValidateError::new("index is not int".to_string()));
-                }
-                match cx.elem_ty(ty) {
-                    Some(elem) => {
-                        if elem != *elem_ty {
-                            return Err(ValidateError::new(
-                                "index projection ty != elem ty".to_string(),
-                            ));
-                        }
-                        ty = elem;
-                    }
-                    None => {
-                        return Err(ValidateError::new(
-                            "index projection on non-array/slice/string".to_string(),
-                        ));
-                    }
-                }
-            }
-            Proj::Ptr => match cx.elem_ty(ty) {
-                Some(elem) => match cx.lookup_ty(&TyKind::Ref(elem)) {
-                    Some(ptr_ty) => {
-                        ty = ptr_ty;
-                    }
-                    None => {
-                        return Err(ValidateError::new(
-                            "slice ptr type &T was never interned".to_string(),
-                        ));
-                    }
-                },
-                None => {
-                    return Err(ValidateError::new(
-                        "Ptr projection on non-array/slice/string".to_string(),
-                    ));
-                }
-            },
-            Proj::Len => match cx.elem_ty(ty) {
-                Some(_) => {
-                    ty = cx.common.int;
-                }
-                None => {
-                    return Err(ValidateError::new(
-                        "Len projection on non-array/slice/string".to_string(),
-                    ));
-                }
-            },
-            Proj::EnumTag => match cx.ty_kind(ty) {
-                TyKind::Enum(id) if !cx.enum_def(*id).is_c_like() => {
-                    ty = cx.common.i32;
-                }
-                _ => {
-                    return Err(ValidateError::new("EnumTag on non-tagged enum".to_string()));
-                }
-            },
-            Proj::EnumPayload { variant, ty: pty } => match cx.ty_kind(ty) {
-                TyKind::Enum(id) if *id == variant.enum_id => {
-                    let def = cx.enum_def(*id);
-                    let v = &def.variants[variant.index as usize];
-                    match v.payload {
-                        Some(p) if p == *pty => ty = p,
-                        _ => {
-                            return Err(ValidateError::new(
-                                "EnumPayload does not match variant".to_string(),
-                            ));
-                        }
-                    }
-                }
-                _ => {
-                    return Err(ValidateError::new("EnumPayload on wrong type".to_string()));
-                }
-            },
-        }
-    }
-
-    let access = fold_access(
-        cx,
-        access0,
-        &place.proj,
-        match place.root {
-            PlaceRoot::Local(id) => local(body, id)?.ty,
-            PlaceRoot::Global(id) => cx.global(id).ty,
-        },
-    );
-
-    if ty != place.ty {
-        return Err(ValidateError::new(
-            "place.ty does not match projections".to_string(),
-        ));
-    }
-    if access.assign != place.access.assign || access.take_ref != place.access.take_ref {
-        return Err(ValidateError::new(
-            "place.access does not match projections".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn fold_access(cx: &IrCx, start: Access, projs: &[Proj], start_ty: Ty) -> Access {
-    let mut access = start;
-    let mut ty = start_ty;
-    for proj in projs {
-        match proj {
-            Proj::Deref => {
-                if let Some(inner) = cx.ref_inner(ty) {
-                    ty = inner;
-                }
-                access = Access::through_ref();
-            }
-            Proj::Field { field, ty: field_ty } => {
-                if cx.struct_def(field.struct_id).script.as_ref()
-                    .is_some_and(|meta| (field.index as usize) < meta.prop_spans.len()) {
-                    access = Access::read_only_view();
-                }
-                ty = *field_ty;
-            }
-            Proj::Index { ty: elem_ty, .. } => {
-                match cx.ty_kind(ty) {
-                    TyKind::String => {
-                        access = Access::read_only_view();
-                    }
-                    _ => {}
-                }
-                ty = *elem_ty;
-            }
-            Proj::Ptr => {
-                match cx.ty_kind(ty) {
-                    TyKind::String => {
-                        access = Access::read_only_view();
-                    }
-                    _ => {}
-                }
-                if let Some(elem) = cx.elem_ty(ty) {
-                    if let Some(ptr_ty) = cx.lookup_ty(&TyKind::Ref(elem)) {
-                        ty = ptr_ty;
-                    }
-                }
-            }
-            Proj::Len => {
-                match cx.ty_kind(ty) {
-                    TyKind::String => {
-                        access = Access::read_only_view();
-                    }
-                    _ => {}
-                }
-                ty = cx.common.int;
-            }
-            Proj::EnumTag => {
-                ty = cx.common.i32;
-            }
-            Proj::EnumPayload { ty: pty, .. } => {
-                ty = *pty;
-            }
-        }
-    }
-    access
 }
 
 fn local(body: &Body, id: LocalId) -> Result<&crate::ir::body::LocalDecl, ValidateError> {

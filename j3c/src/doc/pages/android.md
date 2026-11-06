@@ -30,6 +30,7 @@ j3.toml:
     package = "com.example.mygame"   # Java package, 2+ segments, each starting with a letter. Default com.j3.<name>
     orientation = "landscape"        # landscape (default), portrait, sensorLandscape, sensorPortrait, fullSensor, unspecified
     native_libs = "android/libs"     # extra programs and libraries: android/libs/<abi>/lib<name>.so. Default none
+    foreground_service = "connectedDevice"   # or "dataSync": lets j3.android.service.keepAlive run. Default none
 
 - `apk` needs an Android triple in [emit] target, or the build stops.
 - versionCode is major * 1000000 + minor * 1000 + patch from the first three numbers of `version`
@@ -46,7 +47,7 @@ Build and run:
   the app's log until it exits or --secs passes (default 60). --serial picks one device when several are attached.
   With no device it stops with one line.
 - By hand: `adb install -r target/dist/<name>-<version>.apk`, then `adb shell am start -n <package>/.J3Activity`.
-- `j3c run` refuses an Android target. Run the APK on a device or emulator.
+- `j3c run` refuses an Android target. Run the APK on a device or emulator, or add `--host` (below).
 
 Extra programs and libraries ([android] native_libs):
 - Every file in `<native_libs>/<abi>/` (arm64-v8a, x86_64) goes into the APK's `lib/<abi>/` beside libmain.so. A
@@ -57,11 +58,24 @@ Extra programs and libraries ([android] native_libs):
   `$J3_NATIVE_LIB_DIR/libstockfish.so` with `j3.proc` (fork/exec). Android 10+ refuses to exec from app storage,
   so a program copied there will not start.
 
+Vibrate, notifications, background (`j3c doc j3.android`, `j3.android.notify`, `j3.android.service`):
+- `android.vibrate(ms)`: true when it buzzed. VIBRATE is always in the manifest (no prompt).
+- `notify.post(id, title, text)` shows or replaces notification `id`; tapping it brings the app up and `notify.tapped()`
+  is true once. The first post asks for POST_NOTIFICATIONS (Android 13+); until granted, or when denied, post returns
+  false. `notify.cancel(id)` removes one. Channel "j3" (high importance) is made on first post.
+- `service.keepAlive(true)` starts a foreground service (its own ongoing notification, a partial wake lock), so the
+  process and its sockets live on with the app backgrounded or the screen off; `keepAlive(false)` stops it. Needs
+  `[android] foreground_service`, which declares the service and its permissions (connectedDevice also adds
+  CHANGE_NETWORK_STATE, which Android 14 wants for that type). Start it while in the foreground: Android 12+ refuses
+  from the background. dataSync is capped at 6 hours a day on Android 15.
+- All of them work from any thread (post from a network worker while `App.run` is backgrounded) and return false
+  off Android. They call methods of the generated `J3Activity` through JNI.
+
 What differs on Android:
 - Assets: the include folders are inside the APK. On first launch, and again whenever a listed file changes, they are
   copied to the app's internal storage and the program starts there. Relative paths, scenes, fonts and saves work as on
   desktop. The copy is listed in logcat.
-- `j3.sys.PLATFORM` is 3 (0 Linux, 1 Windows, 2 macOS).
+- `j3.sys.PLATFORM == j3.sys.PLATFORM_ANDROID` (`PLATFORM_NAME` is `"android"`).
 - OpenGL ES 3.0; `game.isGles()` says so. Write shaders as GLSL 330 core: `game.prepGl` rewrites them for ES.
 - Touch: `game.fingerCount()` and `game.finger(i)` (`Finger { id, x, y, down, held, up }`, 10 slots, oldest first).
   Touch also arrives as mouse events; a tap whose down and up land in one frame still gives `mousePressed` that frame
@@ -78,6 +92,8 @@ What differs on Android:
   Certificates are checked against the phone's CA store.
 
 Testing on Linux, with no device:
+- `j3c check --host` and `j3c run --host --headless --frames 60 --screenshot shot.png` ignore [emit] target and build the
+  package for this machine, in place: no copy, symlinks followed, [ui] [link] [dependencies] as written.
 - `J3_GLES=1` gives an ES 3.0 context on desktop. Headless ES needs `app.useGl()`. For the strict Mesa check, add
   `__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json LIBGL_ALWAYS_SOFTWARE=1`.
       SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout 120 j3c run <dir> --headless --frames 60

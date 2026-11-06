@@ -8,6 +8,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::project::Manifest;
 
+mod hints;
+mod link;
+mod symbolize;
+mod target;
+#[cfg(test)]
+mod tests;
+
+pub use hints::failure_hint;
+pub use link::host_lib_present;
+pub(crate) use link::*;
+pub(crate) use symbolize::*;
+pub(crate) use target::*;
+
 static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub struct RunResult {
@@ -414,6 +427,7 @@ pub fn run_exe_in(exe: &Path, cwd: Option<&Path>, args: &[String]) -> Result<Run
             .canonicalize()
             .map_err(|e| format!("project root {}: {e}", dir.display()))?;
         cmd.current_dir(&root);
+        cmd.envs(crate::dist::steam_dev_env(&root));
         cmd.env("J3_ROOT", root);
         // a dev run lets F12 open the UI inspector (`j3.ui.inspect`); `J3_INSPECT=0` turns that off
         cmd.env("J3_INSPECT", std::env::var("J3_INSPECT").unwrap_or_else(|_| "1".into()));
@@ -421,10 +435,16 @@ pub fn run_exe_in(exe: &Path, cwd: Option<&Path>, args: &[String]) -> Result<Run
     let run = cmd
         .output()
         .map_err(|e| format!("run {}: {e}", exe.display()))?;
-    let stderr = match symbolize(&absolute, &String::from_utf8_lossy(&run.stderr)) {
-        Some(text) => text.into_bytes(),
-        None => run.stderr,
+    let root = match cwd {
+        Some(dir) => dir.canonicalize().ok(),
+        None => std::env::current_dir().ok(),
     };
+    let raw = String::from_utf8_lossy(&run.stderr);
+    let raw: String = match &root {
+        Some(root) => raw.lines().map(|l| abort_context(l, root).unwrap_or_else(|| l.to_string()) + "\n").collect(),
+        None => raw.into_owned(),
+    };
+    let stderr = symbolize(&absolute, &raw).unwrap_or(raw).into_bytes();
     Ok(RunResult {
         status: exit_code(&run.status),
         stdout: run.stdout,
@@ -432,443 +452,9 @@ pub fn run_exe_in(exe: &Path, cwd: Option<&Path>, args: &[String]) -> Result<Run
     })
 }
 
-fn signal_name(n: i32) -> &'static str {
-    match n {
-        4 => "SIGILL",
-        6 => "SIGABRT",
-        7 => "SIGBUS",
-        8 => "SIGFPE",
-        11 => "SIGSEGV",
-        _ => "signal",
-    }
-}
 
-fn hex(s: &str) -> Option<u64> {
-    u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
-}
 
-/// Rewrite the crash handler's `j3 crash:` / `j3 pc:` / `j3 at:` lines (raw addresses) into
-/// `function at file:line` using `nm` and `addr2line` when installed. `None` when `err` has no
-/// crash report, so ordinary stderr passes through untouched.
-pub(crate) fn symbolize(exe: &Path, err: &str) -> Option<String> {
-    let mut sig = None;
-    let mut base = None;
-    let mut addrs: Vec<u64> = Vec::new();
-    let mut rest = String::new();
-    for line in err.lines() {
-        if let Some(v) = line.strip_prefix("j3 crash: signal ") {
-            sig = v.trim().parse::<i32>().ok();
-        } else if let Some(v) = line.strip_prefix("j3 base: ") {
-            base = hex(v);
-        } else if let Some(v) = line.strip_prefix("j3 pc: ").or_else(|| line.strip_prefix("j3 at: ")) {
-            addrs.extend(hex(v));
-        } else {
-            rest.push_str(line);
-            rest.push('\n');
-        }
-    }
-    let sig = sig?;
-    let mut out = rest;
-    out.push_str(&format!("crash: {} ({sig})\n", signal_name(sig)));
-    let names = base.and_then(|b| addr_names(exe, b, &addrs));
-    let mut prev: Option<String> = None;
-    let mut count = 0;
-    let flush = |out: &mut String, prev: &mut Option<String>, count: &mut usize| {
-        if let Some(p) = prev.take() {
-            out.push_str(&format!("  {p}"));
-            if *count > 1 {
-                out.push_str(&format!("  (x{count})"));
-            }
-            out.push('\n');
-        }
-        *count = 0;
-    };
-    for (i, a) in addrs.iter().enumerate() {
-        let text = match &names {
-            Some(n) => n[i].clone(),
-            None => format!("{a:#x}"),
-        };
-        if prev.as_deref() != Some(text.as_str()) {
-            flush(&mut out, &mut prev, &mut count);
-            prev = Some(text);
-        }
-        count += 1;
-    }
-    flush(&mut out, &mut prev, &mut count);
-    Some(out)
-}
 
-/// `function at file:line` for each runtime address; needs `nm` (to find the load offset from
-/// `main`) and `addr2line`. Return addresses (all but the first, the faulting pc) step back a byte.
-fn addr_names(exe: &Path, runtime_main: u64, addrs: &[u64]) -> Option<Vec<String>> {
-    let nm = Command::new("nm").arg(exe).output().ok()?;
-    let nm = String::from_utf8_lossy(&nm.stdout).into_owned();
-    let static_main = nm.lines().find_map(|l| {
-        let mut it = l.split_whitespace();
-        let (addr, kind, name) = (it.next()?, it.next()?, it.next()?);
-        (name == "main" && kind.eq_ignore_ascii_case("t")).then(|| hex(addr)).flatten()
-    })?;
-    let offset = runtime_main.wrapping_sub(static_main);
-    let mut cmd = Command::new("addr2line");
-    cmd.args(["-f", "-C", "-p", "-e"]).arg(exe);
-    for (i, a) in addrs.iter().enumerate() {
-        let a = a.wrapping_sub(offset).wrapping_sub(u64::from(i > 0));
-        cmd.arg(format!("{a:#x}"));
-    }
-    let out = cmd.output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let names: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-    (names.len() == addrs.len()).then_some(names)
-}
-
-/// What a target needs to know about its platform. One place to add the next one: a new
-/// `TargetOs` arm and a row in [`release_flags`]. `Other` (wasm, ...) gets only
-/// the portable size wins and no linker flags, so an unknown linker never sees a flag it rejects.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TargetOs {
-    Linux,
-    Windows,
-    Macos,
-    Android,
-    Other,
-}
-
-/// `""` is the host.
-pub(crate) fn target_os(triple: &str) -> TargetOs {
-    let t = triple.to_ascii_lowercase();
-    if t.is_empty() {
-        return if cfg!(windows) {
-            TargetOs::Windows
-        } else if cfg!(target_os = "macos") {
-            TargetOs::Macos
-        } else {
-            TargetOs::Linux
-        };
-    }
-    if t.contains("windows") {
-        TargetOs::Windows
-    } else if t.contains("apple") || t.contains("darwin") {
-        TargetOs::Macos
-    } else if t.contains("android") {
-        // before Linux: `x86_64-linux-android` contains "linux"
-        TargetOs::Android
-    } else if ["linux", "freebsd", "netbsd", "openbsd"].iter().any(|n| t.contains(n)) {
-        TargetOs::Linux
-    } else {
-        TargetOs::Other
-    }
-}
-
-pub(crate) struct ReleaseFlags {
-    /// Clang compile flags.
-    pub compile: Vec<&'static str>,
-    /// Appended after the inputs and libraries.
-    pub link: Vec<&'static str>,
-}
-
-/// Flags that shrink a shipped binary (`j3c build --release`).
-/// - Linux/ELF: strip, no build-id, no RELRO, GNU hash only, no unwind tables (J3 has no
-///   exceptions and the crash handler walks frame pointers); identical-code folding with lld.
-/// - Windows (mingw): strip, no timestamp. Unwind tables stay: x64 needs `.pdata` for SEH.
-/// - macOS (ld64): strip locals and debug (`-s` is ignored there). Compact unwind stays.
-pub(crate) fn release_flags(os: TargetOs, lld: bool) -> ReleaseFlags {
-    match os {
-        TargetOs::Linux => {
-            let mut link = vec!["-Wl,-s", "-Wl,--build-id=none", "-Wl,-z,norelro", "-Wl,--hash-style=gnu"];
-            if lld {
-                link.extend(["-fuse-ld=lld", "-Wl,--icf=safe"]);
-            }
-            ReleaseFlags {
-                compile: vec!["-fno-asynchronous-unwind-tables", "-fno-unwind-tables"],
-                link,
-            }
-        }
-        TargetOs::Windows => ReleaseFlags { compile: vec![], link: vec!["-Wl,-s", "-Wl,--no-insert-timestamp"] },
-        TargetOs::Macos => ReleaseFlags { compile: vec![], link: vec!["-Wl,-x", "-Wl,-S"] },
-        // Unwind tables stay: bionic's unwinder (and the NDK's crash reports) read them.
-        TargetOs::Android => ReleaseFlags { compile: vec!["-fno-asynchronous-unwind-tables"], link: vec!["-Wl,--gc-sections", "-Wl,-s"] },
-        TargetOs::Other => ReleaseFlags { compile: vec![], link: vec![] },
-    }
-}
-
-/// `ld.lld` on `PATH`, looked up once.
-pub(crate) fn lld_present() -> bool {
-    static LLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *LLD.get_or_init(|| {
-        Command::new("ld.lld")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-/// `mold` on `PATH`, looked up once.
-pub(crate) fn mold_on_path() -> bool {
-    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FOUND.get_or_init(|| {
-        std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).any(|d| d.join("mold").is_file()))
-            .unwrap_or(false)
-    })
-}
-
-/// Dev links on the host use mold when it is installed. Release keeps its own linker flags.
-pub(crate) fn use_mold(cmd: &mut Command, release: bool, target: &str) {
-    if !release && cfg!(target_os = "linux") && target.is_empty() && mold_on_path() {
-        cmd.arg("-fuse-ld=mold"); // a manifest `-fuse-ld=` flag comes later and wins
-    }
-}
-
-/// Unwind tables are dropped in release builds only where [`release_flags`] drops them.
-pub(crate) fn release_nounwind(release: bool, triple: &str) -> bool {
-    release && target_os(triple) == TargetOs::Linux
-}
-
-/// `--target=` for `target`; an Android triple also gets the API level, NDK sysroot and `-fPIC`.
-pub(crate) fn target_args(cmd: &mut Command, target: &str) {
-    if target_os(target) == TargetOs::Android {
-        cmd.args(super::android::target_flags(target));
-    } else if !target.is_empty() {
-        cmd.arg(format!("--target={target}"));
-    }
-}
-
-/// The clang for `target`: `[emit] clang`, else the NDK's on Android, else `clang`.
-pub(crate) fn clang_for(clang: &str, target: &str) -> String {
-    if target_os(target) == TargetOs::Android {
-        super::android::compiler(clang)
-    } else if clang.is_empty() {
-        "clang".to_string()
-    } else {
-        clang.to_string()
-    }
-}
-
-pub(crate) fn link_gc_flag(target: &str) -> &'static str {
-    let t = target.to_ascii_lowercase();
-    if t.contains("apple") || t.contains("darwin") {
-        "-Wl,-dead_strip"
-    } else {
-        "-Wl,--gc-sections"
-    }
-}
-
-fn foreign_target(target: &str) -> bool {
-    let t = target.to_ascii_lowercase();
-    t.contains("windows") || t.contains("apple") || t.contains("darwin")
-}
-
-fn windows_target(target: &str) -> bool {
-    target.to_ascii_lowercase().contains("windows")
-}
-
-fn keep_flag(flag: &str, target: &str) -> bool {
-    if !windows_target(target) {
-        return true;
-    }
-    let f = flag.to_ascii_lowercase();
-    !f.contains("rpath") && !f.contains("--disable-new-dtags")
-}
-
-/// `~/.cache/j3/sdl2-mingw/<pkg>/<arch>-w64-mingw32/lib` for every SDL package there, so a
-/// Windows target links `-lSDL2_ttf` without `[link] search` entries.
-fn mingw_sdl_libs(target: &str) -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME") else { return Vec::new() };
-    let arch = target.split('-').next().unwrap_or("x86_64");
-    let Ok(rd) = std::fs::read_dir(PathBuf::from(home).join(".cache/j3/sdl2-mingw")) else { return Vec::new() };
-    let mut dirs: Vec<PathBuf> =
-        rd.flatten().map(|e| e.path().join(format!("{arch}-w64-mingw32/lib"))).filter(|p| p.is_dir()).collect();
-    dirs.sort();
-    dirs
-}
-
-/// `-lNAME` as the target names it: Windows has no libc/libdl to link and calls GL `opengl32`.
-pub(crate) fn windows_lib(name: &str) -> Option<&str> {
-    match name {
-        "c" | "dl" => None,
-        "GL" => Some("opengl32"),
-        other => Some(other),
-    }
-}
-
-pub(crate) fn append_link_args(cmd: &mut Command, opts: &CcOpts, source: &str, target: &str) -> Result<(), String> {
-    let android = target_os(target) == TargetOs::Android;
-    if android {
-        cmd.args(super::android::link_flags(target));
-    }
-    for file in &opts.files {
-        cmd.arg(file);
-    }
-    for dir in &opts.search {
-        // ponytail: path sniff; a per-target [link] table is the real fix
-        if !windows_target(target) && dir.contains("mingw") {
-            continue;
-        }
-        cmd.arg(format!("-L{dir}"));
-        if !foreign_target(target) {
-            cmd.arg(format!("-Wl,-rpath-link,{dir}"));
-        }
-    }
-    if windows_target(target) {
-        for dir in mingw_sdl_libs(target) {
-            cmd.arg(format!("-L{}", dir.display()));
-        }
-    }
-    let mut libs = libs_from_c(source);
-    for lib in &opts.libs {
-        if !libs.iter().any(|l| l == lib) {
-            libs.push(lib.clone());
-        }
-    }
-    for lib in &libs {
-        if windows_target(target) {
-            if let Some(name) = windows_lib(lib) {
-                cmd.arg(format!("-l{name}"));
-            }
-            continue;
-        }
-        cmd.arg(link_lib(lib, &opts.search, target)?);
-    }
-    for flag in &opts.flags {
-        if keep_flag(flag, target) {
-            cmd.arg(flag);
-        }
-    }
-    if windows_target(target) {
-        // The mingw link leaves the TLS directory (`#[thread]` globals) without base relocations, so
-        // an exe that Windows ASLR moves off 0x140000000 crashes at its first thread-local access.
-        cmd.arg("-Wl,--disable-dynamicbase");
-        cmd.arg("-Wl,--disable-high-entropy-va");
-    }
-    Ok(())
-}
-
-/// True when the host linker can see `lib{name}`.
-pub fn host_lib_present(name: &str, search: &[String]) -> bool {
-    link_lib(name, search, "").is_ok()
-}
-
-/// `-lNAME` when the linker can see `libNAME.so`; otherwise a found `libNAME*.so*`.
-/// Debian often ships `libSDL2-2.0.so.0` without the `-dev` symlink.
-/// Windows and macOS pass `-lNAME` through so a missing library is the linker's error.
-fn link_lib(name: &str, search: &[String], target: &str) -> Result<String, String> {
-    if target_os(target) == TargetOs::Android {
-        return Ok(format!("-l{}", super::android::lib_name(name)));
-    }
-    if foreign_target(target) {
-        return Ok(format!("-l{name}"));
-    }
-    if name == "m" {
-        return Ok("-lm".to_string());
-    }
-    let mut dirs: Vec<PathBuf> = search.iter().map(PathBuf::from).collect();
-    for extra in [
-        "/usr/lib/x86_64-linux-gnu",
-        "/lib/x86_64-linux-gnu",
-        "/usr/lib",
-        "/usr/local/lib",
-    ] {
-        let p = PathBuf::from(extra);
-        if p.is_dir() && !dirs.iter().any(|d| d == &p) {
-            dirs.push(p);
-        }
-    }
-    for dir in &dirs {
-        if dir.join(format!("lib{name}.so")).is_file() {
-            return Ok(format!("-l{name}"));
-        }
-    }
-    for dir in &dirs {
-        if let Some(found) = find_soname(dir, name) {
-            return Ok(found);
-        }
-    }
-    let msg = format!("cannot find library `{name}`");
-    Err(match failure_hint(&msg) {
-        Some(hint) => format!("{msg}\n  = help: {hint}"),
-        None => format!("{msg}\n  = help: install it, or take it out of [link] libs"),
-    })
-}
-
-/// Extra line for a failed `run`/`build` that is not a J3 diagnostic.
-/// Names a package when the log mentions a known library or a missing compiler.
-pub fn failure_hint(text: &str) -> Option<String> {
-    if text.contains("-->") {
-        return None;
-    }
-    let mut pkgs: Vec<&str> = Vec::new();
-    let mut push = |pkg: &'static str| {
-        if !pkgs.contains(&pkg) {
-            pkgs.push(pkg);
-        }
-    };
-    if text.contains("SDL2_image") || text.contains("libSDL2_image") || text.contains("IMG_") {
-        push("libsdl2-image-2.0-0");
-    }
-    if text.contains("SDL2_mixer") || text.contains("libSDL2_mixer") || text.contains("Mix_") {
-        push("libsdl2-mixer-2.0-0");
-    }
-    if text.contains("SDL2_ttf") || text.contains("libSDL2_ttf") || text.contains("TTF_") {
-        push("libsdl2-ttf-2.0-0");
-    }
-    if sdl2_core(text) {
-        push("libsdl2-2.0-0");
-    }
-    if text.contains("library `GL`") || text.contains("-lGL") || text.contains("libGL") {
-        push("libgl1");
-    }
-    let mut lines: Vec<String> = Vec::new();
-    if !pkgs.is_empty() {
-        let list = pkgs.join(" ");
-        lines.push(format!("install {list}\n         `sudo apt install {list}`"));
-    }
-    if text.contains("spawn clang")
-        || text.contains("spawn cc")
-        || text.contains("clang: not found")
-        || text.contains("cc: not found")
-    {
-        lines.push("install clang\n         `sudo apt install clang`".to_string());
-    }
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n  = help: "))
-    }
-}
-
-/// `SDL2` itself, not `SDL2_image` / `SDL2_mixer` / `SDL2_ttf`.
-fn sdl2_core(text: &str) -> bool {
-    let mut rest = text;
-    while let Some(i) = rest.find("SDL2") {
-        let after = rest[i + 4..].chars().next();
-        if after != Some('_') {
-            return true;
-        }
-        rest = &rest[i + 4..];
-    }
-    false
-}
-
-fn find_soname(dir: &Path, name: &str) -> Option<String> {
-    let prefix = format!("lib{name}");
-    let entries = fs::read_dir(dir).ok()?;
-    let mut best: Option<PathBuf> = None;
-    for ent in entries.flatten() {
-        let p = ent.path();
-        let fname = match p.file_name().and_then(|n| n.to_str()) {
-            Some(s) => s,
-            None => continue,
-        };
-        let dashed = format!("{prefix}-");
-        let dotted = format!("{prefix}.so");
-        if (fname.starts_with(&dashed) || fname.starts_with(&dotted)) && fname.contains(".so") {
-            best = Some(p);
-            break;
-        }
-    }
-    best.map(|p| p.display().to_string())
-}
 
 pub(crate) fn clang_opt(opt: &str) -> &str {
     match opt {
@@ -899,74 +485,3 @@ fn libs_from_c(source: &str) -> Vec<String> {
     libs
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn link_gc_flag_matches_target() {
-        assert_eq!(super::link_gc_flag(""), "-Wl,--gc-sections");
-        assert_eq!(super::link_gc_flag("x86_64-pc-linux-gnu"), "-Wl,--gc-sections");
-        assert_eq!(super::link_gc_flag("x86_64-pc-windows-gnu"), "-Wl,--gc-sections");
-        assert_eq!(super::link_gc_flag("arm64-apple-darwin"), "-Wl,-dead_strip");
-        assert_eq!(super::link_gc_flag("x86_64-apple-darwin"), "-Wl,-dead_strip");
-    }
-
-    #[test]
-    fn release_flags_per_platform() {
-        use super::{release_flags, target_os, TargetOs};
-        assert_eq!(target_os("x86_64-pc-linux-gnu"), TargetOs::Linux);
-        assert_eq!(target_os("x86_64-pc-windows-gnu"), TargetOs::Windows);
-        assert_eq!(target_os("arm64-apple-darwin"), TargetOs::Macos);
-        assert_eq!(target_os("aarch64-linux-android"), TargetOs::Android);
-        assert_eq!(target_os("x86_64-linux-android26"), TargetOs::Android);
-        assert_eq!(target_os("wasm32-unknown-unknown"), TargetOs::Other);
-        let linux = release_flags(TargetOs::Linux, false);
-        assert!(linux.link.contains(&"-Wl,-s") && !linux.link.contains(&"-fuse-ld=lld"));
-        assert!(linux.compile.contains(&"-fno-unwind-tables"));
-        assert!(release_flags(TargetOs::Linux, true).link.contains(&"-Wl,--icf=safe"));
-        let win = release_flags(TargetOs::Windows, true);
-        assert!(win.compile.is_empty() && !win.link.contains(&"-Wl,--icf=safe"));
-        assert!(release_flags(TargetOs::Macos, true).link.contains(&"-Wl,-x"));
-        let other = release_flags(TargetOs::Other, true);
-        assert!(other.compile.is_empty() && other.link.is_empty());
-        assert!(!super::release_nounwind(true, "x86_64-pc-windows-gnu"));
-        assert!(super::release_nounwind(true, "x86_64-pc-linux-gnu"));
-    }
-
-    #[test]
-    fn android_flags_and_libs() {
-        use super::{clang_for, link_lib, release_flags, TargetOs};
-        let r = release_flags(TargetOs::Android, true);
-        assert!(!r.compile.contains(&"-fno-unwind-tables"));
-        assert!(r.link.contains(&"-Wl,--gc-sections") && r.link.contains(&"-Wl,-s"));
-        assert_eq!(link_lib("GL", &[], "aarch64-linux-android").unwrap(), "-lGLESv3");
-        assert_eq!(link_lib("SDL2_ttf", &[], "x86_64-linux-android").unwrap(), "-lSDL2_ttf");
-        assert_eq!(clang_for("", "x86_64-pc-linux-gnu"), "clang");
-        assert_eq!(clang_for("zig", "x86_64-pc-linux-gnu"), "zig");
-        assert_eq!(clang_for("/opt/my-clang", "aarch64-linux-android"), "/opt/my-clang");
-    }
-
-    #[test]
-    fn missing_library_names_itself() {
-        let err = super::link_lib("not-a-real-lib", &[], "").unwrap_err();
-        assert!(err.contains("not-a-real-lib"), "{err}");
-        assert!(err.contains("take it out of [link] libs"), "{err}");
-    }
-
-    #[test]
-    fn missing_sdl_names_the_package() {
-        let err = super::failure_hint("cannot find library `SDL2_mixer`").unwrap();
-        assert!(err.contains("libsdl2-mixer-2.0-0"), "{err}");
-        assert!(!err.contains("libsdl2-2.0-0"), "{err}");
-        let image = super::failure_hint("libSDL2_image-2.0.so.0\n").unwrap();
-        assert!(image.contains("libsdl2-image-2.0-0"), "{image}");
-        let both = super::failure_hint(
-            "undefined reference to `IMG_Quit'\nundefined reference to `TTF_Quit'",
-        )
-        .unwrap();
-        assert!(both.contains("libsdl2-image-2.0-0"), "{both}");
-        assert!(both.contains("libsdl2-ttf-2.0-0"), "{both}");
-        assert!(super::failure_hint("error: expected `;`\n --> src/main.j3:1:1\n").is_none());
-        let cc = super::failure_hint("spawn clang: No such file or directory (os error 2)").unwrap();
-        assert!(cc.contains("sudo apt install clang"), "{cc}");
-    }
-}

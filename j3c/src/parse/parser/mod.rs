@@ -1,8 +1,8 @@
 use crate::parse::ast::{
     AssignOpStmt, AssignStmt, BinOp, Block, ConstItem, DeferStmt, EnumItem, Expr, ExprKind,
-    FieldItem, File, FnItem, ForEachStmt, ForStmt, Ident, IfStmt, InterpPart, Item, LetStmt,
+    FieldItem, File, FnItem, GpuStage, GpuStruct, ForEachStmt, ForStmt, Ident, IfStmt, InterpPart, Item, LabeledStmt, LetStmt,
     LibFnDecl, MatchArm, MatchStmt, ModLetItem, Param, Pat, ReturnStmt, ScriptBlockItem,
-    ScriptLetItem, Stmt, StructItem, Type, TypeKind, UnaryOp, UseItem, UseLibItem, UseLocalStmt,
+    ScriptLetItem, Stmt, StructItem, TraitItem, TraitMethod, Type, TypeKind, UnaryOp, UseItem, UseLibItem, UseLocalStmt,
     VariantItem, WhileStmt,
 };
 
@@ -11,20 +11,34 @@ struct ItemAttrs {
     try_catch: Option<(Ident, Ident)>,
     singleton: bool,
     thread: bool,
+    impl_fn: bool,
+    /// `#[shader]`, `#[shader(vertex)]`, `#[shader(fragment)]` (see `shader_attrs.rs`).
+    shader: Option<GpuStage>,
+    gpu_struct: GpuStruct,
+    uniform: bool,
+    flat: bool,
 }
 use crate::parse::error::ParseError;
 use crate::parse::syntax::{
-    is_j3ui_widget, ATTR_DEBUG, ATTR_SINGLETON, ATTR_THREAD, ATTR_TRY_CATCH, INTRINSIC_SCRIPT, INTRINSIC_SIZEOF,
+    is_j3ui_widget, INTRINSIC_CLOSURES, INTRINSIC_GPU, INTRINSIC_SIMD, ATTR_DEBUG, ATTR_IMPL, ITEM_EXTEND, ITEM_TRAIT, ATTR_SINGLETON, ATTR_THREAD, ATTR_TRY_CATCH, INTRINSIC_SCRIPT, INTRINSIC_SIZEOF,
     INTRINSIC_SLICE, INTRINSIC_SYSCALL, INTRINSIC_UI_CHOICE, J3UI_END, J3UI_IF, J3UI_POP, SCRIPT_PROPS, SCRIPT_SHARED,
 };
 use crate::parse::token::{Token, TokenKind};
 use crate::span::Span;
 
+mod atomic;
+mod attrs;
+mod bitops;
+mod closure;
 mod expr;
+mod extend;
+mod generics;
 mod items;
 mod primary;
+mod shader_attrs;
 mod script_ui;
 mod stmt;
+mod traits;
 
 pub fn parse_tokens(tokens: &[Token]) -> Result<File, ParseError> {
     let mut p = Parser {
@@ -70,6 +84,10 @@ impl<'a> Parser<'a> {
     fn expect(&mut self, kind: TokenKind, message: &str) -> Result<&Token, ParseError> {
         if self.cur().kind == kind {
             Ok(self.bump())
+        } else if kind == TokenKind::Semi && self.i > 0 {
+            // A missing `;` belongs at the end of the line before, not on the next statement.
+            let end = self.tokens[self.i - 1].span.end;
+            Err(ParseError::new(Span { file: self.cur().span.file, start: end, end: end + 1 }, message))
         } else {
             Err(self.err(message))
         }
@@ -130,7 +148,8 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::UseLocal(s) => s.span,
         Stmt::Match(s) => s.span,
         Stmt::Defer(s) => s.span,
-        Stmt::Break(s) | Stmt::Continue(s) => *s,
+        Stmt::Break(s, _) | Stmt::Continue(s, _) => *s,
+        Stmt::Labeled(s) => s.span,
         Stmt::Block(b) => b.span,
     }
 }
@@ -141,6 +160,8 @@ fn parse_int(text: &str) -> Result<i64, String> {
             Ok(v) => Ok(v),
             Err(_) => Err(format!("invalid hex literal `{text}`")),
         }
+    } else if let Some(bin) = text.strip_prefix("0b") {
+        i64::from_str_radix(bin, 2).map_err(|_| format!("invalid binary literal `{text}`"))
     } else {
         match text.parse::<i64>() {
             Ok(v) => Ok(v),

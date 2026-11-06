@@ -1,4 +1,4 @@
-/// Opcodes. The numbers are the file format; `stdlib/j3/script.j3` has the same table.
+/// Opcodes. The numbers are the file format; `stdlib/j3/script/opcodes.j3` has the same table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Op {
@@ -96,6 +96,10 @@ pub enum Op {
     AppBool = 91,
     Land = 92,
     Lor = 93,
+    Band = 94,
+    Bor = 95,
+    Bxor = 96,
+    Bnot = 97,
 }
 
 impl Op {
@@ -194,6 +198,10 @@ impl Op {
             Op::AppBool => "app.bool",
             Op::Land => "land",
             Op::Lor => "lor",
+            Op::Band => "band",
+            Op::Bor => "bor",
+            Op::Bxor => "bxor",
+            Op::Bnot => "bnot",
         }
     }
 

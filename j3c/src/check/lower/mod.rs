@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::error::CheckError;
 use super::{
-    alloc_fn, field_path, find_operator, instantiate_struct, is_float, is_int, is_numeric,
-    resolve_type_g, ConstPayload, ConstVal, GenEnv, ModData,
+    alloc_fn, join_module, bare_num, field_path, find_operator, instantiate_struct, is_float, is_int, is_numeric,
+    reject_closure, resolve_type_g, ConstPayload, ConstVal, DeclEnv, GenEnv, ModData, TraitEnv,
 };
 use crate::intern::Name;
 use crate::ir::build::BodyBuilder;
@@ -20,15 +20,36 @@ use crate::parse::{self, Expr, ExprKind, FnItem, Ident, InterpPart, Item, MatchA
 use crate::span::Span;
 
 mod binop;
+mod bounds;
 mod call;
+mod closure;
+mod closure_call;
+use closure::fn_label;
+use generic_fn as generic;
 mod enums;
 mod expr;
+mod interp;
+mod generic_fn;
+mod half;
 mod lit;
 mod place;
 mod stmt;
+mod streq;
+mod setup;
+mod simd;
+mod ufcs;
+mod unify;
+pub(crate) use bounds::drain_bounds;
+use bounds::eq_needs_operator;
+use generic_fn::GenCtx;
+use setup::{generic_origins, lower_fn, MergedEnv};
+use ufcs::ThisAdjust;
+use simd::is_vec;
 
 struct OriginNs {
     path: String,
+    names: Vec<Name>,
+    enum_temps: HashMap<String, parse::EnumItem>,
     funcs: HashMap<String, FuncId>,
     types: HashMap<String, Ty>,
     consts: HashMap<String, ConstVal>,
@@ -37,17 +58,20 @@ struct OriginNs {
     mod_types: HashMap<String, HashMap<String, Ty>>,
     globals: HashMap<String, GlobalId>,
     struct_temps: HashMap<String, parse::StructItem>,
-    struct_temp_env: HashMap<String, HashMap<String, Ty>>,
+    struct_temp_env: HashMap<String, DeclEnv>,
 }
 
 /// Lowering state read by every module and written by none, built once before the lower loop.
 pub(crate) struct Shared {
+    /// Generic free-fn templates by `module::name`.
+    gen_fns: HashMap<String, parse::FnItem>,
     origins: HashMap<String, OriginNs>,
     struct_temps: HashMap<String, parse::StructItem>,
-    struct_temp_env: HashMap<String, HashMap<String, Ty>>,
+    struct_temp_env: HashMap<String, DeclEnv>,
+    pub(crate) traits: TraitEnv,
 }
 
-pub(crate) fn shared(mods: &[ModData]) -> Shared {
+pub(crate) fn shared(mods: &[ModData], traits: TraitEnv) -> Shared {
     let mut struct_temps = HashMap::new();
     let mut struct_temp_env = HashMap::new();
     for m in mods.iter() {
@@ -57,44 +81,33 @@ pub(crate) fn shared(mods: &[ModData]) -> Shared {
         for (k, v) in &m.struct_temp_env {
             struct_temp_env.entry(k.clone()).or_insert_with(|| v.clone());
         }
+        // A plain struct's generic method is instantiated from the caller, so its signature
+        // resolves in the defining module's types (`Arena.alloc::<T>` without `use j3.memory.Arena`).
+        for it in &m.ast.items {
+            if let Item::Struct(s) = it {
+                if s.type_params.is_empty() && has_generic_method(s) {
+                    struct_temp_env.entry(s.name.name.clone()).or_insert_with(|| DeclEnv::of(m));
+                }
+            }
+        }
+    }
+    let mut gen_fns = HashMap::new();
+    for m in mods.iter() {
+        for (k, f) in &m.gen_fns {
+            gen_fns.insert(format!("{}::{k}", m.key), f.clone());
+        }
     }
     Shared {
+        gen_fns,
         origins: generic_origins(mods),
         struct_temps,
         struct_temp_env,
+        traits,
     }
 }
 
-fn generic_origins(mods: &[ModData]) -> HashMap<String, OriginNs> {
-    let mut out = HashMap::new();
-    for m in mods {
-        for it in &m.ast.items {
-            let Item::Struct(s) = it else { continue };
-            if s.type_params.is_empty() {
-                continue;
-            }
-            let mut funcs = m.funcs.clone();
-            for (name, id) in &m.imports {
-                funcs.insert(name.clone(), *id);
-            }
-            out.insert(
-                s.name.name.clone(),
-                OriginNs {
-                    path: m.path.clone(),
-                    funcs,
-                    types: m.types.clone(),
-                    consts: m.consts.clone(),
-                    lib_ns: m.lib_ns.clone(),
-                    mod_ns: m.mod_ns.clone(),
-                    mod_types: m.mod_types.clone(),
-                    globals: m.globals.clone(),
-                    struct_temps: m.struct_temps.clone(),
-                    struct_temp_env: m.struct_temp_env.clone(),
-                },
-            );
-        }
-    }
-    out
+fn has_generic_method(s: &parse::StructItem) -> bool {
+    s.methods.iter().any(|m| !m.type_params.is_empty())
 }
 
 fn merge_map<V: Clone>(base: &HashMap<String, V>, extra: &HashMap<String, V>) -> HashMap<String, V> {
@@ -111,6 +124,7 @@ pub(crate) fn lower_module(
     i: usize,
     main_id: FuncId,
     shared: &Shared,
+    errs: &mut Vec<CheckError>,
 ) -> Result<(), CheckError> {
     let origins = &shared.origins;
     let struct_temps = &shared.struct_temps;
@@ -138,6 +152,14 @@ pub(crate) fn lower_module(
             struct_insts.entry(k.clone()).or_insert(*v);
         }
     }
+    let mut fn_insts = HashMap::new();
+    for m in mods.iter() {
+        for (k, v) in &m.fn_insts {
+            fn_insts.entry(k.clone()).or_insert(*v);
+        }
+    }
+    let gen_names = mods[i].gen_names.clone();
+    let gen_mods = mods[i].gen_mods.clone();
     let mut method_temps = mods[i].method_temps.clone();
     let mut method_insts = mods[i].method_insts.clone();
     let mut fn_substs = mods[i].fn_substs.clone();
@@ -147,6 +169,7 @@ pub(crate) fn lower_module(
     let mut pending: Vec<(FuncId, FnItem)> = Vec::new();
     for it in &mods[i].ast.items {
         match it {
+            Item::Fn(f) if !f.type_params.is_empty() => {}
             Item::Fn(f) => pending.push((mods[i].funcs[&f.name.name], f.clone())),
             Item::Struct(s) => {
                 if !s.type_params.is_empty() {
@@ -178,7 +201,7 @@ pub(crate) fn lower_module(
             if matches!(cx.func(id).kind, FuncKind::J3 { .. }) {
                 continue;
             }
-            let body = lower_fn(
+            let body = match lower_fn(
                 cx,
                 &path,
                 id,
@@ -203,21 +226,59 @@ pub(crate) fn lower_module(
                 &mut fn_substs,
                 &mut queue,
                 &module_names,
+                GenCtx::new(&shared.gen_fns, origins, &gen_names, &gen_mods, &mut fn_insts, &shared.traits),
                 &mut mods[i].ir.enums,
                 &mut mods[i].ir.structs,
                 &mut mods[i].ir.funcs,
                 subst,
-            )?;
+            ) {
+                Ok(body) => body,
+                Err(e) => {
+                    errs.push(e);
+                    continue;
+                }
+            };
+            if let Some(e) = missing_return(cx, &path, id, &f, mods[i].ast.is_script) {
+                errs.push(e);
+            }
             cx.func_mut(id).kind = FuncKind::J3 { body };
+            // Generic struct/enum instances made by that body: check their bounds before their methods are lowered.
+            drain_bounds(cx, &shared.traits, &methods, &method_temps, Some(&funcs))?;
         }
     }
     mods[i].insts = enum_insts;
+    mods[i].fn_insts = fn_insts;
     mods[i].methods = methods;
     mods[i].struct_insts = struct_insts;
     mods[i].method_temps = method_temps;
     mods[i].method_insts = method_insts;
     mods[i].fn_substs = fn_substs;
     Ok(())
+}
+
+/// A non-void fn whose body can run off its end (`flow::diverges`).
+fn missing_return(cx: &IrCx, path: &str, id: FuncId, f: &FnItem, is_script: bool) -> Option<CheckError> {
+    if is_script || f.shader.is_some() || f.body.span.is_dummy() {
+        return None;
+    }
+    let ret = cx.fn_sig(cx.func(id).ty)?.1;
+    if ret == cx.common.void || crate::parse::flow::diverges(&f.body) {
+        return None;
+    }
+    let end = f.body.span.end.max(f.body.span.start + 1);
+    let at = Span { file: f.body.span.file, start: end - 1, end };
+    Some(
+        CheckError::new(
+            path,
+            at,
+            format!(
+                "function `{}` can reach its end without returning `{}`",
+                f.name.name,
+                crate::ir::dump::ty_string(cx, ret)
+            ),
+        )
+        .help("end every path with `return ...;` (or `panic(..)` where it cannot happen)"),
+    )
 }
 
 /// Span of the temporary at the root of a field/index chain (`f()` in `f().x[0]`).
@@ -234,6 +295,10 @@ struct Lower<'a> {
     b: BodyBuilder,
     locals: HashMap<String, LocalId>,
     aliases: HashMap<String, Place>,
+    /// Enclosing source loops, innermost last, with their `'label`.
+    loops: Vec<Option<String>>,
+    /// Set by `'label:` for the loop statement that follows it.
+    pending_label: Option<String>,
     script_sid: Option<StructId>,
     /// Set while lowering a place that indexes through a slice (a store there hits real storage).
     store_indirect: bool,
@@ -249,194 +314,27 @@ struct Lower<'a> {
     enum_temps: &'a HashMap<String, parse::EnumItem>,
     enum_insts: &'a mut HashMap<(String, Vec<Ty>), EnumId>,
     struct_temps: &'a HashMap<String, parse::StructItem>,
-    struct_temp_env: &'a HashMap<String, HashMap<String, Ty>>,
+    struct_temp_env: &'a HashMap<String, DeclEnv>,
     struct_insts: &'a mut HashMap<(String, Vec<Ty>), StructId>,
     method_temps: &'a mut HashMap<(u32, String), parse::FnItem>,
     method_insts: &'a mut HashMap<(u32, String, Vec<Ty>), FuncId>,
     fn_substs: &'a mut HashMap<FuncId, HashMap<String, Ty>>,
     pending_mono: &'a mut Vec<(FuncId, parse::FnItem, HashMap<String, Ty>)>,
     module_names: &'a [Name],
+    gen: GenCtx<'a>,
     ir_enums: &'a mut Vec<EnumId>,
     ir_structs: &'a mut Vec<StructId>,
     ir_funcs: &'a mut Vec<FuncId>,
     type_subst: HashMap<String, Ty>,
     ret: Ty,
     tmp: u32,
-}
-
-struct MergedEnv {
-    funcs: HashMap<String, FuncId>,
-    consts: HashMap<String, ConstVal>,
-    types: HashMap<String, Ty>,
-    lib_ns: HashMap<String, HashMap<String, FuncId>>,
-    mod_ns: HashMap<String, HashMap<String, FuncId>>,
-    mod_types: HashMap<String, HashMap<String, Ty>>,
-    globals: HashMap<String, crate::ir::ids::GlobalId>,
-    struct_temps: HashMap<String, parse::StructItem>,
-    struct_temp_env: HashMap<String, HashMap<String, Ty>>,
-}
-
-fn lower_fn(
-    cx: &mut IrCx,
-    path: &str,
-    id: FuncId,
-    f: &FnItem,
-    origins: &HashMap<String, OriginNs>,
-    merged_envs: &mut HashMap<String, MergedEnv>,
-    funcs: &HashMap<String, FuncId>,
-    consts: &HashMap<String, ConstVal>,
-    types: &HashMap<String, Ty>,
-    methods: &mut HashMap<(u32, String), FuncId>,
-    lib_ns: &HashMap<String, HashMap<String, FuncId>>,
-    mod_ns: &HashMap<String, HashMap<String, FuncId>>,
-    mod_types: &HashMap<String, HashMap<String, Ty>>,
-    globals: &HashMap<String, crate::ir::ids::GlobalId>,
-    enum_temps: &HashMap<String, parse::EnumItem>,
-    enum_insts: &mut HashMap<(String, Vec<Ty>), EnumId>,
-    struct_temps: &HashMap<String, parse::StructItem>,
-    struct_temp_env: &HashMap<String, HashMap<String, Ty>>,
-    struct_insts: &mut HashMap<(String, Vec<Ty>), StructId>,
-    method_temps: &mut HashMap<(u32, String), parse::FnItem>,
-    method_insts: &mut HashMap<(u32, String, Vec<Ty>), FuncId>,
-    fn_substs: &mut HashMap<FuncId, HashMap<String, Ty>>,
-    pending_mono: &mut Vec<(FuncId, parse::FnItem, HashMap<String, Ty>)>,
-    module_names: &[Name],
-    ir_enums: &mut Vec<EnumId>,
-    ir_structs: &mut Vec<StructId>,
-    ir_funcs: &mut Vec<FuncId>,
-    type_subst: HashMap<String, Ty>,
-) -> Result<crate::ir::body::Body, CheckError> {
-    let mut body_path = path.to_string();
-    let mut inst_note: Option<String> = None;
-    let merged: Option<&MergedEnv> = if let Some(sid) = cx.func(id).method_of {
-        let sname = cx.name_str(cx.struct_def(sid).name).to_string();
-        if let Some(o) = origins.get(&sname) {
-            if o.path != path {
-                inst_note = Some(format!("while instantiating `{sname}` (from {path})"));
-                body_path = o.path.clone();
-            }
-            Some(merged_envs.entry(sname).or_insert_with(|| MergedEnv {
-                funcs: merge_map(&o.funcs, funcs),
-                consts: merge_map(&o.consts, consts),
-                types: merge_map(&o.types, types),
-                lib_ns: merge_map(&o.lib_ns, lib_ns),
-                mod_ns: merge_map(&o.mod_ns, mod_ns),
-                mod_types: merge_map(&o.mod_types, mod_types),
-                globals: merge_map(&o.globals, globals),
-                struct_temps: merge_map(&o.struct_temps, struct_temps),
-                struct_temp_env: merge_map(&o.struct_temp_env, struct_temp_env),
-            }))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let use_funcs = merged.as_ref().map(|m| &m.funcs).unwrap_or(funcs);
-    let use_consts = merged.as_ref().map(|m| &m.consts).unwrap_or(consts);
-    let use_types = merged.as_ref().map(|m| &m.types).unwrap_or(types);
-    let use_lib_ns = merged.as_ref().map(|m| &m.lib_ns).unwrap_or(lib_ns);
-    let use_mod_ns = merged.as_ref().map(|m| &m.mod_ns).unwrap_or(mod_ns);
-    let use_mod_types = merged.as_ref().map(|m| &m.mod_types).unwrap_or(mod_types);
-    let use_globals = merged.as_ref().map(|m| &m.globals).unwrap_or(globals);
-    let use_struct_temps = merged
-        .as_ref()
-        .map(|m| &m.struct_temps)
-        .unwrap_or(struct_temps);
-    let use_struct_temp_env = merged
-        .as_ref()
-        .map(|m| &m.struct_temp_env)
-        .unwrap_or(struct_temp_env);
-    let (param_tys, ret) = match cx.fn_sig(cx.func(id).ty) {
-        Some((ps, r)) => (ps.clone(), r),
-        None => (Vec::new(), cx.common.void),
-    };
-    let mut b = BodyBuilder::new(cx.common.void);
-    let mut locals = HashMap::new();
-    for (p, ty) in f.params.iter().zip(param_tys.into_iter()) {
-        let n = cx.intern_name(&p.name.name);
-        let pid = b.param(n, ty, p.name.span);
-        if locals.contains_key(&p.name.name) {
-            return Err(CheckError::new(
-                path,
-                p.name.span,
-                format!("duplicate parameter `{}`", p.name.name),
-            ));
-        }
-        locals.insert(p.name.name.clone(), pid);
-    }
-    let mut l = Lower {
-        cx,
-        path: &body_path,
-        b,
-        locals,
-        aliases: HashMap::new(),
-        script_sid: None,
-        store_indirect: false,
-        script_props: HashSet::new(),
-        funcs: use_funcs,
-        consts: use_consts,
-        types: use_types,
-        methods,
-        lib_ns: use_lib_ns,
-        mod_ns: use_mod_ns,
-        mod_types: use_mod_types,
-        globals: use_globals,
-        enum_temps,
-        enum_insts,
-        struct_temps: use_struct_temps,
-        struct_temp_env: use_struct_temp_env,
-        struct_insts,
-        method_temps,
-        method_insts,
-        fn_substs,
-        pending_mono,
-        module_names,
-        ir_enums,
-        ir_structs,
-        ir_funcs,
-        type_subst,
-        ret,
-        tmp: 0,
-    };
-    if let Some(sid) = l.cx.func(id).method_of {
-        if let Some(meta) = l.cx.struct_def(sid).script.clone() {
-            l.script_sid = Some(sid);
-            let this = l.locals["this"];
-            let base =
-                l.b.deref(l.cx, l.b.local_place(this, f.name.span), f.name.span);
-            let fields: Vec<(String, usize)> =
-                l.cx.struct_def(sid)
-                    .fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, field)| (l.cx.name_str(field.name).to_string(), i))
-                    .collect();
-            for (name, index) in fields {
-                let mut place = l.b.field(
-                    l.cx,
-                    base.clone(),
-                    FieldId {
-                        struct_id: sid,
-                        index: index as u32,
-                    },
-                    f.name.span,
-                );
-                if index < meta.prop_spans.len() {
-                    place.access.assign = false;
-                    l.script_props.insert(name.clone());
-                }
-                l.aliases.insert(name, place);
-            }
-        }
-    }
-    for stmt in &f.body.stmts {
-        l.stmt(stmt).map_err(|e| match &inst_note {
-            Some(n) => e.note(n.clone()),
-            None => e,
-        })?;
-    }
-    Ok(l.b.finish())
+    /// Name of the fn being lowered (`Box.push<int>`), the stem of its `$closureN` fns.
+    fn_label: String,
+    closure_n: u32,
+    /// Lowering a closure body (its `break`/`continue` cannot reach the creator's loops).
+    in_closure: bool,
+    /// Names visible outside the closure being lowered; a new local may not reuse them.
+    closure_outer: HashSet<String>,
 }
 
 impl<'a> Lower<'a> {
@@ -532,7 +430,10 @@ impl<'a> Lower<'a> {
     }
 
     fn mismatch(&self, span: Span, what: &str, have: Ty, want: Ty) -> CheckError {
-        CheckError::new(
+        if let Some(e) = self.closure_mismatch(span, have, want) {
+            return e;
+        }
+        let e = CheckError::new(
             self.path,
             span,
             format!(
@@ -540,7 +441,14 @@ impl<'a> Lower<'a> {
                 self.ty_str(want),
                 self.ty_str(have)
             ),
-        )
+        );
+        if self.is_half(have) || self.is_half(want) {
+            return e.help("`f16` is storage only: convert with `f32(x)` to compute, `f16(y)` to store");
+        }
+        if is_numeric(self.cx, have) && is_numeric(self.cx, want) {
+            return e.help(format!("numbers never convert by themselves: write `{}(x)`", self.ty_str(want)));
+        }
+        e
     }
 
     fn unknown(&self, span: Span, kind: &str, name: &str, extra: &[String]) -> CheckError {
@@ -688,15 +596,6 @@ fn embed_alias_names(cx: &IrCx, sid: StructId) -> Vec<String> {
     out
 }
 
-/// `10` / `10.0` with no name or call. Other sides of `+` can lend these a type.
-fn bare_num(expr: &Expr) -> bool {
-    match &expr.kind {
-        ExprKind::Int(_) | ExprKind::Float(_) => true,
-        ExprKind::Unary { op, expr: inner } if *op == parse::UnaryOp::Neg => bare_num(inner),
-        _ => false,
-    }
-}
-
 fn ast_binop(op: parse::BinOp) -> BinOp {
     match op {
         parse::BinOp::Add => BinOp::Add,
@@ -704,6 +603,11 @@ fn ast_binop(op: parse::BinOp) -> BinOp {
         parse::BinOp::Mul => BinOp::Mul,
         parse::BinOp::Div => BinOp::Div,
         parse::BinOp::Rem => BinOp::Rem,
+        parse::BinOp::Shl => BinOp::Shl,
+        parse::BinOp::Shr => BinOp::Shr,
+        parse::BinOp::BitAnd => BinOp::BitAnd,
+        parse::BinOp::BitOr => BinOp::BitOr,
+        parse::BinOp::BitXor => BinOp::BitXor,
         parse::BinOp::Eq => BinOp::Eq,
         parse::BinOp::Ne => BinOp::Ne,
         parse::BinOp::Lt => BinOp::Lt,

@@ -1,0 +1,170 @@
+// Part of j3.script (Vm new/call, frames, call sites); the module doc and `use`s are in ../script.j3. `Vm` methods in an `extend Vm` block.
+module j3.script;
+
+extend Vm {
+    /// Make one instance: defaults first, then the given props. Every prop without a
+    /// default must be given.
+    fn new(this: &Vm, moduleId: int, props: []Prop): ptr {
+        let m = this.moduleAt(moduleId);
+        let instance = alignedAlloc(this.arena, m.instanceSize);
+        clearBytes(instance as int, m.instanceSize);
+        for i in 0..m.fields.len {
+            let field = &m.fields[i];
+            copyBytes(instance as int + field.offset, field.defaultBytes.ptr as int,
+                      field.defaultBytes.len);
+            if field.defaultConst != NO_REG as int {
+                st64(instance as int + field.offset,
+                     m.constants[field.defaultConst].ptr as int as u64);
+            }
+        }
+        for i in 0..props.len {
+            let found = false;
+            for j in 0..m.propCount {
+                let prop = &m.fields[j];
+                if same(prop.name, props[i].name) {
+                    if props[i].size != prop.size { panic("script: prop size differs"); }
+                    copyBytes(instance as int + prop.offset, props[i].value as int, prop.size);
+                    found = true;
+                    break;
+                }
+            }
+            if !found { panic("script: unknown prop"); }
+        }
+        for i in 0..m.propCount {
+            if m.fields[i].defaultBytes.len > 0 { continue; }
+            let given = false;
+            for j in 0..props.len {
+                if same(props[j].name, m.fields[i].name) { given = true; }
+            }
+            if !given { panic("script: a required prop is missing"); }
+        }
+        return instance;
+    }
+
+    /// Call a `pub` script function by key. `args` leave out the instance.
+    fn call(this: &Vm, key: u64, instance: ptr, args: []Arg, result: ptr) {
+        let found = this.function(key);
+        if found as int == 0 { panic("script: no loaded function has that key"); }
+        let f = found as &Function;
+        if !f.public { panic("script: that function is private"); }
+        if f.params.len != args.len + 1 { panic("script: argument count differs"); }
+        let saved = this.top;
+        let regs = this.enter(f);
+        let fp = rd(regs, 0) as int;
+        this.putParam(regs, fp, &f.params[0], instance as int as u64, false);
+        for i in 0..args.len {
+            let p = &f.params[i + 1];
+            if args[i].size != p.size as int { panic("script: argument size differs"); }
+            if p.load == 0 {
+                copyBytes(fp + p.offset as int, args[i].value as int, p.size as int);
+            } else {
+                this.putParam(regs, fp, p, loadAs(args[i].value as int, p.load), false);
+            }
+        }
+        let value = this.exec(f, regs, result);
+        this.top = saved;
+        if !f.retAggregate && f.retSize > 0 && result as int != 0 {
+            storeN(result as int, value, f.retSize);
+        }
+    }
+
+    fn putParam(this: &Vm, regs: int, fp: int, p: &Param, value: u64, aggregate: bool) {
+        if p.reg != NO_REG {
+            wr(regs, p.reg, value);
+        } else if aggregate {
+            copyBytes(fp + p.offset as int, value as int, p.size as int);
+        } else {
+            storeN(fp + p.offset as int, value, p.size as int);
+        }
+    }
+
+    /// Push a frame: registers, then the zeroed local bytes. Register 0 is the frame pointer.
+    fn enter(this: &Vm, f: &Function): int {
+        let start = (this.top + 7) / 8 * 8;
+        let end = start + f.regs * 8 + f.frameSize;
+        if end > this.stackCap { panic("script: VM stack overflow"); }
+        this.top = end;
+        let regs = this.stackBase + start;
+        let fp = regs + f.regs * 8;
+        clearWords(fp, f.frameSize);
+        wr(regs, 0, fp as u64);
+        return regs;
+    }
+
+    fn resolve(this: &Vm, caller: &Function, site: &CallSite) {
+        if site.kind == CALL_SCRIPT {
+            let found = this.function(site.key);
+            if found as int == 0 { panic("script: called script function isn't loaded"); }
+            site.target = found;
+            site.linked = true;
+            return;
+        }
+        let t = this.thunk(site.key);
+        if t < 0 {
+            let m = &this.modules[caller.owner];
+            for i in 0..m.natives.len {
+                if m.natives[i].key == site.key {
+                    printLn(`script: {m.natives[i].name} isn't linked into this program`);
+                }
+            }
+            panic("script: native function not linked; rerun `j3c run` to rebuild");
+        }
+        site.thunk = this.thunkSlots[t].call;
+        site.linked = true;
+    }
+
+    fn callSite(this: &Vm, caller: &Function, regs: int, ins: &Instr) {
+        let site = &caller.calls[ins.imm as int];
+        if !site.linked { this.resolve(caller, site); }
+        if site.kind == CALL_NATIVE {
+            this.callNative(site, regs, ins.dst);
+        } else {
+            this.callScript(site, regs, ins.dst);
+        }
+    }
+
+    /// Pack the arguments in 8-byte slots and run the program's thunk for the target.
+    fn callNative(this: &Vm, site: &CallSite, regs: int, dst: u32) {
+        let saved = this.top;
+        let area = (this.top + 7) / 8 * 8;
+        if area + site.argBytes > this.stackCap { panic("script: VM stack overflow"); }
+        this.top = area + site.argBytes;
+        let args = this.stackBase + area;
+        let off = 0;
+        for i in 0..site.args.len {
+            let arg = &site.args[i];
+            if arg.aggregate != 0 {
+                copyBytes(args + off, rd(regs, arg.reg) as int, arg.size as int);
+            } else {
+                st64(args + off, rd(regs, arg.reg));
+            }
+            off += (arg.size as int + 7) / 8 * 8;
+        }
+        let out = args + off;
+        if site.retAggregate && dst != NO_REG { out = rd(regs, dst) as int; }
+        let native = site.thunk;
+        native(args as ptr, out as ptr);
+        if !site.retAggregate && site.retSize > 0 && dst != NO_REG {
+            wr(regs, dst, loadAs(out, site.retLoad));
+        }
+        this.top = saved;
+    }
+
+    fn callScript(this: &Vm, site: &CallSite, regs: int, dst: u32) {
+        let saved = this.top;
+        let callee = site.target as &Function;
+        let child = this.enter(callee);
+        let fp = rd(child, 0) as int;
+        for i in 0..site.args.len {
+            let arg = &site.args[i];
+            this.putParam(child, fp, &callee.params[i], rd(regs, arg.reg), arg.aggregate != 0);
+        }
+        let out = 0;
+        if site.retAggregate && dst != NO_REG { out = rd(regs, dst) as int; }
+        let value = this.exec(callee, child, out as ptr);
+        this.top = saved;
+        if !site.retAggregate && site.retSize > 0 && dst != NO_REG {
+            wr(regs, dst, value);
+        }
+    }
+}

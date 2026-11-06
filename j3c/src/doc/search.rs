@@ -13,6 +13,7 @@ pub(super) fn symbols(file: &File) -> Vec<Symbol> {
         match item {
             Item::Fn(f) if f.vis_pub && shown(&f.name.name) => add(f.name.name.clone(), &f.doc),
             Item::Const(c) if c.vis_pub && shown(&c.name.name) => add(c.name.name.clone(), &c.doc),
+            Item::Trait(t) if t.vis_pub => add(t.name.name.clone(), &t.doc),
             Item::Struct(s) if s.vis_pub => {
                 add(s.name.name.clone(), &s.doc);
                 for f in &s.fields {

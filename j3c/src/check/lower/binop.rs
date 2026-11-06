@@ -71,6 +71,12 @@ impl<'a> Lower<'a> {
             | parse::BinOp::Ge => {
                 if bare_num(lhs) && !bare_num(rhs) {
                     let r = self.operand(rhs, None)?;
+                    if self.is_half(r.ty()) {
+                        return Err(self.half_error(span, &format!("`{}`", ir_op.as_str())));
+                    }
+                    if is_vec(self.cx, r.ty()) {
+                        return Err(self.vec_cmp_error(span, op));
+                    }
                     if is_numeric(self.cx, r.ty()) {
                         let l = self.operand(lhs, Some(r.ty()))?;
                         if l.ty() != r.ty() {
@@ -85,6 +91,12 @@ impl<'a> Lower<'a> {
                     return Err(CheckError::new(self.path, span, "compare type mismatch"));
                 }
                 let l = self.operand(lhs, None)?;
+                if self.is_half(l.ty()) {
+                    return Err(self.half_error(span, &format!("`{}`", ir_op.as_str())));
+                }
+                if is_vec(self.cx, l.ty()) {
+                    return Err(self.vec_cmp_error(span, op));
+                }
                 if let Some(id) = find_operator(self.cx, l.ty(), op, self.methods) {
                     let fty = self.cx.func(id).ty;
                     let (params, ret) = match self.cx.fn_sig(fty) {
@@ -115,6 +127,9 @@ impl<'a> Lower<'a> {
                         vec![l, r],
                     ));
                 }
+                if let Some(rw) = self.operator_fallback(span, op, &l, rhs)? {
+                    return Ok(rw);
+                }
                 let r_expected = Some(l.ty());
                 let r = if self.is_ptr_ty(l.ty()) && self.fold_int(rhs) == Some(0) {
                     Operand::null(rhs.span, l.ty())
@@ -128,19 +143,45 @@ impl<'a> Lower<'a> {
                     }
                     return Err(CheckError::new(self.path, span, "compare type mismatch"));
                 }
+                if matches!(op, parse::BinOp::Eq | parse::BinOp::Ne) {
+                    if eq_needs_operator(self.cx, l.ty()) {
+                        let sym = ast_binop(op).as_str();
+                        return Err(CheckError::new(
+                            self.path,
+                            span,
+                            format!("`{sym}` does not compare structs or enums with payloads; compare the fields, or define `fn operator{sym}(this, other: T): bool` on it"),
+                        ));
+                    }
+                }
+                if matches!(op, parse::BinOp::Eq | parse::BinOp::Ne) && l.ty() == self.cx.common.string {
+                    return Ok(self.string_eq(span, op == parse::BinOp::Ne, l, r));
+                }
+                self.ord_only(op, l.ty(), span)?;
                 Ok(Rvalue::binary(span, self.cx.common.bool, ir_op, l, r))
             }
             parse::BinOp::Add
             | parse::BinOp::Sub
             | parse::BinOp::Mul
             | parse::BinOp::Div
-            | parse::BinOp::Rem => {
+            | parse::BinOp::Rem
+            | parse::BinOp::Shl
+            | parse::BinOp::Shr
+            | parse::BinOp::BitAnd
+            | parse::BinOp::BitOr
+            | parse::BinOp::BitXor => {
                 if bare_num(lhs) && !bare_num(rhs) {
                     let right_expect = match expected {
                         Some(t) if is_numeric(self.cx, t) => Some(t),
                         _ => None,
                     };
                     let r = self.operand(rhs, right_expect)?;
+                    if self.is_half(r.ty()) {
+                        return Err(self.half_error(span, &format!("`{}`", ir_op.as_str())));
+                    }
+                    if is_vec(self.cx, r.ty()) {
+                        let l = self.operand(lhs, self.cx.vec_lane(r.ty()))?;
+                        return self.vec_arith(span, op, l, r);
+                    }
                     if !is_numeric(self.cx, r.ty()) {
                         return Err(CheckError::new(
                             self.path,
@@ -159,9 +200,22 @@ impl<'a> Lower<'a> {
                     if matches!(op, parse::BinOp::Div | parse::BinOp::Rem) && is_int(self.cx, r.ty()) {
                         self.abort_if_zero(span, &r)?;
                     }
+                    self.int_only(op, r.ty(), span)?;
                     return Ok(Rvalue::binary(span, r.ty(), ir_op, l, r));
                 }
-                let l = self.operand(lhs, None)?;
+                // Both sides untyped: the left takes the destination's numeric type.
+                let left_expect = match expected {
+                    Some(t) if bare_num(lhs) && is_numeric(self.cx, t) => Some(t),
+                    _ => None,
+                };
+                let l = self.operand(lhs, left_expect)?;
+                if self.is_half(l.ty()) {
+                    return Err(self.half_error(span, &format!("`{}`", ir_op.as_str())));
+                }
+                if is_vec(self.cx, l.ty()) {
+                    let r = self.vec_rhs(rhs, l.ty())?;
+                    return self.vec_arith(span, op, l, r);
+                }
                 if let Some(id) = find_operator(self.cx, l.ty(), op, self.methods) {
                     let fty = self.cx.func(id).ty;
                     let (params, ret) = match self.cx.fn_sig(fty) {
@@ -192,6 +246,7 @@ impl<'a> Lower<'a> {
                         vec![l, r],
                     ));
                 }
+                self.int_only(op, l.ty(), span)?;
                 let ty = if is_numeric(self.cx, l.ty()) {
                     l.ty()
                 } else if let Some(t) = expected {
@@ -206,17 +261,93 @@ impl<'a> Lower<'a> {
                 if l.ty() != ty {
                     return Err(CheckError::new(self.path, span, "arithmetic type mismatch"));
                 }
-                let r = self.operand(rhs, Some(ty))?;
+                // a plain name, field or index may be a vector (`2.0 * v`): no expected type
+                let plain = matches!(rhs.kind, ExprKind::Name(_) | ExprKind::Field { .. } | ExprKind::Index { .. });
+                let r = if (ty == self.cx.common.f32 || ty == self.cx.common.i32) && plain {
+                    self.operand(rhs, None)?
+                } else {
+                    self.operand(rhs, Some(ty))?
+                };
+                if is_vec(self.cx, r.ty()) && self.cx.vec_lane(r.ty()) == Some(l.ty()) {
+                    return self.vec_arith(span, op, l, r);
+                }
                 if r.ty() != ty {
                     return Err(CheckError::new(self.path, span, "arithmetic type mismatch"));
                 }
                 if matches!(op, parse::BinOp::Div | parse::BinOp::Rem) && is_int(self.cx, ty) {
                     self.abort_if_zero(span, &r)?;
                 }
+                self.int_only(op, ty, span)?;
                 let _ = expected;
                 Ok(Rvalue::binary(span, ty, ir_op, l, r))
             }
         }
+    }
+
+    /// No explicit `operator!=` / `>` / `<=` / `>=` on a struct: `a != b` is `!(a == b)`, `a > b` is
+    /// `b < a`, `a <= b` is `!(b < a)`, `a >= b` is `!(a < b)`. An explicit operator never reaches
+    /// here (the caller found it first), and no `operator==` / `operator<` means no rewrite.
+    fn operator_fallback(&mut self, span: Span, op: parse::BinOp, l: &Operand, rhs: &Expr) -> Result<Option<Rvalue>, CheckError> {
+        use parse::BinOp as B;
+        let (base, swap, negate) = match op {
+            B::Ne => (B::Eq, false, true),
+            B::Gt => (B::Lt, true, false),
+            B::Le => (B::Lt, true, true),
+            B::Ge => (B::Lt, false, true),
+            _ => return Ok(None),
+        };
+        let Some(id) = find_operator(self.cx, l.ty(), base, self.methods) else { return Ok(None) };
+        let fty = self.cx.func(id).ty;
+        let Some((params, ret)) = self.cx.fn_sig(fty).map(|s| (s.0.clone(), s.1)) else {
+            return Err(CheckError::new(self.path, span, "not a function"));
+        };
+        if params.len() != 2 {
+            return Err(CheckError::new(self.path, span, "binary operator needs two parameters"));
+        }
+        let (want_l, want_r) = if swap { (params[1], params[0]) } else { (params[0], params[1]) };
+        if l.ty() != want_l {
+            return Err(CheckError::new(self.path, span, "operator `this` type mismatch"));
+        }
+        let r = self.operand(rhs, Some(want_r))?;
+        if negate && ret != self.cx.common.bool {
+            return Err(CheckError::new(self.path, span, "an operator used for a comparison fallback must return bool"));
+        }
+        let args = if swap { vec![r, l.clone()] } else { vec![l.clone(), r] };
+        let call = Rvalue::call(span, ret, Operand::fn_addr(span, fty, id), args);
+        if !negate {
+            return Ok(Some(call));
+        }
+        let n = self.fresh("cmp");
+        let tmp = self.b.tmp(n, ret, span);
+        let place = self.b.local_place(tmp, span);
+        self.b.assign(span, place.clone(), call);
+        Ok(Some(Rvalue { ty: ret, span, kind: RvalueKind::Unary { op: UnaryOp::Not, arg: Operand::Copy(place) } }))
+    }
+
+    /// `<< >> & | ^` take integers.
+    fn int_only(&self, op: parse::BinOp, ty: crate::ir::Ty, span: Span) -> Result<(), CheckError> {
+        use parse::BinOp::*;
+        if !matches!(op, Shl | Shr | BitAnd | BitOr | BitXor) || is_int(self.cx, ty) {
+            return Ok(());
+        }
+        let sym = ast_binop(op).as_str();
+        let hint = if ty == self.cx.common.bool { "; use `&&` / `||` for bools" } else { "" };
+        Err(CheckError::new(self.path, span, format!("`{sym}` takes integers{hint}")))
+    }
+
+    /// `< <= > >=` take numbers. A `string` has no order here: `==` / `!=` compare bytes
+    /// (`string_eq`).
+    fn ord_only(&self, op: parse::BinOp, ty: crate::ir::Ty, span: Span) -> Result<(), CheckError> {
+        use parse::BinOp::*;
+        if !matches!(op, Lt | Le | Gt | Ge) || ty != self.cx.common.string {
+            return Ok(());
+        }
+        let sym = ast_binop(op).as_str();
+        Err(CheckError::new(
+            self.path,
+            span,
+            format!("`{sym}` does not order strings; compare bytes in a loop; `==` / `!=` test equality"),
+        ))
     }
 
     pub(super) fn abort_if_zero(&mut self, span: Span, rhs: &Operand) -> Result<(), CheckError> {
@@ -302,6 +433,7 @@ impl<'a> Lower<'a> {
         match expected {
             Some(t) if v == 0 && self.is_ptr_ty(t) => Operand::null(span, t),
             Some(t) if is_int(self.cx, t) => Operand::int(span, t, v as u64),
+            Some(t) if self.is_half(t) => self.half_const(span, v as f64),
             Some(t) if t == self.cx.common.f32 => Operand::f32_const(span, t, v as f32),
             Some(t) if is_float(self.cx, t) => Operand::f64_const(span, t, v as f64),
             _ => Operand::int(span, self.cx.common.int, v as u64),
@@ -310,6 +442,7 @@ impl<'a> Lower<'a> {
 
     pub(super) fn num_from_float(&self, span: Span, v: f64, expected: Option<Ty>) -> Operand {
         match expected {
+            Some(t) if self.is_half(t) => self.half_const(span, v),
             Some(t) if t == self.cx.common.f32 => Operand::f32_const(span, t, v as f32),
             Some(t) if is_float(self.cx, t) => Operand::f64_const(span, t, v),
             _ => Operand::f64_const(span, self.cx.common.float, v),

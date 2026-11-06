@@ -12,6 +12,7 @@ module j3.ui.inputs;
 use j3.game;
 use j3.game.fontLine;
 use j3.game.{ Cursor, Mouse };
+use j3.game.letterbox.toWindow;
 use j3.ui.area;
 use j3.ui.dom;
 use j3.ui.drag;
@@ -30,9 +31,34 @@ use j3.ui.spans;
 use j3.ui.sticky;
 use j3.ui.textedit;
 use j3.ui.textsel;
+use j3.ui.windrag;
 use j3.ui.textedit.Edit;
 use j3.text.{ same, Text };
 use j3.ui.css.Warning;
+
+#[singleton]
+let FOCUS_HOOK: ptr;
+#[singleton]
+let BLUR_HOOK: ptr;
+/// True between a focus hook call and the matching blur: the hook has been told a text box has the focus.
+#[singleton]
+let HOOKED: bool;
+
+/// Call `f(x, y, w, h, kind)` when a text box (`<input>` that types text, or `<textarea>`) gains the keyboard focus. The rect is the box in
+/// window pixels (top-left origin, scroll and the `setVirtualSize` letterbox included, CSS transforms not), read once at the focus change.
+/// `kind`: 0 single line, 1 multi line (`textarea`), 2 `type="email"`, 3 `type="number"`. Moving the focus straight from one text box to
+/// another calls `f` again for the new box and does not call the blur hook. Checkboxes, radios, ranges, buttons and selects never call
+/// it. Main thread; one hook, setting again replaces it; the `Dom` is not passed, so hook state is global. `j3.ui` knows nothing of the
+/// caller: `j3.steam.game.attach` uses it for Steam's on-screen keyboard.
+pub fn setTextFocusHook(f: fn(int, int, int, int, int)) {
+    FOCUS_HOOK = f as ptr;
+}
+
+/// Call `f()` when the focus leaves the text boxes: to a control that is not one, to nothing, or because the focused box left the tree.
+/// Not called when it moves to another text box (`setTextFocusHook` runs instead).
+pub fn setTextBlurHook(f: fn()) {
+    BLUR_HOOK = f as ptr;
+}
 
 /// Run once per frame after `d.beginFrame(size)` and before the build walk.
 pub fn begin(d: &Dom) {
@@ -41,124 +67,6 @@ pub fn begin(d: &Dom) {
     labelClick(d);
     radioClick(d);
     if d.insp { inspect.input(d); }
-}
-
-fn labelable(d: &Dom, id: int): bool {
-    let t = d.nodes.items[id].tag;
-    return d.nodes.items[id].kind == dom.K_ELEM && (t == d.tButton || t == d.tInput || t == d.tSelect);
-}
-
-/// The control a `<label>` activates, -1 for none: the element whose static `id` is its `for` (anywhere in the tree, the first in tree
-/// order), else the first control inside it.
-/// Once per id: `label for` found two elements with this id (it uses the first), in `css.warns` like other runtime authoring mistakes.
-fn warnDup(d: &Dom, id: string) {
-    let m = Text.new(d.mem);
-    m.pushStr("duplicate id \"");
-    m.pushStr(id);
-    m.pushStr("\": a label's for= uses the first");
-    for i in 0..d.css.warns.len {
-        if same(d.css.warns.items[i].msg, m.str()) { return; }
-    }
-    d.css.warns.push(Warning { file: "label for:", line: 1, col: 1, msg: m.str() });
-}
-
-fn labelTarget(d: &Dom, label: int): int {
-    let want = d.forOf(label);
-    let c = d.nodes.items[label].first;
-    if want.len > 0 { c = d.nodes.items[0].first; }
-    // pre-order walk below the start (the label itself, or the root)
-    let top = if want.len > 0 { 0 } else { label };
-    let found = -1;
-    while c >= 0 {
-        let m = &d.mnodes.items[c];
-        if d.nodes.items[c].kind == dom.K_ELEM {
-            if want.len > 0 {
-                if m.id >= 0 && same(d.css.name(m.id), want) {
-                    if found >= 0 {
-                        warnDup(d, want);
-                        return found;
-                    }
-                    found = if labelable(d, c) { c } else { -1 };
-                    if found < 0 { return -1; }
-                }
-            } else if labelable(d, c) {
-                return c;
-            }
-        }
-        let n = &d.nodes.items[c];
-        if n.first >= 0 {
-            c = n.first;
-        } else {
-            while c >= 0 && c != top && d.nodes.items[c].next < 0 { c = d.nodes.items[c].parent; }
-            if c < 0 || c == top { return found; }
-            c = d.nodes.items[c].next;
-        }
-    }
-    return -1;
-}
-
-/// A click on a `<label>` (not on a control inside it, which takes its own) goes to its control: a checkbox toggles, a radio checks and a button is
-/// clicked (`d.clickTo`: `clicked` is true for it as well as for the label), a text box, range or select takes focus. Not for a
-/// disabled control; a drag already cleared `clickNode`.
-fn labelClick(d: &Dom) {
-    let c = d.clickNode;
-    let label = -1;
-    while c >= 0 && label < 0 {
-        if labelable(d, c) { return; }
-        if d.nodes.items[c].tag == d.tLabel { label = c; }
-        c = d.nodes.items[c].parent;
-    }
-    if label < 0 { return; }
-    let t = labelTarget(d, label);
-    if t < 0 || isDisabled(d, t) || !dom.styleVisible(d, t) || !dom.allowedByModal(d, t) { return; }
-    if isFocusable(d, t) { d.focusNode(t); }
-    if d.nodes.items[t].tag == d.tButton || d.mnodes.items[t].type == d.vCheckbox || dom.isRadio(d, t) {
-        d.clickTo = t;
-    }
-}
-
-/// A click on a radio (the mouse, a label that points at it, Space or Enter on it) checks it and unchecks the rest of its group; the one
-/// that became checked has `changed`, every one that flipped has `userToggled`. A disabled radio is not checkable.
-fn radioClick(d: &Dom) {
-    for i in 0..2 {
-        let t = if i == 0 { d.clickNode } else { d.clickTo };
-        if t >= 0 && t < d.nodes.len && dom.isRadio(d, t) && !isDisabled(d, t) && dom.styleVisible(d, t) && dom.allowedByModal(d, t) {
-            dom.radioSet(d, t, true, true);
-        }
-    }
-}
-
-/// Arrow keys on a focused radio: Up / Left go to the previous radio of its group, Down / Right to the next (wrapping, skipping disabled
-/// ones); focus moves and the radio there is checked.
-fn radioKeys(d: &Dom, f: int) {
-    if d.kin.shift || d.kin.ctrl { return; }
-    let dir = if d.kin.up || d.kin.left { -1 } else if d.kin.down || d.kin.right { 1 } else { 0 };
-    if dir == 0 { return; }
-    let t = dom.radioNeighbor(d, f, dir);
-    d.focusNode(t);
-    dom.radioSet(d, t, true, true);
-}
-
-/// A click (mouse, or Enter / Space on the focused summary) on a `<summary>` flips its `<details>`: `:open`, `toggled`. A control inside the
-/// summary takes the click for itself.
-fn toggleDetails(d: &Dom) {
-    let c = d.clickNode;
-    while c >= 0 {
-        let n = &d.nodes.items[c];
-        if n.tag == d.tButton || n.tag == d.tInput || n.tag == d.tSelect {
-            return;
-        }
-        if n.tag == d.tSummary {
-            let p = n.parent;
-            if p >= 0 && d.nodes.items[p].tag == d.tDetails {
-                d.setOpen(p, !d.isOpen(p));
-                d.nodes.items[p].togAt = d.frame;
-                d.nodes.items[p].clkAt = d.frame;
-            }
-            return;
-        }
-        c = n.parent;
-    }
 }
 
 fn beginInput(d: &Dom) {
@@ -176,7 +84,11 @@ fn beginInput(d: &Dom) {
     overlays.input(d, popWas);
     panels.step(d);
     sticky.step(d);
+    windrag.step(d);
     textsel.step(d);
+    if d.downBtn == 1 && d.pop.kind == popup.NONE {
+        middlePaste(d, d.downHit);
+    }
     let f = d.focus;
     if f >= 0 && !isDisabled(d, f) && d.pop.kind == popup.NONE {
         let n = &d.nodes.items[f];
@@ -184,6 +96,7 @@ fn beginInput(d: &Dom) {
             overlays.caretKeys(d, f);
             textKeys(d, f);
             textMouse(d, f);
+            primarySettle(d, f);
         } else if d.mnodes.items[f].type == d.vRange {
             rangeKeys(d, f);
         } else if n.tag == d.tButton || n.mitem || d.mnodes.items[f].type == d.vCheckbox || dom.isRadio(d, f) {
@@ -222,493 +135,3 @@ pub fn overlay(d: &Dom) {
 
 // ---- triggers ----------------------------------------------------------------------------------------
 
-fn isSpaceByte(b: u8): bool {
-    return b == 32 || b == 10 || b == 9;
-}
-
-fn hasByte(set: string, b: u8): bool {
-    for i in 0..set.len {
-        if set[i] == b {
-            return true;
-        }
-    }
-    return false;
-}
-
-/// The trigger the caret of text box `id` is in: a trigger character (`triggers`) at the start of the text or after
-/// whitespace, then non-space bytes up to the caret, none of them in a token. Returns its start, -1 for none; it ends at the caret.
-fn findTrigger(d: &Dom, id: int, e: &Edit): int {
-    let s = e.str();
-    let set = d.nodes.items[id].trigs;
-    let c = e.cur;
-    if e.hasSel() || c > s.len || d.kin.comp.len > 0 {
-        return -1;
-    }
-    let i = c;
-    while i > 0 && c - i < 48 {
-        let b = s[i - 1];
-        if isSpaceByte(b) {
-            return -1;
-        }
-        if hasByte(set, b) && (i == 1 || isSpaceByte(s[i - 2])) {
-            for k in 0..e.sp.len {
-                let t = e.sp.items[k];
-                if spans.isToken(t.kind) && t.start < c && t.start + t.len > i - 1 {
-                    return -1;
-                }
-            }
-            return i - 1;
-        }
-        i -= 1;
-    }
-    return -1;
-}
-
-/// Follow the trigger of the focused text box (`on:trigger`): it starts, changes with each edit, and ends when the caret
-/// leaves it, the box loses focus, or Escape dismissed it (`d.trigSup`: the same trigger stays quiet until it ends).
-fn trigger(d: &Dom) {
-    let f = d.focus;
-    let lo = -1;
-    if f >= 0 && alive(d, f) && isField(d, f) && !isDisabled(d, f) && d.nodes.items[f].trigs.len > 0 && d.nodes.items[f].edit >= 0 {
-        lo = findTrigger(d, f, &d.eds.items[d.nodes.items[f].edit]);
-    }
-    if lo >= 0 && f == d.trigSupNode && lo == d.trigSup {
-        lo = -1;
-    } else {
-        d.trigSup = -1;
-        d.trigSupNode = -1;
-    }
-    if d.trigNode >= 0 && d.trigNode != f {
-        // focus moved to another box: the old box gets its end event first, the new trigger starts next frame (one event slot)
-        d.trigEv = d.trigNode;
-        d.trigChg = d.frame;
-        d.trigNode = -1;
-        return;
-    }
-    if lo < 0 {
-        if d.trigNode >= 0 {
-            d.trigEv = d.trigNode;
-            d.trigChg = d.frame;
-            d.trigNode = -1;
-        }
-        return;
-    }
-    let hi = d.eds.items[d.nodes.items[f].edit].cur;
-    if d.trigNode != f || d.trigLo != lo || d.trigHi != hi || d.nodes.items[f].chg == d.frame {
-        d.trigNode = f;
-        d.trigLo = lo;
-        d.trigHi = hi;
-        d.trigEv = f;
-        d.trigChg = d.frame;
-    }
-}
-
-// ---- focus -----------------------------------------------------------------------------------------
-
-fn alive(d: &Dom, id: int): bool {
-    return id >= 0 && id < d.nodes.len && d.nodes.items[id].kind == dom.K_ELEM;
-}
-
-/// React to focus having moved since the last frame: text boxes get their buffer and SDL text input.
-fn seeFocus(d: &Dom) {
-    if d.focus == d.seen {
-        return;
-    }
-    let old = d.seen;
-    d.seen = d.focus;
-    if alive(d, old) {
-        if isField(d, old) && d.nodes.items[old].edit >= 0 {
-            let e = &d.eds.items[d.nodes.items[old].edit];
-            e.vs = 0;
-            e.anc = e.cur;
-        }
-        if d.pop.owner == old {
-            d.pop = popup.closed();
-        }
-    }
-    let f = d.focus;
-    // stopping first cancels an IME composition begun in the box we left
-    game.textInput(false);
-    if f >= 0 && alive(d, f) && d.nodes.items[f].tag == d.tInput && isField(d, f) {
-        let ed = &d.eds.items[d.claim(f)];
-        ed.set(d.nodes.items[f].sval);
-        ed.t0 = d.now;
-        if d.nodes.items[f].fSel {
-            // a dialog's `autoselect`: only the focus it gave on open
-            d.nodes.items[f].fSel = false;
-            ed.selectAll();
-        }
-        d.nodes.items[f].sval = ed.str();
-        game.textInput(true);
-    } else if f >= 0 && alive(d, f) && d.nodes.items[f].tag == d.tSelect {
-        // type-ahead picks an option by its first letters
-        game.textInput(true);
-    } else if f >= 0 && d.isGrid(f) && alive(d, f) {
-        // typing on a grid cell starts its editor
-        game.textInput(true);
-    } else if f >= 0 && alive(d, f) {
-        let c = d.nodes.items[f].parent;
-        while c >= 0 {
-            if d.nodes.items[c].ov == dom.OV_POPOVER { game.textInput(true); break; }
-            c = d.nodes.items[c].parent;
-        }
-    }
-}
-
-fn focusable(d: &Dom, id: int): bool {
-    return dom.tabStop(d, id) && dom.allowedByModal(d, id);
-}
-
-/// The next node after `id` in document order (-1 at the end).
-fn succ(d: &Dom, id: int): int {
-    let n = &d.nodes.items[id];
-    if n.first >= 0 {
-        return n.first;
-    }
-    let c = id;
-    while c >= 0 {
-        if d.nodes.items[c].next >= 0 {
-            return d.nodes.items[c].next;
-        }
-        c = d.nodes.items[c].parent;
-    }
-    return -1;
-}
-
-/// Tab order key: positive `tabindex` first (ascending), then the rest.
-fn tabKey(d: &Dom, id: int): int {
-    let t = d.nodes.items[id].tabIdx;
-    return if t > 0 { t } else { 2000000000 };
-}
-
-/// Tab (`dir` 1) and Shift+Tab (-1): focus the next focusable element, wrapping. Order is (positive `tabindex`
-/// ascending, then the rest), ties in document order. Two O(n) walks and no allocation; Tab is rare.
-/// Starting point: the focused node's place in the order, even when Tab skips it (`tabindex="-1"`), so Tab goes to the next one
-/// after it; with no focus, or a focus that was removed, Tab starts at the first and Shift+Tab at the last. A `focus-group="trap"`
-/// holding the focus keeps Tab inside it, like the pad.
-fn tab(d: &Dom, dir: int) {
-    if d.nodes.len == 0 {
-        return;
-    }
-    dom.radioMark(d);
-    let f = d.focus;
-    let has = f >= 0 && alive(d, f);
-    let fk = if has { tabKey(d, f) } else { 0 };
-    // the focus's place in document order
-    let fpos = -1;
-    if has {
-        let w = 0;
-        let q = 0;
-        while w >= 0 && w != f {
-            w = succ(d, w);
-            q += 1;
-        }
-        if w == f { fpos = q; }
-    }
-    let after = fpos >= 0;
-    let trap = if after { padnav.groupWith(d, f, "trap") } else { -1 };
-    let best = -1;     // nearest candidate past the focus in direction `dir`
-    let bk = 0;
-    let bp = 0;
-    let wrap = -1;     // the far end, for wrapping
-    let wk = 0;
-    let wp = 0;
-    let c = 0;
-    let p = 0;
-    while c >= 0 {
-        if focusable(d, c) && (trap < 0 || dom.inside(d, trap, c)) {
-            let k = tabKey(d, c);
-            let gt = k > fk || (k == fk && p > fpos);
-            let lt = k < fk || (k == fk && p < fpos);
-            let past = if !after { false } else if dir > 0 { gt } else { lt };
-            let beats = if dir > 0 { k < bk || (k == bk && p < bp) } else { k > bk || (k == bk && p > bp) };
-            if past && (best < 0 || beats) { best = c; bk = k; bp = p; }
-            let far = if dir > 0 { k < wk || (k == wk && p < wp) } else { k > wk || (k == wk && p > wp) };
-            if wrap < 0 || far { wrap = c; wk = k; wp = p; }
-        }
-        c = succ(d, c);
-        p += 1;
-    }
-    // no focus: start at the first (Tab) or last (Shift+Tab); past the end: wrap
-    let to = if best >= 0 { best } else { wrap };
-    if to >= 0 && to != f {
-        d.focusNode(to);
-    }
-}
-
-// ---- text boxes --------------------------------------------------------------------------------------
-
-/// The box's content origin: (left edge, width) in node-local px.
-fn contentX(d: &Dom, id: int): f32 {
-    let e = edgesOf(d, d.nodes.items[id].style, d.nodes.items[id].basisW);
-    return e.bl + e.pl;
-}
-
-fn contentW(d: &Dom, id: int): f32 {
-    let n = &d.nodes.items[id];
-    let e = edgesOf(d, n.style, n.basisW);
-    let w = n.w - e.pl - e.pr - e.bl - e.br;
-    if d.mnodes.items[id].type == d.vSearch {
-        w -= 18.0;
-    }
-    return w;
-}
-
-fn contentY(d: &Dom, id: int): f32 {
-    let e = edgesOf(d, d.nodes.items[id].style, d.nodes.items[id].basisW);
-    return e.bt + e.pt;
-}
-
-fn contentH(d: &Dom, id: int): f32 {
-    let n = &d.nodes.items[id];
-    let e = edgesOf(d, n.style, n.basisW);
-    return n.h - e.pt - e.pb - e.bt - e.bb;
-}
-
-fn touched(d: &Dom, id: int, e: &Edit) {
-    d.nodes.items[id].sval = e.str();
-    d.nodes.items[id].chg = d.frame;
-    dom.aNote(d, dom.EV_VALUE, id);
-    d.syncPlaceholder(id);
-    e.t0 = d.now;
-}
-
-/// The byte nearest to local `x`, `y` in the text box (a password counts bullets, a textarea lines).
-fn hit(d: &Dom, id: int, e: &Edit, x: f32, y: f32): int {
-    let tm = enterText(d, d.nodes.items[id].style);
-    let at = hitIn(d, id, e, x, y);
-    leaveText(tm);
-    return at;
-}
-
-fn hitIn(d: &Dom, id: int, e: &Edit, x: f32, y: f32): int {
-    let st = d.nodes.items[id].style;
-    let font = fontOf(d, st);
-    let bold = isBold(d, st);
-    let ty = d.mnodes.items[id].type;
-    if ty == d.vTextarea {
-        area.layout(e, font, bold, contentW(d, id));
-        return area.indexAt(e, font, bold, x, y);
-    }
-    if ty == d.vPassword {
-        let s = e.str();
-        return textedit.fromMask(s, field.indexAt(font, bold, e.maskOf(s), e.vs, x));
-    }
-    return field.indexAt(font, bold, e.str(), e.vs, x);
-}
-
-/// Typing, deleting, caret keys and the clipboard on the focused text box. A textarea also takes Enter
-/// (a newline; Ctrl+Enter submits), Up, Down, PageUp, PageDown and line Home / End; a password box
-/// neither copies nor cuts. While the IME is composing, only its committed text is taken.
-fn textKeys(d: &Dom, id: int) {
-    let k = &d.kin;
-    let n = &d.nodes.items[id];
-    let e = &d.eds.items[d.claim(id)];
-    let ty = d.mnodes.items[id].type;
-    let multi = ty == d.vTextarea;
-    let before = e.text.len();
-    e.maxlen = n.maxlen;
-    if k.comp.len > 0 {
-        // text committed in the same poll that a new composition began still counts
-        if k.typed.len > 0 {
-            e.paste(k.typed);
-            touched(d, id, e);
-        }
-        return;
-    }
-    if k.ctrl && k.a {
-        e.selectAll();
-    } else if k.ctrl && k.c {
-        if e.hasSel() && ty != d.vPassword {
-            game.setClipboard(e.selected());
-        }
-    } else if k.ctrl && k.x {
-        if e.hasSel() && ty != d.vPassword {
-            game.setClipboard(e.selected());
-            e.deleteSel();
-            touched(d, id, e);
-        }
-    } else if k.ctrl && k.v {
-        let clip = game.clipboard();
-        if clip.len > 0 {
-            e.paste(clip);
-            touched(d, id, e);
-        }
-    } else if k.ctrl && (k.y || (k.z && k.shift)) {
-        if e.redo() {
-            touched(d, id, e);
-        }
-    } else if k.ctrl && k.z {
-        if e.undo() {
-            touched(d, id, e);
-        }
-    } else if k.ctrl && (k.b || k.i) {
-        // rich textarea only: toggles bold / italic on the selection
-        if e.toggle(if k.b { spans.SPAN_BOLD } else { spans.SPAN_ITALIC }) {
-            touched(d, id, e);
-        }
-    }
-    if k.typed.len > 0 {
-        e.insert(k.typed);
-        touched(d, id, e);
-    }
-    if k.back {
-        e.deleteBack(k.ctrl);
-        if e.text.len() != before {
-            touched(d, id, e);
-        }
-    }
-    if k.del {
-        e.deleteFwd(k.ctrl);
-        if e.text.len() != before {
-            touched(d, id, e);
-        }
-    }
-    if k.left { e.left(k.shift, k.ctrl); e.t0 = d.now; }
-    if k.right { e.right(k.shift, k.ctrl); e.t0 = d.now; }
-    if multi {
-        let st = n.style;
-        let font = fontOf(d, st);
-        let bold = isBold(d, st);
-        let tm = enterText(d, st);
-        area.layout(e, font, bold, contentW(d, id));
-        let page = int(contentH(d, id) / f32(fontLine(font))) - 1;
-        if page < 1 {
-            page = 1;
-        }
-        if k.up { area.moveV(e, font, bold, -1, k.shift); e.t0 = d.now; }
-        if k.down { area.moveV(e, font, bold, 1, k.shift); e.t0 = d.now; }
-        if k.pgup { area.moveV(e, font, bold, 0 - page, k.shift); e.t0 = d.now; }
-        if k.pgdn { area.moveV(e, font, bold, page, k.shift); e.t0 = d.now; }
-        if k.home { e.moveTo(if k.ctrl { 0 } else { e.ls.items[area.caretLine(e)] }, k.shift); e.t0 = d.now; }
-        if k.end { e.moveTo(if k.ctrl { e.text.len() } else { area.lineEnd(e, area.caretLine(e)) }, k.shift); e.up = e.cur; e.fcur = -1; e.t0 = d.now; }
-        leaveText(tm);
-    } else {
-        if k.home { e.moveTo(0, k.shift); e.t0 = d.now; }
-        if k.end { e.moveTo(e.text.len(), k.shift); e.t0 = d.now; }
-    }
-    if k.enter {
-        if multi && !k.ctrl {
-            e.insert("\n");
-            touched(d, id, e);
-        } else {
-            n.sub = d.frame;
-            if !n.fSub {
-                overlays.defaultClick(d, id);
-            }
-        }
-    }
-    if k.esc && d.mnodes.items[id].type == d.vSearch && e.text.len() > 0 {
-        e.set("");
-        touched(d, id, e);
-    }
-}
-
-/// Press, drag and the search box's clear button. Presses in quick succession on one spot select a word
-/// (a whole password), then a line (all of a single-line box).
-fn textMouse(d: &Dom, id: int) {
-    let down = d.downHit == id;
-    let drag = d.dragNode == id && d.down && !down;
-    if !down && !drag {
-        return;
-    }
-    let n = &d.nodes.items[id];
-    let st = n.style;
-    let font = fontOf(d, st);
-    let ty = d.mnodes.items[id].type;
-    let e = &d.eds.items[d.claim(id)];
-    let x = d.mx - d.absX(id) - contentX(d, id);
-    let y = d.my - d.absY(id) - contentY(d, id);
-    let cw = contentW(d, id);
-    let s = e.str();
-    if down && ty == d.vSearch && s.len > 0 && x > cw {
-        e.set("");
-        touched(d, id, e);
-        return;
-    }
-    e.t0 = d.now;
-    if drag && ty != d.vTextarea {
-        // past an edge the caret walks one code point a frame, which scrolls the view
-        if x < 0.0 {
-            e.moveTo(e.prev(e.cur), true);
-        } else if x > cw {
-            e.moveTo(e.next(e.cur), true);
-        } else {
-            e.moveTo(hit(d, id, e, x, y), true);
-        }
-        return;
-    }
-    let i = hit(d, id, e, x, y);
-    if drag {
-        e.moveTo(i, true);
-        return;
-    }
-    let again = d.now - e.ct < 400.0 && (i == e.ci || (e.clicks >= 2 && i >= e.lo() && i <= e.hi()));
-    e.clicks = if again && e.clicks < 3 { e.clicks + 1 } else { 1 };
-    e.ct = d.now;
-    e.ci = i;
-    if e.clicks == 1 {
-        e.moveTo(i, d.kin.shift);
-    } else if e.clicks == 2 && ty != d.vPassword {
-        e.selectWord(i);
-    } else if ty == d.vTextarea {
-        e.selectLine(i);
-    } else {
-        e.selectAll();
-    }
-}
-
-// ---- sliders -----------------------------------------------------------------------------------------
-
-fn rangePress(d: &Dom, id: int) {
-    let n = &d.nodes.items[id];
-    if n.multi {
-        let x = d.mx - d.absX(id);
-        d.thumb = slider.pickThumb(x, n.w, n.h, n.attrMin, n.attrMax, n.value, n.high);
-    } else {
-        d.thumb = 0;
-    }
-}
-
-/// Set the thumb in use to `v` (two thumbs never cross); a change counts as user input.
-fn setThumb(d: &Dom, id: int, v: f32) {
-    let n = &d.nodes.items[id];
-    let old = if d.thumb == 1 { n.high } else { n.value };
-    let nv = v;
-    if n.multi && d.thumb == 0 && nv > n.high {
-        nv = n.high;
-    }
-    if n.multi && d.thumb == 1 && nv < n.value {
-        nv = n.value;
-    }
-    if nv == old {
-        return;
-    }
-    if d.thumb == 1 {
-        n.high = nv;
-    } else {
-        n.value = nv;
-    }
-    n.chg = d.frame;
-    dom.aNote(d, dom.EV_VALUE, id);
-}
-
-fn rangeDrag(d: &Dom, id: int) {
-    let n = &d.nodes.items[id];
-    setThumb(d, id, slider.fromX(d.mx - d.absX(id), n.w, n.h, n.attrMin, n.attrMax, n.attrStep));
-}
-
-/// Arrow keys step the thumb (Shift: ten steps), Home / End jump to the ends.
-fn rangeKeys(d: &Dom, id: int) {
-    let k = &d.kin;
-    let n = &d.nodes.items[id];
-    let cur = if d.thumb == 1 && n.multi { n.high } else { n.value };
-    let dir = 0;
-    if k.left || k.down { dir = -1; }
-    if k.right || k.up { dir = 1; }
-    if dir != 0 {
-        setThumb(d, id, slider.nudge(cur, n.attrMin, n.attrMax, n.attrStep, dir, k.shift));
-    }
-    if k.home { setThumb(d, id, n.attrMin); }
-    if k.end { setThumb(d, id, slider.snap(n.attrMax, n.attrMin, n.attrMax, n.attrStep)); }
-}

@@ -326,6 +326,8 @@ pub(super) const KEYWORDS: &[(&str, &str)] = &[
     ("pub", "pub "),
     ("fn", "fn ${1:name}($2) {\n    $0\n}"),
     ("struct", "struct ${1:Name} {\n    $0\n}"),
+    ("trait", "trait ${1:Name} {\n    fn ${2:name}(this: Self): ${3:int};\n}"),
+    ("extend", "extend ${1:Type} {\n    fn ${2:name}(this: &${1:Type}) {\n        $0\n    }\n}"),
     ("enum", "enum ${1:Name} {\n    ${2:A},\n}"),
     ("const", "const ${1:NAME}: ${2:int} = ${3:0};"),
     ("let", "let ${1:name} = $0;"),

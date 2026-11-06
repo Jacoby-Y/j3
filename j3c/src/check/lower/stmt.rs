@@ -3,8 +3,32 @@ use super::*;
 impl<'a> Lower<'a> {
     pub(super) fn stmt(&mut self, stmt: &Stmt) -> Result<(), CheckError> {
         match stmt {
+            Stmt::While(_) | Stmt::For(_) | Stmt::ForEach(_) => {
+                let label = self.pending_label.take();
+                self.loops.push(label);
+                let r = self.stmt_inner(stmt);
+                self.loops.pop();
+                r
+            }
+            Stmt::Labeled(s) => {
+                if self.loops.iter().any(|l| l.as_deref() == Some(s.label.name.as_str())) {
+                    return Err(CheckError::new(
+                        self.path,
+                        s.label.span,
+                        format!("label `'{}` is already used by an enclosing loop", s.label.name),
+                    ));
+                }
+                self.pending_label = Some(s.label.name.clone());
+                self.stmt(&s.body)
+            }
+            _ => self.stmt_inner(stmt),
+        }
+    }
+
+    fn stmt_inner(&mut self, stmt: &Stmt) -> Result<(), CheckError> {
+        match stmt {
             Stmt::Let(s) => {
-                if self.locals.contains_key(&s.name.name) {
+                if self.is_declared(&s.name.name) {
                     return Err(CheckError::new(
                         self.path,
                         s.name.span,
@@ -19,7 +43,7 @@ impl<'a> Lower<'a> {
                 if let Some(want) = want {
                     if rv.ty != want {
                         return Err(self.mismatch(
-                            s.span,
+                            s.value.span,
                             "let type does not match initializer",
                             rv.ty,
                             want,
@@ -77,11 +101,22 @@ impl<'a> Lower<'a> {
                         )
                         .help("props are read-only in the script; copy it into a `let`"));
                     }
-                    return Err(CheckError::new(
+                    let e = CheckError::new(
                         self.path,
                         s.span,
                         self.readonly_global(&place).unwrap_or("cannot assign to this place".to_string()),
-                    ));
+                    );
+                    let in_string = match &s.place.kind {
+                        parse::ExprKind::Index { base, .. } => {
+                            self.try_place(base).is_ok_and(|p| p.ty == self.cx.common.string)
+                        }
+                        _ => false,
+                    };
+                    return Err(if in_string {
+                        e.help("a `string` is a read-only byte view: build or edit bytes with `j3.text` (`j3c doc j3.text`)")
+                    } else {
+                        e
+                    });
                 }
                 let rv = self.rvalue(&s.value, Some(place.ty))?;
                 if rv.ty != place.ty {
@@ -149,7 +184,22 @@ impl<'a> Lower<'a> {
                     self.b.assign(s.span, place, call);
                     return Ok(());
                 }
+                if self.is_half(place.ty) {
+                    return Err(self.half_error(s.span, &format!("`{}=`", ast_binop(s.op).as_str())));
+                }
+                if is_vec(self.cx, place.ty) {
+                    let r = self.vec_rhs(&s.value, place.ty)?;
+                    let rv = self.vec_arith(s.span, s.op, Operand::Copy(place.clone()), r)?;
+                    self.b.assign(s.span, place, rv);
+                    return Ok(());
+                }
                 let rhs = self.operand(&s.value, Some(place.ty))?;
+                if rhs.ty() != place.ty {
+                    return Err(self.mismatch(s.value.span, "assign-op type mismatch", rhs.ty(), place.ty));
+                }
+                if matches!(s.op, parse::BinOp::Div | parse::BinOp::Rem) && is_int(self.cx, place.ty) {
+                    self.abort_if_zero(s.span, &rhs)?;
+                }
                 let ir_op = ast_binop(s.op);
                 self.b.assign_op(s.span, place, ir_op, rhs);
                 Ok(())
@@ -199,7 +249,7 @@ impl<'a> Lower<'a> {
                 self.b.push(crate::ir::stmt::Stmt {
                     ty: self.cx.common.void,
                     span: s.span,
-                    kind: crate::ir::stmt::StmtKind::Break,
+                    kind: crate::ir::stmt::StmtKind::Break(0),
                 });
                 let br_block = self.b.end_block(br);
                 self.b.push(crate::ir::stmt::Stmt {
@@ -211,9 +261,7 @@ impl<'a> Lower<'a> {
                         else_block: None,
                     },
                 });
-                for stmt in &s.body.stmts {
-                    self.stmt(stmt)?;
-                }
+                self.scoped_stmts(&s.body.stmts)?;
                 let body = self.b.end_block(saved);
                 self.b.push(crate::ir::stmt::Stmt {
                     ty: self.cx.common.void,
@@ -228,7 +276,7 @@ impl<'a> Lower<'a> {
             Stmt::UseLocal(s) => self.use_local(s),
             Stmt::ForEach(s) => self.for_each(s),
             Stmt::For(s) => {
-                if self.locals.contains_key(&s.name.name) {
+                if self.is_declared(&s.name.name) {
                     return Err(CheckError::new(
                         self.path,
                         s.name.span,
@@ -277,23 +325,33 @@ impl<'a> Lower<'a> {
                 });
                 Ok(())
             }
-            Stmt::Break(span) => {
-                self.b.push(crate::ir::stmt::Stmt {
-                    ty: self.cx.common.void,
-                    span: *span,
-                    kind: crate::ir::stmt::StmtKind::Break,
-                });
-                Ok(())
-            }
-            Stmt::Continue(span) => {
-                self.b.push(crate::ir::stmt::Stmt {
-                    ty: self.cx.common.void,
-                    span: *span,
-                    kind: crate::ir::stmt::StmtKind::Continue,
-                });
+            Stmt::Break(span, label) | Stmt::Continue(span, label) => {
+                let what = if matches!(stmt, Stmt::Break(..)) { "break" } else { "continue" };
+                let depth = match label {
+                    None if self.loops.is_empty() => {
+                        return Err(self.loop_err(*span, format!("`{what}` outside a loop")));
+                    }
+                    None => 0,
+                    Some(l) => match self.loops.iter().rev().position(|x| x.as_deref() == Some(l.name.as_str())) {
+                        Some(d) => d as u32,
+                        None => {
+                            return Err(self.loop_err(
+                                l.span,
+                                format!("no enclosing loop is labeled `'{}`", l.name),
+                            ))
+                        }
+                    },
+                };
+                let kind = if what == "break" {
+                    crate::ir::stmt::StmtKind::Break(depth)
+                } else {
+                    crate::ir::stmt::StmtKind::Continue(depth)
+                };
+                self.b.push(crate::ir::stmt::Stmt { ty: self.cx.common.void, span: *span, kind });
                 Ok(())
             }
             Stmt::Match(s) => self.lower_match(s),
+            Stmt::Labeled(_) => self.stmt(stmt), // `stmt` handles labels; never reached
             Stmt::Block(b) => {
                 let body = self.lower_block(b)?;
                 self.b.push(crate::ir::stmt::Stmt {
@@ -308,15 +366,25 @@ impl<'a> Lower<'a> {
 
     pub(super) fn lower_block(&mut self, block: &parse::Block) -> Result<crate::ir::body::Block, CheckError> {
         let saved = self.b.begin_block();
-        for stmt in &block.stmts {
+        self.scoped_stmts(&block.stmts)?;
+        Ok(self.b.end_block(saved))
+    }
+
+    /// Lowers `stmts` as one block: a `let` or `use` inside ends with it.
+    pub(super) fn scoped_stmts(&mut self, stmts: &[Stmt]) -> Result<(), CheckError> {
+        let saved_locals = self.locals.clone();
+        let saved_aliases = self.aliases.clone();
+        for stmt in stmts {
             self.stmt(stmt)?;
         }
-        Ok(self.b.end_block(saved))
+        self.locals = saved_locals;
+        self.aliases = saved_aliases;
+        Ok(())
     }
 
     pub(super) fn for_each(&mut self, s: &parse::ForEachStmt) -> Result<(), CheckError> {
         if let Some(i) = &s.index {
-            if self.locals.contains_key(&i.name) {
+            if self.is_declared(&i.name) {
                 return Err(CheckError::new(
                     self.path,
                     i.span,
@@ -324,7 +392,7 @@ impl<'a> Lower<'a> {
                 ));
             }
         }
-        if self.locals.contains_key(&s.name.name) {
+        if self.is_declared(&s.name.name) {
             return Err(CheckError::new(
                 self.path,
                 s.name.span,
@@ -378,9 +446,7 @@ impl<'a> Lower<'a> {
             nplace,
             Rvalue::use_op(s.span, Operand::Copy(elem_place)),
         );
-        for stmt in &s.body.stmts {
-            self.stmt(stmt)?;
-        }
+        self.scoped_stmts(&s.body.stmts)?;
         let body = self.b.end_block(saved);
         self.b.push(crate::ir::stmt::Stmt {
             ty: self.cx.common.void,
@@ -427,7 +493,7 @@ impl<'a> Lower<'a> {
         };
         let names = embed_alias_names(self.cx, sid);
         for name in names {
-            if self.locals.contains_key(&name) || self.aliases.contains_key(&name) {
+            if self.is_declared(&name) || self.aliases.contains_key(&name) {
                 return Err(CheckError::new(
                     self.path,
                     s.name.span,

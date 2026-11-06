@@ -1,0 +1,260 @@
+// Part of j3.net.http: the `Stream` reader (body framing, chunked, readAll); the module doc and `use`s are in ../http.j3.
+module j3.net.http;
+
+/// How the body ends.
+const BODY_LENGTH: int = 0;
+const BODY_CHUNKED: int = 1;
+const BODY_CLOSE: int = 2;
+
+/// Bytes of the receive buffer, and the most a header block may take.
+const BUF: int = 16384;
+const MAX_HEAD: int = 65536;
+
+/// A reply whose headers are read and whose body is read as it arrives. `close` it once.
+pub struct Stream {
+    /// Status code.
+    status: int;
+    /// Reply headers in order.
+    headers: List<Header>;
+    /// The URL that answered (after redirects).
+    url: string;
+    https: bool;
+    plain: Conn;
+    secure: Tls;
+    buf: []u8;
+    lo: int;
+    hi: int;
+    mode: int;
+    /// Body bytes left (`BODY_LENGTH`), or left in this chunk (`BODY_CHUNKED`).
+    left: int;
+    done: bool;
+    /// Set when the body broke off: `read` returned a negative number.
+    failed: HttpError;
+    broken: bool;
+
+    /// The first header called `name` (any case), or "".
+    fn header(this: &Stream, name: string): string {
+        return findHeader(&this.headers, name);
+    }
+
+    /// Read more raw bytes into the buffer. False at the end of the connection or on failure.
+    fn fill(this: &Stream): bool {
+        if this.lo > 0 && this.lo == this.hi {
+            this.lo = 0;
+            this.hi = 0;
+        }
+        if this.hi == this.buf.len {
+            if this.lo == 0 {
+                return false;
+            }
+            let n = this.hi - this.lo;
+            for i in 0..n {
+                this.buf[i] = this.buf[this.lo + i];
+            }
+            this.lo = 0;
+            this.hi = n;
+        }
+        let space = this.buf[this.hi..this.buf.len];
+        let r = if this.https { this.secure.read(space) } else { this.plain.read(space) };
+        if r > 0 {
+            this.hi += r;
+            return true;
+        }
+        if r < 0 {
+            this.broken = true;
+            this.failed = if r == tcp.TIMEOUT { HttpError.Timeout } else { HttpError.Protocol };
+        }
+        return false;
+    }
+
+    /// One raw line (CRLF or LF stripped) from the buffer, on `arena`. False when the connection ended first.
+    fn rawLine(this: &Stream, t: &Text): bool {
+        t.clear();
+        while true {
+            for i in this.lo..this.hi {
+                if this.buf[i] == 10 {
+                    let end = i;
+                    if end > this.lo && this.buf[end - 1] == 13 {
+                        end -= 1;
+                    }
+                    t.pushBytes(this.buf[this.lo..end]);
+                    this.lo = i + 1;
+                    return true;
+                }
+            }
+            if t.len() + this.hi - this.lo > MAX_HEAD {
+                return false;
+            }
+            t.pushBytes(this.buf[this.lo..this.hi]);
+            this.lo = this.hi;
+            if !this.fill() {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /// Start the next chunk of a chunked body. False on a bad size line.
+    fn nextChunk(this: &Stream, scratch: &Text): bool {
+        if !this.rawLine(scratch) {
+            return false;
+        }
+        let line = scratch.str();
+        let n = 0;
+        let digits = 0;
+        for i in 0..line.len {
+            let b = int(lower(line[i]));
+            let d = -1;
+            if b >= 48 && b <= 57 {
+                d = b - 48;
+            } else if b >= 97 && b <= 102 {
+                d = b - 87;
+            }
+            if d < 0 {
+                break;
+            }
+            if digits >= 15 {
+                return false;
+            }
+            n = n * 16 + d;
+            digits += 1;
+        }
+        if digits == 0 {
+            return false;
+        }
+        if n == 0 {
+            // trailers, then a blank line
+            while true {
+                if !this.rawLine(scratch) {
+                    return false;
+                }
+                if scratch.len() == 0 {
+                    break;
+                }
+            }
+            this.done = true;
+            return true;
+        }
+        this.left = n;
+        return true;
+    }
+
+    /// Read up to `out.len` body bytes: the count, 0 at the end of the body, or -1 when it broke
+    /// off (`failed` says why).
+    fn read(this: &Stream, out: []u8): int {
+        if this.done || out.len == 0 {
+            return 0;
+        }
+        if this.broken {
+            return -1;
+        }
+        if this.mode == BODY_CHUNKED && this.left == 0 {
+            let scratch = Text.new(this.headers.arena);
+            if !this.nextChunk(&scratch) {
+                return this.fault();
+            }
+            if this.done {
+                return 0;
+            }
+        }
+        if this.lo == this.hi && !this.fill() {
+            if this.mode == BODY_CLOSE && !this.broken {
+                this.done = true;
+                return 0;
+            }
+            return this.fault();
+        }
+        let n = this.hi - this.lo;
+        if n > out.len {
+            n = out.len;
+        }
+        if this.mode != BODY_CLOSE && n > this.left {
+            n = this.left;
+        }
+        for i in 0..n {
+            out[i] = this.buf[this.lo + i];
+        }
+        this.lo += n;
+        if this.mode != BODY_CLOSE {
+            this.left -= n;
+            if this.left == 0 {
+                if this.mode == BODY_LENGTH {
+                    this.done = true;
+                } else {
+                    // the CRLF after each chunk's data
+                    let tail = Text.new(this.headers.arena);
+                    if !this.rawLine(&tail) || tail.len() != 0 {
+                        this.broken = true;
+                        this.failed = HttpError.Protocol;
+                    }
+                }
+            }
+        }
+        return n;
+    }
+
+    fn fault(this: &Stream): int {
+        if !this.broken {
+            this.broken = true;
+            this.failed = HttpError.Protocol;
+        }
+        return -1;
+    }
+
+    /// The next line of the body into `t` (CR LF or LF stripped). False at the end of the body
+    /// with nothing left; a last line without a newline is still returned. This is how to read
+    /// server-sent events (`data: ...` lines).
+    fn readLine(this: &Stream, t: &Text): bool {
+        t.clear();
+        let one: [1]u8 = [0];
+        let got = false;
+        while true {
+            let r = this.read(one[:]);
+            if r <= 0 {
+                return got;
+            }
+            got = true;
+            if one[0] == 10 {
+                if t.len() > 0 && t.bytes[t.len() - 1] == 13 {
+                    t.pop();
+                }
+                return true;
+            }
+            t.push(one[0]);
+        }
+        return got;
+    }
+
+    /// The rest of the body, on `arena`.
+    fn readAll(this: &Stream, arena: &Arena): Result<[]u8, HttpError> {
+        let t = Text.new(arena);
+        let chunk = arena.alloc::<u8>(BUF);
+        while true {
+            let n = this.read(chunk);
+            if n == 0 {
+                break;
+            }
+            if n < 0 {
+                return Result.Err(this.failed);
+            }
+            t.pushBytes(chunk[0..n]);
+        }
+        return Result.Ok(t.bytes);
+    }
+
+    /// Close the connection.
+    fn close(this: &Stream) {
+        if this.https {
+            this.secure.close();
+        } else {
+            this.plain.close();
+        }
+    }
+
+    fn send(this: &Stream, data: []u8): bool {
+        if this.https {
+            return this.secure.writeAll(data);
+        }
+        return this.plain.writeAll(data);
+    }
+}

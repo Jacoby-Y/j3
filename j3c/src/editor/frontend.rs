@@ -19,12 +19,17 @@ pub(crate) fn frontend(host: &Path) -> Result<(PathBuf, fs::File), String> {
     let sources: Vec<(String, String)> = match std::env::var("J3_EDITOR_SRC") {
         Ok(dir) if !dir.is_empty() => {
             let mut out = Vec::new();
-            for entry in fs::read_dir(&dir).map_err(|e| format!("J3_EDITOR_SRC {dir}: {e}"))? {
-                let path = entry.map_err(|e| e.to_string())?.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("j3") { continue; }
-                let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                let text = fs::read_to_string(&path).map_err(|e| format!("J3_EDITOR_SRC {}: {e}", path.display()))?;
-                out.push((name, text));
+            let root = PathBuf::from(&dir);
+            let mut todo = vec![root.clone()];
+            while let Some(d) = todo.pop() {
+                for entry in fs::read_dir(&d).map_err(|e| format!("J3_EDITOR_SRC {}: {e}", d.display()))? {
+                    let path = entry.map_err(|e| e.to_string())?.path();
+                    if path.is_dir() { todo.push(path); continue; }
+                    if path.extension().and_then(|s| s.to_str()) != Some("j3") { continue; }
+                    let name = path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+                    let text = fs::read_to_string(&path).map_err(|e| format!("J3_EDITOR_SRC {}: {e}", path.display()))?;
+                    out.push((name, text));
+                }
             }
             out.sort();
             out
@@ -57,7 +62,9 @@ pub(crate) fn frontend(host: &Path) -> Result<(PathBuf, fs::File), String> {
         let built = (|| -> Result<(), String> {
             fs::create_dir_all(temp.join("src")).map_err(|e| e.to_string())?;
             for (name, text) in &sources {
-                fs::write(temp.join("src").join(name), text).map_err(|e| e.to_string())?;
+                let file = temp.join("src").join(name);
+                fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
+                fs::write(file, text).map_err(|e| e.to_string())?;
             }
             fs::write(temp.join("font.ttf"), FONT).map_err(|e| e.to_string())?;
             fs::write(temp.join("j3.toml"), "[package]\nname = \"j3_editor\"\nentry = \"src/main.j3\"\n\n[link]\nlibs = [\"SDL2\", \"GL\"]\n")

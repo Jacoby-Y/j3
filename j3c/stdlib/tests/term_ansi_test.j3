@@ -1,0 +1,411 @@
+// Tests for j3.term and j3.term.ansi: parser events, every split point, malformed input, SGR, strip, runs, fuzz.
+//   timeout 120 j3c run j3c/stdlib/tests/term_ansi_test.j3
+// Panics on the first failed check. In samples `~` is ESC, `$` BEL, `^` CAN, `|` SUB.
+
+module term_ansi_test;
+
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.memory.List;
+use j3.rand.Rng;
+use j3.sys.panic;
+use j3.term;
+use j3.term.Color;
+use j3.term.Style;
+use j3.term.ansi;
+use j3.term.ansi.Params;
+use j3.term.ansi.Parser;
+use j3.term.ansi.feed;
+use j3.term.ansi.Run;
+use j3.text.Text;
+
+#[singleton]
+let CHECKS: int;
+
+fn ok(cond: bool, msg: string) {
+    CHECKS += 1;
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic(msg);
+    }
+}
+
+fn eq(a: string, b: string, msg: string) {
+    CHECKS += 1;
+    if !(a == b) {
+        printLn(`FAIL: {msg}`);
+        printLn(`  want: {b}`);
+        printLn(`  got:  {a}`);
+        panic(msg);
+    }
+}
+
+/// `s` with `~` as ESC and `$` as BEL.
+fn mk(s: string, a: &Arena): string {
+    let t = Text.new(a);
+    for i in 0..s.len {
+        let c = s[i];
+        t.push(if c == 0x7e { 0x1b } else if c == 0x24 { 0x07 } else if c == 0x5e { 0x18 } else if c == 0x7c { 0x1a } else { c });
+    }
+    return t.str();
+}
+
+/// Writes every event as a token so two runs can be compared as strings.
+struct Rec {
+    log: Text;
+
+    fn print(this: &Rec, cp: i32) {
+        this.log.add("P").pushInt(int(cp));
+        this.log.add(" ");
+    }
+
+    fn exec(this: &Rec, c0: u8) {
+        this.log.add("X").pushInt(int(c0));
+        this.log.add(" ");
+    }
+
+    fn csi(this: &Rec, p: &Params, final: u8) {
+        this.log.add("C").pushInt(int(p.marker));
+        this.log.add("/").pushInt(p.inter);
+        this.log.add("/");
+        for k in 0..p.n {
+            if k > 0 {
+                this.log.add(if p.colon[k] != 0 { ":" } else { ";" });
+            }
+            this.log.pushInt(int(p.v[k]));
+        }
+        this.log.add("/").pushInt(int(final));
+        this.log.add(" ");
+    }
+
+    fn esc(this: &Rec, inter: int, final: u8) {
+        this.log.add("E").pushInt(inter);
+        this.log.add("/").pushInt(int(final));
+        this.log.add(" ");
+    }
+
+    fn apc(this: &Rec, bytes: string) {}
+
+    fn osc(this: &Rec, bytes: string) {
+        this.log.add("O").add(bytes);
+        this.log.add(" ");
+    }
+}
+
+fn whole(s: string, a: &Arena): string {
+    let r = Rec { log: Text.new(a) };
+    let p = Parser.new(a);
+    p.feed(s, &r);
+    return r.log.str();
+}
+
+fn split2(s: string, at: int, a: &Arena): string {
+    let r = Rec { log: Text.new(a) };
+    let p = Parser.new(a);
+    p.feed(s[0..at], &r);
+    p.feed(s[at..s.len], &r);
+    return r.log.str();
+}
+
+fn bytewise(s: string, a: &Arena): string {
+    let r = Rec { log: Text.new(a) };
+    let p = Parser.new(a);
+    for i in 0..s.len {
+        p.feed(s[i..i + 1], &r);
+    }
+    return r.log.str();
+}
+
+fn splits(s: string, a: &Arena) {
+    let want = whole(s, a);
+    eq(bytewise(s, a), want, "bytewise");
+    for at in 0..=s.len {
+        eq(split2(s, at, a), want, `split at {at}`);
+    }
+}
+
+/// Events with `Params` applied as SGR on top of `style`.
+struct Pen {
+    style: Style;
+
+    fn print(this: &Pen, cp: i32) {}
+    fn exec(this: &Pen, c0: u8) {}
+    fn esc(this: &Pen, inter: int, final: u8) {}
+    fn apc(this: &Pen, bytes: string) {}
+    fn osc(this: &Pen, bytes: string) {}
+
+    fn csi(this: &Pen, p: &Params, final: u8) {
+        if final == 0x6d {
+            this.style = ansi.sgr(this.style, p);
+        }
+    }
+}
+
+fn pen(s: string, a: &Arena): Style {
+    let w = Pen { style: Style.plain() };
+    let p = Parser.new(a);
+    p.feed(mk(s, a), &w);
+    return w.style;
+}
+
+/// Counts and checksums events: no allocation, for the fuzz.
+struct Sum {
+    h: int;
+    n: int;
+
+    fn print(this: &Sum, cp: i32) { this.h = this.h * 31 + int(cp) + 1; this.n += 1; }
+    fn exec(this: &Sum, c0: u8) { this.h = this.h * 31 + int(c0) + 7; this.n += 1; }
+    fn esc(this: &Sum, inter: int, final: u8) { this.h = this.h * 31 + inter + int(final) * 3; this.n += 1; }
+    fn apc(this: &Sum, bytes: string) {}
+    fn osc(this: &Sum, bytes: string) { this.h = this.h * 31 + bytes.len + 11; this.n += 1; }
+
+    fn csi(this: &Sum, p: &Params, final: u8) {
+        this.h = this.h * 31 + int(final) + p.n * 5 + p.inter + int(p.marker);
+        for k in 0..p.n {
+            this.h = this.h * 31 + int(p.v[k]);
+        }
+        this.n += 1;
+    }
+}
+
+fn testEvents(a: &Arena) {
+    eq(whole("hi", a), "P104 P105 ", "ascii");
+    eq(whole(mk("a~[1;31mb", a), a), "P97 C0/0/1;31/109 P98 ", "sgr");
+    eq(whole(mk("~[;5H", a), a), "C0/0/-1;5/72 ", "empty param");
+    eq(whole(mk("~[m", a), a), "C0/0//109 ", "no params");
+    eq(whole(mk("~[?25l", a), a), "C63/0/25/108 ", "private marker");
+    eq(whole(mk("~[2 q", a), a), "C0/32/2/113 ", "intermediate");
+    eq(whole(mk("~[38:2::1:2:3m", a), a), "C0/0/38:2:-1:1:2:3/109 ", "colon params");
+    eq(whole(mk("~(B~7~M", a), a), "E40/66 E0/55 E0/77 ", "esc");
+    eq(whole(mk("~]0;title$x", a), a), "O0;title P120 ", "osc bel");
+    eq(whole(mk("~]0;title~\\x", a), a), "O0;title P120 ", "osc st");
+    eq(whole("é€x", a), "P233 P8364 P120 ", "utf8");
+    eq(whole("😀", a), "P128512 ", "utf8 4 bytes");
+    eq(whole(mk("a\n\r\tb", a), a), "P97 X10 X13 X9 P98 ", "c0");
+    eq(whole(mk("~[1\n2m", a), a), "X10 C0/0/12/109 ", "c0 inside csi runs and keeps the sequence");
+    eq(whole(mk("~[1;2~[3m", a), a), "C0/0/3/109 ", "esc restarts csi");
+    eq(whole(mk("~[1;2^x", a), a), "X24 P120 ", "can aborts");
+    eq(whole(mk("~[1;2|x", a), a), "X26 P120 ", "sub aborts");
+    eq(whole(mk("~[1:2;3;4:5:6m", a), a), "C0/0/1:2;3;4:5:6/109 ", "mixed groups");
+    eq(whole(mk("~[?1;2<m", a), a), "", "private marker after a digit ignores the sequence");
+    eq(whole(mk("~Pq0;2;0;0;0~\\ok", a), a), "P111 P107 ", "dcs dropped");
+    eq(whole(mk("~_apc$x~\\y", a), a), "P121 ", "apc runs to ST, not BEL");
+}
+
+fn testMalformed(a: &Arena) {
+    // Invalid UTF-8 (built from bytes): stray continuation, truncated, overlong, surrogate, too big, bad lead.
+    let t = Text.new(a);
+    let bad: [17]int = [0x80, 0x41, 0xe2, 0x82, 0x41, 0xc0, 0xaf, 0xed, 0xa0, 0x80, 0xf4, 0x90, 0x80, 0x80, 0xff, 0xe2, 0x82];
+    for b in bad {
+        t.push(u8(b));
+    }
+    // Truncated 3-byte at the end stays pending (no event) until more input.
+    eq(whole(t.str(), a), "P65533 P65 P65533 P65 P65533 P65533 P65533 P65533 P65533 ", "bad utf8");
+    splits(t.str(), a);
+
+    // Too many params: first 32 kept, sequence still dispatched.
+    let big = Text.new(a);
+    big.push(0x1b);
+    big.push(0x5b);
+    for i in 0..60 {
+        big.pushInt(i);
+        big.push(0x3b);
+    }
+    big.push(0x6d);
+    let log = whole(big.str(), a);
+    ok(log.len > 10 && log[0] == 0x43, "too many params dispatches");
+    ok(!(log[log.len - 2] == 0x35 && log[log.len - 3] == 0x3b), "no param past the cap");
+    // A huge number clamps instead of overflowing.
+    eq(whole(mk("~[99999999999999999999m", a), a), "C0/0/65535/109 ", "param clamp");
+    // Too many intermediates drop the sequence.
+    eq(whole(mk("~[    m", a), a), "", "intermediate overflow");
+
+    // Overlong OSC is discarded whole; the stream continues.
+    let o = Text.new(a);
+    o.push(0x1b);
+    o.add("]0;");
+    for i in 0..5000 {
+        o.push(0x61);
+    }
+    o.push(7);
+    o.add("z");
+    eq(whole(o.str(), a), "P122 ", "overlong osc dropped");
+    // An OSC at exactly the cap still arrives.
+    let o2 = Text.new(a);
+    o2.push(0x1b);
+    o2.add("]");
+    for i in 0..ansi.MAX_OSC {
+        o2.push(0x61);
+    }
+    o2.push(7);
+    ok(whole(o2.str(), a).len == ansi.MAX_OSC + 2, "osc at the cap");
+    // OSC with UTF-8 keeps its bytes.
+    eq(whole(mk("~]2;hé$", a), a), "O2;hé ", "osc utf8");
+}
+
+fn testSplits(a: &Arena) {
+    let sample = mk("hi~[1;31mred~[0m é€😀 ~]0;tiétle$~]8;;http://x~\\link~(B~[38:2::1:2:3m~[;5H~[?25l$\n~[2 q~Pq1;2~\\z~[1\n2m~[3~[m^x~7", a);
+    splits(sample, a);
+    splits(mk("~[1;2~[3m~]x~]y$~_z~\\w", a), a);
+}
+
+fn testSgr(a: &Arena) {
+    let s = pen("~[1;3;4;9m", a);
+    ok(s.has(term.ATTR_BOLD | term.ATTR_ITALIC | term.ATTR_UNDERLINE | term.ATTR_STRIKE), "attrs on");
+    ok(!s.has(term.ATTR_DIM), "dim off");
+    ok(pen("~[1;2;5;7;8m", a).has(term.ATTR_BOLD | term.ATTR_DIM | term.ATTR_BLINK | term.ATTR_INVERSE | term.ATTR_HIDDEN), "more attrs");
+    ok(pen("~[1;2;3;4;5;7;8;9m~[21;22;23;24;25;27;28;29m", a) == Style.plain(), "21..29 clear");
+    ok(pen("~[1;31;42m~[0m", a) == Style.plain(), "0 resets");
+    ok(pen("~[1m~[m", a) == Style.plain(), "empty resets");
+    ok(pen("~[1m~[;m", a) == Style.plain(), "empty param is 0");
+    ok(pen("~[31m", a).fg == Color.palette(1), "31");
+    ok(pen("~[37m", a).fg == Color.palette(7), "37");
+    ok(pen("~[91m", a).fg == Color.palette(9), "91");
+    ok(pen("~[97m", a).fg == Color.palette(15), "97");
+    ok(pen("~[44m", a).bg == Color.palette(4), "44");
+    ok(pen("~[107m", a).bg == Color.palette(15), "107");
+    ok(pen("~[31;42;39;49m", a) == Style.plain(), "39 49");
+    ok(pen("~[38;5;200m", a).fg == Color.palette(200), "38;5;n");
+    ok(pen("~[48;5;17m", a).bg == Color.palette(17), "48;5;n");
+    ok(pen("~[38;2;10;20;30m", a).fg == Color.rgb(10, 20, 30), "38;2;r;g;b");
+    ok(pen("~[48;2;1;2;3m", a).bg == Color.rgb(1, 2, 3), "48;2;r;g;b");
+    ok(pen("~[38:5:99m", a).fg == Color.palette(99), "38:5:n");
+    ok(pen("~[38:2:4:5:6m", a).fg == Color.rgb(4, 5, 6), "38:2:r:g:b");
+    ok(pen("~[38:2::7:8:9m", a).fg == Color.rgb(7, 8, 9), "38:2::r:g:b");
+    ok(pen("~[48:2:0:7:8:9m", a).bg == Color.rgb(7, 8, 9), "48:2:cs:r:g:b");
+    let c = pen("~[38;2;1;2;3;1;4m", a);
+    ok(c.fg == Color.rgb(1, 2, 3) && c.has(term.ATTR_BOLD | term.ATTR_UNDERLINE), "codes after a color still apply");
+    let d = pen("~[38:5:9;1m", a);
+    ok(d.fg == Color.palette(9) && d.has(term.ATTR_BOLD), "colon color then more");
+    ok(!pen("~[4:0m", a).has(term.ATTR_UNDERLINE), "4:0 is off");
+    ok(pen("~[4:3m", a).has(term.ATTR_UNDERLINE), "4:3 is on");
+    ok(pen("~[38;5m", a) == Style.plain(), "truncated 38 is ignored");
+    ok(pen("~[38;2;1;2m", a) == Style.plain(), "truncated rgb is ignored");
+    ok(pen("~[999;1m", a).has(term.ATTR_BOLD), "unknown code skipped");
+    ok(pen("~[58;2;1;2;3m", a) == Style.plain(), "58;2 consumed whole");
+    ok(pen("~[58;5;9m", a) == Style.plain(), "58;5 consumed whole (no blink)");
+    ok(pen("~[58:2::1:2:3m", a) == Style.plain() && pen("~[58:5:9m", a) == Style.plain(), "58 colon forms");
+    let u = pen("~[58;2;1;2;3;1;59m", a);
+    ok(u.has(term.ATTR_BOLD) && u.fg == Color.default() && !u.has(term.ATTR_BLINK), "codes after 58 apply, 59 ignored");
+    ok(pen("~[38;5;256m", a) == Style.plain() && pen("~[38:5:300m", a) == Style.plain(), "palette over 255 ignored");
+    ok(pen("~[48;2;1;256;3m", a) == Style.plain() && pen("~[38:2::1:2:999m", a) == Style.plain(), "rgb over 255 ignored");
+    ok(pen("~[38;5;255m", a).fg == Color.palette(255), "255 is fine");
+    // Color helpers
+    let k = Color.rgb(1, 2, 3);
+    ok(k.kind() == term.COLOR_RGB && k.r() == 1 && k.g() == 2 && k.b() == 3, "rgb read");
+    ok(Color.palette(5).kind() == term.COLOR_PALETTE && Color.palette(5).index() == 5, "palette read");
+    ok(Color.default().kind() == term.COLOR_DEFAULT, "default kind");
+}
+
+struct Grab {
+    n: int;
+    a: int;
+    b: int;
+    c: int;
+    sc: int;
+    s1: int;
+    s2: int;
+
+    fn print(this: &Grab, cp: i32) {}
+    fn exec(this: &Grab, c0: u8) {}
+    fn esc(this: &Grab, inter: int, final: u8) {}
+    fn apc(this: &Grab, bytes: string) {}
+    fn osc(this: &Grab, bytes: string) {}
+
+    fn csi(this: &Grab, p: &Params, final: u8) {
+        this.n = p.count();
+        this.a = p.param(0, 99);
+        this.b = p.param(1, 98);
+        this.c = p.param(2, 97);
+        this.sc = p.subCount(0);
+        this.s1 = p.sub(0, 1, 55);
+        this.s2 = p.sub(7, 1, 44) + p.sub(-1, 0, 0);
+    }
+}
+
+fn testParams(a: &Arena) {
+    let h = Grab { n: 0, a: 0, b: 0, c: 0, sc: 0, s1: 0, s2: 0 };
+    let q = Parser.new(a);
+    q.feed(mk("~[1m", a), &h);
+    ok(h.s1 == 55 && h.s2 == 44, "sub on a missing group returns def");
+    let g = Grab { n: 0, a: 0, b: 0, c: 0, sc: 0, s1: 0, s2: 0 };
+    let p = Parser.new(a);
+    p.feed(mk("~[;5H", a), &g);
+    ok(g.n == 2 && g.a == 99 && g.b == 5 && g.c == 97, "param defaults");
+    p.feed(mk("~[4:3;7;m", a), &g);
+    ok(g.n == 3 && g.a == 4 && g.b == 7 && g.c == 97 && g.sc == 1 && g.s1 == 3, "sub params");
+    p.feed(mk("~[0m", a), &g);
+    ok(g.n == 1 && g.a == 0 && g.sc == 0 && g.s1 == 55, "zero is not missing");
+    p.feed(mk("~[m", a), &g);
+    ok(g.n == 0 && g.a == 99, "none");
+}
+
+fn testText(a: &Arena) {
+    eq(ansi.strip(mk("a~[1;31mb~[0mc~]0;t$d~(Be\né$f", a), a), "abcde\néf", "strip");
+    eq(ansi.strip("", a), "", "strip empty");
+    let r = ansi.toRuns(mk("ab~[1mcd~[1me~[0mf~[31m~[0mg", a), a);
+    ok(r.len == 3, "runs merge same style");
+    ok(r.items[0].start == 0 && r.items[0].len == 2 && r.items[0].style == Style.plain(), "run 0");
+    ok(r.items[1].start == 2 && r.items[1].len == 3 && r.items[1].style.has(term.ATTR_BOLD), "run 1");
+    ok(r.items[2].start == 5 && r.items[2].len == 2 && r.items[2].style == Style.plain(), "run 2 merges f and g");
+    ok(ansi.toRuns("", a).len == 0, "no runs for empty");
+    ok(ansi.toRuns(mk("~[1m~[0m", a), a).len == 0, "no runs for style-only");
+    let one = ansi.toRuns("plain", a);
+    ok(one.len == 1 && one.items[0].len == 5, "one run");
+    let u = ansi.toRuns(mk("~[32mé~[0mx", a), a);
+    ok(u.len == 2 && u.items[0].len == 2 && u.items[1].start == 2, "runs count bytes");
+}
+
+fn fuzzInput(a: &Arena, n: int): string {
+    let rng = Rng.new(12345);
+    let t = Text.new(a);
+    let alpha = mk("~~~[[[]];:?<>=0123456789 !\"%&'()*+,-./@AHJKmPqXZ_\\ $^|\n", a);
+    for i in 0..n {
+        let r = rng.intRange(0, 100);
+        if r < 55 {
+            t.push(alpha[rng.intRange(0, alpha.len)]);
+        } else if r < 80 {
+            t.push(u8(rng.intRange(0, 256)));
+        } else {
+            t.push(u8(rng.intRange(32, 127)));
+        }
+    }
+    return t.str();
+}
+
+fn testFuzz(a: &Arena) {
+    let data = fuzzInput(a, 1048576);
+    let w = Sum { h: 0, n: 0 };
+    let p = Parser.new(a);
+    p.feed(data, &w);
+    ok(w.n > 1000, "fuzz produced events");
+    let rng = Rng.new(99);
+    let w2 = Sum { h: 0, n: 0 };
+    let p2 = Parser.new(a);
+    let i = 0;
+    while i < data.len {
+        let n = rng.intRange(1, 70);
+        if i + n > data.len {
+            n = data.len - i;
+        }
+        p2.feed(data[i..i + n], &w2);
+        i += n;
+    }
+    ok(w.h == w2.h && w.n == w2.n, "fuzz chunked equals whole");
+    // The same through strip and toRuns must not panic either.
+    let s = ansi.strip(data[0..65536], a);
+    ok(s.len <= 65536 * 3, "strip bounded");
+    ok(ansi.toRuns(data[0..65536], a).len >= 0, "runs survive");
+}
+
+fn main() {
+    let a = Arena.create(33554432);
+    testEvents(&a);
+    testMalformed(&a);
+    testSplits(&a);
+    testSgr(&a);
+    testParams(&a);
+    testText(&a);
+    testFuzz(&a);
+    printLn("term_ansi_test ok");
+}

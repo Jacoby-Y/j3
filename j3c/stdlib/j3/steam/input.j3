@@ -1,0 +1,296 @@
+// Part of j3.steam: ISteamInput lifecycle, controllers, action sets, haptics and callbacks; the module doc and `use`s are in ../steam.j3.
+module j3.steam;
+
+const CB_PAD_CONNECTED: i32 = 2801;
+const CB_PAD_DISCONNECTED: i32 = 2802;
+const CB_PAD_CONFIG: i32 = 2803;
+const CB_PAD_SLOT: i32 = 2804;
+
+/// True between a successful `inputInit` and `inputShutdown`.
+#[singleton]
+let INPUT_ON: bool = false;
+/// True when `inputInit` got `explicitFrame` true, so the `frame()` hook runs `RunFrame`.
+#[singleton]
+let INPUT_PUMPED: bool = false;
+#[singleton]
+let H_PAD_CONN: ptr;
+#[singleton]
+let H_PAD_DISC: ptr;
+#[singleton]
+let H_PAD_CONFIG: ptr;
+#[singleton]
+let H_PAD_SLOT: ptr;
+#[singleton]
+let OFF_PAD_HANDLE: int = 0;
+#[singleton]
+let OFF_PAD_DISC_HANDLE: int = 0;
+#[singleton]
+let OFF_CFG_HANDLE: int = 0;
+#[singleton]
+let OFF_CFG_API: int = 0;
+#[singleton]
+let OFF_CFG_GAMEPAD: int = 0;
+#[singleton]
+let OFF_SLOT_HANDLE: int = 0;
+#[singleton]
+let OFF_SLOT_OLD: int = 0;
+#[singleton]
+let OFF_SLOT_NEW: int = 0;
+
+/// The binding revision of a controller's configuration. `ok` is false when Steam has none.
+pub struct BindingRevision {
+    ok: bool;
+    major: i32;
+    minor: i32;
+}
+
+/// Start Steam Input. With `explicitFrame` true the library does not poll on its own thread: `frame()` (so `attach`) calls
+/// `inputFrame` for you before it delivers callbacks; with false the library polls itself. True when Steam Input is up (also in
+/// fake mode, which finds two controllers: handle 1 is an Xbox One pad and 2 a Steam Deck, and queues their connect callbacks).
+/// False when Steam is absent. Calling it again returns true.
+pub fn inputInit(explicitFrame: bool): bool {
+    if INPUT_ON {
+        return true;
+    }
+    if fake() {
+        INPUT_ON = true;
+        fakeLog(`inputInit explicitFrame={explicitFrame}`);
+        fakeConnect(FAKE_PAD_A);
+        fakeConnect(FAKE_PAD_B);
+        return true;
+    }
+    if !ready() {
+        return false;
+    }
+    let f = method("SteamInput", "SteamAPI_ISteamInput_Init") as fn(ptr, bool): bool;
+    if !f(si(), explicitFrame) {
+        eprintOnce("steam: Steam Input did not start; input calls do nothing");
+        return false;
+    }
+    INPUT_ON = true;
+    INPUT_PUMPED = explicitFrame;
+    return true;
+}
+
+/// Stop Steam Input and forget the action names. Safe without `inputInit`; `shutdown()` does it for you.
+pub fn inputShutdown() {
+    if !INPUT_ON {
+        return;
+    }
+    INPUT_ON = false;
+    INPUT_PUMPED = false;
+    if ready() {
+        let f = method("SteamInput", "SteamAPI_ISteamInput_Shutdown") as fn(ptr): bool;
+        f(si());
+    }
+    ncClear(&C_SET);
+    ncClear(&C_DIGITAL);
+    ncClear(&C_ANALOG);
+    fakeInputReset();
+}
+
+/// Poll the controllers now (`RunFrame`). Only needed when you passed `explicitFrame` true and do not call `frame()`;
+/// `frame()` does it before it delivers callbacks. Does nothing when Steam Input is not started.
+pub fn inputFrame() {
+    if !INPUT_ON || !ready() {
+        return;
+    }
+    let f = method("SteamInput", "SteamAPI_ISteamInput_RunFrame") as fn(ptr, bool);
+    f(si(), true);
+}
+
+/// The hook `frame()` runs before dispatch (registered once by `inputInit`'s part).
+fn inputPump() {
+    if INPUT_PUMPED {
+        inputFrame();
+    }
+}
+
+/// Tell Steam where the Input Action Manifest (the game's actions and default bindings) is, for a dev run with no Steamworks
+/// configuration. An absolute path; true when Steam took it. False when Steam is absent.
+pub fn inputManifest(path: string): bool {
+    if fake() {
+        fakeLog(`inputManifest {path}`);
+        return true;
+    }
+    let p = cs(path, 0);
+    if p as int == 0 {
+        return false;
+    }
+    let f = method("SteamInput", "SteamAPI_ISteamInput_SetInputActionManifestFilePath") as fn(ptr, ptr): bool;
+    return f(si(), p);
+}
+
+/// Ask Steam to send pad connect and disconnect callbacks for all devices (`onPadConnected`, `onPadDisconnected`).
+pub fn inputEnableDeviceCallbacks() {
+    if fake() {
+        fakeLog("inputEnableDeviceCallbacks");
+        return;
+    }
+    let f = method("SteamInput", "SteamAPI_ISteamInput_EnableDeviceCallbacks") as fn(ptr);
+    f(si());
+}
+
+/// Fill `out` with the handles of the connected controllers; returns how many. `out` must hold `INPUT_MAX_COUNT` (16): Steam
+/// writes up to that many, so a smaller slice is refused (logged once, returns 0). 0 when Steam Input is not started.
+pub fn controllers(out: []u64): int {
+    if out.len < INPUT_MAX_COUNT {
+        eprintOnce(`steam: controllers needs room for {INPUT_MAX_COUNT} handles, got {out.len}; call refused`);
+        return 0;
+    }
+    if !INPUT_ON {
+        return 0;
+    }
+    if fake() {
+        out[0] = FAKE_PAD_A;
+        out[1] = FAKE_PAD_B;
+        return 2;
+    }
+    let f = method("SteamInput", "SteamAPI_ISteamInput_GetConnectedControllers") as fn(ptr, ptr): i32;
+    return int(f(si(), out.ptr as ptr));
+}
+
+/// What kind of controller `h` is: one of the `INPUT_*` type constants (`INPUT_UNKNOWN` when Steam Input is not started).
+pub fn inputType(h: u64): int {
+    if !INPUT_ON {
+        return INPUT_UNKNOWN;
+    }
+    if fake() {
+        return fakePadType(h);
+    }
+    let f = method("SteamInput", "SteamAPI_ISteamInput_GetInputTypeForHandle") as fn(ptr, u64): i32;
+    return int(f(si(), h));
+}
+
+/// The controller handle behind XInput/gamepad slot `i`, or 0.
+pub fn controllerForGamepad(i: i32): u64 {
+    if !INPUT_ON {
+        return u64(0);
+    }
+    if fake() {
+        return fakePadAtSlot(int(i));
+    }
+    let f = method("SteamInput", "SteamAPI_ISteamInput_GetControllerForGamepadIndex") as fn(ptr, i32): u64;
+    return f(si(), i);
+}
+
+/// The gamepad slot controller `h` has, or -1 (also when Steam Input is not started).
+pub fn gamepadForController(h: u64): i32 {
+    if !INPUT_ON {
+        return i32(-1);
+    }
+    if fake() {
+        return i32(fakeSlotOf(h));
+    }
+    let f = method("SteamInput", "SteamAPI_ISteamInput_GetGamepadIndexForController") as fn(ptr, u64): i32;
+    return f(si(), h);
+}
+
+/// Open Steam's binding screen for `h` (needs the overlay). True when it opened.
+pub fn showBindingPanel(h: u64): bool {
+    if !INPUT_ON {
+        return false;
+    }
+    if fake() {
+        fakeLog(`showBindingPanel {h}`);
+        return fakePadType(h) != INPUT_UNKNOWN;
+    }
+    let f = method("SteamInput", "SteamAPI_ISteamInput_ShowBindingPanel") as fn(ptr, u64): bool;
+    return f(si(), h);
+}
+
+/// The binding revision of `h`'s configuration (`ok` false when there is none). Fake mode: 1.0 for the two pads.
+pub fn bindingRevision(h: u64): BindingRevision {
+    let none = BindingRevision { ok: false, major: i32(0), minor: i32(0) };
+    if !INPUT_ON {
+        return none;
+    }
+    if fake() {
+        if fakePadType(h) == INPUT_UNKNOWN {
+            return none;
+        }
+        return BindingRevision { ok: true, major: i32(1), minor: i32(0) };
+    }
+    let out = outCell();
+    let f = method("SteamInput", "SteamAPI_ISteamInput_GetDeviceBindingRevision") as fn(ptr, u64, ptr, ptr): bool;
+    if !f(si(), h, out, (out as int + 4) as ptr) {
+        return none;
+    }
+    return BindingRevision { ok: true, major: rdI32(out, 0), minor: rdI32(out, 4) };
+}
+
+/// The Remote Play session id `h` belongs to, or 0 (also when absent and in fake mode).
+pub fn remotePlaySession(h: u64): u32 {
+    if !INPUT_ON || fake() {
+        return u32(0);
+    }
+    let f = method("SteamInput", "SteamAPI_ISteamInput_GetRemotePlaySessionID") as fn(ptr, u64): u32;
+    return f(si(), h);
+}
+
+/// Run `f(handle)` when a controller connects (`SteamInputDeviceConnected_t`; call `inputEnableDeviceCallbacks` first for
+/// non-Steam pads). One handler: setting again replaces it.
+pub fn onPadConnected(f: fn(u64)) {
+    H_PAD_CONN = f as ptr;
+}
+
+/// Run `f(handle)` when a controller disconnects. One handler.
+pub fn onPadDisconnected(f: fn(u64)) {
+    H_PAD_DISC = f as ptr;
+}
+
+/// Run `f(handle, usesSteamInput, usesGamepadApi)` when a controller's configuration loads. One handler.
+pub fn onPadConfig(f: fn(u64, bool, bool)) {
+    H_PAD_CONFIG = f as ptr;
+}
+
+/// Run `f(handle, oldSlot, newSlot)` when a pad moves to another gamepad slot. One handler.
+pub fn onPadSlot(f: fn(u64, i32, i32)) {
+    H_PAD_SLOT = f as ptr;
+}
+
+fn onPadConnCb(p: ptr, n: i32) {
+    if H_PAD_CONN as int != 0 {
+        let f = H_PAD_CONN as fn(u64);
+        f(rdU64(p, OFF_PAD_HANDLE));
+    }
+}
+
+fn onPadDiscCb(p: ptr, n: i32) {
+    if H_PAD_DISC as int != 0 {
+        let f = H_PAD_DISC as fn(u64);
+        f(rdU64(p, OFF_PAD_DISC_HANDLE));
+    }
+}
+
+fn onPadConfigCb(p: ptr, n: i32) {
+    if H_PAD_CONFIG as int != 0 {
+        let f = H_PAD_CONFIG as fn(u64, bool, bool);
+        f(rdU64(p, OFF_CFG_HANDLE), rdBool(p, OFF_CFG_API), rdBool(p, OFF_CFG_GAMEPAD));
+    }
+}
+
+fn onPadSlotCb(p: ptr, n: i32) {
+    if H_PAD_SLOT as int != 0 {
+        let f = H_PAD_SLOT as fn(u64, i32, i32);
+        f(rdU64(p, OFF_SLOT_HANDLE), rdI32(p, OFF_SLOT_OLD), rdI32(p, OFF_SLOT_NEW));
+    }
+}
+
+fn inputInit2() {
+    inputAbiInit();
+    OFF_PAD_HANDLE = lay("SteamInputDeviceConnected_t", "deviceHandle");
+    OFF_PAD_DISC_HANDLE = lay("SteamInputDeviceDisconnected_t", "deviceHandle");
+    OFF_CFG_HANDLE = lay("SteamInputConfigurationLoaded_t", "deviceHandle");
+    OFF_CFG_API = lay("SteamInputConfigurationLoaded_t", "usesSteamInputAPI");
+    OFF_CFG_GAMEPAD = lay("SteamInputConfigurationLoaded_t", "usesGamepadAPI");
+    OFF_SLOT_HANDLE = lay("SteamInputGamepadSlotChange_t", "deviceHandle");
+    OFF_SLOT_OLD = lay("SteamInputGamepadSlotChange_t", "oldGamepadSlot");
+    OFF_SLOT_NEW = lay("SteamInputGamepadSlotChange_t", "newGamepadSlot");
+    onCallback(CB_PAD_CONNECTED, onPadConnCb);
+    onCallback(CB_PAD_DISCONNECTED, onPadDiscCb);
+    onCallback(CB_PAD_CONFIG, onPadConfigCb);
+    onCallback(CB_PAD_SLOT, onPadSlotCb);
+    onBeforeFrame(inputPump);
+    onShutdown(inputShutdown);
+}

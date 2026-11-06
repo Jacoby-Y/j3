@@ -76,20 +76,25 @@ impl<'a> Lexer<'a> {
                     if self.peek() == Some('&') {
                         self.bump();
                         self.push(TokenKind::AndAnd, start, self.i, "");
+                    } else if self.peek() == Some('=') {
+                        self.bump();
+                        self.push(TokenKind::AmpEq, start, self.i, "");
                     } else {
                         self.push(TokenKind::Amp, start, self.i, "");
                     }
                 }
+                '^' => self.assign_op(start, TokenKind::Caret, TokenKind::CaretEq),
+                '~' => self.one(TokenKind::Tilde, start),
                 '|' => {
                     self.bump();
                     if self.peek() == Some('|') {
                         self.bump();
                         self.push(TokenKind::OrOr, start, self.i, "");
+                    } else if self.peek() == Some('=') {
+                        self.bump();
+                        self.push(TokenKind::PipeEq, start, self.i, "");
                     } else {
-                        return Err(ParseError::new(
-                            self.span(start, self.i),
-                            "bitwise `|` not in this subset",
-                        ));
+                        self.push(TokenKind::Pipe, start, self.i, "");
                     }
                 }
                 '!' => {
@@ -132,9 +137,17 @@ impl<'a> Lexer<'a> {
                 '-' => self.assign_op(start, TokenKind::Minus, TokenKind::MinusEq),
                 '*' => self.assign_op(start, TokenKind::Star, TokenKind::StarEq),
                 '/' => self.assign_op(start, TokenKind::Slash, TokenKind::SlashEq),
-                '%' => self.one(TokenKind::Percent, start),
+                '%' => self.assign_op(start, TokenKind::Percent, TokenKind::PercentEq),
                 '"' => self.string(start)?,
                 '`' => self.interpolate(start)?,
+                '\'' if self.peek_at(1).is_some_and(is_ident_start) => {
+                    self.bump();
+                    while self.peek().is_some_and(is_ident_continue) {
+                        self.bump();
+                    }
+                    let text = &self.src[start..self.i];
+                    self.push(TokenKind::Label, start, self.i, text);
+                }
                 c if is_ident_start(c) => self.ident(start),
                 c if c.is_ascii_digit() => self.number(start)?,
                 _ => {
@@ -221,6 +234,19 @@ impl<'a> Lexer<'a> {
     }
 
     fn number(&mut self, start: usize) -> Result<(), ParseError> {
+        if self.peek() == Some('0') && self.peek_at(1) == Some('b') {
+            self.bump();
+            self.bump();
+            if !matches!(self.peek(), Some('0' | '1')) {
+                return Err(ParseError::new(self.span(start, self.i), "invalid binary literal"));
+            }
+            while matches!(self.peek(), Some('0' | '1')) {
+                self.bump();
+            }
+            let text = &self.src[start..self.i];
+            self.push(TokenKind::Int, start, self.i, text);
+            return Ok(());
+        }
         let hex = self.peek() == Some('0') && self.peek_at(1) == Some('x');
         if hex {
             self.bump();

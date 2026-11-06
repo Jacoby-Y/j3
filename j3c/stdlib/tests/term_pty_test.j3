@@ -1,0 +1,145 @@
+// Tests for j3.term.pty: size, colors and the controlling tty through a grid, resize, a missing program,
+// environment overrides. Linux. Every read loop has a 5 s deadline.
+//   timeout 60 j3c run j3c/stdlib/tests/term_pty_test.j3
+// Panics on the first failed check.
+
+module term_pty_test;
+
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.proc.ProcError;
+use j3.result.Result;
+use j3.sys;
+use j3.sys.panic;
+use j3.term.Color;
+use j3.term.ansi.Parser;
+use j3.term.ansi.feed;
+use j3.term.grid.Grid;
+use j3.term.pty;
+use j3.term.pty.Pty;
+use j3.text.Text;
+use j3.text.contains;
+
+fn ok(cond: bool, msg: string) {
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic(msg);
+    }
+}
+
+fn start(argv: []string, env: []string, cols: int, rows: int, a: &Arena): Pty {
+    match pty.spawn(argv, "", env, cols, rows, a) {
+        Result.Ok(p) { return p; }
+        Result.Err(_) { panic(`could not spawn {argv[0]}`); }
+    }
+    return Pty { fd: -1, pid: -1, pend: Text.new(a) };
+}
+
+/// Read into `out` until `needle` shows up (when not empty) or the program closes its side; false on the deadline.
+fn readUntil(p: &Pty, out: &Text, needle: string, buf: []u8): bool {
+    for i in 0..100 {
+        let pfd: [2]i32 = [i32(p.fd), i32(sys.POLLIN)];
+        sys.pollFds(&pfd[0] as ptr, 1, 50);
+        out.pushStr(p.tryRead(buf));
+        if needle.len > 0 && contains(out.str(), needle) {
+            return true;
+        }
+        if p.eof {
+            return needle.len == 0;
+        }
+    }
+    return false;
+}
+
+fn main() {
+    let a = Arena.create(4194304);
+    let buf = a.alloc::<u8>(4096);
+    let none: [1]string = [""];
+
+    // size, colors, controlling tty, exit code, through a grid
+    let argv: [3]string = ["sh", "-c", "stty size; printf '\\033[31mhi\\033[0m\\n'; tty"];
+    let p = start(argv[:], none[0..0], 40, 10, &a);
+    let out = Text.new(&a);
+    ok(readUntil(&p, &out, "", buf), "reads to the end");
+    ok(p.wait() == 0, "exit code 0");
+    let g = Grid.new(&a, 40, 10, 100);
+    let parser = Parser.new(&a);
+    parser.feed(out.str(), &g);
+    let dump = g.dumpText(&a);
+    ok(contains(dump, "10 40"), "stty size sees 10 40");
+    ok(contains(dump, "/dev/pts/"), "tty names a pts");
+    let found = false;
+    for y in 0..10 {
+        for x in 0..39 {
+            if g.cell(x, y).cp == 104 && g.cell(x + 1, y).cp == 105 {
+                found = true;
+                ok(g.cell(x, y).style.fg == Color.palette(1), "hi is red");
+            }
+        }
+    }
+    ok(found, "hi is on the grid");
+    ok(p.eof, "eof flagged");
+
+    // resize reaches the program
+    let argv2: [3]string = ["sh", "-c", "stty size; read x; stty size"];
+    let p2 = start(argv2[:], none[0..0], 80, 24, &a);
+    let out2 = Text.new(&a);
+    ok(readUntil(&p2, &out2, "24 80", buf), "first size");
+    ok(p2.resize(50, 20), "resize");
+    ok(p2.write("\n" as []u8), "write");
+    ok(readUntil(&p2, &out2, "20 50", buf), "second size is 20 50");
+    ok(readUntil(&p2, &out2, "", buf), "resize program ends");
+    ok(p2.wait() == 0, "resize program exit");
+
+    // a missing program fails at once
+    let bad: [1]string = ["no-such-program-j3"];
+    match pty.spawn(bad[:], "", none[0..0], 80, 24, &a) {
+        Result.Ok(_) { panic("missing program started"); }
+        Result.Err(e) {
+            match e {
+                ProcError.NotFound { }
+                ProcError.ExecFailed { panic("wrong error"); }
+                ProcError.Fail { panic("wrong error"); }
+            }
+        }
+    }
+
+    // env overrides (TERM forced, FOO added, inherited names replaced)
+    let argv3: [3]string = ["sh", "-c", "echo $TERM $FOO"];
+    let env3: [2]string = ["FOO=bar", "TERM=dumb"];
+    let p3 = start(argv3[:], env3[:], 80, 24, &a);
+    let out3 = Text.new(&a);
+    ok(readUntil(&p3, &out3, "", buf), "env read");
+    ok(contains(out3.str(), "dumb bar"), "env override wins");
+    p3.wait();
+    let argv4: [3]string = ["sh", "-c", "echo $TERM $FOO"];
+    let env4: [1]string = ["FOO=bar"];
+    let p4 = start(argv4[:], env4[:], 80, 24, &a);
+    let out4 = Text.new(&a);
+    ok(readUntil(&p4, &out4, "", buf), "env read 2");
+    ok(contains(out4.str(), "xterm-256color bar"), "TERM default and FOO");
+    p4.wait();
+
+    // 200 KB into a child that reads slowly: queued, then drained by flush
+    let argv5: [3]string = ["sh", "-c", "cat >/dev/null"];
+    let p5 = start(argv5[:], none[0..0], 80, 24, &a);
+    let big = a.alloc::<u8>(204800);
+    for i in 0..big.len {
+        big[i] = if i % 64 == 63 { 10 } else { 97 };
+    }
+    ok(p5.write(big), "big write queued");
+    for i in 0..100 {
+        if p5.pending() == 0 {
+            break;
+        }
+        let pfd: [2]i32 = [i32(p5.fd), i32(sys.POLLOUT)];
+        sys.pollFds(&pfd[0] as ptr, 1, 50);
+        p5.tryRead(buf);
+    }
+    ok(p5.pending() == 0, "pending drained");
+    ok(p5.wait() != 12345, "close and reap");
+    ok(!p5.write("x" as []u8), "write after close is refused");
+
+    printLn("term_pty_test ok");
+}

@@ -5,9 +5,15 @@
 //! the `[link] search` dirs, their `../bin`, or `~/.cache/j3/sdl2-mingw/dll`. A `.deb` (Linux
 //! targets) installs that folder to `/opt/<name>` with a launcher, menu entry, and icon (`deb.rs`).
 //! An `.apk` (`apk.rs`) packs every Android target's `lib<name>.so` with SDL and the assets.
+//! `steam` (`steam.rs`) lays the same folder out as Steam depot content.
 
 pub mod apk;
-mod deb;
+pub(crate) mod deb;
+mod steam;
+pub(crate) use steam::dev_env as steam_dev_env;
+
+/// The J3 logo, 256x256: the package icon when `[dist] icon` is unset (same art as `logo.svg`).
+pub(crate) const LOGO_PNG: &[u8] = include_bytes!("dist/logo.png");
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,10 +23,12 @@ use crate::project::{Manifest, Output};
 
 /// Package every built target. `built` is `(triple, exe path)`; the triple may be empty (host).
 pub fn package(m: &Manifest, built: &[(String, PathBuf)]) -> Result<Vec<PathBuf>, String> {
-    let dist = m.root.join("target/dist");
+    // Absolute: `zip` runs inside the staging folder, so a relative root (`j3c build .`) points nowhere.
+    let dist = std::path::absolute(m.root.join("target/dist")).map_err(|e| format!("dist dir: {e}"))?;
     fs::create_dir_all(&dist).map_err(|e| format!("mkdir {}: {e}", dist.display()))?;
     let include = include(m);
     let mut out = Vec::new();
+    let steam_targets = if m.dist.outputs.contains(&Output::Steam) { steam::plan(m, built)? } else { Vec::new() };
     // One APK holds every Android triple; those triples have no zip/deb of their own.
     let android = |t: &str| crate::emit::host::target_os(t) == crate::emit::host::TargetOs::Android;
     if m.dist.outputs.contains(&Output::Apk) {
@@ -29,7 +37,8 @@ pub fn package(m: &Manifest, built: &[(String, PathBuf)]) -> Result<Vec<PathBuf>
     }
     for (triple, exe) in built.iter().filter(|(t, _)| !android(t)) {
         let windows = triple.contains("windows");
-        let exe = if windows && !exe.is_file() { exe.with_extension("exe") } else { exe.clone() };
+        // The `.exe` first: a Linux build of the same name may sit beside it (`target/<name>`).
+        let exe = if windows && exe.with_extension("exe").is_file() { exe.with_extension("exe") } else { exe.clone() };
         let stage = m.root.join("target/.j3c/dist").join(crate::project::target_slug(triple));
         let _ = fs::remove_dir_all(&stage);
         // The app folder sits where the `.deb` installs it, so both outputs share one copy.
@@ -64,12 +73,16 @@ pub fn package(m: &Manifest, built: &[(String, PathBuf)]) -> Result<Vec<PathBuf>
                     out.push(deb::build(m, triple, &stage, &dir.join(file), &dist)?)
                 }
                 Output::Apk => {}
+                Output::Steam => steam::stage(m, triple, &dir)?,
                 Output::Deb => eprintln!("j3c: dist: no .deb for {} (Linux targets only)", platform(triple)),
             }
         }
         let _ = fs::remove_dir_all(&stage);
     }
     let _ = fs::remove_dir_all(m.root.join("target/.j3c/dist"));
+    if !steam_targets.is_empty() {
+        out.push(steam::finish(m, &steam_targets)?);
+    }
     Ok(out)
 }
 
@@ -93,7 +106,14 @@ fn zip(m: &Manifest, parent: &Path, zip: &Path) -> Result<PathBuf, String> {
         .output()
         .map_err(|e| format!("run zip: {e} (install `zip`)"))?;
     if !out.status.success() {
-        return Err(format!("zip failed:\n{}", String::from_utf8_lossy(&out.stderr)));
+        // zip prints its I/O errors on stdout
+        return Err(format!(
+            "zip {} failed ({}):\n{}{}",
+            zip.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     Ok(zip.to_path_buf())
 }
@@ -132,9 +152,16 @@ fn dlls(m: &Manifest, exe: &Path) -> Vec<PathBuf> {
         dirs.push(PathBuf::from(home).join(".cache/j3/sdl2-mingw/dll"));
     }
     let mut found: Vec<PathBuf> = Vec::new();
-    // `[link] libs` too: SDL_image/mixer/ttf are opened at runtime (`game.j3` `soTry`), not imported.
+    // `[link] libs` too.
     let mut todo: Vec<String> = m.link.libs.iter().filter_map(|l| crate::emit::host::windows_lib(l)).map(|l| format!("{l}.dll")).collect();
-    todo.extend(imports(exe));
+    let imported = imports(exe);
+    // `j3.game` opens SDL_image/mixer/ttf at runtime (`addons.j3`), so they are never imports; every
+    // SDL game links all three bindings, so ship all three. ponytail: ~3 MB extra for a game that
+    // never plays sound; skip by usage once the compiler can tell which add-ons a program reaches.
+    if imported.iter().any(|d| d.eq_ignore_ascii_case("SDL2.dll")) {
+        todo.extend(["SDL2_image.dll", "SDL2_mixer.dll", "SDL2_ttf.dll"].map(String::from));
+    }
+    todo.extend(imported);
     while let Some(name) = todo.pop() {
         if found.iter().any(|f| f.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(&name))) {
             continue;

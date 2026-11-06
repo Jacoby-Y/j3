@@ -7,6 +7,7 @@ Start from the task. `j3c doc recipes <name>` prints a complete, checked program
     shapes, text, HUDs, debug draw   recipes paint     then j3.gfx.paint
     video settings (mode, resolution, vsync)  recipes display  then j3.game.display
     per-object logic in .j3s         recipes script    then `j3c doc lang` (Scripts), j3.scene3d.scripts
+    mods loaded at runtime (.j2)     recipes j2        then `j3c doc j2`
     meshes built in code             recipes meshgen   then j3.gfx.meshgen
     heavy work off the frame thread  recipes threads   then `j3c doc threads`, j3.thread
     call a web API (https, JSON)     recipes http      then j3.net.http, j3.data.json, examples/openrouter-chat

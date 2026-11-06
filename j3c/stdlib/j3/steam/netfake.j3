@@ -1,0 +1,315 @@
+// Part of j3.steam: the in-process network behind ISteamNetworkingMessages in fake mode. Peers are FAKE_USER
+// (you), FAKE_FRIEND and FAKE_FRIEND2, or any id you name. Incoming messages sit in a bounded queue whose
+// buffers are reused; a message from a peer whose session is not accepted waits. The module doc and `use`s are in ../steam.j3.
+module j3.steam;
+
+/// Messages the fake inbox keeps; when it is full the oldest is dropped (with a line on stderr).
+const NF_CAP: int = 128;
+const NF_PING: i32 = 20;
+const NF_DBG: int = 128;
+
+struct NfMsg {
+    from: u64;
+    channel: i32;
+    num: int;
+    buf: ptr;
+    cap: int;
+    len: int;
+}
+
+/// A message moved out of the inbox for delivery: its bytes are at `off` in `NF_OUT`.
+struct NfOut {
+    from: u64;
+    num: int;
+    off: int;
+    len: int;
+}
+
+struct NfSess {
+    peer: u64;
+    state: i32;
+    pending: bool;
+    reason: i32;
+    dbg: ptr;
+}
+
+#[singleton]
+let NFQ: []NfMsg;
+#[singleton]
+let NFQ_N: int = 0;
+#[singleton]
+let NFS: []NfSess;
+#[singleton]
+let NFS_N: int = 0;
+#[singleton]
+let NF_ECHO: bool = false;
+#[singleton]
+let NF_NUM: int = 0;
+#[singleton]
+let NF_OUT: ptr;
+#[singleton]
+let NF_OUT_CAP: int = 0;
+#[singleton]
+let NF_META: []NfOut;
+
+fn nfReset() {
+    NFQ_N = 0;
+    NFS_N = 0;
+    NF_ECHO = false;
+    NF_NUM = 0;
+    FAKE_RELAY = RELAY_NEVER_TRIED;
+    FAKE_CLOCK = 0;
+}
+
+fn nfFind(peer: u64): int {
+    for i in 0..NFS_N {
+        if NFS[i].peer == peer {
+            return i;
+        }
+    }
+    return -1;
+}
+
+fn nfAdd(peer: u64, state: i32, pending: bool): int {
+    if NFS.len == 0 {
+        NFS = arena().alloc::<NfSess>(16);
+    }
+    if NFS_N >= NFS.len {
+        NFS = grown(NFS, NFS_N);
+    }
+    if NFS[NFS_N].dbg as int == 0 {
+        NFS[NFS_N].dbg = arena().allocBytes(NF_DBG);
+    }
+    NFS[NFS_N].peer = peer;
+    NFS[NFS_N].state = state;
+    NFS[NFS_N].pending = pending;
+    NFS[NFS_N].reason = i32(0);
+    wrU8(NFS[NFS_N].dbg, 0, u8(0));
+    NFS_N += 1;
+    return NFS_N - 1;
+}
+
+fn nfLive(peer: u64): bool {
+    let i = nfFind(peer);
+    return i >= 0 && NFS[i].state == NET_STATE_CONNECTED;
+}
+
+/// Remove inbox entry `i`, keeping its buffer in the array past the end for reuse.
+fn nfTake(i: int) {
+    let m = NFQ[i];
+    for j in i..NFQ_N - 1 {
+        NFQ[j] = NFQ[j + 1];
+    }
+    NFQ[NFQ_N - 1] = m;
+    NFQ_N -= 1;
+}
+
+fn nfPush(from: u64, channel: i32, data: []u8) {
+    if NFQ.len == 0 {
+        NFQ = arena().alloc::<NfMsg>(NF_CAP);
+    }
+    if NFQ_N >= NF_CAP {
+        fakeLog("net inbox full, dropped the oldest message");
+        nfTake(0);
+    }
+    let m = &NFQ[NFQ_N];
+    if m.cap < data.len {
+        m.buf = arena().allocBytes(data.len * 2 + 64);
+        m.cap = data.len * 2 + 64;
+    }
+    for i in 0..data.len {
+        wrU8(m.buf, i, data[i]);
+    }
+    NF_NUM += 1;
+    m.from = from;
+    m.channel = channel;
+    m.num = NF_NUM;
+    m.len = data.len;
+    NFQ_N += 1;
+}
+
+/// Fake mode: a message from `from` arrives on `channel`. From a peer with no live session it also raises the
+/// session request (`onNetRequest`), and the message waits until `netAccept`. Ignored outside fake mode.
+pub fn fakeNetDeliver(from: u64, channel: i32, data: []u8) {
+    if !fake() || from == u64(0) {
+        return;
+    }
+    let i = nfFind(from);
+    if i < 0 {
+        i = nfAdd(from, NET_STATE_CONNECTING, true);
+    } else if NFS[i].state == NET_STATE_CLOSED_BY_PEER || NFS[i].state == NET_STATE_PROBLEM_LOCALLY {
+        NFS[i].state = NET_STATE_CONNECTING;
+        NFS[i].pending = true;
+    } else {
+        nfPush(from, channel, data);
+        return;
+    }
+    fakeLog(`net request from {from}`);
+    let b = netCbBuf();
+    let id = idPut(2, from);
+    for k in 0..ID_BYTES {
+        wrU8(b, no(N_RQ_ID) + k, rdU8(id, k));
+    }
+    fakeCallback(CB_NET_REQUEST, @slice(b, no(N_RQ_ID) + ID_BYTES));
+    nfPush(from, channel, data);
+}
+
+/// Fake mode: with `on`, a message you send to FAKE_FRIEND or FAKE_FRIEND2 comes back as sent by them. Default off.
+pub fn fakeNetEcho(on: bool) {
+    NF_ECHO = on;
+}
+
+/// Fake mode: the session with `peer` breaks. It becomes closed by the peer (`reason` under 3000) or a local
+/// problem, `onNetFailed(peer, reason, debug)` runs on the next `frame()`, and `netSend` then needs
+/// `SEND_AUTO_RESTART_BROKEN_SESSION`. Ignored outside fake mode.
+pub fn fakeNetFail(peer: u64, reason: i32, debug: string) {
+    if !fake() {
+        return;
+    }
+    let i = nfFind(peer);
+    if i < 0 {
+        i = nfAdd(peer, NET_STATE_NONE, false);
+    }
+    NFS[i].pending = false;
+    NFS[i].reason = reason;
+    NFS[i].state = NET_STATE_CLOSED_BY_PEER;
+    if int(reason) >= 3000 {
+        NFS[i].state = NET_STATE_PROBLEM_LOCALLY;
+    }
+    let n = debug.len;
+    if n > NF_DBG - 1 {
+        n = NF_DBG - 1;
+    }
+    for k in 0..n {
+        wrU8(NFS[i].dbg, k, debug[k]);
+    }
+    wrU8(NFS[i].dbg, n, u8(0));
+    fakeLog(`net session with {peer} failed ({reason})`);
+    let b = netCbBuf();
+    writeConn(((b as int) + no(N_FL_INFO)) as ptr, peer, NFS[i].state, reason, debug);
+    fakeCallback(CB_NET_FAILED, @slice(b, no(N_FL_INFO) + no(N_CI_SIZE)));
+}
+
+fn nfSend(to: u64, data: []u8, flags: i32, channel: i32): i32 {
+    let i = nfFind(to);
+    if i < 0 {
+        i = nfAdd(to, NET_STATE_CONNECTED, false);
+    } else if NFS[i].state != NET_STATE_CONNECTED {
+        let again = int(flags) / 32 % 2 == 1;
+        if NFS[i].state == NET_STATE_CLOSED_BY_PEER || NFS[i].state == NET_STATE_PROBLEM_LOCALLY {
+            if !again {
+                return NET_NO_CONNECTION;
+            }
+        }
+        NFS[i].state = NET_STATE_CONNECTED;
+        NFS[i].pending = false;
+    }
+    fakeLog(`netSend {data.len} bytes to {to} on channel {channel}`);
+    if NF_ECHO && (to == FAKE_FRIEND || to == FAKE_FRIEND2) {
+        nfPush(to, channel, data);
+    }
+    return NET_OK;
+}
+
+fn nfReceive(channel: i32, f: fn(u64, []u8, i32, i64, u64), ctx: u64, max: int): int {
+    // phase 1: move matching messages into NF_OUT, so the handler may call fakeNetDeliver or netSend freely
+    let need = max;
+    if need > NFQ_N {
+        need = NFQ_N;
+    }
+    if NF_META.len < need {
+        NF_META = arena().alloc::<NfOut>(need * 2);
+    }
+    let n = 0;
+    let used = 0;
+    let i = 0;
+    while i < NFQ_N && n < max {
+        let m = NFQ[i];
+        if m.channel == channel && nfLive(m.from) {
+            if used + m.len > NF_OUT_CAP {
+                let cap = (used + m.len) * 2 + 256;
+                let fresh = arena().allocBytes(cap);
+                for k in 0..used {
+                    wrU8(fresh, k, rdU8(NF_OUT, k));
+                }
+                NF_OUT = fresh;
+                NF_OUT_CAP = cap;
+            }
+            for k in 0..m.len {
+                wrU8(NF_OUT, used + k, rdU8(m.buf, k));
+            }
+            NF_META[n] = NfOut { from: m.from, num: m.num, off: used, len: m.len };
+            used += m.len;
+            n += 1;
+            nfTake(i);
+        } else {
+            i += 1;
+        }
+    }
+    // phase 2: hand them out (a null handler drops them)
+    if f as int != 0 {
+        for k in 0..n {
+            let o = NF_META[k];
+            let bytes: []u8 = @slice((NF_OUT as int + o.off) as ptr, o.len);
+            f(o.from, bytes, channel, i64(o.num), ctx);
+        }
+    }
+    return n;
+}
+
+fn nfAccept(user: u64): bool {
+    let i = nfFind(user);
+    if i < 0 || !NFS[i].pending {
+        return false;
+    }
+    NFS[i].pending = false;
+    NFS[i].state = NET_STATE_CONNECTED;
+    fakeLog(`netAccept {user}`);
+    return true;
+}
+
+fn nfDrop(user: u64, channel: i32, all: bool) {
+    let i = 0;
+    while i < NFQ_N {
+        if NFQ[i].from == user && (all || NFQ[i].channel == channel) {
+            nfTake(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn nfClose(user: u64): bool {
+    let i = nfFind(user);
+    if i < 0 {
+        return false;
+    }
+    nfDrop(user, i32(0), true);
+    let dead = NFS[i].dbg;
+    NFS[i] = NFS[NFS_N - 1];
+    NFS[NFS_N - 1].dbg = dead;
+    NFS_N -= 1;
+    fakeLog(`netClose {user}`);
+    return true;
+}
+
+fn nfCloseChannel(user: u64, channel: i32): bool {
+    if nfFind(user) < 0 {
+        return false;
+    }
+    nfDrop(user, channel, false);
+    fakeLog(`netCloseChannel {user} {channel}`);
+    return true;
+}
+
+fn nfInfo(user: u64): NetInfo {
+    let i = nfFind(user);
+    if i < 0 {
+        return NetInfo { state: NET_STATE_NONE, endReason: i32(0), endDebug: "", ping: i32(-1) };
+    }
+    let ping = i32(-1);
+    if NFS[i].state == NET_STATE_CONNECTED {
+        ping = NF_PING;
+    }
+    return NetInfo { state: NFS[i].state, endReason: NFS[i].reason, endDebug: fromFixed(NFS[i].dbg, NF_DBG), ping: ping };
+}

@@ -23,8 +23,8 @@ impl<'a> G<'a> {
             if a.name == "slot" && self.slots.slotted.contains(&addr(e)) {
                 continue; // goes to the parent component's slot
             }
-            if e.tag == "glyph" && matches!(a.name.as_str(), "action" | "key" | "pad") {
-                continue; // read by the `glyph` arm below
+            if (e.tag == "glyph" && matches!(a.name.as_str(), "action" | "key" | "pad")) || (e.tag == "icon" && a.name == "name") {
+                continue; // read by the `glyph` / `icon` arm below
             }
             if matches!(a.name.as_str(), "virtual" | "row-height" | "est-height" | "stick-to-bottom" | "keep" | "bind:at-end") {
                 continue; // read by `virtual_attrs`
@@ -111,6 +111,8 @@ impl<'a> G<'a> {
                 }
                 self.upd.s(");\n");
             }
+            // a vector icon: only the named icons' data is copied in (`ui/icons.rs`, `Dom.attrIcon`)
+            "icon" => self.icon(e, &n)?,
             // the disclosure button: focusable, Enter / Space click it (`inputs.begin` flips the `<details>`)
             "summary" => self.upd.line(&format!("d.attrTabIndex({n});")),
             _ => {}
@@ -358,6 +360,51 @@ impl<'a> G<'a> {
     }
 
     /// A string attribute: literal text, `"a {b}"`, or `{expr}`, passed to `d.<call>(n, s)`.
+    /// `<icon name="trash">` or `name={done ? "check" : "circle"}`: every name is checked here and its
+    /// data goes into a `name\tdata` table literal that `Dom.attrIcon` picks from.
+    fn icon(&mut self, e: &Elem, n: &str) -> R<()> {
+        if let Some(c) = e.children.first() {
+            let at = match c { Node::Elem(x) => x.open, _ => e.open };
+            return err(at.0, at.1, "`<icon>` takes no children");
+        }
+        let Some(a) = e.attrs.iter().find(|a| a.name == "name") else {
+            return err(e.open.0, e.open.1, "`<icon>` needs `name=\"trash\"` (a Bootstrap Icons id, or a file in the project's icons/)").map_err(|e| e.help("`j3c doc icons` lists the names; `j3c doc icons <word>` filters them"));
+        };
+        let names: Vec<String> = match &a.value {
+            Value::Str(p) => match p.as_slice() {
+                [Part::Lit(l)] => vec![l.trim().to_string()],
+                _ => return err(a.range.0, a.range.1, "`name` can't have `{}` holes").map_err(|e| e.help("write `name={if done { \"check\" } else { \"x\" }}`: the names must be string literals so their data can be copied in")),
+            },
+            Value::Expr(r) => {
+                let v = string_literals(&self.src[r.0..r.1]);
+                if v.is_empty() {
+                    return err(a.range.0, a.range.1, "`name={...}` has no string literals to take icons from").map_err(|e| e.help("write the names as literals in the expression: `name={if on { \"volume-up\" } else { \"volume-mute\" }}`"));
+                }
+                v
+            }
+            Value::None => return err(a.range.0, a.range.1, "`name` needs a value"),
+        };
+        let mut table = String::new();
+        for name in &names {
+            match icons::find(name, self.icons) {
+                Some(data) => table.push_str(&format!("{name}\t{data}\n")),
+                None => {
+                    let near = icons::suggest(name, self.icons).iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", ");
+                    return err(a.range.0, a.range.1, format!("unknown icon `{name}`")).map_err(|e| e.help(format!("did you mean {near}? `j3c doc icons <word>` searches the names; your own go in icons/<name>.svg")));
+                }
+            }
+        }
+        self.upd.set(self.fi, a.range.0, a.range.1);
+        self.upd.pad();
+        self.upd.s(&format!("d.attrIcon({n}, "));
+        match &a.value {
+            Value::Expr(r) => self.expr(Mode::U, *r)?,
+            _ => self.upd.s(&lit(&names[0])),
+        }
+        self.upd.s(&format!(", {});\n", lit(&table)));
+        Ok(())
+    }
+
     pub(super) fn str_attr(&mut self, a: &Attr, call: &str, n: &str) -> R<()> {
         self.upd.pad();
         self.upd.s(&format!("d.{call}({n}, "));
@@ -417,22 +464,25 @@ impl<'a> G<'a> {
         if k >= 8 {
             return err(a.range.0, a.range.1, "an element takes at most 8 `style:` attributes");
         }
+        // where a bad value warns: the attribute in the `.j3ui`
+        let (line, col) = crate::csslint::line_col(self.src, a.range.0);
+        let at = format!("{}, {line}, {col}", lit(&self.files[self.fi].path));
         self.upd.pad();
         match &a.value {
             Value::Expr(r) if num => {
-                self.upd.s(&format!("d.styleNum({n}, {k}, {}, f32(", lit(prop)));
+                self.upd.s(&format!("d.styleNumAt({n}, {k}, {}, f32(", lit(prop)));
                 self.expr(Mode::U, *r)?;
-                self.upd.s("));\n");
+                self.upd.s(&format!("), {at});\n"));
             }
             Value::Expr(r) => {
-                self.upd.s(&format!("d.styleStr({n}, {k}, {}, ", lit(prop)));
+                self.upd.s(&format!("d.styleStrAt({n}, {k}, {}, ", lit(prop)));
                 self.expr(Mode::U, *r)?;
-                self.upd.s(");\n");
+                self.upd.s(&format!(", {at});\n"));
             }
             Value::Str(p) => {
-                self.upd.s(&format!("d.styleStr({n}, {k}, {}, ", lit(prop)));
+                self.upd.s(&format!("d.styleStrAt({n}, {k}, {}, ", lit(prop)));
                 self.string(Mode::U, p, a.range)?;
-                self.upd.s(");\n");
+                self.upd.s(&format!(", {at});\n"));
             }
             Value::None => unreachable!("checked by style_val"),
         }
@@ -531,4 +581,18 @@ impl<'a> G<'a> {
         }
         Ok(())
     }
+}
+
+/// The `"..."` literals in an expression's text (icon names in `name={...}`).
+fn string_literals(t: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut it = t.split('"');
+    it.next();
+    while let Some(s) = it.next() {
+        if !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+        it.next();
+    }
+    out
 }

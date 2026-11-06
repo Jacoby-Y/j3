@@ -1,0 +1,272 @@
+// The j2 heap: every byte a script allocates comes from here, never from a J3 arena the host
+// passed in. Blocks come in power-of-two size classes (16 B, 32 B, ... 2^k) with one free list
+// per class; fresh blocks are cut from the heap's own mmap'd chunks. `bytes` counts the class sizes of
+// every block in use, which is what `Limits.heapBytes` caps.
+//
+// GC objects (strings, tables, arrays, later closures) start with a `GcHeader` and are linked on
+// `objects`; the sweep walks that list and gives each block back with `freeObject` (the header
+// remembers its class). Buffers an object owns (table entries, array items) carry no header:
+// the owner knows their size and frees them with `freeRaw`. Part of `j3.j2`.
+
+module j3.j2;
+
+/// Object kinds in `GcHeader.kind`. The compiler chunk adds functions, protos and upvalues.
+pub const OBJ_STR: u8 = 1;
+pub const OBJ_TABLE: u8 = 2;
+pub const OBJ_ARRAY: u8 = 3;
+
+/// Size classes: class k holds blocks of 16 << k bytes.
+const CLASSES: int = 48;
+
+/// Bytes per mmap'd page chunk (a bigger block gets a chunk of its own).
+const PAGE_CHUNK: int = 1 << 20;
+
+/// In front of every GC object, 16 bytes.
+pub struct GcHeader {
+    /// The next object on `Heap.objects`.
+    next: ptr;
+    kind: u8;
+    mark: u8;
+    /// Size class of this object's block.
+    cls: u8;
+    /// 1: never collected (chunk names, strings handed to the host by `vm.intern`). The GC treats it as marked.
+    fixed: u8;
+}
+
+/// One `vm.keep` slot. A free slot has `used` false and links the next free one; `gen` counts reuses so a
+/// released `Ref` can never read the value that took its slot.
+struct KeepSlot {
+    v: Value;
+    gen: int;
+    nextFree: int;
+    used: bool;
+}
+
+/// A host's handle on a value (`vm.keep`). `id` 0 is none; otherwise slot + 1 in the low 32
+/// bits and the slot's generation above.
+pub struct Ref {
+    id: int;
+}
+
+pub struct Heap {
+    /// Newest mmap'd page chunk (each starts with [next chunk, byte size]); blocks are cut from
+    /// `cur` at `curUsed` up to `curCap`.
+    chunks: ptr;
+    cur: ptr;
+    curUsed: int;
+    curCap: int;
+    /// Free-list head address per size class (0 when empty); a free block's first word links the
+    /// next. Addresses are ints: the C backend can't index a `[]ptr`.
+    free: []int;
+    /// Every live GC object, newest first.
+    objects: ptr;
+    /// Bytes in blocks currently handed out (class sizes, so slack included).
+    bytes: int;
+    /// GC objects currently on `objects`.
+    liveObjects: int;
+    /// Intern table: open addressing over `&Str` addresses (0 empty).
+    strs: []int;
+    strCount: int;
+    keeps: []KeepSlot;
+    keepFree: int;
+    /// The script's byte cap (`Limits.heapBytes`); a `Buf` never grows past it.
+    limit: int;
+}
+
+/// A new, empty heap.
+pub fn newHeap(): Heap {
+    let h = Heap {
+        chunks: 0 as ptr,
+        cur: 0 as ptr,
+        curUsed: 0,
+        curCap: 0,
+        free: @slice(0 as ptr, 0),
+        strs: @slice(0 as ptr, 0),
+        keeps: @slice(0 as ptr, 0),
+        objects: 0 as ptr,
+        bytes: 0,
+        liveObjects: 0,
+        strCount: 0,
+        keepFree: -1,
+        limit: 1 << 62,
+    };
+    h.free = @slice(h.carve(CLASSES * 8), CLASSES);
+    return h;
+}
+
+/// The size class that fits `n` bytes.
+fn classOf(n: int): int {
+    let k = 0;
+    while (16 << k) < n { k += 1; }
+    return k;
+}
+
+extend Heap {
+    /// Give back every page. The heap and all its values are gone after this.
+    fn destroy(this: &Heap) {
+        let c = this.chunks;
+        while c != 0 as ptr {
+            let hdr: []int = @slice(c, 2);
+            let next = hdr[0] as ptr;
+            munmap(c, hdr[1]);
+            c = next;
+        }
+        this.chunks = 0 as ptr;
+        this.cur = 0 as ptr;
+        this.curUsed = 0;
+        this.curCap = 0;
+    }
+
+    /// `n` fresh (zero) bytes, 16-aligned, from the current chunk or a new one.
+    fn carve(this: &Heap, n: int): ptr {
+        if n > PAGE_CHUNK / 4 {
+            // a big block gets a chunk of its own, so the current chunk's tail isn't wasted
+            return (this.newChunk(n + 16) as int + 16) as ptr;
+        }
+        if this.curUsed + n > this.curCap {
+            this.cur = this.newChunk(PAGE_CHUNK);
+            this.curUsed = 16;
+            this.curCap = PAGE_CHUNK;
+        }
+        let p = (this.cur as int + this.curUsed) as ptr;
+        this.curUsed += n;
+        return p;
+    }
+
+    fn newChunk(this: &Heap, size: int): ptr {
+        let c = this.mapChunk(size);
+        if c == 0 as ptr {
+            panic("j2: the OS refused memory for the script heap");
+        }
+        return c;
+    }
+
+    /// A new chunk of `size` bytes linked on `chunks`, or null when the OS refuses.
+    fn mapChunk(this: &Heap, size: int): ptr {
+        let c = mmapAnon(size);
+        if c == 0 as ptr { return c; }
+        let hdr: []int = @slice(c, 2);
+        hdr[0] = this.chunks as int;
+        hdr[1] = size;
+        this.chunks = c;
+        return c;
+    }
+
+    /// A zeroed block of at least `n` bytes. Free it with `freeRaw(p, n)` (the same `n`).
+    // ponytail: power-of-two classes waste up to half of a big block; add page-run allocation for
+    // buffers over 64 KB if heaps of big arrays show up.
+    fn allocRaw(this: &Heap, n: int): ptr {
+        let k = classOf(n);
+        let size = 16 << k;
+        let p = this.free[k] as ptr;
+        if p != 0 as ptr {
+            let link: []int = @slice(p, 1);
+            this.free[k] = link[0];
+            let words: []int = @slice(p, size / 8);
+            for i in 0..size / 8 { words[i] = 0; }
+        } else {
+            p = this.carve(size);
+        }
+        this.bytes += size;
+        return p;
+    }
+
+    /// `allocRaw(n)`, or null when `n` needs a chunk of its own and the OS refuses it (the
+    /// script-sized buffers use this, so a huge request is an error, not a panic).
+    fn tryAllocRaw(this: &Heap, n: int): ptr {
+        let k = classOf(n);
+        let size = 16 << k;
+        if this.free[k] == 0 && size > PAGE_CHUNK / 4 {
+            let c = this.mapChunk(size + 16);
+            if c == 0 as ptr { return c; }
+            this.bytes += size;
+            return (c as int + 16) as ptr;
+        }
+        return this.allocRaw(n);
+    }
+
+    /// Return a block from `allocRaw(n)`.
+    fn freeRaw(this: &Heap, p: ptr, n: int) {
+        this.freeClass(p, classOf(n));
+    }
+
+    fn freeClass(this: &Heap, p: ptr, k: int) {
+        let link: []int = @slice(p, 1);
+        link[0] = this.free[k];
+        this.free[k] = p as int;
+        this.bytes -= 16 << k;
+    }
+
+    /// A zeroed GC object of `n` bytes (header included), linked on `objects`.
+    fn newObject(this: &Heap, kind: u8, n: int): ptr {
+        let p = this.allocRaw(n);
+        let h = p as &GcHeader;
+        h.next = this.objects;
+        h.kind = kind;
+        h.cls = u8(classOf(n));
+        this.objects = p;
+        this.liveObjects += 1;
+        return p;
+    }
+
+    /// Free the block of a GC object the sweep already unlinked from `objects`. Its owned buffers
+    /// must be freed first (`Table.freeParts`, `Arr.freeParts`).
+    fn freeObject(this: &Heap, p: ptr) {
+        let h = p as &GcHeader;
+        this.liveObjects -= 1;
+        this.freeClass(p, int(h.cls));
+    }
+
+    // ---- keep handles ----
+
+    /// Hold `v` for the host: it stays alive (a GC root) until `releaseRef`.
+    fn keep(this: &Heap, v: Value): Ref {
+        if this.keepFree < 0 {
+            let old = this.keeps;
+            let n = if old.len == 0 { 16 } else { old.len * 2 };
+            let p = this.allocRaw(n * @sizeof(KeepSlot));
+            let next: []KeepSlot = @slice(p, n);
+            for i in 0..old.len { next[i] = old[i]; }
+            for i in old.len..n {
+                next[i].nextFree = if i + 1 < n { i + 1 } else { -1 };
+            }
+            if old.len > 0 { this.freeRaw(old.ptr as ptr, old.len * @sizeof(KeepSlot)); }
+            this.keeps = next;
+            this.keepFree = old.len;
+        }
+        let i = this.keepFree;
+        let s = &this.keeps[i];
+        this.keepFree = s.nextFree;
+        s.v = v;
+        s.used = true;
+        return Ref { id: (i + 1) | (s.gen << 32) };
+    }
+
+    /// The slot of `r`, or -1 when `r` is none, released, or from another heap's reuse.
+    fn keepSlot(this: &Heap, r: Ref): int {
+        let i = (r.id & 0xffffffff) - 1;
+        if i < 0 || i >= this.keeps.len { return -1; }
+        let s = &this.keeps[i];
+        if !s.used || s.gen != (r.id >> 32) { return -1; }
+        return i;
+    }
+
+    /// The kept value, or nil for a none or released `Ref`.
+    fn refValue(this: &Heap, r: Ref): Value {
+        let i = this.keepSlot(r);
+        if i < 0 { return nilv(); }
+        return this.keeps[i].v;
+    }
+
+    /// Let go of `r`. Releasing none or an already released `Ref` does nothing.
+    fn releaseRef(this: &Heap, r: Ref) {
+        let i = this.keepSlot(r);
+        if i < 0 { return; }
+        let s = &this.keeps[i];
+        s.v = nilv();
+        s.used = false;
+        s.gen = (s.gen + 1) & 0x7fffffff;
+        s.nextFree = this.keepFree;
+        this.keepFree = i;
+    }
+}

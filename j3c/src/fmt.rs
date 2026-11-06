@@ -14,6 +14,7 @@ fn reprint(src: &str, tokens: &[Token]) -> String {
     let mut indent: i32 = 0;
     let mut at_line = true;
     let mut prev: Option<TokenKind> = None;
+    let mut prev_prefix = false; // prev is `& - * ! ~` in prefix position
     let mut prev_end: usize = 0;
 
     for tok in tokens {
@@ -44,7 +45,7 @@ fn reprint(src: &str, tokens: &[Token]) -> String {
         if at_line {
             push_indent(&mut out, indent);
             at_line = false;
-        } else if needs_space(prev, tok.kind) {
+        } else if needs_space(prev, tok.kind, prev_prefix) {
             out.push(' ');
         }
 
@@ -80,6 +81,11 @@ fn reprint(src: &str, tokens: &[Token]) -> String {
             _ => {}
         }
 
+        prev_prefix = match tok.kind {
+            TokenKind::Not | TokenKind::Tilde => true,
+            TokenKind::Amp | TokenKind::Minus | TokenKind::Star => !prev.is_some_and(ends_operand),
+            _ => false,
+        };
         prev = Some(tok.kind);
         prev_end = tok.span.end as usize;
     }
@@ -188,10 +194,24 @@ fn push_indent(out: &mut String, indent: i32) {
     }
 }
 
-fn needs_space(prev: Option<TokenKind>, next: TokenKind) -> bool {
+/// Token that can end an operand, so a following `& - *` is binary.
+fn ends_operand(k: TokenKind) -> bool {
+    use TokenKind::*;
+    matches!(k, Ident | Int | Float | String | Interpolate | RParen | RBracket | This)
+}
+
+fn needs_space(prev: Option<TokenKind>, next: TokenKind, prev_prefix: bool) -> bool {
     let Some(p) = prev else {
         return false;
     };
+    // `xs[0]` / `f()[0]` index tight; `= [..]`, `, [..]`, `: []u8` keep the space
+    if next == TokenKind::LBracket {
+        return !(ends_operand(p) || prev_prefix);
+    }
+    // `[]u8`, `[4]i32`: a type's element name follows its `]` directly
+    if p == TokenKind::RBracket && next == TokenKind::Ident {
+        return false;
+    }
     if next == TokenKind::LParen {
         return matches!(
             p,
@@ -204,7 +224,6 @@ fn needs_space(prev: Option<TokenKind>, next: TokenKind) -> bool {
             | TokenKind::Comma
             | TokenKind::Semi
             | TokenKind::RParen
-            | TokenKind::LBracket
             | TokenKind::RBracket
             | TokenKind::RBrace
             | TokenKind::Colon
@@ -219,6 +238,7 @@ fn needs_space(prev: Option<TokenKind>, next: TokenKind) -> bool {
     if matches!(
         p,
         TokenKind::Dot
+            | TokenKind::DotDot
             | TokenKind::DotDotEq
             | TokenKind::ColonColon
             | TokenKind::LParen
@@ -226,28 +246,75 @@ fn needs_space(prev: Option<TokenKind>, next: TokenKind) -> bool {
             | TokenKind::Hash
             | TokenKind::At
             | TokenKind::Not
-            | TokenKind::Amp
+            | TokenKind::Tilde
     ) {
+        return false;
+    }
+    if matches!(p, TokenKind::Amp | TokenKind::Minus | TokenKind::Star) && prev_prefix {
         return false;
     }
     if p == TokenKind::LBrace && next == TokenKind::RBrace {
         return false;
     }
-    if (p == TokenKind::Star || p == TokenKind::Minus) && matches!(next, TokenKind::Ident | TokenKind::Int | TokenKind::Float | TokenKind::LParen) {
-        // could be unary; a space is still fine for binary, unary `*p` / `-n`
-        // prefer no space after unary-looking tokens when prev was a start
-        return !unary_ok(p);
-    }
     true
-}
-
-fn unary_ok(p: TokenKind) -> bool {
-    matches!(p, TokenKind::Star | TokenKind::Minus | TokenKind::Amp | TokenKind::Not)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_ref_and_array_literal_spacing() {
+        let out = format_src("fn main(){let e=[&a,&b];let x=a&b;let y=xs[0];}").expect("fmt");
+        assert!(out.contains("let e = [&a, &b];"), "{out}");
+        assert!(out.contains("let x = a & b;"), "{out}");
+        assert!(out.contains("xs[0]"), "{out}");
+    }
+
+    #[test]
+    fn minus_and_prefix_spacing_unchanged() {
+        let out = format_src("fn main(){let a=b-c;let d=b- -c;f(-x);return -1;}").expect("fmt");
+        assert!(out.contains("let a = b - c;"), "{out}");
+        assert!(out.contains("let d = b - -c;"), "{out}");
+        assert!(out.contains("f(-x);"), "{out}");
+        assert!(out.contains("return -1;"), "{out}");
+    }
+
+    #[test]
+    fn exclusive_range_stays_together() {
+        let out = format_src("fn main(){let r=0..4;}").expect("fmt");
+        assert!(out.contains("let r = 0..4;"), "{out}");
+    }
+
+    #[test]
+    fn range_between_names_stays_together() {
+        let out = format_src("fn main(){let r=a..b;}").expect("fmt");
+        assert!(out.contains("let r = a..b;"), "{out}");
+    }
+
+    #[test]
+    fn index_range_stays_together() {
+        let out = format_src("fn main(){let s=xs[a..b];}").expect("fmt");
+        assert!(out.contains("let s = xs[a..b];"), "{out}");
+    }
+
+    #[test]
+    fn slice_type_stays_together() {
+        let out = format_src("fn f(b:[]u8){}").expect("fmt");
+        assert!(out.contains("b: []u8"), "{out}");
+    }
+
+    #[test]
+    fn sized_array_type_stays_together() {
+        let out = format_src("fn main(){let v:[4]i32=[0,0,0,0];}").expect("fmt");
+        assert!(out.contains("let v: [4]i32 = [0, 0, 0, 0];"), "{out}");
+    }
+
+    #[test]
+    fn slice_of_struct_type_stays_together() {
+        let out = format_src("fn f(vs:[]Vec2){}").expect("fmt");
+        assert!(out.contains("vs: []Vec2"), "{out}");
+    }
 
     #[test]
     fn formats_hello_and_keeps_comment() {
@@ -277,5 +344,11 @@ mod tests {
         assert!(out.contains("props {\n    hinge: int;"), "{out}");
         assert!(out.contains("shared {\n    count: int = 0;"), "{out}");
         assert_eq!(out, format_src(&out).expect("fmt script twice"));
+    }
+
+    #[test]
+    fn extend_block_formats_like_a_struct_body() {
+        let out = format_src("module t;\nextend Box{fn get(this:&Box):int{return this.v;}}\n").expect("fmt");
+        assert_eq!(out, "module t;\nextend Box {\n    fn get(this: &Box): int {\n        return this.v;\n    }\n}\n");
     }
 }

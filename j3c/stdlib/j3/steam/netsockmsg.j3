@@ -1,0 +1,163 @@
+// Part of j3.steam: sending and receiving on P2P connections, and poll groups (one receive call for many
+// connections). Receiving shares the message pointer array, the re-entrancy guard and the release code with
+// netmsg.j3. The module doc and `use`s are in ../steam.j3.
+module j3.steam;
+
+/// Live numbers of a connection, from `connStatus`.
+pub struct ConnStatus {
+    /// `NET_STATE_*`.
+    state: i32;
+    /// Round trip time in milliseconds; -1 when unknown.
+    ping: i32;
+    /// Link quality seen here, 0 to 1.
+    qualityLocal: f32;
+    /// Link quality seen by the other side, 0 to 1.
+    qualityRemote: f32;
+    /// Packets sent per second.
+    outPacketsPerSec: f32;
+    /// Bytes sent per second.
+    outBytesPerSec: f32;
+    /// Packets received per second.
+    inPacketsPerSec: f32;
+    /// Bytes received per second.
+    inBytesPerSec: f32;
+    /// Estimated send rate in bytes per second.
+    sendRateBytesPerSec: i32;
+    /// Unreliable bytes waiting to be sent.
+    pendingUnreliable: i32;
+    /// Reliable bytes waiting to be sent.
+    pendingReliable: i32;
+    /// Reliable bytes sent and not yet acknowledged.
+    sentUnackedReliable: i32;
+    /// How long a message sent now would wait in the queue, in microseconds.
+    queueTime: i64;
+}
+
+/// The login state of the networking stack (`authStatus`).
+pub struct AuthStatus {
+    /// A `RELAY_*` availability value (`RELAY_CURRENT` when ready); `RELAY_UNKNOWN` when Steam is absent.
+    avail: i32;
+    /// Steam's text about it (frame scratch arena).
+    debug: string;
+}
+
+/// Send `data` on `conn` with `flags` (the `SEND_*` values from `netSend`, added together). `data` is copied.
+/// `result.result` is an `EResult` (`NET_OK` when queued, `NET_INVALID_STATE` for a connection the peer closed,
+/// `NET_INVALID_PARAM` for an unknown handle, `NET_LIMIT_EXCEEDED` over `NET_MAX_MESSAGE` bytes, with one line
+/// on stderr); `result.msgNum` is the message number. Result 0 when Steam is absent.
+pub fn sendConn(conn: u32, data: []u8, flags: i32): SendResult {
+    if !on() {
+        return SendResult { result: i32(0), msgNum: i64(0) };
+    }
+    if data.len > NET_MAX_MESSAGE {
+        eprintOnce(`steam: sendConn refused a message over {NET_MAX_MESSAGE} bytes`);
+        return SendResult { result: NET_LIMIT_EXCEEDED, msgNum: i64(0) };
+    }
+    if fake() {
+        return skSend(conn, data);
+    }
+    let out = (skb() as int + SKB_NUM) as ptr;
+    wrU64(out, 0, u64(0));
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_SendMessageToConnection") as fn(ptr, u32, ptr, u32, i32, ptr): i32;
+    let r = f(sk(), conn, data.ptr as ptr, u32(data.len), flags, out);
+    return SendResult { result: r, msgNum: i64(rdU64(out, 0)) };
+}
+
+/// Send what Nagle is holding on `conn` now. Returns an `EResult`; 0 when Steam is absent.
+pub fn flushConn(conn: u32): i32 {
+    if fake() {
+        if skFind(conn) < 0 {
+            return NET_INVALID_PARAM;
+        }
+        return NET_OK;
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_FlushMessagesOnConnection") as fn(ptr, u32): i32;
+    return f(sk(), conn);
+}
+
+/// Take up to `max` messages from `conn` and call `f(conn, from, data, msgNum, connData, ctx)` for each, in
+/// arrival order; returns how many came. `data` is a view valid only inside `f`: copy what you keep. Every
+/// message is released after `f`, also when `f` is null (that drops them). No allocation after the first call.
+/// Do not call a receive function from inside `f`: the nested call returns 0 (it is reported once). Do not use
+/// it on a connection that is in a poll group: read the group instead. 0 when Steam is absent.
+pub fn receiveConn(conn: u32, f: fn(u32, u64, []u8, i64, i64, u64), ctx: u64, max: int): int {
+    max = recvBegin(max);
+    if max == 0 {
+        return 0;
+    }
+    let n = 0;
+    if fake() {
+        n = skReceive(conn, false, f, ctx, max);
+    } else {
+        n = realSockReceive(conn, false, f, ctx, max);
+    }
+    IN_RECV = false;
+    return n;
+}
+
+/// Make a poll group: one `receiveGroup` call reads the messages of every connection put in it with
+/// `setPollGroup`. Returns the handle, or 0 when Steam is absent.
+pub fn pollGroup(): u32 {
+    if fake() {
+        return skGroupNew();
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_CreatePollGroup") as fn(ptr): u32;
+    return f(sk());
+}
+
+/// Destroy a poll group; its connections stay open but leave the group. True when it existed. False when Steam is absent.
+pub fn destroyPollGroup(group: u32): bool {
+    if fake() {
+        return skGroupDestroy(group);
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_DestroyPollGroup") as fn(ptr, u32): bool;
+    return f(sk(), group);
+}
+
+/// Put `conn` in `group` (a connection is in one group at a time; group 0 takes it out). True when it worked.
+/// False when Steam is absent.
+pub fn setPollGroup(conn: u32, group: u32): bool {
+    if fake() {
+        return skSetGroup(conn, group);
+    }
+    let f = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_SetConnectionPollGroup") as fn(ptr, u32, u32): bool;
+    return f(sk(), conn, group);
+}
+
+/// Like `receiveConn`, for every connection in `group`: `f(conn, from, data, msgNum, connData, ctx)` says which
+/// connection each message came from. Same rules as `receiveConn` (release once, views, no nested receive).
+pub fn receiveGroup(group: u32, f: fn(u32, u64, []u8, i64, i64, u64), ctx: u64, max: int): int {
+    max = recvBegin(max);
+    if max == 0 {
+        return 0;
+    }
+    let n = 0;
+    if fake() {
+        n = skReceive(group, true, f, ctx, max);
+    } else {
+        n = realSockReceive(group, true, f, ctx, max);
+    }
+    IN_RECV = false;
+    return n;
+}
+
+fn realSockReceive(h: u32, group: bool, f: fn(u32, u64, []u8, i64, i64, u64), ctx: u64, max: int): int {
+    let out = msgArray(max);
+    let n = 0;
+    if group {
+        let recv = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnPollGroup") as fn(ptr, u32, ptr, i32): i32;
+        n = recvCount("ReceiveMessagesOnPollGroup", int(recv(sk(), h, out, i32(max))), max);
+    } else {
+        let recv = method("SteamNetworkingSockets", "SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection") as fn(ptr, u32, ptr, i32): i32;
+        n = recvCount("ReceiveMessagesOnConnection", int(recv(sk(), h, out, i32(max))), max);
+    }
+    let handler = f as ptr;
+    for i in 0..n {
+        let m = rdPtr(out, i * 8);
+        if handler as int != 0 && m as int != 0 {
+            f(rdU32(m, so(SO_M_CONN)), idGet((m as int + no(N_M_PEER)) as ptr), msgView(m), i64(rdU64(m, no(N_M_NUM))), i64(rdU64(m, so(SO_M_CUD))), ctx);
+        }
+        releaseMsg(m);
+    }
+    return n;
+}

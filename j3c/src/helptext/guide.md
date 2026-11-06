@@ -55,10 +55,17 @@ re-runs without compiling the program; `j3c build` compiles them in.
     j3c doc testing          headless run, screenshot, goldens, imgdiff, HTML snapshot
     j3c doc editor           3D scene editor, scene files, scripts
     j3c doc ship             release builds, zips, .deb with menu entry and icon
+    j3c doc steam            Steam: achievements, cloud, Deck, depot upload, binding check
+    j3c doc j2               j2 scripts and mods read at runtime; `j3c doc j2 lang` for modders
     j3c help manifest        j3.toml keys
     j3c fmt --write          rewrite src/
-    j3c check --json         one JSON object (ok, or message/path/line)
-    j3c check --strict       exit 1 on CSS lint warnings too (`j3c doc css`, Lint)
+    j3c check --json         one JSON object (ok + warnings, or errors[] of message/path/line)
+    j3c check --strict       exit 1 on any warning: code, CSS lint (`j3c doc css`), i18n
+    j3c check --autofix      remove unused imports in place (put back if the result fails to check)
+
+`j3c check` reports up to 20 errors, one per function body, and warns
+about unused locals (`_name` keeps one), unused imports, and code after
+`return` / `break` / `continue` in the project's own modules.
 
 `j3c check` does not run the game. It fails when a linked library is
 missing, or when `tryLoadFont` / `loadFont` / `tryLoadTexture` /

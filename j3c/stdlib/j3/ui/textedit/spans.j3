@@ -1,0 +1,186 @@
+// Part of j3.ui.textedit; Span storage and rich-text formatting. The module doc and `use`s are in ../textedit.j3. `Edit` methods are in `extend Edit` blocks.
+module j3.ui.textedit;
+
+extend Edit {
+    /// A copy of `s` in the box's span-data buffer (span data must outlive the caller's string). The buffer is compacted
+    /// to the data still referenced (spans and undo steps) when it fills, so recycling one box allocates nothing new.
+    fn own(this: &Edit, s: string): string {
+        if s.len == 0 {
+            return "";
+        }
+        if this.dn + s.len > this.da.len {
+            this.compact(s.len);
+        }
+        let at = this.dn;
+        for i in 0..s.len {
+            this.da[at + i] = s[i];
+        }
+        this.dn += s.len;
+        return (this.da[at..at + s.len]) as string;
+    }
+
+    /// Move every live span data string (current spans, undo and redo steps) into the spare buffer, make it the
+    /// buffer, and leave room for `extra` more bytes. The spare only grows (doubling) when live data does.
+    fn compact(this: &Edit, extra: int) {
+        let live = extra;
+        for i in 0..this.sp.len {
+            live += this.sp.items[i].data.len;
+        }
+        for i in 0..this.un {
+            for k in 0..this.us.items[i].sp.len {
+                live += this.us.items[i].sp.items[k].data.len;
+            }
+        }
+        for i in 0..this.rn {
+            for k in 0..this.rs.items[i].sp.len {
+                live += this.rs.items[i].sp.items[k].data.len;
+            }
+        }
+        if this.db.len < live * 2 {
+            this.db = this.text.arena.alloc::<u8>(live * 4 + 256);
+        }
+        this.dn = 0;
+        this.moveData(&this.sp);
+        for i in 0..this.un {
+            this.moveData(&this.us.items[i].sp);
+        }
+        for i in 0..this.rn {
+            this.moveData(&this.rs.items[i].sp);
+        }
+        let t = this.da;
+        this.da = this.db;
+        this.db = t;
+    }
+
+    fn moveData(this: &Edit, l: &List<Span>) {
+        for k in 0..l.len {
+            let d = l.items[k].data;
+            if d.len > 0 {
+                for i in 0..d.len {
+                    this.db[this.dn + i] = d[i];
+                }
+                l.items[k].data = (this.db[this.dn..this.dn + d.len]) as string;
+                this.dn += d.len;
+            }
+        }
+    }
+
+    /// The spans, as a view of the box's own storage (what `bind:spans` reads). It is remembered, so `setSpans` knows when the
+    /// program only echoes it back.
+    fn spans(this: &Edit): []Span {
+        this.hv = []Span { ptr: this.sp.items.ptr, len: this.sp.len };
+        return this.hv;
+    }
+
+    /// Whether `v` is exactly the spans we hold.
+    fn spansMatch(this: &Edit, v: []Span): bool {
+        if v.len != this.sp.len {
+            return false;
+        }
+        for i in 0..v.len {
+            let a = v[i];
+            let b = this.sp.items[i];
+            if a.start != b.start || a.len != b.len || a.kind != b.kind || !same(a.data, b.data) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Replace the spans with `v` (a program's bound value; no undo step). The view `spans()` last gave out is the box's
+    /// own state and changes nothing (a program that echoes its binding never brings back stale spans); a shorter
+    /// slice of it truncates. Any other slice is copied: spans outside the text, empty, of an unknown kind or overlapping
+    /// an earlier token are dropped.
+    fn setSpans(this: &Edit, v: []Span) {
+        if v.ptr == this.sp.items.ptr || (v.ptr == this.hv.ptr && v.len == this.hv.len) {
+            if v.ptr == this.sp.items.ptr && v.len < this.sp.len {
+                this.sp.len = v.len;
+                this.ver += 1;
+            }
+            return;
+        }
+        if this.spansMatch(v) {
+            return;
+        }
+        this.sp.len = 0;
+        let n = this.text.len();
+        for i in 0..v.len {
+            let s = v[i];
+            let ok = s.len > 0 && s.start >= 0 && s.start + s.len <= n && s.kind >= SPAN_BOLD && s.kind <= SPAN_COLOR;
+            for k in 0..this.sp.len {
+                let o = this.sp.items[k];
+                if ok && (isToken(s.kind) || isToken(o.kind)) && s.start < o.start + o.len && o.start < s.start + s.len {
+                    ok = false;
+                }
+            }
+            if ok {
+                this.sp.push(Span { start: s.start, len: s.len, kind: s.kind, data: this.own(s.data) });
+            }
+        }
+        this.ver += 1;
+    }
+
+    /// Ctrl+B / Ctrl+I: give the selection `kind` (bold or italic), or take it off when all of it has it. Tokens inside
+    /// are left plain. Its own undo step. False when the box is not `rich` or nothing is selected.
+    fn toggle(this: &Edit, kind: int): bool {
+        if !this.rich || !this.hasSel() {
+            return false;
+        }
+        let lo = this.snap(this.lo(), -1);
+        let hi = this.snap(this.hi(), 1);
+        this.rec(K_OTHER);
+        this.ver += 1;
+        let on = !covered(&this.sp, kind, lo, hi);
+        uncover(&this.sp, kind, lo, hi);
+        if on {
+            let p = lo;
+            while p < hi {
+                let q = hi;
+                let skip = -1;
+                for i in 0..this.sp.len {
+                    let t = this.sp.items[i];
+                    if isToken(t.kind) {
+                        if t.start <= p && p < t.start + t.len {
+                            skip = t.start + t.len;
+                        } else if t.start > p && t.start < q {
+                            q = t.start;
+                        }
+                    }
+                }
+                if skip >= 0 {
+                    p = skip;
+                } else {
+                    this.sp.push(Span { start: p, len: q - p, kind: kind, data: "" });
+                    p = q;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// Replace the text `lo..hi` with the atomic token `label` (kind `SPAN_MENTION` or `SPAN_EMOJI`, `data` its id):
+    /// one undo step, caret after the chip. For an autocomplete that swaps the typed trigger (`@ja`) for a mention.
+    /// Bold, italic and link spans are split around the label. False when the range is not inside the text.
+    fn replaceWithToken(this: &Edit, lo: int, hi: int, label: string, kind: int, data: string): bool {
+        if !isToken(kind) || lo < 0 || hi < lo || hi > this.text.len() || label.len == 0 {
+            return false;
+        }
+        let a = this.snap(lo, -1);
+        let b = this.snap(hi, 1);
+        this.rec(K_OTHER);
+        this.ver += 1;
+        this.text.remove(a, b - a);
+        if this.sp.len > 0 {
+            spanEdit(&this.sp, a, b - a, 0, false);
+        }
+        this.text.insert(a, label);
+        spanEdit(&this.sp, a, 0, label.len, false);
+        for k in SPAN_BOLD..SPAN_MENTION {
+            uncover(&this.sp, k, a, a + label.len);
+        }
+        this.sp.push(Span { start: a, len: label.len, kind: kind, data: this.own(data) });
+        this.cur = a + label.len;
+        this.anc = this.cur;
+        return true;
+    }
+}
