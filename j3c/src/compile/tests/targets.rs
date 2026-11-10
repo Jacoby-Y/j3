@@ -132,12 +132,13 @@ fn windows_game_checks_and_missing_sdl_is_a_link_error() {
 fn mingw_clang() -> bool {
     let dir = std::env::temp_dir();
     let src = dir.join(format!("j3c_mingw_probe_{}.c", std::process::id()));
-    let obj = dir.join(format!("j3c_mingw_probe_{}.o", std::process::id()));
+    // Link, not just compile: clang can compile for Windows without mingw installed.
+    let obj = dir.join(format!("j3c_mingw_probe_{}.exe", std::process::id()));
     if std::fs::write(&src, "int main(void){return 0;}\n").is_err() {
         return false;
     }
     let ok = std::process::Command::new("clang")
-        .args(["--target=x86_64-pc-windows-gnu", "-c"])
+        .arg("--target=x86_64-pc-windows-gnu")
         .arg("-o")
         .arg(&obj)
         .arg(&src)
