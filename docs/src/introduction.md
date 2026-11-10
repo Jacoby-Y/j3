@@ -19,7 +19,7 @@ The compiler, `j3c`, is a single Rust binary with no dependencies. It carries th
 
 - **The language**: structs with methods, tagged-union enums, slices, arenas, generics on types, and a `?` operator for errors.
 - **The standard library**: windows, input, audio, 2D and 3D rendering, an ECS, physics, UI components styled with CSS, networking, threads, and more, all written in J3.
-- **Tools**: a formatter, a language server, a 3D scene editor, a script VM for hot-reloaded `.j3s` files, and packaging for zip, `.deb`, and Android.
+- **Tools**: a formatter, a language server, a 3D scene editor, a script VM for hot-reloaded `.j3s` files, the j2 runtime for player mods, and packaging for zip, `.deb`, and Android.
 
 ## How to read this book
 

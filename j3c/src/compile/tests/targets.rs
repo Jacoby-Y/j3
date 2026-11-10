@@ -51,7 +51,7 @@ fn llvm_line_info_follows_debug_flag() {
 
 #[test]
 fn llvm_names_locals_when_debug() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/mesh.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/mesh.j3");
     let prog = compile_path(&path).expect("compile mesh");
     let mut opts = emit::EmitOpts::default();
     let ll = emit::emit_llvm(&prog.cx, &prog.modules, &opts).expect("llvm");

@@ -11,7 +11,7 @@ j3c-composer selftest                               # prints ok
 ```
 
 `tools/composer/composer` is the same program, rebuilt when `src/` changes. `./build.sh` at the
-repo root installs `~/.bin/j3c-composer`. The window needs SDL2 + libGL; `run --wav` needs nothing.
+repo root installs `j3c-composer` next to `j3c` (`$J3_BIN_DIR`, else `~/.bin` if it exists, else `~/.local/bin`). The window needs SDL2 + libGL; `run --wav` needs nothing.
 
 ## The file
 

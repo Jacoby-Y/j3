@@ -16,6 +16,7 @@ pub mod i18n;
 pub mod diag;
 pub mod dist;
 pub mod doc;
+pub mod doctor;
 pub mod editor;
 pub mod emit;
 pub mod fmt;

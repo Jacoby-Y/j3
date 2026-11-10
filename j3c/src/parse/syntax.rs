@@ -240,21 +240,21 @@ mod tests {
 
     #[test]
     fn shipped_ui_grammar_is_dump_syntax() {
-        let shipped = include_str!("../../../examples/editors/vscode/syntaxes/j3ui.tmLanguage.json");
+        let shipped = include_str!("../../../editors/vscode/syntaxes/j3ui.tmLanguage.json");
         assert_eq!(
             ui_tm_grammar(),
             shipped,
-            "run `j3c dump-syntax --ui ../examples/editors/vscode/syntaxes/j3ui.tmLanguage.json`"
+            "run `j3c dump-syntax --ui ../editors/vscode/syntaxes/j3ui.tmLanguage.json`"
         );
     }
 
     #[test]
     fn shipped_grammar_is_dump_syntax() {
-        let shipped = include_str!("../../../examples/editors/vscode/syntaxes/j3.tmLanguage.json");
+        let shipped = include_str!("../../../editors/vscode/syntaxes/j3.tmLanguage.json");
         assert_eq!(
             tm_grammar(),
             shipped,
-            "run `j3c dump-syntax ../examples/editors/vscode/syntaxes/j3.tmLanguage.json`"
+            "run `j3c dump-syntax ../editors/vscode/syntaxes/j3.tmLanguage.json`"
         );
     }
 }

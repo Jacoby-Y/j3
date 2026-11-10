@@ -4,7 +4,7 @@
 
 ### Runtime loader silently accepts malformed records (confirmed)
 
-The palette-name and Add-recolor undo fixes passed rechecks during the industry migration. A separate probe of the current `runtime/j3voxel.j3` found these validation gaps:
+The palette-name and Add-recolor undo fixes passed rechecks during a game project migration. A separate probe of the current `runtime/j3voxel.j3` found these validation gaps:
 
 - `size 1 1 1`, `p 1 ffffff`, `v 0 0 0 257`: palette index 257 wraps to 1 instead of reporting invalid input.
 - `size 1 1 1`, `v 0 0 0 1`: an undefined palette entry is accepted and renders black.

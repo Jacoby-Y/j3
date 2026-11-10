@@ -11,7 +11,7 @@ cd j3c
 cargo build --release
 ```
 
-The binary is `j3c/target/release/j3c`. Put it on your `PATH` (the repo's `build.sh` installs it to `~/.bin/j3c`). Check it with:
+The binary is `j3c/target/release/j3c`. Put it on your `PATH` (the repo's `build.sh` builds and installs it to `$J3_BIN_DIR`, else `~/.bin` if that exists, else `~/.local/bin`). Check it with:
 
 ```text
 j3c version

@@ -316,7 +316,7 @@ fn clang_obj(label: &str, obj: &Path, ll: &str, opts: &EmitOpts) -> Result<(), S
     }
     cmd.arg("-o").arg(obj).arg(&ll_path);
     let started = std::time::Instant::now();
-    let out = cmd.output().map_err(|e| format!("spawn {clang}: {e}"))?;
+    let out = cmd.output().map_err(|e| super::host::spawn_err(&clang, e))?;
     let _ = fs::remove_file(&ll_path);
     if time_report {
         // One file per object next to it: `cat <obj dir>/*.time.txt`.
@@ -375,7 +375,7 @@ fn link_objs(
     }
     crate::cli::status("linking");
     let started = std::time::Instant::now();
-    let out = crate::phase::run_ticking(&mut link, "linking").map_err(|e| format!("spawn {clang}: {e}"))?;
+    let out = crate::phase::run_ticking(&mut link, "linking").map_err(|e| super::host::spawn_err(&clang, e))?;
     if timings() {
         eprintln!("j3c: link: {:.3}s", started.elapsed().as_secs_f64());
     }

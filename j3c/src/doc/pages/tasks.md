@@ -1,4 +1,5 @@
 Start from the task. `j3c doc recipes <name>` prints a complete, checked program.
+    set up this machine              `j3c doctor`
     2D game in a window              recipes app2d     then j3.app, j3.game, j3.ui, `j3c doc j3ui-immediate`
     menus, HUDs, panels styled with CSS recipes components then `j3c doc j3ui`
     3D game from editor scenes       recipes scene3d   then j3.scene3d, j3.gfx, `j3c doc editor`

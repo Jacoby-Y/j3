@@ -7,8 +7,7 @@ before startup and link `GL`; SDL creates the GL context. Both passes compile
 GLSL at startup and register cleanup to run before SDL deletes that context.
 
 `j3c doc j3.gfx.urp.raytrace` and `j3c doc j3.gfx.urp.forest` show the public source
-API. Example projects: `examples/raytrace`, `examples/ocean`, and
-`examples/forest`.
+API. The demo projects that used them are not in this repository.
 
 ## Raytraced room and ocean
 
@@ -45,16 +44,11 @@ transmits tinted light in this area visibility estimate. The shadow estimate
 does not simulate focused caustics or exact refracted paths. The scene and
 quality values are supplied independently from GL state.
 
-Run the demo from the repository root with
-`cd j3c && cargo run -- run ../examples/raytrace`. Press **H** to hide the HUD, drag outside it to orbit,
-and scroll outside it to zoom.
-
 `initOcean(source)` installs one alternate fragment shader after `init`; it
 does not replace the built-in room shader. Pass its `Ocean` parameters to
 `renderOcean(&scene, camera, quality, ocean)` each frame. The shader source
 must use the fullscreen vertex interface and the uniforms supplied by this
-module. See `examples/ocean/assets/ocean.frag` for the working GLSL contract,
-and `examples/ocean/README.md` for its wave model and controls.
+module.
 
 The fullscreen renderer changes GL state while drawing and expects to own the
 scene pass for that frame. Draw screen-space UI after `render` or
@@ -81,12 +75,9 @@ or initialize the mesh renderer. In startup, call `gfx.init()`, then
 composites mesh color and depth with volumetric sunlight plus two analytic
 spheres. It expects a completed shadow pass and camera pass each frame. The
 shader is supplied by the project because its scene-specific lighting model
-is not built into `j3.gfx.urp.forest`; `examples/forest/assets/forest.frag` is the
-reference shader. The composite uses screen-space scene hits, so glass cannot
+is not built into `j3.gfx.urp.forest`. The composite uses screen-space scene hits, so glass cannot
 show geometry outside the camera image. Metal falls back to the environment
-texture when a reflected ray misses visible scene geometry. See
-`examples/forest/README.md` for rendering limits, controls, and public asset
-sources.
+texture when a reflected ray misses visible scene geometry.
 
 The framebuffer is resized by `begin()` when the window size changes. The
 forest shutdown callback also shuts down `j3.gfx`; initialize both modules as

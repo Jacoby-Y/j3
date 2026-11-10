@@ -1,3 +1,5 @@
+Superseded by 02-public-release.md; scores below are from 2026-10-29.
+
 # J3 public release readiness
 
 Audit date: 2026-10-29. Build audited: `j3c 0.0.1`, docs `bcaa230c`, working tree with uncommitted changes on top of `f4229e4`.

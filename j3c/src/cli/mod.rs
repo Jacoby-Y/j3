@@ -21,7 +21,26 @@ use dump::*;
 use glsl::dump_glsl;
 pub(crate) use runner::*;
 
-const VERSION: &str = "0.0.1";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Exit code of an internal compiler error (a panic in j3c itself). 101 is taken: it is what a
+/// J3 program's `panic` exits with, and `j3c run` passes that through. 70 is sysexits' EX_SOFTWARE.
+pub const ICE_EXIT: i32 = 70;
+
+/// Any panic prints one report to stderr (stdout is the LSP/MCP protocol) instead of Rust's.
+pub fn ice_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let p = info.payload();
+        let msg = p.downcast_ref::<&str>().copied().or(p.downcast_ref::<String>().map(String::as_str)).unwrap_or("(no message)");
+        let at = info.location().map(|l| format!(" at {}:{}", l.file(), l.line())).unwrap_or_default();
+        eprintln!("internal compiler error: {msg}{at}");
+        eprintln!("j3c {}", env!("CARGO_PKG_VERSION"));
+        eprintln!("please report this at {}/issues with the file that caused it", env!("CARGO_PKG_REPOSITORY"));
+        if cfg!(panic = "abort") {
+            std::process::exit(ICE_EXIT);
+        }
+    }));
+}
 
 pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
     let args: Vec<String> = args.into_iter().collect();
@@ -76,6 +95,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
             }
         },
         "new" => crate::scaffold::cmd(rest),
+        "doctor" => crate::doctor::cmd(rest),
         "editor" => crate::editor::cmd(rest),
         "-e" | "--editor" => editor_tool(rest),
         "check" => check_cmd(rest),
@@ -325,6 +345,7 @@ fn print_help() {
     println!("    -e script-props <f.j3s>  a script's props as JSON (what the inspector edits)");
     println!("                     (-e is short for --editor)");
     println!("    guide            how to start a project");
+    println!("    doctor           check this machine: clang, linker, SDL2 libs, GL, fonts, cache (exit 1 = not ready)");
     println!("    check [path]     typecheck; no emit or link");
     println!("    check --json     one JSON object on stdout");
     println!("    doc [module]     tasks and stdlib modules, or one module's public items (`doc --help`)");

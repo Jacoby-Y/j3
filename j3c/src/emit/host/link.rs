@@ -78,6 +78,7 @@ pub(super) fn link_lib(name: &str, search: &[String], target: &str) -> Result<St
     for extra in [
         "/usr/lib/x86_64-linux-gnu",
         "/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
         "/usr/lib",
         "/usr/local/lib",
     ] {

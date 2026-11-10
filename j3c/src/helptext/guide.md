@@ -3,6 +3,8 @@ j3c guide — start a J3 project
 The compiler is `j3c` on PATH. A new directory does not contain the
 language. The standard library is inside the `j3c` binary. `$J3_STDLIB`
 replaces that copy with a directory when it is set.
+`j3c doctor` checks the machine (clang, linker, SDL2 libs, GL, fonts) and prints
+the package to install for each missing piece.
 
     j3c new mygame           hello: j3.toml + src/main.j3 + AGENTS.md
     j3c new mygame --app     SDL window (links SDL2)
@@ -63,7 +65,8 @@ re-runs without compiling the program; `j3c build` compiles them in.
     j3c check --strict       exit 1 on any warning: code, CSS lint (`j3c doc css`), i18n
     j3c check --autofix      remove unused imports in place (put back if the result fails to check)
 
-`j3c check` reports up to 20 errors, one per function body, and warns
+`j3c check` reports up to 20 errors (one per statement; uses of a failed
+`let` or of a name already reported unknown stay quiet), and warns
 about unused locals (`_name` keeps one), unused imports, and code after
 `return` / `break` / `continue` in the project's own modules.
 
@@ -79,16 +82,15 @@ and sets J3_ROOT, so assets are read from that directory.
 
 Everything above ships inside j3c. Larger games live in the j3 source
 repository (not installed with j3c), under examples/, if you have it:
-    examples/fps-shooter    first-person shooter: biome scenes, bosses, HUD, save, perks
     examples/3d-editor-scene smallest editor project: two scenes, a .j3s script
     examples/editor_village scenes placing scenes (houses in a village)
+    examples/desk-app       .j3ui app shell: sidebar, sortable table, modal, goldens
+    examples/big_ui_test    every .j3ui / CSS feature, one page each
+    examples/j2_script      top-down shooter whose content is j2 mod scripts
+    examples/terminal       terminal emulator on a pty
     examples/gallery        UI: widgets, controls, layout, style, inventory
     examples/scripted       .j3s scripts: props, state, shared, instances
-    examples/idle-breakout  .j3ui UI + canvas game, goldens (golden.toml), bench
-    examples/industry       first-person voxel automation: mine, belts, furnaces
-    examples/blocks-adventure  network-first voxel adventure (DESIGN.md)
-    examples/arcane-bash    3D scene game with editor scenes and tools
-    examples/mini-voxel     small voxel world (PERF.md)
+    examples/openrouter-chat console LLM chat over https and JSON
     tools/bench2d           2D draw benchmark and golden (README.md)
 
 Programmatic art: `j3.gfx.canvas.Canvas.create(arena, w, h, Mode.Pixel)`

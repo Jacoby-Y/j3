@@ -53,6 +53,11 @@ impl BodyBuilder {
         id
     }
 
+    /// Locals allocated so far; the next `LocalId` is this.
+    pub fn local_count(&self) -> u32 {
+        self.locals.len() as u32
+    }
+
     pub fn param(&mut self, name: Name, ty: Ty, span: Span) -> LocalId {
         self.alloc_local(name, ty, Access::let_binding(), LocalKind::Param, span)
     }

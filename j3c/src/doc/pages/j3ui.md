@@ -1,6 +1,6 @@
 `.j3ui` components: Svelte-like markup, J3 script, and CSS, compiled by `j3c` to J3 and painted
 with `j3.gfx.paint`. `j3c doc recipes components` is a complete project; `j3c new mygame
---template ui` writes it; `examples/idle-breakout` is the large one. The older immediate-mode
+--template ui` writes it; `examples/desk-app` and `examples/big_ui_test` are the large ones. The older immediate-mode
 `@j3ui` functions are `j3c doc j3ui-immediate`.
 
 Files. `[ui] dir = "ui"`, `theme = "ui/theme.css"` in j3.toml. `ui/` is scanned recursively

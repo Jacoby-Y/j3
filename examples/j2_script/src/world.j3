@@ -1,0 +1,289 @@
+// Host-side game state. The player and bullets are native (many, simple, hot path).
+// Enemies are j2 tables: a script owns their fields and behaviour, and the host reads
+// only `x y r hp touch score color` from them for collision and drawing.
+
+module j2_arena.world;
+
+use j2_arena.scripts.{ Scripts };
+use j3.j2;
+use j3.j2.{ Limits, Ref, Value, Vm };
+use j3.game.{ Color, Font, Key, Mouse, keyDown, keyPressed, mouseDown, mousePos };
+use j3.gfx.paint;
+use j3.math;
+use j3.math.Vec2;
+use j3.memory.Arena;
+
+pub const ARENA_W: int = 1100;
+pub const ARENA_H: int = 700;
+const MAX_BULLETS: int = 1024;
+const MAX_ENEMIES: int = 512;
+const MAX_WEAPONS: int = 9;
+
+pub struct Bullet {
+    pos: Vec2;
+    vel: Vec2;
+    dmg: f32;
+    life: f32;
+}
+
+pub struct Enemy {
+    kind: string;  // looked up in `kinds` each call, so a reload swaps behaviour live
+    self: Ref;     // this enemy's own table
+    alive: bool;
+}
+
+pub struct Weapon {
+    name: string;
+    def: Ref;      // { cooldown: 0.2, onFire: fn(x, y, aimX, aimY) { .. } }
+}
+
+/// What the player does this tick: the real mouse and keys, or the test's fake ones.
+pub struct Controls {
+    move: Vec2;    // -1..1 per axis
+    aim: Vec2;
+    fire: bool;
+}
+
+pub struct World {
+    mem: &Arena;
+    scripts: Scripts;
+    font: Font;
+    auto: bool;        // ARENA_TEST: `fake` is the input instead of the mouse and keys
+    fake: Controls;
+    tick: int;         // fixed ticks since start
+    player: Vec2;
+    hp: f32;
+    score: int;
+    kills: int;
+    bullets: []Bullet;
+    nBullets: int;
+    enemies: []Enemy;
+    nEnemies: int;
+    kinds: Ref;        // name -> kind table
+    weapons: []Weapon;
+    nWeapons: int;
+    current: int;
+    reload: f32;
+}
+
+/// A color packed as 0xRRGGBB (what the script `rgb()` returns), opaque.
+pub fn color(rgb: int): Color {
+    return Color { r: u8((rgb >> 16) & 255), g: u8((rgb >> 8) & 255), b: u8(rgb & 255), a: 255 };
+}
+
+extend World {
+    fn new(mem: &Arena, auto: bool): World {
+        // One VM for every script. 32 MB script heap; a hook that runs past the step budget
+        // is stopped and its script disabled, so a script writer's `while true {}` can't hang the game.
+        let scripts = Scripts.new(mem, "j2-scripts", Limits { heapBytes: 32 << 20, stepsPerCall: 500000 });
+        return World {
+            mem: mem,
+            scripts: scripts,
+            font: Font { raw: 0 },
+            auto: auto,
+            fake: Controls { move: Vec2 { x: 0, y: 0 }, aim: Vec2 { x: 0, y: 0 }, fire: false },
+            tick: 0,
+            player: Vec2 { x: 550, y: 350 },
+            hp: 100,
+            score: 0,
+            kills: 0,
+            bullets: mem.alloc::<Bullet>(MAX_BULLETS),
+            nBullets: 0,
+            enemies: mem.alloc::<Enemy>(MAX_ENEMIES),
+            nEnemies: 0,
+            kinds: j2.none(),
+            weapons: mem.alloc::<Weapon>(MAX_WEAPONS),
+            nWeapons: 0,
+            current: 0,
+            reload: 0,
+        };
+    }
+
+    // Fresh kinds and weapons, then every script runs again. Enemies on screen keep their
+    // tables (the World holds them) and pick up their kind's new code by name; a kind that's
+    // gone leaves them standing still.
+    fn reloadScripts(this: &World) {
+        let vm = &this.scripts.vm;
+        vm.release(this.kinds);
+        this.kinds = vm.keep(vm.newTable().value());
+        for i in 0..this.nWeapons {
+            vm.release(this.weapons[i].def);
+        }
+        this.nWeapons = 0;
+        this.scripts.loadAll();
+        if this.current >= this.nWeapons {
+            this.current = 0;
+        }
+    }
+
+    fn restart(this: &World) {
+        for i in 0..this.nEnemies {
+            this.scripts.vm.release(this.enemies[i].self);
+        }
+        this.nEnemies = 0;
+        this.nBullets = 0;
+        this.player = Vec2 { x: 550, y: 350 };
+        this.hp = 100;
+        this.score = 0;
+        this.kills = 0;
+        this.reloadScripts(); // waves and script state start over too
+    }
+
+    // Call kind.<hook>(this = enemy, args) for one enemy.
+    fn enemyHook(this: &World, e: &Enemy, hook: string, args: []Value) {
+        let vm = &this.scripts.vm;
+        let kind = vm.get(this.kinds).get(e.kind);
+        if !kind.isNil() {
+            this.scripts.callMethod(kind, hook, vm.value(e.self), args);
+        }
+    }
+
+    fn controls(this: &World): Controls {
+        if this.auto {
+            return this.fake;
+        }
+        let c = Controls { move: Vec2 { x: 0, y: 0 }, aim: mousePos(), fire: mouseDown(Mouse.Left) };
+        if keyDown(Key.W) { c.move.y -= 1; }
+        if keyDown(Key.S) { c.move.y += 1; }
+        if keyDown(Key.A) { c.move.x -= 1; }
+        if keyDown(Key.D) { c.move.x += 1; }
+        for i in 0..this.nWeapons {
+            if keyPressed(weaponKey(i)) { this.current = i; }
+        }
+        return c;
+    }
+
+    fn movePlayer(this: &World, dt: f32) {
+        let c = this.controls();
+        let speed = f32(260) * dt;
+        this.player.x = math.clamp(this.player.x + c.move.x * speed, 12, f32(ARENA_W - 12));
+        this.player.y = math.clamp(this.player.y + c.move.y * speed, 12, f32(ARENA_H - 12));
+    }
+
+    fn fireWeapon(this: &World, dt: f32) {
+        this.reload -= dt;
+        let c = this.controls();
+        if !c.fire || this.nWeapons == 0 || this.reload > 0 {
+            return;
+        }
+        let vm = &this.scripts.vm;
+        let w = &this.weapons[this.current];
+        // def.onFire(x, y, aimX, aimY); it calls shoot() as often as it likes.
+        this.scripts.callMethod(vm.value(w.def), "onFire", vm.value(w.def), [
+            j2.num(f64(this.player.x)), j2.num(f64(this.player.y)), j2.num(f64(c.aim.x)), j2.num(f64(c.aim.y))
+        ]);
+        this.reload = vm.getNum(w.def, "cooldown");
+    }
+
+    fn tickEnemies(this: &World, dt: f32) {
+        // Index loop on purpose: an onTick may spawn, which appends past the old count.
+        let n = this.nEnemies;
+        for i in 0..n {
+            if this.enemies[i].alive {
+                this.enemyHook(&this.enemies[i], "onTick", [j2.num(f64(dt))]);
+            }
+        }
+    }
+
+    fn moveBullets(this: &World, dt: f32) {
+        for i in 0..this.nBullets {
+            let b = &this.bullets[i];
+            b.pos.x += b.vel.x * dt;
+            b.pos.y += b.vel.y * dt;
+            b.life -= dt;
+        }
+    }
+
+    fn collide(this: &World) {
+        let vm = &this.scripts.vm;
+        let n = this.nEnemies;
+        for i in 0..n {
+            let e = &this.enemies[i];
+            if !e.alive { continue; }
+            // ponytail: O(enemies * bullets) scan; use j3.game.space if a script spawns thousands.
+            let ex = vm.getNum(e.self, "x");
+            let ey = vm.getNum(e.self, "y");
+            let er = vm.getNum(e.self, "r");
+            for j in 0..this.nBullets {
+                let b = &this.bullets[j];
+                if b.life > 0 && dist(b.pos, ex, ey) < er {
+                    b.life = 0;
+                    vm.setNum(e.self, "hp", vm.getNum(e.self, "hp") - b.dmg);
+                    this.enemyHook(e, "onHit", [j2.num(f64(b.dmg))]);
+                }
+            }
+            if dist(this.player, ex, ey) < er + 12 {
+                this.hp -= vm.getNum(e.self, "touch") / f32(60); // touch = damage per second
+            }
+        }
+    }
+
+    fn reapDead(this: &World) {
+        let vm = &this.scripts.vm;
+        // onDeath may spawn (slimes split), which appends: those are checked next tick.
+        let n = this.nEnemies;
+        for i in 0..n {
+            let e = &this.enemies[i];
+            if e.alive && vm.getNum(e.self, "hp") <= 0 {
+                e.alive = false;
+                this.score += int(vm.get(e.self).getNum("score", 0.0));
+                this.kills += 1;
+                this.enemyHook(e, "onDeath", j2.noArgs());
+                this.scripts.callAll("onKill", [vm.value(e.self)]);
+                vm.release(e.self);
+            }
+        }
+        let k = 0;
+        for i in 0..this.nEnemies {
+            if this.enemies[i].alive { this.enemies[k] = this.enemies[i]; k += 1; }
+        }
+        this.nEnemies = k;
+        k = 0;
+        for i in 0..this.nBullets {
+            if this.bullets[i].life > 0 { this.bullets[k] = this.bullets[i]; k += 1; }
+        }
+        this.nBullets = k;
+    }
+
+    fn drawEnemies(this: &World) {
+        let vm = &this.scripts.vm;
+        for i in 0..this.nEnemies {
+            let t = vm.get(this.enemies[i].self);
+            // Colors are 24-bit ints: read them as f64 (exact), not through the f32 getNum.
+            paint.circle(Vec2 { x: f32(t.getNum("x", 0.0)), y: f32(t.getNum("y", 0.0)) },
+                f32(t.getNum("r", 0.0)), color(int(t.getNum("color", 0.0))));
+        }
+    }
+
+    fn drawBullets(this: &World) {
+        for i in 0..this.nBullets {
+            paint.circle(this.bullets[i].pos, 3, color(0xffe678));
+        }
+    }
+
+    fn drawPlayer(this: &World) {
+        paint.circle(this.player, 12, color(0x78c8ff));
+    }
+}
+
+fn dist(a: Vec2, x: f32, y: f32): f32 {
+    let dx = a.x - x;
+    let dy = a.y - y;
+    return math.sqrt(dx * dx + dy * dy);
+}
+
+
+// Key 1..9 for weapon slot 0..8.
+fn weaponKey(i: int): Key {
+    match i {
+        0 { return Key.Num1; }
+        1 { return Key.Num2; }
+        2 { return Key.Num3; }
+        3 { return Key.Num4; }
+        4 { return Key.Num5; }
+        5 { return Key.Num6; }
+        6 { return Key.Num7; }
+        7 { return Key.Num8; }
+        _ { return Key.Num9; }
+    }
+}

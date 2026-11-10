@@ -62,6 +62,7 @@ The standard library is written in J3 and ships inside `j3c`. This page is a map
 | `j3.data.save` | Simple key/value save files |
 | `j3.data.assets` | Load-once asset cache |
 | `j3.data.json` | JSON parse and write |
+| `j3.j2` | j2 mod scripts the game loads at runtime (see [Mods with j2](language/j2.md)) |
 | `j3.net` | Non-blocking UDP |
 | `j3.net.tcp`, `j3.net.dns` | TCP connections and name lookup |
 | `j3.net.http`, `j3.net.tls` | HTTP/1.1 and HTTPS clients |

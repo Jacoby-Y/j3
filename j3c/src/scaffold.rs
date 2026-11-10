@@ -135,6 +135,8 @@ pub fn create_ui(name: Option<&str>) -> Result<PathBuf, String> {
     // The editor's own font, so text draws out of the box. Swap it for yours at the same path.
     std::fs::create_dir_all(root.join("assets")).map_err(|e| format!("mkdir: {e}"))?;
     std::fs::write(root.join("assets/font.ttf"), crate::editor::FONT).map_err(|e| format!("write assets/font.ttf: {e}"))?;
+    std::fs::write(root.join("assets/LICENSE-DejaVu.txt"), include_str!("../editor/LICENSE-DejaVu.txt"))
+        .map_err(|e| format!("write assets/LICENSE-DejaVu.txt: {e}"))?;
     write_agent_files(&root, false)?;
     let agents = root.join("AGENTS.md");
     let text = std::fs::read_to_string(&agents).map_err(|e| format!("read AGENTS.md: {e}"))?;

@@ -171,10 +171,15 @@ pub(super) fn json_err(text: &str) -> String {
     format!("{{\"ok\":false,{first},\"errors\":[{}]}}", errors.join(","))
 }
 
-/// The `error: N errors` summary line under several errors.
+/// The `error: N errors` (or `error: N errors (and M more not shown)`) summary line under several errors.
 fn is_count_line(block: &str) -> bool {
     let t = block.trim();
-    t.lines().count() == 1 && t.strip_prefix("error:").is_some_and(|r| r.trim().ends_with(" errors"))
+    t.lines().count() == 1
+        && t.strip_prefix("error:").is_some_and(|r| {
+            let r = r.trim();
+            let r = r.split_once(" (and ").map_or(r, |(a, _)| a);
+            r.ends_with(" errors") && r.split(' ').next().is_some_and(|n| n.parse::<usize>().is_ok())
+        })
 }
 
 /// Rendered diagnostics, one block per `head` line (`error:` / `warning:` at the start of a line).

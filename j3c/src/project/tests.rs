@@ -104,7 +104,7 @@ target = "x86_64-pc-windows-gnu"
 
 #[test]
 fn script_path_is_the_file_not_the_project() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/fps-shooter");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/3d-editor-scene");
     match resolve(&root).expect("project") {
         Input::Project(m) => assert!(
             m.entry.ends_with("src/main.j3"),
@@ -113,7 +113,7 @@ fn script_path_is_the_file_not_the_project() {
         ),
         Input::File(_) | Input::Hello => panic!("expected the game project"),
     }
-    let script = root.join("tools/arena.j3s");
+    let script = root.join("scripts/spin.j3s");
     match resolve(&script).expect("script") {
         Input::File(p) => assert_eq!(p, script),
         Input::Project(_) | Input::Hello => panic!("expected the script file"),

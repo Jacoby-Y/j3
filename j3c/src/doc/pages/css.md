@@ -96,7 +96,7 @@ Units       px  %  ms  s  fr  vw vh vmin vmax (of the window, in logical px)  em
             box-shadow, text-shadow, filters, gradient stops, background/object positions and sizes. In `transform` (`translate*`), `translate` and `transform-origin` they work as plain lengths, also beside `%`, but not inside `calc()`. A `style:` font-size on an element does not re-resolve the `em`/`rem` of that same
             element's own rule (use a class); descendants are fine. Transitions interpolate the resolved px.
             A registered `@property` with syntax '<length>' resolves an `em` against 16px, not the element. A `style:` `transform` text that changes every frame leaks a little memory (a few floats per change): prefer a custom property or a class.
-            A text-size slider is one line: `style:font-size={px}` on the root (see idle-breakout, golden `scaled`).
+            A text-size slider is one line: `style:font-size={px}` on the root.
 Functions   `calc()` with `+ - * /`, `min()`, `max()`, `clamp(lo, v, hi)` on lengths of mixed px, % and viewport units
             (`width: calc(100% - 2 * 16px)`, `padding: clamp(8px, 2vw, 24px)`). `+ -` need spaces and one dimension,
             `*` and `/` need a number on one side (`calc(10px + 5)` and `calc(10px * 2px)` warn at startup). Only on
@@ -251,9 +251,14 @@ Paint
       darken alternate rows; crt adds curvature and a vignette. Numeric amounts also accept percentages (100% = 1).
       Bloom/brightness/contrast/saturate range from 0 to 4; grain/scanlines/crt/grayscale/sepia/invert from 0 to 1.
       Color functions use 1 for identity brightness/contrast/saturate and 0 for identity grayscale/sepia/invert/hue.
-      Bloom's Gaussian spread is fixed at 12 physical pixels. Each group lazily keeps four RGBA8 images at the
-      active paint-surface size. Base cost is one FX pass plus compositing; blur adds two passes, bloom three,
-      custom GLSL one, and 3D projection one. Blur/bloom also regenerate mipmaps; groups copy their backdrop.
+      Bloom's Gaussian spread is fixed at 12 physical pixels. A group's content draws into a shared target the
+      size of the paint surface, but its effect passes and composite cover only what it drew plus twice the
+      effect's reach (blur: about 3 sigma; bloom: about 40 px), rounded up to 64 px: a small glow costs about its
+      own area. Base cost is one FX pass plus compositing; blur adds two passes, bloom three, custom GLSL one, and
+      3D projection one; blur/bloom build only the mips they sample. The backdrop is copied only for a blend mode
+      (or a `backdrop-filter`/blend nested inside), and a group that drew nothing costs nothing. Custom GLSL, 3D
+      projection, a blend inside another group, a group covering most of the surface, and 3D/raw GL content
+      inside a group run at full surface size.
   mix-blend-mode: normal | multiply | screen | overlay | add   composites the group's color with pixels
       already behind it. `add` is a J3 extension.
   perspective: Npx; rotate-x: Ndeg; rotate-y: Ndeg   J3 extensions that project a complete UI group as a plane.

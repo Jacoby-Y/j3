@@ -16,6 +16,7 @@ mod target;
 mod tests;
 
 pub use hints::failure_hint;
+pub(crate) use hints::spawn_err;
 pub use link::host_lib_present;
 pub(crate) use link::*;
 pub(crate) use symbolize::*;
@@ -194,7 +195,7 @@ pub fn compile_llvm(
     let what = format!("clang -O{opt} whole program (one invocation, links too)");
     crate::phase::detail(&what);
     let started = std::time::Instant::now();
-    let out = crate::phase::run_ticking(&mut cmd, &what).map_err(|e| format!("spawn {clang}: {e}"))?;
+    let out = crate::phase::run_ticking(&mut cmd, &what).map_err(|e| hints::spawn_err(&clang, e))?;
     if std::env::var_os("J3C_TIMINGS").is_some() {
         eprintln!("j3c: clang: {:.3}s", started.elapsed().as_secs_f64());
     }
@@ -276,13 +277,13 @@ pub fn compile_llvm_split(
         let child = compile(&vm_src, &vm_obj, "2", false)
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| format!("spawn {clang}: {e}"))?;
+            .map_err(|e| hints::spawn_err(&clang, e))?;
         vm_child = Some(child);
     }
     fs::write(&main_src, main_ll).map_err(|e| format!("write {}: {e}", main_src.display()))?;
     let out = compile(&main_src, &main_obj, clang_opt(&cc.opt), cc.debug)
         .output()
-        .map_err(|e| format!("spawn {clang}: {e}"))?;
+        .map_err(|e| hints::spawn_err(&clang, e))?;
     let _ = fs::remove_file(&main_src);
     if !out.status.success() {
         return Err(format!("{clang} failed:\n{}", String::from_utf8_lossy(&out.stderr)));
@@ -307,7 +308,7 @@ pub fn compile_llvm_split(
     }
     link.arg("-o").arg(&exe_path).arg(&main_obj).arg(&vm_obj);
     append_link_args(&mut link, cc, main_ll, target)?;
-    let linked = link.output().map_err(|e| format!("spawn {clang}: {e}"))?;
+    let linked = link.output().map_err(|e| hints::spawn_err(&clang, e))?;
     let _ = fs::remove_file(&main_obj);
     if std::env::var_os("J3C_TIMINGS").is_some() {
         eprintln!(
@@ -388,7 +389,7 @@ pub fn compile_c(c_source: &str, opts: &CcOpts, target: &str, clang: &str) -> Re
         cmd.args(&r.link);
     }
     crate::cli::status("compiling");
-    let cc = cmd.output().map_err(|e| format!("spawn {compiler}: {e}"))?;
+    let cc = cmd.output().map_err(|e| hints::spawn_err(compiler, e))?;
 
     if !cc.status.success() {
         let err = String::from_utf8_lossy(&cc.stderr);

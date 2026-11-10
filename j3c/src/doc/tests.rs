@@ -211,6 +211,11 @@ fn recipes_check() {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
+        // A recipe that draws text expects the font `j3c new --template ui` ships.
+        if r.files.iter().any(|(_, t)| t.contains("\"assets/font.ttf\"")) {
+            std::fs::create_dir_all(dir.join("assets")).unwrap();
+            std::fs::write(dir.join("assets/font.ttf"), crate::editor::FONT).unwrap();
+        }
         let targets: Vec<PathBuf> = if dir.join("j3.toml").is_file() {
             vec![dir.clone()]
         } else {

@@ -183,11 +183,17 @@ impl<'a> Lower<'a> {
                         return self.vec_arith(span, op, l, r);
                     }
                     if !is_numeric(self.cx, r.ty()) {
-                        return Err(CheckError::new(
-                            self.path,
-                            span,
-                            "arithmetic type mismatch",
-                        ));
+                        let e = CheckError::new(self.path, span, "arithmetic type mismatch");
+                        // ponytail: operators are methods of the left operand; no scalar-left overloads.
+                        if find_operator(self.cx, r.ty(), op, self.methods).is_some() {
+                            return Err(e.help(format!(
+                                "`operator{}` is a method of `{}`, so the `{}` goes on the left: put the number on the right",
+                                ir_op.as_str(),
+                                self.ty_str(r.ty()),
+                                self.ty_str(r.ty()),
+                            )));
+                        }
+                        return Err(e);
                     }
                     let l = self.operand(lhs, Some(r.ty()))?;
                     if l.ty() != r.ty() {

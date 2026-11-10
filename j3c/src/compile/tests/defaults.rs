@@ -22,7 +22,7 @@ fn main() {}
 
 #[test]
 fn inclusive_for_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/inclusive_for.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/inclusive_for.j3");
     let prog = compile_path(&path).expect("compile inclusive_for");
     let run = exec(&prog);
     assert_eq!(

@@ -124,6 +124,7 @@ fn templates_use_the_project_name() {
         }
     }
     assert!(std::fs::metadata(dir.join("todoui/assets/font.ttf")).unwrap().len() > 10_000);
+    assert!(std::fs::read_to_string(dir.join("todoui/assets/LICENSE-DejaVu.txt")).unwrap().contains("Bitstream"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

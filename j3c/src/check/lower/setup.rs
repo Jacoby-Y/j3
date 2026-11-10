@@ -198,6 +198,8 @@ pub(super) fn lower_fn(
         closure_n: 0,
         in_closure: false,
         closure_outer: HashSet::new(),
+        errs: Vec::new(),
+        poisoned: HashSet::new(),
     };
     if let Some(sid) = l.cx.func(id).method_of {
         if let Some(meta) = l.cx.struct_def(sid).script.clone() {
@@ -231,10 +233,17 @@ pub(super) fn lower_fn(
         }
     }
     for stmt in &f.body.stmts {
-        l.stmt(stmt).map_err(|e| match &inst_note {
-            Some(n) => e.note(n.clone()),
-            None => e,
-        })?;
+        l.stmt_recover(stmt);
     }
-    Ok(l.b.finish())
+    let mut errs = std::mem::take(&mut l.errs).into_iter().map(|e| match &inst_note {
+        Some(n) => e.note(n.clone()),
+        None => e,
+    });
+    match errs.next() {
+        Some(mut first) => {
+            first.more = errs.collect();
+            Err(first)
+        }
+        None => Ok(l.b.finish()),
+    }
 }

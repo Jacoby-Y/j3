@@ -1,0 +1,196 @@
+// ARENA_TEST=1: the game plays itself and checks the run, then exits (0 = pass, 1 = fail).
+//
+// Fixed seed, fake input (fire held, aim at the nearest enemy, strafe left and right) for
+// TICKS fixed ticks. Halfway it touches j2-scripts/hello/main.j2 (mtime only, the text stays)
+// so every script reloads with enemies on screen. A broken script in a temp root
+// (target/arena-test/broken) must be disabled with its error while the rest play on.
+// Everything runs per fixed tick, so the result doesn't depend on frame timing.
+//
+//     SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy ARENA_TEST=1 j3c run --headless
+
+module j2_arena.arenatest;
+
+use j2_arena.world.{ World };
+use j3.j2;
+use j3.j2.{ Ref };
+use j3.io.{ makeDirs, printLn, stat, writeFile };
+use j3.math.Vec2;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ contains, cstr, same };
+
+use lib "c" as libc {
+    fn utimensat(dir: i32, path: cstr, times: ptr, flags: i32): i32;
+    fn time(t: ptr): int;
+}
+
+const SEED: int = 1234;
+const TICKS: int = 1200;
+const RELOAD_AFTER: int = 600;   // first tick from here with enemies alive
+const STRAFE: int = 90;          // ticks per strafe direction
+const TEMP_ROOT: string = "target/arena-test";
+const BROKEN_PATH: string = "target/arena-test/broken/main.j2";
+const BROKEN: string = "// written by ARENA_TEST: a typo, so this script must fail to load\nspwan(\"grunt\", 0, 0);\n";
+const HELLO_PATH: string = "j2-scripts/hello/main.j2";
+const AT_FDCWD: i32 = -100;
+const UTIME_OMIT: int = 1073741822;
+
+pub struct Test {
+    wave: int;               // base.currentWave() last tick
+    maxWave: int;
+    reloadTick: int;          // the tick hello was touched; 0 = not yet
+    loadsBefore: int;         // Scripts.loads at the touch
+    enemiesAtReload: int;
+    enemiesAfterReload: int;  // -1 until the reload ran
+    watched: Ref;             // an enemy alive across the reload
+    x0: f32;
+    y0: f32;
+    moved: int;               // -1 unknown, 0 stood still after the reload, 1 moved
+    fails: int;
+}
+
+pub fn new(): Test {
+    return Test {
+        wave: 0, maxWave: 0, reloadTick: 0, loadsBefore: 0, enemiesAtReload: 0, enemiesAfterReload: -1,
+        watched: j2.none(), x0: 0, y0: 0, moved: -1, fails: 0,
+    };
+}
+
+// Before the first load: the seed and the broken script's root.
+pub fn start(w: &World) {
+    w.scripts.vm.seed(SEED);
+    match makeDirs("target/arena-test/broken") {
+        Result.Ok(_) { }
+        Result.Err(_) { printLn("arena_test: cannot make target/arena-test/broken"); }
+    }
+    match writeFile(BROKEN_PATH, BROKEN as []u8) {
+        Result.Ok(_) { }
+        Result.Err(_) { printLn("arena_test: cannot write the broken script"); }
+    }
+    w.scripts.addRoot(TEMP_ROOT);
+}
+
+// After every reload (from update): the enemies must all still be there.
+pub fn reloaded(w: &World, t: &Test) {
+    if t.reloadTick == 0 || t.enemiesAfterReload >= 0 {
+        return;
+    }
+    t.enemiesAfterReload = w.nEnemies;
+    if w.nEnemies > 0 {
+        t.watched = w.enemies[0].self;
+        t.x0 = w.scripts.vm.getNum(t.watched, "x");
+        t.y0 = w.scripts.vm.getNum(t.watched, "y");
+    }
+}
+
+// After the enemies' onTick, before any can die: did the watched one move under the new code?
+pub fn ticked(w: &World, t: &Test) {
+    if t.moved >= 0 || t.enemiesAfterReload <= 0 {
+        return;
+    }
+    let vm = &w.scripts.vm;
+    let moved = vm.getNum(t.watched, "x") != t.x0 || vm.getNum(t.watched, "y") != t.y0;
+    t.moved = if moved { 1 } else { 0 };
+}
+
+// End of every tick: track the wave, steer, touch hello once, finish at TICKS.
+pub fn step(w: &World, t: &Test) {
+    let wave = currentWave(w);
+    if wave != t.wave {
+        printLn(`arena_test: tick {w.tick}: wave {wave}, {w.nEnemies} enemies, {w.kills} kills`);
+        t.wave = wave;
+    }
+    if wave > t.maxWave { t.maxWave = wave; }
+    steer(w);
+    if t.reloadTick == 0 && w.tick >= RELOAD_AFTER && w.nEnemies > 0 {
+        t.reloadTick = w.tick;
+        t.loadsBefore = w.scripts.loads;
+        t.enemiesAtReload = w.nEnemies;
+        touch(HELLO_PATH);
+    }
+    if w.tick >= TICKS {
+        finish(w, t);
+    }
+}
+
+// base.currentWave(), 0 when base is broken.
+fn currentWave(w: &World): int {
+    let s = &w.scripts;
+    let i = s.find("base");
+    if i < 0 || s.list[i].err.len() != 0 {
+        return 0;
+    }
+    match s.vm.call(s.vm.get(s.list[i].exports).get("currentWave"), j2.noArgs()) {
+        Result.Ok(v) { return int(v.asNum()); }
+        Result.Err(_) { return 0; }
+    }
+}
+
+// The fake mouse and keys for the next tick.
+fn steer(w: &World) {
+    let vm = &w.scripts.vm;
+    let dir = if ((w.tick + STRAFE / 2) / STRAFE) % 2 == 0 { f32(1) } else { f32(-1) };
+    w.fake.move = Vec2 { x: dir, y: 0 };
+    w.fake.fire = true;
+    let best = f32(1000000000);
+    w.fake.aim = Vec2 { x: w.player.x + 100, y: w.player.y };
+    for i in 0..w.nEnemies {
+        let x = vm.getNum(w.enemies[i].self, "x");
+        let y = vm.getNum(w.enemies[i].self, "y");
+        let d = (x - w.player.x) * (x - w.player.x) + (y - w.player.y) * (y - w.player.y);
+        if d < best {
+            best = d;
+            w.fake.aim = Vec2 { x: x, y: y };
+        }
+    }
+}
+
+// Set `path`'s mtime to now (one second past its old one if that is not later), text untouched.
+fn touch(path: string) {
+    let old = 0;
+    match stat(path) {
+        Result.Ok(e) { old = e.mtime; }
+        Result.Err(_) { }
+    }
+    let now = libc.time(0 as ptr);
+    let m = if now > old { now } else { old + 1 };
+    let ts = [0, UTIME_OMIT, m, 0]; // atime: leave; mtime: m seconds
+    if libc.utimensat(AT_FDCWD, cstr(path), &ts[0] as ptr, 0) != 0 {
+        printLn("arena_test: cannot touch j2-scripts/hello/main.j2");
+    }
+}
+
+fn finish(w: &World, t: &Test) {
+    let s = &w.scripts;
+    let b = s.find("broken");
+    let brokenErr = if b >= 0 { s.list[b].err.str() } else { "" };
+    // The broken script fails once per load; anything past that is a real script error.
+    let otherErrors = s.errors - s.loads;
+    printLn(`arena_test: wave={t.maxWave} kills={w.kills} score={w.score} hp={w.hp} loads={s.loads}`);
+    printLn(`arena_test: reload at tick {t.reloadTick}: enemies {t.enemiesAtReload} -> {t.enemiesAfterReload}, moved={t.moved}`);
+    printLn(`arena_test: script errors={otherErrors}; the broken one says:`);
+    printLn(brokenErr);
+    expect(t, otherErrors == 0, "no script errors besides the broken one");
+    expect(t, t.maxWave >= 3, "reached wave 3");
+    expect(t, w.kills > 0, "killed something");
+    expect(t, t.reloadTick > 0 && s.loads == t.loadsBefore + 1, "touching hello reloaded the scripts once");
+    expect(t, t.enemiesAtReload > 0 && t.enemiesAfterReload == t.enemiesAtReload, "the reload kept every enemy");
+    expect(t, t.moved == 1, "an enemy from before the reload moves under the new code");
+    expect(t, startsWith(brokenErr, BROKEN_PATH) && contains(brokenErr, "unknown name"),
+        "the broken script shows its error");
+    printLn(if t.fails == 0 { "arena_test PASS" } else { "arena_test FAIL" });
+    sys.exit(if t.fails == 0 { 0 } else { 1 });
+}
+
+fn expect(t: &Test, ok: bool, what: string) {
+    if ok {
+        printLn(`  ok    {what}`);
+    } else {
+        printLn(`  FAIL  {what}`);
+        t.fails += 1;
+    }
+}
+
+fn startsWith(s: string, p: string): bool {
+    return s.len >= p.len && same(s[0..p.len], p);
+}

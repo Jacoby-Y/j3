@@ -145,7 +145,7 @@ pub fn serve() -> i32 {
                     "serverInfo",
                     Json::obj(vec![
                         ("name", Json::Str("j3c".to_string())),
-                        ("version", Json::Str("0.0.1".to_string())),
+                        ("version", Json::Str(env!("CARGO_PKG_VERSION").to_string())),
                     ]),
                 )]);
                 reply(&mut stdout, id, result);

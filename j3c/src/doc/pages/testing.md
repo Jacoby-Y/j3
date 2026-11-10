@@ -73,7 +73,7 @@ The file is the same small TOML subset as `j3.toml` (sections, `key = value`); a
 repeated section is an error `golden.toml:LINE: ...` (exit 2). Each run gets its own process group and is killed
 at the timeout (FAIL).
 
-Checks run only without names and without `--bless`. `examples/idle-breakout/golden.toml` is the plain pattern,
+Checks run only without names and without `--bless`. `examples/j2_script/golden.toml` is the plain pattern,
 `examples/desk-app/golden.toml` adds text goldens and checks.
 
 Make a frame repeatable: fixed dt (above), fixed seeds, and a state the game sets up itself, for

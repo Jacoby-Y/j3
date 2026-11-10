@@ -247,3 +247,18 @@ fn arena_field_is_error() {
     };
     assert!(err.contains("Arena by value") || err.contains("&Arena"), "{err}");
 }
+
+#[test]
+fn number_literal_on_the_left_takes_the_other_side() {
+    let prog = compile_src(
+        "litleft",
+        "module t;\nuse j3.io.printLn;\nfn main() {\n    let far: f32 = 4.0;\n    let b: u8 = 3;\n    let w: i64 = 5;\n    let v = vec4f(1.0, 2.0, 3.0, 4.0);\n    let m = 2 * v * 1;\n    let x: f32 = 2 * far + (1 - far) + -1 * far + 0.5 * far;\n    if 0 < far && 2 * b == 6 && 10 - w == w && 300 > w {\n        printLn(`{x} {2 * b} {m.w} {2 * 3}`);\n    }\n}\n",
+    )
+    .expect("compile");
+    let run = exec(&prog);
+    assert_eq!(run.status, 0, "stderr {}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "3 6 8 6\n");
+    // A float literal never turns into an int.
+    let err = compile_src("litleft_bad", "module t;\nfn f(x: i32): i32 { return 2.0 * x; }\nfn main() {}\n").err().expect("type error");
+    assert!(err.contains("expected `i32`, found `float`"), "{err}");
+}

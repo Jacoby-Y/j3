@@ -10,7 +10,7 @@ This project's UI is `ui/*.j3ui` (markup + J3 + CSS, compiled by j3c), not the `
 - `j3c dump-ui ui` prints the generated J3; compile errors point at the `.j3ui` line.
 - Look and test without a window: `j3c run --frames 30 --screenshot shot.png --headless`, then read the PNG. Never run the app without `--headless`. For a built binary: `SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout 20 ./target/<name>`.
 - Goldens: list states in `golden.toml` and run `j3c golden .` (`--bless` to accept; by hand `J3_CAPTURE=out.png:30 J3_FIXED_DT=0.016` then `j3c -e imgdiff golden/x.png out.png`). Idle-cost check: `J3_STEADY=60:120`. Fake clicks and typing: `j3.ui.testkit`. Layout as text: `j3.ui.domhtml.dumpHtml(&root.dom, "target/ui-snapshot.html")`. All of it: `j3c doc testing`.
-- `assets/font.ttf` is a stock font j3c copied in (theme.css loads it); replace the file to change the typeface.
+- `assets/font.ttf` is a stock font j3c copied in (theme.css loads it); replace the file to change the typeface (`assets/LICENSE-DejaVu.txt` is its license; delete it with the font).
 "#;
 
 pub(super) const SCENES_MARKER: &str = "## 3D scenes and the editor";

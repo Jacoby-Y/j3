@@ -449,12 +449,20 @@ const MAX_ERRORS: usize = 20;
 /// The first error, with the others (deduplicated: generic instances repeat one) as follow-ups.
 fn gather_errors(errs: Vec<CheckError>) -> Option<CheckError> {
     let mut seen = HashSet::new();
-    let mut uniq = errs
+    let mut uniq: Vec<CheckError> = errs
         .into_iter()
+        .flat_map(|mut e| {
+            let more = std::mem::take(&mut e.more);
+            std::iter::once(e).chain(more)
+        })
         .filter(|e| seen.insert((e.path.clone(), e.span.file, e.span.start, e.span.end, e.message.clone())))
-        .take(MAX_ERRORS);
-    let mut first = uniq.next()?;
-    first.more = uniq.collect();
+        .collect();
+    let omitted = uniq.len().saturating_sub(MAX_ERRORS);
+    uniq.truncate(MAX_ERRORS);
+    let mut it = uniq.into_iter();
+    let mut first = it.next()?;
+    first.more = it.collect();
+    first.omitted = omitted;
     Some(first)
 }
 

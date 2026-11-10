@@ -18,6 +18,7 @@
 - [Attributes, Intrinsics, and C](language/attributes.md)
 - [Threads](language/threads.md)
 - [Scripts (.j3s)](language/scripts.md)
+- [Mods with j2 (.j2)](language/j2.md)
 - [Shaders](language/shaders.md)
 
 # The Compiler

@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn hello_has_nothing_to_probe() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/hello.j3");
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/hello.j3");
         let prog = crate::compile::compile_path(&path).expect("hello");
         super::check(&prog, None).expect("hello links nothing extra");
     }

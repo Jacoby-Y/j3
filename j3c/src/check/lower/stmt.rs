@@ -364,6 +364,31 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Lowers one statement; on error records it in `errs` and puts the scope back so the next
+    /// statement is checked. The fn's body is dropped when `errs` is not empty (`lower_fn`).
+    /// Follow-ons (a use of a name whose `let` failed, or a name already reported unknown) are dropped.
+    pub(super) fn stmt_recover(&mut self, stmt: &Stmt) {
+        let n0 = self.b.local_count();
+        let (loops0, indirect0) = (self.loops.len(), self.store_indirect);
+        let Err(e) = self.stmt(stmt) else { return };
+        // Names this statement bound before it failed (a nested block's `let`s) go out of scope.
+        self.locals.retain(|_, id| id.0 < n0);
+        self.aliases.retain(|_, p| !matches!(p.root, crate::ir::place::PlaceRoot::Local(id) if id.0 >= n0));
+        self.loops.truncate(loops0);
+        self.pending_label = None;
+        self.store_indirect = indirect0;
+        if let Stmt::Let(l) = stmt {
+            self.poisoned.insert(l.name.name.clone());
+        }
+        let follow_on = e.unknown.as_ref().is_some_and(|n| self.poisoned.contains(n));
+        if let Some(n) = &e.unknown {
+            self.poisoned.insert(n.clone());
+        }
+        if !follow_on {
+            self.errs.push(e);
+        }
+    }
+
     pub(super) fn lower_block(&mut self, block: &parse::Block) -> Result<crate::ir::body::Block, CheckError> {
         let saved = self.b.begin_block();
         self.scoped_stmts(&block.stmts)?;
@@ -375,7 +400,7 @@ impl<'a> Lower<'a> {
         let saved_locals = self.locals.clone();
         let saved_aliases = self.aliases.clone();
         for stmt in stmts {
-            self.stmt(stmt)?;
+            self.stmt_recover(stmt);
         }
         self.locals = saved_locals;
         self.aliases = saved_aliases;

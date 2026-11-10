@@ -1,0 +1,262 @@
+// Ask an LLM through OpenRouter's chat completions API, three ways:
+//   j3c run examples/openrouter-chat -- "say hi"              one request, whole reply (j3.net.http)
+//   j3c run examples/openrouter-chat -- --stream "say hi"     tokens as they arrive (server-sent events)
+//   j3c run examples/openrouter-chat -- --curl "say hi"       the same request through the curl program (j3.proc)
+// `--model NAME` picks a model (default `openrouter/auto`). The key comes from OPENROUTER_API_KEY.
+// OPENROUTER_URL overrides the endpoint (a local mock for testing).
+//
+// A console program, so it calls the network on the main thread. In a game, do this on a
+// `j3.thread` worker and hand the text back through a `Queue` (`j3c doc recipes http`).
+
+module main;
+
+use j3.data.json;
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.net.http;
+use j3.net.http.{ HttpError, Request };
+use j3.net.tls;
+use j3.proc;
+use j3.proc.ProcError;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+
+const DEFAULT_URL: string = "https://openrouter.ai/api/v1/chat/completions";
+
+fn fail(msg: string) {
+    let line = `error: {msg}`;
+    sys.write(2, line.ptr as ptr, line.len);
+    sys.write(2, "\n".ptr as ptr, 1);
+    sys.exit(1);
+}
+
+/// Write `s` to stdout with no newline (stream tokens as they come).
+fn out(s: string) {
+    sys.write(1, s.ptr as ptr, s.len);
+}
+
+/// `{"model": ..., "messages": [{"role": "user", "content": ...}], "stream": ...}`
+fn requestBody(model: string, prompt: string, stream: bool, a: &Arena): string {
+    let msg = json.obj(a);
+    msg.set("role", json.str("user", a));
+    msg.set("content", json.str(prompt, a));
+    let msgs = json.arr(a);
+    msgs.push(msg);
+    let body = json.obj(a);
+    body.set("model", json.str(model, a));
+    body.set("messages", msgs);
+    if stream {
+        body.set("stream", json.boolean(true, a));
+    }
+    return json.stringify(body, a);
+}
+
+/// The reply text, or the API's error message as a failure.
+fn answer(status: int, body: []u8, a: &Arena): string {
+    let doc = json.null(a);
+    match json.parse(body, a) {
+        Result.Ok(d) { doc = d; }
+        Result.Err(e) { fail(`HTTP {status}, reply is not JSON ({e.msg} at byte {e.at})`); }
+    }
+    let err = doc.get("error");
+    if !err.isNull() {
+        fail(`HTTP {status}: {err.get("message").asStr()}`);
+    }
+    if status != 200 {
+        fail(`HTTP {status}`);
+    }
+    return doc.path("choices.0.message.content").asStr();
+}
+
+fn httpFailure(e: HttpError, a: &Arena) {
+    let t = Text.new(a);
+    t.pushStr(http.errorName(e));
+    match e {
+        HttpError.Tls {
+            t.pushStr(": ");
+            tls.lastError(&t);
+        }
+        HttpError.BadUrl {}
+        HttpError.BadRequest {}
+        HttpError.Resolve {}
+        HttpError.Connect {}
+        HttpError.Timeout {}
+        HttpError.Protocol {}
+        HttpError.TooManyRedirects {}
+    }
+    fail(t.str());
+}
+
+fn newRequest(url: string, key: string, body: string, a: &Arena): Request {
+    let req = http.post(url, body, a);
+    // the request keeps this string, so build it on the arena: a `{...}` string lives on this function's stack
+    let auth = Text.new(a);
+    auth.pushStr("Bearer ");
+    auth.pushStr(key);
+    req.header("Authorization", auth.str());
+    req.header("Content-Type", "application/json");
+    req.timeoutMs = 120000;
+    return req;
+}
+
+fn plain(url: string, key: string, model: string, prompt: string, a: &Arena) {
+    let req = newRequest(url, key, requestBody(model, prompt, false, a), a);
+    match http.request(&req, a) {
+        Result.Ok(res) { printLn(answer(res.status, res.body, a)); }
+        Result.Err(e) { httpFailure(e, a); }
+    }
+}
+
+fn streamed(url: string, key: string, model: string, prompt: string, a: &Arena) {
+    let req = newRequest(url, key, requestBody(model, prompt, true, a), a);
+    let s = http.open(&req, a);
+    match s {
+        Result.Ok(st) {
+            if st.status != 200 {
+                match st.readAll(a) {
+                    Result.Ok(b) { answer(st.status, b, a); }
+                    Result.Err(e) { httpFailure(e, a); }
+                }
+                fail(`HTTP {st.status}`);
+            }
+            let line = Text.new(a);
+            // each event is parsed on its own arena, emptied before the next
+            let ev = Arena.create(65536);
+            while st.readLine(&line) {
+                let l = line.str();
+                // `data: {...}` carries a chunk; `: comment` lines are keep-alives
+                if l.len < 6 || !same(l[0..6], "data: ") {
+                    continue;
+                }
+                let data = l[6..l.len];
+                if same(data, "[DONE]") {
+                    break;
+                }
+                ev.rewind(0);
+                match json.parseStr(data, &ev) {
+                    Result.Ok(chunk) {
+                        let err = chunk.get("error");
+                        if !err.isNull() {
+                            fail(err.get("message").asStr());
+                        }
+                        out(chunk.path("choices.0.delta.content").asStr());
+                    }
+                    Result.Err(_) {}
+                }
+            }
+            if st.broken {
+                httpFailure(st.failed, a);
+            }
+            st.close();
+            out("\n");
+        }
+        Result.Err(e) { httpFailure(e, a); }
+    }
+}
+
+/// `s` as a quoted value for a curl config file.
+fn curlQuote(s: string, t: &Text) {
+    t.push(34);
+    for i in 0..s.len {
+        if s[i] == 34 || s[i] == 92 {
+            t.push(92);
+        }
+        t.push(s[i]);
+    }
+    t.push(34);
+}
+
+fn viaCurl(url: string, key: string, model: string, prompt: string, a: &Arena) {
+    // the whole request goes in on stdin as a curl config (`-K -`), so the key is never in argv
+    let cfg = Text.new(a);
+    cfg.pushStr("url = ");
+    curlQuote(url, &cfg);
+    cfg.pushStr("\nheader = ");
+    curlQuote(`Authorization: Bearer {key}`, &cfg);
+    cfg.pushStr("\nheader = \"Content-Type: application/json\"\ndata-binary = ");
+    curlQuote(requestBody(model, prompt, false, a), &cfg);
+    cfg.pushStr("\nwrite-out = \"\\n%{http_code}\"\n");
+    let argv: [4]string = ["curl", "--silent", "--show-error", "-K-"];
+    match proc.run(argv[:], cfg.str(), a) {
+        Result.Ok(o) {
+            if o.code != 0 {
+                fail(`curl exited {o.code}: {o.errStr()}`);
+            }
+            // the last line is the status code from --write-out
+            let body = o.outStr();
+            let cut = body.len;
+            while cut > 0 && body[cut - 1] != 10 {
+                cut -= 1;
+            }
+            let status = 0;
+            for i in cut..body.len {
+                status = status * 10 + int(body[i]) - 48;
+            }
+            let reply = if cut > 0 { body[0..cut - 1] } else { body };
+            printLn(answer(status, reply as []u8, a));
+        }
+        Result.Err(e) {
+            match e {
+                ProcError.NotFound { fail("curl is not installed"); }
+                ProcError.ExecFailed { fail("curl could not start"); }
+                ProcError.Fail { fail("could not start a process"); }
+            }
+        }
+    }
+}
+
+fn same(a: string, b: string): bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn main() {
+    let a = Arena.create(1048576);
+    let mode = "plain";
+    let model = "openrouter/auto";
+    let words = Text.new(&a);
+    let i = 1;
+    while i < sys.argCount() {
+        let arg = sys.arg(i);
+        if same(arg, "--") {
+            // `j3c run DIR -- args` passes the separator through
+        } else if same(arg, "--stream") || same(arg, "--curl") {
+            mode = arg[2..arg.len];
+        } else if same(arg, "--model") && i + 1 < sys.argCount() {
+            i += 1;
+            model = sys.arg(i);
+        } else {
+            if words.len() > 0 {
+                words.push(32);
+            }
+            words.pushStr(arg);
+        }
+        i += 1;
+    }
+    if words.len() == 0 {
+        fail("usage: openrouter-chat [--stream | --curl] [--model NAME] prompt...");
+    }
+    let key = sys.env("OPENROUTER_API_KEY");
+    if key.len == 0 {
+        fail("set OPENROUTER_API_KEY (https://openrouter.ai/keys)");
+    }
+    let url = sys.env("OPENROUTER_URL");
+    if url.len == 0 {
+        url = DEFAULT_URL;
+    }
+    if same(mode, "stream") {
+        streamed(url, key, model, words.str(), &a);
+    } else if same(mode, "curl") {
+        viaCurl(url, key, model, words.str(), &a);
+    } else {
+        plain(url, key, model, words.str(), &a);
+    }
+}

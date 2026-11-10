@@ -100,7 +100,7 @@ fn bake_samples_texture_at_centroid() {
     fs::create_dir_all(&project).unwrap();
     let scene = project.join("out.j3scene");
     let source = project.join("m.gltf");
-    fs::write(project.join("pal.png"), include_bytes!("../../examples/png_check/pal.png")).unwrap();
+    fs::write(project.join("pal.png"), include_bytes!("../../tests/programs/png_check/pal.png")).unwrap();
     // The position floats read as VEC2 UVs are (0,0), (0,1), (0,0): centroid (0, 1/3),
     // which is pixel (0, 5) of the 19x17 image.
     let text = gltf(r#"[{"mesh":0}]"#, "[0]")
@@ -113,7 +113,7 @@ fn bake_samples_texture_at_centroid() {
     let mesh = fs::read_to_string(project.join("assets/imported/m_mesh0_prim0.j3mesh")).unwrap();
     assert!(mesh.starts_with("# j3mesh 1\n"), "{mesh}");
     let row: Vec<f32> = mesh.lines().nth(2).unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
-    let rgba = include_bytes!("../../examples/png_check/pal.rgba");
+    let rgba = include_bytes!("../../tests/programs/png_check/pal.rgba");
     let at = (5 * 19) * 4;
     for c in 0..3 {
         assert!((row[6 + c] - rgba[at + c] as f32 / 255.0).abs() < 1e-3, "{row:?}");

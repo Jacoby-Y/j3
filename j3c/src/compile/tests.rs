@@ -168,7 +168,7 @@ fn main() {
 
 #[test]
 fn defer_is_block_scoped() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/defer_scope.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/defer_scope.j3");
     let prog = compile_path(&path).expect("compile defer_scope");
     let c = emit::emit_program(&prog.cx, &prog.modules).expect("emit");
     let run = exec(&prog);
@@ -206,7 +206,7 @@ fn parse_file(id: u32, path: &str, src: &str) -> ParsedFile {
 #[test]
 fn occur_mutual_is_error() {
     let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/honesty/occur_mutual.j3");
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/honesty/occur_mutual.j3");
     let err = match compile_path(&path) {
         Ok(_) => panic!("expected occur error"),
         Err(e) => e,
@@ -217,7 +217,7 @@ fn occur_mutual_is_error() {
 #[test]
 fn occur_array_is_error() {
     let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/honesty/occur_array.j3");
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/honesty/occur_array.j3");
     let err = match compile_path(&path) {
         Ok(_) => panic!("expected occur error"),
         Err(e) => e,
@@ -228,8 +228,8 @@ fn occur_array_is_error() {
 
 #[test]
 fn private_use_is_error() {
-    let hidden = include_str!("../../examples/honesty/hidden.j3");
-    let user = include_str!("../../examples/honesty/private_use.j3");
+    let hidden = include_str!("../../tests/programs/honesty/hidden.j3");
+    let user = include_str!("../../tests/programs/honesty/private_use.j3");
     let files = vec![
         parse_file(1, "hidden.j3", hidden),
         parse_file(2, "private_use.j3", user),
@@ -277,8 +277,8 @@ fn unknown_name_suggests_typo() {
 
 #[test]
 fn generic_method_error_is_in_defining_file() {
-    let boxy = include_str!("../../examples/honesty/gen_box.j3");
-    let user = include_str!("../../examples/honesty/gen_use.j3");
+    let boxy = include_str!("../../tests/programs/honesty/gen_box.j3");
+    let user = include_str!("../../tests/programs/honesty/gen_use.j3");
     let files = vec![
         parse_file(1, "boxy.j3", boxy),
         parse_file(2, "user.j3", user),
@@ -302,7 +302,7 @@ fn generic_method_error_is_in_defining_file() {
 
 #[test]
 fn singleton_init_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/singleton_init.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/singleton_init.j3");
     let prog = compile_path(&path).expect("compile singleton");
     let c = emit::emit_program(&prog.cx, &prog.modules).expect("emit");
     assert!(c.contains("7ll") || c.contains("= 7"), "{c}");
@@ -343,7 +343,7 @@ fn main() {
 
 #[test]
 fn read_file_j3_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/read_file.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/read_file.j3");
     let prog = compile_path(&path).expect("compile read_file");
     let run = exec(&prog);
     assert_eq!(
@@ -378,7 +378,7 @@ fn gallery_project_typechecks() {
 
 fn honesty(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/honesty")
+        .join("tests/programs/honesty")
         .join(name)
 }
 

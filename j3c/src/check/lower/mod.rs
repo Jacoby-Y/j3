@@ -335,6 +335,10 @@ struct Lower<'a> {
     in_closure: bool,
     /// Names visible outside the closure being lowered; a new local may not reuse them.
     closure_outer: HashSet<String>,
+    /// Errors of earlier statements in this fn (`stmt_recover`), in source order.
+    errs: Vec<CheckError>,
+    /// Names whose `let` failed or that were reported unknown: a later error naming one is a follow-on.
+    poisoned: HashSet<String>,
 }
 
 impl<'a> Lower<'a> {
@@ -460,6 +464,7 @@ impl<'a> Lower<'a> {
         cands.extend(self.globals.keys().cloned());
         cands.extend(extra.iter().cloned());
         let mut e = CheckError::new(self.path, span, format!("unknown {kind} `{name}`"));
+        e.unknown = Some(name.to_string());
         if let Some(s) = super::error::suggest(name, &cands) {
             e = e.help(format!("did you mean `{s}`?"));
         }

@@ -156,7 +156,7 @@ let _ = k + n;
 
 #[test]
 fn complete_quat_rotate() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/mesh.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/mesh.j3");
     let prog = analyze(&path, &[]).expect("analyze mesh");
     let src = std::fs::read_to_string(&path).unwrap();
     let at = src.find("q.rotate").expect("q.rotate") as u32;

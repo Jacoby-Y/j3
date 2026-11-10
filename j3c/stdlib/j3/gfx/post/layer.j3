@@ -1,6 +1,13 @@
 // Part of j3.gfx.post (filter layers, blur, endLayer); the module doc and `use`s are in ../post.j3.
 module j3.gfx.post;
 
+// A group's content draws into a full-size layer target (painter coordinates unchanged), and `j3.game` records
+// the bounds of every quad drawn into it. At `endLayer` the effect passes run on a pooled target that holds only
+// those bounds plus the effect's spread, and the composite covers only that rect: a small glow costs about its own
+// area. The backdrop (the pixels behind the group) is copied only when something reads it: a blend mode, a nested
+// group's blend, or a `backdrop-filter` inside. The parent framebuffer cannot change while the group is open, so a
+// late copy sees the same pixels an early one would.
+
 pub fn beginLayer() {
     init();
     if LDEPTH >= 8 {
@@ -21,29 +28,58 @@ pub fn beginLayer() {
         h = target(int(size.w), int(size.h));
         LAYERS[LDEPTH] = h;
     }
-    let old = save();
-    let destinationBuffer = get(0x8825);
-    active(0);
-    let s = surface(h);
-    for i in 1.. 4 {
-        allocate(s, i);
-    }
+    let d = LDEPTH;
+    LPFB[d] = u32(get(0x8CA6));
+    LPBUF[d] = get(0x8825);
+    LRECT[d * 4] = int(size.x);
+    LRECT[d * 4 + 1] = int(size.y);
+    LRECT[d * 4 + 2] = int(size.w);
+    LRECT[d * 4 + 3] = int(size.h);
+    LPARENT[d] = DEPTH > 0 && KIND[DEPTH -1] == 1;
+    BPEND[d] = true;
+    BTEX[d] = 0;
+    begin(h, 1);
+    game.p2LayerBegin();
+    game.p2SetBackdropLazy(resolveBase);
+    LDEPTH += 1;
+    // The layer's content is ordinary paint.
+    game.profUiZone(zone);
+}
 
-    // Preserve the exact parent destination for blend modes, including nested layers.
-    framebuffer(0x8CA8, u32(old.draw));
+/// `j3.game`'s lazy-backdrop hook: the innermost open layer's backdrop is being read.
+fn resolveBase() {
+    game.p2SetBackdropBase(baseOf(LDEPTH -1));
+}
+
+/// The complete destination behind layer `d` (its parent's pixels over the parent's own backdrop), in that
+/// layer's `tex[3]`; copied the first time it is asked for.
+fn baseOf(d: int): u32 {
+    if !BPEND[d] {
+        return BTEX[d];
+    }
+    BPEND[d] = false;
+    let under: u32 = if LPARENT[d] {
+        baseOf(d -1)
+    } else {
+        0
+    };
+    let old = save();
+    let s = surface(LAYERS[d]);
+    allocate(s, 2);
+    allocate(s, 3);
+    active(0);
+    framebuffer(0x8CA8, LPFB[d]);
     let rb = get(0x0C02);
-    let db = destinationBuffer;
-    let read = game.glProc("glReadBuffer") as fn(u32);
-    read(u32(db));
+    let read = GL.readBuf as fn(u32);
+    read(u32(LPBUF[d]));
     texture(s.tex[3]);
-    let copy = game.glProc("glCopyTexSubImage2D") as fn(u32, i32, i32, i32, i32, i32, i32, i32);
-    copy(0x0DE1, 0, 0, 0, i32(size.x), i32(size.y), i32(s.w), i32(s.h));
+    copyTo(i32(LRECT[d * 4]), i32(LRECT[d * 4 + 1]), i32(s.w), i32(s.h));
     read(u32(rb));
-    if game.p2BackdropBase() != 0 {
+    if under != 0 {
         raw();
         program(OVER);
         active(1);
-        texture(game.p2BackdropBase());
+        texture(under);
         sampler(OVER, "uBack", 1);
         pass(s, 3, 2, OVER);
         let tt = s.tex[2];
@@ -54,12 +90,8 @@ pub fn beginLayer() {
         s.fb[3] = ff;
     }
     restore(old);
-    begin(h, 1);
-    game.p2LayerBegin();
-    game.p2SetBackdropBase(s.tex[3]);
-    LDEPTH += 1;
-    // The layer's content is ordinary paint.
-    game.profUiZone(zone);
+    BTEX[d] = s.tex[3];
+    return BTEX[d];
 }
 fn pass(s: &Surface, src: int, dst: int, prog: u32) {
     framebuffer(0x8CA9, s.fb[dst]);
@@ -69,11 +101,10 @@ fn pass(s: &Surface, src: int, dst: int, prog: u32) {
     program(prog);
     sampler(prog, "uTex", 0);
     vao(VAO);
-    let draw = game.glProc("glDrawArrays") as fn(u32, i32, i32);
-    game.profDraw(1);
-    draw(4, 0, 3);
+    draw3();
 }
-fn blur(s: &Surface, src: int, temp: int, dst: int, radius: f32) {
+/// Taps reach `12 * stride` px; the first pass samples mip `ceil(log2(stride))` (`FS_BLUR`).
+fn blurStride(radius: f32): f32 {
     let sigma = radius;
     if sigma < 0.125 {
         sigma = 0.125;
@@ -82,34 +113,58 @@ fn blur(s: &Surface, src: int, temp: int, dst: int, radius: f32) {
     if stride < 1 {
         stride = 1;
     }
-    let mip = game.glProc("glGenerateMipmap") as fn(u32);
-    let param = game.glProc("glTexParameteri") as fn(u32, u32, i32);
-    active(0);
-    texture(s.tex[src]);
+    return stride;
+}
+/// Size of one texel of the mip `FS_BLUR` samples at `stride`.
+fn mipBlock(stride: f32): int {
+    let b = 1;
+    while f32(b) < stride {
+        b *= 2;
+    }
+    return b;
+}
+/// Bind `tex` and build only the mips `FS_BLUR` reads at `stride` (a full chain costs more than the blur).
+fn mipTo(tex: u32, stride: f32) {
+    let param = GL.texParam as fn(u32, u32, i32);
+    texture(tex);
+    let lod = 0;
+    while (1 << lod) < mipBlock(stride) {
+        lod += 1;
+    }
+    param(0x0DE1, 0x813D, i32(lod)); // GL_TEXTURE_MAX_LEVEL
+    if lod == 0 {
+        param(0x0DE1, 0x2801, 0x2601);
+        return;
+    }
+    let mip = GL.mip as fn(u32);
     mip(0x0DE1);
     param(0x0DE1, 0x2801, 0x2703);
+}
+fn blur(s: &Surface, src: int, temp: int, dst: int, radius: f32) {
+    let sigma = radius;
+    if sigma < 0.125 {
+        sigma = 0.125;
+    }
+    let stride = blurStride(radius);
+    active(0);
+    mipTo(s.tex[src], stride);
     program(BLUR);
     uniform2(BLUR, "uSigma", sigma, stride);
     uniform2(BLUR, "uStep", stride / f32(s.w), 0);
     pass(s, src, temp, BLUR);
-    texture(s.tex[temp]);
-    mip(0x0DE1);
-    param(0x0DE1, 0x2801, 0x2703);
+    mipTo(s.tex[temp], stride);
     uniform2(BLUR, "uStep", 0, stride / f32(s.h));
     pass(s, temp, dst, BLUR);
 
     // Compositors sample level zero; discard stale mip selection after the write.
     texture(s.tex[dst]);
+    let param = GL.texParam as fn(u32, u32, i32);
     param(0x0DE1, 0x2801, 0x2601);
 }
-/// Packed canonical effects, followed by screen-space perspective bounds.
-pub fn endLayer(f:[] f32, box:[] f32): u32 {
-    if DEPTH < 1 || KIND[DEPTH -1] != 1 || LDEPTH < 1 {
-        panic("unbalanced paint layer");
-    }
-    let zone = game.profUiZone(game.ZONE_UI_LAYER);
-    let s = surface(STACK[DEPTH -1]);
-    raw();
+/// Blur, bloom, FX (and a custom shader) over `s.tex[0]`; returns the image holding the result. `box` is the
+/// group's rect inside `s` (physical, top-left), `ox, oy` where `s` sits in the layer (GL px; screen-anchored
+/// grain and scanlines), `back` the backdrop to blend with (any other image when there is no blend mode).
+fn chain(s: &Surface, f:[] f32, box:[] f32, ox: f32, oy: f32, back: u32): int {
     let cur = 0;
     if f[0] > 0 {
         blur(s, 0, 1, 2, f[0]);
@@ -129,10 +184,7 @@ pub fn endLayer(f:[] f32, box:[] f32): u32 {
     }
     else {
         framebuffer(0x8CA9, s.fb[1]);
-        let cc = game.glProc("glClearColor") as fn(f32, f32, f32, f32);
-        cc(0, 0, 0, 0);
-        let cl = game.glProc("glClear") as fn(u32);
-        cl(0x4000);
+        clearRgba();
     }
     let dst = if cur == 2 {
         0
@@ -146,12 +198,13 @@ pub fn endLayer(f:[] f32, box:[] f32): u32 {
     uniform4(FX, "uD", f[12] *0.017453292, f[13], 0, 0);
     uniform2(FX, "uE", 0, f[15]);
     uniform2(FX, "uResolution", f32(s.w), f32(s.h));
+    uniform2(FX, "uOrigin", ox, oy);
     uniform4(FX, "uBox", box[0] / f32(s.w), 1 -(box[1] + box[3]) / f32(s.h), box[2] / f32(s.w), box[3] / f32(s.h));
     active(1);
     texture(s.tex[bloom]);
     sampler(FX, "uBloom", 1);
     active(2);
-    texture(s.tex[3]);
+    texture(if back != 0 { back } else { s.tex[cur] });
     sampler(FX, "uBack", 2);
     pass(s, cur, dst, FX);
     cur = dst;
@@ -163,26 +216,173 @@ pub fn endLayer(f:[] f32, box:[] f32): u32 {
         let prog = SHADER[id -1];
         program(prog);
         uniform2(prog, "uResolution", f32(s.w), f32(s.h));
-        let loc = game.glProc("glGetUniformLocation") as fn(u32, cstr): i32;
-        let u = game.glProc("glUniform1f") as fn(i32, f32);
-        u(loc(prog, cstr("uTime")), f[15]);
+        uniform1(prog, "uTime", f[15]);
         pass(s, cur, 1, prog);
         cur = 1;
     }
-    if f[17] != 0 || f[18] != 0 {
-        let projectedDst = if cur == 0 {
-            2
+    return cur;
+}
+/// The pooled-target rect for a group that drew `bb` (x0, y0, x1, y1) into `layer`: grown by twice the effect's
+/// reach (pixels the passes read for pixels the composite shows), aligned to the coarsest mip the blur samples so
+/// its texels match the full-size path, sized to multiples of 64 so a moving box keeps its target. Writes x, y
+/// (top-left), w, h into `out`; false when that is no cheaper than the whole layer or cannot fit aligned.
+fn boundedRect(layer: &Surface, f:[] f32, bb:[] f32, out:[] int): bool {
+    let reach: f32 = 2;
+    let block = 1;
+    if f[0] > 0 {
+        let st = blurStride(f[0]);
+        let b = mipBlock(st);
+        reach += 12 * st + f32(b);
+        if b > block {
+            block = b;
+        }
+    }
+    if f[1] > 0 {
+        let st = blurStride(12);
+        let b = mipBlock(st);
+        reach += 12 * st + f32(b);
+        if b > block {
+            block = b;
+        }
+    }
+    let g = reach * 2;
+    // mip blocks line up with the texture's GL bottom-left, so align GL y, not the top-left y
+    let x0 = int(floorf(bb[0] - g));
+    let x1 = int(ceilf(bb[2] + g));
+    let gy0 = layer.h - int(ceilf(bb[3] + g));
+    let gy1 = layer.h - int(floorf(bb[1] - g));
+    let w = roundUp(x1 - x0, 64);
+    let h = roundUp(gy1 - gy0, 64);
+    if w * h * 2 > layer.w * layer.h {
+        return false;
+    }
+    x0 = fitAligned(x0, w, layer.w, block);
+    gy0 = fitAligned(gy0, h, layer.h, block);
+    if x0 < 0 || gy0 < 0 {
+        return false;
+    }
+    out[0] = x0;
+    out[1] = layer.h - gy0 - h;
+    out[2] = w;
+    out[3] = h;
+    return true;
+}
+fn roundUp(v: int, step: int): int {
+    return (v + step -1) / step * step;
+}
+fn floorf(v: f32): f32 {
+    let i = f32(int(v));
+    return if i > v {
+        i -1
+    } else {
+        i
+    };
+}
+fn ceilf(v: f32): f32 {
+    let i = f32(int(v));
+    return if i < v {
+        i + 1
+    } else {
+        i
+    };
+}
+/// `start` moved down to a multiple of `block` and inside `0..limit - size`; -1 when it cannot be both.
+fn fitAligned(start: int, size: int, limit: int, block: int): int {
+    let v = start;
+    if v + size > limit {
+        v = limit - size;
+    }
+    if v < 0 {
+        v = 0;
+    }
+    v = v / block * block;
+    if v + size > limit {
+        return -1;
+    }
+    return v;
+}
+/// Packed canonical effects, followed by screen-space perspective bounds. Returns 0 when the group drew nothing
+/// (nothing to composite); `OUTRECT` says which part of the surface the returned image covers.
+pub fn endLayer(f:[] f32, box:[] f32): u32 {
+    if DEPTH < 1 || KIND[DEPTH -1] != 1 || LDEPTH < 1 {
+        panic("unbalanced paint layer");
+    }
+    game.p2Flush();
+    let zone = game.profUiZone(game.ZONE_UI_LAYER);
+    let d = LDEPTH -1;
+    let s = surface(STACK[DEPTH -1]);
+    let bb:[4] f32 =[0, 0, 0, 0];
+    let tracked = game.p2LayerBounds([] f32 {
+        ptr: &bb[0], len: 4
+    });
+    OUTRECT[2] = 0;
+    let out: u32 = 0;
+    raw();
+    let r:[4] int =[0, 0, 0, 0];
+    let blend = f[13] != 0;
+    if tracked && (bb[2] <= bb[0] || bb[3] <= bb[1]) {
+        // drew nothing: the target is still clear, and there is nothing to show
+    } else if tracked && f[14] == 0 && f[17] == 0 && f[18] == 0 && !(blend && LPARENT[d]) && boundedRect(s, f, [] f32 {
+        ptr: &bb[0], len: 4
+    }, [] int {
+        ptr: &r[0], len: 4
+    }) {
+        let p = pooled(r[2], r[3], blend);
+        let gy = s.h - r[1] - r[3];
+        active(0);
+        framebuffer(0x8CA8, s.fb[0]);
+        texture(p.tex[0]);
+        copyTo(i32(r[0]), i32(gy), i32(r[2]), i32(r[3]));
+        let back: u32 = 0;
+        if blend {
+            // the parent is no layer, so its pixels are the whole backdrop
+            framebuffer(0x8CA8, LPFB[d]);
+            let rb = get(0x0C02);
+            let read = GL.readBuf as fn(u32);
+            read(u32(LPBUF[d]));
+            texture(p.tex[3]);
+            copyTo(i32(LRECT[d * 4] + r[0]), i32(LRECT[d * 4 + 1] + gy), i32(r[2]), i32(r[3]));
+            read(u32(rb));
+            back = p.tex[3];
+        }
+        let inner:[4] f32 =[box[0] - f32(r[0]), box[1] - f32(r[1]), box[2], box[3]];
+        let cur = chain(p, f, [] f32 {
+            ptr: &inner[0], len: 4
+        }, f32(r[0]), f32(gy), back);
+        out = p.tex[cur];
+        for i in 0.. 4 {
+            OUTRECT[i] = f32(r[i]);
+        }
+        // what was drawn, rounded out: next time only that is cleared
+        s.dirty = [int(floorf(bb[0])) -1, int(floorf(bb[1])) -1, int(ceilf(bb[2])) + 1, int(ceilf(bb[3])) + 1];
+    } else {
+        // the whole surface: custom shaders, 3D projection, raw GL content, nested blends, big groups
+        allocate(s, 1);
+        allocate(s, 2);
+        allocate(s, 3);
+        let back: u32 = if blend {
+            baseOf(d)
         } else {
             0
         };
-        project(s.tex[cur], s, projectedDst, box, f[17], f[18], f[16], true);
-        cur = projectedDst;
+        raw();
+        let cur = chain(s, f, box, 0, 0, back);
+        if f[17] != 0 || f[18] != 0 {
+            let projectedDst = if cur == 0 {
+                2
+            } else {
+                0
+            };
+            project(s.tex[cur], s, projectedDst, box, f[17], f[18], f[16], true);
+            cur = projectedDst;
+        }
+        out = s.tex[cur];
+        s.dirty = [0, 0, s.w, s.h];
     }
-    let out = s.tex[cur];
     game.p2LayerEnd();
     DEPTH -= 1;
     LDEPTH -= 1;
-    game.p2SetBackdropBase(BASESTACK[DEPTH]);
+    restoreBase(DEPTH);
     restore(SAVED[DEPTH]);
     game.profUiZone(zone);
     return out;

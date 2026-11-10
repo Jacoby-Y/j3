@@ -2,12 +2,13 @@
 
 use super::*;
 
-fn idle() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/idle-breakout").canonicalize().unwrap()
+/// A small `.j3ui` project (`tests/fixtures/ui_lsp`); some tests assert its line numbers.
+fn fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui_lsp").canonicalize().unwrap()
 }
 
 fn file(name: &str) -> (PathBuf, String) {
-    let p = idle().join("ui").join(name);
+    let p = fixture().join("ui").join(name);
     let t = std::fs::read_to_string(&p).unwrap();
     (p, t)
 }
@@ -55,7 +56,7 @@ fn diagnostic_lands_on_the_j3ui_line() {
     let e = ui.err.expect("error");
     assert_eq!(e.path, "ui/BallCard.j3ui");
     let ((l, c), _) = query::range_of(&bad, e.span);
-    assert_eq!((l + 1, c + 1), (31, 48), "{}", e.message);
+    assert_eq!((l + 1, c + 1), (29, 48), "{}", e.message);
 }
 
 #[test]

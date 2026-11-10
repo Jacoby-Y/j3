@@ -335,10 +335,10 @@ pub fn analyze_ui(
     (r, ui_gen)
 }
 
-const HELLO_SRC: &str = include_str!("../examples/hello.j3");
+const HELLO_SRC: &str = include_str!("../tests/programs/hello.j3");
 
 pub fn default_hello_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/hello.j3")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/hello.j3")
 }
 
 fn builtin_hello(path: &Path) -> bool {

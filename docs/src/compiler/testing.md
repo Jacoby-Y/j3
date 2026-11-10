@@ -37,8 +37,8 @@ A `.j3ui` UI that is still does not redraw: `App` waits for input, resize, `Dom.
 A golden test compares a screenshot against a saved, known-good image.
 
 ```text
-j3c golden examples/idle-breakout            # compare
-j3c golden examples/idle-breakout --bless    # accept new images
+j3c golden examples/j2_script            # compare
+j3c golden examples/j2_script --bless    # accept new images
 ```
 
 The states to capture are listed in the project's `golden.toml`. To compare two images by hand:

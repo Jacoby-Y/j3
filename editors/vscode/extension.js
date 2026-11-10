@@ -110,6 +110,41 @@ function j3cPath() {
   return "j3c";
 }
 
+const INSTALL_URL = "https://github.com/Jacoby-Y/j3#install";
+let missingShown = false;
+
+// True when `bin` is a path that exists, or a bare name found on PATH.
+function found(bin) {
+  if (bin.includes(path.sep)) {
+    return fs.existsSync(bin);
+  }
+  const exts = process.platform === "win32" ? ["", ".exe", ".cmd"] : [""];
+  return (process.env.PATH || "").split(path.delimiter).some((dir) =>
+    exts.some((e) => dir && fs.existsSync(path.join(dir, bin + e)))
+  );
+}
+
+// One message per session, with links to the install steps and the j3.j3cPath setting.
+function reportMissing(bin) {
+  if (missingShown) {
+    return;
+  }
+  missingShown = true;
+  vscode.window
+    .showErrorMessage(
+      `J3: j3c not found (${bin}). Install it, or set "j3.j3cPath" to the binary.`,
+      "Install j3c",
+      "Open Setting"
+    )
+    .then((pick) => {
+      if (pick === "Install j3c") {
+        vscode.env.openExternal(vscode.Uri.parse(INSTALL_URL));
+      } else if (pick === "Open Setting") {
+        vscode.commands.executeCommand("workbench.action.openSettings", "j3.j3cPath");
+      }
+    });
+}
+
 function sh(p) {
   if (/[\s"'\\$]/.test(p)) {
     return `"${String(p).replace(/"/g, '\\"')}"`;
@@ -118,7 +153,13 @@ function sh(p) {
 }
 
 function task(args) {
-  const cmd = [sh(j3cPath()), ...args.map(sh)].join(" ");
+  const bin = j3cPath();
+  if (!found(bin)) {
+    missingShown = false;
+    reportMissing(bin);
+    return;
+  }
+  const cmd = [sh(bin), ...args.map(sh)].join(" ");
   const t = new vscode.Task(
     { type: "j3" },
     vscode.TaskScope.Workspace,
@@ -334,7 +375,11 @@ class Client {
     const bin = j3cPath();
     this.child = spawn(bin, ["lsp"], { stdio: ["pipe", "pipe", "pipe"] });
     this.child.on("error", (err) => {
-      vscode.window.showErrorMessage(`J3: could not start ${bin} (${err.message})`);
+      if (err.code === "ENOENT") {
+        reportMissing(bin);
+      } else {
+        vscode.window.showErrorMessage(`J3: could not start ${bin} (${err.message})`);
+      }
     });
     this.child.stderr.on("data", (d) => console.error(String(d)));
     this.child.stdout.on("data", (d) => this.onData(d));
@@ -343,6 +388,10 @@ class Client {
         return;
       }
       if (Date.now() - this.startedAt < 1000) {
+        if (!found(bin)) {
+          reportMissing(bin);
+          return;
+        }
         vscode.window.showErrorMessage(
           `J3: language server exited immediately (${bin}). Set j3.j3cPath if that binary is missing.`
         );

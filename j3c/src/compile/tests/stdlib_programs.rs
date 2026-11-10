@@ -46,7 +46,7 @@ fn stdlib_option_result_typecheck() {
 
 #[test]
 fn math_rand_j3_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/math_rand.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/math_rand.j3");
     let prog = compile_path(&path).expect("compile math_rand");
     let c = emit::emit_program(&prog.cx, &prog.modules).expect("emit");
     let run = exec(&prog);
@@ -62,7 +62,7 @@ fn math_rand_j3_runs() {
 
 #[test]
 fn mesh_fmt_j3_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/mesh.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/mesh.j3");
     let prog = compile_path(&path).expect("compile mesh");
     let run = exec(&prog);
     assert_eq!(
@@ -77,7 +77,7 @@ fn mesh_fmt_j3_runs() {
 
 #[test]
 fn scene3d_check_j3_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/scene3d_check.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/scene3d_check.j3");
     let prog = compile_path(&path).expect("compile scene3d_check");
     let run = exec(&prog);
     assert_eq!(
@@ -92,7 +92,7 @@ fn scene3d_check_j3_runs() {
 
 #[test]
 fn fpwalk_check_j3_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/fpwalk_check.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/fpwalk_check.j3");
     let prog = compile_path(&path).expect("compile fpwalk_check");
     let run = exec(&prog);
     assert_eq!(
@@ -107,7 +107,7 @@ fn fpwalk_check_j3_runs() {
 
 #[test]
 fn cull_check_j3_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/cull_check.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/cull_check.j3");
     let prog = compile_path(&path).expect("compile cull_check");
     let run = exec(&prog);
     assert_eq!(run.status, 0, "stderr {}", String::from_utf8_lossy(&run.stderr));
@@ -116,7 +116,7 @@ fn cull_check_j3_runs() {
 
 #[test]
 fn bvh_check_j3_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/bvh_check.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/bvh_check.j3");
     let prog = compile_path(&path).expect("compile bvh_check");
     let run = exec(&prog);
     assert_eq!(run.status, 0, "stderr {}", String::from_utf8_lossy(&run.stderr));
@@ -125,7 +125,7 @@ fn bvh_check_j3_runs() {
 
 #[test]
 fn png_check_j3_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/png_check.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/png_check.j3");
     let prog = compile_path(&path).expect("compile png_check");
     let run = exec(&prog);
     assert_eq!(
@@ -140,7 +140,7 @@ fn png_check_j3_runs() {
 
 #[test]
 fn ray_aabb_j3_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/ray_aabb.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/ray_aabb.j3");
     let prog = compile_path(&path).expect("compile ray_aabb");
     let run = exec(&prog);
     assert_eq!(
@@ -155,7 +155,7 @@ fn ray_aabb_j3_runs() {
 
 #[test]
 fn voxel_grid_j3_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/voxel_grid.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/voxel_grid.j3");
     let prog = compile_path(&path).expect("compile voxel_grid");
     let run = exec(&prog);
     assert_eq!(
@@ -170,7 +170,7 @@ fn voxel_grid_j3_runs() {
 
 #[test]
 fn voxel_ao_j3_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/voxel_ao.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/voxel_ao.j3");
     let prog = compile_path(&path).expect("compile voxel_ao");
     let run = exec(&prog);
     assert_eq!(
@@ -185,7 +185,7 @@ fn voxel_ao_j3_runs() {
 
 #[test]
 fn ecs_basic_j3_runs() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/ecs_basic.j3");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/ecs_basic.j3");
     let prog = compile_path(&path).expect("compile ecs_basic");
     let c = emit::emit_program(&prog.cx, &prog.modules).expect("emit");
     let run = exec(&prog);

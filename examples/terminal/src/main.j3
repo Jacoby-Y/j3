@@ -1,0 +1,197 @@
+module terminal;
+
+use j3.app.App;
+use j3.game;
+use j3.game.Font;
+use j3.math.Vec2;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.term.ansi.Parser;
+use j3.term.ansi.feed;
+use j3.term.grid.Grid;
+use j3.term.pty;
+use j3.term.pty.Pty;
+use j3.term.view.View;
+use j3.text.Text;
+
+// Bytes read per frame at most, so a flood (`yes`) cannot freeze the window.
+const READ_CHUNK = 16384;
+const READ_BUDGET = 131072;
+const SCROLLBACK = 5000;
+
+struct World {
+    mem: &Arena;
+    grid: Grid;
+    parser: Parser;
+    pty: Pty;
+    view: View;
+    buf: []u8;
+    out: Text;
+    title: Text;
+    cols: int;
+    rows: int;
+    live: bool;
+    dead: bool;
+    hold: bool;
+}
+
+fn boot(mem: &Arena): World {
+    // Grid, Pty and View are filled in `startup` (the window and font must exist first).
+    return World {
+        mem: mem, grid: Grid.new(mem, 80, 24, 0), parser: Parser.new(mem), pty: mem.alloc::<Pty>(1)[0],
+        view: mem.alloc::<View>(1)[0], buf: mem.alloc::<u8>(READ_CHUNK), out: Text.new(mem), title: Text.new(mem),
+        cols: 80, rows: 24, live: false, dead: false, hold: false,
+    };
+}
+
+fn loadMono(): Font {
+    let f = game.tryLoadFont("assets/mono.ttf", 16);
+    if f.raw == 0 {
+        f = game.tryLoadFont("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 16);
+    }
+    if f.raw == 0 {
+        f = game.tryLoadFont("/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", 16);
+    }
+    return f;
+}
+
+fn startup(w: &World) {
+    let font = loadMono();
+    if font.raw == 0 {
+        game.requestQuit();
+        return;
+    }
+    // CJK and symbols fall back to a wide font when the system has one.
+    game.fontFallback(font, game.tryLoadFont("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 16));
+    game.fontFallback(font, game.tryLoadFont("/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf", 16));
+    w.view = View.new(w.mem, font);
+    // Optional looks: TERM_ITALIC=font.ttf, TERM_LIGATURES=1, TERM_LINE_HEIGHT=150 (percent).
+    let it = game.env("TERM_ITALIC");
+    if it.len > 0 { w.view.italic = game.tryLoadFont(it, 16); }
+    w.view.ligatures = game.env("TERM_LIGATURES").len > 0;
+    let lh = game.env("TERM_LINE_HEIGHT");
+    if lh.len > 0 {
+        let pct = 0;
+        for i in 0..lh.len { if lh[i] >= 48 && lh[i] <= 57 { pct = pct * 10 + int(lh[i] - 48); } }
+        w.view.setLineHeight(pct);
+    }
+    let size = game.windowSize();
+    w.cols = w.view.colsFor(size.x);
+    w.rows = w.view.rowsFor(size.y);
+    w.grid = Grid.withLimits(w.mem, w.cols, w.rows, SCROLLBACK, 512, 160);
+
+    let cmd = game.env("TERM_CMD");
+    let argv = w.mem.alloc::<string>(if cmd.len > 0 { 3 } else { 1 });
+    if cmd.len > 0 {
+        argv[0] = "sh";
+        argv[1] = "-c";
+        argv[2] = cmd;
+        w.hold = true;
+    } else {
+        let sh = game.env("SHELL");
+        argv[0] = if sh.len > 0 { sh } else { "/bin/sh" };
+    }
+    let env = w.mem.alloc::<string>(2);
+    env[0] = "TERM=xterm-256color";
+    env[1] = "COLORTERM=truecolor";
+    match pty.spawn(argv, "", env, w.cols, w.rows, w.mem) {
+        Result.Ok(p) {
+            w.pty = p;
+            w.pty.resizePx(w.cols, w.rows, w.view.cellW, w.view.cellH);
+            w.live = true;
+        }
+        Result.Err(_e) {
+            game.requestQuit();
+        }
+    }
+}
+
+fn frame(w: &World, dt: f32) {
+    if !w.live {
+        return;
+    }
+    if !w.dead {
+        pump(w);
+    }
+    // Resize: only when the cell grid changes.
+    let size = game.windowSize();
+    let c = w.view.colsFor(size.x);
+    let r = w.view.rowsFor(size.y);
+    if (c != w.cols || r != w.rows) && !w.dead {
+        w.cols = c;
+        w.rows = r;
+        w.grid.resize(c, r);
+        w.pty.resizePx(c, r, w.view.cellW, w.view.cellH);
+    }
+    if !w.dead {
+        w.out.clear();
+        w.view.input(&w.grid, &w.out);
+        if w.out.len() > 0 {
+            w.pty.write(w.out.bytes);
+        }
+        w.pty.flush();
+    } else {
+        // Nothing to send; still let the user scroll the finished screen.
+        w.out.clear();
+        w.view.input(&w.grid, &w.out);
+    }
+    if !(w.grid.title.str() == w.title.str()) {
+        w.title.clear();
+        w.title.pushStr(w.grid.title.str());
+        game.setWindowTitle(if w.title.len() > 0 { w.title.str() } else { "terminal" });
+    }
+    if w.hold && !w.dead {
+        // Fixed-length runs (screenshots): give the child a moment each frame.
+        game.delayMs(10);
+    }
+}
+
+/// Read what the child wrote (bounded), feed the grid, answer its queries, notice its exit.
+fn pump(w: &World) {
+    let total = 0;
+    while total < READ_BUDGET {
+        let got = w.pty.tryRead(w.buf);
+        if got.len == 0 {
+            break;
+        }
+        total += got.len;
+        w.parser.feed(got, &w.grid);
+    }
+    if total > 0 {
+        w.view.snap();
+    }
+    if w.grid.reply.len() > 0 {
+        w.pty.write(w.grid.reply.bytes);
+        w.grid.reply.clear();
+    }
+    if w.pty.eof {
+        match w.pty.tryWait() {
+            Option.Some(_code) {
+                w.dead = true;
+                w.pty.close();
+                if !w.hold {
+                    game.requestQuit();
+                }
+            }
+            Option.None {
+            }
+        }
+    }
+}
+
+fn draw(w: &World) {
+    if !w.live {
+        return;
+    }
+    w.view.draw(&w.grid, 0.0, 0.0);
+}
+
+fn main() {
+    let app = App<World>.create("terminal", 960, 540, boot);
+    app.useGl();
+    app.startup(startup);
+    app.always(frame);
+    app.draw(draw);
+    app.run();
+}

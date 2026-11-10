@@ -11,5 +11,6 @@ Window settings every PC game needs. `j3.game` has the primitives (`setWindowMod
 - Labels: `modeName`, `resolutionLabel(&v, &text)`, `fpsLabel(n, &text)`.
 - Borderless is the desktop size (best alt-tab); Fullscreen switches the monitor to `v.w x v.h`.
 - `game.windowFocused()` is false while another window has focus: pause or mute on it.
+- Text needs `assets/font.ttf` (`j3c new --template ui` ships one; any `.ttf` works).
 - Needs a real display. Under `--headless` the calls are no-ops, so test the logic with
   `stdlib/tests/display_test.j3` and the look by hand.

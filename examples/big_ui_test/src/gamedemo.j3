@@ -1,0 +1,382 @@
+module big_ui_test.gamedemo;
+
+use big_ui_test.dialogue;
+use big_ui_test.items;
+use big_ui_test.gameworld;
+use j3.game.frameCount;
+use j3.math.{ cos, sin };
+use j3.memory.Arena;
+use j3.ui.toast.Toasts;
+
+// Plain game state behind the Game page: health, cooldowns, an inventory, damage numbers, quests,
+// a dialogue and a few mobs seen through a fake camera. No UI in here; components read it.
+
+pub const SLOTS: int = 100;
+pub const FLOATS: int = 24;
+pub const MOBS: int = 10;
+pub const SKILLS: int = 4;
+const NO_MOB: int = -1;
+const DT: f32 = 0.0166667;
+
+/// One damage number. `mob` is the mob it floats over, or -1 for the player; `kind`: 0 hurt, 1 crit, 2 heal, 3 hit.
+/// `id` is its pool slot, the `{#each}` key.
+pub struct Floater {
+    id: int;
+    live: bool;
+    age: f32;
+    mob: int;
+    amt: int;
+    kind: int;
+    jit: f32;
+}
+
+/// One mob: world position, health, and its projection to the view (`sx`, `sy`, `depth`, `shown`).
+pub struct Mob {
+    id: int;
+    x: f32;
+    z: f32;
+    hp: int;
+    maxHp: int;
+    lvl: int;
+    seed: f32;
+    sx: f32;
+    sy: f32;
+    depth: f32;
+    shown: bool;
+}
+
+pub struct Demo {
+    t: f32 = 0.0;
+    last: int = -1;
+    auto: bool = true;
+    rng: int = 12345;
+    // player
+    hp: int = 100;
+    hpMax: int = 100;
+    mana: int = 80;
+    manaMax: int = 80;
+    stam: int = 100;
+    stamMax: int = 100;
+    regen: f32 = 0.0;
+    deadFor: f32 = 0.0;
+    px: f32 = 0.0;
+    pz: f32 = -10.0;
+    yaw: f32 = 0.0;
+    // timers for the scripted fight
+    tHit: f32 = 0.0;
+    tHurt: f32 = 0.0;
+    tCast: f32 = 0.0;
+    // skills
+    cd: []f32;
+    cdTotal: []f32;
+    cost: []int;
+    // inventory
+    kind: []int;
+    rarity: []int;
+    count: []int;
+    sel: int = -1;
+    // damage numbers: a bounded pool, a slot is reused when it expires
+    floats: []Floater;
+    // mobs and their projection
+    mobs: []Mob;
+    // quests and dialogue
+    toasts: Toasts;
+    kills: int = 0;
+    questOn: bool = false;
+    dlgLine: int = 0;
+    dlgT0: f32 = 0.0;
+    dlgAnswer: int = -1;
+
+    fn new(): Demo {
+        let mem = Arena.create(65536);
+        let d = Demo { toasts: Toasts.new(), cd: mem.alloc::<f32>(SKILLS), cdTotal: mem.alloc::<f32>(SKILLS), cost: mem.alloc::<int>(SKILLS), kind: mem.alloc::<int>(SLOTS), rarity: mem.alloc::<int>(SLOTS), count: mem.alloc::<int>(SLOTS), floats: mem.alloc::<Floater>(FLOATS), mobs: mem.alloc::<Mob>(MOBS) };
+        for s in 0..SKILLS {
+            d.cd[s] = 0.0;
+            d.cdTotal[s] = 3.0 + f32(s * s) * 1.5;
+            d.cost[s] = 8 + s * 6;
+        }
+        d.cd[1] = 2.0;
+        for i in 0..SLOTS {
+            d.kind[i] = items.kindAt(i);
+            d.rarity[i] = if d.kind[i] < 0 { 0 } else { items.rarityAt(i) };
+            d.count[i] = items.countAt(i);
+        }
+        for i in 0..FLOATS {
+            d.floats[i].id = i;
+        }
+        for i in 0..MOBS {
+            d.mobs[i].id = i;
+            d.mobs[i].seed = f32(i) * 0.9;
+            d.mobs[i].maxHp = 40 + (i % 3) * 20;
+            d.mobs[i].hp = d.mobs[i].maxHp;
+            d.mobs[i].lvl = 2 + i % 5;
+        }
+        d.place();
+        return d;
+    }
+
+    /// Uniform int in 0..n.
+    fn roll(this: &Demo, n: int): int {
+        this.rng = (this.rng * 1103515245 + 12345) % 2147483648;
+        return this.rng / 65536 % n;
+    }
+
+    /// Move the world on by the frames since the last call (call it once per frame; repeats are ignored).
+    fn step(this: &Demo) {
+        let f = frameCount();
+        if f == this.last {
+            return;
+        }
+        let n = if this.last < 0 { 0 } else { f - this.last };
+        this.last = f;
+        if n > 6 {
+            n = 6;
+        }
+        for k in 0..n {
+            this.tick(DT);
+        }
+        this.place();
+    }
+
+    fn tick(this: &Demo, dt: f32) {
+        this.t += dt;
+        this.toasts.tick(this.t * 1000.0);
+        for s in 0..SKILLS {
+            this.cd[s] = if this.cd[s] > dt { this.cd[s] - dt } else { 0.0 };
+        }
+        this.regen += dt;
+        if this.regen >= 0.1 {
+            this.regen -= 0.1;
+            this.mana = if this.mana < this.manaMax { this.mana + 1 } else { this.manaMax };
+            this.stam = if this.stam < this.stamMax { this.stam + 1 } else { this.stamMax };
+        }
+        for i in 0..FLOATS {
+            if this.floats[i].live {
+                this.floats[i].age += dt;
+                if this.floats[i].age > 1.3 {
+                    this.floats[i].live = false;
+                }
+            }
+        }
+        if this.hp <= 0 {
+            this.deadFor += dt;
+            if this.deadFor > 1.8 {
+                this.deadFor = 0.0;
+                this.hp = this.hpMax;
+            }
+        }
+        if this.auto && this.hp > 0 {
+            this.script(dt);
+        }
+    }
+
+    /// The scripted fight: hits on mobs, hits on the player, skills used when ready.
+    fn script(this: &Demo, dt: f32) {
+        this.tHit += dt;
+        this.tHurt += dt;
+        this.tCast += dt;
+        if this.tHit > 0.85 {
+            this.tHit = 0.0;
+            this.hitMob(this.roll(MOBS), 4 + this.roll(20), this.roll(5) == 0);
+        }
+        if this.tHurt > 2.4 {
+            this.tHurt = 0.0;
+            this.hurt(5 + this.roll(14));
+            this.stam = if this.stam > 12 { this.stam - 12 } else { 0 };
+        }
+        if this.tCast > 0.7 {
+            this.tCast = 0.0;
+            this.cast(this.roll(SKILLS));
+        }
+    }
+
+    /// Positions: the player walks a circle, the mobs wander; then project the mobs to the view.
+    fn place(this: &Demo) {
+        let a = this.t * 0.35;
+        this.px = 10.0 * cos(a);
+        this.pz = 10.0 * sin(a);
+        // heading along the circle, swaying a little
+        this.yaw = (0.0 - a) + 3.14159 + 0.5 * sin(this.t * 0.6) + 1.2;
+        for i in 0..MOBS {
+            let ring = 6.0 + f32(i % 4) * 4.5;
+            let w = this.t * (0.12 + f32(i % 3) * 0.05) + this.mobs[i].seed * 2.0;
+            this.mobs[i].x = ring * cos(w + f32(i));
+            this.mobs[i].z = ring * sin(w + f32(i));
+            let p = gameworld.project(this.px, this.pz, this.yaw, this.mobs[i].x, this.mobs[i].z, 2.3);
+            this.mobs[i].sx = p.x;
+            this.mobs[i].sy = p.y;
+            this.mobs[i].depth = p.depth;
+            this.mobs[i].shown = p.shown && this.mobs[i].hp > 0;
+        }
+    }
+
+    // ---- events
+
+    fn hurt(this: &Demo, n: int) {
+        this.hp = if this.hp > n { this.hp - n } else { 0 };
+        this.spawn(NO_MOB, n, 0);
+    }
+
+    fn heal(this: &Demo, n: int) {
+        if this.hp <= 0 {
+            return;
+        }
+        let before = this.hp;
+        this.hp = if this.hp + n < this.hpMax { this.hp + n } else { this.hpMax };
+        this.spawn(NO_MOB, this.hp - before, 2);
+    }
+
+    fn spend(this: &Demo, mana: int, stam: int) {
+        this.mana = if this.mana > mana { this.mana - mana } else { 0 };
+        this.stam = if this.stam > stam { this.stam - stam } else { 0 };
+    }
+
+    fn hitMob(this: &Demo, i: int, dmg: int, crit: bool) {
+        if this.mobs[i].hp <= 0 {
+            return;
+        }
+        let d = if crit { dmg * 2 } else { dmg };
+        this.mobs[i].hp = if this.mobs[i].hp > d { this.mobs[i].hp - d } else { 0 };
+        this.spawn(i, d, if crit { 1 } else { 3 });
+        if this.mobs[i].hp == 0 {
+            this.onKill(i);
+        }
+    }
+
+    fn onKill(this: &Demo, i: int) {
+        this.kills += 1;
+        this.mobs[i].hp = this.mobs[i].maxHp;
+        this.mobs[i].seed += 2.1;
+        if this.questOn {
+            let goal = dialogue.questGoal(0);
+            let done = this.kills >= goal;
+            this.quest(0, if done { 2 } else { 1 });
+            if done {
+                this.kills = 0;
+                this.questOn = false;
+            }
+        }
+    }
+
+    /// Cast skill `s` if it is ready and affordable: a strong hit on the nearest mob in view.
+    fn cast(this: &Demo, s: int) {
+        if this.cd[s] > 0.0 || this.mana < this.cost[s] || this.hp <= 0 {
+            return;
+        }
+        this.spend(this.cost[s], 0);
+        this.cd[s] = this.cdTotal[s];
+        let best = NO_MOB;
+        for i in 0..MOBS {
+            if this.mobs[i].shown && (best == NO_MOB || this.mobs[i].depth < this.mobs[best].depth) {
+                best = i;
+            }
+        }
+        if best != NO_MOB {
+            this.hitMob(best, 14 + s * 9, s == 3);
+        }
+    }
+
+    /// A damage number. `mob` is the mob it floats over, or -1 for the player. `kind`: 0 hurt, 1 crit, 2 heal, 3 hit.
+    /// With the pool full the oldest number is replaced.
+    fn spawn(this: &Demo, mob: int, amount: int, kind: int) {
+        let slot = 0;
+        let oldest: f32 = -1.0;
+        let free = false;
+        for i in 0..FLOATS {
+            if !free && !this.floats[i].live {
+                slot = i;
+                free = true;
+            } else if !free && this.floats[i].age > oldest {
+                oldest = this.floats[i].age;
+                slot = i;
+            }
+        }
+        this.floats[slot].live = true;
+        this.floats[slot].age = 0.0;
+        this.floats[slot].mob = mob;
+        this.floats[slot].amt = amount;
+        this.floats[slot].kind = kind;
+        this.floats[slot].jit = f32(this.roll(41)) - 20.0;
+    }
+
+    /// A quest toast. `status`: 0 started, 1 progress, 2 complete.
+    fn quest(this: &Demo, q: int, status: int) {
+        // one notice per quest: a newer one replaces the older
+        for i in 0..this.toasts.cap {
+            if this.toasts.live(i) && this.toasts.kind(i) / 3 == q {
+                this.toasts.dismiss(i);
+            }
+        }
+        this.toasts.push(dialogue.quest(q), q * 3 + status, 5000.0, this.t * 1000.0);
+    }
+
+    fn acceptQuest(this: &Demo) {
+        this.questOn = true;
+        this.kills = 0;
+        this.quest(0, 0);
+    }
+
+    // ---- inventory
+
+    fn clickSlot(this: &Demo, i: int) {
+        if this.sel >= 0 && this.sel != i {
+            let k = this.kind[this.sel];
+            let r = this.rarity[this.sel];
+            let c = this.count[this.sel];
+            this.kind[this.sel] = this.kind[i];
+            this.rarity[this.sel] = this.rarity[i];
+            this.count[this.sel] = this.count[i];
+            this.kind[i] = k;
+            this.rarity[i] = r;
+            this.count[i] = c;
+            this.sel = -1;
+        } else {
+            this.sel = if this.sel == i { -1 } else { i };
+        }
+    }
+
+    // ---- dialogue
+
+    /// Seconds the current line has been typing.
+    fn typed(this: &Demo): f32 {
+        return this.t - this.dlgT0;
+    }
+
+    fn lineDone(this: &Demo): bool {
+        let line = dialogue.text(this.dlgLine);
+        return this.typed() * 34.0 >= f32(line.len);
+    }
+
+    /// Click: finish the line at once, or go to the next one (the last line waits for an answer).
+    fn advance(this: &Demo) {
+        if !this.lineDone() {
+            this.dlgT0 = this.t - 1000.0;
+        } else if this.dlgLine < dialogue.LINES - 1 {
+            this.dlgLine += 1;
+            this.dlgT0 = this.t;
+        }
+    }
+
+    fn answer(this: &Demo, yes: bool) {
+        if yes {
+            this.acceptQuest();
+        }
+        this.dlgLine = 0;
+        this.dlgT0 = this.t;
+    }
+}
+
+#[singleton]
+let SHARED: Demo;
+#[singleton]
+let STARTED: bool;
+
+/// The one demo state. The page may be mounted many times; the state (and its memory) is made once, so
+/// leaving the page and coming back keeps the fight going instead of allocating again.
+pub fn shared(): &Demo {
+    if !STARTED {
+        SHARED = Demo.new();
+        STARTED = true;
+    }
+    return &SHARED;
+}

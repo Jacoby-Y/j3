@@ -427,17 +427,17 @@ mod tests {
     #[test]
     fn decode_matches_fixtures() {
         for (png, rgba, w, h) in [
-            (&include_bytes!("../examples/png_check/rgb.png")[..], &include_bytes!("../examples/png_check/rgb.rgba")[..], 37, 23),
-            (include_bytes!("../examples/png_check/pal.png"), include_bytes!("../examples/png_check/pal.rgba"), 19, 17),
-            (include_bytes!("../examples/png_check/tiles.png"), include_bytes!("../examples/png_check/tiles.rgba"), 64, 16),
-            (include_bytes!("../examples/png_check/filt.png"), include_bytes!("../examples/png_check/filt.rgba"), 9, 10),
+            (&include_bytes!("../tests/programs/png_check/rgb.png")[..], &include_bytes!("../tests/programs/png_check/rgb.rgba")[..], 37, 23),
+            (include_bytes!("../tests/programs/png_check/pal.png"), include_bytes!("../tests/programs/png_check/pal.rgba"), 19, 17),
+            (include_bytes!("../tests/programs/png_check/tiles.png"), include_bytes!("../tests/programs/png_check/tiles.rgba"), 64, 16),
+            (include_bytes!("../tests/programs/png_check/filt.png"), include_bytes!("../tests/programs/png_check/filt.rgba"), 9, 10),
             // Hand-built: HDIST = 32 (legal, though zlib never writes more than 30).
-            (include_bytes!("../examples/png_check/dist32.png"), include_bytes!("../examples/png_check/dist32.rgba"), 1, 1),
+            (include_bytes!("../tests/programs/png_check/dist32.png"), include_bytes!("../tests/programs/png_check/dist32.rgba"), 1, 1),
         ] {
             assert_eq!(decode(png), Some((w, h, rgba.to_vec())));
         }
         // An IHDR claiming fewer rows than the data holds: inflate stops at the cap.
-        let mut short = include_bytes!("../examples/png_check/rgb.png").to_vec();
+        let mut short = include_bytes!("../tests/programs/png_check/rgb.png").to_vec();
         short[16 + 4..16 + 8].copy_from_slice(&1u32.to_be_bytes());
         assert_eq!(decode(&short), None);
         // A stored RGBA PNG like canvas writes, then compacted (fixed Huffman, Sub/Up rows).

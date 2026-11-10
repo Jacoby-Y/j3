@@ -1,0 +1,299 @@
+// The script loader. A script is a folder with a main.j2 in a script root (j2-scripts/, plus
+// any root `addRoot` adds). Each script runs in its own environment: its top-level names are
+// private, its `pub` names are what other scripts see through `use name;` and what the host
+// calls as hooks (onStart, onTick, onDraw, onKill).
+//
+// Loading is all or nothing: F5 or saving any main.j2 reloads every script from the top
+// (World.reloadScripts), in folder-name order (a `use` loads its target first). That keeps
+// "script A adds to script B's list" correct after a reload without tracking who depends on whom.
+//
+// A script that fails (parse error, runtime error, step budget) is disabled and its error is
+// drawn on screen; the rest keep running. Saving the file tries again.
+
+module j2_arena.scripts;
+
+use j3.j2;
+use j3.j2.{ Error, Limits, Ref, Value, Vm };
+use j3.io.{ DirEntry, IoError, listDir, stat, printLn };
+use j3.game.{ Color, Font };
+use j3.gfx.paint;
+use j3.math.Vec2;
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.text.{ Text, same };
+
+const MAX_SCRIPTS: int = 64;
+const MAX_ROOTS: int = 4;
+const LOG_LINES: int = 8;
+
+pub struct Script {
+    name: string;
+    path: string;      // <root>/<name>/main.j2
+    mtime: int;        // -1 when the file is missing
+    loaded: bool;
+    exports: Ref;      // its pub table; none() while broken
+    err: Text;         // why it is disabled; empty when fine (kept across reloads, reused)
+}
+
+pub struct Scripts {
+    mem: &Arena;
+    roots: []string;
+    nRoots: int;
+    vm: Vm;
+    list: []Script;
+    n: int;
+    log: []Text;       // ring of the last print() lines and errors
+    logHead: int;      // oldest line
+    nLog: int;
+    loads: int;        // loadAll calls (tests read these two)
+    errors: int;       // scripts disabled, ever
+}
+
+extend Scripts {
+    fn new(mem: &Arena, root: string, limits: Limits): Scripts {
+        let s = Scripts {
+            mem: mem,
+            roots: mem.alloc::<string>(MAX_ROOTS),
+            nRoots: 1,
+            vm: Vm.new(mem, limits),
+            list: mem.alloc::<Script>(MAX_SCRIPTS),
+            n: 0,
+            log: mem.alloc::<Text>(LOG_LINES),
+            logHead: 0,
+            nLog: 0,
+            loads: 0,
+            errors: 0,
+        };
+        s.roots[0] = root;
+        for i in 0..MAX_SCRIPTS {
+            s.list[i].err = Text.new(mem);
+        }
+        for i in 0..LOG_LINES {
+            s.log[i] = Text.new(mem);
+        }
+        return s;
+    }
+
+    // Call once the Scripts sits at its final address: `use slimes;` inside a script resolves
+    // through resolveUse, so scripts find each other by folder name.
+    fn attach(this: &Scripts) {
+        this.vm.resolver = resolveUse;
+        this.vm.resolverCtx = this as ptr;
+    }
+
+    // Another folder of script folders (a mods dir, a test's temp dir). Takes effect on the next loadAll.
+    fn addRoot(this: &Scripts, root: string) {
+        if this.nRoots < MAX_ROOTS {
+            this.roots[this.nRoots] = root;
+            this.nRoots += 1;
+        }
+    }
+
+    // (Re)load every script, then run their onStart hooks.
+    fn loadAll(this: &Scripts) {
+        for i in 0..this.n {
+            this.vm.release(this.list[i].exports);
+        }
+        this.n = 0;
+        this.loads += 1;
+        // ponytail: names and paths go to the arena on each reload (~100 bytes a script);
+        // a per-reload arena if someone reloads thousands of times in one session.
+        for r in 0..this.nRoots {
+            match listDir(this.roots[r], this.mem) {
+                Result.Ok(entries) {
+                    for e in entries {
+                        if e.isDir && this.n < MAX_SCRIPTS {
+                            let m = &this.list[this.n];
+                            m.name = e.name;
+                            m.path = joinPath(this.mem, this.roots[r], e.name);
+                            m.mtime = mtimeOf(m.path);
+                            m.loaded = false;
+                            m.exports = j2.none();
+                            m.err.clear();
+                            this.n += 1;
+                        }
+                    }
+                }
+                Result.Err(_) { } // a missing root has no scripts
+            }
+        }
+        this.sortByName();
+        for i in 0..this.n {
+            this.load(&this.list[i]);
+        }
+        this.callAll("onStart", j2.noArgs());
+    }
+
+    // Folder-name order, whatever the root (insertion sort: a few dozen scripts at most).
+    fn sortByName(this: &Scripts) {
+        for i in 1..this.n {
+            let j = i;
+            while j > 0 && less(this.list[j].name, this.list[j - 1].name) {
+                let t = this.list[j];
+                this.list[j] = this.list[j - 1];
+                this.list[j - 1] = t;
+                j -= 1;
+            }
+        }
+    }
+
+    fn load(this: &Scripts, m: &Script) {
+        if m.loaded {
+            return; // a `use` got here first
+        }
+        m.loaded = true;
+        // loadFile = read + lex + parse + compile + run the top level, all in-process.
+        // The Err text reads "j2-scripts/slimes/main.j2:14:9: expected `}`".
+        match this.vm.loadFile(m.name, m.path) {
+            Result.Ok(t) {
+                m.exports = this.vm.keep(t);
+            }
+            Result.Err(e) {
+                this.disable(m, e);
+            }
+        }
+    }
+
+    // True when any main.j2 was saved (or removed) since it loaded.
+    fn changed(this: &Scripts): bool {
+        // ponytail: one stat per script per tick; switch to inotify if a pack has hundreds.
+        for i in 0..this.n {
+            if mtimeOf(this.list[i].path) != this.list[i].mtime {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn find(this: &Scripts, name: string): int {
+        for i in 0..this.n {
+            if same(this.list[i].name, name) { return i; }
+        }
+        return -1;
+    }
+
+    // Call `hook` on every working script that has it.
+    fn callAll(this: &Scripts, hook: string, args: []Value) {
+        for i in 0..this.n {
+            let m = &this.list[i];
+            if m.err.len() == 0 {
+                let f = this.vm.get(m.exports).get(hook);
+                if !f.isNil() {
+                    this.check(this.vm.call(f, args));
+                }
+            }
+        }
+    }
+
+    // t[name](args), with `this` = self when the fn's first parameter is named `this`.
+    // Enemy and weapon hooks go through here.
+    fn callMethod(this: &Scripts, t: Value, name: string, self: Value, args: []Value) {
+        let f = t.asTable().get(name);
+        if !f.isNil() {
+            this.check(this.vm.callWithThis(f, self, args));
+        }
+    }
+
+    // An error knows the chunk (script) whose code raised it; disable that script.
+    fn check(this: &Scripts, r: Result<Value, Error>) {
+        match r {
+            Result.Ok(_) { }
+            Result.Err(e) {
+                let i = this.find(e.chunk);
+                if i >= 0 {
+                    this.disable(&this.list[i], e);
+                } else {
+                    this.sayError("?", e.message); // not from a script folder (cannot happen today)
+                }
+            }
+        }
+    }
+
+    // Copy the error out of the VM first: e.message is a view its next error overwrites.
+    fn disable(this: &Scripts, m: &Script, e: Error) {
+        m.err.clear();
+        m.err.pushStr(e.message);
+        this.vm.release(m.exports);
+        m.exports = j2.none();
+        this.errors += 1;
+        this.sayError(m.name, m.err.str());
+    }
+
+    fn sayError(this: &Scripts, name: string, msg: string) {
+        let t = this.nextLine();
+        t.pushStr("script ");
+        t.pushStr(name);
+        t.pushStr(" disabled: ");
+        t.pushStr(msg);
+        printLn(t.str());
+    }
+
+    // A line for the on-screen log (and the terminal).
+    fn say(this: &Scripts, line: string) {
+        let t = this.nextLine();
+        t.pushStr(line);
+        printLn(t.str());
+    }
+
+    // The newest log slot, emptied (the oldest line goes when the ring is full).
+    fn nextLine(this: &Scripts): &Text {
+        if this.nLog == LOG_LINES {
+            this.logHead = (this.logHead + 1) % LOG_LINES;
+            this.nLog -= 1;
+        }
+        let t = &this.log[(this.logHead + this.nLog) % LOG_LINES];
+        this.nLog += 1;
+        t.clear();
+        return t;
+    }
+
+    fn drawLog(this: &Scripts, font: Font) {
+        let y = f32(690) - f32(18 * this.nLog);
+        for i in 0..this.nLog {
+            let line = this.log[(this.logHead + i) % LOG_LINES].str();
+            let isError = line.len >= 7 && same(line[0..7], "script ");
+            let c = if isError { Color { r: 255, g: 110, b: 110, a: 255 } } else { Color { r: 200, g: 200, b: 200, a: 255 } };
+            paint.text(font, Vec2 { x: 12, y: y }, line, c);
+            y += 18;
+        }
+    }
+}
+
+fn resolveUse(ctx: ptr, vm: &Vm, name: string): Value {
+    let scripts = ctx as &Scripts;
+    let i = scripts.find(name);
+    if i < 0 {
+        return vm.raise(Text.scratch().add("use ").add(name).add(": no script folder with that name").str());
+    }
+    let m = &scripts.list[i];
+    scripts.load(m); // used before its turn in name order: load it now
+    if m.err.len() != 0 {
+        return vm.raise(Text.scratch().add("use ").add(name).add(": that script failed to load").str());
+    }
+    return vm.value(m.exports);
+}
+
+fn mtimeOf(path: string): int {
+    match stat(path) {
+        Result.Ok(e) { return e.mtime; }
+        Result.Err(_) { return -1; }
+    }
+}
+
+// "<root>/<name>/main.j2", kept in `mem` (a backtick string lives only in its function's frame).
+fn joinPath(mem: &Arena, root: string, name: string): string {
+    let t = Text.new(mem);
+    t.pushStr(root);
+    t.pushStr("/");
+    t.pushStr(name);
+    t.pushStr("/main.j2");
+    return t.str();
+}
+
+fn less(a: string, b: string): bool {
+    let n = if a.len < b.len { a.len } else { b.len };
+    for i in 0..n {
+        if a[i] != b[i] { return a[i] < b[i]; }
+    }
+    return a.len < b.len;
+}

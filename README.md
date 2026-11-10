@@ -1,95 +1,172 @@
-<img src="logo.svg" width="96" alt="J3 logo">
+<p align="center"><img src="logo.svg" width="112" alt="J3 logo"></p>
 
 # J3
 
-Ahead-of-time game language. `j3c` parses J3, typechecks it, and prints LLVM IR for the host `clang` to link. C is an optional backend (`--emit c`). The compiler is a Rust crate with no crates.io dependencies and no libLLVM.
+[![CI](https://github.com/Jacoby-Y/j3/actions/workflows/ci.yml/badge.svg)](https://github.com/Jacoby-Y/j3/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Jacoby-Y/j3?include_prereleases)](https://github.com/Jacoby-Y/j3/releases)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-## Requirements
+J3 is a programming language for games. It compiles ahead of time to native code: `j3c` checks your program and hands it to `clang`, and you get a small native binary. The compiler is written in Rust with no third-party crates. One `j3c` binary holds everything else too: the standard library (windows, input, audio, 2D and 3D drawing, UI, physics, networking), a 3D scene editor, a language server, and all the docs.
 
-- Rust (edition 2021) and Cargo
-- `clang` on `PATH`
-- SDL2 for the example games. Image, mixer, and ttf are vendored under `examples/dungeon/lib` and picked up by rpath. The 3D examples also need OpenGL 3.3 (`libGL`).
+**Status:** 0.1, alpha. Linux x86-64 is supported; Linux arm64 has prebuilt binaries but is less tested. Windows, macOS and Android builds are experimental. Expect breaking changes between 0.x releases ([CHANGELOG](CHANGELOG.md)).
 
-## Compiler
+<p align="center"><img src="docs/images/village.png" width="640" alt="examples/editor_village: a first-person walk through a low-poly village built in the J3 scene editor"></p>
 
-From `j3c/`:
+## A small game
 
+A window with a bar you move with the arrow keys:
+
+```j3
+module hello;
+
+use j3.app.App;
+use j3.game.{ Key, clear, drawRect, keyDown, rgb, setColor };
+use j3.math.Vec2;
+use j3.memory.Arena;
+
+struct World { x: f32; }
+
+fn boot(_mem: &Arena): World { return World { x: 280 }; }
+
+fn update(w: &World, dt: f32) {
+    if keyDown(Key.Left) { w.x = w.x - 200.0 * dt; }
+    if keyDown(Key.Right) { w.x = w.x + 200.0 * dt; }
+}
+
+fn draw(w: &World) {
+    setColor(rgb(32, 48, 72));
+    clear();
+    setColor(rgb(240, 200, 64));
+    drawRect(Vec2 { x: w.x, y: 160 }, Vec2 { x: 80, y: 24 });
+}
+
+fn main() {
+    let app = App<World>.create("hello", 640, 360, boot);
+    app.always(update);
+    app.draw(draw);
+    app.run();
+}
 ```
-cargo build --release
-cargo test
+
+## Install
+
+Linux (x86-64 or arm64), into `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Jacoby-Y/j3/main/install.sh | sh
 ```
 
-The binary is `j3c/target/release/j3c`. Put it on `PATH`, or call it by that path. The standard library is compiled into that binary. `J3_STDLIB` (the parent of the `j3/` modules) replaces the embedded copy.
+Or download a `.deb` from [Releases](https://github.com/Jacoby-Y/j3/releases) and run `sudo apt install ./j3c_0.1.0_amd64.deb`. On Arch, `yay -S j3c-bin`.
+
+J3 needs `clang` to build programs, and SDL2, OpenGL and a few fonts for anything with a window. Check your system with:
+
+```sh
+j3c doctor
+```
+
+It prints each requirement as `ok` or missing. On Ubuntu or Debian:
+
+```sh
+sudo apt install clang libsdl2-2.0-0 libsdl2-ttf-2.0-0 libsdl2-image-2.0-0 libsdl2-mixer-2.0-0 \
+  libgl1 fonts-dejavu-core fonts-noto-color-emoji
+```
+
+To uninstall, delete `~/.local/bin/j3c` (and the cache in `~/.cache/j3`). [`packaging/README.md`](packaging/README.md) covers upgrades and the other channels.
+
+### Build from source
+
+You need Rust (stable) and `clang`.
+
+```sh
+git clone https://github.com/Jacoby-Y/j3
+cd j3
+./build.sh
+```
+
+`build.sh` builds a release `j3c` and installs it to `~/.bin` if that exists, else `~/.local/bin` (`J3_BIN_DIR` picks another place). To build without installing, run `cargo build --release` in `j3c/`; the binary is `j3c/target/release/j3c`.
+
+## Quick start
+
+```sh
+j3c new hello --app     # a project with a window: j3.toml and src/main.j3
+cd hello
+j3c run                 # build and run it
+j3c build --release     # a small, stripped binary in target/hello
+```
+
+`j3c new hello` without `--app` makes a console program. `--template ui` starts a `.j3ui` UI project and `--template fps` a first-person 3D project. `j3c guide` walks through the rest.
+
+## Features
+
+- **2D drawing**: batched shapes, text, images and transforms (`j3.gfx.paint`), plus procedural images you can save as PNG (`j3.gfx.canvas`).
+- **3D**: meshes, lights, shadows and materials (`j3.gfx`, `j3.scene3d`), and a 3D scene editor (`j3c editor`) that saves scenes as readable text files.
+- **UI components**: `.j3ui` files with Svelte-like markup, J3 script and a large subset of CSS (flex, grid, animations, inputs).
+- **Shaders in J3**: write vertex and fragment shaders as J3 functions; `j3c` turns them into GLSL.
+- **Mods**: j2, a small scripting language a shipped game can load at runtime for player mods.
+- **Shipping**: `j3c build --release` makes zips and `.deb` packages with a menu entry and icon, Steam depots with Steamworks bindings, and Android APKs.
+- **Tooling**: a language server (`j3c lsp`) and a [VS Code / Cursor extension](editors/vscode/), a formatter, headless screenshots and golden-image tests.
+- **AI agents**: an MCP server that lets coding agents edit and render scenes (see [For AI agents](#for-ai-agents)).
 
 ## Examples
 
-```
-j3c run examples/bounce
-j3c check examples/dungeon
-j3c build examples/island
-```
+Run any of these from the repository root:
 
-`run` and `build` with no path use `./j3.toml`. `build` writes `target/<name>` in the package directory and sets the process working directory to the package root (`J3_ROOT`), so assets load from there.
+| Example | What it shows | Run |
+|---|---|---|
+| [`3d-editor-scene`](examples/3d-editor-scene) | The smallest editor project: two scenes and a `.j3s` script | `j3c run examples/3d-editor-scene` |
+| [`editor_village`](examples/editor_village) | A walkable village where scenes place other scenes (houses) | `j3c run examples/editor_village` |
+| [`desk-app`](examples/desk-app) | A desktop-style `.j3ui` app: sidebar, sortable table, rename dialog, saved settings | `j3c run examples/desk-app` |
+| [`big_ui_test`](examples/big_ui_test) | Every `.j3ui` and CSS feature, one page each | `j3c run examples/big_ui_test` |
+| [`j2_script`](examples/j2_script) | A top-down shooter whose enemies, weapons and HUD are j2 mod scripts | `j3c run examples/j2_script` |
+| [`terminal`](examples/terminal) | A terminal emulator: your shell on a pty, drawn with J3 | `j3c run examples/terminal` |
+| [`gallery`](examples/gallery) | Older immediate-mode UI widgets, layout and styles | `j3c run examples/gallery` |
+| [`scripted`](examples/scripted) | `.j3s` scripts in the console, compiled or on the VM | `j3c run examples/scripted` |
+| [`openrouter-chat`](examples/openrouter-chat) | A console LLM chat over HTTPS and JSON | `OPENROUTER_API_KEY=... j3c run examples/openrouter-chat` |
 
-| Example | What it is |
-|---------|------------|
-| `examples/bounce` | Paddle and ball |
-| `examples/dungeon` | Tile crawler: scenes, UI, save, particles, looping music |
-| `examples/gallery` | UI gallery: widgets, controls, layout, style, inventory |
-| `examples/defense` | Tower defense. Drag the map, scroll to zoom |
-| `examples/island` | Voxel island: GL mesh, shadow map, orbit camera |
-| `examples/minecraft` | First person. Break, place, jump, corner shadows |
-| `examples/leaves` | First person. Pick up leaves, spend them on reach and grab speed |
-| `examples/canvas` | Headless procedural sprite and tile PNG generation |
-| `examples/canvas_preview` | Preview generated assets and in-memory texture uploads |
-| `examples/raytrace` | Interactive glass, metal, and plastic raytracing in a room |
-| `examples/ocean` | Procedural ocean waves with glass and metal reflections |
-| `examples/forest` | Autumn forest with CC0 tree assets, godrays, glass and metal |
+`j3c check examples/<name>` typechecks one without running it. To run one without a window, add `--headless --frames 60 --screenshot shot.png`.
 
-## New project
+<p align="center"><img src="docs/images/desk-app.png" width="560" alt="examples/desk-app: a file list with a sidebar and a details pane"></p>
 
-```
-j3c new mygame
-cd mygame
-j3c check
-j3c run
-```
+## Docs
 
-`j3c new mygame --app` scaffolds an SDL window. `j3c guide` starts a project. `j3c doc lang` is the language, `j3c doc` is the standard library, and `j3c doc j3ui` is `.j3ui` UI components (`j3c new mygame --template ui` starts one; `j3c doc j3ui-immediate` is the older `@j3ui`). `j3c help manifest` lists `j3.toml` keys.
+- `j3c guide`: start here; how a project is laid out and what to read next.
+- `j3c doc lang`: the language in one page. `j3c doc`: the standard library (`j3c doc search <word>`, `j3c doc <module> --short`).
+- `j3c doc recipes`: complete small programs (2D app, 3D scene, UI components, shaders, threads, audio, HTTP, Steam, ...).
+- [The J3 Book](docs/) (`mdbook serve docs`): the language, the compiler and shipping, written for people.
+- [`speculative/`](speculative/): sample programs that double as the compiler's acceptance tests. `01`–`08` are a language tour that compiles and runs (`j3c run speculative/01_basics.j3 --headless --frames 5`), `lang/` has one file per feature, and the numbered `*_ui_*` folders each test one `.j3ui` feature.
+- [`j3c/editor/README.md`](j3c/editor/README.md): the scene editor. [`roadmap.md`](roadmap.md): what is done and what is next.
 
-## Programmatic graphics
+The docs ship inside `j3c`, so `j3c doc` always matches the compiler you run.
 
-`j3.gfx.canvas` draws into an RGBA image without opening a window. Create a `Canvas` in `Mode.Pixel` for crisp sprites and tiles or `Mode.Smooth` for antialiased shapes. Draw shapes, gradients, noise, and other canvases; then call `savePng` to export or `j3.game.textureFromCanvas` to display it. Upload static art once and use `updateTextureFromCanvas` for a changed rectangle. Run `j3c doc j3.gfx.canvas` for the API and `j3c run examples/canvas` for a headless sample that writes `lantern.png` and `stone.png` into that example directory.
+## Platforms
 
-Build art from a readable silhouette, a restrained palette, consistent lighting, and a few deliberate details. The canvas sample uses separate light and dark layers and seeded variation. Check generated assets at their intended display size before adding texture noise.
+| Platform | Status |
+|---|---|
+| Linux x86-64 | Supported: compiler, games, editor, `.deb`/zip shipping, CI |
+| Linux arm64 | Prebuilt `j3c` from the release workflow; untested until the first release runs |
+| Windows | Experimental: `j3c build --target x86_64-pc-windows-gnu` cross-compiles and links; the exe has not been run on Windows |
+| macOS | Experimental: a target exists; never built or run on a Mac |
+| Android | Experimental: builds APKs (`j3c doc android`); a network probe ran on a phone, no game has yet |
+| Steam (Linux, Steam Deck) | Bindings and depot output (`j3c doc steam`); no game shipped yet |
 
-## OpenGL rendering
+## For AI agents
 
-`j3.gfx` provides the mesh renderer. Optional `j3.gfx.urp.raytrace` adds a fullscreen room and sphere path tracer, with `j3.gfx.urp.forest` for compositing `j3.gfx` meshes with volumetric light and glass/metal spheres. All need `App.useGl()` and OpenGL 3.3. Use `j3c doc j3.gfx.urp.raytrace` or `j3c doc j3.gfx.urp.forest` for the module API; the full pass order and GLSL requirements are in [`j3c/stdlib/j3/gfx/urp/README.md`](j3c/stdlib/j3/gfx/urp/README.md). Samples are `examples/raytrace`, `examples/ocean`, and `examples/forest`.
+J3 is built to be driven by coding agents as well as people. [`AGENTS.md`](AGENTS.md) is the map for them, and `j3c -e mcp` is an MCP server that edits, renders and checks 3D scenes (`claude mcp add -s user j3 -- j3c -e mcp`).
 
-## Editor
+## Contributing
 
-`editors/vscode` is the Cursor / VS Code extension: highlighting, `j3c lsp` (completion, imports, signature help, outline), `j3.toml` keys, and run / build / format. Set `j3.j3cPath` when `j3c` is not on `PATH`.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing and pull requests, and the [Code of Conduct](CODE_OF_CONDUCT.md). Security issues: [SECURITY.md](SECURITY.md).
 
-## Layout
+## License
 
-| Path | What |
-|------|------|
-| `j3c/` | Compiler. Map in `j3c/AGENTS.md` |
-| `j3c/stdlib/j3/` | Standard library, written in J3 |
-| `speculative/` | Acceptance programs (`01`–`08` compile and run; `09` typechecks `j3.game`; `10_j3ui.j3` typechecks `@j3ui`) |
-| `examples/` | Playable games |
-| `editors/vscode/` | Editor extension |
-| `tools/j3mesh_import.py` | Mesh importer |
-| `roadmap.md` | What ships and what is still open |
-| `AGENTS.md` | Working notes for this repo |
+J3 is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Bundled fonts, icons and assets keep their own licenses, listed in [THIRD_PARTY.md](THIRD_PARTY.md). It also notes what a game built with J3 has to ship with.
 
 ## Untested features
 
-Built and checked by tests, goldens, or headless runs, but not yet played or used in a real game. Remove an entry when it has been.
+J3 is alpha. These are built and checked by tests, goldens, or headless runs, but have not yet been played or used in a real game. An entry is removed once it has been.
 
-- `.j3ui` components (`j3c doc j3ui`): markup and scoped CSS compiled by `j3c`; only `examples/idle-breakout` uses them.
-- Cursor / VS Code support for `.j3ui` (`editors/vscode`, v0.3.0 `.vsix`): the LSP side is tested over stdio and the grammar by script; not installed or used in an editor yet.
+- `.j3ui` components (`j3c doc j3ui`): markup and scoped CSS compiled by `j3c`; used by `examples/desk-app` and `examples/big_ui_test`, not yet by a shipped game.
+- Cursor / VS Code support for `.j3ui` (`editors/vscode`, v0.4.0 `.vsix`): the LSP side is tested over stdio and the grammar by script; not installed or used in an editor yet.
 - `z-index` in `.j3ui` as nested stacking contexts (opacity, transform, filter, `isolation` and fixed boxes make one (a scroll box does not: its positioned content joins the outer context, clipped and scrolled); sorted lists per context, hit test in paint order): tested by `stdlib/tests/stacking_test.j3`, `dom_test.j3`, the 54 golden and the big_ui_test dropdown headless, not by hand with a mouse.
 - `j3.gfx.paint` (batched 2D shapes, text, clip, transforms) and the `j3.ui.css` / `j3.ui.dom` runtime under it: no hands-on session with mouse, scrolling, or sliders in a real window yet.
 - Terminal stack (`j3c doc term`: `j3.term.*`, `j3.ui.ansi`, `examples/terminal`): checked by `stdlib/tests/term_*_test.j3` (pipes and a pty) and a headless screenshot of `examples/terminal`; not tried: typing feel and key repeat, paste, wheel, resize and title in a real window, real-tty raw mode and the TUI restore (only pipes tested), Wayland, GNOME Terminal and kitty quirks, non-Linux (pty and tty are Linux-only).

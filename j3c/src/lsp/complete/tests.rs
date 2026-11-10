@@ -149,7 +149,7 @@ fn import_edit_for_unimported_export() {
 
 #[test]
 fn signature_of_method_skips_this() {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/mesh.j3");
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/mesh.j3");
     let prog = query::analyze(&path, &[]).expect("mesh");
     let src = std::fs::read_to_string(&path).unwrap();
     let at = src.find("q.rotate(").unwrap() + "q.rotate(".len();
@@ -196,7 +196,7 @@ fn main() {
 #[test]
 fn incomplete_app_dot_lists_methods() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/fps-shooter/src/main.j3");
+        .join("../examples/3d-editor-scene/src/main.j3");
     let mut src = std::fs::read_to_string(&path).unwrap();
     let at_run = src.find("    app.run();\n").expect("run");
     src.insert_str(at_run, "    app.\n");

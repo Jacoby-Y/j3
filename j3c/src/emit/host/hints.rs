@@ -82,3 +82,14 @@ pub(super) fn find_soname(dir: &Path, name: &str) -> Option<String> {
     }
     best.map(|p| p.display().to_string())
 }
+
+/// The error for a compiler or linker that did not start. A missing one is a one-line fix.
+/// `cc` is the C-backend fallback, only tried once clang is already known to be missing.
+pub(crate) fn spawn_err(tool: &str, e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        let tool = if tool == "cc" { "clang (or cc)" } else { tool };
+        format!("error: {tool} not found on PATH; install clang (Debian/Ubuntu: sudo apt install clang)")
+    } else {
+        format!("spawn {tool}: {e}")
+    }
+}

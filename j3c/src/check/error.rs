@@ -10,6 +10,10 @@ pub struct CheckError {
     pub helps: Vec<String>,
     /// Further independent errors (other function bodies), rendered after this one.
     pub more: Vec<CheckError>,
+    /// Errors past the cap that were dropped (rendered as a count).
+    pub omitted: usize,
+    /// Set by `unknown name/function `x``: a later use of `x` in the same fn is a follow-on.
+    pub(crate) unknown: Option<String>,
 }
 
 impl CheckError {
@@ -21,6 +25,8 @@ impl CheckError {
             notes: Vec::new(),
             helps: Vec::new(),
             more: Vec::new(),
+            omitted: 0,
+            unknown: None,
         }
     }
 
@@ -44,8 +50,11 @@ impl CheckError {
             out.push('\n');
             out.push_str(&e.render_one(sources));
         }
-        if !self.more.is_empty() {
-            out.push_str(&format!("\nerror: {} errors\n", self.more.len() + 1));
+        let shown = self.more.len() + 1;
+        if self.omitted > 0 {
+            out.push_str(&format!("\nerror: {shown} errors (and {} more not shown)\n", self.omitted));
+        } else if shown > 1 {
+            out.push_str(&format!("\nerror: {shown} errors\n"));
         }
         out
     }

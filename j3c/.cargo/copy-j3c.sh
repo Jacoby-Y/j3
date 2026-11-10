@@ -1,5 +1,9 @@
 #!/bin/sh
-# Copy the j3c binary to ~/.bin after rustc links it. Cargo has no post-build hook.
+# Opt-in: copy the j3c binary to $J3_BIN_DIR (default ~/.bin) after rustc links it.
+# Cargo has no post-build hook, so this is a rustc wrapper. Not enabled by the repo;
+# turn it on from an untracked cargo config, e.g. ~/.cargo/config.toml:
+#   [build]
+#   rustc-wrapper = "/path/to/j3/j3c/.cargo/copy-j3c.sh"
 "$@" || exit $?
 
 is_j3c=
@@ -30,7 +34,7 @@ for a in "$@"; do
   prev=$a
 done
 
-# J3C_NO_INSTALL=1 builds without touching ~/.bin/j3c.
+# J3C_NO_INSTALL=1 builds without installing.
 [ -z "$J3C_NO_INSTALL" ] || exit 0
 [ -n "$is_j3c" ] && [ -n "$is_bin" ] && [ -z "$is_test" ] || exit 0
 [ -n "$out" ] || out="$out_dir/j3c$extra"
@@ -39,6 +43,6 @@ case "$out" in
   *.rlib|*.rmeta|*.o|*.d|*.so) exit 0 ;;
 esac
 
-dest=/home/jacoby/.bin/j3c
+dest=${J3_BIN_DIR:-$HOME/.bin}/j3c
 install -D -m 755 "$out" "$dest.new"
 mv -f "$dest.new" "$dest"

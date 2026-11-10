@@ -68,4 +68,9 @@ fn missing_sdl_names_the_package() {
     assert!(super::failure_hint("error: expected `;`\n --> src/main.j3:1:1\n").is_none());
     let cc = super::failure_hint("spawn clang: No such file or directory (os error 2)").unwrap();
     assert!(cc.contains("sudo apt install clang"), "{cc}");
+    let ld = super::failure_hint("/usr/bin/ld: cannot find -lSDL2: No such file or directory\n/usr/bin/ld: cannot find -lGL").unwrap();
+    assert!(ld.contains("libsdl2-2.0-0") && ld.contains("libgl1"), "{ld}");
+    let gone = super::spawn_err("cc", std::io::Error::from(std::io::ErrorKind::NotFound));
+    assert_eq!(gone, "error: clang (or cc) not found on PATH; install clang (Debian/Ubuntu: sudo apt install clang)");
+    assert!(super::failure_hint(&gone).is_none(), "one line, no second hint");
 }

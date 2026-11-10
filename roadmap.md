@@ -11,7 +11,7 @@ Non-goals: no GC, borrow checker, trait objects (`dyn`), drop, escaping closures
 - **Runtime checks:** every check names itself as `file:line: reason` and exits 102; `panic` exits 101. Debug builds on x86-64 Linux install a crash handler, symbolized by `j3c run`.
 - **Threads (Linux):** `j3.thread` (pool, queue, mutex), `#[thread]` globals, `@atomic*`. See Multithreading.
 - **Network and processes (Linux):** `j3.net.tcp`, `j3.net.dns` (`getaddrinfo`), `j3.net.tls` (system OpenSSL 3 through `dlopen`, always verified), `j3.net.http` (HTTP/1.1 client, chunked, redirects, streaming lines for SSE), `j3.data.json`, `j3.proc` (spawn with pipes, PATH lookup) on fork/exec/pipe in `j3.sys`. `j3c doc recipes http`, `examples/openrouter-chat`.
-- **UI components:** `.j3ui` (markup, J3 script, scoped CSS) compiled by `j3c` onto `j3.ui.css`/`dom` and the batched `j3.gfx.paint`; `examples/idle-breakout` is the golden reference (plan 022; editor support is stage 08); plan 023 added `{#let}`, data grid, rich textarea, caret popups, flex/selectors/inline boxes, `margin: auto`, `aspect-ratio`, `outline`, `cursor`, `text-decoration`, `font-style`, `:not()` / `:nth-child()` / `:last-child`, `j3c golden`, `J3_STEADY` and `j3.ui.testkit`; plan 026 added grid, transitions and `animate:flip`, drag-and-drop, more selectors and elements, transforms, `@property`, i18n, the F12 inspector, `run --hot`, CSS lint, gamepad focus and the a11y gaps; plan 027 added rotated overflow clips, RTL number neutrals, spacing transitions, `em` in transforms, `url()` custom properties, scroll boxes that are not stacking contexts, positive `tabindex`, radio groups and `<glyph>` input prompts; the screen reader bridge (plan 024) is left).
+- **UI components:** `.j3ui` (markup, J3 script, scoped CSS) compiled by `j3c` onto `j3.ui.css`/`dom` and the batched `j3.gfx.paint`; `examples/desk-app` and `examples/big_ui_test` are the references (plan 022; editor support is stage 08); plan 023 added `{#let}`, data grid, rich textarea, caret popups, flex/selectors/inline boxes, `margin: auto`, `aspect-ratio`, `outline`, `cursor`, `text-decoration`, `font-style`, `:not()` / `:nth-child()` / `:last-child`, `j3c golden`, `J3_STEADY` and `j3.ui.testkit`; plan 026 added grid, transitions and `animate:flip`, drag-and-drop, more selectors and elements, transforms, `@property`, i18n, the F12 inspector, `run --hot`, CSS lint, gamepad focus and the a11y gaps; plan 027 added rotated overflow clips, RTL number neutrals, spacing transitions, `em` in transforms, `url()` custom properties, scroll boxes that are not stacking contexts, positive `tabindex`, radio groups and `<glyph>` input prompts; the screen reader bridge (plan 024) is left).
 - **Stdlib:** `App` stages, ECS, collide, space, physics (light: 2D AABB and a 3D voxel-stopping body, no contact solver), path, anim, input, assets, save, particles, camera rig, UI, `j3.gfx` (GL 3.3, one shadow map, 4 point lights, instancing), voxel grid, math, mesh formats, SDL audio with groups, fades, and positional channels, `scene3d`.
 
 ## Left
@@ -40,13 +40,13 @@ From plan 029 phase C (measurements, plan since deleted). Idle skip shipped (chu
 
 ## Build speed
 
-fps-shooter (54 modules, ~45k lines with stdlib); `J3C_TIMINGS=1` shows the stages. Shipped: check 0.80s to 0.17s, cold build 1.45s to 0.75s (emit inside the parallel clang workers, `mold` when present), a struct edit recompiles 3 of 54 modules, and a rebuilt `j3c` no longer invalidates objects.
+Measured on a 54-module shooter (~45k lines with stdlib); `J3C_TIMINGS=1` shows the stages. Shipped: check 0.80s to 0.17s, cold build 1.45s to 0.75s (emit inside the parallel clang workers, `mold` when present), a struct edit recompiles 3 of 54 modules, and a rebuilt `j3c` no longer invalidates objects.
 
-Open: `lower_module` clones per-module maps (0.06s), the LSP rechecks everything per edit, and there is no function-level pruning.
+Open: `lower_module` clones per-module maps (0.06s), the LSP rechecks everything per edit, and there is no function-level pruning. Further ideas (unmeasured guesses from a 2026-10 code read): cache checked/lowered modules across runs for small edits (dependency-aware invalidation, generic bodies count); hash structured IR for object keys instead of printing it, and memoize symbols/layouts; a line-only debug mode (`DebugOut` without locals/types); emit non-escaping single-assignment temporaries as SSA values instead of stack slots.
 
 ## Binary size
 
-Shipped: `--release` (opt `s`, stripped, no unwind tables on Linux), one `@j3_abort` for all checks in whole-program builds. fps-shooter 4.5 MB to 1.3 MB.
+Shipped: `--release` (opt `s`, stripped, no unwind tables on Linux), one `@j3_abort` for all checks in whole-program builds. A large game went 4.5 MB to 1.3 MB.
 
 Open:
 - A small 3D game still links ~117 KB of `j3.scene3d` and ~66 KB of `j3.gfx` it never runs (URP tracing, PNG decode). Find the roots and split flag-only code into its own import.

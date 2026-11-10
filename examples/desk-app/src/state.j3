@@ -1,0 +1,339 @@
+// The app's data and rules. No drawing: the components read these fields and call these methods.
+// Files are fake and in memory (deterministic, so goldens repeat). A file's id is its index in `files`
+// and never changes, which makes it the row key.
+
+module desk_app.state;
+
+use j3.memory.Arena;
+use j3.rand.Rng;
+use j3.text.{ Text, fmtBytes, same };
+use j3.ui.toast.Toasts;
+
+pub const MAXF = 40;
+pub const NAME_MAX = 40;
+pub const KINDS = 5;
+pub const PAGE_ALL = 0;
+pub const PAGE_STARRED = 1;
+pub const PAGE_SETTINGS = 2;
+/// Sort columns.
+pub const BY_NAME = 0;
+pub const BY_SIZE = 1;
+pub const BY_DATE = 2;
+
+pub struct File {
+    id: int;
+    name: string;
+    /// 0 folder, 1 document, 2 image, 3 code, 4 audio.
+    kind: int;
+    bytes: int;
+    /// Days after 2025-01-01.
+    day: int;
+    starred: bool;
+    hidden: bool;
+    /// Text for the size and date columns, rebuilt when the units preference changes.
+    sizeText: string;
+    dayText: string;
+}
+
+pub struct State {
+    mem: &Arena;
+    files: []File;
+    n: int;
+    /// Visible file ids in table order (`view()` rebuilds it when an input of it changed).
+    order: []int;
+    shown: int;
+    maxBytes: int;
+    /// Bumped by changes `view()` cannot see on its own (rename, star).
+    revision: int = 0;
+    page: int = 0;
+    sel: int = -1;
+    sortKey: int = 0;
+    sortAsc: bool = true;
+    /// The filter box writes here; it is a view of the box's buffer, so `seen` keeps a copy.
+    filter: string = "";
+    seen: []u8;
+    seenLen: int = 0;
+    seenKey: int = -1;
+    seenUnits: int = -1;
+    renaming: bool = false;
+    draft: string = "";
+    toasts: Toasts;
+    now: f32 = 0.0;
+    // Preferences (persisted by prefs.j3)
+    /// 0 comfortable, 1 compact.
+    density: int = 0;
+    /// 0 human (KB, MB), 1 plain bytes.
+    units: int = 0;
+    showHidden: bool = false;
+    sideW: f32 = 220.0;
+    owner: string = "You";
+
+    fn new(mem: &Arena): State {
+        let s = State {
+            mem: mem,
+            files: mem.alloc::<File>(MAXF),
+            n: 0,
+            order: mem.alloc::<int>(MAXF),
+            shown: 0,
+            maxBytes: 1,
+            seen: mem.alloc::<u8>(NAME_MAX),
+            toasts: Toasts.new(),
+        };
+        s.fake();
+        return s;
+    }
+
+    /// 32 deterministic files. Sizes come from a short list and dates from a 12-day window, so several
+    /// files tie on every column (the sort must keep them in id order).
+    fn fake(this: &State) {
+        let stems: [16]string = ["report", "budget", "photo", "notes", "main", "song", "plan", "logo", "draft", "intro", "data", "icon", "theme", "demo", "readme", "todo"];
+        let exts: [5]string = ["", ".txt", ".png", ".j3", ".wav"];
+        let sizes: [6]int = [4096, 12288, 20480, 524288, 3145728, 41943040];
+        let rng = Rng.new(2026);
+        for i in 0..32 {
+            let kind = rng.intRange(0, KINDS);
+            if i >= 16 {
+                // a stem is used twice, so the second file takes another kind and the names stay unique
+                let other = this.files[i - 16].kind;
+                kind = if kind == other { (kind + 1) % KINDS } else { kind };
+            }
+            let t = Text.new(this.mem);
+            if i >= 29 {
+                t.push(46); // ".hidden" style names
+            }
+            t.pushStr(stems[i % 16]);
+            t.pushStr(exts[kind]);
+            let bytes = 0;
+            if kind != 0 {
+                bytes = sizes[rng.intRange(0, 6)];
+            }
+            this.files[i] = File {
+                id: i, name: t.str(), kind: kind, bytes: bytes, day: 400 + rng.intRange(0, 12),
+                starred: i % 5 == 0, hidden: i >= 29, sizeText: "", dayText: "",
+            };
+            if bytes > this.maxBytes {
+                this.maxBytes = bytes;
+            }
+        }
+        this.n = 32;
+    }
+
+    /// The visible ids in order. Filter + sort run only when something they depend on changed.
+    fn view(this: &State): []int {
+        let key = this.sortKey * 4 + (if this.sortAsc { 1 } else { 0 }) + (if this.page == PAGE_STARRED { 2 } else { 0 })
+            + (if this.showHidden { 100 } else { 0 }) + this.revision * 1000;
+        let same_filter = this.filter.len == this.seenLen;
+        if same_filter {
+            for i in 0..this.seenLen {
+                if this.filter[i] != this.seen[i] {
+                    same_filter = false;
+                }
+            }
+        }
+        if key == this.seenKey && same_filter && this.units == this.seenUnits {
+            return this.order[0..this.shown];
+        }
+        if this.units != this.seenUnits {
+            this.relabel();
+        }
+        this.seenKey = key;
+        this.seenUnits = this.units;
+        this.seenLen = if this.filter.len < NAME_MAX { this.filter.len } else { NAME_MAX };
+        for i in 0..this.seenLen {
+            this.seen[i] = this.filter[i];
+        }
+        this.shown = 0;
+        for i in 0..this.n {
+            let f = this.files[i];
+            let ok = (this.showHidden || !f.hidden) && (this.page != PAGE_STARRED || f.starred) && matches(f.name, this.filter);
+            if ok {
+                // insertion sort by strict "before": equal keys stay in id order (stable)
+                let j = this.shown;
+                while j > 0 && this.before(i, this.order[j - 1]) {
+                    this.order[j] = this.order[j - 1];
+                    j -= 1;
+                }
+                this.order[j] = i;
+                this.shown += 1;
+            }
+        }
+        return this.order[0..this.shown];
+    }
+
+    /// Does file `a` sort strictly before `b` under the current column and direction?
+    fn before(this: &State, a: int, b: int): bool {
+        let x = this.files[a];
+        let y = this.files[b];
+        let c = 0;
+        if this.sortKey == BY_NAME {
+            c = compareNames(x.name, y.name);
+        } else if this.sortKey == BY_SIZE {
+            c = cmp(x.bytes, y.bytes);
+        } else {
+            c = cmp(x.day, y.day);
+        }
+        return if this.sortAsc { c < 0 } else { c > 0 };
+    }
+
+    /// Header click: same column flips the direction, another column starts ascending.
+    fn sortBy(this: &State, k: int) {
+        if this.sortKey == k {
+            this.sortAsc = !this.sortAsc;
+        } else {
+            this.sortKey = k;
+            this.sortAsc = true;
+        }
+    }
+
+    /// 0 not sorted by this column, 1 ascending, 2 descending.
+    fn dir(this: &State, k: int): int {
+        if this.sortKey != k {
+            return 0;
+        }
+        return if this.sortAsc { 1 } else { 2 };
+    }
+
+    fn pick(this: &State, id: int) {
+        this.sel = id;
+    }
+
+    /// The selected file, or file 0 when nothing is selected (callers check `sel >= 0` first).
+    fn cur(this: &State): File {
+        return this.files[if this.sel >= 0 { this.sel } else { 0 }];
+    }
+
+    fn toggleStar(this: &State) {
+        if this.sel >= 0 {
+            this.files[this.sel].starred = !this.files[this.sel].starred;
+            this.revision += 1;
+        }
+    }
+
+    fn openRename(this: &State) {
+        if this.sel >= 0 {
+            this.draft = this.files[this.sel].name;
+            this.renaming = true;
+        }
+    }
+
+    /// Why the draft name cannot be used ("" when it can).
+    fn problem(this: &State): string {
+        if this.draft.len == 0 {
+            return "A name is needed";
+        }
+        if this.draft.len > NAME_MAX {
+            return "At most 40 bytes";
+        }
+        for i in 0..this.n {
+            if i != this.sel && lowerSame(this.files[i].name, this.draft) {
+                return "That name is taken";
+            }
+        }
+        return "";
+    }
+
+    /// Apply the draft if it is valid. Returns whether it was.
+    fn commitRename(this: &State, name: string): bool {
+        this.draft = name;
+        if this.problem().len > 0 {
+            return false;
+        }
+        let t = Text.new(this.mem);
+        t.pushStr(name);
+        this.files[this.sel].name = t.str();
+        this.revision += 1;
+        this.renaming = false;
+        this.toast(`Renamed to {name}`, 1);
+        return true;
+    }
+
+    fn toast(this: &State, msg: string, kind: int) {
+        this.toasts.push(msg, kind, 3000.0, this.now);
+    }
+
+    /// Size and date columns as text. Rebuilt on a units change, never per frame.
+    fn relabel(this: &State) {
+        for i in 0..this.n {
+            let f = &this.files[i];
+            let t = Text.new(this.mem);
+            if f.kind == 0 {
+                t.pushStr("-");
+            } else if this.units == 1 {
+                t.pushInt(f.bytes);
+                t.pushStr(" B");
+            } else {
+                fmtBytes(&t, f.bytes);
+            }
+            f.sizeText = t.str();
+            if f.dayText.len == 0 {
+                f.dayText = dayName(this.mem, f.day);
+            }
+        }
+    }
+}
+
+/// `YYYY-MM-DD` for a day count after 2025-01-01 (years of 365 days: it is fake data).
+fn dayName(mem: &Arena, day: int): string {
+    let md: [12]int = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let y = 2025 + day / 365;
+    let d = day % 365;
+    let m = 0;
+    while d >= md[m] {
+        d -= md[m];
+        m += 1;
+    }
+    let t = Text.new(mem);
+    t.pushInt(y);
+    t.pushStr(if m < 9 { "-0" } else { "-" });
+    t.pushInt(m + 1);
+    t.pushStr(if d < 9 { "-0" } else { "-" });
+    t.pushInt(d + 1);
+    return t.str();
+}
+
+fn cmp(a: int, b: int): int {
+    if a < b {
+        return -1;
+    }
+    return if a > b { 1 } else { 0 };
+}
+
+fn lower(b: u8): u8 {
+    return if b >= 65 && b <= 90 { b + 32 } else { b };
+}
+
+/// Case-insensitive byte order: negative, 0 or positive.
+fn compareNames(a: string, b: string): int {
+    let n = if a.len < b.len { a.len } else { b.len };
+    for i in 0..n {
+        let x = int(lower(a[i]));
+        let y = int(lower(b[i]));
+        if x != y {
+            return x - y;
+        }
+    }
+    return a.len - b.len;
+}
+
+fn lowerSame(a: string, b: string): bool {
+    return a.len == b.len && compareNames(a, b) == 0;
+}
+
+/// Case-insensitive substring test; an empty filter matches everything.
+fn matches(name: string, part: string): bool {
+    if part.len == 0 {
+        return true;
+    }
+    for i in 0..(name.len - part.len + 1) {
+        let ok = true;
+        for j in 0..part.len {
+            if lower(name[i + j]) != lower(part[j]) {
+                ok = false;
+            }
+        }
+        if ok {
+            return true;
+        }
+    }
+    return false;
+}
