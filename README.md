@@ -39,6 +39,18 @@ The same todo app built with each HTML/CSS-style UI stack ([code and method](exa
 
 <sub>Release builds, Linux x86-64, 24-thread Intel Core Ultra 7. Electron compiles nothing; it copies Chromium. Tauri and Wails also need about 120 MB of WebKitGTK installed on the user's machine. Dev environment is the compiler, downloaded dependencies, build cache, and system libraries linked against.</sub>
 
+Heavy UI, 1,200 cards that all change every frame, software-rendered under Xvfb so every stack runs the same way:
+
+| Stack | FPS | CPU per frame | Peak memory |
+|---|---:|---:|---:|
+| **J3 + `.j3ui`** | 61.8 | 58.5 ms | 331 MB |
+| Electron | 93.9 | 22.3 ms | 453 MB |
+| Tauri (Rust) | 35.8 | 28.6 ms | 175 MB |
+| Wails (Go) | 35.6 | 29.0 ms | 182 MB |
+| Dioxus native (Rust) | needs a GPU | | |
+
+<sub>J3 paints on the GPU, so software GL costs it the most CPU. On a real GPU the same scene runs at 104 fps on 9.6 ms of CPU in 146 MB. [Method and caveats](examples/ui_app_compare#heavy-ui-fps-and-memory).</sub>
+
 ## Why J3
 
 - **Fast to run, fast to build.** Compiles to native code through clang. Release builds are small (a large game ships in about 1.3 MB).

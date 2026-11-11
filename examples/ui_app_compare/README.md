@@ -22,7 +22,7 @@ Electron, Tauri and Wails share one frontend, [`web/`](web) (plain HTML, CSS and
 | Wails | 8.7 s | **0.6 s** | 8.6 MB | 3.6 MB |
 | Dioxus native | 102.4 s | 65.7 s | 16.3 MB | 6.8 MB |
 
-Linux x86-64, Intel Core Ultra 7 270K Plus (24 threads), release builds. Run `./bench.sh` to measure on your machine (`./bench.sh j3 wails` for some).
+Linux x86-64, Intel Core Ultra 7 270K Plus (24 threads), release builds. Run `./bench.sh` to measure on your machine (`./bench.sh j3 wails` for some), then `./stress.py` (needs `xvfb`) and `./envsize.sh`.
 
 How to read it:
 
@@ -32,6 +32,29 @@ How to read it:
 - Electron's "build" is really packaging: it copies the prebuilt Chromium runtime next to your JS, and nothing gets compiled.
 - Not counted: the system libraries each app needs at runtime. J3 needs SDL2, SDL2_ttf and libGL. Tauri and Wails need WebKitGTK, about 120 MB of `libwebkit2gtk` and `libjavascriptcoregtk` on the machine. Dioxus native needs only libc, OpenSSL and a GPU driver.
 - Every Rust build uses the same release profile (`opt-level = "s"`, LTO, strip, `panic = "abort"`). J3 uses `j3c build --release`, and Wails uses `-ldflags "-s -w"`.
+
+## Heavy UI: FPS and memory
+
+`STRESS=1` switches every app to the same stress scene: 1,200 cards, all on screen, each changing its number, its bar width
+and (staggered, 1 in 8 per frame) its class every frame, so every stack restyles, lays out and paints the whole scene each frame.
+`./stress.py` runs each one in its own Xvfb (1280x800), lets it warm up for 2 s, then counts frames for 8 s (median of 3 runs).
+
+| App | FPS | CPU per frame | Peak memory |
+|---|---:|---:|---:|
+| **J3** | 61.8 | 58.5 ms | 331 MB |
+| Electron | **93.9** | **22.3 ms** | 453 MB |
+| Tauri | 35.8 | 28.6 ms | **175 MB** |
+| Wails | 35.6 | 29.0 ms | 182 MB |
+| Dioxus native | n/a | n/a | n/a |
+
+- **Everything here is software rendering.** Xvfb has no GPU, so GL and Vulkan run on the CPU (Mesa's llvmpipe and lavapipe). That's even for every stack, but it's not how anyone runs these apps.
+- **CPU per frame** is user plus system time of every process the app started (Chromium's GPU and renderer processes, WebKit's web process), divided by frames. Multi-threaded rasterizing can push it above the frame time.
+- **Peak memory** is the summed PSS of those processes, so shared libraries are split between them, not counted once per process. The Xvfb server isn't counted.
+- **J3** is a GPU painter: under llvmpipe its own thread takes about 15 ms a frame and llvmpipe's threads take the rest of the CPU. On a real GPU (RTX 5060 Ti, offscreen SDL, no Xvfb) the same scene runs at **104 fps with 9.6 ms of CPU per frame and 146 MB RSS**. None of the other stacks could be measured without a window, so that number has nothing to line up against yet.
+- **Electron** runs with `--disable-frame-rate-limit --disable-gpu-vsync`. Chromium's Skia rasterizes in software well, and it shows.
+- **Tauri and Wails** are WebKitGTK and land in the same place, about 28 ms of CPU per frame. That is their limit here, not a vsync cap.
+- **Dioxus native** can't run here. Vello rasterizes in GPU compute shaders, and on Xvfb's software Vulkan (no DRI3, so it can't present) and its GL fallback (`WGPU_BACKEND=gl`) it didn't finish one frame in 20 s. It needs a real GPU.
+- **J3 found a bug.** This scene first leaked about 4.6 MB a frame in J3 (8.5 GB in 10 s): the style cache was cleared when full and computed styles were never freed, so every clear rebuilt all styles into new memory. Fixed in `j3c/stdlib/j3/ui/cssmatch/cascade.j3`, with a regression check in `css_test.j3`.
 
 ## Dev environment size
 

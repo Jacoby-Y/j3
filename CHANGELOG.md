@@ -6,6 +6,13 @@ All notable changes to J3 (`j3c`, its stdlib, editor, and tools). Format: [Keep 
 break anything: the language, the stdlib, file formats (`.j3scene`, `.j3ui`, `j3.toml`), and
 command-line flags. Each release lists its breaking changes under **Breaking**.
 
+## [Unreleased]
+
+### Fixed
+- `.j3ui`: a UI with more than about 2000 distinct computed styles (easy with `class="a b{x}"`
+  holes on many elements) no longer grows memory every frame. The style cache grows instead of
+  being cleared when full.
+
 ## [0.1.0] - 2026-11-10
 
 First public release.
