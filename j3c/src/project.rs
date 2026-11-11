@@ -6,6 +6,7 @@ mod deps;
 mod steam;
 mod toml;
 pub use deps::Dep;
+pub(crate) use deps::{unlock, NO_FETCH};
 pub use steam::Steam;
 pub(crate) use steam::{parse_glibc, resolve_path};
 pub(crate) use toml::{toml_doc, toml_list, toml_str};
@@ -31,6 +32,8 @@ pub struct Manifest {
     pub ui: Option<Ui>,
     /// `[dependencies]`, transitive and flat (`j3c help manifest`).
     pub deps: Vec<Dep>,
+    /// `[lib]`: a package for other projects. No `main`; `entry` is `src/<name>.j3` (`use <name>;`).
+    pub lib: bool,
 }
 
 /// `[ui]`: `dir` holds `*.j3ui`; `theme` is one global CSS file.
@@ -374,12 +377,17 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
     if name.is_empty() {
         return Err("j3.toml: package.name is empty".to_string());
     }
+    let lib = tbl.has_section("lib");
+    let lib_entry = format!("src/{name}.j3");
     let entry_rel = tbl
         .get("package", "entry")
         .and_then(TomlVal::as_str)
-        .unwrap_or("src/main.j3");
+        .unwrap_or(if lib { &lib_entry } else { "src/main.j3" });
     let entry = root.join(entry_rel);
     if !entry.is_file() {
+        if lib {
+            return Err(format!("j3.toml: [lib] needs {} (`module {name};`, what `use {name};` loads)", entry.display()));
+        }
         return Err(format!("j3.toml: entry {} not found", entry.display()));
     }
     let mut cc = Cc::default();
@@ -568,6 +576,7 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
         steam,
         ui,
         deps,
+        lib,
     })
 }
 

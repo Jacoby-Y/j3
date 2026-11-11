@@ -61,6 +61,7 @@ usage: j3c doc [topic | module [item]] [--short]
     j3c doc term               terminals: emulator and TUI modules, restore hook, limits
     j3c doc i18n               translated text: locale files, t/tf, plurals, numbers, RTL, j3c check
     j3c doc ship               release builds, zips, and .deb installers with a menu entry and icon
+    j3c doc packages           packages: make one (--lib), use one (path or git deps), j3.lock, fetch/update/add
     j3c doc android            Android: APK builds, [android] keys, touch, running on a device
     j3c doc steam              Steam: setup, achievements, cloud, Deck, depot upload, binding check
     j3c doc shaders            shaders written in J3: #[shader] fns, @shader(vs, fs), j3c dump-glsl
@@ -158,7 +159,8 @@ const GUIDES: &[&[&str]] = &[
     &["threads", "thread"],
     &["term", "terminal", "tui"],
     &["i18n", "locale", "locales", "translation", "l10n"],
-    &["ship", "dist", "deb", "package", "packaging", "release"],
+    &["ship", "dist", "deb", "packaging", "release"],
+    &["packages", "package", "deps", "dependencies", "lib", "lock", "git"],
     &["android", "apk"],
     &["steam", "steamworks"],
     &["j2", "mods", "modding"],
@@ -179,6 +181,7 @@ fn guide(name: &str) -> Option<String> {
         "term" => TERM_PAGE.to_string(),
         "i18n" => I18N_PAGE.to_string(),
         "ship" => SHIP_PAGE.to_string(),
+        "packages" => PACKAGES_PAGE.to_string(),
         "shaders" => SHADERS_PAGE.to_string(),
         "steam" => STEAM_PAGE.to_string(),
         "j2" => J2_PAGE.to_string(),

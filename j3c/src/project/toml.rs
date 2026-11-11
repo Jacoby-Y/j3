@@ -33,6 +33,10 @@ pub(super) struct TomlTable {
 }
 
 impl TomlTable {
+    pub(super) fn has_section(&self, section: &str) -> bool {
+        self.heads.iter().any(|(n, _)| n == section)
+    }
+
     pub(super) fn get(&self, section: &str, key: &str) -> Option<&TomlVal> {
         self.vals
             .iter()

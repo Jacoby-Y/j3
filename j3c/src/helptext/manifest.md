@@ -5,6 +5,13 @@ j3.toml
     entry    file that contains main. Default src/main.j3
     version  package version (the .deb version). Default 0.1.0
     description  one line for the .deb and the menu entry
+    j3       oldest j3c a package builds with, `">=0.1"`; checked when another
+             project depends on it (`j3c doc packages`)
+
+[lib]
+             (no keys) this project is a package for others: no main, entry is
+             src/<name>.j3 (what `use <name>;` loads); `run`/`build` refuse it.
+             `j3c new NAME --lib` makes one
 
 [emit]
     backend  llvm (default) or c
@@ -92,7 +99,13 @@ j3.toml
              missing path, a cycle, a name that is `j3`, this package, or a module of
              src/, one name with two paths. A dep's assets are not found for you.
              Example: android/j3.toml with `jzero = { path = ".." }`, then
-             `use jzero.remote.proto;`
+             `use jzero.remote.proto;`. `use name;` alone loads <root>/name.j3
+    name = { git = "URL", tag = "v1" }   (or rev = "...", branch = "...", or
+             neither for the default branch): cloned with the system git into
+             ~/.cache/j3/pkgs (J3_PKG_DIR), then the same as a path dep. j3.lock
+             beside j3.toml pins every git dep to a commit; commit it. A local
+             path URL is relative to this j3.toml. `j3c fetch`, `j3c update [name]`,
+             `j3c add NAME --path DIR | --git URL [--tag T]`. `j3c doc packages`
 
 [ui]
     dir      folder of .j3ui components. Default ui. All of them become

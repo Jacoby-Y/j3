@@ -1,4 +1,7 @@
 #!/bin/sh
+
+# A special build script for me, the developer
+
 # Release-build j3c and install it onto PATH, then the composer tool.
 # Install dir: $J3_BIN_DIR, else ~/.bin if it exists, else ~/.local/bin.
 set -eu

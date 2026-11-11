@@ -159,6 +159,98 @@ fn main() {{
     )
 }
 
+pub(super) fn lib_toml(name: &str) -> String {
+    format!(
+        r#"# A J3 package. `j3c check` checks it; `j3c run examples/demo` runs the demo that uses it.
+# Others add it with [dependencies] {name} = "../{name}" or {{ git = "URL", tag = "v0.1.0" }}.
+
+[package]
+name = "{name}"
+version = "0.1.0"
+# The oldest j3c this package builds with.
+j3 = ">={ver}"
+
+# A package: `use {name};` loads src/{name}.j3, `use {name}.x;` loads src/x.j3 (`j3c doc packages`).
+[lib]
+"#,
+        ver = env!("CARGO_PKG_VERSION")
+    )
+}
+
+pub(super) fn lib_main(name: &str) -> String {
+    format!(
+        r#"//! {name}: what `use {name};` gives a project. More modules go beside this file as
+//! `src/x.j3` saying `module {name}.x;` (imported as `use {name}.x;`).
+module {name};
+
+use j3.io.printLn;
+
+/// Prints a greeting.
+pub fn hello(who: string) {{
+    printLn(`hello, {{who}}, from {name}`);
+}}
+"#
+    )
+}
+
+pub(super) fn lib_demo_toml(name: &str) -> String {
+    format!(
+        r#"# Uses the package two folders up, as another project would.
+[package]
+name = "demo"
+
+[dependencies]
+{name} = "../.."
+"#
+    )
+}
+
+pub(super) fn lib_demo_main(name: &str) -> String {
+    format!(
+        r#"module demo;
+
+use {name};
+
+fn main() {{
+    {name}.hello("demo");
+}}
+"#
+    )
+}
+
+pub(super) fn lib_readme(name: &str) -> String {
+    format!(
+        r#"# {name}
+
+A J3 package.
+
+## Use it
+
+In your project's `j3.toml`:
+
+```toml
+[dependencies]
+{name} = "../{name}"                                          # a folder on disk
+# {name} = {{ git = "https://example.com/you/{name}", tag = "v0.1.0" }}   # or a git repo
+```
+
+or `j3c add {name} --path ../{name}` / `j3c add {name} --git URL --tag v0.1.0`. Then:
+
+```
+use {name};
+
+fn main() {{
+    {name}.hello("world");
+}}
+```
+
+## Work on it
+
+`j3c check` checks the package, `j3c run examples/demo` runs the demo. Release: commit, `git tag v0.1.0`, push the tag.
+"#
+    )
+}
+
 pub(crate) fn app_toml(name: &str) -> String {
     format!(
         r#"# SDL window. Needs SDL2.

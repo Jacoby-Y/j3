@@ -18,6 +18,7 @@ pub fn docs_id() -> String {
         include_str!("../doc/pages/threads.md"),
         include_str!("../doc/pages/i18n.md"),
         include_str!("../doc/pages/ship.md"),
+        include_str!("../doc/pages/packages.md"),
         include_str!("../doc/pages/android.md"),
         include_str!("../doc/pages/tasks.md"),
         include_str!("../doc/pages/j2.md"),

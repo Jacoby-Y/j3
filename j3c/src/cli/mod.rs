@@ -13,6 +13,7 @@ mod build;
 mod check;
 mod dump;
 mod glsl;
+mod pkg;
 mod runner;
 
 pub(crate) use build::*;
@@ -99,6 +100,9 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
         "editor" => crate::editor::cmd(rest),
         "-e" | "--editor" => editor_tool(rest),
         "check" => check_cmd(rest),
+        "fetch" => pkg::fetch_cmd(rest),
+        "update" => pkg::update_cmd(rest),
+        "add" => pkg::add_cmd(rest),
         "i18n" => crate::i18n::cmd(rest),
         "doc" => crate::doc::cmd(rest),
         "guide" => {
@@ -335,6 +339,10 @@ fn print_help() {
     println!("    new [name] --app SDL window (links SDL2)");
     println!("    new [name] --template fps  first-person 3D game with a scene (SDL2 + GL)");
     println!("    new [name] --template ui   .j3ui components window (SDL2 + ttf + GL; `doc j3ui`)");
+    println!("    new [name] --lib a package other projects import (`doc packages`)");
+    println!("    add NAME --path DIR | --git URL [--tag T]  add a dependency to j3.toml and fetch it");
+    println!("    fetch            download git dependencies, write j3.lock");
+    println!("    update [name]    move git dependencies to their newest commit, rewrite j3.lock");
     println!("    editor [--new] [project]  open the 3D scene editor");
     println!("    -e scene <op> ... list/get/add/set/delete/check scene objects by name (`-e scene --help`)");
     println!("    -e render [opts] draw a scene to a PNG without a window (`-e render --help`)");

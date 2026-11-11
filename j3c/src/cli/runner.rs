@@ -52,6 +52,9 @@ pub(super) fn peel_run(rest: &[String]) -> (bool, Option<&str>, Vec<String>) {
 /// A project with scripts runs in dev mode (`devrun`); everything else runs as before.
 /// A `.j3s` path is a one-shot tool, not the dev watcher.
 pub(super) fn run_user(path: Option<&str>, args: &[String]) -> i32 {
+    if let Some(rc) = super::pkg::refuse_lib(path, "run") {
+        return rc;
+    }
     status("checking");
     if !HOT.load(std::sync::atomic::Ordering::Relaxed) {
         if let Some((_, opts)) = unchanged_project(path, "run") {

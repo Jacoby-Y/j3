@@ -60,7 +60,11 @@ impl Loader {
     }
 
     pub(super) fn dep_module(&self, parts: &[String]) -> Option<PathBuf> {
-        let dep = self.deps.iter().find(|d| parts.len() > 1 && parts[0] == d.name)?;
+        let dep = self.deps.iter().find(|d| parts.first() == Some(&d.name))?;
+        if parts.len() == 1 {
+            // `use hello;` is the package's root module, `src/hello.j3`
+            return Some(dep.root.join(format!("{}.j3", dep.name))).filter(|p| p.is_file());
+        }
         Some(join_mod(&dep.root, &parts[1..])).filter(|p| p.is_file())
     }
 

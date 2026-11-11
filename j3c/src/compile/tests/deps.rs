@@ -125,3 +125,72 @@ fn package_dep_in_parent_dir_loads_from_its_src() {
     assert!(m.deps[0].root.ends_with("a/src"), "{:?}", m.deps);
     compile_manifest(&m).unwrap_or_else(|e| panic!("{e}"));
 }
+
+#[test]
+fn use_dep_alone_loads_its_root_module_and_lib_needs_no_main() {
+    let root = tree("libroot", &[
+        ("app/j3.toml", &app("hello = \"../hello\"")),
+        ("app/src/main.j3", "module app;\nuse hello;\nfn main() { let x = hello.answer(); }\n"),
+        ("hello/j3.toml", "[package]\nname = \"hello\"\nj3 = \">=0.0\"\n\n[lib]\n"),
+        ("hello/src/hello.j3", "module hello;\npub fn answer(): int { return 42; }\n"),
+    ]);
+    load_check(&root).unwrap_or_else(|e| panic!("{e}"));
+    let lib = Manifest::load(&root.join("hello/j3.toml")).unwrap_or_else(|e| panic!("{e}"));
+    assert!(lib.lib && lib.entry.ends_with("src/hello.j3"));
+    compile_manifest(&lib).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn dep_needing_a_newer_j3c_is_an_error() {
+    let root = tree("j3bound", &[
+        ("app/j3.toml", &app("hello = \"../hello\"")),
+        ("app/src/main.j3", MAIN),
+        ("hello/j3.toml", "[package]\nname = \"hello\"\nj3 = \">=999.0\"\n"),
+    ]);
+    let e = Manifest::load(&root.join("app/j3.toml")).unwrap_err();
+    assert!(e.contains("needs j3c >=999.0"), "{e}");
+}
+
+/// Git deps against a local repo: clone at a tag, lock, build offline from the lock, bad ref.
+#[test]
+fn git_dep_clones_locks_and_reuses_the_lock() {
+    let Ok(out) = std::process::Command::new("git").arg("--version").output() else { return };
+    if !out.status.success() {
+        return;
+    }
+    let root = tree("git", &[
+        ("app/src/main.j3", "module app;\nuse leaf.base;\nfn main() { let x = base.answer(); }\n"),
+        ("leaf/j3.toml", "[package]\nname = \"leaf\"\n"),
+        ("leaf/src/base.j3", LEAF),
+    ]);
+    let pkgs = root.join("pkgs");
+    std::env::set_var("J3_PKG_DIR", &pkgs); // the only test that reads J3_PKG_DIR
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git").current_dir(root.join("leaf")).args(["-c", "user.email=t@t", "-c", "user.name=t"]).args(args).output().unwrap();
+        assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "one"]);
+    git(&["tag", "v1"]);
+    let toml = root.join("app/j3.toml");
+    std::fs::write(&toml, app("leaf = { git = \"../leaf\", tag = \"v1\" }")).unwrap();
+    let m = Manifest::load(&toml).unwrap_or_else(|e| panic!("{e}"));
+    assert!(m.deps[0].root.starts_with(&pkgs) && m.deps[0].root.ends_with("src"), "{:?}", m.deps);
+    let lock = std::fs::read_to_string(root.join("app/j3.lock")).unwrap();
+    assert!(lock.contains("[leaf]") && lock.contains("ref = \"tag:v1\""), "{lock}");
+    compile_manifest(&m).unwrap_or_else(|e| panic!("{e}"));
+    // the lock and the cache are enough: no git runs once the source repo is gone
+    std::fs::rename(root.join("leaf"), root.join("leaf-gone")).unwrap();
+    std::fs::create_dir(root.join("leaf")).unwrap();
+    let again = Manifest::load(&toml).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(again.deps, m.deps);
+    std::fs::remove_dir(root.join("leaf")).unwrap();
+    std::fs::rename(root.join("leaf-gone"), root.join("leaf")).unwrap();
+    std::fs::write(&toml, app("leaf = { git = \"../leaf\", tag = \"v9\" }")).unwrap();
+    let e = Manifest::load(&toml).unwrap_err();
+    assert!(e.contains("has no tag `v9`"), "{e}");
+    std::fs::write(&toml, app("leaf = { git = \"../leaf\", tag = \"v1\", rev = \"abc\" }")).unwrap();
+    let e = Manifest::load(&toml).unwrap_err();
+    assert!(e.contains("one of tag, rev, branch"), "{e}");
+}

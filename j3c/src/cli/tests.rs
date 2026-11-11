@@ -212,3 +212,12 @@ fn manifest_help_lists_package_name() {
     assert!(crate::helptext::MANIFEST.contains("J3_STDLIB"));
     assert!(crate::helptext::GUIDE.contains("j3c new"));
 }
+
+#[test]
+fn add_dep_line_places_and_replaces() {
+    use super::pkg::add_dep_line;
+    let t = "[package]\nname = \"a\"\n\n[dependencies]\nx = \"../x\"\n\n[emit]\nopt = 1\n";
+    assert_eq!(add_dep_line(t, "y", "y = { path = \"../y\" }"), "[package]\nname = \"a\"\n\n[dependencies]\nx = \"../x\"\ny = { path = \"../y\" }\n\n[emit]\nopt = 1\n");
+    assert_eq!(add_dep_line(t, "x", "x = { git = \"u\" }"), t.replace("x = \"../x\"", "x = { git = \"u\" }"));
+    assert_eq!(add_dep_line("[package]\nname = \"a\"\n", "y", "y = \"../y\""), "[package]\nname = \"a\"\n\n[dependencies]\ny = \"../y\"\n");
+}

@@ -147,6 +147,9 @@ mod tests {
 }
 
 pub(super) fn build_cwd() -> i32 {
+    if let Some(rc) = super::pkg::refuse_lib(None, "build") {
+        return rc;
+    }
     status("checking");
     if let Some((m, opts)) = unchanged_project(None, "build") {
         return built_unchanged(m, &opts);
@@ -155,6 +158,9 @@ pub(super) fn build_cwd() -> i32 {
 }
 
 pub(super) fn build_path(path: &str) -> i32 {
+    if let Some(rc) = super::pkg::refuse_lib(Some(path), "build") {
+        return rc;
+    }
     status("checking");
     if let Some((m, opts)) = unchanged_project(Some(path), "build") {
         return built_unchanged(m, &opts);

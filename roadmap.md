@@ -17,7 +17,7 @@ Non-goals: no GC, borrow checker, trait objects (`dyn`), drop, escaping closures
 ## Left
 
 - **Scale:** one translation unit per `cc`, and mono re-walks the AST. Measure check vs emit vs clang before touching it.
-- **Package deps.** Path deps (`[deps]`) shipped; still open: versions or a registry, a dep's assets, hot reload watching dep files.
+- **Package deps.** Path and git deps, `j3.lock`, `[lib]` packages, `j3c new --lib` / `add` / `fetch` / `update` shipped (`j3c doc packages`); still open: version ranges over tags, a registry (index repo) and `publish`, a dep's assets and `[link]` libs, hot reload watching dep files, compile caching per dep commit.
 - **Ship a Windows binary:** mingw `clang` and SDL import libs. A missing lib stays a link error.
 - **Pack / install:** rpath and asset roots matter once there is a build to hand someone.
 - **Network follow-ups:** macOS and Windows for `j3.net.tcp`/`dns`/`tls` and `j3.proc` (stubs today), keep-alive and pooling, gzip, a non-blocking poll-style HTTP request for the frame thread, an HTTP server, WebSockets, `SSL_CTX` shared across requests, IP-literal certificate checks.

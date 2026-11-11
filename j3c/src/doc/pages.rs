@@ -13,6 +13,8 @@ pub(super) const TERM_PAGE: &str = include_str!("pages/term.md");
 pub(super) const I18N_PAGE: &str = include_str!("pages/i18n.md");
 /// `j3c doc ship`: release builds and `[dist] build_outputs` (`src/dist.rs`, `src/dist/deb.rs`).
 pub(super) const SHIP_PAGE: &str = include_str!("pages/ship.md");
+/// `j3c doc packages`: `[lib]`, path and git deps, `j3.lock`, fetch/update/add (`src/project/deps.rs`, `src/cli/pkg.rs`).
+pub(super) const PACKAGES_PAGE: &str = include_str!("pages/packages.md");
 /// `j3c doc shaders`: shader fns, `#[vertex]`/`#[varying]`/`#[uniform]`, `@shader`, `j3c dump-glsl` (`src/check/gpu/`).
 pub(super) const SHADERS_PAGE: &str = include_str!("pages/shaders.md");
 /// `j3c doc android`: APK builds, `[android]` keys, running on a device, and the limits (`src/dist/apk.rs`,

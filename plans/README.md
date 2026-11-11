@@ -7,6 +7,7 @@ say "plan 023" and the like point at those old, deleted plans.
 |------|------|--------|
 | [01](01-steam.md) | Steam: what to verify with the real SDK, client, Windows, Deck and sniper | TODO (needs the developer) |
 | [02](02-public-release.md) | Public release checklist: clone-ability, license, hygiene, README, installers, CI | IN PROGRESS |
+| [03](03-ui-cpu.md) | `.j3ui` CPU per frame: layout boundaries, retained paint, cheaper restyles (stress scene) | TODO |
 | [version1](version1.md) | Public release readiness audit (2026-10-29): what blocks a 1.0 | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason). A new plan takes the next

@@ -46,6 +46,8 @@ and (staggered, 1 in 8 per frame) its class every frame, so every stack restyles
 | Tauri | 35.8 | 28.6 ms | **175 MB** |
 | Wails | 35.6 | 29.0 ms | 182 MB |
 | Dioxus native | n/a | n/a | n/a |
+| **J3 on a real GPU** | **104** | **9.6 ms** | **146 MB** |
+| Others on a real GPU | not measured | | |
 
 - **Everything here is software rendering.** Xvfb has no GPU, so GL and Vulkan run on the CPU (Mesa's llvmpipe and lavapipe). That's even for every stack, but it's not how anyone runs these apps.
 - **CPU per frame** is user plus system time of every process the app started (Chromium's GPU and renderer processes, WebKit's web process), divided by frames. Multi-threaded rasterizing can push it above the frame time.

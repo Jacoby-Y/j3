@@ -10,6 +10,7 @@ use templates::*;
 
 pub fn cmd(rest: &[String]) -> i32 {
     let mut app = false;
+    let mut lib = false;
     let mut template: Option<&str> = None;
     let mut name: Option<&str> = None;
     let mut args = rest.iter();
@@ -26,14 +27,18 @@ pub fn cmd(rest: &[String]) -> i32 {
             }
         } else if a == "--app" {
             app = true;
+        } else if a == "--lib" {
+            lib = true;
         } else if a == "--help" || a == "-h" {
-            println!("usage: j3c new [name] [--app | --template fps|ui]");
+            println!("usage: j3c new [name] [--app | --lib | --template fps|ui]");
             println!("    j3c new mygame        printLn hello in ./mygame");
             println!("    j3c new mygame --app  SDL window (links SDL2)");
             println!("    j3c new mygame --template fps   first-person 3D game with a scene (SDL2 + GL)");
             println!("    j3c new mygame --template ui    .j3ui components window (SDL2 + ttf + GL; `j3c doc j3ui`)");
             println!("    j3c new               write into the current directory");
             println!("    j3c new --app         window template in the current directory");
+            println!("    j3c new hello --lib   a package other projects import (`use hello;`; `j3c doc packages`)");
+            println!("    j3c new --lib         make the project here a package (adds [lib]; moves nothing)");
             return 0;
         } else if a.starts_with('-') {
             eprintln!("j3c: unknown flag `{a}`");
@@ -45,6 +50,27 @@ pub fn cmd(rest: &[String]) -> i32 {
             eprintln!("j3c: unexpected argument `{a}`");
             return 1;
         }
+    }
+    if lib {
+        if app || template.is_some() {
+            eprintln!("j3c: `--lib` goes alone (a package has no window or main)");
+            return 1;
+        }
+        return match create_lib(name) {
+            Ok((root, module, made)) => {
+                println!("{}", root.display());
+                for f in made {
+                    println!("  {f}");
+                }
+                println!("next: j3c check; j3c run examples/demo");
+                println!("use it: [dependencies] {module} = \"path/to/{module}\" (or {{ git = \"URL\", tag = \"v0.1.0\" }}), then `use {module};`");
+                0
+            }
+            Err(e) => {
+                eprintln!("j3c: {e}");
+                1
+            }
+        };
     }
     if template.is_some() {
         if app {
@@ -180,6 +206,54 @@ pub(crate) fn add_scenes_section(root: &Path) {
     let Ok(text) = std::fs::read_to_string(&path) else { return };
     if text.contains(SCENES_MARKER) { return; }
     let _ = std::fs::write(&path, format!("{}\n\n{SCENES}", text.trim_end()));
+}
+
+/// `j3c new [name] --lib`: a package (`[lib]`, `src/<name>.j3`, `examples/demo`). In a project that
+/// already has a `j3.toml`, only adds `[lib]` and the files that are missing; nothing is moved.
+pub fn create_lib(name: Option<&str>) -> Result<(PathBuf, String, Vec<String>), String> {
+    let (root, package) = locate(name)?;
+    let toml_path = root.join("j3.toml");
+    let mut made = Vec::new();
+    let module = if toml_path.is_file() {
+        let text = std::fs::read_to_string(&toml_path).map_err(|e| format!("read j3.toml: {e}"))?;
+        let m = crate::project::toml_str(&text, "package", "name").ok_or("j3.toml has no [package] name")?;
+        if m != module_name(&m) {
+            return Err(format!("package name `{m}` is not a module name (letters, digits, `_`); rename it in j3.toml first"));
+        }
+        if !text.lines().any(|l| l.trim() == "[lib]") {
+            let sep = if text.ends_with('\n') { "" } else { "\n" };
+            std::fs::write(&toml_path, format!("{text}{sep}\n# A package: `use {m};` loads src/{m}.j3 (`j3c doc packages`).\n[lib]\n")).map_err(|e| format!("write j3.toml: {e}"))?;
+            made.push("j3.toml (+ [lib])".to_string());
+        }
+        m
+    } else {
+        let m = module_name(&package);
+        std::fs::create_dir_all(&root).map_err(|e| format!("mkdir: {e}"))?;
+        std::fs::write(&toml_path, lib_toml(&m)).map_err(|e| format!("write j3.toml: {e}"))?;
+        made.push("j3.toml".to_string());
+        m
+    };
+    let files = [
+        (format!("src/{module}.j3"), lib_main(&module)),
+        ("examples/demo/j3.toml".to_string(), lib_demo_toml(&module)),
+        ("examples/demo/src/main.j3".to_string(), lib_demo_main(&module)),
+        ("README.md".to_string(), lib_readme(&module)),
+    ];
+    for (rel, text) in files {
+        let p = root.join(&rel);
+        if p.exists() {
+            continue;
+        }
+        let text = if rel.ends_with(".j3") { fmt::format_src(&text).map_err(|e| format!("fmt template: {e}"))? } else { text };
+        std::fs::create_dir_all(p.parent().unwrap_or(&root)).map_err(|e| format!("mkdir: {e}"))?;
+        std::fs::write(&p, text).map_err(|e| format!("write {rel}: {e}"))?;
+        made.push(rel);
+    }
+    if !root.join("AGENTS.md").exists() {
+        write_agent_files(&root, false)?;
+        made.push("AGENTS.md".to_string());
+    }
+    Ok((root, module, made))
 }
 
 fn locate(name: Option<&str>) -> Result<(PathBuf, String), String> {

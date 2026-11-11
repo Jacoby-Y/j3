@@ -148,3 +148,19 @@ fn directory_name_becomes_a_module() {
     assert_eq!(code, 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn lib_project_checks_and_its_demo_uses_it() {
+    let dir = scratch();
+    let root = dir.join("hello");
+    let (root, module, _) = create_lib(Some(root.to_str().unwrap())).expect("create");
+    assert_eq!(module, "hello");
+    let lib = crate::project::Manifest::load(&root.join("j3.toml")).expect("lib manifest");
+    assert!(lib.lib);
+    crate::compile::compile_manifest(&lib).unwrap_or_else(|e| panic!("{e}"));
+    let demo = crate::project::Manifest::load(&root.join("examples/demo/j3.toml")).expect("demo manifest");
+    crate::compile::compile_manifest(&demo).unwrap_or_else(|e| panic!("{e}"));
+    // again on the same folder: adds nothing, keeps the files
+    let (_, _, made) = create_lib(Some(root.to_str().unwrap())).expect("again");
+    assert!(made.is_empty(), "{made:?}");
+}

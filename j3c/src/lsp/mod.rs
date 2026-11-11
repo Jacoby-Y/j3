@@ -51,6 +51,7 @@ impl ProgramCache {
 }
 
 pub fn serve() -> i32 {
+    crate::project::NO_FETCH.store(true, std::sync::atomic::Ordering::Relaxed);
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
     let stdout = io::stdout();

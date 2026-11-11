@@ -79,7 +79,7 @@ pub fn compile_manifest_target(manifest: &Manifest, target: &str) -> Result<Prog
     load_and_check(
         &manifest.entry,
         GameBackend::Sdl,
-        true,
+        !manifest.lib,
         Some(manifest),
         target,
     )
