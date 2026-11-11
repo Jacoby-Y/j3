@@ -6,7 +6,7 @@ All notable changes to J3 (`j3c`, its stdlib, editor, and tools). Format: [Keep 
 break anything: the language, the stdlib, file formats (`.j3scene`, `.j3ui`, `j3.toml`), and
 command-line flags. Each release lists its breaking changes under **Breaking**.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-11-10
 
 First public release.
 
