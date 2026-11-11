@@ -27,7 +27,7 @@
 
 ## Why J3
 
-- **Fast to run, fast to build.** Compiles to native code through clang. Release builds are small (a large game ships in about 1.3 MB).
+- **Fast to run, fast to build.** Compiles to native code through clang. Release builds are small (a large game ships in about 1.3 MB). A todo app builds from clean in 1.7 s and ships in 1.8 MB, next to 51 s and 3.4 MB for Tauri or 274 MB for Electron ([comparison](examples/ui_app_compare)).
 - **One binary, no dependencies.** `j3c` is a single Rust crate with no crates. The compiler, standard library, docs, formatter, LSP, and editor all ship inside it.
 - **UI with HTML/CSS syntax.** `.j3ui` components use Svelte-like markup and a large subset of CSS, compiled to native code. No browser, no webview.
 - **A batteries-included game stdlib.** Windows, input, audio, 2D painting, 3D scenes, physics, ECS, pathfinding, shaders written in J3, threads, saves, JSON, HTTP/TLS.
@@ -135,6 +135,7 @@ In [`examples/`](examples). Run one with `j3c run examples/<name>`.
 | [`terminal`](examples/terminal) | A terminal emulator on a pty |
 | [`j2_script`](examples/j2_script) | A shooter whose content is moddable runtime scripts |
 | [`openrouter-chat`](examples/openrouter-chat) | HTTPS + JSON + streaming in a console app |
+| [`ui_app_compare`](examples/ui_app_compare) | One todo app in J3, Electron, Tauri, Wails, and Dioxus: build time and size |
 
 ## Contributing
 

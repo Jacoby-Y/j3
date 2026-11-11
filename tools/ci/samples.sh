@@ -27,7 +27,7 @@ step() { # label, command...
 for f in speculative/0[1-7]_*.j3 speculative/lang/*.j3; do
   step "run $f" "$j3c" run --headless --frames 5 "$f"
 done
-for d in examples/*/; do
+for d in examples/*/ examples/ui_app_compare/j3/; do
   [ -f "$d/j3.toml" ] || continue
   step "check ${d%/}" "$j3c" check "$d"
 done
