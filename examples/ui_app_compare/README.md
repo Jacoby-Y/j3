@@ -33,6 +33,23 @@ How to read it:
 - Not counted: the system libraries each app needs at runtime. J3 needs SDL2, SDL2_ttf and libGL. Tauri and Wails need WebKitGTK, about 120 MB of `libwebkit2gtk` and `libjavascriptcoregtk` on the machine. Dioxus native needs only libc, OpenSSL and a GPU driver.
 - Every Rust build uses the same release profile (`opt-level = "s"`, LTO, strip, `panic = "abort"`). J3 uses `j3c build --release`, and Wails uses `-ldflags "-s -w"`.
 
+## Dev environment size
+
+What a developer needs on disk to build each app: the compiler toolchain, downloaded dependencies, the build cache left by a release build, and the system libraries the build links against. `./envsize.sh` measures it (run `./bench.sh` first).
+
+| Stack | Toolchain | Downloaded deps | Build cache | System libs | Total |
+|---|---:|---:|---:|---:|---:|
+| **J3 + `.j3ui`** | 238 MB | 0 MB | 8 MB | 4 MB | **251 MB** |
+| Electron | 198 MB | 146 MB | 0 MB | 0 MB | 344 MB |
+| Tauri (Rust) | 561 MB | 567 MB | 990 MB | 143 MB | 2262 MB |
+| Wails (Go) | 233 MB | 110 MB | 124 MB | 143 MB | 610 MB |
+| Dioxus native (Rust) | 561 MB | 1007 MB | 1544 MB | 0 MB | 3111 MB |
+
+- **Toolchain.** J3 counts `j3c` (12 MB, with the stdlib, docs and editor inside) plus clang and LLVM. Rust counts a minimal rustup install (rustc, cargo, std for the host only), without the docs, rust-src or clippy the default profile adds. Go counts its whole `GOROOT`, and Electron counts Node and npm.
+- **Downloaded deps.** J3 downloads nothing. Electron's is `node_modules` plus the Chromium zip it caches. Rust counts the crate sources and `.crate` files in `~/.cargo/registry`, which include crates for other platforms, since `cargo fetch` downloads every one in the lockfile. Go counts the module cache entries the app uses.
+- **System libs** are the Debian packages the build links against: SDL2 and SDL2_ttf for J3, and the WebKitGTK and GTK dev packages for Tauri and Wails.
+- **Not counted:** the system linker and libc headers (gcc, binutils, libc6-dev) that all four AOT stacks use.
+
 ## Running them
 
 ```sh

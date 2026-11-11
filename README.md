@@ -29,15 +29,15 @@
 
 The same todo app built with each HTML/CSS-style UI stack ([code and method](examples/ui_app_compare)):
 
-| Stack | Clean build | Rebuild after a 1-line edit | Shipped size |
-|---|---:|---:|---:|
-| **J3 + `.j3ui`** | **1.7 s** | 0.8 s | **1.8 MB** |
-| Electron | 1.6 s | 1.6 s | 273 MB |
-| Tauri (Rust) | 51 s | 25 s | 3.4 MB |
-| Wails (Go) | 8.7 s | 0.6 s | 8.6 MB |
-| Dioxus native (Rust) | 102 s | 66 s | 16.3 MB |
+| Stack | Clean build | Rebuild after a 1-line edit | Shipped size | Dev environment to build it |
+|---|---:|---:|---:|---:|
+| **J3 + `.j3ui`** | **1.7 s** | 0.8 s | **1.8 MB** | **251 MB** |
+| Electron | 1.6 s | 1.6 s | 273 MB | 344 MB |
+| Tauri (Rust) | 51 s | 25 s | 3.4 MB | 2.3 GB |
+| Wails (Go) | 8.7 s | 0.6 s | 8.6 MB | 610 MB |
+| Dioxus native (Rust) | 102 s | 66 s | 16.3 MB | 3.1 GB |
 
-<sub>Release builds, Linux x86-64, 24-thread Intel Core Ultra 7. Electron compiles nothing; it copies Chromium. Tauri and Wails also need about 120 MB of WebKitGTK installed on the user's machine.</sub>
+<sub>Release builds, Linux x86-64, 24-thread Intel Core Ultra 7. Electron compiles nothing; it copies Chromium. Tauri and Wails also need about 120 MB of WebKitGTK installed on the user's machine. Dev environment is the compiler, downloaded dependencies, build cache, and system libraries linked against.</sub>
 
 ## Why J3
 
