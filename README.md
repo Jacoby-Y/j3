@@ -25,9 +25,23 @@
 
 > **Status: alpha.** Linux (x86-64, arm64) is the main target; Windows, macOS, and Android are in progress. Anything can break before 1.0. A game made entirely in J3 is coming to Steam soon.
 
+## How it compares
+
+The same todo app built with each HTML/CSS-style UI stack ([code and method](examples/ui_app_compare)):
+
+| Stack | Clean build | Rebuild after a 1-line edit | Shipped size |
+|---|---:|---:|---:|
+| **J3 + `.j3ui`** | **1.7 s** | 0.8 s | **1.8 MB** |
+| Electron | 1.6 s | 1.6 s | 273 MB |
+| Tauri (Rust) | 51 s | 25 s | 3.4 MB |
+| Wails (Go) | 8.7 s | 0.6 s | 8.6 MB |
+| Dioxus native (Rust) | 102 s | 66 s | 16.3 MB |
+
+<sub>Release builds, Linux x86-64, 24-thread Intel Core Ultra 7. Electron compiles nothing; it copies Chromium. Tauri and Wails also need about 120 MB of WebKitGTK installed on the user's machine.</sub>
+
 ## Why J3
 
-- **Fast to run, fast to build.** Compiles to native code through clang. Release builds are small (a large game ships in about 1.3 MB). A todo app builds from clean in 1.7 s and ships in 1.8 MB, next to 51 s and 3.4 MB for Tauri or 274 MB for Electron ([comparison](examples/ui_app_compare)).
+- **Fast to run, fast to build.** Compiles to native code through clang. Release builds are small (a large game ships in about 1.3 MB).
 - **One binary, no dependencies.** `j3c` is a single Rust crate with no crates. The compiler, standard library, docs, formatter, LSP, and editor all ship inside it.
 - **UI with HTML/CSS syntax.** `.j3ui` components use Svelte-like markup and a large subset of CSS, compiled to native code. No browser, no webview.
 - **A batteries-included game stdlib.** Windows, input, audio, 2D painting, 3D scenes, physics, ECS, pathfinding, shaders written in J3, threads, saves, JSON, HTTP/TLS.
