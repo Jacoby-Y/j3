@@ -3,7 +3,8 @@ use super::*;
 
 fn run(name: &str, src: &str, want: &str) {
     for r in both_backends(name, src) {
-        assert_eq!(r.status, 0, "{}", String::from_utf8_lossy(&r.stderr));
+        // Test programs print their FAIL line to stdout, so show both.
+        assert_eq!(r.status, 0, "{}{}", String::from_utf8_lossy(&r.stdout), String::from_utf8_lossy(&r.stderr));
         assert_eq!(String::from_utf8_lossy(&r.stdout), want);
     }
 }

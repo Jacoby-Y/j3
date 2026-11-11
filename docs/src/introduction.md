@@ -1,6 +1,6 @@
 # Introduction
 
-J3 is an ahead-of-time compiled language for making games. It looks a little like Rust and a little like Zig, but it is smaller than either: there are no traits, no garbage collector, no borrow checker, and no escaping closures. What you get instead is plain data, explicit memory, and a compiler that turns your program into a native binary through LLVM.
+J3 is an ahead-of-time compiled language for making games. It looks a little like Rust and a little like Zig, but it is smaller than either: there is no garbage collector, no borrow checker, and no escaping closures. What you get instead is plain data, explicit memory, and a compiler that turns your program into a native binary through LLVM.
 
 ```rust
 module hello;
@@ -17,7 +17,7 @@ The compiler, `j3c`, is a single Rust binary with no dependencies. It carries th
 
 ## What's in the box
 
-- **The language**: structs with methods, tagged-union enums, slices, arenas, generics on types, and a `?` operator for errors.
+- **The language**: structs with methods, tagged-union enums, slices, arenas, generics with trait bounds, closures, and a `?` operator for errors.
 - **The standard library**: windows, input, audio, 2D and 3D rendering, an ECS, physics, UI components styled with CSS, networking, threads, and more, all written in J3.
 - **Tools**: a formatter, a language server, a 3D scene editor, a script VM for hot-reloaded `.j3s` files, the j2 runtime for player mods, and packaging for zip, `.deb`, and Android.
 
