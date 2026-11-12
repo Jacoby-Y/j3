@@ -30,6 +30,7 @@ enum OsKind {
     Windows,
     Macos,
     Android,
+    Web,
 }
 
 /// The CPU a target triple names, as the index of `j3.sys.ARCH_*` (empty: the host).
@@ -55,6 +56,7 @@ fn os_kind(target: &str) -> OsKind {
         TargetOs::Windows => OsKind::Windows,
         TargetOs::Macos => OsKind::Macos,
         TargetOs::Android => OsKind::Android,
+        TargetOs::Web => OsKind::Web,
         TargetOs::Linux | TargetOs::Other => OsKind::Linux,
     }
 }

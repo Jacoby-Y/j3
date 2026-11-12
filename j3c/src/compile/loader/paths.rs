@@ -22,6 +22,7 @@ impl Loader {
                 OsKind::Windows => "sys_windows.j3",
                 OsKind::Macos => "sys_macos.j3",
                 OsKind::Android => "sys_android.j3",
+                OsKind::Web => "sys_web.j3",
             };
             return stdlib_dir().join("j3").join(name);
         }
@@ -29,6 +30,7 @@ impl Loader {
             let name = match self.os {
                 OsKind::Windows => "threadsys_windows.j3",
                 OsKind::Android => "threadsys_android.j3",
+                OsKind::Web => "threadsys_web.j3",
                 OsKind::Linux | OsKind::Macos => "threadsys.j3",
             };
             return stdlib_dir().join("j3").join(name);
@@ -37,7 +39,7 @@ impl Loader {
             // x86-64 Linux syscall numbers: other systems get the stub (one copy, never a message)
             let name = match self.os {
                 OsKind::Linux => "instance.j3",
-                OsKind::Windows | OsKind::Macos | OsKind::Android => "instance_other.j3",
+                OsKind::Windows | OsKind::Macos | OsKind::Android | OsKind::Web => "instance_other.j3",
             };
             return stdlib_dir().join("j3").join(name);
         }
@@ -47,6 +49,7 @@ impl Loader {
                 OsKind::Windows => "netsys_windows.j3",
                 OsKind::Macos => "netsys_macos.j3",
                 OsKind::Android => "netsys_android.j3",
+                OsKind::Web => "netsys_web.j3",
             };
             return stdlib_dir().join("j3").join(name);
         }

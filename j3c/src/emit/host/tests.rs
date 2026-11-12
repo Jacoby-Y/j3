@@ -19,6 +19,7 @@ fn release_flags_per_platform() {
     assert_eq!(target_os("aarch64-linux-android"), TargetOs::Android);
     assert_eq!(target_os("x86_64-linux-android26"), TargetOs::Android);
     assert_eq!(target_os("wasm32-unknown-unknown"), TargetOs::Other);
+    assert_eq!(target_os("wasm64-unknown-emscripten"), TargetOs::Web);
     let linux = release_flags(TargetOs::Linux, false);
     assert!(linux.link.contains(&"-Wl,-s") && !linux.link.contains(&"-fuse-ld=lld"));
     assert!(linux.compile.contains(&"-fno-unwind-tables"));

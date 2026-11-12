@@ -55,6 +55,14 @@ fn inlineStyle(d: &Dom, id: int, base: int, ps: int): int {
     if !y.dirty && y.base == base && y.cur >= 0 && y.cur == n.tstyle {
         return y.cur;
     }
+    if dynattr.bare(y) {
+        // no override (only `class` holes, or every `style:` cleared): the cascade row itself, shared with the element's
+        // siblings, not a private copy of it (`a`/`b` keep their last values, so a transition from them still reads them)
+        y.base = base;
+        y.cur = base;
+        y.dirty = false;
+        return base;
+    }
     let dst = 0;
     if y.cur >= 0 && y.cur == y.a {
         if y.b < 0 {
@@ -77,17 +85,28 @@ fn inlineStyle(d: &Dom, id: int, base: int, ps: int): int {
     return dst;
 }
 
-fn applyStyle(d: &Dom, id: int, ps: int) {
+/// Restyle `id` under parent style `ps`. `inl`: only a `style:` value changed (`markInline`), so the last cascade result
+/// `Dyn.base` is reused when the node still shows it. Returns the `styleDiff` bits of the old and new style (0 when unchanged).
+fn applyStyle(d: &Dom, id: int, ps: int, inl: bool): int {
     d.restyled += 1;
     countRestyled();
-    let st = computeStyle(d.css, d.mnodes.items, id, ps);
     let n = &d.nodes.items[id];
+    let st = -1;
+    if inl && n.kind == K_ELEM && n.dyn >= 0 && d.dyns.items[n.dyn].base >= 0 && d.dyns.items[n.dyn].cur == n.tstyle {
+        st = d.dyns.items[n.dyn].base;
+    } else {
+        d.cascaded += 1;
+        st = computeStyle(d.css, d.mnodes.items, id, ps);
+    }
     if n.dyn >= 0 && n.kind == K_ELEM {
         st = inlineStyle(d, id, st, ps);
     }
     if id == 0 { d.css.rootFs = d.css.get(st, P_FONT_SIZE).f; }
     let changed = st != n.tstyle;
     let old = n.tstyle;
+    let oldUsed = n.style;
+    let oldDisp = n.disp;
+    let wasBound = n.bound;
     n.tstyle = st;
     if n.kind == K_ELEM && (changed || old < 0) {
         moveStyle(d, id, old, st);
@@ -150,23 +169,49 @@ fn applyStyle(d: &Dom, id: int, ps: int) {
     } else if !wantAbs && n.isAbs {
         dropAbs(d, id);
     }
-    if changed {
+    n.bound = n.kind == K_ELEM && !n.isAbs && (ds == DP_BLOCK || ds == DP_FLEX || ds == DP_GRID) && definiteBox(d, n.style);
+    if !changed {
+        return 0;
+    }
+    let diff = D_LAYOUT + D_INHERIT;
+    if old >= 0 && ds == oldDisp {
+        let lay = !layingOut(d, id);
+        if inl && n.dyn >= 0 {
+            diff = inlineDiff(d, &d.dyns.items[n.dyn], old, st, ds == DP_INLINE, lay);
+        } else {
+            diff = styleDiff(d, old, st, ds == DP_INLINE, lay, false);
+        }
+    }
+    if diff % 2 == 0 && oldUsed == old && n.style == st {
+        // only what paints changed (no overlay before or after: a blend's id keeps its number while its values move)
+        markPaint(d, id);
+    } else if wasBound && n.bound && n.tr < 0 && ds == oldDisp && oldUsed >= 0 && sameOuter(d, oldUsed, n.style) {
+        // a boundary whose new style keeps the box its parent sees relays inside it only (no motion: `n.style` is then
+        // a blend that changes in place)
+        markInner(d, id);
+    } else {
         markDirty(d, id);
     }
+    return diff;
 }
 
 /// Recompute the styles that are dirty. `force` means an ancestor's style id changed or was restyled.
 fn resolveNode(d: &Dom, id: int, ps: int, force: bool) {
     let need = force || d.nodes.items[id].styleDirty;
-    if !need && !d.nodes.items[id].subStyle {
+    // only a `style:` value changed: the matched rules (so the pseudo boxes) stand, and the subtree restyles only for a
+    // changed inherited value
+    let inl = !need && d.nodes.items[id].inlineDirty;
+    if !need && !inl && !d.nodes.items[id].subStyle {
         return;
     }
     // a restyle only a `:has()` flip asked for leaves the subtree alone when this node's style id did not change
     let kids = need;
-    if need {
+    if inl {
+        kids = (applyStyle(d, id, ps, true) / D_INHERIT) % 2 == 1;
+    } else if need {
         let old = d.nodes.items[id].tstyle;
         let lite = !force && d.nodes.items[id].hasOnly && d.css.hasInner == 0;
-        applyStyle(d, id, ps);
+        applyStyle(d, id, ps, false);
         if lite && d.nodes.items[id].tstyle == old {
             kids = false;
         }
@@ -175,6 +220,7 @@ fn resolveNode(d: &Dom, id: int, ps: int, force: bool) {
         }
     }
     d.nodes.items[id].styleDirty = false;
+    d.nodes.items[id].inlineDirty = false;
     d.nodes.items[id].kidsMk = false;
     d.nodes.items[id].hasOnly = false;
     d.nodes.items[id].subStyle = false;
@@ -229,4 +275,22 @@ fn resolveStyles(d: &Dom) {
         resolveNode(d, 0, -1, false);
         endPass(d.css);
     }
+}
+
+/// `width` and `height` resolve to lengths without a containing block (px, em, a length `calc()`): the border box
+/// can't depend on the content or on a parent size.
+fn definiteBox(d: &Dom, st: int): bool {
+    let e = edgesOf(d, st, -1.0);
+    return specW(d, st, -1.0, e) >= 0.0 && specH(d, st, -1.0, e) >= 0.0;
+}
+
+/// `id` is laid out this frame whatever its style says, and the marks above it are made: a dirty box (`layoutBox` clears
+/// the flag, so it is current), or an inline-level node in a dirty block (whose line layout places all its inline content;
+/// inline nodes keep a stale flag). Proving its restyle paint-only would save nothing.
+fn layingOut(d: &Dom, id: int): bool {
+    let c = id;
+    while c >= 0 && inlineLevel(d, c) {
+        c = d.nodes.items[c].parent;
+    }
+    return c >= 0 && d.nodes.items[c].dirty;
 }

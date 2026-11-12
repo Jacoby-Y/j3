@@ -43,13 +43,13 @@ Heavy UI, 1,200 cards that all change every frame, software-rendered under Xvfb 
 
 | Stack | FPS | CPU per frame | Peak memory |
 |---|---:|---:|---:|
-| **J3 + `.j3ui`** | 61.8 | 58.5 ms | 331 MB |
-| Electron | 93.9 | 22.3 ms | 453 MB |
+| **J3 + `.j3ui`** | **105.2** | 51.5 ms | **164 MB** |
+| Electron | 93.9 | **22.3 ms** | 453 MB |
 | Tauri (Rust) | 35.8 | 28.6 ms | 175 MB |
 | Wails (Go) | 35.6 | 29.0 ms | 182 MB |
 | Dioxus native (Rust) | needs a GPU | | |
 
-<sub>J3 paints on the GPU, so software GL costs it the most CPU. On a real GPU the same scene runs at 104 fps on 9.6 ms of CPU in 146 MB. [Method and caveats](examples/ui_app_compare#heavy-ui-fps-and-memory).</sub>
+<sub>J3 paints on the GPU, so most of its CPU here is Mesa's software GL; J3's own thread takes about 7 ms a frame. On a real GPU the same scene runs at about 400 fps on 2.4 ms of CPU in 190 MB (other stacks not measured there). [Method and caveats](examples/ui_app_compare#heavy-ui-fps-and-memory).</sub>
 
 ## Why J3
 
@@ -121,15 +121,7 @@ UI is a component file:
 curl -fsSL https://raw.githubusercontent.com/Jacoby-Y/j3/main/install.sh | sh
 ```
 
-Or grab the `.deb` from [Releases](https://github.com/Jacoby-Y/j3/releases), or `yay -S j3c-bin` on Arch.
-
-You also need clang and SDL2. `j3c doctor` tells you what's missing. On Ubuntu/Debian:
-
-```sh
-sudo apt install clang libsdl2-2.0-0 libsdl2-ttf-2.0-0 libsdl2-image-2.0-0 libsdl2-mixer-2.0-0 libgl1
-```
-
-From source (needs Rust + clang): `git clone https://github.com/Jacoby-Y/j3 && cd j3 && ./build.sh`
+Linux, Windows, macOS, Android, packages, dependencies, and building from source: see [INSTALL.md](INSTALL.md).
 
 ## Start
 

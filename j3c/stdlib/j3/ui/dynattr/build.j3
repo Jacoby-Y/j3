@@ -1,0 +1,183 @@
+// Part of j3.ui.dynattr (Computed style rows: alloc, build, patch, rebuild.); the module doc and `use`s are in ../dynattr.j3.
+module j3.ui.dynattr;
+
+/// A fresh computed style id (its values are written by `build`).
+pub fn alloc(css: &Css): int {
+    for q in 0..NPROPS {
+        css.vals.push(mk(V_UNSET, 0.0, 0, 0));
+    }
+    css.nstyles += 1;
+    return css.nstyles - 1;
+}
+
+/// Keep the current overrides of `y` as the declarations of its inline-style rule (made on first use, then rewritten in place).
+fn inlineRule(css: &Css, y: &Dyn) {
+    if y.rule < 0 {
+        y.rd = css.decls.len;
+        for q in 0..SLOTS * PER {
+            css.decls.push(Decl { prop: 0, v: mk(V_UNSET, 0.0, 0, 0) });
+        }
+        y.rule = css.rules.len;
+        css.rules.push(Rule { step0: 0, nsteps: 0, decl0: y.rd, ndecl: 0, spec: 0, scope: 0, order: 0, tag: -1, cls0: -1, mq: -1, pe: 0, sib: false, file: "", line: 0, col: 0 });
+    }
+    let n = 0;
+    for k in 0..SLOTS {
+        for j in 0..y.sn[k] {
+            css.decls.items[y.rd + n] = Decl { prop: y.sp[k * PER + j], v: y.sv[k * PER + j] };
+            n += 1;
+        }
+    }
+    css.rules.items[y.rule].ndecl = n;
+}
+
+/// Write style `base` with the overrides on top into `dst`. `parent` is the parent's style (for
+/// `inherit`). True only when inherited values or custom vars changed under `dst`: cached children
+/// then need new styles. Reusing an unchanged inline style must not flush the whole style cache.
+pub fn build(css: &Css, y: &Dyn, base: int, parent: int, dst: int): bool {
+    let s = if dst == y.a { 0 } else { 1 };
+    if y.rb[s] == base && y.rp[s] == parent && parent >= 0 && css.regs.len == 0 && !writesAll(y) {
+        return patch(css, y, s, base, parent, dst);
+    }
+    let r = rebuild(css, y, base, parent, dst);
+    record(y, s, base, parent);
+    return r;
+}
+
+/// The slot names `all`: it writes every property.
+fn writesAll(y: &Dyn): bool {
+    for k in 0..SLOTS {
+        for j in 0..y.sn[k] {
+            if y.sp[k * PER + j] == P_ALL { return true; }
+        }
+    }
+    return false;
+}
+
+/// Note what `dst` (slot index `s`) now holds (`Dyn.rb`).
+fn record(y: &Dyn, s: int, base: int, parent: int) {
+    let n = 0;
+    for k in 0..SLOTS {
+        for j in 0..y.sn[k] {
+            y.rprops[s * SLOTS * PER + n] = y.sp[k * PER + j];
+            n += 1;
+        }
+    }
+    y.rn[s] = n;
+    y.rb[s] = base;
+    y.rp[s] = parent;
+    if writesAll(y) { y.rb[s] = -1; }
+}
+
+/// `build` for a `dst` already built over `base` and `parent`: put back `base`'s values where its old overrides wrote,
+/// write and resolve the new ones, and compare only those properties. The same values as `rebuild`: the rest of `dst` is
+/// `base`'s row, which is resolved already (`resolveAt` leaves it alone) and holds the same custom properties.
+fn patch(css: &Css, y: &Dyn, s: int, base: int, parent: int, dst: int): bool {
+    let o = dst * NPROPS;
+    let ob = base * NPROPS;
+    let r0 = s * SLOTS * PER;
+    let vals = css.vals.items;
+    // computeStyle has finished; its scratch keeps the old values of what changes
+    for i in 0..y.rn[s] {
+        let p = y.rprops[r0 + i];
+        css.out[p] = vals[o + p];
+    }
+    for k in 0..SLOTS {
+        for j in 0..y.sn[k] {
+            let p = y.sp[k * PER + j];
+            css.out[p] = vals[o + p];
+        }
+    }
+    for i in 0..y.rn[s] {
+        let p = y.rprops[r0 + i];
+        vals[o + p] = vals[ob + p];
+    }
+    let vs = css.varsOf(base);
+    for k in 0..SLOTS {
+        for j in 0..y.sn[k] {
+            let p = y.sp[k * PER + j];
+            let v = declValue(css, p, y.sv[k * PER + j], parent, vs);
+            if v.kind != V_UNSET {
+                vals[o + p] = v;
+            }
+        }
+    }
+    fontCalc(css, vals, o, parent);
+    let fs = resolveFontSize(css, vals, o, parent);
+    for k in 0..SLOTS {
+        for j in 0..y.sn[k] {
+            resolveAt(css, vals, o + y.sp[k * PER + j], fs);
+        }
+    }
+    let changed = false;
+    for i in 0..y.rn[s] {
+        changed = changed || inheritedMoved(css, o, y.rprops[r0 + i]);
+    }
+    for k in 0..SLOTS {
+        for j in 0..y.sn[k] {
+            changed = changed || inheritedMoved(css, o, y.sp[k * PER + j]);
+        }
+    }
+    record(y, s, base, parent);
+    return changed;
+}
+
+/// Inherited property `p` of the row at `o` differs from its old value in `css.out`.
+fn inheritedMoved(css: &Css, o: int, p: int): bool {
+    if !inherits(p) { return false; }
+    let a = css.out[p];
+    let b = css.vals.items[o + p];
+    return a.kind != b.kind || a.f != b.f || a.i != b.i || a.c != b.c;
+}
+
+/// `build` from scratch: copy `base`, apply every override, resolve the row.
+fn rebuild(css: &Css, y: &Dyn, base: int, parent: int, dst: int): bool {
+    // computeStyle has finished; reuse its scratch (declValue does not run another cascade).
+    for q in 0..NPROPS { css.out[q] = css.vals.items[dst * NPROPS + q]; }
+    let fresh = css.out[P_DISPLAY].kind == V_UNSET;
+    let oldVars = css.varsOf(dst);
+    let vs = css.varsOf(base);
+    css.setVars(dst, vs);
+    if css.regs.len > 0 {
+        inlineRule(css, y);
+        css.setRulesPlus(dst, base, y.rule, parent);
+    }
+    for q in 0..NPROPS {
+        css.vals.items[dst * NPROPS + q] = css.vals.items[base * NPROPS + q];
+    }
+    for k in 0..SLOTS {
+        for j in 0..y.sn[k] {
+            let p = y.sp[k * PER + j];
+            if p == P_ALL {
+                for q in 0..NPROPS {
+                    let av = declValue(css, q, y.sv[k * PER + j], parent, vs);
+                    css.vals.items[dst * NPROPS + q] = av;
+                }
+                continue;
+            }
+            let v = declValue(css, p, y.sv[k * PER + j], parent, vs);
+            if v.kind != V_UNSET {
+                css.vals.items[dst * NPROPS + p] = v;
+            }
+        }
+    }
+    fontCalc(css, css.vals.items, dst * NPROPS, parent);
+    resolveUnits(css, css.vals.items, dst * NPROPS, parent);
+    // A fresh destination has no cached descendants to invalidate.
+    if fresh { return false; }
+    if oldVars != vs {
+        if css.vsn.items[oldVars] != css.vsn.items[vs] { return true; }
+        for i in 0..css.vsn.items[vs] {
+            let ca = css.vsEnt.items[css.vso.items[oldVars] + i];
+            let cb = css.vsEnt.items[css.vso.items[vs] + i];
+            if ca.name != cb.name || ca.v.kind != cb.v.kind || ca.v.f != cb.v.f || ca.v.i != cb.v.i || ca.v.c != cb.v.c { return true; }
+        }
+    }
+    for q in 0..NPROPS {
+        if inherits(q) {
+            let a = css.out[q];
+            let b = css.vals.items[dst * NPROPS + q];
+            if a.kind != b.kind || a.f != b.f || a.i != b.i || a.c != b.c { return true; }
+        }
+    }
+    return false;
+}

@@ -162,14 +162,16 @@ fn editor_tool(args: &[String]) -> i32 {
             println!("  scene|render|gen|mcp|android|script-props   scene editor tools and the MCP server (`j3c -e scene --help`)");
             println!("  imgdiff a.png b.png [--tol N] [--max N] [--out d.png]   pixel diff for goldens");
             println!("  steam-check --sdk DIR [--no-compile] [--no-windows]   verify j3.steam against the Steamworks SDK");
+            println!("  web serve|run DIR [--headless] [--frames N] [--screenshot F]   serve or run a built web folder");
             0
         }
         Some("mcp") => crate::mcp::cmd(rest),
         Some("android") => crate::android_run::cmd(rest),
+        Some("web") => crate::web::cmd(rest),
         Some("script-props") => script_props_cmd(rest),
         other => {
             if let Some(o) = other { eprintln!("j3c -e: unknown editor tool `{o}`"); }
-            eprintln!("usage: j3c -e scene|render|gen|imgdiff|steam-check|mcp|android|script-props ...  (or --editor)");
+            eprintln!("usage: j3c -e scene|render|gen|imgdiff|steam-check|mcp|android|web|script-props ...  (or --editor)");
             1
         }
     }
@@ -350,6 +352,7 @@ fn print_help() {
     println!("    -e mcp [--project D] MCP server for agents: edit, render, check, play scenes");
     println!("    -e mcp --tools   every MCP tool's arguments and the CLI command doing the same");
     println!("    -e android run [dir] build the APK, install it on an adb device, start it, print its log (`-e android --help`)");
+    println!("    -e web run DIR   serve a built web folder and run it (headless Chrome with --headless) (`-e web --help`)");
     println!("    -e script-props <f.j3s>  a script's props as JSON (what the inspector edits)");
     println!("                     (-e is short for --editor)");
     println!("    guide            how to start a project");

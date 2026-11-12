@@ -41,3 +41,4 @@ pub mod span;
 pub mod ui;
 pub mod stdlib;
 pub mod steamcheck;
+pub mod web;

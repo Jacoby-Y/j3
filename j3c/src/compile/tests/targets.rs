@@ -38,6 +38,41 @@ fn macos_hello_uses_libc() {
 }
 
 #[test]
+fn web_hello_uses_libc() {
+    let triple = "wasm64-unknown-emscripten";
+    let prog = compile_path_target(&default_hello_path(), triple).expect("compile web hello");
+    let mut opts = emit::EmitOpts::default();
+    opts.target = triple.to_string();
+    let ll = emit::emit_llvm(&prog.cx, &prog.modules, &opts).expect("llvm");
+    assert!(ll.contains("target triple = \"wasm64-unknown-emscripten\""));
+    assert!(!ll.contains("target datalayout"), "{ll}");
+    assert!(!ll.contains("@syscall"), "{ll}");
+    assert!(!ll.contains("@dlopen"), "{ll}");
+    assert!(ll.contains("@mmap"), "{ll}");
+    // system clang can lower it to a wasm object (no emsdk needed for this step)
+    let wasm = std::process::Command::new("clang")
+        .arg("-print-targets")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("wasm64"))
+        .unwrap_or(false);
+    if wasm {
+        let dir = std::env::temp_dir().join(format!("j3-web-hello-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("hello.ll");
+        std::fs::write(&src, &ll).unwrap();
+        let out = std::process::Command::new("clang")
+            .args([&format!("--target={triple}"), "-c", "-O1", "-Wno-override-module"])
+            .arg(&src)
+            .arg("-o")
+            .arg(dir.join("hello.o"))
+            .output()
+            .expect("clang");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+#[test]
 fn llvm_line_info_follows_debug_flag() {
     let prog = compile_path(&default_hello_path()).expect("compile");
     let mut opts = emit::EmitOpts::default();

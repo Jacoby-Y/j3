@@ -41,18 +41,19 @@ and (staggered, 1 in 8 per frame) its class every frame, so every stack restyles
 
 | App | FPS | CPU per frame | Peak memory |
 |---|---:|---:|---:|
-| **J3** | 61.8 | 58.5 ms | 331 MB |
-| Electron | **93.9** | **22.3 ms** | 453 MB |
-| Tauri | 35.8 | 28.6 ms | **175 MB** |
+| **J3** | **105.2** | 51.5 ms | **164 MB** |
+| Electron | 93.9 | **22.3 ms** | 453 MB |
+| Tauri | 35.8 | 28.6 ms | 175 MB |
 | Wails | 35.6 | 29.0 ms | 182 MB |
 | Dioxus native | n/a | n/a | n/a |
-| **J3 on a real GPU** | **104** | **9.6 ms** | **146 MB** |
+| **J3 on a real GPU** | **~400** | **2.4 ms** | **190 MB** |
 | Others on a real GPU | not measured | | |
 
 - **Everything here is software rendering.** Xvfb has no GPU, so GL and Vulkan run on the CPU (Mesa's llvmpipe and lavapipe). That's even for every stack, but it's not how anyone runs these apps.
 - **CPU per frame** is user plus system time of every process the app started (Chromium's GPU and renderer processes, WebKit's web process), divided by frames. Multi-threaded rasterizing can push it above the frame time.
 - **Peak memory** is the summed PSS of those processes, so shared libraries are split between them, not counted once per process. The Xvfb server isn't counted.
-- **J3** is a GPU painter: under llvmpipe its own thread takes about 15 ms a frame and llvmpipe's threads take the rest of the CPU. On a real GPU (RTX 5060 Ti, offscreen SDL, no Xvfb) the same scene runs at **104 fps with 9.6 ms of CPU per frame and 146 MB RSS**. None of the other stacks could be measured without a window, so that number has nothing to line up against yet.
+- **J3** is a GPU painter: under llvmpipe its own thread takes about 7 ms a frame and llvmpipe's threads take the rest of the CPU. On a real GPU (RTX 5060 Ti, offscreen SDL, no Xvfb) the same scene runs at **about 400 fps with 2.4 ms of CPU per frame and 190 MB peak RSS**. None of the other stacks could be measured without a window, so that number has nothing to line up against yet.
+- **J3's numbers went down with `plans/03-ui-cpu.md`.** Before it, the scene took 9.6 ms of CPU per frame on the real GPU (104 fps, 361 MB peak RSS) and 58.5 ms under Xvfb (61.8 fps, 331 MB). Changed text no longer lays out the whole grid, since a fixed-size card is a layout boundary. A `style:` value change restyles without re-matching rules. Paint-only class swaps skip layout. Paint reuses per-style decisions. And an element with only a `class="c{n}"` hole now shares its cascade style row instead of copying it, which was half of what was left.
 - **Electron** runs with `--disable-frame-rate-limit --disable-gpu-vsync`. Chromium's Skia rasterizes in software well, and it shows.
 - **Tauri and Wails** are WebKitGTK and land in the same place, about 28 ms of CPU per frame. That is their limit here, not a vsync cap.
 - **Dioxus native** can't run here. Vello rasterizes in GPU compute shaders, and on Xvfb's software Vulkan (no DRI3, so it can't present) and its GL fallback (`WGPU_BACKEND=gl`) it didn't finish one frame in 20 s. It needs a real GPU.

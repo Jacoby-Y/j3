@@ -23,7 +23,7 @@ use pages::*;
 use render::*;
 use search::*;
 
-const HIDDEN: &[&str] = &["game_headless.j3", "build_release.j3", "sys_windows.j3", "sys_macos.j3", "sys_android.j3", "apkassets.j3", "netsys.j3", "netsys_windows.j3", "netsys_macos.j3", "netsys_android.j3", "threadsys.j3", "threadsys_windows.j3", "threadsys_android.j3"];
+const HIDDEN: &[&str] = &["game_headless.j3", "build_release.j3", "sys_windows.j3", "sys_macos.j3", "sys_android.j3", "apkassets.j3", "netsys.j3", "netsys_windows.j3", "netsys_macos.j3", "netsys_android.j3", "threadsys.j3", "threadsys_windows.j3", "threadsys_android.j3", "sys_web.j3", "netsys_web.j3", "threadsys_web.j3"];
 
 /// Public so the runtime or editor can reach them, but not what a game calls.
 const INTERNAL: &[(&str, &str)] = &[

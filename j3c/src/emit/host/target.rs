@@ -11,6 +11,8 @@ pub(crate) enum TargetOs {
     Windows,
     Macos,
     Android,
+    /// Emscripten (`wasm64-unknown-emscripten`): browser, plan 06.
+    Web,
     Other,
 }
 
@@ -30,6 +32,8 @@ pub(crate) fn target_os(triple: &str) -> TargetOs {
         TargetOs::Windows
     } else if t.contains("apple") || t.contains("darwin") {
         TargetOs::Macos
+    } else if t.contains("emscripten") {
+        TargetOs::Web
     } else if t.contains("android") {
         // before Linux: `x86_64-linux-android` contains "linux"
         TargetOs::Android
@@ -68,7 +72,8 @@ pub(crate) fn release_flags(os: TargetOs, lld: bool) -> ReleaseFlags {
         TargetOs::Macos => ReleaseFlags { compile: vec![], link: vec!["-Wl,-x", "-Wl,-S"] },
         // Unwind tables stay: bionic's unwinder (and the NDK's crash reports) read them.
         TargetOs::Android => ReleaseFlags { compile: vec!["-fno-asynchronous-unwind-tables"], link: vec!["-Wl,--gc-sections", "-Wl,-s"] },
-        TargetOs::Other => ReleaseFlags { compile: vec![], link: vec![] },
+        // emcc link flags live in `emit/web.rs` (plan 06 chunk 2)
+        TargetOs::Web | TargetOs::Other => ReleaseFlags { compile: vec![], link: vec![] },
     }
 }
 
