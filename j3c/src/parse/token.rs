@@ -6,6 +6,8 @@ pub enum TokenKind {
     Ident,
     /// `'outer`, a loop label; `text` keeps the quote.
     Label,
+    /// `'a'`, `'\n'`, `'\u{1F600}'`; `text` is the code point in decimal.
+    Char,
     Int,
     Float,
     String,
@@ -74,6 +76,9 @@ pub enum TokenKind {
     CaretEq,
     Tilde,
     AmpEq,
+    /// `<<=` and `>>=`. A lone `<<` / `>>` stays two `Lt` / `Gt` (generics close with `>>`).
+    ShlEq,
+    ShrEq,
     Interpolate,
     /// `///` line. `text` is the body, without the slashes or one leading space.
     Doc,
@@ -180,6 +185,8 @@ impl TokenKind {
             | TokenKind::AmpEq
             | TokenKind::PipeEq
             | TokenKind::CaretEq => Some("keyword.operator.assignment.j3"),
+            // own scope (a sub-scope of assignment) so the grammar tries it before `<` / `<=`
+            TokenKind::ShlEq | TokenKind::ShrEq => Some("keyword.operator.assignment.shift.j3"),
             TokenKind::EqEq
             | TokenKind::Ne
             | TokenKind::Lt
@@ -222,6 +229,8 @@ impl TokenKind {
             TokenKind::PipeEq => Some("|="),
             TokenKind::Caret => Some("^"),
             TokenKind::CaretEq => Some("^="),
+            TokenKind::ShlEq => Some("<<="),
+            TokenKind::ShrEq => Some(">>="),
             TokenKind::Tilde => Some("~"),
             TokenKind::Eq => Some("="),
             TokenKind::EqEq => Some("=="),

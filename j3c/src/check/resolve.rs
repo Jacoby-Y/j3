@@ -7,13 +7,23 @@ pub(crate) fn resolve_type(
     types: &HashMap<String, Ty>,
 ) -> Result<Ty, CheckError> {
     match &ty.kind {
-        TypeKind::Closure { .. } => Err(closure_not_here(path, ty.span)),
+        TypeKind::Closure { boxed, .. } => Err(closure_not_here(path, ty.span, *boxed)),
+        TypeKind::Tuple(es) => {
+            let mut elems = Vec::new();
+            for e in es {
+                let t = resolve_type(cx, e, path, types)?;
+                reject_closure(cx, path, e.span, t, "a tuple element")?;
+                elems.push(t);
+            }
+            Ok(cx.tuple_ty(elems))
+        }
         TypeKind::Ref(inner) => {
             let inner = resolve_type(cx, inner, path, types)?;
             reject_closure(cx, path, ty.span, inner, "behind `&`")?;
             Ok(cx.ty_ref(inner))
         }
         TypeKind::Named(name) => resolve_named(cx, name, ty.span, path, types),
+        TypeKind::Dyn(t) => resolve_dyn(t, path, types),
         TypeKind::Generic { name, .. } => Err(CheckError::new(
             path,
             ty.span,
@@ -52,7 +62,7 @@ pub(crate) fn resolve_type_g(
     env: &mut GenEnv<'_>,
 ) -> Result<Ty, CheckError> {
     match &ty.kind {
-        TypeKind::Closure { params, ret } => {
+        TypeKind::Closure { params, ret, boxed } => {
             let mut ps = Vec::new();
             for p in params {
                 ps.push(resolve_type_g(cx, p, path, env)?);
@@ -65,13 +75,23 @@ pub(crate) fn resolve_type_g(
                 }
                 None => cx.common.void,
             };
-            Ok(cx.closure_ty(ps, r, env.module, ty.span, env.ir_structs))
+            Ok(cx.closure_ty(ps, r, *boxed, env.module, ty.span, env.ir_structs))
+        }
+        TypeKind::Tuple(es) => {
+            let mut elems = Vec::new();
+            for e in es {
+                let t = resolve_type_g(cx, e, path, env)?;
+                reject_closure(cx, path, e.span, t, "a tuple element")?;
+                elems.push(t);
+            }
+            Ok(cx.tuple_ty(elems))
         }
         TypeKind::Ref(inner) => {
             let inner = resolve_type_g(cx, inner, path, env)?;
             reject_closure(cx, path, ty.span, inner, "behind `&`")?;
             Ok(cx.ty_ref(inner))
         }
+        TypeKind::Dyn(t) => resolve_dyn(t, path, env.types),
         TypeKind::Named(name) => {
             if let Some(&t) = env.subst.get(name) {
                 return Ok(t);
@@ -187,37 +207,31 @@ pub(crate) fn instantiate_enum(
     merged.extend(subst);
     let mut variants = Vec::new();
     for v in &temp.variants {
-        let payload = match &v.payload {
-            Some(t) => {
-                let mut nested = GenEnv {
-                    types: env.types,
-                    subst: &merged,
-                    enum_temps: env.enum_temps,
-                    enum_insts: env.enum_insts,
-                    struct_temps: env.struct_temps,
-                    struct_temp_env: env.struct_temp_env,
-                    struct_insts: env.struct_insts,
-                    methods: env.methods,
-                    method_temps: env.method_temps,
-                    method_insts: env.method_insts,
-                    fn_substs: env.fn_substs,
-                    pending_mono: env.pending_mono,
-                    module: env.module,
-                    ir_enums: env.ir_enums,
-                    ir_structs: env.ir_structs,
-                    ir_funcs: env.ir_funcs,
-                };
-                let p = resolve_type_g(cx, t, path, &mut nested)?;
-                reject_closure(cx, path, t.span, p, "an enum payload")?;
-                Some(p)
-            }
-            None => None,
-        };
-        variants.push(VariantDef {
-            name: cx.intern_name(&v.name.name),
-            doc: v.doc.clone(),
-            payload,
-        });
+        let mut fields = Vec::new();
+        for t in &v.fields {
+            let mut nested = GenEnv {
+                types: env.types,
+                subst: &merged,
+                enum_temps: env.enum_temps,
+                enum_insts: env.enum_insts,
+                struct_temps: env.struct_temps,
+                struct_temp_env: env.struct_temp_env,
+                struct_insts: env.struct_insts,
+                methods: env.methods,
+                method_temps: env.method_temps,
+                method_insts: env.method_insts,
+                fn_substs: env.fn_substs,
+                pending_mono: env.pending_mono,
+                module: env.module,
+                ir_enums: env.ir_enums,
+                ir_structs: env.ir_structs,
+                ir_funcs: env.ir_funcs,
+            };
+            let p = resolve_type_g(cx, t, path, &mut nested)?;
+            reject_closure(cx, path, t.span, p, "an enum payload")?;
+            fields.push(p);
+        }
+        variants.push(variant_def(cx, &temp.name.name, v, fields, env.module, env.ir_structs));
     }
     let ename = cx.intern_name(&temp.name.name);
     let id = cx.alloc_enum(EnumDef {
@@ -390,7 +404,12 @@ pub(crate) fn instantiate_struct(
         env.methods.insert(mkey, fid);
         env.ir_funcs.push(fid);
         env.fn_substs.insert(fid, subst.clone());
-        env.pending_mono.push((fid, m.clone(), subst.clone()));
+        if !m.where_bounds.is_empty() {
+            let reqs = crate::check::traits::where_reqs(&m.where_bounds, &cx.struct_def(id).ty_args);
+            cx.method_wheres.insert(fid, reqs);
+        }
+        // Lowered on first use only (`check/lower/lazy.rs`): `List<T>.indexOf` needs `==` only when called.
+        cx.lazy_methods.insert(fid, (m.clone(), subst.clone()));
     }
     Ok(cx.ty_struct(id))
 }
@@ -432,7 +451,14 @@ pub(super) fn resolve_type_ref(
     types: &HashMap<String, Ty>,
 ) -> Result<Ty, CheckError> {
     match &ty.kind {
-        TypeKind::Closure { .. } => Err(closure_not_here(path, ty.span)),
+        TypeKind::Closure { boxed, .. } => Err(closure_not_here(path, ty.span, *boxed)),
+        TypeKind::Tuple(es) => {
+            let mut elems = Vec::new();
+            for e in es {
+                elems.push(resolve_type_ref(cx, e, path, types)?);
+            }
+            cx.tuple_lookup(&elems).ok_or_else(|| CheckError::new(path, ty.span, "unknown tuple type"))
+        }
         TypeKind::Ref(inner) => {
             let inner = resolve_type_ref(cx, inner, path, types)?;
             match cx.lookup_ty(&TyKind::Ref(inner)) {
@@ -441,6 +467,7 @@ pub(super) fn resolve_type_ref(
             }
         }
         TypeKind::Named(name) => resolve_named(cx, name, ty.span, path, types),
+        TypeKind::Dyn(t) => resolve_dyn(t, path, types),
         TypeKind::Generic { name, .. } => Err(CheckError::new(
             path,
             ty.span,
@@ -477,6 +504,19 @@ pub(super) fn resolve_type_ref(
     }
 }
 
+/// `dyn Name`: the fat-pointer type the checker made for the trait `Name` in scope (`check::dyn_types`).
+fn resolve_dyn(t: &crate::parse::Ident, path: &str, types: &HashMap<String, Ty>) -> Result<Ty, CheckError> {
+    if let Some(&ty) = types.get(&crate::check::dyn_type_key(&t.name)) {
+        return Ok(ty);
+    }
+    if types.contains_key(&t.name) {
+        return Err(CheckError::new(path, t.span, format!("`{}` is a type, not a trait", t.name))
+            .note("`dyn` takes a trait: `dyn Backend` holds any value whose type has the trait's methods"));
+    }
+    Err(CheckError::new(path, t.span, format!("unknown trait `{}`", t.name))
+        .help(format!("declare `trait {} {{ .. }}` here, or import it: `use m.{};`", t.name, t.name)))
+}
+
 pub(super) fn resolve_named(
     cx: &IrCx,
     name: &str,
@@ -504,89 +544,6 @@ pub(super) fn resolve_named(
             path,
             span,
             format!("unknown type `{name}`"),
-        )),
-    }
-}
-
-pub(super) fn field_default(
-    cx: &IrCx,
-    path: &str,
-    ty: Ty,
-    field_ty: &Type,
-    params: &[crate::parse::Ident],
-    default: &Option<Expr>,
-) -> Result<Option<Operand>, CheckError> {
-    let Some(expr) = default else {
-        return Ok(None);
-    };
-    if mentions_type_param(field_ty, params) {
-        return Err(CheckError::new(
-            path,
-            expr.span,
-            "default on a generic field",
-        ));
-    }
-    Ok(Some(literal_default(cx, path, ty, expr)?))
-}
-
-pub(super) fn mentions_type_param(ty: &Type, params: &[crate::parse::Ident]) -> bool {
-    match &ty.kind {
-        TypeKind::Named(n) => params.iter().any(|p| p.name == *n),
-        TypeKind::Generic { name, args } => {
-            params.iter().any(|p| p.name == *name)
-                || args.iter().any(|a| mentions_type_param(a, params))
-        }
-        TypeKind::Ref(inner) | TypeKind::Slice(inner) => mentions_type_param(inner, params),
-        TypeKind::Array { elem, .. } => mentions_type_param(elem, params),
-        TypeKind::Fn { params: ps, ret } | TypeKind::Closure { params: ps, ret } => {
-            ps.iter().any(|p| mentions_type_param(p, params))
-                || ret.as_ref().is_some_and(|r| mentions_type_param(r, params))
-        }
-    }
-}
-
-pub(super) fn literal_default(cx: &IrCx, path: &str, ty: Ty, expr: &Expr) -> Result<Operand, CheckError> {
-    let mismatch = |span| CheckError::new(path, span, "field default type mismatch");
-    let folded = expr.folded_literal();
-    let expr = &folded;
-    match &expr.kind {
-        ExprKind::Bool(v) => {
-            if ty != cx.common.bool {
-                return Err(mismatch(expr.span));
-            }
-            Ok(Operand::bool_const(expr.span, ty, *v))
-        }
-        ExprKind::Int(v) => {
-            if *v == 0 && matches!(cx.ty_kind(ty), TyKind::Ptr | TyKind::CStr | TyKind::Ref(_)) {
-                return Ok(Operand::null(expr.span, ty));
-            }
-            if is_int(cx, ty) {
-                return Ok(Operand::int(expr.span, ty, *v as u64));
-            }
-            if ty == cx.common.f32 {
-                return Ok(Operand::f32_const(expr.span, ty, *v as f32));
-            }
-            if is_float(cx, ty) {
-                return Ok(Operand::f64_const(expr.span, ty, *v as f64));
-            }
-            Err(mismatch(expr.span))
-        }
-        ExprKind::Float(v) => {
-            if ty == cx.common.f32 {
-                return Ok(Operand::f32_const(expr.span, ty, *v as f32));
-            }
-            if is_float(cx, ty) {
-                return Ok(Operand::f64_const(expr.span, ty, *v));
-            }
-            Err(mismatch(expr.span))
-        }
-        ExprKind::String(bytes) if ty == cx.common.string => {
-            Ok(Operand::bytes(expr.span, ty, bytes))
-        }
-        _ => Err(CheckError::new(
-            path,
-            expr.span,
-            "field default must be a literal",
         )),
     }
 }

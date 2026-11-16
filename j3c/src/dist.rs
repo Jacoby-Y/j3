@@ -5,12 +5,11 @@
 //! the `[link] search` dirs, their `../bin`, or `~/.cache/j3/sdl2-mingw/dll`. A `.deb` (Linux
 //! targets) installs that folder to `/opt/<name>` with a launcher, menu entry, and icon (`deb.rs`).
 //! An `.apk` (`apk.rs`) packs every Android target's `lib<name>.so` with SDL and the assets.
-//! `steam` (`steam.rs`) lays the same folder out as Steam depot content.
+//! Any other name is a dep's `[dist_outputs]` tool, run last with the staged folders (`pkg.rs`).
 
 pub mod apk;
 pub(crate) mod deb;
-mod steam;
-pub(crate) use steam::dev_env as steam_dev_env;
+mod pkg;
 
 /// The J3 logo, 256x256: the package icon when `[dist] icon` is unset (same art as `logo.svg`).
 pub(crate) const LOGO_PNG: &[u8] = include_bytes!("dist/logo.png");
@@ -22,13 +21,26 @@ use std::process::Command;
 use crate::project::{Manifest, Output};
 
 /// Package every built target. `built` is `(triple, exe path)`; the triple may be empty (host).
-pub fn package(m: &Manifest, built: &[(String, PathBuf)]) -> Result<Vec<PathBuf>, String> {
+/// The error carries the exit code for `j3c build`: a failing package output's own, else 1.
+pub fn package(m: &Manifest, built: &[(String, PathBuf)]) -> Result<Vec<PathBuf>, (String, i32)> {
+    let mut stages = Vec::new();
+    let res = builtins(m, built, &mut stages).map_err(|e| (e, 1)).and_then(|(dist, mut out)| {
+        pkg::run_all(m, built, &stages, &dist, &mut out)?;
+        Ok(out)
+    });
+    let _ = fs::remove_dir_all(m.root.join("target/.j3c/dist"));
+    res
+}
+
+/// The built-in outputs. With package outputs named, each target's staged `<name>/` folder is kept
+/// (pushed to `stages` as `(triple, folder)`) for them; the caller removes it.
+fn builtins(m: &Manifest, built: &[(String, PathBuf)], stages: &mut Vec<(String, PathBuf)>) -> Result<(PathBuf, Vec<PathBuf>), String> {
+    let keep = m.dist.outputs.iter().any(|o| matches!(o, Output::Pkg(_)));
     // Absolute: `zip` runs inside the staging folder, so a relative root (`j3c build .`) points nowhere.
     let dist = std::path::absolute(m.root.join("target/dist")).map_err(|e| format!("dist dir: {e}"))?;
     fs::create_dir_all(&dist).map_err(|e| format!("mkdir {}: {e}", dist.display()))?;
     let include = include(m);
     let mut out = Vec::new();
-    let steam_targets = if m.dist.outputs.contains(&Output::Steam) { steam::plan(m, built)? } else { Vec::new() };
     // One APK holds every Android triple; those triples have no zip/deb of their own.
     let android = |t: &str| crate::emit::host::target_os(t) == crate::emit::host::TargetOs::Android;
     if m.dist.outputs.contains(&Output::Apk) {
@@ -72,18 +84,17 @@ pub fn package(m: &Manifest, built: &[(String, PathBuf)]) -> Result<Vec<PathBuf>
                 Output::Deb if platform(triple).starts_with("linux-") => {
                     out.push(deb::build(m, triple, &stage, &dir.join(file), &dist)?)
                 }
-                Output::Apk => {}
-                Output::Steam => steam::stage(m, triple, &dir)?,
+                Output::Apk | Output::Pkg(_) => {}
                 Output::Deb => eprintln!("j3c: dist: no .deb for {} (Linux targets only)", platform(triple)),
             }
         }
-        let _ = fs::remove_dir_all(&stage);
+        if keep {
+            stages.push((triple.clone(), std::path::absolute(&dir).map_err(|e| format!("{}: {e}", dir.display()))?));
+        } else {
+            let _ = fs::remove_dir_all(&stage);
+        }
     }
-    let _ = fs::remove_dir_all(m.root.join("target/.j3c/dist"));
-    if !steam_targets.is_empty() {
-        out.push(steam::finish(m, &steam_targets)?);
-    }
-    Ok(out)
+    Ok((dist, out))
 }
 
 /// Files and folders shipped beside the program (`[dist] include`, else whichever default dirs exist).

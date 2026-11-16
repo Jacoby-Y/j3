@@ -31,6 +31,8 @@ pub fn docs_id() -> String {
         include_str!("../helptext/recipes/canvas_main.j3"),
         include_str!("../helptext/recipes/canvas.md"),
         include_str!("../helptext/recipes/check.md"),
+        include_str!("../helptext/recipes/watch.md"),
+        include_str!("../helptext/recipes/watch_main.j3"),
         include_str!("../helptext/recipes/components_main.j3"),
         include_str!("../helptext/recipes/components.md"),
         include_str!("../helptext/recipes/components_Screen.j3ui"),

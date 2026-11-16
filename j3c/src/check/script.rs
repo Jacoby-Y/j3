@@ -141,6 +141,7 @@ pub fn prepare(files: &mut [ParsedFile]) -> Result<(), CheckError> {
             debug: false,
             packed: false,
             gpu: parse::GpuStruct::None,
+            derives: Vec::new(),
             name: Ident { name, span },
             type_params: Vec::new(),
             bounds: Vec::new(),

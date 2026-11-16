@@ -19,6 +19,7 @@ use crate::lsp::json::{self, Json};
 use crate::scene::{self, Reply};
 
 mod ops;
+pub(crate) use ops::wild;
 mod schema;
 mod server;
 

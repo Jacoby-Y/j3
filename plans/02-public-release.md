@@ -17,7 +17,7 @@ the first Steam game ships. Scored audit with more detail: [version1](version1.m
 - [x] **LICENSE**: pick one (MIT/Apache-2.0 dual is the Rust norm) and add it at the root, plus `license` in `Cargo.toml` and `editors/vscode/package.json`.
 - [x] **Asset provenance**: 145+ binary assets (png/wav/ttf/glb). Each needs a known source and license, or replace it. Add `ASSETS.md`/`NOTICE` listing third-party files (Bootstrap Icons, Apache fonts, CC0 models, SDL).
 - [x] **Vendored libs**: SDL2 and friends anywhere in the tree need their license files next to them.
-- [ ] **Steamworks**: confirm no Valve SDK file or header copy is tracked; `steam-check` docs say "bring your own SDK".
+- [ ] **Steamworks**: confirm no Valve SDK file or header copy is tracked; the `steam` package's `j3c pkg steam check` docs say "bring your own SDK".
 - [ ] **Name check**: make sure "J3" doesn't collide with an existing trademark/package name on crates.io, npm, apt, Homebrew.
 
 ## 3. Repo hygiene (loose/pointless files)
@@ -77,7 +77,7 @@ the first Steam game ships. Scored audit with more detail: [version1](version1.m
 - [ ] **Windows**: run the built exe for real, fix what breaks, test in CI.
 - [ ] **macOS**: build + run once, decide if it's in scope for v0.1.
 - [ ] **Wayland vs X11, NVIDIA vs Mesa**: smoke-test both; note the ones you can't test.
-- [ ] **Steam Deck / sniper runtime**: covered by [01-steam](01-steam.md), but needed before your game ships anyway.
+- [ ] **Steam Deck / sniper runtime**: covered by the `steam` package's `VERIFY.md` (was plan 01), but needed before your game ships anyway.
 
 ## 8. CI and release process
 

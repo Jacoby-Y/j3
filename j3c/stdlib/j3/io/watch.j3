@@ -1,0 +1,322 @@
+/// File and folder change events (inotify): see edits made outside the app without polling.
+///
+///     let w = Watcher.create(&mem);
+///     match w.add("/tmp/x") {                      // a folder: its direct entries (not recursive)
+///         Result.Ok(id) { dirId = id; }            // a file path watches the file itself
+///         Result.Err(e) { ... }                    // NotFound, Other
+///     }
+///     let evs = List<Event>.new(&mem);
+///     // each frame:
+///     if w.poll(&evs) > 0 {
+///         for e in evs.items[0..evs.len] { ... }      // e.id, e.kind, e.name
+///         evs.len = 0;
+///     }
+///
+/// What each watch reports:
+/// - Folder: `Create`, `Delete`, `Modify` (contents written), `MoveIn`, `MoveOut` with `name` the entry inside it. The folder
+///   itself deleted or moved away: `Delete` with `name` "" (a moved folder keeps reporting under its new path; `remove` it).
+/// - File: `name` is always "". Written: `Modify`. Replaced by "write temp + rename over" (most editors): `Modify`, the
+///   same as an in-place save. Deleted: `Delete`; created again under the same path: `Create` on the same id (an editor
+///   that deletes then writes gives `Delete`, `Create`). Moved away: `Delete`. The watch keeps working across all of these,
+///   since a file watch follows the name in its folder, not the file's inode. A path through a symlink'd file is watched
+///   as the link's name, not the target.
+/// - `Overflow` (id -1): the kernel queue filled up and events were lost. Rescan everything you show.
+///
+/// Repeated writes may arrive as one `Modify` or several. `name` points into the watcher's read buffer: valid until the
+/// next `poll`, so copy it to keep it. `remove` of an unknown id, or of a folder that is gone, does nothing. `poll` never blocks and allocates nothing once `out` has grown.
+///
+/// Waking: a pending change wakes the `j3.game` idle loop (`App.idleSkip`) the way a `j3.thread.Queue` hand-back does, so
+/// an idle app polls on the next frame without polling every frame. A small helper thread per `Watcher` waits for the
+/// kernel and calls `j3.wake`; `close` stops it.
+///
+/// Threads: use a `Watcher` from one thread, the one that made it (main or a worker); its changes still wake the main
+/// loop. Paths up to 4 KB.
+/// Platforms: Linux x86-64 (inotify) and Windows (`ReadDirectoryChangesW`, `watch_windows.j3`). Android, macOS and web
+/// link (macOS and web load `watch_other.j3`, no syscalls) but `add` returns `Err(Other)` and `poll` returns 0.
+/// ponytail: `add` copies the path into `mem` and `remove` does not give it back.
+
+module j3.io.watch;
+
+use j3.io;
+use j3.io.IoError;
+use j3.memory.{ Arena, List };
+use j3.result.Result;
+use j3.sys;
+use j3.text.cstr;
+use j3.thread;
+use j3.thread.Thread;
+use j3.wake;
+
+const SYS_read = 0;
+const SYS_write = 1;
+const SYS_close = 3;
+const SYS_epoll_wait = 232;
+const SYS_epoll_ctl = 233;
+const SYS_inotify_add_watch = 254;
+const SYS_inotify_rm_watch = 255;
+const SYS_eventfd2 = 290;
+const SYS_epoll_create1 = 291;
+const SYS_inotify_init1 = 294;
+
+const IN_MODIFY = 0x2;
+const IN_MOVED_FROM = 0x40;
+const IN_MOVED_TO = 0x80;
+const IN_CREATE = 0x100;
+const IN_DELETE = 0x200;
+const IN_DELETE_SELF = 0x400;
+const IN_MOVE_SELF = 0x800;
+const IN_Q_OVERFLOW = 0x4000;
+const IN_IGNORED = 0x8000;
+const IN_ONLYDIR = 0x1000000;
+/// Every watch is on a folder (a file is watched through its folder), always with this mask, so two ids on one folder
+/// share its kernel watch.
+const MASK = IN_MODIFY | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR;
+/// IN_NONBLOCK | IN_CLOEXEC (eventfd and epoll take the same CLOEXEC bit).
+const NONBLOCK_CLOEXEC = 0x800 | 0x80000;
+const CLOEXEC = 0x80000;
+const EPOLLIN = 1;
+const EPOLLET = 0x80000000;
+const EPOLL_CTL_ADD = 1;
+/// Read buffer: about 4000 short-name events per `poll`; the rest wait for the next one.
+const BUF_LEN = 65536;
+/// One event with the longest name (16-byte header, NAME_MAX 255, NUL).
+const EV_MAX = 16 + 256;
+
+/// What happened. See the module doc for which watch reports which.
+pub enum Kind { Create, Delete, Modify, MoveIn, MoveOut, Overflow }
+
+/// One change, from `Watcher.poll`.
+pub struct Event {
+    /// The watch that fired (from `add`); -1 for `Overflow`.
+    id: int;
+    kind: Kind;
+    /// Entry name inside a watched folder; "" for a watched file and for the watched path itself. Valid until the next `poll`.
+    name: string;
+}
+
+/// One `add`: the kernel watch on a folder, and for a file the name it follows there ("" for a folder).
+struct Watch {
+    id: int;
+    /// Kernel watch descriptor; -1 once the kernel dropped it (folder gone).
+    wd: int;
+    file: string;
+}
+
+/// The helper thread's state, in the arena so it stays put while `Watcher` is copied.
+struct Waker {
+    t: Thread;
+    ep: int;
+    /// eventfd: a write to it ends the thread.
+    stop: int;
+}
+
+/// Watches files and folders. Make it with `create`, end it with `close`.
+pub struct Watcher {
+    /// inotify fd; -1 when it could not be made or after `close`.
+    fd: int;
+    mem: &Arena;
+    buf: []u8;
+    watches: List<Watch>;
+    nextId: int = 1;
+    waker: &Waker;
+
+    /// A watcher with nothing watched. Its buffers and thread come from `mem`.
+    fn create(mem: &Arena): Watcher {
+        let wk = &mem.alloc::<Waker>(1)[0];
+        let w = Watcher { fd: -1, mem: mem, buf: mem.alloc::<u8>(BUF_LEN), watches: List<Watch>.new(mem), waker: wk };
+        wk.ep = -1;
+        wk.stop = -1;
+        if sys.PLATFORM != sys.PLATFORM_LINUX || sys.ARCH != sys.ARCH_X86_64 {
+            return w;
+        }
+        w.fd = @syscall(SYS_inotify_init1, NONBLOCK_CLOEXEC);
+        if w.fd < 0 {
+            w.fd = -1;
+            return w;
+        }
+        wk.ep = @syscall(SYS_epoll_create1, CLOEXEC);
+        wk.stop = @syscall(SYS_eventfd2, 0, CLOEXEC);
+        // struct epoll_event is packed on x86-64: u32 events, u64 data (0 the inotify fd, 1 stop)
+        let ev: [3]u32 = [u32(EPOLLIN | EPOLLET), u32(0), u32(0)];
+        let ok = wk.ep >= 0 && wk.stop >= 0 && @syscall(SYS_epoll_ctl, wk.ep, EPOLL_CTL_ADD, w.fd, &ev[0] as ptr) >= 0;
+        ev[0] = u32(EPOLLIN);
+        ev[1] = u32(1);
+        ok = ok && @syscall(SYS_epoll_ctl, wk.ep, EPOLL_CTL_ADD, wk.stop, &ev[0] as ptr) >= 0;
+        if ok {
+            thread.spawn(&wk.t, "io.watch", wakerLoop, wk as ptr);
+        } else {
+            // no waker: `poll` still works, an idle app just notices on its next safety tick
+            closeFd(wk.ep);
+            closeFd(wk.stop);
+            wk.ep = -1;
+            wk.stop = -1;
+        }
+        return w;
+    }
+
+    /// Watch `path`: a folder reports its direct entries (not recursive), a file reports itself. The id goes in each
+    /// `Event`. `NotFound` when the path (or a file's folder) does not exist.
+    fn add(this: &Watcher, path: string): Result<int, IoError> {
+        if this.fd < 0 || path.len == 0 {
+            return Result.Err(IoError.Other);
+        }
+        let isDir = false;
+        match io.stat(path) {
+            Result.Ok(e) { isDir = e.isDir; }
+            Result.Err(e) { return Result.Err(e); }
+        }
+        let dir = path;
+        let file = "";
+        if !isDir {
+            let slash = -1;
+            for i in 0..path.len {
+                if path[i] == 47 { slash = i; }
+            }
+            file = path[slash + 1..path.len];
+            dir = if slash < 0 { "." } else if slash == 0 { "/" } else { path[0..slash] };
+        }
+        let wd = @syscall(SYS_inotify_add_watch, this.fd, cstr(dir) as ptr, MASK);
+        if wd < 0 {
+            let err = sys.errno();
+            return Result.Err(if err == 2 || err == 20 { IoError.NotFound } else { IoError.Other });
+        }
+        let copy = this.mem.alloc::<u8>(file.len);
+        for i in 0..file.len { copy[i] = file[i]; }
+        let id = this.nextId;
+        this.nextId += 1;
+        this.watches.push(Watch { id: id, wd: wd, file: copy as string });
+        return Result.Ok(id);
+    }
+
+    /// Stop watching `id`. Unknown ids, and watches whose folder is gone, are a no-op.
+    fn remove(this: &Watcher, id: int) {
+        for i in 0..this.watches.len {
+            if this.watches.items[i].id == id {
+                let wd = this.watches.items[i].wd;
+                this.watches.swapRemove(i);
+                if wd >= 0 && this.fd >= 0 && !uses(this, wd) {
+                    @syscall(SYS_inotify_rm_watch, this.fd, wd);
+                }
+                return;
+            }
+        }
+    }
+
+    /// Append the changes since the last call to `out` and return how many. Never blocks.
+    fn poll(this: &Watcher, out: &List<Event>): int {
+        if this.fd < 0 { return 0; }
+        let start = out.len;
+        let used = 0;
+        let overflow = false;
+        // read until drained or the buffer is nearly full: names point into it, so nothing read this call is overwritten
+        while this.buf.len - used >= EV_MAX {
+            let n = @syscall(SYS_read, this.fd, (this.buf.ptr as int + used) as ptr, this.buf.len - used);
+            if n <= 0 { break; }
+            let at = used;
+            used += n;
+            while at < used {
+                let rec = this.buf.ptr as int + at;
+                let wdp = rec as ptr as &i32;
+                let maskp = (rec + 4) as ptr as &u32;
+                let lenp = (rec + 12) as ptr as &u32;
+                let wd = int(*wdp);
+                let mask = int(*maskp);
+                let len = int(*lenp);
+                let nameLen = 0;
+                while nameLen < len && this.buf[at + 16 + nameLen] != 0 { nameLen += 1; }
+                let name = this.buf[at + 16..at + 16 + nameLen] as string;
+                at += 16 + len;
+                if mask & IN_Q_OVERFLOW != 0 {
+                    if !overflow { out.push(Event { id: -1, kind: Kind.Overflow, name: "" }); }
+                    overflow = true;
+                    continue;
+                }
+                dispatch(this, wd, mask, name, out);
+            }
+        }
+        if this.buf.len - used < EV_MAX {
+            // more may be waiting and the edge-triggered waker will not fire for it again
+            wake.wake();
+        }
+        return out.len - start;
+    }
+
+    /// Stop watching everything, end the helper thread and close the kernel handles. Idempotent.
+    fn close(this: &Watcher) {
+        let wk = this.waker;
+        if wk.stop >= 0 {
+            let one: [1]int = [1];
+            @syscall(SYS_write, wk.stop, &one[0] as ptr, 8);
+            thread.join(&wk.t);
+        }
+        closeFd(wk.ep);
+        closeFd(wk.stop);
+        wk.ep = -1;
+        wk.stop = -1;
+        closeFd(this.fd);
+        this.fd = -1;
+        this.watches.len = 0;
+    }
+}
+
+fn dispatch(w0: &Watcher, wd: int, mask: int, name: string, out: &List<Event>) {
+    for i in 0..w0.watches.len {
+        let w = w0.watches.items[i];
+        if w.wd != wd { continue; }
+        if mask & IN_IGNORED != 0 {
+            // the kernel dropped the watch (folder deleted or unmounted): `remove` must not touch the number again
+            w0.watches.items[i].wd = -1;
+            continue;
+        }
+        if mask & (IN_DELETE_SELF | IN_MOVE_SELF) != 0 {
+            if w.file.len == 0 { out.push(Event { id: w.id, kind: Kind.Delete, name: "" }); }
+            continue;
+        }
+        if w.file.len == 0 {
+            let k = if mask & IN_CREATE != 0 { Kind.Create } else if mask & IN_DELETE != 0 { Kind.Delete }
+                else if mask & IN_MOVED_TO != 0 { Kind.MoveIn } else if mask & IN_MOVED_FROM != 0 { Kind.MoveOut } else { Kind.Modify };
+            out.push(Event { id: w.id, kind: k, name: name });
+        } else if same(w.file, name) {
+            // a file followed by name: rename over it reads as a save, rename away as a delete
+            let k = if mask & IN_CREATE != 0 { Kind.Create } else if mask & (IN_DELETE | IN_MOVED_FROM) != 0 { Kind.Delete } else { Kind.Modify };
+            out.push(Event { id: w.id, kind: k, name: "" });
+        }
+    }
+}
+
+fn uses(w: &Watcher, wd: int): bool {
+    for i in 0..w.watches.len {
+        if w.watches.items[i].wd == wd { return true; }
+    }
+    return false;
+}
+
+fn closeFd(fd: int) {
+    if fd >= 0 { @syscall(SYS_close, fd); }
+}
+
+fn same(a: string, b: string): bool {
+    if a.len != b.len { return false; }
+    for i in 0..a.len {
+        if a[i] != b[i] { return false; }
+    }
+    return true;
+}
+
+/// The helper thread: sleep in epoll until the inotify fd gets new data (edge-triggered: once per arrival, not while it
+/// sits unread), then wake the main loop. A write to `stop` ends it.
+fn wakerLoop(p: ptr) {
+    let wk = p as &Waker;
+    let evs: [12]u32 = [u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)];
+    while true {
+        let n = @syscall(SYS_epoll_wait, wk.ep, &evs[0] as ptr, 4, -1);
+        if n < 0 {
+            if sys.errno() == 4 { continue; }
+            return;
+        }
+        for i in 0..n {
+            if evs[i * 3 + 1] == u32(1) { return; }
+        }
+        if n > 0 { wake.wake(); }
+    }
+}

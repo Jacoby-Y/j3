@@ -247,6 +247,8 @@ fn closures_in_scripts_are_rejected() {
     for script in [
         "pub fn run() {\n    let f = fn(x: int): int { return x; };\n}\n",
         "pub fn run(f: closure(int): int) {\n}\n",
+        "pub fn run() {\n    let f = fn[m](x: int): int { return x; };\n}\n",
+        "pub fn run(f: boxed closure(int): int) {\n}\n",
     ] {
         let m = temp_project("cl_script", &[("j3.toml", toml), ("main.j3", main), ("scripts/s.j3s", script)]);
         let e = match compile_manifest(&m) {
@@ -362,4 +364,66 @@ fn main() {
 }
 ";
     run("cl_pool_each", src, "total=999000\n");
+}
+
+#[test]
+fn boxed_closure_errors_have_spans_and_hints() {
+    // a stand-in `Arena` (no stdlib here): `fn[..]` needs `allocAligned`
+    let pre = "module t;\nstruct Arena { n: int; fn allocAligned(this: &Arena, n: int, a: int): ptr { return 0 as ptr; } }\nfn take(f: boxed closure(int): int): int { return f(1); }\n";
+    // a captured stack closure would dangle
+    rejects(
+        &format!("{pre}fn main() {{\n    let mem = Arena {{ n: 0 }};\n    let s = fn(x: int): int {{ return x; }};\n    let b = fn[mem](x: int): int {{ return s(x); }};\n}}\n"),
+        "captured by a boxed closure",
+        7,
+    );
+    // stack closure where a boxed one is wanted: both types named
+    rejects(
+        &format!("{pre}fn main() {{\n    let k = 1;\n    take(fn(x: int): int {{ return x + k; }});\n}}\n"),
+        "expected `boxed closure(int): int`, found `closure(int): int`",
+        6,
+    );
+    rejects(
+        &format!("{pre}fn up(f: closure(int): int): boxed closure(int): int {{\n    return f;\n}}\nfn main() {{}}\n"),
+        "cannot become boxed",
+        5,
+    );
+    rejects(
+        &format!("{pre}fn main() {{\n    let k = 1;\n    let b = fn[k](x: int): int {{ return x + k; }};\n}}\n"),
+        "found `int`",
+        6,
+    );
+    rejects(
+        &format!("{pre}const G: boxed closure(int): int = 0;\nfn main() {{}}\n"),
+        "not allowed here",
+        4,
+    );
+    // a global holds one, set at run time; an initializer cannot make one
+    rejects(
+        &format!("{pre}#[singleton]\nlet G: boxed closure(int): int = 0;\nfn main() {{}}\n"),
+        "starts empty and takes no initializer",
+        5,
+    );
+}
+
+#[test]
+fn boxed_closures_escape_both_backends() {
+    run(
+        "cl_boxed",
+        &format!("{HEAD}use j3.memory.Arena;
+struct Hold {{ f: boxed closure(): int; }}
+fn make(mem: &Arena, k: int): Hold {{
+    return Hold {{ f: fn[mem](): int {{ return k * 2; }} }};
+}}
+fn call(f: closure(): int): int {{ return f(); }}
+fn main() {{
+    let mem = Arena.create(256);
+    let h = make(&mem, 4);
+    let k = 1;
+    let b = fn[mem](): int {{ k += 10; return k; }};
+    k = 100;
+    let f = h.f;
+    printLn(`{{f()}} {{b()}} {{call(b)}} k={{k}}`);
+}}\n"),
+        "8 11 21 k=100\n",
+    );
 }

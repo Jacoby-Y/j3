@@ -15,10 +15,12 @@ elif [ -d "$HOME/.bin" ]; then bin=$HOME/.bin
 else bin=$HOME/.local/bin
 fi
 mkdir -p "$bin"
+# Plan 11 A3: nothing from j3c-bootstrap/ (stage0, j3c-boot) is ever installed.
+inst() { case "$(realpath "$1")" in */j3c-bootstrap/*) echo "build.sh: refusing to install $1 (from j3c-bootstrap/)" >&2; exit 1 ;; esac; install -m 755 "$1" "$2"; }
 cargo build --release --manifest-path j3c/Cargo.toml
-install -m 755 j3c/target/release/j3c "$bin/j3c"
+inst j3c/target/release/j3c "$bin/j3c"
 echo "installed $bin/j3c"
 # Composer (tools/composer): its own program, built with the j3c just installed.
 "$bin/j3c" build tools/composer --release
-install -m 755 tools/composer/target/composer "$bin/j3c-composer"
+inst tools/composer/target/composer "$bin/j3c-composer"
 echo "installed $bin/j3c-composer"

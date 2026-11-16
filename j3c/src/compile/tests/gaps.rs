@@ -262,3 +262,38 @@ fn number_literal_on_the_left_takes_the_other_side() {
     let err = compile_src("litleft_bad", "module t;\nfn f(x: i32): i32 { return 2.0 * x; }\nfn main() {}\n").err().expect("type error");
     assert!(err.contains("expected `i32`, found `float`"), "{err}");
 }
+
+/// Nested arrays (`[2][3]int` locals, params, returns, struct fields, globals, literals) and
+/// `&[N]T` (params, fields, `&g[1]`): C declares `T name[N][M]` and points `&[N]T` at the wrapper.
+#[test]
+fn nested_arrays_and_array_refs_on_both_backends() {
+    let src = "module t;\nuse j3.io.printLn;\n\
+struct Grid { cells: [2][2]int; rows: &[2]int; }\n\
+#[singleton]\nlet G: [2][3]u8 = [[1, 2, 3], [4, 5, 6]];\n\
+fn mk(): [2][3]int { let g: [2][3]int; g[1][2] = 7; g[0][0] = 1; return g; }\n\
+fn sum(g: [2][3]int): int { let s = 0; for i in 0..2 { for j in 0..3 { s += g[i][j]; } } return s; }\n\
+fn bump(a: &[3]int) { a[1] = a[1] + 5; }\n\
+fn row(r: [3]u8): int { return r[0] as int + r[2] as int; }\n\
+fn main() {\n\
+    let g = mk();\n    let r = [1, 2, 3];\n    bump(&r);\n    bump(&g[1]);\n\
+    printLn(`{sum(g)} {r[1]} {g[1][1]}`);\n\
+    let first = [7, 8];\n    let gr = Grid { cells: [[1, 2], [3, 4]], rows: &first };\n\
+    let m = [[0, 0], [0, 0]];\n    m[0] = [5, 6];\n\
+    printLn(`{gr.cells[1][0]} {gr.rows[1]} {row(G[1])} {m[0][1]}`);\n}\n";
+    for r in both_backends("nested_arr", src) {
+        assert_eq!(r.status, 0, "{}", String::from_utf8_lossy(&r.stderr));
+        assert_eq!(String::from_utf8_lossy(&r.stdout), "13 7 5\n3 8 10 6\n");
+    }
+}
+
+#[test]
+fn big_values_go_through_memory() {
+    run_both_ok(&honesty("big_values.j3"), "4 4 5 5 4 5 11\n");
+    let prog = compile_path(&honesty("big_values.j3")).expect("compile");
+    let ll = emit::emit_llvm(&prog.cx, &prog.modules, &emit::EmitOpts::default()).expect("llvm");
+    // LLVM splits a first-class aggregate load/store into one op per field: never for a big type
+    let big = ll.lines().find(|l| l.contains("_Big_") && l.contains(" = type ")).expect("Big type");
+    let name = big.split(' ').next().unwrap_or("");
+    assert!(!ll.contains(&format!("load {name},")) && !ll.contains(&format!("store {name} ")), "{ll}");
+    assert!(ll.contains("(ptr noalias %ret, ptr %a0)"), "sret + pointer param: {ll}");
+}

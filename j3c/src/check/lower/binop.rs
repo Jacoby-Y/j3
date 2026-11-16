@@ -97,7 +97,8 @@ impl<'a> Lower<'a> {
                 if is_vec(self.cx, l.ty()) {
                     return Err(self.vec_cmp_error(span, op));
                 }
-                if let Some(id) = find_operator(self.cx, l.ty(), op, self.methods) {
+                if let Some(id) = self.find_op(span, l.ty(), op)? {
+                    self.op_where(span, id)?;
                     let fty = self.cx.func(id).ty;
                     let (params, ret) = match self.cx.fn_sig(fty) {
                         Some(s) => (s.0.clone(), s.1),
@@ -127,8 +128,19 @@ impl<'a> Lower<'a> {
                         vec![l, r],
                     ));
                 }
+                if matches!(op, parse::BinOp::Eq | parse::BinOp::Ne) && self.cx.tuple_elems(l.ty()).is_some() {
+                    let r = self.operand(rhs, Some(l.ty()))?;
+                    if r.ty() != l.ty() {
+                        return Err(CheckError::new(self.path, span, "compare type mismatch"));
+                    }
+                    return self.tuple_eq(span, op == parse::BinOp::Ne, l, r);
+                }
                 if let Some(rw) = self.operator_fallback(span, op, &l, rhs)? {
                     return Ok(rw);
+                }
+                let base = if matches!(op, parse::BinOp::Eq | parse::BinOp::Ne) { "operator==" } else { "operator<" };
+                if let Some(e) = self.bound_miss(span, l.ty(), &format!("`{}`", ast_binop(op).as_str()), Some(base)) {
+                    return Err(e);
                 }
                 let r_expected = Some(l.ty());
                 let r = if self.is_ptr_ty(l.ty()) && self.fold_int(rhs) == Some(0) {
@@ -144,6 +156,11 @@ impl<'a> Lower<'a> {
                     return Err(CheckError::new(self.path, span, "compare type mismatch"));
                 }
                 if matches!(op, parse::BinOp::Eq | parse::BinOp::Ne) {
+                    if self.cx.dyn_trait(l.ty()).is_some() {
+                        return Err(CheckError::new(self.path, span, format!("`{}` does not compare `{}` values", ast_binop(op).as_str(), self.ty_str(l.ty())))
+                            .note("two `dyn` values may point at equal data through different tables, or the reverse, so neither meaning is safe to pick")
+                            .help("add a method to the trait that says what equal means (`fn id(this: &Self): int;`) and compare its results"));
+                    }
                     if eq_needs_operator(self.cx, l.ty()) {
                         let sym = ast_binop(op).as_str();
                         return Err(CheckError::new(
@@ -185,7 +202,7 @@ impl<'a> Lower<'a> {
                     if !is_numeric(self.cx, r.ty()) {
                         let e = CheckError::new(self.path, span, "arithmetic type mismatch");
                         // ponytail: operators are methods of the left operand; no scalar-left overloads.
-                        if find_operator(self.cx, r.ty(), op, self.methods).is_some() {
+                        if self.find_op(span, r.ty(), op)?.is_some() {
                             return Err(e.help(format!(
                                 "`operator{}` is a method of `{}`, so the `{}` goes on the left: put the number on the right",
                                 ir_op.as_str(),
@@ -222,7 +239,8 @@ impl<'a> Lower<'a> {
                     let r = self.vec_rhs(rhs, l.ty())?;
                     return self.vec_arith(span, op, l, r);
                 }
-                if let Some(id) = find_operator(self.cx, l.ty(), op, self.methods) {
+                if let Some(id) = self.find_op(span, l.ty(), op)? {
+                    self.op_where(span, id)?;
                     let fty = self.cx.func(id).ty;
                     let (params, ret) = match self.cx.fn_sig(fty) {
                         Some(s) => (s.0.clone(), s.1),
@@ -302,7 +320,8 @@ impl<'a> Lower<'a> {
             B::Ge => (B::Lt, false, true),
             _ => return Ok(None),
         };
-        let Some(id) = find_operator(self.cx, l.ty(), base, self.methods) else { return Ok(None) };
+        let Some(id) = self.find_op(span, l.ty(), base)? else { return Ok(None) };
+        self.op_where(span, id)?;
         let fty = self.cx.func(id).ty;
         let Some((params, ret)) = self.cx.fn_sig(fty).map(|s| (s.0.clone(), s.1)) else {
             return Err(CheckError::new(self.path, span, "not a function"));
@@ -330,7 +349,30 @@ impl<'a> Lower<'a> {
         Ok(Some(Rvalue { ty: ret, span, kind: RvalueKind::Unary { op: UnaryOp::Not, arg: Operand::Copy(place) } }))
     }
 
-    /// `<< >> & | ^` take integers.
+    /// The operator fn for `ty`: its own method, else an `#[impl]` fn (`#[impl] fn operator<(a: string, b: string)`
+    /// in `j3.cmp`).
+    pub(super) fn find_op(&mut self, span: Span, ty: crate::ir::Ty, op: parse::BinOp) -> Result<Option<FuncId>, CheckError> {
+        if let Some(id) = find_operator(self.cx, ty, op, self.methods) {
+            return Ok(Some(id));
+        }
+        match crate::check::funcs::operator_name(op) {
+            Some(name) => self.impl_target(span, ty, name),
+            None => Ok(None),
+        }
+    }
+
+    /// An operator method's `where` bounds (a derived `==` on `Pair<A, B>` needs `A: Eq`).
+    fn op_where(&mut self, span: Span, id: FuncId) -> Result<(), CheckError> {
+        match self.cx.method_wheres.get(&id).cloned() {
+            Some(reqs) => {
+                let name = self.cx.name_str(self.cx.func(id).name).to_string();
+                self.check_where(span, &name, &reqs)
+            }
+            None => Ok(()),
+        }
+    }
+
+        /// `<< >> & | ^` take integers.
     fn int_only(&self, op: parse::BinOp, ty: crate::ir::Ty, span: Span) -> Result<(), CheckError> {
         use parse::BinOp::*;
         if !matches!(op, Shl | Shr | BitAnd | BitOr | BitXor) || is_int(self.cx, ty) {
@@ -408,6 +450,7 @@ impl<'a> Lower<'a> {
     pub(super) fn fold_int(&self, expr: &Expr) -> Option<i64> {
         match &expr.kind {
             ExprKind::Int(v) => Some(*v),
+            ExprKind::Char(v) => Some(*v as i64),
             ExprKind::Field { .. } => match self.qualified_const(expr) {
                 Some(ConstVal {
                     kind: ConstPayload::Int(v),
@@ -425,7 +468,13 @@ impl<'a> Lower<'a> {
             ExprKind::Binary { op, lhs, rhs } => {
                 let a = self.fold_int(lhs)?;
                 let b = self.fold_int(rhs)?;
-                crate::ir::wrap::fold_bin(ast_binop(*op), a, b)
+                match op {
+                    parse::BinOp::Div | parse::BinOp::Rem if b != 0 && (self.big_u64(lhs) || self.big_u64(rhs)) => {
+                        let (a, b) = (a as u64, b as u64);
+                        Some(if matches!(op, parse::BinOp::Div) { a / b } else { a % b } as i64)
+                    }
+                    _ => crate::ir::wrap::fold_bin(ast_binop(*op), a, b),
+                }
             }
             ExprKind::Unary {
                 op: parse::UnaryOp::Neg,
@@ -433,6 +482,19 @@ impl<'a> Lower<'a> {
             } => Some(crate::ir::wrap::fold_neg(self.fold_int(expr)?)),
             _ => None,
         }
+    }
+
+    /// `expr` uses a `u64` const above `i64::MAX` (its bits read back negative as an `int`): such
+    /// an expression folds unsigned and, with no other type to take, is a `u64`.
+    pub(super) fn big_u64(&self, expr: &Expr) -> bool {
+        let c = match &expr.kind {
+            ExprKind::Name(n) if !self.shadows(&n.name) => self.consts.get(&n.name).cloned(),
+            ExprKind::Field { .. } => self.qualified_const(expr),
+            ExprKind::Binary { lhs, rhs, .. } => return self.big_u64(lhs) || self.big_u64(rhs),
+            ExprKind::Unary { expr, .. } => return self.big_u64(expr),
+            _ => None,
+        };
+        matches!(c, Some(ConstVal { ty, kind: ConstPayload::Int(v) }) if ty == self.cx.common.u64 && v < 0)
     }
 
     pub(super) fn num_from_int(&self, span: Span, v: i64, expected: Option<Ty>) -> Operand {
@@ -444,6 +506,25 @@ impl<'a> Lower<'a> {
             Some(t) if is_float(self.cx, t) => Operand::f64_const(span, t, v as f64),
             _ => Operand::int(span, self.cx.common.int, v as u64),
         }
+    }
+
+    /// `'a'`: `u8` when ASCII, else a `u32` code point, or the expected int type when it fits.
+    pub(super) fn char_lit(&self, span: Span, v: u32, expected: Option<Ty>) -> Result<Operand, CheckError> {
+        let ty = match expected {
+            Some(t) if is_int(self.cx, t) => t,
+            _ if v < 0x80 => self.cx.common.u8,
+            _ => self.cx.common.u32,
+        };
+        let bits = match self.cx.ty_kind(ty) {
+            TyKind::Int(i) => i.bits() - u32::from(i.is_signed()),
+            _ => 64,
+        };
+        if (bits < 32 && u64::from(v) >> bits != 0) || (bits == 8 && v >= 0x80) {
+            let what = if v < 0x80 { "does not fit" } else { "is not ASCII, so it does not fit" };
+            return Err(CheckError::new(self.path, span, format!("char literal {what} `{}`", self.ty_str(ty)))
+                .help("a code point past ASCII is a `u32`"));
+        }
+        Ok(Operand::int(span, ty, u64::from(v)))
     }
 
     pub(super) fn num_from_float(&self, span: Span, v: f64, expected: Option<Ty>) -> Operand {

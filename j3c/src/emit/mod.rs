@@ -3,6 +3,7 @@
 mod c;
 pub mod bc;
 mod c_expr;
+mod c_static;
 mod c_ty;
 pub(crate) use c_expr::func_c_name;
 pub(crate) mod android;

@@ -116,6 +116,10 @@ pub(super) fn next_semi(src: &str, from: usize) -> usize {
             i += 2;
             continue;
         }
+        if let Some(n) = super::scan::char_skip(src, i) {
+            i += n;
+            continue;
+        }
         match c {
             b'"' => mode = Mode::String,
             b'`' => mode = Mode::Tick,

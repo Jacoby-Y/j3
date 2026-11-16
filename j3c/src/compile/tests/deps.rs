@@ -194,3 +194,12 @@ fn git_dep_clones_locks_and_reuses_the_lock() {
     let e = Manifest::load(&toml).unwrap_err();
     assert!(e.contains("one of tag, rev, branch"), "{e}");
 }
+
+/// `j3.steam` left the stdlib: `use j3.steam;` and a sub-module both name the package.
+#[test]
+fn j3_steam_points_at_the_package() {
+    for (tag, u) in [("steam_moved", "j3.steam"), ("steam_moved_sub", "j3.steam.game.attach")] {
+        let e = compile_src(tag, &format!("module {tag};\nuse {u};\nfn main() {{}}\n")).err().expect("must fail");
+        assert!(e.contains(&format!("`use {u}`: j3.steam moved to the")), "{e}");
+    }
+}

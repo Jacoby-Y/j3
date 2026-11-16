@@ -6,7 +6,8 @@ Attributes go on the line before a declaration.
 
 | Attribute | On | Effect |
 |---|---|---|
-| `#[Debug]` | struct | Can be printed in a `` `{hole}` `` |
+| `#[Debug]` | struct, enum | Can be printed in a `` `{hole}` `` |
+| `#[derive(Eq, Hash, Ord, Debug, Clone)]` | struct, enum | Writes those methods field by field (see [Traits](traits.md#derive)) |
 | `#[TryCatch(Ok, Err)]` | enum | Works with `?` (see [Enums and Errors](enums.md#errors-and-)) |
 | `#[singleton]` | `let` | One value for the whole process |
 | `#[thread]` | `let` (with `#[singleton]`) | One value per thread |
@@ -35,6 +36,7 @@ Intrinsics start with `@` and are handled by the compiler.
 | `@sizeof(T)` | Size of a type in bytes |
 | `@slice(p, n)` | Build a slice from a pointer and a length |
 | `@syscall(...)` | A raw system call |
+| `@embed("f")` `@embedBytes("f")` `@embedDir("dir", "*.txt")` | A file at compile time (see below) |
 | `@atomicLoad(p)` `@atomicStore(p, v)` | Atomic read and write through a `&T` (`int`, `i32`, `u32`, `u64`, `bool`, `ptr`) |
 | `@atomicAdd(p, v)` `@atomicSub(p, v)` `@atomicExchange(p, v)` | Atomic update; returns the old value (no add or sub on `bool`, `ptr`) |
 | `@atomicCas(p, old, new)` | Compare and swap; returns whether it swapped |
@@ -42,6 +44,20 @@ Intrinsics start with `@` and are handled by the compiler.
 | a last argument to any of them | Memory order: `relaxed`, `acquire`, `release`, `acqrel`, `seqcst` (default); load takes no `release`, store no `acquire` |
 | `@script("path.j3s")` | The type of a script (see [Scripts](scripts.md)) |
 | `@j3ui` | Immediate-mode UI functions (`j3c doc j3ui-immediate`) |
+
+### Embedding files
+
+`@embed` puts a file in the binary as a read-only `string`, `@embedBytes` as a `[]u8` (any bytes), and `@embedDir` a table `[N]{ path, data }` of every matching file below a folder (subfolders searched, sorted by `path`). Arguments are string literals. A path is relative to the source file, else to the package root; a missing file is a compile error. `@embedDir` works only as a `const` (leave its type off). Editing an embedded file rebuilds.
+
+```rust
+const GREETING = @embed("embed/greeting.txt");
+const BLOB = @embedBytes("embed/blob.bin");
+const TEXTS = @embedDir("embed", "*.txt");
+
+for i in 0..TEXTS.len {
+    printLn(`{TEXTS[i].path}: {TEXTS[i].data.len}`);
+}
+```
 
 ## Calling C
 

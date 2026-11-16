@@ -171,7 +171,7 @@ fn trait_and_bound_name_errors() {
     assert!(e.message.contains("cannot be generic"), "{}", e.message);
     for (src, want) in [
         ("module t;\nfn f<T: A + A>(x: T) { }\n", "bound `A` is listed twice"),
-        ("module t;\ntrait A { fn a(this: Self): int { return 1; } }\n", "traits have no default bodies"),
+        ("module t;\ntrait A { fn a(this: Self): int }\n", "expected `;` or a default body"),
         ("module t;\ntrait A<T> { fn a(this: Self): int; }\n", "traits take no type parameters"),
         ("module t;\n#[impl]\nstruct S { }\n", "`#[impl]` cannot sit on `struct`"),
     ] {
@@ -183,12 +183,12 @@ fn trait_and_bound_name_errors() {
 }
 
 #[test]
-fn unbounded_generics_are_unchanged() {
+fn unbounded_generics_store_copy_and_pass() {
     run(
         "tr_unbounded",
         &format!(
             "{HEAD}\
-fn pick<T>(a: T, b: T): T {{ if a > b {{ return a; }} return b; }}\n\
+fn pick<T>(a: T, b: T): T {{ let t = a; t = b; if @sizeof(T) > 0 {{ return t; }} return a; }}\n\
 struct Box<T> {{ v: T; }}\n\
 fn main() {{ let b = Box<int> {{ v: pick(3, 9) }}; printLn(`{{b.v}}`); }}\n"
         ),

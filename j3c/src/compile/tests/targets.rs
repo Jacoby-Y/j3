@@ -187,8 +187,12 @@ fn mingw_clang() -> bool {
 
 /// `j3.io` on Windows paths (`\`, `C:`, open flags): build `win_io_test.j3` for Windows and run it
 /// under wine. Skips without mingw clang or wine.
+/// Wine tests run one at a time: each ends with `wineserver -k`, which kills the other's programs.
+static WINE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn windows_io_runs_under_wine() {
+    let _wine = WINE.lock().unwrap_or_else(|e| e.into_inner());
     let wine = std::process::Command::new("wine").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
     if !wine || !mingw_clang() {
         return;
@@ -224,4 +228,81 @@ fn windows_io_runs_under_wine() {
         .status();
     let _ = std::process::Command::new("wineserver").arg("-k").status();
     assert!(out.contains("win_io_test ok"), "{}", out);
+}
+
+/// The Win32 twins (`proc_windows`, `term/pty_windows`, `io/watch_windows`, `instance_windows`,
+/// `game/hotkey_windows`) check for Windows and call no raw `syscall`; `j3.io.watch` has none on web either (macOS links
+/// libSystem's `syscall` for `threadsys.j3` anyway).
+#[test]
+fn windows_os_modules_check_without_syscall() {
+    let dir = std::env::temp_dir().join(format!("j3-winos-check-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.j3");
+    std::fs::write(
+        &file,
+        "module m;\nuse j3.proc;\nuse j3.term.pty;\nuse j3.io.watch.Watcher;\nuse j3.instance;\nuse j3.game.hotkey;\nuse j3.game.Key;\nuse j3.memory.Arena;\n\
+         fn main() {\n    let a = Arena.create(65536);\n    let w = Watcher.create(&a);\n    w.close();\n    instance.claim(\"x\");\n    hotkey.register(Key.F8, hotkey.CTRL);\n    let v: [1]string = [\"cmd\"];\n    proc.run(v[:], \"\", &a);\n    pty.spawn(v[:], \"\", v[0..0], 80, 24, &a);\n}\n",
+    )
+    .unwrap();
+    let prog = compile_path_target(&file, "x86_64-pc-windows-gnu").expect("windows check");
+    let mut opts = emit::EmitOpts::default();
+    opts.target = "x86_64-pc-windows-gnu".to_string();
+    let ll = emit::emit_llvm(&prog.cx, &prog.modules, &opts).expect("llvm");
+    assert!(!ll.contains("@syscall("), "raw syscall on Windows");
+    for f in ["CreatePseudoConsole", "CreateProcessW", "ReadDirectoryChangesW", "CreateNamedPipeA", "RegisterHotKey"] {
+        assert!(ll.contains(f), "{f} missing");
+    }
+    std::fs::write(&file, "module m;\nuse j3.io.watch.Watcher;\nuse j3.memory.Arena;\nfn main() {\n    let a = Arena.create(65536);\n    let w = Watcher.create(&a);\n    w.add(\"/tmp\");\n    w.close();\n}\n").unwrap();
+    for target in ["wasm64-unknown-emscripten"] {
+        let prog = compile_path_target(&file, target).expect("check");
+        let mut opts = emit::EmitOpts::default();
+        opts.target = target.to_string();
+        let ll = emit::emit_llvm(&prog.cx, &prog.modules, &opts).expect("llvm");
+        assert!(!ll.contains("@syscall("), "raw syscall in j3.io.watch on {target}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `win_os_test.j3` under wine: proc, pty (ConPTY), watch, instance request/reply. Wine attaches a pty child to the
+/// console only when the parent has one, so it runs inside `script`. Skips without mingw clang, wine or `script`.
+#[test]
+fn windows_os_runs_under_wine() {
+    let _wine = WINE.lock().unwrap_or_else(|e| e.into_inner());
+    let have = |c: &str, a: &str| std::process::Command::new(c).arg(a).output().map(|o| o.status.success()).unwrap_or(false);
+    if !have("wine", "--version") || !have("script", "--version") || !mingw_clang() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("j3-winos-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.j3");
+    std::fs::write(&file, include_str!("../../../stdlib/tests/win_os_test.j3")).unwrap();
+    let prog = compile_path_target(&file, "x86_64-pc-windows-gnu").expect("check");
+    let mut opts = emit::EmitOpts::default();
+    opts.target = "x86_64-pc-windows-gnu".to_string();
+    let ll = emit::emit_llvm(&prog.cx, &prog.modules, &opts).expect("llvm");
+    let exe = emit::compile_text(&ll, &opts).expect("link");
+    // output to a file, not a pipe: wineserver inherits pipes and `.output()` would wait for it
+    let log = dir.join("out.txt");
+    let _ = std::process::Command::new("timeout")
+        .args(["120", "script", "-qec"])
+        .arg(format!("wine '{}'", exe.display()))
+        .arg("/dev/null")
+        .env("WINEDEBUG", "-all")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("script");
+    let out = String::from_utf8_lossy(&std::fs::read(&log).unwrap_or_default()).to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::process::Command::new("timeout")
+        .args(["60", "wine", "cmd", "/c", "rmdir", "/s", "/q", "C:\\j3_win_os_test"])
+        .env("WINEDEBUG", "-all")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = std::process::Command::new("wineserver").arg("-k").status();
+    assert!(out.contains("win_os_test ok"), "{}", out);
 }

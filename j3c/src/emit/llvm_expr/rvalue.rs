@@ -3,6 +3,8 @@ use super::*;
 impl<'a> LlvmFn<'a> {
     pub fn operand_const(&mut self, op: &Operand) -> Result<String, String> {
         match op {
+            // a fn address in static data (a `dyn` method table) is the symbol itself
+            Operand::Const(c) if matches!(c.kind, ConstKind::FnAddr(_)) => self.const_val(c.ty, &c.kind),
             Operand::Const(c) => self.const_bits(c.ty, &c.kind),
             Operand::Copy(_) => Err("const init needs a constant".to_string()),
         }
@@ -12,7 +14,7 @@ impl<'a> LlvmFn<'a> {
         match op {
             Operand::Copy(place) => {
                 let (ptr, ty) = self.place_ptr(place)?;
-                if matches!(self.cx.ty_kind(ty), TyKind::Array { .. }) {
+                if llvm_ty::in_mem(self.cx, ty) {
                     return Ok((ptr, ll_type(self.cx, ty)?));
                 }
                 let ll = ll_type(self.cx, ty)?;
@@ -20,7 +22,14 @@ impl<'a> LlvmFn<'a> {
             }
             Operand::Const(c) => {
                 let ll = ll_type(self.cx, c.ty)?;
-                Ok((self.const_val(c.ty, &c.kind)?, ll))
+                let v = self.const_val(c.ty, &c.kind)?;
+                if llvm_ty::in_mem(self.cx, c.ty) {
+                    // a constant of an in-memory type is still an address to its users
+                    let slot = self.alloca(&ll);
+                    self.store(&ll, &v, &slot)?;
+                    return Ok((slot, ll));
+                }
+                Ok((v, ll))
             }
         }
     }
@@ -145,37 +154,45 @@ impl<'a> LlvmFn<'a> {
             }
             RvalueKind::Call { func, args } => {
                 let (f, _) = self.operand(func)?;
-                let callee = match func {
+                let lib_fn = match func {
                     Operand::Const(c) => match &c.kind {
-                        ConstKind::FnAddr(id) => crate::emit::llvm::variadic_call_ty(self.cx, self.cx.func(*id)),
+                        ConstKind::FnAddr(id) => Some(self.cx.func(*id)).filter(|f| matches!(f.kind, FuncKind::Lib { .. })),
                         _ => None,
                     },
                     _ => None,
                 };
-                let mut alist = String::new();
-                for (i, a) in args.iter().enumerate() {
-                    if i > 0 {
-                        alist.push_str(", ");
-                    }
-                    let (v, t) = self.operand(a)?;
-                    let v = if matches!(self.cx.ty_kind(a.ty()), TyKind::Array { .. }) {
-                        self.load(&t, &v)
-                    } else {
-                        v
-                    };
-                    alist.push_str(&format!("{t} {v}"));
+                let callee = lib_fn.and_then(|f| crate::emit::llvm::variadic_call_ty(self.cx, f));
+                // J3 callees take big values by address (`llvm::ll_sig_j3`); C takes them by value.
+                let by_addr = |cx: &IrCx, t: Ty| lib_fn.is_none() && llvm_ty::big(cx, t);
+                let mut alist: Vec<String> = Vec::new();
+                let sret = rv.ty != self.cx.common.void && by_addr(self.cx, rv.ty);
+                let ret_slot = if sret { Some(self.alloca(&ll)) } else { None };
+                if let Some(slot) = &ret_slot {
+                    alist.push(format!("ptr {slot}"));
                 }
-                if rv.ty == self.cx.common.void {
+                for a in args.iter() {
+                    let (v, t) = self.operand(a)?;
+                    if by_addr(self.cx, a.ty()) {
+                        alist.push(format!("ptr {v}"));
+                        continue;
+                    }
+                    let v = if llvm_ty::in_mem(self.cx, a.ty()) { self.load(&t, &v) } else { v };
+                    alist.push(format!("{t} {v}"));
+                }
+                let alist = alist.join(", ");
+                if let Some(slot) = ret_slot {
+                    self.inst(&format!("call void {f}({alist})"));
+                    Ok((slot, ll))
+                } else if rv.ty == self.cx.common.void {
                     self.inst(&format!("call void {f}({alist})"));
                     Ok(("undef".to_string(), "void".to_string()))
                 } else {
                     let v = self.fresh();
                     let cty = callee.unwrap_or_else(|| ll.clone());
                     self.inst(&format!("{v} = call {cty} {f}({alist})"));
-                    if matches!(self.cx.ty_kind(rv.ty), TyKind::Array { .. }) {
-                        // Array rvalues use storage addresses inside a function.
-                        let slot = self.fresh();
-                        self.inst(&format!("{slot} = alloca {ll}"));
+                    if llvm_ty::in_mem(self.cx, rv.ty) {
+                        // Array and big rvalues use storage addresses inside a function.
+                        let slot = self.alloca(&ll);
                         self.store(&ll, &v, &slot)?;
                         Ok((slot, ll))
                     } else {
@@ -251,15 +268,22 @@ impl<'a> LlvmFn<'a> {
                 if self.cx.enum_def(variant.enum_id).is_c_like() {
                     return Ok((format!("{}", variant.index), "i32".to_string()));
                 }
-                let slot = self.fresh();
-                self.inst(&format!("{slot} = alloca {ll}"));
+                let slot = self.alloca(&ll);
                 self.inst(&format!("store i32 {}, ptr {slot}", variant.index));
                 if let Some(p) = payload {
                     let (v, vt) = self.operand(p)?;
                     let off = abi::field_offset(self.cx, rv.ty, 1).unwrap_or(4);
                     let pp = self.fresh();
                     self.inst(&format!("{pp} = getelementptr i8, ptr {slot}, i64 {off}"));
-                    self.store(&vt, &v, &pp)?;
+                    if llvm_ty::in_mem(self.cx, p.ty()) {
+                        // an in-memory operand is its address (`aggregate` does the same for fields)
+                        self.copy_mem(&pp, &v, p.ty());
+                    } else {
+                        self.store(&vt, &v, &pp)?;
+                    }
+                }
+                if llvm_ty::in_mem(self.cx, rv.ty) {
+                    return Ok((slot, ll));
                 }
                 Ok((self.load(&ll, &slot), ll))
             }
@@ -361,6 +385,13 @@ impl<'a> LlvmFn<'a> {
                 return Ok(v.to_string());
             }
         }
+        // a C-like enum's tag (`int(tok)`): tags are never negative, so zero-extend
+        let ibits = |t: &str| t.strip_prefix('i').and_then(|b| b.parse::<u32>().ok());
+        if let (Some(fb), Some(tb)) = (ibits(ft), ibits(tt)) {
+            let op = if tb > fb { "zext" } else { "trunc" };
+            self.inst(&format!("{n} = {op} {ft} {v} to {tt}"));
+            return Ok(n);
+        }
         Err(format!("cast {ft} -> {tt} not in LLVM emit"))
     }
 
@@ -379,24 +410,20 @@ impl<'a> LlvmFn<'a> {
                 Ok((b, "%j3_string".to_string()))
             }
             TyKind::Struct(_) | TyKind::Array { .. } => {
-                let slot = self.fresh();
-                self.inst(&format!("{slot} = alloca {ll}"));
+                let slot = self.alloca(&ll);
                 for (i, f) in fields.iter().enumerate() {
                     let (v, vt) = self.operand(f)?;
                     let p = self.fresh();
                     self.inst(&format!(
                         "{p} = getelementptr {ll}, ptr {slot}, i32 0, i32 {i}"
                     ));
-                    if matches!(self.cx.ty_kind(f.ty()), TyKind::Array { .. }) {
-                        let n = llvm_ty::size(self.cx, f.ty());
-                        self.inst(&format!(
-                            "call void @llvm.memcpy.p0.p0.i64(ptr {p}, ptr {v}, i64 {n}, i1 false)"
-                        ));
+                    if llvm_ty::in_mem(self.cx, f.ty()) {
+                        self.copy_mem(&p, &v, f.ty());
                     } else {
                         self.store(&vt, &v, &p)?;
                     }
                 }
-                if matches!(self.cx.ty_kind(ty), TyKind::Array { .. }) {
+                if llvm_ty::in_mem(self.cx, ty) {
                     Ok((slot, ll))
                 } else {
                     Ok((self.load(&ll, &slot), ll))

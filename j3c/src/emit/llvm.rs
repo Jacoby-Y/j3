@@ -23,6 +23,7 @@ mod types;
 use entry::{abort_routine, entry_module, host_entry, host_entry_name, sys_func};
 use prune::prune_unused;
 use types::{emit_enum_types, emit_struct_types, ll_const_init, ll_params, ll_ret, tls};
+pub(crate) use types::ll_sig_j3;
 
 /// Which functions one LLVM text defines. A split build compiles the script VM at `-O2`
 /// as its own object while the rest of a dev build stays at the project's `opt`.
@@ -169,12 +170,8 @@ pub fn emit_llvm_part(
             let func = cx.func(*id);
             match &func.kind {
                 FuncKind::J3 { .. } if !part.defines(*id) => {
-                    out.push_str(&format!(
-                        "declare {} @{}({})\n",
-                        ll_ret(cx, func.ty)?,
-                        c_expr::func_c_name(cx, func),
-                        ll_params(cx, func.ty)?
-                    ));
+                    let (r, p) = ll_sig_j3(cx, func.ty)?;
+                    out.push_str(&format!("declare {r} @{}({p})\n", c_expr::func_c_name(cx, func)));
                 }
                 FuncKind::J3 { body } => {
                     let slot = if dbg.enabled() {
@@ -361,12 +358,8 @@ pub(crate) fn emit_llvm_module(
             let func = cx.func(*id);
             match &func.kind {
                 FuncKind::J3 { .. } if !owns_func(id) => {
-                    out.push_str(&format!(
-                        "declare {} @{}({})\n",
-                        ll_ret(cx, func.ty)?,
-                        c_expr::func_c_name(cx, func),
-                        ll_params(cx, func.ty)?
-                    ));
+                    let (r, p) = ll_sig_j3(cx, func.ty)?;
+                    out.push_str(&format!("declare {r} @{}({p})\n", c_expr::func_c_name(cx, func)));
                 }
                 FuncKind::J3 { body } => {
                     let slot = if dbg.enabled() {

@@ -172,7 +172,7 @@ fn class_and_style_pass_to_the_root() {
         "d.scopePass(n1, p.j3pass_scope);",
         "d.clsPass(n1, p.j3pass_cls);",
         "d.stylePass(n1, 1, p.j3pass_k0, p.j3pass_n0, p.j3pass_f0, p.j3pass_s0);",
-        "j3pass_scope: SCOPE_Page, j3pass_cls: `wide x{w} {if on { \"on\" } else { \"\" }}`",
+        "j3pass_scope: SCOPE_Page, j3pass_cls: Text.scratch().add(`wide x{w} {if on { \"on\" } else { \"\" }}`).str()",
         "j3pass_n0: \"width\", j3pass_k0: 1, j3pass_f0: f32(w), j3pass_s0: \"\"",
         // the use that passes nothing still fills the fields
         "j3pass_scope: 0, j3pass_cls: \"\", j3pass_k0: 0, j3pass_n0: \"\"",

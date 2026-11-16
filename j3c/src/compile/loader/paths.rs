@@ -36,12 +36,27 @@ impl Loader {
             return stdlib_dir().join("j3").join(name);
         }
         if parts.len() == 2 && parts[0] == "j3" && parts[1] == "instance" {
-            // x86-64 Linux syscall numbers: other systems get the stub (one copy, never a message)
+            // x86-64 Linux syscall numbers; Windows uses a named pipe; the rest get the stub (one copy, never a message)
             let name = match self.os {
                 OsKind::Linux => "instance.j3",
-                OsKind::Windows | OsKind::Macos | OsKind::Android | OsKind::Web => "instance_other.j3",
+                OsKind::Windows => "instance_windows.j3",
+                OsKind::Macos | OsKind::Android | OsKind::Web => "instance_other.j3",
             };
             return stdlib_dir().join("j3").join(name);
+        }
+        // `j3.io.watch` is raw x86-64 Linux syscalls: macOS and web get a stub with no OS calls
+        if matches!(self.os, OsKind::Macos | OsKind::Web) && parts.join(".") == "j3.io.watch" {
+            return stdlib_dir().join("j3").join("io").join("watch_other.j3");
+        }
+        // Win32 twins of Linux-only modules: same pub names, one file each (`<path>_windows.j3`)
+        if matches!(self.os, OsKind::Windows) && parts.first().map(|s| s.as_str()) == Some("j3") {
+            let key = parts.join(".");
+            if matches!(key.as_str(), "j3.proc" | "j3.term.pty" | "j3.io.watch" | "j3.game.hotkey") {
+                let mut p = join_mod(&stdlib_dir(), parts);
+                let stem = p.file_stem().unwrap().to_string_lossy().to_string();
+                p.set_file_name(format!("{stem}_windows.j3"));
+                return p;
+            }
         }
         if parts.len() == 2 && parts[0] == "j3" && parts[1] == "netsys" {
             let name = match self.os {

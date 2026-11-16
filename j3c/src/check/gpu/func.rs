@@ -76,7 +76,7 @@ fn ends_with_return(b: &Block) -> bool {
         Some(Stmt::Return(_)) => true,
         Some(Stmt::Block(x)) => ends_with_return(x),
         Some(Stmt::If(i)) => ends_with_return(&i.then_block) && i.else_block.as_ref().is_some_and(ends_with_return),
-        Some(Stmt::Match(m)) => m.arms.iter().any(|a| a.path.len() == 1 && a.path[0].name == "_") && m.arms.iter().all(|a| ends_with_return(&a.body)),
+        Some(Stmt::Match(m)) => m.arms.iter().any(|a| a.guard.is_none() && a.pats.iter().any(|p| matches!(p, crate::parse::Pat::Wild(_)))) && m.arms.iter().all(|a| ends_with_return(&a.body)),
         _ => false,
     }
 }

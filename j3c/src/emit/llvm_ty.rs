@@ -49,6 +49,27 @@ pub fn is_agg(cx: &IrCx, ty: Ty) -> bool {
     }
 }
 
+/// Bytes above which a struct, enum or array value lives in memory, never in an SSA register.
+/// LLVM splits a first-class aggregate `load`/`store`/`ret` into one operation per scalar field,
+/// so copying a 3000-field struct that way made one 190-line function take 25 s in clang.
+pub const BIG: u64 = 64;
+
+/// A value copied with `memcpy` and passed to J3 functions by address (hidden `sret` result
+/// pointer, pointer parameters). `use lib` C calls keep the by-value C ABI.
+pub fn big(cx: &IrCx, ty: Ty) -> bool {
+    let agg = match cx.ty_kind(ty) {
+        TyKind::Struct(_) | TyKind::Array { .. } => true,
+        TyKind::Enum(id) => !cx.enum_def(*id).is_c_like(),
+        _ => false,
+    };
+    agg && size(cx, ty) > BIG
+}
+
+/// Inside a function this value is the address of its storage: every array, and every [`big`] value.
+pub fn in_mem(cx: &IrCx, ty: Ty) -> bool {
+    matches!(cx.ty_kind(ty), TyKind::Array { .. }) || big(cx, ty)
+}
+
 pub fn is_ptr(cx: &IrCx, ty: Ty) -> bool {
     matches!(
         cx.ty_kind(ty),

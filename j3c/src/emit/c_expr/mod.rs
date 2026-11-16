@@ -75,14 +75,26 @@ impl<'a> CWriter<'a> {
         }
     }
 
+    /// `op` where a C value is passed (an argument, a return): an array, which C cannot pass,
+    /// is read as its by-value wrapper struct (same layout: one array member).
+    pub fn value_operand(&mut self, op: &Operand) -> Result<String, String> {
+        let v = self.operand(op)?;
+        if c_ty::array_parts(self.cx, op.ty()).is_none() {
+            return Ok(v);
+        }
+        Ok(format!("(*({} *)({v}))", c_ty::array_wrap_name(self.cx, op.ty())?))
+    }
+
     pub fn place(&mut self, place: &Place) -> Result<String, String> {
         let (mut text, mut ty) = match place.root {
             PlaceRoot::Local(id) => {
-                let ty = match self.body {
-                    Some(body) => body.local(id).ty,
+                let (ty, param) = match self.body {
+                    Some(body) => (body.local(id).ty, body.local(id).kind == crate::ir::body::LocalKind::Param),
                     None => return Err("place emit needs a function body".to_string()),
                 };
-                (self.local_name(id), ty)
+                // an array parameter arrives in its by-value wrapper (`c_ty::array_wrap_name`)
+                let suffix = if param && c_ty::array_parts(self.cx, ty).is_some() { ".a" } else { "" };
+                (format!("{}{suffix}", self.local_name(id)), ty)
             }
             PlaceRoot::Global(id) => {
                 let g = self.cx.global(id);
@@ -97,11 +109,13 @@ impl<'a> CWriter<'a> {
                     ty = *lane_ty;
                 }
                 Proj::Deref => {
-                    text = format!("(*{text})");
                     ty = match self.cx.ref_inner(ty) {
                         Some(inner) => inner,
                         None => return Err("deref of non-ref in C emit".to_string()),
                     };
+                    // `&[N]T` points at the array's wrapper (`c_ty::array_wrap_name`)
+                    let member = if c_ty::array_parts(self.cx, ty).is_some() { ".a" } else { "" };
+                    text = format!("((*{text}){member})");
                 }
                 Proj::Field { field, .. } => {
                     let fname = c_ty::sanitize(self.cx.name_str(self.cx.field_def(*field).name));
@@ -139,7 +153,9 @@ impl<'a> CWriter<'a> {
                     ty = self.cx.common.i32;
                 }
                 Proj::EnumPayload { variant, ty: pty } => {
-                    text = format!("{text}.u.v{}", variant.index);
+                    // an array payload is held in its wrapper (`enum_val`)
+                    let member = if c_ty::array_parts(self.cx, *pty).is_some() { ".a" } else { "" };
+                    text = format!("{text}.u.v{}{member}", variant.index);
                     ty = *pty;
                 }
             }
@@ -201,6 +217,10 @@ impl<'a> CWriter<'a> {
             RvalueKind::Use(op) => self.operand(op),
             RvalueKind::Ref { place } => {
                 let p = self.place(place)?;
+                if c_ty::array_parts(self.cx, place.ty).is_some() {
+                    // the array decays to its first element, the same address as its wrapper
+                    return Ok(format!("(({} *)({p}))", c_ty::array_wrap_name(self.cx, place.ty)?));
+                }
                 Ok(format!("&({p})"))
             }
             RvalueKind::Binary { op, lhs, rhs } => {
@@ -247,7 +267,7 @@ impl<'a> CWriter<'a> {
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    s.push_str(&self.operand(arg)?);
+                    s.push_str(&self.value_operand(arg)?);
                 }
                 s.push(')');
                 Ok(s)

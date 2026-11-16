@@ -23,11 +23,11 @@ fn generic_fns_basic_and_two_params() {
     run(
         "gf_basic",
         &format!(
-            "{HEAD}\
+            "{HEAD}use j3.cmp.Ord;\n\
 fn first<T>(xs: []T): T {{ return xs[0]; }}\n\
 fn swap<T>(a: &T, b: &T) {{ let t = *a; *a = *b; *b = t; }}\n\
 fn pick<A, B>(a: A, b: B): B {{ return b; }}\n\
-fn maxOf<T>(a: T, b: T): T {{ if a > b {{ return a; }} return b; }}\n\
+fn maxOf<T: Ord>(a: T, b: T): T {{ if a > b {{ return a; }} return b; }}\n\
 fn main() {{\n\
     let xs: [3]int = [4, 5, 6];\n\
     let fs: [2]f32 = [1.5, 2.5];\n\

@@ -12,11 +12,13 @@
 | `struct`, `enum` | Types |
 | `const` | Module constant |
 | `let` | Local variable (always mutable) |
-| `if`, `else` | Branch, or a value |
+| `if`, `else` | Branch, or a value; `if let`, `let .. else` |
 | `while`, `for`, `in` | Loops |
-| `match` | Branch on an enum |
+| `match` | Branch on a value by pattern; also an expression |
 | `return`, `break`, `continue` | Leave a function or loop |
 | `defer` | Run at end of block |
+| `dyn` | Trait object type, `dyn Trait` (a contextual word) |
+| `where` | Extra bound on a generic struct's method, `where T: Eq` (a contextual word) |
 | `operator` | Define an operator method |
 | `this` | Method receiver |
 
@@ -29,13 +31,17 @@
 | Other | `bool`, `void`, `string`, `ptr`, `cstr` |
 | Arrays | `[N]T` (fixed), `[]T` (slice) |
 | Pointers | `&T` |
-| Functions | `fn(A, B): R` |
+| Tuples | `(A, B)`, elements `.0` `.1` |
+| Functions | `fn(A, B): R`, `closure(A): R`, `boxed closure(A): R` |
+| Trait objects | `dyn Trait` |
 
 ## Attributes
 
 | Attribute | Meaning |
 |---|---|
 | `#[Debug]` | Printable in string interpolation |
+| `#[derive(Eq, Hash, Ord, Debug, Clone)]` | Write those methods field by field |
+| `#[impl]` | Give a type you cannot edit a trait method |
 | `#[TryCatch(Ok, Err)]` | Enum works with `?` |
 | `#[singleton]` | Process-wide value |
 | `#[thread]` | Per-thread (with `#[singleton]`) |
@@ -43,7 +49,7 @@
 
 ## Intrinsics
 
-`@sizeof`, `@slice`, `@syscall`, `@atomicLoad`, `@atomicStore`, `@atomicAdd`, `@atomicSub`, `@atomicExchange`, `@atomicCas`, `@vmin`, `@vmax`, `@vsqrt`, `@vabs`, `@vsum`, `@vshuffle`, `@vfloat`, `@vint`, `@vload`, `@vstore`, `@script`, `@j3ui`, `@uiChoice`, and the shader builtins and `@shader` ([Shaders](language/shaders.md))
+`@sizeof`, `@slice`, `@embed`, `@embedBytes`, `@embedDir`, `@syscall`, `@atomicLoad`, `@atomicStore`, `@atomicAdd`, `@atomicSub`, `@atomicExchange`, `@atomicCas`, `@vmin`, `@vmax`, `@vsqrt`, `@vabs`, `@vsum`, `@vshuffle`, `@vfloat`, `@vint`, `@vload`, `@vstore`, `@script`, `@j3ui`, `@uiChoice`, and the shader builtins and `@shader` ([Shaders](language/shaders.md))
 
 ## Operators
 
@@ -53,11 +59,11 @@
 | Bits (integers) | `& \| ^ ~ << >>` |
 | Compare | `== != < <= > >=` |
 | Logic | `&& \|\| !` |
-| Assign | `= += -= *= /= %= &= \|= ^=` |
+| Assign | `= += -= *= /= %= &= \|= ^= <<= >>=` |
 | Pointers | `&x` (address), `*p` (deref) |
 | Ranges | `a..b`, `a..=b`, `xs[a..b]`, `xs[:]` |
 | Errors | `expr?` |
 
 ## Not in J3
 
-No interfaces or inheritance; traits are structural (a type has the methods, no `impl` blocks). Closures cannot escape (no heap environments): a `closure(..)` is a parameter or a `let`. No garbage collector or borrow checker. No null and no exceptions. No mutable globals besides `#[singleton]`.
+No interfaces or inheritance; traits are structural (a type has the methods, no `impl` blocks). A stack `closure(..)` is a parameter or a `let`; a closure that must outlive its call is a boxed closure in an arena (no heap or refcounted environments). No garbage collector or borrow checker. No null and no exceptions. No mutable globals besides `#[singleton]`.

@@ -18,6 +18,9 @@ impl<'a> Gen<'a> {
                 }
                 Ok((v.to_string(), GTy::LitInt))
             }
+            ExprKind::BigInt(_) => self.err_help(e.span, "this integer does not fit in 32 bits", "shader integers are i32 or u32"),
+            ExprKind::Zeroed => self.err_help(e.span, "a zero-filled `let` is not supported in shader code", "give the `let` a value"),
+            ExprKind::Char(v) => Ok((v.to_string(), GTy::LitInt)),
             ExprKind::Float(v) => Ok((num::float(*v), GTy::LitFloat)),
             ExprKind::Bool(b) => Ok((b.to_string(), BOOL)),
             ExprKind::Name(n) => self.name(&n.name, n.span),
@@ -85,10 +88,12 @@ impl<'a> Gen<'a> {
             }
             ExprKind::String(_) | ExprKind::Interpolate { .. } => self.err_help(e.span, "strings do not exist in shader code", "shaders compute with numbers"),
             ExprKind::Slice { .. } | ExprKind::SliceLit { .. } | ExprKind::SliceFrom { .. } => self.err_help(e.span, "slices do not exist in shader code", "use a fixed array `[N]T`"),
+            ExprKind::Match(_) => self.err_help(e.span, "a `match` value does not exist in shader code", "use a `match` statement that assigns a variable, or an if-expression"),
             ExprKind::Closure(_) => self.err_help(e.span, "closures do not exist in shader code", "write a `#[shader]` fn and call it"),
+            ExprKind::Tuple(_) => self.err_help(e.span, "tuples do not exist in shader code", "use a struct"),
             ExprKind::Atomic { .. } => self.err_help(e.span, "atomics do not exist in shader code", "each invocation computes independently"),
             ExprKind::Question { .. } => self.err(e.span, "`?` does not exist in shader code (no results or options)"),
-            ExprKind::Syscall { .. } | ExprKind::SizeOf(_) | ExprKind::TypePath { .. } | ExprKind::ScriptType(_) | ExprKind::ScriptLit { .. } | ExprKind::UiChoice { .. } => {
+            ExprKind::Syscall { .. } | ExprKind::SizeOf(_) | ExprKind::TypePath { .. } | ExprKind::ScriptType(_) | ExprKind::ScriptLit { .. } | ExprKind::UiChoice { .. } | ExprKind::Embed { .. } => {
                 self.err(e.span, "this is CPU-only and does not exist in shader code")
             }
         }

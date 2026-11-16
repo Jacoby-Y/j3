@@ -18,14 +18,14 @@ The modules
     j3.term.grid        Grid: cells, cursor, modes, scrollback, `dumpText`; fed by a Parser pure
     j3.term.input       Decoder (bytes to key, paste, mouse, focus events); `encodeKey`,    pure
                         `encodePaste`, `encodeMouse` (events to bytes for a program)
-    j3.term.pty         spawn a program on a pseudo-terminal                                OS, Linux
+    j3.term.pty         spawn a program on a pseudo-terminal                                OS, Linux + Windows
     j3.term.tty         isTty, size, raw mode for the real terminal                         OS, Linux
     j3.term.screen      Screen: back buffer, diffed `flush`, `poll` events                  OS, Linux
     j3.term.view        View: draws a Grid in a window, maps keys and mouse to bytes        GL, main thread
     j3.ui.ansi          AnsiLog: escapes to styled spans for a `.j3ui` pane                 GL, main thread
 
-Pure modules do no OS calls and run on any thread. `pty`, `tty` and `screen` make Linux syscalls; on other
-targets they report an error. `view` and `j3.ui.ansi` draw with `j3.gfx.paint`, so main thread only.
+Pure modules do no OS calls and run on any thread. `tty` and `screen` make Linux syscalls; `pty` does too on
+Linux and uses ConPTY on Windows (`waitReadable` is the portable wait); on other targets they report an error. `view` and `j3.ui.ansi` draw with `j3.gfx.paint`, so main thread only.
 
 
 Two directions
@@ -102,6 +102,9 @@ Known limits
 ------------
 - Resize reflows the primary screen and scrollback: rows that wrapped by printing past the edge (`Grid.wrapped(line)`,
   so a copy joins them) are rejoined and split at the new width; the alt screen is cut or padded.
+- Memory: a `Grid` owns its screens and scrollback and `resize` frees what it replaces, so memory follows the
+  current size (24 bytes per screen cell, two screens at the storage limits; a scrollback line costs about 4 bytes
+  per used cell plus 33 bytes per line of capacity). A host that drops a grid calls `Grid.destroy()`.
 - `examples/terminal` has no selection or copy, and no mouse motion reporting.
 - Up to 2 combining marks (BMP) ride on a cell (`Cell.marks`, `mark(i)`); more are dropped. Width comes from
   `cpWidth` per code point, not per grapheme.
@@ -119,4 +122,4 @@ Known limits
   with the text and `View.draw` paints them. Call `pty.resizePx(cols, rows, view.cellW, view.cellH)` so programs
   see the window in pixels (`kitty +kitten icat` needs it). No shared memory, animation or Unicode placeholders;
   resize and partial scroll regions do not move images. Sixel is not read.
-- `pty` and `sys` use Linux amd64 syscall numbers, like the rest of `sys.j3`.
+- `pty` and `sys` use Linux amd64 syscall numbers on Linux, like the rest of `sys.j3`. On Windows `pty` is ConPTY: no pixel size, and `ResizePseudoConsole` needs Windows 10 1809+ (wine 9 does not implement it).

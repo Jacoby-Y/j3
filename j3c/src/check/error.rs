@@ -14,6 +14,8 @@ pub struct CheckError {
     pub omitted: usize,
     /// Set by `unknown name/function `x``: a later use of `x` in the same fn is a follow-on.
     pub(crate) unknown: Option<String>,
+    /// Raised by a placeholder type parameter (`lower/defcheck.rs`): a definition-site bound error.
+    pub(crate) bound_err: bool,
 }
 
 impl CheckError {
@@ -27,6 +29,7 @@ impl CheckError {
             more: Vec::new(),
             omitted: 0,
             unknown: None,
+            bound_err: false,
         }
     }
 

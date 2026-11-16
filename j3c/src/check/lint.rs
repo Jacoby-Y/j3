@@ -142,6 +142,7 @@ fn stmt_span(s: &Stmt) -> Span {
         Stmt::ForEach(x) => x.span,
         Stmt::UseLocal(x) => x.span,
         Stmt::Match(x) => x.span,
+        Stmt::LetPat(x) => x.span,
         Stmt::Defer(x) => x.span,
         Stmt::Labeled(x) => x.span,
         Stmt::Break(s, _) | Stmt::Continue(s, _) => *s,

@@ -1,0 +1,270 @@
+/// Windows `j3.term.pty`: the pub names of `pty.j3` on a pseudo console (ConPTY: `CreatePseudoConsole`, two pipes,
+/// `CreateProcessW` with `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`). Windows 10 1809 or later.
+/// `fd` is the read end of the output pipe (no `sys.pollFds` on it: use `waitReadable`), `pid` the process id.
+/// ConPTY keeps the output pipe open after the program ends, so once the program is gone and its output is drained
+/// `tryRead` closes the console itself and then reports `eof`.
+
+module j3.term.pty;
+
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.proc;
+use j3.proc.ProcError;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use j3.winsys;
+use j3.winsys.Started;
+
+/// Most bytes `write` queues before it refuses more.
+pub const MAX_PENDING: int = 1048576;
+
+/// The console side of a pty and the program on the other side.
+pub struct Pty {
+    /// Output pipe, read end (-1 once closed).
+    fd: int;
+    /// The program's process id.
+    pid: int;
+    /// True once a read saw the end; everything it wrote has been returned by then.
+    eof: bool = false;
+    /// Set once `tryWait` saw it end (its code then in `code`).
+    done: bool = false;
+    code: int = 0;
+    /// Output `write` queued (from `off`) and not yet sent.
+    pend: Text;
+    off: int = 0;
+    /// Input pipe write end, pseudo console, process handle (0 once closed).
+    win: int = 0;
+    hpc: int = 0;
+    h: int = 0;
+
+    /// Send `data` to the program. False (nothing queued) when the Pty is closed or `MAX_PENDING` bytes are waiting.
+    fn write(this: &Pty, data: []u8): bool {
+        if this.win == 0 || this.pend.bytes.len - this.off + data.len > MAX_PENDING {
+            return false;
+        }
+        this.pend.pushBytes(data);
+        this.flush();
+        return true;
+    }
+
+    /// Bytes queued by `write` that the console has not taken yet.
+    fn pending(this: &Pty): int {
+        return this.pend.bytes.len - this.off;
+    }
+
+    /// Push queued input to the console. False when the program is gone (the queue is dropped).
+    /// ponytail: a pipe write blocks while the 64 KB pipe is full (the console stopped reading); a writer thread
+    /// would make it never block.
+    fn flush(this: &Pty): bool {
+        if this.off < this.pend.bytes.len {
+            let ok = this.win != 0 && winsys.writeAll(this.win, (this.pend.bytes.ptr as int + this.off) as ptr, this.pend.bytes.len - this.off);
+            this.pend.clear();
+            this.off = 0;
+            return ok;
+        }
+        return true;
+    }
+
+    /// Read what the program wrote into `buf` without blocking: a view of `buf` (empty when nothing is waiting).
+    fn tryRead(this: &Pty, buf: []u8): string {
+        if this.fd < 0 || this.eof {
+            return "";
+        }
+        this.flush();
+        let n = winsys.avail(this.fd);
+        if n == 0 && this.hpc != 0 && this.ended() {
+            // the program is gone: closing the console flushes its last frame and then ends the pipe
+            winsys.pcClose(this.hpc);
+            this.hpc = 0;
+            n = winsys.avail(this.fd);
+        }
+        if n < 0 {
+            this.eof = true;
+            return "";
+        }
+        if n == 0 {
+            return "";
+        }
+        let r = winsys.read(this.fd, buf[0..if n < buf.len { n } else { buf.len }]);
+        if r <= 0 {
+            this.eof = true;
+            return "";
+        }
+        return buf[0..r] as string;
+    }
+
+    /// Block until `tryRead` has something to return (output, or the end) or `ms` pass (`ms < 0` waits forever).
+    /// True when it is ready. For a reader thread.
+    /// ponytail: polls the pipe every 5 ms; an overlapped read would wake at once.
+    fn waitReadable(this: &Pty, ms: int): bool {
+        let until = winsys.nowMs() + ms;
+        while true {
+            if this.fd < 0 || this.eof || winsys.avail(this.fd) != 0 || (this.hpc != 0 && this.ended()) {
+                return true;
+            }
+            let left = until - winsys.nowMs();
+            if ms >= 0 && left <= 0 {
+                return false;
+            }
+            winsys.sleepMs(if ms < 0 || left > 5 { 5 } else { left });
+        }
+        return false;
+    }
+
+    fn ended(this: &Pty): bool {
+        if let Option.Some(_) = this.tryWait() {
+            return true;
+        }
+        return false;
+    }
+
+    /// Tell the console its size in cells. False when it failed.
+    fn resize(this: &Pty, cols: int, rows: int): bool {
+        return this.hpc != 0 && winsys.pcResize(this.hpc, coord(cols, rows));
+    }
+
+    /// `resize`; the console has no pixel size, so `cellW`/`cellH` are ignored.
+    fn resizePx(this: &Pty, cols: int, rows: int, cellW: int, cellH: int): bool {
+        return this.resize(cols, rows);
+    }
+
+    /// Its exit code if it has ended, `None` while it runs. Does not block.
+    fn tryWait(this: &Pty): Option<int> {
+        if !this.done {
+            if this.h == 0 {
+                return Option.None;
+            }
+            let c = winsys.exitCodeIfDone(this.h);
+            if c < 0 {
+                return Option.None;
+            }
+            this.done = true;
+            this.code = c;
+        }
+        return Option.Some(this.code);
+    }
+
+    /// Block until it ends and return its exit code. Closes the console first (console programs get
+    /// `CTRL_CLOSE_EVENT` and end); one still running after 500 ms is terminated, so this cannot hang.
+    fn wait(this: &Pty): int {
+        this.close();
+        if !this.done && this.h != 0 {
+            if !winsys.waitFor(this.h, u32(500)) {
+                winsys.terminate(this.h, 128 + sys.SIGKILL);
+                winsys.waitFor(this.h, winsys.INFINITE);
+            }
+            this.tryWait();
+        }
+        return this.code;
+    }
+
+    /// End it (`TerminateProcess` with exit code 128 + `sig`; Windows has no signals).
+    fn kill(this: &Pty, sig: int) {
+        if !this.done && this.h != 0 {
+            winsys.terminate(this.h, 128 + sig);
+        }
+    }
+
+    /// Close the console (its programs get `CTRL_CLOSE_EVENT`, so a shell exits) and the pipes.
+    fn close(this: &Pty) {
+        // our pipe ends first: with nobody reading, `ClosePseudoConsole` could wait on a full output pipe
+        if this.win != 0 {
+            winsys.close(this.win);
+            this.win = 0;
+        }
+        if this.fd >= 0 {
+            winsys.close(this.fd);
+            this.fd = -1;
+            this.eof = true;
+        }
+        if this.hpc != 0 {
+            winsys.pcClose(this.hpc);
+            this.hpc = 0;
+        }
+        this.tryWait();
+    }
+}
+
+/// A `COORD` passed by value: columns in the low half, rows in the high half.
+fn coord(cols: int, rows: int): u32 {
+    return u32(clampDim(cols) + clampDim(rows) * 65536);
+}
+
+fn clampDim(n: int): int {
+    if n < 1 {
+        return 1;
+    }
+    if n > 32767 {
+        return 32767;
+    }
+    return n;
+}
+
+/// Start `argv` (program name first, looked up on `PATH`) on a new pseudo console of `cols` x `rows` cells, with
+/// `cwd` as its working directory ("" keeps this one) and `env` (`"K=V"` strings) added to or replacing the inherited
+/// environment (names compared without case). `TERM=xterm-256color` and `COLORTERM=truecolor` are set too.
+pub fn spawn(argv: []string, cwd: string, env: []string, cols: int, rows: int, arena: &Arena): Result<Pty, ProcError> {
+    if argv.len == 0 {
+        return Result.Err(ProcError.NotFound);
+    }
+    let path = proc.findProgram(argv[0], arena);
+    if path.len == 0 {
+        return Result.Err(ProcError.NotFound);
+    }
+    // input: console reads [0], we write [1]; output: console writes [3], we read [2]
+    let ends = arena.alloc::<int>(4);
+    if !winsys.pipe(false, ends[0..2]) {
+        return Result.Err(ProcError.Fail);
+    }
+    if !winsys.pipe(false, ends[2..4]) {
+        winsys.close(ends[0]);
+        winsys.close(ends[1]);
+        return Result.Err(ProcError.Fail);
+    }
+    let hpc = winsys.pcCreate(coord(cols, rows), ends[0], ends[3]);
+    let made = hpc != 0;
+    // the console holds its own copies
+    winsys.close(ends[0]);
+    winsys.close(ends[3]);
+    if !made {
+        winsys.close(ends[1]);
+        winsys.close(ends[2]);
+        return Result.Err(ProcError.Fail);
+    }
+    let over = arena.alloc::<string>(env.len + 2);
+    over[0] = "TERM=xterm-256color";
+    over[1] = "COLORTERM=truecolor";
+    for i in 0..env.len {
+        over[i + 2] = env[i];
+    }
+    let list = winsys.attrList(arena);
+    let si = arena.alloc::<int>(winsys.SI_SIZE / 8);
+    let s32: []u32 = @slice(si.ptr as ptr, winsys.SI_SIZE / 4);
+    s32[0] = u32(winsys.SI_SIZE);
+    // null std handles: without them a child of a process whose stdio is redirected (or a GUI app) gets that,
+    // not the console. ponytail: wine leaves them null instead, so there the child inherits ours (run under a console)
+    if !winsys.underWine() {
+        s32[15] = winsys.STARTF_USESTDHANDLES;
+    }
+    si[13] = list as int;
+    let ok = list as int != 0 && winsys.setAttr(list, winsys.ATTR_PSEUDOCONSOLE, hpc as ptr, 8);
+    let st = Started { h: 0, pid: 0 };
+    let err = 0;
+    if ok {
+        let cwdW = if cwd.len > 0 { winsys.wide(cwd, arena) } else { 0 as ptr };
+        st = winsys.create(winsys.cmdLine(path, argv, arena), false, winsys.CREATE_UNICODE_ENVIRONMENT, winsys.envBlock(over, arena), cwdW, si.ptr as ptr);
+        err = winsys.lastError();
+    }
+    winsys.freeAttrList(list);
+    if st.h == 0 {
+        winsys.close(ends[1]);
+        winsys.close(ends[2]);
+        winsys.pcClose(hpc);
+        if ok && (err == winsys.ERROR_FILE_NOT_FOUND || err == winsys.ERROR_PATH_NOT_FOUND || err == 267) {
+            return Result.Err(ProcError.NotFound);
+        }
+        return Result.Err(if ok { ProcError.ExecFailed } else { ProcError.Fail });
+    }
+    return Result.Ok(Pty { fd: ends[2], pid: st.pid, pend: Text.new(arena), win: ends[1], hpc: hpc, h: st.h });
+}

@@ -50,7 +50,7 @@ An Android package for phones and emulators. See `j3c doc android`.
 
 ### steam
 
-Steam depot folders and a `steamcmd` build script. See [Shipping on Steam](steam.md).
+Steam depot folders and a `steamcmd` build script. Not built in: it comes from the `steam` package's dist output, so add that dependency first. See [Shipping on Steam](steam.md).
 
 ## Assets and the working directory
 

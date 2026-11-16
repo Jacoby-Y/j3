@@ -60,17 +60,10 @@ Packages: list them in j3.toml and every release build writes them to target/dis
       /usr/share/icons/hicolor/<N>x<N>/apps/<name>.png and /usr/share/pixmaps/<name>.png
   Install with `sudo apt install ./mygame_0.1.0_amd64.deb`; remove with `sudo apt remove mygame`.
 - apk: an Android package, debug-signed, for phones and emulators. See `j3c doc android`.
-- steam: target/dist/steam/content/<os>/ (the zip's folder plus libsteam_api.so or
-  steam_api64.dll from the Steamworks SDK) and scripts/app_build_<appid>.vdf. Keys:
-      [steam]
-      app_id = "480"
-      sdk = "~/steamworks_sdk"          # unzipped SDK root
-      depot_linux = "481"
-      depot_windows = "482"
-      branch = "beta"                   # optional; sets the build live there
-  Linux and Windows x86_64 only. j3c never uploads; scripts/README.txt has the
-  `steamcmd +login <user> +run_app_build <vdf> +quit` line. Setup, the sniper runtime choice,
-  the Deck and store checklists: `j3c doc steam`.
+- steam: comes from the `steam` package (add it under [dependencies]): Steam depot content per OS
+  and scripts/app_build_<appid>.vdf in target/dist/steam/, configured by its [steam] table. Never
+  uploads. `j3c doc steam`, then the package's README.
+- any other name: a dependency's [dist_outputs] tool, run after the built-ins (`j3c doc packages`).
 - `zip = true` (older projects) is the same as build_outputs = ["zip"].
 
 Working directory: games read assets and write saves relative to it (`j3c run` uses the

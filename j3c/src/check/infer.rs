@@ -193,12 +193,17 @@ pub(super) fn peek_ty(
             expr.span,
             "script type is not available here",
         )),
+        ExprKind::Embed { kind: crate::parse::EmbedKind::Dir, .. } => Err(embed_dir_err(path, expr.span)),
+        ExprKind::Embed { kind, .. } => Ok(embed_ty(cx, *kind)),
         ExprKind::Closure(_) => Err(CheckError::new(
             path,
             expr.span,
             "a closure's type is not known here; give the `let` or parameter a `closure(..)` type",
         )),
         ExprKind::Int(_) => Ok(cx.common.int),
+        ExprKind::BigInt(v) => Err(big_int_err(path, expr.span, *v)),
+        ExprKind::Zeroed => Err(CheckError::new(path, expr.span, "a zero-filled `let` needs a type: `let buf: [64]u8;`")),
+        ExprKind::Char(v) => Ok(if *v < 0x80 { cx.common.u8 } else { cx.common.u32 }),
         ExprKind::Float(_) => Ok(cx.common.float),
         ExprKind::Bool(_) => Ok(cx.common.bool),
         ExprKind::String(_) | ExprKind::Interpolate { .. } => Ok(cx.common.string),
@@ -431,6 +436,15 @@ pub(super) fn peek_ty(
                 None => Err(CheckError::new(path, expr.span, "unknown slice type")),
             }
         }
+        ExprKind::Tuple(elems) => {
+            let mut tys = Vec::new();
+            for e in elems {
+                tys.push(peek_ty(cx, e, locals, types, funcs, methods, lib_ns, consts, path)?);
+            }
+            cx.tuple_lookup(&tys).ok_or_else(|| {
+                CheckError::new(path, expr.span, "cannot infer this tuple's type").help("write the fn's return type")
+            })
+        }
         ExprKind::ArrayLit { elems } => {
             if elems.is_empty() {
                 return Err(CheckError::new(path, expr.span, "cannot infer empty array"));
@@ -489,6 +503,17 @@ pub(super) fn peek_ty(
                 ));
             }
             Ok(t)
+        }
+        // the first arm value whose type is known without the arm's bindings
+        ExprKind::Match(m) => {
+            let mut first = None;
+            for t in m.arms.iter().filter_map(|a| a.tail.as_ref()) {
+                match peek_ty(cx, t, locals, types, funcs, methods, lib_ns, consts, path) {
+                    Ok(ty) => return Ok(ty),
+                    Err(e) => first = first.or(Some(e)),
+                }
+            }
+            Err(first.unwrap_or_else(|| CheckError::new(path, expr.span, "this `match` has no arm value; write the fn's return type")))
         }
     }
 }
@@ -561,4 +586,10 @@ pub(super) fn peek_callee(
             "cannot call this expression",
         )),
     }
+}
+
+/// An int literal above `i64::MAX` where no `u64` is expected.
+pub(crate) fn big_int_err(path: &str, span: Span, v: u64) -> CheckError {
+    CheckError::new(path, span, format!("integer literal `{v}` does not fit `int`"))
+        .help("only a `u64` holds values above 9223372036854775807: give the `let`, `const` or field the type `u64`")
 }

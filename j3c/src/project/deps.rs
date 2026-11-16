@@ -10,9 +10,14 @@
 //! `~/.cache/j3/pkgs/<name>-<commit12>/` (`J3_PKG_DIR` overrides), then is a path dep. The project's
 //! `j3.lock` pins each git dep (transitive ones too) to a commit; with the lock and the cache present
 //! no git runs. A checkout dir is never written after it is renamed into place.
+//!
+//! A dep's `[commands]` and `[dist_outputs]` (its tools) are read here too (`deps/tools.rs`).
 
 use super::toml::{is_ident, parse_toml, TomlTable, TomlVal};
 use std::path::{Path, PathBuf};
+
+mod tools;
+pub use tools::{dist_provider, Tool};
 
 /// A resolved dependency: `use <name>.a.b;` loads `<root>/a/b.j3`. `root` is the dep's `src/` when
 /// it is a package (a `j3.toml` beside a `src/`), else the folder itself.
@@ -21,6 +26,13 @@ pub struct Dep {
     pub name: String,
     /// Canonical absolute directory of its modules.
     pub root: PathBuf,
+    /// Canonical absolute folder of the dep (where its `j3.toml` is, when it has one). Tool files are
+    /// relative to it.
+    pub pkg_root: PathBuf,
+    /// `[commands]` of its `j3.toml`, in file order; empty without one.
+    pub commands: Vec<Tool>,
+    /// `[dist_outputs]` of its `j3.toml`, in file order; empty without one.
+    pub dist_outputs: Vec<Tool>,
 }
 
 struct Entry {
@@ -75,6 +87,7 @@ pub(super) fn resolve(root: &Path, tbl: &TomlTable, package: &str) -> Result<Vec
     let lock_old = read_lock(&canon)?;
     let mut w = Walk { out: Vec::new(), from: Vec::new(), stack: vec![(package.to_string(), canon.clone())], lock_old, lock_new: Vec::new() };
     walk(&canon, &toml, list, &mut w)?;
+    tools::check_dist_unique(&w.out)?;
     if !w.lock_new.is_empty() && w.lock_new != w.lock_old {
         write_lock(&canon, &w.lock_new)?;
     }
@@ -236,7 +249,7 @@ fn entries(toml: &Path, tbl: &TomlTable) -> Result<Vec<Entry>, String> {
             _ => None,
         };
         let src = match val {
-            TomlVal::Str(s) => Src::Path(s.clone()),
+            TomlVal::Str(s) | TomlVal::Bare(s) => Src::Path(s.clone()),
             TomlVal::Map(m) if m.len() == 1 && m[0].0 == "path" => Src::Path(m[0].1.clone()),
             TomlVal::Map(m) if field("git").is_some() => {
                 let refs: Vec<&(String, String)> = m.iter().filter(|(k, _)| matches!(k.as_str(), "tag" | "rev" | "branch")).collect();
@@ -296,6 +309,7 @@ fn walk(dir: &Path, toml: &Path, list: Vec<Entry>, w: &mut Walk) -> Result<(), S
             ));
         }
         let mut sub = Vec::new();
+        let (mut commands, mut dist_outputs) = (Vec::new(), Vec::new());
         if dep_toml.is_file() {
             let text = std::fs::read_to_string(&dep_toml).map_err(|err| format!("{at}: read {}: {err}", dep_toml.display()))?;
             let tbl = parse_toml(&text).map_err(|err| err.replacen("j3.toml", &dep_toml.display().to_string(), 1))?;
@@ -308,8 +322,10 @@ fn walk(dir: &Path, toml: &Path, list: Vec<Entry>, w: &mut Walk) -> Result<(), S
                 check_j3_bound(want).map_err(|err| format!("{at}: {err}"))?;
             }
             sub = entries(&dep_toml, &tbl)?;
+            commands = tools::read(&e.name, &dep_toml, &tbl, &root, "commands")?;
+            dist_outputs = tools::read(&e.name, &dep_toml, &tbl, &root, "dist_outputs")?;
         }
-        w.out.push(Dep { name: e.name.clone(), root: mods });
+        w.out.push(Dep { name: e.name.clone(), root: mods, pkg_root: root.clone(), commands, dist_outputs });
         w.from.push(toml.to_path_buf());
         w.stack.push((e.name, root.clone()));
         walk(&root, &dep_toml, sub, w)?;

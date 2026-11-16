@@ -23,23 +23,34 @@ mod binop;
 mod bounds;
 mod call;
 mod closure;
+mod closure_boxed;
 mod closure_call;
+mod dyn_call;
+mod dyn_up;
+pub(crate) mod defcheck;
 use closure::fn_label;
 use generic_fn as generic;
 mod enums;
 mod expr;
 mod interp;
+pub(crate) mod lazy;
 mod generic_fn;
 mod half;
 mod lit;
+mod pat;
 mod place;
 mod stmt;
+mod tuple;
 mod streq;
 mod setup;
+mod scene_script;
 mod simd;
 mod ufcs;
+mod for_iter;
+mod zeroed;
 mod unify;
 pub(crate) use bounds::drain_bounds;
+pub(crate) use generic_fn::mentions;
 use bounds::eq_needs_operator;
 use generic_fn::GenCtx;
 use setup::{generic_origins, lower_fn, MergedEnv};
@@ -59,6 +70,9 @@ struct OriginNs {
     globals: HashMap<String, GlobalId>,
     struct_temps: HashMap<String, parse::StructItem>,
     struct_temp_env: HashMap<String, DeclEnv>,
+    /// Generic fns in scope there (`sortBy` inside `sort<T>`), by name and by module alias.
+    gen_names: HashMap<String, String>,
+    gen_mods: HashMap<String, String>,
 }
 
 /// Lowering state read by every module and written by none, built once before the lower loop.
@@ -69,6 +83,9 @@ pub(crate) struct Shared {
     struct_temps: HashMap<String, parse::StructItem>,
     struct_temp_env: HashMap<String, DeclEnv>,
     pub(crate) traits: TraitEnv,
+    /// Spans of generic templates whose definition check failed (`defcheck.rs`): their instances'
+    /// errors would repeat it, so they are dropped.
+    pub(crate) def_failed: HashSet<Span>,
 }
 
 pub(crate) fn shared(mods: &[ModData], traits: TraitEnv) -> Shared {
@@ -103,6 +120,7 @@ pub(crate) fn shared(mods: &[ModData], traits: TraitEnv) -> Shared {
         struct_temps,
         struct_temp_env,
         traits,
+        def_failed: HashSet::new(),
     }
 }
 
@@ -201,6 +219,7 @@ pub(crate) fn lower_module(
             if matches!(cx.func(id).kind, FuncKind::J3 { .. }) {
                 continue;
             }
+            let is_inst = !subst.is_empty();
             let body = match lower_fn(
                 cx,
                 &path,
@@ -234,13 +253,16 @@ pub(crate) fn lower_module(
             ) {
                 Ok(body) => body,
                 Err(e) => {
-                    errs.push(e);
+                    if !is_inst || !shared.def_failed.contains(&f.span) {
+                        errs.push(e);
+                    }
                     continue;
                 }
             };
             if let Some(e) = missing_return(cx, &path, id, &f, mods[i].ast.is_script) {
                 errs.push(e);
             }
+            lazy::wake(cx, &body.block, &mut queue);
             cx.func_mut(id).kind = FuncKind::J3 { body };
             // Generic struct/enum instances made by that body: check their bounds before their methods are lowered.
             drain_bounds(cx, &shared.traits, &methods, &method_temps, Some(&funcs))?;
@@ -342,91 +364,6 @@ struct Lower<'a> {
 }
 
 impl<'a> Lower<'a> {
-    /// A script instance used by value. Generic code (`List<Door>` growing) may move one;
-    /// user code may not copy one.
-    fn is_script_value(&self, ty: Ty) -> bool {
-        if !self.type_subst.is_empty() {
-            return false;
-        }
-        match self.cx.ty_kind(ty) {
-            TyKind::Struct(sid) => self.cx.struct_def(*sid).script.is_some(),
-            _ => false,
-        }
-    }
-
-    /// `j3.scene3d.Scene`.
-    fn is_scene(&self, sid: StructId) -> bool {
-        let def = self.cx.struct_def(sid);
-        self.cx.name_str(def.name) == "Scene"
-            && def.module.len() == 2
-            && self.cx.name_str(def.module[0]) == "j3"
-            && self.cx.name_str(def.module[1]) == "scene3d"
-    }
-
-    /// `scene.script<Door>(node)`: the registry's `find` for that script type.
-    fn scene_script_find(&self, ty: Ty, span: Span) -> Result<FuncId, CheckError> {
-        let script = match self.cx.ty_kind(ty) {
-            TyKind::Struct(sid) if self.cx.struct_def(*sid).script.is_some() => *sid,
-            _ => {
-                return Err(CheckError::new(
-                    self.path,
-                    span,
-                    "`scene.script<T>` takes a script type",
-                )
-                .help("bind one with `const Door = @script(\"scripts/door.j3s\");`"));
-            }
-        };
-        let path = crate::emit::bc::script_path(self.cx, &self.cx.struct_def(script).module);
-        let want = format!("find__{}", crate::compile::scene_scripts::ident(&path));
-        let registry = |f: &crate::ir::entity::Func| {
-            f.module.len() == 3
-                && self.cx.name_str(f.module[0]) == "j3"
-                && self.cx.name_str(f.module[1]) == "scene3d"
-                && self.cx.name_str(f.module[2]) == "scripts"
-        };
-        self.cx
-            .funcs()
-            .iter()
-            .find(|f| registry(f) && self.cx.name_str(f.name) == want)
-            .map(|f| f.id)
-            .ok_or_else(|| {
-                CheckError::new(
-                    self.path,
-                    span,
-                    format!("no scene attaches {path}, so no object has one"),
-                )
-                .help(format!(
-                    "attach it to an object in the editor (`script={path}` on its line)"
-                ))
-            })
-    }
-
-    fn script_copy(&self, span: Span, ty: Ty) -> CheckError {
-        let name = match self.cx.ty_kind(ty) {
-            TyKind::Struct(sid) => self.cx.name_str(self.cx.struct_def(*sid).name).to_string(),
-            _ => "the script".to_string(),
-        };
-        CheckError::new(self.path, span, "script instances can't be copied")
-            .help(format!("pass `&{name}` instead"))
-    }
-
-    fn script_prop_name<'b>(&self, expr: &'b Expr) -> Option<&'b str> {
-        match &expr.kind {
-            ExprKind::Name(n) if self.script_props.contains(&n.name) => Some(&n.name),
-            ExprKind::Field { base, field } => {
-                if matches!(&base.kind, ExprKind::Name(n) if n.name == "this")
-                    && self.script_props.contains(&field.name)
-                {
-                    Some(&field.name)
-                } else {
-                    self.script_prop_name(base)
-                }
-            }
-            ExprKind::Index { base, .. } => self.script_prop_name(base),
-            _ => None,
-        }
-    }
-
     fn ty_str(&self, ty: Ty) -> String {
         let mut s = String::new();
         dump_ty(self.cx, ty, &mut s);
@@ -437,15 +374,12 @@ impl<'a> Lower<'a> {
         if let Some(e) = self.closure_mismatch(span, have, want) {
             return e;
         }
-        let e = CheckError::new(
-            self.path,
-            span,
-            format!(
-                "{what}: expected `{}`, found `{}`",
-                self.ty_str(want),
-                self.ty_str(have)
-            ),
-        );
+        let (mut w, mut h) = (self.ty_str(want), self.ty_str(have));
+        if w == h {
+            // Two instances of one generic (`Id<A>` vs `Id<B>`): name the type arguments.
+            (w, h) = (self.ty_args_str(want), self.ty_args_str(have));
+        }
+        let e = CheckError::new(self.path, span, format!("{what}: expected `{w}`, found `{h}`"));
         if self.is_half(have) || self.is_half(want) {
             return e.help("`f16` is storage only: convert with `f32(x)` to compute, `f16(y)` to store");
         }
@@ -472,6 +406,9 @@ impl<'a> Lower<'a> {
     }
 
     fn no_method(&self, span: Span, sid: StructId, name: &str) -> CheckError {
+        if let Some(e) = self.bound_miss_sid(span, sid, &format!("method `{name}`"), Some(name)) {
+            return e;
+        }
         let mut names: Vec<String> = self
             .methods
             .keys()
@@ -484,7 +421,7 @@ impl<'a> Lower<'a> {
                 .filter(|(id, _)| *id == sid.0)
                 .map(|(_, n)| n.clone()),
         );
-        let mut e = CheckError::new(self.path, span, format!("no method `{name}`"));
+        let mut e = CheckError::new(self.path, span, format!("no method `{name}` on `{}`", self.cx.name_str(self.cx.struct_def(sid).name)));
         if let Some(s) = super::error::suggest(name, &names) {
             e = e.help(format!("did you mean `{s}`?"));
         }

@@ -201,8 +201,9 @@ impl<'a> G<'a> {
             let r = cls.first().map(|a| at(a)).unwrap_or(e.open);
             self.string(Mode::U, &parts, r)?;
         } else {
-            // one template: the written words, then each `class:x` as `x` or nothing
-            self.upd.s("`");
+            // one template: the written words, then each `class:x` as `x` or nothing; copied to the
+            // frame scratch `Text`, since the child keeps its props past this call
+            self.upd.s("Text.scratch().add(`");
             for p in &parts {
                 match p {
                     Part::Lit(l) if l.contains('`') || l.contains('\n') => return err(e.open.0, e.open.1, "text next to `{...}` can't hold a backtick"),
@@ -219,7 +220,7 @@ impl<'a> G<'a> {
                 self.expr(Mode::U, r)?;
                 self.upd.s(&format!(" {{ {} }} else {{ \"\" }}}}", lit(c)));
             }
-            self.upd.s("`");
+            self.upd.s("`).str()");
         }
         let styles: Vec<&Attr> = e.attrs.iter().filter(|a| a.name.starts_with("style:")).collect();
         for k in 0..pi.styles {

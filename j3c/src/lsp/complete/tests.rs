@@ -208,3 +208,34 @@ fn incomplete_app_dot_lists_methods() {
     assert!(names.contains(&"startup"), "{names:?}");
     assert!(!names.contains(&"App"), "{names:?}");
 }
+
+/// A char literal holding a quote or a paren does not open a string or a call for the scanners.
+#[test]
+fn scanners_step_over_char_literals() {
+    let src = "fn f() { let q = '\"'; let p = '('; g(1, '\\'', x";
+    assert!(lexical_mode(src, src.len()) == scan::Mode::Code);
+    let call = find_call(src, src.len()).expect("inside g(");
+    assert_eq!(call.name, "g");
+    assert_eq!(call.commas, 2);
+    // a label stays code too
+    let src = "'rows: for c in s { if c == '{' { break 'rows; } } q";
+    assert!(lexical_mode(src, src.len()) == scan::Mode::Code);
+}
+
+/// A tuple local completes its elements `0`, `1`; `#[der` completes the `derive` attribute.
+#[test]
+fn tuple_members_and_derive_attribute_complete() {
+    let dir = std::env::temp_dir().join(format!("j3-lsp-tuple-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("main.j3");
+    let src = "module main;\n#[derive(Eq)]\nstruct K { a: int; }\nfn main() {\n    let t = (1, \"x\");\n    let n = t.0;\n}\n";
+    std::fs::write(&file, src).unwrap();
+    let at = src.find("t.0").unwrap() + 2;
+    let items = complete_buffer(&file, &[], src, at as u32);
+    let got = labels(&items);
+    assert!(got.contains(&"0") && got.contains(&"1"), "{got:?}");
+    let at = src.find("derive").unwrap() + 3;
+    let items = complete_buffer(&file, &[], src, at as u32);
+    assert!(labels(&items).contains(&"derive"), "{:?}", labels(&items));
+    let _ = std::fs::remove_dir_all(&dir);
+}

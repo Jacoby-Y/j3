@@ -23,7 +23,7 @@ use pages::*;
 use render::*;
 use search::*;
 
-const HIDDEN: &[&str] = &["game_headless.j3", "build_release.j3", "sys_windows.j3", "sys_macos.j3", "sys_android.j3", "apkassets.j3", "netsys.j3", "netsys_windows.j3", "netsys_macos.j3", "netsys_android.j3", "threadsys.j3", "threadsys_windows.j3", "threadsys_android.j3", "sys_web.j3", "netsys_web.j3", "threadsys_web.j3"];
+const HIDDEN: &[&str] = &["game_headless.j3", "build_release.j3", "sys_windows.j3", "sys_macos.j3", "sys_android.j3", "apkassets.j3", "netsys.j3", "netsys_windows.j3", "netsys_macos.j3", "netsys_android.j3", "threadsys.j3", "threadsys_windows.j3", "threadsys_android.j3", "sys_web.j3", "netsys_web.j3", "threadsys_web.j3", "winsys.j3", "proc_windows.j3", "instance_windows.j3", "pty_windows.j3", "watch_windows.j3", "watch_other.j3", "hotkey_windows.j3"];
 
 /// Public so the runtime or editor can reach them, but not what a game calls.
 const INTERNAL: &[(&str, &str)] = &[
@@ -61,9 +61,9 @@ usage: j3c doc [topic | module [item]] [--short]
     j3c doc term               terminals: emulator and TUI modules, restore hook, limits
     j3c doc i18n               translated text: locale files, t/tf, plurals, numbers, RTL, j3c check
     j3c doc ship               release builds, zips, and .deb installers with a menu entry and icon
-    j3c doc packages           packages: make one (--lib), use one (path or git deps), j3.lock, fetch/update/add
+    j3c doc packages           packages: make one (--lib), use one (path or git deps), j3.lock, fetch/update/add, tools (j3c pkg, dist outputs)
     j3c doc android            Android: APK builds, [android] keys, touch, running on a device
-    j3c doc steam              Steam: setup, achievements, cloud, Deck, depot upload, binding check
+    j3c doc steam              Steam: the steam package (dependency, j3c pkg steam check, steam dist output)
     j3c doc shaders            shaders written in J3: #[shader] fns, @shader(vs, fs), j3c dump-glsl
     j3c doc j2                 j2: scripts and mods the game loads at runtime (host API); `j2 lang` is the language";
 
@@ -160,7 +160,7 @@ const GUIDES: &[&[&str]] = &[
     &["term", "terminal", "tui"],
     &["i18n", "locale", "locales", "translation", "l10n"],
     &["ship", "dist", "deb", "packaging", "release"],
-    &["packages", "package", "deps", "dependencies", "lib", "lock", "git"],
+    &["packages", "package", "deps", "dependencies", "lib", "lock", "git", "pkg", "commands", "dist_outputs", "tools"],
     &["android", "apk"],
     &["steam", "steamworks"],
     &["j2", "mods", "modding"],

@@ -13,8 +13,12 @@
 /// (dropped),
 /// mouse encodings other than SGR, DCS. APC is kitty graphics only (`grid/kitty.j3`).
 /// Any thread: a `Grid` is one value for one screen; nothing is shared.
-/// Memory: all storage comes from the arena given to `new`; growing past the limits (see `withLimits`) or
-/// resizing abandons the old blocks in the arena (like `List`), so keep resizes rare.
+/// Memory: the screens, the scrollback and reflow scratch live in arenas the grid owns, so `resize` frees what it
+/// replaces and memory follows the current size, however many resizes there were. The arena given to `new` only holds
+/// small fixed bookkeeping (about 33 bytes per scrollback line of capacity, link URIs, headers). Each screen cell
+/// costs 24 bytes (two screens of `maxCols x maxRows`). A scrollback line is stored trimmed of trailing default
+/// blanks, about 4 bytes per used cell (+12 at each style or link change, +4 per cell with combining marks).
+/// `destroy` frees the owned storage.
 ///
 /// Coordinates are 0-based and `(x, y)` is column, row. Rows of the visible screen are `0..rows()`; the virtual
 /// line list for scrollback is `0..lineCount()` with line 0 the oldest scrollback line.
@@ -150,14 +154,27 @@ pub struct Grid {
     reserves: int;
     /// BELs seen; the host compares with its last value.
     bells: int;
-    /// Scrollback ring: `sbCap` slots of `maxCols` cells; slot `(sbHead + i) % sbCap` is line `i`, oldest first.
-    sb: []Cell;
-    sbLens: []int;
-    /// Per scrollback slot: the line continues on the next (see `Buf.wrap`).
+    /// Scrollback (`grid/sb.j3`): `sbCap` line slots, slot `(sbHead + i) % sbCap` is line `i`, oldest first. Slot
+    /// metadata is fixed: where the line's record starts in `sbRing`, its length in words, the width it had, and
+    /// whether it continues on the next line (see `Buf.wrap`). `sbRing` is a ring of variable-length records in
+    /// `sbMem`: live words are `[sbH, sbT)`, or `[sbH, sbE)` then `[0, sbT)` when `sbWr`.
+    sbStart: []int;
+    sbWords: []int;
+    sbWidth: []int;
     sbWrap: []u8;
     sbHead: int;
     sbCount: int;
     sbCap: int;
+    sbRing: []u32;
+    sbMem: &Arena;
+    sbH: int;
+    sbT: int;
+    sbE: int;
+    sbWr: bool;
+    /// The screens, tabs and `lnBuf`; replaced whole when storage grows.
+    own: &Arena;
+    /// `line` decodes scrollback lines here (`maxCols` cells).
+    lnBuf: []Cell;
     /// Bytes for the host to write to the child (DSR, DA). Drain with `reply.str()` then `reply.clear()`.
     reply: Text;
     /// OSC 0 / 2.
@@ -179,32 +196,35 @@ pub struct Grid {
     kn: int;
     cellPxW: int;
     cellPxH: int;
-    /// Reflow scratch (`resize/reflow`): logical lines' cells, their starts and lengths, one output row. Grown on
-    /// demand; old blocks stay in the arena.
+    /// Reflow scratch (`resize/reflow`): logical lines' cells, their starts and lengths, one output row. In an arena
+    /// made for one reflow and freed after it; empty between reflows.
     rfCells: []Cell;
     rfStart: []int;
     rfLen: []int;
     rfRow: []Cell;
 
     /// A cleared `cols` x `rows` screen with room for `scrollback` lines. Storage limits are
-    /// `max(cols, 200)` x `max(rows, 60)` (about 20 bytes per cell, committed as touched).
+    /// `max(cols, 200)` x `max(rows, 60)` (24 bytes per cell, two screens; grid-owned, see `destroy`). The scrollback
+    /// costs 33 bytes per line of capacity in `arena` plus about 4 bytes per used cell of each stored line.
     fn new(arena: &Arena, cols: int, rows: int, scrollback: int): Grid {
         let c = if cols < 1 { 1 } else { cols };
         let r = if rows < 1 { 1 } else { rows };
         return Grid.withLimits(arena, c, r, scrollback, if c > 200 { c } else { 200 }, if r > 60 { r } else { 60 });
     }
 
-    /// Like `new` with explicit storage limits for `resize` (`maxCols >= cols`, `maxRows >= rows`).
-    /// `maxCols` also sets the scrollback stride, so size it to the widest window you expect.
+    /// Like `new` with explicit storage limits for `resize` (`maxCols >= cols`, `maxRows >= rows`). Past them,
+    /// `resize` moves the screens to bigger storage and frees the old.
     fn withLimits(arena: &Arena, cols: int, rows: int, scrollback: int, maxCols: int, maxRows: int): Grid {
         let sbCap = if scrollback < 0 { 0 } else { scrollback };
+        let own = ownedArena(arena, ownBytes(maxCols, maxRows));
+        let sbMem = ownedArena(arena, 64);
         let g = Grid {
             ncols: cols,
             nrows: rows,
             maxCols: maxCols,
             maxRows: maxRows,
-            pri: newBuf(arena, maxCols, maxRows),
-            altb: newBuf(arena, maxCols, maxRows),
+            pri: newBuf(own, maxCols, maxRows),
+            altb: newBuf(own, maxCols, maxRows),
             isAlt: false,
             cx: 0,
             cy: 0,
@@ -213,7 +233,7 @@ pub struct Grid {
             link: 0,
             top: 0,
             bot: rows - 1,
-            tabs: arena.alloc::<u8>(maxCols),
+            tabs: own.alloc::<u8>(maxCols),
             modes: MODE_WRAP | MODE_CURSOR,
             saved: homeSaved(),
             saved1049: homeSaved(),
@@ -226,12 +246,21 @@ pub struct Grid {
             syncAt: -1,
             bells: 0,
             reserves: 0,
-            sb: arena.alloc::<Cell>(sbCap * maxCols),
-            sbLens: arena.alloc::<int>(sbCap),
+            sbStart: arena.alloc::<int>(sbCap),
+            sbWords: arena.alloc::<int>(sbCap),
+            sbWidth: arena.alloc::<int>(sbCap),
             sbWrap: arena.alloc::<u8>(sbCap),
             sbHead: 0,
             sbCount: 0,
             sbCap: sbCap,
+            sbRing: sbMem.alloc::<u32>(0),
+            sbMem: sbMem,
+            sbH: 0,
+            sbT: 0,
+            sbE: 0,
+            sbWr: false,
+            own: own,
+            lnBuf: own.alloc::<Cell>(maxCols),
             reply: Text.new(arena),
             title: Text.new(arena),
             links: List<string>.new(arena),
@@ -248,13 +277,24 @@ pub struct Grid {
             kn: 0,
             cellPxW: 8,
             cellPxH: 16,
-            rfCells: arena.alloc::<Cell>(0),
-            rfStart: arena.alloc::<int>(0),
-            rfLen: arena.alloc::<int>(0),
-            rfRow: arena.alloc::<Cell>(0),
+            rfCells: own.alloc::<Cell>(0),
+            rfStart: own.alloc::<int>(0),
+            rfLen: own.alloc::<int>(0),
+            rfRow: own.alloc::<Cell>(0),
         };
         g.resetTabs();
         return g;
+    }
+
+    /// Free the storage the grid owns (screens, scrollback, kitty images). The grid must not be used after; the
+    /// arena given to `new` still holds the bookkeeping and is the caller's to destroy.
+    fn destroy(this: &Grid) {
+        this.kittyFreeAll();
+        this.sbClear();
+        this.sbMem.destroy();
+        this.own.destroy();
+        this.ncols = 0;
+        this.nrows = 0;
     }
 
     /// Columns.
@@ -337,7 +377,8 @@ pub struct Grid {
     }
 
     /// Virtual line `i`: `0..scrollbackLen()` is scrollback, oldest first (its length is the width it had when it
-    /// scrolled off, which may differ from `cols()` after a resize), then the screen rows. Empty when out of range.
+    /// scrolled off or was reflowed, which may differ from `cols()`), then the screen rows. Empty when out of range.
+    /// A scrollback line is decoded into a buffer the grid reuses: valid until the next `line` / `viewLine` call.
     fn line(this: &Grid, i: int): []Cell {
         if i < 0 || i >= this.sbCount + this.nrows {
             return this.pri.cells[0..0];
@@ -345,9 +386,7 @@ pub struct Grid {
         if i >= this.sbCount {
             return this.rowCells(i - this.sbCount);
         }
-        let slot = (this.sbHead + i) % this.sbCap;
-        let s = slot * this.maxCols;
-        return this.sb[s..s + this.sbLens[slot]];
+        return this.sbLine(i, true);
     }
 
     /// Whether virtual line `i` (see `line`) wrapped into line `i + 1` by printing past its end, so a copy should join
@@ -420,6 +459,18 @@ pub struct Grid {
         }
         return this.links.items[id - 1];
     }
+}
+
+/// Bytes `newBuf` twice, tabs and `lnBuf` take from the owned arena at limits `c` x `r`.
+fn ownBytes(c: int, r: int): int {
+    return 2 * (c * r * @sizeof(Cell) + r * 18) + c + c * @sizeof(Cell) + 4096;
+}
+
+/// A fresh arena of `cap` bytes whose header sits in `arena` (an `Arena` is never stored by value).
+fn ownedArena(arena: &Arena, cap: int): &Arena {
+    let slot = arena.alloc::<Arena>(1);
+    slot[0] = Arena.create(cap);
+    return &slot[0];
 }
 
 fn newBuf(arena: &Arena, maxCols: int, maxRows: int): Buf {

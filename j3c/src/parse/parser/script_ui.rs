@@ -25,7 +25,7 @@ impl<'a> Parser<'a> {
             TokenKind::Struct => Ok(Item::Struct(self.struct_item(vis_pub, false, doc)?)),
             TokenKind::Enum => Ok(Item::Enum(self.enum_item(
                 vis_pub,
-                ItemAttrs { debug: false, try_catch: None, singleton: false, thread: false, impl_fn: false, shader: None, gpu_struct: GpuStruct::None, uniform: false, flat: false },
+                ItemAttrs { debug: false, try_catch: None, derives: Vec::new(), singleton: false, thread: false, impl_fn: false, shader: None, gpu_struct: GpuStruct::None, uniform: false, flat: false },
                 doc,
             )?)),
             TokenKind::Ident if !vis_pub && self.cur().text == SCRIPT_PROPS => {
@@ -143,6 +143,7 @@ impl<'a> Parser<'a> {
             name,
             type_params: Vec::new(),
             bounds: Vec::new(),
+            where_bounds: Vec::new(),
             is_impl: false,
             shader: None,
             params,

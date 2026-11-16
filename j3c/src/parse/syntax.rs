@@ -23,11 +23,16 @@ pub const ATTR_SINGLETON: &str = "singleton";
 pub const ATTR_TRY_CATCH: &str = "TryCatch";
 pub const ATTR_THREAD: &str = "thread";
 pub const ATTR_IMPL: &str = "impl";
-pub const ATTRIBUTES: &[&str] = &[ATTR_DEBUG, ATTR_SINGLETON, ATTR_TRY_CATCH, ATTR_THREAD, ATTR_IMPL, "shader", "vertex", "varying", "uniform", "flat"];
+/// `#[derive(Eq, Hash, Ord, Debug, Clone)]` on a struct or enum (`check/derive.rs`).
+pub const ATTR_DERIVE: &str = "derive";
+pub const DERIVES: &[&str] = &["Eq", "Hash", "Ord", "Debug", "Clone"];
+pub const ATTRIBUTES: &[&str] = &[ATTR_DEBUG, ATTR_DERIVE, ATTR_SINGLETON, ATTR_TRY_CATCH, ATTR_THREAD, ATTR_IMPL, "shader", "vertex", "varying", "uniform", "flat"];
 /// Contextual item word: `trait Name { .. }`, only when an identifier follows.
 pub const ITEM_TRAIT: &str = "trait";
 /// Contextual item word: `extend Type { fn .. }`, only when an identifier follows.
 pub const ITEM_EXTEND: &str = "extend";
+/// Contextual word after a method's signature: `where T: Eq`, bounds on the struct's type parameters.
+pub const FN_WHERE: &str = "where";
 
 pub const INTRINSIC_SYSCALL: &str = "syscall";
 pub const INTRINSIC_SIZEOF: &str = "sizeof";
@@ -53,8 +58,14 @@ pub const ATOMIC_ORDERS: &[&str] = &["relaxed", "acquire", "release", "acqrel", 
 pub const INTRINSIC_GPU: &[&str] = &["shader", "discard", "fragCoord", "vertexId", "mix", "clamp", "dot", "cross", "length", "distance", "normalize", "min", "max", "abs", "sign", "floor", "ceil", "fract", "pow", "exp", "log", "sqrt", "sin", "cos", "tan", "atan", "step", "smoothstep", "mod", "fwidth", "dFdx", "dFdy", "texture", "textureLod", "texelFetch", "textureSize", "reflect", "refract", "transpose", "inverse"];
 /// Contextual type word: `closure(A): R`, only when followed by `(`.
 pub const TYPE_CLOSURE: &str = "closure";
+/// Contextual type word: `boxed closure(A): R`, only when `closure` follows.
+pub const TYPE_BOXED: &str = "boxed";
+/// Contextual type word: `dyn Trait`, only when an identifier follows.
+pub const TYPE_DYN: &str = "dyn";
 pub const INTRINSIC_J3UI: &str = "j3ui";
 pub const INTRINSIC_SCRIPT: &str = "script";
+/// `@embed("f")` (string), `@embedBytes("f")` (`[]u8`), `@embedDir("dir", "*.j3")` (table of `{ path, data }`).
+pub const INTRINSIC_EMBED: &[&str] = &["embed", "embedBytes", "embedDir"];
 pub const SCRIPT_PROPS: &str = "props";
 pub const SCRIPT_SHARED: &str = "shared";
 pub const INTRINSICS: &[&str] = &[
@@ -64,6 +75,9 @@ pub const INTRINSICS: &[&str] = &[
     INTRINSIC_SLICE,
     INTRINSIC_J3UI,
     INTRINSIC_SCRIPT,
+    "embed",
+    "embedBytes",
+    "embedDir",
     "atomicLoad",
     "atomicStore",
     "atomicAdd",
@@ -135,6 +149,8 @@ pub const BUILTIN_TYPES: &[&str] = &[
 ];
 
 const OPERATOR_KINDS: &[TokenKind] = &[
+    TokenKind::ShlEq,
+    TokenKind::ShrEq,
     TokenKind::ColonColon,
     TokenKind::DotDot,
     TokenKind::DotDotEq,
@@ -200,6 +216,7 @@ mod tests {
             assert!(g.contains(name), "missing type {name}");
         }
         assert!(g.contains(TYPE_CLOSURE), "missing closure type word");
+        assert!(g.contains(TYPE_DYN), "missing dyn type word");
         assert!(g.contains(ITEM_TRAIT), "missing trait item word");
         assert!(g.contains(ITEM_EXTEND), "missing extend item word");
         for k in OPERATOR_KINDS {

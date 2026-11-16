@@ -11,14 +11,7 @@ impl<'a> Lower<'a> {
     ) -> Result<Rvalue, CheckError> {
         if let ExprKind::Field { base, field } = &func.kind {
             if let Some(ename) = self.enum_ctor_name(base) {
-                if args.len() != 1 {
-                    return Err(CheckError::new(
-                        self.path,
-                        span,
-                        "enum variant takes one payload",
-                    ));
-                }
-                return self.construct_variant(span, &ename, &field.name, Some(&args[0]), expected);
+                return self.construct_variant(span, &ename, &field.name, args, expected);
             }
         }
         match &func.kind {
@@ -57,6 +50,12 @@ impl<'a> Lower<'a> {
                 }
                 if let Some(&local) = self.locals.get(&n.name) {
                     let place = self.b.local_place(local, n.span);
+                    return self.call_fn_op(span, Operand::Copy(place), args);
+                }
+                // `#[singleton] let ON_HIT: boxed closure(int);` called as `ON_HIT(3)`
+                if let Some(&gid) = self.globals.get(&n.name).filter(|g| self.cx.is_boxed_closure(self.cx.global(**g).ty)) {
+                    let ty = self.cx.global(gid).ty;
+                    let place = Place::global(gid, ty, self.global_access(gid), n.span);
                     return self.call_fn_op(span, Operand::Copy(place), args);
                 }
                 Err(self.unknown(n.span, "function", &n.name, &[]))
@@ -106,10 +105,20 @@ impl<'a> Lower<'a> {
                 while let Some(inner) = self.cx.ref_inner(recv_ty) {
                     recv_ty = inner;
                 }
+                if self.cx.dyn_trait(recv_ty).is_some() {
+                    return self.call_dyn(span, recv, field, args);
+                }
                 let sid = match self.cx.ty_kind(recv_ty) {
                     TyKind::Struct(id) => Some(*id),
                     _ => None,
                 };
+                if let (Some(sid), "fmt", [arg]) = (sid, field.name.as_str(), args) {
+                    if let ExprKind::Interpolate { parts } = &arg.kind {
+                        if self.is_text(sid) {
+                            return self.text_fmt(span, recv, sid, parts);
+                        }
+                    }
+                }
                 if let Some(id) = self.ufcs_target(sid, &field.name, recv.ty) {
                     return self.call_id(span, id, Some(recv), args);
                 }
@@ -118,8 +127,14 @@ impl<'a> Lower<'a> {
                     self.methods.contains_key(&key) || self.method_temps.contains_key(&key)
                 });
                 if !has_method {
-                    if let Some(id) = self.impl_target(recv.ty, &field.name) {
+                    if field.name == "hash" && args.is_empty() && sid.is_some_and(|s| self.cx.is_tuple_struct(s)) {
+                        return self.tuple_hash(span, recv);
+                    }
+                    if let Some(id) = self.impl_target(span, recv.ty, &field.name)? {
                         return self.call_id(span, id, Some(recv), args);
+                    }
+                    if let Some(rv) = self.call_default(span, &field.name, recv.clone(), args)? {
+                        return Ok(rv);
                     }
                     if let Some(m) = self.generic_named(&field.name) {
                         return self.call_generic(span, &m, &field.name, type_args, Some(recv), args);
@@ -131,11 +146,16 @@ impl<'a> Lower<'a> {
                         let e = CheckError::new(
                             self.path,
                             field.span,
-                            format!("no method `{}`", field.name),
+                            format!("no method `{}` on `{}`", field.name, self.ty_str(recv_ty)),
                         );
                         return Err(self.ufcs_hint(e, &field.name));
                     }
                 };
+                if type_args.is_empty() {
+                    if let Some(rv) = self.call_method_inferred(span, sid, &field.name, recv.clone(), args)? {
+                        return Ok(rv);
+                    }
+                }
                 let targs = self.resolve_type_args(type_args)?;
                 if field.name == "script" && targs.len() == 1 && self.is_scene(sid) {
                     let id = self.scene_script_find(targs[0], field.span)?;
@@ -390,7 +410,12 @@ impl<'a> Lower<'a> {
     ) -> Result<FuncId, CheckError> {
         if type_args.is_empty() {
             return match self.methods.get(&(sid.0, name.to_string())).copied() {
-                Some(id) => self.script_method_visible(sid, id, name, span),
+                Some(id) => {
+                    if let Some(reqs) = self.cx.method_wheres.get(&id).cloned() {
+                        self.check_where(span, name, &reqs)?;
+                    }
+                    self.script_method_visible(sid, id, name, span)
+                }
                 None => Err(self.no_method(span, sid, name)),
             };
         }
@@ -429,6 +454,8 @@ impl<'a> Lower<'a> {
             ));
         }
         self.check_call_bounds(span, &format!("`{name}`"), &temp.type_params, &temp.bounds, &type_args)?;
+        let reqs = crate::check::traits::where_reqs(&temp.where_bounds, &self.cx.struct_def(sid).ty_args);
+        self.check_where(span, name, &reqs)?;
         let mut subst = HashMap::new();
         for (pname, ty) in &self.cx.struct_def(sid).ty_args {
             subst.insert(pname.clone(), *ty);

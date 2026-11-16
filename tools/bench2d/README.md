@@ -10,6 +10,7 @@
 | `paint-rects` / `paint-text` | `N` | same via `j3.gfx.paint` |
 | `paint-mixed` | | mixed via paint |
 | `shapes` | | every paint primitive and edge case (the golden) |
+| `tree` | | a skill tree: 200 long width-5 lines, `fillShape` polygons and circles in one bloom layer under translate + scale (6 draws; `j3c/stdlib/tests/paint_batch_test.j3` locks the draw count and line cost) |
 
 Usage: `bench2d <scene> [N] [frames]`. Default 300 frames, first 30 skipped; a 3rd arg runs that many frames (watch memory). The binary is `target/bench2d`. It opts out of idle-frame skipping, so every frame draws.
 

@@ -14,6 +14,21 @@ fn cmp_test_runs_on_both_backends() {
     run("cmp15", include_str!("../../../stdlib/tests/cmp_test.j3"), "cmp_test ok\n");
 }
 
+/// `j3.text` numbers, UTF-8 and split: 1M random f64 bit patterns print and parse back (opt 2 keeps it to a second).
+#[test]
+fn text_utils_test_runs_on_both_backends() {
+    for r in both_backends_opt("textutils", include_str!("../../../stdlib/tests/text_utils_test.j3"), "2") {
+        assert_eq!(r.status, 0, "{}{}", String::from_utf8_lossy(&r.stdout), String::from_utf8_lossy(&r.stderr));
+        assert_eq!(String::from_utf8_lossy(&r.stdout), "text_utils_test ok\n");
+    }
+}
+
+/// `j3.hash`: published vectors for FNV-1a 64, XXH3 64 and SHA-256, incremental == one-shot.
+#[test]
+fn hash_test_runs_on_both_backends() {
+    run("hash", include_str!("../../../stdlib/tests/hash_test.j3"), "hash_test ok\n");
+}
+
 #[test]
 fn map_test_runs_on_both_backends() {
     run("map15", include_str!("../../../stdlib/tests/map_test.j3"), "map_test ok\n");
@@ -72,127 +87,6 @@ fn j2_lib_test_runs_on_both_backends() {
     run("j2lib", include_str!("../../../stdlib/tests/j2_lib_test.j3"), "j2_lib_test ok\n");
 }
 
-/// `j3.steam` without Steam (fake mode, layouts). LLVM only: `j3.steam.game` names `j3.app`, which the C backend cannot emit.
-#[test]
-fn steam_test_runs() {
-    let dir = std::env::temp_dir().join(format!("j3-steam1-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("main.j3");
-    std::fs::write(&file, include_str!("../../../stdlib/tests/steam_test.j3")).unwrap();
-    let prog = compile_path(&file).expect("check");
-    let r = emit::run_program(&prog.cx, &prog.modules, &llvm_opts()).expect("run");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(r.status, 0, "{}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(String::from_utf8_lossy(&r.stdout), "steam_test ok\n");
-}
-
-/// `j3.steam` achievements, stats and leaderboards without Steam (absent, fake mode, both struct layouts). LLVM only, like `steam_test_runs`.
-#[test]
-fn steam_stats_test_runs() {
-    let dir = std::env::temp_dir().join(format!("j3-steam2-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("main.j3");
-    std::fs::write(&file, include_str!("../../../stdlib/tests/steam_stats_test.j3")).unwrap();
-    let prog = compile_path(&file).expect("check");
-    let r = emit::run_program(&prog.cx, &prog.modules, &llvm_opts()).expect("run");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(r.status, 0, "{}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(String::from_utf8_lossy(&r.stdout), "steam_stats_test ok\n");
-}
-
-/// `j3.steam` friends, overlay, utils, screenshots and timeline without Steam (absent, fake mode, both struct layouts). LLVM only, like `steam_test_runs`.
-#[test]
-fn steam_social_test_runs() {
-    let dir = std::env::temp_dir().join(format!("j3-steam3-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("main.j3");
-    std::fs::write(&file, include_str!("../../../stdlib/tests/steam_social_test.j3")).unwrap();
-    let prog = compile_path(&file).expect("check");
-    let r = emit::run_program(&prog.cx, &prog.modules, &llvm_opts()).expect("run");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(r.status, 0, "{}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(String::from_utf8_lossy(&r.stdout), "steam_social_test ok\n");
-}
-
-/// `j3.steam` lobbies and matchmaking without Steam (absent, fake mode, both struct layouts). LLVM only, like `steam_test_runs`.
-#[test]
-fn steam_lobby_test_runs() {
-    let dir = std::env::temp_dir().join(format!("j3-steam7-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("main.j3");
-    std::fs::write(&file, include_str!("../../../stdlib/tests/steam_lobby_test.j3")).unwrap();
-    let prog = compile_path(&file).expect("check");
-    let r = emit::run_program(&prog.cx, &prog.modules, &llvm_opts()).expect("run");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(r.status, 0, "{}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(String::from_utf8_lossy(&r.stdout), "steam_lobby_test ok\n");
-}
-
-/// `j3.steam` networking messages, relay status and shared networking types without Steam (absent, fake mode, both struct layouts). LLVM only, like `steam_test_runs`.
-#[test]
-fn steam_net_test_runs() {
-    let dir = std::env::temp_dir().join(format!("j3-steam8-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("main.j3");
-    std::fs::write(&file, include_str!("../../../stdlib/tests/steam_net_test.j3")).unwrap();
-    let prog = compile_path(&file).expect("check");
-    let r = emit::run_program(&prog.cx, &prog.modules, &llvm_opts()).expect("run");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(r.status, 0, "{}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(String::from_utf8_lossy(&r.stdout), "steam_net_test ok\n");
-}
-
-/// `j3.steam` P2P sockets (ISteamNetworkingSockets: fake loopback, poll groups, callbacks 1221/1222) without Steam (absent, fake mode, both struct layouts). LLVM only, like `steam_test_runs`.
-#[test]
-fn steam_sock_test_runs() {
-    let dir = std::env::temp_dir().join(format!("j3-steam8b-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("main.j3");
-    std::fs::write(&file, include_str!("../../../stdlib/tests/steam_sock_test.j3")).unwrap();
-    let prog = compile_path(&file).expect("check");
-    let r = emit::run_program(&prog.cx, &prog.modules, &llvm_opts()).expect("run");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(r.status, 0, "{}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(String::from_utf8_lossy(&r.stdout), "steam_sock_test ok\n");
-}
-
-/// `j3.steam` apps, DLC and Steam Cloud (plus `userDir`) without Steam (absent, fake mode, both struct layouts). LLVM only, like `steam_test_runs`.
-#[test]
-fn steam_cloud_test_runs() {
-    let dir = std::env::temp_dir().join(format!("j3-steam4-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("main.j3");
-    std::fs::write(&file, include_str!("../../../stdlib/tests/steam_cloud_test.j3")).unwrap();
-    let prog = compile_path(&file).expect("check");
-    let r = emit::run_program(&prog.cx, &prog.modules, &llvm_opts()).expect("run");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(r.status, 0, "{}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(String::from_utf8_lossy(&r.stdout), "steam_cloud_test ok\n");
-}
-
-/// `j3.steam` Steam Input without Steam (absent, fake pads, caches, both struct layouts). LLVM only, like `steam_test_runs`.
-#[test]
-fn steam_input_test_runs() {
-    let dir = std::env::temp_dir().join(format!("j3-steam5-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("main.j3");
-    std::fs::write(&file, include_str!("../../../stdlib/tests/steam_input_test.j3")).unwrap();
-    let prog = compile_path(&file).expect("check");
-    let r = emit::run_program(&prog.cx, &prog.modules, &llvm_opts()).expect("run");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(r.status, 0, "{}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(String::from_utf8_lossy(&r.stdout), "steam_input_test ok\n");
-}
-
-/// `j3.sys.ARCH` and `ARCH_NAME` follow the host CPU (the loader rewrites them from the target triple).
 #[test]
 fn sys_arch_matches_host() {
     let dir = std::env::temp_dir().join(format!("j3-arch-{}", std::process::id()));
@@ -226,6 +120,21 @@ fn main() {\n    let mem = Arena.create(4096);\n    let m = Map<int, int>.new(&m
     let l = List<int>.new(&mem);\n    l.push(3);\n    printLn(`{m.getOr(1, 0)} {l.len}`);\n}\n",
         "2 1\n",
     );
+}
+
+/// `j3.io.watch`: create, delete, move in/out, modify and replace-by-rename each reach `poll` with the right id and kind.
+#[test]
+fn watch_test_runs() {
+    let dir = std::env::temp_dir().join(format!("j3-watch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.j3");
+    std::fs::write(&file, include_str!("../../../stdlib/tests/watch_test.j3")).unwrap();
+    let prog = compile_path(&file).expect("check");
+    let r = emit::run_program(&prog.cx, &prog.modules, &llvm_opts()).expect("run");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(r.status, 0, "{}", String::from_utf8_lossy(&r.stdout));
+    assert_eq!(String::from_utf8_lossy(&r.stdout), "watch_test ok\n");
 }
 
 /// Idle frame skipping (chunk 26): the loop's decision and `Dom.idleMs`, no window. LLVM only: the C backend cannot emit a `Dom` yet.
@@ -276,11 +185,17 @@ fn term_width_test_runs_on_both_backends() {
     run("term_width", include_str!("../../../stdlib/tests/term_width_test.j3"), "term_width_test ok\n");
 }
 
-/// `j3.term.grid` (chunk 3 of plan 031): cursor, deferred wrap, regions, erase, wide chars, alt screen, resize, scrollback,
-/// replies, 1 MB of text, and captured program output. Reads `stdlib/tests/term_fixtures/` relative to the crate root.
+/// `j3.term.grid` (chunk 3 of plan 031): cursor, deferred wrap, regions, erase, wide chars, alt screen, modes, replies.
 #[test]
 fn term_grid_test_runs_on_both_backends() {
     run("term_grid", include_str!("../../../stdlib/tests/term_grid_test.j3"), "term_grid_test ok\n");
+}
+
+/// `j3.term.grid`, part 2: resize, reflow, marks, scrollback, 1 MB of text, and captured program output.
+/// Reads `stdlib/tests/term_fixtures/` relative to the crate root.
+#[test]
+fn term_grid_scroll_test_runs_on_both_backends() {
+    run("term_grid_scroll", include_str!("../../../stdlib/tests/term_grid_scroll_test.j3"), "term_grid_scroll_test ok\n");
 }
 
 /// `j3.term.pty` (chunk 6 of plan 031): a program on a pty, size, colors, controlling tty, resize, missing program, env.
@@ -314,4 +229,10 @@ fn term_input_test_runs_on_both_backends() {
 #[test]
 fn instance_test_runs_on_both_backends() {
     run("instance", include_str!("../../../stdlib/tests/instance_test.j3"), "instance_test ok\n");
+}
+
+/// `j3.sys.setenv`: set, read back through `env`, overwrite, bad names refused.
+#[test]
+fn env_test_runs_on_both_backends() {
+    run("envset", include_str!("../../../stdlib/tests/env_test.j3"), "env_test ok\n");
 }

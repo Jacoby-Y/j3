@@ -4,7 +4,11 @@ impl<'a> Codegen<'a> {
     /// Evaluate an aggregate rvalue into the memory at `dst` (an address register).
     pub(super) fn aggregate_into(&mut self, dst: u32, rv: &Rvalue) -> Result<(), String> {
         match &rv.kind {
-            RvalueKind::Use(op) => {
+            // `s as []u8` and back: the same `{ ptr, len }` bytes
+            RvalueKind::Use(op) | RvalueKind::Cast { from: op }
+                if matches!(rv.kind, RvalueKind::Use(_))
+                    || [op.ty(), rv.ty].iter().all(|t| matches!(self.cx.ty_kind(*t), TyKind::String | TyKind::Slice { .. })) =>
+            {
                 let src = self.operand(op)?;
                 let size = abi::size(self.cx, rv.ty);
                 if src != dst && size > 0 {

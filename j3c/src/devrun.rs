@@ -34,7 +34,7 @@ pub enum Prepared {
 
 /// Where the dev binary lives: its own folder in `target/.j3c`, not beside the real one.
 pub fn dev_out(m: &Manifest) -> PathBuf {
-    let dev = m.out_path().with_file_name(format!("{}-dev", m.name));
+    let dev = m.out_path().with_file_name(format!("{}-dev", m.bin));
     emit::host::cache_dir(&dev, m.emit.primary()).join(dev.file_name().expect("dev name"))
 }
 
@@ -175,6 +175,7 @@ fn native_source_key(prog: &Program) -> u64 {
         f.path.hash(&mut h);
         f.src.hash(&mut h);
     }
+    prog.cx.hash_embeds(&mut h);
     h.finish()
 }
 
@@ -208,7 +209,6 @@ pub(crate) fn launch(exe: &Path, root: &Path, args: &[String], envs: &[(&str, &P
         .env("J3_ROOT", &root)
         // a dev run lets F12 open the UI inspector (`j3.ui.inspect`); `J3_INSPECT=0` turns that off
         .env("J3_INSPECT", std::env::var("J3_INSPECT").unwrap_or_else(|_| "1".into()))
-        .envs(crate::dist::steam_dev_env(&root))
         .envs(envs.iter().copied())
         .stderr(Stdio::piped())
         .spawn()

@@ -279,6 +279,11 @@ impl<'a> Codegen<'a> {
                 return Err("`@atomic*` isn't supported in scripts (the VM runs on one thread)".to_string())
             }
             RvalueKind::Simd { .. } => return Err("vec4f is not supported in scripts yet".to_string()),
+            // a payloadless enum is its tag
+            RvalueKind::Enum { variant, payload: None } if self.cx.enum_def(variant.enum_id).is_c_like() => {
+                let tag = self.const_reg(variant.index as u64);
+                self.push(Instr::new(Op::Mov, dst, tag, NO_REG, 0));
+            }
             RvalueKind::Aggregate { .. } | RvalueKind::Enum { .. } => {
                 return Err("aggregate value in a scalar slot".to_string())
             }

@@ -24,7 +24,8 @@ icon = "assets/icon.png"
 
 | Key | Meaning | Default |
 |---|---|---|
-| `name` | Binary name; `build` writes `target/<name>` | required |
+| `name` | Package name; `build` writes `target/<name>` | required |
+| `bin` | Program file name, when it differs from `name` (`target/<bin>`; dist folders keep `name`) | `name` |
 | `entry` | File containing `main` | `src/main.j3` |
 | `version` | Package version (used for `.deb`) | `0.1.0` |
 | `description` | One line for packages and the menu entry | |
@@ -58,7 +59,7 @@ What `j3c build --release` packages into `target/dist/`. See [Shipping a Game](s
 
 | Key | Meaning |
 |---|---|
-| `build_outputs` | Any of `"zip"`, `"deb"`, `"apk"` |
+| `build_outputs` | Any of `"zip"`, `"deb"`, `"apk"`, or a dependency's `[dist_outputs]` name (below) |
 | `include` | Files and folders to ship. Default: whichever of `assets`, `scripts`, `scenes`, `locales` exist |
 | `icon` | `.png` (square 256 or 512) or `.svg` |
 | `title` | Menu name. Default: the name, title-cased |
@@ -79,6 +80,25 @@ jzero = { path = ".." }
 ```j3
 use jzero.remote.proto.{ Frame, encode, decode };
 ```
+
+## `[commands]` and `[dist_outputs]`
+
+These go in a **package's own** `j3.toml`. Each entry is a J3 program (a file with `fn main`, path relative to the package root) that `j3c` builds for the host, caches in `~/.cache/j3/tools/` (`$J3_PKG_DIR/tools/` when set) and runs with the importing project's root as cwd. The tool is built with the package as the project, so `use <package>.x;` works in it.
+
+```toml
+[commands]
+check = { file = "tools/check.j3", help = "one line for `j3c pkg mypkg`" }
+
+[dist_outputs]
+itch = "tools/itch.j3"
+```
+
+- `j3c pkg` lists every dependency's tools, `j3c pkg mypkg` lists one package's, and `j3c pkg mypkg check ARGS...` runs one, passing the args through untouched. `j3c` exits with the tool's exit code.
+- A game whose `[dist] build_outputs` names `itch` runs that tool on `j3c build --release`, after the built-ins, with `--dist`, `--built TRIPLE=EXE`, `--stage TRIPLE=FOLDER`, `--name`, `--version` and `--release`. A non-zero exit fails the build with that code. If the tool's last line of stdout is a folder, the build lists it among the files it wrote. Built-in names always win.
+- A tool gets `J3_PROJECT_ROOT`, `J3_PKG_ROOT`, `J3_PKG_NAME`, `J3C` (the running compiler), `J3_TOOL_API=1` and `J3_MANIFEST`. `J3_MANIFEST` points to the project's whole `j3.toml` as JSON, which the tool reads with `j3.data.json`. `j3c manifest --json` prints the same JSON.
+- Tools run as you, with your permissions. They run only when you type `j3c pkg` or when your own `j3.toml` names a dist output. Fetching a package (`j3c add`, `fetch`, `update`) never runs one.
+
+`j3c doc packages` has the full contract: the JSON typing rules, the flags, and the cache key.
 
 ## `[ui]`
 

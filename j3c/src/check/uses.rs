@@ -30,6 +30,10 @@ pub(super) fn resolve_all_uses(mods: &mut [ModData], phase: UsePhase) -> Result<
                 ));
             }
         };
+        // `use j3.cmp.{}` (made for `#[derive]`) only loads the module.
+        if u.names.as_ref().is_some_and(|n| n.is_empty()) {
+            continue;
+        }
         if names.is_empty() {
             let alias = match u.path.last() {
                 Some(p) => p.name.clone(),

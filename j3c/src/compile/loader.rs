@@ -1,6 +1,7 @@
 use super::*;
 
 mod cycles;
+mod embed;
 mod paths;
 mod scripts;
 
@@ -160,7 +161,7 @@ impl Loader {
         parsed: Result<parse::File, parse::ParseError>,
         part_of: Option<&str>,
     ) -> Result<(), String> {
-        let ast = match parsed {
+        let mut ast = match parsed {
             Ok(f) => f,
             Err(e) => {
                 if let Some(g) = self.ui_gen.as_ref().filter(|g| g.label == path) {
@@ -179,6 +180,7 @@ impl Loader {
                 }
             }
         }
+        self.read_embeds(&path, &text, &mut ast)?;
         self.files.push(ParsedFile {
             path,
             src: text,
@@ -258,6 +260,9 @@ impl Loader {
     /// The plain module loads of file `i`, or None when the file needs the serial path.
     fn plan_imports(&self, i: usize, planned: &HashSet<String>, first_id: u32) -> Option<Vec<Planned>> {
         if !script_deps::find(&self.files[i].ast).is_empty() {
+            return None;
+        }
+        if derives_generic(&self.files[i].ast) && !self.loaded.contains(CMP) && !planned.contains(CMP) {
             return None;
         }
         let mut out: Vec<Planned> = Vec::new();
@@ -370,6 +375,10 @@ impl Loader {
                 })
                 .collect();
             for (path, names) in uses {
+                // ponytail: a stub module cannot fail on `use`, and `j3.steam.game.attach` has no file to stub; drop after one release
+                if path.len() >= 2 && path[0] == "j3" && path[1] == "steam" && !source_exists(&self.module_path(&path[..2])) {
+                    return Err(format!("`use {}`: j3.steam moved to the \"steam\" package: add steam = {{ git = \"https://github.com/Jacoby-Y/j3-steam\", tag = \"v0.1.0\" }} under [dependencies] and write `use steam;` (j3c doc steam)", path.join(".")));
+                }
                 if path.join(".") == scene_scripts::MODULE {
                     self.load_registry()?;
                 } else if path.join(".") == crate::i18n::MODULE || path.join(".") == crate::appconfig::MODULE {
@@ -383,6 +392,9 @@ impl Loader {
                 } else {
                     return Err(format!("cannot resolve `use {}`", path.join(".")));
                 }
+            }
+            if derives_generic(&self.files[i].ast) {
+                self.load_module(&["j3".to_string(), "cmp".to_string()])?;
             }
             let scripts = script_deps::find(&self.files[i].ast);
             for script in scripts {
@@ -436,6 +448,19 @@ impl Loader {
 
 /// A file in a parts folder whose `module` line names another module is its own module, so it
 /// is not parsed as a part. No such line (or an odd one): the parser decides.
+/// `j3.cmp`, whose traits a derive on a generic type names in its bounds (`check/derive.rs`).
+const CMP: &str = "j3.cmp";
+
+/// A `#[derive(..)]` on a generic struct or enum: its methods are bounded by `j3.cmp`'s traits,
+/// so that module loads even when the file does not `use` it.
+fn derives_generic(ast: &parse::File) -> bool {
+    ast.items.iter().any(|it| match it {
+        parse::Item::Struct(s) => !s.derives.is_empty() && !s.type_params.is_empty(),
+        parse::Item::Enum(e) => !e.derives.is_empty() && !e.type_params.is_empty(),
+        _ => false,
+    })
+}
+
 fn other_module(text: &str, key: &str) -> bool {
     for line in text.lines() {
         let line = line.trim();

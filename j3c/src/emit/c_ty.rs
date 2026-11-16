@@ -1,4 +1,5 @@
-//! IR types as C type names. Arrays are not a C type — declare them as `T name[N]`.
+//! IR types as C type names. Arrays are not a C value type: declare them as `T name[N]`, and pass
+//! or return them in a one-member wrapper struct (`array_wrap_name`).
 
 use crate::intern::Name;
 use crate::ir::cx::IrCx;
@@ -123,7 +124,14 @@ pub fn is_ptr_word(cx: &IrCx, ty: Ty) -> bool {
     matches!(cx.ty_kind(ty), TyKind::Ref(_) | TyKind::Ptr | TyKind::CStr)
 }
 
-/// C type for values that are not C arrays (`int64_t buf[4]` is special-cased).
+/// `[N]T` where C needs a value type (a return, a parameter, a fn type, an enum payload):
+/// `struct j3_arr_aN_T { T a[N]; }` (`c.rs` emits it), and `&[N]T` points at one. Locals, fields
+/// and globals stay `T name[N]` (`array_decl`).
+pub fn array_wrap_name(cx: &IrCx, ty: Ty) -> Result<String, String> {
+    Ok(format!("j3_arr_{}", type_frag(cx, ty)?))
+}
+
+/// C type for values; an array is its wrapper struct (declare locals as `T name[N]`).
 pub fn c_type(cx: &IrCx, ty: Ty) -> Result<String, String> {
     match cx.ty_kind(ty) {
         TyKind::Void => Ok("void".to_string()),
@@ -148,9 +156,7 @@ pub fn c_type(cx: &IrCx, ty: Ty) -> Result<String, String> {
             Ok(format!("{inner_c} *"))
         }
         TyKind::Slice { .. } => slice_name(cx, ty),
-        TyKind::Array { .. } => {
-            Err("C array types are emitted as `T name[N]`, not as a standalone type".to_string())
-        }
+        TyKind::Array { .. } => array_wrap_name(cx, ty),
         TyKind::Fn { .. } => fn_typedef_name(cx, ty),
         TyKind::Struct(_) => struct_name(cx, ty),
         TyKind::Enum(id) => {
@@ -190,6 +196,20 @@ pub fn fn_typedef(cx: &IrCx, ty: Ty) -> Result<String, String> {
     }
     s.push_str(");\n");
     Ok(s)
+}
+
+/// `T name[N][M]` for a (possibly nested) array: C arrays all the way down, so `g[i][j]` indexes
+/// it; only the outermost level is ever wrapped (`array_wrap_name`).
+pub fn array_decl(cx: &IrCx, ty: Ty, name: &str) -> Result<String, String> {
+    let mut dims = String::new();
+    let mut t = ty;
+    while let Some((elem, len)) = array_parts(cx, t) {
+        dims.push_str(&format!("[{len}]"));
+        t = elem;
+    }
+    let base = c_type(cx, t)?;
+    let sep = if base.ends_with('*') { "" } else { " " };
+    Ok(format!("{base}{sep}{name}{dims}"))
 }
 
 pub fn array_parts(cx: &IrCx, ty: Ty) -> Option<(Ty, u64)> {

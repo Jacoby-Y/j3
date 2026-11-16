@@ -39,6 +39,14 @@ impl<'a> Lower<'a> {
                     Some(t) => Some(self.resolve_ty(t)?),
                     None => None,
                 };
+                if let (ExprKind::Zeroed, Some(want)) = (&s.value.kind, want) {
+                    let n = self.cx.intern_name(&s.name.name);
+                    let id = self.b.let_local(n, want, s.name.span);
+                    self.b.set_doc(id, s.doc.clone());
+                    self.zero_fill(self.b.local_place(id, s.name.span), s.span)?;
+                    self.locals.insert(s.name.name.clone(), id);
+                    return Ok(());
+                }
                 let rv = self.rvalue(&s.value, want)?;
                 if let Some(want) = want {
                     if rv.ty != want {
@@ -150,7 +158,7 @@ impl<'a> Lower<'a> {
                         self.readonly_global(&place).unwrap_or("cannot assign-op this place".to_string()),
                     ));
                 }
-                if let Some(id) = find_operator(self.cx, place.ty, s.op, self.methods) {
+                if let Some(id) = self.find_op(s.span, place.ty, s.op)? {
                     let fty = self.cx.func(id).ty;
                     let (params, ret) = match self.cx.fn_sig(fty) {
                         Some(sig) => (sig.0.clone(), sig.1),
@@ -204,11 +212,7 @@ impl<'a> Lower<'a> {
                 self.b.assign_op(s.span, place, ir_op, rhs);
                 Ok(())
             }
-            Stmt::Expr(e) => {
-                let rv = self.rvalue(e, None)?;
-                self.b.expr(e.span, rv);
-                Ok(())
-            }
+            Stmt::Expr(e) => self.expr_stmt(e),
             Stmt::If(s) => {
                 let cond = self.operand(&s.cond, Some(self.cx.common.bool))?;
                 let then_block = self.lower_block(&s.then_block)?;
@@ -350,7 +354,8 @@ impl<'a> Lower<'a> {
                 self.b.push(crate::ir::stmt::Stmt { ty: self.cx.common.void, span: *span, kind });
                 Ok(())
             }
-            Stmt::Match(s) => self.lower_match(s),
+            Stmt::Match(s) => self.lower_match(s, None),
+            Stmt::LetPat(s) => self.lower_let_pat(s),
             Stmt::Labeled(_) => self.stmt(stmt), // `stmt` handles labels; never reached
             Stmt::Block(b) => {
                 let body = self.lower_block(b)?;
@@ -380,6 +385,11 @@ impl<'a> Lower<'a> {
         if let Stmt::Let(l) = stmt {
             self.poisoned.insert(l.name.name.clone());
         }
+        if let Stmt::LetPat(l) = stmt {
+            crate::parse::walk::pat_binds(&l.pat, &mut |n| {
+                self.poisoned.insert(n.name.clone());
+            });
+        }
         let follow_on = e.unknown.as_ref().is_some_and(|n| self.poisoned.contains(n));
         if let Some(n) = &e.unknown {
             self.poisoned.insert(n.clone());
@@ -387,6 +397,16 @@ impl<'a> Lower<'a> {
         if !follow_on {
             self.errs.push(e);
         }
+    }
+
+    /// An expression run for its effect; a `match` there is a statement `match`.
+    pub(super) fn expr_stmt(&mut self, e: &parse::Expr) -> Result<(), CheckError> {
+        if let parse::ExprKind::Match(m) = &e.kind {
+            return self.lower_match(m, None);
+        }
+        let rv = self.rvalue(e, None)?;
+        self.b.expr(e.span, rv);
+        Ok(())
     }
 
     pub(super) fn lower_block(&mut self, block: &parse::Block) -> Result<crate::ir::body::Block, CheckError> {
@@ -424,19 +444,14 @@ impl<'a> Lower<'a> {
                 format!("shadowing `{}` is a compile error", s.name.name),
             ));
         }
-        let mut iter = self.try_place(&s.iter)?;
+        // A call (`m.entries(&a)`) or a literal is held in a temporary for the loop.
+        let mut iter = self.base_place(&s.iter)?;
         while self.cx.ref_inner(iter.ty).is_some() {
             iter = self.b.deref(self.cx, iter, s.span);
         }
         let elem = match self.cx.elem_ty(iter.ty) {
             Some(e) => e,
-            None => {
-                return Err(CheckError::new(
-                    self.path,
-                    s.iter.span,
-                    "`for` over non-array/slice",
-                ));
-            }
+            None => return self.for_iter(s, iter),
         };
         let end = self.seq_len(&iter, s.span)?;
         let iname = match &s.index {

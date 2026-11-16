@@ -1,0 +1,180 @@
+// More of `j3.io`: buffered reading and writing of a file descriptor, and the process's
+// buffered `stdin()` / `stdout()`. For line protocols and `Content-Length` framing (LSP, MCP):
+//
+//     let inp = io.stdin();
+//     let out = io.stdout();
+//     while true {
+//         let line = inp.readLine(&arena)?;           // "Content-Length: 12" ("\r\n" cut off)
+//         ...                                         // `None` at the end of input
+//         let body = inp.readExact(len, &arena)?;      // exactly `len` bytes, however they arrive
+//         out.writeStr(reply);
+//         out.flush()?;                               // nothing reaches the fd before `flush`
+//     }
+//
+// `Writer` never flushes by itself at exit: call `flush` before returning from `main` or `exit`
+// (bytes still buffered when the process ends are lost). Not thread-safe: one thread per Reader/Writer.
+
+module j3.io;
+
+/// Reads `fd` through `buf`. `stdin()` is the one for fd 0; `reader` makes others (pipes, files).
+pub struct Reader {
+    fd: int;
+    buf: []u8;
+    /// Unread bytes are `buf[at..end]`.
+    at: int;
+    end: int;
+
+    /// Read more of the fd into the buffer (after the unread bytes): the count, 0 at the end.
+    fn fill(this: &Reader): Result<int, IoError> {
+        if this.at > 0 {
+            let n = this.end - this.at;
+            for i in 0..n {
+                this.buf[i] = this.buf[this.at + i];
+            }
+            this.at = 0;
+            this.end = n;
+        }
+        if this.end == this.buf.len {
+            return Result.Err(IoError.Other);
+        }
+        let n = readSome(this.fd, this.buf[this.end..this.buf.len]);
+        if n < 0 {
+            return Result.Err(IoError.Other);
+        }
+        this.end += n;
+        return Result.Ok(n);
+    }
+
+    /// The next line without its `\n` (and a `\r` before it), copied to `arena`; any length.
+    /// The last line may lack the `\n`. `None` at the end of input.
+    fn readLine(this: &Reader, arena: &Arena): Result<Option<string>, IoError> {
+        let t = Text.new(arena);
+        let got = false;
+        while true {
+            for i in this.at..this.end {
+                if this.buf[i] == 10 {
+                    t.pushBytes(this.buf[this.at..i]);
+                    this.at = i + 1;
+                    let s = t.str();
+                    if s.len > 0 && s[s.len - 1] == 13 {
+                        s = s[0..s.len - 1];
+                    }
+                    return Result.Ok(Option.Some(s));
+                }
+            }
+            if this.end > this.at {
+                got = true;
+                t.pushBytes(this.buf[this.at..this.end]);
+            }
+            this.at = 0;
+            this.end = 0;
+            if this.fill()? == 0 {
+                if got {
+                    return Result.Ok(Option.Some(t.str()));
+                }
+                return Result.Ok(Option.None);
+            }
+        }
+        return Result.Ok(Option.None);
+    }
+
+    /// Exactly `n` bytes, copied to `arena`, from the buffer and then straight from the fd (a body
+    /// split over many reads, or several messages in one read, both work). `Other` when the input
+    /// ends first.
+    fn readExact(this: &Reader, n: int, arena: &Arena): Result<[]u8, IoError> {
+        let out = arena.alloc::<u8>(n);
+        let have = this.end - this.at;
+        if have > n {
+            have = n;
+        }
+        for i in 0..have {
+            out[i] = this.buf[this.at + i];
+        }
+        this.at += have;
+        while have < n {
+            let r = readSome(this.fd, out[have..n]);
+            if r <= 0 {
+                return Result.Err(IoError.Other);
+            }
+            have += r;
+        }
+        return Result.Ok(out);
+    }
+}
+
+/// A `Reader` of `fd` using `buf` (its size bounds one `fill`, not a line).
+pub fn reader(fd: int, buf: []u8): Reader {
+    return Reader { fd: fd, buf: buf, at: 0, end: 0 };
+}
+
+/// Writes to `fd` through `buf`; `flush` sends what is buffered. `stdout()` is the one for fd 1.
+pub struct Writer {
+    fd: int;
+    buf: []u8;
+    /// Buffered bytes are `buf[0..len]`.
+    len: int;
+
+    /// Buffer `data` (written through when it does not fit). `Other` when the fd write fails.
+    fn write(this: &Writer, data: []u8): Result<bool, IoError> {
+        if this.len + data.len > this.buf.len {
+            this.flush()?;
+            if data.len >= this.buf.len {
+                if !writeAll(this.fd, data) {
+                    return Result.Err(IoError.Other);
+                }
+                return Result.Ok(true);
+            }
+        }
+        for i in 0..data.len {
+            this.buf[this.len + i] = data[i];
+        }
+        this.len += data.len;
+        return Result.Ok(true);
+    }
+
+    /// `write` of a string.
+    fn writeStr(this: &Writer, s: string): Result<bool, IoError> {
+        return this.write(s as []u8);
+    }
+
+    /// Send every buffered byte to the fd (short writes looped, `EINTR` retried).
+    fn flush(this: &Writer): Result<bool, IoError> {
+        let n = this.len;
+        this.len = 0;
+        if n > 0 && !writeAll(this.fd, this.buf[0..n]) {
+            return Result.Err(IoError.Other);
+        }
+        return Result.Ok(true);
+    }
+}
+
+/// A `Writer` of `fd` using `buf`.
+pub fn writer(fd: int, buf: []u8): Writer {
+    return Writer { fd: fd, buf: buf, len: 0 };
+}
+
+#[singleton]
+let STDIN_BUF: [65536]u8;
+#[singleton]
+let STDOUT_BUF: [65536]u8;
+#[singleton]
+let STDIN: Reader;
+#[singleton]
+let STDOUT: Writer;
+
+/// The process's buffered stdin (fd 0, 64 KiB buffer). Do not mix with raw `sys.read` of fd 0.
+pub fn stdin(): &Reader {
+    if STDIN.buf.len == 0 {
+        STDIN = reader(0, STDIN_BUF[:]);
+    }
+    return &STDIN;
+}
+
+/// The process's buffered stdout (fd 1, 64 KiB buffer). Call `flush` after each message and
+/// before exit; `printLn` writes fd 1 directly, so flush before mixing them.
+pub fn stdout(): &Writer {
+    if STDOUT.buf.len == 0 {
+        STDOUT = writer(1, STDOUT_BUF[:]);
+    }
+    return &STDOUT;
+}

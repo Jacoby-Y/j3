@@ -180,6 +180,7 @@ pub(super) fn source_key(prog: &compile::Program, opts: &emit::EmitOpts, fast: b
         f.path.hash(&mut h);
         f.src.hash(&mut h);
     }
+    prog.cx.hash_embeds(&mut h);
     format!("{opts:?}").hash(&mut h);
     (fast || FAST.load(std::sync::atomic::Ordering::Relaxed)).hash(&mut h);
     if let Some(meta) = crate::editor::host_exe().ok().and_then(|p| std::fs::metadata(p).ok()) {
@@ -206,16 +207,31 @@ pub(super) fn mark_built(prog: &compile::Program, opts: &emit::EmitOpts, fast: b
     if let Some(stamp) = source_stamp(opts) {
         let _ = std::fs::write(stamp, source_key(prog, opts, fast));
     }
-    mark_inputs();
+    mark_inputs(prog);
 }
 
-/// `inputs.key` for this build, taken before parsing; written once the output matches it.
-static INPUTS: std::sync::Mutex<Option<(PathBuf, String)>> = std::sync::Mutex::new(None);
+/// `inputs.key` for this build (stamp, key, project root), taken before parsing; written once the
+/// output matches it.
+static INPUTS: std::sync::Mutex<Option<(PathBuf, String, PathBuf)>> = std::sync::Mutex::new(None);
 
 /// Record that the output was built from the project files as they were when this build started.
-pub(super) fn mark_inputs() {
-    if let Some((stamp, key)) = INPUTS.lock().ok().and_then(|mut g| g.take()) {
-        let _ = std::fs::write(stamp, key);
+/// Not when an `@embed` read a file the stat-only key does not cover (outside the root, under
+/// `target/` or a dot folder): the next build must parse to see it.
+pub(super) fn mark_inputs(prog: &compile::Program) {
+    if let Some((stamp, key, root)) = INPUTS.lock().ok().and_then(|mut g| g.take()) {
+        let root = root.canonicalize().unwrap_or(root);
+        let covered = |disk: &str| {
+            let Ok(p) = Path::new(disk).canonicalize() else { return false };
+            let Ok(rel) = p.strip_prefix(&root) else { return false };
+            let mut parts = rel.components().map(|c| c.as_os_str().to_string_lossy().to_string());
+            let first = parts.next().unwrap_or_default();
+            first != "target" && !first.starts_with('.') && !parts.any(|c| c.starts_with('.'))
+        };
+        // (and only from this project's own program: tests build several projects in one process)
+        let own = prog.cx.files.iter().any(|f| Path::new(&f.path).canonicalize().is_ok_and(|p| p.starts_with(&root)));
+        if own && prog.cx.embeds.values().flat_map(|v| v.iter()).all(|f| covered(&f.disk)) {
+            let _ = std::fs::write(stamp, key);
+        }
     }
 }
 
@@ -283,7 +299,7 @@ pub(super) fn unchanged_project(path: Option<&str>, kind: &str) -> Option<(Manif
     let stamp = emit::host::cache_dir(&out, &opts.target).join(format!("inputs.{kind}.key"));
     let same = out.exists() && std::fs::read_to_string(&stamp).map(|k| k == key).unwrap_or(false);
     if let Ok(mut g) = INPUTS.lock() {
-        *g = Some((stamp, key));
+        *g = Some((stamp, key, m.root.clone()));
     }
     same.then_some((m, opts))
 }
@@ -394,7 +410,7 @@ pub(super) fn build_inner(prog: Result<(compile::Program, Option<Manifest>), Str
                     let fast = manifest.as_ref().map(|m| m.cc.fast || m.emit.fast).unwrap_or(false);
                     let out = opts.cc.out.clone().expect("out path");
                     if up_to_date(&prog, &opts, fast) {
-                        mark_inputs();
+                        mark_inputs(&prog);
                         status("up to date");
                         println!("{}", out.display());
                     } else {
@@ -469,9 +485,9 @@ pub(super) fn package(manifest: &Option<Manifest>, built: &[(String, PathBuf)]) 
             }
             0
         }
-        Err(e) => {
+        Err((e, code)) => {
             print_fail(&e);
-            1
+            code
         }
     }
 }

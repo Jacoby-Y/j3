@@ -57,7 +57,7 @@ re-runs without compiling the program; `j3c build` compiles them in.
     j3c doc testing          headless run, screenshot, goldens, imgdiff, HTML snapshot
     j3c doc editor           3D scene editor, scene files, scripts
     j3c doc ship             release builds, zips, .deb with menu entry and icon
-    j3c doc steam            Steam: achievements, cloud, Deck, depot upload, binding check
+    j3c doc steam            Steam: the steam package (bindings, SDK check, depot output)
     j3c doc j2               j2 scripts and mods read at runtime; `j3c doc j2 lang` for modders
     j3c help manifest        j3.toml keys
     j3c fmt --write          rewrite src/

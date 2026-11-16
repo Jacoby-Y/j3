@@ -42,9 +42,25 @@ fn main() {
 }
 ```
 
-The type is `closure(A, B): R`. A closure value points into the stack of the function that made it, so it can only be a parameter or a `let`. The compiler rejects it as a struct field, a global, an array element, a generic argument (`List<closure(int)>`), a return type, a `&` target, or a cast, with a message that says what to do instead. For the same reason it never converts to a plain `fn(..)` or `ptr`: `thread.spawn` and `pool.submit` still take `fn(ptr)` plus a struct.
+The type is `closure(A, B): R`. A closure value points into the stack of the function that made it, so it can only be a parameter or a `let`. The compiler rejects it as a struct field, a global, an array element, a generic argument (`List<closure(int)>`), a return type, a `&` target, or a cast, with a message that says what to do instead. For the same reason it never converts to a plain `fn(..)` or `ptr`. A closure that must outlive its call is a boxed closure (below).
 
 A named `fn` can be passed where a `closure(..)` is wanted, and a literal that captures nothing can be passed where a plain `fn(..)` is wanted. Inside a closure body, `return` leaves the closure, `defer` runs when it ends, and `break`/`continue` cannot cross its edge. A name the closure uses cannot be redeclared inside it (shadowing is an error everywhere). Closures are not available in `.j3s` scripts.
+
+### Boxed closures
+
+`fn[mem](..) { }` is a boxed closure: it copies the values it captures into arena `mem` (an `Arena` or `&Arena`) when it is made. Its type is `boxed closure(A): R`, a value like any other: a struct field, a return value, a `List` element, a pool job (`pool.submitBoxed(fn[mem]() { .. })`).
+
+```rust
+fn adder(mem: &Arena, k: int): boxed closure(int): int {
+    return fn[mem](x: int): int { return x + k; };
+}
+
+let base = 100;
+let snap = fn[mem](x: int): int { return base + x; };
+base = 0;                                // snap(1) is still 101
+```
+
+Captures are copies taken at creation, so a later write to the original is not seen, and a write inside the closure changes its own copy, kept between calls. It never frees itself and lives as long as `mem`. It can be passed where a `closure(..)` of the same signature is wanted, never the other way. It cannot capture a stack closure, and a captured pointer (`&x`, `this`) is copied as a pointer, so keeping its target alive is up to you. A `#[singleton] let ON_HIT: boxed closure(int): int;` can hold one: it starts empty (calling it before it is assigned crashes) and takes no initializer, so set it at startup and call it as `ON_HIT(3)`. A `const` cannot hold one (a const is compile-time data; the captures live in an arena made at run time), and neither can `.j3s` scripts or shader code. See `speculative/lang/boxed_closures.j3`.
 
 ## Modules
 

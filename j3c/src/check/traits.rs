@@ -7,6 +7,7 @@ use super::*;
 use crate::parse::Ident;
 
 /// One type parameter with bounds and the type it was given.
+#[derive(Clone)]
 pub(crate) struct BoundReq {
     pub param: String,
     pub arg: Ty,
@@ -15,6 +16,7 @@ pub(crate) struct BoundReq {
 }
 
 /// A generic struct/enum instance whose parameters have bounds, waiting for the trait tables.
+#[derive(Clone)]
 pub(crate) struct BoundSite {
     pub path: String,
     pub span: Span,
@@ -43,6 +45,41 @@ pub(crate) struct TraitEnv {
     pub defs: HashMap<String, TraitDef>,
     /// `#[impl]` fns by (method name, first-parameter type without `&`).
     pub impls: HashMap<(String, Ty), ImplFn>,
+    /// Trait keys with a default body for a method name. The body is the generic fn
+    /// `default_fn_name(trait, method)` of the trait's module, with `Self` as its type parameter.
+    pub defaults: HashMap<String, Vec<String>>,
+    /// `#[derive(..)]` on a generic enum: by (method name, the enum's declaration span), the generic
+    /// fn `Enum.method` that `derive.rs` wrote in its module (instantiated per enum instance).
+    pub enum_derives: HashMap<(String, Span), EnumDerive>,
+}
+
+pub(crate) struct EnumDerive {
+    pub module: String,
+    pub fname: String,
+    /// Each type parameter and the trait keys the derive needs of it.
+    pub params: Vec<(String, Vec<Ident>)>,
+}
+
+/// The hidden generic fn holding a default body: `Eq.ne` (a `.` no source name has).
+pub(crate) fn default_fn_name(trait_name: &str, method: &str) -> String {
+    format!("{trait_name}.{method}")
+}
+
+/// `key` and every trait it names as a supertrait, transitively, `key` first.
+pub(crate) fn with_supers(env: &TraitEnv, key: &str) -> Vec<String> {
+    let mut out = vec![key.to_string()];
+    let mut i = 0;
+    while i < out.len() {
+        if let Some(def) = env.defs.get(&out[i]) {
+            for s in &def.item.supers {
+                if !out.contains(&s.name) {
+                    out.push(s.name.clone());
+                }
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 pub(crate) fn ty_text(cx: &IrCx, ty: Ty) -> String {
@@ -55,9 +92,41 @@ pub(crate) fn trait_key(module: &str, name: &str) -> String {
     format!("{module}::{name}")
 }
 
+/// The `ModData.types` entry `dyn Name` resolves through (no source type name has a space).
+pub(crate) fn dyn_type_key(name: &str) -> String {
+    format!("dyn {name}")
+}
+
+/// Every trait in scope that some file writes as `dyn Name` gets its fat-pointer type in the
+/// module's type table. Only written ones, so a program without `dyn` gains no structs.
+pub(super) fn dyn_types(cx: &mut IrCx, mods: &mut [ModData], written: &HashSet<String>) {
+    if written.is_empty() {
+        return;
+    }
+    for m in mods.iter_mut() {
+        // sorted: struct ids (and so emitted type names) must not depend on hash order
+        let mut found: Vec<(&String, &String)> = m.traits.iter().filter(|(n, _)| written.contains(*n)).collect();
+        found.sort();
+        for (name, key) in found {
+            m.types.insert(dyn_type_key(name), cx.dyn_ty(key));
+        }
+    }
+}
+
 /// `module::Name` → `Name`.
 pub(crate) fn trait_short(key: &str) -> &str {
     key.rsplit("::").next().unwrap_or(key)
+}
+
+/// A method's `where T: B` bounds with the struct instance's type arguments (`ty_args`).
+pub(crate) fn where_reqs(wheres: &[(Ident, Vec<Ident>)], ty_args: &[(String, Ty)]) -> Vec<BoundReq> {
+    wheres
+        .iter()
+        .filter_map(|(p, bs)| {
+            let arg = ty_args.iter().find(|(n, _)| *n == p.name)?.1;
+            Some(BoundReq { param: p.name.clone(), arg, bounds: bs.clone() })
+        })
+        .collect()
 }
 
 /// Queues the bound checks of a new instance `name<args>` of a template with `bounds`.
@@ -169,6 +238,27 @@ fn register_trait(
                     .note("a closure cannot satisfy a bound"));
             }
         }
+        // A default body is a generic fn over `Self: Trait`, instantiated for each type that uses it.
+        if let Some(body) = &meth.body {
+            let fname = default_fn_name(name, &meth.name.name);
+            m.gen_fns.insert(
+                fname.clone(),
+                FnItem {
+                    span: meth.span,
+                    doc: String::new(),
+                    vis_pub: false,
+                    name: Ident { name: fname, span: meth.name.span },
+                    type_params: vec![Ident { name: "Self".to_string(), span: t.name.span }],
+                    bounds: vec![vec![Ident { name: trait_key(key, name), span: t.name.span }]],
+                    where_bounds: Vec::new(),
+                    is_impl: false,
+                    shader: None,
+                    params: meth.params.clone(),
+                    ret: meth.ret.clone(),
+                    body: body.clone(),
+                },
+            );
+        }
     }
     m.traits.insert(name.clone(), trait_key(key, name));
     Ok(())
@@ -177,10 +267,11 @@ fn register_trait(
 fn find_closure(t: &Type) -> Option<Span> {
     match &t.kind {
         TypeKind::Closure { .. } => Some(t.span),
-        TypeKind::Named(_) => None,
+        TypeKind::Named(_) | TypeKind::Dyn(_) => None,
         TypeKind::Generic { args, .. } => args.iter().find_map(find_closure),
         TypeKind::Ref(i) | TypeKind::Slice(i) => find_closure(i),
         TypeKind::Array { elem, .. } => find_closure(elem),
+        TypeKind::Tuple(es) => es.iter().find_map(find_closure),
         TypeKind::Fn { params, ret } => params.iter().find_map(find_closure).or_else(|| ret.as_deref().and_then(find_closure)),
     }
 }
@@ -227,10 +318,26 @@ pub(super) fn bind_traits(mods: &mut [ModData]) -> Result<(), CheckError> {
         let mut result = Ok(());
         for it in items.iter_mut() {
             let r = match it {
-                Item::Fn(f) => bind_list(&m.path, &m.traits, &types, &mut f.bounds),
+                Item::Trait(t) => bind_list(&m.path, &m.traits, &types, std::slice::from_mut(&mut t.supers)),
+                Item::Fn(f) => match f.where_bounds.first() {
+                    Some((p, _)) => Err(CheckError::new(m.path.clone(), p.span, "`where` is for methods of a generic struct")
+                        .help(format!("bound the fn's own type parameter in place: `fn {}<{}: ..>(..)`", f.name.name, p.name))),
+                    None => bind_list(&m.path, &m.traits, &types, &mut f.bounds),
+                },
                 Item::Enum(e) => bind_list(&m.path, &m.traits, &types, &mut e.bounds),
                 Item::Struct(s) => bind_list(&m.path, &m.traits, &types, &mut s.bounds).and_then(|_| {
-                    s.methods.iter_mut().try_for_each(|f| bind_list(&m.path, &m.traits, &types, &mut f.bounds))
+                    let params: Vec<String> = s.type_params.iter().map(|p| p.name.clone()).collect();
+                    s.methods.iter_mut().try_for_each(|f| {
+                        bind_list(&m.path, &m.traits, &types, &mut f.bounds)?;
+                        for (p, bs) in f.where_bounds.iter_mut() {
+                            if !params.contains(&p.name) {
+                                return Err(CheckError::new(m.path.clone(), p.span, format!("`where` names `{}`, which is not a type parameter of `{}`", p.name, s.name.name))
+                                    .note("`where` bounds a parameter of the struct for one method; a method's own parameters take bounds in `<T: ..>`"));
+                            }
+                            bind_list(&m.path, &m.traits, &types, std::slice::from_mut(bs))?;
+                        }
+                        Ok(())
+                    })
                 }),
                 _ => Ok(()),
             };
@@ -252,6 +359,10 @@ fn bind_list(
     bounds: &mut [Vec<Ident>],
 ) -> Result<(), CheckError> {
     for b in bounds.iter_mut().flatten() {
+        // already a key (`j3.cmp::Eq`, written by `derive.rs`; no source name has `::`)
+        if b.name.contains("::") {
+            continue;
+        }
         match traits.get(&b.name) {
             Some(key) => b.name = key.clone(),
             None if types.contains(&b.name) => {
@@ -275,13 +386,38 @@ pub(super) fn build_env(cx: &mut IrCx, mods: &[ModData]) -> Result<TraitEnv, Che
         for it in &m.ast.items {
             if let Item::Trait(t) = it {
                 let key = trait_key(&m.key, &t.name.name);
+                for meth in t.methods.iter().filter(|x| x.body.is_some()) {
+                    env.defaults.entry(meth.name.name.clone()).or_default().push(key.clone());
+                }
                 env.defs.insert(key, TraitDef { item: t.clone(), path: m.path.clone(), types: m.types.clone() });
+            }
+        }
+    }
+    // `trait A: B` and `trait B: A`: a cycle (checks still end, `with_supers` keeps each once).
+    for m in mods {
+        for it in &m.ast.items {
+            let Item::Trait(t) = it else { continue };
+            let key = trait_key(&m.key, &t.name.name);
+            if t.supers.iter().any(|s| with_supers(&env, &s.name).contains(&key)) {
+                return Err(CheckError::new(m.path.clone(), t.name.span, format!("trait `{}` is its own supertrait", t.name.name))
+                    .note("supertraits cannot form a cycle"));
             }
         }
     }
     for m in mods {
         for it in &m.ast.items {
             let Item::Fn(f) = it else { continue };
+            if let Some((en, meth)) = f.name.name.split_once('.') {
+                let decl = m.ast.items.iter().find_map(|o| match o {
+                    Item::Enum(e) if e.name.name == en && !e.type_params.is_empty() => Some(e.span),
+                    _ => None,
+                });
+                if let Some(span) = decl {
+                    let params = f.type_params.iter().map(|p| p.name.clone()).zip(f.bounds.iter().cloned()).collect();
+                    env.enum_derives.insert((meth.to_string(), span), EnumDerive { module: m.key.clone(), fname: f.name.name.clone(), params });
+                }
+                continue;
+            }
             if !f.is_impl {
                 continue;
             }
@@ -325,4 +461,19 @@ pub(super) fn build_env(cx: &mut IrCx, mods: &[ModData]) -> Result<TraitEnv, Che
         }
     }
     Ok(env)
+}
+
+/// Each trait of `env` for hover: its declaration as written, with its module.
+pub(super) fn trait_docs(cx: &IrCx, env: &TraitEnv) -> Vec<TraitDoc> {
+    let mut out: Vec<TraitDoc> = env
+        .defs
+        .iter()
+        .map(|(key, d)| {
+            let src = cx.file(d.item.span.file).and_then(|f| f.src.get(d.item.span.start as usize..d.item.span.end as usize));
+            let module = key.rsplit_once("::").map_or("", |(m, _)| m).to_string();
+            TraitDoc { name: d.item.name.name.clone(), module, span: d.item.name.span, doc: d.item.doc.clone(), sig: src.unwrap_or("").trim().to_string() }
+        })
+        .collect();
+    out.sort_by(|a, b| (&a.module, &a.name).cmp(&(&b.module, &b.name)));
+    out
 }

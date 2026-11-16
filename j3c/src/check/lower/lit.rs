@@ -152,6 +152,26 @@ impl<'a> Lower<'a> {
         Ok(Rvalue::aggregate(span, ty, out))
     }
 
+    /// `(a, b)`: each element typed by the expected tuple's element when there is one.
+    pub(super) fn tuple_lit(&mut self, span: Span, elems: &[Expr], expected: Option<Ty>) -> Result<Rvalue, CheckError> {
+        let want: Vec<Ty> = expected
+            .and_then(|t| self.cx.tuple_elems(t))
+            .filter(|w| w.len() == elems.len())
+            .map(|w| w.to_vec())
+            .unwrap_or_default();
+        let mut ops = Vec::new();
+        for (i, e) in elems.iter().enumerate() {
+            let op = self.operand(e, want.get(i).copied())?;
+            reject_closure(self.cx, self.path, e.span, op.ty(), "a tuple element")?;
+            if op.ty() == self.cx.common.void {
+                return Err(CheckError::new(self.path, e.span, "a tuple element needs a value"));
+            }
+            ops.push(op);
+        }
+        let ty = self.cx.tuple_ty(ops.iter().map(|o| o.ty()).collect());
+        Ok(Rvalue::aggregate(span, ty, ops))
+    }
+
     pub(super) fn array_lit(
         &mut self,
         span: Span,
@@ -450,5 +470,16 @@ impl<'a> Lower<'a> {
         };
         let n = self.operand(len, Some(self.cx.common.int))?;
         Ok(Rvalue::aggregate(span, slice_ty, vec![p, n]))
+    }
+}
+
+impl<'a> Lower<'a> {
+    /// `@embed(..)` / `@embedBytes(..)` inside a body: the bytes as a constant at this use.
+    pub(super) fn embed_value(&mut self, span: Span, kind: crate::parse::EmbedKind) -> Result<Rvalue, CheckError> {
+        if kind == crate::parse::EmbedKind::Dir {
+            return Err(crate::check::embed::embed_dir_err(self.path, span));
+        }
+        let files = crate::check::embed::embedded(self.cx, self.path, span)?;
+        Ok(Rvalue::use_op(span, Operand::bytes(span, crate::check::embed::embed_ty(self.cx, kind), &files[0].data)))
     }
 }

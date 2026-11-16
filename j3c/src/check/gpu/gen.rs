@@ -175,6 +175,8 @@ impl<'a> Gen<'a> {
             TypeKind::Slice(_) => self.err_help(t.span, "slices do not exist in shader code", "use a fixed array `[N]T`"),
             TypeKind::Generic { name, .. } => self.err_help(t.span, format!("`{name}<..>` is a generic type"), "shader code has no generics; write the concrete type"),
             TypeKind::Fn { .. } | TypeKind::Closure { .. } => self.err_help(t.span, "function values and closures do not exist in shader code", "call the `#[shader]` fn directly"),
+            TypeKind::Tuple(_) => self.err_help(t.span, "tuples do not exist in shader code", "use a struct"),
+            TypeKind::Dyn(_) => self.err_help(t.span, "`dyn` values do not exist in shader code", "shader code has no pointers or method tables; pass the concrete struct"),
         }
     }
 

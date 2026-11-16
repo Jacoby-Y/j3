@@ -16,8 +16,10 @@ fn reprint(src: &str, tokens: &[Token]) -> String {
     let mut prev: Option<TokenKind> = None;
     let mut prev_prefix = false; // prev is `& - * ! ~` in prefix position
     let mut prev_end: usize = 0;
+    let inline = inline_braces(tokens);
 
-    for tok in tokens {
+    for (i, tok) in tokens.iter().enumerate() {
+        let flat = inline.contains(&i);
         if tok.kind == TokenKind::Eof {
             break;
         }
@@ -34,7 +36,9 @@ fn reprint(src: &str, tokens: &[Token]) -> String {
             at_line = true;
         }
 
-        if tok.kind == TokenKind::RBrace {
+        if tok.kind == TokenKind::RBrace && flat {
+            out.push(' ');
+        } else if tok.kind == TokenKind::RBrace {
             indent = (indent - 1).max(0);
             if !at_line {
                 out.push('\n');
@@ -45,6 +49,12 @@ fn reprint(src: &str, tokens: &[Token]) -> String {
         if at_line {
             push_indent(&mut out, indent);
             at_line = false;
+        } else if prev.is_some_and(is_angle) || is_angle(tok.kind) {
+            // `<` `>` touching a neighbour carry meaning (`a << b`, `List<T>.new`, `Map<K, List<V>>`):
+            // keep the source's spacing around them.
+            if start != prev_end {
+                out.push(' ');
+            }
         } else if needs_space(prev, tok.kind, prev_prefix) {
             out.push(' ');
         }
@@ -52,6 +62,7 @@ fn reprint(src: &str, tokens: &[Token]) -> String {
         out.push_str(token_src(src, tok));
 
         match tok.kind {
+            _ if flat => {}
             TokenKind::Doc => {
                 out.push('\n');
                 at_line = true;
@@ -73,6 +84,7 @@ fn reprint(src: &str, tokens: &[Token]) -> String {
                 if !next_is(tokens, tok, TokenKind::Eof)
                     && !next_is(tokens, tok, TokenKind::Else)
                     && !next_is(tokens, tok, TokenKind::Semi)
+                    && !trailing_comment(src, tok)
                 {
                     out.push('\n');
                     at_line = true;
@@ -102,6 +114,26 @@ fn reprint(src: &str, tokens: &[Token]) -> String {
     out
 }
 
+/// `S { a, b: c, .. }` written on one line: a `{` after a name holding only names, literals,
+/// `,` `:` `..`, whose `}` is followed by what follows a pattern (`)` `=` `{` `|` `,` `if`).
+/// Indexes of both braces.
+fn inline_braces(tokens: &[Token]) -> std::collections::HashSet<usize> {
+    use TokenKind::*;
+    let mut out = std::collections::HashSet::new();
+    for (i, t) in tokens.iter().enumerate() {
+        if t.kind != LBrace || i == 0 || tokens[i - 1].kind != Ident {
+            continue;
+        }
+        let Some(len) = tokens[i + 1..].iter().position(|t| !matches!(t.kind, Ident | Comma | Colon | DotDot | Int | Char)) else { continue };
+        let close = i + 1 + len;
+        if tokens[close].kind == RBrace && tokens.get(close + 1).is_some_and(|n| matches!(n.kind, RParen | Eq | LBrace | Pipe | Comma | If)) {
+            out.insert(i);
+            out.insert(close);
+        }
+    }
+    out
+}
+
 fn token_src<'a>(src: &'a str, tok: &'a Token) -> &'a str {
     let a = tok.span.start as usize;
     let b = tok.span.end as usize;
@@ -121,11 +153,12 @@ fn next_is(tokens: &[Token], cur: &Token, want: TokenKind) -> bool {
         .unwrap_or(false)
 }
 
+/// A `//` comment follows `tok` on its line with nothing between.
 fn trailing_comment(src: &str, tok: &Token) -> bool {
     let i = tok.span.end as usize;
     let rest = src.get(i..).unwrap_or("");
     let line = rest.split('\n').next().unwrap_or("");
-    line.contains("//")
+    line.trim_start().starts_with("//")
 }
 
 fn emit_gap(out: &mut String, gap: &str, indent: i32, at_line: &mut bool) {
@@ -145,6 +178,8 @@ fn emit_gap(out: &mut String, gap: &str, indent: i32, at_line: &mut bool) {
         }
     }
     if let Some(idx) = gap.find("//") {
+        // only the newlines before this comment decide a blank line above it; the rest recurse
+        let blank = gap[..idx].matches('\n').count() >= 2;
         let after = &gap[idx..];
         let comment = after.split('\n').next().unwrap_or(after).trim_end();
         let trailing = !gap[..idx].contains('\n');
@@ -194,6 +229,11 @@ fn push_indent(out: &mut String, indent: i32) {
     }
 }
 
+/// `< > <= >=`: the lexer keeps `<<`, `>>` and generic brackets as these, so touching matters.
+fn is_angle(k: TokenKind) -> bool {
+    matches!(k, TokenKind::Lt | TokenKind::Gt | TokenKind::Le | TokenKind::Ge)
+}
+
 /// Token that can end an operand, so a following `& - *` is binary.
 fn ends_operand(k: TokenKind) -> bool {
     use TokenKind::*;
@@ -206,17 +246,23 @@ fn needs_space(prev: Option<TokenKind>, next: TokenKind, prev_prefix: bool) -> b
     };
     // `xs[0]` / `f()[0]` index tight; `= [..]`, `, [..]`, `: []u8` keep the space
     if next == TokenKind::LBracket {
-        return !(ends_operand(p) || prev_prefix);
+        // `fn[mem](..)`: a boxed closure's arena sits tight on `fn`
+        return !(ends_operand(p) || prev_prefix || p == TokenKind::Hash || p == TokenKind::Fn);
     }
     // `[]u8`, `[4]i32`: a type's element name follows its `]` directly
     if p == TokenKind::RBracket && next == TokenKind::Ident {
         return false;
     }
+    // `{ a, .. }` in a struct pattern
+    if next == TokenKind::DotDot && matches!(p, TokenKind::Comma | TokenKind::LBrace) {
+        return true;
+    }
+    // `f(x)`, `fn(int)`, `-(a)` tight; `return (a, b)`, `x: (int, int)`, `let (a, b)`, `= (..)` spaced
     if next == TokenKind::LParen {
-        return matches!(
-            p,
-            TokenKind::If | TokenKind::While | TokenKind::For | TokenKind::Match
-        );
+        use TokenKind::*;
+        return !(ends_operand(p)
+            || prev_prefix
+            || matches!(p, Fn | LParen | LBracket | Dot | ColonColon | Hash | At | Not | Tilde | Lt | Gt));
     }
     if matches!(
         next,
@@ -350,5 +396,74 @@ mod tests {
     fn extend_block_formats_like_a_struct_body() {
         let out = format_src("module t;\nextend Box{fn get(this:&Box):int{return this.v;}}\n").expect("fmt");
         assert_eq!(out, "module t;\nextend Box {\n    fn get(this: &Box): int {\n        return this.v;\n    }\n}\n");
+    }
+
+    #[test]
+    fn shifts_generics_and_attributes_keep_their_spacing() {
+        let src = "#[Debug]\nstruct P { x: int; }\nfn main() { let v = 1 << 20; let w = v >> 4; let l = List<int>.new(); let m: Map<int, List<int>> = Map<int, List<int>>.new(); let c = a < b && b > c; let d = f<T>(x) > (y); }\n";
+        let out = format_src(src).expect("fmt");
+        for want in ["#[Debug]\nstruct P", "1 << 20", "v >> 4", "List<int>.new()", "Map<int, List<int>> = Map<int, List<int>>.new()", "a < b && b > c", "f<T>(x) > (y)"] {
+            assert!(out.contains(want), "{want}\n{out}");
+        }
+        assert_eq!(format_src(&out).expect("fmt2"), out);
+    }
+
+    #[test]
+    fn comment_after_closing_brace_is_stable() {
+        let out = format_src("fn main() {\n    if a { b(); } // why\n    c();\n}\n").expect("fmt");
+        assert!(out.contains("} // why\n    c();"), "{out}");
+        assert_eq!(format_src(&out).expect("fmt2"), out);
+        let moved = format_src("fn main() {\n    if a {\n    }\n    // why\n    c();\n}\n").expect("fmt");
+        assert_eq!(format_src(&moved).expect("fmt2"), moved);
+        assert!(!moved.contains("\n\n"), "{moved}");
+    }
+
+    /// Kind, text, and (for `< > <= >=`) whether it touches the token before: what the parser reads.
+    fn shape(src: &str) -> Vec<(TokenKind, String, bool)> {
+        let toks = lex::lex(src, FileId(1)).expect("lex");
+        let mut prev_end = usize::MAX;
+        toks.iter()
+            .map(|t| {
+                let touch = is_angle(t.kind) && t.span.start as usize == prev_end;
+                prev_end = t.span.end as usize;
+                (t.kind, token_src(src, t).trim().to_string(), touch)
+            })
+            .collect()
+    }
+
+    fn j3_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                j3_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "j3") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// fmt never changes what the parser sees and is idempotent, over every sample and stdlib file.
+    #[test]
+    fn fmt_round_trips_speculative_and_stdlib() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        j3_files(&root.join("../speculative"), &mut files);
+        j3_files(&root.join("stdlib"), &mut files);
+        assert!(files.len() > 100, "{}", files.len());
+        let mut bad = Vec::new();
+        for f in &files {
+            let src = std::fs::read_to_string(f).unwrap();
+            if lex::lex(&src, FileId(1)).is_err() {
+                continue; // a deliberately broken sample
+            }
+            let once = format_src(&src).unwrap();
+            if shape(&src) != shape(&once) {
+                bad.push(format!("{}: tokens changed", f.display()));
+            } else if format_src(&once).unwrap() != once {
+                bad.push(format!("{}: not idempotent", f.display()));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 }

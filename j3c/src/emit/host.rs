@@ -428,7 +428,6 @@ pub fn run_exe_in(exe: &Path, cwd: Option<&Path>, args: &[String]) -> Result<Run
             .canonicalize()
             .map_err(|e| format!("project root {}: {e}", dir.display()))?;
         cmd.current_dir(&root);
-        cmd.envs(crate::dist::steam_dev_env(&root));
         cmd.env("J3_ROOT", root);
         // a dev run lets F12 open the UI inspector (`j3.ui.inspect`); `J3_INSPECT=0` turns that off
         cmd.env("J3_INSPECT", std::env::var("J3_INSPECT").unwrap_or_else(|_| "1".into()));

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 mod tests;
+mod traits;
 
 pub struct Hover {
     pub text: String,
@@ -31,7 +32,14 @@ pub fn analyze(path: &Path, overlays: &[(PathBuf, String)]) -> Result<Program, S
 
 pub fn hover(prog: &Program, path: &str, offset: u32) -> Option<Hover> {
     let file = file_by_path(&prog.cx, path)?;
+    if let Some((text, span)) = traits::char_hover(&file.src, file.id, offset) {
+        return Some(Hover { text, span });
+    }
     let (name, span) = ident_at(&file.src, file.id, offset)?;
+    if name == "dyn" {
+        let t = traits::after_dyn(&file.src, span).and_then(|n| traits::find_trait(prog, file.id, &n))?;
+        return Some(Hover { text: traits::trait_hover(t, true), span });
+    }
     if let Some(local) = find_local(&prog.cx, file.id, offset, &name) {
         let ty = dump::ty_string(&prog.cx, local.ty);
         let kind = match local.kind {
@@ -134,6 +142,9 @@ pub fn hover(prog: &Program, path: &str, offset: u32) -> Option<Hover> {
             span,
         });
     }
+    if let Some(t) = traits::find_trait(prog, file.id, &name) {
+        return Some(Hover { text: traits::trait_hover(t, false), span });
+    }
     if let Some(g) = find_global(&prog.cx, &name) {
         let ty = dump::ty_string(&prog.cx, g.ty);
         return Some(Hover {
@@ -186,7 +197,10 @@ pub fn definition(prog: &Program, path: &str, offset: u32) -> Option<Location> {
             });
         }
     }
-    let (name, _) = ident_at(&file.src, file.id, offset)?;
+    let (mut name, span) = ident_at(&file.src, file.id, offset)?;
+    if name == "dyn" {
+        name = traits::after_dyn(&file.src, span)?;
+    }
     if let Some(alias) = prog
         .script_aliases
         .iter()
@@ -205,6 +219,9 @@ pub fn definition(prog: &Program, path: &str, offset: u32) -> Option<Location> {
     }
     if let Some(e) = find_enum(&prog.cx, &name) {
         return loc_of(&prog.cx, e.span);
+    }
+    if let Some(t) = traits::find_trait(prog, file.id, &name) {
+        return loc_of(&prog.cx, t.span);
     }
     if let Some(g) = find_global(&prog.cx, &name) {
         return loc_of(&prog.cx, g.span);

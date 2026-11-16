@@ -106,6 +106,14 @@ impl<'a> Lexer<'a> {
                         self.push(TokenKind::Not, start, self.i, "");
                     }
                 }
+                '<' if self.peek_at(1) == Some('<') && self.peek_at(2) == Some('=') => {
+                    self.i += 3;
+                    self.push(TokenKind::ShlEq, start, self.i, "");
+                }
+                '>' if self.peek_at(1) == Some('>') && self.peek_at(2) == Some('=') => {
+                    self.i += 3;
+                    self.push(TokenKind::ShrEq, start, self.i, "");
+                }
                 '<' => {
                     self.bump();
                     if self.peek() == Some('=') {
@@ -140,14 +148,7 @@ impl<'a> Lexer<'a> {
                 '%' => self.assign_op(start, TokenKind::Percent, TokenKind::PercentEq),
                 '"' => self.string(start)?,
                 '`' => self.interpolate(start)?,
-                '\'' if self.peek_at(1).is_some_and(is_ident_start) => {
-                    self.bump();
-                    while self.peek().is_some_and(is_ident_continue) {
-                        self.bump();
-                    }
-                    let text = &self.src[start..self.i];
-                    self.push(TokenKind::Label, start, self.i, text);
-                }
+                '\'' => self.quote(start)?,
                 c if is_ident_start(c) => self.ident(start),
                 c if c.is_ascii_digit() => self.number(start)?,
                 _ => {
@@ -272,7 +273,10 @@ impl<'a> Lexer<'a> {
                     break;
                 }
             }
-            if self.peek() == Some('.')
+            // `t.0.1` is two field accesses, not `t.` then the float `0.1`.
+            let after_dot = self.tokens.last().is_some_and(|t| t.kind == TokenKind::Dot);
+            if !after_dot
+                && self.peek() == Some('.')
                 && self.peek_at(1).map(|c| c.is_ascii_digit()).unwrap_or(false)
             {
                 self.bump();
@@ -283,6 +287,12 @@ impl<'a> Lexer<'a> {
                         break;
                     }
                 }
+                self.exponent(start)?;
+                let text = &self.src[start..self.i];
+                self.push(TokenKind::Float, start, self.i, text);
+                return Ok(());
+            }
+            if !after_dot && self.exponent(start)? {
                 let text = &self.src[start..self.i];
                 self.push(TokenKind::Float, start, self.i, text);
                 return Ok(());
@@ -291,6 +301,28 @@ impl<'a> Lexer<'a> {
         let text = &self.src[start..self.i];
         self.push(TokenKind::Int, start, self.i, text);
         Ok(())
+    }
+
+    /// `e9`, `E+10`, `e-3` after a number's digits: true when one was read. An `e` with no
+    /// digit after it (and no sign) is left alone, so `1.e` stays a field access.
+    fn exponent(&mut self, start: usize) -> Result<bool, ParseError> {
+        if !matches!(self.peek(), Some('e' | 'E')) {
+            return Ok(false);
+        }
+        let sign = matches!(self.peek_at(1), Some('+' | '-'));
+        let digit_at = if sign { 2 } else { 1 };
+        if !self.peek_at(digit_at).is_some_and(|c| c.is_ascii_digit()) {
+            if sign {
+                let end = self.i + digit_at;
+                return Err(ParseError::new(self.span(start, end), "malformed float exponent: expected digits after the sign"));
+            }
+            return Ok(false);
+        }
+        self.i += digit_at;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.bump();
+        }
+        Ok(true)
     }
 
     fn string(&mut self, start: usize) -> Result<(), ParseError> {
@@ -366,6 +398,36 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
+    /// `'a'`, `'\n'`, `'\u{1F600}'` (a `Char` token whose text is the code point in decimal),
+    /// else `'rows` (a `Label`). A char is the closing quote right after one char or one escape.
+    fn quote(&mut self, start: usize) -> Result<(), ParseError> {
+        match char_lit(&self.src[start..]) {
+            Some(Ok((v, len))) => {
+                self.i = start + len;
+                self.push(TokenKind::Char, start, self.i, &v.to_string());
+                return Ok(());
+            }
+            Some(Err((msg, len))) => return Err(ParseError::new(self.span(start, start + len), msg)),
+            None => {}
+        }
+        self.bump();
+        if !self.peek().is_some_and(is_ident_start) {
+            return Err(ParseError::new(self.span(start, self.i), "unexpected character '\\''"));
+        }
+        while self.peek().is_some_and(is_ident_continue) {
+            self.bump();
+        }
+        if self.peek() == Some('\'') {
+            return Err(ParseError::new(
+                self.span(start, self.i + 1),
+                "a char literal holds one character (a string is `\"..\"`)",
+            ));
+        }
+        let text = &self.src[start..self.i];
+        self.push(TokenKind::Label, start, self.i, text);
+        Ok(())
+    }
+
     fn doc_comment(&mut self) {
         let start = self.i;
         self.bump();
@@ -438,4 +500,84 @@ fn is_ident_start(c: char) -> bool {
 
 fn is_ident_continue(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// The char literal at the start of `s` (which starts with `'`): `Some(Ok((code point, byte len)))`,
+/// `Some(Err((message, byte len)))` for a bad one, `None` when it is not one (a `'label`).
+/// Shared with the LSP's text scanners so a `'"'` does not open a string there.
+pub fn char_lit(s: &str) -> Option<Result<(u32, usize), (String, usize)>> {
+    let c = s.get(1..)?.chars().next()?;
+    if c == '\\' {
+        let (v, n) = match char_escape(&s[2..]) {
+            Ok(x) => x,
+            Err(m) => return Some(Err((m, (2 + s[2..].chars().next().map_or(0, char::len_utf8)).min(s.len())))),
+        };
+        let end = 2 + n;
+        if s[end..].starts_with('\'') {
+            return Some(Ok((v, end + 1)));
+        }
+        return Some(Err(("a char literal holds one character (a string is `\"..\"`)".to_string(), close_at(s, end))));
+    }
+    if c == '\'' {
+        return Some(Err(("empty char literal".to_string(), 2)));
+    }
+    if c == '\n' {
+        return None;
+    }
+    let end = 1 + c.len_utf8();
+    if s[end..].starts_with('\'') {
+        return Some(Ok((c as u32, end + 1)));
+    }
+    if is_ident_start(c) {
+        return None;
+    }
+    if s[end..].split('\n').next().is_some_and(|line| line.contains('\'')) {
+        return Some(Err(("a char literal holds one character (a string is `\"..\"`)".to_string(), close_at(s, end))));
+    }
+    None
+}
+
+/// Byte length up to and including the next `'` on this line, else up to `from`.
+fn close_at(s: &str, from: usize) -> usize {
+    let line = s[from..].split('\n').next().unwrap_or("");
+    match line.find('\'') {
+        Some(k) => from + k + 1,
+        None => from,
+    }
+}
+
+/// The escape after a `\` in a char literal: its code point and byte length.
+fn char_escape(s: &str) -> Result<(u32, usize), String> {
+    let c = s.chars().next().ok_or("unterminated char literal")?;
+    let simple = match c {
+        'n' => Some(10),
+        'r' => Some(13),
+        't' => Some(9),
+        '0' => Some(0),
+        '\\' => Some(92),
+        '\'' => Some(39),
+        '"' => Some(34),
+        _ => None,
+    };
+    if let Some(v) = simple {
+        return Ok((v, 1));
+    }
+    if c == 'x' {
+        let hex = s.get(1..3).filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+        let v = hex.and_then(|h| u32::from_str_radix(h, 16).ok()).ok_or("`\\x` takes two hex digits")?;
+        if v > 0x7f {
+            return Err("`\\x` is ASCII (up to `\\x7f`); write `\\u{..}` for a code point".to_string());
+        }
+        return Ok((v, 3));
+    }
+    if c == 'u' {
+        let body = s.strip_prefix("u{").ok_or("`\\u` takes `{hex}`")?;
+        let close = body.find('}').filter(|&k| (1..=6).contains(&k)).ok_or("`\\u{..}` takes 1 to 6 hex digits")?;
+        let v = u32::from_str_radix(&body[..close], 16).map_err(|_| "`\\u{..}` takes hex digits")?;
+        if char::from_u32(v).is_none() {
+            return Err(format!("`\\u{{{}}}` is not a Unicode scalar value", &body[..close]));
+        }
+        return Ok((v, 3 + close));
+    }
+    Err(format!("unknown char escape \\{c}"))
 }

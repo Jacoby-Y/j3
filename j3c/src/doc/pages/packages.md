@@ -1,7 +1,8 @@
-Packages: make one, use one (path or git), j3.lock
+Packages: make one, use one (path or git), j3.lock, package tools (j3c pkg, dist outputs)
 
-A package is a J3 project other projects import. It is source only: no build scripts run when
-it is fetched, and only the modules a program imports are compiled, for that program's target.
+A package is a J3 project other projects import. It is source only: nothing runs when it is
+fetched, and only the modules a program imports are compiled, for that program's target. It can
+also ship tools, which run only when you ask (Package tools, below).
 
 Make a package:
 
@@ -53,6 +54,107 @@ Git deps and j3.lock:
     Path deps are never locked: they are whatever is on disk.
 
     The LSP never runs git; a dep that is not downloaded says to run `j3c fetch`.
+
+Package tools: [commands] and [dist_outputs]
+
+A package can ship J3 programs that j3c builds for the host and runs for you. Declare them in
+the package's own j3.toml; paths are relative to the package root (beside j3.toml, not src/):
+
+    [commands]                    run by `j3c pkg hello greet [args...]`
+    greet = "tools/greet.j3"
+    check = { file = "tools/check.j3", help = "one line, shown by `j3c pkg hello`" }
+
+    [dist_outputs]                run by `j3c build --release` when the game names it
+    itch = "tools/itch.j3"        (game: [dist] build_outputs = ["zip", "itch"])
+
+A name uses letters, digits, `-` and `_`. The file must exist; `help` is optional. A tool is a
+program with `fn main`, built with the package as the project: `use hello.x;` loads the
+package's src/x.j3, and the package's own deps come from the game's dep list. A tool entry can
+`use` the package's src/ modules and the parts in its own folder (tools/check/ beside
+tools/check.j3), not sibling files in tools/: put code two tools share in src/ (e.g. src/tool/,
+then `use hello.tool.x;`).
+
+    j3c pkg                       every dependency's commands and dist outputs, with their help
+    j3c pkg hello                 that package's commands (dist outputs listed as `dist: NAME`)
+    j3c pkg hello greet a b       build (cached) and run it; args after the command go to the
+                                  tool untouched (`--help` too); j3c exits with the tool's code
+
+An unknown package or command is an error that lists what exists.
+
+Trust: tools run as you (your files, your network, like `cargo run`), and only when you run
+`j3c pkg` or your own j3.toml names the output. Never on fetch: `j3c add`, `fetch` and `update`
+run nothing.
+
+What a tool sees (J3_TOOL_API=1; a change to any of this bumps the number):
+
+    cwd                the project's root (the folder with the game's j3.toml), absolute
+    J3_PROJECT_ROOT    the same folder
+    J3_PKG_ROOT        the package's root (the folder with its j3.toml)
+    J3_PKG_NAME        the package's name
+    J3C                absolute path of the running j3c (call `$J3C build`, `$J3C -e ...`)
+    J3_TOOL_API        1; check it and stop on a number you don't know
+    J3_MANIFEST        target/.j3c/manifest.json, the project's j3.toml as JSON, written before each run
+    stdin, stdout, stderr are inherited. Killed by signal N is exit 128+N.
+
+A tool is always a dev build: `j3.build.RELEASE` is false inside it (a dist output gets `--release`).
+
+Manifest JSON (`j3c manifest --json [path]` prints the same, one line): every table, unknown ones
+included, so a package reads its own table (`[hello] key = "..."`) from the game's j3.toml with
+j3.data.json. `[a.b]` nests b in a. Keys keep the file's order; a key set twice keeps its last
+value. Bare `true`/`false` are booleans and bare numbers (`2`, `-1.5`) are numbers; everything else
+is a string: quoted values, other bare tokens (`1.2.3`), array items and inline-table values. An
+empty table is {}.
+
+Example tool (reads J3_MANIFEST):
+
+    //! tools/greet.j3: `j3c pkg hello greet` prints [hello] greeting from the game's j3.toml.
+    module hello.greet;
+
+    use j3.io.{printLn, readFile};
+    use j3.sys;
+    use j3.memory.Arena;
+    use j3.data.json;
+
+    fn main() {
+        if sys.env("J3_TOOL_API") != "1" {
+            printLn("greet: needs J3_TOOL_API 1 (update the hello package)");
+            sys.exit(2);
+        }
+        let a = Arena.create(65536);
+        match readFile(sys.env("J3_MANIFEST"), &a) {
+            Result.Ok(bytes) {
+                match json.parseStr(bytes as string, &a) {
+                    Result.Ok(j) { printLn(j.path("hello.greeting").asStr()); }
+                    Result.Err(e) { printLn(`greet: bad manifest: {e.msg}`); sys.exit(1); }
+                }
+            }
+            Result.Err(e) { printLn("greet: no manifest"); sys.exit(1); }
+        }
+    }
+
+Dist outputs: `[dist] build_outputs` takes any name. The built-ins (zip, deb, apk) always
+win; a package output with a built-in name never runs (the build warns). Any other name must be in
+one dep's [dist_outputs], else:
+    j3.toml: dist.build_outputs: no package provides "itch" (add one under [dependencies]); built in: ...
+Two deps providing the same name is an error. After the built-ins, each package output runs once,
+in build_outputs order, with:
+
+    --dist <abs target/dist>
+    --built <triple>=<abs exe>        once per built target; an empty triple is the host
+    --stage <triple>=<abs folder>     once per non-Android target: the <name>/ folder the zip packs
+                                      (exe, [dist] include, Windows DLLs), made even with zip off.
+                                      Removed after the last tool runs: copy out of it.
+    --name N --version V              from [package]
+    --release
+
+The tool's stdout is echoed live. The last non-empty stdout line, when it is an existing folder (relative
+to the project root), joins the build's "wrote" list; anything else is a warning. A non-zero exit
+fails the build with that code: dist output `itch` (package `P`, FILE) failed with exit code N.
+
+Cache: ~/.cache/j3/tools/<pkg>-<hash>/<tool> ($J3_PKG_DIR/tools/ when J3_PKG_DIR is set). The hash
+covers the j3c binary, the tool file, every file under the package's src/ and tools/, and the
+other deps, so an edit rebuilds and prints `building hello:greet (first run)` to stderr. A build
+error prints the compiler's diagnostics. Old cache folders are not removed; delete them freely.
 
 Publish a package: push the repo, then `git tag v0.1.0 && git push --tags`. Importers point at
 the tag. There is no registry yet: share the git URL.

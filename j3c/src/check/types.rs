@@ -93,7 +93,7 @@ pub(super) fn fill_struct_fields(cx: &mut IrCx, mods: &mut [ModData], i: usize) 
                     }
                     if !matches!(
                         expr.kind,
-                        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_)
+                        ExprKind::Int(_) | ExprKind::Char(_) | ExprKind::Float(_) | ExprKind::Bool(_)
                     ) {
                         return Err(CheckError::new(
                             path.clone(),
@@ -379,15 +379,11 @@ pub(super) fn collect_enums(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Re
         let types = mods[i].types.clone();
         let mut variants = Vec::new();
         for v in &e.variants {
-            let payload = match &v.payload {
-                Some(t) => Some(resolve_type(cx, t, &path, &types)?),
-                None => None,
-            };
-            variants.push(VariantDef {
-                name: cx.intern_name(&v.name.name),
-                doc: v.doc.clone(),
-                payload,
-            });
+            let mut fields = Vec::new();
+            for t in &v.fields {
+                fields.push(resolve_type(cx, t, &path, &types)?);
+            }
+            variants.push(variant_def(cx, &e.name.name, v, fields, &names, &mut mods[i].ir.structs));
         }
         let try_catch = enum_try_catch(cx, id, &e, &path, &variants)?;
         let def = cx.enum_def_mut(id);
@@ -395,6 +391,45 @@ pub(super) fn collect_enums(cx: &mut IrCx, mods: &mut [ModData], i: usize) -> Re
         def.try_catch = try_catch;
     }
     Ok(())
+}
+
+/// A variant from its resolved field types. Two or more fields become a payload struct
+/// `Enum.Variant { 0: A, 1: B }`, pushed on `structs` (the module that declares the enum).
+pub(super) fn variant_def(
+    cx: &mut IrCx,
+    enum_name: &str,
+    v: &parse::VariantItem,
+    mut fields: Vec<Ty>,
+    module: &[Name],
+    structs: &mut Vec<StructId>,
+) -> VariantDef {
+    let name = cx.intern_name(&v.name.name);
+    let (payload, multi) = match fields.len() {
+        0 => (None, false),
+        1 => (fields.pop(), false),
+        _ => {
+            let fields = fields
+                .into_iter()
+                .enumerate()
+                .map(|(k, ty)| FieldDef { name: cx.intern_name(&k.to_string()), doc: String::new(), ty, embedded: false, default: None })
+                .collect();
+            let sname = cx.intern_name(&format!("{enum_name}.{}", v.name.name));
+            let id = cx.alloc_struct(StructDef {
+                module: module.to_vec(),
+                name: sname,
+                doc: String::new(),
+                fields,
+                packed: false,
+                debug: false,
+                span: v.span,
+                ty_args: Vec::new(),
+                script: None,
+            });
+            structs.push(id);
+            (Some(cx.ty_struct(id)), true)
+        }
+    };
+    VariantDef { name, doc: v.doc.clone(), payload, multi }
 }
 
 pub(super) fn enum_try_catch(

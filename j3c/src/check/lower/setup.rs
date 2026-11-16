@@ -14,6 +14,8 @@ pub(super) struct MergedEnv {
     globals: HashMap<String, crate::ir::ids::GlobalId>,
     struct_temps: HashMap<String, parse::StructItem>,
     struct_temp_env: HashMap<String, DeclEnv>,
+    gen_names: HashMap<String, String>,
+    gen_mods: HashMap<String, String>,
 }
 
 pub(super) fn generic_origins(mods: &[ModData]) -> HashMap<String, OriginNs> {
@@ -52,6 +54,8 @@ fn origin_of(m: &ModData) -> OriginNs {
         globals: m.globals.clone(),
         struct_temps: m.struct_temps.clone(),
         struct_temp_env: m.struct_temp_env.clone(),
+        gen_names: m.gen_names.clone(),
+        gen_mods: m.gen_mods.clone(),
     }
 }
 
@@ -116,6 +120,8 @@ pub(super) fn lower_fn(
                 globals: merge_map(&o.globals, globals),
                 struct_temps: merge_map(&o.struct_temps, struct_temps),
                 struct_temp_env: merge_map(&o.struct_temp_env, struct_temp_env),
+                gen_names: merge_map(&o.gen_names, gen.names),
+                gen_mods: merge_map(&o.gen_mods, gen.mods),
             }))
         } else {
             None
@@ -139,6 +145,11 @@ pub(super) fn lower_fn(
         .as_ref()
         .map(|m| &m.struct_temp_env)
         .unwrap_or(struct_temp_env);
+    // The body names generic fns as its own module sees them, not as the caller does.
+    let gen = match merged {
+        Some(m) => gen.rebind(&m.gen_names, &m.gen_mods),
+        None => gen,
+    };
     let (param_tys, ret) = match cx.fn_sig(cx.func(id).ty) {
         Some((ps, r)) => (ps.clone(), r),
         None => (Vec::new(), cx.common.void),

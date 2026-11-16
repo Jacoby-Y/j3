@@ -1,0 +1,321 @@
+// j3.io OS pieces (plan B6): j3.io.path, atomic replace (also killed halfway), temp files,
+// flock contention between two processes, copyFile, walk with a glob, proc.waitAny. Linux.
+//   timeout 60 j3c run j3c/stdlib/tests/io_os_test.j3
+// Run by cargo (`compile/tests/stdlib_cmp.rs`) on both backends. Panics on the first failed check.
+
+module io_os_test;
+
+use j3.io;
+use j3.io.{ printLn, IoError };
+use j3.io.path;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.proc;
+use j3.proc.Child;
+use j3.result.Result;
+use j3.sys;
+use j3.sys.panic;
+use j3.text.same;
+
+fn ok(cond: bool, msg: string) {
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic(msg);
+    }
+}
+
+fn is(got: string, want: string, msg: string) {
+    if !same(got, want) {
+        printLn(`FAIL: {msg}: got "{got}", want "{want}"`);
+        panic(msg);
+    }
+}
+
+fn testPath(a: &Arena) {
+    is(path.normalize("./a//b/../c/", a), "a/c", "normalize dots");
+    is(path.normalize("/../x/./y/..", a), "/x", "normalize abs");
+    is(path.normalize("", a), ".", "normalize empty");
+    is(path.normalize("a/..", a), ".", "normalize to dot");
+    is(path.normalize("../../a/b/..", a), "../../a", "normalize leading dotdot");
+    is(path.normalize("a/../../b", a), "../b", "normalize climb");
+    is(path.normalize("/", a), "/", "normalize root");
+    is(path.normalize("//a//", a), "/a", "normalize slashes");
+    is(path.join("a", "b", a), "a/b", "join");
+    is(path.join("a/", "b", a), "a/b", "join slash");
+    is(path.join("a", "/b", a), "/b", "join abs");
+    is(path.join("", "b", a), "b", "join empty a");
+    is(path.join("a", "", a), "a", "join empty b");
+    is(path.dirname("a/b"), "a", "dirname");
+    is(path.dirname("a"), ".", "dirname bare");
+    is(path.dirname("/a"), "/", "dirname root child");
+    is(path.dirname("/"), "/", "dirname root");
+    is(path.dirname("a/b/"), "a", "dirname trailing");
+    is(path.dirname("a//b"), "a", "dirname double");
+    is(path.dirname("/a/b"), "/a", "dirname abs");
+    is(path.basename("a/b.j3"), "b.j3", "basename");
+    is(path.basename("a/b/"), "b", "basename trailing");
+    is(path.basename("/"), "/", "basename root");
+    is(path.ext("a/b.tar.gz"), ".gz", "ext");
+    is(path.ext(".bashrc"), "", "ext dotfile");
+    is(path.ext("a/b"), "", "ext none");
+    is(path.ext(".."), "", "ext dotdot");
+    ok(path.isAbs("/x") && !path.isAbs("x"), "isAbs");
+    ok(path.glob("*.j3", "main.j3") && !path.glob("*.j3", "main.j3s"), "glob star");
+    ok(path.glob("a?c", "abc") && path.glob("src/*/x", "src/a/b/x") && !path.glob("a?c", "ac"), "glob");
+}
+
+fn good<T, E>(r: Result<T, E>): bool {
+    if let Result.Ok(_) = r {
+        return true;
+    }
+    return false;
+}
+
+fn none<T>(o: Option<T>): bool {
+    if let Option.Some(_) = o {
+        return false;
+    }
+    return true;
+}
+
+fn read(p: string, a: &Arena): string {
+    match io.readFile(p, a) {
+        Result.Ok(b) { return b as string; }
+        Result.Err(_) { panic(`readFile {p}`); }
+    }
+    return "";
+}
+
+fn must(r: Result<int, IoError>, msg: string): int {
+    match r {
+        Result.Ok(n) { return n; }
+        Result.Err(_) { panic(msg); }
+    }
+    return 0;
+}
+
+/// Names in `dir` that start with `prefix`.
+fn countPrefix(dir: string, prefix: string, a: &Arena): int {
+    let n = 0;
+    if let Result.Ok(ents) = io.listDir(dir, a) {
+        for i in 0..ents.len {
+            let e = ents[i].name;
+            if e.len >= prefix.len && same(e[0..prefix.len], prefix) {
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
+
+fn testAtomic(base: string, a: &Arena) {
+    let f = path.join(base, "a.txt", a);
+    must(io.writeFile(f, "old" as []u8), "writeFile");
+    must(io.writeFileAtomic(f, "new" as []u8), "writeFileAtomic");
+    is(read(f, a), "new", "atomic replaced");
+    ok(countPrefix(base, ".a.txt.tmp", a) == 0, "no temp left after commit");
+
+    // killed halfway: a child starts replacing the file, writes part of it, and is SIGKILLed
+    let pid = sys.fork();
+    if pid == 0 {
+        if let Result.Ok(w) = io.createAtomic(f, a) {
+            w.write("partial" as []u8);
+            sys.kill(sys.getpid(), sys.SIGKILL);
+        }
+        sys.exit(1);
+    }
+    let st: i32 = 0;
+    sys.waitpid(pid, &st, 0);
+    ok(sys.exitCode(st) == 128 + 9, "child was killed");
+    is(read(f, a), "new", "killed halfway leaves old file");
+    ok(countPrefix(base, ".a.txt.tmp", a) == 1, "killed writer left its temp");
+
+    // a failing rename (file over a non-empty dir) removes the temp and reports the error
+    let d = path.join(base, "d", a);
+    ok(good(io.makeDirs(path.join(d, "e", a))), "makeDirs");
+    ok(!good(io.writeFileAtomic(d, "x" as []u8)), "atomic over dir fails");
+    ok(countPrefix(base, ".d.tmp", a) == 0, "failed rename removed temp");
+    ok(!good(io.writeFileAtomic(path.join(base, "nodir/x", a), "x" as []u8)), "atomic in missing dir fails");
+    io.removeDir(path.join(d, "e", a));
+    ok(good(io.removeDir(d)), "removeDir");
+}
+
+fn testCopyWalkTemp(base: string, a: &Arena) {
+    let big = a.alloc::<u8>(200000);
+    for i in 0..big.len {
+        big[i] = u8(i % 251);
+    }
+    let src = path.join(base, "big.bin", a);
+    must(io.writeFile(src, big), "write big");
+    ok(must(io.copyFile(src, path.join(base, "copy.bin", a)), "copyFile") == big.len, "copy count");
+    is(read(path.join(base, "copy.bin", a), a), big as string, "copy bytes");
+    ok(!good(io.copyFile(path.join(base, "missing", a), src)), "copy missing fails");
+
+    let w = path.join(base, "w", a);
+    io.makeDirs(path.join(w, "sub/deep", a));
+    must(io.writeFile(path.join(w, "y.txt", a), "" as []u8), "w y");
+    must(io.writeFile(path.join(w, "x.j3", a), "" as []u8), "w x");
+    must(io.writeFile(path.join(w, "sub/z.j3", a), "" as []u8), "w z");
+    must(io.writeFile(path.join(w, "sub/deep/q.j3", a), "" as []u8), "w q");
+    if let Result.Ok(es) = io.walk(w, "*.j3", a) {
+        ok(es.len == 3, "walk count");
+        is(es[0].name, "x.j3", "walk 0");
+        is(es[1].name, "sub/z.j3", "walk 1");
+        is(es[2].name, "sub/deep/q.j3", "walk 2");
+    } else {
+        panic("walk");
+    }
+    if let Result.Ok(es) = io.walk(w, "sub/*", a) {
+        ok(es.len == 2, "walk slash pattern");
+    }
+    if let Result.Ok(es) = io.walk(w, "", a) {
+        ok(es.len == 4, "walk all");
+    }
+    ok(!good(io.walk(path.join(base, "nope", a), "", a)), "walk missing root");
+
+    if let Result.Ok(t1) = io.tempFile(base, "tf", a) {
+        if let Result.Ok(t2) = io.tempFile(base, "tf", a) {
+            ok(!same(t1.path, t2.path), "temp names differ");
+            sys.close(t2.fd);
+        }
+        sys.close(t1.fd);
+    } else {
+        panic("tempFile");
+    }
+    ok(countPrefix(base, "tf", a) == 2, "two temp files");
+
+    let real = path.realpath(base, a);
+    if let Option.Some(r) = real {
+        ok(path.isAbs(r), "realpath abs");
+        if let Option.Some(r2) = path.realpath(path.join(base, "w/./sub/../x.j3", a), a) {
+            is(r2, path.join(r, "w/x.j3", a), "realpath resolves");
+        } else {
+            panic("realpath file");
+        }
+    } else {
+        panic("realpath");
+    }
+    ok(none(path.realpath(path.join(base, "missing", a), a)), "realpath missing");
+}
+
+fn testLock(base: string, a: &Arena) {
+    let lp = path.join(base, "l.lock", a);
+    let held = io.lockFile(lp);
+    ok(good(held), "lockFile");
+    let heldFd = -1;
+    if let Result.Ok(l) = held {
+        heldFd = l.fd;
+    }
+    let fds: [2]i32 = [0, 0];
+    sys.pipe(fds[:], 0);
+    let pid = sys.fork();
+    if pid == 0 {
+        // the second process: drop the inherited lock fd (as `execve` would, it is CLOEXEC); the
+        // lock is taken, so tryLock fails; then lock waits for it
+        sys.close(heldFd);
+        let code = 0;
+        if let Result.Ok(o) = io.tryLockFile(lp) {
+            if let Option.Some(_) = o {
+                code = 10;
+            }
+        } else {
+            code = 11;
+        }
+        let b: u8 = 1;
+        sys.write(int(fds[1]), &b as ptr, 1);
+        if code == 0 && !good(io.lockFile(lp)) {
+            code = 12;
+        }
+        sys.exit(i32(code));
+    }
+    let b: u8 = 0;
+    ok(sys.read(int(fds[0]), &b as ptr, 1) == 1, "child tried the lock");
+    if let Result.Ok(l) = held {
+        l.unlock();
+    }
+    let st: i32 = 0;
+    sys.waitpid(pid, &st, 0);
+    ok(sys.exitCode(st) == 0, `lock child code {sys.exitCode(st)}`);
+    sys.close(int(fds[0]));
+    sys.close(int(fds[1]));
+    // the child's lock went away with it
+    if let Result.Ok(o) = io.tryLockFile(lp) {
+        if let Option.Some(l) = o {
+            l.unlock();
+        } else {
+            panic("lock free after child exit");
+        }
+    }
+}
+
+fn start(cmd: string, a: &Arena): Child {
+    let argv: [3]string = ["sh", "-c", cmd];
+    match proc.start(argv[:], a) {
+        Result.Ok(c) { return c; }
+        Result.Err(_) { panic("proc.start"); }
+    }
+    return Child { pid: 0, stdin: -1, stdout: -1, stderr: -1 };
+}
+
+fn next(cs: []Child): int {
+    match proc.waitAny(cs) {
+        Result.Ok(i) { return i; }
+        Result.Err(_) { panic("waitAny"); }
+    }
+    return -1;
+}
+
+fn testWaitAny(a: &Arena) {
+    // a child outside the set: waitAny must not reap it
+    let other = sys.fork();
+    if other == 0 {
+        sys.exit(9);
+    }
+    let cs = a.alloc::<Child>(3);
+    cs[0] = start("sleep 0.4; exit 3", a);
+    cs[1] = start("exit 5", a);
+    cs[2] = start("sleep 0.15; exit 7", a);
+    let i = next(cs);
+    ok(i == 1 && cs[1].code == 5, "first done");
+    i = next(cs);
+    ok(i == 2 && cs[2].code == 7, "second done");
+    i = next(cs);
+    ok(i == 0 && cs[0].code == 3, "third done");
+    ok(!good(proc.waitAny(cs)), "none left");
+    for k in 0..3 {
+        ok(cs[k].wait() == [3, 5, 7][k], "wait after waitAny");
+    }
+
+    // several end together: each call returns a different one
+    let two = a.alloc::<Child>(2);
+    two[0] = start("exit 1", a);
+    two[1] = start("exit 2", a);
+    let sl: [2]string = ["sleep", "0.2"];
+    proc.run(sl[:], "", a);
+    let x = next(two);
+    let y = next(two);
+    ok(x != y && two[0].code == 1 && two[1].code == 2, "two at once");
+    two[0].wait();
+    two[1].wait();
+
+    let st: i32 = 0;
+    ok(sys.waitpid(other, &st, 0) == other && sys.exitCode(st) == 9, "unrelated child not reaped");
+}
+
+fn main() {
+    let a = Arena.create(1 << 20);
+    testPath(&a);
+    let base = "";
+    match io.tempDir("", "j3iotest", &a) {
+        Result.Ok(d) { base = d; }
+        Result.Err(_) { panic("tempDir"); }
+    }
+    testAtomic(base, &a);
+    testCopyWalkTemp(base, &a);
+    testLock(base, &a);
+    testWaitAny(&a);
+    let rm: [3]string = ["rm", "-rf", base];
+    proc.run(rm[:], "", &a);
+    ok(!io.exists(base), "cleaned up");
+    printLn("io_os_test ok");
+}

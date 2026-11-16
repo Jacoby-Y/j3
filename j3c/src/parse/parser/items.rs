@@ -25,6 +25,7 @@ impl<'a> Parser<'a> {
         while self.cur().kind != TokenKind::Eof {
             items.push(self.item()?);
         }
+        derive_use(&module, &mut items);
         let end = self.prev_end(start);
         Ok(File {
             span: join(start, end),
@@ -32,6 +33,8 @@ impl<'a> Parser<'a> {
             module,
             is_script: self.script_module.is_some(),
             items,
+            embeds: Vec::new(),
+            dyns: std::mem::take(&mut self.dyns),
         })
     }
 
@@ -100,6 +103,7 @@ impl<'a> Parser<'a> {
                     return Err(self.err("`#[TryCatch]` cannot sit on `struct`"));
                 }
                 let mut s = self.struct_item(vis_pub, attrs.debug, doc)?;
+                s.derives = attrs.derives;
                 s.gpu = match (attrs.gpu_struct, attrs.shader) {
                     (GpuStruct::None, Some(_)) => GpuStruct::Plain,
                     (g, _) => g,
@@ -124,7 +128,7 @@ impl<'a> Parser<'a> {
                 if !attrs.singleton {
                     return Err(self.err("module `let` needs `#[singleton]`"));
                 }
-                if attrs.debug || attrs.try_catch.is_some() || attrs.impl_fn {
+                if attrs.debug || attrs.try_catch.is_some() || attrs.impl_fn || !attrs.derives.is_empty() {
                     return Err(
                         self.err("`#[singleton]` cannot mix with `#[Debug]` / `#[TryCatch]` / `#[impl]`")
                     );
@@ -238,6 +242,7 @@ impl<'a> Parser<'a> {
                 debug,
                 packed: false,
                 gpu: GpuStruct::None,
+                derives: Vec::new(),
                 name,
                 type_params,
                 bounds,
@@ -294,6 +299,7 @@ impl<'a> Parser<'a> {
             debug,
             packed: false,
             gpu: GpuStruct::None,
+            derives: Vec::new(),
             name,
             type_params,
             bounds,
@@ -316,17 +322,26 @@ impl<'a> Parser<'a> {
                 break;
             }
             let vname = self.ident()?;
-            let mut payload = None;
+            let mut fields = Vec::new();
             if self.cur().kind == TokenKind::LParen {
                 let _ = self.bump();
-                payload = Some(self.ty()?);
-                self.expect(TokenKind::RParen, "expected `)` after variant payload")?;
+                loop {
+                    fields.push(self.ty()?);
+                    if self.cur().kind != TokenKind::Comma || self.look(1).kind == TokenKind::RParen {
+                        break;
+                    }
+                    let _ = self.bump();
+                }
+                if self.cur().kind == TokenKind::Comma {
+                    let _ = self.bump();
+                }
+                self.expect(TokenKind::RParen, "expected `,` or `)` after a variant field")?;
             }
             variants.push(VariantItem {
                 span: vname.span,
                 doc: vdoc,
                 name: vname,
-                payload,
+                fields,
             });
             if self.cur().kind == TokenKind::Comma {
                 let _ = self.bump();
@@ -341,6 +356,7 @@ impl<'a> Parser<'a> {
             vis_pub,
             debug: attrs.debug,
             try_catch: attrs.try_catch,
+            derives: attrs.derives,
             name,
             type_params,
             bounds,
@@ -415,6 +431,7 @@ impl<'a> Parser<'a> {
             let _ = self.bump();
             ret = Some(self.ty()?);
         }
+        let where_bounds = self.where_clause()?;
         let body = self.block()?;
         Ok(FnItem {
             span: join(start, body.span),
@@ -423,11 +440,29 @@ impl<'a> Parser<'a> {
             name,
             type_params,
             bounds,
+            where_bounds,
             is_impl: false,
             shader: None,
             params,
             ret,
             body,
         })
+    }
+}
+
+/// A derived `hash` or `<` calls the `#[impl]` fns of `j3.cmp` on `int`, `string` and the other
+/// primitives, so a module that derives them loads `j3.cmp`: `use j3.cmp.{}` names nothing, so it
+/// cannot clash with the module's own imports (`check/uses.rs` skips it).
+fn derive_use(module: &[Ident], items: &mut Vec<Item>) {
+    let needs = |ds: &[Ident]| ds.iter().any(|d| d.name == "Hash" || d.name == "Ord");
+    let at = items.iter().find_map(|it| match it {
+        Item::Struct(s) if needs(&s.derives) => Some(s.derives[0].span),
+        Item::Enum(e) if needs(&e.derives) => Some(e.derives[0].span),
+        _ => None,
+    });
+    let is_cmp = module.len() == 2 && module[0].name == "j3" && module[1].name == "cmp";
+    if let (Some(span), false) = (at, is_cmp) {
+        let path = ["j3", "cmp"].iter().map(|n| Ident { name: n.to_string(), span }).collect();
+        items.push(Item::Use(UseItem { span, path, names: Some(Vec::new()) }));
     }
 }

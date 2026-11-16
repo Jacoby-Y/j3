@@ -3,6 +3,10 @@
 //! `fn(x: int): int { x + k }` becomes a ctx struct holding `&k`, a generated fn `outer$closureN(ctx, x)`
 //! whose captured names are aliases for `(*ctx.c0)`, and the value `{ $f: outer$closureN, $ctx: &ctx }`.
 //! The ctx lives in the creating frame, so a closure cannot outlive it (the type rules enforce that).
+//!
+//! `fn[mem](x: int): int { x + k }` (boxed) copies `k` itself into a ctx allocated from arena `mem`, and
+//! has type `boxed closure(int): int`: same two words, but free to be stored, returned or sent to a
+//! thread. It never frees; it lives as long as `mem` (`speculative/lang/boxed_closures.j3`).
 
 use super::*;
 use crate::ir::entity::{FieldDef, Func, StructDef, Vis};
@@ -67,9 +71,23 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Why a closure was passed where a plain `fn`/`ptr` is wanted, when that is the mismatch.
+    /// Why a closure was passed where a plain `fn`/`ptr` (or a boxed closure) is wanted, when that is the mismatch.
     pub(super) fn closure_mismatch(&self, span: Span, have: Ty, want: Ty) -> Option<CheckError> {
         self.cx.closure_sig(have)?;
+        if self.cx.is_boxed_closure(want) && !self.cx.is_boxed_closure(have) {
+            return Some(
+                CheckError::new(
+                    self.path,
+                    span,
+                    format!(
+                        "expected `{}`, found `{}`: a stack closure points into the frame that made it and cannot become boxed",
+                        self.ty_str(want),
+                        self.ty_str(have)
+                    ),
+                )
+                .help("only a `fn[mem](..) { .. }` literal makes a boxed closure; it copies its captures into arena `mem`"),
+            );
+        }
         if !matches!(self.cx.ty_kind(want), TyKind::Fn { .. } | TyKind::Ptr) {
             return None;
         }
@@ -96,6 +114,11 @@ impl<'a> Lower<'a> {
         if self.script_sid.is_some() {
             return Err(self.script_closure_err(span));
         }
+        let boxed = lit.arena.is_some();
+        let arena = match &lit.arena {
+            Some(e) => Some(self.arena_arg(e)?),
+            None => None,
+        };
         let want = self.want_of(expected);
         let (want_params, want_ret) = match &want {
             Want::Closure(p, r) | Want::Plain(p, r) => (Some(p.clone()), Some(*r)),
@@ -163,12 +186,14 @@ impl<'a> Lower<'a> {
             } else {
                 continue;
             };
-            if !place.access.take_ref {
+            if boxed {
+                reject_closure(self.cx, self.path, span, place.ty, &format!("captured by a boxed closure (`{name}`)"))?;
+            } else if !place.access.take_ref {
                 return Err(CheckError::new(self.path, span, format!("cannot capture `{name}`: its address cannot be taken")));
             }
             caps.push((name, place));
         }
-        let plain = matches!(want, Want::Plain(..));
+        let plain = matches!(want, Want::Plain(..)) && !boxed;
         if plain && !caps.is_empty() {
             return Err(CheckError::new(
                 self.path,
@@ -200,17 +225,17 @@ impl<'a> Lower<'a> {
         });
         self.ir_funcs.push(fid);
 
-        // The ctx struct: one `&T` per captured name.
+        // The ctx struct: one `&T` per captured name (one `T`, a copy, when boxed).
         let ctx = if caps.is_empty() {
             None
         } else {
             let mut fields = Vec::new();
             for (i, (_, pl)) in caps.iter().enumerate() {
-                let ref_ty = self.cx.ty_ref(pl.ty);
+                let ty = if boxed { pl.ty } else { self.cx.ty_ref(pl.ty) };
                 fields.push(FieldDef {
                     name: self.cx.intern_name(&format!("c{i}")),
                     doc: String::new(),
-                    ty: ref_ty,
+                    ty,
                     embedded: false,
                     default: None,
                 });
@@ -231,16 +256,18 @@ impl<'a> Lower<'a> {
             Some(sid)
         };
 
-        let body = self.closure_body(span, lit, &label, &ptys, ret, plain, ctx, &caps)?;
+        let body = self.closure_body(span, lit, &label, &ptys, ret, plain, boxed, ctx, &caps)?;
+        lazy::wake(self.cx, &body.block, self.pending_mono);
         self.cx.func_mut(fid).kind = FuncKind::J3 { body };
 
         if plain {
             return Ok(Rvalue::use_op(span, Operand::fn_addr(span, fn_ty, fid)));
         }
         let ptr = self.cx.common.ptr;
-        let ctx_op = match ctx {
-            None => Operand::null(span, ptr),
-            Some(sid) => {
+        let ctx_op = match (ctx, arena) {
+            (None, _) => Operand::null(span, ptr),
+            (Some(sid), Some((mem, alloc))) => self.boxed_ctx(span, sid, mem, alloc, &caps),
+            (Some(sid), None) => {
                 let ctx_ty = self.cx.ty_struct(sid);
                 let n = self.fresh("ctx");
                 let tmp = self.b.tmp(n, ctx_ty, span);
@@ -259,7 +286,7 @@ impl<'a> Lower<'a> {
                 Operand::Copy(cast_place)
             }
         };
-        let cty = self.cx.closure_ty(ptys, ret, self.module_names, span, self.ir_structs);
+        let cty = self.cx.closure_ty(ptys, ret, boxed, self.module_names, span, self.ir_structs);
         Ok(Rvalue::aggregate(span, cty, vec![Operand::fn_addr(span, fn_ty, fid), ctx_op]))
     }
 
@@ -273,6 +300,7 @@ impl<'a> Lower<'a> {
         ptys: &[Ty],
         ret: Ty,
         plain: bool,
+        boxed: bool,
         ctx: Option<StructId>,
         caps: &[(String, Place)],
     ) -> Result<crate::ir::body::Body, CheckError> {
@@ -316,7 +344,7 @@ impl<'a> Lower<'a> {
                 for (i, (name, orig)) in caps.iter().enumerate() {
                     let base = self.b.deref(self.cx, typed_place.clone(), span);
                     let field = self.b.field(self.cx, base, FieldId { struct_id: sid, index: i as u32 }, span);
-                    let mut place = self.b.deref(self.cx, field, span);
+                    let mut place = if boxed { field } else { self.b.deref(self.cx, field, span) };
                     place.access = orig.access;
                     self.aliases.insert(name.clone(), place);
                 }

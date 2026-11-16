@@ -163,7 +163,18 @@ pub fn emit_script(cx: &IrCx, module: &Module) -> Result<BcModule, String> {
             Some(ConstInit::Scalar(v)) => {
                 const_bytes(cx, v, size, &mut constants).unwrap_or_default()
             }
-            _ => (Vec::new(), None),
+            Some(table) => {
+                let mut image = vec![0u8; size as usize];
+                if !table_image(cx, g.ty, table, &mut image) {
+                    return Err(format!(
+                        "{}: `{}` is a table holding strings (`@embedDir`, `[N]string`), which a `.j3s` script cannot hold yet; declare it in a `.j3` module and `use` it",
+                        meta.path,
+                        cx.name_str(g.name)
+                    ));
+                }
+                (image, None)
+            }
+            None => (Vec::new(), None),
         };
         let key = global_key(cx, *id);
         layout_bytes.extend(key.to_le_bytes());
@@ -301,6 +312,8 @@ fn class(cx: &IrCx, ty: Ty) -> Option<Class> {
         TyKind::Float(FloatTy::F32) => Class::F32,
         TyKind::Float(FloatTy::F64) => Class::F64,
         TyKind::Ptr | TyKind::CStr | TyKind::Ref(_) | TyKind::Fn { .. } => Class::Ptr,
+        // a payloadless enum is its `i32` tag (`ir/abi.rs`)
+        TyKind::Enum(id) if cx.enum_def(*id).is_c_like() => Class::Int { bits: 32, signed: true },
         _ => return None,
     })
 }
@@ -361,6 +374,35 @@ fn canonical(c: Class, bits: u64) -> u64 {
         }
         Class::F32 => bits & 0xffff_ffff,
         _ => bits,
+    }
+}
+
+/// Writes a struct or array initializer of plain scalars into `out` (the global's bytes).
+/// False when it holds byte data (strings), which needs more than one constant pointer.
+fn table_image(cx: &IrCx, ty: Ty, init: &ConstInit, out: &mut [u8]) -> bool {
+    match init {
+        ConstInit::Scalar(v) => match const_bytes(cx, v, out.len() as u32, &mut Vec::new()) {
+            Some((bytes, None)) => {
+                out[..bytes.len()].copy_from_slice(&bytes);
+                true
+            }
+            _ => false,
+        },
+        ConstInit::Fields(fs) => {
+            let TyKind::Struct(sid) = cx.ty_kind(ty) else { return false };
+            let def = cx.struct_def(*sid);
+            fs.iter().all(|(name, v)| {
+                let Some(i) = def.fields.iter().position(|f| cx.name_str(f.name) == name) else { return false };
+                let (Some(at), fty) = (abi::field_offset(cx, ty, i), def.fields[i].ty) else { return false };
+                let at = at as usize;
+                table_image(cx, fty, v, &mut out[at..at + abi::size(cx, fty) as usize])
+            })
+        }
+        ConstInit::Elems(es) => {
+            let TyKind::Array { elem, .. } = cx.ty_kind(ty) else { return false };
+            let n = abi::size(cx, *elem) as usize;
+            es.iter().enumerate().all(|(k, v)| table_image(cx, *elem, v, &mut out[k * n..(k + 1) * n]))
+        }
     }
 }
 

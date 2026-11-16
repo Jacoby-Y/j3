@@ -44,7 +44,7 @@ pub(crate) fn thin_lto(opts: &EmitOpts) -> bool {
     (opts.cc.release
         || (opts.incremental && !opts.incremental_all && matches!(opts.cc.opt.as_str(), "2" | "3" | "s" | "z")))
         && opts.backend == crate::emit::Backend::Llvm
-        && opts.target.is_empty()
+        && crate::emit::host::is_host_target(&opts.target)
         && cfg!(target_os = "linux")
         && opts.cc.out.is_some()
         && (lld_present() || mold_on_path())

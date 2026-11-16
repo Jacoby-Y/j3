@@ -14,6 +14,13 @@ pub fn names_in_block(block: &Block, f: &mut dyn FnMut(&Ident)) {
 fn names_in_stmt(stmt: &Stmt, f: &mut dyn FnMut(&Ident)) {
     match stmt {
         Stmt::Let(s) => names_in_expr(&s.value, f),
+        Stmt::LetPat(s) => {
+            names_in_pat(&s.pat, f);
+            names_in_expr(&s.value, f);
+            if let Some(b) = &s.else_block {
+                names_in_block(b, f);
+            }
+        }
         Stmt::Return(s) => {
             if let Some(v) = &s.value {
                 names_in_expr(v, f);
@@ -49,15 +56,7 @@ fn names_in_stmt(stmt: &Stmt, f: &mut dyn FnMut(&Ident)) {
             names_in_block(&s.body, f);
         }
         Stmt::UseLocal(s) => f(&s.name),
-        Stmt::Match(s) => {
-            names_in_expr(&s.expr, f);
-            for arm in &s.arms {
-                if let Some(v) = &arm.value {
-                    names_in_expr(v, f);
-                }
-                names_in_block(&arm.body, f);
-            }
-        }
+        Stmt::Match(s) => names_in_match(s, f),
         Stmt::Defer(s) => names_in_block(&s.body, f),
         Stmt::Labeled(s) => names_in_stmt(&s.body, f),
         Stmt::Break(..) | Stmt::Continue(..) => {}
@@ -65,15 +64,60 @@ fn names_in_stmt(stmt: &Stmt, f: &mut dyn FnMut(&Ident)) {
     }
 }
 
+fn names_in_match(s: &MatchStmt, f: &mut dyn FnMut(&Ident)) {
+    names_in_expr(&s.expr, f);
+    for arm in &s.arms {
+        for p in &arm.pats {
+            names_in_pat(p, f);
+        }
+        if let Some(g) = &arm.guard {
+            names_in_expr(g, f);
+        }
+        names_in_block(&arm.body, f);
+        if let Some(t) = &arm.tail {
+            names_in_expr(t, f);
+        }
+    }
+}
+
+/// Calls `f` for every name `pat` binds.
+pub fn pat_binds(pat: &Pat, f: &mut dyn FnMut(&Ident)) {
+    match pat {
+        Pat::Bind(n) => f(n),
+        Pat::Variant { payload, .. } => payload.iter().for_each(|p| pat_binds(p, f)),
+        Pat::Struct { fields, .. } => fields.iter().for_each(|(_, p)| pat_binds(p, f)),
+        Pat::Tuple { elems, .. } => elems.iter().for_each(|p| pat_binds(p, f)),
+        Pat::Wild(_) | Pat::Lit(_) | Pat::Range { .. } => {}
+    }
+}
+
+fn names_in_pat(pat: &Pat, f: &mut dyn FnMut(&Ident)) {
+    match pat {
+        Pat::Bind(_) | Pat::Wild(_) => {}
+        Pat::Variant { payload, .. } => payload.iter().for_each(|p| names_in_pat(p, f)),
+        Pat::Struct { fields, .. } => fields.iter().for_each(|(_, p)| names_in_pat(p, f)),
+        Pat::Tuple { elems, .. } => elems.iter().for_each(|p| names_in_pat(p, f)),
+        Pat::Lit(e) => names_in_expr(e, f),
+        Pat::Range { lo, hi } => {
+            names_in_expr(lo, f);
+            names_in_expr(hi, f);
+        }
+    }
+}
+
 fn names_in_expr(expr: &Expr, f: &mut dyn FnMut(&Ident)) {
     match &expr.kind {
         ExprKind::Name(n) => f(n),
         ExprKind::Int(_)
+        | ExprKind::BigInt(_)
+        | ExprKind::Zeroed
+        | ExprKind::Char(_)
         | ExprKind::Float(_)
         | ExprKind::Bool(_)
         | ExprKind::String(_)
         | ExprKind::TypePath { .. }
         | ExprKind::ScriptType(_)
+        | ExprKind::Embed { .. }
         | ExprKind::SizeOf(_) => {}
         ExprKind::StructLit { fields, .. }
         | ExprKind::SliceLit { fields, .. }
@@ -82,7 +126,7 @@ fn names_in_expr(expr: &Expr, f: &mut dyn FnMut(&Ident)) {
                 names_in_expr(e, f);
             }
         }
-        ExprKind::ArrayLit { elems } => elems.iter().for_each(|e| names_in_expr(e, f)),
+        ExprKind::ArrayLit { elems } | ExprKind::Tuple(elems) => elems.iter().for_each(|e| names_in_expr(e, f)),
         ExprKind::Index { base, index } => {
             names_in_expr(base, f);
             names_in_expr(index, f);
@@ -128,6 +172,12 @@ fn names_in_expr(expr: &Expr, f: &mut dyn FnMut(&Ident)) {
             names_in_expr(then_expr, f);
             names_in_expr(else_expr, f);
         }
-        ExprKind::Closure(c) => names_in_block(&c.body, f),
+        ExprKind::Closure(c) => {
+            if let Some(a) = &c.arena {
+                names_in_expr(a, f);
+            }
+            names_in_block(&c.body, f)
+        }
+        ExprKind::Match(m) => names_in_match(m, f),
     }
 }

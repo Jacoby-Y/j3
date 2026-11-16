@@ -1,0 +1,308 @@
+/// Windows `j3.game.hotkey`: the pub names of `hotkey.j3` on `RegisterHotKey`. The combo is registered to a hidden
+/// message-only window of this module, so `WM_HOTKEY` reaches it whether SDL's event loop or `pressed()` pumps the
+/// thread's messages. Main thread only (the thread that registers gets the messages).
+/// - Windows keeps the combo from the focused app while it is registered, like X11's grab.
+/// - `pressed` is true once per press; holding the key does not repeat (`MOD_NOREPEAT`).
+/// - `Err(Taken)` when another program registered the combo. `Err(NoDisplay)` under `--headless`
+///   (`SDL_VIDEODRIVER=offscreen`/`dummy`), so tests never take real keys.
+/// - Windows drops the registration when the process exits.
+
+module j3.game.hotkey;
+
+use j3.game.Key;
+use j3.result.Result;
+use j3.sys;
+use j3.text.same;
+
+use lib "user32" as u32lib {
+    fn RegisterHotKey(wnd: int, id: i32, mods: u32, vk: u32): i32;
+    fn UnregisterHotKey(wnd: int, id: i32): i32;
+    fn RegisterClassExA(wc: ptr): u16;
+    fn CreateWindowExA(ex: u32, cls: ptr, name: ptr, style: u32, x: i32, y: i32, w: i32, h: i32, parent: int, menu: int, inst: int, param: ptr): int;
+    fn DefWindowProcA(wnd: int, msg: u32, wp: int, lp: int): int;
+    fn PeekMessageA(msg: ptr, wnd: int, lo: u32, hi: u32, remove: u32): i32;
+}
+
+use lib "kernel32" as k32 {
+    fn GetModuleHandleA(name: ptr): int;
+}
+
+/// No modifier.
+pub const NONE: int = 0;
+/// Shift held.
+pub const SHIFT: int = 1;
+/// Ctrl held.
+pub const CTRL: int = 4;
+/// Alt held.
+pub const ALT: int = 8;
+/// Super (Windows key) held.
+pub const SUPER: int = 64;
+
+/// Why `register` failed.
+pub enum HotkeyError {
+    /// The hidden window could not be made.
+    Unsupported,
+    /// Headless.
+    NoDisplay,
+    /// Another program already registered this combo.
+    Taken,
+    /// The key has no virtual-key code.
+    UnknownKey,
+    /// More than `MAX` hotkeys at once.
+    Full,
+}
+
+/// Hotkeys registered at once.
+pub const MAX: int = 16;
+
+const WM_HOTKEY: u32 = 0x0312;
+const MOD_NOREPEAT: int = 0x4000;
+
+/// A registered combo. `Hotkey {}` is an empty handle that never fires.
+pub struct Hotkey {
+    /// Slot index + 1 (also the `RegisterHotKey` id); 0 is the empty handle.
+    slot: int = 0;
+
+    /// True once for each press since the last call. False after `unregister`.
+    fn pressed(this: &Hotkey): bool {
+        if this.slot == 0 {
+            return false;
+        }
+        pump();
+        let s = &SLOTS[this.slot - 1];
+        if !s.used || s.count == 0 {
+            return false;
+        }
+        s.count -= 1;
+        return true;
+    }
+
+    /// Release the combo. The handle reads false afterwards.
+    fn unregister(this: &Hotkey) {
+        if this.slot == 0 {
+            return;
+        }
+        let s = &SLOTS[this.slot - 1];
+        if !s.used {
+            return;
+        }
+        u32lib.UnregisterHotKey(WND, i32(this.slot));
+        s.used = false;
+        s.count = 0;
+    }
+}
+
+struct Slot {
+    used: bool = false;
+    vk: int = 0;
+    mods: int = 0;
+    count: int = 0;
+}
+
+#[singleton]
+let WND: int = 0;
+#[singleton]
+let SLOTS: [16]Slot;
+/// One `MSG` (48 bytes on x64).
+#[singleton]
+let MSG: [6]int;
+
+/// Register `key` + `mods` (`NONE`, or a sum such as `CTRL + SHIFT`) for the whole desktop.
+pub fn register(key: Key, mods: int): Result<Hotkey, HotkeyError> {
+    let v = sys.env("SDL_VIDEODRIVER");
+    if same(v, "offscreen") || same(v, "dummy") {
+        return Result.Err(HotkeyError.NoDisplay);
+    }
+    if WND == 0 && !makeWindow() {
+        return Result.Err(HotkeyError.Unsupported);
+    }
+    let code = vkOf(key);
+    let m = winMods(mods);
+    let slot = 0 - 1;
+    for i in 0..MAX {
+        if SLOTS[i].used && SLOTS[i].vk == code && SLOTS[i].mods == m {
+            return Result.Err(HotkeyError.Taken);
+        }
+        if slot < 0 && !SLOTS[i].used {
+            slot = i;
+        }
+    }
+    if slot < 0 {
+        return Result.Err(HotkeyError.Full);
+    }
+    if u32lib.RegisterHotKey(WND, i32(slot + 1), u32(m + MOD_NOREPEAT), u32(code)) == 0 {
+        // ERROR_HOTKEY_ALREADY_REGISTERED 1409, or anything else the system refuses
+        return Result.Err(HotkeyError.Taken);
+    }
+    SLOTS[slot] = Slot { used: true, vk: code, mods: m, count: 0 };
+    return Result.Ok(Hotkey { slot: slot + 1 });
+}
+
+/// The module's SHIFT/CTRL/ALT/SUPER bits as `MOD_SHIFT` 4, `MOD_CONTROL` 2, `MOD_ALT` 1, `MOD_WIN` 8.
+fn winMods(mods: int): int {
+    let out = 0;
+    if mods & SHIFT != 0 { out += 4; }
+    if mods & CTRL != 0 { out += 2; }
+    if mods & ALT != 0 { out += 1; }
+    if mods & SUPER != 0 { out += 8; }
+    return out;
+}
+
+fn wndProc(wnd: int, msg: u32, wp: int, lp: int): int {
+    if msg == WM_HOTKEY {
+        hit(wp);
+        return 0;
+    }
+    return u32lib.DefWindowProcA(wnd, msg, wp, lp);
+}
+
+fn hit(id: int) {
+    if id >= 1 && id <= MAX && SLOTS[id - 1].used {
+        SLOTS[id - 1].count += 1;
+    }
+}
+
+/// Take the `WM_HOTKEY`s SDL has not pumped yet.
+fn pump() {
+    if WND == 0 {
+        return;
+    }
+    while u32lib.PeekMessageA(&MSG[0] as ptr, WND, WM_HOTKEY, WM_HOTKEY, u32(1)) != 0 {
+        hit(MSG[2]);
+    }
+}
+
+/// A message-only window (parent `HWND_MESSAGE`) of class `j3hotkey`.
+fn makeWindow(): bool {
+    let inst = k32.GetModuleHandleA(0 as ptr);
+    // WNDCLASSEXA: cbSize, style, lpfnWndProc @8, hInstance @24, lpszClassName @64; 80 bytes
+    let wc: [10]int = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    wc[0] = 80;
+    wc[1] = wndProc as ptr as int;
+    wc[3] = inst;
+    wc[8] = "j3hotkey\0".ptr as int;
+    u32lib.RegisterClassExA(&wc[0] as ptr);
+    WND = u32lib.CreateWindowExA(u32(0), "j3hotkey\0".ptr as ptr, "\0".ptr as ptr, u32(0), 0, 0, 0, 0, 0 - 3, 0, inst, 0 as ptr);
+    return WND != 0;
+}
+
+/// Windows virtual-key code of `key`.
+fn vkOf(key: Key): int {
+    match key {
+        Key.Escape { return 0x1b; }
+        Key.Left { return 0x25; }
+        Key.Right { return 0x27; }
+        Key.Up { return 0x26; }
+        Key.Down { return 0x28; }
+        Key.Space { return 0x20; }
+        Key.Enter { return 0x0d; }
+        Key.Tab { return 0x09; }
+        Key.Shift { return 0xa0; }
+        Key.Ctrl { return 0xa2; }
+        Key.Backspace { return 0x08; }
+        Key.A { return 0x41; }
+        Key.B { return 0x42; }
+        Key.C { return 0x43; }
+        Key.D { return 0x44; }
+        Key.E { return 0x45; }
+        Key.F { return 0x46; }
+        Key.G { return 0x47; }
+        Key.H { return 0x48; }
+        Key.I { return 0x49; }
+        Key.J { return 0x4a; }
+        Key.K { return 0x4b; }
+        Key.L { return 0x4c; }
+        Key.M { return 0x4d; }
+        Key.N { return 0x4e; }
+        Key.O { return 0x4f; }
+        Key.P { return 0x50; }
+        Key.Q { return 0x51; }
+        Key.R { return 0x52; }
+        Key.S { return 0x53; }
+        Key.T { return 0x54; }
+        Key.U { return 0x55; }
+        Key.V { return 0x56; }
+        Key.W { return 0x57; }
+        Key.X { return 0x58; }
+        Key.Y { return 0x59; }
+        Key.Z { return 0x5a; }
+        Key.Num0 { return 0x30; }
+        Key.Num1 { return 0x31; }
+        Key.Num2 { return 0x32; }
+        Key.Num3 { return 0x33; }
+        Key.Num4 { return 0x34; }
+        Key.Num5 { return 0x35; }
+        Key.Num6 { return 0x36; }
+        Key.Num7 { return 0x37; }
+        Key.Num8 { return 0x38; }
+        Key.Num9 { return 0x39; }
+        Key.F1 { return 0x70; }
+        Key.F2 { return 0x71; }
+        Key.F3 { return 0x72; }
+        Key.F4 { return 0x73; }
+        Key.F5 { return 0x74; }
+        Key.F6 { return 0x75; }
+        Key.F7 { return 0x76; }
+        Key.F8 { return 0x77; }
+        Key.F9 { return 0x78; }
+        Key.F10 { return 0x79; }
+        Key.F11 { return 0x7a; }
+        Key.F12 { return 0x7b; }
+        Key.F13 { return 0x7c; }
+        Key.F14 { return 0x7d; }
+        Key.F15 { return 0x7e; }
+        Key.F16 { return 0x7f; }
+        Key.F17 { return 0x80; }
+        Key.F18 { return 0x81; }
+        Key.F19 { return 0x82; }
+        Key.F20 { return 0x83; }
+        Key.F21 { return 0x84; }
+        Key.F22 { return 0x85; }
+        Key.F23 { return 0x86; }
+        Key.F24 { return 0x87; }
+        Key.Delete { return 0x2e; }
+        Key.Home { return 0x24; }
+        Key.End { return 0x23; }
+        Key.Minus { return 0xbd; }
+        Key.Period { return 0xbe; }
+        Key.Alt { return 0xa4; }
+        Key.PageUp { return 0x21; }
+        Key.PageDown { return 0x22; }
+        Key.Insert { return 0x2d; }
+        Key.PrintScreen { return 0x2c; }
+        Key.ScrollLock { return 0x91; }
+        Key.Pause { return 0x13; }
+        Key.CapsLock { return 0x14; }
+        Key.NumLock { return 0x90; }
+        Key.Menu { return 0x5d; }
+        Key.Super { return 0x5b; }
+        Key.ShiftRight { return 0xa1; }
+        Key.CtrlRight { return 0xa3; }
+        Key.AltRight { return 0xa5; }
+        Key.Grave { return 0xc0; }
+        Key.Equals { return 0xbb; }
+        Key.LeftBracket { return 0xdb; }
+        Key.RightBracket { return 0xdd; }
+        Key.Backslash { return 0xdc; }
+        Key.Semicolon { return 0xba; }
+        Key.Apostrophe { return 0xde; }
+        Key.Comma { return 0xbc; }
+        Key.Slash { return 0xbf; }
+        Key.KpDivide { return 0x6f; }
+        Key.KpMultiply { return 0x6a; }
+        Key.KpMinus { return 0x6d; }
+        Key.KpPlus { return 0x6b; }
+        Key.KpEnter { return 0x0d; }
+        Key.KpPeriod { return 0x6e; }
+        Key.Kp0 { return 0x60; }
+        Key.Kp1 { return 0x61; }
+        Key.Kp2 { return 0x62; }
+        Key.Kp3 { return 0x63; }
+        Key.Kp4 { return 0x64; }
+        Key.Kp5 { return 0x65; }
+        Key.Kp6 { return 0x66; }
+        Key.Kp7 { return 0x67; }
+        Key.Kp8 { return 0x68; }
+        Key.Kp9 { return 0x69; }
+    }
+}

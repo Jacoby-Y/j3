@@ -57,6 +57,9 @@ pub struct VariantDef {
     pub doc: String,
     /// `None` = payloadless. Any payload makes the whole enum a tagged union.
     pub payload: Option<Ty>,
+    /// `V(A, B, ..)`: `payload` is a struct of the fields, named `0`, `1`, .. (C layout, so the
+    /// union, its alignment and both backends need nothing special). `false` for `V(A)`.
+    pub multi: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

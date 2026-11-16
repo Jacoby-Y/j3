@@ -10,11 +10,8 @@ impl<'a> LlvmFn<'a> {
             StmtKind::Assign { place, rvalue } => {
                 let (ptr, _) = self.place_ptr(place)?;
                 let (v, ty) = self.rvalue(rvalue)?;
-                if matches!(self.cx.ty_kind(place.ty), TyKind::Array { .. }) {
-                    let n = llvm_ty::size(self.cx, place.ty);
-                    self.inst(&format!(
-                        "call void @llvm.memcpy.p0.p0.i64(ptr {ptr}, ptr {v}, i64 {n}, i1 false)"
-                    ));
+                if llvm_ty::in_mem(self.cx, place.ty) {
+                    self.copy_mem(&ptr, &v, place.ty);
                 } else {
                     self.store(&ty, &v, &ptr)?;
                 }
@@ -32,6 +29,13 @@ impl<'a> LlvmFn<'a> {
                 let _ = self.rvalue(rvalue)?;
             }
             StmtKind::Return { value } => match value {
+                Some(v) if self.sret => {
+                    // into the caller's slot now: defers below may still change the local
+                    let (e, _) = self.operand(v)?;
+                    self.copy_mem("%ret", &e, v.ty());
+                    self.emit_defers_through(false)?;
+                    self.term("ret void");
+                }
                 Some(v) => {
                     let (e, ty) = self.operand(v)?;
                     let e = if matches!(self.cx.ty_kind(v.ty()), TyKind::Array { .. }) {
@@ -39,8 +43,7 @@ impl<'a> LlvmFn<'a> {
                     } else {
                         e
                     };
-                    let slot = self.fresh();
-                    self.inst(&format!("{slot} = alloca {ty}"));
+                    let slot = self.alloca(&ty);
                     self.store(&ty, &e, &slot)?;
                     self.emit_defers_through(false)?;
                     let loaded = self.load(&ty, &slot);

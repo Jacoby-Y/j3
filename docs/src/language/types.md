@@ -10,6 +10,13 @@ let speed: f32 = 4.5;  // annotated
 hp -= 1;               // fine: let is mutable
 ```
 
+A `let` with a type and no value starts as zeros: numbers 0, bools `false`, pointers null, strings empty, and arrays and structs of those (field defaults do not apply). A reference or an enum has no zero, so it needs a value.
+
+```rust
+let buf: [64]u8;       // 64 zero bytes
+let pts: [8]Vec2;      // every x and y is 0
+```
+
 A `let` lasts until the end of its block. A later sibling block can reuse the name, but a name still in scope cannot be shadowed:
 
 ```rust
@@ -33,9 +40,27 @@ if far > 1.0 { let a = 2; printLn(`a={a}`); }   // fine: the first `a` has ended
 | `void` | No value |
 | `ptr`, `cstr` | Raw pointer and C string, for talking to C |
 
+## Tuples
+
+`(int, string)` is a type, `(a, b)` a value (two or more elements; `(x)` is just `x`), and `.0` / `.1` its elements (`t.0.1` nests). A function returns several values as a tuple, and `let` takes them apart:
+
+```rust
+fn divmod(a: int, b: int): (int, int) {
+    return (a / b, a % b);
+}
+
+let (q, r) = divmod(17, 5);
+let nest: ((int, f32), string) = ((1, 2.5), "hi");
+let ((a, b), s) = nest;
+```
+
+Tuple patterns also work in `match` arms, inside a variant (`Option.Some((k, v))`), and in `for (k, v) in xs`. A tuple is a plain struct, one type per element list in the whole program. `==`, `!=` and `hash()` work when every element has them, so a tuple can be a `Map` key; interpolation prints `(1, x)`. No other operators.
+
 ## Numbers and conversions
 
 A literal with no context is an `int`, or an `f64` if it has a dot. A literal next to a typed value takes that value's type, so with `far: f32`, both `2 * far` and `far * 0.5` are `f32`.
+
+A char literal `'a'` is a `u8` when it is ASCII and a `u32` code point otherwise (`'é'`, `'\u{1F600}'`). Like a number it takes the other operand's int type, so `ch == 'a'` works with `ch: u8` or `ch: int`. Escapes: `\n \r \t \0 \\ \' \"`, `\x7f` (ASCII only) and `\u{..}`. `'rows:` is still a loop label.
 
 Variables never convert on their own. Convert explicitly by calling the type:
 
@@ -51,7 +76,9 @@ let k = int(far);
 
 Integer overflow wraps. `%` truncates like C (`-7 % 3 == -1`); use `math.wrapi(-7, 3)` when you want an index that wraps around to `2`. Dividing by zero stops the program.
 
-The compound assignments `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, and `^=` exist.
+The compound assignments `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, and `>>=` exist.
+
+`1e9`, `2.5e-3` and `1E+10` are float literals, typed like `1.5`. An int literal above `i64::MAX` (`0xFFFFFFFFFFFFFFFF`, `18446744073709551615`) is accepted only where a `u64` is expected (`let m: u64 = ...`, `const M: u64 = ...`, a `u64` field or argument); anywhere else it is a compile error. A `const M: u64` folds on all 64 bits (`0xFFFF_FFFF_FFFF_FFFF & X`; `/`, `%` and `>>` unsigned) and can be an integer `match` arm even above `i64::MAX`.
 
 `&`, `|`, `^` and unary `~` work on integers of one type (`x & 0xff` types the literal; `0b1010` and `0xff` are integer literals). Precedence, tightest first: unary `- ! ~ &x`, `* / %`, `+ -`, `<< >>`, `&`, `^`, `|`, comparisons, `&&`, `||`. Unlike C, `x & MASK == 0` is `(x & MASK) == 0`. `~` on an unsigned type keeps its width (`~u8(0) == 255`). `<`, `<=`, `>`, `>=` take numbers; a `string` has no order (a compile error). Compare with `==` / `!=`, or `text.same` from `j3.text`. Bools use `&&` / `||`.
 
@@ -89,4 +116,16 @@ let hp = 7;
 printLn(`{name} has {hp} hp`);
 ```
 
-A struct in a hole needs the [`#[Debug]`](attributes.md) attribute. The result lives in the calling function's stack frame and holds up to 512 bytes; going past that stops the program. For longer text, build it with `j3.text.Text`.
+A struct or enum in a hole needs the [`#[Debug]`](attributes.md) attribute. The result lives in the calling function's stack frame and holds up to 512 bytes; going past that stops the program (exit 102). A lone hole, `` `{s}` `` with `s: string`, is `s` itself and has no limit.
+
+Because it lives in the frame, the string cannot leave the function. Returning it (directly, through a `let`, a branch, a `match`, or inside a struct, array or tuple), storing it through a reference, a slice or into a global (except from `main`), or passing it to a function that keeps it (`List.push`, `Map.put`, your own fn that stores its parameter) is a compile error that says where the callee keeps it. Calls through a fn value, closure, `dyn` method or C function are assumed to keep nothing.
+
+Text that must outlive the call, or is longer than 512 bytes, goes into a `j3.text.Text` the caller owns. `t.fmt(`...`)` appends each part straight into `t`, with no limit and no intermediate string, and returns `t`:
+
+```rust
+fn label(t: &Text, n: int): string {
+    return t.fmt(`n={n}`).str();
+}
+```
+
+`Text` also has `pushU64`, `pushHex`, `pushF64` / `pushF32` (the shortest text that reads back exactly), `pushChar` (UTF-8), `indent(n)`, `pushLine`, and `flushTo(fd)` for writing a big output in pieces. Backtick strings take no `\n` escapes; end a line with `t.pushLine(..)`. See `speculative/lang/text_fmt.j3`.

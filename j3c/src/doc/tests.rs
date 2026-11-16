@@ -32,7 +32,7 @@ fn index_lists_tasks_modules_and_provenance() {
     assert!(text.contains("internal (not for games): "), "{text}");
     assert!(text.contains(" j3.scene3d.editor.paste "), "{text}");
     assert!(!text.contains("Main thread only"), "{text}");
-    assert!(text.len() < 17_400, "index grew to {} bytes", text.len());
+    assert!(text.len() < 18_000, "index grew to {} bytes", text.len());
 }
 
 #[test]

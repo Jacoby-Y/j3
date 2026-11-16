@@ -64,6 +64,7 @@ See [Testing Headless](testing.md).
 
 | Command | Prints |
 |---|---|
+| `j3c dump-ast <file\|dir>` | The parsed AST as S-expressions |
 | `j3c dump-ir` | The checked IR |
 | `j3c dump-llvm` | LLVM IR |
 | `j3c dump-c` | C source |

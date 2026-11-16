@@ -268,6 +268,6 @@ What an agent can do here, with no device and no emulator image:
 - **SDL3** (native safe area, better lifecycle API). A separate migration for all platforms.
 - **Play Asset Delivery / asset packs, Play Games Services, in-app billing, ads, Play Integrity.** Each one is a JNI-and-manifest job of its own, worth doing when a game needs it.
 - **The editor and MCP tools on Android.**
-- Linux-only modules: `j3.instance`, `j3.term.pty`/`tty`/`screen`, `j3.game.hotkey`, `dragFiles`, `j3.steam`. Not applicable on Android. Small follow-up (not a chunk): make `j3.instance` return `Err` when `sys.PLATFORM != PLATFORM_LINUX` so linking it on arm64 cannot make wrong raw syscalls.
+- Linux-only modules: `j3.instance`, `j3.term.pty`/`tty`/`screen`, `j3.game.hotkey`, `dragFiles`, the `steam` package. Not applicable on Android. Small follow-up (not a chunk): make `j3.instance` return `Err` when `sys.PLATFORM != PLATFORM_LINUX` so linking it on arm64 cannot make wrong raw syscalls.
 - Vulkan, and Android-specific GPU tuning (ASTC textures, tile-friendly passes). Performance work comes after it runs correctly.
 - Gradle / Android Studio project export.

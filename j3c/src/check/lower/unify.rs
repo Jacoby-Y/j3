@@ -31,7 +31,7 @@ impl<'a> Lower<'a> {
                     Ok(())
                 }
             },
-            K::Named(_) => Ok(()),
+            K::Named(_) | K::Dyn(_) => Ok(()),
             K::Ref(inner) => match self.cx.ref_inner(a) {
                 Some(x) => self.unify(inner, x, tps, bind),
                 None => Ok(()),
@@ -42,6 +42,13 @@ impl<'a> Lower<'a> {
             },
             K::Array { elem, .. } => match self.cx.ty_kind(a) {
                 TyKind::Array { elem: e, .. } => self.unify(elem, *e, tps, bind),
+                _ => Ok(()),
+            },
+            K::Tuple(ps) => match self.cx.tuple_elems(a) {
+                Some(es) if es.len() == ps.len() => {
+                    let es = es.to_vec();
+                    ps.iter().zip(es).try_for_each(|(p, e)| self.unify(p, e, tps, bind))
+                }
                 _ => Ok(()),
             },
             K::Generic { name, args } => {
@@ -66,7 +73,7 @@ impl<'a> Lower<'a> {
                 };
                 self.unify_sig(params, ret.as_deref(), &ps, r, tps, bind)
             }
-            K::Closure { params, ret } => {
+            K::Closure { params, ret, .. } => {
                 let (ps, r) = match self.cx.closure_sig(a) {
                     Some((ps, r)) => (ps.clone(), *r),
                     None => return Ok(()),

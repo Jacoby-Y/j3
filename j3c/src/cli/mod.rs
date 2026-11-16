@@ -18,6 +18,7 @@ mod runner;
 
 pub(crate) use build::*;
 use check::*;
+pub(crate) use check::json_str;
 use dump::*;
 use glsl::dump_glsl;
 pub(crate) use runner::*;
@@ -79,6 +80,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
             None => { eprintln!("usage: j3c dump-bc <file.j3s>"); 1 }
         },
         "dump-syntax" => dump_syntax(rest),
+        "dump-ast" => dump_ast(rest),
         "dump-ui" => match rest.first() {
             Some(path) => match crate::ui::dump(std::path::Path::new(path)) {
                 Ok(t) => {
@@ -103,8 +105,10 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
         "fetch" => pkg::fetch_cmd(rest),
         "update" => pkg::update_cmd(rest),
         "add" => pkg::add_cmd(rest),
+        "pkg" => pkg::pkg_cmd(rest),
         "i18n" => crate::i18n::cmd(rest),
         "doc" => crate::doc::cmd(rest),
+        "manifest" => manifest_cmd(rest),
         "guide" => {
             print!("{}", crate::helptext::GUIDE);
             0
@@ -156,12 +160,15 @@ fn editor_tool(args: &[String]) -> i32 {
         Some("render") => crate::scene::render_cmd(rest),
         Some("gen") => crate::gen::cmd(rest),
         Some("imgdiff") => crate::imgdiff::cmd(rest),
-        Some("steam-check") => crate::steamcheck::cmd(rest),
+        Some("steam-check") => {
+            // ponytail: remove after one release (plan 09 chunk 6)
+            eprintln!("j3c -e steam-check moved to the steam package: j3c pkg steam check --sdk DIR (add steam = {{ git = \"https://github.com/Jacoby-Y/j3-steam\", tag = \"v0.1.0\" }} under [dependencies])");
+            1
+        }
         Some("--help" | "-h") => {
             println!("usage: j3c -e <tool> ...  (or --editor)");
             println!("  scene|render|gen|mcp|android|script-props   scene editor tools and the MCP server (`j3c -e scene --help`)");
             println!("  imgdiff a.png b.png [--tol N] [--max N] [--out d.png]   pixel diff for goldens");
-            println!("  steam-check --sdk DIR [--no-compile] [--no-windows]   verify j3.steam against the Steamworks SDK");
             println!("  web serve|run DIR [--headless] [--frames N] [--screenshot F]   serve or run a built web folder");
             0
         }
@@ -171,7 +178,7 @@ fn editor_tool(args: &[String]) -> i32 {
         Some("script-props") => script_props_cmd(rest),
         other => {
             if let Some(o) = other { eprintln!("j3c -e: unknown editor tool `{o}`"); }
-            eprintln!("usage: j3c -e scene|render|gen|imgdiff|steam-check|mcp|android|web|script-props ...  (or --editor)");
+            eprintln!("usage: j3c -e scene|render|gen|imgdiff|mcp|android|web|script-props ...  (or --editor)");
             1
         }
     }
@@ -291,6 +298,40 @@ fn help_cmd(rest: &[String]) -> i32 {
     }
 }
 
+/// `j3c manifest`: the `j3.toml` key list (`j3c help manifest`). `j3c manifest --json [path]`: the project's
+/// `j3.toml` (found from `path` or the cwd, like `check`) as one line of JSON, every table included.
+fn manifest_cmd(rest: &[String]) -> i32 {
+    let (json, paths): (Vec<&String>, Vec<&String>) = rest.iter().partition(|a| *a == "--json");
+    if json.is_empty() || paths.len() > 1 || paths.iter().any(|p| p.starts_with('-')) {
+        if !json.is_empty() || !paths.is_empty() {
+            eprintln!("usage: j3c manifest [--json [path]]");
+            return 1;
+        }
+        print!("{}", crate::helptext::MANIFEST);
+        return 0;
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let start = cwd.join(paths.first().map(|p| p.as_str()).unwrap_or("."));
+    let toml = if start.file_name().is_some_and(|n| n == "j3.toml") { Some(start.clone()) } else { project::find_toml_up(&start) };
+    let Some(toml) = toml.filter(|t| t.is_file()) else {
+        eprintln!("j3c manifest: no j3.toml at or above {}", start.display());
+        return 1;
+    };
+    let res = std::fs::read_to_string(&toml)
+        .map_err(|e| format!("read {}: {e}", toml.display()))
+        .and_then(|text| project::toml_json(&text).map_err(|e| e.replacen("j3.toml", &toml.display().to_string(), 1)));
+    match res {
+        Ok(j) => {
+            println!("{j}");
+            0
+        }
+        Err(e) => {
+            eprintln!("j3c manifest: {e}");
+            1
+        }
+    }
+}
+
 /// Strip `--frames N`, `--screenshot FILE`, and `--headless` from `run`'s arguments and pass
 /// them to the program: `j3.app` stops after N frames and saves the last one as a PNG, and
 /// headless runs use SDL's offscreen video and silent audio, so no window or sound appears.
@@ -345,6 +386,7 @@ fn print_help() {
     println!("    add NAME --path DIR | --git URL [--tag T]  add a dependency to j3.toml and fetch it");
     println!("    fetch            download git dependencies, write j3.lock");
     println!("    update [name]    move git dependencies to their newest commit, rewrite j3.lock");
+    println!("    pkg [NAME [CMD args...]]  list package tools, or build and run one (`doc packages`)");
     println!("    editor [--new] [project]  open the 3D scene editor");
     println!("    -e scene <op> ... list/get/add/set/delete/check scene objects by name (`-e scene --help`)");
     println!("    -e render [opts] draw a scene to a PNG without a window (`-e render --help`)");
@@ -368,7 +410,6 @@ fn print_help() {
     println!("    doc testing      headless run, screenshots, goldens, imgdiff");
     println!("    golden <dir> [names] [--bless]  headless goldens of a project: states in <dir>/golden.toml (`doc testing`)");
     println!("    -e imgdiff a.png b.png [--tol N] [--max N] [--out d.png]  pixel diff for goldens (exit 1 = differs)");
-    println!("    -e steam-check --sdk DIR  verify j3.steam against the Steamworks SDK: symbols, calls, layouts, ids (exit 1 = mismatch)");
     println!("    build [path]     emit, compile, write `target/<name>`");
     println!("    run [path]       emit, compile, execute");
     println!("    run --frames N [--screenshot F.png] [--headless]  stop an App after N frames;");
@@ -379,6 +420,7 @@ fn print_help() {
     println!("    fmt --write      rewrite files");
     println!("    fmt --check      exit 1 if formatting would change a file");
     println!("    lsp              language server (stdio JSON-RPC)");
+    println!("    dump-ast <file|dir>  print the parsed AST as S-expressions (the parse oracle)");
     println!("    dump-ir [path]   parse + typecheck; print IR");
     println!("    dump-ir samples  print hand-built place-IR samples");
     println!("    dump-c [path]    print C from the program");
@@ -390,10 +432,11 @@ fn print_help() {
     println!("    --fast           with run/build: strip bounds-check Abort; no `-g`");
     println!("    --emit llvm|c    backend (default llvm; override [emit] backend)");
     println!("    --opt N          0/1/2/3/s/z (override [emit] opt)");
-    println!("    --release        with run/build: smallest binary (opt s, no `-g`, stripped; keeps checks); build also writes [dist] build_outputs (zip, deb: `j3c doc ship`); `j3.build.RELEASE`/`DEV` say which");
+    println!("    --release        with run/build: smallest binary (opt s, no `-g`, stripped; keeps checks); build also writes [dist] build_outputs (zip, deb, or a package output: `j3c doc ship`); `j3.build.RELEASE`/`DEV` say which");
     println!("    size [path]      what is in `target/<name>`: sections, code per module, biggest functions");
     println!("    run samples      emit, compile, execute place tests");
     println!("    help manifest    print j3.toml keys");
+    println!("    manifest --json [path]  the project's j3.toml as JSON (every table), for scripts and package tools");
     println!("    version          print version");
     println!("    version --verbose  docs id, stdlib source, binary path: spot a stale j3c");
     println!("    help             print this help");

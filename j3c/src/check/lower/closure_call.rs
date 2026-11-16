@@ -135,6 +135,8 @@ impl<'a> Lower<'a> {
             b.assign(span, place.clone(), call);
             b.return_op(span, Some(Operand::Copy(place)));
         }
+        let body = b.finish();
+        lazy::wake(self.cx, &body.block, self.pending_mono);
         let name = format!("{}$thunk", self.cx.name_str(self.cx.func(id).name));
         let tname = self.cx.intern_name(&name);
         let tty = self.cx.closure_fn_ty(params, ret);
@@ -147,7 +149,7 @@ impl<'a> Lower<'a> {
             ty: tty,
             vis: Vis::Private,
             method_of: None,
-            kind: FuncKind::J3 { body: b.finish() },
+            kind: FuncKind::J3 { body },
             span,
         });
         self.ir_funcs.push(tid);

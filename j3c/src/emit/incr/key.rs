@@ -322,6 +322,12 @@ pub(super) fn hash_operand_into(cx: &IrCx, op: &Operand, out: &mut String) {
     if let Operand::Const(c) = op {
         match &c.kind {
             ConstKind::FnAddr(id) => out.push_str(&c_expr::func_c_name(cx, cx.func(*id))),
+            // `@embed` data can be megabytes: its hash, not its `Debug` text.
+            ConstKind::Bytes(b) if b.len() > 256 => {
+                let mut h = DefaultHasher::new();
+                b.hash(&mut h);
+                out.push_str(&format!("Bytes#{}:{:016x}", b.len(), h.finish()));
+            }
             kind => out.push_str(&format!("{kind:?}")),
         }
         out.push(';');

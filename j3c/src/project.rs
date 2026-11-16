@@ -3,19 +3,18 @@
 use std::path::{Path, PathBuf};
 
 mod deps;
-mod steam;
 mod toml;
-pub use deps::Dep;
+pub use deps::{dist_provider, Dep, Tool};
 pub(crate) use deps::{unlock, NO_FETCH};
-pub use steam::Steam;
-pub(crate) use steam::{parse_glibc, resolve_path};
-pub(crate) use toml::{toml_doc, toml_list, toml_str};
+pub(crate) use toml::{toml_doc, toml_json, toml_list, toml_str};
 use toml::{parse_toml, TomlVal};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub root: PathBuf,
     pub name: String,
+    /// `[package] bin`: the program's file name (`target/<bin>`), default `name`.
+    pub bin: String,
     /// `[package] version`, default `0.1.0` (the `.deb` version).
     pub version: String,
     /// `[package] description`, default `<name>, made with j3`.
@@ -26,8 +25,6 @@ pub struct Manifest {
     pub link: Link,
     pub dist: Dist,
     pub android: Android,
-    /// `[steam]` (`build_outputs = ["steam"]`, dev env).
-    pub steam: Steam,
     /// `[ui]`: present when the project has `.j3ui` components.
     pub ui: Option<Ui>,
     /// `[dependencies]`, transitive and flat (`j3c help manifest`).
@@ -140,19 +137,18 @@ fn check_java_package(p: &str) -> bool {
 }
 
 /// One `[dist] build_outputs` entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Output {
     Zip,
     Deb,
     /// Signed debug APK from the Android triples in `[emit] target` (`dist/apk.rs`).
     Apk,
-    /// Steam depot content + `app_build_<id>.vdf` (`dist/steam.rs`).
-    Steam,
+    /// A dep's `[dist_outputs]` tool of this name, run by `dist/pkg.rs`. Built-in names never become one.
+    Pkg(String),
 }
 
 impl Output {
-    pub const ALL: [(&'static str, Output); 4] =
-        [("zip", Output::Zip), ("deb", Output::Deb), ("apk", Output::Apk), ("steam", Output::Steam)];
+    pub const ALL: [(&'static str, Output); 3] = [("zip", Output::Zip), ("deb", Output::Deb), ("apk", Output::Apk)];
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,16 +249,16 @@ impl Manifest {
         self.out_path_for(self.emit.primary())
     }
 
-    /// One target keeps `target/<name>`. Several get `target/<triple>/<name>`.
-    /// An Android triple is always `target/<triple>/lib<name>.so` (the APK picks it up by ABI).
+    /// One target keeps `target/<bin>`. Several get `target/<triple>/<bin>`.
+    /// An Android triple is always `target/<triple>/lib<bin>.so` (the APK picks it up by ABI).
     pub fn out_path_for(&self, target: &str) -> PathBuf {
         let dir = self.root.join("target");
         if crate::emit::host::target_os(target) == crate::emit::host::TargetOs::Android {
-            dir.join(target_slug(target)).join(format!("lib{}.so", self.name))
+            dir.join(target_slug(target)).join(format!("lib{}.so", self.bin))
         } else if self.emit.targets.len() <= 1 {
-            dir.join(&self.name)
+            dir.join(&self.bin)
         } else {
-            dir.join(target_slug(target)).join(&self.name)
+            dir.join(target_slug(target)).join(&self.bin)
         }
     }
 }
@@ -377,6 +373,13 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
     if name.is_empty() {
         return Err("j3.toml: package.name is empty".to_string());
     }
+    let bin = match tbl.get("package", "bin").and_then(TomlVal::as_str) {
+        Some(b) if b.is_empty() || b.contains(['/', '\\']) || b.starts_with('.') => {
+            return Err(format!("j3.toml: package.bin `{b}` must be a plain file name"))
+        }
+        Some(b) => b.to_string(),
+        None => name.clone(),
+    };
     let lib = tbl.has_section("lib");
     let lib_entry = format!("src/{name}.j3");
     let entry_rel = tbl
@@ -420,7 +423,7 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
     if let Some(v) = tbl.get("emit", "target") {
         emit.targets = match v {
             TomlVal::List(xs) => xs.clone(),
-            TomlVal::Str(s) => vec![s.clone()],
+            TomlVal::Str(s) | TomlVal::Bare(s) => vec![s.clone()],
             TomlVal::Map(_) => return Err("j3.toml: emit.target must be a string or an array".to_string()),
         };
         if emit.targets.iter().any(|s| s.is_empty()) {
@@ -470,10 +473,8 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
     };
     if let Some(v) = tbl.get("dist", "build_outputs") {
         for o in v.as_list("dist.build_outputs")? {
-            let Some(&(_, out)) = Output::ALL.iter().find(|(n, _)| *n == o) else {
-                let names: Vec<&str> = Output::ALL.iter().map(|(n, _)| *n).collect();
-                return Err(format!("j3.toml: dist.build_outputs: unknown `{o}` (have {})", names.join(", ")));
-            };
+            // Checked against the deps' `[dist_outputs]` once they resolve (`check_outputs`).
+            let out = Output::ALL.iter().find(|(n, _)| *n == o).map_or(Output::Pkg(o), |(_, b)| b.clone());
             if !dist.outputs.contains(&out) {
                 dist.outputs.push(out);
             }
@@ -560,11 +561,12 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
     } else {
         None
     };
-    let steam = steam::parse(&tbl, &root, &name, &version)?;
     let deps = deps::resolve(&root, &tbl, &name)?;
+    check_outputs(&dist.outputs, &deps)?;
     Ok(Manifest {
         root,
         name,
+        bin,
         version,
         description,
         entry,
@@ -573,11 +575,27 @@ pub(crate) fn parse_manifest(text: &str, root: PathBuf) -> Result<Manifest, Stri
         link,
         dist,
         android,
-        steam,
         ui,
         deps,
         lib,
     })
+}
+
+/// Every `Output::Pkg` names a dep's dist output. (A built-in name never becomes one; `dist/pkg.rs`
+/// warns when a dep's output is shadowed by a built-in.)
+fn check_outputs(outputs: &[Output], deps: &[Dep]) -> Result<(), String> {
+    for o in outputs {
+        if let Output::Pkg(n) = o {
+            if dist_provider(deps, n).is_none() {
+                let names: Vec<&str> = Output::ALL.iter().map(|(n, _)| *n).collect();
+                return Err(format!(
+                    "j3.toml: dist.build_outputs: no package provides \"{n}\" (add one under [dependencies]); built in: {}",
+                    names.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

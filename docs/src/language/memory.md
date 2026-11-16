@@ -64,7 +64,23 @@ for i in 0..hits.len {
 }
 ```
 
-`items` and `len` are public fields; `hits.items[0..hits.len]` is the live slice. When the arena rewinds past where the list allocated, the list's memory goes with it.
+`items` and `len` are public fields; `hits.items[0..hits.len]` (or `hits.slice()`) is the live slice. `List` also has `pop`, `last`, `insert(i, x)`, `clear`, `extend`, `reserve`, and `indexOf` / `contains` for types with `==`. When the arena rewinds past where the list allocated, the list's memory goes with it.
+
+`mem.new(value)` allocates one value and returns a `&T` to it, which is how trees of `&T` are built (`mem.new(Expr.Add(mem.new(Expr.Num(2)), r))`).
+
+## Other collections
+
+All of these take their memory from an arena and are not shared across threads:
+
+| Module | What |
+|---|---|
+| `j3.data.map` | `Map<K, V>`: `put`, `get`, `getOr`, `getPtr`, `getOrPut`, `each`, `entries`, `sortedKeys` |
+| `j3.data.set` | `Set<T>`: `add`, `has`, `remove`, `each`, `sorted` |
+| `j3.data.pool` | `Pool<T>` with typed `Id<T>` handles (`Id<A>` is not an `Id<B>`; ids are `Map` keys) |
+| `j3.data.intern` | `Interner`: `string` to `u32` and back |
+| `j3.cmp` | `sort(xs)`, `sortBy(xs, less)`: stable merge sort |
+
+`speculative/lang/collections.j3` uses each of them.
 
 ## Entities are indices
 

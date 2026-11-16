@@ -121,7 +121,7 @@ build cannot work. [Plan 05](05-macos.md) fixes it (host triple plus a per-tripl
 
 - `cargo build --release --target x86_64-pc-windows-gnu` (rustup target installed, `J3C_NO_INSTALL=1`) compiles with one
   warning (an unused `mut`) and gives `j3c.exe` at 13 MB (V). Every `std::os::unix` use is behind `#[cfg(unix)]`
-  (`main.rs`, `editor/mod.rs`, `emit/host.rs:410`, `golden.rs`, `dist/deb.rs`, `dist/steam.rs`, `hot.rs`).
+  (`main.rs`, `editor/mod.rs`, `emit/host.rs:410`, `golden.rs`, `dist/deb.rs`, `hot.rs`).
 - Under wine, `j3c.exe version --verbose`, `check` of a console project and `doc search` work (V). **`check` of any
   SDL project fails** with "`j3.gfx.canvas` has no `loadPng`" (V). Root cause, `src/stdlib/mod.rs`: `embedded()` and
   `parts()` compare `strip_prefix(..).to_str()`, which is `gfx\canvas.j3` on Windows, with the `/`-keyed `FILES`
@@ -132,7 +132,7 @@ build cannot work. [Plan 05](05-macos.md) fixes it (host triple plus a per-tripl
   `editor/frontend.rs` (`target/j3_editor` `.is_file()`), `scene/mod.rs` (`dir.join("target/j3_editor")`) and
   `run_exe_in` (`canonicalize` of the bare path). `cli/build.rs:33`, `dist.rs:41` and `hot.rs:357` patch around it locally.
 - Paths keyed on `HOME`, which cmd/PowerShell do not set (Read): `editor/frontend.rs:124 cache_root`,
-  `emit/host/target.rs:158 mingw_sdl_libs`, `dist.rs:151`, `project/steam.rs:29`, `project.rs:454`, `doctor.rs`
+  `emit/host/target.rs:158 mingw_sdl_libs`, `dist.rs:151`, `project.rs:454`, `doctor.rs`
   ("~/.cache/j3 writable"). `config.rs` already uses `%APPDATA%`.
 - `--headless` sets `SDL_VIDEODRIVER=offscreen` (`cli/mod.rs:322`, `scene/mod.rs:308`, `mcp/ops.rs:301`,
   `golden.rs:138`). The Windows SDL build's offscreen driver has no GL (`j3c doc ship`, unverified here), so headless runs,
@@ -150,7 +150,7 @@ build cannot work. [Plan 05](05-macos.md) fixes it (host triple plus a per-tripl
 - `.github/workflows/ci.yml` and `release.yml` run only on `ubuntu-24.04`, `ubuntu-22.04` and `ubuntu-22.04-arm` (Read). No job
   builds a Windows target.
 - [Plan 02](02-public-release.md) has open boxes for "Windows: zip + winget/Scoop" (§6) and "Windows: run the built exe,
-  test in CI" (§7). [Plan 01](01-steam.md) item 7 covers the Windows Steam checks (`steam_api64.dll`, cloud,
+  test in CI" (§7). The `steam` package's `VERIFY.md` (was plan 01) item 7 covers the Windows Steam checks (`steam_api64.dll`, cloud,
   `J3_STEAM_FAKE`). Its status line says its Windows primitives were tested under wine.
 
 ## Gaps and blockers
@@ -229,7 +229,7 @@ In priority order. Bold ones block "a game runs and ships":
     `with_extension("exe")` patches go away.
 13. **One cache root**: `editor::cache_root()` falls back to `%LOCALAPPDATA%` and then `%USERPROFILE%\AppData\Local` when
     `XDG_CACHE_HOME` and `HOME` are unset. Every `HOME/.cache/j3` site calls it, so `sdl2-mingw` and `pkgs`
-    live under `%LOCALAPPDATA%\j3\` on Windows. The `~/` expansion in `project.rs:454` / `project/steam.rs:29` also
+    live under `%LOCALAPPDATA%\j3\` on Windows. The `~/` expansion in `project.rs:454` also
     accepts `USERPROFILE`.
 14. **ASLR**: keep `--disable-dynamicbase` until real hardware has run. Then try lld (`-fuse-ld=lld`, llvm-mingw's
     default), which writes TLS base relocations correctly. Turn ASLR on wherever that is shown to work. Wine
@@ -380,7 +380,7 @@ wineserver inherits pipes, see `targets.rs:171`. Run `wineserver -k` after a bat
 - Files: `j3c/src/stdlib/mod.rs` (`embedded`, `parts`: turn `\` into `/` before comparing; add a unit test with
   a backslashed path that runs on every OS, built by hand with `Path::new` components), `src/editor/frontend.rs`
   (`cache_root` per decision 13), `src/emit/host/target.rs:158`, `src/dist.rs:151`, `src/project.rs:454`,
-  `src/project/steam.rs:29`, `src/doctor.rs` (Windows rows: llvm-mingw clang finds `x86_64-w64-mingw32` headers,
+  `src/doctor.rs` (Windows rows: llvm-mingw clang finds `x86_64-w64-mingw32` headers,
   SDL kit present, `%LOCALAPPDATA%\j3` writable), `src/dist.rs:101` (no `zip` → `tar -a -c -f x.zip`, which is bsdtar and
   ships with Windows 10+), `src/lsp/proto.rs` (`file:///C:/` both ways, strip `\\?\`), `src/cli/mod.rs:322`,
   `src/scene/mod.rs:308`, `src/mcp/ops.rs:301`, `src/golden.rs:138` (decision 10, `cfg!(windows)`),
@@ -464,7 +464,7 @@ On a Windows 10 22H2 or 11 x64 machine, ideally one NVIDIA or AMD and one Intel 
 8. Host: install llvm-mingw, unzip `j3c`, follow `INSTALL.md`. Then `j3c new x --app`, `run`, `run --hot` (edit and save),
    `build --release`, `j3c editor`, `j3c -e mcp` + render from Claude Code, the VS Code extension (diagnostics, go to
    definition on `C:\` paths).
-9. Steam: [plan 01](01-steam.md) item 7.
+9. Steam: the `steam` package's `VERIFY.md` item 7.
 10. Defender/SmartScreen: does an unsigned zip game get flagged? Write down what players see.
 
 ## Out of scope

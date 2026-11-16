@@ -100,6 +100,11 @@ pub fn compile_manifest_dev(manifest: &Manifest) -> Result<Program, String> {
     )
 }
 
+/// A package tool (`pkgtool`): `manifest` is the package with the tool as entry; no window.
+pub fn compile_tool(manifest: &Manifest) -> Result<Program, String> {
+    load_and_check(&manifest.entry, GameBackend::Headless, true, Some(manifest), "")
+}
+
 pub fn check_path_lib(entry: &Path) -> Result<Program, String> {
     load_and_check(entry, GameBackend::Sdl, false, None, "")
 }

@@ -62,6 +62,12 @@ pub(crate) struct LlvmFn<'a> {
     /// ` optsize` / ` optsize minsize` for `-Os` / `-Oz` objects that LTO optimizes again: the
     /// link-time backend only keeps the size goal through these attributes.
     pub(crate) size_attr: &'static str,
+    /// Temporary slots (`alloca`) made while emitting the body, moved to the entry block at `entry_at`:
+    /// an `alloca` inside a loop would grow the stack every iteration in unoptimized builds.
+    hoisted: String,
+    entry_at: Option<usize>,
+    /// The function returns a [`llvm_ty::big`] value through the hidden pointer `%ret`.
+    sret: bool,
 }
 
 impl<'a> LlvmFn<'a> {
@@ -82,6 +88,9 @@ impl<'a> LlvmFn<'a> {
             abort_files: None,
             nounwind: false,
             size_attr: "",
+            hoisted: String::new(),
+            entry_at: None,
+            sret: false,
         }
     }
 
@@ -102,6 +111,9 @@ impl<'a> LlvmFn<'a> {
             abort_files: None,
             nounwind: false,
             size_attr: "",
+            hoisted: String::new(),
+            entry_at: None,
+            sret: false,
         }
     }
 
@@ -117,6 +129,17 @@ impl<'a> LlvmFn<'a> {
         let n = self.tmp;
         self.tmp += 1;
         format!("b{n}")
+    }
+
+    /// A fresh stack slot of type `ty`, allocated once in the entry block.
+    fn alloca(&mut self, ty: &str) -> String {
+        let slot = self.fresh();
+        if self.entry_at.is_some() {
+            self.hoisted.push_str(&format!("  {slot} = alloca {ty}\n"));
+        } else {
+            self.inst(&format!("{slot} = alloca {ty}"));
+        }
+        slot
     }
 
     fn inst(&mut self, s: &str) {
@@ -186,8 +209,7 @@ impl<'a> LlvmFn<'a> {
         if !da.is_empty() && !vals.is_empty() {
             let fmt = format!("{}:{}: {}{da}%lld{db}%lld\n\0", self.file.replace('%', "%%"), self.line, kind.message());
             let p = self.bytes_global(fmt.as_bytes());
-            let buf = self.fresh();
-            self.inst(&format!("{buf} = alloca [512 x i8], align 1"));
+            let buf = self.alloca("[512 x i8], align 1");
             let n = self.fresh();
             self.inst(&format!("{n} = call i32 (ptr, i64, ptr, ...) @snprintf(ptr {buf}, i64 512, ptr {p}, i64 {a}, i64 {b})"));
             let n64 = self.fresh();
@@ -232,7 +254,8 @@ impl<'a> LlvmFn<'a> {
     pub fn emit_func(&mut self, func: &Func) -> Result<String, String> {
         let body = self.body.ok_or("func body missing")?;
         let (params, ret) = self.cx.fn_sig(func.ty).ok_or("func without fn type")?;
-        let ret_ll = if ret == self.cx.common.void {
+        self.sret = ret != self.cx.common.void && llvm_ty::big(self.cx, ret);
+        let ret_ll = if ret == self.cx.common.void || self.sret {
             "void".to_string()
         } else {
             ll_type(self.cx, ret)?
@@ -258,13 +281,15 @@ impl<'a> LlvmFn<'a> {
             dbg_attr.insert_str(0, " nounwind");
         }
         dbg_attr.insert_str(0, self.size_attr);
-        let mut args = String::new();
-        for (i, p) in params.iter().enumerate() {
-            if i > 0 {
-                args.push_str(", ");
-            }
-            args.push_str(&format!("{} %a{i}", ll_type(self.cx, *p)?));
+        let mut args: Vec<String> = Vec::new();
+        if self.sret {
+            args.push("ptr noalias %ret".to_string());
         }
+        for (i, p) in params.iter().enumerate() {
+            let t = if llvm_ty::big(self.cx, *p) { "ptr".to_string() } else { ll_type(self.cx, *p)? };
+            args.push(format!("{t} %a{i}"));
+        }
+        let args = args.join(", ");
         self.text.push_str(&format!(
             "define {linkage}{ret_ll} @{name}({args}){dbg_attr} {{\n"
         ));
@@ -279,9 +304,17 @@ impl<'a> LlvmFn<'a> {
                 self.local_ptr(decl.id)
             ));
         }
+        self.entry_at = Some(self.text.len());
+        self.hoisted.clear();
         self.declare_locals(func, body);
         for (i, id) in body.params.iter().enumerate() {
             let ty = body.local(*id).ty;
+            if llvm_ty::big(self.cx, ty) {
+                // the caller passed its own storage: copy it before the body can write either
+                let local = self.local_ptr(*id);
+                self.copy_mem(&local, &format!("%a{i}"), ty);
+                continue;
+            }
             let ll = ll_type(self.cx, ty)?;
             self.store(&ll, &format!("%a{i}"), &self.local_ptr(*id))?;
         }
@@ -295,6 +328,10 @@ impl<'a> LlvmFn<'a> {
             }
         }
         self.text.push_str("}\n");
+        if let Some(at) = self.entry_at.take() {
+            let hoisted = std::mem::take(&mut self.hoisted);
+            self.text.insert_str(at, &hoisted);
+        }
         let mut out = std::mem::take(&mut self.globals);
         out.push_str(&self.text);
         self.text.clear();
@@ -349,6 +386,12 @@ impl<'a> LlvmFn<'a> {
     fn store(&mut self, ty: &str, val: &str, ptr: &str) -> Result<(), String> {
         self.inst(&format!("store {ty} {val}, ptr {ptr}"));
         Ok(())
+    }
+
+    /// `memcpy` of one `ty` value from `src` to `dst` (both addresses).
+    fn copy_mem(&mut self, dst: &str, src: &str, ty: Ty) {
+        let n = llvm_ty::size(self.cx, ty);
+        self.inst(&format!("call void @llvm.memcpy.p0.p0.i64(ptr {dst}, ptr {src}, i64 {n}, i1 false)"));
     }
 
     fn load(&mut self, ty: &str, ptr: &str) -> String {

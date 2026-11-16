@@ -8,6 +8,16 @@ command-line flags. Each release lists its breaking changes under **Breaking**.
 
 ## [Unreleased]
 
+### Breaking
+- Steam left `j3c` and is now the `steam` package (`steam = { git = "URL", tag = "v0.1.0" }` under
+  `[dependencies]`; `j3c doc steam`). `use j3.steam;` becomes `use steam;` (and `j3.steam.game` /
+  `j3.steam.ui` become `steam.game` / `steam.ui`); the old path fails with a line saying what to add.
+  `j3c -e steam-check --sdk DIR` becomes `j3c pkg steam check --sdk DIR` (the old command prints that
+  and exits 1). The built-in `steam` dist output is now the package's (`[dist] build_outputs =
+  ["steam"]` needs the dependency), and the `[steam]` table is read by the package, not `j3c`.
+  `j3c run` no longer sets `SteamAppId` / `J3_STEAM_LIB`; the package's dev-build `steam.init` does.
+  `j3c doc recipes steam` is the package's `examples/spacewar`.
+
 ### Fixed
 - `.j3ui`: a UI with more than about 2000 distinct computed styles (easy with `class="a b{x}"`
   holes on many elements) no longer grows memory every frame. The style cache grows instead of
@@ -18,6 +28,11 @@ command-line flags. Each release lists its breaking changes under **Breaking**.
 First public release.
 
 ### Added
+- Windows (`x86_64-pc-windows-gnu`) backends with the same pub API: `j3.term.pty` on ConPTY, `j3.proc` on
+  `CreateProcessW` (pipes, exit codes, cwd, `PATH` + `.exe`/`.bat`/`.cmd`), `j3.io.watch` on
+  `ReadDirectoryChangesW`, `j3.instance` on a named pipe, `j3.game.hotkey` on `RegisterHotKey`.
+  `Pty.waitReadable(ms)` on every platform is the reader thread's wait (no fd polling). `j3.io.watch`
+  no longer links raw `syscall` on macOS or web (a stub there). Tested under wine (`win_os_test.j3`).
 - `j3c`: an ahead-of-time compiler for the J3 game language, one Rust crate with no
   dependencies, compiling through clang to native Linux binaries (Windows, macOS, Android targets in progress).
 - Language: structs, enums, generics, traits, closures, UFCS, `extend`, SIMD, `f16`, and GPU

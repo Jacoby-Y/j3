@@ -1,4 +1,4 @@
-//! `j3c fetch`, `j3c update`, `j3c add`: package commands. Resolving lives in `project/deps.rs`;
+//! `j3c fetch`, `j3c update`, `j3c add`, `j3c pkg`: package commands. Resolving lives in `project/deps.rs`;
 //! these only load the manifest (which fetches and writes `j3.lock`) or edit `j3.toml`.
 
 use super::*;
@@ -65,6 +65,86 @@ pub(super) fn update_cmd(rest: &[String]) -> i32 {
             1
         }
     }
+}
+
+const PKG_USAGE: &str = "usage: j3c pkg [NAME [CMD [args...]]]\n  no NAME: every dependency's commands and dist outputs; NAME: that one's commands;\n  NAME CMD: build (cached) and run that command of the package, args passed untouched, exit code = its";
+
+/// `j3c pkg [NAME [CMD args...]]`: list package tools, or run one (`pkgtool::run`).
+pub(super) fn pkg_cmd(rest: &[String]) -> i32 {
+    if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
+        println!("{PKG_USAGE}");
+        return 0;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => pkg_in(&cwd, rest),
+        Err(e) => {
+            eprintln!("j3c pkg: cwd: {e}");
+            1
+        }
+    }
+}
+
+/// `j3c pkg` for the project around `start`.
+pub(super) fn pkg_in(start: &Path, rest: &[String]) -> i32 {
+    let m = match project::find_toml_up(start)
+        .ok_or_else(|| format!("no j3.toml in {} or above it", start.display()))
+        .and_then(|t| Manifest::load(&t))
+    {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("j3c pkg: {e}");
+            return 1;
+        }
+    };
+    let Some(name) = rest.first() else {
+        let with: Vec<&project::Dep> = m.deps.iter().filter(|d| !d.commands.is_empty() || !d.dist_outputs.is_empty()).collect();
+        if with.is_empty() {
+            println!("no package tools: no dependency has [commands] or [dist_outputs]");
+        }
+        for d in with {
+            print!("{}", tools_text(d));
+        }
+        return 0;
+    };
+    let Some(dep) = m.deps.iter().find(|d| &d.name == name) else {
+        let names: Vec<&str> = m.deps.iter().map(|d| d.name.as_str()).collect();
+        let have = if names.is_empty() { "the project has no dependencies".to_string() } else { format!("dependencies: {}", names.join(", ")) };
+        eprintln!("j3c pkg: no dependency `{name}` in {}\n  = note: {have}", m.root.join("j3.toml").display());
+        return 1;
+    };
+    let Some(cmd) = rest.get(1) else {
+        print!("{}", tools_text(dep));
+        return 0;
+    };
+    let Some(tool) = dep.commands.iter().find(|t| &t.name == cmd) else {
+        let names: Vec<&str> = dep.commands.iter().map(|t| t.name.as_str()).collect();
+        let have = if names.is_empty() { format!("`{name}` has no [commands]") } else { format!("commands of `{name}`: {}", names.join(", ")) };
+        eprintln!("j3c pkg: `{name}` has no command `{cmd}`\n  = note: {have}");
+        return 1;
+    };
+    match crate::pkgtool::run(&m, dep, tool, &rest[2..], &[]) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("j3c pkg: {e}");
+            1
+        }
+    }
+}
+
+/// A dep's tools, one per line under its name (`j3c pkg`, `j3c pkg NAME`).
+pub(super) fn tools_text(d: &project::Dep) -> String {
+    let mut out = format!("{}\n", d.name);
+    if d.commands.is_empty() {
+        out.push_str("  (no commands)\n");
+    }
+    let kinds = d.commands.iter().map(|t| ("", t)).chain(d.dist_outputs.iter().map(|t| ("dist: ", t)));
+    for (kind, t) in kinds {
+        match &t.help {
+            Some(h) => out.push_str(&format!("  {kind}{}  {h}\n", t.name)),
+            None => out.push_str(&format!("  {kind}{}\n", t.name)),
+        }
+    }
+    out
 }
 
 /// `j3c add <name> (--path DIR | --git URL [--tag T | --rev R | --branch B])`: one line under

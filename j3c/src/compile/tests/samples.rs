@@ -303,7 +303,12 @@ fn both_backends_run_01_through_08() {
         (
             "lang/small_gaps.j3",
             false,
-            "scaled=6\ntotal=3 rest=2\nzero\nother 1\ntwo\nother 3\nr0 c0\nr1 c0\na=1\na=2\nflags=3 low=3 inv=252 all=255\n",
+            "scaled=6\ntotal=3 rest=2\nzero\nother 1\ntwo\nother 3\nr0 c0\nr1 c0\na=1\na=2\nflags=3 low=3 inv=252 all=255\ndir=2 turn=3\narray 0 15 9 10\n",
+        ),
+        (
+            "lang/literals.j3",
+            false,
+            "kw=1230 two\nzero sum=0 x=0+4 y=0 on=false\nu64 max=true top=1 low=true\nfloats 1000000000 2 100 3\nshift 16 4\niter total=78 runes=3 sum=8694\nsplit 4 3 lines 2 high half all other 255\n",
         ),
         (
             "lang/ufcs.j3",
@@ -319,18 +324,73 @@ fn both_backends_run_01_through_08() {
         (
             "lang/traits.j3",
             false,
-            "3 | 70 | 2\ntrue false true true\n9 6 true false\ntotal=43\n",
+            "3 | 70 | 2\ntrue false true true\n9 6 true false\ntotal=43 true\ntag=203 direct=203 true\n",
+        ),
+        (
+            "lang/dyn.j3",
+            false,
+            "llvm 6 102 calls=2\nllvm lines=102\nc lines=7\ntotal=6 calls=4\npass=15 picked=c named=c up=llvm\n",
         ),
         (
             "lang/simd.j3",
             false,
             "2.5 4.5 6.5 8.5\n1 2 2.5 2.5\n4 3 2 1\n10\n10 4\n2147483647 -2147483648 1 -1\n2 2 6 16\n6 12\n2 4 6\n",
         ),
+        (
+            "lang/chars.j3",
+            false,
+            "a=97 smile=128512 e=233\n10 13 9 0 92 39 34 127\nwide=65 upper=65 same=true\nn=42\nfound=3\n",
+        ),
+        (
+            "lang/patterns.j3",
+            false,
+            "name name name digit space other\nadd\nmul\nnegative -3\nnumber 8\nother\n4 9 -1\nscore=143\n",
+        ),
+        (
+            "lang/variants.j3",
+            false,
+            "eval=15\nnamed=4 width=5\nExpr.Named(x, Span { lo: 4, hi: 9 }, true)\nExpr.Bin(BinOp.Add, &Expr, &Expr)\nlo=1 end=7\n",
+        ),
+        (
+            "lang/match_expr.j3",
+            false,
+            "cost=9\ndigit space other\narea=12 12 -1\nradius=5 0\nsquare rect circle dot\ntotal=12\nnot add\n",
+        ),
+        (
+            "lang/embed.j3",
+            false,
+            "greeting 27 bytes: hello from a file\nline two\n\nblob len=7 nul=0 ff=255 sum=57756288667\nb.txt: 6\ngreeting.txt: 27\ninline second\n",
+        ),
+        (
+            "lang/text_fmt.j3",
+            false,
+            "i=-5 u=-1 f=1.5 x=0.1 b=true Tok { name: let, at: Span { lo: 4, hi: 7 }, hot: true }\ni=-5 u=-1 f=1.5 x=0.1 b=true Tok { name: let, at: Span { lo: 4, hi: 7 }, hot: true }\nKind.Num(3, 2.5) Kind.Word(w) Kind.End done\n18446744073709551615 ff 0.1 \u{1F600}A   end\nlen=580\n",
+        ),
         ("lang/f16.j3", false, "0.25 0.875 1.5\n65504 true\n2048 2052 0.0999756\n2 8 12\n"),
         (
             "lang/shader.j3",
             false,
             "vert 827 bytes, frag 430 bytes\nuniforms: uScreen uAtlas\nattributes: 4\n  loc 0 comps 2 offset 0 stride 8 divisor 0\n  loc 1 comps 2 offset 0 stride 32 divisor 1\n  loc 2 comps 2 offset 8 stride 32 divisor 1\n  loc 3 comps 4 offset 16 stride 32 divisor 1\nhash -8512555711321048290 1809110793748906764\n",
+        ),
+        (
+            "lang/collections.j3",
+            false,
+            "fn if let\nsorted 1 3 9 has3=true at5=2 pop=9\na=1 b=3 c=1\ntotal=5\neval=3 uses=3 Expr.Add(&Expr, &Expr)\nx=0 y=1 again=0 str=y\n",
+        ),
+        (
+            "lang/tuples.j3",
+            false,
+            "q=3 r=2 t=2,1\n2.5 1 2.5 hi ((1, 2.5), hi)\nfound at 1 -> 50\n5 6 0\ntrue true true\nlen=2 at=home total=12\n",
+        ),
+        (
+            "lang/derive.j3",
+            false,
+            "true false true Key { name: x, n: 2 } true\ntrue true true true Shape.Rect(1, 2)\nShape.Dot Shape.Circle(2) Shape.Circle(4) Shape.Rect(0, 1)\nlen=2 a=5 pair=true same-as-tuple=true\nopt=true false true true map=12\n",
+        ),
+        (
+            "lang/boxed_closures.j3",
+            false,
+            "add5=6 add7=8 via stack param=15\nsnap=101 base=0\ncounter=3 n=0\nlist total=60 double=42 global=61\npool 11 22 33 on main=0 here=1\n",
         ),
         (
             "lang/closures.j3",

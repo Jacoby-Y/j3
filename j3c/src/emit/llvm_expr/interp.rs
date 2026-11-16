@@ -135,9 +135,8 @@ impl<'a> LlvmFn<'a> {
                 }
                 let fname = self.cx.name_str(field.name).to_string();
                 self.interp_memcpy(buf, used, format!("{fname}: ").as_bytes(), cap)?;
-                let slot = self.fresh();
                 let ll = ll_type(self.cx, ty)?;
-                self.inst(&format!("{slot} = alloca {ll}"));
+                let slot = self.alloca(&ll);
                 self.store(&ll, e, &slot)?;
                 let fp = self.fresh();
                 self.inst(&format!(

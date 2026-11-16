@@ -1,6 +1,7 @@
-//! Find `@script` edges in the parsed module graph.
+//! Find `@script` edges and `@embed*` files in the parsed module graph.
 
-use crate::parse::{Block, Expr, ExprKind, File, InterpPart, Item, Stmt};
+use crate::parse::EmbedKind;
+use crate::parse::{Block, Expr, ExprKind, File, InterpPart, Item, MatchStmt, Stmt};
 use crate::span::Span;
 
 pub struct ScriptRef {
@@ -8,8 +9,30 @@ pub struct ScriptRef {
     pub span: Span,
 }
 
+/// One `@embed*` call: what it reads, keyed by its span.
+pub struct EmbedRef {
+    pub kind: EmbedKind,
+    pub path: String,
+    pub glob: String,
+    pub span: Span,
+}
+
+#[derive(Default)]
+struct Refs {
+    scripts: Vec<ScriptRef>,
+    embeds: Vec<EmbedRef>,
+}
+
 pub fn find(file: &File) -> Vec<ScriptRef> {
-    let mut out = Vec::new();
+    refs(file).scripts
+}
+
+pub fn embeds(file: &File) -> Vec<EmbedRef> {
+    refs(file).embeds
+}
+
+fn refs(file: &File) -> Refs {
+    let mut out = Refs::default();
     for item in &file.items {
         match item {
             Item::Const(c) => expr(&c.value, &mut out),
@@ -48,10 +71,16 @@ pub fn find(file: &File) -> Vec<ScriptRef> {
     out
 }
 
-fn block(b: &Block, out: &mut Vec<ScriptRef>) {
+fn block(b: &Block, out: &mut Refs) {
     for stmt in &b.stmts {
         match stmt {
             Stmt::Let(s) => expr(&s.value, out),
+            Stmt::LetPat(s) => {
+                expr(&s.value, out);
+                if let Some(b) = &s.else_block {
+                    block(b, out);
+                }
+            }
             Stmt::Return(s) => {
                 if let Some(e) = &s.value {
                     expr(e, out);
@@ -86,12 +115,7 @@ fn block(b: &Block, out: &mut Vec<ScriptRef>) {
                 expr(&s.iter, out);
                 block(&s.body, out);
             }
-            Stmt::Match(s) => {
-                expr(&s.expr, out);
-                for arm in &s.arms {
-                    block(&arm.body, out);
-                }
-            }
+            Stmt::Match(s) => match_refs(s, out),
             Stmt::Defer(s) => block(&s.body, out),
             Stmt::Block(b) => block(b, out),
             Stmt::Labeled(s) => block(&Block { span: s.span, stmts: vec![(*s.body).clone()] }, out),
@@ -100,14 +124,33 @@ fn block(b: &Block, out: &mut Vec<ScriptRef>) {
     }
 }
 
-fn expr(e: &Expr, out: &mut Vec<ScriptRef>) {
+fn match_refs(s: &MatchStmt, out: &mut Refs) {
+    expr(&s.expr, out);
+    for arm in &s.arms {
+        if let Some(g) = &arm.guard {
+            expr(g, out);
+        }
+        block(&arm.body, out);
+        if let Some(t) = &arm.tail {
+            expr(t, out);
+        }
+    }
+}
+
+fn expr(e: &Expr, out: &mut Refs) {
     match &e.kind {
-        ExprKind::ScriptType(path) => out.push(ScriptRef {
+        ExprKind::ScriptType(path) => out.scripts.push(ScriptRef {
             path: path.clone(),
             span: e.span,
         }),
+        ExprKind::Embed { kind, path, glob } => out.embeds.push(EmbedRef {
+            kind: *kind,
+            path: path.clone(),
+            glob: glob.clone(),
+            span: e.span,
+        }),
         ExprKind::ScriptLit { path, fields } => {
-            out.push(ScriptRef {
+            out.scripts.push(ScriptRef {
                 path: path.clone(),
                 span: e.span,
             });
@@ -121,6 +164,7 @@ fn expr(e: &Expr, out: &mut Vec<ScriptRef>) {
             }
         }
         ExprKind::ArrayLit { elems }
+        | ExprKind::Tuple(elems)
         | ExprKind::Syscall { args: elems }
         | ExprKind::Atomic { args: elems, .. } => {
             for value in elems {
@@ -150,7 +194,12 @@ fn expr(e: &Expr, out: &mut Vec<ScriptRef>) {
                 expr(arg, out);
             }
         }
-        ExprKind::Closure(c) => block(&c.body, out),
+        ExprKind::Closure(c) => {
+            if let Some(a) = &c.arena {
+                expr(a, out);
+            }
+            block(&c.body, out)
+        }
         ExprKind::UiChoice { value, index, .. } => {
             expr(value, out);
             expr(index, out);
@@ -179,8 +228,12 @@ fn expr(e: &Expr, out: &mut Vec<ScriptRef>) {
             expr(then_expr, out);
             expr(else_expr, out);
         }
+        ExprKind::Match(m) => match_refs(m, out),
         ExprKind::Name(_)
         | ExprKind::Int(_)
+        | ExprKind::BigInt(_)
+        | ExprKind::Zeroed
+        | ExprKind::Char(_)
         | ExprKind::Float(_)
         | ExprKind::Bool(_)
         | ExprKind::String(_)

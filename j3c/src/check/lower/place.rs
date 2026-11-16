@@ -77,11 +77,10 @@ impl<'a> Lower<'a> {
                     let ty = self.cx.global(gid).ty;
                     return Ok(Place::global(gid, ty, self.global_access(gid), n.span));
                 }
-                Err(CheckError::new(
-                    self.path,
-                    n.span,
-                    format!("`{}` is not a place", n.name),
-                ))
+                let mut e = CheckError::new(self.path, n.span, format!("`{}` is not a place", n.name));
+                // a name whose `let` failed: a follow-on error (`stmt_recover`)
+                e.unknown = Some(n.name.clone());
+                Err(e)
             }
             ExprKind::String(bytes) => {
                 let n = self.fresh("s");
@@ -158,7 +157,9 @@ impl<'a> Lower<'a> {
                                 }
                                 Ok(place)
                             }
-                            None => Err(crate::check::error::no_field(self.cx, self.path, field.span, sid, &field.name)),
+                            None => Err(self
+                                .bound_miss_sid(field.span, sid, &format!("field `{}`", field.name), None)
+                                .unwrap_or_else(|| crate::check::error::no_field(self.cx, self.path, field.span, sid, &field.name))),
                         }
                     }
                     TyKind::String | TyKind::Slice { .. } => match field.name.as_str() {
@@ -182,7 +183,8 @@ impl<'a> Lower<'a> {
                 op: parse::UnaryOp::Deref,
                 expr: inner,
             } => {
-                let inner_place = self.try_place(inner)?;
+                // `*m.getPtr(k) += 1`: a pointer from a call is held in a temporary.
+                let inner_place = self.base_place(inner)?;
                 Ok(self.b.deref(self.cx, inner_place, expr.span))
             }
             _ => Err(CheckError::new(

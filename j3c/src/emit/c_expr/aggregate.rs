@@ -126,6 +126,9 @@ impl<'a> CWriter<'a> {
                 if fields.len() as u64 != *len {
                     return Err("aggregate field count != array len".to_string());
                 }
+                if c_ty::array_parts(self.cx, *elem).is_some() {
+                    return Err("nested array literal outside an assignment (`stmt` copies its rows)".into());
+                }
                 let elem_c = c_type(self.cx, *elem)?;
                 let mut s = format!("({elem_c}[{len}]){{ ");
                 for (i, f) in fields.iter().enumerate() {
@@ -164,7 +167,7 @@ impl<'a> CWriter<'a> {
         let cname = c_ty::enum_c_name(self.cx, variant.enum_id);
         match payload {
             Some(p) => {
-                let v = self.operand(p)?;
+                let v = self.value_operand(p)?;
                 Ok(format!(
                     "({cname}){{ .tag = {tag}, .u.v{idx} = {v} }}",
                     tag = variant.index,

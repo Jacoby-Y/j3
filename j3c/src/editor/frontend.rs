@@ -191,7 +191,7 @@ pub(super) fn cleanup_frontends(cache: &Path, current: &Path) {
 }
 
 /// Every file's path and bytes under `dir`, in a stable order.
-pub(super) fn hash_dir(dir: &Path, hasher: &mut DefaultHasher) {
+pub(crate) fn hash_dir(dir: &Path, hasher: &mut DefaultHasher) {
     let Ok(read) = fs::read_dir(dir) else { return };
     let mut entries: Vec<PathBuf> = read.flatten().map(|e| e.path()).collect();
     entries.sort();

@@ -1,5 +1,8 @@
 use crate::span::Span;
 
+pub use super::expr::{BinOp, ClosureLit, ClosureParam, EmbedKind, Expr, ExprKind, InterpPart, UnaryOp};
+pub use super::pat::{LetPatStmt, MatchArm, MatchStmt, Pat};
+
 #[derive(Clone, Debug)]
 pub struct Ident {
     pub name: String,
@@ -15,6 +18,20 @@ pub struct File {
     /// Scripts get their module name from their path, not a `module` line.
     pub is_script: bool,
     pub items: Vec<Item>,
+    /// What each `@embed*` in this file read, by the call's span; the loader fills it.
+    pub embeds: Vec<(Span, std::sync::Arc<Vec<EmbedFile>>)>,
+    /// Trait names this file writes as `dyn Name`; the checker makes a fat-pointer type for each.
+    pub dyns: Vec<String>,
+}
+
+/// One file an `@embed*` read.
+#[derive(Debug)]
+pub struct EmbedFile {
+    /// For `@embedDir`, the path below the folder (`/`-separated); else the path as written.
+    pub name: String,
+    /// Where it was read from, for the build stamp.
+    pub disk: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +104,8 @@ pub struct EnumItem {
     pub vis_pub: bool,
     pub debug: bool,
     pub try_catch: Option<(Ident, Ident)>,
+    /// `#[derive(Eq, Hash, Ord, Clone)]` (`Debug` sets `debug`); `check/derive.rs` writes the fns.
+    pub derives: Vec<Ident>,
     pub name: Ident,
     pub type_params: Vec<Ident>,
     /// `T: A + B`, same index as `type_params`.
@@ -99,7 +118,8 @@ pub struct VariantItem {
     pub span: Span,
     pub doc: String,
     pub name: Ident,
-    pub payload: Option<Type>,
+    /// `V(A, B)`: the positional fields; empty for a variant with no payload.
+    pub fields: Vec<Type>,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +147,8 @@ pub struct StructItem {
     pub debug: bool,
     pub packed: bool,
     pub gpu: GpuStruct,
+    /// `#[derive(..)]`, as on `EnumItem`.
+    pub derives: Vec<Ident>,
     pub name: Ident,
     pub type_params: Vec<Ident>,
     pub bounds: Vec<Vec<Ident>>,
@@ -182,6 +204,9 @@ pub struct FnItem {
     pub name: Ident,
     pub type_params: Vec<Ident>,
     pub bounds: Vec<Vec<Ident>>,
+    /// `where T: Eq + Hash` after the signature of a generic struct's method: bounds on the
+    /// struct's own type parameters that only this method needs (`List.indexOf`).
+    pub where_bounds: Vec<(Ident, Vec<Ident>)>,
     /// `#[impl]`: a free fn that gives a type a trait's method (`speculative/lang/traits.j3`).
     pub is_impl: bool,
     /// `#[shader]` / `#[shader(vertex)]` / `#[shader(fragment)]`: GPU code, never lowered for the CPU.
@@ -198,6 +223,8 @@ pub struct TraitItem {
     pub doc: String,
     pub vis_pub: bool,
     pub name: Ident,
+    /// `trait Ord: Eq`: a type meeting `Ord` must meet these too (keys after `bind_traits`).
+    pub supers: Vec<Ident>,
     pub methods: Vec<TraitMethod>,
 }
 
@@ -207,6 +234,8 @@ pub struct TraitMethod {
     pub name: Ident,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
+    /// A default body: a type without its own method gets this one (`check/traits.rs`).
+    pub body: Option<Block>,
 }
 
 #[derive(Clone, Debug)]
@@ -234,6 +263,8 @@ pub enum Stmt {
     ForEach(ForEachStmt),
     UseLocal(UseLocalStmt),
     Match(MatchStmt),
+    /// `let Span { lo, hi } = s;`: a destructuring `let`.
+    LetPat(LetPatStmt),
     Defer(DeferStmt),
     /// `'outer: while ...` / `'outer: for ...`.
     Labeled(LabeledStmt),
@@ -290,33 +321,6 @@ pub struct ForEachStmt {
 pub struct UseLocalStmt {
     pub span: Span,
     pub name: Ident,
-}
-
-#[derive(Clone, Debug)]
-pub struct MatchStmt {
-    pub span: Span,
-    pub expr: Expr,
-    pub arms: Vec<MatchArm>,
-}
-
-#[derive(Clone, Debug)]
-pub struct MatchArm {
-    pub span: Span,
-    /// An integer arm (`3`, `-1`) has an empty `path` and the literal here.
-    pub value: Option<Expr>,
-    pub path: Vec<Ident>,
-    pub payload: Option<Pat>,
-    pub body: Block,
-}
-
-#[derive(Clone, Debug)]
-pub enum Pat {
-    Bind(Ident),
-    Wild,
-    Variant {
-        path: Vec<Ident>,
-        payload: Option<Box<Pat>>,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -378,162 +382,16 @@ pub enum TypeKind {
         params: Vec<Type>,
         ret: Option<Box<Type>>,
     },
-    /// `closure(A, B): R`: a capturing function value; a param or `let` type only.
+    /// `closure(A, B): R`: param or `let` only; `boxed closure(..)` (arena captures) goes anywhere.
     Closure {
         params: Vec<Type>,
         ret: Option<Box<Type>>,
+        boxed: bool,
     },
-}
-
-#[derive(Clone, Debug)]
-pub struct Expr {
-    pub span: Span,
-    pub kind: ExprKind,
-}
-
-#[derive(Clone, Debug)]
-pub enum ExprKind {
-    Name(Ident),
-    Int(i64),
-    Float(f64),
-    Bool(bool),
-    String(Vec<u8>),
-    StructLit {
-        name: Ident,
-        type_args: Vec<Type>,
-        fields: Vec<(Ident, Expr)>,
-    },
-    TypePath {
-        name: Ident,
-        args: Vec<Type>,
-    },
-    ArrayLit {
-        elems: Vec<Expr>,
-    },
-    /// `[]T { ptr: …, len: … }`
-    SliceLit {
-        elem: Type,
-        fields: Vec<(Ident, Expr)>,
-    },
-    Index {
-        base: Box<Expr>,
-        index: Box<Expr>,
-    },
-    Slice {
-        base: Box<Expr>,
-        start: Option<Box<Expr>>,
-        end: Option<Box<Expr>>,
-    },
-    Field {
-        base: Box<Expr>,
-        field: Ident,
-    },
-    Call {
-        func: Box<Expr>,
-        type_args: Vec<Type>,
-        args: Vec<Expr>,
-    },
-    Syscall {
-        args: Vec<Expr>,
-    },
-    /// `@atomicLoad(p)`, `@atomicStore(p, v)`, `@atomicAdd(p, v)`, `@atomicCas(p, old, new)`, each with
-    /// an optional trailing order word (`acquire`); `order` is already validated for `op`.
-    Atomic {
-        op: crate::ir::op::AtomicOp,
-        order: crate::ir::op::AtomicOrder,
-        args: Vec<Expr>,
-    },
-    /// The type of a project-local `.j3s` file.
-    ScriptType(String),
-    /// `@script("path.j3s") { prop: value }`.
-    ScriptLit {
-        path: String,
-        fields: Vec<(Ident, Expr)>,
-    },
-    SizeOf(Type),
-    /// Compiler UI lowering: test an int index or a candidate-set enum against one arm.
-    UiChoice { set: Type, value: Box<Expr>, index: Box<Expr> },
-    SliceFrom {
-        ptr: Box<Expr>,
-        len: Box<Expr>,
-    },
-    Cast {
-        expr: Box<Expr>,
-        ty: Type,
-    },
-    Binary {
-        op: BinOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
-    Unary {
-        op: UnaryOp,
-        expr: Box<Expr>,
-    },
-    Interpolate {
-        parts: Vec<InterpPart>,
-    },
-    If {
-        cond: Box<Expr>,
-        then_expr: Box<Expr>,
-        else_expr: Box<Expr>,
-    },
-    Question {
-        expr: Box<Expr>,
-    },
-    /// `fn(a: int, b): T { body }`, a closure literal.
-    Closure(Box<ClosureLit>),
-}
-
-#[derive(Clone, Debug)]
-pub struct ClosureLit {
-    pub params: Vec<ClosureParam>,
-    pub ret: Option<Type>,
-    pub body: Block,
-}
-
-/// A closure parameter; the type may be left out when the expected type gives it.
-#[derive(Clone, Debug)]
-pub struct ClosureParam {
-    pub name: Ident,
-    pub ty: Option<Type>,
-}
-
-#[derive(Clone, Debug)]
-pub enum InterpPart {
-    Lit(Vec<u8>),
-    Expr(Expr),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Rem,
-    Shl,
-    Shr,
-    BitAnd,
-    BitOr,
-    BitXor,
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    And,
-    Or,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum UnaryOp {
-    Neg,
-    BitNot,
-    Ref,
-    Deref,
-    Not,
+    /// `(A, B)`: two or more elements, read as `.0`, `.1`.
+    Tuple(Vec<Type>),
+    /// `dyn Trait`: a data pointer plus the trait's method table (`check/lower/dyn_call.rs`).
+    Dyn(Ident),
 }
 
 impl File {
@@ -546,29 +404,5 @@ impl File {
             s.push_str(&part.name);
         }
         s
-    }
-}
-
-impl Expr {
-    /// `-3` and `-0.5` as the literals they are (the parser keeps them as negation).
-    pub fn folded_literal(&self) -> Expr {
-        if let ExprKind::Unary {
-            op: UnaryOp::Neg,
-            expr,
-        } = &self.kind
-        {
-            let kind = match expr.kind {
-                ExprKind::Int(v) => Some(ExprKind::Int(v.wrapping_neg())),
-                ExprKind::Float(v) => Some(ExprKind::Float(-v)),
-                _ => None,
-            };
-            if let Some(kind) = kind {
-                return Expr {
-                    span: self.span,
-                    kind,
-                };
-            }
-        }
-        self.clone()
     }
 }

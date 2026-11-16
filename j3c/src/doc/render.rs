@@ -163,12 +163,15 @@ pub(super) fn render_item(out: &mut String, cx: &Cx, item: &Item) -> usize {
             1
         }
         Item::Trait(t) if t.vis_pub && cx.filter.top(&t.name.name) => {
-            out.push_str(&format!("trait {}\n", t.name.name));
+            let supers: Vec<&str> = t.supers.iter().map(|s| s.name.as_str()).collect();
+            let supers = if supers.is_empty() { String::new() } else { format!(": {}", supers.join(" + ")) };
+            out.push_str(&format!("trait {}{supers}\n", t.name.name));
             push_doc(out, &t.doc, "    ");
             for m in &t.methods {
                 let ps: Vec<String> = m.params.iter().map(|p| format!("{}: {}", p.name.name, ty_str(&p.ty))).collect();
                 let ret = m.ret.as_ref().map(|r| format!(": {}", ty_str(r))).unwrap_or_default();
-                out.push_str(&format!("    fn {}({}){}\n", m.name.name, ps.join(", "), ret));
+                let default = if m.body.is_some() { " { default }" } else { "" };
+                out.push_str(&format!("    fn {}({}){}{default}\n", m.name.name, ps.join(", "), ret));
             }
             cx.at(out, t.span, "    ");
             1
@@ -244,9 +247,9 @@ pub(super) fn render_enum(out: &mut String, cx: &Cx, e: &EnumItem) -> usize {
     for v in &variants {
         out.push_str("    ");
         out.push_str(&v.name.name);
-        if let Some(ty) = &v.payload {
+        if !v.fields.is_empty() {
             out.push('(');
-            out.push_str(&ty_str(ty));
+            out.push_str(&v.fields.iter().map(ty_str).collect::<Vec<_>>().join(", "));
             out.push(')');
         }
         out.push('\n');
@@ -380,8 +383,14 @@ pub(super) fn ty_str(t: &Type) -> String {
         TypeKind::Ref(inner) => format!("&{}", ty_str(inner)),
         TypeKind::Array { len, elem } => format!("[{len}]{}", ty_str(elem)),
         TypeKind::Slice(elem) => format!("[]{}", ty_str(elem)),
-        TypeKind::Fn { params, ret } | TypeKind::Closure { params, ret } => {
-            let word = if matches!(t.kind, TypeKind::Fn { .. }) { "fn" } else { "closure" };
+        TypeKind::Tuple(es) => format!("({})", es.iter().map(ty_str).collect::<Vec<_>>().join(", ")),
+        TypeKind::Dyn(t) => format!("dyn {}", t.name),
+        TypeKind::Fn { params, ret } | TypeKind::Closure { params, ret, .. } => {
+            let word = match t.kind {
+                TypeKind::Fn { .. } => "fn",
+                TypeKind::Closure { boxed: true, .. } => "boxed closure",
+                _ => "closure",
+            };
             let params: Vec<String> = params.iter().map(ty_str).collect();
             match ret {
                 Some(r) => format!("{word}({}): {}", params.join(", "), ty_str(r)),

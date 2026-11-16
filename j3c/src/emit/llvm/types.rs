@@ -23,6 +23,25 @@ pub(super) fn ll_params(cx: &IrCx, fn_ty: Ty) -> Result<String, String> {
     Ok(s)
 }
 
+/// A J3 function's LLVM return and parameter types: a [`llvm_ty::big`] result becomes a leading
+/// `ptr` it is written through (`void` return), and a big parameter is a `ptr` to a copy the
+/// callee makes. `use lib` functions keep [`ll_ret`]/[`ll_params`] (the C ABI).
+pub(crate) fn ll_sig_j3(cx: &IrCx, fn_ty: Ty) -> Result<(String, String), String> {
+    let (params, ret) = cx.fn_sig(fn_ty).ok_or("not a fn type")?;
+    let mut ps = Vec::new();
+    let r = if ret == cx.common.void {
+        "void".to_string()
+    } else if llvm_ty::big(cx, ret) {
+        ps.push("ptr".to_string());
+        "void".to_string()
+    } else {
+        ll_type(cx, ret)?
+    };
+    for p in params.iter() {
+        ps.push(if llvm_ty::big(cx, *p) { "ptr".to_string() } else { ll_type(cx, *p)? });
+    }
+    Ok((r, ps.join(", ")))
+}
 
 pub(super) fn emit_struct_types(cx: &IrCx, modules: &[Module], out: &mut String) -> Result<(), String> {
     let mut ids = Vec::new();

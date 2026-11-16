@@ -10,6 +10,8 @@ xs[0] = 11;
 printLn(`{xs.len}`);    // 4
 ```
 
+An array is a value: assigning one copies it, and a function can take and return one (`fn corners(w: int): [4]int { return [0, w, w * 2, w * 3]; }`), on both backends.
+
 ## Slices
 
 `[]T` is a slice: a pointer and a length. It views memory someone else owns and never allocates. An array turns into a slice when you pass it where one is expected.
@@ -50,7 +52,9 @@ To build or change text, use `j3.text.Text`:
 let t = Text.scratch().add("score: ").add(`{score}`).str();
 ```
 
-A `Text.scratch()` result lasts until the next frame. See `j3c doc j3.text`.
+A `Text.scratch()` result lasts until the next frame. `t.fmt(`x={x}`)` appends a backtick string straight into a `Text` (see [String interpolation](types.md#string-interpolation)).
+
+`j3.text` also reads strings: `startsWith`, `endsWith`, `trim`, `lastIndexOf`, `replace`, `split(s, ",")` and `lines(s)` (iterators), `parseInt(s, 10)` / `parseU64` / `parseF64` (each an `Option`; floats round correctly), `writeF64` (the shortest text that reads back exactly), and UTF-8 with `decodeRune(s, i): (u32, int)`, `encodeRune`, `isValidUtf8` and `for cp in text.runes(s) { }`. See `j3c doc j3.text`.
 
 ## Growable lists
 

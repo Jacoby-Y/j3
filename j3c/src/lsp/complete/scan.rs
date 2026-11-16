@@ -35,6 +35,10 @@ pub(super) fn find_call(src: &str, offset: usize) -> Option<CallSite> {
             i += 2;
             continue;
         }
+        if let Some(n) = char_skip(src, i) {
+            i += n;
+            continue;
+        }
         match b[i] {
             b'"' => mode = Mode::String,
             b'`' => mode = Mode::Tick,
@@ -232,6 +236,10 @@ pub(super) fn lexical_mode(src: &str, offset: usize) -> Mode {
             i += 2;
             continue;
         }
+        if let Some(n) = char_skip(src, i) {
+            i += n;
+            continue;
+        }
         match b[i] {
             b'"' => mode = Mode::String,
             b'`' => mode = Mode::Tick,
@@ -281,6 +289,10 @@ pub(super) fn comment_at(line: &str) -> Option<usize> {
             i += 1;
             continue;
         }
+        if let Some(n) = char_skip(line, i) {
+            i += n;
+            continue;
+        }
         if b[i] == b'"' {
             string = true;
         } else if b[i] == b'`' {
@@ -327,6 +339,9 @@ pub(super) const KEYWORDS: &[(&str, &str)] = &[
     ("fn", "fn ${1:name}($2) {\n    $0\n}"),
     ("struct", "struct ${1:Name} {\n    $0\n}"),
     ("trait", "trait ${1:Name} {\n    fn ${2:name}(this: Self): ${3:int};\n}"),
+    ("dyn", "dyn ${1:Trait}"),
+    ("where", "where ${1:T}: ${2:Eq}"),
+    ("boxed", "boxed closure(${1:int}): ${2:int}"),
     ("extend", "extend ${1:Type} {\n    fn ${2:name}(this: &${1:Type}) {\n        $0\n    }\n}"),
     ("enum", "enum ${1:Name} {\n    ${2:A},\n}"),
     ("const", "const ${1:NAME}: ${2:int} = ${3:0};"),
@@ -342,3 +357,15 @@ pub(super) const KEYWORDS: &[(&str, &str)] = &[
     ("continue", "continue;"),
     ("defer", "defer $0;"),
 ];
+
+/// The byte length of a char literal (`'"'`, `'{'`) at `i`, so a scanner steps over it instead
+/// of opening a string or a brace there. The lexer's own rule.
+pub(super) fn char_skip(src: &str, i: usize) -> Option<usize> {
+    if src.as_bytes().get(i) != Some(&b'\'') {
+        return None;
+    }
+    match crate::parse::lex::char_lit(src.get(i..)?) {
+        Some(Ok((_, n))) => Some(n),
+        _ => None,
+    }
+}

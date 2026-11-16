@@ -9,6 +9,9 @@ pub(super) fn repo_keywords(out: &mut String) {
     // Contextual: `trait Name`, so a variable called `trait` stays a variable.
     match_rule(out, 4, "storage.type.trait.j3", &format!("\\b{}(?=\\s+{})", ITEM_TRAIT, IDENT), true);
     match_rule(out, 4, "storage.type.extend.j3", &format!("\\b{}(?=\\s+{})", ITEM_EXTEND, IDENT), true);
+    match_rule(out, 4, "keyword.other.where.j3", &format!("\\b{}(?=\\s+{}\\s*:)", FN_WHERE, IDENT), true);
+    match_rule(out, 4, "storage.type.dyn.j3", &format!("\\b{}(?=\\s+{})", TYPE_DYN, IDENT), true);
+    match_rule(out, 4, "storage.modifier.boxed.j3", &format!("\\b{}(?=\\s+{}\\()", TYPE_BOXED, TYPE_CLOSURE), true);
     for (i, (scope, names)) in groups.iter().enumerate() {
         let last = i + 1 == groups.len();
         let refs: Vec<&str> = names.iter().copied().collect();
@@ -134,10 +137,25 @@ pub(super) fn repo_numbers(out: &mut String) {
         out,
         4,
         "constant.numeric.float.j3",
-        "\\b[0-9]+\\.[0-9]+\\b",
+        "\\b[0-9]+(?:\\.[0-9]+(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+)\\b",
         true,
     );
     match_rule(out, 4, "constant.numeric.integer.j3", "\\b[0-9]+\\b", false);
+    out.push_str("      ]\n");
+    out.push_str("    }");
+}
+
+/// Char literals (`'a'`, `'\n'`, `'\u{1F600}'`), matched before labels so `'a'` is not `'a`.
+pub(super) fn repo_chars(out: &mut String) {
+    out.push_str("    \"chars\": {\n");
+    out.push_str("      \"patterns\": [\n");
+    match_rule(
+        out,
+        4,
+        "constant.character.j3",
+        r#"'(?:[^'\\\n]|\\(?:[nrt0\\'"]|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f]{1,6}\}))'"#,
+        false,
+    );
     out.push_str("      ]\n");
     out.push_str("    }");
 }

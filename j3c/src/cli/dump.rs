@@ -241,3 +241,59 @@ pub(super) fn dump_c_samples() -> i32 {
         }
     }
 }
+
+/// `j3c dump-ast <file|dir>`: the parsed AST as S-expressions (`parse/dump.rs`). A lex error prints
+/// what `j3c fmt` prints (fmt only lexes); a parse error prints the rendered diagnostic. Exit 1.
+pub(super) fn dump_ast(rest: &[String]) -> i32 {
+    const USAGE: &str = "usage: j3c dump-ast <file.j3|file.j3s|dir>";
+    let path = match rest {
+        [p] if !p.starts_with('-') => p.as_str(),
+        [h] if h == "--help" || h == "-h" => {
+            println!("{USAGE}");
+            println!("  prints the parsed AST of each file as S-expressions (a dir: `;; path` before each)");
+            return 0;
+        }
+        _ => {
+            eprintln!("{USAGE}");
+            return 1;
+        }
+    };
+    let files = match collect_j3(Some(path)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("j3c: {e}");
+            return 1;
+        }
+    };
+    let many = files.len() > 1;
+    for file in &files {
+        let src = match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("j3c: read {}: {e}", file.display());
+                return 1;
+            }
+        };
+        if let Err(e) = crate::fmt::format_src(&src) {
+            eprintln!("j3c: fmt {}: {e}", file.display());
+            return 1;
+        }
+        let script = file.extension().is_some_and(|x| x == "j3s");
+        let id = crate::span::FileId(1);
+        let parsed =
+            if script { crate::parse::parse_script(&src, id, &["script".to_string()]) } else { crate::parse::parse(&src, id) };
+        match parsed {
+            Ok(ast) => {
+                if many {
+                    println!(";; {}", file.display());
+                }
+                print!("{}", crate::parse::dump::dump(&ast));
+            }
+            Err(e) => {
+                eprint!("{}", crate::parse::format_error(&file.display().to_string(), &src, &e));
+                return 1;
+            }
+        }
+    }
+    0
+}

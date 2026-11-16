@@ -16,18 +16,24 @@ pub(super) fn mod_origin_key(module: &str) -> String {
 pub(super) fn site_note(cx: &IrCx, id: FuncId) -> Option<String> {
     let (span, _) = cx.inst_sites.get(&id)?;
     let (path, line) = cx.file(span.file)?.loc(span.start);
-    Some(format!(
-        "while instantiating `{}` (called at {path}:{line})",
-        cx.name_str(cx.func(id).name)
-    ))
+    let f = cx.func(id);
+    let name = match f.method_of {
+        Some(sid) => {
+            let sd = cx.struct_def(sid);
+            let args: Vec<String> = sd.ty_args.iter().map(|(_, t)| super::super::traits::ty_text(cx, *t)).collect();
+            format!("{}<{}>.{}", cx.name_str(sd.name), args.join(", "), cx.name_str(f.name))
+        }
+        None => cx.name_str(f.name).to_string(),
+    };
+    Some(format!("while instantiating `{name}` (called at {path}:{line})"))
 }
 
 /// What the lowering of one fn knows about generic free fns.
 pub(super) struct GenCtx<'a> {
-    temps: &'a HashMap<String, FnItem>,
+    pub(super) temps: &'a HashMap<String, FnItem>,
     origins: &'a HashMap<String, OriginNs>,
-    names: &'a HashMap<String, String>,
-    mods: &'a HashMap<String, String>,
+    pub names: &'a HashMap<String, String>,
+    pub mods: &'a HashMap<String, String>,
     insts: &'a mut HashMap<(String, Vec<Ty>), FuncId>,
     pub traits: &'a TraitEnv,
     /// How deep the fn being lowered sits in a chain of instantiations.
@@ -45,6 +51,14 @@ impl<'a> GenCtx<'a> {
     ) -> GenCtx<'a> {
         GenCtx { temps, origins, names, mods, insts, traits, depth: 0 }
     }
+
+    /// The same context with the generic fns in scope of another module (an instance's origin).
+    pub fn rebind<'b>(self, names: &'b HashMap<String, String>, mods: &'b HashMap<String, String>) -> GenCtx<'b>
+    where
+        'a: 'b,
+    {
+        GenCtx { temps: self.temps, origins: self.origins, names, mods, insts: self.insts, traits: self.traits, depth: self.depth }
+    }
 }
 
 /// The template without its body: `alloc_fn` reads only the signature.
@@ -56,6 +70,7 @@ fn signature_of(f: &FnItem) -> FnItem {
         name: f.name.clone(),
         type_params: Vec::new(),
         bounds: Vec::new(),
+        where_bounds: Vec::new(),
         is_impl: false,
         shader: None,
         params: f.params.clone(),
@@ -65,14 +80,16 @@ fn signature_of(f: &FnItem) -> FnItem {
 }
 
 /// Does `t` write any of the names in `tps`?
-fn mentions(t: &parse::Type, tps: &[String]) -> bool {
+pub(crate) fn mentions(t: &parse::Type, tps: &[String]) -> bool {
     use parse::TypeKind as K;
     match &t.kind {
         K::Named(n) => tps.contains(n),
         K::Generic { args, .. } => args.iter().any(|a| mentions(a, tps)),
         K::Ref(i) | K::Slice(i) => mentions(i, tps),
         K::Array { elem, .. } => mentions(elem, tps),
-        K::Fn { params, ret } | K::Closure { params, ret } => {
+        K::Tuple(es) => es.iter().any(|e| mentions(e, tps)),
+        K::Dyn(_) => false,
+        K::Fn { params, ret } | K::Closure { params, ret, .. } => {
             params.iter().any(|p| mentions(p, tps)) || ret.as_deref().is_some_and(|r| mentions(r, tps))
         }
     }
@@ -161,7 +178,7 @@ impl<'a> Lower<'a> {
         }
         // A closure literal's written types (`fn(v: int): f32 {..}`) also bind what its parameter names.
         for (arg, param) in args.iter().zip(&tmpl.params[skip..]) {
-            if let (ExprKind::Closure(c), parse::TypeKind::Closure { params: pp, ret: pr }) = (&arg.kind, &param.ty.kind) {
+            if let (ExprKind::Closure(c), parse::TypeKind::Closure { params: pp, ret: pr, .. }) = (&arg.kind, &param.ty.kind) {
                 for (cp, want) in c.params.iter().zip(pp) {
                     if let Some(t) = &cp.ty {
                         let ty = self.resolve_ty(t)?;
@@ -218,6 +235,81 @@ impl<'a> Lower<'a> {
         Ok(Rvalue::call(span, ret, Operand::fn_addr(span, fty, id), ops))
     }
 
+    /// `mem.new(v)` for `fn new<T>(this: &Arena, value: T): &T`: a generic method called without `::<..>`
+    /// infers its own type args from the arguments, as `call_generic` does for free fns. `None` when
+    /// `name` is not (only) a generic method of `sid`, so the plain method path reports.
+    pub(super) fn call_method_inferred(
+        &mut self,
+        span: Span,
+        sid: StructId,
+        name: &str,
+        recv: Place,
+        args: &[Expr],
+    ) -> Result<Option<Rvalue>, CheckError> {
+        let key = (sid.0, name.to_string());
+        if self.methods.contains_key(&key) {
+            return Ok(None);
+        }
+        let Some(temp) = self.method_temps.get(&key).cloned() else { return Ok(None) };
+        if temp.params.len() != args.len() + 1 {
+            return Ok(None);
+        }
+        let tps: Vec<String> = temp.type_params.iter().map(|p| p.name.clone()).collect();
+        let mut bind: HashMap<String, Ty> = HashMap::new();
+        let mut slots = Vec::new();
+        for (arg, param) in args.iter().zip(&temp.params[1..]) {
+            if bare_num(arg) || matches!(arg.kind, ExprKind::Closure(_)) || !mentions(&param.ty, &tps) {
+                slots.push(Slot::Later);
+                continue;
+            }
+            let op = self.operand(arg, None)?;
+            self.bind_arg(arg.span, &param.ty, op.ty(), &tps, &mut bind)?;
+            slots.push(Slot::Done(op));
+        }
+        let mut targs = Vec::new();
+        for (tp, ident) in tps.iter().zip(&temp.type_params) {
+            match bind.get(tp) {
+                Some(&t) => targs.push(t),
+                None => {
+                    return Err(CheckError::new(self.path, span, format!("cannot infer type parameter `{tp}` of `{name}`"))
+                        .note(format!("`{tp}` is declared at {}", self.line_of(ident.span)))
+                        .help(format!("write it: `.{name}::<int>(..)`")));
+                }
+            }
+        }
+        let id = self.lookup_method(sid, name, targs, span)?;
+        let fty = self.cx.func(id).ty;
+        let Some((params, ret)) = self.cx.fn_sig(fty).map(|(p, r)| (p.clone(), r)) else {
+            return Err(CheckError::new(self.path, span, "not a function"));
+        };
+        let mut ops = vec![self.auto_this(span, recv, params[0])?];
+        for (i, (arg, slot)) in args.iter().zip(slots).enumerate() {
+            let want = params[1 + i];
+            let op = match slot {
+                Slot::Done(op) => op,
+                Slot::Later => self.operand(arg, Some(want))?,
+            };
+            ops.push(self.adapt_arg(arg.span, op, want)?);
+        }
+        Ok(Some(Rvalue::call(span, ret, Operand::fn_addr(span, fty, id), ops)))
+    }
+
+    /// `ty_str` with the type arguments of generic struct and enum instances (`Id<A>`).
+    pub(super) fn ty_args_str(&self, ty: Ty) -> String {
+        let args: Vec<Ty> = match self.cx.ty_kind(ty) {
+            TyKind::Struct(id) => self.cx.struct_def(*id).ty_args.iter().map(|(_, t)| *t).collect(),
+            TyKind::Enum(id) => self.cx.enum_def(*id).ty_args.clone(),
+            TyKind::Ref(inner) => return format!("&{}", self.ty_args_str(*inner)),
+            _ => Vec::new(),
+        };
+        let base = self.ty_str(ty);
+        if args.is_empty() {
+            return base;
+        }
+        let parts: Vec<String> = args.iter().map(|t| self.ty_args_str(*t)).collect();
+        format!("{base}<{}>", parts.join(", "))
+    }
+
     fn bind_arg(
         &self,
         span: Span,
@@ -257,7 +349,7 @@ impl<'a> Lower<'a> {
         Err(self.mismatch(span, "type mismatch", op.ty(), want))
     }
 
-    fn line_of(&self, span: Span) -> String {
+    pub(super) fn line_of(&self, span: Span) -> String {
         match self.cx.file(span.file) {
             Some(f) => {
                 let (p, l) = f.loc(span.start);
@@ -268,7 +360,7 @@ impl<'a> Lower<'a> {
     }
 
     /// The instance of `name` for `targs`: made once, queued for lowering, shared by all modules.
-    fn generic_instance(
+    pub(super) fn generic_instance(
         &mut self,
         span: Span,
         module: &str,

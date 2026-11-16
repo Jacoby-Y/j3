@@ -1,0 +1,327 @@
+/// Windows `j3.proc`: the pub names of `proc.j3` on `CreateProcessW` with inherited pipes (only those three handles
+/// reach the child). The program is found on `PATH` with `.exe`, `.com`, `.bat`, `.cmd` tried in turn; a batch file
+/// runs through `cmd.exe`. Arguments are quoted for the C runtime's parser. No console window opens for the child.
+
+module j3.proc;
+
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use j3.thread;
+use j3.thread.Thread;
+use j3.winsys;
+use j3.winsys.Started;
+
+/// Why a program could not be run.
+pub enum ProcError {
+    /// No such program on `PATH` (or at the given path).
+    NotFound,
+    /// It exists but `CreateProcessW` refused it (not executable, bad format).
+    ExecFailed,
+    /// Pipes or process creation failed.
+    Fail,
+}
+
+/// What a finished program left behind.
+pub struct Output {
+    /// Exit code.
+    code: int;
+    /// Everything it wrote to stdout.
+    out: []u8;
+    /// Everything it wrote to stderr.
+    err: []u8;
+
+    /// stdout as a string.
+    fn outStr(this: &Output): string {
+        return this.out as string;
+    }
+
+    /// stderr as a string.
+    fn errStr(this: &Output): string {
+        return this.err as string;
+    }
+}
+
+/// A running program and the parent's ends of its stdin, stdout, and stderr pipes (Win32 handles).
+pub struct Child {
+    /// Process id.
+    pid: int;
+    /// Write end of its stdin (-1 once closed).
+    stdin: int;
+    /// Read end of its stdout.
+    stdout: int;
+    /// Read end of its stderr.
+    stderr: int;
+    /// Set once `tryWait` saw it end (its code then in `code`).
+    done: bool = false;
+    code: int = 0;
+    /// Process handle.
+    h: int = 0;
+
+    /// Write `data` to its stdin. False when it stopped reading.
+    fn write(this: &Child, data: []u8): bool {
+        return this.stdin >= 0 && winsys.writeAll(this.stdin, data.ptr as ptr, data.len);
+    }
+
+    /// Close its stdin, so it sees end of input.
+    fn closeStdin(this: &Child) {
+        if this.stdin >= 0 {
+            winsys.close(this.stdin);
+            this.stdin = -1;
+        }
+    }
+
+    /// Read up to `buf.len` bytes of its stdout: the count, 0 at the end, negative on failure.
+    fn read(this: &Child, buf: []u8): int {
+        return winsys.read(this.stdout, buf);
+    }
+
+    /// Read up to `buf.len` bytes of its stderr, like `read`.
+    fn readErr(this: &Child, buf: []u8): int {
+        return winsys.read(this.stderr, buf);
+    }
+
+    /// `read` without blocking: `None` when no bytes are waiting yet, else what `read` returns.
+    fn tryRead(this: &Child, buf: []u8): Option<int> {
+        return tryReadFd(this.stdout, buf);
+    }
+
+    /// `readErr` without blocking: `None` when no bytes are waiting yet.
+    fn tryReadErr(this: &Child, buf: []u8): Option<int> {
+        return tryReadFd(this.stderr, buf);
+    }
+
+    /// Its exit code if it has ended, `None` while it runs. Does not block or close the pipes.
+    fn tryWait(this: &Child): Option<int> {
+        if !this.done {
+            let c = winsys.exitCodeIfDone(this.h);
+            if c < 0 {
+                return Option.None;
+            }
+            this.done = true;
+            this.code = c;
+        }
+        return Option.Some(this.code);
+    }
+
+    /// Write `input` to stdin, read stdout and stderr to the end (both at once, so neither pipe
+    /// fills and stalls the program), then wait for it.
+    fn collect(this: &Child, input: []u8, arena: &Arena): Output {
+        let out = Text.new(arena);
+        let err = Text.new(arena);
+        let buf = arena.alloc::<u8>(65536);
+        // stdin from a helper thread: a pipe write blocks while full, and the program may not read until we read
+        let feed = Feed { h: this.stdin, data: input };
+        let t = &arena.alloc::<Thread>(1)[0];
+        let feeding = input.len > 0;
+        if feeding {
+            thread.spawn(t, "proc.stdin", feedLoop, &feed as ptr);
+            this.stdin = -1;
+        } else {
+            this.closeStdin();
+        }
+        let outOpen = true;
+        let errOpen = true;
+        while outOpen || errOpen {
+            let busy = false;
+            for k in 0..2 {
+                let open = if k == 0 { outOpen } else { errOpen };
+                if !open { continue; }
+                let h = if k == 0 { this.stdout } else { this.stderr };
+                let n = winsys.avail(h);
+                if n == 0 { continue; }
+                let r = if n < 0 { 0 } else { winsys.read(h, buf[0..if n < buf.len { n } else { buf.len }]) };
+                if r <= 0 {
+                    if k == 0 { outOpen = false; } else { errOpen = false; }
+                } else {
+                    busy = true;
+                    if k == 0 { out.pushBytes(buf[0..r]); } else { err.pushBytes(buf[0..r]); }
+                }
+            }
+            if !busy && (outOpen || errOpen) {
+                winsys.sleepMs(1);
+            }
+        }
+        if feeding {
+            thread.join(t);
+        }
+        let code = this.wait();
+        return Output { code: code, out: out.bytes, err: err.bytes };
+    }
+
+    /// Wait for it to end, close the pipes, and return its exit code.
+    fn wait(this: &Child): int {
+        this.closeStdin();
+        if this.stdout >= 0 {
+            winsys.close(this.stdout);
+            this.stdout = -1;
+        }
+        if this.stderr >= 0 {
+            winsys.close(this.stderr);
+            this.stderr = -1;
+        }
+        if !this.done && this.h != 0 {
+            winsys.waitFor(this.h, winsys.INFINITE);
+            this.tryWait();
+        }
+        return this.code;
+    }
+
+    /// Stop it (`TerminateProcess`, exit code 143 like `SIGTERM`). `wait` afterwards.
+    fn kill(this: &Child) {
+        if !this.done && this.h != 0 {
+            winsys.terminate(this.h, 128 + sys.SIGTERM);
+        }
+    }
+}
+
+struct Feed {
+    h: int;
+    data: []u8;
+}
+
+fn feedLoop(p: ptr) {
+    let f = p as &Feed;
+    winsys.writeAll(f.h, f.data.ptr as ptr, f.data.len);
+    winsys.close(f.h);
+}
+
+/// Wait until one of `children` that has not ended yet ends, and return its index; its `code`
+/// is then set. Children that already ended (`done`) are skipped. `Fail` when none is left running
+/// or more than 64 are.
+pub fn waitAny(children: []Child): Result<int, ProcError> {
+    let hs: [64]int;
+    let idx: [64]int;
+    let n = 0;
+    for i in 0..children.len {
+        if !children[i].done {
+            if ended(&children[i]) {
+                return Result.Ok(i);
+            }
+            if n == 64 {
+                return Result.Err(ProcError.Fail);
+            }
+            hs[n] = children[i].h;
+            idx[n] = i;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return Result.Err(ProcError.Fail);
+    }
+    let r = winsys.waitAnyOf(&hs[0] as ptr, n, winsys.INFINITE);
+    if r < 0 {
+        return Result.Err(ProcError.Fail);
+    }
+    ended(&children[idx[r]]);
+    return Result.Ok(idx[r]);
+}
+
+fn ended(c: &Child): bool {
+    if let Option.Some(_) = c.tryWait() {
+        return true;
+    }
+    return false;
+}
+
+/// Read up to `buf.len` bytes of pipe handle `fd` without blocking: `None` when nothing is waiting, `Some(0)` at the
+/// end, else the count.
+pub fn tryReadFd(fd: int, buf: []u8): Option<int> {
+    let n = winsys.avail(fd);
+    if n == 0 {
+        return Option.None;
+    }
+    if n < 0 {
+        return Option.Some(0);
+    }
+    return Option.Some(winsys.read(fd, buf[0..if n < buf.len { n } else { buf.len }]));
+}
+
+/// Run `argv` (program name first) with `input` on its stdin and wait for it to end.
+pub fn run(argv: []string, input: string, arena: &Arena): Result<Output, ProcError> {
+    let c = startIn(argv, "", arena)?;
+    return Result.Ok(c.collect(input as []u8, arena));
+}
+
+/// Start `argv` in this directory. Write with `Child.write`, then `collect` or `wait`.
+pub fn start(argv: []string, arena: &Arena): Result<Child, ProcError> {
+    return startIn(argv, "", arena);
+}
+
+/// Start `argv` with `cwd` as its working directory ("" keeps this one).
+pub fn startIn(argv: []string, cwd: string, arena: &Arena): Result<Child, ProcError> {
+    if argv.len == 0 {
+        return Result.Err(ProcError.NotFound);
+    }
+    let path = findProgram(argv[0], arena);
+    if path.len == 0 {
+        return Result.Err(ProcError.NotFound);
+    }
+    // three pipes, read end then write end; the child gets stdin's read end and the others' write ends
+    let ends = arena.alloc::<int>(6);
+    for k in 0..3 {
+        if !winsys.pipe(true, ends[k * 2..k * 2 + 2]) {
+            for i in 0..k * 2 { winsys.close(ends[i]); }
+            return Result.Err(ProcError.Fail);
+        }
+    }
+    winsys.noInherit(ends[1]);
+    winsys.noInherit(ends[2]);
+    winsys.noInherit(ends[4]);
+    let kids = arena.alloc::<int>(3);
+    kids[0] = ends[0];
+    kids[1] = ends[3];
+    kids[2] = ends[5];
+    let list = winsys.attrList(arena);
+    let si = arena.alloc::<int>(winsys.SI_SIZE / 8);
+    let s32: []u32 = @slice(si.ptr as ptr, winsys.SI_SIZE / 4);
+    s32[0] = u32(winsys.SI_SIZE);
+    s32[15] = winsys.STARTF_USESTDHANDLES;
+    si[10] = kids[0];
+    si[11] = kids[1];
+    si[12] = kids[2];
+    si[13] = list as int;
+    let ok = list as int != 0 && winsys.setAttr(list, winsys.ATTR_HANDLE_LIST, kids.ptr as ptr, 24);
+    let cwdW = if cwd.len > 0 { winsys.wide(cwd, arena) } else { 0 as ptr };
+    let st = Started { h: 0, pid: 0 };
+    let err = 0;
+    if ok {
+        st = winsys.create(winsys.cmdLine(path, argv, arena), true, winsys.CREATE_NO_WINDOW, 0 as ptr, cwdW, si.ptr as ptr);
+        err = winsys.lastError();
+    }
+    winsys.freeAttrList(list);
+    winsys.close(kids[0]);
+    winsys.close(kids[1]);
+    winsys.close(kids[2]);
+    if st.h == 0 {
+        winsys.close(ends[1]);
+        winsys.close(ends[2]);
+        winsys.close(ends[4]);
+        if !ok {
+            return Result.Err(ProcError.Fail);
+        }
+        if err == winsys.ERROR_FILE_NOT_FOUND || err == winsys.ERROR_PATH_NOT_FOUND || err == 267 {
+            return Result.Err(ProcError.NotFound);
+        }
+        return Result.Err(ProcError.ExecFailed);
+    }
+    return Result.Ok(Child { pid: st.pid, stdin: ends[1], stdout: ends[2], stderr: ends[4], h: st.h });
+}
+
+/// `name` itself when it has a path separator or drive, else the first `dir\name` on `PATH` (with `.exe`, `.com`,
+/// `.bat`, `.cmd` tried when `name` has no extension). "" when none.
+pub fn findProgram(name: string, arena: &Arena): string {
+    return winsys.findProgram(name, arena);
+}
+
+/// NUL-terminated copy of `s` on `arena` (the returned bytes include the NUL).
+pub fn cString(s: string, arena: &Arena): []u8 {
+    let b = arena.alloc::<u8>(s.len + 1);
+    for i in 0..s.len {
+        b[i] = s[i];
+    }
+    b[s.len] = 0;
+    return b;
+}

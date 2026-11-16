@@ -1,0 +1,160 @@
+// Tests for j3.io.watch (inotify). Linux. Run from the repo root:
+//   timeout 60 j3c run j3c/stdlib/tests/watch_test.j3
+// Panics on the first failed check.
+
+module watch_test;
+
+use j3.io.printLn;
+use j3.io.watch.{ Event, Kind, Watcher };
+use j3.memory.{ Arena, List, newArena };
+use j3.proc;
+use j3.result.Result;
+use j3.sys.panic;
+
+const D = "/tmp/j3_watch_test/d";
+
+fn ok(cond: bool, msg: string) {
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic(msg);
+    }
+}
+
+fn eq(a: string, b: string): bool {
+    if a.len != b.len { return false; }
+    for i in 0..a.len {
+        if a[i] != b[i] { return false; }
+    }
+    return true;
+}
+
+fn sh(cmd: string, a: &Arena) {
+    match proc.run(["/bin/sh", "-c", cmd], "", a) {
+        Result.Ok(o) { ok(o.code == 0, cmd); }
+        Result.Err(_) { ok(false, cmd); }
+    }
+}
+
+fn kindNo(k: Kind): int {
+    match k {
+        Kind.Create { return 0; }
+        Kind.Delete { return 1; }
+        Kind.Modify { return 2; }
+        Kind.MoveIn { return 3; }
+        Kind.MoveOut { return 4; }
+        Kind.Overflow { return 5; }
+    }
+    return -1;
+}
+
+/// How many events in `evs` match.
+fn count(evs: &List<Event>, id: int, k: Kind, name: string): int {
+    let n = 0;
+    for i in 0..evs.len {
+        let e = evs.items[i];
+        if e.id == id && kindNo(e.kind) == kindNo(k) && eq(e.name, name) { n += 1; }
+    }
+    return n;
+}
+
+fn countId(evs: &List<Event>, id: int): int {
+    let n = 0;
+    for i in 0..evs.len {
+        let e = evs.items[i];
+        if e.id == id { n += 1; }
+    }
+    return n;
+}
+
+fn addOk(w: &Watcher, path: string): int {
+    match w.add(path) {
+        Result.Ok(id) { return id; }
+        Result.Err(_) { ok(false, path); }
+    }
+    return -1;
+}
+
+fn drain(w: &Watcher, evs: &List<Event>) {
+    evs.len = 0;
+    w.poll(evs);
+}
+
+fn main() {
+    let a = newArena(1048576);
+    sh("rm -rf /tmp/j3_watch_test && mkdir -p /tmp/j3_watch_test/d && printf 'v1' > /tmp/j3_watch_test/d/f.txt", &a);
+    let w = Watcher.create(&a);
+    let dirId = addOk(&w, D);
+    let fileId = addOk(&w, "/tmp/j3_watch_test/d/f.txt");
+    ok(dirId != fileId, "two ids");
+    match w.add("/tmp/j3_watch_test/nope") {
+        Result.Ok(_) { ok(false, "add missing"); }
+        Result.Err(_) { }
+    }
+    let evs = List<Event>.new(&a);
+    ok(w.poll(&evs) == 0, "quiet at start");
+
+    sh("touch /tmp/j3_watch_test/d/new.txt", &a);
+    drain(&w, &evs);
+    ok(count(&evs, dirId, Kind.Create, "new.txt") == 1, "create");
+    ok(countId(&evs, fileId) == 0, "file watch ignores siblings");
+
+    sh("rm /tmp/j3_watch_test/d/new.txt", &a);
+    drain(&w, &evs);
+    ok(count(&evs, dirId, Kind.Delete, "new.txt") == 1, "delete");
+
+    sh("printf x > /tmp/j3_watch_test/out.txt && mv /tmp/j3_watch_test/out.txt /tmp/j3_watch_test/d/in.txt", &a);
+    drain(&w, &evs);
+    ok(count(&evs, dirId, Kind.MoveIn, "in.txt") == 1, "move in");
+
+    sh("mv /tmp/j3_watch_test/d/in.txt /tmp/j3_watch_test/gone.txt", &a);
+    drain(&w, &evs);
+    ok(count(&evs, dirId, Kind.MoveOut, "in.txt") == 1, "move out");
+
+    sh("printf v2 >> /tmp/j3_watch_test/d/f.txt", &a);
+    drain(&w, &evs);
+    ok(count(&evs, fileId, Kind.Modify, "") >= 1, "file modify");
+    ok(count(&evs, dirId, Kind.Modify, "f.txt") >= 1, "folder sees the write");
+
+    // an editor's save: write a temp file, rename it over
+    sh("printf v3 > /tmp/j3_watch_test/d/.f.tmp && mv /tmp/j3_watch_test/d/.f.tmp /tmp/j3_watch_test/d/f.txt", &a);
+    drain(&w, &evs);
+    ok(count(&evs, fileId, Kind.Modify, "") == 1, "rename over is Modify");
+    ok(count(&evs, fileId, Kind.Delete, "") == 0, "rename over is not Delete");
+    ok(count(&evs, dirId, Kind.MoveIn, "f.txt") == 1, "folder sees the rename");
+
+    // the watch survives the replace
+    sh("printf v4 >> /tmp/j3_watch_test/d/f.txt", &a);
+    drain(&w, &evs);
+    ok(count(&evs, fileId, Kind.Modify, "") >= 1, "modify after replace");
+
+    // delete then create again: same id
+    sh("rm /tmp/j3_watch_test/d/f.txt && touch /tmp/j3_watch_test/d/f.txt", &a);
+    drain(&w, &evs);
+    ok(count(&evs, fileId, Kind.Delete, "") == 1 && count(&evs, fileId, Kind.Create, "") == 1, "delete + create");
+
+    // remove: no more events for that id; unknown ids are a no-op
+    w.remove(fileId);
+    w.remove(fileId);
+    w.remove(999);
+    sh("printf v5 >> /tmp/j3_watch_test/d/f.txt", &a);
+    drain(&w, &evs);
+    ok(countId(&evs, fileId) == 0, "removed file watch is quiet");
+    ok(count(&evs, dirId, Kind.Modify, "f.txt") >= 1, "folder still watched");
+
+    // the folder itself deleted: Delete with "", then remove is a no-op
+    sh("rm -rf /tmp/j3_watch_test/d", &a);
+    drain(&w, &evs);
+    ok(count(&evs, dirId, Kind.Delete, "") == 1, "folder deleted");
+    w.remove(dirId);
+
+    // steady state: polling an empty queue allocates nothing
+    let used = a.used;
+    for i in 0..100 { drain(&w, &evs); }
+    ok(a.used == used, "poll allocates nothing");
+
+    w.close();
+    w.close();
+    ok(w.poll(&evs) == 0, "closed");
+    sh("rm -rf /tmp/j3_watch_test", &a);
+    printLn("watch_test ok");
+}

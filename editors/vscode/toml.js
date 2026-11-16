@@ -8,7 +8,8 @@ const SCHEMA = {
   package: {
     doc: "Package identity. `name` is required. `entry` defaults to `src/main.j3`.",
     keys: {
-      name: { doc: "Binary name. `build` writes `target/<name>`." },
+      name: { doc: "Package name. `build` writes `target/<name>`." },
+      bin: { doc: "Program file name when it differs from `name`: `build` writes `target/<bin>`. Default `name`." },
       entry: {
         doc: "File that contains `main`. Default `src/main.j3`.",
         suggest: ['"src/main.j3"'],
@@ -74,9 +75,9 @@ const SCHEMA = {
     doc: "Packaging. `build_outputs = [\"zip\", \"deb\"]` makes `build --release` write them per target to `target/dist/`. Menu actions: `[dist.actions]` with `id = { name = \"New Island\", exec = \"--new-island\" }`.",
     keys: {
       build_outputs: {
-        doc: "What `build --release` writes to `target/dist/`: `zip` (program, `include`, Windows DLLs), `deb` (Linux: installs to `/opt/<name>` with a launcher, menu entry, and icon), and `apk` (Android, needs an Android triple in `[emit] target`; `j3c doc android`), and `steam` (Steam depot content + `app_build_<id>.vdf`, needs `[steam]`).",
+        doc: "What `build --release` writes to `target/dist/`: `zip` (program, `include`, Windows DLLs), `deb` (Linux: installs to `/opt/<name>` with a launcher, menu entry, and icon) and `apk` (Android, needs an Android triple in `[emit] target`; `j3c doc android`). Any other name runs the dependency `[dist_outputs]` tool of that name after the built-ins (`j3c doc packages`), e.g. `steam` from the `steam` package.",
         list: true,
-        suggest: ['"zip"', '"deb"', '"apk"', '"steam"'],
+        suggest: ['"zip"', '"deb"', '"apk"'],
       },
       icon: { doc: "`.png` (square 256 or 512) or `.svg` for the `.deb` menu entry.", suggest: ['"assets/icon.png"'] },
       title: { doc: "Menu name. Default: the package name, title-cased." },
@@ -95,9 +96,9 @@ const SCHEMA = {
     },
   },
   steam: {
-    doc: "Steamworks (`build_outputs = [\"steam\"]`). A dev run with `app_id` sets `SteamAppId` and, with `sdk`, `J3_STEAM_LIB`.",
+    doc: "Read by the `steam` package, not j3c (`j3c doc steam`; the package's README lists the keys). Its `steam` dist output and its dev-build `steam.init` use them.",
     keys: {
-      app_id: { doc: "Numeric Steam app id. Required for the `steam` output; dev runs set `SteamAppId`/`SteamGameId` from it (no steam_appid.txt).", suggest: ['"480"'] },
+      app_id: { doc: "Numeric Steam app id. Required for the `steam` output; a dev build's `steam.init` sets `SteamAppId`/`SteamGameId` from it (no steam_appid.txt).", suggest: ['"480"'] },
       sdk: { doc: "Unzipped Steamworks SDK root (`~` and project-relative paths work). Holds `redistributable_bin/` with `libsteam_api.so` and `steam_api64.dll`.", suggest: ['"~/steamworks_sdk"'] },
       depot_linux: { doc: "Depot id for the Linux build. Required when a Linux target is built.", suggest: ['"481"'] },
       depot_windows: { doc: "Depot id for the Windows build. Required when a Windows target is built.", suggest: ['"482"'] },
@@ -120,6 +121,16 @@ const SCHEMA = {
   },
   dependencies: {
     doc: "Path dependencies: `name = { path = \"../dir\" }` (relative to this file). `use name.a.b;` loads `<dir>/src/a/b.j3` (a package) or `<dir>/a/b.j3`, which says `module name.a.b;`. Only imported modules are compiled, for this package's target.",
+    free: true,
+    keys: {},
+  },
+  commands: {
+    doc: "In a package's own `j3.toml`: tools that `j3c pkg <package> <name> [args]` builds for the host (cached) and runs with cwd = the game's root. `name = \"tools/x.j3\"` or `name = { file = \"tools/x.j3\", help = \"one line\" }`, relative to the package root. Never run on fetch (`j3c doc packages`).",
+    free: true,
+    keys: {},
+  },
+  dist_outputs: {
+    doc: "In a package's own `j3.toml`: tools that `j3c build --release` runs when the game's `[dist] build_outputs` names them, with `--dist`, `--built`, `--stage`, `--name`, `--version`, `--release`. Same form as `[commands]` (`j3c doc packages`).",
     free: true,
     keys: {},
   },

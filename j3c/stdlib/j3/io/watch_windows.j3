@@ -1,0 +1,270 @@
+/// Windows `j3.io.watch`: the pub names of `watch.j3` on `ReadDirectoryChangesW` (overlapped), one folder handle per
+/// `add`. Same events as Linux; names match without case like the file system. A folder watch whose folder is deleted
+/// reports `Delete` with name "" and stops. A file replaced by "write temp + rename over" reads as `Modify`.
+/// ponytail: all watches signal one auto-reset event; a change that lands while `poll` re-arms another watch can miss
+/// its wake (it is still seen on the next `poll`). One event per watch plus a re-arm signal would close that gap.
+
+module j3.io.watch;
+
+use j3.io;
+use j3.io.IoError;
+use j3.memory.{ Arena, List };
+use j3.result.Result;
+use j3.thread;
+use j3.thread.Thread;
+use j3.wake;
+use j3.winsys;
+
+/// Bytes of change records each watch can hold between two `poll`s (more is `Overflow`).
+const DIR_BUF = 16384;
+/// UTF-8 names of one `poll`.
+const BUF_LEN = 65536;
+/// FILE_NOTIFY_CHANGE_FILE_NAME | DIR_NAME | SIZE | LAST_WRITE.
+const FILTER = 0x1 | 0x2 | 0x8 | 0x10;
+const ACT_ADDED = 1;
+const ACT_REMOVED = 2;
+const ACT_MODIFIED = 3;
+const ACT_OLD_NAME = 4;
+const ACT_NEW_NAME = 5;
+
+/// What happened. See the module doc for which watch reports which.
+pub enum Kind { Create, Delete, Modify, MoveIn, MoveOut, Overflow }
+
+/// One change, from `Watcher.poll`.
+pub struct Event {
+    /// The watch that fired (from `add`); -1 for `Overflow`.
+    id: int;
+    kind: Kind;
+    /// Entry name inside a watched folder; "" for a watched file and for the watched path itself. Valid until the next `poll`.
+    name: string;
+}
+
+/// One `add`: an open folder handle with a read in flight, and for a file the name it follows there ("" for a folder).
+struct Watch {
+    id: int;
+    /// Folder handle; 0 once the folder is gone.
+    h: int;
+    file: string;
+    /// OVERLAPPED (32 bytes) and the record buffer, in the arena so they stay put while the read runs.
+    ov: []int;
+    recs: []u8;
+}
+
+struct Waker {
+    t: Thread;
+    /// [0] signaled by every watch's completed read, [1] ends the thread.
+    ev: [2]int;
+}
+
+/// Watches files and folders. Make it with `create`, end it with `close`.
+pub struct Watcher {
+    /// 1 while open; -1 when it could not be made or after `close`.
+    fd: int;
+    mem: &Arena;
+    buf: []u8;
+    watches: List<Watch>;
+    nextId: int = 1;
+    waker: &Waker;
+
+    /// A watcher with nothing watched. Its buffers and thread come from `mem`.
+    fn create(mem: &Arena): Watcher {
+        let wk = &mem.alloc::<Waker>(1)[0];
+        let w = Watcher { fd: -1, mem: mem, buf: mem.alloc::<u8>(BUF_LEN), watches: List<Watch>.new(mem), waker: wk };
+        wk.ev[0] = winsys.newEvent(false);
+        wk.ev[1] = winsys.newEvent(true);
+        if wk.ev[0] == 0 || wk.ev[1] == 0 {
+            winsys.close(wk.ev[0]);
+            winsys.close(wk.ev[1]);
+            return w;
+        }
+        w.fd = 1;
+        thread.spawn(&wk.t, "io.watch", wakerLoop, wk as ptr);
+        return w;
+    }
+
+    /// Watch `path`: a folder reports its direct entries (not recursive), a file reports itself. The id goes in each
+    /// `Event`. `NotFound` when the path (or a file's folder) does not exist.
+    fn add(this: &Watcher, path: string): Result<int, IoError> {
+        if this.fd < 0 || path.len == 0 {
+            return Result.Err(IoError.Other);
+        }
+        let isDir = false;
+        match io.stat(path) {
+            Result.Ok(e) { isDir = e.isDir; }
+            Result.Err(e) { return Result.Err(e); }
+        }
+        let dir = path;
+        let file = "";
+        if !isDir {
+            let slash = -1;
+            for i in 0..path.len {
+                if path[i] == 47 || path[i] == 92 { slash = i; }
+            }
+            file = path[slash + 1..path.len];
+            // `C:\x` keeps the root's slash: `C:` alone means the drive's current folder
+            dir = if slash < 0 { "." } else if slash == 0 || (slash == 2 && path[1] == 58) { path[0..slash + 1] } else { path[0..slash] };
+        }
+        let h = winsys.openDir(dir, this.mem);
+        if h == winsys.INVALID || h == 0 {
+            let err = winsys.lastError();
+            return Result.Err(if err == winsys.ERROR_FILE_NOT_FOUND || err == winsys.ERROR_PATH_NOT_FOUND { IoError.NotFound } else { IoError.Other });
+        }
+        let copy = this.mem.alloc::<u8>(file.len);
+        for i in 0..file.len { copy[i] = file[i]; }
+        let id = this.nextId;
+        let wt = Watch { id: id, h: h, file: copy as string, ov: this.mem.alloc::<int>(4), recs: this.mem.alloc::<u8>(DIR_BUF) };
+        wt.ov[3] = this.waker.ev[0];
+        if !arm(&wt) {
+            winsys.close(h);
+            return Result.Err(IoError.Other);
+        }
+        this.nextId += 1;
+        this.watches.push(wt);
+        return Result.Ok(id);
+    }
+
+    /// Stop watching `id`. Unknown ids, and watches whose folder is gone, are a no-op.
+    fn remove(this: &Watcher, id: int) {
+        for i in 0..this.watches.len {
+            if this.watches.items[i].id == id {
+                stop(&this.watches.items[i]);
+                this.watches.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Append the changes since the last call to `out` and return how many. Never blocks.
+    fn poll(this: &Watcher, out: &List<Event>): int {
+        if this.fd < 0 { return 0; }
+        let start = out.len;
+        let used = 0;
+        let overflow = false;
+        for i in 0..this.watches.len {
+            let w = &this.watches.items[i];
+            if w.h == 0 { continue; }
+            let got = winsys.overlapped(w.h, w.ov.ptr as ptr, false);
+            if got < 0 {
+                let err = winsys.lastError();
+                if err == winsys.ERROR_IO_INCOMPLETE { continue; }
+                // the folder is gone (or the handle broke): report it like inotify's delete-self, then stop
+                if w.file.len == 0 { out.push(Event { id: w.id, kind: Kind.Delete, name: "" }); }
+                winsys.close(w.h);
+                w.h = 0;
+                continue;
+            }
+            if got == 0 {
+                // the record buffer overflowed: the changes are lost
+                if !overflow { out.push(Event { id: -1, kind: Kind.Overflow, name: "" }); }
+                overflow = true;
+            } else {
+                used = records(this, w, got, used, out);
+            }
+            if !arm(w) {
+                if w.file.len == 0 { out.push(Event { id: w.id, kind: Kind.Delete, name: "" }); }
+                winsys.close(w.h);
+                w.h = 0;
+            }
+        }
+        return out.len - start;
+    }
+
+    /// Stop watching everything, end the helper thread and close the handles. Idempotent.
+    fn close(this: &Watcher) {
+        if this.fd < 0 { return; }
+        for i in 0..this.watches.len {
+            stop(&this.watches.items[i]);
+        }
+        this.watches.len = 0;
+        let wk = this.waker;
+        winsys.setEvent(wk.ev[1]);
+        thread.join(&wk.t);
+        winsys.close(wk.ev[0]);
+        winsys.close(wk.ev[1]);
+        this.fd = -1;
+    }
+}
+
+/// Start the next `ReadDirectoryChangesW` on `w`.
+fn arm(w: &Watch): bool {
+    return winsys.readChanges(w.h, w.recs, FILTER, w.ov.ptr as ptr);
+}
+
+/// Cancel the read in flight, wait for the cancel to land (the kernel writes into `recs` until then), close.
+fn stop(w: &Watch) {
+    if w.h == 0 { return; }
+    winsys.cancelIo(w.h, w.ov.ptr as ptr);
+    winsys.overlapped(w.h, w.ov.ptr as ptr, true);
+    winsys.close(w.h);
+    w.h = 0;
+}
+
+/// Turn `n` bytes of FILE_NOTIFY_INFORMATION records into events; names go into `wr.buf` from `used`. Returns the new `used`.
+fn records(wr: &Watcher, w: &Watch, n: int, used0: int, out: &List<Event>): int {
+    let used = used0;
+    let at = 0;
+    while at + 12 <= n {
+        let rec = w.recs.ptr as int + at;
+        let next = rd32(rec);
+        let act = rd32(rec + 4);
+        let nameBytes = rd32(rec + 8);
+        let len = winsys.utf8((rec + 12) as ptr, nameBytes / 2, wr.buf[used..wr.buf.len]);
+        let name = wr.buf[used..used + len] as string;
+        used += len;
+        if w.file.len == 0 {
+            let k = if act == ACT_ADDED { Kind.Create } else if act == ACT_REMOVED { Kind.Delete }
+                else if act == ACT_NEW_NAME { Kind.MoveIn } else if act == ACT_OLD_NAME { Kind.MoveOut } else { Kind.Modify };
+            out.push(Event { id: w.id, kind: k, name: name });
+        } else if sameFold(w.file, name) {
+            // rename over the file shows up as removed + new name: one `Modify`, like an in-place save
+            if !(act == ACT_REMOVED && renamedLater(w, rec, n, name, wr)) {
+                let k = if act == ACT_ADDED { Kind.Create } else if act == ACT_REMOVED || act == ACT_OLD_NAME { Kind.Delete } else { Kind.Modify };
+                out.push(Event { id: w.id, kind: k, name: "" });
+            }
+        }
+        if next == 0 { break; }
+        at += next;
+    }
+    return used;
+}
+
+/// A later record in the same batch renames something to `name`.
+fn renamedLater(w: &Watch, from: int, n: int, name: string, wr: &Watcher): bool {
+    let tmp: [512]u8;
+    let at = from - w.recs.ptr as int;
+    while true {
+        let next = rd32(w.recs.ptr as int + at);
+        if next == 0 { return false; }
+        at += next;
+        if at + 12 > n { return false; }
+        let rec = w.recs.ptr as int + at;
+        if rd32(rec + 4) == ACT_NEW_NAME {
+            let len = winsys.utf8((rec + 12) as ptr, rd32(rec + 8) / 2, tmp[:]);
+            if sameFold(tmp[0..len] as string, name) { return true; }
+        }
+    }
+    return false;
+}
+
+fn rd32(at: int): int {
+    let p = at as ptr as &u32;
+    return int(*p);
+}
+
+fn sameFold(a: string, b: string): bool {
+    if a.len != b.len { return false; }
+    for i in 0..a.len {
+        if winsys.fold(int(a[i])) != winsys.fold(int(b[i])) { return false; }
+    }
+    return true;
+}
+
+/// The helper thread: sleep until a read completes, then wake the main loop. The stop event ends it.
+fn wakerLoop(p: ptr) {
+    let wk = p as &Waker;
+    while true {
+        let r = winsys.waitAnyOf(&wk.ev[0] as ptr, 2, winsys.INFINITE);
+        if r != 0 { return; }
+        wake.wake();
+    }
+}

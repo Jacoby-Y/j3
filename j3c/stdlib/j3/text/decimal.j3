@@ -1,0 +1,225 @@
+// Part of j3.text: the exact fallback of parseF64 for inputs Eisel-Lemire cannot settle (near
+// ties, subnormals, over 19 digits, huge exponents). The number is held as decimal digits and
+// scaled by powers of two until its binary digits can be read off; a port of Go's strconv
+// decimal (Simple Decimal Conversion). Slow, but rare.
+
+module j3.text;
+
+/// Decimal digits kept; past this a nonzero digit only sets `trunc` (enough for a correct tie).
+const DEC_DIGITS: int = 800;
+
+/// The digits (values 0-9, most significant first) and a product buffer, per thread.
+#[singleton]
+#[thread]
+let DIG: [800]u8;
+#[singleton]
+#[thread]
+let DIGTMP: [820]u8;
+
+/// 0.d1d2d3... * 10^dp, digits in DIG[0..nd].
+struct Dec {
+    nd: int;
+    dp: int;
+    /// A nonzero digit was dropped past DEC_DIGITS.
+    trunc: bool;
+}
+
+/// Drop trailing zero digits.
+fn decTrim(a: &Dec) {
+    while a.nd > 0 && DIG[a.nd - 1] == 0 {
+        a.nd -= 1;
+    }
+    if a.nd == 0 {
+        a.dp = 0;
+    }
+}
+
+/// a = a / 2^k, k in 1..60.
+fn decRight(a: &Dec, k: int) {
+    let sh = u64(k);
+    let r = 0;
+    let w = 0;
+    let n: u64 = 0;
+    while (n >> sh) == 0 {
+        if r >= a.nd {
+            if n == 0 {
+                a.nd = 0;
+                return;
+            }
+            while (n >> sh) == 0 {
+                n = n * 10;
+                r += 1;
+            }
+            break;
+        }
+        n = n * 10 + u64(DIG[r]);
+        r += 1;
+    }
+    a.dp -= r - 1;
+    let mask = (u64(1) << sh) - 1;
+    while r < a.nd {
+        let c = u64(DIG[r]);
+        DIG[w] = u8(n >> sh);
+        w += 1;
+        n = (n & mask) * 10 + c;
+        r += 1;
+    }
+    while n > 0 {
+        let dig = n >> sh;
+        n = n & mask;
+        if w < DEC_DIGITS {
+            DIG[w] = u8(dig);
+            w += 1;
+        } else if dig > 0 {
+            a.trunc = true;
+        }
+        n = n * 10;
+    }
+    a.nd = w;
+    decTrim(a);
+}
+
+/// a = a * 2^k, k in 1..60 (at most 19 new digits).
+fn decLeft(a: &Dec, k: int) {
+    let sh = u64(k);
+    let end = a.nd + 19;
+    let w = end;
+    let n: u64 = 0;
+    let r = a.nd - 1;
+    while r >= 0 || n > 0 {
+        if r >= 0 {
+            n += u64(DIG[r]) << sh;
+            r -= 1;
+        }
+        let q = n / 10;
+        w -= 1;
+        DIGTMP[w] = u8(n - q * 10);
+        n = q;
+    }
+    let total = end - w;
+    a.dp += total - a.nd;
+    a.nd = 0;
+    for i in 0..total {
+        let v = DIGTMP[w + i];
+        if i < DEC_DIGITS {
+            DIG[i] = v;
+            a.nd += 1;
+        } else if v != 0 {
+            a.trunc = true;
+        }
+    }
+    decTrim(a);
+}
+
+/// a = a * 2^k (k < 0 divides).
+fn decShift(a: &Dec, k: int) {
+    if a.nd == 0 {
+        return;
+    }
+    while k > 60 {
+        decLeft(a, 60);
+        k -= 60;
+    }
+    while k < -60 {
+        decRight(a, 60);
+        k += 60;
+    }
+    if k > 0 { decLeft(a, k); }
+    if k < 0 { decRight(a, 0 - k); }
+}
+
+/// Whether rounding to `nd` digits goes up (ties to even; a dropped tail breaks a tie upward).
+fn decRoundUp(a: &Dec, nd: int): bool {
+    if nd < 0 || nd >= a.nd {
+        return false;
+    }
+    if DIG[nd] == 5 && nd + 1 == a.nd {
+        if a.trunc { return true; }
+        return nd > 0 && DIG[nd - 1] % 2 == 1;
+    }
+    return DIG[nd] >= 5;
+}
+
+/// The integer part, rounded to nearest (dp <= 20).
+fn decRounded(a: &Dec): u64 {
+    let n: u64 = 0;
+    let i = 0;
+    while i < a.dp && i < a.nd {
+        n = n * 10 + u64(DIG[i]);
+        i += 1;
+    }
+    while i < a.dp {
+        n = n * 10;
+        i += 1;
+    }
+    if decRoundUp(a, a.dp) {
+        n += 1;
+    }
+    return n;
+}
+
+/// The f64 bits (sign clear) nearest to `digits` (digits and at most one `.`) times 10^e.
+fn slowF64(digits: string, e: int): u64 {
+    let a = Dec { nd: 0, dp: 0, trunc: false };
+    let dot = false;
+    for k in 0..digits.len {
+        let c = digits[k];
+        if c == '.' {
+            dot = true;
+            a.dp = a.nd;
+        } else if c == '0' && a.nd == 0 {
+            a.dp -= 1;
+        } else if a.nd < DEC_DIGITS {
+            DIG[a.nd] = c - '0';
+            a.nd += 1;
+        } else if c != '0' {
+            a.trunc = true;
+        }
+    }
+    if !dot {
+        a.dp = a.nd;
+    }
+    a.dp += e;
+    decTrim(&a);
+    if a.nd == 0 || a.dp < -330 {
+        return 0;
+    }
+    let inf = u64(0x7FF) << 52;
+    if a.dp > 310 {
+        return inf;
+    }
+    // scale into [0.5, 1) by powers of two, counting them in exp
+    let powtab: [9]int = [1, 3, 6, 9, 13, 16, 19, 23, 26];
+    let exp = 0;
+    while a.dp > 0 {
+        let n = if a.dp >= 9 { 27 } else { powtab[a.dp] };
+        decShift(&a, 0 - n);
+        exp += n;
+    }
+    while a.dp < 0 || (a.dp == 0 && DIG[0] < 5) {
+        let n = if 0 - a.dp >= 9 { 27 } else { powtab[0 - a.dp] };
+        decShift(&a, n);
+        exp -= n;
+    }
+    // [0.5, 1) is [1, 2) * 2^(exp - 1); below 2^-1022 it is subnormal
+    exp -= 1;
+    if exp < -1022 {
+        let n = -1022 - exp;
+        decShift(&a, 0 - n);
+        exp += n;
+    }
+    if exp + 1023 >= 0x7FF {
+        return inf;
+    }
+    decShift(&a, 53);
+    let mant = decRounded(&a);
+    if mant == u64(2) << 52 {
+        mant = mant >> 1;
+        exp += 1;
+        if exp + 1023 >= 0x7FF {
+            return inf;
+        }
+    }
+    let bexp: u64 = if (mant & (u64(1) << 52)) == 0 { 0 } else { u64(exp + 1023) };
+    return (bexp << 52) | (mant & ((u64(1) << 52) - 1));
+}

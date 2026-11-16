@@ -1,0 +1,317 @@
+// More of `j3.io`: atomic replace, temp files and dirs, file locks, `copyFile`, `walk`. Linux;
+// on other targets the calls under them (`sys.fsync`, `sys.flock`, ...) fail, so these return `Other`.
+
+module j3.io;
+
+/// `write` until all of `data` is out: short writes looped, `EINTR` retried. False on failure.
+fn writeAll(fd: int, data: []u8): bool {
+    let at = 0;
+    while at < data.len {
+        let n = write(fd, (data.ptr as int + at) as ptr, data.len - at);
+        if n < 0 && sys.errno() == sys.EINTR {
+            continue;
+        }
+        if n <= 0 {
+            return false;
+        }
+        at += n;
+    }
+    return true;
+}
+
+/// `read` with `EINTR` retried: the count, 0 at the end, negative on failure.
+fn readSome(fd: int, buf: []u8): int {
+    while true {
+        let n = read(fd, buf.ptr as ptr, buf.len);
+        if n >= 0 || sys.errno() != sys.EINTR {
+            return n;
+        }
+    }
+    return -1;
+}
+
+/// Per-thread counter for unique temp names (with the pid and the clock, then `O_EXCL` retries).
+#[singleton]
+#[thread]
+let TEMP_SEQ: int;
+
+/// `<dir>/<prefix><pid>-<ms>-<seq>` NUL-terminated on `arena` (the NUL is the last byte).
+fn tempName(dir: string, prefix: string, arena: &Arena): []u8 {
+    TEMP_SEQ += 1;
+    let t = Text.new(arena);
+    t.pushStr(dir);
+    if dir.len > 0 && dir[dir.len - 1] != 47 {
+        t.push(47);
+    }
+    t.pushStr(prefix);
+    t.fmt(`{sys.getpid()}-{sys.monotonicMs()}-{TEMP_SEQ}`);
+    t.push(0);
+    return t.bytes;
+}
+
+/// Name without the NUL.
+fn noNul(c: []u8): string {
+    return c[0..c.len - 1] as string;
+}
+
+/// Open a new file with a unique name in `dir` (`O_EXCL`, so never one that exists). The fd and
+/// the NUL-terminated name.
+fn createUnique(dir: string, prefix: string, arena: &Arena): Result<TempFile, IoError> {
+    for attempt in 0..100 {
+        let name = tempName(dir, prefix, arena);
+        let fd = openMode(name.ptr as ptr, O_RDWR + O_CREAT + sys.O_EXCL + sys.O_CLOEXEC, 420);
+        if fd >= 0 {
+            return Result.Ok(TempFile { path: noNul(name), fd: fd });
+        }
+        if sys.errno() != sys.EEXIST {
+            return Result.Err(errOf(0 - sys.errno()));
+        }
+    }
+    return Result.Err(IoError.Other);
+}
+
+/// A file being written beside `path` that replaces it in one step on `commit`. Until then (and
+/// if the process dies first) `path` keeps its old contents; a crash can leave the temp file
+/// (`.<name>.tmp<pid>-...` in the same directory). `writeFileAtomic` is the one-call form.
+pub struct AtomicFile {
+    /// The file to replace.
+    path: string;
+    /// The temp file beside it.
+    tmp: string;
+    /// Open fd of `tmp` (-1 after `commit`/`abort`).
+    fd: int;
+
+    /// Append `data`. On failure the temp is removed (`abort`) and `path` is untouched.
+    fn write(this: &AtomicFile, data: []u8): Result<bool, IoError> {
+        if this.fd < 0 || !writeAll(this.fd, data) {
+            this.abort();
+            return Result.Err(IoError.Other);
+        }
+        return Result.Ok(true);
+    }
+
+    /// `fsync` the temp, close it, and rename it over `path`. On failure the temp is removed and
+    /// `path` keeps its old contents.
+    fn commit(this: &AtomicFile): Result<bool, IoError> {
+        if this.fd < 0 || sys.fsync(this.fd) < 0 {
+            this.abort();
+            return Result.Err(IoError.Other);
+        }
+        let r = close(this.fd);
+        this.fd = -1;
+        if r < 0 {
+            sys.unlink(cstr(this.tmp) as ptr);
+            return Result.Err(IoError.Other);
+        }
+        // ponytail: the directory is not fsynced, so a power cut right after can still show the
+        // old file (never a torn one); fsync the dir here if that ever matters
+        match rename(this.tmp, this.path) {
+            Result.Ok(_) { return Result.Ok(true); }
+            Result.Err(e) {
+                sys.unlink(cstr(this.tmp) as ptr);
+                return Result.Err(e);
+            }
+        }
+    }
+
+    /// Drop the temp file; `path` is untouched. Safe to call twice.
+    fn abort(this: &AtomicFile) {
+        if this.fd >= 0 {
+            close(this.fd);
+            this.fd = -1;
+            sys.unlink(cstr(this.tmp) as ptr);
+        }
+    }
+}
+
+/// Start replacing `dest`: a new temp file in its directory (same filesystem, so the final
+/// `rename` is atomic), mode 0644. Names are allocated in `arena`.
+pub fn createAtomic(dest: string, arena: &Arena): Result<AtomicFile, IoError> {
+    let pre = Text.new(arena);
+    pre.push(46);
+    pre.pushStr(path.basename(dest));
+    pre.pushStr(".tmp");
+    let t = createUnique(path.dirname(dest), pre.str(), arena)?;
+    return Result.Ok(AtomicFile { path: dest, tmp: t.path, fd: t.fd });
+}
+
+/// Replace `path` with `data` atomically: readers see the old file or the new one, never a part.
+/// Temp file beside it, write, `fsync`, `rename`; on any failure the temp is removed and the old
+/// file stays. Returns the byte count.
+pub fn writeFileAtomic(path: string, data: []u8): Result<int, IoError> {
+    let a = Arena.create(4096);
+    defer a.destroy();
+    let f = createAtomic(path, &a)?;
+    f.write(data)?;
+    f.commit()?;
+    return Result.Ok(data.len);
+}
+
+/// A temp file from `tempFile`: its path and open read-write fd (close it with `sys.close`).
+pub struct TempFile {
+    path: string;
+    fd: int;
+}
+
+/// The directory for temp files: `$TMPDIR`, else `/tmp`.
+pub fn tempRoot(): string {
+    let d = sys.env("TMPDIR");
+    if d.len == 0 {
+        return "/tmp";
+    }
+    return d;
+}
+
+/// Create a new empty file `<dir>/<prefix><unique>` (mode 0644, never one that exists; `dir` ""
+/// is `tempRoot()`). Remove it yourself (`remove`).
+pub fn tempFile(dir: string, prefix: string, arena: &Arena): Result<TempFile, IoError> {
+    return createUnique(if dir.len == 0 { tempRoot() } else { dir }, prefix, arena);
+}
+
+/// Create a new empty directory `<dir>/<prefix><unique>` (mode 0700; `dir` "" is `tempRoot()`)
+/// and return its path. Remove it yourself (`removeDir` once empty).
+pub fn tempDir(dir: string, prefix: string, arena: &Arena): Result<string, IoError> {
+    let d = if dir.len == 0 { tempRoot() } else { dir };
+    for attempt in 0..100 {
+        let name = tempName(d, prefix, arena);
+        let r = sys.mkdir(name.ptr as ptr, 448);
+        if r == 0 {
+            return Result.Ok(noNul(name));
+        }
+        if r != 0 - sys.EEXIST {
+            return Result.Err(errOf(r));
+        }
+    }
+    return Result.Err(IoError.Other);
+}
+
+/// Delete the empty directory `path` (rmdir(2)).
+pub fn removeDir(path: string): Result<bool, IoError> {
+    let r = sys.rmdir(cstr(path) as ptr);
+    if r < 0 {
+        return Result.Err(errOf(r));
+    }
+    return Result.Ok(true);
+}
+
+/// An exclusive `flock` on a lock file, held until `unlock` (or the process ends). Advisory: it
+/// only stops others that lock the same path. Two locks on one path conflict even in one process.
+/// A `fork`ed child shares the lock until it closes `fd` or `execve`s (the fd is `O_CLOEXEC`).
+pub struct FileLock {
+    fd: int;
+
+    /// Release the lock (closes the fd). Safe to call twice.
+    fn unlock(this: &FileLock) {
+        if this.fd >= 0 {
+            close(this.fd);
+            this.fd = -1;
+        }
+    }
+}
+
+/// Open (creating, mode 0644) the lock file `path`.
+fn openLock(path: string): Result<int, IoError> {
+    let fd = openMode(cstr(path) as ptr, O_RDWR + O_CREAT + sys.O_CLOEXEC, 420);
+    if fd < 0 {
+        return Result.Err(errOf(0 - sys.errno()));
+    }
+    return Result.Ok(fd);
+}
+
+/// Take the exclusive lock on `path`, waiting while another process holds it.
+pub fn lockFile(path: string): Result<FileLock, IoError> {
+    let fd = openLock(path)?;
+    if sys.flock(fd, sys.LOCK_EX) < 0 {
+        close(fd);
+        return Result.Err(IoError.Other);
+    }
+    return Result.Ok(FileLock { fd: fd });
+}
+
+/// Take the exclusive lock on `path` if it is free: `None` (without waiting) when someone holds it.
+pub fn tryLockFile(path: string): Result<Option<FileLock>, IoError> {
+    let fd = openLock(path)?;
+    let r = sys.flock(fd, sys.LOCK_EX + sys.LOCK_NB);
+    if r < 0 {
+        close(fd);
+        if r == 0 - sys.EWOULDBLOCK {
+            return Result.Ok(Option.None);
+        }
+        return Result.Err(IoError.Other);
+    }
+    return Result.Ok(Option.Some(FileLock { fd: fd }));
+}
+
+/// Copy the file `from` to `to` (created or truncated, mode 0644: permission bits are not
+/// copied). Returns the byte count. On a failure `to` may be partly written; copy to a temp and
+/// `rename`, or use `createAtomic`, when that matters.
+pub fn copyFile(from: string, to: string): Result<int, IoError> {
+    let src = open(cstr(from) as ptr, O_RDONLY + sys.O_CLOEXEC);
+    if src < 0 {
+        return Result.Err(errOf(0 - sys.errno()));
+    }
+    let dst = openMode(cstr(to) as ptr, O_WRONLY + O_CREAT + O_TRUNC + sys.O_CLOEXEC, 420);
+    if dst < 0 {
+        let e = sys.errno();
+        close(src);
+        return Result.Err(errOf(0 - e));
+    }
+    let a = Arena.create(65536);
+    defer a.destroy();
+    let buf = a.alloc::<u8>(65536);
+    let total = 0;
+    let ok = true;
+    while ok {
+        let n = readSome(src, buf);
+        if n == 0 {
+            break;
+        }
+        ok = n > 0 && writeAll(dst, buf[0..n]);
+        total += n;
+    }
+    close(src);
+    if close(dst) < 0 || !ok {
+        return Result.Err(IoError.Other);
+    }
+    return Result.Ok(total);
+}
+
+/// Every file under `root`, recursively, whose path matches `pattern` (`path.glob`: `*` and `?`;
+/// "" matches all). A pattern without `/` is matched against the file name, one with `/` against
+/// the path relative to `root`. `name` of each entry is that relative path (`"a/b.j3"`), in
+/// `mem`. Sorted by name within each directory, a directory's files before its subdirectories'.
+/// Directories themselves are not returned, and symlinked directories are not entered (no
+/// cycles). A directory that cannot be listed is an error.
+pub fn walk(root: string, pattern: string, mem: &Arena): Result<[]DirEntry, IoError> {
+    let out = List<DirEntry>.new(mem);
+    let slash = false;
+    for i in 0..pattern.len {
+        if pattern[i] == 47 {
+            slash = true;
+        }
+    }
+    walkIn(root, "", pattern, slash, &out, mem)?;
+    return Result.Ok(out.items[0..out.len]);
+}
+
+fn walkIn(root: string, rel: string, pattern: string, slash: bool, out: &List<DirEntry>, mem: &Arena): Result<bool, IoError> {
+    let ents = listDir(path.join(root, rel, mem), mem)?;
+    sortBy(ents, fn(a: DirEntry, b: DirEntry): bool { return a.name < b.name; });
+    for i in 0..ents.len {
+        let e = ents[i];
+        if e.isDir {
+            continue;
+        }
+        let r = path.join(rel, e.name, mem);
+        if pattern.len == 0 || path.glob(pattern, if slash { r } else { e.name }) {
+            out.push(DirEntry { name: r, isDir: false, size: e.size, mtime: e.mtime, isLink: e.isLink });
+        }
+    }
+    for i in 0..ents.len {
+        let e = ents[i];
+        if e.isDir && !e.isLink {
+            walkIn(root, path.join(rel, e.name, mem), pattern, slash, out, mem)?;
+        }
+    }
+    return Result.Ok(true);
+}

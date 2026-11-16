@@ -1,7 +1,8 @@
-j3.toml
+j3.toml   (`j3c manifest --json [path]` prints the parsed file as JSON, every table included)
 
 [package]
-    name     binary name (required). `build` writes target/<name>
+    name     package name (required). `build` writes target/<name>
+    bin      program file name instead of name: `build` writes target/<bin>
     entry    file that contains main. Default src/main.j3
     version  package version (the .deb version). Default 0.1.0
     description  one line for the .deb and the menu entry
@@ -46,10 +47,8 @@ j3.toml
                     from ~/.local/share/<name> (so relative saves work), a
                     menu entry, the icon. Depends come from the libraries
                     the program loads. Needs `tar`, not dpkg
-             steam  target/dist/steam/: content/<os>/ (the zip folder plus
-                    libsteam_api.so or steam_api64.dll from [steam] sdk) and
-                    scripts/app_build_<appid>.vdf with the steamcmd line in
-                    README.txt. Linux and Windows x86_64 only; never uploads
+             NAME   any other name: the dep whose [dist_outputs] has NAME runs
+                    it after the built-ins (`j3c doc packages`)
     zip      true: same as build_outputs = ["zip"]
     include  files and folders to ship. Default: whichever of
              assets, scripts, scenes, locales exist
@@ -61,16 +60,8 @@ j3.toml
     depends  extra .deb packages, after the ones found
 
 [steam]
-    app_id   numeric app id. Required for build_outputs "steam". A dev run
-             (`j3c run`) sets SteamAppId and SteamGameId from it
-    sdk      unzipped Steamworks SDK root (~ and project-relative ok). Dev runs
-             set J3_STEAM_LIB to its libsteam_api.so; "steam" copies the libs
-    depot_linux, depot_windows  depot ids; each needed when that OS is built
-    branch   set the build live on this branch (not "default"). Default: none
-    runtime_libs  folder of .so files copied beside the Linux exe (libs built in
-             the sniper SDK container); libssl.so.3 and SDL add-ons load from there first
-    glibc_max  highest GLIBC the Linux build may need; warns above it. Default 2.31
-    desc     build description. Default "<name> <version>"
+    read by the `steam` package, not j3c (j3c ignores it): app_id, sdk, depots,
+    branch, ... Its README lists the keys; `j3c doc steam`
 
 [splash]
     enabled  true shows a startup splash in App.run: the J3 logo animates as
@@ -106,6 +97,13 @@ j3.toml
              beside j3.toml pins every git dep to a commit; commit it. A local
              path URL is relative to this j3.toml. `j3c fetch`, `j3c update [name]`,
              `j3c add NAME --path DIR | --git URL [--tag T]`. `j3c doc packages`
+
+[commands]   (in a package's own j3.toml) tools `j3c pkg PKG NAME [args]` runs:
+    name = "tools/x.j3"  or  name = { file = "tools/x.j3", help = "one line" }
+             relative to the package root; built for the host, cached, run with
+             cwd = the game's root and J3_MANIFEST (`j3c doc packages`)
+[dist_outputs]   (in a package's own j3.toml) the same form; `j3c build --release`
+             runs one when the game's [dist] build_outputs names it
 
 [ui]
     dir      folder of .j3ui components. Default ui. All of them become

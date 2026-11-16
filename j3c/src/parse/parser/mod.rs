@@ -1,6 +1,6 @@
 use crate::parse::ast::{
     AssignOpStmt, AssignStmt, BinOp, Block, ConstItem, DeferStmt, EnumItem, Expr, ExprKind,
-    FieldItem, File, FnItem, GpuStage, GpuStruct, ForEachStmt, ForStmt, Ident, IfStmt, InterpPart, Item, LabeledStmt, LetStmt,
+    FieldItem, File, FnItem, GpuStage, GpuStruct, ForEachStmt, ForStmt, Ident, IfStmt, InterpPart, Item, LabeledStmt, LetPatStmt, LetStmt,
     LibFnDecl, MatchArm, MatchStmt, ModLetItem, Param, Pat, ReturnStmt, ScriptBlockItem,
     ScriptLetItem, Stmt, StructItem, TraitItem, TraitMethod, Type, TypeKind, UnaryOp, UseItem, UseLibItem, UseLocalStmt,
     VariantItem, WhileStmt,
@@ -9,6 +9,8 @@ use crate::parse::ast::{
 struct ItemAttrs {
     debug: bool,
     try_catch: Option<(Ident, Ident)>,
+    /// `#[derive(Eq, Hash, ..)]` without `Debug` (which sets `debug`).
+    derives: Vec<Ident>,
     singleton: bool,
     thread: bool,
     impl_fn: bool,
@@ -19,8 +21,9 @@ struct ItemAttrs {
     flat: bool,
 }
 use crate::parse::error::ParseError;
+use crate::parse::pat::path_expr;
 use crate::parse::syntax::{
-    is_j3ui_widget, INTRINSIC_CLOSURES, INTRINSIC_GPU, INTRINSIC_SIMD, ATTR_DEBUG, ATTR_IMPL, ITEM_EXTEND, ITEM_TRAIT, ATTR_SINGLETON, ATTR_THREAD, ATTR_TRY_CATCH, INTRINSIC_SCRIPT, INTRINSIC_SIZEOF,
+    is_j3ui_widget, INTRINSIC_CLOSURES, INTRINSIC_EMBED, INTRINSIC_GPU, INTRINSIC_SIMD, ATTR_DEBUG, ATTR_DERIVE, ATTR_IMPL, DERIVES, FN_WHERE, ITEM_EXTEND, ITEM_TRAIT, TYPE_BOXED, TYPE_CLOSURE, TYPE_DYN, ATTR_SINGLETON, ATTR_THREAD, ATTR_TRY_CATCH, INTRINSIC_SCRIPT, INTRINSIC_SIZEOF,
     INTRINSIC_SLICE, INTRINSIC_SYSCALL, INTRINSIC_UI_CHOICE, J3UI_END, J3UI_IF, J3UI_POP, SCRIPT_PROPS, SCRIPT_SHARED,
 };
 use crate::parse::token::{Token, TokenKind};
@@ -30,6 +33,7 @@ mod atomic;
 mod attrs;
 mod bitops;
 mod closure;
+mod embed;
 mod expr;
 mod extend;
 mod generics;
@@ -39,6 +43,8 @@ mod shader_attrs;
 mod script_ui;
 mod stmt;
 mod traits;
+mod types;
+mod value;
 
 pub fn parse_tokens(tokens: &[Token]) -> Result<File, ParseError> {
     let mut p = Parser {
@@ -46,6 +52,7 @@ pub fn parse_tokens(tokens: &[Token]) -> Result<File, ParseError> {
         i: 0,
         j3ui_recv: None,
         script_module: None,
+        dyns: Vec::new(),
     };
     p.file()
 }
@@ -56,6 +63,7 @@ pub fn parse_script_tokens(tokens: &[Token], module: &[String]) -> Result<File, 
         i: 0,
         j3ui_recv: None,
         script_module: Some(module.to_vec()),
+        dyns: Vec::new(),
     };
     p.file()
 }
@@ -66,6 +74,8 @@ struct Parser<'a> {
     /// First parameter name while parsing an `@j3ui` body.
     j3ui_recv: Option<String>,
     script_module: Option<Vec<String>>,
+    /// Trait names written as `dyn Name`, for `File.dyns`.
+    dyns: Vec<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -147,6 +157,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::ForEach(s) => s.span,
         Stmt::UseLocal(s) => s.span,
         Stmt::Match(s) => s.span,
+        Stmt::LetPat(s) => s.span,
         Stmt::Defer(s) => s.span,
         Stmt::Break(s, _) | Stmt::Continue(s, _) => *s,
         Stmt::Labeled(s) => s.span,
@@ -154,20 +165,19 @@ fn stmt_span(stmt: &Stmt) -> Span {
     }
 }
 
-fn parse_int(text: &str) -> Result<i64, String> {
-    if let Some(hex) = text.strip_prefix("0x") {
-        match i64::from_str_radix(hex, 16) {
-            Ok(v) => Ok(v),
-            Err(_) => Err(format!("invalid hex literal `{text}`")),
-        }
+/// An int literal: `Int`, or `BigInt` above `i64::MAX` (only a `u64` takes it).
+fn parse_int(text: &str) -> Result<ExprKind, String> {
+    let v = if let Some(hex) = text.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).map_err(|_| format!("hex literal `{text}` does not fit 64 bits"))?
     } else if let Some(bin) = text.strip_prefix("0b") {
-        i64::from_str_radix(bin, 2).map_err(|_| format!("invalid binary literal `{text}`"))
+        u64::from_str_radix(bin, 2).map_err(|_| format!("binary literal `{text}` does not fit 64 bits"))?
     } else {
-        match text.parse::<i64>() {
-            Ok(v) => Ok(v),
-            Err(_) => Err(format!("invalid integer `{text}`")),
-        }
-    }
+        text.parse::<u64>().map_err(|_| format!("integer `{text}` does not fit 64 bits"))?
+    };
+    Ok(match i64::try_from(v) {
+        Ok(v) => ExprKind::Int(v),
+        Err(_) => ExprKind::BigInt(v),
+    })
 }
 
 fn split_interp(text: &str, span: Span) -> Result<Vec<InterpPart>, ParseError> {
@@ -238,6 +248,7 @@ fn parse_hole_expr(src: &str, span: Span, base: u32) -> Result<Expr, ParseError>
         i: 0,
         j3ui_recv: None,
         script_module: None,
+        dyns: Vec::new(),
     };
     let expr = p.expr()?;
     if p.cur().kind != TokenKind::Eof {

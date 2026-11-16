@@ -167,3 +167,65 @@ fn complete_quat_rotate() {
         items.iter().map(|c| c.label.clone()).collect::<Vec<_>>()
     );
 }
+
+/// Names bound by `if let` and `let .. else` are locals: hover gives their type, and
+/// completion lists them.
+#[test]
+fn if_let_and_let_else_bindings_hover_and_complete() {
+    let path = default_hello_path();
+    let src = "\
+module hello;
+
+enum Tok { Num(int), Word(string), End }
+
+fn f(t: Tok): int {
+if let Tok.Word(word) = t {
+let _ = word;
+}
+let Tok.Num(count) = t else { return 0; };
+return count;
+}
+
+fn main() {
+let _ = f(Tok.End);
+}
+";
+    let overlay = vec![(path.clone(), src.to_string())];
+    let prog = analyze(&path, &overlay).expect("analyze");
+    let shown = path.display().to_string();
+    let word = src.find("_ = word").unwrap() as u32 + 4;
+    let h = hover(&prog, &shown, word).expect("hover word");
+    assert!(h.text.contains("string"), "{}", h.text);
+    let count = src.find("return count").unwrap() as u32 + 7;
+    let h = hover(&prog, &shown, count).expect("hover count");
+    assert!(h.text.contains("int"), "{}", h.text);
+    let items = complete(&prog, &shown, count + 2);
+    assert!(items.iter().any(|c| c.label == "count"), "{:?}", items.iter().map(|c| &c.label).collect::<Vec<_>>());
+}
+
+#[test]
+fn hover_and_goto_on_dyn_and_char_literals() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../speculative/lang/dyn.j3");
+    let prog = analyze(&path, &[]).expect("analyze dyn");
+    let src = std::fs::read_to_string(&path).unwrap();
+    let shown = path.display().to_string();
+    let decl = src.find("pub trait Backend").unwrap() + "pub trait ".len();
+    // `dyn` and the trait after it: the declaration, and goto lands on its name
+    let at = src.find("out: dyn Backend").unwrap() + "out: ".len();
+    let h = hover(&prog, &shown, at as u32).expect("hover dyn");
+    assert!(h.text.contains("trait Backend: Named") && h.text.contains("fn emit"), "{}", h.text);
+    let name_at = at + "dyn ".len();
+    let h = hover(&prog, &shown, name_at as u32).expect("hover trait name");
+    assert!(h.text.contains("trait Backend") && !h.text.contains("`dyn` value"), "{}", h.text);
+    for off in [at, name_at] {
+        let d = definition(&prog, &shown, off as u32).expect("goto trait");
+        assert_eq!(d.span.start as usize, decl, "{}", d.path);
+    }
+
+    let chars = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../speculative/lang/chars.j3");
+    let prog = analyze(&chars, &[]).expect("analyze chars");
+    let src = std::fs::read_to_string(&chars).unwrap();
+    let at = src.find("let a = 'a'").unwrap() + "let a = '".len();
+    let h = hover(&prog, &chars.display().to_string(), at as u32).expect("hover char");
+    assert!(h.text.contains("'a': u8") && h.text.contains("code point 97 (U+0061)"), "{}", h.text);
+}

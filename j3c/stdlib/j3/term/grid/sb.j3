@@ -1,0 +1,208 @@
+/// Compact scrollback of `Grid`: each line is a variable-length record of `u32` words in a ring the grid owns
+/// (`sbRing` in `sbMem`), trimmed of trailing plain blanks. Part of `j3.term.grid`.
+///
+/// Record: one word per cell, `cp` in bits 0..20, `width` in 21..22; bit 24 (`SB_STYLE`) means three words follow
+/// with the cell's style and link (`fg.v`, `bg.v`, `attr | link << 16`), kept until the next change (a line starts
+/// plain, link 0); then bit 23 (`SB_MARKS`) means one word of `marks` follows. Pushing and dropping a line are
+/// O(its length); the ring grows by doubling into a new arena and frees the old one.
+/// ponytail: cp above 0x1fffff would be cut; the parser never makes one (it caps at U+10FFFF).
+
+module j3.term.grid;
+
+const SB_CP = 0x1fffff;
+const SB_MARKS = 1 << 23;
+const SB_STYLE = 1 << 24;
+
+extend Grid {
+    /// Drop all scrollback lines (the ring keeps its storage).
+    fn sbClear(this: &Grid) {
+        this.sbHead = 0;
+        this.sbCount = 0;
+        this.sbH = 0;
+        this.sbT = 0;
+        this.sbE = 0;
+        this.sbWr = false;
+    }
+
+    /// Append `cells` as the newest scrollback line (`wrap`: it continues on the next), dropping the oldest when
+    /// all `sbCap` slots are used.
+    fn sbPush(this: &Grid, cells: []Cell, wrap: bool) {
+        if this.sbCap == 0 {
+            return;
+        }
+        if this.sbCount == this.sbCap {
+            this.sbDrop();
+        }
+        let n = cells.len;
+        while n > 0 && plainBlank(cells[n - 1]) {
+            n -= 1;
+        }
+        let words = this.sbEncode(cells, n, -1);
+        let at = this.sbPlace(words);
+        if at < 0 {
+            this.sbGrow(words);
+            at = this.sbPlace(words);
+        }
+        this.sbEncode(cells, n, at);
+        let slot = (this.sbHead + this.sbCount) % this.sbCap;
+        this.sbCount += 1;
+        this.sbStart[slot] = at;
+        this.sbWords[slot] = words;
+        this.sbWidth[slot] = cells.len;
+        this.sbWrap[slot] = if wrap { 1 } else { 0 };
+    }
+
+    /// Words the first `n` of `cells` take; with `at >= 0` they are also written to `sbRing[at..]`.
+    fn sbEncode(this: &Grid, cells: []Cell, n: int, at: int): int {
+        let cur = Style.plain();
+        let curLink = u16(0);
+        let k = 0;
+        for x in 0..n {
+            let c = cells[x];
+            let w = (u32(c.cp) & u32(SB_CP)) | (u32(c.width) << 21);
+            let restyle = !(c.style == cur) || c.link != curLink;
+            if restyle {
+                w |= u32(SB_STYLE);
+            }
+            if c.marks != 0 {
+                w |= u32(SB_MARKS);
+            }
+            if at >= 0 {
+                this.sbRing[at + k] = w;
+            }
+            k += 1;
+            if restyle {
+                cur = c.style;
+                curLink = c.link;
+                if at >= 0 {
+                    this.sbRing[at + k] = c.style.fg.v;
+                    this.sbRing[at + k + 1] = c.style.bg.v;
+                    this.sbRing[at + k + 2] = u32(c.style.attr) | (u32(c.link) << 16);
+                }
+                k += 3;
+            }
+            if c.marks != 0 {
+                if at >= 0 {
+                    this.sbRing[at + k] = c.marks;
+                }
+                k += 1;
+            }
+        }
+        return k;
+    }
+
+    /// Claim `n` contiguous words for the newest record: its start, or -1 when the ring has no room.
+    fn sbPlace(this: &Grid, n: int): int {
+        if !this.sbWr {
+            if this.sbH == this.sbT {
+                this.sbH = 0;
+                this.sbT = 0;
+            }
+            if this.sbT + n <= this.sbRing.len {
+                let s = this.sbT;
+                this.sbT += n;
+                return s;
+            }
+            if n <= this.sbH {
+                this.sbE = this.sbT;
+                this.sbWr = true;
+                this.sbT = n;
+                return 0;
+            }
+            return -1;
+        }
+        if this.sbT + n <= this.sbH {
+            let s = this.sbT;
+            this.sbT += n;
+            return s;
+        }
+        return -1;
+    }
+
+    /// Forget the oldest line. Records are laid in order, so the oldest non-empty one starts at `sbH`.
+    fn sbDrop(this: &Grid) {
+        let slot = this.sbHead;
+        let w = this.sbWords[slot];
+        if w > 0 {
+            this.sbH = this.sbStart[slot] + w;
+            if this.sbWr && this.sbH == this.sbE {
+                this.sbH = 0;
+                this.sbWr = false;
+            }
+        }
+        this.sbHead = (this.sbHead + 1) % this.sbCap;
+        this.sbCount -= 1;
+        if this.sbCount == 0 {
+            this.sbClear();
+        }
+    }
+
+    /// Move the live records, packed oldest first, into a new ring with room for `need` more words, and free the old.
+    fn sbGrow(this: &Grid, need: int) {
+        let live = 0;
+        for i in 0..this.sbCount {
+            live += this.sbWords[(this.sbHead + i) % this.sbCap];
+        }
+        let cap = mx(mx(this.sbRing.len * 2, live + need), 4096);
+        let na = Arena.create(cap * 4);
+        let ring = na.alloc::<u32>(cap);
+        let t = 0;
+        for i in 0..this.sbCount {
+            let slot = (this.sbHead + i) % this.sbCap;
+            let s = this.sbStart[slot];
+            for k in 0..this.sbWords[slot] {
+                ring[t + k] = this.sbRing[s + k];
+            }
+            this.sbStart[slot] = t;
+            t += this.sbWords[slot];
+        }
+        this.sbMem.destroy();
+        *this.sbMem = na;
+        this.sbRing = ring;
+        this.sbH = 0;
+        this.sbT = t;
+        this.sbE = 0;
+        this.sbWr = false;
+    }
+
+    /// Scrollback line `i` decoded into `lnBuf`: its stored cells, then (with `pad`) plain blanks to the width it had.
+    fn sbLine(this: &Grid, i: int, pad: bool): []Cell {
+        let slot = (this.sbHead + i) % this.sbCap;
+        let p = this.sbStart[slot];
+        let end = p + this.sbWords[slot];
+        let st = Style.plain();
+        let link = u16(0);
+        let x = 0;
+        while p < end {
+            let w = this.sbRing[p];
+            p += 1;
+            if (w & u32(SB_STYLE)) != 0 {
+                st = Style { fg: Color { v: this.sbRing[p] }, bg: Color { v: this.sbRing[p + 1] }, attr: u16(this.sbRing[p + 2] & 0xffff) };
+                link = u16(this.sbRing[p + 2] >> 16);
+                p += 3;
+            }
+            let marks = u32(0);
+            if (w & u32(SB_MARKS)) != 0 {
+                marks = this.sbRing[p];
+                p += 1;
+            }
+            this.lnBuf[x] = Cell { cp: i32(w & u32(SB_CP)), style: st, width: u8((w >> 21) & 3), link: link, marks: marks };
+            x += 1;
+        }
+        if !pad {
+            return this.lnBuf[0..x];
+        }
+        let n = this.sbWidth[slot];
+        let blank = Cell.blank(Style.plain());
+        for k in x..n {
+            this.lnBuf[k] = blank;
+        }
+        return this.lnBuf[0..n];
+    }
+
+    /// Whether scrollback line `i` starts with a wide character (without decoding it).
+    fn sbStartsWide(this: &Grid, i: int): bool {
+        let slot = (this.sbHead + i) % this.sbCap;
+        return this.sbWords[slot] > 0 && ((this.sbRing[this.sbStart[slot]] >> 21) & 3) == 2;
+    }
+}

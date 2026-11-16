@@ -213,7 +213,12 @@ pub(crate) fn find_operator(
     op: parse::BinOp,
     methods: &HashMap<(u32, String), FuncId>,
 ) -> Option<FuncId> {
-    let name = match op {
+    find_method(cx, ty, operator_name(op)?, methods)
+}
+
+/// `operator<` for `<`; `None` for an operator a type cannot define.
+pub(crate) fn operator_name(op: parse::BinOp) -> Option<&'static str> {
+    Some(match op {
         parse::BinOp::Add => "operator+",
         parse::BinOp::Sub => "operator-",
         parse::BinOp::Mul => "operator*",
@@ -225,8 +230,7 @@ pub(crate) fn find_operator(
         parse::BinOp::Gt => "operator>",
         parse::BinOp::Ge => "operator>=",
         _ => return None,
-    };
-    find_method(cx, ty, name, methods)
+    })
 }
 
 pub(super) fn find_main(mods: &[ModData]) -> Result<FuncId, CheckError> {

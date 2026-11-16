@@ -22,6 +22,7 @@ pub(super) const TOP_INCLUDES: &[&str] = &[
     "let-decl",
     "script-block",
     "keywords",
+    "chars",
     "labels",
     "types",
     "constants-bool",
@@ -78,6 +79,8 @@ pub fn tm_grammar() -> String {
     repo_script_block(&mut out);
     sep(&mut out);
     repo_keywords(&mut out);
+    sep(&mut out);
+    repo_chars(&mut out);
     sep(&mut out);
     repo_labels(&mut out);
     sep(&mut out);

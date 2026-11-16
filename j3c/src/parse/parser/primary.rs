@@ -7,7 +7,13 @@ impl<'a> Parser<'a> {
             match self.cur().kind {
                 TokenKind::Dot => {
                     let _ = self.bump();
-                    let field = self.ident()?;
+                    // `t.0`: a tuple element (or a multi-field variant payload's field).
+                    let field = if self.cur().kind == TokenKind::Int && self.cur().text.bytes().all(|b| b.is_ascii_digit()) {
+                        let tok = self.bump().clone();
+                        Ident { name: tok.text, span: tok.span }
+                    } else {
+                        self.ident()?
+                    };
                     let span = join(expr.span, field.span);
                     expr = Expr {
                         span,
@@ -177,11 +183,12 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Int => {
                 let _ = self.bump();
-                let value = parse_int(&tok.text).map_err(|m| ParseError::new(tok.span, m))?;
-                Ok(Expr {
-                    span: tok.span,
-                    kind: ExprKind::Int(value),
-                })
+                let kind = parse_int(&tok.text).map_err(|m| ParseError::new(tok.span, m))?;
+                Ok(Expr { span: tok.span, kind })
+            }
+            TokenKind::Char => {
+                let _ = self.bump();
+                Ok(Expr { span: tok.span, kind: ExprKind::Char(tok.text.parse().unwrap_or(0)) })
             }
             TokenKind::Float => {
                 let _ = self.bump();
@@ -281,6 +288,7 @@ impl<'a> Parser<'a> {
                             },
                         })
                     }
+                    n if INTRINSIC_EMBED.contains(&n) => self.embed(n, start),
                     INTRINSIC_SCRIPT => {
                         self.expect(TokenKind::LParen, "expected `(` after `@script`")?;
                         let path = self.cur().clone();
@@ -309,8 +317,24 @@ impl<'a> Parser<'a> {
             TokenKind::LParen => {
                 let _ = self.bump();
                 let expr = self.expr()?;
-                self.expect(TokenKind::RParen, "expected `)`")?;
-                Ok(expr)
+                if self.cur().kind != TokenKind::Comma {
+                    self.expect(TokenKind::RParen, "expected `)`")?;
+                    return Ok(expr);
+                }
+                // `(a, b)`: a tuple; `(a)` stays a parenthesized expression.
+                let mut elems = vec![expr];
+                while self.cur().kind == TokenKind::Comma {
+                    let _ = self.bump();
+                    if self.cur().kind == TokenKind::RParen {
+                        break;
+                    }
+                    elems.push(self.expr()?);
+                }
+                if elems.len() < 2 {
+                    return Err(self.err("a tuple has two or more elements; drop the `,` for a parenthesized expression"));
+                }
+                self.expect(TokenKind::RParen, "expected `)` after tuple elements")?;
+                Ok(Expr { span: join(tok.span, self.prev_end(tok.span)), kind: ExprKind::Tuple(elems) })
             }
             TokenKind::LBracket => {
                 let start = tok.span;
@@ -366,6 +390,10 @@ impl<'a> Parser<'a> {
                 })
             }
             TokenKind::If => self.if_expr(),
+            TokenKind::Match => {
+                let m = self.match_stmt()?;
+                Ok(Expr { span: m.span, kind: ExprKind::Match(Box::new(m)) })
+            }
             _ => Err(self.err("expected expression")),
         }
     }

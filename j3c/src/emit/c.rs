@@ -3,12 +3,12 @@
 use std::collections::HashSet;
 
 use crate::emit::c_expr::{self, CWriter};
+use crate::emit::c_static::Statics;
 use crate::emit::c_ty::{self, c_type};
 use crate::ir::cx::IrCx;
-use crate::ir::entity::{ConstInit, FuncKind};
+use crate::ir::entity::FuncKind;
 use crate::ir::ids::{EnumId, StructId};
 use crate::ir::module::Module;
-use crate::ir::operand::{ConstKind, Operand};
 use crate::ir::ty::{Ty, TyKind};
 
 pub fn emit_c(cx: &IrCx, module: &Module) -> Result<String, String> {
@@ -78,6 +78,12 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
     if !fn_slices.is_empty() {
         out.push('\n');
     }
+    // by-value array wrappers, named before the fn types that pass them; bodies with the structs
+    let arrays = collect_array_tys(cx, modules, &fn_tys);
+    for ty in &arrays {
+        let name = c_ty::array_wrap_name(cx, *ty)?;
+        out.push_str(&format!("typedef struct {name} {name};\n"));
+    }
     for ty in &fn_tys {
         out.push_str(&c_ty::fn_typedef(cx, *ty)?);
     }
@@ -87,37 +93,7 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
 
     emit_slice_bodies(cx, &fn_slices, &mut out)?;
 
-    emit_struct_bodies(cx, modules, &mut out)?;
-
-    for module in modules {
-        for id in &module.globals {
-            let g = cx.global(*id);
-            let name = c_expr::global_c_name(cx, g);
-            let init = match &g.init {
-                Some(v) => format!(" = {}", emit_const_init(cx, v)?),
-                None => String::new(),
-            };
-            let st = if g.thread {
-                "static _Thread_local"
-            } else {
-                "static"
-            };
-            if let Some((elem, len)) = c_ty::array_parts(cx, g.ty) {
-                let elem_c = c_type(cx, elem)?;
-                out.push_str(&format!("{st} {elem_c} {name}[{len}]{init};\n"));
-            } else {
-                let ty = c_type(cx, g.ty)?;
-                if ty.ends_with('*') {
-                    out.push_str(&format!("{st} {ty}{name}{init};\n"));
-                } else {
-                    out.push_str(&format!("{st} {ty} {name}{init};\n"));
-                }
-            }
-        }
-    }
-    if modules.iter().any(|m| !m.globals.is_empty()) {
-        out.push('\n');
-    }
+    emit_struct_bodies(cx, modules, &arrays, &mut out)?;
 
     let mut w = CWriter::new(cx);
 
@@ -157,6 +133,38 @@ pub fn emit_program(cx: &IrCx, modules: &[Module]) -> Result<String, String> {
         }
     }
     out.push('\n');
+
+    // after the prototypes: a method table (`dyn`) holds fn addresses
+    let mut data = Statics::default();
+    for module in modules {
+        for id in &module.globals {
+            let g = cx.global(*id);
+            let name = c_expr::global_c_name(cx, g);
+            let init = match &g.init {
+                Some(v) => format!(" = {}", data.init(cx, v)?),
+                None => String::new(),
+            };
+            out.push_str(&std::mem::take(&mut data.arrays));
+            let st = if g.thread {
+                "static _Thread_local"
+            } else {
+                "static"
+            };
+            if c_ty::array_parts(cx, g.ty).is_some() {
+                out.push_str(&format!("{st} {}{init};\n", c_ty::array_decl(cx, g.ty, &name)?));
+            } else {
+                let ty = c_type(cx, g.ty)?;
+                if ty.ends_with('*') {
+                    out.push_str(&format!("{st} {ty}{name}{init};\n"));
+                } else {
+                    out.push_str(&format!("{st} {ty} {name}{init};\n"));
+                }
+            }
+        }
+    }
+    if modules.iter().any(|m| !m.globals.is_empty()) {
+        out.push('\n');
+    }
 
     for module in modules {
         for id in &module.funcs {
@@ -254,101 +262,17 @@ fn module_is(cx: &IrCx, module: &Module, parts: &[&str]) -> bool {
     true
 }
 
-fn emit_const_init(cx: &IrCx, init: &ConstInit) -> Result<String, String> {
-    match init {
-        ConstInit::Scalar(op) => match op {
-            Operand::Const(c) => match &c.kind {
-                ConstKind::Bytes(bytes) => Ok(format!(
-                    "{{ .ptr = (uint8_t *){}, .len = {}ll }}",
-                    c_expr::c_bytes_literal(bytes),
-                    bytes.len()
-                )),
-                ConstKind::F32Bits(bits) => static_f32(*bits),
-                ConstKind::F64Bits(bits) => static_f64(*bits),
-                _ => {
-                    let mut w = CWriter::new(cx);
-                    w.operand(op)
-                }
-            },
-            _ => {
-                let mut w = CWriter::new(cx);
-                w.operand(op)
-            }
-        },
-        ConstInit::Fields(fs) => {
-            let mut parts = Vec::new();
-            for (name, v) in fs {
-                let fname = c_ty::sanitize(name);
-                parts.push(format!(".{fname} = {}", emit_const_init(cx, v)?));
-            }
-            Ok(format!("{{ {} }}", parts.join(", ")))
-        }
-        ConstInit::Elems(es) => {
-            let mut parts = Vec::new();
-            for v in es {
-                parts.push(emit_const_init(cx, v)?);
-            }
-            Ok(format!("{{ {} }}", parts.join(", ")))
-        }
-    }
-}
-
-fn static_f32(bits: u32) -> Result<String, String> {
-    let value = f32::from_bits(bits);
-    if value == 0.0 {
-        if bits & 0x8000_0000 != 0 {
-            return Ok("-0.0f".to_string());
-        }
-        return Ok("0.0f".to_string());
-    }
-    if !value.is_finite() {
-        return Err(format!("non-finite f32 in static init: bits={bits}"));
-    }
-    for prec in [1usize, 8, 9, 12, 17] {
-        let mut s = format!("{:.*}", prec, value);
-        if s.parse::<f32>().ok().map(|v| v.to_bits()) == Some(bits) {
-            if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-                s.push_str(".0");
-            }
-            s.push('f');
-            return Ok(s);
-        }
-    }
-    Err(format!("f32 static init did not round-trip: bits={bits}"))
-}
-
-fn static_f64(bits: u64) -> Result<String, String> {
-    let value = f64::from_bits(bits);
-    if value == 0.0 {
-        if bits & 0x8000_0000_0000_0000 != 0 {
-            return Ok("-0.0".to_string());
-        }
-        return Ok("0.0".to_string());
-    }
-    if !value.is_finite() {
-        return Err(format!("non-finite f64 in static init: bits={bits}"));
-    }
-    for prec in [1usize, 8, 9, 12, 17] {
-        let mut s = format!("{:.*}", prec, value);
-        if s.parse::<f64>().ok().map(|v| v.to_bits()) == Some(bits) {
-            if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-                s.push_str(".0");
-            }
-            return Ok(s);
-        }
-    }
-    Err(format!("f64 static init did not round-trip: bits={bits}"))
-}
-
 /// A by-value type body: a struct or a tagged enum. C needs a body after the bodies it holds.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Body {
     Struct(StructId),
     Enum(EnumId),
+    /// An array's by-value wrapper (`c_ty::array_wrap_name`).
+    Array(Ty),
 }
 
-fn emit_struct_bodies(cx: &IrCx, modules: &[Module], out: &mut String) -> Result<(), String> {
-    let mut nodes = Vec::new();
+fn emit_struct_bodies(cx: &IrCx, modules: &[Module], arrays: &[Ty], out: &mut String) -> Result<(), String> {
+    let mut nodes: Vec<Body> = arrays.iter().map(|t| Body::Array(*t)).collect();
     for module in modules {
         for id in &module.structs {
             let n = Body::Struct(*id);
@@ -372,6 +296,10 @@ fn emit_struct_bodies(cx: &IrCx, modules: &[Module], out: &mut String) -> Result
         match n {
             Body::Struct(id) => emit_struct_body(cx, id, out)?,
             Body::Enum(id) => emit_enum_body(cx, id, out)?,
+            Body::Array(ty) => {
+                let name = c_ty::array_wrap_name(cx, ty)?;
+                out.push_str(&format!("struct {name} {{\n    {};\n}};\n\n", c_ty::array_decl(cx, ty, "a")?));
+            }
         }
     }
     Ok(())
@@ -388,9 +316,8 @@ fn emit_struct_body(cx: &IrCx, id: StructId, out: &mut String) -> Result<(), Str
     out.push_str(&format!("struct {cname} {{\n"));
     for field in &def.fields {
         let fname = c_ty::sanitize(cx.name_str(field.name));
-        if let Some((elem, len)) = c_ty::array_parts(cx, field.ty) {
-            let elem_c = c_type(cx, elem)?;
-            out.push_str(&format!("    {elem_c} {fname}[{len}];\n"));
+        if c_ty::array_parts(cx, field.ty).is_some() {
+            out.push_str(&format!("    {};\n", c_ty::array_decl(cx, field.ty, &fname)?));
             continue;
         }
         let ty = c_type(cx, field.ty)?;
@@ -437,8 +364,13 @@ fn visit_body(cx: &IrCx, n: Body, seen: &mut HashSet<Body>, ordered: &mut Vec<Bo
             .iter()
             .filter_map(|v| v.payload)
             .collect(),
+        Body::Array(ty) => vec![ty],
     };
     for ty in held {
+        // an enum holds an array payload in its wrapper
+        if matches!(n, Body::Enum(_)) && c_ty::array_parts(cx, ty).is_some() {
+            visit_body(cx, Body::Array(ty), seen, ordered);
+        }
         for dep in value_bodies(cx, ty) {
             visit_body(cx, dep, seen, ordered);
         }
@@ -453,6 +385,51 @@ fn value_bodies(cx: &IrCx, ty: Ty) -> Vec<Body> {
         TyKind::Array { elem, .. } => value_bodies(cx, *elem),
         _ => Vec::new(),
     }
+}
+
+/// Array types C wraps: passed by value (in a fn type, `fn_tys`), an enum payload, or behind a
+/// reference (`&[N]T` is a wrapper pointer) in a field, local or global.
+fn collect_array_tys(cx: &IrCx, modules: &[Module], fn_tys: &[Ty]) -> Vec<Ty> {
+    let mut out = Vec::new();
+    let add = |ty: Ty, out: &mut Vec<Ty>| {
+        if c_ty::array_parts(cx, ty).is_some() && !out.contains(&ty) {
+            out.push(ty);
+        }
+    };
+    // `&[N]T` anywhere inside `ty` (through refs, slices, arrays)
+    fn refs(cx: &IrCx, ty: Ty, out: &mut Vec<Ty>, add: &dyn Fn(Ty, &mut Vec<Ty>)) {
+        match cx.ty_kind(ty) {
+            TyKind::Ref(inner) => {
+                add(*inner, out);
+                refs(cx, *inner, out, add);
+            }
+            TyKind::Slice { elem } | TyKind::Array { elem, .. } => refs(cx, *elem, out, add),
+            _ => {}
+        }
+    }
+    for ty in fn_tys {
+        if let TyKind::Fn { params, ret } = cx.ty_kind(*ty) {
+            for t in params.iter().chain(std::iter::once(ret)) {
+                add(*t, &mut out);
+                refs(cx, *t, &mut out, &add);
+            }
+        }
+    }
+    for m in modules {
+        for id in &m.enums {
+            cx.enum_def(*id).variants.iter().filter_map(|v| v.payload).for_each(|t| add(t, &mut out));
+        }
+        let fields = m.structs.iter().flat_map(|id| cx.struct_def(*id).fields.iter().map(|f| f.ty));
+        let locals = m.funcs.iter().flat_map(|id| match &cx.func(*id).kind {
+            FuncKind::J3 { body } => body.locals.iter().map(|d| d.ty).collect(),
+            _ => Vec::new(),
+        });
+        let globals = m.globals.iter().map(|id| cx.global(*id).ty);
+        for t in fields.chain(locals).chain(globals).collect::<Vec<_>>() {
+            refs(cx, t, &mut out, &add);
+        }
+    }
+    out
 }
 
 fn emit_slice_fields(

@@ -34,14 +34,33 @@ impl<'a> Parser<'a> {
             TokenKind::Let => {
                 let start = self.cur().span;
                 let _ = self.bump();
+                if !matches!(self.look(1).kind, TokenKind::Eq | TokenKind::Colon) {
+                    self.forbid_doc(&doc)?;
+                    let pat = self.pat(false)?;
+                    self.expect(TokenKind::Eq, "expected `=` after a `let` pattern")?;
+                    let value = self.expr()?;
+                    let else_block = if self.cur().kind == TokenKind::Else {
+                        let _ = self.bump();
+                        Some(self.block()?)
+                    } else {
+                        None
+                    };
+                    self.expect(TokenKind::Semi, "expected `;` after let")?;
+                    return Ok(Stmt::LetPat(LetPatStmt { span: join(start, self.prev_end(start)), pat, value, else_block }));
+                }
                 let name = self.ident()?;
                 let mut ty = None;
                 if self.cur().kind == TokenKind::Colon {
                     let _ = self.bump();
                     ty = Some(self.ty()?);
                 }
-                self.expect(TokenKind::Eq, "expected `=` in let")?;
-                let value = self.expr()?;
+                // `let buf: [64]u8;`: zero-filled, the type says what
+                let value = if ty.is_some() && self.cur().kind == TokenKind::Semi {
+                    Expr { span: join(start, self.prev_end(start)), kind: ExprKind::Zeroed }
+                } else {
+                    self.expect(TokenKind::Eq, "expected `=` in let")?;
+                    self.expr()?
+                };
                 self.expect(TokenKind::Semi, "expected `;` after let")?;
                 Ok(Stmt::Let(LetStmt {
                     span: join(start, self.prev_end(start)),
@@ -64,7 +83,7 @@ impl<'a> Parser<'a> {
                     value,
                 }))
             }
-            TokenKind::If => Ok(Stmt::If(self.if_stmt()?)),
+            TokenKind::If => self.if_any_stmt(),
             TokenKind::While => Ok(Stmt::While(self.while_stmt()?)),
             TokenKind::For => self.for_stmt(),
             TokenKind::Match => Ok(Stmt::Match(self.match_stmt()?)),
@@ -123,7 +142,9 @@ impl<'a> Parser<'a> {
                     | TokenKind::PercentEq
                     | TokenKind::AmpEq
                     | TokenKind::PipeEq
-                    | TokenKind::CaretEq => {
+                    | TokenKind::CaretEq
+                    | TokenKind::ShlEq
+                    | TokenKind::ShrEq => {
                         let op = match self.cur().kind {
                             TokenKind::PlusEq => BinOp::Add,
                             TokenKind::MinusEq => BinOp::Sub,
@@ -132,6 +153,8 @@ impl<'a> Parser<'a> {
                             TokenKind::AmpEq => BinOp::BitAnd,
                             TokenKind::PipeEq => BinOp::BitOr,
                             TokenKind::CaretEq => BinOp::BitXor,
+                            TokenKind::ShlEq => BinOp::Shl,
+                            TokenKind::ShrEq => BinOp::Shr,
                             _ => BinOp::Rem,
                         };
                         let _ = self.bump();
@@ -162,10 +185,10 @@ impl<'a> Parser<'a> {
         if self.cur().kind == TokenKind::Else {
             let _ = self.bump();
             if self.cur().kind == TokenKind::If {
-                let inner = self.if_stmt()?;
+                let inner = self.if_any_stmt()?;
                 else_block = Some(Block {
-                    span: inner.span,
-                    stmts: vec![Stmt::If(inner)],
+                    span: stmt_span(&inner),
+                    stmts: vec![inner],
                 });
             } else {
                 else_block = Some(self.block()?);
@@ -200,6 +223,9 @@ impl<'a> Parser<'a> {
     pub(super) fn for_stmt(&mut self) -> Result<Stmt, ParseError> {
         let start = self.cur().span;
         self.expect(TokenKind::For, "expected `for`")?;
+        if self.cur().kind == TokenKind::LParen {
+            return self.for_tuple(start);
+        }
         let first = self.ident()?;
         if self.cur().kind == TokenKind::Comma {
             let _ = self.bump();
@@ -241,6 +267,19 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    /// `for (k, v) in xs { .. }`: each element bound to a hidden name, then destructured by a
+    /// `let (k, v) = ..;` at the top of the body.
+    fn for_tuple(&mut self, start: Span) -> Result<Stmt, ParseError> {
+        let pat = self.pat(false)?;
+        self.expect(TokenKind::In, "expected `in`")?;
+        let iter = self.expr()?;
+        let mut body = self.block()?;
+        let name = Ident { name: format!("$each{}", start.start), span: pat.span() };
+        let value = Expr { span: name.span, kind: ExprKind::Name(name.clone()) };
+        body.stmts.insert(0, Stmt::LetPat(LetPatStmt { span: pat.span(), pat, value, else_block: None }));
+        Ok(Stmt::ForEach(ForEachStmt { span: join(start, body.span), index: None, name, iter, body }))
+    }
+
     pub(super) fn match_stmt(&mut self) -> Result<MatchStmt, ParseError> {
         let start = self.cur().span;
         self.expect(TokenKind::Match, "expected `match`")?;
@@ -258,65 +297,178 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `pat | pat if guard { body }`.
     pub(super) fn match_arm(&mut self) -> Result<MatchArm, ParseError> {
         let start = self.cur().span;
-        if matches!(self.cur().kind, TokenKind::Int | TokenKind::Minus) {
-            let neg = self.cur().kind == TokenKind::Minus;
-            if neg {
-                let _ = self.bump();
-            }
-            let lit = self.cur().clone();
-            self.expect(TokenKind::Int, "expected an integer match arm")?;
-            let n = parse_int(&lit.text).map_err(|m| ParseError::new(lit.span, m))?;
-            let mut value = Expr { span: join(start, lit.span), kind: ExprKind::Int(n) };
-            if neg {
-                value = Expr {
-                    span: value.span,
-                    kind: ExprKind::Unary { op: UnaryOp::Neg, expr: Box::new(value) },
-                };
-            }
-            let body = self.block()?;
-            return Ok(MatchArm { span: join(start, body.span), value: Some(value), path: Vec::new(), payload: None, body });
-        }
-        let path = self.path()?;
-        let mut payload = None;
-        if self.cur().kind == TokenKind::LParen {
+        let pats = self.or_pats()?;
+        let mut guard = None;
+        if self.cur().kind == TokenKind::If {
             let _ = self.bump();
-            payload = Some(self.pat()?);
-            self.expect(TokenKind::RParen, "expected `)` after match payload")?;
+            guard = Some(self.expr()?);
         }
-        let body = self.block()?;
-        Ok(MatchArm {
-            span: join(start, body.span),
-            value: None,
-            path,
-            payload,
-            body,
-        })
+        let (body, tail) = self.arm_block()?;
+        Ok(MatchArm { span: join(start, body.span), pats, guard, body, tail })
     }
 
-    pub(super) fn pat(&mut self) -> Result<Pat, ParseError> {
+    /// `A | B(x)`: an arm's alternatives.
+    pub(super) fn or_pats(&mut self) -> Result<Vec<Pat>, ParseError> {
+        let mut pats = vec![self.pat(true)?];
+        while self.cur().kind == TokenKind::Pipe {
+            let _ = self.bump();
+            pats.push(self.pat(true)?);
+        }
+        Ok(pats)
+    }
+
+    /// One pattern. `top`: an arm's own pattern, where a single name is an enum path or an int
+    /// `const` (resolved by the checker), never a binding.
+    pub(super) fn pat(&mut self, top: bool) -> Result<Pat, ParseError> {
+        let start = self.cur().span;
         if self.cur().kind == TokenKind::Ident && self.cur().text == "_" {
             let _ = self.bump();
-            return Ok(Pat::Wild);
+            return Ok(Pat::Wild(start));
         }
-        let path = self.path()?;
-        if path.len() == 1
-            && self.cur().kind != TokenKind::LParen
-            && self.cur().kind != TokenKind::Dot
-        {
-            return Ok(Pat::Bind(path.into_iter().next().unwrap()));
-        }
-        let mut inner = None;
         if self.cur().kind == TokenKind::LParen {
             let _ = self.bump();
-            inner = Some(Box::new(self.pat()?));
-            self.expect(TokenKind::RParen, "expected `)` after pattern")?;
+            let mut elems = vec![self.pat(false)?];
+            while self.cur().kind == TokenKind::Comma && self.look(1).kind != TokenKind::RParen {
+                let _ = self.bump();
+                elems.push(self.pat(false)?);
+            }
+            if self.cur().kind == TokenKind::Comma {
+                let _ = self.bump();
+            }
+            if elems.len() < 2 {
+                return Err(ParseError::new(start, "a tuple pattern has two or more elements"));
+            }
+            self.expect(TokenKind::RParen, "expected `,` or `)` in a tuple pattern")?;
+            return Ok(Pat::Tuple { span: join(start, self.prev_end(start)), elems });
         }
-        Ok(Pat::Variant {
-            path,
-            payload: inner,
-        })
+        if self.cur().kind == TokenKind::Ident && matches!(self.cur().text.as_str(), "true" | "false") {
+            let v = self.bump().text == "true";
+            return Ok(Pat::Lit(Expr { span: start, kind: ExprKind::Bool(v) }));
+        }
+        if self.cur().kind == TokenKind::String {
+            let tok = self.bump().clone();
+            return Ok(Pat::Lit(Expr { span: tok.span, kind: ExprKind::String(tok.text.into_bytes()) }));
+        }
+        let lo = if matches!(self.cur().kind, TokenKind::Int | TokenKind::Minus | TokenKind::Char) {
+            self.pat_lit()?
+        } else {
+            let path = self.path()?;
+            let span = join(start, self.prev_end(start));
+            if self.cur().kind != TokenKind::DotDotEq {
+                if self.cur().kind == TokenKind::LBrace && (!top || self.struct_pat_ahead()) {
+                    return self.struct_pat(start, path);
+                }
+                if path.len() == 1 && !top && self.cur().kind != TokenKind::LParen {
+                    return Ok(Pat::Bind(path.into_iter().next().unwrap()));
+                }
+                let mut payload = Vec::new();
+                if self.cur().kind == TokenKind::LParen {
+                    let _ = self.bump();
+                    loop {
+                        payload.push(self.pat(false)?);
+                        if self.cur().kind != TokenKind::Comma || self.look(1).kind == TokenKind::RParen {
+                            break;
+                        }
+                        let _ = self.bump();
+                    }
+                    if self.cur().kind == TokenKind::Comma {
+                        let _ = self.bump();
+                    }
+                    self.expect(TokenKind::RParen, "expected `,` or `)` in a pattern")?;
+                }
+                return Ok(Pat::Variant { span: join(start, self.prev_end(start)), path, payload });
+            }
+            path_expr(&path, span)
+        };
+        if self.cur().kind != TokenKind::DotDotEq {
+            if self.cur().kind == TokenKind::DotDot {
+                return Err(self.err("a range pattern includes its end: write `..=`"));
+            }
+            return Ok(Pat::Lit(lo));
+        }
+        let _ = self.bump();
+        let hi = if matches!(self.cur().kind, TokenKind::Int | TokenKind::Minus | TokenKind::Char) {
+            self.pat_lit()?
+        } else {
+            let s = self.cur().span;
+            let path = self.path()?;
+            path_expr(&path, join(s, self.prev_end(s)))
+        };
+        Ok(Pat::Range { lo, hi })
+    }
+
+    /// At an arm's `Path {`: is the `{ .. }` a struct pattern? Yes when what follows its `}` can
+    /// only follow a pattern (`{` of the body, `|`, `if`), not start the next arm.
+    fn struct_pat_ahead(&self) -> bool {
+        let mut depth = 0usize;
+        let mut n = 0;
+        loop {
+            match self.look(n).kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(self.look(n + 1).kind, TokenKind::LBrace | TokenKind::Pipe | TokenKind::If);
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            n += 1;
+        }
+    }
+
+    /// `Path { a, b: pat, .. }`, at the `{`.
+    fn struct_pat(&mut self, start: Span, path: Vec<Ident>) -> Result<Pat, ParseError> {
+        self.expect(TokenKind::LBrace, "expected `{`")?;
+        let mut fields = Vec::new();
+        let mut rest = false;
+        while self.cur().kind != TokenKind::RBrace {
+            if self.cur().kind == TokenKind::DotDot {
+                let _ = self.bump();
+                rest = true;
+                break;
+            }
+            let name = self.ident()?;
+            let pat = if self.cur().kind == TokenKind::Colon {
+                let _ = self.bump();
+                self.pat(false)?
+            } else {
+                Pat::Bind(name.clone())
+            };
+            fields.push((name, pat));
+            if self.cur().kind != TokenKind::Comma {
+                break;
+            }
+            let _ = self.bump();
+        }
+        let msg = if rest { "`..` ends a struct pattern: expected `}`" } else { "expected `,` or `}` in a struct pattern" };
+        self.expect(TokenKind::RBrace, msg)?;
+        Ok(Pat::Struct { span: join(start, self.prev_end(start)), path, fields, rest })
+    }
+
+    /// `3`, `-1`, `'a'` in a pattern.
+    fn pat_lit(&mut self) -> Result<Expr, ParseError> {
+        let start = self.cur().span;
+        let neg = self.cur().kind == TokenKind::Minus;
+        if neg {
+            let _ = self.bump();
+        }
+        let lit = self.cur().clone();
+        let kind = match lit.kind {
+            TokenKind::Int => parse_int(&lit.text).map_err(|m| ParseError::new(lit.span, m))?,
+            TokenKind::Char if !neg => ExprKind::Char(lit.text.parse().unwrap_or(0)),
+            _ => return Err(self.err("expected an integer or char pattern")),
+        };
+        let _ = self.bump();
+        let mut value = Expr { span: join(start, lit.span), kind };
+        if neg {
+            value = Expr { span: value.span, kind: ExprKind::Unary { op: UnaryOp::Neg, expr: Box::new(value) } };
+        }
+        Ok(value)
     }
 
     pub(super) fn defer_stmt(&mut self) -> Result<DeferStmt, ParseError> {
@@ -334,106 +486,6 @@ impl<'a> Parser<'a> {
         Ok(DeferStmt {
             span: join(start, body.span),
             body,
-        })
-    }
-
-    pub(super) fn ty(&mut self) -> Result<Type, ParseError> {
-        let start = self.cur().span;
-        if self.cur().kind == TokenKind::Amp {
-            let _ = self.bump();
-            let inner = self.ty()?;
-            return Ok(Type {
-                span: join(start, inner.span),
-                kind: TypeKind::Ref(Box::new(inner)),
-            });
-        }
-        if self.cur().kind == TokenKind::LBracket {
-            let _ = self.bump();
-            if self.cur().kind == TokenKind::RBracket {
-                let _ = self.bump();
-                let elem = self.ty()?;
-                return Ok(Type {
-                    span: join(start, elem.span),
-                    kind: TypeKind::Slice(Box::new(elem)),
-                });
-            }
-            let ntok = self.cur().clone();
-            if ntok.kind != TokenKind::Int {
-                return Err(self.err("expected array length or `[]`"));
-            }
-            let _ = self.bump();
-            let len = parse_int(&ntok.text).map_err(|m| ParseError::new(ntok.span, m))?;
-            if len < 0 {
-                return Err(ParseError::new(ntok.span, "array length must be >= 0"));
-            }
-            self.expect(TokenKind::RBracket, "expected `]` after array length")?;
-            let elem = self.ty()?;
-            return Ok(Type {
-                span: join(start, elem.span),
-                kind: TypeKind::Array {
-                    len: len as u64,
-                    elem: Box::new(elem),
-                },
-            });
-        }
-        if self.cur().kind == TokenKind::Fn {
-            let _ = self.bump();
-            self.expect(TokenKind::LParen, "expected `(` after `fn`")?;
-            let mut params = Vec::new();
-            if self.cur().kind != TokenKind::RParen {
-                loop {
-                    params.push(self.ty()?);
-                    if self.cur().kind == TokenKind::Comma {
-                        let _ = self.bump();
-                        if self.cur().kind == TokenKind::RParen {
-                            break;
-                        }
-                        continue;
-                    }
-                    break;
-                }
-            }
-            self.expect(TokenKind::RParen, "expected `)` after fn type params")?;
-            let mut ret = None;
-            if self.cur().kind == TokenKind::Colon {
-                let _ = self.bump();
-                ret = Some(Box::new(self.ty()?));
-            }
-            return Ok(Type {
-                span: join(start, self.prev_end(start)),
-                kind: TypeKind::Fn { params, ret },
-            });
-        }
-        let name = self.ident()?;
-        if name.name == "closure" && self.cur().kind == TokenKind::LParen {
-            return self.closure_type(name.span);
-        }
-        if self.cur().kind == TokenKind::Lt {
-            let _ = self.bump();
-            let mut args = Vec::new();
-            loop {
-                args.push(self.ty()?);
-                if self.cur().kind == TokenKind::Comma {
-                    let _ = self.bump();
-                    if self.cur().kind == TokenKind::Gt {
-                        break;
-                    }
-                    continue;
-                }
-                break;
-            }
-            self.expect(TokenKind::Gt, "expected `>` after type arguments")?;
-            return Ok(Type {
-                span: join(name.span, self.prev_end(name.span)),
-                kind: TypeKind::Generic {
-                    name: name.name,
-                    args,
-                },
-            });
-        }
-        Ok(Type {
-            span: name.span,
-            kind: TypeKind::Named(name.name),
         })
     }
 }

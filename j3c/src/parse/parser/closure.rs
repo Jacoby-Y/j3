@@ -1,11 +1,15 @@
-//! Closure syntax: the literal `fn(a: int, b): T { body }` and the type `closure(A, B): T`.
+//! Closure syntax: the literal `fn(a: int, b): T { body }` (`fn[mem](..)` boxed) and the type
+//! `closure(A, B): T` (`boxed closure(A, B): T`).
 
 use super::*;
 use crate::parse::ast::{ClosureLit, ClosureParam};
 
 impl<'a> Parser<'a> {
-    /// After `closure` has been read, at `(`.
-    pub(super) fn closure_type(&mut self, start: Span) -> Result<Type, ParseError> {
+    /// After `closure` (or `boxed closure`) has been read, at `(`.
+    pub(super) fn closure_type(&mut self, start: Span, boxed: bool) -> Result<Type, ParseError> {
+        if boxed && self.cur().kind != TokenKind::LParen {
+            return Err(self.err("expected `(` after `boxed closure`"));
+        }
         self.expect(TokenKind::LParen, "expected `(` after `closure`")?;
         let mut params = Vec::new();
         while self.cur().kind != TokenKind::RParen {
@@ -23,7 +27,7 @@ impl<'a> Parser<'a> {
         }
         Ok(Type {
             span: join(start, self.prev_end(start)),
-            kind: TypeKind::Closure { params, ret },
+            kind: TypeKind::Closure { params, ret, boxed },
         })
     }
 
@@ -31,6 +35,12 @@ impl<'a> Parser<'a> {
     pub(super) fn closure_lit(&mut self) -> Result<Expr, ParseError> {
         let start = self.cur().span;
         self.expect(TokenKind::Fn, "expected `fn`")?;
+        let mut arena = None;
+        if self.cur().kind == TokenKind::LBracket {
+            let _ = self.bump();
+            arena = Some(self.expr()?);
+            self.expect(TokenKind::RBracket, "expected `]` after the arena of `fn[mem](..)`")?;
+        }
         if self.cur().kind != TokenKind::LParen {
             return Err(self.err(
                 "expected `(` after `fn`: a closure is `fn(x: int): int { ... }`; named functions are declared at the top level",
@@ -60,7 +70,7 @@ impl<'a> Parser<'a> {
         let body = self.block()?;
         Ok(Expr {
             span: join(start, body.span),
-            kind: ExprKind::Closure(Box::new(ClosureLit { params, ret, body })),
+            kind: ExprKind::Closure(Box::new(ClosureLit { arena, params, ret, body })),
         })
     }
 }

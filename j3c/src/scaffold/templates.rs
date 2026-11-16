@@ -172,6 +172,12 @@ j3 = ">={ver}"
 
 # A package: `use {name};` loads src/{name}.j3, `use {name}.x;` loads src/x.j3 (`j3c doc packages`).
 [lib]
+
+# Tools for projects that use this package (built and run only on request, never on fetch):
+# [commands]                 # j3c pkg {name} check ...
+# check = {{ file = "tools/check.j3", help = "one line for `j3c pkg {name}`" }}
+# [dist_outputs]             # a game's [dist] build_outputs = ["NAME"] runs it on build --release
+# NAME = "tools/dist.j3"
 "#,
         ver = env!("CARGO_PKG_VERSION")
     )

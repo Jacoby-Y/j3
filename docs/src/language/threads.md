@@ -12,6 +12,7 @@
 |---|---|
 | Run one thing in the background | `spawn(&t, name, f, arg)`, later `join(&t)` |
 | Run many jobs on a few workers | `Pool.create(&arena, workers, queueCap)`, then `submit` / `trySubmit` |
+| Run a job with captured state | `pool.submitBoxed(fn[mem]() { .. })`: a [boxed closure](functions.md#boxed-closures) copies what it captures into arena `mem` |
 | Do the same work over `0..n` | `pool.parallelForEach(n, fn(lo, hi) { .. })` (a closure; it waits for every range, which is why a closure is safe here). Lower level: `pool.parallelFor(n, f, ctx)` |
 | Get results back to the frame loop | A `Queue<T>`: workers push, the main thread `tryPop`s |
 | Share a counter or cancel flag | `@atomicAdd` / `@atomicLoad` / `@atomicStore` on an `int`, `i32`, `u32`, `u64`, `bool` or `ptr` (`@atomicAdd` only on the integers), with an optional order (`acquire`, `release`, `relaxed`, ...) |

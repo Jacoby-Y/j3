@@ -14,6 +14,8 @@ Pick a tool
 -----------
     run one thing in the background   spawn(&t, name, f, arg), later join(&t)
     many jobs on a few workers        Pool.create(&arena, workers, queueCap), then submit / trySubmit
+    a job with captured state         pool.submitBoxed(fn[mem]() { .. })   (captures copied into arena mem,
+                                      which must outlive the job: pool.wait before rewinding it)
     the same work over 0..n           pool.parallelForEach(n, fn(lo, hi) { .. })   (writes out[i]; it waits)
                                       body runs on several workers at once: write out[i] or use atomics for
                                       anything else captured. One thread at a time; never from inside a pool
@@ -49,8 +51,12 @@ The rules
    returns.
    Never spin on a plain flag: the compiler may hoist the load. Use @atomicLoad or a Queue.
 3. A job is a plain fn(ptr) plus ONE ptr to a struct the spawner owns and keeps alive until the
-   job has finished. A closure cannot be a job (it points into the creator's stack and has no `fn(ptr)` form). Put what the job needs in that struct: its
-   input, the slice it alone writes, an index, a &Queue to send the result to.
+   job has finished. A stack closure cannot be a job (it points into the creator's stack). Put what
+   the job needs in that struct: its input, the slice it alone writes, an index, a &Queue to send
+   the result to. Or let the compiler write that struct: `pool.submitBoxed(fn[mem]() { .. })` copies
+   the captured values into arena `mem` (on the submitting thread) and runs the body on a worker.
+   `mem` must outlive the job, and a captured `&x` must too; the job must not allocate from `mem`
+   (rule 4).
 4. One Arena per thread. Two threads allocating from one Arena race. A worker allocates from its
    own arena or from memory.scratch, which is per thread and which a pool worker rewinds after
    every job, so scratch memory never outlives the job: copy results into the struct main gave
@@ -79,7 +85,8 @@ values at once, never one value at once:
     j3.math  j3.rand  j3.text (its cstr scratch is per thread)  j3.io (lines from two threads can
     interleave)  j3.option  j3.result  j3.gfx.voxel  j3.gfx.noise  j3.gfx.mesh  j3.gfx.bvh
     j3.gfx.canvas (on an arena you own)  j3.game.path  .space  .collide  .tile  .anim  .ecs
-    .physics  j3.data.save  j3.data.res  j3.data.json
+    .physics  j3.data.save  j3.data.res  j3.data.json  j3.io.watch (one Watcher per thread; its
+    changes still wake the main loop)
 Made for workers, since every call blocks: j3.net.tcp  .dns  .tls (loads libssl once under a lock;
 its lastError is per thread)  .http  j3.proc (`recipes http`).
 Inside j3.gfx only these touch no state: emitFace, emitFaceAo (mesh building), boxInClip, rayAabb

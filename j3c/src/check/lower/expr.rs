@@ -2,6 +2,15 @@ use super::*;
 
 impl<'a> Lower<'a> {
     pub(super) fn operand(&mut self, expr: &Expr, expected: Option<Ty>) -> Result<Operand, CheckError> {
+        if let Some(want) = expected.filter(|t| self.cx.dyn_trait(*t).is_some()) {
+            return match self.to_dyn(expr, want)? {
+                Rvalue { kind: RvalueKind::Use(op), .. } => Ok(op),
+                rv => Ok(self.tmp_op(expr.span, rv)),
+            };
+        }
+        if let ExprKind::Char(v) = expr.kind {
+            return self.char_lit(expr.span, v, expected);
+        }
         if let Some(v) = self.fold_int(expr) {
             if v == 0 {
                 if let Some(want) = expected {
@@ -10,6 +19,7 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+            let expected = expected.or_else(|| self.big_u64(expr).then_some(self.cx.common.u64));
             return Ok(self.num_from_int(expr.span, v, expected));
         }
         if let ExprKind::Float(v) = expr.kind {
@@ -35,6 +45,9 @@ impl<'a> Lower<'a> {
                 if let Some(op) = self.text_to_string(expr.span, &place, want)? {
                     return Ok(op);
                 }
+                if let Some(rv) = self.boxed_as_stack(expr.span, &place, want) {
+                    return Ok(self.tmp_op(expr.span, rv));
+                }
                 return Err(self.mismatch(
                     expr.span,
                     "type mismatch",
@@ -58,12 +71,30 @@ impl<'a> Lower<'a> {
     }
 
     pub(super) fn rvalue(&mut self, expr: &Expr, expected: Option<Ty>) -> Result<Rvalue, CheckError> {
+        let rv = self.rvalue_raw(expr, expected)?;
+        if let Some(want) = expected.filter(|w| *w != rv.ty && self.cx.is_boxed_closure(rv.ty)) {
+            let place = self.materialize_rv(rv, expr.span);
+            return Ok(match self.boxed_as_stack(expr.span, &place, want) {
+                Some(view) => view,
+                None => Rvalue::use_op(expr.span, Operand::Copy(place)),
+            });
+        }
+        Ok(rv)
+    }
+
+    fn rvalue_raw(&mut self, expr: &Expr, expected: Option<Ty>) -> Result<Rvalue, CheckError> {
+        if let Some(want) = expected.filter(|t| self.cx.dyn_trait(*t).is_some()) {
+            return self.to_dyn(expr, want);
+        }
         if matches!(expr.kind, ExprKind::Name(_)) {
             if let Ok(place) = self.try_place(expr) {
                 if self.is_script_value(place.ty) {
                     return Err(self.script_copy(expr.span, place.ty));
                 }
             }
+        }
+        if let ExprKind::Char(v) = expr.kind {
+            return Ok(Rvalue::use_op(expr.span, self.char_lit(expr.span, v, expected)?));
         }
         if let Some(v) = self.fold_int(expr) {
             if v == 0 {
@@ -73,6 +104,7 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+            let expected = expected.or_else(|| self.big_u64(expr).then_some(self.cx.common.u64));
             return Ok(Rvalue::use_op(
                 expr.span,
                 self.num_from_int(expr.span, v, expected),
@@ -124,10 +156,16 @@ impl<'a> Lower<'a> {
                 expr.span,
                 self.num_from_int(expr.span, *v, expected),
             )),
+            ExprKind::BigInt(v) => match expected {
+                Some(t) if t == self.cx.common.u64 => Ok(Rvalue::use_op(expr.span, Operand::int(expr.span, t, *v))),
+                _ => Err(crate::check::infer::big_int_err(self.path, expr.span, *v)),
+            },
+            ExprKind::Zeroed => Err(CheckError::new(self.path, expr.span, "a zero-filled value is only a typed `let`: `let buf: [64]u8;`")),
             ExprKind::Float(v) => Ok(Rvalue::use_op(
                 expr.span,
                 self.num_from_float(expr.span, *v, expected),
             )),
+            ExprKind::Char(v) => Ok(Rvalue::use_op(expr.span, self.char_lit(expr.span, *v, expected)?)),
             ExprKind::StructLit {
                 name,
                 type_args,
@@ -175,6 +213,7 @@ impl<'a> Lower<'a> {
             }
             ExprKind::SliceFrom { ptr, len } => self.slice_from(expr.span, ptr, len, expected),
             ExprKind::ArrayLit { elems } => self.array_lit(expr.span, elems, expected),
+            ExprKind::Tuple(elems) => self.tuple_lit(expr.span, elems, expected),
             ExprKind::SliceLit { elem, fields } => self.slice_lit(expr.span, elem, fields),
             ExprKind::Index { .. } => {
                 let place = self.place(expr)?;
@@ -201,7 +240,7 @@ impl<'a> Lower<'a> {
                     }
                 }
                 if let Some(ename) = self.enum_ctor_name(base) {
-                    return self.construct_variant(expr.span, &ename, &field.name, None, expected);
+                    return self.construct_variant(expr.span, &ename, &field.name, &[], expected);
                 }
                 if field.name == "len" {
                     if let Ok(p) = self.try_place(base) {
@@ -241,6 +280,7 @@ impl<'a> Lower<'a> {
                 let rv = self.binary(expr.span, *op, lhs, rhs, expected)?;
                 self.half_guard(expr.span, rv)
             }
+            ExprKind::Match(m) => self.match_value(m, expected),
             ExprKind::If {
                 cond,
                 then_expr,
@@ -366,6 +406,7 @@ impl<'a> Lower<'a> {
                 "a script type is not a value",
             )),
             ExprKind::ScriptLit { path, fields } => self.script_lit(expr.span, path, fields),
+            ExprKind::Embed { kind, .. } => self.embed_value(expr.span, *kind),
             ExprKind::Closure(lit) => self.closure_lit(expr.span, lit, expected),
         }
     }

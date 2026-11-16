@@ -1,9 +1,17 @@
 //! The TOML subset `j3.toml` and the user config use: tables, string and string-array values, and one-line
-//! inline tables of strings (`{ name = "x", exec = "y" }`).
+//! inline tables of strings (`{ name = "x", exec = "y" }`). Strings are kept as written; `unescape` decodes
+//! them. `toml/json.rs` turns a parsed file into JSON for package tools (`j3c manifest --json`).
+
+mod json;
+pub(crate) use json::toml_json;
 
 #[derive(Clone, Debug)]
 pub(super) enum TomlVal {
+    /// A quoted `"string"`.
     Str(String),
+    /// An unquoted token (`true`, `2`, `1.5`, `llvm`). Read as a string everywhere except `to_json`, which
+    /// types it.
+    Bare(String),
     List(Vec<String>),
     /// An inline table of string values, in file order.
     Map(Vec<(String, String)>),
@@ -12,7 +20,7 @@ pub(super) enum TomlVal {
 impl TomlVal {
     pub(super) fn as_str(&self) -> Option<&str> {
         match self {
-            TomlVal::Str(s) => Some(s),
+            TomlVal::Str(s) | TomlVal::Bare(s) => Some(s),
             TomlVal::List(_) | TomlVal::Map(_) => None,
         }
     }
@@ -20,7 +28,7 @@ impl TomlVal {
     pub(super) fn as_list(&self, key: &str) -> Result<Vec<String>, String> {
         match self {
             TomlVal::List(v) => Ok(v.clone()),
-            TomlVal::Str(_) | TomlVal::Map(_) => Err(format!("j3.toml: `{key}` must be an array")),
+            TomlVal::Str(_) | TomlVal::Bare(_) | TomlVal::Map(_) => Err(format!("j3.toml: `{key}` must be an array")),
         }
     }
 }
@@ -28,7 +36,7 @@ impl TomlVal {
 pub(super) struct TomlTable {
     pub(super) vals: Vec<(String, String, TomlVal)>,
     /// `[section]` headers with their line numbers, in file order (a header with no keys still counts).
-    heads: Vec<(String, usize)>,
+    pub(super) heads: Vec<(String, usize)>,
     pub(super) lines: Vec<usize>,
 }
 
@@ -116,7 +124,7 @@ fn parse_key_val(line: &str, line_no: usize) -> Result<(String, TomlVal), String
     } else if rhs.starts_with('"') {
         TomlVal::Str(parse_string(rhs, line_no)?)
     } else if is_bare(rhs) {
-        TomlVal::Str(rhs.to_string())
+        TomlVal::Bare(rhs.to_string())
     } else {
         TomlVal::Str(parse_string(rhs, line_no)?)
     };
@@ -156,16 +164,21 @@ fn parse_inline_table(s: &str, line_no: usize) -> Result<Vec<(String, String)>, 
         .ok_or_else(|| format!("j3.toml:{line_no}: expected `{{ key = \"value\", ... }}` on one line"))?;
     let mut out = Vec::new();
     let mut cur = String::new();
-    let mut in_str = false;
+    let (mut in_str, mut esc) = (false, false);
     for ch in inner.chars().chain(std::iter::once(',')) {
-        if ch == '"' {
+        // `\"` inside a string is a quote, not its end (as in `strip_comment`)
+        if esc {
+            esc = false;
+        } else if in_str && ch == '\\' {
+            esc = true;
+        } else if ch == '"' {
             in_str = !in_str;
         }
         if ch == ',' && !in_str {
             let part = cur.trim();
             if !part.is_empty() {
                 match parse_key_val(part, line_no)? {
-                    (k, TomlVal::Str(v)) => out.push((k, v)),
+                    (k, TomlVal::Str(v) | TomlVal::Bare(v)) => out.push((k, v)),
                     (k, _) => return Err(format!("j3.toml:{line_no}: `{k}` in an inline table must be a string")),
                 }
             }
@@ -188,10 +201,16 @@ fn parse_string_array(s: &str, line_no: usize) -> Result<Vec<String>, String> {
     }
     let mut out = Vec::new();
     let mut cur = String::new();
-    let mut in_str = false;
+    let (mut in_str, mut esc) = (false, false);
     for ch in inner.chars() {
-        if ch == '"' {
-            in_str = !in_str;
+        if esc || (in_str && ch == '\\') || ch == '"' {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else {
+                in_str = !in_str;
+            }
             cur.push(ch);
             continue;
         }
@@ -229,9 +248,53 @@ pub(crate) fn toml_doc(text: &str) -> Result<(Vec<(String, usize)>, Vec<(String,
     let mut out = Vec::new();
     for ((s, k, v), line) in t.vals.into_iter().zip(t.lines) {
         match v {
-            TomlVal::Str(v) => out.push((s, k, v, line)),
+            TomlVal::Str(v) | TomlVal::Bare(v) => out.push((s, k, v, line)),
             TomlVal::List(_) | TomlVal::Map(_) => return Err(format!("j3.toml:{line}: `{k}` must be a string or number")),
         }
     }
     Ok((t.heads, out))
+}
+
+/// A TOML basic string's escapes decoded (the reader keeps them as written): `\"`, `\\`, `\n`, `\t`, `\r`,
+/// `\b`, `\f`, `\uXXXX`, `\UXXXXXXXX`. Anything else stays as written.
+pub(super) fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.char_indices();
+    while let Some((i, c)) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let simple = match s[i + 1..].chars().next() {
+            Some('"') => Some('"'),
+            Some('\\') => Some('\\'),
+            Some('n') => Some('\n'),
+            Some('t') => Some('\t'),
+            Some('r') => Some('\r'),
+            Some('b') => Some('\u{8}'),
+            Some('f') => Some('\u{c}'),
+            _ => None,
+        };
+        if let Some(ch) = simple {
+            out.push(ch);
+            it.next();
+            continue;
+        }
+        let hex = match s[i + 1..].chars().next() {
+            Some('u') => 4,
+            Some('U') => 8,
+            _ => 0,
+        };
+        let code = s.get(i + 2..i + 2 + hex).filter(|h| hex > 0 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+        match code.and_then(|h| char::from_u32(u32::from_str_radix(h, 16).ok()?)) {
+            Some(ch) => {
+                out.push(ch);
+                for _ in 0..hex + 1 {
+                    it.next();
+                }
+            }
+            None => out.push(c),
+        }
+    }
+    out
 }

@@ -44,6 +44,13 @@ pub(crate) fn target_os(triple: &str) -> TargetOs {
     }
 }
 
+/// `""`, or a Linux triple for this machine's CPU (`x86_64-linux-gnu` from a target list):
+/// the host's own toolchain builds it, so host-only paths (ThinLTO) still apply.
+pub(crate) fn is_host_target(triple: &str) -> bool {
+    triple.is_empty()
+        || (cfg!(target_os = "linux") && target_os(triple) == TargetOs::Linux && triple.starts_with(std::env::consts::ARCH))
+}
+
 pub(crate) struct ReleaseFlags {
     /// Clang compile flags.
     pub compile: Vec<&'static str>,

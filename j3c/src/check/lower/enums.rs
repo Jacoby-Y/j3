@@ -87,32 +87,43 @@ impl<'a> Lower<'a> {
         ))
     }
 
+    /// `E.V`, `E.V(x)` or `E.V(a, b, c)`: `args` are the fields written in parens.
     pub(super) fn construct_variant(
         &mut self,
         span: Span,
         enum_name: &str,
         variant: &str,
-        payload: Option<&Expr>,
+        args: &[Expr],
         expected: Option<Ty>,
     ) -> Result<Rvalue, CheckError> {
         let id = self.ctor_enum_id(enum_name, expected, span)?;
         let (vid, pty) = self.find_variant(id, variant, span)?;
-        let payload_op = match (pty, payload) {
-            (None, None) => None,
-            (Some(ty), Some(e)) => Some(self.operand(e, Some(ty))?),
-            (Some(_), None) => {
-                return Err(CheckError::new(
-                    self.path,
-                    span,
-                    format!("`{enum_name}.{variant}` needs a payload"),
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(CheckError::new(
-                    self.path,
-                    span,
-                    format!("`{enum_name}.{variant}` has no payload"),
-                ));
+        let ftys = self.variant_field_tys(vid);
+        let name = format!("{enum_name}.{variant}");
+        if args.len() != ftys.len() {
+            let msg = match (ftys.len(), args.len()) {
+                (0, _) => format!("`{name}` has no payload"),
+                (1, 0) => format!("`{name}` needs a payload"),
+                (n, _) => format!("`{name}` takes {n} field{}, got {}", if n == 1 { "" } else { "s" }, args.len()),
+            };
+            return Err(CheckError::new(self.path, span, msg));
+        }
+        let payload_op = match (pty, self.cx.enum_def(id).variants[vid.index as usize].multi) {
+            (None, _) => None,
+            (Some(ty), false) => Some(self.operand(&args[0], Some(ty))?),
+            (Some(ty), true) => {
+                let mut ops = Vec::new();
+                for (k, (a, fty)) in args.iter().zip(ftys).enumerate() {
+                    let op = self.operand(a, Some(fty)).map_err(|mut e| {
+                        e.message = format!("field {k} of `{name}`: {}", e.message);
+                        e
+                    })?;
+                    if op.ty() != fty {
+                        return Err(self.mismatch(a.span, &format!("field {k} of `{name}`"), op.ty(), fty));
+                    }
+                    ops.push(op);
+                }
+                Some(Operand::Copy(self.materialize_rv(Rvalue::aggregate(span, ty, ops), span)))
             }
         };
         let ty = self.cx.ty_enum(id);
@@ -126,6 +137,31 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(Rvalue::enum_new(span, ty, vid, payload_op))
+    }
+
+    /// The fields of variant `vid`, in order: none, its one payload, or the payload struct's.
+    pub(super) fn variant_field_tys(&self, vid: VariantId) -> Vec<Ty> {
+        let v = &self.cx.enum_def(vid.enum_id).variants[vid.index as usize];
+        match (v.payload, v.multi) {
+            (None, _) => Vec::new(),
+            (Some(p), false) => vec![p],
+            (Some(p), true) => match self.cx.ty_kind(p) {
+                TyKind::Struct(sid) => self.cx.struct_def(*sid).fields.iter().map(|f| f.ty).collect(),
+                _ => unreachable!("a multi-field payload is a struct"),
+            },
+        }
+    }
+
+    /// The place of field `k` of variant `vid` in the enum value at `place`.
+    pub(super) fn variant_field_place(&self, place: &Place, vid: VariantId, k: usize, span: Span) -> Place {
+        let v = &self.cx.enum_def(vid.enum_id).variants[vid.index as usize];
+        let pty = v.payload.expect("a variant with fields has a payload");
+        let payload = self.payload_place(place, vid, pty, span);
+        if !v.multi {
+            return payload;
+        }
+        let TyKind::Struct(sid) = *self.cx.ty_kind(pty) else { unreachable!("a multi-field payload is a struct") };
+        self.b.field(self.cx, payload, crate::ir::ids::FieldId { struct_id: sid, index: k as u32 }, span)
     }
 
     pub(super) fn enum_id_of(&self, ty: Ty, span: Span, what: &str) -> Result<EnumId, CheckError> {
@@ -189,287 +225,6 @@ impl<'a> Lower<'a> {
             }
         };
         self.find_variant(enum_id, vname, span)
-    }
-
-    pub(super) fn check_exhaustive(
-        &self,
-        enum_id: EnumId,
-        arms: &[MatchArm],
-        span: Span,
-    ) -> Result<(), CheckError> {
-        let n = self.cx.enum_def(enum_id).variants.len();
-        let mut full = vec![false; n];
-        let mut nested: Vec<HashSet<u32>> = vec![HashSet::new(); n];
-        let mut nested_enum: Vec<Option<EnumId>> = vec![None; n];
-        for (i, v) in self.cx.enum_def(enum_id).variants.iter().enumerate() {
-            if let Some(pty) = v.payload {
-                if let TyKind::Enum(id) = self.cx.ty_kind(pty) {
-                    nested_enum[i] = Some(*id);
-                }
-            }
-        }
-        for arm in arms {
-            let (vid, payload_ty) = self.variant_from_path(enum_id, &arm.path, arm.span)?;
-            let i = vid.index as usize;
-            match &arm.payload {
-                None => {
-                    if payload_ty.is_some() {
-                        return Err(CheckError::new(
-                            self.path,
-                            arm.span,
-                            "match arm is missing a payload",
-                        ));
-                    }
-                    full[i] = true;
-                }
-                Some(Pat::Wild) | Some(Pat::Bind(_)) => {
-                    if payload_ty.is_none() {
-                        return Err(CheckError::new(
-                            self.path,
-                            arm.span,
-                            "match arm has an unexpected payload",
-                        ));
-                    }
-                    full[i] = true;
-                }
-                Some(Pat::Variant { path, .. }) => {
-                    let pty = match payload_ty {
-                        Some(t) => t,
-                        None => {
-                            return Err(CheckError::new(
-                                self.path,
-                                arm.span,
-                                "match arm has an unexpected payload",
-                            ));
-                        }
-                    };
-                    let nid = self.enum_id_of(pty, arm.span, "nested match")?;
-                    let (nv, _) = self.variant_from_path(nid, path, arm.span)?;
-                    nested[i].insert(nv.index);
-                }
-            }
-        }
-        let def = self.cx.enum_def(enum_id);
-        let ename = self.cx.name_str(def.name);
-        let mut missing = Vec::new();
-        for i in 0..n {
-            if full[i] {
-                continue;
-            }
-            let vname = self.cx.name_str(def.variants[i].name);
-            if let Some(eid) = nested_enum[i] {
-                let inner = self.cx.enum_def(eid);
-                if nested[i].len() == inner.variants.len() {
-                    continue;
-                }
-                if !nested[i].is_empty() {
-                    let iname = self.cx.name_str(inner.name);
-                    for (k, v) in inner.variants.iter().enumerate() {
-                        if !nested[i].contains(&(k as u32)) {
-                            missing.push(format!("`{ename}.{vname}({iname}.{})`", self.cx.name_str(v.name)));
-                        }
-                    }
-                    continue;
-                }
-            }
-            let payload = if def.variants[i].payload.is_some() { "(_)" } else { "" };
-            missing.push(format!("`{ename}.{vname}{payload}`"));
-        }
-        if !missing.is_empty() {
-            return Err(CheckError::new(self.path, span, format!("match is not exhaustive: missing {}", missing.join(", ")))
-                .help("add an arm for each (enum matches take no `_` arm)"));
-        }
-        Ok(())
-    }
-
-    pub(super) fn arm_cond(
-        &mut self,
-        scrut: &Place,
-        enum_id: EnumId,
-        arm: &MatchArm,
-    ) -> Result<Operand, CheckError> {
-        let (vid, payload_ty) = self.variant_from_path(enum_id, &arm.path, arm.span)?;
-        let outer = self.is_variant(scrut, vid, arm.span);
-        match &arm.payload {
-            Some(Pat::Variant { path, .. }) => {
-                let pty = match payload_ty {
-                    Some(t) => t,
-                    None => {
-                        return Err(CheckError::new(
-                            self.path,
-                            arm.span,
-                            "match arm has an unexpected payload",
-                        ));
-                    }
-                };
-                let nid = self.enum_id_of(pty, arm.span, "nested match")?;
-                let (nv, _) = self.variant_from_path(nid, path, arm.span)?;
-                let inner_place = self.payload_place(scrut, vid, pty, arm.span);
-                let inner = self.is_variant(&inner_place, nv, arm.span);
-                Ok(self.and_ops(arm.span, outer, inner))
-            }
-            _ => Ok(outer),
-        }
-    }
-
-    pub(super) fn lower_match_arm(
-        &mut self,
-        scrut: &Place,
-        enum_id: EnumId,
-        arm: &MatchArm,
-    ) -> Result<crate::ir::body::Block, CheckError> {
-        let saved_locals = self.locals.clone();
-        let saved_aliases = self.aliases.clone();
-        let saved = self.b.begin_block();
-        if let Some(Pat::Bind(n)) = &arm.payload {
-            if self.is_declared(&n.name) || self.aliases.contains_key(&n.name) {
-                return Err(CheckError::new(
-                    self.path,
-                    n.span,
-                    format!("shadowing `{}` is a compile error", n.name),
-                ));
-            }
-            let (vid, payload_ty) = self.variant_from_path(enum_id, &arm.path, arm.span)?;
-            let pty = match payload_ty {
-                Some(t) => t,
-                None => {
-                    return Err(CheckError::new(
-                        self.path,
-                        arm.span,
-                        "match arm has an unexpected payload",
-                    ));
-                }
-            };
-            let src = self.payload_place(scrut, vid, pty, n.span);
-            let id = self.b.let_local(self.cx.intern_name(&n.name), pty, n.span);
-            let dest = self.b.local_place(id, n.span);
-            self.b
-                .assign(n.span, dest, Rvalue::use_op(n.span, Operand::Copy(src)));
-            self.locals.insert(n.name.clone(), id);
-        }
-        for stmt in &arm.body.stmts {
-            self.stmt(stmt)?;
-        }
-        let block = self.b.end_block(saved);
-        self.locals = saved_locals;
-        self.aliases = saved_aliases;
-        Ok(block)
-    }
-
-    pub(super) fn lower_match(&mut self, s: &parse::MatchStmt) -> Result<(), CheckError> {
-        let op = self.operand(&s.expr, None)?;
-        if let TyKind::Int(int_ty) = *self.cx.ty_kind(op.ty()) {
-            return self.lower_int_match(s, op, int_ty);
-        }
-        let enum_id = self.enum_id_of(op.ty(), s.span, "match")?;
-        self.check_exhaustive(enum_id, &s.arms, s.span)?;
-        let scrut = self.materialize(op, s.span);
-        let mut else_block = None;
-        for arm in s.arms.iter().rev() {
-            let then_block = self.lower_match_arm(&scrut, enum_id, arm)?;
-            let cond = self.arm_cond(&scrut, enum_id, arm)?;
-            let saved = self.b.begin_block();
-            self.b.push(crate::ir::stmt::Stmt {
-                ty: self.cx.common.void,
-                span: arm.span,
-                kind: crate::ir::stmt::StmtKind::If {
-                    cond,
-                    then_block,
-                    else_block,
-                },
-            });
-            else_block = Some(self.b.end_block(saved));
-        }
-        if let Some(block) = else_block {
-            for stmt in block.stmts {
-                self.b.push(stmt);
-            }
-        }
-        Ok(())
-    }
-
-    /// `match n { 1 { } -2 { } LIMIT { } _ { } }`: arms are int literals or int `const`s, `_` is
-    /// required, and the whole thing is one `Switch`.
-    fn lower_int_match(
-        &mut self,
-        s: &parse::MatchStmt,
-        scrut: Operand,
-        int_ty: crate::ir::ty::IntTy,
-    ) -> Result<(), CheckError> {
-        let (lo, hi) = match (int_ty.is_signed(), int_ty.bits()) {
-            (true, b) => (-(1i128 << (b - 1)), (1i128 << (b - 1)) - 1),
-            (false, b) => (0, (1i128 << b) - 1),
-        };
-        let mut cases: Vec<(u64, crate::ir::body::Block)> = Vec::new();
-        let mut seen: HashMap<i64, ()> = HashMap::new();
-        let mut default = None;
-        for arm in &s.arms {
-            if arm.payload.is_some() {
-                return Err(CheckError::new(self.path, arm.span, "an integer match arm has no payload"));
-            }
-            if arm.value.is_none() && arm.path.len() == 1 && arm.path[0].name == "_" {
-                if default.is_some() {
-                    return Err(CheckError::new(self.path, arm.span, "duplicate `_` arm"));
-                }
-                default = Some(self.int_arm_block(&arm.body)?);
-                continue;
-            }
-            let expr = match &arm.value {
-                Some(e) => e.clone(),
-                None => {
-                    let mut e = Expr { span: arm.path[0].span, kind: ExprKind::Name(arm.path[0].clone()) };
-                    for seg in &arm.path[1..] {
-                        e = Expr { span: seg.span, kind: ExprKind::Field { base: Box::new(e), field: seg.clone() } };
-                    }
-                    e
-                }
-            };
-            let v = match self.fold_int(&expr) {
-                Some(v) => v,
-                None => {
-                    return Err(CheckError::new(
-                        self.path,
-                        expr.span,
-                        "an integer match arm is an int literal or an int `const`",
-                    ))
-                }
-            };
-            if (v as i128) < lo || (v as i128) > hi {
-                let mut ty = String::new();
-                dump_ty(self.cx, scrut.ty(), &mut ty);
-                return Err(CheckError::new(self.path, expr.span, format!("match arm `{v}` does not fit `{ty}`")));
-            }
-            if seen.insert(v, ()).is_some() {
-                return Err(CheckError::new(self.path, expr.span, format!("duplicate match arm `{v}`")));
-            }
-            cases.push((v as u64, self.int_arm_block(&arm.body)?));
-        }
-        let default = match default {
-            Some(b) => b,
-            None => {
-                return Err(CheckError::new(self.path, s.span, "a `match` on an integer needs a `_` arm")
-                    .help("integers can't be listed exhaustively; add `_ { }`"))
-            }
-        };
-        self.b.push(crate::ir::stmt::Stmt {
-            ty: self.cx.common.void,
-            span: s.span,
-            kind: crate::ir::stmt::StmtKind::Switch { scrut, cases, default },
-        });
-        Ok(())
-    }
-
-    fn int_arm_block(&mut self, body: &parse::Block) -> Result<crate::ir::body::Block, CheckError> {
-        let saved_locals = self.locals.clone();
-        let saved_aliases = self.aliases.clone();
-        let saved = self.b.begin_block();
-        for stmt in &body.stmts {
-            self.stmt(stmt)?;
-        }
-        let block = self.b.end_block(saved);
-        self.locals = saved_locals;
-        self.aliases = saved_aliases;
-        Ok(block)
     }
 
     pub(super) fn question(&mut self, span: Span, inner: &Expr) -> Result<Rvalue, CheckError> {

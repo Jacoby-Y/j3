@@ -243,6 +243,13 @@ impl<'a> Parser<'a> {
 
     pub(super) fn if_expr(&mut self) -> Result<Expr, ParseError> {
         let start = self.cur().span;
+        if self.look(1).kind == TokenKind::Let {
+            let (m, has_else) = self.if_let()?;
+            if !has_else {
+                return Err(ParseError::new(m.span, "if-expression needs `else`"));
+            }
+            return Ok(Expr { span: m.span, kind: ExprKind::Match(Box::new(m)) });
+        }
         self.expect(TokenKind::If, "expected `if`")?;
         let cond = self.expr()?;
         self.expect(TokenKind::LBrace, "expected `{`")?;

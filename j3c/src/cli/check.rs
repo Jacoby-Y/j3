@@ -144,7 +144,7 @@ pub(super) fn check_json(entry: &str, css: &[String], i18n: &[String], warnings:
     format!("{{\"ok\":true,\"entry\":{}{}{}{warns}}}", json_str(entry), arr("css", css), arr("i18n", i18n))
 }
 
-pub(super) fn json_str(s: &str) -> String {
+pub(crate) fn json_str(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {

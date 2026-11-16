@@ -9,9 +9,8 @@ pub(crate) fn emit_local_decls(w: &mut CWriter, body: &Body) -> Result<String, S
             continue;
         }
         let name = w.local_name(decl.id);
-        if let Some((elem, len)) = c_ty::array_parts(w.cx, decl.ty) {
-            let elem_c = c_type(w.cx, elem)?;
-            out.push_str(&format!("    {elem_c} {name}[{len}];\n"));
+        if c_ty::array_parts(w.cx, decl.ty).is_some() {
+            out.push_str(&format!("    {};\n", c_ty::array_decl(w.cx, decl.ty, &name)?));
         } else {
             let ty = c_type(w.cx, decl.ty)?;
             if ty.ends_with('*') {

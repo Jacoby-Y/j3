@@ -126,6 +126,7 @@ impl<'a> Gen<'a> {
             }
             Stmt::ForEach(f) => return self.err_help(f.span, "there are no slices or collections in shader code", "count with `for i in 0..N` and index a fixed array"),
             Stmt::Defer(d) => return self.err_help(d.span, "`defer` does not exist in shader code", "write the statements where they should run"),
+            Stmt::LetPat(l) => return self.err_help(l.span, "a destructuring `let` does not exist in shader code", "read the fields: `let a = s.a;`"),
             Stmt::Labeled(l) => return self.err_help(l.span, "labels do not exist in GLSL", "restructure with a `bool` flag"),
             Stmt::UseLocal(u) => return self.err(u.span, "`use` does not exist in shader code"),
         }
@@ -169,30 +170,41 @@ impl<'a> Gen<'a> {
         let mut seen = Vec::new();
         let mut has_default = false;
         for arm in &m.arms {
-            let head = match &arm.value {
-                Some(v) => {
-                    let n = lit_value(v).ok_or_else(|| self.e(v.span, "a `match` arm is an integer literal"))?;
-                    if seen.contains(&n) {
-                        return self.err(v.span, format!("duplicate arm `{n}`"));
+            if let Some(g) = &arm.guard {
+                return self.err_help(g.span, "a shader `match` arm has no guard", "use `if` inside the arm");
+            }
+            let mut heads = Vec::new();
+            for pat in &arm.pats {
+                heads.push(match pat {
+                    crate::parse::Pat::Lit(v) => {
+                        let n = lit_value(v).ok_or_else(|| self.e(v.span, "a `match` arm is an integer literal"))?;
+                        if seen.contains(&n) {
+                            return self.err(v.span, format!("duplicate arm `{n}`"));
+                        }
+                        if sty == U32 && n < 0 {
+                            return self.err(v.span, "a u32 `match` has no negative arms");
+                        }
+                        seen.push(n);
+                        format!("case {n}{}:", if sty == U32 { "u" } else { "" })
                     }
-                    if sty == U32 && n < 0 {
-                        return self.err(v.span, "a u32 `match` has no negative arms");
+                    crate::parse::Pat::Wild(_) => {
+                        if has_default {
+                            return self.err(arm.span, "a second `_` arm");
+                        }
+                        has_default = true;
+                        "default:".to_string()
                     }
-                    seen.push(n);
-                    format!("case {n}{}:", if sty == U32 { "u" } else { "" })
-                }
-                None if arm.path.len() == 1 && arm.path[0].name == "_" => {
-                    if has_default {
-                        return self.err(arm.span, "a second `_` arm");
-                    }
-                    has_default = true;
-                    "default:".to_string()
-                }
-                None => return self.err_help(arm.span, "enum patterns do not exist in shader code", "`match` on an i32 with integer arms and `_`"),
-            };
+                    crate::parse::Pat::Variant { .. } => return self.err_help(pat.span(), "enum patterns do not exist in shader code", "`match` on an i32 with integer arms and `_`"),
+                    _ => return self.err_help(pat.span(), "shader `match` arms are integer literals and `_`", "`match` on an i32 with integer arms and `_`"),
+                });
+            }
+            let head = heads.join(" ");
             self.depth += 1;
             self.line(&format!("{head} {{"));
             self.block(&arm.body)?;
+            if let Some(t) = &arm.tail {
+                return self.err_help(t.span, "a shader `match` arm has no value", "end the expression with `;`");
+            }
             self.depth += 1;
             self.line("break;");
             self.depth -= 1;
@@ -236,6 +248,7 @@ fn op_sym(op: crate::parse::BinOp) -> &'static str {
 fn lit_value(e: &Expr) -> Option<i64> {
     match &e.kind {
         ExprKind::Int(v) => Some(*v),
+        ExprKind::Char(v) => Some(*v as i64),
         ExprKind::Unary { op: UnaryOp::Neg, expr } => lit_value(expr).map(|v| -v),
         _ => None,
     }

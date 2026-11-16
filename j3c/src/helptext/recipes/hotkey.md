@@ -8,7 +8,7 @@ window. `j3.game.hotkey` grabs the combo on the X11 root window; `j3c doc j3.gam
   it), so `hk.pressed() || game.keyPressed(Key.F8)` covers both the grab and the fallback.
   `Hotkey {}` is an empty handle that never fires.
 - While registered, the focused app never gets that combo. Pick one people do not type.
-- Errors: `Taken` (another app holds it), `Unsupported` (Wayland, no libX11, not Linux),
+- Errors: `Taken` (another app holds it), `Unsupported` (Wayland, no libX11, macOS, Android; Windows uses `RegisterHotKey`),
   `NoDisplay` (no X server, `--headless`), `UnknownKey` (not on this keymap). Fall back to the
   in-window key; never panic on them.
 - `hk.unregister()` frees the combo; the X server also drops grabs when the process exits.

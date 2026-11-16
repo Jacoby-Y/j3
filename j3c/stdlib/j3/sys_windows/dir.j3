@@ -1,0 +1,222 @@
+// Part of j3.sys for Windows (files and directories for `j3.io`: stat, rename, remove, mkdir, directory listing); the module doc and `use lib`s are in ../sys_windows.j3.
+module j3.sys;
+
+// Files and directories (`j3.io`): stat, rename, remove, mkdir and directory listing work.
+
+/// `statAt` dirfd meaning "relative to the working directory".
+pub const AT_FDCWD: int = -100;
+#[singleton]
+#[thread]
+let STAT_W: [9]u32;
+
+// Directory listing. `open` of a directory gives a pseudo fd (`DIR_BASE` + slot) that stands for a FindFirstFileA
+// search; `dirents` turns its entries into linux_dirent64 records and `statAt` resolves names against its path.
+// Eight directories can be open per thread.
+fn wb(p: ptr, off: int): u8 {
+    let b = (p as int + off) as ptr as &u8;
+    return *b;
+}
+
+const DIR_BASE: int = 1000000;
+const DIR_SLOTS: int = 8;
+const DIR_PATH_MAX: int = 520;
+const FIND_SIZE: int = 320;
+
+#[singleton]
+#[thread]
+let DIR_STATE: [8]int;
+#[singleton]
+#[thread]
+let DIR_HANDLE: [8]int;
+#[singleton]
+#[thread]
+let DIR_PATH: [4160]u8;
+#[singleton]
+#[thread]
+let DIR_FIND: [2560]u8;
+#[singleton]
+#[thread]
+let FULL_PATH: [1100]u8;
+
+fn dirOpen(path: ptr): int {
+    let n = 0;
+    while n < DIR_PATH_MAX - 4 && wb(path, n) != 0 {
+        n += 1;
+    }
+    if n >= DIR_PATH_MAX - 4 {
+        return 0 - 1;
+    }
+    for slot in 0..DIR_SLOTS {
+        if DIR_STATE[slot] == 0 {
+            let base = slot * DIR_PATH_MAX;
+            for k in 0..n {
+                DIR_PATH[base + k] = wb(path, k);
+            }
+            if n > 0 && DIR_PATH[base + n - 1] != 92 && DIR_PATH[base + n - 1] != 47 {
+                DIR_PATH[base + n] = 92;
+                n += 1;
+            }
+            DIR_PATH[base + n] = 42;
+            DIR_PATH[base + n + 1] = 0;
+            DIR_STATE[slot] = 1;
+            DIR_HANDLE[slot] = 0 - 1;
+            return DIR_BASE + slot;
+        }
+    }
+    return 0 - 1;
+}
+
+fn dirClose(fd: int): int {
+    let slot = fd - DIR_BASE;
+    if slot < 0 || slot >= DIR_SLOTS || DIR_STATE[slot] == 0 {
+        return 0 - 1;
+    }
+    if DIR_HANDLE[slot] != 0 - 1 {
+        k32.FindClose(DIR_HANDLE[slot]);
+    }
+    DIR_STATE[slot] = 0;
+    return 0;
+}
+
+/// Negative error for the last failed Win32 call, in the numbers `j3.io` knows: -2 not found, -17 exists,
+/// else minus the Win32 code.
+fn winErr(): int {
+    let e = errno();
+    if e == 2 || e == 3 {
+        return 0 - 2;
+    }
+    if e == 183 {
+        return 0 - 17;
+    }
+    if e <= 0 {
+        return 0 - 1;
+    }
+    return 0 - e;
+}
+
+/// `stat` of `path` (NUL-terminated) via `GetFileAttributesExA`. For a directory fd from `open`, `path` is a name
+/// inside it; otherwise `dir` is ignored (only `AT_FDCWD` or full paths work). Fills `out`: is-directory 1/0, size
+/// in bytes, mtime in unix seconds; a 4th slot, if present, gets is-symlink (always 0 here). 0, or a negative error.
+/// ponytail: GetFileAttributesExA never follows a reparse point, so this matches `lstatAt` for a link; follow
+/// with CreateFileA + GetFileInformationByHandle if that matters.
+pub fn statAt(dir: int, path: ptr, out: []int): int {
+    let r = lstatAt(dir, path, out);
+    if out.len > 3 {
+        out[3] = 0;
+    }
+    return r;
+}
+
+/// Like `statAt`, for the link itself: a 4th slot in `out`, if present, gets 1 for a reparse point (symlink or
+/// junction).
+pub fn lstatAt(dir: int, path: ptr, out: []int): int {
+    let target = path;
+    if dir >= DIR_BASE {
+        let slot = dir - DIR_BASE;
+        if slot >= DIR_SLOTS || DIR_STATE[slot] == 0 {
+            return 0 - 9;
+        }
+        let base = slot * DIR_PATH_MAX;
+        let n = 0;
+        while DIR_PATH[base + n] != 42 {
+            n += 1;
+        }
+        for k in 0..n {
+            FULL_PATH[k] = DIR_PATH[base + k];
+        }
+        let m = 0;
+        while n + m < 1090 && wb(path, m) != 0 {
+            FULL_PATH[n + m] = wb(path, m);
+            m += 1;
+        }
+        FULL_PATH[n + m] = 0;
+        target = &FULL_PATH[0] as ptr;
+    }
+    if k32.GetFileAttributesExA(target, u32(0), &STAT_W[0] as ptr) == 0 {
+        return winErr();
+    }
+    // WIN32_FILE_ATTRIBUTE_DATA: attributes @0, last write FILETIME (100 ns since 1601) @20/@24, size high @28, low @32
+    out[0] = if (int(STAT_W[0]) / 16) % 2 == 1 { 1 } else { 0 };
+    out[1] = int(STAT_W[7]) * 4294967296 + int(STAT_W[8]);
+    out[2] = (int(STAT_W[6]) * 4294967296 + int(STAT_W[5])) / 10000000 - 11644473600;
+    if out.len > 3 {
+        // FILE_ATTRIBUTE_REPARSE_POINT 0x400
+        out[3] = if (int(STAT_W[0]) / 1024) % 2 == 1 { 1 } else { 0 };
+    }
+    return 0;
+}
+
+/// Directory entries of a pseudo fd from `open`, as `linux_dirent64` records in `buf` (d_reclen u16 @16, d_name @19,
+/// NUL-terminated; no "." or ".."). Bytes written, 0 at the end, negative on error. Uses FindFirstFileA/FindNextFileA.
+pub fn dirents(fd: int, buf: []u8): int {
+    let slot = fd - DIR_BASE;
+    if slot < 0 || slot >= DIR_SLOTS || DIR_STATE[slot] == 0 {
+        return 0 - 9;
+    }
+    let data = &DIR_FIND[slot * FIND_SIZE] as ptr;
+    let used = 0;
+    while DIR_STATE[slot] != 3 {
+        if DIR_STATE[slot] == 1 {
+            let h = k32.FindFirstFileA(&DIR_PATH[slot * DIR_PATH_MAX] as ptr, data);
+            if h == 0 - 1 {
+                let e = winErr();
+                DIR_STATE[slot] = 3;
+                if e == 0 - 2 {
+                    return 0;
+                }
+                return e;
+            }
+            DIR_HANDLE[slot] = h;
+            DIR_STATE[slot] = 2;
+        }
+        // DIR_STATE 2: `data` holds an entry not yet written
+        let len = 0;
+        while wb(data, 44 + len) != 0 {
+            len += 1;
+        }
+        let dots = (len == 1 && wb(data, 44) == 46) || (len == 2 && wb(data, 44) == 46 && wb(data, 45) == 46);
+        if !dots {
+            let reclen = (19 + len + 1 + 7) / 8 * 8;
+            if used + reclen > buf.len {
+                if used == 0 {
+                    return 0 - 22;
+                }
+                return used;
+            }
+            for k in 0..reclen {
+                buf[used + k] = 0;
+            }
+            buf[used + 16] = u8(reclen % 256);
+            buf[used + 17] = u8(reclen / 256);
+            for k in 0..len {
+                buf[used + 19 + k] = wb(data, 44 + k);
+            }
+            used += reclen;
+        }
+        if k32.FindNextFileA(DIR_HANDLE[slot], data) == 0 {
+            DIR_STATE[slot] = 3;
+        }
+    }
+    return used;
+}
+/// Rename or move `from` to `to`, replacing `to` (`MoveFileExA` with REPLACE_EXISTING). 0, or a negative error.
+pub fn rename(from: ptr, to: ptr): int {
+    if k32.MoveFileExA(from, to, u32(1)) == 0 {
+        return winErr();
+    }
+    return 0;
+}
+/// Delete the file `path` (`DeleteFileA`). 0, or a negative error.
+pub fn unlink(path: ptr): int {
+    if k32.DeleteFileA(path) == 0 {
+        return winErr();
+    }
+    return 0;
+}
+/// Make the directory `path` (`CreateDirectoryA`; `mode` is ignored). 0, or a negative error (-17 when it exists).
+pub fn mkdir(path: ptr, mode: int): int {
+    if k32.CreateDirectoryA(path, 0) == 0 {
+        return winErr();
+    }
+    return 0;
+}

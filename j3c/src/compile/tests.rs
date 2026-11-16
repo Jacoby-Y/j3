@@ -577,12 +577,23 @@ fn both_backends_opt(name: &str, src: &str, opt: &str) -> Vec<emit::RunResult> {
     out
 }
 
+mod collections;
 mod defaults;
 mod diag;
 mod gaps;
+mod io_os;
+mod literals;
+mod match_expr;
+mod text_embed;
+mod patterns;
+mod variants;
 mod samples;
 mod script_dev;
 mod script_scene;
 mod statements;
 mod stdlib_programs;
 mod targets;
+mod tuples;
+mod derive;
+mod dyn_trait;
+mod bound_defs;

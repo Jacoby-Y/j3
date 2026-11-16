@@ -2,15 +2,18 @@
 /// load at most 3/4. `remove` shifts the following entries back (no tombstones), so add/remove churn allocates nothing. `K` needs `Hash` and `Eq`
 /// (`j3c doc j3.cmp`): ints, floats, bools, `string`, `Entity`. Memory comes from the arena you pass
 /// (like `List`): growth abandons the old buffers, `clear` keeps them, and rewinding the arena frees all.
-/// Iterate by slot: `for i in 0..m.cap { if m.live(i) { m.keyAt(i); m.valAt(i); } }` (order is unspecified;
-/// do not `put` or `remove` while iterating). Not shared across threads (same as `List`).
+/// Iterate with `for (k, v) in m.entries(&arena)`, `m.each(fn(k: K, v: V) { .. })`, or by slot: `for i in 0..m.cap { if m.live(i) { m.keyAt(i);
+/// m.valAt(i); } }` (order is unspecified; do not `put` or `remove` while iterating). For deterministic output
+/// walk `m.sortedKeys(&arena)` (`K: Ord`). `getPtr` / `getOrPut` give a `&V` for in-place updates, valid until
+/// the next `put`. Not shared across threads (same as `List`).
 /// Do not use NaN float keys: `NaN == NaN` is false, so each `put` adds a new slot and `get` never finds it.
 
 module j3.data.map;
 
-use j3.cmp.{ Eq, Hash };
+use j3.cmp.{ Eq, Hash, Ord, sort };
 use j3.memory.Arena;
 use j3.option.Option;
+use j3.sys.panic;
 
 /// Slot states in `state`.
 const EMPTY: u8 = 0;
@@ -47,6 +50,7 @@ pub struct Map<K: Hash + Eq, V> {
 
     /// Slot holding `k`, or -1.
     fn find(this: &Map<K, V>, k: K): int {
+        if this.cap == 0 { return -1; }
         let i = int(k.hash() & u64(this.cap - 1));
         while this.state[i] != EMPTY {
             if this.keys[i] == k { return i; }
@@ -79,7 +83,11 @@ pub struct Map<K: Hash + Eq, V> {
             this.vals[i] = v;
             return;
         }
-        if (this.len + 1) * 4 > this.cap * 3 { this.rehash(this.cap * 2); }
+        if this.cap == 0 {
+            this.rehash(8);
+        } else if (this.len + 1) * 4 > this.cap * 3 {
+            this.rehash(this.cap * 2);
+        }
         i = int(k.hash() & u64(this.cap - 1));
         while this.state[i] == FULL { i = (i + 1) & (this.cap - 1); }
         this.state[i] = FULL;
@@ -109,6 +117,66 @@ pub struct Map<K: Hash + Eq, V> {
         this.state[i] = EMPTY;
         this.len -= 1;
         return true;
+    }
+
+    /// Pointer to the value for `k`, valid until the next `put`; panics when `k` is absent (test `has`, or
+    /// use `getOrPut`). `let p = m.getPtr(k); *p += 1;` updates in place.
+    fn getPtr(this: &Map<K, V>, k: K): &V {
+        let i = this.find(k);
+        if i < 0 { panic("Map.getPtr: key not present"); }
+        return &this.vals[i];
+    }
+
+    /// Pointer to the value for `k`, adding `k` with value `d` first when absent; valid until the next `put`.
+    fn getOrPut(this: &Map<K, V>, k: K, d: V): &V {
+        if this.find(k) < 0 { this.put(k, d); }
+        return &this.vals[this.find(k)];
+    }
+
+    /// Call `f(key, value)` for every entry, in slot order (unspecified). `f` must not `put` or `remove`.
+    fn each(this: &Map<K, V>, f: closure(K, V)) {
+        for i in 0..this.cap {
+            if this.state[i] == FULL { f(this.keys[i], this.vals[i]); }
+        }
+    }
+
+    /// Every entry as a `(key, value)` tuple, in slot order (unspecified), in a slice from `arena`:
+    /// `for (k, v) in m.entries(&tmp) { .. }`. A copy: later `put`s do not change it.
+    fn entries(this: &Map<K, V>, arena: &Arena): [](K, V) {
+        let out = arena.alloc::<(K, V)>(this.len);
+        let n = 0;
+        for i in 0..this.cap {
+            if this.state[i] == FULL {
+                out[n] = (this.keys[i], this.vals[i]);
+                n += 1;
+            }
+        }
+        return out;
+    }
+
+    /// Every key, sorted ascending (`K: Ord`, checked where this is called), in a slice from `arena`:
+    /// the deterministic order for output, where Rust would use a `BTreeMap`.
+    fn sortedKeys(this: &Map<K, V>, arena: &Arena): []K where K: Ord {
+        let out = arena.alloc::<K>(this.len);
+        let n = 0;
+        for i in 0..this.cap {
+            if this.state[i] == FULL {
+                out[n] = this.keys[i];
+                n += 1;
+            }
+        }
+        sort(out);
+        return out;
+    }
+
+    /// Forget the storage (the arena keeps it until rewound) and become empty with no slots; a later `put`
+    /// allocates again. Use `clear` to keep the slots.
+    fn free(this: &Map<K, V>) {
+        this.keys = this.arena.alloc::<K>(0);
+        this.vals = this.arena.alloc::<V>(0);
+        this.state = this.arena.alloc::<u8>(0);
+        this.cap = 0;
+        this.len = 0;
     }
 
     /// Drop every entry, keeping the slots.

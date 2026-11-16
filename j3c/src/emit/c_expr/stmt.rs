@@ -59,6 +59,17 @@ impl<'a> CWriter<'a> {
                             };
                             Ok(line)
                         }
+                    } else if c_ty::array_parts(self.cx, rvalue.ty)
+                        .is_some_and(|(e, _)| c_ty::array_parts(self.cx, e).is_some())
+                    {
+                        // `[[..], [..]]`: C has no array-valued initializer, so copy each row
+                        let p = self.place(place)?;
+                        let mut s = String::new();
+                        for (i, f) in fields.iter().enumerate() {
+                            let v = self.operand(f)?;
+                            s.push_str(&format!("{pad}memcpy(({p})[{i}], {v}, sizeof(({p})[{i}]));\n"));
+                        }
+                        Ok(s)
                     } else {
                         let p = self.place(place)?;
                         let v = self.rvalue(rvalue)?;
@@ -72,10 +83,11 @@ impl<'a> CWriter<'a> {
                 } else {
                     let p = self.place(place)?;
                     let v = self.rvalue(rvalue)?;
-                    let line = if c_ty::array_parts(self.cx, place.ty).is_some() {
-                        format!("{pad}memcpy({p}, {v}, sizeof({p}));\n")
-                    } else {
-                        format!("{pad}{p} = {v};\n")
+                    let line = match (c_ty::array_parts(self.cx, place.ty).is_some(), &rvalue.kind) {
+                        // a call returns an array in its wrapper struct
+                        (true, RvalueKind::Call { .. }) => format!("{pad}memcpy({p}, ({v}).a, sizeof({p}));\n"),
+                        (true, _) => format!("{pad}memcpy({p}, {v}, sizeof({p}));\n"),
+                        (false, _) => format!("{pad}{p} = {v};\n"),
                     };
                     Ok(line)
                 }
@@ -114,7 +126,7 @@ impl<'a> CWriter<'a> {
             StmtKind::Return { value } => {
                 match value {
                     Some(v) => {
-                        let e = self.operand(v)?;
+                        let e = self.value_operand(v)?;
                         let ty = c_type(self.cx, v.ty())?;
                         let tmp = self.fresh("j3_ret_");
                         let mut s = format!("{pad}{ty} {tmp} = {e};\n");

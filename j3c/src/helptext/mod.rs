@@ -60,10 +60,10 @@ pub fn recipes() -> Vec<Recipe> {
             files: vec![("j3.toml", PAINT_TOML.replace("painted", "recorder").replace(", \"SDL2_ttf\"", "")), ("src/main.j3", HOTKEY_MAIN.to_string())],
         },
         Recipe {
-            name: "steam",
-            what: "Steam: init, attach, unlock an achievement, post a score, rich presence (no-op without Steam)",
-            text: RECIPE_STEAM,
-            files: vec![("j3.toml", PAINT_TOML.replace("painted", "spacerun").replace(", \"SDL2_ttf\"", "")), ("src/main.j3", STEAM_MAIN.to_string())],
+            name: "watch",
+            what: "notice files changed outside the app (a folder and a file)",
+            text: RECIPE_WATCH,
+            files: vec![("j3.toml", PAINT_TOML.replace("painted", "watcher").replace(", \"SDL2_ttf\"", "")), ("src/main.j3", WATCH_MAIN.to_string())],
         },
         Recipe {
             name: "paste",
@@ -246,9 +246,9 @@ const RECIPE_HOTKEY: &str = include_str!("recipes/hotkey.md");
 
 const HOTKEY_MAIN: &str = include_str!("recipes/hotkey_main.j3");
 
-const RECIPE_STEAM: &str = include_str!("recipes/steam.md");
+const RECIPE_WATCH: &str = include_str!("recipes/watch.md");
 
-const STEAM_MAIN: &str = include_str!("recipes/steam_main.j3");
+const WATCH_MAIN: &str = include_str!("recipes/watch_main.j3");
 
 const RECIPE_PASTE: &str = include_str!("recipes/paste.md");
 

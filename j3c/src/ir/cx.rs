@@ -35,6 +35,7 @@ pub struct CommonTys {
     pub f16: Ty,
 }
 
+#[derive(Clone)]
 pub struct SourceFile {
     pub id: FileId,
     pub path: String,
@@ -58,6 +59,8 @@ impl SourceFile {
     }
 }
 
+/// `Clone`: the generic-definition check (`check/lower/defcheck.rs`) lowers in a throwaway copy.
+#[derive(Clone)]
 pub struct IrCx {
     names: Names,
     tys: Vec<TyKind>,
@@ -70,14 +73,45 @@ pub struct IrCx {
     pub files: Vec<SourceFile>,
     file_index: HashMap<FileId, usize>,
     pub(crate) closures: crate::ir::closure::ClosureTables,
+    pub(crate) tuples: crate::ir::tuple::TupleTables,
+    /// `dyn Trait` fat pointers and their method tables (`ir/dyn_ty.rs`).
+    pub(crate) dyns: crate::ir::dyn_ty::DynTables,
     /// Where each generic free-fn instance was first called (span, instantiation depth).
     pub(crate) inst_sites: HashMap<FuncId, (crate::span::Span, u32)>,
     /// Generic struct/enum instances made since the last drain, whose type parameters have
     /// trait bounds to check (`check/traits.rs`).
     pub(crate) bound_queue: Vec<crate::check::BoundSite>,
+    /// Methods of generic struct instances whose bodies wait for a first use (`check/lower/lazy.rs`).
+    pub(crate) lazy_methods: HashMap<FuncId, (crate::parse::FnItem, HashMap<String, Ty>)>,
+    /// Type parameters stood in by empty structs while a generic body is checked once
+    /// (`check/lower/defcheck.rs`); only ever filled in the throwaway copy that check uses.
+    pub(crate) placeholders: HashMap<StructId, crate::check::Placeholder>,
+    /// `where` bounds of generic-struct method instances, checked at each call (`lookup_method`).
+    pub(crate) method_wheres: HashMap<FuncId, Vec<crate::check::BoundReq>>,
+    /// Warnings raised while lowering bodies (a `_` arm that covers nothing); `check_files_inner`
+    /// moves them into `Program.warnings`.
+    pub(crate) lower_warnings: Vec<crate::diag::Diagnostic>,
+    /// What each `@embed*` call read, by its span (`parse::File.embeds`); the build stamp hashes them.
+    pub embeds: HashMap<crate::span::Span, std::sync::Arc<Vec<crate::parse::EmbedFile>>>,
+    /// The program's `fn main` (root module), once `check` has found it.
+    pub(crate) entry: Option<crate::ir::ids::FuncId>,
+    /// Spans of interpolations lowered into a 512-byte frame buffer (`check/frame_str`).
+    pub(crate) frame_interps: std::collections::HashSet<crate::span::Span>,
 }
 
 impl IrCx {
+    /// Every embedded file (path and bytes) into `h`, in a fixed order: a build stamp that
+    /// hashes the sources calls this too, so editing an embedded file rebuilds.
+    pub fn hash_embeds(&self, h: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        let mut files: Vec<&crate::parse::EmbedFile> = self.embeds.values().flat_map(|v| v.iter()).collect();
+        files.sort_by(|a, b| (&a.disk, &a.name).cmp(&(&b.disk, &b.name)));
+        for f in files {
+            f.disk.hash(h);
+            f.data.hash(h);
+        }
+    }
+
     pub fn new() -> IrCx {
         let mut cx = IrCx {
             names: Names::new(),
@@ -90,8 +124,17 @@ impl IrCx {
             files: Vec::new(),
             file_index: HashMap::new(),
             closures: Default::default(),
+            tuples: Default::default(),
+            dyns: Default::default(),
             inst_sites: HashMap::new(),
             bound_queue: Vec::new(),
+            lazy_methods: HashMap::new(),
+            placeholders: HashMap::new(),
+            method_wheres: HashMap::new(),
+            lower_warnings: Vec::new(),
+            embeds: HashMap::new(),
+            entry: None,
+            frame_interps: Default::default(),
             common: CommonTys {
                 void: Ty(0),
                 bool: Ty(0),

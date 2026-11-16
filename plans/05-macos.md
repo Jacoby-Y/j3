@@ -59,7 +59,7 @@ Scratch projects in `/tmp/claude-1000/.../scratchpad/mac/`.
 | SDL add-ons (ttf, image, mixer) | `game/addons.j3:135-185` | dlopened by Linux soname, then the Windows DLL name. No macOS row: fonts/images/sound **panic** on a Mac. |
 | Crash handler | `emit/llvm_crash.rs` | x86-64 desktop Linux only (correct once fed the real triple). |
 | Save dir | `data/save.j3:315` | macOS branch exists (`~/Library/Application Support`). |
-| Steam | `steam/fns.j3:66` | `libsteam_api.dylib` name exists; `[dist] steam` is Linux/Windows only (plan 01). |
+| Steam | `steam` package `src/steam/fns.j3:67` | `libsteam_api.dylib` name exists; its `steam` dist output is Linux/Windows only. |
 
 **ABI (verified)**
 
@@ -289,6 +289,6 @@ Each chunk ends with `cargo test` green in `j3c/` (with `J3C_NO_INSTALL=1`) and 
   `struct stat`) or a libc layer shared with this plan's Darwin port. Until then INSTALL.md overstates arm64 Linux.
 - The `open`/`close` i64-return bug in `sys_android.j3` (same as chunk 3's): plan 07.
 - Metal, MoltenVK, SDL3 (see Design decisions: ANGLE first if GL goes away).
-- Steam on macOS (depots, overlay in a bundle): plan 01 lists macOS depots out of scope; chunk 7 only keeps the entitlement hook.
+- Steam on macOS (depots, overlay in a bundle): the `steam` package's README lists macOS depots out of scope; chunk 7 only keeps the entitlement hook.
 - iOS, the Mac App Store (sandbox entitlements), automated notarization, a `.dmg` output, Sparkle-style updates.
 - Intel-only test hardware: x86-64 is CI-tested best effort.

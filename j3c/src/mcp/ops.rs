@@ -56,7 +56,7 @@ pub(super) fn import_sources(root: &Path, args: &Json) -> Result<Vec<PathBuf>, S
 }
 
 /// `name` matches `pat`, where `*` is any run of characters.
-pub(super) fn wild(pat: &str, name: &str) -> bool {
+pub(crate) fn wild(pat: &str, name: &str) -> bool {
     match pat.split_once('*') {
         None => pat == name,
         Some((head, rest)) => {
@@ -293,7 +293,6 @@ pub(super) fn play(root: &Path, args: &Json) -> Result<Answer, String> {
     let _ = fs::remove_file(&shot);
     let mut child = Command::new(&exe)
         .current_dir(root)
-        .envs(crate::dist::steam_dev_env(root))
         .env("J3_ROOT", root)
         .env("J3_SCENE", &rel)
         .env("J3_FRAMES", frames.to_string())

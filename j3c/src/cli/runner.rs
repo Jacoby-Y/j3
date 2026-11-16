@@ -212,7 +212,7 @@ pub(super) fn run_loaded(
                 let fast = manifest.as_ref().map(|m| m.cc.fast || m.emit.fast).unwrap_or(false);
                 if up_to_date(&prog, &opts, fast) {
                     if let Some(exe) = &opts.cc.out {
-                        mark_inputs();
+                        mark_inputs(&prog);
                         status("up to date");
                         status("running");
                         return match emit::run_exe_in(exe, opts.cwd.as_deref(), args) {

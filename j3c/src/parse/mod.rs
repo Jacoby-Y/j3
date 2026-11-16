@@ -8,20 +8,24 @@
 
 mod ast;
 mod error;
+mod expr;
 pub mod extend;
 pub(crate) mod lex;
 mod parser;
+mod pat;
 pub mod syntax;
 mod token;
 pub mod flow;
 pub mod walk;
+pub mod dump;
 
 pub use ast::{
-    AssignOpStmt, AssignStmt, BinOp, Block, ClosureLit, ClosureParam, ConstItem, EnumItem, Expr, ExprKind, ExtendItem, FieldItem, File,
-    FnItem, ForEachStmt, GpuStage, GpuStruct, IfStmt, Ident, InterpPart, Item, LetStmt, LibFnDecl, MatchArm, MatchStmt,
+    AssignOpStmt, AssignStmt, BinOp, Block, ClosureLit, ClosureParam, ConstItem, EmbedFile, EmbedKind, EnumItem, Expr, ExprKind, ExtendItem, FieldItem, File,
+    FnItem, ForEachStmt, GpuStage, GpuStruct, IfStmt, Ident, InterpPart, Item, LetPatStmt, LetStmt, LibFnDecl, MatchArm, MatchStmt,
     ModLetItem, Param, Pat, ReturnStmt, ScriptBlockItem, ScriptLetItem, Stmt, StructItem, Type,
     TraitItem, TraitMethod, TypeKind, UnaryOp, UseItem, UseLibItem, UseLocalStmt, VariantItem,
 };
+pub use pat::path_expr;
 pub use error::ParseError;
 pub use token::{keyword, Token, TokenKind};
 
@@ -35,6 +39,16 @@ pub fn parse(src: &str, file: FileId) -> Result<File, ParseError> {
 pub fn parse_script(src: &str, file: FileId, module: &[String]) -> Result<File, ParseError> {
     let tokens = lex::lex(src, file)?;
     parser::parse_script_tokens(&tokens, module)
+}
+
+/// Items parsed from generated source (`#[derive]`, `check/derive.rs`), every span set to `at` so
+/// an error in them points at the line that asked for them.
+pub fn parse_items_at(src: &str, at: crate::span::Span) -> Result<Vec<Item>, ParseError> {
+    let mut tokens = lex::lex(&format!("module derived;\n{src}"), at.file)?;
+    for t in &mut tokens {
+        t.span = at;
+    }
+    Ok(parser::parse_tokens(&tokens)?.items)
 }
 
 pub fn format_error(path: &str, src: &str, err: &ParseError) -> String {

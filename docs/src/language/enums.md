@@ -32,6 +32,22 @@ match find(xs, 2) {
 }
 ```
 
+A variant can hold several positional fields, built and matched the same way:
+
+```rust
+enum Expr { Bin(BinOp, &Expr, &Expr), Lit(int), Named(string, Span, bool) }
+
+fn eval(e: &Expr): int {
+    match *e {
+        Expr.Bin(BinOp.Add, l, r) { return eval(l) + eval(r); }
+        Expr.Bin(BinOp.Mul, l, r) { return eval(l) * eval(r); }
+        Expr.Lit(n) { return n; }
+        Expr.Named(_, Span { lo, .. }, true) { return lo; }
+        Expr.Named(_, _, false) { return 0; }
+    }
+}
+```
+
 Patterns nest, and `_` inside a pattern matches anything:
 
 ```rust
@@ -41,6 +57,8 @@ match greet() {
     Result.Err(_) { panic("unexpected io"); }
 }
 ```
+
+Mark an enum `#[Debug]` (or `#[derive(Debug)]`) to print it in a backtick string, as `Expr.Bin(BinOp.Add, &Expr, &Expr)`: a pointer prints as its type, so a recursive enum stops there. A `match` that misses a case is a compile error listing up to 10 missing patterns, such as `Expr.Bin(BinOp.Sub, _, _)`.
 
 ## Errors and `?`
 
@@ -57,9 +75,10 @@ fn loadName(): Result<string, IoError> {
     return Result.Err(IoError.NotFound);
 }
 
-fn greet(): Result<string, IoError> {
+fn greet(t: &Text): Result<string, IoError> {
     let name = loadName()?;          // returns the Err early
-    return Result.Ok(`hello {name}`);
+    t.fmt(`hello {name}`);           // a backtick string can't leave the fn: write into the caller's Text
+    return Result.Ok(t.str());
 }
 ```
 

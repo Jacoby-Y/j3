@@ -58,7 +58,7 @@ Heavy UI, 1,200 cards that all change every frame, software-rendered under Xvfb 
 - **UI with HTML/CSS syntax.** `.j3ui` components use Svelte-like markup and a large subset of CSS, compiled to native code. No browser, no webview.
 - **A batteries-included game stdlib.** Windows, input, audio, 2D painting, 3D scenes, physics, ECS, pathfinding, shaders written in J3, threads, saves, JSON, HTTP/TLS.
 - **Made for agents too.** `j3c doc` answers from the binary you run, and `j3c -e mcp` is an MCP server that lets Claude Code (or any MCP client) build, render, and check 3D scenes.
-- **Ships for real.** `.deb`, zip, Steam (achievements, cloud, depots), and Android apk builds from `j3.toml`.
+- **Ships for real.** `.deb`, zip, and Android apk builds from `j3.toml`; Steam (achievements, cloud, depots) through the `steam` package.
 
 ## A taste
 

@@ -6,6 +6,7 @@
 
 mod error;
 pub(crate) mod gpu;
+mod frame_str;
 mod lower;
 pub(crate) mod script;
 
@@ -32,8 +33,12 @@ use crate::span::{FileId, Span};
 
 mod closure_ty;
 mod consteval;
+mod global_init;
+mod derive;
+mod embed;
 mod exports;
 mod extend;
+mod field_default;
 pub mod lint;
 mod funcs;
 mod generic_fn;
@@ -45,13 +50,17 @@ mod uses;
 
 use closure_ty::*;
 use consteval::*;
+use global_init::*;
+use embed::*;
 use exports::*;
 use extend::merge_extends;
 use funcs::*;
 use generic_fn::*;
 use infer::*;
+use field_default::*;
 use resolve::*;
-pub(crate) use traits::{BoundReq, BoundSite, TraitEnv};
+pub(crate) use lower::defcheck::Placeholder;
+pub(crate) use traits::{default_fn_name, dyn_type_key, with_supers, BoundReq, BoundSite, TraitEnv};
 use traits::*;
 use types::*;
 use uses::*;
@@ -77,6 +86,18 @@ pub struct Program {
     pub warnings: Vec<crate::diag::Diagnostic>,
     /// Edits that remove what `warnings` names, where that is safe (unused imports): `check --autofix`.
     pub fixes: Vec<lint::Fix>,
+    /// Every trait, for LSP hover and goto (`dyn Trait` too).
+    pub traits: Vec<TraitDoc>,
+}
+
+/// A trait as hover shows it: `sig` is the declaration's source, `span` its name.
+#[derive(Clone, Debug)]
+pub struct TraitDoc {
+    pub name: String,
+    pub module: String,
+    pub span: Span,
+    pub doc: String,
+    pub sig: String,
 }
 
 impl Program {
@@ -237,15 +258,21 @@ fn check_files_cfg(files: Vec<ParsedFile>, require_main: bool) -> Result<Program
 
 fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<Program, CheckError> {
     let t_all = std::time::Instant::now();
-    let (warnings, fixes) = lint::lint(&files);
+    let (mut warnings, fixes) = lint::lint(&files);
     script::prepare(&mut files)?;
     let shaders = gpu::prepare(&mut files)?;
     let mut cx = IrCx::new();
     let _ = cx.ty_ref(cx.common.u8);
+    let _ = cx.ty_slice(cx.common.u8);
 
     let mut mods: Vec<ModData> = Vec::new();
+    let mut dyn_names: HashSet<String> = HashSet::new();
     for file in files {
+        dyn_names.extend(file.ast.dyns.iter().cloned());
         cx.add_file(file.file_id, file.path.clone(), file.src.clone());
+        for (span, files) in &file.ast.embeds {
+            cx.embeds.insert(*span, files.clone());
+        }
         // A part file (`ui/dom/*.j3` saying `module j3.ui.dom;`) adds its items to the module
         // loaded just before it; its spans keep their own file id.
         let key = file.ast.module_key();
@@ -296,6 +323,7 @@ fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<P
     }
 
     merge_extends(&mut mods)?;
+    derive::expand(&mut mods)?;
     crate::cli::timing("  check: setup", t_all);
     crate::phase::detail("collecting names, types, functions");
     let t = std::time::Instant::now();
@@ -306,6 +334,7 @@ fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<P
         collect_exports(&mut mods, i);
     }
     bind_traits(&mut mods)?;
+    dyn_types(&mut cx, &mut mods, &dyn_names);
     for i in 0..mods.len() {
         collect_struct_names(&mut cx, &mut mods, i)?;
     }
@@ -353,10 +382,12 @@ fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<P
         Err(_) if !require_main => dummy_main(&mut cx),
         Err(e) => return Err(e),
     };
+    cx.entry = Some(main_id);
     resolve_all_uses(&mut mods, UsePhase::Vals)?;
     share_methods(&mut mods);
     for i in 0..mods.len() {
         collect_globals(&mut cx, &mut mods, i)?;
+        collect_embeds(&mut cx, &mut mods, i)?;
     }
     let t = std::time::Instant::now();
     for i in 0..mods.len() {
@@ -375,12 +406,19 @@ fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<P
         // Instances made while collecting signatures (`fn f(m: Map<K, V>)`) could not be checked before.
         lower::drain_bounds(&mut cx, &traits, &all, &temps, None)?;
     }
-    let shared = lower::shared(&mods, traits);
+    let trait_docs = traits::trait_docs(&cx, &traits);
+    let mut shared = lower::shared(&mods, traits);
     // Function bodies are independent: an error in one is kept and the rest are still checked.
-    let mut errs: Vec<CheckError> = Vec::new();
+    // Generic bodies are checked once against their bounds first, so those errors lead.
+    let t_defs = std::time::Instant::now();
+    let mut errs: Vec<CheckError> = lower::defcheck::check_defs(&cx, &mods, &mut shared);
+    crate::cli::timing("  check: generic defs", t_defs);
     for i in 0..mods.len() {
         crate::phase::detail(&format!("lower {}/{} {}", i + 1, mods.len(), mods[i].key));
         lower::lower_module(&mut cx, &mut mods, i, main_id, &shared, &mut errs)?;
+        // a method table is defined by the module whose lowering made it; the others declare it
+        let vts = cx.take_new_vtables();
+        mods[i].ir.globals.extend(vts);
         if errs.len() >= MAX_ERRORS {
             break;
         }
@@ -388,7 +426,28 @@ fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<P
     if let Some(e) = gather_errors(errs) {
         return Err(e);
     }
+    let t_frame = std::time::Instant::now();
+    if let Some(e) = gather_errors(frame_str::check(&cx)) {
+        return Err(e);
+    }
+    crate::cli::timing("  check: frame strings", t_frame);
+    for m in mods.iter_mut() {
+        lower::lazy::drop_unused(&cx, &mut m.ir.funcs);
+    }
+    // Tuple structs belong to no module; the last one carries them so the emitters declare them
+    // (not the first: that is the entry, whose IR dump should not show tuples the stdlib uses).
+    if let Some(m) = mods.last_mut() {
+        m.ir.structs.extend(cx.take_new_tuples());
+        m.ir.structs.extend(cx.take_new_dyn_structs());
+    }
     crate::cli::timing("  check: lower", t);
+    // a generic body lowers once per instance: one warning per place
+    let mut seen = HashSet::new();
+    for w in std::mem::take(&mut cx.lower_warnings) {
+        if seen.insert((w.span.file, w.span.start, w.span.end, w.message.clone())) {
+            warnings.push(w);
+        }
+    }
 
     crate::phase::detail("exports, docs, script aliases");
     let t = std::time::Instant::now();
@@ -440,6 +499,7 @@ fn check_files_inner(mut files: Vec<ParsedFile>, require_main: bool) -> Result<P
         shaders,
         warnings,
         fixes,
+        traits: trait_docs,
     })
 }
 
@@ -509,7 +569,7 @@ pub(crate) fn field_path(
 /// other operand's type, or the destination's when both sides are untyped.
 pub(crate) fn bare_num(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::Int(_) | ExprKind::Float(_) => true,
+        ExprKind::Int(_) | ExprKind::Char(_) | ExprKind::Float(_) => true,
         ExprKind::Unary { op, expr: inner } if *op == parse::UnaryOp::Neg => bare_num(inner),
         ExprKind::Binary { op, lhs, rhs } => {
             matches!(

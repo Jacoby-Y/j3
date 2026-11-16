@@ -99,13 +99,19 @@ platform.
    target. The link and run scripts are the only package code `j3c` executes; they run only when that
    target is built or run, never on fetch (say so in `packages.md`).
 4. **Link script contract.** `j3c build` compiles the per-module objects as for any cross target, then
-   runs the link script as `j3c run --file <pkg>/<link> --` with: `--objs <file listing object paths>`,
+   runs the link script through plan 09's shared runner, `pkgtool::run(project: &Manifest, dep: &Dep,
+   tool: &Tool, args: &[String], env: &[(String, String)]) -> Result<i32, String>` (or
+   `pkgtool::command(..same..) -> Result<Command, String>` when it needs the stdout), with a `Tool`
+   (`project/deps/tools.rs`: name, absolute file, help) built from `[platform] link` / `run`. So it gets
+   the same build (package as project, host, opt 0, cached in `~/.cache/j3/tools/`), env (`J3_PROJECT_ROOT`,
+   `J3_PKG_ROOT`, `J3_PKG_NAME`, `J3C`, `J3_TOOL_API`, `J3_MANIFEST`) and exit-code rules as `j3c pkg`
+   (`j3c doc packages`). Args: `--objs <file listing object paths>`,
    `--out <dir>`, `--name <package name>`, `--root <project dir>`, `--pkg <platform package dir>`,
    `--libs SDL2,SDL2_ttf,...` (from `[link] libs` and `use lib` markers, as the native link sees
    them), `--include assets,scripts,...` (`dist::include`), `--release` when set, `--clang <path>`.
    Its exit code is the build's. The run script gets `--out <dir>` plus the user's run flags
    (`--frames`, `--screenshot`, `--headless`, `--secs`); `j3web`'s run script calls `j3c -e web run`.
-   The host build of each script is cached like any `j3c run --file`.
+   The host build of each script is cached by `pkgtool`, not `j3c run --file`.
 5. **Runtime split inside the package**: `rt/*.c` freestanding C (`-ffreestanding -nostdlib`, compiled
    by the link script with the system clang) for crt, `malloc` on `__builtin_wasm_memory_grow`,
    `mem*`/`str*`, `snprintf` (`%lld %d %s %g %.*g` only), fd table, the SDL and TTF entry points and the
@@ -152,8 +158,8 @@ developer to `sudo apt install lld-18`.
    `web_hello_uses_libc` to use the fixture and `wasm64-unknown-unknown`.
 2. **Link and run hooks.** Files: `src/cli/build.rs` (platform target: compile objects into
    `target/.j3c/<triple>/<name>/obj` as today's per-module path does, write the objects list, run the
-   link script per decision 4, report its exit code), `src/cli/runner.rs` (platform target: build,
-   then the run script or, without one, print the out dir), `src/doc/pages/packages.md` (`[platform]`,
+   link script per decision 4 via `pkgtool::run`, report its exit code), `src/cli/runner.rs` (platform
+   target: build, then the run script via `pkgtool::run` or, without one, print the out dir), `src/doc/pages/packages.md` (`[platform]`,
    the trust note). Test: the fixture package's `tools/link.j3` writes `out/linked.txt` with its args
    and object count; `j3c build` of the fixture game produces it; a link script exiting 3 fails the
    build with 3.
