@@ -482,7 +482,7 @@ report), then `./build.sh` (installs only the Rust `j3c`, see A3).
   go to `Canceled`, with the reason in the body. Card numbers shift after every `mv`/`rm`, so run
   `jzctl kanban show 'j3c bootstrap'` before each change. Tick the matching `[ ]` box below too.
 
-1. [ ] Plan 09 chunks 6-7 land (Steam out of `j3c`). A1 baseline commit + tag, A2 stage 0 + `stage0.sh`, A3 binary name + `build.sh` guard.
+1. [x] Plan 09 chunks 6-7 land (Steam out of `j3c`). A1 baseline commit + tag, A2 stage 0 + `stage0.sh`, A3 binary name + `build.sh` guard.
 2. [x] A4 `diff.sh` + `corpus.txt` + double-run determinism check, A5 fmt oracle (decide on `dump-ast`).
 3. [x] A7 stub refresh + `coverage.sh` + `DELETED.md`, A9 `layers.txt` + `layers.sh`.
 4. [x] A8 `PORT_DEBT.md`, A10 + B7 checklists in `j3c-bootstrap/AGENTS.md`, A6 `--norm`, A11 first scale
