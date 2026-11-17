@@ -15,6 +15,8 @@ usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-kno
   -j N            parallel jobs (default: core count, 4 for run)
   files           inputs instead of tests/corpus.txt (paths or project folders)
      glsl runs `dump-glsl PATH`; ui runs `dump-ui PROJECT/ui` (the project's `.j3ui` folder).
+     tests/bad-ui/NAME is a UI project with one error: ui compares the `dump-ui` error text, and err takes
+     such a folder (any folder with a `j3.toml`) as one case, `check .` in a scratch copy.
      ir/llvm/glsl/ui/run export J3_STDLIB=<repo>/j3c/stdlib to both sides, so stage0's build-dir stdlib path
      stays out of the output.
 Env: DIFF_TIMEOUT seconds per command (default 30; ir/llvm 120; run 300).
@@ -85,6 +87,8 @@ expand() {
     local p=$1
     [ -e "$p" ] || die "input $p does not exist"
     if [ -f "$p" ]; then echo "$p"; return; fi
+    # err: a folder with a `j3.toml` is one project case (tests/bad-ui/NAME), checked as a whole.
+    if [ $mode = err ] && [ -f "$p/j3.toml" ]; then echo "$p"; return; fi
     case $mode in
         fmt|ast|err) find "$p" \( -name target -o -name node_modules -o -name '*.d' \) -prune -o -name '*.j3' -type f -print | sort ;;
         *) if [ -f "$p/j3.toml" ]; then echo "$p"
@@ -115,7 +119,10 @@ one() {
     set +e
     local d=$tmp/$1 f=$2 cwd=$root arg=$2 who
     mkdir -p "$d"
-    if [ $mode = err ]; then
+    if [ $mode = err ] && [ -d "$root/$f" ]; then
+        # A project case: `check .` in a copy (no target/ left in the tree).
+        mkdir -p "$d/w"; cp -r "$root/$f/." "$d/w/"; rm -rf "$d/w/target"; cwd=$d/w; arg=.
+    elif [ $mode = err ]; then
         mkdir -p "$d/w"; cp "$root/$f" "$d/w/"; cwd=$d/w; arg=$(basename "$f")
         # A case's companion files (a `.j3s` beside it): tests/bad/NAME.d/ is copied next to NAME.j3.
         [ ! -d "$root/${f%.j3}.d" ] || cp -r "$root/${f%.j3}.d/." "$d/w/"

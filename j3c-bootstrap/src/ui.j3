@@ -1,4 +1,118 @@
 // `.j3ui` components: markup to J3 source text, plus the span map back.
 //
 // Port of: j3c/src/ui/mod.rs
+// J3: Parts: markup parser (`ui/markup.j3`), J3 text generator (`ui/gen.j3`), the span map (`ui/map.j3`)
+// that turns errors in the generated text back into `.j3ui` line:col. Contract: `contracts-c2e.md`.
+// J3: Errors are `Diag`s (plan 11 B3), not rendered strings. `tryBuild` adds every `.j3ui` to the
+// Session's sources (path = the shown path), so a generation error is a plain span in the `.j3ui`
+// (Rust `show` + `BuildErr`: the LSP reads the Diag), and `remap` only rewrites a span: an error in the
+// generated text gets the span of the `.j3ui` range it came from (plus the segment's hint as a help).
+// Rust `render_parse_error` is `parse.report` followed by `remapAll` (`load.j3` `finishParse`).
+// J3: Rust `locator` is `attach`: it fills `Source.gen` of the generated file, and `base/span.locate` reads
+// it (only the backend asks, for runtime abort lines; sema reports the generated line, as Rust does while
+// it checks, and `remap` then moves the error).
+// J3: Rust `dump` (the `dump-ui` command) is `cmd/ui.j3`: it needs the embedded stdlib (`load`), which sits
+// below this stage. For the same reason `tryBuild` takes the text of `ui/css/props.j3` from its caller.
+// J3: Wave 16 wrote these bodies to wire the loader, driver and `dump-ui`; chunk D owns the file, checks
+// them against Rust and covers `remap` with `tests/unit/ui_remap_test.j3`.
 module j3c.ui;
+
+use j3.data.pool.{ Id, Pool };
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.text.Text;
+use j3c.base.diag.{ Diag, Diags, Note, NoteKind, Severity };
+use j3c.base.span.{ GenPiece, Source, Span, isNone, isWholeFile, noSpan };
+use j3c.ui.gen;
+use j3c.ui.gen.{ Section, SrcFile, Theme };
+use j3c.ui.icons.Icon;
+use j3c.ui.map.SpanMap;
+use j3c.ui.markup.UiError;
+
+/// The Session pieces the generator writes into (`ui` sits below `driver`).
+pub struct UiCx {
+    arena: &Arena;
+    diags: &Diags;
+    sources: &Pool<Source>;
+}
+
+pub struct Generated {
+    /// The generated file's name in the loader (what errors say before remapping).
+    label: string;
+    /// Module key, `<package>.ui`.
+    key: string;
+    text: string;
+    map: SpanMap;
+    /// Scan order (by shown path); `Seg.file` and `GenError.file` index it. Each has its `src`.
+    files: List<SrcFile>;
+    /// One per component, in component-name order.
+    sections: List<Section>;
+}
+
+/// `<package>.ui.generated`.
+pub fn label(package: string, a: &Arena): string { return Text.new(a).add(package).add(".ui.generated").str(); }
+
+/// A generation error as a diagnostic at its `.j3ui` range (Rust `show`); not added to `cx.diags`.
+pub fn show(cx: UiCx, file: &SrcFile, e: UiError): Diag {
+    let d = cx.diags.make(0, Severity.Error, Span { file: file.src, lo: u32(e.lo), hi: u32(e.hi) }, e.msg);
+    if e.help.len > 0 { d.notes.push(Note { kind: NoteKind.Help, span: noSpan(), msg: e.help }); }
+    return d;
+}
+
+/// Generate the `<package>.ui` module from `files` (scan order; their `src` is set here). `icons` are the
+/// project's own (`icons.loadDir`), found before the Bootstrap set; `propsText` is the embedded stdlib
+/// file `ui/css/props.j3`. The error is not added to `cx.diags`: the loader adds it, `dump-ui` renders it.
+pub fn tryBuild(cx: UiCx, files: List<SrcFile>, package: string, theme: Option<Theme>, icons: &List<Icon>, propsText: string): Result<Generated, Diag> {
+    let a = cx.arena;
+    for i in 0..files.len {
+        files.items[i].src = cx.sources.add(Source.of(files.items[i].path, files.items[i].text, a));
+    }
+    match gen.generate(&files, package, theme, icons, propsText, a) {
+        Result.Ok(b) {
+            return Result.Ok(Generated { label: label(package, a), key: Text.new(a).add(package).add(".ui").str(), text: b.text,
+                map: SpanMap { segs: b.segs }, files: files, sections: b.sections });
+        }
+        Result.Err(e) { return Result.Err(show(cx, &files.items[e.file], e.err)); }
+    }
+}
+
+/// `sp` moved to the `.j3ui` when it lies in the generated text; `hint` gets the segment's help line.
+fn remapSpan(g: &Generated, sources: &Pool<Source>, sp: Span, hint: &string): Span {
+    if isNone(sp) || isWholeFile(sp) || int(sp.file.i) >= sources.len() { return sp; }
+    if sources.get(sp.file).path != g.label { return sp; }
+    match g.map.toSrc(int(sp.lo), int(sp.hi)) {
+        Option.Some(s) {
+            *hint = s.hint;
+            return Span { file: g.files.items[s.file].src, lo: u32(s.lo), hi: u32(s.hi) };
+        }
+        Option.None { return sp; }
+    }
+}
+
+/// An error in the generated text, moved to the `.j3ui` it came from (Rust `remap` / `remap_one`): the
+/// span, and the span of each note. A segment's hint becomes one more help. A second call changes nothing.
+pub fn remap(g: &Generated, sources: &Pool<Source>, d: &Diag) {
+    let hint = "";
+    d.span = remapSpan(g, sources, d.span, &hint);
+    for i in 0..d.notes.len {
+        let unused = "";
+        d.notes.items[i].span = remapSpan(g, sources, d.notes.items[i].span, &unused);
+    }
+    if hint.len > 0 { d.notes.push(Note { kind: NoteKind.Help, span: noSpan(), msg: hint }); }
+}
+
+/// `remap` on every diagnostic of `diags` from index `from` on.
+pub fn remapAll(g: &Generated, sources: &Pool<Source>, diags: &Diags, from: int) {
+    for i in from..diags.items.len { remap(g, sources, &diags.items.items[i]); }
+}
+
+/// Make the generated file `src` report `.j3ui` lines (Rust `locator`): its `Source.gen` gets one piece
+/// per segment, read by `base/span.locate`.
+pub fn attach(g: &Generated, sources: &Pool<Source>, src: Id<Source>) {
+    let s = sources.get(src);
+    for i in 0..g.map.segs.len {
+        let seg = g.map.segs.items[i];
+        s.gen.push(GenPiece { lo: u32(seg.lo), hi: u32(seg.hi), file: g.files.items[seg.file].src, at: u32(seg.slo), copy: seg.copy });
+    }
+}

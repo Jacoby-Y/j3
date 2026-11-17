@@ -1,0 +1,158 @@
+// `dump-ui FILE|DIR`: the J3 source generated from a project's `.j3ui` components (one component's
+// section when given a file, the components under a folder when given one below the project root).
+//
+// Port of: j3c/src/cli/mod.rs (the `dump-ui` arm), ui/mod.rs (`dump`)
+// J3: Rust `ui::dump` lives here because it reads the embedded stdlib (`load.stdlibFile`) and the manifest;
+// `ui` sits below `load`. Like Rust's `build`, it passes no project icons. Output goes to stdout as is;
+// an error goes to stderr with no newline added (Rust `eprint!`), exit 1. A generation error is rendered
+// from its Diag against the `.j3ui`.
+// J3: Wave 16 wrote this to wire the command; chunk D owns the file and checks each branch against stage 0
+// (the corpus gate, `dump-ui PROJECT/ui`, takes the walk-up + "components under the path" branch).
+module j3c.cmd.ui;
+
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, endsWith, startsWith };
+use j3c.base.diag;
+use j3c.base.fsx;
+use j3c.base.span.{ NO_FILE, Source };
+use j3c.cmd.check.err;
+use j3c.driver;
+use j3c.driver.Session;
+use j3c.load.stdlibFile;
+use j3c.project.manifest;
+use j3c.project.manifest.Input;
+use j3c.ui;
+use j3c.ui.{ Generated, UiCx };
+use j3c.ui.gen.{ Section, SrcFile, Theme };
+use j3c.ui.icons.Icon;
+use j3c.ui.scan;
+use j3.data.pool.Id;
+
+/// Rust `cli/mod.rs` `"dump-ui"`.
+pub fn dumpUiCmd(rest: []string): int {
+    if rest.len == 0 {
+        err("usage: j3c dump-ui <file.j3ui|project dir>\n");
+        return 1;
+    }
+    let s = Session.new(driver.defaults());
+    defer s.free();
+    let t = Text.new(s.arena);
+    match dump(s, rest[0], &t) {
+        Result.Ok(_) {
+            t.flushTo(1);
+            return 0;
+        }
+        Result.Err(e) {
+            err(e);
+            return 1;
+        }
+    }
+}
+
+/// `canonicalize(p)` or Rust's `io::Error` text.
+fn canon(p: string, a: &Arena): Result<string, string> {
+    match path.realpath(p, a) {
+        Option.Some(r) { return Result.Ok(r); }
+        Option.None { return Result.Err(fsx.osError(sys.errno(), a)); }
+    }
+}
+
+/// Rust `Path::starts_with`: `p` is `dir` or below it (whole components).
+fn under(p: string, dir: string): bool {
+    if !startsWith(p, dir) { return false; }
+    return p.len == dir.len || endsWith(dir, "/") || p[dir.len] == '/';
+}
+
+fn section(g: &Generated, name: string): Result<Section, string> {
+    for i in 0..g.sections.len { if g.sections.items[i].name == name { return Result.Ok(g.sections.items[i]); } }
+    return Result.Err("component not found");
+}
+
+/// Rust `ui::dump`: the text for `p` appended to `t`.
+fn dump(s: &Session, p: string, t: &Text): Result<bool, string> {
+    let a = s.arena;
+    // A dir below the project root (`j3c dump-ui ui`) walks up to the nearest j3.toml.
+    let up: Option<string> = Option.None;
+    if fsx.isDir(p) && !fsx.isFile(path.join(p, "j3.toml", a)) { up = manifest.findTomlUp(p, a); }
+    let m = match up {
+        Option.Some(toml) { manifest.load(toml, a)? }
+        Option.None {
+            match manifest.resolve(p, a)? {
+                Input.Project(m) { m }
+                Input.File(_) { return Result.Err("dump-ui needs a project with j3.toml"); }
+                Input.Hello { return Result.Err("dump-ui needs a project with j3.toml"); }
+            }
+        }
+    };
+    let u = match m.ui {
+        Option.Some(u) { u }
+        Option.None { return Result.Err("this project has no [ui] section in j3.toml"); }
+    };
+    let dir = path.join(m.root, u.dir, a);
+    let extra = List<string>.new(a);
+    let found = scan.scan(dir, u.dir, &extra, a)?;
+    let files = List<SrcFile>.new(a);
+    for i in 0..found.len {
+        let text = fsx.readText(found.items[i].path, a)?;
+        files.push(SrcFile { path: found.items[i].shown, name: found.items[i].name, text: text, src: Id<Source> { i: NO_FILE } });
+    }
+    let theme: Option<Theme> = Option.None;
+    match u.theme {
+        Option.Some(th) {
+            // ponytail: Rust says `read <theme as written>: E`; this is `read <joined path>: E` (chunk D: match it)
+            let text = fsx.readText(path.join(m.root, th, a), a)?;
+            theme = Option.Some(Theme { path: th, text: text });
+        }
+        Option.None {}
+    }
+    let icons = List<Icon>.new(a);
+    let props = match stdlibFile("ui/css/props.j3") { Option.Some(x) { x } Option.None { "" } };
+    let cx = UiCx { arena: a, diags: &s.diags, sources: &s.sources };
+    let g = match ui.tryBuild(cx, files, m.name, theme, &icons, props) {
+        Result.Ok(g) { g }
+        Result.Err(d) {
+            let e = Text.new(a);
+            diag.render(&d, &s.sources, &e);
+            return Result.Err(e.str());
+        }
+    };
+    if endsWith(p, ".j3ui") {
+        let abs = canon(p, a)?;
+        for i in 0..found.len {
+            match path.realpath(found.items[i].path, a) {
+                Option.Some(r) {
+                    if r != abs { continue; }
+                    let sec = section(&g, found.items[i].name)?;
+                    t.add(g.text[sec.lo..sec.hi]);
+                    return Result.Ok(true);
+                }
+                Option.None {}
+            }
+        }
+        return Result.Err("component not found");
+    }
+    match up {
+        Option.Some(_) {
+            // Only the components under `p`; their canonical paths decide, so `.`/symlinks work.
+            let base = canon(p, a)?;
+            for i in 0..found.len {
+                match path.realpath(found.items[i].path, a) {
+                    Option.Some(r) {
+                        if !under(r, base) { continue; }
+                        let sec = section(&g, found.items[i].name)?;
+                        t.add(g.text[sec.lo..sec.hi]);
+                    }
+                    Option.None {}
+                }
+            }
+            return Result.Ok(true);
+        }
+        Option.None {}
+    }
+    t.add(g.text);
+    return Result.Ok(true);
+}

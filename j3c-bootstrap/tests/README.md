@@ -21,7 +21,7 @@ compare the text. Unit checks live beside the code they cover, as `*_test.j3` fi
 |---|---|---|
 | `fmt` | `fmt FILE` | stdout, stderr, exit code |
 | `ast` | `dump-ast FILE` | stdout, stderr, exit code |
-| `err` | `check FILE` (on a copy in a scratch folder, so no `j3.toml` above it applies) | stdout, stderr, exit code |
+| `err` | `check FILE` (on a copy in a scratch folder, so no `j3.toml` above it applies); `check .` in a copy of a project folder (`bad-ui/span_*`) | stdout, stderr, exit code |
 | `ir` | `dump-ir PATH` (`--norm`: temps renumbered by `norm_ir.awk`, plan A6) | stdout, stderr, exit code |
 | `llvm` | `dump-llvm PATH` | stdout, stderr, exit code |
 | `glsl` | `dump-glsl PATH` (`--es`: `dump-glsl PATH --es`, the OpenGL ES text) | stdout, stderr, exit code |
@@ -43,6 +43,10 @@ harness, or comparing stage 2 later).
   A case that needs more files (a `.j3s` script) keeps them in `bad/NAME.d/`, copied beside `NAME.j3`
   for the check (`*.d` folders are never inputs themselves). A `NAME.d/` with a `j3.toml` makes the case a
   project: `check .` in the copy, entry `NAME.j3`, modules in `NAME.d/src/`.
+- `bad-ui/`: one small UI project per `.j3ui` error (`j3.toml` with `[ui]`, `src/main.j3`, `ui/*.j3ui`; the
+  `.j3ui` says in a comment which error it shows). `ui` runs `dump-ui NAME/ui` on each and compares the error
+  text; the `span_*` ones are also `err` cases (`check .` in a scratch copy): their error is found in the
+  generated J3 and must be shown at the `.j3ui` line (the span map).
 - `proj/`: small multi-module projects for `fmt`/`ast`/`ir`/`llvm`/`run` (rules that need two modules, such
   as an instance body lowered with the names of the module that uses it: `merged_names`, `merged_types`).
 - `known/MODE.txt`: inputs that fail today, one per line. It only shrinks: a listed input that passes

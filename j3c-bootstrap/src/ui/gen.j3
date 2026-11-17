@@ -1,4 +1,547 @@
-// Generator: components to J3 text in the runtime's shape.
+// Generator: `.j3ui` components to J3 source text, in the shape `speculative/12_ui_runtime/README.md`
+// describes. All components of a project become one module, `<package>.ui`.
 //
 // Port of: j3c/src/ui/gen/mod.rs
+// J3: J3 from the file (script bodies, `{expr}`, handlers) is copied verbatim; the only edits are
+// token-level (`this.` before an instance `let` or script `fn`, `emit x` to `ev.x = true`), found with the
+// real lexer. The text then goes through the normal parser like any file.
+// J3: Contract file (`.swarm-opus/11-port/contracts-c2e.md`). The types, constants and helpers here are
+// frozen by wave 16; chunk B fills `generate` (and may add `use` lines and private helpers). Every `use`
+// of the module is here: part files share them, and a part adds a `use` only for a name no other file of
+// the module imports (a repeated `use` across parts is an error in stage 0).
+// J3: Rust tuples are small structs (`Rename`, `LetIn`, `Inst`, `IfState`, `ScopeBase`, `EachCx`,
+// `SlotMark`, `SlotUse`, `ConstName`, `Payload`, `SlotHas`, `Section`, `ChoiceSet`). Rust's `BTreeSet` /
+// `BTreeMap` are byte-sorted `List`s (`sortedInsert`, `choiceSetAt`); `HashMap` / `HashSet` are `Map` /
+// `Set` used for lookups only (rule 3). Identity is `Elem.uid`, never an address (`markup/types.j3`).
+// J3: `G`'s methods are `extend G { .. }` blocks in the part files (`gen/*.j3`); a method in one part calls
+// a method in another freely (checked in wave 16, as `shader.Gen` does). No `extend` on an enum (stage 0
+// refuses it): `Node`, `Value`, `Part`, `Mode` helpers are free fns.
+// J3: Strings a `G` keeps (names, `tags`, `rename`, ..) are arena copies or source slices; generated text
+// goes through `Out` (a `Text`), built with `Text.new(g.a)` / `t.fmt(..)`, never plain interpolation.
 module j3c.ui.gen;
+
+use j3.cmp.sortBy;
+use j3.data.map.Map;
+use j3.data.pool.Id;
+use j3.data.set.Set;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.text;
+use j3.text.{ Text, contains, endsWith, startsWith };
+use j3c.base.intern.own;
+use j3c.base.span.Source;
+use j3c.syntax.lex.lex;
+use j3c.syntax.token.{ ParseError, Token, TokenKind };
+use j3c.ui.icons;
+use j3c.ui.icons.Icon;
+use j3c.ui.map.{ Out, Seg };
+use j3c.ui.markup;
+use j3c.ui.markup.{ Attr, Branch, EachNode, Elem, EvParam, FnDef, IfNode, Inject, LetDef, LetNode, Markup, Named, Node, Part, Parts, Prop, Range, Script, TextNode, UiError, Value, notYet, uiErr };
+use j3c.ui.pass;
+use j3c.ui.pass.Pass;
+
+pub struct SrcFile {
+    /// As shown in errors, e.g. `ui/Game.j3ui`.
+    path: string;
+    /// The component name (dotted path from `ui/`).
+    name: string;
+    text: string;
+    /// The `.j3ui` as a Session source (path = `path`), so an error is a plain `Span` in it. Set by
+    /// `ui.tryBuild` before `generate` runs.
+    src: Id<Source>;
+}
+
+pub struct Theme {
+    path: string;
+    text: string;
+}
+
+/// A component's name and its byte range in the generated text.
+pub struct Section {
+    name: string;
+    lo: int;
+    hi: int;
+}
+
+pub struct Built {
+    text: string;
+    segs: List<Seg>;
+    sections: List<Section>;
+}
+
+/// `file` is the index into the scan-ordered file list.
+pub struct GenError {
+    file: int;
+    err: UiError;
+}
+
+/// The `<glyph action>` names the runtime knows (`dom/glyph.j3`).
+pub const GLYPH_ACTIONS: [11]string = ["confirm", "back", "prev", "next", "up", "down", "left", "right", "page-up", "page-down", "scroll"];
+
+pub const ELEMENTS: [47]string = [
+    "div", "span", "p", "h1", "h2", "small", "header", "nav", "main", "section", "label", "button", "input", "textarea", "select", "option", "dl", "dt", "dd", "canvas", "dialog", "aside", "img", "svg", "path", "h3", "h4", "h5", "h6", "ul", "ol", "li", "a", "hr", "strong", "em", "b", "i", "pre", "code", "br", "progress", "meter", "details", "summary", "glyph", "icon"
+];
+
+pub const MOUSE: [19]string = ["click", "mousedown", "mouseup", "mousemove", "wheel", "input", "change", "submit", "close", "contextmenu", "trigger", "edit", "dragstart", "dragend", "dragenter", "dragleave", "dragover", "drop", "toggle"];
+
+/// J3 names the generated module already declares or imports.
+const RESERVED: [7]string = ["Arena", "List", "Css", "Dom", "Vec2", "Keyed", "THEME"];
+
+/// Payload types an event can carry: each has a literal to fill the field on frames without an emit.
+const EV_TYPES: [8]string = ["int", "bool", "string", "float", "f32", "f64", "i32", "u8"];
+
+const FIXED_NAMES: [27]string = ["d", "p", "ev", "this", "mem", "ready", "css", "dom", "init", "update", "paint", "new", "styles", "render", "ps", "cs", "inputs", "j3Reset", "slotSite", "slotOwn", "slotI", "sev", "destroy", "mounting", "event", "dm", "comp"];
+
+const NUMBERED: [22]string = ["n", "s", "e", "b", "m", "i", "a", "x", "c", "if", "cnt", "slotNow", "slotWas", "pass", "size", "ua", "us", "up", "ul", "uh", "pv", "bh"];
+
+pub struct Comp {
+    /// Dotted path from `ui/` (`game.Bar`): what markup writes.
+    name: string;
+    /// The J3 name (`game_Bar`).
+    id: string;
+    /// Index into the scan-ordered file list.
+    fi: int;
+    mk: Markup;
+    sc: Script;
+    /// 1-based position in component-name order.
+    scope: int;
+}
+
+/// (script name, module-level J3 name) of a `const`.
+pub struct ConstName {
+    name: string;
+    j3: string;
+}
+
+/// (event, payload name).
+pub struct Payload {
+    ev: string;
+    name: string;
+}
+
+/// A `<slot>` this component declares ("" is the default) and the use sites that fill it.
+pub struct SlotHas {
+    name: string;
+    sites: List<int>;
+}
+
+pub struct Names {
+    props: List<string>;
+    lets: List<string>;
+    consts: List<ConstName>;
+    fns: List<string>;
+    /// Script fns that `emit`, directly or by calling one that does.
+    emitting: List<string>;
+    events: List<string>;
+    /// In declaration order.
+    payload: List<Payload>;
+    /// `$slots.x`.
+    slotHas: List<SlotHas>;
+}
+
+pub fn emptyNames(a: &Arena): Names {
+    return Names { props: List<string>.new(a), lets: List<string>.new(a), consts: List<ConstName>.new(a), fns: List<string>.new(a),
+        emitting: List<string>.new(a), events: List<string>.new(a), payload: List<Payload>.new(a), slotHas: List<SlotHas>.new(a) };
+}
+
+/// The generated `bool` method behind `$slots.<name>` (the default slot is `default`).
+pub fn slotHasFn(name: string, a: &Arena): string {
+    return Text.new(a).add("slotHas_").add(if name.len == 0 { "default" } else { name }).str();
+}
+
+fn allDigits(s: string): bool {
+    if s.len == 0 { return false; }
+    for i in 0..s.len { if s[i] < '0' || s[i] > '9' { return false; } }
+    return true;
+}
+
+fn inList(xs: []string, s: string): bool {
+    for i in 0..xs.len { if xs[i] == s { return true; } }
+    return false;
+}
+
+pub fn isReserved(n: string): bool {
+    if inList(FIXED_NAMES[0..FIXED_NAMES.len], n) || startsWith(n, pass.PREFIX) { return true; }
+    for i in 0..NUMBERED.len {
+        let pre = NUMBERED[i];
+        if startsWith(n, pre) && allDigits(n[pre.len..n.len]) { return true; }
+    }
+    return startsWith(n, "tag_") || startsWith(n, "cls_") || startsWith(n, "slotHas_");
+}
+
+/// The module-level names the generated file takes (`RESERVED`).
+pub fn isReservedComp(id: string): bool { return inList(RESERVED[0..RESERVED.len], id); }
+
+/// An event payload type the generator can default (`EV_TYPES`).
+pub fn isEvType(ty: string): bool { return inList(EV_TYPES[0..EV_TYPES.len], ty); }
+
+pub fn evDefault(ty: string): string {
+    if ty == "bool" { return "false"; }
+    if ty == "string" { return "\"\""; }
+    if ty == "int" || ty == "i32" || ty == "u8" { return "0"; }
+    return "0.0";
+}
+
+/// `pick: false, pick_slot: 0, close: false`: every field of the component's `Events` struct.
+pub fn evInit(sc: &Script, src: string, a: &Arena): string {
+    let t = Text.new(a);
+    for i in 0..sc.events.len {
+        let e = sc.events.items[i].name;
+        if t.len() > 0 { t.add(", "); }
+        t.add(e).add(": false");
+        for k in 0..sc.evParams.len {
+            let p = sc.evParams.items[k];
+            if p.ev != e { continue; }
+            t.add(", ").add(e).add("_").add(p.name).add(": ").add(evDefault(text.trim(src[p.ty.lo..p.ty.hi])));
+        }
+    }
+    return t.str();
+}
+
+/// Every char outside `[A-Za-z0-9_]` as one `_` (one per code point, not per byte).
+pub fn san(s: string, a: &Arena): string {
+    let t = Text.new(a);
+    for i in 0..s.len {
+        let c = s[i];
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' { t.push(c); }
+        else if c < 0x80 || c >= 0xc0 { t.push('_'); } // a continuation byte adds nothing
+    }
+    return t.str();
+}
+
+/// `s` as a J3 string literal: only `\`, `"`, newline, `\r` and tab are escaped.
+pub fn lit(s: string, a: &Arena): string {
+    let t = Text.new(a);
+    t.push('"');
+    for i in 0..s.len {
+        let c = s[i];
+        if c == '\\' { t.add("\\\\"); }
+        else if c == '"' { t.add("\\\""); }
+        else if c == '\n' { t.add("\\n"); }
+        else if c == '\r' { t.add("\\r"); }
+        else if c == '\t' { t.add("\\t"); }
+        else { t.push(c); }
+    }
+    t.push('"');
+    return t.str();
+}
+
+pub fn ge(file: int, e: UiError): GenError { return GenError { file: file, err: e }; }
+
+/// `prefix` + the sanitised `orig`, with `_<pos>` when an earlier name of `list` sanitises alike.
+pub fn fieldName(prefix: string, list: &List<string>, orig: string, a: &Arena): string {
+    let pos = 0;
+    for i in 0..list.len { if list.items[i] == orig { pos = i; break; } }
+    let base = san(orig, a);
+    let t = Text.new(a).add(prefix).add(base);
+    for i in 0..pos {
+        if san(list.items[i], a) == base {
+            t.add("_");
+            t.pushInt(pos);
+            break;
+        }
+    }
+    return t.str();
+}
+
+/// Byte-order `a < b` (Rust `str` order).
+pub fn strLess(a: string, b: string): bool {
+    let n = if a.len < b.len { a.len } else { b.len };
+    for i in 0..n { if a[i] != b[i] { return a[i] < b[i]; } }
+    return a.len < b.len;
+}
+
+/// Insert `s` into the byte-sorted `xs` unless it is there (Rust `BTreeSet::insert`); true when added.
+/// The caller makes `s` outlive the list (an arena copy or a source slice).
+pub fn sortedInsert(xs: &List<string>, s: string): bool {
+    let at = 0;
+    while at < xs.len && strLess(xs.items[at], s) { at += 1; }
+    if at < xs.len && xs.items[at] == s { return false; }
+    xs.push(s);
+    let k = xs.len - 1;
+    while k > at {
+        xs.items[k] = xs.items[k - 1];
+        k -= 1;
+    }
+    xs.items[at] = s;
+    return true;
+}
+
+/// A dynamic component's candidate set: the enum `name` (`Of_A_B`) and its candidates in first-seen order.
+pub struct ChoiceSet {
+    name: string;
+    candidates: List<string>;
+}
+
+/// Index of the set `name` in the byte-sorted `sets` (Rust `BTreeMap`), -1 when absent; `at` gets the
+/// place to insert it.
+pub fn choiceSetAt(sets: &List<ChoiceSet>, name: string, at: &int): int {
+    let k = 0;
+    while k < sets.len && strLess(sets.items[k].name, name) { k += 1; }
+    *at = k;
+    if k < sets.len && sets.items[k].name == name { return k; }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------------------
+// the per-component generator state
+
+/// Which buffer a piece goes to: `update` or `paint`.
+pub enum Mode { U, P }
+
+/// `iv * k + j` slot numbering inside a row (Rust `Base = Option<(String, usize)>` is `Option<Base>`).
+pub struct Base {
+    iv: string;
+    k: int;
+}
+
+/// A name written differently (a keyed `{#each}` binds its item twice, and J3 has no shadowing).
+pub struct Rename {
+    from: string;
+    to: string;
+}
+
+/// A `{#let}` in scope: (markup name, J3 name, expression).
+pub struct LetIn {
+    name: string;
+    j3: string;
+    expr: Range;
+}
+
+/// A component instance: its number, the component's J3 name, and its container (0 for the component
+/// itself, else the `{#each}` whose row struct holds it).
+pub struct Inst {
+    id: int;
+    comp: string;
+    container: int;
+}
+
+/// A stateful `{#if}`: its state number and container.
+pub struct IfState {
+    id: int;
+    container: int;
+}
+
+/// `(locals, lets)` in scope where a container's body starts.
+pub struct ScopeBase {
+    locals: int;
+    lets: int;
+}
+
+/// What a `virtual` element says about its list (`virtualAttrs`): the node variable, `row-height` (none:
+/// rows are measured), `est-height`, `stick-to-bottom`, `keep={keys}` and `bind:at-end={place}`.
+pub struct Virt {
+    n: string;
+    rh: Option<Value>;
+    est: Option<Value>;
+    stick: bool;
+    keep: Option<Range>;
+    atEnd: Option<Range>;
+}
+
+/// A `use:name` on an element: the state it keeps in its container (`ua<k>` handle, `us<k>` mounted,
+/// `up<k>` last parameter).
+pub struct ActDef {
+    k: int;
+    container: int;
+    name: string;
+    /// Type of the parameter (None: `use:name` without one).
+    ty: Option<string>;
+    destroy: bool;
+}
+
+/// A `bind:this={place}` whose place is still reachable after the build (a component field, or an element
+/// of one): reset to -1 when the element goes.
+pub struct BindDef {
+    k: int;
+    container: int;
+    place: Range;
+}
+
+/// An `{#each}`. With `rows` its state (component instances, `{#if}` branches, nested lists) lives in one
+/// `<Comp>_R<id>` struct per row, so it can follow a key; without, the loop keeps none.
+pub struct EachDef {
+    id: int;
+    container: int;
+    keyed: bool;
+    rows: bool;
+    virt: bool;
+}
+
+/// `a..b` of `{#each a..b as i}`.
+pub struct RangePair {
+    a: Range;
+    b: Range;
+}
+
+/// A parsed `{#each}` head (Rust control.rs `EachHead`).
+pub struct EachHead {
+    expr: Range;
+    range: Option<RangePair>;
+    item: Named;
+    /// `as &x`: the item is a pointer to the element, so the body can change it in place.
+    byRef: bool;
+    index: Option<Named>;
+    /// `(expr)` after the names: what identifies a row across frames.
+    key: Option<Range>;
+    /// `(expr : int)`: an int key, kept as raw bytes (no formatting).
+    keyInt: bool;
+}
+
+/// An enclosing `{#each}`: a slot method re-binds the loop item from its index.
+pub struct EachCx {
+    head: EachHead;
+    k: int;
+    eid: int;
+    rows: bool;
+}
+
+/// `(site, owner)` of one use that fills a slot.
+pub struct SlotUse {
+    site: int;
+    owner: string;
+}
+
+/// A `<slot>` someone fills: (number, method name part, its uses).
+pub struct SlotMark {
+    k: int;
+    name: string;
+    calls: List<SlotUse>;
+}
+
+/// A use of a component with children: which slots it fills.
+pub struct Site {
+    /// 1-based, project-wide (component-name order, then tree order); names the generated
+    /// `slot<id>_<name>_update` methods on the using component.
+    id: int;
+    child: string;
+    /// The using component's J3 name.
+    owner: string;
+    names: List<string>;
+}
+
+/// Lookups only; never iterated into output.
+pub struct Slots {
+    list: List<Site>;
+    /// Component elements with children, by `Elem.uid`, to their `list` index (Rust `by_addr`).
+    byUid: Map<int, int>;
+    /// `uid`s of direct children carrying a valid `slot="x"`.
+    slotted: Set<int>;
+    /// What the uses of each component pass as `class` / `style:` (see `pass`), by component name.
+    pass: Map<string, Pass>;
+}
+
+pub fn emptySlots(a: &Arena): Slots {
+    return Slots { list: List<Site>.new(a), byUid: Map<int, int>.new(a, 16), slotted: Set<int>.new(a, 16), pass: Map<string, Pass>.new(a, 16) };
+}
+
+/// The token-level rewrite's inputs (Rust rewrite.rs `Rw`).
+pub struct Rw {
+    a: &Arena;
+    src: string;
+    fi: int;
+    names: &Names;
+    locals: &List<string>;
+    /// Names to write differently.
+    rename: &List<Rename>;
+    emitOk: bool;
+    /// Inside a script `fn`: `emit` writes the component's `sev` (merged into the update's events), not the local `ev`.
+    sev: bool;
+    /// Calling a script fn that emits is fine here: handlers and fns, not a markup expression (it would
+    /// emit on every update), `on:draw` or `onDestroy`.
+    callsEmit: bool;
+}
+
+pub struct G {
+    a: &Arena;
+    all: &List<Comp>;
+    files: &List<SrcFile>;
+    themePath: Option<string>;
+    /// The project's `icons/*.svg` (before Bootstrap).
+    icons: &List<Icon>;
+    c: &Comp;
+    src: string;
+    fi: int;
+    root: bool;
+    /// Node numbers by `uid` (Rust's `id` cells), written by `number` in `run`; shared by the project.
+    ids: []int;
+    /// The longhand CSS property names, space separated (`cssProps`).
+    cssProps: string;
+    names: Names;
+    locals: List<string>;
+    rename: List<Rename>;
+    /// `{#let}`s in scope.
+    lets: List<LetIn>;
+    upd: Out;
+    pnt: Out;
+    /// Props read in `update` / `paint`, byte-sorted (`sortedInsert`; Rust `BTreeSet`).
+    usedU: List<string>;
+    usedP: List<string>;
+    /// The temp counter behind `nk()`: the order of `nk()` calls is the contract.
+    k: int;
+    tags: List<string>;
+    classes: List<string>;
+    insts: List<Inst>;
+    ifs: List<IfState>;
+    eachs: List<EachDef>;
+    acts: List<ActDef>;
+    binds: List<BindDef>;
+    /// Where each container's body starts: a `bind:this` place can be reset later only from there.
+    bases: List<ScopeBase>;
+    /// The enclosing `{#each}`s that have a row struct: `r<id>` is the row being built.
+    own: List<int>;
+    /// `r<id>.uid` of the enclosing keyed rows.
+    gstk: List<string>;
+    idx: List<string>;
+    slots: &Slots;
+    /// The enclosing `{#each}`s.
+    ectx: List<EachCx>;
+    /// The `slot<id>_<name>_*` methods of this component's component uses.
+    slotFns: Out;
+    /// Has a `<slot>`: `slotSite`, `slotOwn` and `slotI` say whose content to run.
+    hasSlot: bool;
+    /// The `<slot>`s someone fills. `update` ends by telling the owner when one that ran last frame did
+    /// not run this frame.
+    slotMarks: List<SlotMark>;
+    /// Has slot methods: `emit` in them lands in `sev`, merged into the update's events.
+    ownsSlot: bool;
+    /// A `virtual` element's settings for the one `{#each}` it holds.
+    virt: Option<Virt>;
+    /// Inside a `virtual` `{#each}` (slot content can't be re-bound there).
+    inVirt: int;
+    /// `uid`s of the elements that may carry `animate:flip`: the row elements of keyed, non-`virtual` `{#each}`s.
+    flipRows: List<int>;
+    usesList: bool;
+    usesKeyed: bool;
+    usesVirt: bool;
+    /// `uid` of this component's root element when some use passes `class` / `style:` to it, else -1
+    /// (Rust: an address, 0 for none).
+    passRoot: int;
+}
+
+/// A generator for component `c` (Rust `G::new`).
+pub fn newG(a: &Arena, all: &List<Comp>, files: &List<SrcFile>, themePath: Option<string>, icons: &List<Icon>, c: &Comp, root: bool, slots: &Slots, ids: []int, cssProps: string): G {
+    return G { a: a, all: all, files: files, themePath: themePath, icons: icons, c: c, src: files.items[c.fi].text, fi: c.fi, root: root,
+        ids: ids, cssProps: cssProps, names: emptyNames(a), locals: List<string>.new(a), rename: List<Rename>.new(a), lets: List<LetIn>.new(a),
+        upd: Out.new(a, c.fi), pnt: Out.new(a, c.fi), usedU: List<string>.new(a), usedP: List<string>.new(a), k: 0,
+        tags: List<string>.new(a), classes: List<string>.new(a), insts: List<Inst>.new(a), ifs: List<IfState>.new(a),
+        eachs: List<EachDef>.new(a), acts: List<ActDef>.new(a), binds: List<BindDef>.new(a), bases: List<ScopeBase>.new(a),
+        own: List<int>.new(a), gstk: List<string>.new(a), idx: List<string>.new(a), slots: slots, ectx: List<EachCx>.new(a),
+        slotFns: Out.new(a, c.fi), hasSlot: false, slotMarks: List<SlotMark>.new(a), ownsSlot: false, virt: Option.None, inVirt: 0,
+        flipRows: List<int>.new(a), usesList: false, usesKeyed: false, usesVirt: false, passRoot: -1 };
+}
+
+/// The `<package>.ui` module text for `files` (scan order). `propsText` is the embedded stdlib file
+/// `ui/css/props.j3` (`ui` sits below `load`, so the caller reads it: `load.stdlibFile`); `cssProps` cuts
+/// the names out of it. Everything is allocated in `a`.
+// Steps (Rust `generate`): order by component name (`scope` = position + 1) and check names; per file
+// `markup.parse(text, a, &uid)` + `parseScript`; `lowerChoices` (same `uid` counter); edges + `cycle`;
+// `resolveInject`; `declaredSlots` + `scanSites`; `pass.scan`; `ids` = `a.alloc::<int>(uid)` (zeros);
+// per component `newG(..).run()`; then the header, `head.append(&body)` and the section shift.
+pub fn generate(files: &List<SrcFile>, package: string, theme: Option<Theme>, icons: &List<Icon>, propsText: string, a: &Arena): Result<Built, GenError> {
+    return Result.Err(ge(0, notYet("gen.generate (chunk B)"))); // STUB B
+}
+
+/// Attributes and directives an element accepts (for editor completion; Rust `element_attrs`).
+pub fn elementAttrs(tag: string, a: &Arena): List<string> { return accepted(tag, a); }
