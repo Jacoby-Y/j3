@@ -1,5 +1,188 @@
-// What shader code can see: every module's items by name, cross-module reach.
+// What the shader pass can see: every module's items by name, and how a name in one module reaches
+// another through `use`.
 //
 // Part of module j3c.shader.
 // Port of: j3c/src/check/gpu/index.rs
+// J3: `GMod` and `Index` are declared in `shader.j3`. Rust's `find` takes a closure over `GMod`; here it
+// takes a `Has` and the name. Rust keeps `paths`/`srcs` maps of the non-script files; a span's path and
+// text come from the Session's `sources` pool by `span.file`.
 module j3c.shader;
+
+/// Whether any file has shader items or an `@shader` const (the pass is skipped otherwise).
+pub fn hasGpu(parsed: &Parsed): bool {
+    for i in 0..parsed.files.len {
+        let f = &parsed.files.items[i].ast;
+        if f.isScript { continue; }
+        for k in 0..f.items.len {
+            match f.items.items[k] {
+                Item.Fn(x) { match x.shader { Option.Some(s) { return true; } Option.None {} } }
+                Item.Struct(s) { if s.gpu != GpuStruct.None { return true; } }
+                Item.Let(l) { if l.uniform { return true; } }
+                Item.Const(c) { if isShaderCall(parsed.ast, c.value) { return true; } }
+                _ {}
+            }
+        }
+    }
+    return false;
+}
+
+/// `@shader(..)`: a call of the name `@shader`.
+fn isShaderCall(ast: &Ast, e: Id<Expr>): bool {
+    match ast.expr(e) {
+        Expr.Call(c) {
+            match ast.expr(c.func) {
+                Expr.Name(n) { return ast.str(n.name) == "@shader"; }
+                _ { return false; }
+            }
+        }
+        _ { return false; }
+    }
+}
+
+/// `a.b.c` of the first `n` path parts (an arena string).
+fn usePath(ast: &Ast, path: &List<Ident>, n: int): string {
+    let t = Text.new(ast.arena);
+    for i in 0..n {
+        if i > 0 { t.push('.'); }
+        t.add(ast.str(path.items[i].name));
+    }
+    return t.str();
+}
+
+fn gmodNew(a: &Arena, key: string): GMod {
+    return GMod { key: key, fns: Map<Sym, FnItem>.new(a, 8), cpuFns: Set<Sym>.new(a, 8), structs: Map<Sym, StructItem>.new(a, 8),
+        consts: Map<Sym, ConstItem>.new(a, 8), uniforms: Map<Sym, ModLetItem>.new(a, 8), globals: Set<Sym>.new(a, 8),
+        imports: Map<Sym, string>.new(a, 8), aliases: Map<Sym, string>.new(a, 8) };
+}
+
+/// Rust `Index::new`: every non-script file's items, by module (part files share one `GMod`).
+pub fn indexNew(cx: LoadCx, parsed: &Parsed): &Index {
+    let a = cx.arena;
+    let ix = &a.alloc::<Index>(1)[0];
+    *ix = Index { arena: a, names: cx.names, ast: parsed.ast, diags: cx.diags, sources: cx.sources, mods: List<GMod>.new(a),
+        byKey: Map<string, int>.new(a, 64) };
+    let ast = parsed.ast;
+    for i in 0..parsed.files.len {
+        let f = &parsed.files.items[i].ast;
+        if f.isScript { continue; }
+        let key = f.moduleKey(ast);
+        let at = ix.byKey.getOr(key, -1);
+        if at < 0 {
+            at = ix.mods.len;
+            ix.mods.push(gmodNew(a, key));
+            ix.byKey.put(key, at);
+        }
+        let m = &ix.mods.items[at];
+        for k in 0..f.items.len {
+            match f.items.items[k] {
+                Item.Fn(x) {
+                    match x.shader {
+                        Option.Some(s) { m.fns.put(x.name.name, x); }
+                        Option.None { m.cpuFns.add(x.name.name); }
+                    }
+                }
+                Item.Struct(s) { m.structs.put(s.name.name, s); }
+                Item.Const(c) { m.consts.put(c.name.name, c); }
+                Item.Let(l) {
+                    if l.uniform { m.uniforms.put(l.name.name, l); } else { m.globals.add(l.name.name); }
+                }
+                Item.Use(u) {
+                    let moduleName = usePath(ast, &u.path, u.path.len);
+                    match u.names {
+                        Option.Some(names) {
+                            for n in 0..names.len { m.imports.put(names.items[n].name, moduleName); }
+                        }
+                        Option.None {
+                            // `use a.b` is a module (`b.x`) or the item `b` of module `a`; both readings are kept
+                            if u.path.len > 0 {
+                                let last = u.path.items[u.path.len - 1].name;
+                                if u.path.len > 1 { m.imports.put(last, usePath(ast, &u.path, u.path.len - 1)); }
+                                m.aliases.put(last, moduleName);
+                            }
+                        }
+                    }
+                }
+                _ {}
+            }
+        }
+    }
+    return ix;
+}
+
+/// Whether `m` owns `name` as the kind `has` asks for.
+fn gmodHas(m: &GMod, name: Sym, has: Has): bool {
+    match has {
+        Has.ShaderFn { return m.fns.has(name); }
+        Has.CpuFn { return m.cpuFns.has(name); }
+        Has.Struct { return m.structs.has(name); }
+        Has.Const { return m.consts.has(name); }
+        Has.Uniform { return m.uniforms.has(name); }
+    }
+}
+
+extend Index {
+    /// Rust `Index::module`.
+    fn modOf(this: &Index, key: string): Option<&GMod> {
+        let i = this.byKey.getOr(key, -1);
+        if i < 0 { return Option.None; }
+        return Option.Some(&this.mods.items[i]);
+    }
+
+    /// The module that defines `name` as seen from `from`: `qual.name` through a `use` alias, else `from`
+    /// itself, else what `from` imported by name. `has` says what kind of thing is looked up.
+    fn find(this: &Index, from: string, qual: Option<Sym>, name: Sym, has: Has): Option<&GMod> {
+        let me: &GMod = match this.modOf(from) { Option.Some(m) { m } Option.None { return Option.None; } };
+        let key = "";
+        match qual {
+            Option.Some(q) {
+                match me.aliases.get(q) { Option.Some(k) { key = k; } Option.None { return Option.None; } }
+            }
+            Option.None {
+                if gmodHas(me, name, has) { return Option.Some(me); }
+                match me.imports.get(name) { Option.Some(k) { key = k; } Option.None { return Option.None; } }
+            }
+        }
+        match this.modOf(key) {
+            Option.Some(t) {
+                if gmodHas(t, name, has) { return Option.Some(t); }
+                return Option.None;
+            }
+            Option.None { return Option.None; }
+        }
+    }
+
+    /// Whether `q` names a `use`d module in `from` (so `q.name` is a qualified name, not a field).
+    fn isAlias(this: &Index, from: string, q: Sym): bool {
+        match this.modOf(from) {
+            Option.Some(m) { return m.aliases.has(q); }
+            Option.None { return false; }
+        }
+    }
+
+    /// The path of the file `sp` is in ("" for no file).
+    fn path(this: &Index, sp: Span): string {
+        if int(sp.file.i) >= this.sources.len() { return ""; }
+        return this.sources.get(sp.file).path;
+    }
+
+    /// `file:line` of a span, for the comment above each emitted fn.
+    fn at(this: &Index, sp: Span): string {
+        let line = 0;
+        let path = "";
+        if int(sp.file.i) < this.sources.len() {
+            let s = this.sources.get(sp.file);
+            path = s.path;
+            let end = int(sp.lo);
+            if end > s.text.len { end = s.text.len; }
+            line = 1;
+            for i in 0..end {
+                if s.text[i] == '\n' { line += 1; }
+            }
+        }
+        let slash = lastIndexOf(path, "/");
+        let t = Text.new(this.arena);
+        t.add(path[slash + 1..path.len]).add(":");
+        t.pushInt(line);
+        return t.str();
+    }
+}

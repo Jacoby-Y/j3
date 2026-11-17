@@ -1,5 +1,244 @@
-// Vertex and fragment entries and the program pair `@shader` makes.
+// Entry fns: a vertex stage, a fragment stage, and the pair that `@shader(vs, fs)` makes. The entry's
+// params and return become `in`/`out` declarations and a `main` that calls it.
 //
 // Part of module j3c.shader.
 // Port of: j3c/src/check/gpu/entry.rs
+// J3: Rust's `Stage` is `StageOut` here (`driver.Stage` is a different thing and the name reads better).
 module j3c.shader;
+
+/// A varying carries numbers: scalar or vector of f32/i32/u32.
+fn checkVaryingField(g: &Gen, f: &FieldItem, ty: GTy): Result<bool, Diag> {
+    let ok = false;
+    match ty {
+        GTy.Scalar(b) { ok = b != Base.B; }
+        GTy.Vec(v) { ok = v.base != Base.B; }
+        _ {}
+    }
+    if ok { return Result.Ok(true); }
+    let msg = g.t().add("a `#[varying]` field cannot be ").add(ty.name(g.ix.arena)).str();
+    return Result.Err(g.errHelp(g.ix.ast.typeSpan(f.ty), msg, "use f32, i32, u32 or a vector of them"));
+}
+
+/// The first varying field is `position: vec4`, the clip-space position.
+fn checkVaryingHead(g: &Gen, s: &StructItem, fields: &List<GField>): Result<bool, Diag> {
+    if fields.len > 0 && g.str(fields.items[0].name) == "position" && gtyEq(fields.items[0].ty, GTy.Vec(GVec { base: Base.F, n: 4 })) {
+        return Result.Ok(true);
+    }
+    let msg = g.t().add("`").add(g.str(s.name.name)).add("` must start with `position: vec4`").str();
+    return Result.Err(g.errHelp(s.name.span, msg, "the first varying field is the clip-space position (`gl_Position`); the fragment shader sees `gl_FragCoord` there"));
+}
+
+/// One emitted stage (Rust `entry::Stage`).
+struct StageOut {
+    text: string;
+    uniforms: List<string>;
+    /// Vertex: the varying struct returned. Fragment: the one taken, if any.
+    varying: Option<string>;
+    attribs: List<VAttr>;
+}
+
+/// The struct item of a struct key `module::Name` that `structTy` resolved.
+fn structOf(g: &Gen, key: string, sp: Span): Result<&StructItem, Diag> {
+    let at = find(key, "::");
+    let Option.Some(m) = g.ix.modOf(key[0..at]) else { return Result.Err(g.e(sp, "internal: shader struct without a module")); };
+    return Result.Ok(m.structs.getPtr(g.ix.names.intern(key[at + 2..key.len])));
+}
+
+/// Render the stage `g` wrote, with `io` and `main`'s lines; the text and the uniform names.
+fn finish(g: &Gen, title: string, io: List<string>, main: &List<string>, varying: Option<string>, attribs: List<VAttr>): StageOut {
+    let a = g.ix.arena;
+    let names = List<string>.new(a);
+    let decls = List<string>.new(a);
+    for i in 0..g.uniformsOut.len {
+        names.push(g.uniformsOut.items[i].name);
+        decls.push(g.uniformsOut.items[i].decl);
+    }
+    let m = Text.new(a);
+    m.add("void main() {\n");
+    for i in 0..main.len { m.add("    ").add(main.items[i]).add("\n"); }
+    m.add("}\n");
+    let st = StageText { title: title, structs: g.structsOut, io: io, uniforms: decls, consts: g.constsOut, fns: g.fnsOut, main: m.str() };
+    return StageOut { text: st.render(a), uniforms: names, varying: varying, attribs: attribs };
+}
+
+fn flatWord(f: &GField): string {
+    if f.flat || f.ty.isInt() { return "flat "; }
+    return "";
+}
+
+fn vertexStage(ix: &Index, moduleName: string, f: &FnItem, title: string): Result<StageOut, Diag> {
+    let a = ix.arena;
+    let g = genNew(ix, Only.Vertex);
+    let sig = g.emitFn(moduleName, f, f.name.span)?;
+    let io = List<string>.new(a);
+    let main = List<string>.new(a);
+    let all = List<VAttr>.new(a);
+    let args = Text.new(a);
+    let loc: u32 = 0;
+    for pi in 0..f.params.len {
+        let p = f.params.items[pi];
+        let pty = sig.params.items[pi].ty;
+        let psp = ix.ast.typeSpan(p.ty);
+        let GTy.Struct(st) = pty else {
+            return Result.Err(g.errHelp(psp, "a vertex fn takes `#[vertex]` structs", "one struct per vertex buffer; `#[vertex(instance)]` for per-instance data"));
+        };
+        let info = *g.sinfo.getPtr(st.key);
+        if info.kind != GpuStruct.Vertex && info.kind != GpuStruct.VertexInstance {
+            let msg = g.t().add("`").add(pty.name(a)).add("` is not a vertex struct").str();
+            return Result.Err(g.errHelp(psp, msg, "mark it `#[vertex]` (or `#[vertex(instance)]`)"));
+        }
+        let s = structOf(&g, st.key, psp)?;
+        checkLayout(&g, s)?;
+        let div: u32 = 0;
+        if info.kind == GpuStruct.VertexInstance { div = 1; }
+        checkLimit(&g, s, loc)?;
+        let mine = attribs(&g, s, loc, div)?;
+        let ctor = Text.new(a);
+        ctor.add(st.glsl).add(" p_");
+        ctor.pushInt(pi);
+        ctor.add(" = ").add(st.glsl).add("(");
+        let k = 0;
+        for fi in 0..info.fields.len {
+            let fl = info.fields.items[fi];
+            let v = g.t().add("a_").add(mangle(g.str(p.name.name), a)).add("_").add(mangle(g.str(fl.name), a)).str();
+            // one attribute per field; a mat4 takes four locations
+            let first = mine.items[k];
+            k += 1;
+            if gtyEq(fl.ty, GTy.Mat(4)) { k += 3; }
+            let decl = g.t();
+            decl.add("layout(location=");
+            decl.pushU64(u64(first.loc));
+            decl.add(") in ").add(fl.ty.glsl(a)).add(" ").add(v).add(";");
+            io.push(decl.str());
+            if fi > 0 { ctor.add(", "); }
+            ctor.add(v);
+        }
+        loc += u32(mine.len);
+        for i in 0..mine.len { all.push(mine.items[i]); }
+        // main's locals never use user names (`input`, `r`, a fn called like a param)
+        main.push(ctor.add(");").str());
+        if pi > 0 { args.add(", "); }
+        args.add("p_");
+        args.pushInt(pi);
+    }
+    let GTy.Struct(rs) = sig.ret else {
+        return Result.Err(g.errHelp(f.name.span, "a vertex fn returns a `#[varying]` struct", "its first field is `position: vec4`"));
+    };
+    let rinfo = *g.sinfo.getPtr(rs.key);
+    if rinfo.kind != GpuStruct.Varying {
+        let msg = g.t().add("`").add(sig.ret.name(a)).add("` is not a `#[varying]` struct").str();
+        return Result.Err(g.errHelp(f.name.span, msg, "mark it `#[varying]`"));
+    }
+    main.push(g.t().add(rs.glsl).add(" p_ret = ").add(sig.glsl).add("(").add(args.str()).add(");").str());
+    for i in 0..rinfo.fields.len {
+        let fl = rinfo.fields.items[i];
+        if i == 0 {
+            main.push(g.t().add("gl_Position = p_ret.").add(fl.glsl).add(";").str());
+            continue;
+        }
+        let v = mangle(g.str(fl.name), a);
+        io.push(g.t().add(flatWord(&fl)).add("out ").add(fl.ty.glsl(a)).add(" v_").add(v).add(";").str());
+        main.push(g.t().add("v_").add(v).add(" = p_ret.").add(fl.glsl).add(";").str());
+    }
+    return Result.Ok(finish(&g, g.t().add(title).add(" (vertex)").str(), io, &main, Option.Some(rs.key), all));
+}
+
+fn fragmentStage(ix: &Index, moduleName: string, f: &FnItem, title: string): Result<StageOut, Diag> {
+    let a = ix.arena;
+    let g = genNew(ix, Only.Fragment);
+    let sig = g.emitFn(moduleName, f, f.name.span)?;
+    if !gtyEq(sig.ret, GTy.Vec(GVec { base: Base.F, n: 4 })) {
+        let msg = g.t().add("a fragment fn returns the color as vec4, not ").add(sig.ret.name(a)).str();
+        return Result.Err(g.errHelp(f.name.span, msg, "write `: vec4`"));
+    }
+    if sig.params.len > 1 {
+        return Result.Err(g.errHelp(f.params.items[1].name.span, "a fragment fn takes the `#[varying]` struct and nothing else", "read other values through `#[uniform]`s"));
+    }
+    let io = List<string>.new(a);
+    let main = List<string>.new(a);
+    let varying: Option<string> = Option.None;
+    let callArgs = "";
+    if sig.params.len == 1 {
+        let pty = sig.params.items[0].ty;
+        let psp = ix.ast.typeSpan(f.params.items[0].ty);
+        let GTy.Struct(st) = pty else {
+            return Result.Err(g.errHelp(psp, "a fragment fn takes the `#[varying]` struct the vertex fn returns", "or no parameters"));
+        };
+        let info = *g.sinfo.getPtr(st.key);
+        if info.kind != GpuStruct.Varying {
+            return Result.Err(g.err(psp, g.t().add("`").add(pty.name(a)).add("` is not a `#[varying]` struct").str()));
+        }
+        let ctor = Text.new(a);
+        ctor.add(st.glsl).add(" p_0 = ").add(st.glsl).add("(");
+        for i in 0..info.fields.len {
+            let fl = info.fields.items[i];
+            if i == 0 {
+                ctor.add("gl_FragCoord");
+                continue;
+            }
+            let v = mangle(g.str(fl.name), a);
+            io.push(g.t().add(flatWord(&fl)).add("in ").add(fl.ty.glsl(a)).add(" v_").add(v).add(";").str());
+            ctor.add(", v_").add(v);
+        }
+        main.push(ctor.add(");").str());
+        callArgs = "p_0";
+        varying = Option.Some(st.key);
+    }
+    io.push("layout(location=0) out vec4 oColor;");
+    main.push(g.t().add("oColor = ").add(sig.glsl).add("(").add(callArgs).add(");").str());
+    return Result.Ok(finish(&g, g.t().add(title).add(" (fragment)").str(), io, &main, varying, List<VAttr>.new(a)));
+}
+
+/// What `pair` built (Rust `entry::Built`).
+struct Built {
+    vert: string;
+    frag: string;
+    uniforms: List<string>;
+    attribs: List<VAttr>;
+}
+
+/// The program for `@shader(vs, fs)`: both stages, and the check that the varying structs agree.
+fn pair(ix: &Index, vm: string, vf: &FnItem, fm: string, ff: &FnItem, title: string, at: Span): Result<Built, Diag> {
+    let v = vertexStage(ix, vm, vf, title)?;
+    let f = fragmentStage(ix, fm, ff, title)?;
+    match f.varying {
+        Option.Some(fk) {
+            let vk = "";
+            match v.varying {
+                Option.Some(k) { vk = k; }
+                Option.None {}
+            }
+            if vk != fk {
+                let msg = Text.new(ix.arena);
+                msg.add("`").add(ix.names.str(ff.name.name)).add("` takes `").add(shortKey(fk)).add("` but `").add(ix.names.str(vf.name.name));
+                msg.add("` returns `").add(shortKey(vk)).add("`");
+                return Result.Err(withHelp(ix, errAt(ix, at, msg.str()), "a vertex and a fragment fn are paired by the same `#[varying]` struct"));
+            }
+        }
+        Option.None {}
+    }
+    let uniforms = v.uniforms;
+    for i in 0..f.uniforms.len {
+        if !uniforms.contains(f.uniforms.items[i]) { uniforms.push(f.uniforms.items[i]); }
+    }
+    return Result.Ok(Built { vert: v.text, frag: f.text, uniforms: uniforms, attribs: v.attribs });
+}
+
+/// Check one shader fn that no `@shader` reaches (so nothing is left unchecked).
+fn checkAlone(ix: &Index, moduleName: string, f: &FnItem): Result<bool, Diag> {
+    let title = Text.new(ix.arena).add(moduleName).add(".").add(ix.names.str(f.name.name)).str();
+    let stage = GpuStage.Helper;
+    match f.shader {
+        Option.Some(s) { stage = s; }
+        Option.None {}
+    }
+    match stage {
+        GpuStage.Vertex { vertexStage(ix, moduleName, f, title)?; }
+        GpuStage.Fragment { fragmentStage(ix, moduleName, f, title)?; }
+        GpuStage.Helper {
+            let g = genNew(ix, Only.Any);
+            g.emitFn(moduleName, f, f.name.span)?;
+        }
+    }
+    return Result.Ok(true);
+}

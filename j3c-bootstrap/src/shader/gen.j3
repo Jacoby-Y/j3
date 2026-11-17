@@ -1,5 +1,359 @@
-// The generator state per stage, walking checked code into GLSL.
+// The generator state per stage: type-checks shader code and writes its GLSL in one walk (a `Gen` per
+// stage, so each stage holds only what it reaches). Type and name lookup live here; fns, statements and
+// expressions are the sibling files.
 //
 // Part of module j3c.shader.
 // Port of: j3c/src/check/gpu/gen.rs
+// J3: The types (`Gen`, `Cur`, `SInfo`, ...) are in `shader.j3`. Rust's generic `err<T>` / `err_help<T>`
+// return a `Result`; here `e`, `err` and `errHelp` make the Diag and the caller writes
+// `return Result.Err(g.err(..))`. A scope is a list in declaration order (Rust: a HashMap), searched from
+// its end so a later local of the same name wins as an insert does. Names are `Sym`s; text is built in
+// the Index's arena.
 module j3c.shader;
+
+/// A CPU type and what to write in shader code instead (Rust `CPU_ONLY`'s triple).
+struct CpuOnly {
+    word: string;
+    why: string;
+    fix: string;
+}
+
+const CPU_ONLY: [17]CpuOnly = [
+    CpuOnly { word: "int", why: "`int` is 64-bit and shaders have no 64-bit integers", fix: "write `i32`" },
+    CpuOnly { word: "i64", why: "64-bit integers do not exist in shader code", fix: "write `i32`" },
+    CpuOnly { word: "u64", why: "64-bit integers do not exist in shader code", fix: "write `u32`" },
+    CpuOnly { word: "f64", why: "64-bit floats do not exist in shader code", fix: "write `f32`" },
+    CpuOnly { word: "i8", why: "8-bit integers do not exist in shader code", fix: "write `i32`" },
+    CpuOnly { word: "i16", why: "16-bit integers do not exist in shader code", fix: "write `i32`" },
+    CpuOnly { word: "u8", why: "8-bit integers do not exist in shader code", fix: "write `u32`" },
+    CpuOnly { word: "u16", why: "16-bit integers do not exist in shader code", fix: "write `u32`" },
+    CpuOnly { word: "float", why: "`float` is not a J3 type", fix: "write `f32`" },
+    CpuOnly { word: "string", why: "strings do not exist in shader code", fix: "shaders compute with numbers; pass text as a texture" },
+    CpuOnly { word: "ptr", why: "pointers do not exist in shader code", fix: "only a fn parameter may be `&T`; it becomes `inout`" },
+    CpuOnly { word: "cstr", why: "pointers do not exist in shader code", fix: "only a fn parameter may be `&T`; it becomes `inout`" },
+    CpuOnly { word: "vec4f", why: "`vec4f` is the CPU SIMD type", fix: "write `vec4`" },
+    CpuOnly { word: "vec4i", why: "`vec4i` is the CPU SIMD type", fix: "write `ivec4`" },
+    CpuOnly { word: "Vec2", why: "`Vec2` is a CPU type", fix: "write `vec2` (CPU types appear only in `#[vertex]` struct fields)" },
+    CpuOnly { word: "Vec3", why: "`Vec3` is a CPU type", fix: "write `vec3` (CPU types appear only in `#[vertex]` struct fields)" },
+    CpuOnly { word: "Mat4", why: "`Mat4` is a CPU type", fix: "write `mat4` (CPU types appear only in `#[vertex]` struct fields)" },
+];
+
+/// Rust `Cur { module, ret, in_const, ..Cur::default() }`.
+fn curNew(a: &Arena, moduleName: string, ret: GTy, inConst: bool): Cur {
+    return Cur { moduleName: moduleName, scopes: List<List<GLocal>>.new(a), ret: ret, ctl: List<bool>.new(a), inConst: inConst };
+}
+
+/// Rust `Gen::new`.
+fn genNew(ix: &Index, stage: Only): Gen {
+    let a = ix.arena;
+    return Gen { ix: ix, stage: stage, cur: curNew(a, "", GTy.Void, false), body: Text.new(a), depth: 1,
+        structsOut: List<string>.new(a), constsOut: List<string>.new(a), uniformsOut: List<UniformOut>.new(a),
+        fnsOut: List<string>.new(a), sinfo: Map<string, &SInfo>.new(a, 8), sigs: Map<string, &FnSig>.new(a, 8),
+        stack: List<string>.new(a), constsDone: Map<string, ConstDone>.new(a, 8), taken: Map<string, string>.new(a, 8),
+        gnames: Map<string, string>.new(a, 8), building: Set<string>.new(a, 8) };
+}
+
+/// `d` with a `help:` line.
+fn withHelp(ix: &Index, d: Diag, help: string): Diag {
+    let out = d;
+    out.notes.push(Note { kind: NoteKind.Help, span: noSpan(), msg: own(ix.arena, help) });
+    return out;
+}
+
+/// `MODULE::NAME`, the key of a module-level thing.
+fn itemKey(a: &Arena, moduleName: string, nm: string): string {
+    return Text.new(a).add(moduleName).add("::").add(nm).str();
+}
+
+/// The text after the last `::` (Rust `k.rsplit("::").next()`).
+fn shortKey(k: string): string {
+    let at = lastIndexOf(k, "::");
+    if at < 0 { return k; }
+    return k[at + 2..k.len];
+}
+
+extend Gen {
+    /// A new `Text` in the Index's arena.
+    fn t(this: &Gen): Text { return Text.new(this.ix.arena); }
+
+    fn str(this: &Gen, s: Sym): string { return this.ix.names.str(s); }
+
+    /// Rust `Gen::e`: the bare error.
+    fn e(this: &Gen, sp: Span, msg: string): Diag { return errAt(this.ix, sp, msg); }
+
+    /// Rust `Gen::err`: an error with the generic pointer to the docs; use `errHelp` when the fix is known.
+    fn err(this: &Gen, sp: Span, msg: string): Diag {
+        return withHelp(this.ix, errAt(this.ix, sp, msg), "`j3c doc shaders` lists what shader code supports");
+    }
+
+    /// Rust `Gen::err_help`: an error with a help line.
+    fn errHelp(this: &Gen, sp: Span, msg: string, help: string): Diag {
+        return withHelp(this.ix, errAt(this.ix, sp, msg), help);
+    }
+
+    /// The emitted name of a module-level thing: its own name unless GLSL reserves it or another thing took it.
+    fn globalName(this: &Gen, moduleName: string, name: Sym): string {
+        let a = this.ix.arena;
+        let key = itemKey(a, moduleName, this.str(name));
+        match this.gnames.get(key) {
+            Option.Some(n) { return n; }
+            Option.None {}
+        }
+        let n = mangle(this.str(name), a);
+        let clash = false;
+        match this.taken.get(n) {
+            Option.Some(k) { clash = k != key; }
+            Option.None {}
+        }
+        if clash {
+            let t = Text.new(a);
+            for i in 0..moduleName.len {
+                if moduleName[i] == '.' { t.push('_'); } else { t.push(moduleName[i]); }
+            }
+            n = t.add("_").add(n).str();
+        }
+        this.taken.put(n, key);
+        this.gnames.put(key, n);
+        return n;
+    }
+
+    /// A type written in shader code. A fn parameter's `&T` is unwrapped by `emitFn` before it gets here.
+    fn tyOf(this: &Gen, t: Id<Type>, moduleName: string): Result<GTy, Diag> {
+        let sp = this.ix.ast.typeSpan(t);
+        match this.ix.ast.ty(t) {
+            Type.Named(n) {
+                let word = this.str(n.name);
+                match builtinType(word) {
+                    Option.Some(b) { return Result.Ok(b); }
+                    Option.None {}
+                }
+                for i in 0..CPU_ONLY.len {
+                    if CPU_ONLY[i].word == word { return Result.Err(this.errHelp(sp, CPU_ONLY[i].why, CPU_ONLY[i].fix)); }
+                }
+                return this.structTy(moduleName, n.name, sp);
+            }
+            Type.Array(arr) {
+                let et = this.tyOf(arr.elem, moduleName)?;
+                match et {
+                    GTy.Array(_) {
+                        return Result.Err(this.errHelp(sp, "arrays of arrays do not exist in GLSL ES", "flatten to one `[N]T` and index with `i * W + j`"));
+                    }
+                    GTy.Sampler(_) { return Result.Err(this.err(sp, "arrays of samplers are not supported")); }
+                    _ {}
+                }
+                if arr.len == 0 { return Result.Err(this.err(sp, "an array needs at least one element")); }
+                return Result.Ok(GTy.Array(GArray { elem: this.ix.arena.new::<GTy>(et), len: arr.len }));
+            }
+            Type.Ref(_) {
+                return Result.Err(this.errHelp(sp, "pointers do not exist in shader code", "only a fn parameter may be `&T`; it becomes an `inout` parameter"));
+            }
+            Type.Slice(_) { return Result.Err(this.errHelp(sp, "slices do not exist in shader code", "use a fixed array `[N]T`")); }
+            Type.Generic(gt) {
+                let msg = this.t().add("`").add(this.str(gt.name)).add("<..>` is a generic type").str();
+                return Result.Err(this.errHelp(sp, msg, "shader code has no generics; write the concrete type"));
+            }
+            Type.Fn(_) { return Result.Err(this.fnTypeErr(sp)); }
+            Type.Closure(_) { return Result.Err(this.fnTypeErr(sp)); }
+            Type.Tuple(_) { return Result.Err(this.errHelp(sp, "tuples do not exist in shader code", "use a struct")); }
+            Type.Dyn(_) {
+                return Result.Err(this.errHelp(sp, "`dyn` values do not exist in shader code", "shader code has no pointers or method tables; pass the concrete struct"));
+            }
+        }
+    }
+
+    fn fnTypeErr(this: &Gen, sp: Span): Diag {
+        return this.errHelp(sp, "function values and closures do not exist in shader code", "call the `#[shader]` fn directly");
+    }
+
+    /// A struct used from shader code: built once, emitted before its first use.
+    fn structTy(this: &Gen, moduleName: string, name: Sym, sp: Span): Result<GTy, Diag> {
+        let a = this.ix.arena;
+        let nm = this.str(name);
+        let Option.Some(owner) = this.ix.find(moduleName, Option.None, name, Has.Struct) else {
+            let msg = this.t().add("unknown type `").add(nm).add("` in shader code").str();
+            return Result.Err(this.errHelp(sp, msg, "shader types are f32 i32 u32 bool vec2..4 ivec/uvec/bvec mat2..4 sampler2D and `#[shader]` structs"));
+        };
+        let s = owner.structs.getPtr(name);
+        let key = itemKey(a, owner.key, nm);
+        match this.sinfo.get(key) {
+            Option.Some(info) { return Result.Ok(GTy.Struct(GStruct { key: key, glsl: info.glsl })); }
+            Option.None {}
+        }
+        if s.gpu == GpuStruct.None {
+            let msg = this.t().add("`").add(nm).add("` is a CPU struct and cannot be used in shader code").str();
+            let help = this.t().add("write `#[shader] struct ").add(nm).add("` (then it exists only on the GPU), or `#[vertex]` for a vertex buffer layout").str();
+            return Result.Err(this.errHelp(sp, msg, help));
+        }
+        if s.typeParams.len != 0 { return Result.Err(this.err(s.name.span, "a shader struct cannot be generic")); }
+        if !this.building.add(key) {
+            return Result.Err(this.err(s.name.span, this.t().add("struct `").add(nm).add("` contains itself").str()));
+        }
+        let gname = this.globalName(owner.key, name);
+        let isVertex = s.gpu == GpuStruct.Vertex || s.gpu == GpuStruct.VertexInstance;
+        let fields = List<GField>.new(a);
+        let decl = Text.new(a);
+        decl.add("struct ").add(gname).add(" {\n");
+        for i in 0..s.fields.len {
+            let f = s.fields.items[i];
+            let fname = this.str(f.name.name);
+            // CPU-only padding (layout.j3)
+            if isVertex && fname.len > 0 && fname[0] == '_' { continue; }
+            let ty = GTy.Void;
+            if isVertex { ty = cpuToGpu(this, &f)?; } else { ty = this.tyOf(f.ty, owner.key)?; }
+            if s.gpu == GpuStruct.Varying { checkVaryingField(this, &f, ty)?; }
+            let hasDefault = false;
+            match f.default {
+                Option.Some(_) { hasDefault = true; }
+                Option.None {}
+            }
+            if f.embedded || hasDefault { return Result.Err(this.err(f.span, "shader struct fields have no `use` or default")); }
+            let fg = mangle(fname, a);
+            decl.add("    ").add(ty.glsl(a)).add(" ").add(fg).add(";\n");
+            fields.push(GField { name: f.name.name, glsl: fg, ty: ty, flat: f.flat });
+        }
+        decl.add("};");
+        if fields.len == 0 {
+            return Result.Err(this.err(s.name.span, this.t().add("struct `").add(nm).add("` has no fields").str()));
+        }
+        if s.gpu == GpuStruct.Varying { checkVaryingHead(this, s, &fields)?; }
+        this.building.remove(key);
+        this.structsOut.push(decl.str());
+        this.sinfo.put(key, a.new::<SInfo>(SInfo { kind: s.gpu, glsl: gname, fields: fields }));
+        return Result.Ok(GTy.Struct(GStruct { key: key, glsl: gname }));
+    }
+
+    /// A `#[uniform]` visible from `moduleName` as `qual.name` or `name`; declared once in the stage that reads it.
+    fn uniform(this: &Gen, moduleName: string, qual: Option<Sym>, name: Sym): Result<Option<Val>, Diag> {
+        let none: Option<Val> = Option.None;
+        let Option.Some(owner) = this.ix.find(moduleName, qual, name, Has.Uniform) else { return Result.Ok(none); };
+        let u = owner.uniforms.getPtr(name);
+        let ty = this.uniformTy(u, owner.key)?;
+        let nm = this.str(name);
+        let seen = false;
+        for i in 0..this.uniformsOut.len {
+            if this.uniformsOut.items[i].name == nm { seen = true; }
+        }
+        if !seen {
+            let decl = this.t().add("uniform ").add(glslDecl(ty, this.ix.arena)).add(" ").add(nm).add(";").str();
+            this.uniformsOut.push(UniformOut { name: nm, decl: decl });
+        }
+        return Result.Ok(Option.Some(Val { text: nm, ty: ty }));
+    }
+
+    /// The type of a uniform, with the rules that make its name usable (the CPU binds it by exactly this name).
+    fn uniformTy(this: &Gen, u: &ModLetItem, owner: string): Result<GTy, Diag> {
+        let nm = this.str(u.name.name);
+        if isReserved(nm) {
+            let msg = this.t().add("uniform `").add(nm).add("` has a name GLSL reserves").str();
+            let help = this.t();
+            help.add("the CPU binds uniforms by exactly this name, so it cannot be renamed for you; call it `u");
+            // Rust `name[..1].to_uppercase()`: a reserved word starts with an ASCII byte.
+            let c = nm[0];
+            if c >= 'a' && c <= 'z' { c = c - 32; }
+            help.push(c);
+            help.add(nm[1..nm.len]).add("`");
+            return Result.Err(this.errHelp(u.name.span, msg, help.str()));
+        }
+        let ty = this.tyOf(u.ty, owner)?;
+        let bad = false;
+        match ty {
+            GTy.Struct(_) { bad = true; }
+            GTy.Void { bad = true; }
+            GTy.Array(arr) {
+                match *arr.elem {
+                    GTy.Struct(_) { bad = true; }
+                    _ {}
+                }
+            }
+            _ {}
+        }
+        if bad {
+            return Result.Err(this.errHelp(this.ix.ast.typeSpan(u.ty), "a uniform is a scalar, vector, matrix, sampler, or array of those",
+                "uniform blocks are not supported; declare one `#[uniform] let` per value"));
+        }
+        return Result.Ok(ty);
+    }
+
+    /// A module `const` visible from `moduleName`; emitted once as a GLSL `const`.
+    fn constRef(this: &Gen, moduleName: string, qual: Option<Sym>, name: Sym): Result<Option<Val>, Diag> {
+        let a = this.ix.arena;
+        let none: Option<Val> = Option.None;
+        let Option.Some(owner) = this.ix.find(moduleName, qual, name, Has.Const) else { return Result.Ok(none); };
+        let c = owner.consts.getPtr(name);
+        let key = itemKey(a, owner.key, this.str(name));
+        match this.constsDone.get(key) {
+            Option.Some(v) { return Result.Ok(Option.Some(Val { text: v.glsl, ty: v.ty })); }
+            Option.None {}
+        }
+        let saved = this.cur;
+        this.cur = curNew(a, owner.key, GTy.Void, true);
+        this.pushScope();
+        let want: Option<GTy> = Option.None;
+        match c.ty {
+            Option.Some(ct) { want = Option.Some(this.tyOf(ct, owner.key)?); }
+            Option.None {}
+        }
+        let v = this.expr(c.value, want)?;
+        let ty = GTy.Void;
+        match want {
+            Option.Some(w) { ty = w; }
+            Option.None { ty = v.ty.settle(); }
+        }
+        let text = this.coerce(v, ty, this.ix.ast.exprSpan(c.value))?;
+        this.cur = saved;
+        let gname = this.globalName(owner.key, name);
+        let line = Text.new(a);
+        line.add("const ");
+        match ty {
+            GTy.Array(arr) {
+                line.add((*arr.elem).glsl(a)).add(" ").add(gname).add("[");
+                line.pushU64(arr.len);
+                line.add("]");
+            }
+            _ { line.add(ty.glsl(a)).add(" ").add(gname); }
+        }
+        line.add(" = ").add(text).add(";");
+        this.constsOut.push(line.str());
+        this.constsDone.put(key, ConstDone { glsl: gname, ty: ty });
+        return Result.Ok(Option.Some(Val { text: gname, ty: ty }));
+    }
+
+    fn pushScope(this: &Gen) { this.cur.scopes.push(List<GLocal>.new(this.ix.arena)); }
+
+    fn popScope(this: &Gen) {
+        if this.cur.scopes.len > 0 { this.cur.scopes.len -= 1; }
+    }
+
+    /// The innermost local called `name`.
+    fn local(this: &Gen, name: Sym): Option<GLocal> {
+        let si = this.cur.scopes.len - 1;
+        while si >= 0 {
+            let sc = &this.cur.scopes.items[si];
+            let i = sc.len - 1;
+            while i >= 0 {
+                if sc.items[i].name == name { return Option.Some(sc.items[i]); }
+                i -= 1;
+            }
+            si -= 1;
+        }
+        return Option.None;
+    }
+
+    /// Declare a local in the innermost scope; its emitted name.
+    fn declare(this: &Gen, name: Sym, ty: GTy): string {
+        let g = mangle(this.str(name), this.ix.arena);
+        let n = this.cur.scopes.len;
+        if n > 0 { this.cur.scopes.items[n - 1].push(GLocal { name: name, glsl: g, ty: ty }); }
+        return g;
+    }
+
+    /// One line of the fn body at the current depth.
+    fn line(this: &Gen, text: string) {
+        for i in 0..this.depth { this.body.pushStr("    "); }
+        this.body.pushStr(text);
+        this.body.push('\n');
+    }
+}
+
+/// `float[4]` for a declaration prefix; the name goes after it (`float[4] k`).
+fn glslDecl(t: GTy, a: &Arena): string { return t.glsl(a); }

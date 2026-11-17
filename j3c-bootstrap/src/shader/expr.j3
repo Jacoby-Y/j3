@@ -2,4 +2,417 @@
 //
 // Part of module j3c.shader.
 // Port of: j3c/src/check/gpu/expr.rs
+// J3: Each fn answers a `Val` (GLSL text + type); calls are `call.j3`, operators `ops.j3`. Rust's private
+// `name`/`unary`/`field`/`index` are `nameExpr`/`unaryExpr`/`fieldExpr`/`indexExpr`.
 module j3c.shader;
+use j3.cmp.sort;
+use j3c.base.diag.didYouMean;
+use j3c.syntax.ast.FieldInit;
+
+/// `parts` joined with `, ` (an arena string).
+fn joinComma(parts: &List<string>, a: &Arena): string {
+    let t = Text.new(a);
+    for i in 0..parts.len {
+        if i > 0 { t.add(", "); }
+        t.add(parts.items[i]);
+    }
+    return t.str();
+}
+
+/// `n` in decimal (an arena string).
+fn intText(n: int, a: &Arena): string {
+    let t = Text.new(a);
+    t.pushInt(n);
+    return t.str();
+}
+
+/// `d` with "did you mean `X`?" when a candidate is close, else with `other` ("" for no help).
+fn withSuggest(d: Diag, name: string, cands: &List<string>, other: string, a: &Arena): Diag {
+    let out = d;
+    let help = other;
+    match didYouMean(name, cands.slice(), a) {
+        Option.Some(h) { help = Text.new(a).add("did you mean `").add(h).add("`?").str(); }
+        Option.None {}
+    }
+    if help.len > 0 { out.notes.push(Note { kind: NoteKind.Help, span: noSpan(), msg: help }); }
+    return out;
+}
+
+extend Gen {
+    fn expr(this: &Gen, e: Id<Expr>, want: Option<GTy>): Result<Val, Diag> {
+        let a = this.ix.arena;
+        let ast = this.ix.ast;
+        let sp = ast.exprSpan(e);
+        match ast.expr(e) {
+            Expr.Int(v) {
+                if v > 4294967295 || v < -2147483648 {
+                    return Result.Err(this.errHelp(sp, "this integer does not fit in 32 bits", "shader integers are i32 or u32"));
+                }
+                return Result.Ok(Val { text: intText(v, a), ty: GTy.LitInt });
+            }
+            Expr.BigInt(v) { return Result.Err(this.errHelp(sp, "this integer does not fit in 32 bits", "shader integers are i32 or u32")); }
+            Expr.Zeroed { return Result.Err(this.errHelp(sp, "a zero-filled `let` is not supported in shader code", "give the `let` a value")); }
+            Expr.Char(v) { return Result.Ok(Val { text: intText(int(v), a), ty: GTy.LitInt }); }
+            Expr.Float(v) { return Result.Ok(Val { text: floatText(v, a), ty: GTy.LitFloat }); }
+            Expr.Bool(b) {
+                if b { return Result.Ok(Val { text: "true", ty: gBool() }); }
+                return Result.Ok(Val { text: "false", ty: gBool() });
+            }
+            Expr.Name(n) { return this.nameExpr(n.name, n.span); }
+            Expr.Unary(u) { return this.unaryExpr(u.op, u.expr, sp); }
+            Expr.Binary(b) {
+                let l = this.expr(b.lhs, Option.None)?;
+                let r = this.expr(b.rhs, Option.None)?;
+                let o = this.arith(b.op, l, r, sp)?;
+                return Result.Ok(Val { text: Text.new(a).add("(").add(o.l).add(" ").add(opSym(b.op)).add(" ").add(o.r).add(")").str(), ty: o.ty });
+            }
+            Expr.Cast(c) {
+                let to = this.tyOf(c.ty, this.cur.moduleName)?;
+                return this.cast(c.expr, to, sp);
+            }
+            Expr.Call(c) { return this.call(e, c.func, &c.typeArgs, &c.args); }
+            Expr.Field(f) { return this.fieldExpr(f.base, f.field.name, f.field.span); }
+            Expr.Index(x) { return this.indexExpr(x.base, x.index, sp); }
+            Expr.If(x) {
+                let c = this.expr(x.cond, Option.None)?;
+                if !gtyEq(c.ty, gBool()) {
+                    return Result.Err(this.err(ast.exprSpan(x.cond), Text.new(a).add("a condition must be bool, found ").add(c.ty.name(a)).str()));
+                }
+                let t = this.expr(x.thenExpr, want)?;
+                let f = this.expr(x.elseExpr, want)?;
+                let ty = t.ty;
+                if !gtyEq(t.ty, f.ty) && isLit(t.ty) { ty = f.ty; }
+                let tt = this.coerce(t, ty, ast.exprSpan(x.thenExpr))?;
+                let ft = this.coerce(f, ty, ast.exprSpan(x.elseExpr))?;
+                return Result.Ok(Val { text: Text.new(a).add("(").add(c.text).add(" ? ").add(tt).add(" : ").add(ft).add(")").str(), ty: ty });
+            }
+            Expr.StructLit(s) { return this.structLit(sp, s.name, s.typeArgs.len, &s.fields); }
+            Expr.ArrayLit(l) { return this.arrayLit(sp, &l.elems, want); }
+            Expr.String(s) { return Result.Err(this.errHelp(sp, "strings do not exist in shader code", "shaders compute with numbers")); }
+            Expr.Interpolate(i) { return Result.Err(this.errHelp(sp, "strings do not exist in shader code", "shaders compute with numbers")); }
+            Expr.Slice(s) { return Result.Err(this.errHelp(sp, "slices do not exist in shader code", "use a fixed array `[N]T`")); }
+            Expr.SliceLit(s) { return Result.Err(this.errHelp(sp, "slices do not exist in shader code", "use a fixed array `[N]T`")); }
+            Expr.SliceFrom(s) { return Result.Err(this.errHelp(sp, "slices do not exist in shader code", "use a fixed array `[N]T`")); }
+            Expr.Match(m) {
+                return Result.Err(this.errHelp(sp, "a `match` value does not exist in shader code",
+                    "use a `match` statement that assigns a variable, or an if-expression"));
+            }
+            Expr.Closure(c) { return Result.Err(this.errHelp(sp, "closures do not exist in shader code", "write a `#[shader]` fn and call it")); }
+            Expr.Tuple(t) { return Result.Err(this.errHelp(sp, "tuples do not exist in shader code", "use a struct")); }
+            Expr.Atomic(x) { return Result.Err(this.errHelp(sp, "atomics do not exist in shader code", "each invocation computes independently")); }
+            Expr.Question(q) { return Result.Err(this.err(sp, "`?` does not exist in shader code (no results or options)")); }
+            Expr.Syscall(s) { return Result.Err(this.err(sp, "this is CPU-only and does not exist in shader code")); }
+            Expr.SizeOf(s) { return Result.Err(this.err(sp, "this is CPU-only and does not exist in shader code")); }
+            Expr.TypePath(t) { return Result.Err(this.err(sp, "this is CPU-only and does not exist in shader code")); }
+            Expr.ScriptType(s) { return Result.Err(this.err(sp, "this is CPU-only and does not exist in shader code")); }
+            Expr.ScriptLit(s) { return Result.Err(this.err(sp, "this is CPU-only and does not exist in shader code")); }
+            Expr.UiChoice(u) { return Result.Err(this.err(sp, "this is CPU-only and does not exist in shader code")); }
+            Expr.Embed(x) { return Result.Err(this.err(sp, "this is CPU-only and does not exist in shader code")); }
+        }
+    }
+
+    /// `Name { a: x, b: y }`: every field of the shader struct, in declaration order.
+    fn structLit(this: &Gen, sp: Span, name: Ident, typeArgs: int, fields: &List<FieldInit>): Result<Val, Diag> {
+        let a = this.ix.arena;
+        let ast = this.ix.ast;
+        if typeArgs > 0 { return Result.Err(this.err(name.span, "shader structs are not generic")); }
+        let ty = this.structTy(this.cur.moduleName, name.name, name.span)?;
+        let key = "";
+        let glsl = "";
+        match ty {
+            GTy.Struct(s) { key = s.key; glsl = s.glsl; }
+            _ {}
+        }
+        let info: &SInfo = *this.sinfo.getPtr(key);
+        let sname = ast.str(name.name);
+        let parts = List<string>.new(a);
+        for i in 0..info.fields.len {
+            let f = info.fields.items[i];
+            let at = -1;
+            for k in 0..fields.len {
+                if fields.items[k].name.name == f.name { at = k; break; }
+            }
+            if at < 0 {
+                return Result.Err(this.err(sp, Text.new(a).add("`").add(sname).add("` needs its field `").add(ast.str(f.name)).add("`").str()));
+            }
+            let v = fields.items[at].value;
+            let val = this.expr(v, Option.Some(f.ty))?;
+            parts.push(this.coerce(val, f.ty, ast.exprSpan(v))?);
+        }
+        for k in 0..fields.len {
+            let n = fields.items[k].name;
+            let known = false;
+            for i in 0..info.fields.len {
+                if info.fields.items[i].name == n.name { known = true; }
+            }
+            if !known {
+                return Result.Err(this.err(n.span, Text.new(a).add("`").add(sname).add("` has no field `").add(ast.str(n.name)).add("`").str()));
+            }
+        }
+        return Result.Ok(Val { text: Text.new(a).add(glsl).add("(").add(joinComma(&parts, a)).add(")").str(), ty: ty });
+    }
+
+    /// `[a, b, c]`: the wanted array type says the element type and the count.
+    fn arrayLit(this: &Gen, sp: Span, elems: &List<Id<Expr>>, want: Option<GTy>): Result<Val, Diag> {
+        let a = this.ix.arena;
+        let ast = this.ix.ast;
+        let elem = GTy.Void;
+        let n: u64 = 0;
+        let ok = false;
+        let wty = GTy.Void;
+        match want {
+            Option.Some(w) {
+                wty = w;
+                match w {
+                    GTy.Array(ar) { elem = *ar.elem; n = ar.len; ok = true; }
+                    _ {}
+                }
+            }
+            Option.None {}
+        }
+        if !ok { return Result.Err(this.errHelp(sp, "an array literal needs a known type", "write `let a: [4]f32 = [..]`")); }
+        if u64(elems.len) != n {
+            let m = Text.new(a);
+            m.add("the type has ");
+            m.pushU64(n);
+            m.add(" elements, the literal has ");
+            m.pushInt(elems.len);
+            return Result.Err(this.err(sp, m.str()));
+        }
+        let parts = List<string>.new(a);
+        for i in 0..elems.len {
+            let x = elems.items[i];
+            let v = this.expr(x, Option.Some(elem))?;
+            parts.push(this.coerce(v, elem, ast.exprSpan(x))?);
+        }
+        let t = Text.new(a);
+        t.add(elem.glsl(a)).add("[");
+        t.pushU64(n);
+        t.add("](").add(joinComma(&parts, a)).add(")");
+        return Result.Ok(Val { text: t.str(), ty: wty });
+    }
+
+    /// A name: a local, a uniform, a const; anything else is an error that says what it found.
+    fn nameExpr(this: &Gen, n: Sym, sp: Span): Result<Val, Diag> {
+        let a = this.ix.arena;
+        match this.local(n) {
+            Option.Some(l) { return Result.Ok(Val { text: l.glsl, ty: l.ty }); }
+            Option.None {}
+        }
+        let moduleName = this.cur.moduleName;
+        match this.uniform(moduleName, Option.None, n)? {
+            Option.Some(r) { return Result.Ok(r); }
+            Option.None {}
+        }
+        match this.constRef(moduleName, Option.None, n)? {
+            Option.Some(r) { return Result.Ok(r); }
+            Option.None {}
+        }
+        let s = this.ix.names.str(n);
+        match this.ix.modOf(moduleName) {
+            Option.Some(me) {
+                if me.globals.has(n) {
+                    return Result.Err(this.errHelp(sp,
+                        Text.new(a).add("`").add(s).add("` is a CPU global; shader code reads only `#[uniform]`s and consts").str(),
+                        Text.new(a).add("declare `#[uniform] let ").add(s).add(": <type>;` and set it by name from the CPU").str()));
+                }
+                if me.cpuFns.has(n) {
+                    return Result.Err(this.err(sp, Text.new(a).add("`").add(s).add("` is a CPU fn; it is not a value in shader code").str()));
+                }
+            }
+            Option.None {}
+        }
+        let names = List<string>.new(a);
+        for i in 0..this.cur.scopes.len {
+            let sc = &this.cur.scopes.items[i];
+            for k in 0..sc.len { names.push(this.ix.names.str(sc.items[k].name)); }
+        }
+        sort::<string>(names.slice());
+        return Result.Err(withSuggest(this.e(sp, Text.new(a).add("unknown name `").add(s).add("`").str()), s, &names, "", a));
+    }
+
+    fn unaryExpr(this: &Gen, op: UnaryOp, inner: Id<Expr>, sp: Span): Result<Val, Diag> {
+        let a = this.ix.arena;
+        if op == UnaryOp.Ref || op == UnaryOp.Deref {
+            return Result.Err(this.errHelp(sp, "pointers do not exist in shader code",
+                "only a call argument for a `&T` parameter may be written `&x`"));
+        }
+        let v = this.expr(inner, Option.None)?;
+        let sign = "";
+        match op {
+            UnaryOp.Neg {
+                match v.ty {
+                    GTy.LitInt { sign = "(-"; }
+                    GTy.LitFloat { sign = "(-"; }
+                    GTy.Scalar(b) { if b == Base.F || b == Base.I { sign = "(-"; } }
+                    GTy.Vec(x) { if x.base == Base.F || x.base == Base.I { sign = "(-"; } }
+                    GTy.Mat(n) { sign = "(-"; }
+                    _ {}
+                }
+            }
+            UnaryOp.Not { if gtyEq(v.ty, gBool()) { sign = "(!"; } }
+            UnaryOp.BitNot { if intScalar(v.ty) { sign = "(~"; } }
+            UnaryOp.Ref {}
+            UnaryOp.Deref {}
+        }
+        if sign.len == 0 { return Result.Err(this.err(sp, Text.new(a).add("this operator does not apply to ").add(v.ty.name(a)).str())); }
+        return Result.Ok(Val { text: Text.new(a).add(sign).add(v.text).add(")").str(), ty: v.ty });
+    }
+
+    /// `x as f32` and `f32(x)`: scalar to scalar.
+    fn cast(this: &Gen, inner: Id<Expr>, to: GTy, sp: Span): Result<Val, Diag> {
+        let a = this.ix.arena;
+        match to {
+            GTy.Scalar(b) {}
+            _ {
+                return Result.Err(this.errHelp(sp, Text.new(a).add("cannot convert to ").add(to.name(a)).str(),
+                    "casts are between f32, i32, u32 and bool; build vectors with a constructor like `vec3(..)`"));
+            }
+        }
+        let v = this.expr(inner, Option.None)?;
+        let wrap = false;
+        match v.ty {
+            GTy.LitInt {
+                if !gtyEq(to, gBool()) { return Result.Ok(Val { text: this.coerce(v, to, sp)?, ty: to }); }
+                wrap = true;
+            }
+            GTy.LitFloat {
+                if gtyEq(to, gF32()) { return Result.Ok(Val { text: v.text, ty: to }); }
+                wrap = true;
+            }
+            GTy.Scalar(b) {
+                if gtyEq(v.ty, to) { return Result.Ok(Val { text: v.text, ty: to }); }
+                wrap = true;
+            }
+            _ {}
+        }
+        if !wrap {
+            return Result.Err(this.err(sp, Text.new(a).add("cannot convert ").add(v.ty.name(a)).add(" to ").add(to.name(a))
+                .add("; casts are between scalars").str()));
+        }
+        return Result.Ok(Val { text: Text.new(a).add(to.glsl(a)).add("(").add(v.text).add(")").str(), ty: to });
+    }
+
+    /// `base.field`: `alias.NAME` (a uniform or const of a `use`d module), a struct field, or a swizzle.
+    fn fieldExpr(this: &Gen, base: Id<Expr>, field: Sym, sp: Span): Result<Val, Diag> {
+        let a = this.ix.arena;
+        let ast = this.ix.ast;
+        let moduleName = this.cur.moduleName;
+        let fname = ast.str(field);
+        match ast.expr(base) {
+            Expr.Name(q) {
+                let isLocal = false;
+                match this.local(q.name) { Option.Some(l) { isLocal = true; } Option.None {} }
+                if !isLocal && this.ix.isAlias(moduleName, q.name) {
+                    match this.uniform(moduleName, Option.Some(q.name), field)? {
+                        Option.Some(r) { return Result.Ok(r); }
+                        Option.None {}
+                    }
+                    match this.constRef(moduleName, Option.Some(q.name), field)? {
+                        Option.Some(r) { return Result.Ok(r); }
+                        Option.None {}
+                    }
+                    return Result.Err(this.err(sp, Text.new(a).add("module `").add(ast.str(q.name)).add("` has no uniform or const `").add(fname)
+                        .add("`").str()));
+                }
+            }
+            _ {}
+        }
+        let b = this.expr(base, Option.None)?;
+        match b.ty {
+            GTy.Struct(s) {
+                let info: &SInfo = *this.sinfo.getPtr(s.key);
+                let names = List<string>.new(a);
+                for i in 0..info.fields.len {
+                    let f = info.fields.items[i];
+                    if f.name == field { return Result.Ok(Val { text: Text.new(a).add(b.text).add(".").add(f.glsl).str(), ty: f.ty }); }
+                    names.push(ast.str(f.name));
+                }
+                let d = this.e(sp, Text.new(a).add("`").add(b.ty.name(a)).add("` has no field `").add(fname).add("`").str());
+                return Result.Err(withSuggest(d, fname, &names, Text.new(a).add("fields: ").add(joinComma(&names, a)).str(), a));
+            }
+            GTy.Vec(v) {
+                match swizzleLen(fname, v.n) {
+                    Option.Some(k) {
+                        let text = Text.new(a).add(b.text).add(".").add(fname).str();
+                        if k == 1 { return Result.Ok(Val { text: text, ty: GTy.Scalar(v.base) }); }
+                        return Result.Ok(Val { text: text, ty: GTy.Vec(GVec { base: v.base, n: k }) });
+                    }
+                    Option.None {
+                        let h = Text.new(a);
+                        h.add("components of a ");
+                        h.pushInt(v.n);
+                        h.add("-vector are ").add("xyzw"[0..v.n]);
+                        return Result.Err(this.errHelp(sp, Text.new(a).add("`").add(fname).add("` is not a swizzle of ").add(b.ty.name(a)).str(), h.str()));
+                    }
+                }
+            }
+            _ {
+                return Result.Err(this.errHelp(sp, Text.new(a).add(b.ty.name(a)).add(" has no field `").add(fname).add("`").str(),
+                    "methods do not exist in shader code; call a `#[shader]` fn"));
+            }
+        }
+    }
+
+    /// `base[index]` on an array, a vector or a matrix (a column).
+    fn indexExpr(this: &Gen, base: Id<Expr>, index: Id<Expr>, sp: Span): Result<Val, Diag> {
+        let a = this.ix.arena;
+        let ast = this.ix.ast;
+        let b = this.expr(base, Option.None)?;
+        let i = this.expr(index, Option.None)?;
+        let isp = ast.exprSpan(index);
+        if !intScalar(i.ty) {
+            return Result.Err(this.errHelp(isp, Text.new(a).add("an index is i32 or u32, found ").add(i.ty.name(a)).str(), "convert it: `i as i32`"));
+        }
+        let elem = GTy.Void;
+        let len: u64 = 0;
+        match b.ty {
+            GTy.Array(ar) { elem = *ar.elem; len = ar.len; }
+            GTy.Vec(v) { elem = GTy.Scalar(v.base); len = u64(v.n); }
+            GTy.Mat(n) { elem = GTy.Vec(GVec { base: Base.F, n: n }); len = u64(n); }
+            _ { return Result.Err(this.err(sp, Text.new(a).add(b.ty.name(a)).add(" cannot be indexed").str())); }
+        }
+        match ast.expr(index) {
+            Expr.Int(k) {
+                if k < 0 || u64(k) >= len {
+                    let m = Text.new(a);
+                    m.add("index ");
+                    m.pushInt(k);
+                    m.add(" is out of range for ");
+                    m.pushU64(len);
+                    m.add(" elements");
+                    let h = Text.new(a);
+                    h.add("valid indices are 0..");
+                    h.pushU64(len - 1);
+                    return Result.Err(this.errHelp(isp, m.str(), h.str()));
+                }
+            }
+            _ {}
+        }
+        return Result.Ok(Val { text: Text.new(a).add(b.text).add("[").add(i.text).add("]").str(), ty: elem });
+    }
+}
+
+/// `v.xx = ..` repeats a component, which GLSL rejects.
+pub fn swizzleAssignCheck(g: &Gen, e: Id<Expr>, ty: GTy): Result<bool, Diag> {
+    match g.ix.ast.expr(e) {
+        Expr.Field(f) {
+            let vecOrScalar = false;
+            match ty {
+                GTy.Scalar(b) { vecOrScalar = true; }
+                GTy.Vec(v) { vecOrScalar = true; }
+                _ {}
+            }
+            let name = g.ix.ast.str(f.field.name);
+            let sw = false;
+            match swizzleLen(name, 4) { Option.Some(k) { sw = true; } Option.None {} }
+            if vecOrScalar && sw && swizzleRepeats(name) {
+                let a = g.ix.arena;
+                return Result.Err(g.errHelp(f.field.span, Text.new(a).add("`.").add(name).add("` repeats a component and cannot be assigned").str(),
+                    "assign each component once, like `v.xy = ..`"));
+            }
+        }
+        _ {}
+    }
+    return Result.Ok(true);
+}

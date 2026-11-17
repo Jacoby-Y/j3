@@ -2,20 +2,244 @@
 // globals.
 //
 // Part of module j3c.sema.
-// Port of: j3c/src/check/script.rs
+// Port of: j3c/src/check/script.rs, check/types.rs (the `script` mark of collect_struct_names)
 // J3: sema, not lower: it rewrites declarations before typing, and its output is plain items the rest of
 // sema types like any others. The dev-mode rewrite of script bodies is `devmode`, an IR pass.
+// J3: Rust marks the script struct (`StructDef.script`) where it allocates it; here `declareTypes` is
+// plain and `resolveScriptAliases`, the next stage, sets `StructDecl.scriptPath` / `propSpans` first.
 module j3c.sema;
-// J3: Contract (wave 13): contracts-c2d.md. Both entries are wired in `sema.declarations` and are no-ops
-// until chunk C (wave 14) fills them: a script module's items are untouched, so its struct does not exist
-// yet (`unknown type`).
+// J3: Contract (wave 13): contracts-c2d.md. Both entries are wired in `sema.declarations`.
+// J3: The one `use` in a sema part file: `sema.j3` (frozen in wave 14) lacks these two names; wave 15 moves
+// them there.
 
 /// Rust `script::prepare`: each `.j3s` file's props / state / methods as one `pub` struct named after the
 /// file (`scriptName`), its `shared` fields as module `let`s; rewrites `cx.parsed.files[i].ast.items`. Runs
 /// after `lint`, before `shader.prepare` and `buildModules`. False after an error Diag.
-pub fn prepareScripts(cx: &SemaCx): bool { return true; }
+pub fn prepareScripts(cx: &SemaCx): bool {
+    for i in 0..cx.parsed.files.len {
+        if cx.parsed.files.items[i].ast.isScript && !prepareScript(cx, i) { return false; }
+    }
+    return true;
+}
+
+fn prepareScript(cx: &SemaCx, fi: int): bool {
+    let file = cx.parsed.files.items[fi];
+    let ast = cx.ast;
+    let name = ast.sym(scriptName(file.path, cx.arena));
+    let fields = List<FieldItem>.new(cx.arena);
+    let state = List<FieldItem>.new(cx.arena);
+    let methods = List<FnItem>.new(cx.arena);
+    let shared = List<Item>.new(cx.arena);
+    let kept = List<Item>.new(cx.arena);
+    // ponytail: a list scan; a script has a handful of names. A `Set<Sym>` if scripts grow to hundreds.
+    let seen = List<Sym>.new(cx.arena);
+    let hasProps = false;
+    let hasShared = false;
+    for k in 0..file.ast.items.len {
+        let item = file.ast.items.items[k];
+        match item {
+            Item.Fn(_) {}
+            _ { kept.push(item); }
+        }
+        match item {
+            Item.Props(b) {
+                if hasProps { return fail(cx, b.span, "a script has one `props` block"); }
+                hasProps = true;
+                for j in 0..b.fields.len {
+                    let f = b.fields.items[j];
+                    if !takeName(cx, &seen, f.name, name) { return false; }
+                    match f.default {
+                        Option.Some(v) { if !scriptLiteral(cx, v, "prop default") { return false; } }
+                        Option.None {}
+                    }
+                    fields.push(f);
+                }
+            }
+            Item.Shared(b) {
+                if hasShared { return fail(cx, b.span, "a script has one `shared` block"); }
+                hasShared = true;
+                for j in 0..b.fields.len {
+                    let f = b.fields.items[j];
+                    if !takeName(cx, &seen, f.name, name) { return false; }
+                    match f.default {
+                        Option.Some(v) { if !scriptLiteral(cx, v, "shared initializer") { return false; } }
+                        Option.None {}
+                    }
+                    shared.push(Item.Let(ModLetItem { span: f.span, doc: f.doc, name: f.name, ty: f.ty, value: f.default, thread: false, uniform: false }));
+                }
+            }
+            Item.State(s) {
+                if !takeName(cx, &seen, s.name, name) { return false; }
+                if !scriptLiteral(cx, s.value, "state initializer") { return false; }
+                let ty = match s.ty {
+                    Option.Some(t) { t }
+                    Option.None {
+                        match inferredType(cx, s.value) {
+                            Option.Some(t) { t }
+                            Option.None { return fail(cx, ast.exprSpan(s.value), "cannot infer script state type"); }
+                        }
+                    }
+                };
+                state.push(FieldItem { span: s.span, doc: "", name: s.name, ty: ty, embedded: false, flat: false, default: Option.Some(s.value) });
+            }
+            Item.Fn(f) {
+                if !takeName(cx, &seen, f.name, name) { return false; }
+                let thisSym = ast.sym("this");
+                for j in 0..f.params.len {
+                    if f.params.items[j].name.name == thisSym { return fail(cx, f.name.span, "`this` is reserved for the script instance"); }
+                }
+                let method = f;
+                let named = ast.addType(Type.Named(NamedType { name: name }), f.name.span);
+                let params = List<Param>.new(cx.arena);
+                params.push(Param { name: Ident { name: thisSym, span: f.name.span }, ty: ast.addType(Type.Ref(RefType { ty: named }), f.name.span) });
+                for j in 0..f.params.len { params.push(f.params.items[j]); }
+                method.params = params;
+                methods.push(method);
+            }
+            Item.Const(c) { if !takeName(cx, &seen, c.name, name) { return false; } }
+            Item.Struct(s) { if !takeName(cx, &seen, s.name, name) { return false; } }
+            Item.Enum(e) { if !takeName(cx, &seen, e.name, name) { return false; } }
+            // `extend` is rejected by the script parser.
+            Item.Use(_) {}
+            Item.UseLib(_) {}
+            Item.Let(_) {}
+            Item.Trait(_) {}
+            Item.Extend(_) {}
+        }
+    }
+    for j in 0..state.len { fields.push(state.items[j]); }
+    let span = file.ast.span;
+    kept.push(Item.Struct(StructItem { span: span, doc: "", visPub: true, debug: false, packed: false, gpu: GpuStruct.None,
+        derives: List<Ident>.new(cx.arena), name: Ident { name: name, span: span }, typeParams: List<Ident>.new(cx.arena),
+        bounds: List<List<Ident>>.new(cx.arena), fields: fields, methods: methods }));
+    for j in 0..shared.len { kept.push(shared.items[j]); }
+    cx.parsed.files.items[fi].ast.items = kept;
+    return true;
+}
+
+/// Rust `take_name` + `unique`: props, fns, consts and struct/enum names share one namespace, and the
+/// script type (`Door` for `door.j3s`) is the struct, so nothing else may take its name.
+fn takeName(cx: &SemaCx, seen: &List<Sym>, name: Ident, script: Sym): bool {
+    if name.name == script { return fail(cx, name.span, quoted(cx, "", script, " is the script type; pick another name")); }
+    for i in 0..seen.len {
+        if seen.items[i] == name.name { return fail(cx, name.span, quoted(cx, "", name.name, " already in script scope")); }
+    }
+    seen.push(name.name);
+    return true;
+}
+
+/// Rust `literal`: a prop default, shared or state initializer is a number, bool or string literal.
+fn scriptLiteral(cx: &SemaCx, e: Id<Expr>, what: string): bool {
+    match foldedLiteral(cx.ast, e) {
+        Expr.Int(_) { return true; }
+        Expr.Float(_) { return true; }
+        Expr.Bool(_) { return true; }
+        Expr.String(_) { return true; }
+        _ {}
+    }
+    return failHelp(cx, cx.ast.exprSpan(e), Text.new(cx.arena).add(what).add(" must be a literal").str(), "use a number, bool, or string literal");
+}
+
+/// Rust `inferred_type`: the type of a state `let` without one, from its literal.
+fn inferredType(cx: &SemaCx, e: Id<Expr>): Option<Id<Type>> {
+    let name = "";
+    match foldedLiteral(cx.ast, e) {
+        Expr.Int(_) { name = "int"; }
+        Expr.Float(_) { name = "f32"; }
+        Expr.Bool(_) { name = "bool"; }
+        Expr.String(_) { name = "string"; }
+        _ { return Option.None; }
+    }
+    return Option.Some(cx.ast.addType(Type.Named(NamedType { name: cx.ast.sym(name) }), cx.ast.exprSpan(e)));
+}
+
+/// `script.a.b` for `a/b.j3s` (the module key the loader gives a script).
+fn scriptKey(arena: &Arena, rel: string): string {
+    let n = rel.len;
+    while n >= 4 && rel[n - 4..n] == ".j3s" { n -= 4; }
+    let t = Text.new(arena);
+    t.add("script.");
+    for i in 0..n {
+        if rel[i] == '/' { t.push('.'); } else { t.push(rel[i]); }
+    }
+    return t.str();
+}
+
+/// The script module with key `key` (Rust `mods.iter().position(m.key == key && is_script)`).
+fn scriptModule(cx: &SemaCx, key: string): Option<Id<ModDecl>> {
+    for i in 0..cx.tables.mods.len() {
+        let m = cx.tables.mods.idAt(i);
+        let md = cx.tables.modAt(m);
+        if md.isScript && md.key == key { return Option.Some(m); }
+    }
+    return Option.None;
+}
+
+/// The struct `name` declared in `m`.
+fn ownStruct(cx: &SemaCx, m: Id<ModDecl>, name: string): Option<Id<StructDecl>> {
+    let ss = cx.tables.modAt(m).structs;
+    for i in 0..ss.len {
+        if cx.tables.str(cx.tables.structAt(ss.items[i]).name) == name { return Option.Some(ss.items[i]); }
+    }
+    return Option.None;
+}
 
 /// Rust `script::resolve_aliases`: bind every `const X = @script("p.j3s");` as the script's struct in the
 /// const's module and record it in `cx.typed.scriptAliases`. Runs after `declareTypes` on every module,
-/// before `fillEnums`. False after an error Diag.
-pub fn resolveScriptAliases(cx: &SemaCx): bool { return true; }
+/// before `fillEnums`. False after an error Diag. First marks each script module's own struct (Rust
+/// `collect_struct_names`: path and prop spans; other structs of the file are ordinary types).
+pub fn resolveScriptAliases(cx: &SemaCx): bool {
+    let n = cx.tables.mods.len();
+    for i in 0..n {
+        let m = cx.tables.mods.idAt(i);
+        let md = *cx.tables.modAt(m);
+        if !md.isScript || md.files.len == 0 { continue; }
+        let path = cx.parsed.files.items[md.files.items[0]].path;
+        let sid = match ownStruct(cx, m, scriptName(path, cx.arena)) {
+            Option.Some(s) { s }
+            Option.None { continue; }
+        };
+        let spans = List<Span>.new(cx.arena);
+        for k in 0..md.items.len {
+            match md.items.items[k] {
+                Item.Props(b) { for j in 0..b.fields.len { spans.push(b.fields.items[j].span); } }
+                _ {}
+            }
+        }
+        let sd = cx.tables.structAt(sid);
+        sd.scriptPath = Option.Some(own(cx.arena, path));
+        sd.propSpans = spans;
+    }
+    for i in 0..n {
+        let m = cx.tables.mods.idAt(i);
+        let md = *cx.tables.modAt(m);
+        for k in 0..md.items.len {
+            let c = match md.items.items[k] {
+                Item.Const(c) { c }
+                _ { continue; }
+            };
+            let rel = match cx.ast.expr(c.value) {
+                Expr.ScriptType(p) { p }
+                _ { continue; }
+            };
+            let at = c.name.span;
+            let src = match scriptModule(cx, scriptKey(cx.arena, rel)) {
+                Option.Some(s) { s }
+                Option.None { return fail(cx, at, Text.new(cx.arena).add("no script at ").add(rel).str()); }
+            };
+            let sid = match ownStruct(cx, src, scriptName(rel, cx.arena)) {
+                Option.Some(s) { s }
+                Option.None { return fail(cx, at, Text.new(cx.arena).add("script ").add(rel).add(" has no type").str()); }
+            };
+            match scopeType(cx, m, c.name.name) {
+                Option.Some(_) { return fail(cx, at, quoted(cx, "", c.name.name, " already in scope")); }
+                Option.None {}
+            }
+            bind(cx, m, c.name.name, refStruct(sid));
+            if md.files.len > 0 {
+                cx.typed.scriptAliases.push(ScriptAlias { file: cx.parsed.files.items[md.files.items[0]].src, name: c.name.name, decl: sid });
+            }
+        }
+    }
+    return true;
+}

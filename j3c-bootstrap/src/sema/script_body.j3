@@ -4,47 +4,218 @@
 //
 // Part of module j3c.sema.
 // Port of: j3c/src/check/lower/scene_script.rs, check/lower/lit.rs (script_lit; struct_lit_sid's script half),
-// check/lower/setup.rs (the script aliases)
+// check/lower/setup.rs (the script aliases), check/lower/call.rs (script_method_visible, the implicit `this`
+// call), check/lower/place.rs (private fields, read-only props)
 // J3: sema decides all of it; lower sees plain nodes (`TExpr.StructLit`, a `Call` of the registry's `find`
 // fn, field places) and only copies `StructDecl.scriptPath` / `propSpans` to the IR (`lower/script.j3`).
+// J3: Rust keeps `script_props` (names) and clears `access.assign` on a prop's place; here a prop is "one
+// of the script struct's first `propSpans.len` fields" and `canAssign` asks `scriptReadOnly` per field place.
 module j3c.sema;
-// J3: Contract (wave 13): contracts-c2d.md, chunk C. Each stub answers what the old call site did, so
-// output is unchanged until it is filled.
+// J3: Contract (wave 13): contracts-c2d.md, chunk C.
 
 extend BodyCx {
+    /// Whether this body is a method of script struct `sid` (Rust `script_sid == Some(sid)`).
+    fn inScript(this: &BodyCx, sid: Id<StructDecl>): bool {
+        match this.scriptSid { Option.Some(s) { return s == sid; } Option.None { return false; } }
+    }
+
+    /// How many leading fields of `sid` are props; -1 when `sid` is not a script struct.
+    fn scriptProps(this: &BodyCx, sid: Id<StructDecl>): int {
+        let sd = this.cx.tables.structAt(sid);
+        match sd.scriptPath { Option.Some(_) { return sd.propSpans.len; } Option.None { return -1; } }
+    }
+
     /// Rust `setup.rs:215-243`: when `this.f` is a method of a script struct, set `scriptSid` and bind every
     /// field as an alias place `(*this).field` (`Binding.alias`). Called once, after the parameters are bound.
-    fn scriptEnter(this: &BodyCx) {}
+    fn scriptEnter(this: &BodyCx) {
+        let d = *this.cx.tables.fnAt(this.f);
+        let sid = match d.recv { Option.Some(s) { s } Option.None { return; } };
+        if this.scriptProps(sid) < 0 { return; }
+        let l = match this.findLocal(this.sym("this")) { Option.Some(l) { l } Option.None { return; } };
+        let lt = this.cx.typed.local(l).ty;
+        let inner = match this.refInner(lt) { Option.Some(t) { t } Option.None { return; } };
+        this.scriptSid = Option.Some(sid);
+        let sp = d.span;
+        match d.item { Option.Some(it) { sp = it.name.span; } Option.None {} }
+        let lp = this.place(TPlace.Local(LocalPlace { local: l }), lt, sp);
+        let base = this.place(TPlace.Deref(DerefPlace { ptr: this.load(lp) }), inner, sp);
+        let fields = this.cx.tables.structAt(sid).fields;
+        for i in 0..fields.len {
+            this.bindAlias(fields.items[i].name, this.place(TPlace.Field(FieldPlace { base: base, index: i }), fields.items[i].ty, sp));
+        }
+    }
 
     /// `Name { .. }` where `Name` is script struct `sid` (Rust `struct_lit_sid` with `script` set): state is
     /// not a prop, a missing required prop names where it is declared.
     fn scriptStructLit(this: &BodyCx, sp: Span, sid: Id<StructDecl>, s: &StructLitExpr): Result<Id<TExpr>, TErr> {
-        return Result.Err(this.notYet(sp, "sema script structs"));
+        return this.scriptFields(sp, sid, &s.fields);
     }
 
     /// `@script("path") { .. }` (Rust `script_lit`): `no script at PATH`, else `scriptStructLit`'s rules.
     fn scriptLit(this: &BodyCx, sp: Span, l: &ScriptLitExpr): Result<Id<TExpr>, TErr> {
-        return Result.Err(this.notYet(sp, "sema script literal"));
+        match scriptModule(this.cx, scriptKey(this.cx.arena, l.path)) {
+            Option.Some(m) {
+                let ss = this.cx.tables.modAt(m).structs;
+                for i in 0..ss.len {
+                    if this.scriptProps(ss.items[i]) >= 0 { return this.scriptFields(sp, ss.items[i], &l.fields); }
+                }
+            }
+            Option.None {}
+        }
+        let t = Text.new(this.cx.arena);
+        t.add("no script at ").add(l.path);
+        return Result.Err(this.err(sp, t.str()));
+    }
+
+    /// Rust `struct_lit_sid` for a script struct: only props may be written; a prop without a default is
+    /// required.
+    fn scriptFields(this: &BodyCx, sp: Span, sid: Id<StructDecl>, fields: &List<FieldInit>): Result<Id<TExpr>, TErr> {
+        let sd = *this.cx.tables.structAt(sid);
+        let st = this.cx.tables.structTy(sid, this.cx.arena.alloc::<Id<Ty>>(0));
+        let vals = this.cx.arena.alloc::<Id<TExpr>>(sd.fields.len);
+        let set = this.cx.arena.alloc::<bool>(sd.fields.len);
+        for i in 0..set.len { set[i] = false; } // arena memory may be reused, not zeroed
+        let written = List<int>.new(this.cx.arena);
+        for k in 0..fields.len {
+            let fi = fields.items[k];
+            let idx = -1;
+            for i in 0..sd.fields.len {
+                if sd.fields.items[i].name == fi.name.name {
+                    idx = i;
+                    break;
+                }
+            }
+            if idx < 0 {
+                let t = Text.new(this.cx.arena);
+                t.add("`").add(this.str(sd.name)).add("` has no field `").add(this.str(fi.name.name)).add("`");
+                return Result.Err(this.err(fi.name.span, t.str()));
+            }
+            if idx >= sd.propSpans.len {
+                let t = Text.new(this.cx.arena);
+                t.add("`").add(this.str(fi.name.name)).add("` is script state, not a prop");
+                return Result.Err(this.help(this.err(fi.name.span, t.str()), "move it into `props` if callers should set it"));
+            }
+            if set[idx] {
+                let t = Text.new(this.cx.arena);
+                t.add("duplicate field `").add(this.str(fi.name.name)).add("`");
+                return Result.Err(this.err(fi.name.span, t.str()));
+            }
+            vals[idx] = this.operand(fi.value, Option.Some(sd.fields.items[idx].ty))?;
+            set[idx] = true;
+            written.push(idx);
+        }
+        let items = List<Id<TExpr>>.new(this.cx.arena);
+        for i in 0..sd.fields.len {
+            if set[i] {
+                items.push(vals[i]);
+                continue;
+            }
+            match sd.fields.items[i].default {
+                Option.Some(d) {
+                    items.push(this.constValue(sp, d));
+                    continue;
+                }
+                Option.None {}
+            }
+            let fname = this.str(sd.fields.items[i].name);
+            let t = Text.new(this.cx.arena);
+            if i >= sd.propSpans.len {
+                t.add("missing field `").add(fname).add("`");
+                return Result.Err(this.err(sp, t.str()));
+            }
+            t.add("missing required prop `").add(fname).add("`");
+            let n = Text.new(this.cx.arena);
+            n.add("prop declared at ").add(lineOf(this.cx, sd.propSpans.items[i]));
+            let h = Text.new(this.cx.arena);
+            h.add("add `").add(fname).add(": ...` to the script literal");
+            return Result.Err(this.help(this.note(this.err(sp, t.str()), n.str()), h.str()));
+        }
+        return Result.Ok(this.expr(TExpr.StructLit(TStructLit { items: items, written: written }), st, sp));
     }
 
     /// A field of script struct `sid` named at `sp` (Rust place.rs:139): Some(`script fields are private`)
     /// outside the script's own methods, None to go on with the normal field path.
     fn scriptFieldCheck(this: &BodyCx, sp: Span, sid: Id<StructDecl>): Option<TErr> {
-        return Option.Some(this.notYet(sp, "sema script fields"));
+        if this.inScript(sid) { return Option.None; }
+        return Option.Some(this.help(this.err(sp, "script fields are private"), "add a `pub fn` to expose this value"));
     }
 
     /// Whether field place `p` is a prop of the script being typed (Rust clears `access.assign`).
     /// `canAssign` asks for every `TPlace.Field`.
-    fn scriptReadOnly(this: &BodyCx, p: Id<TPlace>): bool { return false; }
+    fn scriptReadOnly(this: &BodyCx, p: Id<TPlace>): bool {
+        let sid = match this.scriptSid { Option.Some(s) { s } Option.None { return false; } };
+        match this.cx.typed.place(p) {
+            TPlace.Field(f) {
+                match this.structOf(this.placeTy(f.base)) {
+                    Option.Some(s) { return s == sid && f.index < this.scriptProps(sid); }
+                    Option.None {}
+                }
+            }
+            _ {}
+        }
+        return false;
+    }
+
+    /// Rust `script_prop_name`: the prop an assignment target `e` writes into (`hinge`, `this.hinge`,
+    /// `hinge.id`, `hinge[i]`), for the read-only error.
+    fn scriptPropName(this: &BodyCx, e: Id<Expr>): Option<Sym> {
+        match this.cx.ast.expr(e) {
+            Expr.Name(n) { if this.isScriptProp(n.name) { return Option.Some(n.name); } }
+            Expr.Field(fe) {
+                let onThis = false;
+                match this.cx.ast.expr(fe.base) {
+                    Expr.Name(n) { onThis = this.str(n.name) == "this"; }
+                    _ {}
+                }
+                if onThis && this.isScriptProp(fe.field.name) { return Option.Some(fe.field.name); }
+                return this.scriptPropName(fe.base);
+            }
+            Expr.Index(ix) { return this.scriptPropName(ix.base); }
+            _ {}
+        }
+        return Option.None;
+    }
+
+    /// Rust `script_props.contains(name)`.
+    fn isScriptProp(this: &BodyCx, name: Sym): bool {
+        let sid = match this.scriptSid { Option.Some(s) { s } Option.None { return false; } };
+        let sd = this.cx.tables.structAt(sid);
+        for i in 0..sd.propSpans.len {
+            if i < sd.fields.len && sd.fields.items[i].name == name { return true; }
+        }
+        return false;
+    }
+
+    /// Rust stmt.rs:104 / :147: the error for an assignment to place expression `e` that `canAssign`
+    /// refused, when it writes into a prop.
+    fn scriptPropAssign(this: &BodyCx, e: Id<Expr>): Option<TErr> {
+        let prop = match this.scriptPropName(e) { Option.Some(p) { p } Option.None { return Option.None; } };
+        let t = Text.new(this.cx.arena);
+        t.add("prop `").add(this.str(prop)).add("` is read-only in the script");
+        return Option.Some(this.help(this.err(this.cx.ast.exprSpan(e), t.str()), "props are read-only in the script; copy it into a `let`"));
+    }
 
     /// Rust `is_script_value` + `script_copy`: Some(`script instances can't be copied`) when `t` is a script
     /// struct and this body is not a generic instance. Asked for a place used as a value.
-    fn scriptCopy(this: &BodyCx, sp: Span, t: Id<Ty>): Option<TErr> { return Option.None; }
+    fn scriptCopy(this: &BodyCx, sp: Span, t: Id<Ty>): Option<TErr> {
+        // Rust `type_subst` is non-empty: generic code (`List<Door>` growing) may move one.
+        match this.inst { Option.Some(_) { return Option.None; } Option.None {} }
+        match this.gen { Option.Some(_) { return Option.None; } Option.None {} }
+        let sid = match this.structOf(t) { Option.Some(s) { s } Option.None { return Option.None; } };
+        if this.scriptProps(sid) < 0 { return Option.None; }
+        let h = Text.new(this.cx.arena);
+        h.add("pass `&").add(this.str(this.cx.tables.structAt(sid).name)).add("` instead");
+        return Option.Some(this.help(this.err(sp, "script instances can't be copied"), h.str()));
+    }
 
     /// Rust call.rs:28: `name(args)` in a script method, when the script has method `name`: the call on
     /// `this`. None for anything else.
     fn scriptThisCall(this: &BodyCx, sp: Span, n: Ident, args: &List<Id<Expr>>): Result<Option<Id<TExpr>>, TErr> {
-        return Result.Ok(Option.None);
+        let sid = match this.scriptSid { Option.Some(s) { s } Option.None { return Result.Ok(Option.None); } };
+        let f = match this.findMethod(sid, n.name) { Option.Some(f) { f } Option.None { return Result.Ok(Option.None); } };
+        let l = match this.findLocal(this.sym("this")) { Option.Some(l) { l } Option.None { return Result.Ok(Option.None); } };
+        let recv = this.place(TPlace.Local(LocalPlace { local: l }), this.cx.typed.local(l).ty, n.span);
+        return Result.Ok(Option.Some(this.callId(sp, f, Option.Some(recv), args)?));
     }
 
     /// Rust call.rs:160 + `scene_script_find`: `recv.script::<T>(args)` on `j3.scene3d.Scene` (`s`) is a call
@@ -52,10 +223,76 @@ extend BodyCx {
     /// type argument, or `s` is not `Scene`.
     fn sceneScriptCall(this: &BodyCx, sp: Span, recv: Id<TPlace>, s: Id<StructDecl>, field: Ident, typeArgs: &List<Id<Type>>,
             args: &List<Id<Expr>>): Result<Option<Id<TExpr>>, TErr> {
-        return Result.Ok(Option.None);
+        if typeArgs.len != 1 || this.str(field.name) != "script" { return Result.Ok(Option.None); }
+        let sd = this.cx.tables.structAt(s);
+        if this.str(sd.name) != "Scene" || this.cx.tables.modAt(sd.owner).key != "j3.scene3d" { return Result.Ok(Option.None); }
+        let t = this.resolve(typeArgs.items[0])?;
+        let f = this.sceneScriptFind(t, field.span)?;
+        return Result.Ok(Option.Some(this.callId(sp, f, Option.Some(recv), args)?));
+    }
+
+    /// Rust `scene_script_find`: the registry's `find__a__b` for script type `t` (`a/b.j3s`).
+    fn sceneScriptFind(this: &BodyCx, t: Id<Ty>, sp: Span): Result<Id<FnDecl>, TErr> {
+        let script: Option<Id<StructDecl>> = Option.None;
+        match this.structOf(t) {
+            Option.Some(s) { if this.scriptProps(s) >= 0 { script = Option.Some(s); } }
+            Option.None {}
+        }
+        let sid = match script {
+            Option.Some(s) { s }
+            Option.None {
+                return Result.Err(this.help(this.err(sp, "`scene.script<T>` takes a script type"),
+                    "bind one with `const Door = @script(\"scripts/door.j3s\");`"));
+            }
+        };
+        // Rust `bc::script_path` and `scene_scripts::ident`: the module path without its `script` head.
+        let mp = this.cx.tables.modAt(this.cx.tables.structAt(sid).owner).path;
+        let path = Text.new(this.cx.arena);
+        let want = Text.new(this.cx.arena);
+        want.add("find__");
+        for i in 1..mp.len {
+            if i > 1 {
+                path.add("/");
+                want.add("__");
+            }
+            path.add(this.str(mp.items[i]));
+            want.add(this.str(mp.items[i]));
+        }
+        path.add(".j3s");
+        match this.cx.tables.modKeys.get(this.sym("j3.scene3d.scripts")) {
+            Option.Some(rm) {
+                let fns = this.cx.tables.modAt(rm).fns;
+                let w = this.sym(want.str());
+                for i in 0..fns.len {
+                    if this.cx.tables.fnAt(fns.items[i]).name == w { return Result.Ok(fns.items[i]); }
+                }
+            }
+            Option.None {}
+        }
+        let m = Text.new(this.cx.arena);
+        m.add("no scene attaches ").add(path.str()).add(", so no object has one");
+        let h = Text.new(this.cx.arena);
+        h.add("attach it to an object in the editor (`script=").add(path.str()).add("` on its line)");
+        return Result.Err(this.help(this.err(sp, m.str()), h.str()));
     }
 
     /// Rust `script_method_visible`: Some(`NAME is private to PATH`) when `f` is a non-`pub` method of script
     /// struct `s` called from outside it.
-    fn scriptMethodVisible(this: &BodyCx, s: Id<StructDecl>, f: Id<FnDecl>, name: Sym, sp: Span): Option<TErr> { return Option.None; }
+    fn scriptMethodVisible(this: &BodyCx, s: Id<StructDecl>, f: Id<FnDecl>, name: Sym, sp: Span): Option<TErr> {
+        let path = match this.cx.tables.structAt(s).scriptPath { Option.Some(p) { p } Option.None { return Option.None; } };
+        if this.inScript(s) || this.cx.tables.fnAt(f).visPub { return Option.None; }
+        let t = Text.new(this.cx.arena);
+        t.add("`").add(this.str(name)).add("` is private to ").add(path);
+        return Option.Some(this.help(this.err(sp, t.str()), "add `pub` to expose this function"));
+    }
+
+    /// Rust call.rs:436 (`lookup_method` with type arguments, before the instance is made): Some(`NAME is
+    /// private to this script`) when generic method `f` of script struct `s` is not `pub` and the caller is
+    /// outside the script.
+    fn scriptGenericPrivate(this: &BodyCx, s: Id<StructDecl>, f: Id<FnDecl>, name: Sym, sp: Span): Option<TErr> {
+        if this.scriptProps(s) < 0 || this.inScript(s) || this.cx.tables.fnAt(f).visPub { return Option.None; }
+        let t = Text.new(this.cx.arena);
+        t.add("`").add(this.str(name)).add("` is private to this script");
+        return Option.Some(this.help(this.err(sp, t.str()), "add `pub` to expose this function"));
+    }
 }

@@ -86,7 +86,7 @@ expand() {
     [ -e "$p" ] || die "input $p does not exist"
     if [ -f "$p" ]; then echo "$p"; return; fi
     case $mode in
-        fmt|ast|err) find "$p" \( -name target -o -name node_modules \) -prune -o -name '*.j3' -type f -print | sort ;;
+        fmt|ast|err) find "$p" \( -name target -o -name node_modules -o -name '*.d' \) -prune -o -name '*.j3' -type f -print | sort ;;
         *) if [ -f "$p/j3.toml" ]; then echo "$p"
            else find "$p" \( -name target -o -name node_modules \) -prune -o -name j3.toml -print | sed 's|/j3.toml$||' | sort; fi ;;
     esac
@@ -115,7 +115,13 @@ one() {
     set +e
     local d=$tmp/$1 f=$2 cwd=$root arg=$2 who
     mkdir -p "$d"
-    if [ $mode = err ]; then mkdir -p "$d/w"; cp "$root/$f" "$d/w/"; cwd=$d/w; arg=$(basename "$f"); fi
+    if [ $mode = err ]; then
+        mkdir -p "$d/w"; cp "$root/$f" "$d/w/"; cwd=$d/w; arg=$(basename "$f")
+        # A case's companion files (a `.j3s` beside it): tests/bad/NAME.d/ is copied next to NAME.j3.
+        [ ! -d "$root/${f%.j3}.d" ] || cp -r "$root/${f%.j3}.d/." "$d/w/"
+        # A companion with a `j3.toml` (entry NAME.j3, modules in `src/`) makes the case a project.
+        [ ! -f "$d/w/j3.toml" ] || arg=.
+    fi
     local -a cmd
     case $mode in
         fmt) cmd=(fmt "$arg") ;;
@@ -150,6 +156,8 @@ one() {
     else
         echo DIFF >"$d/status"; diff -u --label stage0 --label j3c-boot "$d/a.txt" "$d/b.txt" | head -40 >"$d/detail"
     fi
+    # Only status and detail are read after this; dumps of a whole corpus would fill the disk.
+    rm -rf "$d/w" "$d"/*.out "$d"/*.err "$d"/*.txt "$d"/*.rc
     true
 }
 export -f one

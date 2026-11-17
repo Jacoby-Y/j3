@@ -37,9 +37,14 @@ harness, or comparing stage 2 later).
 
 - `corpus.txt`: inputs per mode, one path or glob per line under `[mode mode ...]` section headers. A
   folder is a project for `ir`/`llvm`/`run` (a folder without `j3.toml` means every project under it);
-  `fmt`/`ast`/`err` take every `.j3` under it, skipping `target/`.
+  `fmt`/`ast`/`err` take every `.j3` under it, skipping `target/` and `*.d/`.
 - `bad/`: parse, name and type errors for `err`, beside the Rust goldens in
   `j3c/src/compile/tests/diag/`.
+  A case that needs more files (a `.j3s` script) keeps them in `bad/NAME.d/`, copied beside `NAME.j3`
+  for the check (`*.d` folders are never inputs themselves). A `NAME.d/` with a `j3.toml` makes the case a
+  project: `check .` in the copy, entry `NAME.j3`, modules in `NAME.d/src/`.
+- `proj/`: small multi-module projects for `fmt`/`ast`/`ir`/`llvm`/`run` (rules that need two modules, such
+  as an instance body lowered with the names of the module that uses it: `merged_names`, `merged_types`).
 - `known/MODE.txt`: inputs that fail today, one per line. It only shrinks: a listed input that passes
   fails the run until its line is removed. `--update-known` rewrites the list from the current run
   (keeping entries for inputs this run did not cover).

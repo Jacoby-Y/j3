@@ -2,4 +2,133 @@
 //
 // Part of module j3c.shader.
 // Port of: j3c/src/check/gpu/func.rs
+// J3: The parameters are the fn's first scope, in order (Rust: a HashMap; a repeated name's last one wins
+// either way). `FnSig` is arena-allocated and shared through `Gen.sigs` (Rust `Rc<FnSig>`).
 module j3c.shader;
+
+extend Gen {
+    /// Emit `f` (and, first, everything it calls) unless already done; the signature either way.
+    /// `at` is where the call sits, for the recursion error.
+    fn emitFn(this: &Gen, moduleName: string, f: &FnItem, at: Span): Result<&FnSig, Diag> {
+        let a = this.ix.arena;
+        let nm = this.str(f.name.name);
+        let key = itemKey(a, moduleName, nm);
+        match this.sigs.get(key) {
+            Option.Some(s) { return Result.Ok(s); }
+            Option.None {}
+        }
+        let pos = this.stack.indexOf(key);
+        if pos >= 0 {
+            let cycle = this.t();
+            cycle.add("recursion: ");
+            for i in pos..this.stack.len { cycle.add(shortKey(this.stack.items[i])).add(" -> "); }
+            cycle.add(nm);
+            return Result.Err(this.errHelp(at, cycle.str(), "GLSL has no recursion; write the loop out with `while` or `for i in 0..N`"));
+        }
+        if f.typeParams.len != 0 {
+            let msg = this.t().add("`").add(nm).add("` is generic").str();
+            return Result.Err(this.errHelp(f.name.span, msg, "shader fns have no generics; write one fn per type"));
+        }
+        let gname = this.globalName(moduleName, f.name.name);
+        let params = List<SigParam>.new(a);
+        let plist = Text.new(a);
+        let locals = List<GLocal>.new(a);
+        for i in 0..f.params.len {
+            let p = f.params.items[i];
+            let pt = GTy.Void;
+            let inout = false;
+            match this.ix.ast.ty(p.ty) {
+                Type.Ref(r) {
+                    pt = this.tyOf(r.ty, moduleName)?;
+                    inout = true;
+                }
+                _ { pt = this.tyOf(p.ty, moduleName)?; }
+            }
+            if inout {
+                match pt {
+                    GTy.Sampler(_) { return Result.Err(this.err(this.ix.ast.typeSpan(p.ty), "a sampler cannot be an `inout` parameter")); }
+                    _ {}
+                }
+            }
+            let g = mangle(this.str(p.name.name), a);
+            if i > 0 { plist.add(", "); }
+            if inout { plist.add("inout "); }
+            plist.add(pt.glsl(a)).add(" ").add(g);
+            locals.push(GLocal { name: p.name.name, glsl: g, ty: pt });
+            params.push(SigParam { ty: pt, inout: inout });
+        }
+        let ret = GTy.Void;
+        match f.ret {
+            Option.Some(rt) { ret = this.tyOf(rt, moduleName)?; }
+            Option.None {}
+        }
+        let sig = a.new::<FnSig>(FnSig { glsl: gname, params: params, ret: ret });
+        this.stack.push(key);
+        let saved = this.cur;
+        this.cur = curNew(a, moduleName, ret, false);
+        let savedBody = this.body;
+        this.body = Text.new(a);
+        let savedDepth = this.depth;
+        this.depth = 1;
+        this.cur.scopes.push(locals);
+        let result = this.blockStmts(&f.body);
+        this.cur = saved;
+        let text = this.body.str();
+        this.body = savedBody;
+        this.depth = savedDepth;
+        this.stack.len -= 1;
+        result?;
+        let isVoid = false;
+        match ret {
+            GTy.Void { isVoid = true; }
+            _ {}
+        }
+        if !isVoid && !endsWithReturn(this.ix.ast, &f.body) {
+            let msg = this.t().add("fn `").add(nm).add("` can reach its end without returning a ").add(ret.name(a)).str();
+            return Result.Err(this.errHelp(f.body.span, msg, "end every path with `return`"));
+        }
+        let out = Text.new(a);
+        out.add("// ").add(this.ix.at(f.span)).add("\n").add(ret.glsl(a)).add(" ").add(gname).add("(").add(plist.str()).add(") {\n");
+        out.add(text).add("}\n");
+        this.fnsOut.push(out.str());
+        this.sigs.put(key, sig);
+        return Result.Ok(sig);
+    }
+}
+
+/// Whether every path through `b` ends in `return` (the last statement, or an `if`/`else` or `match` with `_`).
+fn endsWithReturn(ast: &Ast, b: &Block): bool {
+    if b.stmts.len == 0 { return false; }
+    match ast.stmt(b.stmts.items[b.stmts.len - 1]) {
+        Stmt.Return(_) { return true; }
+        Stmt.Block(x) { return endsWithReturn(ast, &x); }
+        Stmt.If(i) {
+            if !endsWithReturn(ast, &i.thenBlock) { return false; }
+            match i.elseBlock {
+                Option.Some(eb) { return endsWithReturn(ast, &eb); }
+                Option.None { return false; }
+            }
+        }
+        Stmt.Match(m) {
+            let hasWild = false;
+            for ai in 0..m.arms.len {
+                let arm = m.arms.items[ai];
+                if !endsWithReturn(ast, &arm.body) { return false; }
+                let guarded = false;
+                match arm.guard {
+                    Option.Some(_) { guarded = true; }
+                    Option.None {}
+                }
+                if guarded { continue; }
+                for pi in 0..arm.pats.len {
+                    match ast.pat(arm.pats.items[pi]) {
+                        Pat.Wild { hasWild = true; }
+                        _ {}
+                    }
+                }
+            }
+            return hasWild;
+        }
+        _ { return false; }
+    }
+}

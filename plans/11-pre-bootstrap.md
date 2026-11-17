@@ -554,11 +554,14 @@ Gate: full-file `ir --norm`, `llvm`, `run` exact and `check` same on the C2b and
 - [x] Wave 11 (5 agents, shared worktree, one feature each end to end): tuples + lint; closures; simd/f16/intrinsics; frame strings/Text.fmt; dyn + derive.
 - [x] Wave 12 (integration): full-file parity, delete the untyped-fn staging, C2b review leftovers, shrink known lists.
 
-### Milestone C2d: gpu/shader + `dump-glsl`, script AOT, `@uiChoice`, `--fast`
+### Milestone C2d: gpu/shader + `dump-glsl`, script AOT, `@uiChoice`, `--fast` — DONE (glsl 4/4 + es; c2d ir/llvm 23/23; known ir/llvm 142 → 62 `.j3ui` projects; self-compile IR exact; review fixes applied)
 Gate: `diff.sh glsl` exact; full-file `ir --norm`, `llvm` exact on the C2d corpus; C2c gate stays green; `notYet` deleted. Survey: `.swarm-opus/11-port/survey-c2d.md`. (`.j3ui` is C2e; the script VM stays in C4.)
-- [ ] Wave 13 (contracts, 1 agent): layer move, prepare call sites, hooks for the 4 `notYet` sites, shader shared types, `dump-glsl`/`dump-ui` wiring, `diff.sh` `glsl`/`ui` modes, float-const fix, `contracts-c2d.md`, `c2d-corpus.txt`.
-- [ ] Wave 14 (4 agents, shared worktree): shader types/expressions; shader generator + `dump-glsl`; scripts AOT + `@uiChoice`; `--fast` + driver.
-- [ ] Wave 15 (integration): full-file parity on the C2d corpus and the other non-`.j3ui` entries, shrink known lists, delete `notYet`.
+- [x] Wave 13 (contracts, 1 agent): layer move, prepare call sites, hooks for the 4 `notYet` sites, shader shared types, `dump-glsl`/`dump-ui` wiring, `diff.sh` `glsl`/`ui` modes, float-const fix, `contracts-c2d.md`, `c2d-corpus.txt`.
+- [x] Wave 14 (4 agents, shared worktree): shader types/expressions; shader generator + `dump-glsl`; scripts AOT + `@uiChoice`; `--fast` + driver.
+- [x] Wave 15 (integration): full-file parity on the C2d corpus and the other non-`.j3ui` entries, shrink known lists, delete `notYet`.
 
 ### Milestone C2e: `.j3ui` (markup parser, gen, span map, `dump-ui`)
-Gate: `diff.sh ui` exact on the UI projects, then full-file `ir --norm`, `llvm`. Partition after C2d.
+Gate: `diff.sh ui` exact on the UI projects and `tests/bad-ui`, then full-file `ir --norm`, `llvm`. Survey: `.swarm-opus/11-port/survey-c2e.md`.
+- [ ] Wave 16 (contracts, 1 agent): `ui/map`, `ui/markup/types` in full, `G` and ~75 stub signatures, `loadUi`/remap/locator/`dump-ui` wiring, `contracts-c2e.md`, `c2e-corpus.txt`.
+- [ ] Wave 17 (4 agents, shared worktree): markup front end; generator core; tree walk (elements, control, components, slots); attributes + `ui.j3` surface + error cases.
+- [ ] Wave 18 (integration): `diff.sh ui` by tier, then ir/llvm on the 62 projects, span-map error cases.

@@ -1,0 +1,194 @@
+// `shader.prepare` (`shader.j3`): a two-module program through the driver to `Stage.Load`, then `prepare`
+// on the parsed files. Checks the program it emits (name, `file:line`, uniform order, attribute ints, a few
+// GLSL lines), the removed names in file order (sema's `explainGone` list), the rewritten items (shader
+// items gone, `#[vertex]` struct kept, the `@shader` const now a `let` holding a `Source` literal, `use`
+// names of removed items pruned), the first error as a Diag with its help, and a program with no shader
+// code left untouched.
+module shader_prepare_test;
+
+use j3.io;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.{ Text, contains };
+use j3c.base.diag.NoteKind;
+use j3c.driver;
+use j3c.driver.{ Session, Stage };
+use j3c.load.LoadCx;
+use j3c.shader.{ ATTR_INTS, MAX_ATTRIBS, Prepared, prepare };
+use j3c.syntax.ast.{ Expr, Item };
+
+const HELP: [4]string = [
+    "module prephelp;",
+    "#[uniform] pub let uScale: f32;",
+    "#[shader] pub fn k(x: f32): f32 { return x * uScale; }",
+    "pub fn cpuFn(): int { return 1; }",
+];
+
+const SRC: [16]string = [
+    "module prep;",
+    "use prephelp.{ cpuFn, k };",
+    "use prephelp.uScale;",
+    "#[vertex] struct B { pos: Vec2; _pad: Vec2; tint: Rgba8; id: i32; }",
+    "#[uniform] let uTint: vec4;",
+    "#[varying] struct V { position: vec4; tint: vec4; #[flat] id: i32; }",
+    "#[shader] fn unused(x: f32): f32 { return x; }",
+    "#[shader(vertex)] fn vs(b: B): V {",
+    "    return V { position: vec4(b.pos * k(1.0), 0.0, 1.0), tint: b.tint, id: b.id };",
+    "}",
+    "#[shader(fragment)] fn fs(v: V): vec4 {",
+    "    if v.id < 0 { return uTint; }",
+    "    return v.tint * uTint * uScale;",
+    "}",
+    "const PROG = @shader(vs, fs);",
+    "fn main() { cpuFn(); }",
+];
+
+const GONE: [7]string = ["uTint", "V", "unused", "vs", "fs", "uScale", "k"];
+
+fn join(lines: []string, mem: &Arena): string {
+    let text = Text.new(mem);
+    for i in 0..lines.len { text.add(lines[i]).add("\n"); }
+    return text.str();
+}
+
+fn write(dir: string, file: string, text: string, mem: &Arena): string {
+    let p = Text.new(mem).add(dir).add("/").add(file).str();
+    match io.writeFile(p, text as []u8) { Result.Ok(_) {} Result.Err(_) { panic("cannot write the case"); } }
+    return p;
+}
+
+/// Load `entry` and run `prepare` on it; the session stays alive for the caller's checks.
+fn run(entry: string): (&Session, Option<Prepared>) {
+    let o = driver.defaults();
+    o.entry = entry;
+    let s = Session.new(o);
+    if !driver.run(s, Stage.Load) { panic("load fails"); }
+    let parsed = match s.loaded { Option.Some(p) { p } Option.None { panic("nothing loaded"); return (s, Option.None); } };
+    return (s, prepare(LoadCx { arena: s.arena, names: &s.names, diags: &s.diags, sources: &s.sources }, &parsed));
+}
+
+fn main() {
+    let mem = Arena.create(1 << 12);
+    // outside this package, whose project would otherwise load
+    let d = Text.new(&mem).add(io.tempRoot()).add("/j3c-boot-shader-prepare").str();
+    match io.makeDirs(d) { Result.Ok(_) {} Result.Err(_) { panic("cannot make the case dir"); } }
+    // a project: a lone file cannot import a module beside it. It stops before sema (`Vec2`, `Rgba8` and
+    // `Source` are not imported, so the stdlib's own shader items stay out of the lists).
+    let src = Text.new(&mem).add(d).add("/src").str();
+    match io.makeDirs(src) { Result.Ok(_) {} Result.Err(_) { panic("cannot make the case dir"); } }
+    let toml = write(d, "j3.toml", "[package]\nname = \"prep\"\nentry = \"src/prep.j3\"\n", &mem);
+    write(src, "prephelp.j3", join(HELP, &mem), &mem);
+    write(src, "prep.j3", join(SRC, &mem), &mem);
+    let (s, r) = run(toml);
+    let p = match r { Option.Some(x) { x } Option.None { panic(`prepare failed: {s.diags.at(0).msg}`); return; } };
+
+    // the program
+    if p.programs.len != 1 { panic(`{p.programs.len} programs, want 1`); }
+    let g = p.programs.items[0];
+    if g.moduleName != "prep" || g.name != "PROG" || g.at != "prep.j3:15" { panic(`program {g.moduleName}.{g.name} at {g.at}`); }
+    // vertex-stage uniforms first, then the fragment's new ones
+    if g.uniforms.len != 2 || g.uniforms.items[0] != "uScale" || g.uniforms.items[1] != "uTint" { panic("uniform order"); }
+    // pos (loc 0), tint (loc 1, normalized bytes at offset 16), id (loc 2, int at 20); `_pad` has no location
+    let want: [24]u32 = [0, 2, 0x1406, 0, 24, 0, 0, 0, 1, 4, 0x1401, 16, 24, 0, 0, 1, 2, 1, 0x1404, 20, 24, 0, 1, 0];
+    if g.attribs.len != want.len { panic(`{g.attribs.len} attribute ints, want {want.len}`); }
+    for i in 0..want.len {
+        if g.attribs.items[i] != want[i] { panic(`attribute int {i}: {g.attribs.items[i]}, want {want[i]}`); }
+    }
+    if !contains(g.vert, "layout(location=2) in int a_b_id;") || !contains(g.vert, "flat out int v_id;") || !contains(g.vert, "gl_Position = p_ret.position;") {
+        panic(g.vert);
+    }
+    if !contains(g.frag, "uniform vec4 uTint;") || !contains(g.frag, "flat in int v_id;") || !contains(g.frag, "oColor = fs(p_0);") { panic(g.frag); }
+    if contains(g.vert, "unused") || contains(g.frag, "unused") { panic("an unreachable helper was emitted"); }
+
+    // the removed names, in file order (the entry first, then what it imports)
+    if p.gone.len != GONE.len { panic(`{p.gone.len} gone names`); }
+    for i in 0..GONE.len {
+        if s.names.str(p.gone.items[i]) != GONE[i] { panic(`gone {i}: {s.names.str(p.gone.items[i])}, want {GONE[i]}`); }
+    }
+
+    // the rewritten files
+    let parsed = match s.loaded { Option.Some(x) { x } Option.None { panic("nothing loaded"); return; } };
+    let seen = Text.new(&mem);
+    for fi in 0..parsed.files.len {
+        let f = parsed.files.items[fi];
+        let key = f.ast.moduleKey(parsed.ast);
+        if key != "prep" && key != "prephelp" { continue; }
+        for i in 0..f.ast.items.len {
+            match f.ast.items.items[i] {
+                Item.Use(u) {
+                    seen.add("use");
+                    match u.names {
+                        Option.Some(ns) { for k in 0..ns.len { seen.add(":").add(s.names.str(ns.items[k].name)); } }
+                        Option.None {}
+                    }
+                    seen.add(" ");
+                }
+                Item.Fn(x) { seen.add("fn:").add(s.names.str(x.name.name)).add(" "); }
+                Item.Struct(x) { seen.add("struct:").add(s.names.str(x.name.name)).add(" "); }
+                Item.Const(x) { seen.add("const:").add(s.names.str(x.name.name)).add(" "); }
+                Item.Let(l) {
+                    seen.add("let:").add(s.names.str(l.name.name)).add(" ");
+                    if l.uniform || l.thread { panic("the Source let is a plain let"); }
+                    let v = match l.value { Option.Some(x) { x } Option.None { panic("the Source let has no value"); return; } };
+                    match parsed.ast.expr(v) {
+                        Expr.StructLit(lit) {
+                            if s.names.str(lit.name.name) != "Source" || lit.fields.len != 5 { panic("the Source literal"); }
+                            match parsed.ast.expr(lit.fields.items[0].value) {
+                                Expr.String(text) { if text != g.vert { panic("Source.vert"); } }
+                                _ { panic("Source.vert is not a string"); }
+                            }
+                            match parsed.ast.expr(lit.fields.items[2].value) {
+                                Expr.String(text) { if text != "uScale uTint" { panic(text); } }
+                                _ { panic("Source.uniforms is not a string"); }
+                            }
+                            match parsed.ast.expr(lit.fields.items[3].value) {
+                                Expr.Int(n) { if n != 3 { panic("Source.count"); } }
+                                _ { panic("Source.count is not an int"); }
+                            }
+                            match parsed.ast.expr(lit.fields.items[4].value) {
+                                Expr.ArrayLit(arr) {
+                                    if arr.elems.len != MAX_ATTRIBS * ATTR_INTS { panic("Source.data length"); }
+                                    match parsed.ast.expr(arr.elems.items[10]) {
+                                        Expr.Int(n) { if n != 0x1401 { panic("Source.data[10]"); } }
+                                        _ { panic("Source.data holds ints"); }
+                                    }
+                                }
+                                _ { panic("Source.data is not an array"); }
+                            }
+                        }
+                        _ { panic("the Source let is not a struct literal"); }
+                    }
+                }
+                _ { seen.add("other "); }
+            }
+        }
+    }
+    if seen.str() != "use:cpuFn struct:B let:PROG fn:main fn:cpuFn " { panic(seen.str()); }
+    s.free();
+
+    // an error: the first one, as a Diag with its help, and no result
+    // (lone files, outside the project above: a file inside one loads the project)
+    let d2 = Text.new(&mem).add(io.tempRoot()).add("/j3c-boot-shader-prepare-lone").str();
+    match io.makeDirs(d2) { Result.Ok(_) {} Result.Err(_) { panic("cannot make the case dir"); } }
+    let (s2, r2) = run(write(d2, "prepbad.j3", "module prepbad;\n#[shader] fn f(x: int): f32 { return 1.0; }\nfn main() {}\n", &mem));
+    match r2 { Option.Some(_) { panic("a bad shader fn prepared"); } Option.None {} }
+    if s2.diags.count() != 1 { panic(`{s2.diags.count()} diags, want 1`); }
+    let dg = s2.diags.at(0);
+    if dg.msg != "`int` is 64-bit and shaders have no 64-bit integers" || dg.span.lo != 34 { panic(dg.msg); }
+    if dg.notes.len != 1 || dg.notes.items[0].msg != "write `i32`" { panic("the help line"); }
+    match dg.notes.items[0].kind { NoteKind.Help {} NoteKind.Note { panic("a note, want a help"); } }
+    s2.free();
+
+    // no shader code: nothing emitted, nothing removed, the items untouched
+    let (s3, r3) = run(write(d2, "prepnone.j3", "module prepnone;\nstruct P { x: int; }\nconst K = 3;\nfn main() {}\n", &mem));
+    let p3 = match r3 { Option.Some(x) { x } Option.None { panic("plain code failed"); return; } };
+    if p3.programs.len != 0 || p3.gone.len != 0 { panic("plain code has shader output"); }
+    let parsed3 = match s3.loaded { Option.Some(x) { x } Option.None { panic("nothing loaded"); return; } };
+    for fi in 0..parsed3.files.len {
+        let f = parsed3.files.items[fi];
+        if f.ast.moduleKey(parsed3.ast) == "prepnone" && f.ast.items.len != 3 { panic("plain items changed"); }
+    }
+    s3.free();
+}

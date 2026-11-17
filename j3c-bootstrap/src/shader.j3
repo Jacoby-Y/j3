@@ -7,9 +7,9 @@
 // after `lint` and `prepareScripts`), deletes the shader items and turns `const P = @shader(vs, fs)` into a
 // plain `let P: Source = Source { .. }`. It sees no sema, lower or IR type (tools/layers.txt: above sema).
 module j3c.shader;
-// J3: Contract (wave 13): `.swarm-opus/11-port/contracts-c2d.md`. This file holds every `use` of the module
-// (part files have none), the types more than one part file reads, and `prepare`, the one entry sema calls.
-// The type shapes and `prepare`'s signature are frozen; chunk B (wave 14) writes `prepare`'s body here.
+// J3: Contract: `.swarm-opus/11-port/contracts-c2d.md`. This file holds the module's shared `use`s (a part
+// file adds only a name no other file imports), the types more than one part file reads, and `prepare`,
+// the one entry sema calls, with the item rewrite (Rust `prepare`, `analyze`, `program`, `source_let`).
 
 use j3.data.map.Map;
 use j3.data.pool.{ Id, Pool };
@@ -21,9 +21,10 @@ use j3.text.Text;
 use j3c.base.diag.{ Diag, Diags, Note, NoteKind, Severity };
 use j3c.base.intern.{ Names, Sym, own };
 use j3c.base.span.{ Source, Span, noSpan };
-use j3c.load.{ LoadCx, Parsed, ParsedFile };
-use j3c.syntax.ast.{ Ast, BinOp, Block, ConstItem, Expr, FieldItem, File, FnItem, GpuStage, GpuStruct, Ident, Item, ModLetItem, Stmt,
-    StructItem, Type, UnaryOp, UseItem };
+use j3c.load.{ LoadCx, Parsed };
+use j3c.syntax.ast.{ Ast, BinOp, Block, ConstItem, Expr, FieldItem, FnItem, GpuStage, GpuStruct, Ident, Item, ModLetItem, Stmt,
+    StructItem, Type, UnaryOp };
+use j3c.syntax.ast.{ ArrayLitExpr, IfStmt, JumpStmt, MatchStmt, NamedType, Pat, StructLitExpr };
 
 /// One `@shader(vs, fs)` program as emitted: what `j3c dump-glsl` prints (Rust `ShaderProgram`). Every
 /// string is an arena copy.
@@ -56,8 +57,284 @@ pub struct Prepared {
 /// for the normal checker. None after an error Diag (already added to `cx.diags`). A program with no shader
 /// item is untouched and gives two empty lists.
 pub fn prepare(cx: LoadCx, parsed: &Parsed): Option<Prepared> {
-    // J3: Wave 13 stub: no rewrite, so shader items still reach sema and fail there as before.
-    return Option.Some(Prepared { programs: List<ShaderProgram>.new(cx.arena), gone: List<Sym>.new(cx.arena) });
+    let a = cx.arena;
+    let out = Prepared { programs: List<ShaderProgram>.new(a), gone: List<Sym>.new(a) };
+    if !hasGpu(parsed) { return Option.Some(out); }
+    let ix = indexNew(cx, parsed);
+    match analyze(parsed, ix, &out.programs) {
+        Result.Ok(_) {}
+        Result.Err(d) {
+            cx.diags.add(d);
+            return Option.None;
+        }
+    }
+    // names that stop existing for the CPU, so `use a.k;` / `use a.{ k }` of them must go too
+    let goneMods = List<string>.new(a);
+    for fi in 0..parsed.files.len {
+        let f = &parsed.files.items[fi];
+        if f.ast.isScript { continue; }
+        let key = f.ast.moduleKey(parsed.ast);
+        for i in 0..f.ast.items.len {
+            match goneName(&f.ast.items.items[i]) {
+                Option.Some(n) {
+                    goneMods.push(key);
+                    out.gone.push(n);
+                }
+                Option.None {}
+            }
+        }
+    }
+    for fi in 0..parsed.files.len {
+        if parsed.files.items[fi].ast.isScript { continue; }
+        let old = parsed.files.items[fi].ast.items;
+        let key = parsed.files.items[fi].ast.moduleKey(parsed.ast);
+        let items = List<Item>.new(a);
+        for i in 0..old.len {
+            let it = old.items[i];
+            match goneName(&it) {
+                Option.Some(_) { continue; }
+                Option.None {}
+            }
+            match it {
+                Item.Const(c) {
+                    let at = -1;
+                    for k in 0..out.programs.len {
+                        if at < 0 && out.programs.items[k].moduleName == key && out.programs.items[k].name == cx.names.str(c.name.name) { at = k; }
+                    }
+                    if at < 0 { items.push(it); } else { items.push(Item.Let(sourceLet(parsed.ast, &c, &out.programs.items[at]))); }
+                }
+                Item.Use(u) {
+                    let n = u.path.len;
+                    match u.names {
+                        Option.Some(names) {
+                            let whole = usePath(parsed.ast, &u.path, n);
+                            let kept = List<Ident>.new(a);
+                            for k in 0..names.len {
+                                if !isGone(&goneMods, &out.gone, whole, names.items[k].name) { kept.push(names.items[k]); }
+                            }
+                            if kept.len == 0 { continue; }
+                            let nu = u;
+                            nu.names = Option.Some(kept);
+                            items.push(Item.Use(nu));
+                        }
+                        Option.None {
+                            if n > 1 && isGone(&goneMods, &out.gone, usePath(parsed.ast, &u.path, n - 1), u.path.items[n - 1].name) { continue; }
+                            items.push(it);
+                        }
+                    }
+                }
+                _ { items.push(it); }
+            }
+        }
+        parsed.files.items[fi].ast.items = items;
+    }
+    return Option.Some(out);
+}
+
+/// The name of an item `prepare` removes: a shader fn, a `#[varying]` / `#[shader]` struct, a uniform.
+fn goneName(it: &Item): Option<Sym> {
+    match *it {
+        Item.Fn(x) {
+            match x.shader {
+                Option.Some(_) { return Option.Some(x.name.name); }
+                Option.None {}
+            }
+        }
+        Item.Struct(s) {
+            if s.gpu == GpuStruct.Varying || s.gpu == GpuStruct.Plain { return Option.Some(s.name.name); }
+        }
+        Item.Let(l) {
+            if l.uniform { return Option.Some(l.name.name); }
+        }
+        _ {}
+    }
+    return Option.None;
+}
+
+fn isGone(mods: &List<string>, names: &List<Sym>, m: string, n: Sym): bool {
+    for i in 0..names.len {
+        if names.items[i] == n && mods.items[i] == m { return true; }
+    }
+    return false;
+}
+
+/// Rust `analyze`: check every shader item in file order; the programs go to `out`.
+fn analyze(parsed: &Parsed, ix: &Index, out: &List<ShaderProgram>): Result<bool, Diag> {
+    for fi in 0..parsed.files.len {
+        let f = &parsed.files.items[fi];
+        if f.ast.isScript { continue; }
+        let key = f.ast.moduleKey(parsed.ast);
+        for i in 0..f.ast.items.len {
+            // J3: Rust makes a `Gen` per item; here only the items that use one do (a `Gen` allocates its maps).
+            match f.ast.items.items[i] {
+                Item.Let(l) {
+                    if !l.uniform { continue; }
+                    let g = genNew(ix, Only.Any);
+                    g.uniformTy(&l, key)?;
+                }
+                Item.Struct(s) {
+                    if s.gpu == GpuStruct.None { continue; }
+                    let g = genNew(ix, Only.Any);
+                    g.structTy(key, s.name.name, s.name.span)?;
+                    if s.gpu == GpuStruct.Vertex || s.gpu == GpuStruct.VertexInstance { checkLayout(&g, &s)?; }
+                }
+                Item.Fn(x) {
+                    match x.shader {
+                        Option.Some(_) { checkAlone(ix, key, &x)?; }
+                        Option.None {}
+                    }
+                }
+                Item.Const(c) {
+                    match shaderArgs(ix.ast, &c) {
+                        Option.Some(args) { out.push(program(ix, key, &c, &args)?); }
+                        Option.None {}
+                    }
+                }
+                _ {}
+            }
+        }
+    }
+    return Result.Ok(true);
+}
+
+/// The arguments of `@shader(..)` when that is the const's value.
+fn shaderArgs(ast: &Ast, c: &ConstItem): Option<List<Id<Expr>>> {
+    match ast.expr(c.value) {
+        Expr.Call(call) {
+            match ast.expr(call.func) {
+                Expr.Name(n) {
+                    if ast.str(n.name) == "@shader" { return Option.Some(call.args); }
+                }
+                _ {}
+            }
+        }
+        _ {}
+    }
+    return Option.None;
+}
+
+/// An entry fn and the module that owns it.
+struct EntryFn {
+    key: string;
+    f: &FnItem;
+}
+
+/// `vs` or `mod.vs`, as a shader fn of the stage wanted.
+fn entryFn(ix: &Index, moduleName: string, e: Id<Expr>, stage: GpuStage): Result<EntryFn, Diag> {
+    let sp = ix.ast.exprSpan(e);
+    let qual: Option<Sym> = Option.None;
+    let name = Sym { i: 0 };
+    let ok = false;
+    match ix.ast.expr(e) {
+        Expr.Name(n) {
+            name = n.name;
+            ok = true;
+        }
+        Expr.Field(fe) {
+            match ix.ast.expr(fe.base) {
+                Expr.Name(q) {
+                    qual = Option.Some(q.name);
+                    name = fe.field.name;
+                    ok = true;
+                }
+                _ {}
+            }
+        }
+        _ {}
+    }
+    if !ok { return Result.Err(errAt(ix, sp, "`@shader` takes fn names")); }
+    let nm = ix.names.str(name);
+    let word = "fragment";
+    if stage == GpuStage.Vertex { word = "vertex"; }
+    let Option.Some(owner) = ix.find(moduleName, qual, name, Has.ShaderFn) else {
+        let msg = Text.new(ix.arena).add("`").add(nm).add("` is not a shader fn").str();
+        let help = Text.new(ix.arena).add("write `#[shader(").add(word).add(")]` above it").str();
+        return Result.Err(withHelp(ix, errAt(ix, sp, msg), help));
+    };
+    let f = owner.fns.getPtr(name);
+    let same = false;
+    match f.shader {
+        Option.Some(s) { same = s == stage; }
+        Option.None {}
+    }
+    if !same {
+        let msg = Text.new(ix.arena).add("`").add(nm).add("` is not a ").add(word).add(" shader").str();
+        let help = Text.new(ix.arena).add("`@shader` takes the vertex fn first, then the fragment fn; mark `").add(nm).add("` `#[shader(").add(word).add(")]`").str();
+        return Result.Err(withHelp(ix, errAt(ix, sp, msg), help));
+    }
+    return Result.Ok(EntryFn { key: owner.key, f: f });
+}
+
+/// Rust `program`: the `ShaderProgram` of `const NAME = @shader(vs, fs);`.
+fn program(ix: &Index, moduleName: string, c: &ConstItem, args: &List<Id<Expr>>): Result<ShaderProgram, Diag> {
+    let a = ix.arena;
+    let vsp = ix.ast.exprSpan(c.value);
+    if args.len != 2 {
+        return Result.Err(withHelp(ix, errAt(ix, vsp, "`@shader` takes a vertex fn and a fragment fn"), "`const PROG = @shader(vs, fs);`"));
+    }
+    let v = entryFn(ix, moduleName, args.items[0], GpuStage.Vertex)?;
+    let f = entryFn(ix, moduleName, args.items[1], GpuStage.Fragment)?;
+    let cname = ix.names.str(c.name.name);
+    let title = Text.new(a).add(moduleName).add(".").add(cname).str();
+    let b = pair(ix, v.key, v.f, f.key, f.f, title, vsp)?;
+    let flat = List<u32>.new(a);
+    for i in 0..b.attribs.len {
+        let at = b.attribs.items[i];
+        flat.push(at.loc);
+        flat.push(at.comps);
+        flat.push(at.glType);
+        flat.push(at.offset);
+        flat.push(at.stride);
+        flat.push(at.divisor);
+        if at.isInt { flat.push(1); } else { flat.push(0); }
+        if at.normalized { flat.push(1); } else { flat.push(0); }
+    }
+    return Result.Ok(ShaderProgram { moduleName: moduleName, name: cname, at: ix.at(c.span), vert: b.vert, frag: b.frag, uniforms: b.uniforms,
+        attribs: flat });
+}
+
+/// `let PROG: Source = Source { vert: .., frag: .., uniforms: .., count: n, data: [..] };` (a constant
+/// global, so the text is static data and `PROG` costs nothing at run time). Every node has the const's span.
+fn sourceLet(ast: &Ast, c: &ConstItem, p: &ShaderProgram): ModLetItem {
+    let a = ast.arena;
+    let sp = c.span;
+    let sname = ast.sym("Source");
+    let ty = ast.addType(Type.Named(NamedType { name: sname }), sp);
+    match c.ty {
+        Option.Some(ct) {
+            ty = ct;
+            match ast.ty(ct) {
+                Type.Named(n) { sname = n.name; }
+                _ {}
+            }
+        }
+        Option.None {}
+    }
+    let uniforms = Text.new(a);
+    for i in 0..p.uniforms.len {
+        if i > 0 { uniforms.add(" "); }
+        uniforms.add(p.uniforms.items[i]);
+    }
+    let data = List<Id<Expr>>.new(a);
+    for i in 0..MAX_ATTRIBS * ATTR_INTS {
+        let v: i64 = 0;
+        if i < p.attribs.len { v = i64(p.attribs.items[i]); }
+        data.push(ast.addExpr(Expr.Int(v), sp));
+    }
+    let fields = List<FieldInit>.new(a);
+    fields.push(FieldInit { name: Ident { name: ast.sym("vert"), span: sp }, value: ast.addExpr(Expr.String(p.vert), sp) });
+    fields.push(FieldInit { name: Ident { name: ast.sym("frag"), span: sp }, value: ast.addExpr(Expr.String(p.frag), sp) });
+    fields.push(FieldInit { name: Ident { name: ast.sym("uniforms"), span: sp }, value: ast.addExpr(Expr.String(uniforms.str()), sp) });
+    fields.push(FieldInit { name: Ident { name: ast.sym("count"), span: sp }, value: ast.addExpr(Expr.Int(i64(p.attribs.len / ATTR_INTS)), sp) });
+    fields.push(FieldInit { name: Ident { name: ast.sym("data"), span: sp }, value: ast.addExpr(Expr.ArrayLit(ArrayLitExpr { elems: data }), sp) });
+    let lit = StructLitExpr { name: Ident { name: sname, span: sp }, typeArgs: List<Id<Type>>.new(a), fields: fields };
+    return ModLetItem { span: sp, doc: c.doc, name: c.name, ty: ty, value: Option.Some(ast.addExpr(Expr.StructLit(lit), sp)), thread: false,
+        uniform: false };
+}
+
+/// Rust `gpu::err_at`: an error Diag at `sp`, made but not yet added (`msg` is copied into the arena).
+fn errAt(ix: &Index, sp: Span, msg: string): Diag {
+    return ix.diags.make(0, Severity.Error, sp, own(ix.arena, msg));
 }
 
 // ---- Shared types (Rust check/gpu/ty.rs, index.rs, gen.rs, builtins.rs, emit/glsl/program.rs) ----

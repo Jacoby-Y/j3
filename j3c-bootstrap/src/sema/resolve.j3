@@ -107,16 +107,26 @@ struct TyEnv {
     /// Rust `resolve_type`: no closure types, no generic types (consts, globals, plain enum payloads,
     /// `use lib`). False: Rust `resolve_type_g` (fields and signatures).
     plain: bool;
+    /// An instance body's second module, as index + 1 (0: none): the one whose queue types the body. A
+    /// type name unbound in `m` is looked up there (Rust setup.rs `MergedEnv` `types` / `struct_temps` /
+    /// `enum_temps`: `merge_map(origin, that module)`, origin wins).
+    alt: u32;
 }
 
-fn plainEnv(m: Id<ModDecl>): TyEnv { return TyEnv { m: m, gen: Option.None, selfTy: Option.None, plain: true }; }
+fn plainEnv(m: Id<ModDecl>): TyEnv { return TyEnv { m: m, gen: Option.None, selfTy: Option.None, plain: true, alt: 0 }; }
 
-fn genEnv(m: Id<ModDecl>, gen: Option<Id<Generics>>): TyEnv { return TyEnv { m: m, gen: gen, selfTy: Option.None, plain: false }; }
+fn genEnv(m: Id<ModDecl>, gen: Option<Id<Generics>>): TyEnv { return TyEnv { m: m, gen: gen, selfTy: Option.None, plain: false, alt: 0 }; }
 
 /// Rust `resolve_type` / `resolve_type_g`: the `Ty` an AST type means in module `m`, with `gen` the
 /// generic parameters in scope (None outside a template). Unknown names are a Diag and `Ty.Error`.
 pub fn resolveTy(cx: &SemaCx, m: Id<ModDecl>, gen: Option<Id<Generics>>, t: Id<Type>): Id<Ty> {
+    return resolveTyIn(cx, m, 0, gen, t);
+}
+
+/// `resolveTy` for an instance body: `alt` is `TyEnv.alt` (0: none).
+pub fn resolveTyIn(cx: &SemaCx, m: Id<ModDecl>, alt: u32, gen: Option<Id<Generics>>, t: Id<Type>): Id<Ty> {
     let env = genEnv(m, gen);
+    env.alt = alt;
     match tyOf(cx, env, t) {
         Option.Some(r) { return r; }
         Option.None { return cx.tables.common.error; }
@@ -170,7 +180,7 @@ fn tyOf(cx: &SemaCx, env: TyEnv, id: Id<Type>): Option<Id<Ty>> {
                 if !rejectClosure(cx, cx.ast.typeSpan(g.args.items[i]), a, "a generic type argument") { return Option.None; }
                 args.push(a);
             }
-            let r = instTy(cx, env.m, g.name, args, sp)?;
+            let r = instTy(cx, env, g.name, args, sp)?;
             // Outside a template this is where Rust instantiated the template and reported its errors.
             match env.gen {
                 Option.None {
@@ -212,6 +222,14 @@ fn tyOf(cx: &SemaCx, env: TyEnv, id: Id<Type>): Option<Id<Ty>> {
     return Option.None;
 }
 
+/// `scopeType` in `m`, then in the merged module `alt` (index + 1, 0: none).
+pub fn scopeTypeIn(cx: &SemaCx, m: Id<ModDecl>, alt: u32, name: Sym): Option<DeclRef> {
+    let r = scopeType(cx, m, name);
+    match r { Option.Some(_) { return r; } Option.None {} }
+    if alt != 0 { return scopeType(cx, Id<ModDecl> { i: alt - 1 }, name); }
+    return r;
+}
+
 /// A bare type name: `Self`, a template parameter, a struct or enum in scope, a builtin.
 fn namedTy(cx: &SemaCx, env: TyEnv, name: Sym, sp: Span): Option<Id<Ty>> {
     let t = cx.tables;
@@ -226,7 +244,7 @@ fn namedTy(cx: &SemaCx, env: TyEnv, name: Sym, sp: Span): Option<Id<Ty>> {
         }
         Option.None {}
     }
-    match scopeType(cx, env.m, name) {
+    match scopeTypeIn(cx, env.m, env.alt, name) {
         Option.Some(d) {
             if !isTemplate(cx, d) {
                 if d.kind == DeclKind.Struct { return Option.Some(t.structTy(d.asStruct(), t.items(t.common.none))); }
@@ -239,7 +257,24 @@ fn namedTy(cx: &SemaCx, env: TyEnv, name: Sym, sp: Span): Option<Id<Ty>> {
         }
         Option.None {}
     }
-    match builtinTy(t, s) { Option.Some(b) { return Option.Some(b); } Option.None {} }
+    match builtinTy(t, s) {
+        Option.Some(b) {
+            // Rust resolve.rs:529: the VM has no vector ops and no f16, so a `.j3s` file may not name them
+            // (both vector types say `vec4f`, as Rust does).
+            if !isNone(sp) && endsWith(cx.sources.get(sp.file).path, ".j3s") {
+                if b == t.common.vec4f || b == t.common.vec4i {
+                    failHelp(cx, sp, "vec4f is not supported in scripts yet", "scripts run on the VM; use four `f32` values, or move this code into a `.j3` module");
+                    return Option.None;
+                }
+                if b == t.common.half {
+                    failHelp(cx, sp, "f16 is not supported in scripts yet", "scripts run on the VM; use `f32`, or move this code into a `.j3` module");
+                    return Option.None;
+                }
+            }
+            return Option.Some(b);
+        }
+        Option.None {}
+    }
     if s == "Self" {
         failHelp(cx, sp, "`Self` is only valid inside a `trait` body", "write the type's own name here");
         return Option.None;
@@ -250,9 +285,9 @@ fn namedTy(cx: &SemaCx, env: TyEnv, name: Sym, sp: Span): Option<Id<Ty>> {
 
 /// `Name<args>`: an instance of a struct or enum template (Rust `instantiate_struct`/`_enum`, minus the
 /// instance: B11.2 makes it when a body reaches it).
-fn instTy(cx: &SemaCx, m: Id<ModDecl>, name: Sym, args: List<Id<Ty>>, sp: Span): Option<Id<Ty>> {
+fn instTy(cx: &SemaCx, env: TyEnv, name: Sym, args: List<Id<Ty>>, sp: Span): Option<Id<Ty>> {
     let t = cx.tables;
-    match scopeType(cx, m, name) {
+    match scopeTypeIn(cx, env.m, env.alt, name) {
         Option.Some(d) {
             if isTemplate(cx, d) {
                 let want = 0;

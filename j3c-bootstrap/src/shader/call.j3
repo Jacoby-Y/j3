@@ -1,5 +1,262 @@
-// Calls: builtins, constructors, conversions, shader fns.
+// Calls: `@` builtins, constructors, scalar conversions, shader fns.
 //
 // Part of module j3c.shader.
 // Port of: j3c/src/check/gpu/call.rs
+// J3: Rust's private `user_call`/`builtin_call`/`ctor` are `userCall`/`builtinCall`/`ctor`.
 module j3c.shader;
+
+/// A CPU type name a call tries to convert to.
+fn cpuConvName(n: string): bool {
+    return n == "int" || n == "i64" || n == "u64" || n == "f64" || n == "u8" || n == "i8" || n == "u16" || n == "i16";
+}
+
+extend Gen {
+    fn call(this: &Gen, e: Id<Expr>, func: Id<Expr>, typeArgs: &List<Id<Type>>, args: &List<Id<Expr>>): Result<Val, Diag> {
+        let a = this.ix.arena;
+        let ast = this.ix.ast;
+        let sp = ast.exprSpan(e);
+        if typeArgs.len > 0 {
+            return Result.Err(this.errHelp(ast.typeSpan(typeArgs.items[0]), "shader fns have no type arguments", "shader code has no generics"));
+        }
+        let moduleName = this.cur.moduleName;
+        match ast.expr(func) {
+            Expr.Name(n) {
+                let name = ast.str(n.name);
+                if startsWith(name, "@") { return this.builtinCall(name[1..name.len], args, sp); }
+                match builtinType(name) {
+                    Option.Some(t) {
+                        match t {
+                            GTy.Scalar(b) {
+                                if args.len == 1 { return this.cast(args.items[0], t, sp); }
+                                return Result.Err(this.err(sp, Text.new(a).add("`").add(name).add("(x)` takes one value").str()));
+                            }
+                            GTy.Vec(v) { return this.ctor(t, args, sp); }
+                            GTy.Mat(m) { return this.ctor(t, args, sp); }
+                            _ { return Result.Err(this.err(sp, Text.new(a).add("`").add(name).add("` cannot be built with a constructor").str())); }
+                        }
+                    }
+                    Option.None {}
+                }
+                if cpuConvName(name) {
+                    return Result.Err(this.errHelp(n.span, Text.new(a).add("`").add(name).add("(..)` converts to a type shaders do not have").str(),
+                        "convert to `i32`, `u32` or `f32`"));
+                }
+                return this.userCall(moduleName, Option.None, n.name, Option.None, args, sp);
+            }
+            Expr.Field(f) {
+                match ast.expr(f.base) {
+                    Expr.Name(q) {
+                        let isLocal = false;
+                        match this.local(q.name) { Option.Some(l) { isLocal = true; } Option.None {} }
+                        if !isLocal && this.ix.isAlias(moduleName, q.name) {
+                            return this.userCall(moduleName, Option.Some(q.name), f.field.name, Option.None, args, sp);
+                        }
+                    }
+                    _ {}
+                }
+                // `x.f(..)` is `f(x, ..)` when `f` is a shader fn (UFCS); any other method does not exist
+                match this.ix.find(moduleName, Option.None, f.field.name, Has.ShaderFn) {
+                    Option.Some(m) {}
+                    Option.None {
+                        return Result.Err(this.errHelp(f.field.span,
+                            Text.new(a).add("`.").add(ast.str(f.field.name)).add("(..)` is a method call; shader code has none").str(),
+                            "call a `#[shader]` fn, an `@` builtin, or use a swizzle like `.xy`"));
+                    }
+                }
+                return this.userCall(moduleName, Option.None, f.field.name, Option.Some(f.base), args, sp);
+            }
+            _ { return Result.Err(this.err(ast.exprSpan(func), "only named fns can be called in shader code")); }
+        }
+    }
+
+    /// A call of a `#[shader]` fn (emitted on first use); `recv` is the receiver of `x.f(..)`.
+    fn userCall(this: &Gen, moduleName: string, qual: Option<Sym>, name: Sym, recv: Option<Id<Expr>>, args: &List<Id<Expr>>, sp: Span): Result<Val, Diag> {
+        let a = this.ix.arena;
+        let ast = this.ix.ast;
+        let s = ast.str(name);
+        if this.cur.inConst { return Result.Err(this.err(sp, "a shader `const` initializer cannot call fns")); }
+        let owner: &GMod = match this.ix.find(moduleName, qual, name, Has.ShaderFn) {
+            Option.Some(m) { m }
+            Option.None {
+                match this.ix.find(moduleName, qual, name, Has.CpuFn) {
+                    Option.Some(m) {
+                        return Result.Err(this.errHelp(sp,
+                            Text.new(a).add("`").add(s).add("` is a CPU fn; shader code can call only `#[shader]` fns and `@` builtins").str(),
+                            Text.new(a).add("write `#[shader]` above `fn ").add(s).add("` (it then exists only on the GPU), or inline it").str()));
+                    }
+                    Option.None {}
+                }
+                let names = List<string>.new(a);
+                match this.ix.modOf(moduleName) {
+                    Option.Some(m) {
+                        for i in 0..m.fns.cap {
+                            if m.fns.live(i) { names.push(ast.str(m.fns.keyAt(i))); }
+                        }
+                    }
+                    Option.None {}
+                }
+                sort::<string>(names.slice());
+                return Result.Err(withSuggest(this.e(sp, Text.new(a).add("unknown fn `").add(s).add("` in shader code").str()), s, &names,
+                    "shader code calls `#[shader]` fns, `@` builtins, and constructors like `vec3(..)`", a));
+            }
+        };
+        let f = owner.fns.getPtr(name);
+        match f.shader {
+            Option.Some(st) {
+                if st == GpuStage.Vertex || st == GpuStage.Fragment {
+                    return Result.Err(this.errHelp(sp, Text.new(a).add("`").add(s).add("` is a shader entry and cannot be called").str(),
+                        "move shared code into a plain `#[shader]` fn"));
+                }
+            }
+            Option.None {}
+        }
+        let sig = this.emitFn(owner.key, f, sp)?;
+        let all = List<Id<Expr>>.new(a);
+        match recv { Option.Some(r) { all.push(r); } Option.None {} }
+        all.extend(args.slice());
+        if all.len != sig.params.len {
+            let m = Text.new(a);
+            m.add("`").add(s).add("` takes ");
+            m.pushInt(sig.params.len);
+            m.add(" arguments, found ");
+            m.pushInt(all.len);
+            return Result.Err(this.err(sp, m.str()));
+        }
+        let parts = List<string>.new(a);
+        for i in 0..all.len {
+            let arg = all.items[i];
+            let p = sig.params.items[i];
+            if p.inout {
+                let target = arg;
+                match ast.expr(arg) {
+                    Expr.Unary(u) { if u.op == UnaryOp.Ref { target = u.expr; } }
+                    _ {}
+                }
+                let v = this.place(target)?;
+                if !gtyEq(v.ty, p.ty) {
+                    return Result.Err(this.err(ast.exprSpan(arg), Text.new(a).add("expected ").add(p.ty.name(a)).add(", found ").add(v.ty.name(a)).str()));
+                }
+                parts.push(v.text);
+            } else {
+                let v = this.expr(arg, Option.Some(p.ty))?;
+                parts.push(this.coerce(v, p.ty, ast.exprSpan(arg))?);
+            }
+        }
+        return Result.Ok(Val { text: Text.new(a).add(sig.glsl).add("(").add(joinComma(&parts, a)).add(")").str(), ty: sig.ret });
+    }
+
+    /// `@name(..)`: a row of the builtin table; literals take the type of the first typed argument.
+    fn builtinCall(this: &Gen, name: string, args: &List<Id<Expr>>, sp: Span): Result<Val, Diag> {
+        let a = this.ix.arena;
+        let ast = this.ix.ast;
+        if name == "shader" {
+            return Result.Err(this.errHelp(sp, "`@shader` pairs entries at module level", "write `const PROG = @shader(vs, fs);` outside any fn"));
+        }
+        let b: Builtin = match builtinLookup(name) {
+            Option.Some(x) { x }
+            Option.None {
+                return Result.Err(this.errHelp(sp, Text.new(a).add("`@").add(name).add("` does not exist in shader code").str(),
+                    "the shader builtins are listed by `j3c doc shaders`"));
+            }
+        };
+        if args.len < b.min || args.len > b.max {
+            let m = Text.new(a);
+            m.add("`@").add(name).add("` takes ");
+            m.pushInt(b.min);
+            if b.min != b.max {
+                m.add(" to ");
+                m.pushInt(b.max);
+            }
+            m.add(" arguments, found ");
+            m.pushInt(args.len);
+            return Result.Err(this.err(sp, m.str()));
+        }
+        if b.only != Only.Any && this.stage != Only.Any && b.only != this.stage {
+            let want = "vertex";
+            let have = "fragment";
+            if b.only == Only.Fragment { want = "fragment"; have = "vertex"; }
+            return Result.Err(this.errHelp(sp, Text.new(a).add("`@").add(name).add("` exists only in ").add(want).add(" shaders").str(),
+                Text.new(a).add("this code is reached from a ").add(have).add(" shader").str()));
+        }
+        let vals = List<Val>.new(a);
+        for i in 0..args.len { vals.push(this.expr(args.items[i], Option.None)?); }
+        // literals take the element type of the first typed numeric argument (`@clamp(x, 0, 1)` with x: f32)
+        let lit = gI32();
+        let anchored = false;
+        let anyFloat = false;
+        for i in 0..vals.len {
+            match vals.items[i].ty {
+                GTy.Scalar(s) { if !anchored { lit = vals.items[i].ty; anchored = true; } }
+                GTy.Vec(v) { if !anchored { lit = GTy.Scalar(v.base); anchored = true; } }
+                GTy.Mat(n) { if !anchored { lit = gF32(); anchored = true; } }
+                GTy.LitFloat { anyFloat = true; }
+                _ {}
+            }
+        }
+        if !anchored && anyFloat { lit = gF32(); }
+        let texts = List<string>.new(a);
+        let tys = List<GTy>.new(a);
+        for i in 0..vals.len {
+            let v = vals.items[i];
+            let ty = v.ty;
+            if isLit(v.ty) { ty = lit; }
+            texts.push(this.coerce(v, ty, ast.exprSpan(args.items[i]))?);
+            tys.push(ty);
+        }
+        let res = GTy.Void;
+        match b.result(&tys) {
+            Result.Ok(t) { res = t; }
+            Result.Err(want) {
+                let have = List<string>.new(a);
+                for i in 0..tys.len { have.push(tys.items[i].name(a)); }
+                return Result.Err(this.errHelp(sp, Text.new(a).add("`@").add(name).add("` does not take (").add(joinComma(&have, a)).add(")").str(),
+                    Text.new(a).add("it takes ").add(want).str()));
+            }
+        }
+        match b.rule {
+            Rule.Discard { return Result.Ok(Val { text: "discard", ty: res }); }
+            Rule.FragCoord { return Result.Ok(Val { text: b.glsl, ty: res }); }
+            Rule.VertexId { return Result.Ok(Val { text: b.glsl, ty: res }); }
+            _ { return Result.Ok(Val { text: Text.new(a).add(b.glsl).add("(").add(joinComma(&texts, a)).add(")").str(), ty: res }); }
+        }
+    }
+
+    /// `vec3(1.0, v2)`, `mat4(1.0)`: a scalar splat, or components adding up to the size.
+    fn ctor(this: &Gen, to: GTy, args: &List<Id<Expr>>, sp: Span): Result<Val, Diag> {
+        let a = this.ix.arena;
+        let ast = this.ix.ast;
+        let elem = gF32();
+        let need = 0;
+        match to {
+            GTy.Vec(v) { elem = GTy.Scalar(v.base); need = v.n; }
+            GTy.Mat(n) { need = n * n; }
+            _ {}
+        }
+        if args.len == 0 { return Result.Err(this.err(sp, Text.new(a).add("`").add(to.name(a)).add("(..)` needs arguments").str())); }
+        let parts = List<string>.new(a);
+        let lanes = 0;
+        for i in 0..args.len {
+            let arg = args.items[i];
+            let v = this.expr(arg, Option.None)?;
+            match v.ty.lanes() {
+                Option.Some(n) { lanes += n; }
+                Option.None {
+                    return Result.Err(this.err(ast.exprSpan(arg), Text.new(a).add("cannot build ").add(to.name(a)).add(" from ").add(v.ty.name(a)).str()));
+                }
+            }
+            let ty = v.ty;
+            if isLit(v.ty) { ty = elem; }
+            parts.push(this.coerce(v, ty, ast.exprSpan(arg))?);
+        }
+        let splat = args.len == 1 && lanes == 1;
+        if !splat && lanes != need {
+            let m = Text.new(a);
+            m.add(to.name(a)).add(" needs ");
+            m.pushInt(need);
+            m.add(" components, found ");
+            m.pushInt(lanes);
+            return Result.Err(this.errHelp(sp, m.str(), "give one scalar for all components, or exactly the right count"));
+        }
+        return Result.Ok(Val { text: Text.new(a).add(to.glsl(a)).add("(").add(joinComma(&parts, a)).add(")").str(), ty: to });
+    }
+}

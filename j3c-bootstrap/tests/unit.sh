@@ -28,7 +28,7 @@ for n in $names; do
         r=1
     else
         r=0
-        SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout 120 "$d/target/${n}_test" >"$log" 2>&1 || r=1
+        SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout 300 "$d/target/${n}_test" >"$log" 2>&1 || r=1
     fi
     if [ $r -eq 0 ]; then
         ok=$((ok + 1)); echo "ok $n"

@@ -1,5 +1,348 @@
-// The statement subset, with a fix-it error for everything outside it.
+// The statement subset, with a fix-it error for everything outside it: `defer`, labels, `for x in slice`,
+// enum `match`, `use`.
 //
 // Part of module j3c.shader.
 // Port of: j3c/src/check/gpu/stmt.rs
+// J3: `R<()>` is `Result<bool, Diag>` (always `true`). A `break` / `continue`'s span is the statement's.
 module j3c.shader;
+
+extend Gen {
+    /// A `{ .. }` of its own scope; the braces are the caller's.
+    fn block(this: &Gen, b: &Block): Result<bool, Diag> {
+        this.pushScope();
+        this.depth += 1;
+        let r = this.blockStmts(b);
+        this.depth -= 1;
+        this.popScope();
+        return r;
+    }
+
+    fn blockStmts(this: &Gen, b: &Block): Result<bool, Diag> {
+        for i in 0..b.stmts.len { this.stmt(b.stmts.items[i])?; }
+        return Result.Ok(true);
+    }
+
+    fn cond(this: &Gen, e: Id<Expr>): Result<string, Diag> {
+        let v = this.expr(e, Option.None)?;
+        if !gtyEq(v.ty, gBool()) {
+            let msg = this.t().add("a condition must be bool, found ").add(v.ty.name(this.ix.arena)).str();
+            return Result.Err(this.errHelp(this.ix.ast.exprSpan(e), msg, "compare it: `x != 0.0`"));
+        }
+        return Result.Ok(bare(v.text));
+    }
+
+    fn stmt(this: &Gen, id: Id<Stmt>): Result<bool, Diag> {
+        let a = this.ix.arena;
+        let ast = this.ix.ast;
+        match ast.stmt(id) {
+            Stmt.Let(l) {
+                let want: Option<GTy> = Option.None;
+                match l.ty {
+                    Option.Some(lt) { want = Option.Some(this.tyOf(lt, this.cur.moduleName)?); }
+                    Option.None {}
+                }
+                let v = this.expr(l.value, want)?;
+                let ty = GTy.Void;
+                match want {
+                    Option.Some(w) { ty = w; }
+                    Option.None { ty = v.ty.settle(); }
+                }
+                let holds = true;
+                match ty {
+                    GTy.Void { holds = false; }
+                    GTy.Sampler(_) { holds = false; }
+                    _ {}
+                }
+                if !holds {
+                    return Result.Err(this.err(ast.exprSpan(l.value), this.t().add("a `let` cannot hold ").add(ty.name(a)).str()));
+                }
+                let text = this.coerce(v, ty, ast.exprSpan(l.value))?;
+                let g = this.declare(l.name.name, ty);
+                this.line(this.t().add(ty.glsl(a)).add(" ").add(g).add(" = ").add(bare(text)).add(";").str());
+            }
+            Stmt.Return(r) {
+                let isVoid = false;
+                match this.cur.ret {
+                    GTy.Void { isVoid = true; }
+                    _ {}
+                }
+                match r.value {
+                    Option.None {
+                        if !isVoid {
+                            let msg = this.t().add("this fn returns ").add(this.cur.ret.name(a)).add("; give `return` a value").str();
+                            return Result.Err(this.err(r.span, msg));
+                        }
+                        this.line("return;");
+                    }
+                    Option.Some(rv) {
+                        if isVoid { return Result.Err(this.err(ast.exprSpan(rv), "this fn returns nothing")); }
+                        let rt = this.cur.ret;
+                        let v = this.expr(rv, Option.Some(rt))?;
+                        let text = this.coerce(v, rt, ast.exprSpan(rv))?;
+                        this.line(this.t().add("return ").add(bare(text)).add(";").str());
+                    }
+                }
+            }
+            Stmt.Assign(s) {
+                let p = this.place(s.place)?;
+                let v = this.expr(s.value, Option.Some(p.ty))?;
+                let text = this.coerce(v, p.ty, ast.exprSpan(s.value))?;
+                this.line(this.t().add(p.text).add(" = ").add(bare(text)).add(";").str());
+            }
+            Stmt.AssignOp(s) {
+                let p = this.place(s.place)?;
+                let r = this.expr(s.value, Option.None)?;
+                let out = this.arith(s.op, p, r, s.span)?;
+                if !gtyEq(out.ty, p.ty) {
+                    let msg = this.t().add("`").add(opSym(s.op)).add("=` on ").add(p.ty.name(a)).add(" would make ").add(out.ty.name(a)).str();
+                    return Result.Err(this.err(s.span, msg));
+                }
+                this.line(this.t().add(p.text).add(" ").add(opSym(s.op)).add("= ").add(bare(out.r)).add(";").str());
+            }
+            Stmt.Expr(s) {
+                match ast.expr(s.expr) {
+                    Expr.Call(_) {}
+                    _ { return Result.Err(this.err(ast.exprSpan(s.expr), "this expression does nothing")); }
+                }
+                let v = this.expr(s.expr, Option.None)?;
+                this.line(this.t().add(v.text).add(";").str());
+            }
+            Stmt.If(i) { this.ifStmt(&i, "")?; }
+            Stmt.While(w) {
+                let c = this.cond(w.cond)?;
+                this.line(this.t().add("while (").add(c).add(") {").str());
+                this.cur.ctl.push(true);
+                this.block(&w.body)?;
+                this.cur.ctl.len -= 1;
+                this.line("}");
+            }
+            Stmt.For(f) {
+                let lo = this.expr(f.start, Option.None)?;
+                let hi = this.expr(f.end, Option.None)?;
+                let from = this.rangeBound(lo, ast.exprSpan(f.start))?;
+                let to = this.rangeBound(hi, ast.exprSpan(f.end))?;
+                this.pushScope();
+                let v = this.declare(f.name.name, gI32());
+                let cmp = "<";
+                if f.inclusive { cmp = "<="; }
+                let head = this.t();
+                head.add("for (int ").add(v).add(" = ").add(from).add("; ").add(v).add(" ").add(cmp).add(" ").add(to).add("; ").add(v).add("++) {");
+                this.line(head.str());
+                this.cur.ctl.push(true);
+                this.block(&f.body)?;
+                this.cur.ctl.len -= 1;
+                this.popScope();
+                this.line("}");
+            }
+            Stmt.Match(m) { this.matchStmt(&m)?; }
+            Stmt.Block(b) {
+                this.line("{");
+                this.block(&b)?;
+                this.line("}");
+            }
+            Stmt.Break(j) { this.jump(ast.stmtSpan(id), &j, true)?; }
+            Stmt.Continue(j) { this.jump(ast.stmtSpan(id), &j, false)?; }
+            Stmt.ForEach(f) {
+                return Result.Err(this.errHelp(f.span, "there are no slices or collections in shader code", "count with `for i in 0..N` and index a fixed array"));
+            }
+            Stmt.Defer(d) {
+                return Result.Err(this.errHelp(d.span, "`defer` does not exist in shader code", "write the statements where they should run"));
+            }
+            Stmt.LetPat(l) {
+                return Result.Err(this.errHelp(l.span, "a destructuring `let` does not exist in shader code", "read the fields: `let a = s.a;`"));
+            }
+            Stmt.Labeled(l) { return Result.Err(this.errHelp(l.span, "labels do not exist in GLSL", "restructure with a `bool` flag")); }
+            Stmt.UseLocal(u) { return Result.Err(this.err(u.span, "`use` does not exist in shader code")); }
+        }
+        return Result.Ok(true);
+    }
+
+    /// `break` / `continue` (Rust's shared `Stmt::Break | Stmt::Continue` arm).
+    fn jump(this: &Gen, sp: Span, j: &JumpStmt, isBreak: bool): Result<bool, Diag> {
+        match j.label {
+            Option.Some(_) { return Result.Err(this.errHelp(sp, "labels do not exist in GLSL", "restructure with a `bool` flag")); }
+            Option.None {}
+        }
+        let n = this.cur.ctl.len;
+        if isBreak && n > 0 {
+            if this.cur.ctl.items[n - 1] {
+                this.line("break;");
+                return Result.Ok(true);
+            }
+            return Result.Err(this.errHelp(sp, "`break` inside a `match` would leave the match, not the loop (GLSL `switch`)", "set a flag and `break` after the `match`"));
+        }
+        if !isBreak && this.cur.ctl.contains(true) {
+            this.line("continue;");
+            return Result.Ok(true);
+        }
+        return Result.Err(this.err(sp, "`break` and `continue` belong inside a loop"));
+    }
+
+    fn ifStmt(this: &Gen, i: &IfStmt, lead: string): Result<bool, Diag> {
+        let c = this.cond(i.cond)?;
+        this.line(this.t().add(lead).add("if (").add(c).add(") {").str());
+        this.block(&i.thenBlock)?;
+        match i.elseBlock {
+            Option.None { this.line("}"); }
+            Option.Some(b) {
+                if b.stmts.len == 1 {
+                    match this.ix.ast.stmt(b.stmts.items[0]) {
+                        Stmt.If(n) {
+                            this.ifStmt(&n, "} else ")?;
+                            return Result.Ok(true);
+                        }
+                        _ {}
+                    }
+                }
+                this.line("} else {");
+                this.block(&b)?;
+                this.line("}");
+            }
+        }
+        return Result.Ok(true);
+    }
+
+    /// A `for` bound is an `i32` (a bare literal takes that type).
+    fn rangeBound(this: &Gen, v: Val, sp: Span): Result<string, Diag> {
+        let ok = false;
+        match v.ty {
+            GTy.Scalar(b) { ok = b == Base.I; }
+            GTy.LitInt { ok = true; }
+            _ {}
+        }
+        if !ok {
+            let msg = this.t().add("a range bound is i32 in shader code, found ").add(v.ty.name(this.ix.arena)).str();
+            return Result.Err(this.errHelp(sp, msg, "convert it: `n as i32`"));
+        }
+        return Result.Ok(v.text);
+    }
+
+    fn matchStmt(this: &Gen, m: &MatchStmt): Result<bool, Diag> {
+        let a = this.ix.arena;
+        let ast = this.ix.ast;
+        let sv = this.expr(m.expr, Option.None)?;
+        let sty = sv.ty.settle();
+        let isInt = false;
+        let isU = false;
+        match sty {
+            GTy.Scalar(b) {
+                isInt = b == Base.I || b == Base.U;
+                isU = b == Base.U;
+            }
+            _ {}
+        }
+        if !isInt {
+            let msg = this.t().add("shader `match` is on an i32 or u32, found ").add(sty.name(a)).str();
+            return Result.Err(this.errHelp(ast.exprSpan(m.expr), msg, "enum and struct patterns do not exist in shader code; use `if`"));
+        }
+        this.line(this.t().add("switch (").add(sv.text).add(") {").str());
+        this.cur.ctl.push(false);
+        let seen = List<i64>.new(a);
+        let hasDefault = false;
+        for ai in 0..m.arms.len {
+            let arm = m.arms.items[ai];
+            match arm.guard {
+                Option.Some(g) { return Result.Err(this.errHelp(ast.exprSpan(g), "a shader `match` arm has no guard", "use `if` inside the arm")); }
+                Option.None {}
+            }
+            let head = this.t();
+            for pi in 0..arm.pats.len {
+                let pid = arm.pats.items[pi];
+                if pi > 0 { head.add(" "); }
+                match ast.pat(pid) {
+                    Pat.Lit(lp) {
+                        let vsp = ast.exprSpan(lp.expr);
+                        let Option.Some(n) = litValue(ast, lp.expr) else { return Result.Err(this.e(vsp, "a `match` arm is an integer literal")); };
+                        if seen.contains(n) {
+                            let msg = this.t();
+                            msg.add("duplicate arm `");
+                            msg.pushInt(n);
+                            return Result.Err(this.err(vsp, msg.add("`").str()));
+                        }
+                        if isU && n < 0 { return Result.Err(this.err(vsp, "a u32 `match` has no negative arms")); }
+                        seen.push(n);
+                        head.add("case ");
+                        head.pushInt(n);
+                        if isU { head.add("u"); }
+                        head.add(":");
+                    }
+                    Pat.Wild {
+                        if hasDefault { return Result.Err(this.err(arm.span, "a second `_` arm")); }
+                        hasDefault = true;
+                        head.add("default:");
+                    }
+                    Pat.Variant(_) {
+                        return Result.Err(this.errHelp(ast.patSpan(pid), "enum patterns do not exist in shader code", "`match` on an i32 with integer arms and `_`"));
+                    }
+                    _ {
+                        return Result.Err(this.errHelp(ast.patSpan(pid), "shader `match` arms are integer literals and `_`", "`match` on an i32 with integer arms and `_`"));
+                    }
+                }
+            }
+            this.depth += 1;
+            this.line(head.add(" {").str());
+            this.block(&arm.body)?;
+            match arm.tail {
+                Option.Some(tl) { return Result.Err(this.errHelp(ast.exprSpan(tl), "a shader `match` arm has no value", "end the expression with `;`")); }
+                Option.None {}
+            }
+            this.depth += 1;
+            this.line("break;");
+            this.depth -= 1;
+            this.line("}");
+            this.depth -= 1;
+        }
+        this.cur.ctl.len -= 1;
+        if !hasDefault { return Result.Err(this.errHelp(m.span, "a shader `match` needs a `_` arm", "add `_ { }`")); }
+        this.line("}");
+        return Result.Ok(true);
+    }
+
+    /// An assignable place: a local, or a field or index of one.
+    fn place(this: &Gen, e: Id<Expr>): Result<Val, Diag> {
+        let ast = this.ix.ast;
+        let root = e;
+        while true {
+            match ast.expr(root) {
+                Expr.Field(f) { root = f.base; }
+                Expr.Index(ix) { root = ix.base; }
+                Expr.Unary(u) {
+                    if u.op != UnaryOp.Deref { break; }
+                    root = u.expr;
+                }
+                _ { break; }
+            }
+        }
+        match ast.expr(root) {
+            Expr.Name(n) {
+                match this.local(n.name) {
+                    Option.Some(_) {}
+                    Option.None {
+                        let msg = this.t().add("`").add(this.str(n.name)).add("` is not a local and cannot be assigned").str();
+                        return Result.Err(this.errHelp(n.span, msg, "uniforms and consts are read-only in shader code; copy it with `let`"));
+                    }
+                }
+            }
+            _ { return Result.Err(this.err(ast.exprSpan(e), "this cannot be assigned to")); }
+        }
+        let r = this.expr(e, Option.None)?;
+        swizzleAssignCheck(this, e, r.ty)?;
+        return Result.Ok(r);
+    }
+}
+
+/// `3` or `-3` as a number.
+fn litValue(ast: &Ast, e: Id<Expr>): Option<i64> {
+    match ast.expr(e) {
+        Expr.Int(v) { return Option.Some(v); }
+        Expr.Char(v) { return Option.Some(i64(v)); }
+        Expr.Unary(u) {
+            if u.op != UnaryOp.Neg { return Option.None; }
+            match litValue(ast, u.expr) {
+                Option.Some(v) { return Option.Some(-v); }
+                Option.None { return Option.None; }
+            }
+        }
+        _ { return Option.None; }
+    }
+}

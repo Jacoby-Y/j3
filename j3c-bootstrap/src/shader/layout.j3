@@ -1,5 +1,199 @@
-// `#[vertex]` structs: CPU field types as GPU attributes, layout match checks.
+// `#[vertex]` structs: the CPU field types the shader sees as GPU types, and the check that the struct's
+// real (C) layout is the tightly packed one a vertex buffer attribute list describes.
 //
 // Part of module j3c.shader.
 // Port of: j3c/src/check/gpu/layout.rs
+// J3: `MAX_ATTRIBS` is in `shader.j3`. `VAttr` keeps Rust's fields; `prepare` flattens it to `ATTR_INTS`
+// u32s per attribute.
 module j3c.shader;
+
+/// What a CPU field type is on the GPU.
+struct CpuTy {
+    gpu: GTy;
+    size: u32;
+    align: u32;
+    /// Components per attribute location (a `mat4` is four locations of 4).
+    comps: u32;
+    locs: u32;
+    glType: u32;
+    isInt: bool;
+    /// Fixed-point bytes read as 0..1 floats (`Rgba8`).
+    normalized: bool;
+}
+
+const GL_INT: u32 = 0x1404;
+const GL_UNSIGNED_INT: u32 = 0x1405;
+const GL_UNSIGNED_BYTE: u32 = 0x1401;
+const GL_FLOAT: u32 = 0x1406;
+
+fn cpuTyOf(gpu: GTy, size: u32, align: u32, comps: u32, locs: u32, glType: u32, isInt: bool): CpuTy {
+    return CpuTy { gpu: gpu, size: size, align: align, comps: comps, locs: locs, glType: glType, isInt: isInt, normalized: false };
+}
+
+fn fvecTy(n: int): GTy { return GTy.Vec(GVec { base: Base.F, n: n }); }
+
+/// Rust `cpu_ty`: the `#[vertex]` field types by name.
+fn cpuTy(word: string): Option<CpuTy> {
+    match word {
+        "f32" { return Option.Some(cpuTyOf(gF32(), 4, 4, 1, 1, GL_FLOAT, false)); }
+        "i32" { return Option.Some(cpuTyOf(gI32(), 4, 4, 1, 1, GL_INT, true)); }
+        "u32" { return Option.Some(cpuTyOf(gU32(), 4, 4, 1, 1, GL_UNSIGNED_INT, true)); }
+        "Vec2" { return Option.Some(cpuTyOf(fvecTy(2), 8, 4, 2, 1, GL_FLOAT, false)); }
+        "Vec3" { return Option.Some(cpuTyOf(fvecTy(3), 12, 4, 3, 1, GL_FLOAT, false)); }
+        "vec4f" { return Option.Some(cpuTyOf(fvecTy(4), 16, 16, 4, 1, GL_FLOAT, false)); }
+        "Mat4" { return Option.Some(cpuTyOf(GTy.Mat(4), 64, 4, 4, 4, GL_FLOAT, false)); }
+        // four bytes, the shader sees a vec4 of 0..1
+        "Rgba8" {
+            let c = cpuTyOf(fvecTy(4), 4, 1, 4, 1, GL_UNSIGNED_BYTE, false);
+            c.normalized = true;
+            return Option.Some(c);
+        }
+        _ { return Option.None; }
+    }
+}
+
+fn fieldTy(g: &Gen, f: &FieldItem): Result<CpuTy, Diag> {
+    let small = false;
+    match g.ix.ast.ty(f.ty) {
+        Type.Named(n) {
+            let word = g.str(n.name);
+            match cpuTy(word) {
+                Option.Some(c) { return Result.Ok(c); }
+                Option.None {}
+            }
+            small = word == "u8" || word == "i8" || word == "u16" || word == "i16";
+        }
+        _ {}
+    }
+    let help = g.t();
+    help.add("those have a GPU twin (float, int, uint, vec2, vec3, vec4, mat4; `Rgba8` is four bytes read as a 0..1 vec4)");
+    if small { help.add("; for padding use an f32 or Vec2 `_pad` field, not a small integer"); }
+    return Result.Err(g.errHelp(g.ix.ast.typeSpan(f.ty), "a `#[vertex]` field is f32, i32, u32, Vec2, Vec3, vec4f, Mat4 or Rgba8", help.str()));
+}
+
+/// The GPU type of a `#[vertex]` struct field.
+fn cpuToGpu(g: &Gen, f: &FieldItem): Result<GTy, Diag> {
+    let c = fieldTy(g, f)?;
+    return Result.Ok(c.gpu);
+}
+
+fn alignUp(v: u32, a: u32): u32 { return (v + a - 1) / a * a; }
+
+/// The bytes of padding a `_pad` field would need, as the type to write.
+fn padWord(g: &Gen, bytes: u32): string {
+    if bytes == 4 { return "`_pad: f32`"; }
+    if bytes == 8 { return "`_pad: Vec2`"; }
+    if bytes == 12 { return "`_pad: Vec3`"; }
+    let t = g.t();
+    t.add("`_pad` fields totalling ");
+    t.pushU64(u64(bytes));
+    return t.add(" bytes").str();
+}
+
+fn isPadField(g: &Gen, f: &FieldItem): bool {
+    let fname = g.str(f.name.name);
+    return fname.len > 0 && fname[0] == '_';
+}
+
+/// CPU offsets must equal the packed offsets, field by field and in total.
+fn checkLayout(g: &Gen, s: &StructItem): Result<bool, Diag> {
+    let cpu: u32 = 0;
+    let packed: u32 = 0;
+    let maxAlign: u32 = 1;
+    let sname = g.str(s.name.name);
+    for i in 0..s.fields.len {
+        let f = s.fields.items[i];
+        let c = fieldTy(g, &f)?;
+        let at = alignUp(cpu, c.align);
+        if at != packed {
+            let msg = g.t();
+            msg.add("`").add(sname).add(".").add(g.str(f.name.name)).add("` is at byte ");
+            msg.pushU64(u64(at));
+            msg.add(" in the CPU struct but vertex data is packed, so the shader reads it at byte ");
+            msg.pushU64(u64(packed));
+            let help = g.t().add("insert ").add(padWord(g, at - packed)).add(" before it, or put the `vec4f` fields first").str();
+            return Result.Err(g.errHelp(f.name.span, msg.str(), help));
+        }
+        cpu = at + c.size;
+        packed += c.size;
+        if c.align > maxAlign { maxAlign = c.align; }
+    }
+    let size = alignUp(cpu, maxAlign);
+    if size != packed {
+        let msg = g.t();
+        msg.add("`").add(sname).add("` is ");
+        msg.pushU64(u64(size));
+        msg.add(" bytes on the CPU (aligned to ");
+        msg.pushU64(u64(maxAlign));
+        msg.add(") but its vertex stride is ");
+        msg.pushU64(u64(packed));
+        let help = g.t().add("add ").add(padWord(g, size - packed)).add(" at the end").str();
+        return Result.Err(g.errHelp(s.name.span, msg.str(), help));
+    }
+    return Result.Ok(true);
+}
+
+/// The field of `s` whose attribute location (counting from `first`) passes the limit is the error.
+fn checkLimit(g: &Gen, s: &StructItem, first: u32): Result<bool, Diag> {
+    let loc = first;
+    let max = u32(MAX_ATTRIBS);
+    for i in 0..s.fields.len {
+        let f = s.fields.items[i];
+        let c = fieldTy(g, &f)?;
+        if isPadField(g, &f) { continue; }
+        loc += c.locs;
+        if loc > max {
+            let msg = g.t();
+            msg.add("`").add(g.str(s.name.name)).add(".").add(g.str(f.name.name)).add("` needs attribute location ");
+            msg.pushU64(u64(loc - 1));
+            msg.add(", past the limit of ");
+            msg.pushU64(u64(max));
+            let help = g.t();
+            help.add("a program has at most ");
+            help.pushU64(u64(max));
+            help.add(" vertex attribute locations (a Mat4 takes 4); drop or pack fields");
+            return Result.Err(g.errHelp(f.name.span, msg.str(), help.str()));
+        }
+    }
+    return Result.Ok(true);
+}
+
+/// One vertex attribute location (Rust `VAttr`).
+struct VAttr {
+    loc: u32;
+    comps: u32;
+    glType: u32;
+    offset: u32;
+    stride: u32;
+    divisor: u32;
+    isInt: bool;
+    normalized: bool;
+}
+
+/// One attribute per location, from `first`; `_`-named pad fields take bytes but no location.
+fn attribs(g: &Gen, s: &StructItem, first: u32, divisor: u32): Result<List<VAttr>, Diag> {
+    let out = List<VAttr>.new(g.ix.arena);
+    let all = List<CpuTy>.new(g.ix.arena);
+    let stride: u32 = 0;
+    for i in 0..s.fields.len {
+        let f = s.fields.items[i];
+        let c = fieldTy(g, &f)?;
+        stride += c.size;
+        all.push(c);
+    }
+    let off: u32 = 0;
+    let loc = first;
+    for i in 0..s.fields.len {
+        let f = s.fields.items[i];
+        let c = all.items[i];
+        if !isPadField(g, &f) {
+            for k in 0..int(c.locs) {
+                out.push(VAttr { loc: loc, comps: c.comps, glType: c.glType, offset: off + u32(k) * 16, stride: stride, divisor: divisor,
+                    isInt: c.isInt, normalized: c.normalized });
+                loc += 1;
+            }
+        }
+        off += c.size;
+    }
+    return Result.Ok(out);
+}
