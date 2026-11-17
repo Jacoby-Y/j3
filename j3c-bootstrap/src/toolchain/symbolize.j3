@@ -3,3 +3,201 @@
 // Part of module j3c.toolchain.
 // Port of: j3c/src/emit/host/symbolize.rs
 module j3c.toolchain;
+// J3: `nm` and `addr2line` run through `j3.proc` (found on PATH, as Rust's `Command`).
+
+/// Rust `symbolize`: rewrite the crash handler's `j3 crash:` / `j3 pc:` / `j3 at:` lines of `stderr` into
+/// `function at file:line` of `exe`; a failed check's walk (`j3 base:` + `j3 at:`, no `j3 crash:`) becomes a
+/// `called from` list. None when there are neither, so ordinary stderr passes through untouched.
+pub fn symbolize(exe: string, stderr: string, arena: &Arena): Option<string> {
+    let sig = -1;
+    let base: Option<u64> = Option.None;
+    let addrs = List<u64>.new(arena);
+    let out = Text.new(arena);
+    let it = lines(stderr);
+    while true {
+        let line = match it.next() { Option.Some(l) { l } Option.None { break; } };
+        if startsWith(line, "j3 crash: signal ") {
+            match parseInt(trim(line[17..line.len]), 10) { Option.Some(n) { sig = n; } Option.None {} }
+        } else if startsWith(line, "j3 base: ") {
+            base = hex(line[9..line.len]);
+        } else if startsWith(line, "j3 pc: ") || startsWith(line, "j3 at: ") {
+            match hex(line[7..line.len]) { Option.Some(a) { addrs.push(a); } Option.None {} }
+        } else {
+            out.add(line).push('\n');
+        }
+    }
+    if sig < 0 && addrs.len == 0 { return Option.None; }
+    let names: Option<List<string>> = Option.None;
+    match base { Option.Some(b) { names = addrNames(exe, b, addrs.slice(), sig >= 0, arena); } Option.None {} }
+    // folded runs of one frame (text, count); stop at the runtime's own entry frames
+    let runs = List<string>.new(arena);
+    let counts = List<int>.new(arena);
+    for i in 0..addrs.len {
+        let t = "";
+        match names {
+            Option.Some(n) { t = n.items[i]; }
+            Option.None {
+                let h = Text.new(arena);
+                h.add("0x").pushHex(addrs.items[i]);
+                t = h.str();
+            }
+        }
+        if startsWith(t, "j3.sys.start ") || startsWith(t, "main at ") || startsWith(t, "?? ") { break; }
+        if runs.len > 0 && runs.items[runs.len - 1] == t {
+            counts.items[counts.len - 1] += 1;
+        } else {
+            runs.push(t);
+            counts.push(1);
+        }
+    }
+    if sig >= 0 {
+        // ponytail: heuristic (the walk stops at 32 frames), as Rust; the exact test is the fault address
+        let deep = -1;
+        for i in 0..runs.len { if counts.items[i] >= 16 { deep = i; break; } }
+        if deep >= 0 && sig == 11 {
+            let f = runs.items[deep];
+            let at = find(f, " at ");
+            let name = if at >= 0 { f[0..at] } else { f };
+            out.add("crash: stack overflow (SIGSEGV): endless recursion in `").add(name).add("`?\n");
+        } else {
+            out.add("crash: ").add(signalName(sig)).add(" (");
+            out.pushInt(sig);
+            out.add(")\n");
+        }
+    } else {
+        out.add("called from:\n");
+    }
+    for i in 0..runs.len {
+        out.add("  ").add(runs.items[i]);
+        if counts.items[i] > 1 {
+            out.add("  (x");
+            out.pushInt(counts.items[i]);
+            out.add(")");
+        }
+        out.push('\n');
+    }
+    return Option.Some(out.str());
+}
+
+fn signalName(n: int): string {
+    if n == 4 { return "SIGILL"; }
+    if n == 6 { return "SIGABRT"; }
+    if n == 7 { return "SIGBUS"; }
+    if n == 8 { return "SIGFPE"; }
+    if n == 11 { return "SIGSEGV"; }
+    return "signal";
+}
+
+/// Rust `hex`: trimmed, any `0x` prefixes dropped, base 16.
+fn hex(s: string): Option<u64> {
+    let t = trim(s);
+    while startsWith(t, "0x") { t = t[2..t.len]; }
+    return parseU64(t, 16);
+}
+
+/// Rust `addr_names`: `function at file:line` for each runtime address via `nm` (the load offset from
+/// `main`) and `addr2line`. Return addresses (all but a crash's first, the faulting pc) step back a byte.
+fn addrNames(exe: string, runtimeMain: u64, addrs: []u64, firstIsPc: bool, arena: &Arena): Option<List<string>> {
+    let nmArgv: [2]string = ["nm", exe];
+    let nm = match proc.run(nmArgv, "", arena) { Result.Ok(o) { o } Result.Err(_) { return Option.None; } };
+    let staticMain: Option<u64> = Option.None;
+    let it = lines(nm.outStr());
+    while true {
+        let l = match it.next() { Option.Some(x) { x } Option.None { break; } };
+        let ws = split(l, " ");
+        let toks = List<string>.new(arena);
+        while true {
+            match ws.next() { Option.Some(w) { if w.len > 0 { toks.push(w); } } Option.None { break; } }
+        }
+        if toks.len >= 3 && toks.items[2] == "main" && (toks.items[1] == "t" || toks.items[1] == "T") {
+            staticMain = hex(toks.items[0]);
+            break;
+        }
+    }
+    let sm = match staticMain { Option.Some(v) { v } Option.None { return Option.None; } };
+    let offset = runtimeMain - sm;
+    let argv = List<string>.new(arena);
+    argv.push("addr2line");
+    argv.push("-f");
+    argv.push("-C");
+    argv.push("-p");
+    argv.push("-e");
+    argv.push(exe);
+    for i in 0..addrs.len {
+        let back: u64 = if i > 0 || !firstIsPc { 1 } else { 0 };
+        let t = Text.new(arena);
+        t.add("0x").pushHex(addrs[i] - offset - back);
+        argv.push(t.str());
+    }
+    let o = match proc.run(argv.slice(), "", arena) { Result.Ok(x) { x } Result.Err(_) { return Option.None; } };
+    let names = List<string>.new(arena);
+    let ol = lines(o.outStr());
+    while true {
+        match ol.next() { Option.Some(x) { names.push(x); } Option.None { break; } }
+    }
+    if names.len != addrs.len { return Option.None; }
+    return Option.Some(names);
+}
+
+/// Rust `abort_context`: a failed runtime check's `/abs/path/file.j3:85: reason` line with the path made
+/// relative to `root` and the source lines around it (`>` marks the failing one). None when `line` is not
+/// one, or the file can't be read.
+pub fn abortContext(line: string, root: string, arena: &Arena): Option<string> {
+    let body = line;
+    if startsWith(body, "runtime check failed: ") { body = body[22..body.len]; }
+    let sep = find(body, ": ");
+    if sep < 0 { return Option.None; }
+    let head = body[0..sep];
+    let reason = body[sep + 2..body.len];
+    let colon = lastIndexOf(head, ":");
+    if colon < 0 { return Option.None; }
+    let file = head[0..colon];
+    let num = 0;
+    match parseInt(head[colon + 1..head.len], 10) {
+        Option.Some(n) { num = n; }
+        Option.None { return Option.None; }
+    }
+    if !(endsWith(file, ".j3") || endsWith(file, ".j3s")) || num <= 0 { return Option.None; }
+    let full = if path.isAbs(file) { file } else { path.join(root, file, arena) };
+    let src = "";
+    match fsx.readText(full, arena) {
+        Result.Ok(t) { src = t; }
+        Result.Err(_) { return Option.None; }
+    }
+    let shown = file;
+    if root.len > 0 && startsWith(file, root) && file.len > root.len && file[root.len] == '/' {
+        shown = file[root.len + 1..file.len];
+    }
+    // Rust `str::lines`: split on `\n`, drop one `\r` before it, no empty last line.
+    let ls = List<string>.new(arena);
+    let it = lines(src);
+    while true {
+        match it.next() {
+            Option.Some(l) { ls.push(l); }
+            Option.None { break; }
+        }
+    }
+    if num > ls.len { return Option.None; }
+    let width = intWidth(num + 1, arena);
+    let t = Text.new(arena);
+    t.add(shown).add(":");
+    t.pushInt(num);
+    t.add(": ").add(reason);
+    let lo = if num - 1 < 1 { 1 } else { num - 1 };
+    let hi = if num + 1 < ls.len { num + 1 } else { ls.len };
+    for n in lo..hi + 1 {
+        t.push('\n');
+        t.push(if n == num { '>' } else { ' ' });
+        t.push(' ');
+        for _ in intWidth(n, arena)..width { t.push(' '); }
+        t.pushInt(n);
+        t.add(" | ").add(ls.items[n - 1]);
+    }
+    return Option.Some(t.str());
+}
+
+fn intWidth(n: int, arena: &Arena): int {
+    let t = Text.new(arena);
+    t.pushInt(n);
+    return t.len();
+}

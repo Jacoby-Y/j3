@@ -1,0 +1,149 @@
+// Fat pointers: `dyn Trait` is an ordinary struct `{ $data: ptr, $vt: ptr }`, one per trait; `$vt` points
+// at a method table, a struct of `fn(ptr, P..): R` fields then one `$up.Trait: fn(): ptr` per supertrait,
+// with one table global per (type, trait) for the whole program.
+//
+// Part of module j3c.ir.
+// Port of: j3c/src/ir/dyn_ty.rs
+// J3: IR does not see sema, so a trait is named here by an opaque `u32` (`lower` passes the sema
+// `TraitDecl` index) plus the strings Rust's names need (`short` name, module path, the `module::Name`
+// key in `$up.<key>`). Which slots a table has is sema's (`DynLayout`); these tables keep IR identity:
+// one fat struct and one table struct per trait, one global per (type, trait), and the "made since"
+// lists the module lists are fed from.
+module j3c.ir;
+
+/// One method of a `dyn` trait: its name and its table entry type `fn(ptr, P..): R` (Rust `DynSlot`;
+/// `from` is sema's, not needed here).
+pub struct DynSlot {
+    name: Sym;
+    fnTy: Id<TyKind>;
+}
+
+/// A trait's fat-pointer struct and, once made, its table struct (0 = none yet, else type id + 1).
+pub struct DynTrait {
+    traitId: u32;
+    fat: Id<TyKind>;
+    fatStruct: Id<StructDef>;
+    table: u32;
+}
+
+/// Rust `DynTables`.
+pub struct DynTables {
+    traits: List<DynTrait>;
+    /// The table global of each (type, trait), by `dynVtableKey`.
+    vtables: Map<u64, u32>;
+    /// Structs made since the last `takeNewDynStructs`.
+    fresh: List<Id<StructDef>>;
+    /// Table globals made since the last `takeNewVtables`.
+    freshGlobals: List<Id<GlobalDef>>;
+}
+
+/// Empty tables (`IrCx.new`).
+pub fn dynTablesNew(arena: &Arena): DynTables {
+    return DynTables { traits: List<DynTrait>.new(arena), vtables: Map<u64, u32>.new(arena, 16), fresh: List<Id<StructDef>>.new(arena),
+        freshGlobals: List<Id<GlobalDef>>.new(arena) };
+}
+
+fn dynVtableKey(ty: Id<TyKind>, traitId: u32): u64 { return (u64(ty.i) << 32) | u64(traitId); }
+
+extend IrCx {
+    fn dynPlainField(this: &IrCx, name: string, ty: Id<TyKind>): FieldDef {
+        return FieldDef { name: this.internName(name), doc: "", ty: ty, embedded: false, default: Option.None };
+    }
+
+    /// Rust `anon_struct`: a struct of module `moduleName` with a dummy span, noted as fresh.
+    fn dynAnonStruct(this: &IrCx, name: string, moduleName: List<Sym>, fields: List<FieldDef>): Id<StructDef> {
+        let id = this.allocStruct(StructDef { moduleName: moduleName, name: this.internName(name), doc: "", fields: fields, packed: false,
+            debug: false, span: noSpan(), tyArgs: List<TyArg>.new(this.arena), script: Option.None });
+        this.dyns.fresh.push(id);
+        return id;
+    }
+
+    fn dynIndex(this: &IrCx, traitId: u32): int {
+        for i in 0..this.dyns.traits.len { if this.dyns.traits.items[i].traitId == traitId { return i; } }
+        return -1;
+    }
+
+    /// Rust `dyn_ty`: `dyn Short` for trait `traitId`, a `{ $data: ptr, $vt: ptr }` struct of module
+    /// `moduleName` (the trait's), dummy span; one per trait.
+    fn dynTy(this: &IrCx, traitId: u32, short: string, moduleName: List<Sym>): Id<TyKind> {
+        let at = this.dynIndex(traitId);
+        if at >= 0 { return this.dyns.traits.items[at].fat; }
+        let ptr = this.common.ptr;
+        let fields = List<FieldDef>.new(this.arena);
+        fields.push(this.dynPlainField("$data", ptr));
+        fields.push(this.dynPlainField("$vt", ptr));
+        let n = Text.new(this.arena).add("dyn ").add(short);
+        let id = this.dynAnonStruct(n.str(), moduleName, fields);
+        let ty = this.tyStruct(id);
+        this.dyns.traits.push(DynTrait { traitId: traitId, fat: ty, fatStruct: id, table: 0 });
+        return ty;
+    }
+
+    /// Rust `dyn_trait`: the trait when `ty` is a `dyn Trait`.
+    fn dynTrait(this: &IrCx, ty: Id<TyKind>): Option<u32> {
+        match this.tyKind(ty) {
+            TyKind.Struct(s) {
+                for i in 0..this.dyns.traits.len {
+                    if this.dyns.traits.items[i].fatStruct == s.id { return Option.Some(this.dyns.traits.items[i].traitId); }
+                }
+            }
+            _ {}
+        }
+        return Option.None;
+    }
+
+    /// Rust `dyn_table_struct` (made once per trait): `vtable Short`, field `i` is `slots[i]`, then one
+    /// `$up.<key>: fn(): ptr` per entry of `upKeys` (the supertraits' `module::Name` keys).
+    fn dynTableStruct(this: &IrCx, traitId: u32, short: string, moduleName: List<Sym>, slots: &List<DynSlot>, upKeys: &List<string>): Id<TyKind> {
+        match this.dynTable(traitId) { Option.Some(t) { return t; } Option.None {} }
+        // Rust has the fat struct since `dyn_types`; a table is never made before it.
+        this.dynTy(traitId, short, moduleName);
+        let fields = List<FieldDef>.new(this.arena);
+        for i in 0..slots.len { fields.push(FieldDef { name: slots.items[i].name, doc: "", ty: slots.items[i].fnTy, embedded: false, default: Option.None }); }
+        let upTy = this.dynUpFnTy();
+        for i in 0..upKeys.len { fields.push(this.dynPlainField(Text.new(this.arena).add("$up.").add(upKeys.items[i]).str(), upTy)); }
+        let n = Text.new(this.arena).add("vtable ").add(short);
+        let ty = this.tyStruct(this.dynAnonStruct(n.str(), moduleName, fields));
+        this.dyns.traits.items[this.dynIndex(traitId)].table = ty.i + 1;
+        return ty;
+    }
+
+    /// The table struct of `traitId`, when `dynTableStruct` has made it.
+    fn dynTable(this: &IrCx, traitId: u32): Option<Id<TyKind>> {
+        let at = this.dynIndex(traitId);
+        if at < 0 || this.dyns.traits.items[at].table == 0 { return Option.None; }
+        return Option.Some(Id<TyKind> { i: this.dyns.traits.items[at].table - 1 });
+    }
+
+    /// Rust `dyn_up_fn_ty`: `fn(): ptr`.
+    fn dynUpFnTy(this: &IrCx): Id<TyKind> { return this.tyFn(List<Id<TyKind>>.new(this.arena), this.common.ptr); }
+
+    /// Rust `dyns.vtables.get`: the table global of (`ty`, `traitId`), when made.
+    fn dynVtable(this: &IrCx, ty: Id<TyKind>, traitId: u32): Option<Id<GlobalDef>> {
+        match this.dyns.vtables.get(dynVtableKey(ty, traitId)) {
+            Option.Some(g) { return Option.Some(Id<GlobalDef> { i: g }); }
+            Option.None {}
+        }
+        return Option.None;
+    }
+
+    /// Rust `dyns.vtables.insert` + `note_vtable`: records global `g` as the table of (`ty`, `traitId`).
+    fn noteVtable(this: &IrCx, ty: Id<TyKind>, traitId: u32, g: Id<GlobalDef>) {
+        this.dyns.vtables.put(dynVtableKey(ty, traitId), g.i);
+        this.dyns.freshGlobals.push(g);
+    }
+
+    /// Rust `take_new_dyn_structs`: fat-pointer and table structs made since the last call.
+    fn takeNewDynStructs(this: &IrCx): List<Id<StructDef>> {
+        let out = this.dyns.fresh;
+        this.dyns.fresh = List<Id<StructDef>>.new(this.arena);
+        return out;
+    }
+
+    /// Rust `take_new_vtables`: table globals made since the last call.
+    fn takeNewVtables(this: &IrCx): List<Id<GlobalDef>> {
+        let out = this.dyns.freshGlobals;
+        this.dyns.freshGlobals = List<Id<GlobalDef>>.new(this.arena);
+        return out;
+    }
+}

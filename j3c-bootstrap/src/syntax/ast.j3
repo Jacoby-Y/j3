@@ -6,4 +6,506 @@
 // J3: Plain enums with `Id<Expr>` children instead of `Box`. Adding syntax (plan 11 B7): a new variant here
 // must fail to compile in every exhaustive match over it (`walk`, `fmt`, `sema`, LSP, textmate, script VM
 // and shader rejections) until each handles it; the file list is in `j3c-bootstrap/AGENTS.md`.
+// J3: Storage rule (`.swarm-opus/11-port/contracts.md`): the four recursive node kinds `Expr`, `Stmt`,
+// `Type`, `Pat` live in the `Ast` pools (one `Ast` per Session, shared by every file so `extend` can move
+// methods between files), and every pooled node's span is in the `Spans<T>` beside its pool (Rust's
+// `Expr.span`, `Type.span`, `stmt_span()`, `Pat::span()`). Everything else is ported field for field,
+// `span` included: items, `Block`, `MatchArm`, `Ident`, and the payload structs Rust had (`IfStmt`,
+// `MatchStmt`, ...), whose `span` equals the side-table span of the node holding them. A variant payload is never a generic or imported type (stage 0 refuses `V(Id<T>)`,
+// `V(List<T>)` and `V(Sym)`), so
+// every Rust variant that holds a node, list or option has a payload struct with Rust's field names:
+// `Expr::Binary { op, lhs, rhs }` is `Expr.Binary(BinaryExpr { op, lhs, rhs })`, `Stmt::Expr(e)` is
+// `Stmt.Expr(ExprStmt { expr })`, `TypeKind::Ref(t)` is `Type.Ref(RefType { ty })`. Rust `XStmt` payload
+// structs keep their names and fields, `span` included. `TypeKind::Named(s)` is `Type.Named(NamedType { name })`.
+// J3: Names are `Sym`s (`Ident.name`, `Type.Named`); other stored strings (docs, string literals, paths)
+// are arena copies (AGENTS.md rule 1).
 module j3c.syntax.ast;
+
+use j3.data.pool.{ Id, Pool };
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.text.Text;
+use j3c.base.ids.Spans;
+use j3c.base.intern.{ Names, Sym };
+use j3c.base.span.Span;
+
+/// The node tables of one compile. Build a node with `addExpr`/`addStmt`/`addType`/`addPat` (value +
+/// span in one call); read it with `expr(id)` (a copy) and `exprSpan(id)`.
+pub struct Ast {
+    arena: &Arena;
+    names: &Names;
+    exprs: Pool<Expr>;
+    exprSpans: Spans<Expr>;
+    stmts: Pool<Stmt>;
+    stmtSpans: Spans<Stmt>;
+    types: Pool<Type>;
+    typeSpans: Spans<Type>;
+    pats: Pool<Pat>;
+    patSpans: Spans<Pat>;
+
+    /// Empty tables in `arena`, names interned in `names` (the Session's).
+    fn new(arena: &Arena, names: &Names): Ast {
+        return Ast { arena: arena, names: names, exprs: Pool<Expr>.new(arena), exprSpans: Spans<Expr>.new(arena),
+            stmts: Pool<Stmt>.new(arena), stmtSpans: Spans<Stmt>.new(arena), types: Pool<Type>.new(arena),
+            typeSpans: Spans<Type>.new(arena), pats: Pool<Pat>.new(arena), patSpans: Spans<Pat>.new(arena) };
+    }
+
+    fn addExpr(this: &Ast, e: Expr, sp: Span): Id<Expr> {
+        let id = this.exprs.add(e);
+        this.exprSpans.set(id, sp);
+        return id;
+    }
+    fn addStmt(this: &Ast, s: Stmt, sp: Span): Id<Stmt> {
+        let id = this.stmts.add(s);
+        this.stmtSpans.set(id, sp);
+        return id;
+    }
+    fn addType(this: &Ast, t: Type, sp: Span): Id<Type> {
+        let id = this.types.add(t);
+        this.typeSpans.set(id, sp);
+        return id;
+    }
+    fn addPat(this: &Ast, p: Pat, sp: Span): Id<Pat> {
+        let id = this.pats.add(p);
+        this.patSpans.set(id, sp);
+        return id;
+    }
+
+    /// The node of `id`, copied (a `Pool.get` pointer dies on the next add).
+    fn expr(this: &Ast, id: Id<Expr>): Expr { return *this.exprs.get(id); }
+    fn stmt(this: &Ast, id: Id<Stmt>): Stmt { return *this.stmts.get(id); }
+    fn ty(this: &Ast, id: Id<Type>): Type { return *this.types.get(id); }
+    fn pat(this: &Ast, id: Id<Pat>): Pat { return *this.pats.get(id); }
+
+    fn exprSpan(this: &Ast, id: Id<Expr>): Span { return this.exprSpans.get(id); }
+    fn stmtSpan(this: &Ast, id: Id<Stmt>): Span { return this.stmtSpans.get(id); }
+    fn typeSpan(this: &Ast, id: Id<Type>): Span { return this.typeSpans.get(id); }
+    fn patSpan(this: &Ast, id: Id<Pat>): Span { return this.patSpans.get(id); }
+
+    /// The string of `s`.
+    fn str(this: &Ast, s: Sym): string { return this.names.str(s); }
+    /// `s` interned.
+    fn sym(this: &Ast, s: string): Sym { return this.names.intern(s); }
+}
+
+/// A name and where it was written.
+pub struct Ident {
+    name: Sym;
+    span: Span;
+}
+
+/// One parsed file.
+pub struct File {
+    span: Span;
+    /// `///` lines immediately above `module`.
+    doc: string;
+    moduleName: List<Ident>;
+    /// Scripts get their module name from their path, not a `module` line.
+    isScript: bool;
+    items: List<Item>;
+    /// What each `@embed*` in this file read, by the call's span; the loader fills it.
+    embeds: List<EmbedRead>;
+    /// Trait names this file writes as `dyn Name`; the checker makes a fat-pointer type for each.
+    dyns: List<Sym>;
+
+    /// `a.b.c`, in `arena`.
+    fn moduleKey(this: &File, ast: &Ast): string {
+        let t = Text.new(ast.arena);
+        for i in 0..this.moduleName.len {
+            if i > 0 { t.push('.'); }
+            t.pushStr(ast.str(this.moduleName.items[i].name));
+        }
+        return t.str();
+    }
+}
+
+/// The files one `@embed*` call read (Rust `(Span, Arc<Vec<EmbedFile>>)`).
+pub struct EmbedRead {
+    at: Span;
+    files: List<EmbedFile>;
+}
+
+/// One file an `@embed*` read.
+pub struct EmbedFile {
+    /// For `@embedDir`, the path below the folder (`/`-separated); else the path as written.
+    name: string;
+    /// Where it was read from, for the build stamp.
+    disk: string;
+    data: []u8;
+}
+
+pub enum Item {
+    Use(UseItem),
+    UseLib(UseLibItem),
+    Const(ConstItem),
+    Fn(FnItem),
+    Struct(StructItem),
+    /// `extend T { fn .. }`: methods of `T` written outside its body; merged by `extend.merge`.
+    Extend(ExtendItem),
+    Enum(EnumItem),
+    Trait(TraitItem),
+    Let(ModLetItem),
+    Props(ScriptBlockItem),
+    Shared(ScriptBlockItem),
+    State(ScriptLetItem),
+}
+
+pub struct ScriptBlockItem {
+    span: Span;
+    fields: List<FieldItem>;
+}
+
+pub struct ScriptLetItem {
+    span: Span;
+    name: Ident;
+    ty: Option<Id<Type>>;
+    value: Id<Expr>;
+}
+
+pub struct ModLetItem {
+    span: Span;
+    doc: string;
+    name: Ident;
+    ty: Id<Type>;
+    value: Option<Id<Expr>>;
+    /// `#[thread]`: one copy per thread.
+    thread: bool;
+    /// `#[uniform] let name: vec2;`: a shader uniform, removed before checking.
+    uniform: bool;
+}
+
+/// `#[shader]` fn kinds (`j3c doc shaders`).
+pub enum GpuStage {
+    /// `#[shader]`: a helper callable from entries.
+    Helper,
+    Vertex,
+    Fragment,
+}
+
+/// Struct kinds that exist for shaders: `#[vertex]`, `#[vertex(instance)]`, `#[varying]`, `#[shader]`.
+pub enum GpuStruct {
+    None,
+    Vertex,
+    VertexInstance,
+    Varying,
+    Plain,
+}
+
+/// `#[TryCatch(Ok, Err)]`: the success and failure variants `?` uses.
+pub struct TryCatch {
+    ok: Ident;
+    err: Ident;
+}
+
+pub struct EnumItem {
+    span: Span;
+    doc: string;
+    visPub: bool;
+    debug: bool;
+    tryCatch: Option<TryCatch>;
+    /// `#[derive(Eq, Hash, Ord, Clone)]` (`Debug` sets `debug`).
+    derives: List<Ident>;
+    name: Ident;
+    typeParams: List<Ident>;
+    /// `T: A + B`, same index as `typeParams`.
+    bounds: List<List<Ident>>;
+    variants: List<VariantItem>;
+}
+
+pub struct VariantItem {
+    span: Span;
+    doc: string;
+    name: Ident;
+    /// `V(A, B)`: the positional fields; empty for a variant with no payload.
+    fields: List<Id<Type>>;
+}
+
+pub struct UseLibItem {
+    span: Span;
+    libName: string;
+    alias: Ident;
+    decls: List<LibFnDecl>;
+}
+
+pub struct LibFnDecl {
+    span: Span;
+    name: Ident;
+    params: List<Param>;
+    ret: Option<Id<Type>>;
+    symbol: Option<string>;
+}
+
+pub struct StructItem {
+    span: Span;
+    doc: string;
+    visPub: bool;
+    debug: bool;
+    packed: bool;
+    gpu: GpuStruct;
+    /// `#[derive(..)]`, as on `EnumItem`.
+    derives: List<Ident>;
+    name: Ident;
+    typeParams: List<Ident>;
+    bounds: List<List<Ident>>;
+    fields: List<FieldItem>;
+    methods: List<FnItem>;
+}
+
+/// `extend Box<T> { methods }`: more methods of a struct declared in the same module.
+pub struct ExtendItem {
+    span: Span;
+    name: Ident;
+    typeParams: List<Ident>;
+    methods: List<FnItem>;
+}
+
+pub struct FieldItem {
+    span: Span;
+    doc: string;
+    name: Ident;
+    ty: Id<Type>;
+    embedded: bool;
+    /// `#[flat] name: vec4;` on a `#[varying]` struct: no interpolation.
+    flat: bool;
+    /// `name: Type = 0`. A literal, checked later. Absent means the field is required.
+    default: Option<Id<Expr>>;
+}
+
+pub struct UseItem {
+    span: Span;
+    path: List<Ident>;
+    /// `use j3.memory.{ Arena, List }`; `None` means the path is the whole use.
+    names: Option<List<Ident>>;
+}
+
+pub struct ConstItem {
+    span: Span;
+    doc: string;
+    visPub: bool;
+    name: Ident;
+    ty: Option<Id<Type>>;
+    value: Id<Expr>;
+}
+
+/// `where T: Eq + Hash`: one parameter and its bounds (Rust `(Ident, Vec<Ident>)`).
+pub struct WhereBound {
+    name: Ident;
+    bounds: List<Ident>;
+}
+
+pub struct FnItem {
+    span: Span;
+    doc: string;
+    visPub: bool;
+    name: Ident;
+    typeParams: List<Ident>;
+    bounds: List<List<Ident>>;
+    /// `where T: Eq + Hash` after the signature of a generic struct's method: bounds on the struct's own
+    /// type parameters that only this method needs (`List.indexOf`).
+    whereBounds: List<WhereBound>;
+    /// `#[impl]`: a free fn that gives a type a trait's method.
+    isImpl: bool;
+    /// `#[shader]` / `#[shader(vertex)]` / `#[shader(fragment)]`: GPU code, never lowered for the CPU.
+    shader: Option<GpuStage>;
+    params: List<Param>;
+    ret: Option<Id<Type>>;
+    body: Block;
+    /// Written by `#[derive(..)]` for a generic enum (`sema/derive.j3`), never by the parser.
+    derived: bool;
+}
+
+/// `trait Name { fn m(this: Self): T; }`: a list of signatures a type must have.
+pub struct TraitItem {
+    span: Span;
+    doc: string;
+    visPub: bool;
+    name: Ident;
+    /// `trait Ord: Eq`: a type meeting `Ord` must meet these too.
+    supers: List<Ident>;
+    methods: List<TraitMethod>;
+}
+
+pub struct TraitMethod {
+    span: Span;
+    name: Ident;
+    params: List<Param>;
+    ret: Option<Id<Type>>;
+    /// A default body: a type without its own method gets this one.
+    body: Option<Block>;
+}
+
+pub struct Param {
+    name: Ident;
+    ty: Id<Type>;
+}
+
+pub struct Block {
+    span: Span;
+    stmts: List<Id<Stmt>>;
+}
+
+/// A statement; its span is `Ast.stmtSpan(id)`.
+pub enum Stmt {
+    Let(LetStmt),
+    Return(ReturnStmt),
+    Assign(AssignStmt),
+    AssignOp(AssignOpStmt),
+    Expr(ExprStmt),
+    If(IfStmt),
+    While(WhileStmt),
+    For(ForStmt),
+    ForEach(ForEachStmt),
+    UseLocal(UseLocalStmt),
+    Match(MatchStmt),
+    /// `let Span { lo, hi } = s;`: a destructuring `let`.
+    LetPat(LetPatStmt),
+    Defer(DeferStmt),
+    /// `'outer: while ...` / `'outer: for ...`.
+    Labeled(LabeledStmt),
+    /// `break;` or `break 'outer;` (the label without its quote).
+    Break(JumpStmt),
+    Continue(JumpStmt),
+    Block(Block),
+}
+
+pub struct ExprStmt {
+    expr: Id<Expr>;
+}
+
+/// `break` / `continue` and the optional label.
+pub struct JumpStmt {
+    label: Option<Ident>;
+}
+
+pub struct IfStmt {
+    span: Span;
+    cond: Id<Expr>;
+    thenBlock: Block;
+    elseBlock: Option<Block>;
+}
+
+pub struct LabeledStmt {
+    span: Span;
+    label: Ident;
+    /// A `While`, `For` or `ForEach`.
+    body: Id<Stmt>;
+}
+
+pub struct WhileStmt {
+    span: Span;
+    cond: Id<Expr>;
+    body: Block;
+}
+
+pub struct ForStmt {
+    span: Span;
+    name: Ident;
+    start: Id<Expr>;
+    end: Id<Expr>;
+    /// `0..=n` visits `n`. Lowered as an exclusive end of `n + 1`.
+    inclusive: bool;
+    body: Block;
+}
+
+pub struct ForEachStmt {
+    span: Span;
+    index: Option<Ident>;
+    name: Ident;
+    iter: Id<Expr>;
+    body: Block;
+}
+
+pub struct UseLocalStmt {
+    span: Span;
+    name: Ident;
+}
+
+pub struct DeferStmt {
+    span: Span;
+    body: Block;
+}
+
+pub struct AssignStmt {
+    span: Span;
+    place: Id<Expr>;
+    value: Id<Expr>;
+}
+
+pub struct AssignOpStmt {
+    span: Span;
+    place: Id<Expr>;
+    op: BinOp;
+    value: Id<Expr>;
+}
+
+pub struct LetStmt {
+    span: Span;
+    doc: string;
+    name: Ident;
+    ty: Option<Id<Type>>;
+    value: Id<Expr>;
+}
+
+pub struct ReturnStmt {
+    span: Span;
+    value: Option<Id<Expr>>;
+}
+
+/// A type as written; its span is `Ast.typeSpan(id)`.
+pub enum Type {
+    Named(NamedType),
+    Generic(GenericType),
+    Ref(RefType),
+    Array(ArrayType),
+    Slice(SliceType),
+    Fn(FnType),
+    /// `closure(A, B): R`: param or `let` only; `boxed closure(..)` (arena captures) goes anywhere.
+    Closure(ClosureType),
+    /// `(A, B)`: two or more elements, read as `.0`, `.1`.
+    Tuple(TupleType),
+    /// `dyn Trait`: a data pointer plus the trait's method table.
+    Dyn(Ident),
+}
+
+/// `int`, `Vec2`, `T`.
+pub struct NamedType {
+    name: Sym;
+}
+
+/// `Name<args>`.
+pub struct GenericType {
+    name: Sym;
+    args: List<Id<Type>>;
+}
+
+/// `&ty`.
+pub struct RefType {
+    ty: Id<Type>;
+}
+
+/// `[len]elem`.
+pub struct ArrayType {
+    len: u64;
+    elem: Id<Type>;
+}
+
+/// `[]elem`.
+pub struct SliceType {
+    elem: Id<Type>;
+}
+
+/// `fn(params): ret`.
+pub struct FnType {
+    params: List<Id<Type>>;
+    ret: Option<Id<Type>>;
+}
+
+pub struct ClosureType {
+    params: List<Id<Type>>;
+    ret: Option<Id<Type>>;
+    boxed: bool;
+}
+
+pub struct TupleType {
+    elems: List<Id<Type>>;
+}

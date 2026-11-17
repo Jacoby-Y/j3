@@ -3,3 +3,148 @@
 // Port of: j3c/src/cli/dump.rs, cli/glsl.rs, parse/syntax.rs (dump-syntax entry)
 // J3: `dump-ast` (the parse oracle, plan 11 A5) is a pre-freeze Rust addition; see PORT_DEBT.md.
 module j3c.cmd.dump;
+// J3: C1 ports `dump-ast`; C2a `dump-ir` / `dump-llvm` (Rust `dispatch` + `dump_ir_*` / `dump_ll_*`, through the
+// driver to `Stage.Passes`). `dump-ir samples` / `dump-llvm samples` print a not-supported line: the IR
+// samples are a unit-test fixture (`tests/unit/ir_samples`). The other dump commands print `not ported yet`
+// from `cmd.args`. One Session per file (scale check A11: one Session for the whole corpus held 500 MB).
+
+use j3.data.pool.Id;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.result.Result;
+use j3.text.Text;
+use j3c.base.diag;
+use j3c.base.fsx;
+use j3c.base.intern.own;
+use j3c.base.span.{ Lines, Source };
+use j3c.cmd.check.{ collectJ3, err, failText, out };
+use j3c.cmd.run.{ noFlags, peelRun, printFail };
+use j3c.driver;
+use j3c.driver.{ Mode, Session, Stage };
+use j3c.syntax.ast.{ Ast, File };
+use j3c.syntax.dump;
+use j3c.syntax.fmt;
+use j3c.syntax.parse;
+use j3c.syntax.token.ParseError;
+
+const DUMP_AST_USAGE = "usage: j3c dump-ast <file.j3|file.j3s|dir>\n";
+
+/// `j3c dump-ast <file|dir>`: each file's AST as S-expressions (a dir: `;; path` before each). Every file
+/// must also pass `fmt` (Rust `dump_ast`).
+pub fn dumpAstCmd(rest: []string): int {
+    if rest.len == 1 && (rest[0] == "--help" || rest[0] == "-h") {
+        out(DUMP_AST_USAGE);
+        out("  prints the parsed AST of each file as S-expressions (a dir: `;; path` before each)\n");
+        return 0;
+    }
+    if rest.len != 1 || (rest[0].len > 0 && rest[0][0] == '-') {
+        err(DUMP_AST_USAGE);
+        return 1;
+    }
+    let mem = Arena.create(1 << 12);
+    defer mem.destroy();
+    let files = List<string>.new(&mem);
+    match collectJ3(rest[0], &mem) {
+        Result.Ok(v) { files = v; }
+        Result.Err(e) { err(Text.new(&mem).add("j3c: ").add(e).add("\n").str()); return 1; }
+    }
+    for fi in 0..files.len {
+        if !dumpOne(files.items[fi], files.len > 1) { return 1; }
+    }
+    return 0;
+}
+
+/// `j3c dump-ir [path]` (Rust `dump_ir_path`): typecheck, run the IR passes, print the IR.
+pub fn dumpIrCmd(rest: []string): int { return dumpProgram(rest, false); }
+
+/// `j3c dump-llvm [path]` (Rust `dump_ll_path`): the program's LLVM IR text.
+pub fn dumpLlvmCmd(rest: []string): int { return dumpProgram(rest, true); }
+
+/// Compile the path (none: the project in the cwd, else the built-in hello) through `Stage.Passes`, then print
+/// the IR or the `.ll` (Rust `dispatch` with `peel_args`: `--release`, `--emit`, `--opt` reach the build
+/// settings `dump-llvm` uses; `--fast` is refused).
+fn dumpProgram(rest: []string, llvm: bool): int {
+    let mem = Arena.create(1 << 12);
+    defer mem.destroy();
+    let f = noFlags(&mem);
+    peelRun(rest, &f, false);
+    if f.fast {
+        err("j3c: `--fast` is only for `run` / `build`\n");
+        return 1;
+    }
+    if f.path == "samples" {
+        err("j3c: `samples` is not supported by j3c-boot: the IR samples are a unit-test fixture (tests/unit/ir_samples)\n");
+        return 1;
+    }
+    let opts = driver.defaults();
+    opts.mode = Mode.Check;
+    opts.entry = f.path;
+    opts.release = f.release;
+    opts.emit = f.emit;
+    opts.opt = f.opt;
+    let s = Session.new(opts);
+    defer s.free();
+    if !driver.run(s, Stage.Passes) {
+        // Rust: `dump-ir` prints the failure with `print_fail`, `dump-llvm` as `j3c: E`.
+        if llvm {
+            err(Text.new(s.arena).add("j3c: ").add(failText(s)).add("\n").str());
+        } else {
+            printFail(failText(s), s.arena);
+        }
+        return 1;
+    }
+    let t = Text.new(s.arena);
+    if llvm {
+        if !driver.emitLlvm(s, &t) {
+            err(Text.new(s.arena).add("j3c: emit LLVM failed: ").add(failText(s)).add("\n").str());
+            return 1;
+        }
+    } else {
+        driver.dumpIr(s, &t);
+    }
+    t.flushTo(1);
+    return 0;
+}
+
+/// Read, fmt-gate, parse and print one file; false after printing its error. Each file gets its own
+/// Session, dropped after it is printed (Rust drops each file's AST too), so memory stays one file's worth.
+fn dumpOne(file: string, many: bool): bool {
+    let s = Session.new(driver.defaults());
+    defer s.free();
+    let src = "";
+    match fsx.readText(file, s.arena) {
+        Result.Ok(x) { src = x; }
+        Result.Err(e) { err(Text.new(s.arena).add("j3c: ").add(e).add("\n").str()); return false; }
+    }
+    match fmt.format(src, s.arena) {
+        Result.Ok(_) {}
+        Result.Err(e) { err(Text.new(s.arena).add("j3c: fmt ").add(file).add(": ").add(e).add("\n").str()); return false; }
+    }
+    let ast = Ast.new(s.arena, &s.names);
+    let id = s.sources.add(Source { path: own(s.arena, file), text: src, lines: Lines.of(src, s.arena) });
+    match parseOne(file, src, id, &ast) {
+        Result.Ok(f) {
+            let t = Text.new(s.arena);
+            if many { t.add(";; ").add(file).add("\n"); }
+            dump.dumpAst(&ast, &f, &t);
+            out(t.str());
+            return true;
+        }
+        Result.Err(e) {
+            parse.report(e, &s.diags);
+            let t = Text.new(s.arena);
+            diag.render(s.diags.at(s.diags.count() - 1), &s.sources, &t);
+            err(t.str());
+            return false;
+        }
+    }
+}
+
+/// A `.j3s` file parses as a script of module `script`, anything else as a `.j3` file.
+fn parseOne(file: string, src: string, id: Id<Source>, ast: &Ast): Result<File, ParseError> {
+    if path.ext(file) == ".j3s" {
+        let script: [1]string = ["script"];
+        return parse.parseScript(src, id, script, ast);
+    }
+    return parse.parseFile(src, id, ast);
+}

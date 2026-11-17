@@ -2,3 +2,164 @@
 //
 // Port of: j3c/src/config.rs
 module j3c.project.config;
+// J3: `$XDG_CONFIG_HOME/j3/config.toml` (else `~/.config/j3/config.toml`; `%APPDATA%` / `~/Library/...` on
+// Windows / macOS), `J3_CONFIG` overrides. `[compiler] compilation_tracking = true` appends each build to
+// `<project>/target/compilation.log`; `J3C_COMPILATION_TRACKING=0|1` overrides the file.
+// J3: Rust's `LAST_ERR` global (the last error `print_fail` showed) is `Compile.lastErr`, filled by the
+// caller, so no stored string outlives its arena. ponytail: env vars set to "" read as unset.
+
+use j3.io;
+use j3.io.path;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, find, lines, trim };
+use j3c.base.fsx;
+use j3c.base.intern.own;
+use j3c.base.toml;
+
+/// Rust `env!("CARGO_PKG_VERSION")`: the j3c version this port matches (`[package] j3` bounds, the log).
+pub const J3C_VERSION: string = "0.1.0";
+
+/// Linux `O_APPEND` (`j3.sys` has no constant for it).
+const O_APPEND: int = 1024;
+
+/// The config file's path, None when no variable names a home for it.
+pub fn configPath(arena: &Arena): Option<string> {
+    let o = sys.env("J3_CONFIG");
+    if o.len > 0 { return Option.Some(own(arena, o)); }
+    let dir = "";
+    if sys.PLATFORM == sys.PLATFORM_WINDOWS {
+        dir = sys.env("APPDATA");
+        if dir.len == 0 { return Option.None; }
+    } else if sys.PLATFORM == sys.PLATFORM_MACOS {
+        let h = sys.env("HOME");
+        if h.len == 0 { return Option.None; }
+        dir = path.join(h, "Library/Application Support", arena);
+    } else {
+        dir = sys.env("XDG_CONFIG_HOME");
+        if dir.len == 0 {
+            let h = sys.env("HOME");
+            if h.len == 0 { return Option.None; }
+            dir = path.join(h, ".config", arena);
+        }
+    }
+    return Option.Some(path.join(path.join(dir, "j3", arena), "config.toml", arena));
+}
+
+/// A `[section] key` string from the user config, if the file and key exist.
+pub fn get(section: string, key: string, arena: &Arena): Option<string> {
+    match configPath(arena) {
+        Option.Some(p) {
+            match fsx.readText(p, arena) {
+                Result.Ok(text) { return toml.str(text, section, key, arena); }
+                Result.Err(_) { return Option.None; }
+            }
+        }
+        Option.None { return Option.None; }
+    }
+}
+
+pub fn compilationTracking(arena: &Arena): bool {
+    let v = sys.env("J3C_COMPILATION_TRACKING");
+    if v.len == 0 {
+        match get("compiler", "compilation_tracking", arena) { Option.Some(s) { v = s; } Option.None {} }
+    }
+    return v == "1" || v == "true" || v == "on";
+}
+
+pub struct Compile {
+    root: string;
+    opt: string;
+    backend: string;
+    target: string;
+    modules: int;
+    secs: f64;
+    /// Per-phase times from `phase.report`, "" if none were recorded.
+    phases: string;
+    ok: bool;
+    /// The last error the build printed (Rust `LAST_ERR`), "" when none.
+    lastErr: string;
+}
+
+/// `x` with one decimal (Rust `{:.1}`), for the non-negative times the log prints. ponytail: rounds half up
+/// where Rust rounds the exact binary value half to even; a tie shows up only in the log's last digit.
+fn oneDecimal(t: &Text, x: f64) {
+    let tenths = int(x * 10.0 + 0.5);
+    t.pushInt(tenths / 10);
+    t.add(".");
+    t.pushInt(tenths % 10);
+}
+
+/// Append one entry to `<root>/target/compilation.log`. Never fails the build.
+pub fn logCompile(c: &Compile, arena: &Arena) {
+    let s = Text.new(arena);
+    s.add("COMPILE: ").add(nowUtc(arena)).add("\n");
+    s.add("    j3c version: ").add(J3C_VERSION).add("\n    backend=").add(c.backend).add(" opt=").add(c.opt).add("\n");
+    if c.target.len > 0 { s.add("    target: ").add(c.target).add("\n"); }
+    s.add("    ");
+    s.pushInt(c.modules);
+    s.add(" modules\n    time: ");
+    oneDecimal(&s, c.secs);
+    s.add("s\n");
+    if c.phases.len > 0 { s.add("    phases:\n").add(c.phases); }
+    if c.ok {
+        s.add("    result: ok\n");
+    } else {
+        let line = "";
+        let found = false;
+        for l in lines(c.lastErr) {
+            if !found && find(l, "error") >= 0 { line = l; found = true; }
+        }
+        if !found {
+            line = "build failed";
+            for l in lines(c.lastErr) { if !found { line = l; found = true; } }
+        }
+        s.add("    result: FAILED\n    ").add(trim(line)).add("\n");
+    }
+    s.add("\n");
+    let dir = path.join(c.root, "target", arena);
+    io.makeDirs(dir);
+    let fd = io.openPath(path.join(dir, "compilation.log", arena), sys.O_WRONLY | sys.O_CREAT | O_APPEND, 420);
+    if fd < 0 { return; }
+    let out = s.str();
+    sys.write(fd, out.ptr as ptr, out.len);
+    sys.close(fd);
+}
+
+/// `YYYY-MM-DD HH:MM UTC` now (civil-from-days, Howard Hinnant).
+fn nowUtc(arena: &Arena): string {
+    let ts: [2]int = [0, 0];
+    let t = 0;
+    // CLOCK_REALTIME = 0, Linux amd64 `clock_gettime` = 228
+    if @syscall(228, 0, &ts[0] as ptr) >= 0 { t = ts[0]; }
+    let days = t / 86400;
+    let rem = t % 86400;
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (if m <= 2 { 1 } else { 0 });
+    let out = Text.new(arena);
+    out.pushInt(y);
+    out.add("-");
+    pad2(&out, m);
+    out.add("-");
+    pad2(&out, d);
+    out.add(" ");
+    pad2(&out, rem / 3600);
+    out.add(":");
+    pad2(&out, rem % 3600 / 60);
+    out.add(" UTC");
+    return out.str();
+}
+
+fn pad2(t: &Text, n: int) {
+    if n < 10 { t.add("0"); }
+    t.pushInt(n);
+}

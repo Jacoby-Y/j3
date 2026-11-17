@@ -1,10 +1,88 @@
 // The one instantiation queue (plan 11 B11.2): generic fns, generic struct methods, `dyn` vtables,
-// `#[impl]` bound checks and `derive` methods are each "instance requested at span S", drained to a fixed
-// point after bodies are typed. Demand-driven: only what is reached gets typed and lowered.
+// bound checks and `derive` methods are each "instance requested at span S". Each module's `Fn` instances
+// drain to a fixed point after that module's bodies (`drainFor`, Rust `lower_module`'s queue); `Bound`
+// checks drain after each body that typed. Demand-driven: only what is reached gets typed and lowered.
 //
 // Part of module j3c.sema.
 // Port of: (new; replaces Rust's `bound_queue`, `lazy_methods` + `wake` in `check/lower/lazy.rs`,
 // `take_new_vtables`, and `fn_insts` bookkeeping)
 // J3: Instance keys are `(item, []Ty)` interned once; the requesting span is kept for errors, so a bound
-// failure in an instance points at the use that asked for it, as Rust's text does.
+// failure points at the use that asked for it, as Rust's text does. An instance body's errors carry
+// Rust's "while instantiating" note (`gen_body.genInstErrors`).
 module j3c.sema;
+
+/// Request instance `key` at `at` (the use that needs it); the same key gives the same id. Queued until
+/// `drain`.
+pub fn request(cx: &SemaCx, key: InstKey, at: Span): Id<Instance> {
+    match cx.tables.instMap.get(key) {
+        Option.Some(id) { return id; }
+        Option.None {}
+    }
+    let id = cx.tables.instances.add(Instance { key: key, at: at, resolved: List<Callee>.new(cx.arena), body: Option.None, done: false, depth: 0 });
+    cx.tables.instMap.put(key, id);
+    return id;
+}
+
+/// Work the queue to a fixed point: type what each instance needs, fill `resolved`, run bound checks.
+/// False after an error Diag. Instances requested while draining are drained in the same pass (the pool
+/// only grows, so the index loop reaches them: Rust's first-in-first-out batches).
+/// J3: C2b: `Fn` instances are typed by `gen_body.genDrainFn` (their own body, concrete types), `Bound`
+/// checks by `trait_queue.traitDrainBound`; vtables, derives and `#[Debug]` printers are C2c+.
+pub fn drain(cx: &SemaCx): bool { return drainFor(cx, Option.None); }
+
+/// `drain` while module `hint`'s bodies are the ones being typed (Rust lowers a module's instances in
+/// that module's queue, after its plain fns). After each instance body that typed, the bound checks
+/// queued so far run (`drainBodyBounds`); a `Bound` entry met here was left by a body that failed and
+/// waits for the next body that types, as Rust's `bound_queue` does.
+pub fn drainFor(cx: &SemaCx, hint: Option<Id<ModDecl>>): bool {
+    let i = 0;
+    while i < cx.tables.instances.len() {
+        let id = Id<Instance> { i: u32(i) };
+        i += 1;
+        let inst = cx.tables.instanceAt(id);
+        if inst.done || inst.key.kind == InstKind.Bound { continue; }
+        if !drainOne(cx, id) { return false; }
+        cx.tables.instanceAt(id).done = true;
+        match cx.tables.instanceAt(id).body {
+            Option.Some(_) { if !drainBodyBounds(cx, hint) { return false; } }
+            Option.None {}
+        }
+    }
+    return true;
+}
+
+/// Rust `drain_bounds(..)?` after a body lowered (lower/mod.rs:268): the `Bound` checks queued so far,
+/// with `hint`'s plain fns for the help line. A failure ends the run with that one error
+/// (`Typed.boundFatal`; `checkProgram` drops the body errors gathered before it).
+pub fn drainBodyBounds(cx: &SemaCx, hint: Option<Id<ModDecl>>): bool {
+    if drainBoundsIn(cx, hint) { return true; }
+    cx.typed.boundFatal = true;
+    return false;
+}
+
+/// Only the `Bound` checks queued so far (Rust `drain_bounds` after the declarations: "instances made
+/// while collecting signatures"); `checkProgram` runs it before any body. False after an error Diag.
+pub fn drainBounds(cx: &SemaCx): bool { return drainBoundsIn(cx, Option.None); }
+
+/// `drainBounds` with the module whose plain fns the error's help may name (`traitDrainBound`).
+pub fn drainBoundsIn(cx: &SemaCx, hint: Option<Id<ModDecl>>): bool {
+    for i in 0..cx.tables.instances.len() {
+        let id = Id<Instance> { i: u32(i) };
+        let inst = cx.tables.instanceAt(id);
+        if inst.done || inst.key.kind != InstKind.Bound { continue; }
+        if !traitDrainBound(cx, id, hint) { return false; }
+        cx.tables.instanceAt(id).done = true;
+    }
+    return true;
+}
+
+/// One instance's work (exhaustive over `InstKind`, so a new kind fails to compile here).
+fn drainOne(cx: &SemaCx, id: Id<Instance>): bool {
+    match cx.tables.instanceAt(id).key.kind {
+        InstKind.Fn { return genDrainFn(cx, id); }
+        // `BodyCx.dynVtable` filled the instance when it requested it (the checks need the requesting body).
+        InstKind.Vtable { return true; }
+        InstKind.Bound { return traitDrainBound(cx, id, Option.None); }
+    }
+    return false;
+}

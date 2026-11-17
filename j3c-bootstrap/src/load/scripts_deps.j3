@@ -1,0 +1,242 @@
+// `@script` edges and `@embed*` calls in a parsed file, the project's `.j3s` files, and a script path's
+// module name.
+//
+// Port of: j3c/src/compile/script_deps.rs, compile/loader/scripts.rs (script_paths, script_module_parts)
+module j3c.load.scripts_deps;
+// J3: Its own module (not a `j3c.load` part) so its `use`s stay private; `load/scripts.j3` holds the
+// `Loader` methods. The AST walk is exhaustive (no `_` arm), so a new node kind fails to compile here.
+
+use j3.cmp.sortBy;
+use j3.data.pool.Id;
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.text.{ Text, endsWith };
+use j3c.base.intern.own;
+use j3c.base.span.Span;
+use j3c.syntax.ast.{ Ast, Block, EmbedKind, Expr, FieldInit, File, InterpPart, Item, MatchStmt, Stmt };
+
+/// One `@script("p")` type or `@script("p") { .. }` literal: the path as written and where.
+pub struct ScriptRef {
+    path: string;
+    span: Span;
+}
+
+/// One `@embed*` call: what it reads, keyed by its span.
+pub struct EmbedRef {
+    kind: EmbedKind;
+    path: string;
+    glob: string;
+    span: Span;
+}
+
+struct Refs {
+    scripts: List<ScriptRef>;
+    embeds: List<EmbedRef>;
+}
+
+/// Every `@script` reference in `file`, in source order (Rust `script_deps::find`).
+pub fn find(ast: &Ast, file: &File): List<ScriptRef> { return refs(ast, file).scripts; }
+
+/// Every `@embed*` call in `file`, in source order (Rust `script_deps::embeds`).
+pub fn embeds(ast: &Ast, file: &File): List<EmbedRef> { return refs(ast, file).embeds; }
+
+fn refs(ast: &Ast, file: &File): Refs {
+    let out = Refs { scripts: List<ScriptRef>.new(ast.arena), embeds: List<EmbedRef>.new(ast.arena) };
+    for i in 0..file.items.len {
+        match file.items.items[i] {
+            Item.Const(c) { expr(ast, c.value, &out); }
+            Item.Fn(f) { block(ast, &f.body, &out); }
+            Item.Struct(s) {
+                for k in 0..s.fields.len { optExpr(ast, s.fields.items[k].default, &out); }
+                for k in 0..s.methods.len { block(ast, &s.methods.items[k].body, &out); }
+            }
+            Item.Extend(e) { for k in 0..e.methods.len { block(ast, &e.methods.items[k].body, &out); } }
+            Item.Let(l) { optExpr(ast, l.value, &out); }
+            Item.Props(b) { for k in 0..b.fields.len { optExpr(ast, b.fields.items[k].default, &out); } }
+            Item.Shared(b) { for k in 0..b.fields.len { optExpr(ast, b.fields.items[k].default, &out); } }
+            Item.State(s) { expr(ast, s.value, &out); }
+            Item.Use(_) {}
+            Item.UseLib(_) {}
+            Item.Enum(_) {}
+            Item.Trait(_) {}
+        }
+    }
+    return out;
+}
+
+fn optExpr(ast: &Ast, e: Option<Id<Expr>>, out: &Refs) {
+    match e { Option.Some(x) { expr(ast, x, out); } Option.None {} }
+}
+
+fn optBlock(ast: &Ast, b: Option<Block>, out: &Refs) {
+    match b { Option.Some(x) { block(ast, &x, out); } Option.None {} }
+}
+
+fn block(ast: &Ast, b: &Block, out: &Refs) {
+    for i in 0..b.stmts.len { stmt(ast, b.stmts.items[i], out); }
+}
+
+fn stmt(ast: &Ast, id: Id<Stmt>, out: &Refs) {
+    match ast.stmt(id) {
+        Stmt.Let(s) { expr(ast, s.value, out); }
+        Stmt.LetPat(s) { expr(ast, s.value, out); optBlock(ast, s.elseBlock, out); }
+        Stmt.Return(s) { optExpr(ast, s.value, out); }
+        Stmt.Assign(s) { expr(ast, s.place, out); expr(ast, s.value, out); }
+        Stmt.AssignOp(s) { expr(ast, s.place, out); expr(ast, s.value, out); }
+        Stmt.Expr(e) { expr(ast, e.expr, out); }
+        Stmt.If(s) { expr(ast, s.cond, out); block(ast, &s.thenBlock, out); optBlock(ast, s.elseBlock, out); }
+        Stmt.While(s) { expr(ast, s.cond, out); block(ast, &s.body, out); }
+        Stmt.For(s) { expr(ast, s.start, out); expr(ast, s.end, out); block(ast, &s.body, out); }
+        Stmt.ForEach(s) { expr(ast, s.iter, out); block(ast, &s.body, out); }
+        Stmt.Match(s) { matchRefs(ast, &s, out); }
+        Stmt.Defer(s) { block(ast, &s.body, out); }
+        Stmt.Block(b) { block(ast, &b, out); }
+        Stmt.Labeled(s) { stmt(ast, s.body, out); }
+        Stmt.UseLocal(_) {}
+        Stmt.Break(_) {}
+        Stmt.Continue(_) {}
+    }
+}
+
+fn matchRefs(ast: &Ast, s: &MatchStmt, out: &Refs) {
+    expr(ast, s.expr, out);
+    for i in 0..s.arms.len {
+        let arm = s.arms.items[i];
+        optExpr(ast, arm.guard, out);
+        block(ast, &arm.body, out);
+        optExpr(ast, arm.tail, out);
+    }
+}
+
+fn fields(ast: &Ast, fs: List<FieldInit>, out: &Refs) {
+    for i in 0..fs.len { expr(ast, fs.items[i].value, out); }
+}
+
+fn exprs(ast: &Ast, es: List<Id<Expr>>, out: &Refs) {
+    for i in 0..es.len { expr(ast, es.items[i], out); }
+}
+
+fn expr(ast: &Ast, id: Id<Expr>, out: &Refs) {
+    match ast.expr(id) {
+        Expr.ScriptType(p) { out.scripts.push(ScriptRef { path: p, span: ast.exprSpan(id) }); }
+        Expr.Embed(e) { out.embeds.push(EmbedRef { kind: e.kind, path: e.path, glob: e.glob, span: ast.exprSpan(id) }); }
+        Expr.ScriptLit(s) {
+            out.scripts.push(ScriptRef { path: s.path, span: ast.exprSpan(id) });
+            fields(ast, s.fields, out);
+        }
+        Expr.StructLit(s) { fields(ast, s.fields, out); }
+        Expr.SliceLit(s) { fields(ast, s.fields, out); }
+        Expr.ArrayLit(a) { exprs(ast, a.elems, out); }
+        Expr.Tuple(t) { exprs(ast, t.elems, out); }
+        Expr.Syscall(s) { exprs(ast, s.args, out); }
+        Expr.Atomic(a) { exprs(ast, a.args, out); }
+        Expr.Index(x) { expr(ast, x.base, out); expr(ast, x.index, out); }
+        Expr.Slice(s) { expr(ast, s.base, out); optExpr(ast, s.start, out); optExpr(ast, s.end, out); }
+        Expr.Field(f) { expr(ast, f.base, out); }
+        Expr.Cast(c) { expr(ast, c.expr, out); }
+        Expr.Unary(u) { expr(ast, u.expr, out); }
+        Expr.Question(q) { expr(ast, q.expr, out); }
+        Expr.Call(c) { expr(ast, c.func, out); exprs(ast, c.args, out); }
+        Expr.Closure(c) { optExpr(ast, c.arena, out); block(ast, &c.body, out); }
+        Expr.UiChoice(u) { expr(ast, u.value, out); expr(ast, u.index, out); }
+        Expr.SliceFrom(s) { expr(ast, s.ptr, out); expr(ast, s.len, out); }
+        Expr.Binary(b) { expr(ast, b.lhs, out); expr(ast, b.rhs, out); }
+        Expr.Interpolate(it) {
+            for i in 0..it.parts.len {
+                match it.parts.items[i] { InterpPart.Expr(h) { expr(ast, h.expr, out); } InterpPart.Lit(_) {} }
+            }
+        }
+        Expr.If(f) { expr(ast, f.cond, out); expr(ast, f.thenExpr, out); expr(ast, f.elseExpr, out); }
+        Expr.Match(m) { matchRefs(ast, &m, out); }
+        Expr.Name(_) {}
+        Expr.Int(_) {}
+        Expr.BigInt(_) {}
+        Expr.Zeroed {}
+        Expr.Char(_) {}
+        Expr.Float(_) {}
+        Expr.Bool(_) {}
+        Expr.String(_) {}
+        Expr.TypePath(_) {}
+        Expr.SizeOf(_) {}
+    }
+}
+
+/// Rust `Path::extension` of `name` is `j3s` (a leading `.` starts no extension).
+fn isJ3sName(name: string): bool {
+    let k = name.len - 1;
+    while k > 0 && name[k] != '.' { k -= 1; }
+    return k > 0 && name[k + 1..name.len] == "j3s";
+}
+
+fn visit(dir: string, rel: string, out: &List<string>, arena: &Arena) {
+    match io.listDir(dir, arena) {
+        Result.Ok(ents) {
+            for i in 0..ents.len {
+                let e = ents[i];
+                let r = if rel.len == 0 { e.name } else { Text.new(arena).add(rel).add("/").add(e.name).str() };
+                if e.isDir && !e.isLink {
+                    if e.name != ".git" && e.name != "target" { visit(path.join(dir, e.name, arena), r, out, arena); }
+                } else if isJ3sName(e.name) {
+                    out.push(r);
+                }
+            }
+        }
+        Result.Err(_) {}
+    }
+}
+
+/// Every `.j3s` under `root` (skipping `target/` and `.git/`, not following symlinked folders), relative,
+/// `/`-separated, sorted by bytes (Rust `script_paths`). Strings in `arena`.
+pub fn scriptPaths(root: string, arena: &Arena): List<string> {
+    let out = List<string>.new(arena);
+    visit(root, "", &out, arena);
+    sortBy(out.items[0..out.len], fn(a: string, b: string): bool { return a < b; });
+    return out;
+}
+
+fn isModuleComponent(part: string): bool {
+    if part.len == 0 { return false; }
+    for i in 0..part.len {
+        let b = part[i];
+        let alpha = (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z');
+        if !(alpha || b == '_' || (i > 0 && b >= '0' && b <= '9')) { return false; }
+    }
+    return true;
+}
+
+/// `scripts/door.j3s` -> `["script", "scripts", "door"]` (Rust `script_module_parts`). Err is Rust's
+/// message; strings in `arena`.
+pub fn scriptModuleParts(rel: string, arena: &Arena): Result<List<string>, string> {
+    // Rust: absolute, or a `.`/`..` component (`.` only counts first; `Path::components` drops it later)
+    let bad = rel.len > 0 && rel[0] == '/';
+    let start = 0;
+    let first = true;
+    for i in 0..rel.len + 1 {
+        if i == rel.len || rel[i] == '/' {
+            let c = rel[start..i];
+            if c == ".." || (first && c == ".") { bad = true; }
+            if c.len > 0 { first = false; }
+            start = i + 1;
+        }
+    }
+    if bad { return Result.Err(Text.new(arena).add("script path must be relative to the project root: ").add(rel).str()); }
+    if !endsWith(rel, ".j3s") { return Result.Err(Text.new(arena).add("script path must end in `.j3s`: ").add(rel).str()); }
+    let stem = rel[0..rel.len - 4];
+    let parts = List<string>.new(arena);
+    parts.push("script");
+    start = 0;
+    for i in 0..stem.len + 1 {
+        if i == stem.len || stem[i] == '/' {
+            let part = stem[start..i];
+            if !isModuleComponent(part) {
+                return Result.Err(Text.new(arena).add("script path has an invalid module component: ").add(rel).str());
+            }
+            parts.push(own(arena, part));
+            start = i + 1;
+        }
+    }
+    return Result.Ok(parts);
+}

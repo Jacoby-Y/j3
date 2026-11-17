@@ -28,3 +28,21 @@ Rust time or RSS above 4x the Rust RSS.
 
 | Input | Rust wall | Rust RSS | j3c-boot wall | j3c-boot RSS | Ratio wall | Ratio RSS |
 |---|---|---|---|---|---|---|
+| `dump-ast` of 1005 files (the `[fmt ast]` corpus, `j3c/stdlib/j3`, `j3c/editor/src`; 167k lines, 6.0 MB), one dir, fmt gate included | 0.29 s | 8.5 MB | 0.32 s | 6.0 MB | 1.1x | 0.7x |
+| same, before the fix below (one Session for every file) | 0.29 s | 8.5 MB | 0.37 s | 500 MB | 1.3x | 59x |
+| `check` of the editor project (load + parse: 179 files, 1.6 MB with the stdlib) | 0.030 s | 60 MB | 0.07 s | 97 MB | 2.3x | 1.6x |
+| `check` of `j3c-bootstrap` (load + parse: 100 files, 0.75 MB) | 0.020 s | 39 MB | 0.03 s | 45 MB | 1.5x | 1.2x |
+
+- Date: 2026-11-16, same machine. stage0 as above (docs 51255b76). j3c-boot built with `j3c build --release`
+  (a dev build, `opt = 0`, is about 3.5x slower on `dump-ast`: 1.25 s). Median of 2-3 runs, `/usr/bin/time -v`.
+- Rust "load + parse" is its own `J3C_TIMINGS=1` line (no process start), with RSS read from `/proc` when that
+  line is printed (Rust `check` goes on to sema; its whole-run peak is 120 MB for the editor, 94 MB for
+  `j3c-bootstrap`). j3c-boot `check` stops after load (`sema not ported yet`), so its numbers are the whole
+  process. Both load the same files (179 and 100).
+- Fixed here: `dump-ast` kept every file's tokens, fmt output and AST in one Session arena (500 MB over the
+  corpus); it now uses one Session per file, as Rust drops each file.
+- Where j3c-boot's memory goes (for C2, not a blocker): the arena never frees, so each file's token list
+  and every `List`/`Pool` growth step stay until the Session ends (about 60 bytes of RSS per source byte,
+  vs Rust's 38). A scratch arena per parsed file for its tokens is the first lever if sema's numbers need it.
+
+**Verdict: within budget (parse wall at most 2.3x, RSS at most 1.6x of Rust); C2 is not blocked.**

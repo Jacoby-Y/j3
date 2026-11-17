@@ -1,8 +1,524 @@
 // One fn's dataflow for `frame_str`: what each local may hold (a param's data, the frame buffer, a pointer
 // to another local), statement by statement. Branches join, loops run to a fixed point, a whole-local store
-// replaces what the local held, a field store adds to it; calls apply the callee's summary.
+// replaces what the local held, a field store adds to it; stores, escapes and returns fill the summary and
+// raise the errors.
 //
 // Part of module j3c.sema.
-// Port of: j3c/src/check/frame_str/flow.rs, check/frame_str/flow/call.rs
-// J3: Walks typed-tree statements instead of structured IR (see `frame_str`).
+// Port of: j3c/src/check/frame_str/flow.rs
+// J3: Walks typed-tree statements instead of structured IR (see `frame_str`), giving each the states the
+// IR `lower` makes for it would get: a `while` is `while true { cond; if !cond { break } body }`, an
+// iterator `for` calls `next` per round, a `match` is an `if` chain (the last tested arm falls through), a
+// guarded one runs its arms in sequence, an int `Switch` joins its cases. Values and places are
+// `frame_str_expr`.
 module j3c.sema;
+
+/// The walk of one unit (Rust `Flow`).
+struct FsFlow {
+    g: &FrameStr;
+    unit: int;
+    out: FsSum;
+    /// Spans already reported: one frame string kept by several calls is one error.
+    reported: List<Span>;
+    /// Enclosing loops: their ids and the states at their `break`s and `continue`s.
+    loopIds: List<int>;
+    loopBrk: List<FsState>;
+    loopCont: List<FsState>;
+    /// The program's `fn main`: its frame lasts the run.
+    entry: bool;
+    report: bool;
+
+    fn run(this: &FsFlow) {
+        let g = this.g;
+        let a = g.cx.arena;
+        let u = g.units.items[this.unit];
+        let st = fsState(a, true);
+        let off = g.ctxParams(this.unit);
+        // the closure `$ctx` (Rust: `_ctx`, the param cast to `&ctx`)
+        if off == 1 { st.add(fsCtxKey(), fsValTok(a, fsParam(0))); }
+        let body = g.cx.typed.body(u.body);
+        for i in 0..body.params.len {
+            let p = body.params.items[i];
+            if g.hasPtr(g.cx.typed.local(p).ty) { st.add(p.i, fsValTok(a, fsParam(i + off))); }
+        }
+        this.block(&body.body, &st);
+    }
+
+    fn block(this: &FsFlow, b: &TBlock, st: &FsState) {
+        for i in 0..b.stmts.len {
+            if !st.live { return; }
+            this.stmt(b.stmts.items[i], st);
+        }
+    }
+
+    /// `b` on a copy of `st`, joined back (an `if` without `else`, a `defer`).
+    fn branch(this: &FsFlow, b: &TBlock, st: &FsState) {
+        let c = st.clone();
+        this.block(b, &c);
+        st.join(&c);
+    }
+
+    fn stmt(this: &FsFlow, id: Id<TStmt>, st: &FsState) {
+        let typed = this.g.cx.typed;
+        let a = this.g.cx.arena;
+        match typed.stmt(id) {
+            TStmt.Error {}
+            TStmt.Let(l) {
+                let v = fsVal(a);
+                let whole = true;
+                match l.init {
+                    Option.Some(e) { match typed.expr(e) { TExpr.Zeroed { whole = false; } _ { v = this.eval(e, st); } } }
+                    Option.None { whole = false; }
+                }
+                // a zeroed `let` of a struct or array is filled field by field: nothing is replaced
+                if whole || !this.aggregate(typed.local(l.local).ty) { st.remove(l.local.i); }
+                st.add(l.local.i, v);
+            }
+            TStmt.Expr(e) { this.eval(e.expr, st); }
+            TStmt.Assign(s) {
+                let pl = this.place(s.place, st);
+                let v = this.eval(s.value, st);
+                this.store(&pl, v, typed.exprSpan(s.value), st);
+            }
+            TStmt.AssignOp(s) {
+                this.place(s.place, st);
+                this.eval(s.value, st);
+            }
+            TStmt.If(s) {
+                this.eval(s.cond, st);
+                let c = st.clone();
+                this.block(&s.thenBlock, &c);
+                match s.elseBlock { Option.Some(eb) { this.block(&eb, st); } Option.None {} }
+                st.join(&c);
+            }
+            TStmt.While(w) { this.loopFlow(w.id, FS_LOOP_WHILE, id, st); }
+            TStmt.ForRange(f) {
+                this.eval(f.start, st);
+                this.eval(f.end, st);
+                this.loopFlow(f.id, FS_LOOP_PLAIN, id, st);
+            }
+            TStmt.ForEach(f) {
+                if f.kind == ForKind.Iter { this.loopFlow(f.id, FS_LOOP_ITER, id, st); } else { this.loopFlow(f.id, FS_LOOP_SEQ, id, st); }
+            }
+            TStmt.Match(m) { this.matchFlow(&m.m, st); }
+            TStmt.LetPat(l) {
+                let v = this.eval(l.value, st);
+                match l.elseBlock { Option.Some(eb) { this.branch(&eb, st); } Option.None {} }
+                this.bindPat(l.pat, v, st, false);
+            }
+            TStmt.Return(r) {
+                match r.value {
+                    Option.Some(e) {
+                        let v = this.eval(e, st);
+                        let sp = typed.exprSpan(e);
+                        if !this.g.located(sp) { sp = typed.stmtSpan(id); }
+                        this.ret(v, sp, st);
+                    }
+                    Option.None {}
+                }
+                st.live = false;
+            }
+            TStmt.Break(j) { this.jump(j.target, true, st); }
+            TStmt.Continue(j) { this.jump(j.target, false, st); }
+            TStmt.Defer(d) { this.branch(&d.body, st); }
+            TStmt.Block(b) { this.block(&b.block, st); }
+        }
+    }
+
+    /// A struct, tuple or array (a zeroed `let` fills these part by part).
+    fn aggregate(this: &FsFlow, ty: Id<Ty>): bool {
+        match this.g.cx.tables.ty(ty) {
+            Ty.Struct(_) { return true; }
+            Ty.Tuple(_) { return true; }
+            Ty.Array(_) { return true; }
+            _ { return false; }
+        }
+        return false;
+    }
+
+    fn jump(this: &FsFlow, target: int, isBreak: bool, st: &FsState) {
+        for i in 0..this.loopIds.len {
+            if this.loopIds.items[i] != target { continue; }
+            if isBreak { this.loopBrk.items[i].join(st); } else { this.loopCont.items[i].join(st); }
+        }
+        st.live = false;
+    }
+
+    /// Rust `loop_`: a loop body to a fixed point; after it, whatever reached the loop head or a `break`.
+    fn loopFlow(this: &FsFlow, id: int, kind: int, stmt: Id<TStmt>, st: &FsState) {
+        let a = this.g.cx.arena;
+        let head = st.clone();
+        while true {
+            this.loopIds.push(id);
+            this.loopBrk.push(fsState(a, false));
+            this.loopCont.push(fsState(a, false));
+            let s = head.clone();
+            this.loopBody(kind, stmt, &s);
+            let brk = this.loopBrk.pop();
+            let cont = this.loopCont.pop();
+            this.loopIds.pop();
+            let next = head.clone();
+            next.join(&s);
+            next.join(&cont);
+            if next.eq(&head) {
+                head.join(&brk);
+                st.assign(&head);
+                return;
+            }
+            head = next;
+        }
+    }
+
+    /// One round of loop statement `stmt`, as `lower` shapes it.
+    fn loopBody(this: &FsFlow, kind: int, stmt: Id<TStmt>, st: &FsState) {
+        let typed = this.g.cx.typed;
+        let top = this.loopIds.len - 1;
+        match typed.stmt(stmt) {
+            TStmt.While(w) {
+                // `while true { c = cond; if !c { break } body }`
+                this.eval(w.cond, st);
+                this.loopBrk.items[top].join(st);
+                this.block(&w.body, st);
+            }
+            TStmt.ForRange(f) { this.block(&f.body, st); }
+            TStmt.ForEach(f) {
+                let pl = this.place(f.source, st);
+                let ty = typed.placeTy(f.source);
+                while true {
+                    match this.g.cx.tables.ty(ty) {
+                        Ty.Ref(r) { pl.deref.push(true); pl.field.push(-1); ty = r.inner; }
+                        _ { break; }
+                    }
+                }
+                let v = fsVal(this.g.cx.arena);
+                if kind == FS_LOOP_ITER {
+                    // `o = next(&it); if o is not Some { break } x = payload`
+                    let vals = List<FsVal>.new(this.g.cx.arena);
+                    vals.push(fsValOf(this.address(&pl, st)));
+                    let sp = typed.placeSpan(f.source);
+                    let spans = List<Span>.new(this.g.cx.arena);
+                    spans.push(sp);
+                    match f.next {
+                        Option.Some(c) { v = this.callFlow(this.g.calleeUnit(c), &vals, &spans, sp, true, st); }
+                        Option.None {}
+                    }
+                    this.loopBrk.items[top].join(st);
+                    if v.fkeys.len > 0 { v = fsValOf(fsFlat(v)); }
+                } else {
+                    // `x = seq[i]`
+                    pl.deref.push(this.isSeqPtr(ty));
+                    pl.field.push(-1);
+                    v = this.walk(&pl, pl.deref.len, st);
+                }
+                st.remove(f.var.i);
+                if this.g.hasPtr(typed.local(f.var).ty) { st.add(f.var.i, v); }
+                this.block(&f.body, st);
+            }
+            _ {}
+        }
+    }
+
+    /// Rust `lower_match` shapes: arms from the state before the `match`, joined; the arms' values joined
+    /// (the `_matchN` temp each arm assigns).
+    fn matchFlow(this: &FsFlow, m: &TMatch, st: &FsState): FsVal {
+        let a = this.g.cx.arena;
+        let sv = this.eval(m.scrut, st);
+        let out = fsVal(a);
+        let guarded = false;
+        for i in 0..m.arms.len { match m.arms.items[i].guard { Option.Some(_) { guarded = true; } Option.None {} } }
+        if guarded && !m.switch {
+            // `if !done { if test { bind; if guard { done = true; body } } }` per arm, in order
+            for i in 0..m.arms.len {
+                let arm = &m.arms.items[i];
+                let c = st.clone();
+                this.bindPat(arm.pat, sv, &c, false);
+                match arm.guard { Option.Some(ge) { this.eval(ge, &c); } Option.None {} }
+                let b = c.clone();
+                fsValAdd(&out, this.armBody(arm, &b));
+                c.join(&b);
+                st.join(&c);
+            }
+            return out;
+        }
+        let acc = fsState(a, false);
+        let fall = true;
+        for i in 0..m.arms.len {
+            let arm = &m.arms.items[i];
+            let c = st.clone();
+            this.bindPat(arm.pat, sv, &c, false);
+            fsValAdd(&out, this.armBody(arm, &c));
+            acc.join(&c);
+            if m.switch {
+                // the `Switch` default: any arm that is not a constant
+                match this.g.cx.typed.pat(arm.pat) { TPat.Lit(_) {} _ { fall = false; } }
+            } else if i + 1 == m.arms.len {
+                fall = !this.irrefutable(arm.pat);
+            }
+        }
+        if fall { acc.join(st); }
+        st.assign(&acc);
+        return out;
+    }
+
+    fn armBody(this: &FsFlow, arm: &TArm, st: &FsState): FsVal {
+        this.block(&arm.body, st);
+        if st.live {
+            match arm.value { Option.Some(e) { return this.eval(e, st); } Option.None {} }
+        }
+        return fsVal(this.g.cx.arena);
+    }
+
+    /// A pattern `lower` makes no test for (Rust `pat_test` giving None).
+    fn irrefutable(this: &FsFlow, p: Id<TPat>): bool {
+        let typed = this.g.cx.typed;
+        match typed.pat(p) {
+            TPat.Wild { return true; }
+            TPat.Bind(_) { return true; }
+            TPat.Lit(_) { return false; }
+            TPat.Range(_) { return false; }
+            TPat.Variant(_) { return false; }
+            TPat.Tuple(ps) {
+                for i in 0..ps.items.len { if !this.irrefutable(ps.items.items[i]) { return false; } }
+                return true;
+            }
+            TPat.Struct(sp) {
+                for i in 0..sp.pats.len { if !this.irrefutable(sp.pats.items[i]) { return false; } }
+                return true;
+            }
+            TPat.Or(ps) {
+                for i in 0..ps.items.len { if this.irrefutable(ps.items.items[i]) { return true; } }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /// The names of `p` set from the matched value `v` (Rust: copies out of the scrutinee's sub-places).
+    /// `weak`: a later alternative of an or-pattern adds to what the first one bound.
+    fn bindPat(this: &FsFlow, p: Id<TPat>, v: FsVal, st: &FsState, weak: bool) {
+        let typed = this.g.cx.typed;
+        let t = this.g.cx.tables;
+        match typed.pat(p) {
+            TPat.Wild {}
+            TPat.Lit(_) {}
+            TPat.Range(_) {}
+            TPat.Bind(b) {
+                if !weak { st.remove(b.local.i); }
+                if this.g.hasPtr(typed.local(b.local).ty) { st.add(b.local.i, v); }
+            }
+            TPat.Variant(vp) {
+                let multi = false;
+                match t.ty(typed.patTy(p)) {
+                    Ty.Enum(e) { multi = t.enumAt(e.decl).variants.items[vp.variant].multi; }
+                    _ {}
+                }
+                // the payload (no field step), then a field of a multi payload's struct
+                let pv = fsValClone(v);
+                if v.fkeys.len > 0 { pv = fsValOf(fsFlat(v)); }
+                for i in 0..vp.fields.len {
+                    if multi { this.bindPat(vp.fields.items[i], fsValOf(fsSelect(pv, i)), st, weak); } else { this.bindPat(vp.fields.items[i], pv, st, weak); }
+                }
+            }
+            TPat.Tuple(ps) {
+                for i in 0..ps.items.len { this.bindPat(ps.items.items[i], fsValOf(fsSelect(v, i)), st, weak); }
+            }
+            TPat.Struct(sp) {
+                for i in 0..sp.pats.len { this.bindPat(sp.pats.items[i], fsValOf(fsSelect(v, sp.fields.items[i])), st, weak); }
+            }
+            TPat.Or(ps) {
+                for i in 0..ps.items.len { this.bindPat(ps.items.items[i], v, st, weak || i > 0); }
+            }
+        }
+    }
+
+    /// Rust `store`: `place = v`.
+    fn store(this: &FsFlow, pl: &FsPlace, v: FsVal, span: Span, st: &FsState) {
+        let k = pl.lastDeref();
+        if k >= 0 {
+            if !fsValEmpty(v) {
+                let target = fsFlat(this.walk(pl, k, st));
+                this.storeThrough(target, pl.fieldAfter(k + 1), fsFlat(v), span, fsSink(FS_STORE), st);
+            }
+            return;
+        }
+        if pl.global {
+            // `main`'s frame lasts as long as the program's main thread; a `#[thread]` global is per-thread
+            // scratch (the CSS token buffer), refilled before it is read again
+            if this.entry || pl.thread { return; }
+            let seen = fsSet(this.g.cx.arena);
+            this.escape(fsFlat(v), span, fsSink(FS_STORE), span, st, &seen);
+            return;
+        }
+        if pl.deref.len == 0 { st.remove(pl.key); }
+        if fsValEmpty(v) { return; }
+        if pl.deref.len == 0 {
+            st.add(pl.key, v);
+            return;
+        }
+        let f = pl.fieldAfter(0);
+        if f >= 0 {
+            let add = fsVal(this.g.cx.arena);
+            fsAddField(&add, f, fsFlat(v));
+            st.add(pl.key, add);
+            return;
+        }
+        st.add(pl.key, fsValOf(fsFlat(v)));
+    }
+
+    /// Rust `store_through`: stores `v` into field `slot` (-1: the whole) of what `target` points at.
+    /// `sink`: how the error reads when `v` holds frame data and the memory outlives this frame.
+    fn storeThrough(this: &FsFlow, target: List<u64>, slot: int, v: List<u64>, span: Span, sink: FsSink, st: &FsState) {
+        if v.len == 0 { return; }
+        let a = this.g.cx.arena;
+        let known = false;
+        for i in 0..target.len {
+            let t = target.items[i];
+            if fsIsLoc(t) {
+                known = true;
+                let add = fsVal(a);
+                let f = fsField(t);
+                if f < 0 { f = slot; }
+                if f >= 0 { fsAddField(&add, f, v); } else { add.whole.extend(v.slice()); }
+                st.add(fsId(t), add);
+            } else if fsIsParam(t) {
+                known = true;
+                // a field address is its param's pointer with that field as the slot
+                let dst = t;
+                let dslot = u32(slot + 1);
+                if fsIsAddr(t) && fsField(t) >= 0 {
+                    dst = fsBase(t);
+                    dslot = u32(fsField(t) + 1);
+                }
+                let local = fsSet(a);
+                for k in 0..v.len {
+                    let s = v.items[k];
+                    if fsIsParam(s) { this.addInto(s, dst, dslot); }
+                    // a caller's memory outlives this frame
+                    if fsIsFrame(s) || fsIsLoc(s) { local.push(s); }
+                }
+                let seen = fsSet(a);
+                this.escape(local, span, sink, span, st, &seen);
+            } else if fsIsFrame(t) {
+                known = true;
+            }
+        }
+        if !known || fsSetHas(target, fsU()) {
+            let seen = fsSet(a);
+            this.escape(v, span, sink, span, st, &seen);
+        }
+    }
+
+    fn addInto(this: &FsFlow, src: u64, dst: u64, slot: u32) {
+        let l = &this.out.into;
+        let i = 0;
+        while i < l.len {
+            let x = l.items[i];
+            if x.src == src && x.dst == dst && x.slot == slot { return; }
+            if x.src > src || (x.src == src && (x.dst > dst || (x.dst == dst && x.slot > slot))) { break; }
+            i += 1;
+        }
+        l.insert(i, FsInto { src: src, dst: dst, slot: slot });
+    }
+
+    fn addRet(this: &FsFlow, slot: u32, tok: u64) {
+        let l = &this.out.ret;
+        let i = 0;
+        while i < l.len {
+            let x = l.items[i];
+            if x.slot == slot && x.tok == tok { return; }
+            if x.slot > slot || (x.slot == slot && x.tok > tok) { break; }
+            i += 1;
+        }
+        l.insert(i, FsRet { tok: tok, slot: slot });
+    }
+
+    /// Rust `escape`: `v` is kept past this frame (at `span`): its params escape, frame data is an error.
+    /// `keep` is where it is kept, for callers' notes.
+    fn escape(this: &FsFlow, v: List<u64>, span: Span, sink: FsSink, keep: Span, st: &FsState, seen: &List<u64>) {
+        for i in 0..v.len {
+            let t = v.items[i];
+            if fsIsParam(t) {
+                let e = &this.out.esc;
+                let k = 0;
+                while k < e.len && e.items[k] < t { k += 1; }
+                if k < e.len && e.items[k] == t { continue; }
+                e.insert(k, t);
+                this.out.site.insert(k, keep);
+            } else if fsIsFrame(t) {
+                this.error(fsId(t), span, sink);
+            } else if fsIsLoc(t) && !fsSetHas(*seen, t) {
+                fsSetAdd(seen, t);
+                let held = this.held(st, t);
+                this.escape(held, span, sink, keep, st, seen);
+            }
+        }
+    }
+
+    /// Rust `ret`: `v` goes out with the result.
+    fn ret(this: &FsFlow, v: FsVal, span: Span, st: &FsState) {
+        let a = this.g.cx.arena;
+        let locals = fsSet(a);
+        this.retPart(0, v.whole, &locals, span);
+        for k in 0..v.fkeys.len { this.retPart(u32(v.fkeys.items[k] + 1), v.fsets.items[k], &locals, span); }
+        // a pointer to a local: the caller cannot follow it, and what the local holds goes out with it
+        if locals.len == 0 { return; }
+        this.out.retU = true;
+        let seen = fsSet(a);
+        while locals.len > 0 {
+            let t = locals.pop();
+            if fsSetHas(seen, t) { continue; }
+            fsSetAdd(&seen, t);
+            let held = this.held(st, t);
+            for i in 0..held.len {
+                let h = held.items[i];
+                if fsIsFrame(h) {
+                    this.error(fsId(h), span, fsSink(FS_RETURN));
+                } else if fsIsParam(h) {
+                    this.addRet(0, h);
+                } else if fsIsLoc(h) {
+                    locals.push(h);
+                }
+            }
+        }
+    }
+
+    /// One part of a returned value: the whole (`slot` 0) or a field (`slot` = field + 1).
+    fn retPart(this: &FsFlow, slot: u32, toks: List<u64>, locals: &List<u64>, span: Span) {
+        for i in 0..toks.len {
+            let t = toks.items[i];
+            if fsIsParam(t) {
+                this.addRet(slot, t);
+            } else if t == fsU() {
+                this.out.retU = true;
+            } else if fsIsFrame(t) {
+                this.error(fsId(t), span, fsSink(FS_RETURN));
+            } else {
+                locals.push(t);
+            }
+        }
+    }
+
+    /// Rust `Flow::error`: frame buffer `buf` reaches `sink` at `at`: one error per backtick string, at the
+    /// string.
+    fn error(this: &FsFlow, buf: u32, at: Span, sink: FsSink) {
+        // `main`'s frame lasts the run
+        if !this.report || (this.entry && sink.kind != FS_RETURN) { return; }
+        let span = this.g.cx.typed.exprSpan(Id<TExpr> { i: buf });
+        for i in 0..this.reported.len { if this.reported.items[i] == span { return; } }
+        this.reported.push(span);
+        this.g.error(span, at, sink);
+    }
+
+    /// Rust `held`: what the local a pointer token `t` points into holds (narrowed to its field).
+    fn held(this: &FsFlow, st: &FsState, t: u64): List<u64> {
+        if !fsIsLoc(t) { return fsSet(this.g.cx.arena); }
+        let v = st.get(fsId(t));
+        let f = fsField(t);
+        if f >= 0 { return fsSelect(v, f); }
+        return fsFlat(v);
+    }
+}
+
+const FS_LOOP_PLAIN = 0;
+const FS_LOOP_WHILE = 1;
+const FS_LOOP_SEQ = 2;
+const FS_LOOP_ITER = 3;

@@ -1,0 +1,200 @@
+// Closure typing (`sema/closures.j3`, `sema/closure_lit.j3`): a small program through the driver to
+// `Stage.Sema`, then its typed tree read back: a literal's captures in first-use order and its own body
+// reading them through `TPlace.Capture`, a literal as a plain fn, a named fn as a closure, a boxed literal
+// and a boxed closure seen as a stack one; `j3.cmp.sortBy` and `j3.io.walkIn` typed; two error texts.
+module sema_closure_test;
+
+use j3.data.pool.Id;
+use j3.io;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+use j3c.driver;
+use j3c.driver.{ Session, Stage };
+use j3c.sema.{ Checked, ConvKind, TBody, TClosure, TExpr, TPlace, TStmt, Ty };
+
+const SRC: [20]string = [
+    "module clos;",
+    "use j3.cmp.sortBy;",
+    "use j3.io;",
+    "use j3.memory.{ Arena };",
+    "fn apply(f: closure(int): int, x: int): int { return f(x); }",
+    "fn plain(f: fn(int): int): int { return f(1); }",
+    "fn triple(x: int): int { return x * 3; }",
+    "fn caps(): int {",
+    "    let a = 1;",
+    "    let b = 2;",
+    "    let c = fn(x: int): int { b += x; return a + b; };",
+    "    return c(1);",
+    "}",
+    "fn conv(): int { return apply(triple, 2) + plain(fn(x) { return x; }); }",
+    "fn boxed(mem: &Arena, k: int): int {",
+    "    let f = fn[mem](x: int): int { return x + k; };",
+    "    return apply(f, 1);",
+    "}",
+    "fn order(xs: []int) { sortBy(xs, fn(p: int, q: int): bool { return p < q; }); }",
+    "fn main() { }",
+];
+
+const BAD: [12]string = [
+    "module bad;",
+    "fn plain(f: fn(int): int): int { return f(1); }",
+    "fn gen<T>(x: T): T { return x; }",
+    "fn main() {",
+    "    let k = 2;",
+    "    plain(fn(x: int): int { return x + k; });",
+    "    let c = fn(x: int): int { return x + k; };",
+    "    plain(c);",
+    "    let e = c == c;",
+    "    plain(gen);",
+    "    let z: closure(int): int;",
+    "}",
+];
+
+/// Write `text` as `NAME.j3` in a temp dir (outside this package, whose project would otherwise load).
+fn put(name: string, lines: []string, mem: &Arena): string {
+    let text = Text.new(mem);
+    for i in 0..lines.len { text.add(lines[i]).add("\n"); }
+    let d = Text.new(mem).add(io.tempRoot()).add("/j3c-boot-sema-closure").str();
+    match io.makeDirs(d) { Result.Ok(_) {} Result.Err(_) { panic("cannot make the case dir"); } }
+    let p = Text.new(mem).add(d).add("/").add(name).add(".j3").str();
+    match io.writeFile(p, text.str() as []u8) { Result.Ok(_) {} Result.Err(_) { panic("cannot write a case"); } }
+    return p;
+}
+
+fn body(c: &Checked, name: string): TBody {
+    let fns = &c.tables.fns;
+    for i in 0..fns.len() {
+        let d = fns.get(fns.idAt(i));
+        if c.tables.str(d.name) != name || c.tables.modAt(d.owner).key != "clos" { continue; }
+        match d.body {
+            Option.Some(b) { return c.typed.body(b); }
+            Option.None {}
+        }
+    }
+    panic(`no typed body for {name}`);
+    return c.typed.body(Id<TBody> { i: 0 });
+}
+
+/// The closure literal that initializes the `let` at statement `k` of `b`.
+fn litOf(c: &Checked, b: &TBody, k: int): TClosure {
+    match c.typed.stmt(b.body.stmts.items[k]) {
+        TStmt.Let(l) {
+            match l.init {
+                Option.Some(e) {
+                    match c.typed.expr(e) {
+                        TExpr.Closure(cl) {
+                            match c.tables.ty(c.typed.exprTy(e)) { Ty.Closure(_) {} _ { panic("a closure literal's type is a closure"); } }
+                            return cl;
+                        }
+                        _ {}
+                    }
+                }
+                Option.None {}
+            }
+        }
+        _ {}
+    }
+    panic("not a closure let");
+    return litOf(c, b, k);
+}
+
+fn capName(c: &Checked, p: Id<TPlace>): string {
+    match c.typed.place(p) {
+        TPlace.Local(l) { return c.tables.str(c.typed.local(l.local).name); }
+        _ {}
+    }
+    return "";
+}
+
+fn main() {
+    let mem = Arena.create(1 << 12);
+    let o = driver.defaults();
+    o.entry = put("clos", SRC, &mem);
+    let s = Session.new(o);
+    if !driver.run(s, Stage.Sema) { panic("sema fails on the closure program"); }
+    let c = match s.checked { Option.Some(x) { x } Option.None { panic("no checked program"); return; } };
+
+    // captures in first-use order (`b`, then `a`); the body is its own TBody reading them through the ctx
+    let cb = body(c, "caps");
+    let lit = litOf(c, &cb, 2);
+    if lit.boxed || lit.plain { panic("caps: a stack closure"); }
+    if lit.captures.len != 2 { panic("caps: two captures"); }
+    if capName(c, lit.captures.items[0]) != "b" || capName(c, lit.captures.items[1]) != "a" { panic("caps: first-use order b, a"); }
+    let lb = c.typed.body(lit.body);
+    if lb.params.len != 1 || c.tables.str(c.typed.local(lb.params.items[0]).name) != "x" { panic("caps: the body's parameter is x"); }
+    match c.typed.stmt(lb.body.stmts.items[0]) {
+        TStmt.AssignOp(a) {
+            match c.typed.place(a.place) {
+                TPlace.Capture(cp) { if cp.index != 0 || cp.outer != lit.captures.items[0] { panic("caps: `b` is capture 0"); } }
+                _ { panic("caps: `b += x` stores through a capture"); }
+            }
+        }
+        _ { panic("caps: an assign-op first"); }
+    }
+    // the enclosing body does not list the closure's locals
+    if cb.locals.len != 3 { panic("caps: a, b, c are the outer locals"); }
+
+    // the other shapes, found in the user module's nodes
+    let plain = 0;
+    let thunk = 0;
+    let view = 0;
+    let boxed = 0;
+    let userFile = cb.body.span.file;
+    for i in 0..c.typed.exprs.len() {
+        let id = c.typed.exprs.idAt(i);
+        if c.typed.exprSpan(id).file != userFile { continue; }
+        match c.typed.expr(id) {
+            TExpr.Closure(cl) {
+                if cl.plain {
+                    plain += 1;
+                    match c.tables.ty(c.typed.exprTy(id)) { Ty.Fn(_) {} _ { panic("a plain literal's type is a fn"); } }
+                }
+                if cl.boxed {
+                    boxed += 1;
+                    match cl.mem { Option.Some(_) {} Option.None { panic("a boxed literal has its arena"); } }
+                    match cl.alloc { Option.Some(f) { if c.tables.str(c.tables.fnAt(f).name) != "allocAligned" { panic("boxed: Arena.allocAligned"); } } Option.None { panic("boxed: no allocator"); } }
+                    if cl.captures.len != 1 { panic("boxed: captures k"); }
+                }
+            }
+            TExpr.Convert(cv) {
+                if cv.kind == ConvKind.FnToClosure { thunk += 1; }
+                if cv.kind == ConvKind.BoxedToStack { view += 1; }
+            }
+            _ {}
+        }
+    }
+    if plain != 1 { panic("one literal as a plain fn"); }
+    if thunk != 1 { panic("one named fn as a closure"); }
+    if view != 1 { panic("one boxed closure seen as a stack one"); }
+    if boxed != 1 { panic("one boxed literal"); }
+
+    // error texts
+    let o2 = driver.defaults();
+    o2.entry = put("bad", BAD, &mem);
+    let s2 = Session.new(o2);
+    if driver.run(s2, Stage.Sema) { panic("bad: sema should fail"); }
+    let cap = false;
+    let mis = false;
+    for i in 0..s2.diags.count() {
+        let m = s2.diags.at(i).msg;
+        if m == "this closure captures `k`, so it cannot be a plain `fn(int): int`" { cap = true; }
+        if m == "expected `fn(int): int`, found `closure(int): int`: a closure carries its captures and cannot become a plain fn or ptr" { mis = true; }
+    }
+    let eq = false;
+    let gen = false;
+    let zero = false;
+    for i in 0..s2.diags.count() {
+        let m = s2.diags.at(i).msg;
+        if m == "`==` does not compare structs or enums with payloads; compare the fields, or define `fn operator==(this, other: T): bool` on it" { eq = true; }
+        if m == "unknown name `gen`" { gen = true; }
+        if m == "`fn(ptr, int): int` has no zero value" { zero = true; }
+    }
+    if !eq { panic("bad: a closure `==` is refused"); }
+    if !gen { panic("bad: a generic fn as a value is an unknown name"); }
+    if !zero { panic("bad: a closure has no zero value"); }
+    if !cap { panic("bad: no capture error"); }
+    if !mis { panic("bad: no closure mismatch error"); }
+}

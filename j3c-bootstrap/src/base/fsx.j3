@@ -6,3 +6,203 @@
 // these now. Port call sites straight to them; add a helper here only for a gap, and delete this file if it
 // stays empty.
 module j3c.base.fsx;
+// J3: C1 gaps (loader, `fmt` / `dump-ast` / `check` file lists): `osError` (Rust's `io::Error` text),
+// `samePath` (`compile/loader/paths.rs`), `listJ3` (`cli/check.rs`). The `emit/incr.rs` part waits for C3
+// (backend, incremental objects), `scene/history.rs` and `editor/frontend.rs` for C5 (tools); each adds
+// here only what `j3.io` lacks.
+
+use j3.cmp.sortBy;
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, isValidUtf8 };
+
+/// glibc's `strerror` text for errno 0..133 (what Rust's `io::Error` prints), by number.
+const ERRNO_TEXT: [134]string = [
+    "Success", "Operation not permitted", "No such file or directory", "No such process",
+    "Interrupted system call", "Input/output error", "No such device or address", "Argument list too long",
+    "Exec format error", "Bad file descriptor", "No child processes", "Resource temporarily unavailable",
+    "Cannot allocate memory", "Permission denied", "Bad address", "Block device required",
+    "Device or resource busy", "File exists", "Invalid cross-device link", "No such device", "Not a directory",
+    "Is a directory", "Invalid argument", "Too many open files in system", "Too many open files",
+    "Inappropriate ioctl for device", "Text file busy", "File too large", "No space left on device",
+    "Illegal seek", "Read-only file system", "Too many links", "Broken pipe",
+    "Numerical argument out of domain", "Numerical result out of range", "Resource deadlock avoided",
+    "File name too long", "No locks available", "Function not implemented", "Directory not empty",
+    "Too many levels of symbolic links", "Unknown error 41", "No message of desired type",
+    "Identifier removed", "Channel number out of range", "Level 2 not synchronized", "Level 3 halted",
+    "Level 3 reset", "Link number out of range", "Protocol driver not attached", "No CSI structure available",
+    "Level 2 halted", "Invalid exchange", "Invalid request descriptor", "Exchange full", "No anode",
+    "Invalid request code", "Invalid slot", "Unknown error 58", "Bad font file format", "Device not a stream",
+    "No data available", "Timer expired", "Out of streams resources", "Machine is not on the network",
+    "Package not installed", "Object is remote", "Link has been severed", "Advertise error", "Srmount error",
+    "Communication error on send", "Protocol error", "Multihop attempted", "RFS specific error", "Bad message",
+    "Value too large for defined data type", "Name not unique on network", "File descriptor in bad state",
+    "Remote address changed", "Can not access a needed shared library", "Accessing a corrupted shared library",
+    ".lib section in a.out corrupted", "Attempting to link in too many shared libraries",
+    "Cannot exec a shared library directly", "Invalid or incomplete multibyte or wide character",
+    "Interrupted system call should be restarted", "Streams pipe error", "Too many users",
+    "Socket operation on non-socket", "Destination address required", "Message too long",
+    "Protocol wrong type for socket", "Protocol not available", "Protocol not supported",
+    "Socket type not supported", "Operation not supported", "Protocol family not supported",
+    "Address family not supported by protocol", "Address already in use", "Cannot assign requested address",
+    "Network is down", "Network is unreachable", "Network dropped connection on reset",
+    "Software caused connection abort", "Connection reset by peer", "No buffer space available",
+    "Transport endpoint is already connected", "Transport endpoint is not connected",
+    "Cannot send after transport endpoint shutdown", "Too many references: cannot splice",
+    "Connection timed out", "Connection refused", "Host is down", "No route to host",
+    "Operation already in progress", "Operation now in progress", "Stale file handle",
+    "Structure needs cleaning", "Not a XENIX named type file", "No XENIX semaphores available",
+    "Is a named type file", "Remote I/O error", "Disk quota exceeded", "No medium found", "Wrong medium type",
+    "Operation canceled", "Required key not available", "Key has expired", "Key has been revoked",
+    "Key was rejected by service", "Owner died", "State not recoverable",
+    "Operation not possible due to RF-kill", "Memory page has hardware error"
+];
+
+/// True when `path` is a regular file (following symlinks).
+pub fn isFile(path: string): bool {
+    match io.stat(path) {
+        Result.Ok(e) { return !e.isDir; }
+        Result.Err(_) { return false; }
+    }
+}
+
+/// True when `path` is a directory (following symlinks).
+pub fn isDir(path: string): bool {
+    match io.stat(path) {
+        Result.Ok(e) { return e.isDir; }
+        Result.Err(_) { return false; }
+    }
+}
+
+/// The next component of `p` at or after byte `i`: (start, end), start -1 at the end. Repeated `/` and
+/// `.` parts are skipped except a leading `.`, as Rust's `Path::components` does.
+fn nextComp(p: string, i: int): (int, int) {
+    while true {
+        while i < p.len && p[i] == '/' { i += 1; }
+        if i >= p.len { return (-1, i); }
+        let e = i;
+        while e < p.len && p[e] != '/' { e += 1; }
+        if e - i == 1 && p[i] == '.' && i > 0 {
+            i = e;
+            continue;
+        }
+        return (i, e);
+    }
+    return (-1, i);
+}
+
+/// `a` against `b` by components (Rust `Path` `==` and `Ord`): negative, 0, positive. A rooted path sorts
+/// first. ponytail: `.` and `..` compare as names, where Rust ranks them below every name; only paths that
+/// differ there (never `listJ3`'s, which share their folder) could sort differently.
+fn pathCmp(a: string, b: string): int {
+    let ra = a.len > 0 && a[0] == '/';
+    let rb = b.len > 0 && b[0] == '/';
+    if ra != rb { return if ra { -1 } else { 1 }; }
+    let ia = 0;
+    let ib = 0;
+    while true {
+        let (sa, ea) = nextComp(a, ia);
+        let (sb, eb) = nextComp(b, ib);
+        if sa < 0 || sb < 0 { return (if sa < 0 { 0 } else { 1 }) - (if sb < 0 { 0 } else { 1 }); }
+        let x = a[sa..ea];
+        let y = b[sb..eb];
+        if x < y { return -1; }
+        if y < x { return 1; }
+        ia = ea;
+        ib = eb;
+    }
+    return 0;
+}
+
+/// True when `a` and `b` name the same file: equal as paths, else both canonicalize to one path, else
+/// compared as written (Rust `same_path`).
+pub fn samePath(a: string, b: string, arena: &Arena): bool {
+    if pathCmp(a, b) == 0 { return true; }
+    match path.realpath(a, arena) {
+        Option.Some(x) {
+            match path.realpath(b, arena) {
+                Option.Some(y) { return x == y; }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
+    return a == b;
+}
+
+/// Rust's `io::Error` text for `errno`: `No such file or directory (os error 2)`, in `arena`.
+pub fn osError(errno: int, arena: &Arena): string {
+    let t = Text.new(arena);
+    if errno >= 0 && errno < ERRNO_TEXT.len {
+        t.add(ERRNO_TEXT[errno]);
+    } else {
+        t.add("Unknown error ");
+        t.pushInt(errno);
+    }
+    t.add(" (os error ");
+    t.pushInt(errno);
+    t.add(")");
+    return t.str();
+}
+
+/// `read PATH: E` for the last failed call (Rust `format!("read {}: {e}", path.display())`).
+fn readErr(p: string, arena: &Arena): string {
+    let e = sys.errno();
+    return Text.new(arena).add("read ").add(p).add(": ").add(osError(e, arena)).str();
+}
+
+/// The whole file as text, in `arena`. Err is Rust's `read PATH: E` message (`osError`).
+pub fn readText(p: string, arena: &Arena): Result<string, string> {
+    // `io.readFile` on a directory sizes it with `lseek` (a huge number on ext4) and allocates that: say
+    // EISDIR first, as Rust's failing `read` does. ponytail: drop once `j3.io.readFile` refuses directories.
+    if isDir(p) { return Result.Err(Text.new(arena).add("read ").add(p).add(": ").add(osError(21, arena)).str()); }
+    match io.readFile(p, arena) {
+        Result.Ok(b) {
+            // `fs::read_to_string`'s own error (no errno)
+            if !isValidUtf8(b as string) {
+                return Result.Err(Text.new(arena).add("read ").add(p).add(": stream did not contain valid UTF-8").str());
+            }
+            return Result.Ok(b as string);
+        }
+        Result.Err(_) { return Result.Err(readErr(p, arena)); }
+    }
+}
+
+/// Rust `Path::extension` of `name` is `j3` or `j3s` (a leading `.` starts no extension).
+fn isJ3Name(name: string): bool {
+    let k = name.len - 1;
+    while k > 0 && name[k] != '.' { k -= 1; }
+    if k <= 0 { return false; }
+    let ext = name[k + 1..name.len];
+    return ext == "j3" || ext == "j3s";
+}
+
+fn walkJ3(dir: string, out: &List<string>, arena: &Arena): Result<bool, string> {
+    match io.listDir(dir, arena) {
+        Result.Ok(ents) {
+            for i in 0..ents.len {
+                let p = path.join(dir, ents[i].name, arena);
+                if ents[i].isDir {
+                    walkJ3(p, out, arena)?;
+                } else if isJ3Name(ents[i].name) {
+                    out.push(p);
+                }
+            }
+            return Result.Ok(true);
+        }
+        Result.Err(_) { return Result.Err(readErr(dir, arena)); }
+    }
+}
+
+/// Every `.j3` / `.j3s` file under `dir`, recursively (symlinked folders followed), sorted as Rust sorts
+/// `PathBuf`s (by component). Err is `read DIR: E` (Rust `cli/check.rs` `list_j3`).
+pub fn listJ3(dir: string, arena: &Arena): Result<List<string>, string> {
+    let out = List<string>.new(arena);
+    walkJ3(dir, &out, arena)?;
+    sortBy(out.items[0..out.len], fn(a: string, b: string): bool { return pathCmp(a, b) < 0; });
+    return Result.Ok(out);
+}

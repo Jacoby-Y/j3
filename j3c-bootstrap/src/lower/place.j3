@@ -3,4 +3,174 @@
 //
 // Part of module j3c.lower.
 // Port of: j3c/src/check/lower/place.rs, check/lower/scene_script.rs
+// J3: `place(p, hint)`: `hint` names the temporary a `TPlace.Temp` root gets, which in Rust depended on who
+// asked: `base_place` (`_iN`, the value's rvalue), `receiver_place` (`_recvN`, the value's operand); a
+// string literal is always `try_place`'s `_sN`. Scene scripts are C2e.
 module j3c.lower;
+
+extend FnLower {
+    /// The IR place of typed place `p` (Rust `try_place` / `base_place`).
+    fn place(this: &FnLower, p: Id<TPlace>, hint: string): Place {
+        let typed = this.lw.typed;
+        let sp = typed.placeSpan(p);
+        let ty = this.lw.irTy(typed.placeTy(p));
+        match typed.place(p) {
+            TPlace.Local(l) { return this.b.localPlace(this.localOf(l.local), sp); }
+            TPlace.Global(g) {
+                let id = Id<GlobalDef> { i: this.lw.globalIds.items[int(g.global.i)] - 1 };
+                let access = letBinding();
+                if this.ir().globals.get(id).readonly { access = readOnlyView(); }
+                return Place.global(this.cx.arena, id, ty, access, sp);
+            }
+            TPlace.Field(f) {
+                let base = this.place(f.base, "i");
+                match this.ir().tyKind(base.ty) {
+                    TyKind.Struct(s) { return this.b.field(this.ir(), base, FieldId { structId: s.id, index: u32(f.index) }, sp); }
+                    _ { panic("lower: field of a non-struct"); }
+                }
+            }
+            TPlace.Deref(d) {
+                match this.node(d.ptr) {
+                    TExpr.Load(r) { return this.b.deref(this.ir(), this.place(r.place, "i"), sp); }
+                    _ {}
+                }
+                let inner = this.spill("i", this.rvalue(d.ptr), this.spanOf(d.ptr));
+                return this.b.deref(this.ir(), inner, sp);
+            }
+            TPlace.Index(ix) {
+                let base = this.place(ix.base, "i");
+                let idx = this.bindOperand(this.operand(ix.index), sp);
+                if ix.checked {
+                    let len = this.seqLen(base, sp);
+                    this.boundsCheck(sp, idx, len);
+                }
+                return this.b.index(this.ir(), base, idx, sp);
+            }
+            TPlace.Temp(t) {
+                match this.node(t.value) {
+                    TExpr.Str(_) { return this.spill("s", this.rvalue(t.value), sp); }
+                    _ {}
+                }
+                if hint == "recv" {
+                    let op = this.operand(t.value);
+                    return this.spill("recv", Rvalue.useOp(sp, op), sp);
+                }
+                return this.spill(hint, this.rvalue(t.value), sp);
+            }
+            TPlace.Payload(pl) {
+                let base = this.place(pl.base, "i");
+                match this.ir().tyKind(base.ty) {
+                    TyKind.Enum(en) { return this.variantFieldPlace(base, VariantId { enumId: en.id, index: u32(pl.variant) }, pl.field, sp); }
+                    _ { panic("lower: payload of a non-enum"); }
+                }
+            }
+            TPlace.Len(s) { return this.b.sliceLen(this.ir(), this.place(s.base, "i"), sp); }
+            TPlace.Ptr(s) { return this.b.slicePtr(this.ir(), this.place(s.base, "i"), sp); }
+            TPlace.Tag(s) { return this.b.enumTag(this.ir(), this.place(s.base, "i"), sp); }
+            TPlace.Lane(l) { return this.simdLane(l, sp); }
+            TPlace.Capture(c) { return this.closureCapture(c, sp); }
+            TPlace.Error { panic("lower: poisoned place"); }
+        }
+        return this.b.localPlace(Id<LocalDecl> { i: 0 }, sp);
+    }
+
+    /// The IR local of typed local `l`, made on first sight (a `let` makes it in Rust's order first).
+    fn localOf(this: &FnLower, l: Id<TLocal>): Id<LocalDecl> {
+        match this.locals.get(l.i) {
+            Option.Some(id) { return Id<LocalDecl> { i: id }; }
+            Option.None { panic("lower: local used before its let"); }
+        }
+        return Id<LocalDecl> { i: 0 };
+    }
+
+    /// A new `let` local for typed local `l`.
+    fn letOf(this: &FnLower, l: Id<TLocal>): Id<LocalDecl> {
+        let d = this.lw.typed.local(l);
+        let id = this.b.letLocal(d.name, this.lw.irTy(d.ty), d.span);
+        this.locals.put(l.i, id.i);
+        return id;
+    }
+
+    /// Rust `seq_len`: an array's length as a constant, a slice's or string's `.len`.
+    fn seqLen(this: &FnLower, p: Place, sp: Span): Operand {
+        match this.ir().tyKind(p.ty) {
+            TyKind.Array(a) { return this.int(sp, a.len); }
+            _ {}
+        }
+        return Operand.Copy(this.b.sliceLen(this.ir(), this.copyOf(p), sp));
+    }
+
+    /// `_bcN = a OP b` (bool).
+    fn bc(this: &FnLower, sp: Span, op: BinOp, a: Operand, b: Operand): Operand {
+        return Operand.Copy(this.spill("bc", Rvalue.binary(sp, this.ir().common.bool, op, a, b), sp));
+    }
+
+    /// `if lt || ge { abort(kind, a, b) }` (Rust `bounds_check` and its inclusive twin).
+    fn checkAbort(this: &FnLower, sp: Span, cond: Operand, kind: AbortKind, a: Operand, b: Operand) {
+        let saved = this.b.beginBlock();
+        let args = List<Operand>.new(this.cx.arena);
+        args.push(a);
+        args.push(b);
+        this.push(sp, StmtKind.Abort(AbortStmt { kind: kind, args: args }));
+        this.pushIf(sp, cond, this.b.endBlock(saved), Option.None);
+    }
+
+    /// Rust `bounds_check`: `index < 0 || index >= len` aborts.
+    fn boundsCheck(this: &FnLower, sp: Span, index: Operand, len: Operand) {
+        let lt = this.bc(sp, BinOp.Lt, index, this.int(sp, 0));
+        let ge = this.bc(sp, BinOp.Ge, index, len);
+        let cond = this.bc(sp, BinOp.Or, lt, ge);
+        this.checkAbort(sp, cond, AbortKind.Index, index, len);
+    }
+
+    /// Rust `bounds_check_inclusive`: `index < 0 || index > len` aborts.
+    fn boundsCheckIncl(this: &FnLower, sp: Span, index: Operand, len: Operand) {
+        let lt = this.bc(sp, BinOp.Lt, index, this.int(sp, 0));
+        let gt = this.bc(sp, BinOp.Gt, index, len);
+        let cond = this.bc(sp, BinOp.Or, lt, gt);
+        this.checkAbort(sp, cond, AbortKind.Slice, index, len);
+    }
+
+    /// Rust `slice_bounds`: both ends in `0..=len`, `end >= start`.
+    fn sliceBounds(this: &FnLower, sp: Span, start: Operand, end: Operand, len: Operand) {
+        this.boundsCheckIncl(sp, start, len);
+        this.boundsCheckIncl(sp, end, len);
+        let order = this.bc(sp, BinOp.Lt, end, start);
+        this.checkAbort(sp, order, AbortKind.SliceOrder, end, start);
+    }
+
+    /// Rust `slice_rvalue` / `slice_rvalue_place` (and `array_to_slice`, whose `_slN` the caller adds).
+    fn sliceOf(this: &FnLower, e: Id<TExpr>, base: Id<TPlace>, start: Option<Id<TExpr>>, end: Option<Id<TExpr>>): Rvalue {
+        let sp = this.spanOf(e);
+        let place = Place.local(this.cx.arena, Id<LocalDecl> { i: 0 }, this.ir().common.void, letBinding(), sp);
+        match this.lw.typed.place(base) {
+            TPlace.Temp(t) {
+                match this.node(t.value) {
+                    TExpr.ArrayLit(_) { place = this.spill("a", this.rvalue(t.value), sp); }
+                    _ { place = this.place(base, "i"); }
+                }
+            }
+            _ { place = this.place(base, "i"); }
+        }
+        let c = this.ir().common;
+        let elem = c.u8;
+        match this.ir().elemTy(place.ty) { Option.Some(t) { elem = t; } Option.None { panic("lower: slice of a non-sequence"); } }
+        let full = this.seqLen(place, sp);
+        let s = this.int(sp, 0);
+        match start { Option.Some(x) { s = this.operand(x); } Option.None {} }
+        let en = full;
+        match end { Option.Some(x) { en = this.operand(x); } Option.None {} }
+        this.sliceBounds(sp, s, en, full);
+        let isString = place.ty == c.string;
+        let first = this.b.index(this.ir(), place, s, sp);
+        let ptrTy = this.ir().tyRef(elem);
+        let ptr = this.spill("ptr", Rvalue.refPlace(sp, ptrTy, first), sp);
+        let len = this.spill("sl", Rvalue.binary(sp, c.int, BinOp.Sub, en, s), sp);
+        let sliceTy = c.string;
+        if !isString { sliceTy = this.ir().tySlice(elem); }
+        let ops = List<Operand>.new(this.cx.arena);
+        ops.push(Operand.Copy(ptr));
+        ops.push(Operand.Copy(len));
+        return Rvalue.aggregate(sp, sliceTy, ops);
+    }
+}

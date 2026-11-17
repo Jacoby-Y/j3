@@ -3,13 +3,201 @@
 //
 // Port of: j3c/src/check/lower/mod.rs, check/lower/setup.rs,
 // check/lower/defcheck.rs (replaced by sema typing generic bodies once with bound-only placeholders, B11.1),
-// check/lower/lazy.rs (replaced by sema's instantiation queue, B11.2)
+// check/lower/lazy.rs (the IR half: `lower/inst_wake.j3`; which instances exist is sema's queue, B11.2)
 // J3: Lowering is a dumb walk (plan 11 B11.1): every type, method, trait impl and generic instance is already
 //     chosen on sema's typed tree. Lower makes no type decisions and reports no type errors.
-// J3: No `defcheck` (no `IrCx` clone, no throwaway lowering) and no `lazy_methods` + `wake` scan for `FnAddr`s:
-//     generic fns, generic struct methods, vtables, bound checks and derives are instances sema requests on
-//     one queue and drains to a fixed point before lowering (B11.2). Nothing unused is made, so nothing is
-//     dropped after.
+// J3: No `defcheck` (no `IrCx` clone, no throwaway lowering). Sema types every instance body (B11.2); lower
+//     still owns IR identity and order (contracts-c2b.md "IR order"): an instance's IR fn is made on first
+//     use, a generic struct instance's methods are made with it, woken by the first body that names one and
+//     dropped at the end when none did (`lower/inst_*.j3`).
 // J3: The unit of work is one module (B5): `lowerModule(&Session, module, sigs)` takes every signature as an
 //     explicit input and reads no global state, so modules lower in parallel once signatures are done.
 module j3c.lower;
+// J3: Contract (wave 4, `.swarm-opus/11-port/contracts-c2a-sema.md`): `LowerCx`, `lowerProgram`,
+// `lowerModule`, `FnLower`. Every `use` of the module is here (stage 0 rejects one repeated in a part).
+// J3: Layout (wave 6): `lower/decls.j3` makes the IR entities from sema's decls in Rust's allocation order
+// (structs of every module, then enums, fields, fns, globals; Rust's `collect_*` passes) and maps each
+// sema `Ty` to an IR type once (`Lw.tyMemo`). `FnLower` mirrors Rust's `Lower`: the same `operand` /
+// `rvalue` / `place` split, so temporaries get Rust's names and order (`diff.sh ir --norm`).
+// J3: Name clashes (stage 0 has no `use as`): sema's and ir's `ConstInit`, `BinOp`, `UnaryOp`. sema's
+// `ConstInit` is read in its own module `lower/seminit.j3`; the AST ops are converted by their `as int`
+// order (`irBinOp`, `irUnary` in `lower/binop.j3`).
+
+use j3.data.map.Map;
+use j3.data.pool.{ Id, Pool };
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.sys.panic;
+use j3.text.{ Text, f32Bits, f64Bits };
+use j3c.base.diag.Diags;
+use j3c.base.intern.{ Names, Sym, own };
+use j3c.base.span.{ Source, Span, noSpan };
+use j3c.ir.{ AbortKind, AbortStmt, BinOp, Block, BodyBuilder, ConstElems, ConstField, ConstFields, ConstInit, ConstKind, DeferStmt, EnumDef, FieldDef,
+    FieldId, ForRangeStmt, Func, FuncKind, GlobalDef, IfStmt, INTERP_CAP, InterpFillStmt, InterpLit, InterpPart, IrCx, J3Fn, LibFn,
+    LocalDecl, Module, Operand, Place, Program, Proj, Rvalue, RvalueKind, ScalarInit, Stmt, StmtKind, StructDef, SwitchCase, SwitchStmt, TryCatch, TyArg,
+    TyKind, UnaryOp, UnaryRv, VariantDef, VariantId, Vis, WhileStmt, abiSize, letBinding, opBool, opBytes, opF32Bits, opF64Bits, opFnAddr, opInt,
+    opNull, operandTy, readOnlyView };
+use j3c.ir.dump.tyString;
+use j3c.ir.names.pushStableTy;
+use j3c.lower.seminit.{ FlatInit, InitKind, flatten };
+use j3c.sema.{ BinKind, BindPat, Callee, CapturePlace, Checked, ClosureOpKind, ClosureTy, DynCallee, DynLayout, DynSlotDecl, DynTy, LanePlace,
+    TClosure, TClosureOp, TElems, TLetIn, TSimd, TTextFmt, TToDyn, TraitDecl, ConstPayload, ConvKind, EnumDecl, FnDecl, FnKind, ForKind, Generics, GlobalDecl, Instance,
+    InstKey, InstKind, Origin, StructDecl, TArm, TBlock, TBlockExpr, TForEach, TLetPat, TLitPat, TMatch, TPat, TPats, TQuestion, TRangePat,
+    TStructLit, TStructPat, TBody, TExpr, TInterpPart, TLocal, TPlace, TStmt, TVariantPat, Tables, Ty, TyList, Typed, TypedMod, subst };
+
+/// What every lowering step reads: the session's arena, names and diagnostics, and sema's output.
+pub struct LowerCx {
+    arena: &Arena;
+    names: &Names;
+    diags: &Diags;
+    checked: &Checked;
+    /// Trait names any loaded file writes as `dyn Name` (the parser's `File.dyns`; Rust `dyn_names`).
+    dyns: List<Sym>;
+}
+
+/// Program-wide lowering state (Rust `Shared` plus the decl-to-IR id tables `ModData` held). Ids are
+/// stored `+ 1` so 0 means "none yet".
+pub struct Lw {
+    cx: &LowerCx;
+    t: &Tables;
+    typed: &Typed;
+    p: &Program;
+    /// `&p.cx` (taken once: stage 0 copies the struct in `&this.p.cx`).
+    irp: &IrCx;
+    structIds: List<u32>;
+    enumIds: List<u32>;
+    fnIds: List<u32>;
+    globalIds: List<u32>;
+    tyMemo: List<u32>;
+    /// Generic struct/enum instances made so far (Rust `struct_insts` / `enum_insts`): `instKey` to IR id.
+    insts: Map<u64, u32>;
+    /// Tuple structs made so far (they join the last module's structs when every body is lowered).
+    tuples: List<Id<StructDef>>;
+    /// Sema module index to program module index + 1.
+    modIds: List<int>;
+    /// The program module that receives instances made now (Rust's `env.ir_structs` owner).
+    curMod: int;
+    /// Sema `Instance` index to its IR fn id + 1 (0 = none yet); grown by `lower/inst_*` (C2b).
+    instFuncs: List<u32>;
+    /// `Fn` instances whose IR fn exists and whose body waits to be lowered, in Rust's queue order
+    /// (`lower/inst_queue.j3`: first-in first-out batches, per module).
+    pending: List<Id<Instance>>;
+    /// The IR fn of every non-generic method of every generic struct instance (Rust `methods` for
+    /// instances), by `instMethodKey(IR struct id, fn decl index)`.
+    methodFns: Map<u64, u32>;
+    /// Struct-instance methods no lowered body has named yet (Rust `lazy_methods`): IR fn id to the sema
+    /// instance + 1 that names it (0 = none seen yet).
+    lazy: Map<u32, u32>;
+    /// Generic-method instances made in the current module (Rust's per-module `method_insts`): their
+    /// `instFuncs` entries are cleared when the next module starts, so each module makes its own copy.
+    modInsts: List<u32>;
+
+    fn ir(this: &Lw): &IrCx { return this.irp; }
+}
+
+/// `Lw.insts` key: a generic struct (`isEnum` false) or enum decl index and its type-args list id.
+pub fn instKey(decl: u32, args: u32, isEnum: bool): u64 {
+    let k = (u64(decl) << 33) | u64(args);
+    if isEnum { k = k | (u64(1) << 32); }
+    return k;
+}
+
+/// One fn being lowered (Rust `Lower`'s per-fn half): the typed body, the instance it is the body of (None
+/// for a plain fn), the loop and defer stacks, the IR builder.
+// J3: Field order: enum-typed fields first (stage 0 layout hazard, notes.md), bools last.
+pub struct FnLower {
+    inst: Option<Id<Instance>>;
+    cx: &LowerCx;
+    lw: &Lw;
+    body: Id<TBody>;
+    /// Typed loop ids (`TLoop.id`) of the enclosing loops, innermost last (Rust `loops`).
+    loops: List<int>;
+    /// Open `defer` blocks, innermost last, by scope depth (C2a: unused, `defer` is a plain IR stmt).
+    defers: List<int>;
+    b: BodyBuilder;
+    /// `TLocal` id to IR local id.
+    locals: Map<u32, u32>;
+    ret: Id<TyKind>;
+    /// Rust `tmp`: the counter behind every `_hintN` name.
+    tmp: int;
+    /// Closure state (`lower/closure.j3`): the fn label, the closure counter, the ctx of a closure body.
+    clo: ClosureFrame;
+}
+
+/// Lower every module of `cx.checked` (load order) into one IR program. None after an error Diag (lower
+/// reports none of its own once ported: sema has accepted the program).
+pub fn lowerProgram(cx: &LowerCx): Option<Program> {
+    // J3: The Session's sources are not in `LowerCx` (contract); the driver points `p.cx.sources` at them.
+    let none = cx.arena.new::<Pool<Source>>(Pool<Source>.new(cx.arena));
+    let p = cx.arena.new::<Program>(Program.new(cx.arena, cx.names, none));
+    let lw = declareAll(cx, p);
+    for i in 0..cx.checked.mods.len { lowerMod(lw, &cx.checked.mods.items[i]); }
+    if cx.diags.hasErrors() { return Option.None; }
+    instDropUnused(lw);
+    if p.modules.len > 0 { p.modules.items[p.modules.len - 1].structs.extend(lw.tuples.slice()); }
+    dynProgramDone(lw);
+    return Option.Some(*p);
+}
+
+/// Lower one module's bodies into `out` (B5: reads only `cx` and `m`). False after an error Diag.
+// J3: `out` must be empty: every module's declarations go in first (a body names fns of other modules),
+// then only `m`'s bodies are lowered. `lowerProgram` declares once and lowers every module.
+pub fn lowerModule(cx: &LowerCx, m: &TypedMod, out: &Program): bool {
+    lowerMod(declareAll(cx, out), m);
+    return !cx.diags.hasErrors();
+}
+
+/// The bodies of `m`, in sema's order (Rust's `lower_module` queue for plain fns and methods), then the
+/// instances they reached (`instLowerQueued`, Rust's later batches of the same queue).
+fn lowerMod(lw: &Lw, m: &TypedMod) {
+    lw.curMod = modIndex(lw, m.owner.i);
+    instNewModule(lw);
+    for i in 0..m.bodies.len { lowerBody(lw, m.bodies.items[i]); }
+    instLowerQueued(lw);
+    dynModuleDone(lw);
+}
+
+/// `declareAll` over a fresh `Lw` for `p` (Rust interns `&u8` and `[]u8` first, `check_files_inner`).
+fn declareAll(cx: &LowerCx, p: &Program): &Lw {
+    let lw = cx.arena.new::<Lw>(Lw { cx: cx, t: cx.checked.tables, typed: cx.checked.typed, p: p, irp: &p.cx, structIds: List<u32>.new(cx.arena),
+        enumIds: List<u32>.new(cx.arena), fnIds: List<u32>.new(cx.arena), globalIds: List<u32>.new(cx.arena),
+        tyMemo: List<u32>.new(cx.arena), insts: Map<u64, u32>.new(cx.arena, 64), tuples: List<Id<StructDef>>.new(cx.arena), modIds: List<int>.new(cx.arena), curMod: 0,
+        instFuncs: List<u32>.new(cx.arena), pending: List<Id<Instance>>.new(cx.arena),
+        methodFns: Map<u64, u32>.new(cx.arena, 64), lazy: Map<u32, u32>.new(cx.arena, 64), modInsts: List<u32>.new(cx.arena) });
+    p.cx.tyRef(p.cx.common.u8);
+    p.cx.tySlice(p.cx.common.u8);
+    declareDecls(lw);
+    return lw;
+}
+
+/// Lower a plain fn's typed body into its `Func`.
+fn lowerBody(lw: &Lw, id: Id<TBody>) {
+    let fid = lw.fnIds.items[int(lw.typed.body(id).decl.i)];
+    if fid == 0 { return; }
+    lowerInto(lw, id, Id<Func> { i: fid - 1 }, Option.None);
+}
+
+/// Lower typed body `id` into IR fn `func` (Rust `lower_fn` + the `FuncKind::J3` store in `lower_module`);
+/// `inst`: the instance it is the body of (C2b, `lower/inst_queue.j3`), None for a plain fn.
+fn lowerInto(lw: &Lw, id: Id<TBody>, func: Id<Func>, inst: Option<Id<Instance>>) {
+    let tb = lw.typed.body(id);
+    let ir = lw.ir();
+    let ret = ir.common.void;
+    let params = List<Id<TyKind>>.new(lw.cx.arena);
+    match ir.fnSig(ir.funcMut(func).ty) {
+        Option.Some(s) { ret = s.ret; params = s.params; }
+        Option.None {}
+    }
+    let f = lw.cx.arena.new::<FnLower>(FnLower { inst: inst, cx: lw.cx, lw: lw, body: id, loops: List<int>.new(lw.cx.arena),
+        defers: List<int>.new(lw.cx.arena), b: BodyBuilder.new(lw.cx.arena, ir.common.void), locals: Map<u32, u32>.new(lw.cx.arena, 32),
+        ret: ret, tmp: 0, clo: closureFrameNone() });
+    for i in 0..tb.params.len {
+        let l = lw.typed.local(tb.params.items[i]);
+        let pid = f.b.param(l.name, params.items[i], l.span);
+        f.locals.put(tb.params.items[i].i, pid.i);
+    }
+    f.stmts(&tb.body);
+    let body = f.b.finish();
+    instWake(lw, &body.block);
+    ir.funcMut(func).kind = FuncKind.J3(J3Fn { body: body });
+}

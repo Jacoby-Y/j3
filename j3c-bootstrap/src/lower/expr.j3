@@ -2,4 +2,249 @@
 //
 // Part of module j3c.lower.
 // Port of: j3c/src/check/lower/expr.rs
+// J3: Rust's `operand` / `rvalue` split is kept so temporaries come out where Rust made them: an operand
+// is a constant (folded int, float literal, null), a place read (`Load`, no temp), or anything else
+// spilled to a fresh `_tN`. Which source construct a node came from is read off the node's shape (sema
+// mirrors Rust's typing): `Load(Temp(..))` as an operand is Rust's `receiver_place` (`_recvN`), a string
+// literal in a place position is `Temp(Str)` (`_sN`).
 module j3c.lower;
+
+extend FnLower {
+    fn ir(this: &FnLower): &IrCx { return this.lw.ir(); }
+    fn tyOf(this: &FnLower, e: Id<TExpr>): Id<TyKind> { return this.lw.irTy(this.lw.typed.exprTy(e)); }
+    fn spanOf(this: &FnLower, e: Id<TExpr>): Span { return this.lw.typed.exprSpan(e); }
+    fn node(this: &FnLower, e: Id<TExpr>): TExpr { return this.lw.typed.expr(e); }
+
+    /// Rust `fresh`: `_{hint}{n}`, one counter for every hint.
+    fn fresh(this: &FnLower, hint: string): Sym {
+        let t = Text.new(this.cx.arena);
+        t.add("_").add(hint).pushInt(this.tmp);
+        this.tmp += 1;
+        return this.ir().internName(t.str());
+    }
+
+    /// A fresh temporary local of type `ty`, as a place.
+    fn tmpPlace(this: &FnLower, hint: string, ty: Id<TyKind>, sp: Span): Place {
+        let n = this.fresh(hint);
+        return this.b.localPlace(this.b.tmp(n, ty, sp), sp);
+    }
+
+    /// `rv` stored in a fresh `_{hint}N` (Rust `materialize_rv` and friends).
+    fn spill(this: &FnLower, hint: string, rv: Rvalue, sp: Span): Place {
+        let p = this.tmpPlace(hint, rv.ty, sp);
+        this.b.assign(sp, this.copyOf(p), rv);
+        return p;
+    }
+
+    /// An independent copy of `p` (`Place.project` grows the proj list it was given).
+    fn copyOf(this: &FnLower, p: Place): Place {
+        let q = p;
+        q.proj = List<Proj>.new(this.cx.arena);
+        q.proj.extend(p.proj.slice());
+        return q;
+    }
+
+    fn bool(this: &FnLower, sp: Span, v: bool): Operand { return opBool(sp, this.ir().common.bool, v); }
+    fn int(this: &FnLower, sp: Span, v: u64): Operand { return opInt(sp, this.ir().common.int, v); }
+
+    fn push(this: &FnLower, sp: Span, kind: StmtKind) { this.b.push(Stmt { ty: this.ir().common.void, span: sp, kind: kind }); }
+
+    /// `if cond { then }` with no else.
+    fn pushIf(this: &FnLower, sp: Span, cond: Operand, thenBlock: Block, elseBlock: Option<Block>) {
+        this.push(sp, StmtKind.If(IfStmt { cond: cond, thenBlock: thenBlock, elseBlock: elseBlock }));
+    }
+
+    /// Rust `operand`: a constant, a place read, or the rvalue in a fresh `_tN`.
+    fn operand(this: &FnLower, e: Id<TExpr>): Operand {
+        let sp = this.spanOf(e);
+        match this.node(e) {
+            TExpr.Int(v) { return opInt(sp, this.tyOf(e), v); }
+            TExpr.Float(f) {
+                // Rust's `-1.5` as an `f16` is an rvalue: `_tN` here, direct in `rvalue`.
+                // A named float const (`Origin.ConstUse`) is Rust's `const_rvalue`: `_tN` too.
+                let o = this.lw.typed.origin(e);
+                if o != Origin.NegHalf && o != Origin.ConstUse { return this.floatOp(sp, this.tyOf(e), f); }
+            }
+            TExpr.Null { return opNull(sp, this.tyOf(e)); }
+            TExpr.Load(r) {
+                match this.lw.typed.place(r.place) {
+                    TPlace.Temp(_) { return Operand.Copy(this.place(r.place, "recv")); }
+                    _ { return Operand.Copy(this.place(r.place, "i")); }
+                }
+            }
+            // Rust `operand` with a `dyn` wanted: `to_dyn`'s value in `_dynN` (`tmp_op`).
+            TExpr.ToDyn(_) { return Operand.Copy(this.spill("dyn", this.rvalue(e), sp)); }
+            TExpr.Convert(c) {
+                if c.kind == ConvKind.DynUpcast { return Operand.Copy(this.spill("dyn", this.rvalue(e), sp)); }
+                // Rust `boxed_as_stack`: a boxed closure place given as a stack closure, also `_dynN`.
+                match this.closureBoxedOperand(e) { Option.Some(op) { return op; } Option.None {} }
+                // Rust `text_to_string`: `Text` where a `string` is wanted, cast through `_txtN`.
+                if this.lw.typed.origin(e) == Origin.TextToString {
+                    let from = this.operand(c.expr);
+                    return Operand.Copy(this.spill("txt", Rvalue.cast(sp, this.tyOf(e), from), sp));
+                }
+            }
+            TExpr.SliceOf(s) {
+                // Rust `array_to_slice` (an array place where a slice is wanted): the slice in `_slN`. An array
+                // literal's (`ArrayLitToSlice`) is a use of `_slN`, so it lands in `_tN` below, as in Rust.
+                if this.lw.typed.origin(e) == Origin.ArrayToSlice { return Operand.Copy(this.spill("sl", this.sliceOf(e, s.base, s.start, s.end), sp)); }
+            }
+            _ {}
+        }
+        return Operand.Copy(this.spill("t", this.rvalue(e), sp));
+    }
+
+    /// A float constant of type `ty` (IEEE bits; an `f16` is rounded by `halfConst`, `lower/half.j3`).
+    fn floatOp(this: &FnLower, sp: Span, ty: Id<TyKind>, f: f64): Operand {
+        let c = this.ir().common;
+        if ty == c.f32 { return opF32Bits(sp, ty, f32Bits(f32(f))); }
+        if ty == c.f16 { return this.halfConst(sp, ty, f); }
+        return opF64Bits(sp, ty, f64Bits(f));
+    }
+
+    /// Rust `rvalue`.
+    fn rvalue(this: &FnLower, e: Id<TExpr>): Rvalue {
+        let sp = this.spanOf(e);
+        // Before `tyOf`: Rust makes a closure literal's `closure(..)` struct last, after its body fn and ctx.
+        match this.node(e) { TExpr.Closure(cl) { return this.closureLit(e, &cl); } _ {} }
+        let ty = this.tyOf(e);
+        let c = this.ir().common;
+        match this.node(e) {
+            TExpr.Int(_) { return Rvalue.useOp(sp, this.operand(e)); }
+            TExpr.Float(f) { return Rvalue.useOp(sp, this.floatOp(sp, ty, f)); }
+            TExpr.Null { return Rvalue.useOp(sp, this.operand(e)); }
+            TExpr.Bool(v) { return Rvalue.useOp(sp, opBool(sp, ty, v)); }
+            TExpr.Str(s) { return Rvalue.useOp(sp, opBytes(this.cx.arena, sp, ty, s as []u8)); }
+            TExpr.Load(_) { return Rvalue.useOp(sp, this.operand(e)); }
+            TExpr.AddrOf(r) { return Rvalue.refPlace(sp, ty, this.place(r.place, "i")); }
+            TExpr.Unary(u) {
+                if this.lw.typed.origin(e) == Origin.OpFallback {
+                    // Rust `operator_fallback`'s negated call (`a != b` through `operator==`) is held in `_cmpN`.
+                    let call = this.spill("cmp", this.rvalue(u.operand), sp);
+                    return Rvalue { ty: ty, span: sp, kind: RvalueKind.Unary(UnaryRv { op: UnaryOp.Not, arg: Operand.Copy(call) }) };
+                }
+                let arg = this.operand(u.operand);
+                return Rvalue { ty: ty, span: sp, kind: RvalueKind.Unary(UnaryRv { op: irUnary(u.op as int), arg: arg }) };
+            }
+            TExpr.Binary(b) { return this.binary(e, b.op as int, b.kind, b.lhs, b.rhs); }
+            TExpr.Convert(cv) { return this.convert(e, cv.expr, cv.kind); }
+            TExpr.Call(call) { return this.call(e, call.callee, &call.args); }
+            TExpr.StructLit(s) { return this.structLit(e, &s); }
+            TExpr.ArrayLit(a) {
+                let ops = List<Operand>.new(this.cx.arena);
+                // Rust `array_lit` with no wanted type lowers `elems[0]` once to learn the element type.
+                if this.lw.typed.origin(e) == Origin.ArrayPeek { this.operand(a.items.items[0]); }
+                for i in 0..a.items.len { ops.push(this.operand(a.items.items[i])); }
+                return Rvalue.aggregate(sp, ty, ops);
+            }
+            TExpr.SliceLit(s) {
+                let ops = List<Operand>.new(this.cx.arena);
+                ops.push(this.operand(s.ptr));
+                ops.push(this.operand(s.len));
+                return Rvalue.aggregate(sp, ty, ops);
+            }
+            TExpr.SliceOf(s) {
+                let o = this.lw.typed.origin(e);
+                if o == Origin.ArrayToSlice || o == Origin.ArrayLitToSlice {
+                    return Rvalue.useOp(sp, Operand.Copy(this.spill("sl", this.sliceOf(e, s.base, s.start, s.end), sp)));
+                }
+                return this.sliceOf(e, s.base, s.start, s.end);
+            }
+            TExpr.EnumVal(v) { return this.enumVal(e, v.variant, &v.payload); }
+            TExpr.FnAddr(f) { return Rvalue.useOp(sp, opFnAddr(sp, ty, this.calleeFn(f.callee))); }
+            TExpr.If(i) {
+                let cond = this.operand(i.cond);
+                let saved = this.b.beginBlock();
+                let thenRv = this.rvalue(i.thenExpr);
+                let place = this.tmpPlace("if", thenRv.ty, sp);
+                this.b.assign(this.spanOf(i.thenExpr), this.copyOf(place), thenRv);
+                let thenBlock = this.b.endBlock(saved);
+                saved = this.b.beginBlock();
+                let elseRv = this.rvalue(i.elseExpr);
+                this.b.assign(this.spanOf(i.elseExpr), this.copyOf(place), elseRv);
+                let elseBlock = this.b.endBlock(saved);
+                this.pushIf(sp, cond, thenBlock, Option.Some(elseBlock));
+                return Rvalue.useOp(sp, Operand.Copy(place));
+            }
+            TExpr.Interp(it) { return this.interpolate(sp, &it.parts); }
+            TExpr.Syscall(a) {
+                let nr = this.operand(a.items.items[0]);
+                let rest = List<Operand>.new(this.cx.arena);
+                for i in 1..a.items.len { rest.push(this.operand(a.items.items[i])); }
+                return Rvalue.syscall(sp, c.int, nr, rest);
+            }
+            TExpr.Atomic(a) {
+                let ops = List<Operand>.new(this.cx.arena);
+                for i in 0..a.args.len { ops.push(this.operand(a.args.items[i])); }
+                return Rvalue.atomic(sp, ty, a.op, a.order, ops);
+            }
+            TExpr.ArrayLen(n) { return Rvalue.useOp(sp, opInt(sp, c.int, n)); }
+            TExpr.SizeOf(s) { return Rvalue.useOp(sp, opInt(sp, c.int, abiSize(this.ir(), this.lw.irTy(s.ty)))); }
+            TExpr.Zeroed { panic("lower: a zero value outside a typed let"); }
+            TExpr.Error { panic("lower: poisoned expression"); }
+            TExpr.Tuple(t) { return this.tupleLit(e, &t); }
+            TExpr.ToDyn(d) { return this.dynTo(e, &d); }
+            TExpr.Block(b) { return this.patBlockValue(e, &b); }
+            TExpr.Match(m) { return this.patMatchExpr(e, &m); }
+            TExpr.Question(q) { return this.patQuestion(e, q); }
+            TExpr.Closure(cl) { return this.closureLit(e, &cl); }
+            TExpr.ClosureOp(co) { return this.closureOp(e, &co); }
+            TExpr.LetIn(l) { return this.tupleLetIn(e, &l); }
+            TExpr.TextFmt(tf) { return this.interpTextFmt(e, &tf); }
+            TExpr.Simd(s) { return this.simdOp(e, &s); }
+        }
+        return Rvalue.useOp(sp, opInt(sp, c.int, 0));
+    }
+
+    /// `as` / `T(x)` and the conversions sema made explicit: Rust's `Rvalue::cast(to, operand(x))`.
+    fn convert(this: &FnLower, e: Id<TExpr>, inner: Id<TExpr>, kind: ConvKind) : Rvalue {
+        let sp = this.spanOf(e);
+        match kind {
+            ConvKind.ToHalf { return this.halfConvert(e, inner); }
+            ConvKind.FromHalf { return this.halfConvert(e, inner); }
+            ConvKind.FnToClosure { return this.closureFromFn(e, inner); }
+            ConvKind.BoxedToStack { return this.closureBoxedToStack(e, inner); }
+            ConvKind.DynUpcast { return this.dynUpcast(e, inner); }
+            ConvKind.ArrayToSlice { return this.rvalue(inner); }
+            ConvKind.IntResize {}
+            ConvKind.IntToFloat {}
+            ConvKind.FloatToInt {}
+            ConvKind.FloatResize {}
+            ConvKind.PtrCast {}
+            ConvKind.PtrToInt {}
+            ConvKind.IntToPtr {}
+            ConvKind.StringBytes {}
+            ConvKind.EnumTag {}
+            ConvKind.BoolToInt {}
+        }
+        let from = this.operand(inner);
+        return Rvalue.cast(sp, this.tyOf(e), from);
+    }
+
+    /// The IR fn a callee names (instances: `lower/inst_queue.j3`; `dyn` is C2c).
+    fn calleeFn(this: &FnLower, c: Callee): Id<Func> {
+        match c {
+            Callee.Fn(f) { return this.lw.funcOf(f.decl.i); }
+            Callee.Inst(i) { return instFn(this.lw, i.inst); }
+            Callee.Bound(_) { panic("lower: a bound callee outside a template (sema types instances concretely)"); }
+            Callee.Dyn(_) { panic("lower: a dyn slot is not a fn address (`dynCall` lowers the call)"); }
+            Callee.Value(_) { panic("lower: a fn value is not a fn address"); }
+        }
+        return Id<Func> { i: 0 };
+    }
+
+    /// Rust `bind_operand`: a copy out of a projected place goes in `_iN` first.
+    fn bindOperand(this: &FnLower, op: Operand, sp: Span): Operand {
+        match op {
+            Operand.Const(_) { return op; }
+            Operand.Copy(p) { if p.proj.len == 0 { return op; } }
+        }
+        return Operand.Copy(this.spill("i", Rvalue.useOp(sp, op), sp));
+    }
+
+    /// Rust `bind_bool` / `eq_ops`: `_cN = lhs == rhs`.
+    fn eqOps(this: &FnLower, sp: Span, lhs: Operand, rhs: Operand): Operand {
+        let c = this.ir().common;
+        return Operand.Copy(this.spill("c", Rvalue.binary(sp, c.bool, BinOp.Eq, lhs, rhs), sp));
+    }
+}

@@ -1,0 +1,169 @@
+// clang's argv is Rust `compile_llvm`'s, flag for flag, and the host helpers match emit/host/tests.rs.
+module toolchain_argv_test;
+
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.{ Text, contains };
+use j3c.toolchain;
+use j3c.toolchain.{ TargetOs, abortContext, cacheDir, clangArgv, clangFor, defaultEmitOpts, failureHint, hostLibPresent,
+    linkGcFlag, moldOnPath, releaseFlags, releaseNounwind, targetOs };
+
+fn main() {
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    argvs(&mem);
+    hosts(&mem);
+    hints(&mem);
+    context(&mem);
+}
+
+/// `argv` joined with spaces.
+fn joined(argv: &List<string>, mem: &Arena): string {
+    let t = Text.new(mem);
+    for i in 0..argv.len {
+        if i > 0 { t.push(' '); }
+        t.add(argv.items[i]);
+    }
+    return t.str();
+}
+
+fn expect(got: string, want: string) {
+    if got != want {
+        let mem = Arena.create(1 << 12);
+        panic(Text.new(&mem).add("got:  ").add(got).add("\nwant: ").add(want).str());
+    }
+}
+
+fn argvs(mem: &Arena) {
+    // A dev run of a single file (Rust `EmitOpts::default()`).
+    let e = defaultEmitOpts(mem);
+    let a = List<string>.new(mem);
+    let none = List<string>.new(mem);
+    match clangArgv(&a, "define i32 @main()", &e.cc, e.clang, "", "", none.items[0..0], false, "/tmp/x.ll", "/tmp/x.bin", mem) {
+        Result.Ok(_) {}
+        Result.Err(x) { panic(x); }
+    }
+    let mold = if moldOnPath() { " -fuse-ld=mold" } else { "" };
+    expect(joined(&a, mem), Text.new(mem).add("clang -Wno-override-module -O0 -ffunction-sections -fdata-sections -Wl,--gc-sections -g")
+        .add(mold).add(" -o /tmp/x.bin /tmp/x.ll").str());
+
+    // `use lib` markers, extra flags, cpu, `-ftime-report`, `--fast` (no -g), opt letters.
+    let b = List<string>.new(mem);
+    e.cc.debug = false;
+    e.cc.opt = "S";
+    let extra = List<string>.new(mem);
+    extra.push("-march=native");
+    match clangArgv(&b, "; use lib \"m\"\n; use lib \"m\"\n", &e.cc, "", "", "znver3", extra.items[0..1], true, "s.ll", "o", mem) {
+        Result.Ok(_) {}
+        Result.Err(x) { panic(x); }
+    }
+    expect(joined(&b, mem), Text.new(mem).add("clang -Wno-override-module -Os -ffunction-sections -fdata-sections -Wl,--gc-sections -mcpu=znver3")
+        .add(mold).add(" -march=native -ftime-report -o o s.ll -lm").str());
+
+    // A Windows release: target, libs mapped (`c` dropped, GL is opengl32), rpath flags dropped, no mold,
+    // release link flags last.
+    let w = defaultEmitOpts(mem);
+    w.cc.release = true;
+    w.cc.debug = false;
+    w.cc.opt = "s";
+    w.cc.libs.push("c");
+    w.cc.libs.push("GL");
+    w.cc.search.push("/opt/libs");
+    w.cc.flags.push("-Wl,-rpath,$ORIGIN");
+    w.cc.flags.push("-static");
+    let c = List<string>.new(mem);
+    match clangArgv(&c, "", &w.cc, "clang", "x86_64-pc-windows-gnu", "", none.items[0..0], false, "a.ll", "a.exe", mem) {
+        Result.Ok(_) {}
+        Result.Err(x) { panic(x); }
+    }
+    // `~/.cache/j3/sdl2-mingw` adds -L dirs when present: check the fixed parts around them
+    let got = joined(&c, mem);
+    if !contains(got, "clang -Wno-override-module -Os -ffunction-sections -fdata-sections -Wl,--gc-sections --target=x86_64-pc-windows-gnu -o a.exe a.ll -L/opt/libs ")
+        || !contains(got, " -lopengl32 -static -Wl,--disable-dynamicbase -Wl,--disable-high-entropy-va -Wl,-s -Wl,--no-insert-timestamp")
+        || contains(got, "rpath") || contains(got, "-lc ") {
+        panic(got);
+    }
+
+    // A missing library names itself.
+    let d = List<string>.new(mem);
+    w.cc.libs.push("not-a-real-lib");
+    match clangArgv(&d, "", &w.cc, "clang", "", "", none.items[0..0], false, "a.ll", "a", mem) {
+        Result.Ok(_) { panic("missing library linked"); }
+        Result.Err(x) { if !contains(x, "cannot find library `not-a-real-lib`") || !contains(x, "take it out of [link] libs") { panic(x); } }
+    }
+}
+
+fn hosts(mem: &Arena) {
+    expect(linkGcFlag(""), "-Wl,--gc-sections");
+    expect(linkGcFlag("x86_64-pc-windows-gnu"), "-Wl,--gc-sections");
+    expect(linkGcFlag("arm64-apple-darwin"), "-Wl,-dead_strip");
+    if targetOs("x86_64-pc-linux-gnu") != TargetOs.Linux || targetOs("x86_64-pc-windows-gnu") != TargetOs.Windows
+        || targetOs("arm64-apple-darwin") != TargetOs.Macos || targetOs("x86_64-linux-android26") != TargetOs.Android
+        || targetOs("wasm32-unknown-unknown") != TargetOs.Other || targetOs("wasm64-unknown-emscripten") != TargetOs.Web {
+        panic("targetOs");
+    }
+    let l = releaseFlags(TargetOs.Linux, false, mem);
+    if l.link.len != 4 || l.compile.items[1] != "-fno-unwind-tables" { panic("linux release flags"); }
+    if releaseFlags(TargetOs.Linux, true, mem).link.items[5] != "-Wl,--icf=safe" { panic("lld icf"); }
+    if releaseFlags(TargetOs.Windows, true, mem).compile.len != 0 { panic("windows keeps unwind tables"); }
+    let o = releaseFlags(TargetOs.Other, true, mem);
+    if o.compile.len != 0 || o.link.len != 0 { panic("other release flags"); }
+    if releaseNounwind(true, "x86_64-pc-windows-gnu") || !releaseNounwind(true, "x86_64-pc-linux-gnu") { panic("nounwind"); }
+    expect(clangFor("", "x86_64-pc-linux-gnu", mem), "clang");
+    expect(clangFor("zig", "x86_64-pc-linux-gnu", mem), "zig");
+    expect(clangFor("/opt/my-clang", "aarch64-linux-android", mem), "/opt/my-clang");
+    let none = List<string>.new(mem);
+    if hostLibPresent("not-a-real-lib", &none) { panic("hostLibPresent"); }
+    expect(cacheDir("/p/target/game", "", mem), "/p/target/.j3c/host/game");
+    expect(cacheDir("/p/target/x86_64-pc-windows-gnu/game", "x86_64-pc-windows-gnu", mem), "/p/target/.j3c/x86_64-pc-windows-gnu/game");
+    expect(cacheDir("/p/target/.j3c/host/dev/game", "", mem), "/p/target/.j3c/host/dev");
+}
+
+fn hints(mem: &Arena) {
+    let mixer = some(failureHint("cannot find library `SDL2_mixer`", mem));
+    if !contains(mixer, "libsdl2-mixer-2.0-0") || contains(mixer, "libsdl2-2.0-0") { panic(mixer); }
+    let both = some(failureHint("undefined reference to `IMG_Quit'\nundefined reference to `TTF_Quit'", mem));
+    expect(both, "install libsdl2-image-2.0-0 libsdl2-ttf-2.0-0\n         `sudo apt install libsdl2-image-2.0-0 libsdl2-ttf-2.0-0`");
+    match failureHint("error: expected `;`\n --> src/main.j3:1:1\n", mem) {
+        Option.Some(h) { panic(h); }
+        Option.None {}
+    }
+    let cc = some(failureHint("spawn clang: No such file or directory (os error 2)", mem));
+    expect(cc, "install clang\n         `sudo apt install clang`");
+    let ld = some(failureHint("/usr/bin/ld: cannot find -lSDL2: No such file or directory\n/usr/bin/ld: cannot find -lGL", mem));
+    expect(ld, "install libsdl2-2.0-0 libgl1\n         `sudo apt install libsdl2-2.0-0 libgl1`");
+    let pair = some(failureHint("-lGL\nspawn cc: x", mem));
+    expect(pair, "install libgl1\n         `sudo apt install libgl1`\n  = help: install clang\n         `sudo apt install clang`");
+}
+
+fn some(h: Option<string>): string {
+    match h {
+        Option.Some(s) { return s; }
+        Option.None { panic("no hint"); }
+    }
+    return "";
+}
+
+fn context(mem: &Arena) {
+    io.makeDirs("target/unit/toolchain_argv/ctx");
+    let src = "fn main() {\n    let a = 1;\n    let b = a / 0;\n}\n";
+    io.writeFile("target/unit/toolchain_argv/ctx/m.j3", src as []u8);
+    let root = "";
+    match path.realpath("target/unit/toolchain_argv", mem) {
+        Option.Some(r) { root = r; }
+        Option.None { panic("realpath"); }
+    }
+    let line = Text.new(mem).add("runtime check failed: ").add(root).add("/ctx/m.j3:3: division by zero").str();
+    match abortContext(line, root, mem) {
+        Option.Some(t) { expect(t, "ctx/m.j3:3: division by zero\n  2 |     let a = 1;\n> 3 |     let b = a / 0;\n  4 | }"); }
+        Option.None { panic("no abort context"); }
+    }
+    match abortContext("plain stderr line", root, mem) {
+        Option.Some(t) { panic(t); }
+        Option.None {}
+    }
+}

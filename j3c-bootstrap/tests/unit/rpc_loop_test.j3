@@ -1,0 +1,174 @@
+// The shared JSON-RPC loop (`lsp/proto`): requests in, exact replies out, for both framings, through small
+// read buffers (frames split over reads), and the malformed-frame cases. MCP's handler table on top of it.
+module rpc_loop_test;
+
+use j3.data.json;
+use j3.data.json.Json;
+use j3.io;
+use j3.io.{ Reader, Writer };
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys;
+use j3.sys.panic;
+use j3.text.Text;
+use j3c.lsp.proto.{ Framing, Handler, RpcError, STOP, serve, writeMessage };
+use j3c.mcp.server;
+use j3c.mcp.server.State;
+use j3c.scene;
+
+fn echo(state: ptr, params: &Json, arena: &Arena): Result<&Json, RpcError> {
+    *(state as &int) += 1;
+    return Result.Ok(params);
+}
+fn fail(state: ptr, params: &Json, arena: &Arena): Result<&Json, RpcError> {
+    return Result.Err(RpcError { code: -32000, msg: "it broke" });
+}
+fn exit(state: ptr, params: &Json, arena: &Arena): Result<&Json, RpcError> {
+    return Result.Err(RpcError { code: STOP, msg: "" });
+}
+
+/// `body` with a Content-Length header (bytes).
+fn frame(body: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    t.pushStr("Content-Length: ");
+    t.pushInt(body.len);
+    t.pushStr("\r\n\r\n");
+    t.pushStr(body);
+    return t.str();
+}
+
+fn cat(a: string, b: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    t.pushStr(a);
+    t.pushStr(b);
+    return t.str();
+}
+
+/// Run `serve` on `input` (read through a `bufSize`-byte buffer); its output, and the exit code in `rc`.
+fn runServe(input: string, framing: Framing, hs: []Handler, state: ptr, bufSize: int, rc: &int, arena: &Arena): string {
+    let inF = match io.tempFile("", "rpc_in", arena) { Result.Ok(f) { f } Result.Err(_) { panic("tempFile") } };
+    let outF = match io.tempFile("", "rpc_out", arena) { Result.Ok(f) { f } Result.Err(_) { panic("tempFile") } };
+    sys.close(inF.fd);
+    sys.close(outF.fd);
+    io.writeFile(inF.path, input as []u8);
+    let ifd = io.openPath(inF.path, sys.O_RDONLY, 0);
+    let ofd = io.openPath(outF.path, sys.O_WRONLY | sys.O_TRUNC, 0);
+    if ifd < 0 || ofd < 0 { panic("open temp files"); }
+    let r = io.reader(ifd, arena.alloc::<u8>(bufSize));
+    let w = io.writer(ofd, arena.alloc::<u8>(64));
+    *rc = serve(&r, &w, framing, hs, state);
+    sys.close(ifd);
+    sys.close(ofd);
+    let out = match io.readFile(outF.path, arena) { Result.Ok(b) { b as string } Result.Err(_) { panic("readFile") } };
+    io.remove(inF.path);
+    io.remove(outF.path);
+    return out;
+}
+
+fn expect(what: string, got: string, want: string, rc: int, wantRc: int) {
+    if got != want || rc != wantRc {
+        io.printLn(`{what}: rc {rc} (want {wantRc})`);
+        io.printLn("got:");
+        io.printLn(got);
+        io.printLn("want:");
+        io.printLn(want);
+        panic(`{what}: wrong reply`);
+    }
+}
+
+fn main() {
+    let arena = Arena.create(1 << 20);
+    let hs = arena.alloc::<Handler>(3);
+    hs[0] = Handler { method: "echo", run: echo };
+    hs[1] = Handler { method: "fail", run: fail };
+    hs[2] = Handler { method: "exit", run: exit };
+    let calls = 0;
+    let st = &calls as ptr;
+    let rc = 0;
+
+    // writeMessage: header length is bytes ("é" is 2).
+    {
+        let t = io.tempFile("", "rpc_w", &arena);
+        let f = match t { Result.Ok(f) { f } Result.Err(_) { panic("tempFile") } };
+        let w = io.writer(f.fd, arena.alloc::<u8>(16));
+        writeMessage(&w, Framing.ContentLength, "{\"a\":\"é\"}");
+        writeMessage(&w, Framing.Line, "{}");
+        w.flush();
+        sys.close(f.fd);
+        let got = match io.readFile(f.path, &arena) { Result.Ok(b) { b as string } Result.Err(_) { panic("readFile") } };
+        io.remove(f.path);
+        expect("writeMessage", got, "Content-Length: 10\r\n\r\n{\"a\":\"é\"}{}\n", 0, 0);
+    }
+
+    // Content-Length: request, notification, unknown method, handler error, bad JSON, response (ignored),
+    // then a garbage Content-Length (bad frame: -32700 and exit 1; nothing after it is read).
+    let req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"echo\",\"params\":{\"x\":\"héllo\"}}";
+    let input = frame(req, &arena);
+    input = cat(input, frame("{\"jsonrpc\":\"2.0\",\"method\":\"echo\"}", &arena), &arena);
+    input = cat(input, frame("{\"jsonrpc\":\"2.0\",\"id\":\"b\",\"method\":\"nope\"}", &arena), &arena);
+    input = cat(input, frame("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"fail\"}", &arena), &arena);
+    input = cat(input, frame("{oops", &arena), &arena);
+    input = cat(input, frame("{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":1}", &arena), &arena);
+    input = cat(input, frame("[1]", &arena), &arena);
+    input = cat(input, "Content-Length: twelve\r\n\r\n{}", &arena);
+    input = cat(input, frame("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"echo\"}", &arena), &arena);
+    let want = frame("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"x\":\"héllo\"}}", &arena);
+    want = cat(want, frame("{\"jsonrpc\":\"2.0\",\"id\":\"b\",\"error\":{\"code\":-32601,\"message\":\"method not found: nope\"}}", &arena), &arena);
+    want = cat(want, frame("{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32000,\"message\":\"it broke\"}}", &arena), &arena);
+    want = cat(want, frame("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"parse error: expected a string key at byte 1\"}}", &arena), &arena);
+    want = cat(want, frame("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"invalid request: not an object\"}}", &arena), &arena);
+    let badFrame = frame("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"parse error: bad frame\"}}", &arena);
+    want = cat(want, badFrame, &arena);
+    let bufs = [7, 4096];
+    for b in bufs {
+        calls = 0;
+        let got = runServe(input, Framing.ContentLength, hs, st, b, &rc, &arena);
+        expect("content-length", got, want, rc, 1);
+        if calls != 2 { panic(`echo ran {calls} times, want 2 (request and notification)`); }
+    }
+
+    // Other bad frames: no Content-Length, a body cut short, input ending inside the headers.
+    let ok1 = frame("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}", &arena);
+    let okIn = frame("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"echo\",\"params\":{}}", &arena);
+    let cases = [
+        "Content-Type: x\r\n\r\n{}",
+        "Content-Length: 50\r\n\r\n{\"jsonrpc\":\"2.0\"}",
+        "Content-Length: 2\r\n",
+        "Content-Length: -3\r\n\r\n",
+    ];
+    for c in cases {
+        let got = runServe(cat(okIn, c, &arena), Framing.ContentLength, hs, st, 7, &rc, &arena);
+        expect(c, got, cat(ok1, badFrame, &arena), rc, 1);
+    }
+
+    // Stop: `exit` as a request gets a null result, and the loop ends there (rc 0).
+    let stopIn = cat(frame("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"exit\"}", &arena), okIn, &arena);
+    expect("stop", runServe(stopIn, Framing.ContentLength, hs, st, 4096, &rc, &arena),
+        frame("{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":null}", &arena), rc, 0);
+    // Empty input is a clean end.
+    expect("empty", runServe("", Framing.ContentLength, hs, st, 7, &rc, &arena), "", rc, 0);
+    // An id without a string method is answered -32600; a client's response (id + result) is not.
+    let noMethod = cat(frame("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":3}", &arena),
+        frame("{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":1}", &arena), &arena);
+    expect("no method", runServe(noMethod, Framing.ContentLength, hs, st, 4096, &rc, &arena),
+        frame("{\"jsonrpc\":\"2.0\",\"id\":6,\"error\":{\"code\":-32600,\"message\":\"invalid request: no method\"}}", &arena), rc, 0);
+
+    // Line framing (MCP) with the MCP handler table: blank lines skipped, bad JSON answered and passed.
+    let state = State { tools: scene.tools(&arena) };
+    let mcpIn = "\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\r\n  \n{bad\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"nope\"}}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"scene_list\",\"arguments\":{}}}\n{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/list\"}";
+    let got = runServe(mcpIn, Framing.Line, server.handlers(&arena), &state as ptr, 7, &rc, &arena);
+    let lastAt = 0;
+    let n = 0;
+    for i in 0..got.len {
+        if got[i] == 10 { n += 1; if n == 4 { lastAt = i + 1; } }
+    }
+    let head = got[0..lastAt];
+    let wantHead = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"parse error: expected a string key at byte 1\"}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"unknown tool `nope`\"}}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"j3c-boot: this tool is not ported yet (plan 11 C5)\"}],\"isError\":true}}\n";
+    expect("mcp", head, wantHead, rc, 0);
+    let list = match json.parseStr(got[lastAt..got.len - 1], &arena) {
+        Result.Ok(j) { j }
+        Result.Err(_) { panic("tools/list reply is not one JSON line") }
+    };
+    if list.path("result.tools").len() != state.tools.len || n != 5 { panic("tools/list reply"); }
+    io.printLn("rpc_loop ok");
+}

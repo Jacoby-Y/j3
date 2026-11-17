@@ -1,0 +1,243 @@
+// Values of generic types: generic enum constructors (`Option.Some(x)` at the expected instance), generic
+// struct literals (`Box<int> { v: 1 }`), and `for x in it` over an iterator (a struct with
+// `next(this: &Self): Option<T>`, generic struct instances included).
+//
+// Part of module j3c.sema.
+// Port of: check/lower/enums.rs (ctor_enum_id's template case, construct_variant on an instance),
+// check/lower/lit.rs (struct_lit with type args, struct_lit_sid on an instance), check/lower/for_iter.rs
+// (for_iter, option_shape)
+// J3: An enum or struct instance is `Ty.Enum/Struct { decl, args }`; payload and field types are the
+// template's at `args` (`generics.subst` / `fieldTyOf`). `for` over an iterator is one `TForEach` with
+// `kind = ForKind.Iter`, `next` the method callee (`Callee.Inst` on a generic struct) and `some` the
+// `Some` variant: lower builds Rust's `while true { o = it.next(); .. }` from it.
+module j3c.sema;
+
+extend BodyCx {
+    /// `E.V`, `E.V(x)` of generic enum `en` (Rust `construct_variant`): the instance is the expected type
+    /// (`want`, matched by declaration), else `` `E` needs an expected type ``.
+    fn genVariant(this: &BodyCx, sp: Span, en: Id<EnumDecl>, variant: Ident, args: &List<Id<Expr>>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let t = this.cx.tables;
+        let ed = *t.enumAt(en);
+        let et = this.com().error;
+        let eargs = t.common.none;
+        match want {
+            Option.Some(w) { match this.ty(w) { Ty.Enum(e) { if e.decl == en { et = w; eargs = e.args; } } _ {} } }
+            Option.None {}
+        }
+        if et == this.com().error {
+            let m = Text.new(this.cx.arena);
+            m.add("`").add(this.str(ed.name)).add("` needs an expected type");
+            return Result.Err(this.err(sp, m.str()));
+        }
+        let g = match ed.gen { Option.Some(x) { x } Option.None { return Result.Err(this.err(sp, "not a generic enum")); } };
+        let vi = -1;
+        for i in 0..ed.variants.len {
+            if ed.variants.items[i].name == variant.name { vi = i; }
+        }
+        if vi < 0 {
+            let m = Text.new(this.cx.arena);
+            m.add("unknown variant `").add(this.str(variant.name)).add("`");
+            return Result.Err(this.err(sp, m.str()));
+        }
+        let v = ed.variants.items[vi];
+        let ftys = List<Id<Ty>>.new(this.cx.arena);
+        match v.payload {
+            Option.Some(p) {
+                let pt = subst(t, g, p, eargs);
+                if v.multi {
+                    match this.ty(pt) {
+                        Ty.Tuple(tt) { ftys.extend(t.items(tt.elems)); }
+                        _ { return Result.Err(this.tupleMultiPayload(sp, pt)); }
+                    }
+                } else {
+                    ftys.push(pt);
+                }
+            }
+            Option.None {}
+        }
+        let name = Text.new(this.cx.arena);
+        name.add(this.str(ed.name)).add(".").add(this.str(variant.name));
+        if args.len != ftys.len {
+            let m = Text.new(this.cx.arena);
+            if ftys.len == 0 {
+                m.add("`").add(name.str()).add("` has no payload");
+            } else if ftys.len == 1 && args.len == 0 {
+                m.add("`").add(name.str()).add("` needs a payload");
+            } else {
+                m.add("`").add(name.str()).add("` takes ");
+                m.pushInt(ftys.len);
+                m.add(" field");
+                if ftys.len != 1 { m.add("s"); }
+                m.add(", got ");
+                m.pushInt(args.len);
+            }
+            return Result.Err(this.err(sp, m.str()));
+        }
+        let payload = List<Id<TExpr>>.new(this.cx.arena);
+        if ftys.len == 1 && !v.multi {
+            payload.push(this.operand(args.items[0], Option.Some(ftys.items[0]))?);
+        } else {
+            for k in 0..args.len {
+                match this.operand(args.items[k], Option.Some(ftys.items[k])) {
+                    Result.Ok(x) { payload.push(x); }
+                    Result.Err(e) {
+                        let m = Text.new(this.cx.arena);
+                        m.add("field ");
+                        m.pushInt(k);
+                        m.add(" of `").add(name.str()).add("`: ").add(e.diag.msg);
+                        let out = e;
+                        out.diag.msg = own(this.cx.arena, m.str());
+                        return Result.Err(out);
+                    }
+                }
+            }
+        }
+        return Result.Ok(this.expr(TExpr.EnumVal(TEnumVal { variant: vi, payload: payload }), et, sp));
+    }
+
+    /// `S<T> { .. }` or `S { .. }` of a generic struct (Rust `struct_lit`): without type args the name is
+    /// no type (Rust's `types` holds no templates); with them, the fields at the instance's types.
+    fn genStructLit(this: &BodyCx, sp: Span, s: &StructLitExpr): Result<Id<TExpr>, TErr> {
+        if s.typeArgs.len == 0 {
+            let m = Text.new(this.cx.arena);
+            m.add("unknown type `").add(this.str(s.name.name)).add("`");
+            return Result.Err(this.err(s.name.span, m.str()));
+        }
+        let st = this.genStructInst(s.name, &s.typeArgs)?;
+        let sid = match this.structOf(st) { Option.Some(x) { x } Option.None { return Result.Err(this.err(s.name.span, "not a struct")); } };
+        let sd = *this.cx.tables.structAt(sid);
+        let wname = this.str(s.name.name);
+        let vals = this.cx.arena.alloc::<Id<TExpr>>(sd.fields.len);
+        let set = this.cx.arena.alloc::<bool>(sd.fields.len);
+        for i in 0..set.len { set[i] = false; } // arena memory may be reused, not zeroed
+        let written = List<int>.new(this.cx.arena);
+        for k in 0..s.fields.len {
+            let fi = s.fields.items[k];
+            let idx = -1;
+            for i in 0..sd.fields.len {
+                if sd.fields.items[i].name == fi.name.name {
+                    idx = i;
+                    break;
+                }
+            }
+            if idx < 0 {
+                let m = Text.new(this.cx.arena);
+                m.add("`").add(wname).add("` has no field `").add(this.str(fi.name.name)).add("`");
+                return Result.Err(this.err(fi.name.span, m.str()));
+            }
+            if set[idx] {
+                let m = Text.new(this.cx.arena);
+                m.add("duplicate field `").add(this.str(fi.name.name)).add("`");
+                return Result.Err(this.err(fi.name.span, m.str()));
+            }
+            vals[idx] = this.operand(fi.value, Option.Some(fieldTyOf(this.cx.tables, st, idx)))?;
+            set[idx] = true;
+            written.push(idx);
+        }
+        let items = List<Id<TExpr>>.new(this.cx.arena);
+        for i in 0..sd.fields.len {
+            if set[i] {
+                items.push(vals[i]);
+                continue;
+            }
+            match sd.fields.items[i].default {
+                Option.Some(d) { items.push(this.constValue(sp, d)); }
+                Option.None {
+                    let m = Text.new(this.cx.arena);
+                    m.add("missing field `").add(this.str(sd.fields.items[i].name)).add("`");
+                    return Result.Err(this.err(sp, m.str()));
+                }
+            }
+        }
+        return Result.Ok(this.expr(TExpr.StructLit(TStructLit { items: items, written: written }), st, sp));
+    }
+
+    /// `for x in it` where `src` is not an array, slice or string (Rust `for_iter`): a struct with
+    /// `next(this: &Self): Option<T>`. `id` is the loop's id (taken).
+    fn genForIter(this: &BodyCx, sp: Span, f: &ForEachStmt, id: int, src: Id<TPlace>): Result<Id<TStmt>, TErr> {
+        let t = this.cx.tables;
+        let span = this.cx.ast.exprSpan(f.iter);
+        let st = this.placeTy(src);
+        let tname = this.tyStr(st);
+        let protocol = Text.new(this.cx.arena);
+        protocol.add("`for` takes an array, a slice, a range, or an iterator: a struct with `fn next(this: &").add(tname).add("): Option<T>`");
+        let s = match this.ty(st) {
+            Ty.Struct(x) { x }
+            _ {
+                let m = Text.new(this.cx.arena);
+                m.add("`for` over a `").add(tname).add("`");
+                return Result.Err(this.help(this.err(span, m.str()), protocol.str()));
+            }
+        };
+        let next = this.findMethodAny(s.decl, this.sym("next"));
+        match next { Option.Some(x) { if this.ownParams(x) > 0 { next = Option.None; } } Option.None {} }
+        let fid = match next {
+            Option.Some(x) { x }
+            Option.None {
+                let m = Text.new(this.cx.arena);
+                m.add("`for` over `").add(tname).add("`, which has no `next` method");
+                return Result.Err(this.help(this.err(span, m.str()), protocol.str()));
+            }
+        };
+        let d = *t.fnAt(fid);
+        let p0 = this.com().error;
+        let ret = d.ret;
+        if d.params.len == 1 { p0 = d.params.items[0].ty; }
+        match d.gen {
+            Option.Some(g) {
+                p0 = subst(t, g, p0, s.args);
+                ret = subst(t, g, ret, s.args);
+            }
+            Option.None {}
+        }
+        let shape = this.optionShape(p0, ret);
+        if shape.some < 0 {
+            let m = Text.new(this.cx.arena);
+            m.add("`").add(tname).add(".next` is not `fn next(this: &").add(tname).add("): Option<T>`");
+            return Result.Err(this.help(this.err(span, m.str()), protocol.str()));
+        }
+        match f.index {
+            Option.Some(i) { return Result.Err(this.help(this.err(i.span, "an iterator `for` has no index"), "count in a `let` before the loop")); }
+            Option.None {}
+        }
+        let callee = Callee.Fn(FnCallee { decl: fid });
+        match d.gen {
+            Option.Some(_) { callee = Callee.Inst(InstCallee { inst: this.genInstance(span, fid, s.args)? }); }
+            Option.None {}
+        }
+        let n0 = this.scope.len;
+        let v = this.newLocal(f.name.name, shape.elem, f.name.span, false);
+        this.bind(f.name.name, v);
+        let body = this.scopedBlock(&f.body);
+        this.scope.len = n0;
+        return Result.Ok(this.stmtNode(TStmt.ForEach(TForEach { id: id, kind: ForKind.Iter, index: Option.None, var: v, source: src,
+            next: Option.Some(callee), some: shape.some, body: body }), sp));
+    }
+
+    /// Rust `option_shape`: `next`'s `Some` variant and its payload type, when it takes one `&` parameter
+    /// and returns an `Option`-shaped enum (`Some(T)` and a payload-less `None`). `some < 0`: not.
+    fn optionShape(this: &BodyCx, p0: Id<Ty>, ret: Id<Ty>): OptionShape {
+        let t = this.cx.tables;
+        let no = OptionShape { some: -1, elem: this.com().error };
+        match this.refInner(p0) { Option.Some(_) {} Option.None { return no; } }
+        let e = match this.ty(ret) { Ty.Enum(x) { x } _ { return no; } };
+        let ed = t.enumAt(e.decl);
+        if ed.variants.len != 2 { return no; }
+        let k = -1;
+        for i in 0..2 { if this.str(ed.variants.items[i].name) == "Some" { k = i; break; } }
+        if k < 0 { return no; }
+        let sv = ed.variants.items[k];
+        let nv = ed.variants.items[1 - k];
+        match nv.payload { Option.Some(_) { return no; } Option.None {} }
+        if this.str(nv.name) != "None" || sv.multi { return no; }
+        let pt = match sv.payload { Option.Some(x) { x } Option.None { return no; } };
+        match ed.gen { Option.Some(g) { pt = subst(t, g, pt, e.args); } Option.None {} }
+        return OptionShape { some: k, elem: pt };
+    }
+}
+
+/// `optionShape`'s answer.
+struct OptionShape {
+    some: int;
+    elem: Id<Ty>;
+}

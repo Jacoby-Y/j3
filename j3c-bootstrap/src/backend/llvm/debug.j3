@@ -2,4 +2,173 @@
 //
 // Part of module j3c.backend.llvm.
 // Port of: j3c/src/emit/llvm_expr/debug.rs
+// J3: `DebugOut` is Rust's, field for field: the id maps are `Map`s used for lookups only; metadata is
+// printed from `body` in allocation order (rule 3). Entries: `DebugOut.off`, `DebugOut.prepare`, `finish`.
+// Rust's `file.loc` (the `.j3ui` line for generated code) is the plain source line until the UI port (C4).
 module j3c.backend.llvm;
+
+/// Line locations plus named locals.
+pub struct DebugOut {
+    on: bool;
+    next: u32;
+    body: Text;
+    subs: Map<Id<Func>, u32>;
+    /// Key `(scope, line)` packed as `scope << 32 | line`.
+    locs: Map<u64, u32>;
+    files: Map<Id<Source>, u32>;
+    tys: Map<Id<TyKind>, u32>;
+    expr: u32;
+    empty: u32;
+
+    /// No debug info.
+    fn off(arena: &Arena): DebugOut {
+        return DebugOut { on: false, next: 0, body: Text.new(arena), subs: Map<Id<Func>, u32>.new(arena, 16),
+            locs: Map<u64, u32>.new(arena, 16), files: Map<Id<Source>, u32>.new(arena, 16), tys: Map<Id<TyKind>, u32>.new(arena, 16),
+            expr: 0, empty: 0 };
+    }
+
+    /// Compile unit, files and one `DISubprogram` per fn of `modules` (only `keep` when given).
+    fn prepare(cx: &IrCx, modules: []Module, keep: Option<&Set<Id<Func>>>, arena: &Arena): DebugOut {
+        let fileIds = List<Id<Source>>.new(arena);
+        let seen = Set<Id<Source>>.new(arena, 16);
+        for mi in 0..modules.len {
+            let fs = modules[mi].funcs;
+            for i in 0..fs.len {
+                let func = cx.funcMut(fs.items[i]);
+                if !debugFn(cx, func, keep) { continue; }
+                if seen.add(func.span.file) { fileIds.push(func.span.file); }
+            }
+        }
+        if fileIds.len == 0 { return DebugOut.off(arena); }
+        let dbg = DebugOut.off(arena);
+        dbg.on = true;
+        let cu = dbg.alloc();
+        let dwarf = dbg.alloc();
+        let ver = dbg.alloc();
+        let empty = dbg.alloc();
+        let subty = dbg.alloc();
+        let types = dbg.alloc();
+        let fileMds = List<u32>.new(arena);
+        for i in 0..fileIds.len { fileMds.push(dbg.alloc()); }
+        let file0 = fileMds.items[0];
+        let b = &dbg.body;
+        b.fmt(`!{cu} = distinct !DICompileUnit(language: DW_LANG_C99, file: !{file0}, producer: `).add("\"j3c\"");
+        b.fmt(`, isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug, enums: !{empty}, retainedTypes: !{empty}, globals: !{empty}, imports: !{empty})`).push('\n');
+        b.fmt(`!{dwarf} = !`).add("{i32 7, !\"Dwarf Version\", i32 4}\n");
+        b.fmt(`!{ver} = !`).add("{i32 2, !\"Debug Info Version\", i32 3}\n");
+        dbg.empty = empty;
+        b.fmt(`!{empty} = !`).add("{}\n");
+        let expr = dbg.alloc();
+        dbg.expr = expr;
+        b.fmt(`!{expr} = !DIExpression()`).push('\n');
+        b.fmt(`!{subty} = !DISubroutineType(types: !{types})`).push('\n');
+        b.fmt(`!{types} = !`).add("{null}\n");
+        for i in 0..fileIds.len {
+            let src = match cx.source(fileIds.items[i]) { Option.Some(s) { s } Option.None { continue; } };
+            let md = fileMds.items[i];
+            let p = src.path;
+            let slash = lastIndexOf(p, "/");
+            let name = p;
+            let dir = ".";
+            if slash >= 0 {
+                name = p[slash + 1..p.len];
+                if slash == 0 { dir = "/"; } else { dir = p[0..slash]; }
+            }
+            b.fmt(`!{md} = !DIFile(filename: `).push('"');
+            pushMdStr(b, name);
+            b.add("\", directory: \"");
+            pushMdStr(b, dir);
+            b.add("\")\n");
+            dbg.files.put(fileIds.items[i], md);
+        }
+        for mi in 0..modules.len {
+            let fs = modules[mi].funcs;
+            for i in 0..fs.len {
+                let func = cx.funcMut(fs.items[i]);
+                if !debugFn(cx, func, keep) { continue; }
+                let src = match cx.source(func.span.file) { Option.Some(s) { s } Option.None { continue; } };
+                let fileMd = match dbg.files.get(func.span.file) { Option.Some(m) { m } Option.None { continue; } };
+                let line = srcLine(&src, func.span.lo);
+                if line < 1 { line = 1; }
+                let sp = dbg.alloc();
+                // The J3 name (`game.update`, `Player.hit`), and no linkageName: `addr2line -f`
+                // (crash traces) and debuggers then show it instead of the mangled C symbol.
+                b.fmt(`!{sp} = distinct !DISubprogram(name: `).push('"');
+                let ownerAt = b.len();
+                match func.methodOf {
+                    Option.Some(sid) { pushMdStr(b, cx.nameStr(cx.structDef(sid).name)); }
+                    Option.None {
+                        for k in 0..func.moduleName.len {
+                            if k > 0 { b.push('.'); }
+                            pushMdStr(b, cx.nameStr(func.moduleName.items[k]));
+                        }
+                    }
+                }
+                if b.len() > ownerAt { b.push('.'); }
+                pushMdStr(b, cx.nameStr(func.name));
+                b.fmt(`", scope: !{fileMd}, file: !{fileMd}, line: {line}, type: !{subty}, scopeLine: {line}, flags: DIFlagPrototyped, spFlags: DISPFlagDefinition, unit: !{cu}, retainedNodes: !{empty})`).push('\n');
+                dbg.subs.put(func.id, sp);
+            }
+        }
+        if dbg.subs.len == 0 { return DebugOut.off(arena); }
+        return dbg;
+    }
+
+    fn subprogram(this: &DebugOut, id: Id<Func>): Option<u32> { return this.subs.get(id); }
+
+    fn location(this: &DebugOut, scope: u32, line: u32): u32 {
+        let l = line;
+        if l < 1 { l = 1; }
+        let key = (u64(scope) << 32) | u64(l);
+        match this.locs.get(key) { Option.Some(id) { return id; } Option.None {} }
+        let id = this.alloc();
+        this.body.fmt(`!{id} = !DILocation(line: {l}, column: 1, scope: !{scope})`).push('\n');
+        this.locs.put(key, id);
+        return id;
+    }
+
+    fn fileOf(this: &DebugOut, file: Id<Source>): Option<u32> { return this.files.get(file); }
+
+    fn localVar(this: &DebugOut, cx: &IrCx, scope: u32, file: u32, name: string, ty: Id<TyKind>, line: u32): u32 {
+        let tyMd = this.diType(cx, ty);
+        let id = this.alloc();
+        this.body.fmt(`!{id} = !DILocalVariable(name: `).push('"');
+        pushMdStr(&this.body, name);
+        this.body.fmt(`", scope: !{scope}, file: !{file}, line: {line}, type: !{tyMd})`).push('\n');
+        return id;
+    }
+
+    /// The metadata text (Rust `finish`).
+    fn finish(this: &DebugOut, out: &Text) {
+        if !this.on { return; }
+        out.add("!llvm.dbg.cu = !{!0}\n");
+        out.add("!llvm.module.flags = !{!1, !2}\n");
+        out.add(this.body.str());
+    }
+
+    fn alloc(this: &DebugOut): u32 {
+        let id = this.next;
+        this.next += 1;
+        return id;
+    }
+}
+
+/// A J3 fn with a real span in a known file (and in `keep` when given).
+fn debugFn(cx: &IrCx, func: &Func, keep: Option<&Set<Id<Func>>>): bool {
+    match func.kind {
+        FuncKind.J3(_) {}
+        FuncKind.Lib(_) { return false; }
+        FuncKind.Decl { return false; }
+    }
+    if isNone(func.span) { return false; }
+    match keep { Option.Some(k) { if !k.has(func.id) { return false; } } Option.None {} }
+    match cx.source(func.span.file) { Option.Some(_) { return true; } Option.None { return false; } }
+}
+
+/// `s` with `\` and `"` escaped (Rust `ll_md_str`).
+fn pushMdStr(t: &Text, s: string) {
+    for i in 0..s.len {
+        let c = s[i];
+        if c == '\\' { t.add("\\\\"); } else if c == '"' { t.add("\\\""); } else { t.push(c); }
+    }
+}

@@ -1,0 +1,199 @@
+// The IR data model by hand (wave 4 contract): builtin types and interning, struct/enum layout (`abi`),
+// a fn with params, locals, a call and a branch built with `BodyBuilder`, read back; wrap folds; abort
+// text; the dump/validate/LLVM entries are reachable and report "not ported" (until waves 5 and 6).
+module ir_model_test;
+
+use j3.data.pool.Id;
+use j3.memory.List;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+use j3c.backend;
+use j3c.backend.Opts;
+use j3c.base.intern.Sym;
+use j3c.base.span.noSpan;
+use j3c.driver;
+use j3c.driver.Session;
+use j3c.ir.{ AbortKind, BinOp, Block, BodyBuilder, ConstKind, EnumDef, FieldDef, FieldId, Func, FuncKind, IntTy, J3Fn, LocalKind,
+    Module, Operand, Program, Rvalue, RvalueKind, StmtKind, StructDef, TyKind, VariantDef, Vis, abiAlign, abiSize, abortTextWith,
+    fieldOffset, foldBin, foldNeg, opFnAddr, opInt, operandTy, TyArg };
+use j3c.ir.dump.dumpProgram;
+use j3c.ir.validate;
+
+fn mod1(s: &Session, name: string): List<Sym> {
+    let l = List<Sym>.new(s.arena);
+    l.push(s.names.intern(name));
+    return l;
+}
+
+fn types(s: &Session, p: &Program) {
+    let cx = &p.cx;
+    let c = cx.common;
+    if c.void.i != 0 || c.int != c.i64 || c.float != c.f64 || c.f16.i != 17 { panic("common type order"); }
+    match cx.builtinNamed("int") { Option.Some(t) { if t != c.i64 { panic("int alias"); } } Option.None { panic("builtin int"); } }
+    match cx.builtinNamed("Foo") { Option.Some(_) { panic("Foo is builtin"); } Option.None {} }
+    let r1 = cx.tyRef(c.int);
+    let r2 = cx.tyRef(c.int);
+    if r1 != r2 || cx.tyRef(c.u8) == r1 { panic("ref interning"); }
+    let ps = List<Id<TyKind>>.new(s.arena);
+    ps.push(c.int);
+    ps.push(r1);
+    let f1 = cx.tyFn(ps, c.bool);
+    let qs = List<Id<TyKind>>.new(s.arena);
+    qs.push(c.int);
+    qs.push(r1);
+    if cx.tyFn(qs, c.bool) != f1 || cx.tyFn(qs, c.int) == f1 { panic("fn interning"); }
+    match cx.fnSig(f1) { Option.Some(sig) { if sig.params.len != 2 || sig.ret != c.bool { panic("fnSig"); } } Option.None { panic("fnSig none"); } }
+    match cx.lookupTy(TyKind.Int(IntTy.U16)) { Option.Some(t) { if t != c.u16 { panic("lookup u16"); } } Option.None { panic("lookup"); } }
+    match cx.elemTy(c.string) { Option.Some(t) { if t != c.u8 { panic("string elem"); } } Option.None { panic("elemTy"); } }
+    if abiSize(cx, c.string) != 16 || abiAlign(cx, c.string) != 8 { panic("string layout"); }
+    match fieldOffset(cx, cx.tySlice(c.u8), 1) { Option.Some(o) { if o != 8 { panic("slice len offset"); } } Option.None { panic("slice"); } }
+}
+
+fn layout(s: &Session, p: &Program) {
+    let cx = &p.cx;
+    let c = cx.common;
+    let fs = List<FieldDef>.new(s.arena);
+    fs.push(FieldDef { name: s.names.intern("tag"), doc: "", ty: c.u8, embedded: false, default: Option.None });
+    fs.push(FieldDef { name: s.names.intern("v"), doc: "", ty: c.int, embedded: false, default: Option.None });
+    fs.push(FieldDef { name: s.names.intern("w"), doc: "", ty: c.i32, embedded: false, default: Option.None });
+    let sid = cx.allocStruct(StructDef { moduleName: mod1(s, "m"), name: s.names.intern("P"), doc: "", fields: fs, packed: false,
+        debug: false, span: noSpan(), tyArgs: List<TyArg>.new(s.arena), script: Option.None });
+    let pt = cx.tyStruct(sid);
+    if abiSize(cx, pt) != 24 || abiAlign(cx, pt) != 8 { panic("struct layout"); }
+    match fieldOffset(cx, pt, 2) { Option.Some(o) { if o != 16 { panic("field 2 offset"); } } Option.None { panic("offset"); } }
+    if cx.fieldDef(FieldId { structId: sid, index: 1 }).ty != c.int { panic("fieldDef"); }
+    let vs = List<VariantDef>.new(s.arena);
+    vs.push(VariantDef { name: s.names.intern("None"), doc: "", payload: Option.None, multi: false });
+    let eid = cx.allocEnum(EnumDef { moduleName: mod1(s, "m"), name: s.names.intern("E"), doc: "", variants: vs, tryCatch: Option.None,
+        debug: false, span: noSpan(), tyArgs: List<Id<TyKind>>.new(s.arena) });
+    if abiSize(cx, cx.tyEnum(eid)) != 4 { panic("c-like enum is i32"); }
+    cx.enumDefMut(eid).variants.push(VariantDef { name: s.names.intern("Some"), doc: "", payload: Option.Some(pt), multi: false });
+    if abiSize(cx, cx.tyEnum(eid)) != 32 || abiAlign(cx, cx.tyEnum(eid)) != 8 { panic("tagged enum layout"); }
+    match fieldOffset(cx, cx.tyEnum(eid), 1) { Option.Some(o) { if o != 8 { panic("union offset"); } } Option.None { panic("enum"); } }
+}
+
+/// `fn add(a: int, b: int): int { let c = a + b; if c > 0 { return c; } return 0; }` and
+/// `fn main(): int { return add(1, 2); }` in module `m`.
+fn program(s: &Session, p: &Program) {
+    let cx = &p.cx;
+    let c = cx.common;
+    let sp = noSpan();
+    let ps = List<Id<TyKind>>.new(s.arena);
+    ps.push(c.int);
+    ps.push(c.int);
+    let addTy = cx.tyFn(ps, c.int);
+
+    let b = BodyBuilder.new(s.arena, c.void);
+    let a = b.param(s.names.intern("a"), c.int, sp);
+    let bb = b.param(s.names.intern("b"), c.int, sp);
+    let cl = b.letLocal(s.names.intern("c"), c.int, sp);
+    b.assign(sp, b.localPlace(cl, sp), Rvalue.binary(sp, c.int, BinOp.Add, Operand.Copy(b.localPlace(a, sp)), Operand.Copy(b.localPlace(bb, sp))));
+    let t = b.tmp(s.names.intern("_t0"), c.bool, sp);
+    b.assign(sp, b.localPlace(t, sp), Rvalue.binary(sp, c.bool, BinOp.Gt, Operand.Copy(b.localPlace(cl, sp)), opInt(sp, c.int, 0)));
+    let saved = b.beginBlock();
+    b.returnOp(sp, Option.Some(Operand.Copy(b.localPlace(cl, sp))));
+    let thenB = b.endBlock(saved);
+    b.ifThen(sp, Operand.Copy(b.localPlace(t, sp)), thenB);
+    b.returnOp(sp, Option.Some(opInt(sp, c.int, 0)));
+    let addId = cx.allocFunc(Func { id: Id<Func> { i: 0 }, doc: "", moduleName: mod1(s, "m"), name: s.names.intern("add"), ty: addTy,
+        vis: Vis.Pub, methodOf: Option.None, kind: FuncKind.J3(J3Fn { body: b.finish() }), span: sp });
+
+    let mb = BodyBuilder.new(s.arena, c.void);
+    let args = List<Operand>.new(s.arena);
+    args.push(opInt(sp, c.int, 1));
+    args.push(opInt(sp, c.int, 2));
+    let r = mb.tmp(s.names.intern("_t1"), c.int, sp);
+    mb.assign(sp, mb.localPlace(r, sp), Rvalue.call(sp, c.int, opFnAddr(sp, addTy, addId), args));
+    mb.returnOp(sp, Option.Some(Operand.Copy(mb.localPlace(r, sp))));
+    let mainId = cx.allocFunc(Func { id: Id<Func> { i: 0 }, doc: "", moduleName: mod1(s, "m"), name: s.names.intern("main"),
+        ty: cx.tyFn(List<Id<TyKind>>.new(s.arena), c.int), vis: Vis.Private, methodOf: Option.None, kind: FuncKind.J3(J3Fn { body: mb.finish() }), span: sp });
+    cx.entry = Option.Some(mainId);
+
+    let m = Module.new(s.arena, mod1(s, "m"));
+    m.funcs.push(addId);
+    m.funcs.push(mainId);
+    p.modules.push(m);
+
+    // Read it back.
+    let add = cx.func(p.modules.items[0].funcs.items[0]);
+    if add.id != addId || mainId.i != 1 || s.names.str(add.name) != "add" { panic("func ids"); }
+    match add.kind {
+        FuncKind.J3(j) {
+            let body = j.body;
+            if body.locals.len() != 4 || body.params.len != 2 || body.block.stmts.len != 4 { panic("add body shape"); }
+            if body.local(cl).kind != LocalKind.Let || body.local(t).ty != c.bool { panic("locals"); }
+            match body.block.stmts.items[2].kind {
+                StmtKind.If(i) {
+                    if i.thenBlock.stmts.len != 1 { panic("then block"); }
+                    match i.elseBlock { Option.Some(_) { panic("else"); } Option.None {} }
+                    if operandTy(i.cond) != c.bool { panic("cond type"); }
+                }
+                _ { panic("stmt 2 is not an if"); }
+            }
+        }
+        _ { panic("add kind"); }
+    }
+    match cx.func(mainId).kind {
+        FuncKind.J3(j) {
+            match j.body.block.stmts.items[0].kind {
+                StmtKind.Assign(asg) {
+                    match asg.rvalue.kind {
+                        RvalueKind.Call(call) {
+                            if call.args.len != 2 { panic("call args"); }
+                            match call.func {
+                                Operand.Const(k) {
+                                    match k.kind { ConstKind.FnAddr(fa) { if fa.func != addId { panic("callee"); } } _ { panic("callee kind"); } }
+                                }
+                                Operand.Copy(_) { panic("callee copy"); }
+                            }
+                        }
+                        _ { panic("not a call"); }
+                    }
+                }
+                _ { panic("main stmt 0"); }
+            }
+        }
+        _ { panic("main kind"); }
+    }
+}
+
+fn folds() {
+    let min: i64 = -9223372036854775807 - 1;
+    match foldBin(BinOp.Div, 1, 0) { Option.Some(_) { panic("div 0 folded"); } Option.None {} }
+    match foldBin(BinOp.Rem, 1, 0) { Option.Some(_) { panic("rem 0 folded"); } Option.None {} }
+    match foldBin(BinOp.Div, min, -1) { Option.Some(v) { if v != min { panic("MIN / -1"); } } Option.None { panic("div"); } }
+    match foldBin(BinOp.Rem, min, -1) { Option.Some(v) { if v != 0 { panic("MIN % -1"); } } Option.None { panic("rem"); } }
+    match foldBin(BinOp.Sub, -7, 3) { Option.Some(v) { if v != -10 { panic("sub"); } } Option.None { panic("sub none"); } }
+    if foldNeg(min) != min || foldNeg(5) != -5 { panic("neg"); }
+}
+
+fn main() {
+    let s = Session.new(driver.defaults());
+    let p = Program.new(s.arena, &s.names, &s.sources);
+    types(s, &p);
+    layout(s, &p);
+    program(s, &p);
+    folds();
+
+    let t = Text.new(s.arena);
+    let vals = s.arena.alloc::<i64>(2);
+    vals[0] = 5;
+    vals[1] = 3;
+    if abortTextWith(AbortKind.Index, vals, &t).str() != "index out of bounds: index 5, len 3" { panic(t.str()); }
+    t.clear();
+    if abortTextWith(AbortKind.Div0, vals, &t).str() != "integer divide by zero" { panic("div0 text"); }
+
+    // Validate and the llvm backend are ported: the model program passes both.
+    match validate.validateProgram(&p) { Result.Ok(_) {} Result.Err(e) { panic(e.message); } }
+    let d: fn(&Program, &Text) = dumpProgram;
+    match backend.find("llvm", noSpan(), &s.diags) {
+        Option.Some(be) {
+            let o = Opts { target: "", opt: 0, debug: true };
+            if !be.emit(&p, &o, &t, &s.diags) { panic(s.diags.at(s.diags.count() - 1).msg); }
+        }
+        Option.None { panic("llvm backend"); }
+    }
+    s.free();
+}

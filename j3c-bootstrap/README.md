@@ -31,11 +31,11 @@ Stages, in order. A stage may use only the stages above it (`tools/layers.txt`, 
 | syntax | `syntax/*` | tokens, lexer, AST, parser (`syntax/parse` parts), extend folding, flow, walk, fmt |
 | ui | `ui.j3`, `ui/markup` + parts, `ui/gen` + parts | the `.j3ui` compiler |
 | load | `load.j3` + parts | find and parse every module, embedded stdlib, cycles, scripts, scene scripts |
+| shader | `shader.j3` + parts | the shader language: check and write GLSL in one walk; an AST pass sema runs before it builds modules |
 | sema | `sema.j3` + parts | resolve, uses, types, traits, generics, and every body typed into a typed tree (plan 11 B11) |
 | ir | `ir.j3` + parts, `ir/validate`, `ir/dump`, `ir/fast` | the typed IR and IR-to-IR passes |
 | lower | `lower.j3` + parts | sema's typed tree to IR, no type decisions (plan 11 B11) |
 | devmode | `devmode.j3` | the script dev-mode rewrite (an IR pass) |
-| shader | `shader.j3` + parts | the shader language: check and write GLSL in one walk |
 | backend | `backend.j3`, `backend/{llvm,bc}` + parts | IR to LLVM text, script bytecode (no C backend: plan 11 B8a) |
 | toolchain, cache | `toolchain.j3` + parts, `cache.j3` + parts | run clang and link, incremental objects |
 | driver | `driver.j3` | `Options` + `Session`, one `driver.run`; every command and tool compiles through it |

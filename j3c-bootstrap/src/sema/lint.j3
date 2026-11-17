@@ -1,5 +1,157 @@
-// Code warnings on the user's own modules: unused names, imports, shadowing hints, autofix edits.
+// Code warnings on the user's own modules (not `j3.*`, not generated `.j3ui` code): unused locals,
+// unused `use`s, statements after a `return` / `break` / `continue`, and the autofix edits for the `use`s.
+// Built to never warn wrongly: when unsure, stay quiet.
 //
 // Part of module j3c.sema.
 // Port of: j3c/src/check/lint.rs
 module j3c.sema;
+// J3: C2c (contracts-c2c.md, owner: tuples + lint): `lint` is wired first in `declarations` (Rust
+// check/mod.rs:261), so its warnings lead; fixes go to `Typed.fixes` (`Checked.fixes`, read by `cmd/check`).
+// Modules go in key order (Rust sorts its map's keys), files in load order inside one. Each module group
+// works in a scratch arena; `Diags.add` and the fixes copy what they keep. The `use` half is `lint_uses.j3`.
+
+use j3.text.endsWith;
+use j3c.syntax.walk.namesInBlock;
+
+/// A source edit `check --autofix` can apply: replace `src[start..end]` of `path` with `text` (Rust
+/// `lint::Fix`).
+pub struct LintFix {
+    path: string;
+    start: int;
+    end: int;
+    text: string;
+}
+
+/// Rust `lint::lint`: warnings on the user's own modules as warning Diags, autofix edits into
+/// `cx.typed.fixes`. Runs on the parsed files (`cx.parsed`), before any declaration.
+pub fn lint(cx: &SemaCx) {
+    let files = &cx.parsed.files;
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    // the user files: index into `files` and module key, side by side
+    let idx = List<int>.new(&mem);
+    let keys = List<string>.new(&mem);
+    let mods = Set<string>.new(&mem, 16);
+    for i in 0..files.len {
+        let f = &files.items[i];
+        let key = f.ast.moduleKey(cx.ast);
+        if f.ast.isScript || key == "j3" || startsWith(key, "j3.") || endsWith(f.path, ".generated") { continue; }
+        idx.push(i);
+        keys.push(key);
+        mods.add(key);
+    }
+    let sorted = mods.sorted(&mem);
+    for k in 0..sorted.len {
+        let scratch = Arena.create(1 << 16);
+        let group = List<int>.new(&scratch);
+        for i in 0..idx.len { if keys.items[i] == sorted[k] { group.push(idx.items[i]); } }
+        for g in 0..group.len {
+            let f = &files.items[group.items[g]];
+            for j in 0..f.ast.items.len {
+                match f.ast.items.items[j] {
+                    Item.Fn(func) { lintBody(cx, &func.body, &scratch); }
+                    Item.Struct(s) {
+                        for m in 0..s.methods.len { lintBody(cx, &s.methods.items[m].body, &scratch); }
+                    }
+                    // Rust lints before `extend` blocks are merged, so their methods are not looked at.
+                    Item.Extend(_) {}
+                    Item.Use(_) {}
+                    Item.UseLib(_) {}
+                    Item.Const(_) {}
+                    Item.Enum(_) {}
+                    Item.Trait(_) {}
+                    Item.Let(_) {}
+                    Item.Props(_) {}
+                    Item.Shared(_) {}
+                    Item.State(_) {}
+                }
+            }
+        }
+        lintUses(cx, group.slice(), &scratch);
+        scratch.destroy();
+    }
+}
+
+/// A warning Diag at `span`, with one `help:` line unless `help` is empty.
+fn lintWarn(cx: &SemaCx, span: Span, msg: string, help: string) {
+    let d = cx.diags.make(0, Severity.Warning, span, msg);
+    if help.len > 0 { d.notes.push(Note { kind: NoteKind.Help, span: noSpan(), msg: help }); }
+    cx.diags.add(d);
+}
+
+/// Unused locals and unreachable statements of one fn body (Rust `body`).
+fn lintBody(cx: &SemaCx, block: &Block, mem: &Arena) {
+    let used = Set<Sym>.new(mem, 64);
+    namesInBlock(cx.ast, block, fn(id: Ident) { used.add(id.name); });
+    let lets = List<Ident>.new(mem);
+    lintBlocks(cx, block, &lets);
+    for i in 0..lets.len {
+        let l = lets.items[i];
+        let name = cx.ast.str(l.name);
+        if startsWith(name, "_") || used.has(l.name) { continue; }
+        let m = Text.new(mem).add("unused local `").add(name).add("`");
+        let h = Text.new(mem).add("remove it, or name it `_").add(name).add("` to keep it");
+        lintWarn(cx, l.span, m.str(), h.str());
+    }
+}
+
+/// Rust `walk_blocks`: `block`, then every block nested in its statements (closures excluded). Collects
+/// each block's `let` names and warns about its unreachable statement.
+fn lintBlocks(cx: &SemaCx, block: &Block, lets: &List<Ident>) {
+    for i in 0..block.stmts.len {
+        match cx.ast.stmt(block.stmts.items[i]) {
+            Stmt.Let(l) { lets.push(l.name); }
+            _ {}
+        }
+    }
+    lintUnreachable(cx, block);
+    for i in 0..block.stmts.len { lintStmt(cx, block.stmts.items[i], lets); }
+}
+
+/// The statement after the first `return` / `break` / `continue` of `b` (Rust `unreachable`).
+fn lintUnreachable(cx: &SemaCx, b: &Block) {
+    for i in 0..b.stmts.len {
+        let what = match cx.ast.stmt(b.stmts.items[i]) {
+            Stmt.Return(_) { "return" }
+            Stmt.Break(_) { "break" }
+            Stmt.Continue(_) { "continue" }
+            _ { continue; }
+        };
+        if i + 1 < b.stmts.len {
+            let m = Text.new(cx.arena).add("unreachable code after `").add(what).add("`");
+            lintWarn(cx, cx.ast.stmtSpan(b.stmts.items[i + 1]), m.str(), "");
+        }
+        return;
+    }
+}
+
+/// Rust `walk_stmt`: the blocks a statement holds.
+fn lintStmt(cx: &SemaCx, id: Id<Stmt>, lets: &List<Ident>) {
+    match cx.ast.stmt(id) {
+        Stmt.If(s) {
+            lintBlocks(cx, &s.thenBlock, lets);
+            match s.elseBlock {
+                Option.Some(b) { lintBlocks(cx, &b, lets); }
+                Option.None {}
+            }
+        }
+        Stmt.While(w) { lintBlocks(cx, &w.body, lets); }
+        Stmt.For(x) { lintBlocks(cx, &x.body, lets); }
+        Stmt.ForEach(x) { lintBlocks(cx, &x.body, lets); }
+        Stmt.Match(m) {
+            for i in 0..m.arms.len { lintBlocks(cx, &m.arms.items[i].body, lets); }
+        }
+        Stmt.Defer(d) { lintBlocks(cx, &d.body, lets); }
+        Stmt.Labeled(l) { lintStmt(cx, l.body, lets); }
+        Stmt.Block(b) { lintBlocks(cx, &b, lets); }
+        Stmt.Let(_) {}
+        Stmt.Return(_) {}
+        Stmt.Assign(_) {}
+        Stmt.AssignOp(_) {}
+        Stmt.Expr(_) {}
+        Stmt.UseLocal(_) {}
+        Stmt.LetPat(_) {}
+        Stmt.Break(_) {}
+        Stmt.Continue(_) {}
+    }
+}

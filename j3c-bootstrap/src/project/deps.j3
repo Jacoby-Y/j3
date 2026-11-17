@@ -2,3 +2,468 @@
 //
 // Port of: j3c/src/project/deps.rs, project/deps/tools.rs, cli/pkg.rs (resolving part)
 module j3c.project.deps;
+// J3: Resolved once when the manifest loads (`resolve`), so every command sees one list. A path dep is
+// relative to the `j3.toml` that declares it; a git dep is cloned with the system `git` into
+// `<cache>/pkgs/<name>-<commit12>/` (`J3_PKG_DIR` overrides), pinned by the project's `j3.lock`. A dep's
+// `[commands]` / `[dist_outputs]` are read by the part `project/deps/tools.j3`; cloning is the part
+// `project/deps/git.j3`. The `j3c pkg` command itself (`cli/pkg.rs`) is `cmd/pkg.j3`, C5.
+// J3: Rust's `NO_FETCH` static is `setNoFetch`. Paths are strings, compared as written once canonical
+// (`realpath`). ponytail: env vars set to "" read as unset (`sys.env` cannot tell them apart).
+
+use j3.cmp.sortBy;
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.proc;
+use j3.proc.ProcError;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, find, parseU64, trim };
+use j3c.base.fsx;
+use j3c.base.fsx.{ isDir, isFile, osError };
+use j3c.base.intern.own;
+use j3c.base.toml;
+use j3c.base.toml.{ Table, Val, asStr, isIdent };
+use j3c.project.config.J3C_VERSION;
+
+/// A resolved dependency: `use <name>.a.b;` loads `<root>/a/b.j3`. `root` is the dep's `src/` when it is a
+/// package (a `j3.toml` beside a `src/`), else the folder itself.
+pub struct Dep {
+    name: string;
+    /// Canonical absolute directory of its modules.
+    root: string;
+    /// Canonical absolute folder of the dep (where its `j3.toml` is); tool files are relative to it.
+    pkgRoot: string;
+    /// `[commands]` of its `j3.toml`, in file order; empty without one.
+    commands: List<Tool>;
+    /// `[dist_outputs]` of its `j3.toml`, in file order; empty without one.
+    distOutputs: List<Tool>;
+}
+
+/// One `[dependencies]` line.
+struct DepEntry {
+    name: string;
+    /// Path dep: the relative dir. Git dep: the URL (a local one made absolute).
+    src: string;
+    isGit: bool;
+    /// Git only: `tag:`/`rev:`/`branch:` + value, or `head` (the form `j3.lock` stores).
+    at: string;
+    line: int;
+}
+
+/// One `j3.lock` entry.
+struct Locked {
+    name: string;
+    git: string;
+    at: string;
+    commit: string;
+}
+
+struct Walk {
+    out: List<Dep>;
+    /// The `j3.toml` that first declared `out[i]`, for the clash message.
+    from: List<string>;
+    /// (name, root) from the project down to the dep being read, for cycles.
+    stackNames: List<string>;
+    stackRoots: List<string>;
+    lockOld: List<Locked>;
+    lockNew: List<Locked>;
+}
+
+/// The LSP sets this: never run git while typing; a missing dep says to run `j3c fetch`.
+#[singleton]
+let NO_FETCH: bool;
+
+pub fn setNoFetch(on: bool) { NO_FETCH = on; }
+
+/// `err` with its first `j3.toml` replaced by `p` (Rust `replacen("j3.toml", p, 1)`), in `arena`.
+pub fn renameToml(err: string, p: string, arena: &Arena): string {
+    let i = find(err, "j3.toml");
+    if i < 0 { return err; }
+    return Text.new(arena).add(err[0..i]).add(p).add(err[i + 7..err.len]).str();
+}
+
+/// Rust `Path::parent`: None for "" and "/"; "" for a bare name. A view into `p`.
+pub fn parentOf(p: string): Option<string> {
+    let e = p.len;
+    while e > 1 && p[e - 1] == '/' { e -= 1; }
+    if e == 0 || (e == 1 && p[0] == '/') { return Option.None; }
+    let i = e - 1;
+    while i >= 0 && p[i] != '/' { i -= 1; }
+    if i < 0 { return Option.Some(""); }
+    while i > 0 && p[i - 1] == '/' { i -= 1; }
+    if i == 0 { return Option.Some("/"); }
+    return Option.Some(p[0..i]);
+}
+
+/// `p` made canonical, else `{p's errno text}` (Rust `canonicalize` and its `io::Error`).
+fn canon(p: string, arena: &Arena): Result<string, string> {
+    match path.realpath(p, arena) {
+        Option.Some(c) { return Result.Ok(c); }
+        Option.None { return Result.Err(osError(sys.errno(), arena)); }
+    }
+}
+
+/// `TOML:LINE: [dependencies] NAME`, the head of every entry error.
+fn atLine(toml: string, line: int, name: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    t.add(toml).add(":");
+    t.pushInt(line);
+    t.add(": [dependencies] ").add(name);
+    return t.str();
+}
+
+/// Every dep of the project at `root` (direct and transitive), each name once.
+pub fn resolve(root: string, tbl: &Table, pkg: string, arena: &Arena): Result<List<Dep>, string> {
+    let tomlPath = path.join(root, "j3.toml", arena);
+    let list = entries(tomlPath, tbl, arena)?;
+    let out = List<Dep>.new(arena);
+    if list.len == 0 { return Result.Ok(out); }
+    let src = path.join(root, "src", arena);
+    for i in 0..list.len {
+        let e = list.items[i];
+        let file = Text.new(arena).add(e.name).add(".j3").str();
+        if e.name == pkg || isFile(path.join(src, file, arena)) || isDir(path.join(src, e.name, arena)) {
+            let t = Text.new(arena);
+            t.add(tomlPath).add(":");
+            t.pushInt(e.line);
+            t.add(": [dependencies] ").add(e.name).add(": clashes with a module of this project (`use ").add(e.name);
+            t.add("...`); rename the dep");
+            return Result.Err(t.str());
+        }
+    }
+    let c = match path.realpath(root, arena) { Option.Some(x) { x } Option.None { root } };
+    let w = Walk {
+        out: out, from: List<string>.new(arena), stackNames: List<string>.new(arena),
+        stackRoots: List<string>.new(arena), lockOld: readLock(c, arena)?, lockNew: List<Locked>.new(arena)
+    };
+    w.stackNames.push(pkg);
+    w.stackRoots.push(c);
+    walk(c, tomlPath, list, &w, arena)?;
+    checkDistUnique(&w.out, arena)?;
+    if w.lockNew.len > 0 && !sameLocks(&w.lockNew, &w.lockOld) { writeLock(c, &w.lockNew, arena)?; }
+    return Result.Ok(w.out);
+}
+
+fn sameLocks(a: &List<Locked>, b: &List<Locked>): bool {
+    if a.len != b.len { return false; }
+    for i in 0..a.len {
+        let x = a.items[i];
+        let y = b.items[i];
+        if x.name != y.name || x.git != y.git || x.at != y.at || x.commit != y.commit { return false; }
+    }
+    return true;
+}
+
+/// `j3c update [name]`: forget the locked commit of one git dep (or all), so the next load resolves it
+/// again. The caller reloads the manifest, which writes the new lock.
+pub fn unlock(root: string, name: Option<string>, arena: &Arena): Result<bool, string> {
+    let old = readLock(root, arena)?;
+    let keep = List<Locked>.new(arena);
+    match name {
+        Option.Some(n) {
+            let found = false;
+            for i in 0..old.len {
+                if old.items[i].name == n { found = true; } else { keep.push(old.items[i]); }
+            }
+            if !found {
+                return Result.Err(Text.new(arena).add("j3.lock has no `").add(n).add("` (only git deps are locked)").str());
+            }
+        }
+        Option.None {}
+    }
+    if keep.len == 0 {
+        io.remove(path.join(root, "j3.lock", arena));
+        return Result.Ok(true);
+    }
+    return writeLock(root, &keep, arena);
+}
+
+fn isHex(s: string): bool {
+    for i in 0..s.len {
+        let c = s[i];
+        if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) { return false; }
+    }
+    return true;
+}
+
+fn lockGet(tbl: &Table, section: string, key: string): string {
+    match tbl.get(section, key) {
+        Option.Some(v) { match asStr(v) { Option.Some(s) { return s; } Option.None {} } }
+        Option.None {}
+    }
+    return "";
+}
+
+fn readLock(root: string, arena: &Arena): Result<List<Locked>, string> {
+    let p = path.join(root, "j3.lock", arena);
+    let out = List<Locked>.new(arena);
+    let text = match fsx.readText(p, arena) { Result.Ok(t) { t } Result.Err(_) { return Result.Ok(out); } };
+    let tbl = match toml.parse(text, arena) {
+        Result.Ok(t) { t }
+        Result.Err(e) { return Result.Err(renameToml(e, p, arena)); }
+    };
+    for i in 0..tbl.vals.len {
+        let section = tbl.vals.items[i].section;
+        let seen = false;
+        for j in 0..out.len { if out.items[j].name == section { seen = true; } }
+        if seen { continue; }
+        let l = Locked {
+            name: section, git: lockGet(&tbl, section, "git"), at: lockGet(&tbl, section, "ref"),
+            commit: lockGet(&tbl, section, "commit")
+        };
+        if l.commit.len < 12 || !isHex(l.commit) {
+            return Result.Err(Text.new(arena).add(p).add(": [").add(section).add("] has no commit; delete the file or run `j3c update`").str());
+        }
+        out.push(l);
+    }
+    return Result.Ok(out);
+}
+
+fn writeLock(root: string, list: &List<Locked>, arena: &Arena): Result<bool, string> {
+    let sorted = List<Locked>.new(arena);
+    sorted.extend(list.items[0..list.len]);
+    sortBy(sorted.items[0..sorted.len], fn(a: Locked, b: Locked): bool { return a.name < b.name; });
+    let t = Text.new(arena);
+    t.add("# Written by j3c: the commit each git dependency builds from. Commit this file.\n");
+    t.add("# `j3c update [name]` moves deps to the newest commit of their tag/branch.\n");
+    for i in 0..sorted.len {
+        let l = sorted.items[i];
+        t.add("\n[").add(l.name).add("]\ngit = \"").add(l.git).add("\"\nref = \"").add(l.at);
+        t.add("\"\ncommit = \"").add(l.commit).add("\"\n");
+    }
+    let p = path.join(root, "j3.lock", arena);
+    let s = t.str();
+    match io.writeFile(p, s as []u8) {
+        Result.Ok(_) { return Result.Ok(true); }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("write ").add(p).add(": ").add(osError(sys.errno(), arena)).str()); }
+    }
+}
+
+/// `v` as dot-separated numbers (Rust `split('.').map(parse::<u64>)`), None on any bad part.
+fn versionParts(v: string, arena: &Arena): Option<List<u64>> {
+    let out = List<u64>.new(arena);
+    let s = trim(v);
+    let start = 0;
+    for i in 0..s.len + 1 {
+        if i < s.len && s[i] != '.' { continue; }
+        let part = s[start..i];
+        // Rust's integer parse takes one leading `+`
+        if part.len > 1 && part[0] == '+' { part = part[1..part.len]; }
+        match parseU64(part, 10) { Option.Some(n) { out.push(n); } Option.None { return Option.None; } }
+        start = i + 1;
+    }
+    return Option.Some(out);
+}
+
+/// `a < b` as Rust compares `Vec<u64>` (lexicographic, a prefix first).
+fn versionLess(a: &List<u64>, b: &List<u64>): bool {
+    for i in 0..a.len {
+        if i >= b.len { return false; }
+        if a.items[i] != b.items[i] { return a.items[i] < b.items[i]; }
+    }
+    return a.len < b.len;
+}
+
+/// `[package] j3 = ">=0.4"`: the oldest j3c the package builds with.
+fn checkJ3Bound(want: string, arena: &Arena): Result<bool, string> {
+    let t = trim(want);
+    if t.len < 2 || t[0] != '>' || t[1] != '=' {
+        return Result.Err(Text.new(arena).add("`j3 = \"").add(want).add("\"`: write `>=X.Y` (the oldest j3c it needs)").str());
+    }
+    let minV = versionParts(t[2..t.len], arena);
+    let have = versionParts(J3C_VERSION, arena);
+    match minV {
+        Option.Some(m) {
+            match have {
+                Option.Some(h) {
+                    if versionLess(&h, &m) {
+                        return Result.Err(Text.new(arena).add("needs j3c ").add(want).add(", this is ").add(J3C_VERSION).add("; update j3c").str());
+                    }
+                    return Result.Ok(true);
+                }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
+    return Result.Err(Text.new(arena).add("`j3 = \"").add(want).add("\"`: not a version").str());
+}
+
+fn mapField(v: Val, k: string): Option<string> {
+    match v {
+        Val.Map(m) { for i in 0..m.pairs.len { if m.pairs.items[i].key == k { return Option.Some(m.pairs.items[i].value); } } }
+        _ {}
+    }
+    return Option.None;
+}
+
+fn isRefKey(k: string): bool { return k == "tag" || k == "rev" || k == "branch"; }
+
+/// The `[dependencies]` lines of the `j3.toml` at `tomlPath`, checked.
+fn entries(tomlPath: string, tbl: &Table, arena: &Arena): Result<List<DepEntry>, string> {
+    let out = List<DepEntry>.new(arena);
+    for i in 0..tbl.vals.len {
+        let ent = tbl.vals.items[i];
+        if ent.section != "dependencies" { continue; }
+        let line = tbl.lines.items[i];
+        let key = ent.key;
+        let at = atLine(tomlPath, line, key, arena);
+        let e = DepEntry { name: key, src: "", isGit: false, at: "", line: line };
+        let shape = Text.new(arena);
+        shape.add(at).add(": write `").add(key).add(" = { path = \"path/to/dir\" }` or `").add(key);
+        shape.add(" = { git = \"URL\", tag = \"v1.0\" }`");
+        match ent.val {
+            Val.Str(s) { e.src = s; }
+            Val.Bare(s) { e.src = s; }
+            Val.List(_) { return Result.Err(shape.str()); }
+            Val.Map(m) {
+                let gitUrl = "";
+                let hasGit = false;
+                match mapField(ent.val, "git") { Option.Some(u) { gitUrl = u; hasGit = true; } Option.None {} }
+                if m.pairs.len == 1 && m.pairs.items[0].key == "path" {
+                    e.src = m.pairs.items[0].value;
+                } else if hasGit {
+                    let nrefs = 0;
+                    let first = "";
+                    for j in 0..m.pairs.len {
+                        let p = m.pairs.items[j];
+                        if isRefKey(p.key) {
+                            if nrefs == 0 { first = Text.new(arena).add(p.key).add(":").add(p.value).str(); }
+                            nrefs += 1;
+                        }
+                    }
+                    if nrefs > 1 || m.pairs.len > 1 + nrefs {
+                        let t = Text.new(arena);
+                        t.add(at).add(": write `").add(key).add(" = { git = \"URL\", tag = \"v1.0\" }` (one of tag, rev, branch; or none for the default branch)");
+                        return Result.Err(t.str());
+                    }
+                    let url = gitUrl;
+                    if find(url, "://") < 0 && find(url, "@") < 0 {
+                        let base = match parentOf(tomlPath) { Option.Some(d) { d } Option.None { "." } };
+                        match canon(path.join(base, url, arena), arena) {
+                            Result.Ok(c) { url = c; }
+                            Result.Err(err) {
+                                return Result.Err(Text.new(arena).add(at).add(": git `").add(url).add("`: ").add(err).str());
+                            }
+                        }
+                    }
+                    e.src = url;
+                    e.isGit = true;
+                    e.at = if nrefs > 0 { first } else { "head" };
+                } else {
+                    return Result.Err(shape.str());
+                }
+            }
+        }
+        if key == "j3" || !isIdent(key) || find(key, "-") >= 0 {
+            return Result.Err(Text.new(arena).add(at).add(": `").add(key).add("` is not a usable module name (letters, digits, `_`; not `j3`)").str());
+        }
+        for j in 0..out.len {
+            if out.items[j].name == key { return Result.Err(Text.new(arena).add(at).add(": listed twice").str()); }
+        }
+        out.push(e);
+    }
+    return Result.Ok(out);
+}
+
+fn walk(dir: string, tomlPath: string, list: List<DepEntry>, w: &Walk, arena: &Arena): Result<bool, string> {
+    for li in 0..list.len {
+        let e = list.items[li];
+        let at = atLine(tomlPath, e.line, e.name, arena);
+        let joined = "";
+        if e.isGit {
+            joined = match gitCheckout(e.name, e.src, e.at, w, arena) {
+                Result.Ok(d) { d }
+                Result.Err(err) { return Result.Err(Text.new(arena).add(at).add(": ").add(err).str()); }
+            };
+        } else {
+            joined = path.join(dir, e.src, arena);
+            if !isDir(joined) {
+                let t = Text.new(arena);
+                t.add(at).add(": path `").add(e.src).add("` is not a directory (looked for ").add(joined).add(")");
+                return Result.Err(t.str());
+            }
+        }
+        let root = match canon(joined, arena) {
+            Result.Ok(c) { c }
+            Result.Err(err) { return Result.Err(Text.new(arena).add(at).add(": ").add(joined).add(": ").add(err).str()); }
+        };
+        for i in 0..w.stackRoots.len {
+            if w.stackRoots.items[i] == root {
+                let t = Text.new(arena);
+                t.add(at).add(": dependency cycle ");
+                for j in i..w.stackNames.len { t.add(w.stackNames.items[j]).add(" -> "); }
+                t.add(e.name);
+                return Result.Err(t.str());
+            }
+        }
+        let depToml = path.join(root, "j3.toml", arena);
+        let src = path.join(root, "src", arena);
+        let mods = if isFile(depToml) && isDir(src) { src } else { root };
+        let known = -1;
+        for i in 0..w.out.len { if known < 0 && w.out.items[i].name == e.name { known = i; } }
+        if known >= 0 {
+            if w.out.items[known].root == mods { continue; }
+            let t = Text.new(arena);
+            t.add(at).add(": `").add(e.name).add("` is ").add(mods).add(" here but ").add(w.out.items[known].root);
+            t.add(" in ").add(w.from.items[known]).add("; one name needs one path");
+            return Result.Err(t.str());
+        }
+        let sub = List<DepEntry>.new(arena);
+        let commands = List<Tool>.new(arena);
+        let dists = List<Tool>.new(arena);
+        if isFile(depToml) {
+            let text = match fsx.readText(depToml, arena) {
+                Result.Ok(t) { t }
+                Result.Err(err) { return Result.Err(Text.new(arena).add(at).add(": ").add(err).str()); }
+            };
+            let tbl = match toml.parse(text, arena) {
+                Result.Ok(t) { t }
+                Result.Err(err) { return Result.Err(renameToml(err, depToml, arena)); }
+            };
+            match tbl.get("package", "name") {
+                Option.Some(v) {
+                    match asStr(v) {
+                        Option.Some(n) {
+                            if n != e.name {
+                                let t = Text.new(arena);
+                                t.add(at).add(": ").add(depToml).add(" says [package] name = \"").add(n);
+                                t.add("\"; the key here must match it (or drop the name)");
+                                return Result.Err(t.str());
+                            }
+                        }
+                        Option.None {}
+                    }
+                }
+                Option.None {}
+            }
+            match tbl.get("package", "j3") {
+                Option.Some(v) {
+                    match asStr(v) {
+                        Option.Some(want) {
+                            match checkJ3Bound(want, arena) {
+                                Result.Ok(_) {}
+                                Result.Err(err) { return Result.Err(Text.new(arena).add(at).add(": ").add(err).str()); }
+                            }
+                        }
+                        Option.None {}
+                    }
+                }
+                Option.None {}
+            }
+            sub = entries(depToml, &tbl, arena)?;
+            commands = readTools(e.name, depToml, &tbl, root, "commands", arena)?;
+            dists = readTools(e.name, depToml, &tbl, root, "dist_outputs", arena)?;
+        }
+        w.out.push(Dep { name: e.name, root: mods, pkgRoot: root, commands: commands, distOutputs: dists });
+        w.from.push(tomlPath);
+        w.stackNames.push(e.name);
+        w.stackRoots.push(root);
+        walk(root, depToml, sub, w, arena)?;
+        w.stackNames.pop();
+        w.stackRoots.pop();
+    }
+    return Result.Ok(true);
+}

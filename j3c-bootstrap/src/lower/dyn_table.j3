@@ -1,0 +1,162 @@
+// `dyn` method tables: a trait's table struct, the table global of one (type, trait) and its thunks.
+//
+// Part of module j3c.lower.
+// Port of: j3c/src/check/lower/dyn_call.rs (dyn_table and vtable: the IR half, dyn_thunk),
+// check/lower/dyn_up.rs (dyn_up_thunk)
+// J3: The layout (`DynLayout`) and each slot's target (`Instance.resolved` of the `InstKind.Vtable`
+// instance) are sema's. Order as in Rust: the table struct at the first conversion, upcast or call of
+// the trait; a table's thunks `$dyn.<stable_ty>.<key>.<m>` in slot order (a default-body instance is
+// allocated just before its thunk), then per supertrait that trait's whole table and the
+// `$dyn.<stem>.$up.<key>` thunk, then the global `$vt.<stem>`; thunks and the global belong to the
+// module being lowered.
+module j3c.lower;
+use j3c.ir.DynSlot;
+
+/// Sema's table layout of trait `tr` (made where sema typed the first conversion or call).
+fn dynLayoutOf(lw: &Lw, tr: Id<TraitDecl>): DynLayout {
+    let ls = lw.t.dynLayouts;
+    for i in 0..ls.len { if ls.items[i].decl == tr { return ls.items[i]; } }
+    panic("lower: a `dyn` trait without a table layout");
+    return ls.items[0];
+}
+
+/// Rust `dyn_table`'s IR half: the table struct `vtable Short` of trait `tr`, made once.
+fn dynTable(lw: &Lw, tr: Id<TraitDecl>): Id<TyKind> {
+    let ir = lw.ir();
+    match ir.dynTable(tr.i) { Option.Some(t) { return t; } Option.None {} }
+    let a = lw.cx.arena;
+    let lay = dynLayoutOf(lw, tr);
+    let slots = List<DynSlot>.new(a);
+    for i in 0..lay.slots.len {
+        let s = lay.slots.items[i];
+        let m = lw.t.traitAt(s.from).methods.items[s.method];
+        let ps = List<Id<TyKind>>.new(a);
+        ps.push(ir.common.ptr);
+        for p in 1..m.params.len { ps.push(lw.irTy(m.params.items[p].ty)); }
+        slots.push(DynSlot { name: s.name, fnTy: ir.tyFn(ps, lw.irTy(m.ret)) });
+    }
+    let ups = List<string>.new(a);
+    for i in 0..lay.ups.len { ups.push(dynKey(lw, lay.ups.items[i])); }
+    let td = lw.t.traitAt(tr);
+    return ir.dynTableStruct(tr.i, lw.t.str(td.name), lw.t.modAt(td.owner).path, &slots, &ups);
+}
+
+/// The IR fn a table slot's target names (Rust `dyn_target`'s result; an instance's IR fn is made here).
+fn dynTargetFn(lw: &Lw, c: Callee): Id<Func> {
+    match c {
+        Callee.Fn(f) { return lw.funcOf(f.decl.i); }
+        Callee.Inst(i) { return instFn(lw, i.inst); }
+        _ { panic("lower: a `dyn` table slot target is a fn or an instance"); }
+    }
+    return Id<Func> { i: 0 };
+}
+
+/// Rust `vtable`: the table global of sema `Vtable` instance `inst` (`(trait, [type])`), one per program,
+/// made at the conversion at `sp` that first needs it.
+fn dynVtable(lw: &Lw, sp: Span, inst: Id<Instance>): Id<GlobalDef> {
+    let ir = lw.ir();
+    let a = lw.cx.arena;
+    let it = *lw.t.instanceAt(inst);
+    if it.key.kind != InstKind.Vtable { panic("lower: a `dyn` conversion without a vtable instance"); }
+    let tr = Id<TraitDecl> { i: it.key.item.i };
+    let ty = lw.irTy(lw.t.items(it.key.args)[0]);
+    match ir.dynVtable(ty, tr.i) { Option.Some(g) { return g; } Option.None {} }
+    let table = dynTable(lw, tr);
+    let tsid = structIdOf(lw, table);
+    let lay = dynLayoutOf(lw, tr);
+    let stem = Text.new(a);
+    pushStableTy(&stem, ir, ty, 0);
+    stem.add(".").add(dynKey(lw, tr));
+    let fields = List<ConstField>.new(a);
+    for i in 0..lay.slots.len {
+        let fnTy = ir.structDef(tsid).fields.items[i].ty;
+        let name = lw.t.str(lay.slots.items[i].name);
+        let target = dynTargetFn(lw, it.resolved.items[i]);
+        let thunk = dynThunk(lw, sp, ty, stem.str(), name, fnTy, target);
+        fields.push(ConstField { name: name, init: ConstInit.Scalar(ScalarInit { value: opFnAddr(sp, fnTy, thunk) }) });
+    }
+    for i in 0..lay.ups.len {
+        let up = lay.ups.items[i];
+        let item = it.key.item;
+        item.i = up.i;
+        let upInst = match lw.t.instMap.get(InstKey { kind: InstKind.Vtable, item: item, args: it.key.args }) {
+            Option.Some(x) { x }
+            Option.None { panic("lower: a `dyn` table without its supertrait's table"); return Id<GlobalDef> { i: 0 }; }
+        };
+        let key = dynKey(lw, up);
+        let thunk = dynUpThunk(lw, sp, stem.str(), key, dynVtable(lw, sp, upInst));
+        fields.push(ConstField { name: Text.new(a).add("$up.").add(key).str(), init: ConstInit.Scalar(ScalarInit { value: opFnAddr(sp, ir.funcMut(thunk).ty, thunk) }) });
+    }
+    let g = ir.allocGlobal(GlobalDef { id: Id<GlobalDef> { i: 0 }, doc: "", moduleName: lw.p.modules.items[lw.curMod].name,
+        init: Option.Some(ConstInit.Fields(ConstFields { fields: fields })), name: ir.internName(Text.new(a).add("$vt.").add(stem.str()).str()),
+        ty: table, span: sp, thread: false, readonly: false });
+    ir.noteVtable(ty, tr.i, g);
+    return g;
+}
+
+/// A private J3 fn `name` of type `fty` with `body`, on the module being lowered.
+fn dynAllocFn(lw: &Lw, sp: Span, name: string, fty: Id<TyKind>, body: Body): Id<Func> {
+    let ir = lw.ir();
+    let id = ir.allocFunc(Func { id: Id<Func> { i: 0 }, doc: "", moduleName: lw.p.modules.items[lw.curMod].name,
+        kind: FuncKind.J3(J3Fn { body: body }), name: ir.internName(name), ty: fty, vis: Vis.Private, methodOf: Option.None, span: sp });
+    lw.p.modules.items[lw.curMod].funcs.push(id);
+    return id;
+}
+
+/// Rust `dyn_thunk`: `$dyn.<T>.<trait>.<m>(this: ptr, a0..)`: `target(this as &T, a0..)`.
+fn dynThunk(lw: &Lw, sp: Span, ty: Id<TyKind>, stem: string, slot: string, fnTy: Id<TyKind>, target: Id<Func>): Id<Func> {
+    let ir = lw.ir();
+    let a = lw.cx.arena;
+    let void = ir.common.void;
+    let params = List<Id<TyKind>>.new(a);
+    let ret = void;
+    match ir.fnSig(fnTy) { Option.Some(s) { params = s.params; ret = s.ret; } Option.None {} }
+    let targetTy = ir.funcMut(target).ty;
+    let rty = ir.tyRef(ty);
+    // the type's method may take `this: T` by value; the trait's always takes `&Self`
+    let byRef = false;
+    match ir.fnSig(targetTy) { Option.Some(s) { byRef = s.params.len > 0 && s.params.items[0] == rty; } Option.None {} }
+    let b = BodyBuilder.new(a, void);
+    let this = b.param(ir.internName("$this"), ir.common.ptr, sp);
+    let r = b.tmp(ir.internName("$self"), rty, sp);
+    b.assign(sp, b.localPlace(r, sp), Rvalue.cast(sp, rty, Operand.Copy(b.localPlace(this, sp))));
+    let first = b.localPlace(r, sp);
+    if !byRef { first = b.deref(ir, first, sp); }
+    let args = List<Operand>.new(a);
+    args.push(Operand.Copy(first));
+    for i in 1..params.len {
+        let n = Text.new(a).add("a");
+        n.pushInt(i);
+        let p = b.param(ir.internName(n.str()), params.items[i], sp);
+        args.push(Operand.Copy(b.localPlace(p, sp)));
+    }
+    let call = Rvalue.call(sp, ret, opFnAddr(sp, targetTy, target), args);
+    if ret == void {
+        b.expr(sp, call);
+        b.returnOp(sp, Option.None);
+    } else {
+        let t = b.tmp(ir.internName("_r"), ret, sp);
+        b.assign(sp, b.localPlace(t, sp), call);
+        b.returnOp(sp, Option.Some(Operand.Copy(b.localPlace(t, sp))));
+    }
+    let body = b.finish();
+    instWake(lw, &body.block);
+    return dynAllocFn(lw, sp, Text.new(a).add("$dyn.").add(stem).add(".").add(slot).str(), fnTy, body);
+}
+
+/// Rust `dyn_up_thunk`: `$dyn.<stem>.$up.<key>`: returns the type's table `g` for supertrait `key`.
+fn dynUpThunk(lw: &Lw, sp: Span, stem: string, key: string, g: Id<GlobalDef>): Id<Func> {
+    let ir = lw.ir();
+    let a = lw.cx.arena;
+    let ptr = ir.common.ptr;
+    let gty = ir.global(g).ty;
+    let gref = ir.tyRef(gty);
+    let b = BodyBuilder.new(a, ir.common.void);
+    let r = b.tmp(ir.internName("$r"), gref, sp);
+    b.assign(sp, b.localPlace(r, sp), Rvalue.refPlace(sp, gref, Place.global(a, g, gty, letBinding(), sp)));
+    let p = b.tmp(ir.internName("$p"), ptr, sp);
+    b.assign(sp, b.localPlace(p, sp), Rvalue.cast(sp, ptr, Operand.Copy(b.localPlace(r, sp))));
+    b.returnOp(sp, Option.Some(Operand.Copy(b.localPlace(p, sp))));
+    let body = b.finish();
+    return dynAllocFn(lw, sp, Text.new(a).add("$dyn.").add(stem).add(".$up.").add(key).str(), ir.dynUpFnTy(), body);
+}

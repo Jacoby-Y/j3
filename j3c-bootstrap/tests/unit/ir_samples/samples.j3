@@ -1,0 +1,189 @@
+// Hand-built IR that locks in places (test fixture: `stage0/j3c dump-ir samples` prints the same module).
+// Covers: `this.x *= s` through `&Vec2` (auto-deref is `Proj.Deref`); `xs[i] += 1` binds the index once;
+// `g.mem.checkpoint()` refs the Arena header, it does not copy it.
+//
+// Port of: j3c/src/ir/samples.rs, ir/samples/bodies.rs (tests.rs is `ir_dump_samples_test` and `ir_validate_samples_test`)
+// J3: Shared fixture, the `syntax_dump_test` trick: a test entry `tests/unit/X_test.j3` gets these parts
+// when `tests/unit/X_test` is a symlink to `ir_samples/` and the entry says `module ir_samples;` (parts are
+// found by entry file name and share its module). This part holds the fixture's `use`s; an entry adds
+// only names not imported here (a duplicate `use` across parts is an error). `placeSamples(p)` fills an
+// empty `Program` (one module, `ir.samples`) instead of returning a fresh cx: the Session owns names and
+// the arena. Float constants are their IEEE bits (Rust `f32::to_bits`). Rust's `place.clone()` is
+// `clonePlace` (`Place.project` shares its proj list with the place it came from).
+module ir_samples;
+
+use j3.data.pool.Id;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3c.base.intern.Sym;
+use j3c.base.span.{ Span, noSpan };
+use j3c.ir.{ BinOp, Block, Body, BodyBuilder, FieldDef, FieldId, Func, FuncKind, IrCx, J3Fn, Module, Operand, Place, Program, Proj,
+    Rvalue, Stmt, StructDef, TyArg, TyKind, Vis, opBool, opF32Bits, opFnAddr, opInt, opNull };
+
+/// Rust `place_samples()`: structs `Vec2` (#[Debug]), `Arena`, `Game`; fns `checkpoint`, `scale`, `bump`,
+/// `tick`, `main`, in module `ir.samples`, appended to `p.modules`.
+pub fn placeSamples(p: &Program) {
+    let cx = &p.cx;
+    let span = noSpan();
+    let path = List<Sym>.new(cx.arena);
+    path.push(cx.internName("ir"));
+    path.push(cx.internName("samples"));
+    let c = cx.common;
+
+    let vec2Id = allocStruct(cx, path, "Vec2", true);
+    addField(cx, vec2Id, "x", c.f32);
+    addField(cx, vec2Id, "y", c.f32);
+    let vec2Ty = cx.tyStruct(vec2Id);
+    let vec2Ref = cx.tyRef(vec2Ty);
+    let xField = FieldId { structId: vec2Id, index: 0 };
+    let yField = FieldId { structId: vec2Id, index: 1 };
+
+    let arenaId = allocStruct(cx, path, "Arena", false);
+    addField(cx, arenaId, "ptr", c.ptr);
+    addField(cx, arenaId, "used", c.int);
+    addField(cx, arenaId, "cap", c.int);
+    let arenaTy = cx.tyStruct(arenaId);
+    let arenaRef = cx.tyRef(arenaTy);
+
+    let gameId = allocStruct(cx, path, "Game", false);
+    addField(cx, gameId, "mem", arenaRef);
+    addField(cx, gameId, "running", c.bool);
+    let gameTy = cx.tyStruct(gameId);
+    let gameRef = cx.tyRef(gameTy);
+    let memField = FieldId { structId: gameId, index: 0 };
+    let runningField = FieldId { structId: gameId, index: 1 };
+
+    let checkpointTy = cx.tyFn(tys(cx, [arenaRef]), c.int);
+    let usedField = FieldId { structId: arenaId, index: 1 };
+    let cpBody = checkpointBody(cx, arenaRef, usedField, span);
+    let checkpointId = allocFn(cx, path, "checkpoint", checkpointTy, Vis.Pub, Option.Some(arenaId), cpBody);
+
+    let scaleTy = cx.tyFn(tys(cx, [vec2Ref, c.f32]), c.void);
+    let scBody = scaleBody(cx, vec2Ref, c.f32, xField, yField, span);
+    let scaleId = allocFn(cx, path, "scale", scaleTy, Vis.Private, Option.Some(vec2Id), scBody);
+
+    let sliceInt = cx.tySlice(c.int);
+    let bumpTy = cx.tyFn(tys(cx, [sliceInt, c.int]), c.void);
+    let bmBody = bumpBody(cx, sliceInt, c.int, span);
+    let none: Option<Id<StructDef>> = Option.None;
+    let bumpId = allocFn(cx, path, "bump", bumpTy, Vis.Private, none, bmBody);
+
+    let tickTy = cx.tyFn(tys(cx, [gameRef]), c.void);
+    let tkBody = tickBody(cx, gameRef, memField, runningField, checkpointId, checkpointTy, span);
+    let tickId = allocFn(cx, path, "tick", tickTy, Vis.Private, none, tkBody);
+
+    let mainTy = cx.tyFn(List<Id<TyKind>>.new(cx.arena), c.void);
+    let mk = MainKit { arenaTy: arenaTy, gameTy: gameTy, vec2Ty: vec2Ty, sliceInt: sliceInt, runningField: runningField,
+        xField: xField, yField: yField, scaleId: scaleId, scaleTy: scaleTy, bumpId: bumpId, bumpTy: bumpTy, tickId: tickId,
+        tickTy: tickTy };
+    let mnBody = mainBody(cx, mk, span);
+    let mainId = allocFn(cx, path, "main", mainTy, Vis.Pub, none, mnBody);
+
+    let m = Module.new(cx.arena, path);
+    m.structs.push(vec2Id);
+    m.structs.push(arenaId);
+    m.structs.push(gameId);
+    m.funcs.push(checkpointId);
+    m.funcs.push(scaleId);
+    m.funcs.push(bumpId);
+    m.funcs.push(tickId);
+    m.funcs.push(mainId);
+    p.modules.push(m);
+}
+
+/// The ids and types `main_body` takes (Rust passes them one by one).
+struct MainKit {
+    arenaTy: Id<TyKind>;
+    gameTy: Id<TyKind>;
+    vec2Ty: Id<TyKind>;
+    sliceInt: Id<TyKind>;
+    runningField: FieldId;
+    xField: FieldId;
+    yField: FieldId;
+    scaleId: Id<Func>;
+    scaleTy: Id<TyKind>;
+    bumpId: Id<Func>;
+    bumpTy: Id<TyKind>;
+    tickId: Id<Func>;
+    tickTy: Id<TyKind>;
+}
+
+fn mainBody(cx: &IrCx, k: MainKit, span: Span): Body {
+    let c = cx.common;
+    let arrTy = cx.tyArray(c.int, 4);
+    let b = BodyBuilder.new(cx.arena, c.void);
+
+    let arena = b.letLocal(cx.internName("arena"), k.arenaTy, span);
+    b.assign(span, b.localPlace(arena, span),
+        Rvalue.aggregate(span, k.arenaTy, ops(cx, [opNull(span, c.ptr), opInt(span, c.int, 7), opInt(span, c.int, 9)])));
+
+    let arenaP = b.refTmp(cx, cx.internName("arena_p"), b.localPlace(arena, span), span);
+    let g = b.letLocal(cx.internName("g"), k.gameTy, span);
+    b.assign(span, b.localPlace(g, span), Rvalue.aggregate(span, k.gameTy, ops(cx, [arenaP, opBool(span, c.bool, true)])));
+
+    let gArg = b.refTmp(cx, cx.internName("g_p"), b.localPlace(g, span), span);
+    b.expr(span, Rvalue.call(span, c.void, opFnAddr(span, k.tickTy, k.tickId), ops(cx, [gArg])));
+
+    let running = b.field(cx, b.localPlace(g, span), k.runningField, span);
+    b.ifThen(span, Operand.Copy(running), exitBlock(cx, span, 1));
+
+    let v = b.letLocal(cx.internName("v"), k.vec2Ty, span);
+    // 10.0, 20.0
+    b.assign(span, b.localPlace(v, span),
+        Rvalue.aggregate(span, k.vec2Ty, ops(cx, [opF32Bits(span, c.f32, 0x41200000), opF32Bits(span, c.f32, 0x41a00000)])));
+    let vArg = b.refTmp(cx, cx.internName("v_p"), b.localPlace(v, span), span);
+    // 2.0
+    b.expr(span, Rvalue.call(span, c.void, opFnAddr(span, k.scaleTy, k.scaleId), ops(cx, [vArg, opF32Bits(span, c.f32, 0x40000000)])));
+
+    let vPlace = b.localPlace(v, span);
+    let vx = b.field(cx, clonePlace(cx.arena, vPlace), k.xField, span);
+    let vy = b.field(cx, vPlace, k.yField, span);
+    failIfNe(&b, cx, span, Operand.Copy(vx), opF32Bits(span, c.f32, 0x41a00000), "bad_x"); // 20.0
+    failIfNe(&b, cx, span, Operand.Copy(vy), opF32Bits(span, c.f32, 0x42200000), "bad_y"); // 40.0
+
+    let buf = b.letLocal(cx.internName("buf"), arrTy, span);
+    for i in 0..4 {
+        let elem = b.index(cx, b.localPlace(buf, span), opInt(span, c.int, u64(i)), span);
+        b.assign(span, elem, Rvalue.useOp(span, opInt(span, c.int, 0)));
+    }
+    let buf0Place = b.index(cx, b.localPlace(buf, span), opInt(span, c.int, 0), span);
+    let buf0 = b.refTmp(cx, cx.internName("buf0"), buf0Place, span);
+    let xs = b.letLocal(cx.internName("xs"), k.sliceInt, span);
+    b.assign(span, b.localPlace(xs, span), Rvalue.aggregate(span, k.sliceInt, ops(cx, [buf0, opInt(span, c.int, 4)])));
+    b.expr(span, Rvalue.call(span, c.void, opFnAddr(span, k.bumpTy, k.bumpId),
+        ops(cx, [Operand.Copy(b.localPlace(xs, span)), opInt(span, c.int, 0)])));
+    let buf0After = b.index(cx, b.localPlace(buf, span), opInt(span, c.int, 0), span);
+    failIfNe(&b, cx, span, Operand.Copy(buf0After), opInt(span, c.int, 1), "bad_buf");
+
+    return b.finish();
+}
+
+/// Rust `Place::clone`: same root and type, its own proj list.
+pub fn clonePlace(arena: &Arena, p: Place): Place {
+    let q = p;
+    q.proj = List<Proj>.new(arena);
+    for i in 0..p.proj.len { q.proj.push(p.proj.items[i]); }
+    return q;
+}
+
+fn ops(cx: &IrCx, xs: []Operand): List<Operand> {
+    let l = List<Operand>.new(cx.arena);
+    for i in 0..xs.len { l.push(xs[i]); }
+    return l;
+}
+
+fn tys(cx: &IrCx, xs: []Id<TyKind>): List<Id<TyKind>> {
+    let l = List<Id<TyKind>>.new(cx.arena);
+    for i in 0..xs.len { l.push(xs[i]); }
+    return l;
+}
+
+fn allocFn(cx: &IrCx, path: List<Sym>, name: string, ty: Id<TyKind>, vis: Vis, methodOf: Option<Id<StructDef>>, body: Body): Id<Func> {
+    return cx.allocFunc(Func { id: Id<Func> { i: 0 }, doc: "", moduleName: path, name: cx.internName(name), ty: ty, vis: vis,
+        methodOf: methodOf, kind: FuncKind.J3(J3Fn { body: body }), span: noSpan() });
+}
+
+fn addField(cx: &IrCx, id: Id<StructDef>, name: string, ty: Id<TyKind>) {
+    let f = FieldDef { name: cx.internName(name), doc: "", ty: ty, embedded: false, default: Option.None };
+    cx.structDefMut(id).fields.push(f);
+}

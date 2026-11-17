@@ -1,9 +1,399 @@
-// Load a program: find every module from the entry's `use`s in waves, parse each file (main file plus parts),
+// Load a program: find every module from the entry's `use`s, parse each file (main file plus parts),
 // always pull in `j3.sys`, and hand the parsed module graph to `sema`.
 //
-// Port of: j3c/src/compile/loader.rs (module waves; compile.rs itself is on driver.j3, plan 11 B1)
-// J3: Parse files on a thread pool per wave (the Rust loader was serial). Stage functions take explicit
-// inputs (plan 11 B5): `parseFile(src, file: FileId): ParsedFile` is pure (no globals, no Session writes
-// besides its returned diags), so it can run in parallel and be memoized by `(file, hash of src)`.
-// Resolving a module's `use`s to files is a separate step that reads only the module list and paths.
+// Port of: j3c/src/compile/loader.rs (module waves; the rest of compile.rs is in driver.j3)
+// J3: Rust parses each wave on threads; this port is serial (below). Stage functions take explicit inputs
+// (plan 11 B5): parsing a file writes nothing but its returned diags, so a parallel walk can come later.
 module j3c.load;
+// J3: C1 is serial: `loadImports` runs Rust's serial walk (`imports_of`) for every file, which loads files
+// in the order Rust's parallel plan keeps them. ponytail: the per-wave thread pool comes when timing asks.
+// J3: Entry: `loadProgram(cx, opts)` = Rust `cli::load_input` + `compile_input` + the load half of
+// `load_and_check_with` (resolve the project, the `.j3s` tool host, entry, `j3.sys`, imports, scene scripts,
+// dev `j3.script`, the cycle check). `load` sits below `driver`, so it takes the Session's pieces (`LoadCx`).
+// J3: Errors. Loader methods return `Result<bool, string>` (Rust's `Result<(), String>`): `Err(msg)` is Rust's plain
+// message, which `loadProgram` turns into a code-0 Diag with `noSpan()` (the CLI prints it as Rust's
+// `print_fail` does: `j3c: msg`, raw when it holds `error:`/`-->`). A spanned error (parse errors, a bad
+// `@embed`, a missing script) is added to `diags` at the site, which then returns `Err("")`.
+// J3: Seams with `load/scripts_deps.j3` (its own module: `find`, `embeds`, `scriptModuleParts`, `scriptPaths`),
+// `load/scripts.j3` and `load/scene_scripts.j3`, Rust names camelCased:
+// `Loader.loadScript(rel, source: int, span)`, `Loader.loadSceneScripts()`, `Loader.loadRegistry()` (all `Result<bool, string>`),
+// `SCENE_MODULE`, `SCENE_LABEL`. Part files share this file's `use`s.
+// J3: Stored strings (paths, texts) are in `cx.arena` (the Session's); one `Ast` for every file.
+
+use j3.cmp.sortBy;
+use j3.data.pool.{ Id, Pool };
+use j3.data.map.Map;
+use j3.data.set.Set;
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text;
+use j3.text.{ Text, contains, endsWith, startsWith };
+use j3c.base.diag;
+use j3c.base.diag.{ Diags, Note, NoteKind, Severity };
+use j3c.base.fsx;
+use j3c.base.intern.{ Names, own };
+use j3c.base.span.{ Lines, Source, Span, noSpan };
+use j3c.base.text_fmt.{ hasLower, isAlpha, pushEscaped };
+use j3c.base.toml;
+use j3c.load.scene_registry;
+use j3c.load.scene_scan;
+use j3c.load.scene_scan.Scan;
+use j3c.load.scripts_deps;
+use j3c.load.scripts_deps.scriptModuleParts;
+use j3c.project.appconfig;
+use j3c.project.deps.{ Dep, parentOf };
+use j3c.project.manifest;
+use j3c.project.manifest.{ Input, Manifest };
+use j3c.syntax.ast.{ Ast, EmbedFile, EmbedKind, EmbedRead, File, Item, UseItem };
+use j3c.syntax.parse;
+use j3c.syntax.token.ParseError;
+
+/// The Session pieces the loader writes into (`load` sits below `driver`).
+pub struct LoadCx {
+    arena: &Arena;
+    names: &Names;
+    diags: &Diags;
+    sources: &Pool<Source>;
+}
+
+/// What to load (from `driver.Options`).
+pub struct LoadOpts {
+    /// File, project dir or `j3.toml`; "" for the project in the cwd, else the built-in hello.
+    entry: string;
+    /// Target triple, "" for the host (a project's `[emit]` primary when "" and there is a project).
+    target: string;
+    /// `GameBackend::Headless`: `j3.game` is `game_headless.j3`.
+    headless: bool;
+    /// `--release`: `j3.build` is `build_release.j3`.
+    release: bool;
+    /// `compile_manifest_dev`: `j3.script` (the VM) joins when the program has scripts.
+    dev: bool;
+}
+
+/// One parsed file: a module's main file or one of its parts (Rust `check::ParsedFile`).
+pub struct ParsedFile {
+    /// As Rust shows it (`path.display()`), or a generated module's label.
+    path: string;
+    text: string;
+    src: Id<Source>;
+    ast: File;
+}
+
+/// The parsed module graph `sema` checks.
+pub struct Parsed {
+    ast: &Ast;
+    files: List<ParsedFile>;
+    /// The project, when the entry is one (`!isLib` = Rust `require_main`).
+    project: Option<Manifest>;
+}
+
+/// A source that replaces the file at `path` (the `.j3s` tool host; LSP buffers later).
+pub struct Overlay {
+    path: string;
+    text: string;
+}
+
+pub enum GameBackend { Sdl, Headless }
+
+pub enum OsKind { Linux, Windows, Macos, Android, Web }
+
+/// `[ui]` of the project: `<package>.ui` is generated from `*.j3ui` when imported.
+pub struct UiCfg {
+    package: string;
+    root: string;
+    dir: string;
+    theme: Option<string>;
+}
+
+pub struct Loader {
+    arena: &Arena;
+    ast: &Ast;
+    diags: &Diags;
+    sources: &Pool<Source>;
+    files: List<ParsedFile>;
+    loaded: Set<string>;
+    game: GameBackend;
+    os: OsKind;
+    /// Index of `j3.sys.ARCH_*` for the target.
+    arch: int;
+    srcDir: Option<string>;
+    package: Option<string>;
+    /// `[package] version`, patched into `j3.build.VERSION`.
+    version: Option<string>;
+    deps: List<Dep>;
+    scriptRoot: string;
+    overlays: List<Overlay>;
+    uiCfg: Option<UiCfg>;
+    release: bool;
+    /// Rust `stdlib_dir()`, `using_override()`, and the embedded files by name.
+    stdlib: string;
+    override: bool;
+    stdIndex: Map<string, int>;
+    /// Rust `default_hello_path()`.
+    hello: string;
+    /// The project's scenes, scanned once (Rust `Loader.scene_scan`).
+    sceneScan: Option<Scan>;
+}
+
+/// Load the program `opts` names into `cx`. None: the errors are in `cx.diags`.
+pub fn loadProgram(cx: LoadCx, opts: LoadOpts): Option<Parsed> {
+    let ast = cx.arena.new::<Ast>(Ast.new(cx.arena, cx.names));
+    let input = if opts.entry.len == 0 { manifest.resolveCwd(cx.arena) } else { manifest.resolve(opts.entry, cx.arena) };
+    let r: Result<bool, string> = Result.Ok(true);
+    let prog = Parsed { ast: ast, files: List<ParsedFile>.new(cx.arena), project: Option.None };
+    match input {
+        Result.Err(e) { r = Result.Err(e); }
+        Result.Ok(inp) {
+            match inp {
+                Input.Hello { r = loadWith(cx, ast, opts, helloPath(cx.arena), Option.None, &prog); }
+                Input.File(p) { r = loadWith(cx, ast, opts, p, Option.None, &prog); }
+                Input.Project(m) {
+                    prog.project = Option.Some(m);
+                    r = loadWith(cx, ast, opts, m.entry, Option.Some(m), &prog);
+                }
+            }
+        }
+    }
+    match r {
+        Result.Ok(_) { return Option.Some(prog); }
+        Result.Err(e) {
+            if e.len > 0 { cx.diags.add(cx.diags.make(0, Severity.Error, noSpan(), e)); }
+            return Option.None;
+        }
+    }
+}
+
+/// Rust `load_and_check_with` up to the cycle check.
+fn loadWith(cx: LoadCx, ast: &Ast, opts: LoadOpts, entry: string, project: Option<Manifest>, out: &Parsed): Result<bool, string> {
+    let a = cx.arena;
+    let scriptEntry = path.ext(entry) == ".j3s";
+    let target = opts.target;
+    let l = Loader { arena: a, ast: ast, diags: cx.diags, sources: cx.sources, files: List<ParsedFile>.new(a),
+        loaded: Set<string>.new(a, 64), game: if opts.headless { GameBackend.Headless } else { GameBackend.Sdl },
+        os: OsKind.Linux, arch: 0, srcDir: Option.None, package: Option.None, version: Option.None,
+        deps: List<Dep>.new(a), scriptRoot: ".", overlays: List<Overlay>.new(a), uiCfg: Option.None, release: opts.release,
+        stdlib: stdlibDir(a), override: usingOverride(), stdIndex: stdIndex(a), hello: helloPath(a), sceneScan: Option.None };
+    let hasProject = false;
+    match project {
+        Option.Some(m) {
+            hasProject = true;
+            if target.len == 0 { target = m.emit.primary(); }
+            l.srcDir = Option.Some(m.srcDir(a));
+            l.package = Option.Some(m.name);
+            l.version = Option.Some(m.version);
+            l.deps = m.deps;
+            l.scriptRoot = m.root;
+            match m.ui {
+                Option.Some(u) { l.uiCfg = Option.Some(UiCfg { package: m.name, root: m.root, dir: u.dir, theme: u.theme }); }
+                Option.None {}
+            }
+        }
+        Option.None {
+            l.scriptRoot = match parentOf(entry) { Option.Some(p) { p } Option.None { "." } };
+        }
+    }
+    if scriptEntry {
+        l.scriptRoot = match parentOf(entry) { Option.Some(p) { if p.len == 0 { "." } else { p } } Option.None { "." } };
+    }
+    l.os = osKind(target);
+    l.arch = archKind(target);
+    let entryPath = entry;
+    if scriptEntry {
+        let host = toolHost(&l, entry)?;
+        entryPath = path.join(l.scriptRoot, ".j3c-tool-host.j3", a);
+        l.overlays.push(Overlay { path: entryPath, text: host });
+    }
+    l.loadPath(entryPath)?;
+    l.loadModule(mods(a, "j3", "sys"))?;
+    l.loadImports()?;
+    if hasProject { l.loadSceneScripts()?; }
+    if opts.dev && anyScript(&l) {
+        l.loadModule(mods(a, "j3", "script"))?;
+        l.loadImports()?;
+    }
+    checkImportCycles(&l)?;
+    out.files = l.files;
+    return Result.Ok(true);
+}
+
+fn anyScript(l: &Loader): bool {
+    for i in 0..l.files.len { if l.files.items[i].ast.isScript { return true; } }
+    return false;
+}
+
+/// `[a, b]` as a module path.
+fn mods(a: &Arena, x: string, y: string): List<string> {
+    let out = List<string>.new(a);
+    out.push(x);
+    out.push(y);
+    return out;
+}
+
+/// The parts of `xs` joined with `.`, in `a`.
+pub fn joinKey(xs: []string, a: &Arena): string {
+    let t = Text.new(a);
+    for i in 0..xs.len {
+        if i > 0 { t.push('.'); }
+        t.pushStr(xs[i]);
+    }
+    return t.str();
+}
+
+extend Loader {
+    /// A plain error (`Err(msg)`), in the arena.
+    fn fail(this: &Loader, msg: string): Result<bool, string> { return Result.Err(own(this.arena, msg)); }
+
+    fn loadPath(this: &Loader, p: string): Result<bool, string> {
+        let text = this.readText(p)?;
+        let before = this.files.len;
+        this.parseText(p, text)?;
+        if this.files.len > before && !endsWith(p, ".j3s") { this.loadParts(p)?; }
+        return Result.Ok(true);
+    }
+
+    /// Files in the folder beside `X.j3` that say `module <same name>;` are more of the same module
+    /// (`ui/dom.j3` + `ui/dom/*.j3`). A file there with another module name is its own module.
+    fn loadParts(this: &Loader, p: string): Result<bool, string> {
+        let key = "";
+        if this.files.len > 0 { key = this.files.items[this.files.len - 1].ast.moduleKey(this.ast); }
+        let ps = this.parts(stripExt(p));
+        for i in 0..ps.len {
+            let text = this.readText(ps.items[i])?;
+            if otherModule(text, key) { continue; }
+            this.parseInner(ps.items[i], text, Option.Some(key))?;
+        }
+        return Result.Ok(true);
+    }
+
+    /// The `j3.sys` files carry a placeholder `ARCH` and `ARCH_NAME`; the target's own go in (same line
+    /// count). `j3.build` gets the package's `NAME` and `VERSION` the same way.
+    fn withArch(this: &Loader, p: string, src: string): string {
+        let a = this.arena;
+        let name = path.basename(p);
+        if (name == "build.j3" || name == "build_release.j3") && contains(src, "module j3.build;") {
+            let v = Text.new(a);
+            v.add("pub const VERSION: string = \"");
+            pushEscaped(&v, match this.version { Option.Some(x) { x } Option.None { "0.0.0" } }, false);
+            let n = Text.new(a);
+            n.add("pub const NAME: string = \"");
+            pushEscaped(&n, match this.package { Option.Some(x) { x } Option.None { "" } }, false);
+            let s1 = replaceOnce(src, "pub const VERSION: string = \"0.0.0\";", v.add("\";").str(), a);
+            return replaceOnce(s1, "pub const NAME: string = \"\";", n.add("\";").str(), a);
+        }
+        if !(name == "sys.j3" || name == "sys_windows.j3" || name == "sys_macos.j3" || name == "sys_android.j3") { return src; }
+        let names: [6]string = ["x86_64", "aarch64", "x86", "arm", "riscv", "other"];
+        let t = Text.new(a);
+        t.add("pub const ARCH: int = ");
+        t.pushInt(this.arch);
+        t.add(";");
+        let s1 = replaceOnce(src, "pub const ARCH: int = 0;", t.str(), a);
+        return replaceOnce(s1, "pub const ARCH_NAME: string = \"x86_64\";", Text.new(a).add("pub const ARCH_NAME: string = \"").add(names[this.arch]).add("\";").str(), a);
+    }
+
+    fn readText(this: &Loader, p: string): Result<string, string> {
+        for i in 0..this.overlays.len {
+            if fsx.samePath(this.overlays.items[i].path, p, this.arena) { return Result.Ok(this.overlays.items[i].text); }
+        }
+        match this.embedded(p) {
+            Option.Some(src) { return Result.Ok(this.withArch(p, src)); }
+            Option.None {}
+        }
+        if p == this.hello { return Result.Ok(HELLO_SRC); }
+        let text = fsx.readText(p, this.arena)?;
+        return Result.Ok(this.withArch(p, text));
+    }
+
+    fn parseText(this: &Loader, p: string, text: string): Result<bool, string> { return this.parseInner(p, text, Option.None); }
+
+    /// `partOf`: the module key of the main file when this is one of its parts; a file that names another
+    /// module is skipped, and a part is never dropped as already loaded.
+    fn parseInner(this: &Loader, p: string, text: string, partOf: Option<string>): Result<bool, string> {
+        let a = this.arena;
+        let shown = own(a, p);
+        let id = this.sources.add(Source { path: shown, text: text, lines: Lines.of(text, a) });
+        let parsed: Result<File, ParseError> = Result.Err(ParseError { span: noSpan(), msg: "" });
+        if endsWith(p, ".j3s") {
+            let rel = match stripPrefix(p, this.scriptRoot, a) {
+                Option.Some(r) { r }
+                Option.None {
+                    return this.fail(Text.new(a).add("script ").add(p).add(" is outside the project root ").add(this.scriptRoot).str());
+                }
+            };
+            let ps = scriptModuleParts(rel, a)?;
+            parsed = parse.parseScript(text, id, ps.items[0..ps.len], this.ast);
+        } else {
+            parsed = parse.parseFile(text, id, this.ast);
+        }
+        return this.finishParse(shown, text, id, parsed, partOf);
+    }
+
+    /// Keep a parsed file: errors reported against the source, a repeated module dropped.
+    fn finishParse(this: &Loader, p: string, text: string, id: Id<Source>, parsed: Result<File, ParseError>, partOf: Option<string>): Result<bool, string> {
+        let f = match parsed {
+            Result.Ok(f) { f }
+            Result.Err(e) {
+                // J3: C4: a generated `.j3ui` module renders its parse errors against the `.j3ui` (`render_parse_error`).
+                parse.report(e, this.diags);
+                return Result.Err("");
+            }
+        };
+        let key = f.moduleKey(this.ast);
+        match partOf {
+            Option.Some(main) { if key != main { return Result.Ok(true); } }
+            Option.None { if !this.loaded.add(key) { return Result.Ok(true); } }
+        }
+        this.readEmbeds(p, &f)?;
+        this.files.push(ParsedFile { path: p, text: text, src: id, ast: f });
+        return Result.Ok(true);
+    }
+
+    fn loadModule(this: &Loader, ps: List<string>): Result<bool, string> {
+        let a = this.arena;
+        let key = joinKey(ps.items[0..ps.len], a);
+        if this.loaded.has(key) { return Result.Ok(true); }
+        if key == SCENE_MODULE { return this.loadRegistry(); }
+        if key == I18N_MODULE {
+            // `[i18n]` of the project's j3.toml baked in as constants, so a built binary needs no j3.toml
+            return this.parseText(I18N_LABEL, i18nConfigModule(this.scriptRoot, a));
+        }
+        if key == appconfig.MODULE {
+            // `[splash]` and `[dist] icon`, baked in the same way
+            return this.parseText(appconfig.LABEL, appconfig.configModule(this.scriptRoot, a));
+        }
+        if this.isUiModule(key) { return this.loadUi(); }
+        let p = this.modulePath(ps);
+        if !this.exists(p) {
+            return this.fail(Text.new(a).add("cannot find module `").add(key).add("` (looked for ").add(p).add(")").str());
+        }
+        this.loadPath(p)?;
+        return this.depModuleLine(key, p);
+    }
+
+    /// `<package>.ui` when the project has `[ui]`.
+    fn isUiModule(this: &Loader, key: string): bool {
+        match this.uiCfg {
+            Option.Some(u) { return key == Text.new(this.arena).add(u.package).add(".ui").str(); }
+            Option.None { return false; }
+        }
+    }
+}
+
+/// `s` with the first `old` replaced by `new` (Rust `replacen(old, new, 1)`).
+fn replaceOnce(s: string, old: string, new: string, a: &Arena): string {
+    let at = text.find(s, old);
+    if at < 0 { return s; }
+    return Text.new(a).add(s[0..at]).add(new).add(s[at + old.len..s.len]).str();
+}
+
+/// `p` without its last extension (Rust `with_extension("")`): `a/b.j3` -> `a/b`.
+fn stripExt(p: string): string {
+    let base = path.basename(p);
+    let k = base.len - 1;
+    while k > 0 && base[k] != '.' { k -= 1; }
+    if k <= 0 { return p; }
+    return p[0..p.len - (base.len - k)];
+}

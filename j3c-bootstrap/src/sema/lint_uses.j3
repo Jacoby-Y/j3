@@ -1,0 +1,134 @@
+// Unused `use` names of one module and the edits that remove them (`check --autofix`).
+//
+// Part of module j3c.sema.
+// Port of: j3c/src/check/lint.rs (unused_uses, use_fix, apply_fixes)
+module j3c.sema;
+// J3: A name counts as used when any token of the module outside its `use` items is that identifier, or
+// any string literal contains it (a name in an interpolation, a reflection key). The files are lexed
+// again for that, into the caller's scratch arena.
+
+use j3.cmp.sortBy;
+use j3.text.{ contains, trim };
+use j3c.syntax.lex.lex;
+use j3c.syntax.token.TokenKind;
+
+/// Rust `unused_uses`: one warning and one fix per `use` item of the module made of `group` (indices
+/// into `cx.parsed.files`) that names something nothing mentions. A file that does not lex: no warnings.
+fn lintUses(cx: &SemaCx, group: []int, mem: &Arena) {
+    let files = &cx.parsed.files;
+    let idents = Set<string>.new(mem, 256);
+    let strings = Text.new(mem);
+    for g in 0..group.len {
+        let f = &files.items[group[g]];
+        let toks = match lex(f.text, f.src, mem) {
+            Result.Ok(t) { t }
+            Result.Err(_) { return; }
+        };
+        let inUse = false;
+        for i in 0..toks.len {
+            let t = &toks.items[i];
+            match t.kind {
+                TokenKind.Use { inUse = true; }
+                TokenKind.Semi { inUse = false; }
+                TokenKind.Ident { if !inUse { idents.add(t.text); } }
+                TokenKind.String { strings.add(t.text).add("\n"); }
+                TokenKind.Interpolate { strings.add(t.text).add("\n"); }
+                _ {}
+            }
+        }
+    }
+    let lits = strings.str();
+    for g in 0..group.len {
+        let f = &files.items[group[g]];
+        for j in 0..f.ast.items.len {
+            let u = match f.ast.items.items[j] {
+                Item.Use(x) { x }
+                _ { continue; }
+            };
+            let names = List<Ident>.new(mem);
+            match u.names {
+                Option.Some(ns) { names.extend(ns.slice()); }
+                Option.None { if u.path.len > 0 { names.push(u.path.items[u.path.len - 1]); } }
+            }
+            let unused = List<Ident>.new(mem);
+            let kept = List<Ident>.new(mem);
+            for i in 0..names.len {
+                let n = cx.ast.str(names.items[i].name);
+                if !idents.has(n) && !contains(lits, n) { unused.push(names.items[i]); } else { kept.push(names.items[i]); }
+            }
+            if unused.len == 0 { continue; }
+            cx.typed.fixes.push(lintUseFix(cx, f, &u, kept.slice(), names.len, mem));
+            // one warning per `use` line, however many of its names are unused
+            let first = unused.items[0];
+            if unused.len == 1 {
+                let m = Text.new(mem).add("unused import `").add(cx.ast.str(first.name)).add("`");
+                lintWarn(cx, first.span, m.str(), "remove it from the `use`");
+            } else {
+                let m = Text.new(mem).add("unused imports ");
+                for i in 0..unused.len {
+                    if i > 0 { m.add(", "); }
+                    m.add("`").add(cx.ast.str(unused.items[i].name)).add("`");
+                }
+                let span = Span { file: first.span.file, lo: first.span.lo, hi: unused.items[unused.len - 1].span.hi };
+                lintWarn(cx, span, m.str(), "remove them from the `use`");
+            }
+        }
+    }
+}
+
+/// Rust `use_fix`: the edit that drops the unused names of `u`: the whole line when none is kept, else
+/// the `use` rewritten with the kept names (`use m.{ a, b };`, or `use m.a;` for one).
+fn lintUseFix(cx: &SemaCx, f: &ParsedFile, u: &UseItem, kept: []Ident, total: int, mem: &Arena): LintFix {
+    let start = int(u.span.lo);
+    let end = int(u.span.hi);
+    let src = f.text;
+    let path = own(cx.arena, f.path);
+    if kept.len == 0 || total == 0 {
+        // the whole line, when the `use` is alone on it
+        let ls = start;
+        while ls > 0 && src[ls - 1] != '\n' { ls -= 1; }
+        let le = end;
+        while le < src.len && src[le] != '\n' { le += 1; }
+        if le < src.len { le += 1; }
+        if trim(src[ls..start]).len == 0 && trim(src[end..le]).len == 0 {
+            start = ls;
+            end = le;
+        } else {
+            while end < src.len && src[end] == ' ' { end += 1; }
+        }
+        return LintFix { path: path, start: start, end: end, text: "" };
+    }
+    let t = Text.new(mem).add("use ");
+    for i in 0..u.path.len {
+        if i > 0 { t.add("."); }
+        t.add(cx.ast.str(u.path.items[i].name));
+    }
+    if kept.len == 1 {
+        t.add(".").add(cx.ast.str(kept[0].name)).add(";");
+    } else {
+        t.add(".{ ");
+        for i in 0..kept.len {
+            if i > 0 { t.add(", "); }
+            t.add(cx.ast.str(kept[i].name));
+        }
+        t.add(" };");
+    }
+    return LintFix { path: path, start: start, end: end, text: own(cx.arena, t.str()) };
+}
+
+/// Rust `apply_fixes`: `fixes` applied to `src` (all for one file; they do not overlap), last edit first
+/// so earlier offsets stay right. The result is in `arena`.
+pub fn applyFixes(src: string, fixes: []LintFix, arena: &Arena): string {
+    let sorted = List<LintFix>.new(arena);
+    sorted.extend(fixes);
+    sortBy(sorted.slice(), fn(a: LintFix, b: LintFix): bool { return a.start > b.start; });
+    let out = Text.new(arena).add(src);
+    for i in 0..sorted.len {
+        let f = sorted.items[i];
+        if f.end <= out.len() && f.start <= f.end {
+            out.remove(f.start, f.end - f.start);
+            out.insert(f.start, f.text);
+        }
+    }
+    return out.str();
+}

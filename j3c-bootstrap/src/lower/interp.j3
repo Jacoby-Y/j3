@@ -3,4 +3,246 @@
 //
 // Part of module j3c.lower.
 // Port of: j3c/src/check/lower/interp.rs
+// J3: Folding and the single-`{s}` shortcut are sema's (it gives a `Str` / the value itself). Here: the
+// frame buffer `_ibufN` / `_inN`, one `InterpFill` per run of printable parts, and the expansion of what the
+// backend does not print itself (pointers as their type name, arrays up to 64, `#[Debug]` structs and
+// enums, tuples). Parts go to an `InterpDest`: the frame buffer here, a `Text` in `interp_text.j3`
+// (`Text.fmt`). The frame-string escape check is sema's (`sema/frame_str.j3`, on the typed tree).
 module j3c.lower;
+
+/// Rust `Dest` + `Fill`: where interpolated parts go. `text` false: the `INTERP_CAP` buffer `buf` / `used`
+/// (`me` unused). `text` true: `me.pushBytes(..)` (`push`), numbers and bools printed into the scratch
+/// `buf` / `used` first.
+// J3: One struct instead of an enum (stage 0 cannot put `Place` pairs in a payload); `Operand` first
+// (stage-0 ABI hazard (a)), bool last.
+pub struct InterpDest {
+    me: Operand;
+    buf: Place;
+    used: Place;
+    push: Id<Func>;
+    text: bool;
+}
+
+extend FnLower {
+    /// Rust `interpolate` (after folding): the parts into a fresh 512-byte buffer, the string over it.
+    fn interpolate(this: &FnLower, sp: Span, parts: &List<TInterpPart>): Rvalue {
+        let a = this.cx.arena;
+        let ir = this.ir();
+        let ops = List<InterpPart>.new(a);
+        for i in 0..parts.len {
+            match parts.items[i] {
+                TInterpPart.Lit(s) { ops.push(InterpPart.Lit(InterpLit { bytes: s as []u8 })); }
+                TInterpPart.Value(v) { ops.push(InterpPart.Value(this.operand(v.expr))); }
+            }
+        }
+        let d = this.newFill(sp, INTERP_CAP);
+        this.appendParts(sp, &d, &ops);
+        return this.fillValue(sp, &d, ir.common.string);
+    }
+
+    /// Rust `new_fill`: a fresh `[cap]u8` buffer and its length, set to 0 (a frame-buffer dest).
+    fn newFill(this: &FnLower, sp: Span, cap: u64): InterpDest {
+        let ir = this.ir();
+        let buf = this.tmpPlace("ibuf", ir.tyArray(ir.common.u8, cap), sp);
+        let used = this.tmpPlace("in", ir.common.int, sp);
+        this.b.assign(sp, this.copyOf(used), Rvalue.useOp(sp, this.int(sp, 0)));
+        return InterpDest { me: this.int(sp, 0), buf: buf, used: used, push: Id<Func> { i: 0 }, text: false };
+    }
+
+    /// Rust `append_parts`: leaves are batched into one fill, anything else expanded.
+    fn appendParts(this: &FnLower, sp: Span, d: &InterpDest, ops: &List<InterpPart>) {
+        let pending = List<InterpPart>.new(this.cx.arena);
+        for i in 0..ops.len {
+            match ops.items[i] {
+                InterpPart.Value(op) {
+                    if !this.leaf(d, operandTy(op)) {
+                        let place = this.materialize(op, sp);
+                        this.interpExpand(sp, d, place, &pending);
+                        continue;
+                    }
+                }
+                InterpPart.Lit(_) {}
+            }
+            pending.push(ops.items[i]);
+        }
+        this.flushFill(sp, d, &pending);
+    }
+
+    /// Rust `fill_value`: the filled bytes of `d` as a `ty` (`string` or `[]u8`) `{ ptr, len }`.
+    fn fillValue(this: &FnLower, sp: Span, d: &InterpDest, ty: Id<TyKind>): Rvalue {
+        let ir = this.ir();
+        let a = this.cx.arena;
+        let start = this.b.index(ir, this.copyOf(d.buf), this.int(sp, 0), sp);
+        let ptrTy = ir.tyRef(ir.common.u8);
+        let ptr = this.spill("iptr", Rvalue.refPlace(sp, ptrTy, start), sp);
+        let fields = List<Operand>.new(a);
+        fields.push(Operand.Copy(ptr));
+        fields.push(Operand.Copy(this.copyOf(d.used)));
+        return Rvalue.aggregate(sp, ty, fields);
+    }
+
+    /// Rust `materialize`: a place as is, a constant in a fresh `_tN`.
+    fn materialize(this: &FnLower, op: Operand, sp: Span): Place {
+        match op {
+            Operand.Copy(p) { return p; }
+            Operand.Const(_) {}
+        }
+        return this.spill("t", Rvalue.useOp(sp, op), sp);
+    }
+
+    /// Rust `leaf`: a value `d` takes whole. The buffer: what the backends print (`emitPrints`); a `Text`:
+    /// only strings, bools and numbers (a `#[Debug]` struct is expanded, so a long string in it is pushed
+    /// whole).
+    fn leaf(this: &FnLower, d: &InterpDest, ty: Id<TyKind>): bool {
+        if !d.text { return this.emitPrints(ty); }
+        match this.ir().tyKind(ty) {
+            TyKind.String { return true; }
+            TyKind.Bool { return true; }
+            TyKind.Int(_) { return true; }
+            TyKind.Float(_) { return true; }
+            _ { return false; }
+        }
+    }
+
+    /// Rust `emit_prints`: the backend prints it (primitives, strings, `#[Debug]` structs of those).
+    fn emitPrints(this: &FnLower, ty: Id<TyKind>): bool {
+        let ir = this.ir();
+        match ir.tyKind(ty) {
+            TyKind.String { return true; }
+            TyKind.Bool { return true; }
+            TyKind.Int(_) { return true; }
+            TyKind.Float(_) { return true; }
+            TyKind.Struct(s) {
+                let def = ir.structDef(s.id);
+                if !def.debug { return false; }
+                for k in 0..def.fields.len { if !this.emitPrints(def.fields.items[k].ty) { return false; } }
+                return true;
+            }
+            _ { return false; }
+        }
+    }
+
+    /// Rust `flush_fill`: pending parts as one `InterpFill` (none when empty), or pushed onto the `Text`.
+    fn flushFill(this: &FnLower, sp: Span, d: &InterpDest, pending: &List<InterpPart>) {
+        if pending.len == 0 { return; }
+        if d.text { this.interpFlushText(sp, d, pending); return; }
+        let parts = List<InterpPart>.new(this.cx.arena);
+        parts.extend(pending.slice());
+        pending.clear();
+        this.push(sp, StmtKind.InterpFill(InterpFillStmt { buf: this.copyOf(d.buf), used: this.copyOf(d.used), parts: parts }));
+    }
+
+    fn lit(this: &FnLower, pending: &List<InterpPart>, s: string) {
+        pending.push(InterpPart.Lit(InterpLit { bytes: own(this.cx.arena, s) as []u8 }));
+    }
+
+    /// A tuple struct (Rust `tuple_elems`): one of `Lw.tuples`.
+    // ponytail: linear scan per expanded struct; a flag list by struct id when programs hold thousands of
+    // tuple types.
+    fn interpIsTuple(this: &FnLower, s: Id<StructDef>): bool {
+        for i in 0..this.lw.tuples.len { if this.lw.tuples.items[i].i == s.i { return true; } }
+        return false;
+    }
+
+    /// Rust `interp_expand`: the text of the value at `place` appended to `pending`, fields one by one.
+    fn interpExpand(this: &FnLower, sp: Span, d: &InterpDest, place: Place, pending: &List<InterpPart>) {
+        let ir = this.ir();
+        let ty = place.ty;
+        if this.leaf(d, ty) {
+            pending.push(InterpPart.Value(Operand.Copy(place)));
+            return;
+        }
+        match ir.tyKind(ty) {
+            TyKind.Ref(_) { this.lit(pending, tyString(ir, ty, this.cx.arena)); }
+            TyKind.Ptr { this.lit(pending, tyString(ir, ty, this.cx.arena)); }
+            TyKind.Struct(s) {
+                let def = ir.structDef(s.id);
+                if this.interpIsTuple(s.id) {
+                    for k in 0..def.fields.len {
+                        if k == 0 { this.lit(pending, "("); } else { this.lit(pending, ", "); }
+                        let fp = this.b.field(ir, this.copyOf(place), FieldId { structId: s.id, index: u32(k) }, sp);
+                        this.interpExpand(sp, d, fp, pending);
+                    }
+                    this.lit(pending, ")");
+                    return;
+                }
+                if !def.debug { panic("lower: interpolation of a struct sema refused"); }
+                let t = Text.new(this.cx.arena);
+                t.add(ir.nameStr(def.name)).add(" { ");
+                this.lit(pending, t.str());
+                for k in 0..def.fields.len {
+                    let h = Text.new(this.cx.arena);
+                    if k > 0 { h.add(", "); }
+                    h.add(ir.nameStr(def.fields.items[k].name)).add(": ");
+                    this.lit(pending, h.str());
+                    let fp = this.b.field(ir, this.copyOf(place), FieldId { structId: s.id, index: u32(k) }, sp);
+                    this.interpExpand(sp, d, fp, pending);
+                }
+                this.lit(pending, " }");
+            }
+            TyKind.Array(arr) {
+                for k in 0..int(arr.len) {
+                    if k == 0 { this.lit(pending, "["); } else { this.lit(pending, ", "); }
+                    let ep = this.b.index(ir, this.copyOf(place), this.int(sp, u64(k)), sp);
+                    this.interpExpand(sp, d, ep, pending);
+                }
+                if arr.len == 0 { this.lit(pending, "[]"); } else { this.lit(pending, "]"); }
+            }
+            TyKind.Enum(en) { this.interpEnum(sp, d, place, en.id, pending); }
+            _ { panic("lower: interpolation of a type sema refused"); }
+        }
+    }
+
+    /// A `#[Debug]` enum: an `if` chain over the variants, each printing `Enum.Variant(fields)`.
+    fn interpEnum(this: &FnLower, sp: Span, d: &InterpDest, place: Place, eid: Id<EnumDef>, pending: &List<InterpPart>) {
+        this.flushFill(sp, d, pending);
+        let ir = this.ir();
+        let def = ir.enumDef(eid);
+        let n = def.variants.len;
+        let elseBlock: Option<Block> = Option.None;
+        let k = n - 1;
+        while k >= 0 {
+            let vid = VariantId { enumId: eid, index: u32(k) };
+            let vd = def.variants.items[k];
+            let saved = this.b.beginBlock();
+            let text = List<InterpPart>.new(this.cx.arena);
+            let t = Text.new(this.cx.arena);
+            t.add(ir.nameStr(def.name)).add(".").add(ir.nameStr(vd.name));
+            this.lit(&text, t.str());
+            let nf = 0;
+            match vd.payload {
+                Option.Some(p) {
+                    nf = 1;
+                    if vd.multi { match ir.tyKind(p) { TyKind.Struct(s) { nf = ir.structDef(s.id).fields.len; } _ {} } }
+                }
+                Option.None {}
+            }
+            for f in 0..nf {
+                if f == 0 { this.lit(&text, "("); } else { this.lit(&text, ", "); }
+                let fp = this.variantFieldPlace(this.copyOf(place), vid, f, sp);
+                this.interpExpand(sp, d, fp, &text);
+            }
+            if nf > 0 { this.lit(&text, ")"); }
+            this.flushFill(sp, d, &text);
+            let body = this.b.endBlock(saved);
+            let chained = body;
+            match elseBlock {
+                Option.Some(eb) {
+                    if k + 1 < n {
+                        let s2 = this.b.beginBlock();
+                        let cond = this.isVariant(this.copyOf(place), vid, sp);
+                        this.pushIf(sp, cond, body, Option.Some(eb));
+                        chained = this.b.endBlock(s2);
+                    }
+                }
+                Option.None {}
+            }
+            elseBlock = Option.Some(chained);
+            k -= 1;
+        }
+        match elseBlock {
+            Option.Some(b) { for i in 0..b.stmts.len { this.b.push(b.stmts.items[i]); } }
+            Option.None {}
+        }
+    }
+}

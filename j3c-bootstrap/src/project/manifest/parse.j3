@@ -1,0 +1,340 @@
+// `parseManifest`: every `j3.toml` key Rust reads, its default, and its error text.
+//
+// Port of: j3c/src/project.rs (parse_manifest, check_outputs, Java package names)
+module j3c.project.manifest;
+// J3: A part of `project/manifest.j3` (its `use`s). Checks run in Rust's order, so the first error is the
+// same one. Strings are kept as written (escapes too), as Rust's `TomlVal::as_str` does.
+
+/// Accepted `[android] foreground_service` values (Android's `foregroundServiceType` names).
+const SERVICE_TYPES: [2]string = ["connectedDevice", "dataSync"];
+
+/// Accepted `[android] orientation` values (Android's `screenOrientation` names).
+const ORIENTATIONS: [6]string = ["landscape", "portrait", "sensorLandscape", "sensorPortrait", "fullSensor", "unspecified"];
+
+const JAVA_KEYWORDS: [53]string = [
+    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class", "const", "continue", "default", "do",
+    "double", "else", "enum", "extends", "final", "finally", "float", "for", "goto", "if", "implements", "import",
+    "instanceof", "int", "interface", "long", "native", "new", "package", "private", "protected", "public", "return",
+    "short", "static", "strictfp", "super", "switch", "synchronized", "this", "throw", "throws", "transient", "try",
+    "void", "volatile", "while", "true", "false", "null",
+];
+
+fn isJavaKeyword(s: string): bool {
+    for i in 0..JAVA_KEYWORDS.len { if JAVA_KEYWORDS[i] == s { return true; } }
+    return false;
+}
+
+
+/// One Java package segment from free text: lowercase, `-` to `_`, other characters dropped, a letter
+/// first (`app` is put in front otherwise), keywords get a `_` suffix. Non-ASCII bytes are all dropped,
+/// as Rust drops non-ASCII chars.
+fn javaSegment(s: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..s.len {
+        let c = s[i];
+        if c >= 'A' && c <= 'Z' { c = c + 32; }
+        if c == '-' { c = '_'; }
+        if (c >= 'a' && c <= 'z') || isDigit(c) || c == '_' { t.push(c); }
+    }
+    let seg = t.str();
+    if seg.len == 0 || !(seg[0] >= 'a' && seg[0] <= 'z') { seg = Text.new(arena).add("app").add(seg).str(); }
+    if isJavaKeyword(seg) { seg = Text.new(arena).add(seg).add("_").str(); }
+    return seg;
+}
+
+/// The default package for a project called `name`.
+pub fn defaultJavaPackage(name: string, arena: &Arena): string {
+    return Text.new(arena).add("com.j3.").add(javaSegment(name, arena)).str();
+}
+
+/// An explicit `[android] package` must already be a valid Java package of 2+ segments.
+pub fn checkJavaPackage(p: string): bool {
+    let segs = 0;
+    let start = 0;
+    for i in 0..p.len + 1 {
+        if i < p.len && p[i] != '.' { continue; }
+        let s = p[start..i];
+        if s.len == 0 || !isAlpha(s[0]) || isJavaKeyword(s) { return false; }
+        for j in 0..s.len { if !isAlpha(s[j]) && !isDigit(s[j]) && s[j] != '_' { return false; } }
+        segs += 1;
+        start = i + 1;
+    }
+    return segs >= 2;
+}
+
+/// `[section] key` as a string (Rust `.get(..).and_then(TomlVal::as_str)`).
+fn getStr(tbl: &Table, section: string, key: string): Option<string> {
+    match tbl.get(section, key) { Option.Some(v) { return asStr(v); } Option.None { return Option.None; } }
+}
+
+/// Rust `TomlVal::as_list`: the array, else `j3.toml: `KEY` must be an array`.
+fn asList(v: Val, key: string, arena: &Arena): Result<List<string>, string> {
+    match v {
+        Val.List(l) { return Result.Ok(l.items); }
+        _ { return Result.Err(Text.new(arena).add("j3.toml: `").add(key).add("` must be an array").str()); }
+    }
+}
+
+/// `[section] key` as an array when present, else `dflt`.
+fn listOr(tbl: &Table, section: string, key: string, what: string, dflt: List<string>, arena: &Arena): Result<List<string>, string> {
+    match tbl.get(section, key) { Option.Some(v) { return asList(v, what, arena); } Option.None { return Result.Ok(dflt); } }
+}
+
+fn strOr(o: Option<string>, d: string): string {
+    match o { Option.Some(s) { return s; } Option.None { return d; } }
+}
+
+fn isActionId(id: string): bool {
+    for i in 0..id.len { if !isAlpha(id[i]) && !isDigit(id[i]) && id[i] != '-' { return false; } }
+    return true;
+}
+
+fn joinNames(xs: []string, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..xs.len {
+        if i > 0 { t.add(", "); }
+        t.add(xs[i]);
+    }
+    return t.str();
+}
+
+/// Rust `str::parse::<usize>`: one optional `+`, then digits. ponytail: values past `int` read as None.
+fn parseUsize(s: string): Option<int> {
+    let d = if s.len > 1 && s[0] == '+' { s[1..s.len] } else { s };
+    if d.len == 0 || d[0] == '-' || d[0] == '+' { return Option.None; }
+    return parseInt(d, 10);
+}
+
+fn hasOutput(xs: &List<Output>, o: Output): bool {
+    for i in 0..xs.len { if outputEq(xs.items[i], o) { return true; } }
+    return false;
+}
+
+/// `text` (a `j3.toml`) read as the manifest of the project at `root`.
+pub fn parseManifest(text: string, root: string, arena: &Arena): Result<Manifest, string> {
+    let tbl = toml.parse(text, arena)?;
+    let name = match getStr(&tbl, "package", "name") {
+        Option.Some(n) { n }
+        Option.None { return Result.Err("j3.toml: missing [package] name"); }
+    };
+    if name.len == 0 { return Result.Err("j3.toml: package.name is empty"); }
+    let bin = name;
+    match getStr(&tbl, "package", "bin") {
+        Option.Some(b) {
+            if b.len == 0 || find(b, "/") >= 0 || find(b, "\\") >= 0 || b[0] == '.' {
+                return Result.Err(Text.new(arena).add("j3.toml: package.bin `").add(b).add("` must be a plain file name").str());
+            }
+            bin = b;
+        }
+        Option.None {}
+    }
+    let isLib = tbl.hasSection("lib");
+    let dfltEntry = if isLib { Text.new(arena).add("src/").add(name).add(".j3").str() } else { "src/main.j3" };
+    let entry = path.join(root, strOr(getStr(&tbl, "package", "entry"), dfltEntry), arena);
+    if !isFile(entry) {
+        if isLib {
+            let t = Text.new(arena);
+            t.add("j3.toml: [lib] needs ").add(entry).add(" (`module ").add(name).add(";`, what `use ").add(name).add(";` loads)");
+            return Result.Err(t.str());
+        }
+        return Result.Err(Text.new(arena).add("j3.toml: entry ").add(entry).add(" not found").str());
+    }
+    let cc = defaultCc();
+    cc.std = strOr(getStr(&tbl, "cc", "std"), cc.std);
+    cc.opt = strOr(getStr(&tbl, "cc", "opt"), cc.opt);
+    match getStr(&tbl, "cc", "fast") { Option.Some(s) { cc.fast = s == "true"; } Option.None {} }
+    let emit = defaultEmit(arena);
+    emit.backend = strOr(getStr(&tbl, "emit", "backend"), emit.backend);
+    match getStr(&tbl, "emit", "opt") {
+        Option.Some(s) { emit.opt = s; }
+        Option.None { match tbl.get("emit", "backend") { Option.Some(_) {} Option.None { emit.opt = cc.opt; } } }
+    }
+    match getStr(&tbl, "emit", "debug") {
+        Option.Some(s) { emit.debug = s != "false" && s != "0"; }
+        Option.None { if cc.fast { emit.debug = false; } }
+    }
+    match getStr(&tbl, "emit", "fast") { Option.Some(s) { emit.fast = s == "true"; } Option.None {} }
+    match tbl.get("emit", "target") {
+        Option.Some(v) {
+            match v {
+                Val.List(xs) { emit.targets = xs.items; }
+                Val.Str(s) { emit.targets.push(s); }
+                Val.Bare(s) { emit.targets.push(s); }
+                Val.Map(_) { return Result.Err("j3.toml: emit.target must be a string or an array"); }
+            }
+            for i in 0..emit.targets.len {
+                if emit.targets.items[i].len == 0 { return Result.Err("j3.toml: emit.target has an empty triple"); }
+            }
+        }
+        Option.None {}
+    }
+    emit.cpu = strOr(getStr(&tbl, "emit", "cpu"), emit.cpu);
+    emit.clang = strOr(getStr(&tbl, "emit", "clang"), emit.clang);
+    emit.flags = listOr(&tbl, "emit", "flags", "emit.flags", emit.flags, arena)?;
+    match getStr(&tbl, "emit", "incremental") {
+        Option.Some(s) {
+            emit.incremental = s != "false" && s != "0";
+            emit.incrementalAll = s == "all";
+        }
+        Option.None {}
+    }
+    match getStr(&tbl, "emit", "chunks") { Option.Some(s) { emit.chunks = parseUsize(s); } Option.None {} }
+    let link = defaultLink(arena);
+    link.libs = listOr(&tbl, "link", "libs", "link.libs", link.libs, arena)?;
+    let search = listOr(&tbl, "link", "search", "link.search", link.search, arena)?;
+    let home = sys.env("HOME");
+    for i in 0..search.len {
+        let d = search.items[i];
+        // ponytail: HOME set to "" reads as unset here, where Rust would give `/rest`
+        if d.len >= 2 && d[0] == '~' && d[1] == '/' && home.len > 0 {
+            link.search.push(Text.new(arena).add(home).add("/").add(d[2..d.len]).str());
+        } else {
+            link.search.push(d);
+        }
+    }
+    link.files = listOr(&tbl, "link", "files", "link.files", link.files, arena)?;
+    link.flags = listOr(&tbl, "link", "flags", "link.flags", link.flags, arena)?;
+    let dist = parseDist(&tbl, arena)?;
+    let android = Android {
+        package: defaultJavaPackage(name, arena), orientation: "landscape", nativeLibs: Option.None,
+        foregroundService: Option.None
+    };
+    match getStr(&tbl, "android", "package") {
+        Option.Some(p) {
+            if !checkJavaPackage(p) {
+                let t = Text.new(arena);
+                t.add("j3.toml: android.package: `").add(p);
+                t.add("` is not a Java package (like com.example.game: 2+ dot-separated segments, each starting with a letter)");
+                return Result.Err(t.str());
+            }
+            android.package = p;
+        }
+        Option.None {}
+    }
+    match getStr(&tbl, "android", "orientation") {
+        Option.Some(o) {
+            let ok = false;
+            for i in 0..ORIENTATIONS.len { if ORIENTATIONS[i] == o { ok = true; } }
+            if !ok {
+                let t = Text.new(arena);
+                t.add("j3.toml: android.orientation: unknown `").add(o).add("` (have ").add(joinNames(ORIENTATIONS[0..ORIENTATIONS.len], arena)).add(")");
+                return Result.Err(t.str());
+            }
+            android.orientation = o;
+        }
+        Option.None {}
+    }
+    android.nativeLibs = getStr(&tbl, "android", "native_libs");
+    match getStr(&tbl, "android", "foreground_service") {
+        Option.Some(s) {
+            let ok = false;
+            for i in 0..SERVICE_TYPES.len { if SERVICE_TYPES[i] == s { ok = true; } }
+            if !ok {
+                let t = Text.new(arena);
+                t.add("j3.toml: android.foreground_service: unknown `").add(s).add("` (have ").add(joinNames(SERVICE_TYPES[0..SERVICE_TYPES.len], arena)).add(")");
+                return Result.Err(t.str());
+            }
+            android.foregroundService = Option.Some(s);
+        }
+        Option.None {}
+    }
+    let version = strOr(getStr(&tbl, "package", "version"), "0.1.0");
+    let description = match getStr(&tbl, "package", "description") {
+        Option.Some(d) { d }
+        Option.None { Text.new(arena).add(name).add(", made with j3").str() }
+    };
+    let ui: Option<Ui> = Option.None;
+    let hasDir = match tbl.get("ui", "dir") { Option.Some(_) { true } Option.None { false } };
+    let hasTheme = match tbl.get("ui", "theme") { Option.Some(_) { true } Option.None { false } };
+    if hasDir || hasTheme {
+        let off = listOr(&tbl, "ui", "lint-off", "ui.lint-off", List<string>.new(arena), arena)?;
+        match getStr(&tbl, "ui", "lint") { Option.Some(s) { if s == "false" { off.push("*"); } } Option.None {} }
+        ui = Option.Some(Ui { dir: strOr(getStr(&tbl, "ui", "dir"), "ui"), theme: getStr(&tbl, "ui", "theme"), lintOff: off });
+    }
+    let ds = deps.resolve(root, &tbl, name, arena)?;
+    checkOutputs(&dist.outputs, &ds, arena)?;
+    return Result.Ok(Manifest {
+        root: root, name: name, bin: bin, version: version, description: description, entry: entry, cc: cc,
+        emit: emit, link: link, dist: dist, android: android, ui: ui, deps: ds, isLib: isLib
+    });
+}
+
+/// `[dist]` and `[dist.actions]`.
+fn parseDist(tbl: &Table, arena: &Arena): Result<Dist, string> {
+    let dist = Dist {
+        outputs: List<Output>.new(arena), include: List<string>.new(arena), icon: Option.None, title: "",
+        categories: "Game;", maintainer: "", depends: List<string>.new(arena), section: "games",
+        postinst: Option.None, prerm: Option.None, actions: List<DesktopAction>.new(arena)
+    };
+    match tbl.get("dist", "build_outputs") {
+        Option.Some(v) {
+            let xs = asList(v, "dist.build_outputs", arena)?;
+            // checked against the deps' `[dist_outputs]` once they resolve (`checkOutputs`)
+            for i in 0..xs.len {
+                let o = outputOf(xs.items[i]);
+                if !hasOutput(&dist.outputs, o) { dist.outputs.push(o); }
+            }
+        }
+        Option.None {}
+    }
+    match getStr(tbl, "dist", "zip") {
+        Option.Some(z) { if z == "true" && !hasOutput(&dist.outputs, Output.Zip) { dist.outputs.insert(0, Output.Zip); } }
+        Option.None {}
+    }
+    dist.include = listOr(tbl, "dist", "include", "dist.include", dist.include, arena)?;
+    dist.depends = listOr(tbl, "dist", "depends", "dist.depends", dist.depends, arena)?;
+    dist.icon = getStr(tbl, "dist", "icon");
+    dist.title = strOr(getStr(tbl, "dist", "title"), "");
+    dist.categories = strOr(getStr(tbl, "dist", "categories"), dist.categories);
+    dist.maintainer = strOr(getStr(tbl, "dist", "maintainer"), "");
+    dist.section = strOr(getStr(tbl, "dist", "section"), dist.section);
+    dist.postinst = getStr(tbl, "dist", "postinst");
+    dist.prerm = getStr(tbl, "dist", "prerm");
+    for i in 0..tbl.vals.len {
+        let e = tbl.vals.items[i];
+        if e.section != "dist.actions" { continue; }
+        let id = e.key;
+        let kv = match e.val {
+            Val.Map(m) { m.pairs }
+            _ {
+                return Result.Err(Text.new(arena).add("j3.toml: dist.actions.").add(id).add(" must be `{ name = \"...\", exec = \"...\" }`").str());
+            }
+        };
+        if !isActionId(id) {
+            return Result.Err(Text.new(arena).add("j3.toml: dist.actions.").add(id).add(": an action id is letters, digits and `-`").str());
+        }
+        let name = "";
+        let hasName = false;
+        let exec = "";
+        let hasExec = false;
+        for j in 0..kv.len {
+            if !hasName && kv.items[j].key == "name" { name = kv.items[j].value; hasName = true; }
+            if !hasExec && kv.items[j].key == "exec" { exec = kv.items[j].value; hasExec = true; }
+        }
+        if !hasName { return Result.Err(Text.new(arena).add("j3.toml: dist.actions.").add(id).add(" needs `name`").str()); }
+        let kept = List<DesktopAction>.new(arena);
+        for j in 0..dist.actions.len { if dist.actions.items[j].id != id { kept.push(dist.actions.items[j]); } }
+        kept.push(DesktopAction { id: id, name: name, exec: exec });
+        dist.actions = kept;
+    }
+    return Result.Ok(dist);
+}
+
+/// Every `Output.Pkg` names a dep's dist output. (A built-in name never becomes one.)
+fn checkOutputs(outputs: &List<Output>, deps: &List<Dep>, arena: &Arena): Result<bool, string> {
+    for i in 0..outputs.len {
+        match outputs.items[i] {
+            Output.Pkg(n) {
+                let (d, _) = distProvider(deps, n);
+                if d < 0 {
+                    let t = Text.new(arena);
+                    t.add("j3.toml: dist.build_outputs: no package provides \"").add(n);
+                    t.add("\" (add one under [dependencies]); built in: ").add(BUILTIN_OUTPUTS);
+                    return Result.Err(t.str());
+                }
+            }
+            _ {}
+        }
+    }
+    return Result.Ok(true);
+}

@@ -1,0 +1,232 @@
+// The expression/statement/pattern parser against the oracle: each case is a fn body (or a whole file
+// when it starts with `module`), written to `target/unit/syntax_parse_exprs/case.j3` (unit.sh makes the folder), parsed here and
+// printed (`dumpAst`, or the parse error rendered as `dump-ast` does), and compared byte for byte with
+// `stage0/j3c dump-ast` on the same file (stdout when it parses, stderr when it does not). Mostly parse
+// errors (message and position), plus precedence and ambiguity cases and deep nesting.
+module syntax_parse_exprs_test;
+
+use j3.io;
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.proc;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+use j3c.base.diag;
+use j3c.base.span.{ Lines, Source };
+use j3c.driver;
+use j3c.driver.Session;
+use j3c.syntax.ast.Ast;
+use j3c.syntax.dump.dumpAst;
+use j3c.syntax.parse;
+
+const PATH = "target/unit/syntax_parse_exprs/case.j3";
+
+/// Parses `body` (wrapped in a fn unless it is a file) both ways; false on a difference.
+fn same(arena: &Arena, body: string): bool {
+    let src = body;
+    if body.len < 6 || body[0..6] != "module" { src = Text.new(arena).add("module m;\n\nfn f() {\n").add(body).add("\n}\n").str(); }
+    match io.writeFile(PATH, src as []u8) {
+        Result.Ok(_) {}
+        Result.Err(_) { panic("cannot write the case file"); }
+    }
+    let s = Session.new(driver.defaults());
+    let ast = Ast.new(s.arena, &s.names);
+    let id = s.sources.add(Source { path: PATH, text: src, lines: Lines.of(src, s.arena) });
+    let got = Text.new(arena);
+    let code = 0;
+    match parse.parseFile(src, id, &ast) {
+        Result.Ok(f) { dumpAst(&ast, &f, &got); }
+        Result.Err(e) {
+            parse.report(e, &s.diags);
+            diag.render(s.diags.at(s.diags.count() - 1), &s.sources, &got);
+            code = 1;
+        }
+    }
+    s.free();
+    match proc.run(["stage0/j3c", "dump-ast", PATH], "", arena) {
+        Result.Ok(o) {
+            let want = o.outStr();
+            if o.code != 0 { want = o.errStr(); }
+            if o.code == code && want == got.str() { return true; }
+            printLn("DIFF on:");
+            printLn(src);
+            printLn("--- stage0");
+            printLn(want);
+            printLn("--- j3c-boot");
+            printLn(got.str());
+            return false;
+        }
+        Result.Err(_) { panic("cannot run stage0/j3c"); }
+    }
+}
+
+fn main() {
+    let arena = Arena.create(1 << 24);
+    defer arena.destroy();
+    let cases = [
+        // precedence, associativity, unary vs binary, casts, postfix chains
+        "x = a || b && c == d < e | f ^ g & h << i + j * k as u8 as i32;",
+        "x = a - b - c / d % e >> f > g;",
+        "x = -a.b[c]?(d).e::<T>(f) - -1 * !*&~y;",
+        "x = m & MASK == 0 && a != b || c <= d >= e;",
+        "x = t.0.1 + List<int>.new(a).len + S<T> { a: 1, b: 2, }.a;",
+        "x = a < b; y = a<b>c; z = f(a < b, c > d);",
+        "x = [1, 2, 3,][1..][..2][:][a..b];",
+        "x = (a, (b, c),); y = (a); z = [];",
+        "x = []u8 { ptr: p, len: n };",
+        "x = 1.5e3 + 0x1F + 0b101 + 'a' + 18446744073709551615;",
+        "x = `a{b + 1}c{f(`{d}`)}`;",
+        "x = if a { 1 } else if b { 2 } else { 3 };",
+        "x = if let Option.Some(v) = o { v } else { 0 };",
+        "x = match y { A { 1 } B | C if z { 2 } _ { 3 } };",
+        "x = fn(a: int, b): int { return a + b; }; y = fn[mem](a) { };",
+        "let c: closure(int, f32): bool = g; let d: boxed closure() = h;",
+        "x = @syscall(1, 2) + @sizeof([4]u8) + @atomicAdd(p, 1, acqrel) + @atomicLoad(p);",
+        "x = @slice(p, n); y = @uiChoice(Set, v, 2); z = @embed(\"a.txt\"); w = @embedDir(\"d\", \"*.png\");",
+        "x = @script(\"a.j3s\") { hp: 1, name: \"n\" }; y = @closureCall(f, 1);",
+        // struct literal vs block
+        "if a == b { } if a == B { } while x { } for i in 0..n { } for i in 0..=n { }",
+        "if S { a: 1 } == s { }",
+        // statements
+        "let buf: [64]u8; let a: int = 1; let (p, q) = t; let E.A(v) = e else { return; };",
+        "'outer: for i, x in xs { 'inner: while true { break 'outer; continue 'inner; break; continue; } }",
+        "for (k, v) in m { k; } defer x(); defer { y(); } use z; return; { a(); }",
+        "a += 1; a -= 1; a *= 1; a /= 1; a %= 1; a &= 1; a |= 1; a ^= 1; a <<= 1; a >>= 1;",
+        "if let A(x) = y { } else if let B = z { } else if w { } else { }",
+        "if let A(x) = y { } else if c { 1 } else { 2 }",
+        // patterns
+        "match x { 'a'..='z' | 'A'..='Z' { } -5..=-1 { } LO..=m.HI { } 0 { } \"s\" { } true { } _ { } }",
+        "match x { E.A(a, (b, c), _,) { } S { a, b: B.C(d), .. } { } T { a: 1 } | U { } m.K { } }",
+        "match x { E.A { 1 } E.B { 2 } }",
+        "match x { A { if let B(y) = y { y } else { 0 } } C { match z { _ { 1 } } } D { if q { 1 } else { 2 } } }",
+        "match x { A { let a = 1; a + 1 } B { f(); } C { } }",
+        // errors: expressions
+        "let x = ;",
+        "let x = 1\nlet y = 2;",
+        "x = 1",
+        "x += ;",
+        "f(1, 2;",
+        "a[1;",
+        "a[1..2;",
+        "a[..;",
+        "a[:;",
+        "x = (1,);",
+        "x = (1, 2;",
+        "x = (1;",
+        "x = [1, 2;",
+        "x = []u8 x;",
+        "x = []u8 { ptr p };",
+        "x = S { a 1 };",
+        "x = S { a: 1, b: };",
+        "x = S { a: 1 b: 2 };",
+        "x.;",
+        "f::<int>;",
+        "f::<int(1);",
+        "x = 1 + * ;",
+        "x = a as ;",
+        "x = 99999999999999999999;",
+        "x = 0xFFFFFFFFFFFFFFFFF;",
+        "x = 0b11111111111111111111111111111111111111111111111111111111111111111;",
+        "x = `a{}b`;",
+        "x = `a{1 2}b`;",
+        "x = `a{(}b`;",
+        "x = if a { 1 };",
+        "x = if a { 1 } else 2;",
+        "x = if let Some(v) = o { v };",
+        "x = if a 1;",
+        // errors: intrinsics
+        "@foo(1);",
+        "@slice(p);",
+        "@atomicLoad(p, q, r);",
+        "@atomicCas(p);",
+        "@atomicLoad(p, release);",
+        "@atomicStore(p, 1, acquire);",
+        "@atomicStore(p, 1, 3);",
+        "@atomicAdd(p, 1, wrong);",
+        "@script(1);",
+        "@script(\"a.txt\");",
+        "@script(\"a.j3s\";",
+        "x = @script(\"a.j3s\") { hp 1 };",
+        "@embed(1);",
+        "@embed(\"\");",
+        "@embedDir(\"d\");",
+        "@embedDir(\"d\", 2);",
+        "@embedBytes(\"a\";",
+        "@embed;",
+        "@sizeof(int;",
+        "@sizeof int;",
+        "@uiChoice(T, a b);",
+        "@uiChoice(T a);",
+        "@uiChoice(T, a, b;",
+        "@1;",
+        // errors: closures
+        "x = fn(x) 1;",
+        "x = fn x() { };",
+        "x = fn[mem (x) { };",
+        "x = fn(a b) { };",
+        "x = fn(a: int): { };",
+        "let c: closure(int = 1;",
+        "let c: boxed closure = 1;",
+        // errors: statements
+        "'outer: x = 1;",
+        "'outer x = 1;",
+        "break 'a",
+        "continue",
+        "return 1",
+        "for (a, b) xs { }",
+        "for i in 0..10 x",
+        "for i, in xs { }",
+        "for i x { }",
+        "for 1 in x { }",
+        "while x y",
+        "if x y",
+        "if x { } else y",
+        "defer x",
+        "use ;",
+        "use a",
+        "let = 1;",
+        "let x: int = ;",
+        "let x 1;",
+        "let (a, b) = t",
+        "let (a, b) t;",
+        "let E.A(v) = e else return;",
+        "/// doc\nx = 1;",
+        "/// doc\nlet (a, b) = t;",
+        "{ x = 1;",
+        "x = 1; }",
+        // errors: patterns and match
+        "match x { 1..2 { } }",
+        "match x { -'a' { } }",
+        "match x { - { } }",
+        "match x { (a) { } }",
+        "match x { (a, b { } }",
+        "match x { E.A(a b) { } }",
+        "match x { S { a, .. b } { } }",
+        "match x { S { a b } { } }",
+        "match x { 99999999999999999999 { } }",
+        "match x { A }",
+        "match x { A {",
+        "match x A { }",
+        "match x { A if { } }",
+        "match x { A | { } }",
+        "match x { 1..= { } }",
+        "match x { A { 1 2 } }",
+        "match x { A { if a { 1 } } }",
+        "match x { A { if a { 1 } else { 2 } x } }",
+        "if let = x { }",
+        "if let A x { }",
+        "if let A = x { } else if let B = y",
+        "if let A = x { } else if y { 1 }",
+        "if let A = x { } else if y 1",
+        // deep nesting (recursion depth)
+        "x = ((((((((((((((((((((((((((((((((((((((((((((((((((1))))))))))))))))))))))))))))))))))))))))))))))))));",
+        "x = --------------------------------------------------------------------------------------------1;",
+        "module m;\nfn f(): int { return 1 }\n",
+        "module m;\nconst A = [1, 2, 3];\nconst B: int = -A[0] + 1 << 2;\n"
+    ];
+    let ok = true;
+    for i in 0..cases.len { ok = same(&arena, cases[i]) && ok; }
+    if !ok { panic("parser differs from stage0 dump-ast"); }
+    printLn(`syntax parse exprs ok: {cases.len} cases`);
+}

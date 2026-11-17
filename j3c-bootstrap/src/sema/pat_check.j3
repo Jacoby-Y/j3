@@ -1,0 +1,340 @@
+// `match` checks before the arms are typed: arm order, exhaustiveness of enum and tuple matches (with
+// Rust's example list), and the `_`-covers-nothing warning. Int and string arms are in `pat_check_int.j3`.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/pat/check.rs (arm order, exhaustiveness, warnings)
+module j3c.sema;
+
+/// The examples a "not exhaustive" error lists (Rust `MAX_MISSING`).
+const PAT_MAX_MISSING = 10;
+
+/// An int arm value (Rust `i128`): `v`, or with `big` the u64 whose bits `v` holds (above `i64::MAX`).
+struct PatInt {
+    v: i64;
+    big: bool;
+}
+
+/// The values an int pattern matches, both ends included.
+struct PatRange {
+    lo: PatInt;
+    hi: PatInt;
+}
+
+/// One unguarded int arm value for the overlap check.
+struct PatSeen {
+    r: PatRange;
+    span: Span;
+}
+
+extend BodyCx {
+    /// Rust `check_arm_order`: one unguarded `_` at most, and it is the last arm.
+    fn patArmOrder(this: &BodyCx, arms: &List<MatchArm>): Result<bool, TErr> {
+        let wild = false;
+        for i in 0..arms.len {
+            let arm = arms.items[i];
+            let hasWild = this.patArmWild(&arm);
+            if wild {
+                if hasWild { return Result.Err(this.err(arm.span, "duplicate `_` arm")); }
+                return Result.Err(this.err(arm.span, "this arm never runs: the `_` arm before it matches everything"));
+            }
+            if hasWild { wild = true; }
+        }
+        return Result.Ok(true);
+    }
+
+    /// An unguarded arm with a `_` alternative.
+    fn patArmWild(this: &BodyCx, arm: &MatchArm): bool {
+        match arm.guard { Option.Some(_) { return false; } Option.None {} }
+        for k in 0..arm.pats.len {
+            match this.cx.ast.pat(arm.pats.items[k]) { Pat.Wild { return true; } _ {} }
+        }
+        return false;
+    }
+
+    /// Rust `check_exhaustive`: every value of `t` (an enum or a tuple) has an unguarded arm, unless there
+    /// is a `_` (then warn if it covers none).
+    fn patExhaustive(this: &BodyCx, t: Id<Ty>, arms: &List<MatchArm>, sp: Span): Result<bool, TErr> {
+        let isEnum = match this.enumOf(t) { Option.Some(_) { true } Option.None { false } };
+        let rows = List<List<Id<Pat>>>.new(this.cx.arena);
+        let wild: Option<Span> = Option.None;
+        for i in 0..arms.len {
+            let arm = arms.items[i];
+            let guarded = match arm.guard { Option.Some(_) { true } Option.None { false } };
+            for k in 0..arm.pats.len {
+                let p = arm.pats.items[k];
+                match this.cx.ast.pat(p) {
+                    Pat.Wild {
+                        if !guarded { wild = Option.Some(this.cx.ast.patSpan(p)); }
+                        continue;
+                    }
+                    Pat.Variant(vp) {
+                        if !isEnum { return Result.Err(this.err(this.cx.ast.patSpan(p), "a tuple match arm is `(a, b)` or `_`")); }
+                        this.patVariant(t, &vp.path, vp.payload.len, vp.span)?;
+                    }
+                    Pat.Tuple(tp) {
+                        if isEnum { return Result.Err(this.patEnumArmErr(p)); }
+                        this.patTupleElems(t, tp.elems.len, tp.span)?;
+                    }
+                    _ {
+                        if !isEnum { return Result.Err(this.err(this.cx.ast.patSpan(p), "a tuple match arm is `(a, b)` or `_`")); }
+                        return Result.Err(this.patEnumArmErr(p));
+                    }
+                }
+                if !guarded {
+                    let row = List<Id<Pat>>.new(this.cx.arena);
+                    row.push(p);
+                    rows.push(row);
+                }
+            }
+        }
+        let any = this.cx.ast.addPat(Pat.Wild, sp);
+        let tys = this.cx.arena.alloc::<Id<Ty>>(1);
+        tys[0] = t;
+        let missing = List<List<string>>.new(this.cx.arena);
+        this.patUncovered(&rows, tys, any, &missing)?;
+        match wild {
+            Option.Some(w) {
+                if missing.len == 0 {
+                    if isEnum { this.patWarn(w, "this `_` arm covers no variant: every one has its own arm"); }
+                    else { this.patWarn(w, "this `_` arm covers nothing: the arms before it match every value"); }
+                }
+                return Result.Ok(true);
+            }
+            Option.None {}
+        }
+        if missing.len == 0 { return Result.Ok(true); }
+        let m = Text.new(this.cx.arena);
+        m.add("match is not exhaustive: missing ");
+        for i in 0..missing.len {
+            if i > 0 { m.add(", "); }
+            m.add("`").add(missing.items[i].items[0]).add("`");
+        }
+        if missing.len >= PAT_MAX_MISSING { m.add(", ..."); }
+        return Result.Err(this.help(this.err(sp, m.str()), "add an arm for each, or `_ { }` for the rest (a guarded arm does not count)"));
+    }
+
+    fn patEnumArmErr(this: &BodyCx, p: Id<Pat>): TErr {
+        return this.help(this.err(this.cx.ast.patSpan(p), "an enum match arm is `Enum.Variant`"), "value and range patterns match integers");
+    }
+
+    /// Rust `uncovered`: values of types `tys` (one per column) no row matches, one example per column
+    /// pushed on `out` (at most `PAT_MAX_MISSING`). A column splits by variant (or into fields) when some
+    /// row looks inside it; other values are covered only by `_` or a name.
+    fn patUncovered(this: &BodyCx, rows: &List<List<Id<Pat>>>, tys: []Id<Ty>, any: Id<Pat>, out: &List<List<string>>): Result<bool, TErr> {
+        if out.len >= PAT_MAX_MISSING { return Result.Ok(true); }
+        let a = this.cx.arena;
+        let ast = this.cx.ast;
+        if tys.len == 0 {
+            if rows.len == 0 { out.push(List<string>.new(a)); }
+            return Result.Ok(true);
+        }
+        let t = tys[0];
+        let rest = tys[1..tys.len];
+        let split = false;
+        for i in 0..rows.len {
+            match ast.pat(rows.items[i].items[0]) {
+                Pat.Variant(_) { split = true; }
+                Pat.Struct(_) { split = true; }
+                Pat.Tuple(_) { split = true; }
+                _ {}
+            }
+        }
+        let tk = this.ty(t);
+        let isAgg = false;
+        match tk { Ty.Struct(_) { isAgg = true; } Ty.Tuple(_) { isAgg = true; } _ {} }
+        match tk {
+            Ty.Enum(e) {
+                if split {
+                    let ed = this.cx.tables.enumAt(e.decl);
+                    let ename = this.str(ed.name);
+                    let nv = ed.variants.len;
+                    for k in 0..nv {
+                        let ftys = this.patFieldTys(t, k);
+                        let spec = List<List<Id<Pat>>>.new(a);
+                        for i in 0..rows.len {
+                            let r = rows.items[i];
+                            let row = List<Id<Pat>>.new(a);
+                            match ast.pat(r.items[0]) {
+                                Pat.Variant(vp) {
+                                    let vi = this.patVariant(t, &vp.path, vp.payload.len, vp.span)?;
+                                    if vi != k { continue; }
+                                    row.extend(vp.payload.slice());
+                                }
+                                _ {
+                                    if !irrefutable(ast, r.items[0]) { continue; }
+                                    for q in 0..ftys.len { row.push(any); }
+                                }
+                            }
+                            row.extend(r.items[1..r.len]);
+                            spec.push(row);
+                        }
+                        let sub = List<List<string>>.new(a);
+                        this.patUncovered(&spec, patCols(a, ftys.slice(), rest), any, &sub)?;
+                        let vname = Text.new(a);
+                        vname.add(ename).add(".").add(this.str(this.cx.tables.enumAt(e.decl).variants.items[k].name));
+                        for i in 0..sub.len {
+                            let w = sub.items[i];
+                            let head = Text.new(a);
+                            head.add(vname.str());
+                            if ftys.len > 0 {
+                                head.add("(");
+                                for q in 0..ftys.len { if q > 0 { head.add(", "); } head.add(w.items[q]); }
+                                head.add(")");
+                            }
+                            out.push(patWitness(a, head.str(), w.items[ftys.len..w.len]));
+                        }
+                    }
+                    out.len = patMin(out.len, PAT_MAX_MISSING);
+                    return Result.Ok(true);
+                }
+            }
+            _ {}
+        }
+        if isAgg && split { return this.patUncoveredAgg(rows, t, rest, any, out); }
+        if t == this.com().bool {
+            let anyBool = false;
+            for i in 0..rows.len {
+                match patBoolValue(ast, rows.items[i].items[0]) { Option.Some(_) { anyBool = true; } Option.None {} }
+            }
+            if anyBool {
+                for b in 0..2 {
+                    let v = b == 0;
+                    let spec = List<List<Id<Pat>>>.new(a);
+                    for i in 0..rows.len {
+                        let r = rows.items[i];
+                        let keep = irrefutable(ast, r.items[0]);
+                        match patBoolValue(ast, r.items[0]) { Option.Some(x) { if x == v { keep = true; } } Option.None {} }
+                        if keep { spec.push(patTail(a, &r)); }
+                    }
+                    let sub = List<List<string>>.new(a);
+                    this.patUncovered(&spec, rest, any, &sub)?;
+                    let name = "false";
+                    if v { name = "true"; }
+                    for i in 0..sub.len { out.push(patWitness(a, name, sub.items[i].slice())); }
+                }
+                out.len = patMin(out.len, PAT_MAX_MISSING);
+                return Result.Ok(true);
+            }
+        }
+        let spec = List<List<Id<Pat>>>.new(a);
+        for i in 0..rows.len {
+            let r = rows.items[i];
+            if irrefutable(ast, r.items[0]) { spec.push(patTail(a, &r)); }
+        }
+        let sub = List<List<string>>.new(a);
+        this.patUncovered(&spec, rest, any, &sub)?;
+        for i in 0..sub.len { out.push(patWitness(a, "_", sub.items[i].slice())); }
+        out.len = patMin(out.len, PAT_MAX_MISSING);
+        return Result.Ok(true);
+    }
+
+    /// `patUncovered`'s struct / tuple column: split into the fields.
+    fn patUncoveredAgg(this: &BodyCx, rows: &List<List<Id<Pat>>>, t: Id<Ty>, rest: []Id<Ty>, any: Id<Pat>, out: &List<List<string>>): Result<bool, TErr> {
+        let a = this.cx.arena;
+        let ast = this.cx.ast;
+        let ftys = List<Id<Ty>>.new(a);
+        let names = List<string>.new(a);
+        let sname = "";
+        let tuple = false;
+        match this.ty(t) {
+            Ty.Tuple(tt) { tuple = true; ftys.extend(this.cx.tables.items(tt.elems)); }
+            Ty.Struct(s) {
+                let sd = this.cx.tables.structAt(s.decl);
+                sname = this.str(sd.name);
+                for k in 0..sd.fields.len {
+                    ftys.push(fieldTyOf(this.cx.tables, t, k));
+                    names.push(this.str(sd.fields.items[k].name));
+                }
+            }
+            _ {}
+        }
+        let n = ftys.len;
+        let spec = List<List<Id<Pat>>>.new(a);
+        for i in 0..rows.len {
+            let r = rows.items[i];
+            let head = a.alloc::<Id<Pat>>(n);
+            for k in 0..n { head[k] = any; }
+            match ast.pat(r.items[0]) {
+                Pat.Struct(st) {
+                    let fields = this.patStructFields(t, &st)?;
+                    for k in 0..fields.len { head[fields.items[k]] = st.fields.items[k].pat; }
+                }
+                Pat.Tuple(tp) {
+                    this.patTupleElems(t, tp.elems.len, tp.span)?;
+                    for k in 0..n { head[k] = tp.elems.items[k]; }
+                }
+                _ { if !irrefutable(ast, r.items[0]) { continue; } }
+            }
+            let row = List<Id<Pat>>.new(a);
+            row.extend(head);
+            row.extend(r.items[1..r.len]);
+            spec.push(row);
+        }
+        let sub = List<List<string>>.new(a);
+        this.patUncovered(&spec, patCols(a, ftys.slice(), rest), any, &sub)?;
+        for i in 0..sub.len {
+            let w = sub.items[i];
+            let head = Text.new(a);
+            if tuple {
+                head.add("(");
+                for k in 0..n { if k > 0 { head.add(", "); } head.add(w.items[k]); }
+                head.add(")");
+            } else {
+                let shown = 0;
+                for k in 0..n {
+                    if w.items[k] == "_" { continue; }
+                    if shown == 0 { head.add(sname).add(" { "); } else { head.add(", "); }
+                    head.add(names.items[k]).add(": ").add(w.items[k]);
+                    shown += 1;
+                }
+                if shown == 0 { head.add("_"); } else { head.add(", .. }"); }
+            }
+            out.push(patWitness(a, head.str(), w.items[n..w.len]));
+        }
+        out.len = patMin(out.len, PAT_MAX_MISSING);
+        return Result.Ok(true);
+    }
+
+    /// Rust `warn`: a warning on the user's own code (not `j3.*`, not a `.generated` file), once per place.
+    fn patWarn(this: &BodyCx, sp: Span, msg: string) {
+        let key = this.cx.tables.modAt(this.m).key;
+        if key == "j3" || startsWith(key, "j3.") || patEndsWith(this.path, ".generated") { return; }
+        for k in 0..this.cx.diags.count() {
+            let o = this.cx.diags.at(k);
+            if o.span.file == sp.file && o.span.lo == sp.lo && o.span.hi == sp.hi && o.msg == msg { return; }
+        }
+        this.cx.diags.add(this.cx.diags.make(0, Severity.Warning, sp, own(this.cx.arena, msg)));
+    }
+}
+
+fn patEndsWith(s: string, suffix: string): bool {
+    return s.len >= suffix.len && s[s.len - suffix.len..s.len] == suffix;
+}
+
+fn patMin(a: int, b: int): int {
+    if a < b { return a; }
+    return b;
+}
+
+/// `xs` then `rest`.
+fn patCols(a: &Arena, xs: []Id<Ty>, rest: []Id<Ty>): []Id<Ty> {
+    let out = a.alloc::<Id<Ty>>(xs.len + rest.len);
+    for i in 0..xs.len { out[i] = xs[i]; }
+    for i in 0..rest.len { out[xs.len + i] = rest[i]; }
+    return out;
+}
+
+/// A row without its first column.
+fn patTail(a: &Arena, r: &List<Id<Pat>>): List<Id<Pat>> {
+    let out = List<Id<Pat>>.new(a);
+    out.extend(r.items[1..r.len]);
+    return out;
+}
+
+/// An example: `head`, then `tail`'s columns.
+fn patWitness(a: &Arena, head: string, tail: []string): List<string> {
+    let out = List<string>.new(a);
+    out.push(head);
+    out.extend(tail);
+    return out;
+}

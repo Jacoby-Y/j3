@@ -1,5 +1,246 @@
-// Where a `closure(..)` type may appear, and the arena-boxed escaping form.
+// Closures in fn bodies, all but the literal: calls through a closure value, a named fn standing in for a
+// closure, `@closureFn` / `@closureCtx` / `@closureFrom`, a boxed closure seen as a stack one, the
+// closure mismatch texts, and where a closure value may go.
 //
 // Part of module j3c.sema.
-// Port of: j3c/src/check/closure_ty.rs
+// Port of: j3c/src/check/closure_ty.rs, check/lower/closure.rs, check/lower/closure_call.rs,
+// check/lower/closure_boxed.rs
+// J3: C2c hooks (contracts-c2c.md, owner: closures); the literal is `closure_lit.j3`. Where a closure
+// *type* may be written is checked by `resolve.rejectClosure` / `closureNotHere` (Rust `closure_ty.rs`);
+// `closureReject` is the same rule as a typing error for a value's type.
+// J3: Rust's `boxed_as_stack` reads the two words off a place. From `operand` the place is the written one
+// (`Convert(Load(p), BoxedToStack)`); from `rvalue` Rust first stores the value in a temporary, which is a
+// `TPlace.Temp` here (`Convert(Load(Temp(v)), BoxedToStack)`), so `lower` tells the two apart by shape.
 module j3c.sema;
+
+use j3c.load.stdlibDir;
+use j3c.syntax.token.{ NameList, isIn, names };
+
+extend BodyCx {
+    /// The signature when `t` is a closure type, stack or boxed (Rust `closure_sig`).
+    fn closureSigOf(this: &BodyCx, t: Id<Ty>): Option<ClosureTy> {
+        match this.ty(t) { Ty.Closure(c) { return Option.Some(c); } _ { return Option.None; } }
+        return Option.None;
+    }
+
+    /// Rust `is_boxed_closure`.
+    fn isBoxedClosure(this: &BodyCx, t: Id<Ty>): bool {
+        match this.ty(t) { Ty.Closure(c) { return c.boxed; } _ { return false; } }
+        return false;
+    }
+
+    /// `a` and `b` name the same parameter and return types.
+    fn closureSameSig(this: &BodyCx, a: ClosureTy, b: ClosureTy): bool {
+        let pa = this.cx.tables.items(a.params);
+        let pb = this.cx.tables.items(b.params);
+        if a.ret != b.ret || pa.len != pb.len { return false; }
+        for i in 0..pa.len {
+            if pa[i] != pb[i] { return false; }
+        }
+        return true;
+    }
+
+    /// Rust `fn_to_closure`: named fn `f` where `w` is wanted: `Convert(FnAddr, FnToClosure)` when `w` is
+    /// a closure of `f`'s signature, else None (the caller then compares the fn type).
+    fn closureFromFn(this: &BodyCx, sp: Span, f: Id<FnDecl>, w: Id<Ty>): Result<Option<Id<TExpr>>, TErr> {
+        let sig = match this.closureSigOf(w) { Option.Some(s) { s } Option.None { return Result.Ok(Option.None); } };
+        let d = this.cx.tables.fnAt(f);
+        let ps = this.cx.tables.items(sig.params);
+        if d.ret != sig.ret || d.params.len != ps.len { return Result.Ok(Option.None); }
+        for i in 0..ps.len {
+            if d.params.items[i].ty != ps[i] { return Result.Ok(Option.None); }
+        }
+        if this.cx.tables.modAt(this.m).isScript { return Result.Err(this.closureScriptErr(sp)); }
+        let addr = this.expr(TExpr.FnAddr(TFnAddr { callee: Callee.Fn(FnCallee { decl: f }) }), this.fnTyOf(f), sp);
+        return Result.Ok(Option.Some(this.expr(TExpr.Convert(TConvert { expr: addr, kind: ConvKind.FnToClosure }), w, sp)));
+    }
+
+    /// Rust `reject_closure` as a typing error: a stack closure of type `t` cannot be `place` ("borrowed
+    /// with `&`", "an array element", "a tuple element", "captured by a boxed closure (`x`)"). None: fine.
+    fn closureReject(this: &BodyCx, sp: Span, t: Id<Ty>, place: string): Option<TErr> {
+        match this.ty(t) {
+            Ty.Closure(c) { if c.boxed { return Option.None; } }
+            _ { return Option.None; }
+        }
+        let e = this.err(sp, cat3(this.cx, "a closure cannot be ", place, ": it points into the stack of the function that made it"));
+        return Option.Some(this.help(e, CLOSURE_HOW));
+    }
+
+    /// Rust `call_closure`: `fv(args)` where `fv` is a closure value (a `Call` with `Callee.Value`).
+    fn closureCall(this: &BodyCx, sp: Span, fv: Id<TExpr>, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let sig = match this.closureSigOf(this.exprTy(fv)) {
+            Option.Some(s) { s }
+            Option.None { return Result.Err(this.err(sp, "cannot call this expression")); }
+        };
+        let ps = this.cx.tables.items(sig.params);
+        if ps.len != args.len {
+            let m = Text.new(this.cx.arena);
+            m.add("takes ");
+            m.pushInt(ps.len);
+            m.add(" args, got ");
+            m.pushInt(args.len);
+            return Result.Err(this.err(sp, m.str()));
+        }
+        let out = List<Id<TExpr>>.new(this.cx.arena);
+        for i in 0..args.len { out.push(this.operand(args.items[i], Option.Some(ps[i]))?); }
+        return Result.Ok(this.expr(TExpr.Call(TCall { callee: Callee.Value(ValueCallee { expr: fv }), args: out }), sig.ret, sp));
+    }
+
+    /// Rust `call`'s last name case (check/lower/call.rs:56): `ON_HIT(3)` where `ON_HIT` is a global of a
+    /// boxed closure type. None: `n` is no such global (the caller reports the unknown function).
+    fn closureGlobalCall(this: &BodyCx, sp: Span, n: Ident, args: &List<Id<Expr>>): Result<Option<Id<TExpr>>, TErr> {
+        let g = match this.globalNamed(n.name) { Option.Some(g) { g } Option.None { return Result.Ok(Option.None); } };
+        let gt = this.cx.tables.globalAt(g).ty;
+        if !this.isBoxedClosure(gt) { return Result.Ok(Option.None); }
+        let p = this.place(TPlace.Global(GlobalPlace { global: g }), gt, n.span);
+        return Result.Ok(Option.Some(this.callValue(sp, this.load(p), args)?));
+    }
+
+    /// Rust `closure_intrinsic`: every `@name(..)` call that is not a simd intrinsic (`@closureFn`,
+    /// `@closureCtx`, `@closureFrom`; the shader-builtin and stdlib-only errors).
+    fn closureIntrinsic(this: &BodyCx, sp: Span, n: Ident, args: &List<Id<Expr>>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let full = this.str(n.name);
+        let c = this.com();
+        if isIn(full[1..full.len], names(NameList.IntrinsicGpu)) {
+            if full == "@shader" {
+                return Result.Err(this.help(this.err(n.span, "`@shader` pairs a vertex and a fragment fn in a module `const`"),
+                    "write `const PROG: Source = @shader(vs, fs);` at module level, with `use j3.gpu.{ Source };`"));
+            }
+            return Result.Err(this.help(this.err(n.span, cat3(this.cx, "`", full, "` is a shader builtin; it works only inside a `#[shader]` fn")),
+                "mark the enclosing fn `#[shader]`, `#[shader(vertex)]` or `#[shader(fragment)]` (`j3c doc shaders`)"));
+        }
+        // Stdlib origin, not the module name: a user file may say `module j3;`.
+        if !closureInStdlib(this.cx.arena, this.path) {
+            return Result.Err(this.help(this.err(n.span, cat3(this.cx, "`", full, "` is for the standard library only")),
+                "take a `closure(..)` parameter and call it; a closure cannot be turned into a ptr"));
+        }
+        let from = full == "@closureFrom";
+        let wantArgs = 1;
+        if from { wantArgs = 2; }
+        if args.len != wantArgs {
+            let m = Text.new(this.cx.arena);
+            m.add("`").add(full).add("` takes ");
+            m.pushInt(wantArgs);
+            m.add(" argument(s)");
+            return Result.Err(this.err(sp, m.str()));
+        }
+        let ops = List<Id<TExpr>>.new(this.cx.arena);
+        if from {
+            let ty = c.error;
+            match want { Option.Some(w) { if this.isClosure(w) { ty = w; } } Option.None {} }
+            if ty == c.error {
+                return Result.Err(this.help(this.err(sp, "`@closureFrom` needs a `closure(..)` type to build"), "annotate the `let` or parameter that receives it"));
+            }
+            ops.push(this.operand(args.items[0], Option.Some(c.ptr))?);
+            ops.push(this.operand(args.items[1], Option.Some(c.ptr))?);
+            return Result.Ok(this.expr(TExpr.ClosureOp(TClosureOp { kind: ClosureOpKind.From, args: ops }), ty, sp));
+        }
+        let v = this.operand(args.items[0], Option.None)?;
+        if !this.isClosure(this.exprTy(v)) {
+            return Result.Err(this.mismatch(this.cx.ast.exprSpan(args.items[0]), cat3(this.cx, "`", full, "` takes a closure"), this.exprTy(v), c.ptr));
+        }
+        ops.push(v);
+        let kind = ClosureOpKind.Ctx;
+        if full == "@closureFn" { kind = ClosureOpKind.Fn; }
+        return Result.Ok(this.expr(TExpr.ClosureOp(TClosureOp { kind: kind, args: ops }), c.ptr, sp));
+    }
+
+    /// Rust `closure_mismatch`: the error when a closure `have` meets `want` (a plain fn / ptr, or a
+    /// boxed closure); None: the ordinary mismatch text.
+    fn closureMismatch(this: &BodyCx, sp: Span, have: Id<Ty>, want: Id<Ty>): Option<TErr> {
+        if !this.isClosure(have) { return Option.None; }
+        let m = Text.new(this.cx.arena);
+        m.add("expected `").add(this.tyStr(want)).add("`, found `").add(this.tyStr(have)).add("`: ");
+        if this.isBoxedClosure(want) && !this.isBoxedClosure(have) {
+            m.add("a stack closure points into the frame that made it and cannot become boxed");
+            return Option.Some(this.help(this.err(sp, m.str()), "only a `fn[mem](..) { .. }` literal makes a boxed closure; it copies its captures into arena `mem`"));
+        }
+        match this.ty(want) {
+            Ty.Fn(_) {}
+            Ty.Ptr {}
+            _ { return Option.None; }
+        }
+        m.add("a closure carries its captures and cannot become a plain fn or ptr");
+        return Option.Some(this.help(this.err(sp, m.str()), "take a `closure(..)` parameter instead, or pass a named fn"));
+    }
+
+    /// `have` is a boxed closure and `want` the stack closure of the same signature (Rust
+    /// `boxed_as_stack`'s test).
+    fn closureBoxedFits(this: &BodyCx, have: Id<Ty>, want: Id<Ty>): bool {
+        let h = match this.closureSigOf(have) { Option.Some(s) { s } Option.None { return false; } };
+        let w = match this.closureSigOf(want) { Option.Some(s) { s } Option.None { return false; } };
+        return h.boxed && !w.boxed && this.closureSameSig(h, w);
+    }
+
+    /// Rust `boxed_as_stack` in `operand` (check/lower/expr.rs:48): place `p` holds a boxed closure and
+    /// stack closure `w` of the same signature is wanted: `Convert(Load(p), BoxedToStack)`. None: no.
+    fn closureBoxedPlace(this: &BodyCx, sp: Span, p: Id<TPlace>, w: Id<Ty>): Option<Id<TExpr>> {
+        if !this.closureBoxedFits(this.placeTy(p), w) { return Option.None; }
+        return Option.Some(this.expr(TExpr.Convert(TConvert { expr: this.load(p), kind: ConvKind.BoxedToStack }), w, sp));
+    }
+
+    /// Rust `rvalue`'s boxed view (check/lower/expr.rs:75): value `v` against `want`; a boxed closure
+    /// where a stack closure of the same signature is wanted becomes `Convert(Load(Temp(v)), BoxedToStack)`
+    /// (Rust stores the value first), anything else is `v`.
+    // ponytail: Rust also stores a boxed closure that does NOT fit before handing it back; every caller
+    // then reports the mismatch, so no lowered program has that temporary.
+    fn closureBoxedView(this: &BodyCx, sp: Span, v: Id<TExpr>, want: Option<Id<Ty>>): Id<TExpr> {
+        let w = match want { Option.Some(w) { w } Option.None { return v; } };
+        if !this.closureBoxedFits(this.exprTy(v), w) { return v; }
+        let tmp = this.place(TPlace.Temp(TempPlace { value: v }), this.exprTy(v), sp);
+        return this.expr(TExpr.Convert(TConvert { expr: this.load(tmp), kind: ConvKind.BoxedToStack }), w, sp);
+    }
+
+    /// Rust `call_generic` (check/lower/generic_fn.rs:179): closure literal `arg` for parameter type `pt`
+    /// of generics `g`: its written parameter and return types bind type parameters in `out` (`bindArg`).
+    /// Called for every argument; not a closure literal: nothing.
+    fn closureBindArg(this: &BodyCx, g: Id<Generics>, pt: Id<Ty>, arg: Id<Expr>, out: []Id<Ty>): Result<bool, TErr> {
+        let lit = match this.cx.ast.expr(arg) { Expr.Closure(l) { l } _ { return Result.Ok(true); } };
+        let sig = match this.closureSigOf(pt) { Option.Some(s) { s } Option.None { return Result.Ok(true); } };
+        let ps = this.cx.tables.items(sig.params);
+        for i in 0..lit.params.len {
+            if i >= ps.len { break; }
+            match lit.params.items[i].ty {
+                Option.Some(ty) {
+                    let have = this.resolve(ty)?;
+                    this.bindArg(this.cx.ast.typeSpan(ty), g, ps[i], have, out)?;
+                }
+                Option.None {}
+            }
+        }
+        match lit.ret {
+            Option.Some(ty) {
+                // Rust binds only against a written return type; an omitted one is `void` here, which
+                // names no type parameter, so `unify` does nothing.
+                let have = this.resolve(ty)?;
+                this.bindArg(this.cx.ast.typeSpan(ty), g, sig.ret, have, out)?;
+            }
+            Option.None {}
+        }
+        return Result.Ok(true);
+    }
+}
+
+/// Rust `in_stdlib`: `path` is under the stdlib dir, judged lexically (`.` and `..` resolved first, so
+/// `<stdlib>/../x.j3` is not inside it).
+fn closureInStdlib(a: &Arena, path: string): bool {
+    let parts = List<string>.new(a);
+    let start = 0;
+    for i in 0..path.len + 1 {
+        if i < path.len && path[i] != '/' { continue; }
+        let part = path[start..i];
+        start = i + 1;
+        if part == "." || (part.len == 0 && parts.len > 0) { continue; }
+        if part == ".." { if parts.len > 0 { parts.len -= 1; } continue; }
+        parts.push(part);
+    }
+    let norm = Text.new(a);
+    for i in 0..parts.len {
+        if i > 0 { norm.add("/"); }
+        norm.add(parts.items[i]);
+    }
+    let dir = stdlibDir(a);
+    let n = norm.str();
+    if n.len < dir.len || n[0..dir.len] != dir { return false; }
+    return n.len == dir.len || n[dir.len] == '/';
+}

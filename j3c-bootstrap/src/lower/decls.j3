@@ -1,0 +1,469 @@
+// The IR entities of a program from sema's declarations: one `Module` per source module, structs, enums
+// (multi-field payload structs `Enum.Variant`), fields with defaults, fn signatures, globals with their
+// constant data, the entry; and sema `Ty` to IR `Ty`, generic struct/enum instances made on first use.
+//
+// Part of module j3c.lower.
+// Port of: (the IR half of check/types.rs `collect_struct_names`/`fill_struct_fields`/`collect_enums`/
+// `variant_def`, check/funcs.rs `collect_funcs`/`alloc_fn`, check/global_init.rs `collect_globals`, check/embed.rs
+// `collect_embeds`, check/resolve.rs `instantiate_struct`/`instantiate_enum`; their checks are sema's)
+// J3: Order is Rust's id order: every module's structs, then every module's enums (each enum's payload
+// structs before it), then fields, fns, globals, module by module. Sema's pools and `ModDecl` lists are
+// already in declaration order. Templates (`gen` Some) make nothing; an instance is made when a type
+// first needs it; its methods come with it (`inst_queue.instStructMethods`).
+module j3c.lower;
+
+/// Program module index of sema module `i` (`isLib` modules have none).
+fn modIndex(lw: &Lw, i: u32): int { return lw.modIds.items[int(i)] - 1; }
+
+/// Make every IR entity of the program (Rust `check_files_inner` from `collect_struct_names` to
+/// `collect_embeds`), in Rust's order.
+fn declareDecls(lw: &Lw) {
+    let t = lw.t;
+    let ir = lw.ir();
+    let a = lw.cx.arena;
+    for i in 0..t.structs.len() { lw.structIds.push(0); }
+    for i in 0..t.enums.len() { lw.enumIds.push(0); }
+    for i in 0..t.fns.len() { lw.fnIds.push(0); }
+    for i in 0..t.globals.len() { lw.globalIds.push(0); }
+    for i in 0..t.mods.len() { lw.modIds.push(0); }
+    let mods = lw.cx.checked.mods;
+    for k in 0..mods.len {
+        let md = t.modAt(mods.items[k].owner);
+        lw.modIds.items[int(mods.items[k].owner.i)] = k + 1;
+        lw.p.modules.push(Module.new(a, md.path));
+    }
+    // Rust `dyn_types` (check/mod.rs:337): the fat-pointer structs of written `dyn` traits come first.
+    dynDeclare(lw);
+    for k in 0..mods.len {
+        lw.curMod = k;
+        let md = t.modAt(mods.items[k].owner);
+        for j in 0..md.structs.len {
+            let sid = md.structs.items[j];
+            let sd = t.structAt(sid);
+            match sd.gen { Option.Some(_) { continue; } Option.None {} }
+            // An `@embedDir` row struct (the only struct without an item) is made with its global: `embedRow`.
+            match sd.item { Option.Some(_) {} Option.None { continue; } }
+            let id = ir.allocStruct(StructDef { moduleName: md.path, name: sd.name, doc: sd.doc, fields: List<FieldDef>.new(a),
+                packed: sd.packed, debug: sd.debug, span: sd.span, tyArgs: List<TyArg>.new(a), script: scriptMeta(sd) });
+            lw.structIds.items[int(sid.i)] = id.i + 1;
+            lw.p.modules.items[k].structs.push(id);
+        }
+    }
+    for k in 0..mods.len {
+        lw.curMod = k;
+        let md = t.modAt(mods.items[k].owner);
+        for j in 0..md.enums.len {
+            let eid = md.enums.items[j];
+            match t.enumAt(eid).gen { Option.Some(_) { continue; } Option.None {} }
+            declareEnum(lw, eid.i, t.common.none);
+        }
+    }
+    for k in 0..mods.len {
+        lw.curMod = k;
+        let md = t.modAt(mods.items[k].owner);
+        for j in 0..md.structs.len {
+            let sid = md.structs.items[j];
+            if lw.structIds.items[int(sid.i)] != 0 { fillFields(lw, sid.i, Id<StructDef> { i: lw.structIds.items[int(sid.i)] - 1 }, t.common.none); }
+        }
+    }
+    for k in 0..mods.len {
+        lw.curMod = k;
+        let md = t.modAt(mods.items[k].owner);
+        for j in 0..md.fns.len { declareFn(lw, md.fns.items[j].i, k); }
+    }
+    for k in 0..mods.len {
+        lw.curMod = k;
+        let md = t.modAt(mods.items[k].owner);
+        for j in 0..md.globals.len { declareGlobal(lw, md.globals.items[j].i, k); }
+    }
+    match lw.cx.checked.entry {
+        Option.Some(e) { if lw.fnIds.items[int(e.i)] != 0 { ir.entry = Option.Some(Id<Func> { i: lw.fnIds.items[int(e.i)] - 1 }); } }
+        Option.None {}
+    }
+}
+
+/// Enum `i` at type args `args` (none for a plain enum). Returns its IR id.
+// J3: Rust's two orders: a plain enum is allocated first, then its variants are resolved (`collect_enums`:
+// a payload may name the enum itself, `Bin(&Expr, &Expr)`); an instance resolves its variants first, so
+// the instances its payloads name get the lower ids (`instantiate_enum`).
+fn declareEnum(lw: &Lw, i: u32, args: Id<TyList>): Id<EnumDef> {
+    let t = lw.t;
+    let ir = lw.ir();
+    let a = lw.cx.arena;
+    let ed = t.enumAt(Id<EnumDecl> { i: i });
+    let path = lw.p.modules.items[lw.curMod].name;
+    let ai = t.items(args);
+    let id = Id<EnumDef> { i: 0 };
+    if ai.len == 0 {
+        id = ir.allocEnum(EnumDef { moduleName: path, name: ed.name, doc: ed.doc, variants: List<VariantDef>.new(a), tryCatch: Option.None,
+            debug: ed.debug, span: ed.span, tyArgs: List<Id<TyKind>>.new(a) });
+        // Rust `collect_enums` interns the type at the declaration (the backend needs it for an unused enum).
+        ir.tyEnum(id);
+        lw.enumIds.items[int(i)] = id.i + 1;
+        lw.p.modules.items[lw.curMod].enums.push(id);
+    }
+    let vs = List<VariantDef>.new(a);
+    for v in 0..ed.variants.len {
+        let vd = ed.variants.items[v];
+        let payload: Option<Id<TyKind>> = Option.None;
+        match vd.payload {
+            Option.Some(pt) {
+                let st = substIn(lw, ed.gen, pt, args);
+                if vd.multi { payload = Option.Some(variantStruct(lw, ed.name, vd.name, vd.span, st, path)); }
+                else { payload = Option.Some(lw.irTy(st)); }
+            }
+            Option.None {}
+        }
+        vs.push(VariantDef { name: vd.name, doc: vd.doc, payload: payload, multi: vd.multi });
+    }
+    if ai.len == 0 {
+        ir.enumDefMut(id).variants = vs;
+    } else {
+        let targs = List<Id<TyKind>>.new(a);
+        for k in 0..ai.len { targs.push(lw.irTy(ai[k])); }
+        id = ir.allocEnum(EnumDef { moduleName: path, name: ed.name, doc: ed.doc, variants: vs, tryCatch: Option.None, debug: ed.debug,
+            span: ed.span, tyArgs: targs });
+        lw.p.modules.items[lw.curMod].enums.push(id);
+    }
+    match ed.tryCatch {
+        Option.Some(c) { ir.enumDefMut(id).tryCatch = Option.Some(TryCatch { success: VariantId { enumId: id, index: u32(c.success) },
+            failure: VariantId { enumId: id, index: u32(c.failure) } }); }
+        Option.None {}
+    }
+    return id;
+}
+
+/// Rust `variant_def`'s payload struct `Enum.Variant { 0: A, 1: B }` (sema's `Ty.Tuple` of the fields).
+fn variantStruct(lw: &Lw, ename: Sym, vname: Sym, span: Span, tuple: Id<Ty>, path: List<Sym>): Id<TyKind> {
+    let ir = lw.ir();
+    let a = lw.cx.arena;
+    let fields = List<FieldDef>.new(a);
+    match lw.t.ty(tuple) {
+        Ty.Tuple(tt) {
+            let es = lw.t.items(tt.elems);
+            for k in 0..es.len {
+                let n = Text.new(a);
+                n.pushInt(k);
+                fields.push(FieldDef { name: ir.internName(n.str()), doc: "", ty: lw.irTy(es[k]), embedded: false, default: Option.None });
+            }
+        }
+        _ { panic("lower: a multi-field variant payload is a tuple"); }
+    }
+    let n = Text.new(a);
+    n.add(ir.nameStr(ename)).add(".").add(ir.nameStr(vname));
+    let id = ir.allocStruct(StructDef { moduleName: path, name: ir.internName(n.str()), doc: "", fields: fields, packed: false,
+        debug: false, span: span, tyArgs: List<TyArg>.new(a), script: Option.None });
+    lw.p.modules.items[lw.curMod].structs.push(id);
+    return ir.tyStruct(id);
+}
+
+/// Fields of struct decl `i` (at `args`) into IR struct `id` (Rust `fill_struct_fields`).
+fn fillFields(lw: &Lw, i: u32, id: Id<StructDef>, args: Id<TyList>) {
+    let sd = lw.t.structAt(Id<StructDecl> { i: i });
+    let fields = List<FieldDef>.new(lw.cx.arena);
+    for k in 0..sd.fields.len {
+        let fd = sd.fields.items[k];
+        let fty = lw.irTy(substIn(lw, sd.gen, fd.ty, args));
+        let def: Option<Operand> = Option.None;
+        match fd.default {
+            Option.Some(v) { def = Option.Some(lw.constOp(noSpan(), v.ty, v.kind)); }
+            Option.None {}
+        }
+        fields.push(FieldDef { name: fd.name, doc: fd.doc, ty: fty, embedded: fd.embedded, default: def });
+    }
+    lw.ir().structDefMut(id).fields = fields;
+}
+
+/// `t` with the template's parameters replaced by `args` (none: `t` itself).
+fn substIn(lw: &Lw, gen: Option<Id<Generics>>, t: Id<Ty>, args: Id<TyList>): Id<Ty> {
+    match gen {
+        Option.Some(g) { if lw.t.items(args).len > 0 { return subst(lw.t, g, t, args); } }
+        Option.None {}
+    }
+    return t;
+}
+
+/// Rust `alloc_fn` / the `use lib` arm of `collect_funcs`: fn decl `i` of program module `k`.
+fn declareFn(lw: &Lw, i: u32, k: int) {
+    let ir = lw.ir();
+    let a = lw.cx.arena;
+    let fd = lw.t.fnAt(Id<FnDecl> { i: i });
+    match fd.gen { Option.Some(_) { return; } Option.None {} }
+    let params = List<Id<TyKind>>.new(a);
+    for p in 0..fd.params.len { params.push(lw.irTy(fd.params.items[p].ty)); }
+    let fty = ir.tyFn(params, lw.irTy(fd.ret));
+    let path = lw.p.modules.items[k].name;
+    let methodOf: Option<Id<StructDef>> = Option.None;
+    match fd.recv {
+        Option.Some(s) { if lw.structIds.items[int(s.i)] != 0 { methodOf = Option.Some(Id<StructDef> { i: lw.structIds.items[int(s.i)] - 1 }); } }
+        Option.None {}
+    }
+    let vis = Vis.Private;
+    if fd.visPub { vis = Vis.Pub; }
+    let kind = FuncKind.Decl;
+    let doc = fd.doc;
+    match fd.kind {
+        FnKind.Lib {
+            let sym = fd.name;
+            if fd.symbol.len > 0 { sym = ir.internName(fd.symbol); }
+            kind = FuncKind.Lib(LibFn { libName: ir.internName(fd.libName), symbol: sym });
+            vis = Vis.Private;
+            doc = "";
+        }
+        FnKind.J3 {}
+        FnKind.Decl {}
+        FnKind.Generated {}
+    }
+    let id = ir.allocFunc(Func { id: Id<Func> { i: 0 }, doc: doc, moduleName: path, kind: kind, name: fd.name, ty: fty,
+        vis: vis, methodOf: methodOf, span: fd.span });
+    lw.fnIds.items[int(i)] = id.i + 1;
+    lw.p.modules.items[k].funcs.push(id);
+}
+
+/// Rust `collect_globals` / `collect_embeds`: global decl `i` of program module `k`, its folded init (a
+/// zero init of a mutable global is None, Rust `const_init_is_zero`).
+fn declareGlobal(lw: &Lw, i: u32, k: int) {
+    let ir = lw.ir();
+    let gd = lw.t.globalAt(Id<GlobalDecl> { i: i });
+    embedRow(lw, gd.ty, k);
+    let ty = lw.irTy(gd.ty);
+    let init: Option<ConstInit> = Option.None;
+    match gd.init {
+        Option.Some(ci) {
+            let fi = flatten(lw.cx.arena, ci);
+            if gd.readonly || !zeroInit(&fi) { init = Option.Some(lw.constInit(&fi)); }
+        }
+        Option.None {}
+    }
+    let id = ir.allocGlobal(GlobalDef { id: Id<GlobalDef> { i: 0 }, doc: gd.doc, moduleName: lw.p.modules.items[k].name,
+        init: init, name: gd.name, ty: ty, span: gd.span, thread: gd.thread, readonly: gd.readonly });
+    lw.globalIds.items[int(i)] = id.i + 1;
+    lw.p.modules.items[k].globals.push(id);
+}
+
+/// Rust `collect_embeds` / `file_struct`: the `EmbedFile.X` row struct of an `@embedDir` global of type `ty`
+/// is allocated here, just before its global (after the fns and the module's earlier globals), so its IR
+/// id (in LLVM type names) is Rust's. Any other type: nothing.
+fn embedRow(lw: &Lw, ty: Id<Ty>, k: int) {
+    match lw.t.ty(ty) {
+        Ty.Array(a) {
+            match lw.t.ty(a.elem) {
+                Ty.Struct(s) {
+                    if lw.structIds.items[int(s.decl.i)] != 0 || lw.t.items(s.args).len > 0 { return; }
+                    let sd = lw.t.structAt(s.decl);
+                    let id = lw.ir().allocStruct(StructDef { moduleName: lw.p.modules.items[k].name, name: sd.name, doc: sd.doc,
+                        fields: List<FieldDef>.new(lw.cx.arena), packed: sd.packed, debug: sd.debug, span: sd.span,
+                        tyArgs: List<TyArg>.new(lw.cx.arena), script: Option.None });
+                    lw.structIds.items[int(s.decl.i)] = id.i + 1;
+                    lw.p.modules.items[k].structs.push(id);
+                    fillFields(lw, s.decl.i, id, lw.t.common.none);
+                }
+                _ {}
+            }
+        }
+        _ {}
+    }
+}
+
+/// Rust `const_init_is_zero`: every scalar a zero / false / null / empty string.
+fn zeroInit(fi: &FlatInit): bool {
+    match fi.kind {
+        InitKind.Scalar {
+            match fi.val {
+                Option.Some(v) {
+                    match v.kind {
+                        ConstPayload.Int(n) { return n == 0; }
+                        ConstPayload.Float(f) { return f64Bits(f) == 0; }
+                        ConstPayload.Bool(b) { return !b; }
+                        ConstPayload.String(s) { return s.len == 0; }
+                        ConstPayload.Null { return true; }
+                        ConstPayload.FnAddr(_) { return false; }
+                    }
+                }
+                Option.None { return true; }
+            }
+        }
+        InitKind.Fields {}
+        InitKind.Elems {}
+    }
+    for j in 0..fi.kids.len { if !zeroInit(&fi.kids.items[j]) { return false; } }
+    return true;
+}
+
+extend Lw {
+    /// The IR type of sema type `t` (memoized; Rust's `resolve_type` result).
+    fn irTy(this: &Lw, t: Id<Ty>): Id<TyKind> {
+        let i = int(t.i);
+        while this.tyMemo.len <= i { this.tyMemo.push(0); }
+        if this.tyMemo.items[i] != 0 { return Id<TyKind> { i: this.tyMemo.items[i] - 1 }; }
+        let out = this.irTyNew(t);
+        while this.tyMemo.len <= i { this.tyMemo.push(0); }
+        this.tyMemo.items[i] = out.i + 1;
+        return out;
+    }
+
+    fn irTyNew(this: &Lw, t: Id<Ty>): Id<TyKind> {
+        let ir = this.ir();
+        let c = ir.common;
+        match this.t.ty(t) {
+            Ty.Void { return c.void; }
+            Ty.Bool { return c.bool; }
+            Ty.Int(k) {
+                let n = k as int;
+                if n == 0 { return c.i8; }
+                if n == 1 { return c.i16; }
+                if n == 2 { return c.i32; }
+                if n == 3 { return c.i64; }
+                if n == 4 { return c.u8; }
+                if n == 5 { return c.u16; }
+                if n == 6 { return c.u32; }
+                return c.u64;
+            }
+            Ty.Float(k) { if (k as int) == 0 { return c.f32; } return c.f64; }
+            Ty.Half { return c.f16; }
+            Ty.Vec(k) { if (k as int) == 0 { return c.vec4f; } return c.vec4i; }
+            Ty.Ptr { return c.ptr; }
+            Ty.CStr { return c.cstr; }
+            Ty.String { return c.string; }
+            Ty.Ref(r) { return ir.tyRef(this.irTy(r.inner)); }
+            Ty.Array(a) { return ir.tyArray(this.irTy(a.elem), a.len); }
+            Ty.Slice(s) { return ir.tySlice(this.irTy(s.elem)); }
+            Ty.Fn(f) {
+                let ps = List<Id<TyKind>>.new(this.cx.arena);
+                let items = this.t.items(f.params);
+                for k in 0..items.len { ps.push(this.irTy(items[k])); }
+                return ir.tyFn(ps, this.irTy(f.ret));
+            }
+            Ty.Struct(s) {
+                if this.t.items(s.args).len == 0 {
+                    let id = this.structIds.items[int(s.decl.i)];
+                    if id == 0 { panic("lower: struct type before its declaration"); }
+                    return ir.tyStruct(Id<StructDef> { i: id - 1 });
+                }
+                return ir.tyStruct(this.structInst(s.decl.i, s.args));
+            }
+            Ty.Enum(e) {
+                if this.t.items(e.args).len == 0 {
+                    let id = this.enumIds.items[int(e.decl.i)];
+                    if id == 0 { panic("lower: enum type before its declaration"); }
+                    return ir.tyEnum(Id<EnumDef> { i: id - 1 });
+                }
+                return ir.tyEnum(this.enumInst(e.decl.i, e.args));
+            }
+            Ty.Error { panic("lower: poisoned type"); }
+            Ty.Tuple(tt) { return this.tupleTy(tt.elems); }
+            Ty.Closure(cl) { return closureIrTy(this, cl); }
+            Ty.Dyn(d) { return dynIrTy(this, d); }
+            Ty.Param(_) { panic("lower: type parameter outside an instance"); }
+            Ty.TraitSelf { panic("lower: Self outside a trait instance"); }
+        }
+        return c.void;
+    }
+
+    /// Rust `IrCx::tuple_ty`: `(A, B)` is a struct `(A, B) { 0: A, 1: B }` of module `tuple`, one per
+    /// element list (sema interns the `Ty`, so the memo in `irTy` keeps it single). It goes on the last
+    /// module's struct list at the end (Rust `check_files_inner`), in the order made.
+    fn tupleTy(this: &Lw, elems: Id<TyList>): Id<TyKind> {
+        let ir = this.ir();
+        let a = this.cx.arena;
+        let es = this.t.items(elems);
+        let fields = List<FieldDef>.new(a);
+        let name = Text.new(a);
+        name.add("(");
+        for k in 0..es.len {
+            let ty = this.irTy(es[k]);
+            if k > 0 { name.add(", "); }
+            name.add(tyString(ir, ty, a));
+            let n = Text.new(a);
+            n.pushInt(k);
+            fields.push(FieldDef { name: ir.internName(n.str()), doc: "", ty: ty, embedded: false, default: Option.None });
+        }
+        name.add(")");
+        let path = List<Sym>.new(a);
+        path.push(ir.internName("tuple"));
+        let id = ir.allocStruct(StructDef { moduleName: path, name: ir.internName(name.str()), doc: "", fields: fields, packed: false,
+            debug: false, span: noSpan(), tyArgs: List<TyArg>.new(a), script: Option.None });
+        this.tuples.push(id);
+        return ir.tyStruct(id);
+    }
+
+    /// Rust `instantiate_struct`: struct decl `i` at `args`; its methods' IR fns via `instStructMethods`.
+    fn structInst(this: &Lw, i: u32, args: Id<TyList>): Id<StructDef> {
+        match this.insts.get(instKey(i, args.i, false)) { Option.Some(id) { return Id<StructDef> { i: id }; } Option.None {} }
+        let a = this.cx.arena;
+        let sd = this.t.structAt(Id<StructDecl> { i: i });
+        let targs = List<TyArg>.new(a);
+        let ai = this.t.items(args);
+        match sd.gen {
+            Option.Some(g) {
+                let names = this.t.genericsAt(g).names;
+                for k in 0..ai.len { targs.push(TyArg { name: this.ir().nameStr(names.items[k]), ty: this.irTy(ai[k]) }); }
+            }
+            Option.None {}
+        }
+        let id = this.ir().allocStruct(StructDef { moduleName: this.p.modules.items[this.curMod].name, name: sd.name, doc: sd.doc,
+            fields: List<FieldDef>.new(a), packed: sd.packed, debug: sd.debug, span: sd.span, tyArgs: targs, script: Option.None });
+        this.insts.put(instKey(i, args.i, false), id.i);
+        this.p.modules.items[this.curMod].structs.push(id);
+        fillFields(this, i, id, args);
+        instStructMethods(this, i, args, id);
+        return id;
+    }
+
+    /// Rust `instantiate_enum`: enum decl `i` at `args`.
+    fn enumInst(this: &Lw, i: u32, args: Id<TyList>): Id<EnumDef> {
+        match this.insts.get(instKey(i, args.i, true)) { Option.Some(id) { return Id<EnumDef> { i: id }; } Option.None {} }
+        let id = declareEnum(this, i, args);
+        this.insts.put(instKey(i, args.i, true), id.i);
+        return id;
+    }
+
+    /// A sema constant as an IR operand of type `ty` (Rust stores `Operand` constants directly).
+    fn constOp(this: &Lw, sp: Span, ty: Id<Ty>, kind: ConstPayload): Operand {
+        let ir = this.ir();
+        let t = this.irTy(ty);
+        match kind {
+            ConstPayload.Int(n) { return opInt(sp, t, u64(n)); }
+            ConstPayload.Float(f) {
+                if t == ir.common.f32 { return opF32Bits(sp, t, f32Bits(f32(f))); }
+                return opF64Bits(sp, t, f64Bits(f));
+            }
+            ConstPayload.Bool(b) { return opBool(sp, t, b); }
+            ConstPayload.String(s) { return opBytes(this.cx.arena, sp, t, s as []u8); }
+            ConstPayload.Null { return opNull(sp, t); }
+            ConstPayload.FnAddr(f) { return opFnAddr(sp, t, this.funcOf(f.decl.i)); }
+        }
+    }
+
+    /// The IR fn of fn decl `i` (declared by `declareDecls`).
+    fn funcOf(this: &Lw, i: u32): Id<Func> {
+        let id = this.fnIds.items[int(i)];
+        if id == 0 { panic("lower: call to a fn with no IR (a template?)"); }
+        return Id<Func> { i: id - 1 };
+    }
+
+    /// A flattened sema init as an IR `ConstInit`.
+    fn constInit(this: &Lw, fi: &FlatInit): ConstInit {
+        let a = this.cx.arena;
+        match fi.kind {
+            InitKind.Scalar {
+                match fi.val {
+                    Option.Some(v) { return ConstInit.Scalar(ScalarInit { value: this.constOp(noSpan(), v.ty, v.kind) }); }
+                    Option.None { panic("lower: scalar init without a value"); }
+                }
+            }
+            InitKind.Fields {
+                let fs = List<ConstField>.new(a);
+                for j in 0..fi.kids.len {
+                    fs.push(ConstField { name: this.ir().nameStr(fi.names.items[j]), init: this.constInit(&fi.kids.items[j]) });
+                }
+                return ConstInit.Fields(ConstFields { fields: fs });
+            }
+            InitKind.Elems {
+                let es = List<ConstInit>.new(a);
+                for j in 0..fi.kids.len { es.push(this.constInit(&fi.kids.items[j])); }
+                return ConstInit.Elems(ConstElems { elems: es });
+            }
+        }
+    }
+}

@@ -1,5 +1,272 @@
 // Expressions by precedence climbing, with the operator table in one place; `@atomic*` argument forms.
+// Binding order, loosest first: `||`, `&&`, `== !=`, `< <= > >=`, `|`, `^`, `&`, `<< >>`, `+ -`,
+// `* / %`, `as`, prefix `- & * ~ !`, then postfix (in `primary.j3`). `&` below `==` is not C's:
+// `x & MASK == 0` is `(x & MASK) == 0`.
 //
 // Part of module j3c.syntax.parse.
 // Port of: j3c/src/parse/parser/expr.rs, parse/parser/bitops.rs, parse/parser/atomic.rs
+// J3: Rust's `bit_level(tok, op, next: fn)` is `exprBitLevel(level)` (0 `|`, 1 `^`, 2 `&`), since a
+// method value is not passed around here. Uses come from `parse.j3`.
 module j3c.syntax.parse;
+
+extend Parser {
+    /// A full expression (Rust `expr`, the `||` level).
+    fn expr(this: &Parser): Result<Id<Expr>, ParseError> { return this.exprOr(); }
+
+    fn exprOr(this: &Parser): Result<Id<Expr>, ParseError> {
+        let lhs = this.exprAnd()?;
+        while this.at(TokenKind.OrOr) {
+            this.bump();
+            let rhs = this.exprAnd()?;
+            lhs = this.exprBin(BinOp.Or, lhs, rhs);
+        }
+        return Result.Ok(lhs);
+    }
+
+    fn exprAnd(this: &Parser): Result<Id<Expr>, ParseError> {
+        let lhs = this.exprEq()?;
+        while this.at(TokenKind.AndAnd) {
+            this.bump();
+            let rhs = this.exprEq()?;
+            lhs = this.exprBin(BinOp.And, lhs, rhs);
+        }
+        return Result.Ok(lhs);
+    }
+
+    fn exprEq(this: &Parser): Result<Id<Expr>, ParseError> {
+        let lhs = this.exprRel()?;
+        while true {
+            let op = BinOp.Eq;
+            match this.cur().kind {
+                TokenKind.EqEq { op = BinOp.Eq; }
+                TokenKind.Ne { op = BinOp.Ne; }
+                _ { break; }
+            }
+            this.bump();
+            let rhs = this.exprRel()?;
+            lhs = this.exprBin(op, lhs, rhs);
+        }
+        return Result.Ok(lhs);
+    }
+
+    fn exprRel(this: &Parser): Result<Id<Expr>, ParseError> {
+        let lhs = this.exprBitor()?;
+        while true {
+            let op = BinOp.Lt;
+            match this.cur().kind {
+                TokenKind.Lt { op = BinOp.Lt; }
+                TokenKind.Le { op = BinOp.Le; }
+                TokenKind.Gt { op = BinOp.Gt; }
+                TokenKind.Ge { op = BinOp.Ge; }
+                _ { break; }
+            }
+            this.bump();
+            let rhs = this.exprBitor()?;
+            lhs = this.exprBin(op, lhs, rhs);
+        }
+        return Result.Ok(lhs);
+    }
+
+    /// `|`, then `^`, then `&` (Rust `bitops.rs`).
+    fn exprBitor(this: &Parser): Result<Id<Expr>, ParseError> { return this.exprBitLevel(0); }
+
+    /// One of the three bit levels: 0 `|` over 1 `^` over 2 `&` over `exprShift`. A `&` here follows a
+    /// finished operand, so it is binary; prefix address-of is parsed in `unary`.
+    fn exprBitLevel(this: &Parser, level: int): Result<Id<Expr>, ParseError> {
+        let tok = TokenKind.Pipe;
+        let op = BinOp.BitOr;
+        if level == 1 { tok = TokenKind.Caret; op = BinOp.BitXor; }
+        else if level == 2 { tok = TokenKind.Amp; op = BinOp.BitAnd; }
+        let lhs = this.exprBitNext(level)?;
+        while this.at(tok) {
+            this.bump();
+            let rhs = this.exprBitNext(level)?;
+            lhs = this.exprBin(op, lhs, rhs);
+        }
+        return Result.Ok(lhs);
+    }
+
+    fn exprBitNext(this: &Parser, level: int): Result<Id<Expr>, ParseError> {
+        if level == 2 { return this.exprShift(); }
+        return this.exprBitLevel(level + 1);
+    }
+
+    /// `<<` / `>>`: two touching `<` / `>` tokens (the lexer keeps them apart for generics).
+    fn exprShift(this: &Parser): Result<Id<Expr>, ParseError> {
+        let lhs = this.exprAdd()?;
+        while true {
+            let a = this.cur();
+            let b = this.look(1);
+            let op = BinOp.Shl;
+            if a.kind == TokenKind.Lt && b.kind == TokenKind.Lt && a.span.hi == b.span.lo { op = BinOp.Shl; }
+            else if a.kind == TokenKind.Gt && b.kind == TokenKind.Gt && a.span.hi == b.span.lo { op = BinOp.Shr; }
+            else { break; }
+            this.bump();
+            this.bump();
+            let rhs = this.exprAdd()?;
+            lhs = this.exprBin(op, lhs, rhs);
+        }
+        return Result.Ok(lhs);
+    }
+
+    fn exprAdd(this: &Parser): Result<Id<Expr>, ParseError> {
+        let lhs = this.exprMul()?;
+        while true {
+            let op = BinOp.Add;
+            match this.cur().kind {
+                TokenKind.Plus { op = BinOp.Add; }
+                TokenKind.Minus { op = BinOp.Sub; }
+                _ { break; }
+            }
+            this.bump();
+            let rhs = this.exprMul()?;
+            lhs = this.exprBin(op, lhs, rhs);
+        }
+        return Result.Ok(lhs);
+    }
+
+    fn exprMul(this: &Parser): Result<Id<Expr>, ParseError> {
+        let lhs = this.exprAs()?;
+        while true {
+            let op = BinOp.Mul;
+            match this.cur().kind {
+                TokenKind.Star { op = BinOp.Mul; }
+                TokenKind.Slash { op = BinOp.Div; }
+                TokenKind.Percent { op = BinOp.Rem; }
+                _ { break; }
+            }
+            this.bump();
+            let rhs = this.exprAs()?;
+            lhs = this.exprBin(op, lhs, rhs);
+        }
+        return Result.Ok(lhs);
+    }
+
+    fn exprAs(this: &Parser): Result<Id<Expr>, ParseError> {
+        let e = this.unary()?;
+        while this.at(TokenKind.As) {
+            this.bump();
+            let t = this.ty()?;
+            let span = join(this.ast.exprSpan(e), this.ast.typeSpan(t));
+            e = this.ast.addExpr(Expr.Cast(CastExpr { expr: e, ty: t }), span);
+        }
+        return Result.Ok(e);
+    }
+
+    fn unary(this: &Parser): Result<Id<Expr>, ParseError> {
+        let start = this.cur().span;
+        let op = UnaryOp.Neg;
+        match this.cur().kind {
+            TokenKind.Minus { op = UnaryOp.Neg; }
+            TokenKind.Amp { op = UnaryOp.Ref; }
+            TokenKind.Star { op = UnaryOp.Deref; }
+            TokenKind.Tilde { op = UnaryOp.BitNot; }
+            TokenKind.Not { op = UnaryOp.Not; }
+            _ { return this.postfix(); }
+        }
+        this.bump();
+        let e = this.unary()?;
+        return Result.Ok(this.ast.addExpr(Expr.Unary(UnaryExpr { op: op, expr: e }), join(start, this.ast.exprSpan(e))));
+    }
+
+    /// `if c { a } else { b }` as a value (and `if let`).
+    fn ifExpr(this: &Parser): Result<Id<Expr>, ParseError> {
+        let start = this.cur().span;
+        if this.look(1).kind == TokenKind.Let {
+            let (m, hasElse) = this.ifLet()?;
+            if !hasElse { return Result.Err(this.errAt(m.span, "if-expression needs `else`")); }
+            return Result.Ok(this.ast.addExpr(Expr.Match(m), m.span));
+        }
+        this.expect(TokenKind.If, "expected `if`")?;
+        let cond = this.expr()?;
+        this.expect(TokenKind.LBrace, "expected `{`")?;
+        let thenExpr = this.expr()?;
+        this.expect(TokenKind.RBrace, "expected `}`")?;
+        this.expect(TokenKind.Else, "if-expression needs `else`")?;
+        let elseExpr = cond;
+        if this.at(TokenKind.If) {
+            elseExpr = this.ifExpr()?;
+        } else {
+            this.expect(TokenKind.LBrace, "expected `{`")?;
+            elseExpr = this.expr()?;
+            this.expect(TokenKind.RBrace, "expected `}`")?;
+        }
+        let ie = IfExpr { cond: cond, thenExpr: thenExpr, elseExpr: elseExpr };
+        return Result.Ok(this.ast.addExpr(Expr.If(ie), this.since(start)));
+    }
+
+    /// `(a, b, c)` call arguments.
+    fn args(this: &Parser): Result<List<Id<Expr>>, ParseError> {
+        this.expect(TokenKind.LParen, "expected `(`")?;
+        let out = List<Id<Expr>>.new(this.ast.arena);
+        if !this.at(TokenKind.RParen) {
+            while true {
+                out.push(this.expr()?);
+                if this.eat(TokenKind.Comma) {
+                    if this.at(TokenKind.RParen) { break; }
+                    continue;
+                }
+                break;
+            }
+        }
+        this.expect(TokenKind.RParen, "expected `)` after arguments")?;
+        return Result.Ok(out);
+    }
+
+    /// `a.b.c`.
+    fn path(this: &Parser): Result<List<Ident>, ParseError> {
+        let parts = List<Ident>.new(this.ast.arena);
+        parts.push(this.ident()?);
+        while this.at(TokenKind.Dot) && this.look(1).kind == TokenKind.Ident {
+            this.bump();
+            parts.push(this.ident()?);
+        }
+        return Result.Ok(parts);
+    }
+
+    /// Split the order word off `args` (when present) and check it against `op` (Rust `atomic.rs`).
+    fn atomicOrder(this: &Parser, op: AtomicOp, args: &List<Id<Expr>>, nameSpan: Span): Result<AtomicOrder, ParseError> {
+        let n = atomicOpValues(op) + 1;
+        if args.len == n { return Result.Ok(AtomicOrder.SeqCst); }
+        let name = atomicOpName(op);
+        if args.len != n + 1 {
+            let t = Text.new(this.ast.arena);
+            t.add("`@").add(name).add("` takes a pointer and ").pushInt(atomicOpValues(op));
+            t.add(" value(s), then an optional order (e.g. `acquire`)");
+            return Result.Err(this.errAt(nameSpan, t.str()));
+        }
+        let last = args.pop();
+        let lastSpan = this.ast.exprSpan(last);
+        let valid = Text.new(this.ast.arena);
+        let all = [AtomicOrder.Relaxed, AtomicOrder.Acquire, AtomicOrder.Release, AtomicOrder.AcqRel, AtomicOrder.SeqCst];
+        for i in 0..all.len {
+            if !atomicOpAllows(op, all[i]) { continue; }
+            if valid.bytes.len > 0 { valid.add(", "); }
+            valid.add(atomicOrderName(all[i]));
+        }
+        let word: Option<AtomicOrder> = Option.None;
+        match this.ast.expr(last) {
+            Expr.Name(id) { word = atomicOrderFromName(this.ast.str(id.name)); }
+            _ {}
+        }
+        match word {
+            Option.Some(o) {
+                if atomicOpAllows(op, o) { return Result.Ok(o); }
+                let t = Text.new(this.ast.arena);
+                t.add("`@").add(name).add("` cannot use order `").add(atomicOrderName(o)).add("`; use one of: ").add(valid.str());
+                return Result.Err(this.errAt(lastSpan, t.str()));
+            }
+            Option.None {
+                let t = Text.new(this.ast.arena);
+                t.add("`@").add(name).add("` takes a memory order here; use one of: ").add(valid.str());
+                return Result.Err(this.errAt(lastSpan, t.str()));
+            }
+        }
+    }
+
+    /// `lhs op rhs`, spanning both.
+    fn exprBin(this: &Parser, op: BinOp, lhs: Id<Expr>, rhs: Id<Expr>): Id<Expr> {
+        let span = join(this.ast.exprSpan(lhs), this.ast.exprSpan(rhs));
+        return this.ast.addExpr(Expr.Binary(BinaryExpr { op: op, lhs: lhs, rhs: rhs }), span);
+    }
+}

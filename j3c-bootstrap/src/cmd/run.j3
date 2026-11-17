@@ -1,4 +1,321 @@
 // `j3c run`: projects, single files, `.j3s` tools, `--headless`, `--frames`, `--screenshot`.
 //
-// Port of: j3c/src/cli/runner.rs, devrun.rs
+// Port of: j3c/src/cli/runner.rs, devrun.rs, the run flags of cli/mod.rs (`take_run_flags`, run help)
+// J3: Checks through `driver.run(s, Stage.Passes)`, prints warnings, builds on to `Stage.Link` (Options.run = true: temp output, Android refused), then runs
+//     `Session.exe` with `toolchain.runExe` and reports like Rust `report_run`. The shared failure printing
+//     (`printFail` with its `= help:` hint, warnings, the library refusal) is here; `cmd/build.j3` uses it.
+// J3: Not ported yet: dev mode for projects with `.j3s` scene scripts (`devrun.rs`, C4: such a project runs
+//     as a plain build), `--hot` (`hot.rs`), the up-to-date shortcuts (`unchanged_project`/`up_to_date`:
+//     j3c-boot always rebuilds), `preflight`, `run samples` (the IR samples are a unit-test fixture now).
 module j3c.cmd.run;
+
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, contains, endsWith, parseInt, startsWith };
+use j3c.base.diag;
+use j3c.base.diag.Severity;
+use j3c.base.fsx;
+use j3c.cmd.check.{ err, failText, out };
+use j3c.driver;
+use j3c.driver.{ Mode, Session, Stage };
+use j3c.project.manifest;
+use j3c.project.manifest.Input;
+use j3c.toolchain;
+use j3c.toolchain.discard;
+
+const RUN_HELP: string = "usage: j3c run [path | file.j3 | tool.j3s] [--frames N] [--screenshot F.png] [--headless] [--hot] [--file] [--host] [--splash]\n  --hot       rebuild and restart on .j3/.j3ui/.j3s edits; the old run stays up if the build fails (`j3c doc j3ui`).\n  --headless  offscreen video, silent audio: no window. Agents always pass it (`j3c doc testing`).\n  --host      ignore [emit] target: build and run an Android package for this machine, in place (`j3c doc testing`).\n  --splash    show the startup splash in a dev run (`j3c doc ship`); same as J3_SPLASH=1\n  --frames N  stop an App after N frames; --screenshot saves the last one (relative to your cwd).\n";
+
+/// `run`/`build` flags (Rust `peel_run`/`peel_args` + `take_run_flags`): one path, then the program's arguments.
+pub struct RunFlags {
+    /// "" = the project in the cwd.
+    path: string;
+    args: List<string>;
+    fast: bool;
+    release: bool;
+    /// `--emit NAME`, "" = the manifest's.
+    emit: string;
+    /// `--opt LEVEL`, "" = the manifest's.
+    opt: string;
+    hot: bool;
+    fileOnly: bool;
+    host: bool;
+}
+
+/// Rust `take_run_flags`: strip `--frames N`, `--screenshot F`, `--headless`, `--splash` (passed to the
+/// program as env) and `--hot`/`--file`/`--host` from `rest`; the other arguments in order. Err: the usage
+/// error text.
+pub fn takeRunFlags(rest: []string, f: &RunFlags, arena: &Arena): Result<List<string>, string> {
+    let out = List<string>.new(arena);
+    let i = 0;
+    while i < rest.len {
+        let a = rest[i];
+        if a == "--frames" {
+            if i + 1 >= rest.len { return Result.Err("--frames needs a count"); }
+            let n = rest[i + 1];
+            i += 1;
+            // Rust `parse::<u32>()`: digits with an optional `+`, at most u32::MAX; 0 is refused too.
+            let digits = if n.len > 1 && n[0] == '+' { n[1..n.len] } else { n };
+            let ok = false;
+            if digits.len > 0 && digits[0] != '-' && digits[0] != '+' {
+                match parseInt(digits, 10) {
+                    Option.Some(v) { ok = v > 0 && v <= 4294967295; }
+                    Option.None {}
+                }
+            }
+            if !ok { return Result.Err(Text.new(arena).add("--frames wants a positive whole number, not `").add(n).add("`").str()); }
+            sys.setenv("J3_FRAMES", n);
+        } else if a == "--screenshot" {
+            if i + 1 >= rest.len { return Result.Err("--screenshot needs a file"); }
+            let p = rest[i + 1];
+            i += 1;
+            // The program runs in its project root; keep the path the user meant.
+            if !path.isAbs(p) {
+                match path.realpath(".", arena) {
+                    Option.Some(cwd) { p = path.join(cwd, p, arena); }
+                    Option.None { return Result.Err("cannot read the current directory"); }
+                }
+            }
+            sys.setenv("J3_SCREENSHOT", p);
+        } else if a == "--hot" {
+            f.hot = true;
+        } else if a == "--file" {
+            f.fileOnly = true;
+        } else if a == "--host" {
+            f.host = true;
+        } else if a == "--splash" {
+            sys.setenv("J3_SPLASH", "1");
+        } else if a == "--headless" {
+            sys.setenv("SDL_VIDEODRIVER", "offscreen");
+            sys.setenv("SDL_AUDIODRIVER", "dummy");
+        } else {
+            out.push(a);
+        }
+        i += 1;
+    }
+    return Result.Ok(out);
+}
+
+/// Rust `peel_run` (`args` = true) / `peel_args` (false): `--fast`, `--release`, `--emit V`, `--opt V` anywhere,
+/// the first other non-flag is the path; with `args`, everything else after the path is the program's.
+pub fn peelRun(rest: []string, f: &RunFlags, args: bool) {
+    let i = 0;
+    while i < rest.len {
+        let a = rest[i];
+        if a == "--fast" {
+            f.fast = true;
+        } else if a == "--release" {
+            f.release = true;
+        } else if a == "--emit" {
+            if i + 1 < rest.len {
+                f.emit = rest[i + 1];
+                i += 1;
+            }
+        } else if startsWith(a, "--emit=") {
+            f.emit = a[7..a.len];
+        } else if a == "--opt" {
+            if i + 1 < rest.len {
+                f.opt = rest[i + 1];
+                i += 1;
+            }
+        } else if startsWith(a, "--opt=") {
+            f.opt = a[6..a.len];
+        } else if f.path.len == 0 && !startsWith(a, "-") {
+            f.path = a;
+        } else if f.path.len > 0 && args {
+            f.args.push(a);
+        }
+        i += 1;
+    }
+}
+
+/// No flags, no path.
+pub fn noFlags(arena: &Arena): RunFlags {
+    return RunFlags { path: "", args: List<string>.new(arena), fast: false, release: false, emit: "", opt: "", hot: false,
+        fileOnly: false, host: false };
+}
+
+/// The session for building `f` (`run` = Rust's run path: temp output, Android refused).
+pub fn sessionFor(f: &RunFlags, run: bool): &Session {
+    let opts = driver.defaults();
+    opts.entry = f.path;
+    opts.mode = Mode.Build;
+    opts.fast = f.fast;
+    opts.release = f.release;
+    opts.emit = f.emit;
+    opts.opt = f.opt;
+    opts.hot = f.hot;
+    opts.fileOnly = f.fileOnly;
+    opts.host = f.host;
+    opts.run = run;
+    let s = Session.new(opts);
+    s.phases.enable();
+    return s;
+}
+
+/// `j3c run [flags] [path] [args]` (Rust `run_dispatch`): exit code.
+pub fn runCmd(rest: []string): int {
+    for i in 0..rest.len {
+        if rest[i] == "--help" || rest[i] == "-h" {
+            out(RUN_HELP);
+            return 0;
+        }
+    }
+    let mem = Arena.create(1 << 12);
+    defer mem.destroy();
+    let f = noFlags(&mem);
+    let left = List<string>.new(&mem);
+    match takeRunFlags(rest, &f, &mem) {
+        Result.Ok(v) { left = v; }
+        Result.Err(e) { err(Text.new(&mem).add("j3c run: ").add(e).add("\n").str()); return 1; }
+    }
+    peelRun(left.items[0..left.len], &f, true);
+    if f.path == "samples" {
+        err("j3c: `run samples` is not supported by j3c-boot: the IR samples are a unit-test fixture (tests/unit/ir_samples)\n");
+        return 1;
+    }
+    manifest.setHost(f.host);
+    manifest.setFileOnly(f.fileOnly);
+    let refused = refuseLib(f.path, "run", &mem);
+    if refused != 0 { return refused; }
+    let s = sessionFor(&f, true);
+    defer s.free();
+    s.phases.begin("parse");
+    if !noHello(s, f.path) { return 1; }
+    // Rust `run_loaded`/`build_loaded`: warnings once the check (through lower and validate) is clean,
+    // before the backend and clang, so a failed link still shows them.
+    if !driver.run(s, Stage.Passes) {
+        printFail(failText(s), s.arena);
+        return 1;
+    }
+    printWarnings(s);
+    if !driver.run(s, Stage.Link) {
+        printFail(failText(s), s.arena);
+        return 1;
+    }
+    s.phases.begin("running");
+    let code = 1;
+    match toolchain.runExe(s.exe, s.emit.cwd, f.args.items[0..f.args.len], s.arena) {
+        Result.Ok(r) { code = reportRun(r.status, r.stdout, r.stderr, s.arena); }
+        Result.Err(e) { printFail(e, s.arena); }
+    }
+    if s.emit.cc.out.len == 0 { discard(s.exe); }
+    return code;
+}
+
+/// Rust `compile_user`: no path and no `j3.toml` in the cwd is an error, not the built-in hello. False after
+/// printing it.
+pub fn noHello(s: &Session, p: string): bool {
+    if p.len > 0 { return true; }
+    match manifest.resolveCwd(s.arena) {
+        Result.Ok(inp) {
+            match inp {
+                Input.Hello {
+                    printFail("no j3.toml in the current directory\n  = help: `j3c new`\n  = help: `j3c new --app`\n  = help: `j3c guide`", s.arena);
+                    return false;
+                }
+                Input.File(_) {}
+                Input.Project(_) {}
+            }
+        }
+        Result.Err(e) {
+            printFail(e, s.arena);
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Rust `refuse_lib`: `run`/`build` of a library project prints why and returns 1; 0 otherwise.
+pub fn refuseLib(p: string, cmd: string, arena: &Arena): int {
+    let r = if p.len == 0 { manifest.resolveCwd(arena) } else { manifest.resolve(p, arena) };
+    match r {
+        Result.Ok(inp) {
+            match inp {
+                Input.Project(m) {
+                    if !m.isLib { return 0; }
+                    let t = Text.new(arena);
+                    t.add("j3c ").add(cmd).add(": ").add(m.name).add(" is a library ([lib] in j3.toml), not a program\n");
+                    let demo = path.join(m.root, "examples/demo", arena);
+                    if fsx.isFile(path.join(demo, "j3.toml", arena)) {
+                        t.add("  = help: `j3c ").add(cmd).add(" ").add(demo).add("`, or `j3c check` the library\n");
+                    } else {
+                        t.add("  = help: `j3c check` it; run it from a project that depends on it\n");
+                    }
+                    err(t.str());
+                    return 1;
+                }
+                Input.Hello {}
+                Input.File(_) {}
+            }
+        }
+        Result.Err(_) {}
+    }
+    return 0;
+}
+
+/// Rust `print_fail`: a diagnostic as it is, anything else as `j3c: E`; then the `= help:` install hint
+/// when the text names a missing library or compiler (and doesn't already carry it).
+pub fn printFail(e: string, arena: &Arena) {
+    let t = Text.new(arena);
+    if contains(e, "error:") || contains(e, "warning:") || contains(e, "-->") {
+        t.add(e);
+        if !endsWith(e, "\n") { t.add("\n"); }
+    } else {
+        t.add("j3c: ").add(e).add("\n");
+    }
+    hint(&t, e, arena);
+    err(t.str());
+}
+
+/// Rust `print_hint`, appended to `t`.
+fn hint(t: &Text, text: string, arena: &Arena) {
+    match toolchain.failureHint(text, arena) {
+        Option.Some(h) { if !contains(text, h) { t.add("  = help: ").add(h).add("\n"); } }
+        Option.None {}
+    }
+}
+
+/// Rust `print_warnings`: code warnings to stderr (the program still builds and runs).
+pub fn printWarnings(s: &Session) {
+    let t = Text.new(s.arena);
+    for i in 0..s.diags.count() {
+        let d = s.diags.at(i);
+        if d.severity == Severity.Warning {
+            diag.render(d, &s.sources, &t);
+            t.add("\n");
+        }
+    }
+    err(t.str());
+}
+
+/// Rust `exit_reason`: what a non-zero exit code means.
+fn exitReason(code: int, t: &Text) {
+    if code == 101 { t.add(" (panic)"); }
+    if code == 102 { t.add(" (runtime check failed)"); }
+    if code >= 129 && code <= 159 {
+        t.add(" (killed by signal ");
+        t.pushInt(code - 128);
+        t.add(")");
+    }
+}
+
+/// Rust `report_run`: the program's stdout; its stderr on a clean exit; on a failure the exit line, its
+/// stderr (or that it wrote none) and an install hint. Returns its exit code.
+pub fn reportRun(status: int, stdout: string, stderr: string, arena: &Arena): int {
+    out(stdout);
+    if status == 0 && stderr.len > 0 { err(stderr); }
+    if status != 0 {
+        let t = Text.new(arena);
+        t.add("j3c: program exited ");
+        t.pushInt(status);
+        exitReason(status, &t);
+        t.add("\n");
+        if stderr.len == 0 { t.add("j3c: it wrote nothing to stderr\n"); } else { t.add(stderr).add("\n"); }
+        hint(&t, stderr, arena);
+        err(t.str());
+    }
+    return status;
+}

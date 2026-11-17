@@ -1,0 +1,169 @@
+// One pattern against one place: its test (a bool operand, or none when it always matches), its bindings,
+// and the parts a compound pattern (variant fields, struct fields, tuple elements) looks into. A variant's
+// parts are tested only after its tag matched (they read the payload union).
+//
+// Part of module j3c.lower.
+// Port of: check/lower/pat/test.rs (`pat_test`, `parts_test`, `pat_binds`, `pat_parts`)
+// J3: Sema resolved every pattern (`TPat`): the variant index, the struct field indexes, int values folded
+// (`Lit` / inclusive `Range` of `TExpr.Int`), so the Rust lookups and their errors are not here.
+// J3: A place is copied (`copyOf`) before each projection or read: `Place.project` shares its proj list.
+module j3c.lower;
+
+/// A name a pattern binds (Rust `Binding`): typed local `local` reads `place`; `span` is the name's.
+struct PatBinding {
+    place: Place;
+    local: Id<TLocal>;
+    span: Span;
+}
+
+/// One sub-pattern and the place it reads.
+struct PatPart {
+    place: Place;
+    pat: Id<TPat>;
+}
+
+extend FnLower {
+    /// Rust `pat_test`: whether the value at `place` matches `pat`; None when it always does.
+    fn patTest(this: &FnLower, place: Place, pat: Id<TPat>): Option<Operand> {
+        let sp = this.lw.typed.patSpan(pat);
+        let c = this.ir().common;
+        let none: Option<Operand> = Option.None;
+        match this.lw.typed.pat(pat) {
+            TPat.Wild { return none; }
+            TPat.Bind(_) { return none; }
+            TPat.Lit(l) {
+                match this.node(l.value) {
+                    TExpr.Str(_) {
+                        // Rust `operand` of a string literal: held in `_sN`
+                        let want = Operand.Copy(this.spill("s", this.rvalue(l.value), sp));
+                        let rv = this.stringEq(sp, false, Operand.Copy(this.copyOf(place)), want);
+                        return Option.Some(Operand.Copy(this.spill("c", rv, sp)));
+                    }
+                    TExpr.Bool(v) { return Option.Some(this.eqOps(sp, Operand.Copy(this.copyOf(place)), opBool(sp, c.bool, v))); }
+                    TExpr.Int(v) { return Option.Some(this.eqOps(sp, Operand.Copy(this.copyOf(place)), opInt(sp, place.ty, v))); }
+                    _ { panic("lower: a literal pattern is an int, a bool or a string"); }
+                }
+            }
+            TPat.Range(r) {
+                let ge = this.spill("c", Rvalue.binary(sp, c.bool, BinOp.Ge, Operand.Copy(this.copyOf(place)), opInt(sp, place.ty, this.patInt(r.lo))), sp);
+                let hi = this.patInt(r.hi);
+                if !r.inclusive { hi -= 1; }
+                let le = this.spill("c", Rvalue.binary(sp, c.bool, BinOp.Le, Operand.Copy(this.copyOf(place)), opInt(sp, place.ty, hi)), sp);
+                return Option.Some(this.patAnd(sp, Operand.Copy(ge), Operand.Copy(le)));
+            }
+            TPat.Variant(v) {
+                let vid = this.patVariantId(place.ty, v.variant);
+                let outer = this.isVariant(this.copyOf(place), vid, sp);
+                // `matched = tag; if tag { matched = parts }`
+                let saved = this.b.beginBlock();
+                match this.patPartsTest(sp, place, pat) {
+                    Option.Some(inner) {
+                        let matched = this.tmpPlace("pm", c.bool, sp);
+                        this.b.assign(sp, this.copyOf(matched), Rvalue.useOp(sp, inner));
+                        let thenBlock = this.b.endBlock(saved);
+                        this.b.assign(sp, this.copyOf(matched), Rvalue.useOp(sp, outer));
+                        this.pushIf(sp, outer, thenBlock, Option.None);
+                        return Option.Some(Operand.Copy(matched));
+                    }
+                    Option.None {
+                        this.b.endBlock(saved);
+                        return Option.Some(outer);
+                    }
+                }
+            }
+            TPat.Tuple(_) { return this.patPartsTest(sp, place, pat); }
+            TPat.Struct(_) { return this.patPartsTest(sp, place, pat); }
+            TPat.Or(_) { panic("lower: `|` below the top of a pattern"); }
+        }
+        return none;
+    }
+
+    /// Rust `and_ops`: `_cN = lhs && rhs`.
+    fn patAnd(this: &FnLower, sp: Span, lhs: Operand, rhs: Operand): Operand {
+        return Operand.Copy(this.spill("c", Rvalue.binary(sp, this.ir().common.bool, BinOp.And, lhs, rhs), sp));
+    }
+
+    /// The folded value of an int pattern bound.
+    fn patInt(this: &FnLower, e: Id<TExpr>): u64 {
+        match this.node(e) { TExpr.Int(v) { return v; } _ { panic("lower: an int pattern is a folded constant"); } }
+        return 0;
+    }
+
+    /// Variant `index` of the enum type `ty`.
+    fn patVariantId(this: &FnLower, ty: Id<TyKind>, index: int): VariantId {
+        match this.ir().tyKind(ty) {
+            TyKind.Enum(en) { return VariantId { enumId: en.id, index: u32(index) }; }
+            _ { panic("lower: a variant of a non-enum"); }
+        }
+        return VariantId { enumId: Id<EnumDef> { i: 0 }, index: 0 };
+    }
+
+    /// Rust `parts_test`: every part of the compound `pat` matches; None when each always does.
+    fn patPartsTest(this: &FnLower, sp: Span, place: Place, pat: Id<TPat>): Option<Operand> {
+        let parts = List<PatPart>.new(this.cx.arena);
+        this.patParts(place, pat, &parts);
+        let all: Option<Operand> = Option.None;
+        for k in 0..parts.len {
+            match this.patTest(parts.items[k].place, parts.items[k].pat) {
+                Option.Some(t) {
+                    match all {
+                        Option.Some(a) { all = Option.Some(this.patAnd(sp, a, t)); }
+                        Option.None { all = Option.Some(t); }
+                    }
+                }
+                Option.None {}
+            }
+        }
+        return all;
+    }
+
+    /// Rust `pat_binds`: the names `pat` binds, in pattern order, read from `place`.
+    fn patBinds(this: &FnLower, place: Place, pat: Id<TPat>, out: &List<PatBinding>) {
+        match this.lw.typed.pat(pat) {
+            TPat.Bind(b) { out.push(PatBinding { place: this.copyOf(place), local: b.local, span: this.lw.typed.patSpan(pat) }); }
+            TPat.Wild {}
+            TPat.Lit(_) {}
+            TPat.Range(_) {}
+            TPat.Variant(_) { this.patPartBinds(place, pat, out); }
+            TPat.Tuple(_) { this.patPartBinds(place, pat, out); }
+            TPat.Struct(_) { this.patPartBinds(place, pat, out); }
+            TPat.Or(_) { panic("lower: `|` below the top of a pattern"); }
+        }
+    }
+
+    fn patPartBinds(this: &FnLower, place: Place, pat: Id<TPat>, out: &List<PatBinding>) {
+        let parts = List<PatPart>.new(this.cx.arena);
+        this.patParts(place, pat, &parts);
+        for k in 0..parts.len { this.patBinds(parts.items[k].place, parts.items[k].pat, out); }
+    }
+
+    /// Rust `pat_parts`: each sub-pattern of a variant, struct or tuple pattern with the place it reads.
+    fn patParts(this: &FnLower, place: Place, pat: Id<TPat>, out: &List<PatPart>) {
+        let sp = this.lw.typed.patSpan(pat);
+        match this.lw.typed.pat(pat) {
+            TPat.Variant(v) {
+                let vid = this.patVariantId(place.ty, v.variant);
+                for k in 0..v.fields.len {
+                    out.push(PatPart { place: this.variantFieldPlace(this.copyOf(place), vid, k, sp), pat: v.fields.items[k] });
+                }
+            }
+            TPat.Struct(s) {
+                for k in 0..s.pats.len { out.push(PatPart { place: this.patField(place, s.fields.items[k], sp), pat: s.pats.items[k] }); }
+            }
+            TPat.Tuple(t) {
+                for k in 0..t.items.len { out.push(PatPart { place: this.patField(place, k, sp), pat: t.items.items[k] }); }
+            }
+            _ { panic("lower: a pattern without parts"); }
+        }
+    }
+
+    /// Field `k` of the struct (or tuple struct) at `place`.
+    fn patField(this: &FnLower, place: Place, k: int, sp: Span): Place {
+        let ir = this.ir();
+        match ir.tyKind(place.ty) {
+            TyKind.Struct(s) { return this.b.field(ir, this.copyOf(place), FieldId { structId: s.id, index: u32(k) }, sp); }
+            _ { panic("lower: a struct pattern on a non-struct"); }
+        }
+        return place;
+    }
+}

@@ -1,5 +1,496 @@
-// Human-readable IR text (`j3c dump-ir`).
+// Human-readable IR text (`j3c dump-ir`). No spans.
 //
 // Port of: j3c/src/ir/dump.rs
 // J3: This text is the oracle for differential tests against the Rust j3c (see tests/README.md).
+// J3: Rust returns `String`; here every printer appends to a `Text` (AGENTS.md rule 2). Entries:
+// `dumpProgram` (Rust `dump_program`: modules joined by a blank line), `dumpModule` (Rust
+// `dump_module_into`), `dumpFunc`, `dumpTy`, `tyString` (an arena copy). Rust builds a place's text
+// inside out (`format!("(*{})", text)`); here `dumpPlace` writes the `(*` prefixes first (one per
+// `Deref`), then the root, then each projection, closing a paren at each `Deref`: same text, no copies.
 module j3c.ir.dump;
+
+use j3.data.pool.Id;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.text.{ Text, decodeRune, isValidUtf8 };
+use j3c.ir.{ Block, Body, ConstKind, FloatTy, Func, FuncKind, IntTy, InterpPart, IrCx, LocalDecl, LocalKind, Module, Operand, Place, PlaceRoot,
+    Program, Proj, Rvalue, RvalueKind, SimdOp, Stmt, StmtKind, TyKind, Vis, assignOpStr, binOpStr, laneName, simdName, unaryOpStr,
+    vecName };
+use j3c.syntax.ast.{ atomicOpName, atomicOrderName };
+
+/// Every module of `prog` in order, separated by an empty line (Rust `dump_program(cx, modules)`).
+pub fn dumpProgram(prog: &Program, out: &Text) {
+    for i in 0..prog.modules.len {
+        if i > 0 { out.push('\n'); }
+        dumpModule(&prog.cx, &prog.modules.items[i], out);
+    }
+}
+
+/// One module: `module a.b;`, its structs, then its fns (Rust `dump_module_into`).
+pub fn dumpModule(cx: &IrCx, m: &Module, out: &Text) {
+    out.pushStr("module ");
+    for i in 0..m.name.len {
+        if i > 0 { out.push('.'); }
+        out.pushStr(cx.nameStr(m.name.items[i]));
+    }
+    out.pushStr(";\n\n");
+    for i in 0..m.structs.len {
+        let def = cx.structDef(m.structs.items[i]);
+        if def.debug { out.pushStr("#[Debug]\n"); }
+        if def.packed { out.pushStr("packed "); }
+        out.add("struct ").add(cx.nameStr(def.name)).add(" {\n");
+        for j in 0..def.fields.len {
+            let f = def.fields.items[j];
+            out.pushStr("    ");
+            if f.embedded { out.pushStr("use "); }
+            out.add(cx.nameStr(f.name)).add(": ");
+            dumpTy(cx, f.ty, out);
+            out.pushStr(";\n");
+        }
+        out.pushStr("}\n\n");
+    }
+    for i in 0..m.funcs.len {
+        let f = cx.func(m.funcs.items[i]);
+        dumpFunc(cx, &f, out);
+        out.push('\n');
+    }
+}
+
+/// One fn: signature, then its body when it has one (Rust `dump_func`).
+pub fn dumpFunc(cx: &IrCx, f: &Func, out: &Text) {
+    match f.vis { Vis.Pub { out.pushStr("pub "); } Vis.Private {} }
+    out.add("fn ").add(cx.nameStr(f.name));
+    match cx.fnSig(f.ty) {
+        Option.Some(sig) {
+            out.push('(');
+            match f.kind {
+                FuncKind.J3(j) {
+                    for i in 0..j.body.params.len {
+                        if i > 0 { out.pushStr(", "); }
+                        let d = j.body.local(j.body.params.items[i]);
+                        out.add(cx.nameStr(d.name)).add(": ");
+                        dumpTy(cx, d.ty, out);
+                    }
+                }
+                FuncKind.Lib(_) { dumpTyList(cx, sig.params.items[0..sig.params.len], out); }
+                FuncKind.Decl { dumpTyList(cx, sig.params.items[0..sig.params.len], out); }
+            }
+            out.push(')');
+            if sig.ret != cx.common.void {
+                out.pushStr(": ");
+                dumpTy(cx, sig.ret, out);
+            }
+        }
+        Option.None { out.pushStr("(/* bad fn type */)"); }
+    }
+    match f.kind {
+        FuncKind.J3(j) {
+            out.pushStr(" {\n");
+            dumpBody(cx, &j.body, out);
+            out.pushStr("}\n");
+        }
+        FuncKind.Decl { out.pushStr(";\n"); }
+        FuncKind.Lib(l) { out.add(" = lib \"").add(cx.nameStr(l.libName)).add("\" \"").add(cx.nameStr(l.symbol)).add("\";\n"); }
+    }
+}
+
+fn dumpTyList(cx: &IrCx, tys: []Id<TyKind>, out: &Text) {
+    for i in 0..tys.len {
+        if i > 0 { out.pushStr(", "); }
+        dumpTy(cx, tys[i], out);
+    }
+}
+
+fn dumpBody(cx: &IrCx, body: &Body, out: &Text) {
+    let any = false;
+    for i in 0..body.locals.len() {
+        let d = body.local(Id<LocalDecl> { i: u32(i) });
+        match d.kind {
+            LocalKind.Param { continue; }
+            LocalKind.Tmp { out.pushStr("    let tmp "); }
+            LocalKind.Const { out.pushStr("    let const "); }
+            LocalKind.Let { out.pushStr("    let "); }
+        }
+        any = true;
+        out.add(cx.nameStr(d.name)).add(": ");
+        dumpTy(cx, d.ty, out);
+        out.pushStr(";\n");
+    }
+    if any { out.push('\n'); }
+    for i in 0..body.block.stmts.len { dumpStmt(cx, body, &body.block.stmts.items[i], 1, out); }
+}
+
+fn dumpStmts(cx: &IrCx, body: &Body, b: &Block, indent: int, out: &Text) {
+    for i in 0..b.stmts.len { dumpStmt(cx, body, &b.stmts.items[i], indent, out); }
+}
+
+/// `{\n` + the block one level in + the closing `}` at `indent` (no newline after it).
+fn dumpBraced(cx: &IrCx, body: &Body, b: &Block, indent: int, out: &Text) {
+    out.pushStr(" {\n");
+    dumpStmts(cx, body, b, indent + 1, out);
+    writeIndent(indent, out);
+    out.push('}');
+}
+
+fn dumpStmt(cx: &IrCx, body: &Body, s: &Stmt, indent: int, out: &Text) {
+    writeIndent(indent, out);
+    match s.kind {
+        StmtKind.Assign(a) {
+            dumpPlace(cx, body, &a.place, out);
+            out.pushStr(" = ");
+            dumpRvalue(cx, body, &a.rvalue, out);
+            out.pushStr(";\n");
+        }
+        StmtKind.AssignOp(a) {
+            dumpPlace(cx, body, &a.place, out);
+            out.push(' ');
+            match assignOpStr(a.op) { Option.Some(t) { out.pushStr(t); } Option.None { out.pushStr("?="); } }
+            out.push(' ');
+            dumpOperand(cx, body, a.rhs, out);
+            out.pushStr(";\n");
+        }
+        StmtKind.Expr(rv) {
+            dumpRvalue(cx, body, &rv, out);
+            out.pushStr(";\n");
+        }
+        StmtKind.Return(r) {
+            out.pushStr("return");
+            match r.value {
+                Option.Some(v) {
+                    out.push(' ');
+                    dumpOperand(cx, body, v, out);
+                }
+                Option.None {}
+            }
+            out.pushStr(";\n");
+        }
+        StmtKind.Break(n) {
+            if n == 0 { out.pushStr("break;\n"); } else { out.pushStr("break "); out.pushU64(u64(n)); out.pushStr(";\n"); }
+        }
+        StmtKind.Continue(n) {
+            if n == 0 { out.pushStr("continue;\n"); } else { out.pushStr("continue "); out.pushU64(u64(n)); out.pushStr(";\n"); }
+        }
+        StmtKind.Abort(_) { out.pushStr("abort;\n"); }
+        StmtKind.Div0 { out.pushStr("abort div0;\n"); }
+        StmtKind.Block(inner) {
+            out.pushStr("{\n");
+            dumpStmts(cx, body, &inner, indent + 1, out);
+            writeIndent(indent, out);
+            out.pushStr("}\n");
+        }
+        StmtKind.Defer(d) {
+            out.pushStr("defer");
+            dumpBraced(cx, body, &d.body, indent, out);
+            out.push('\n');
+        }
+        StmtKind.InterpFill(f) {
+            out.pushStr("interp ");
+            dumpPlace(cx, body, &f.buf, out);
+            out.pushStr(" used ");
+            dumpPlace(cx, body, &f.used, out);
+            out.pushStr(" `");
+            for i in 0..f.parts.len {
+                match f.parts.items[i] {
+                    InterpPart.Lit(l) { pushLossy(out, l.bytes as string); }
+                    InterpPart.Value(op) {
+                        out.push('{');
+                        dumpOperand(cx, body, op, out);
+                        out.push('}');
+                    }
+                }
+            }
+            out.pushStr("`;\n");
+        }
+        StmtKind.Switch(sw) {
+            out.pushStr("switch ");
+            dumpOperand(cx, body, sw.scrut, out);
+            out.pushStr(" {\n");
+            for i in 0..sw.cases.len {
+                writeIndent(indent + 1, out);
+                out.pushU64(sw.cases.items[i].value);
+                dumpBraced(cx, body, &sw.cases.items[i].block, indent + 1, out);
+                out.push('\n');
+            }
+            writeIndent(indent + 1, out);
+            out.push('_');
+            dumpBraced(cx, body, &sw.default, indent + 1, out);
+            out.push('\n');
+            writeIndent(indent, out);
+            out.pushStr("}\n");
+        }
+        StmtKind.If(i) {
+            out.pushStr("if ");
+            dumpOperand(cx, body, i.cond, out);
+            dumpBraced(cx, body, &i.thenBlock, indent, out);
+            match i.elseBlock {
+                Option.Some(e) {
+                    out.pushStr(" else");
+                    dumpBraced(cx, body, &e, indent, out);
+                }
+                Option.None {}
+            }
+            out.push('\n');
+        }
+        StmtKind.While(w) {
+            out.pushStr("while ");
+            dumpOperand(cx, body, w.cond, out);
+            dumpBraced(cx, body, &w.body, indent, out);
+            out.push('\n');
+        }
+        StmtKind.ForRange(f) {
+            out.pushStr("for ");
+            dumpPlace(cx, body, &f.index, out);
+            out.pushStr(" .. ");
+            dumpOperand(cx, body, f.end, out);
+            dumpBraced(cx, body, &f.body, indent, out);
+            out.push('\n');
+        }
+    }
+}
+
+/// Rust `String::from_utf8_lossy`.
+// ponytail: each bad byte is one U+FFFD (`decodeRune`); Rust folds a cut-off sequence into one. Interp
+// literals come from source text, which is valid UTF-8.
+fn pushLossy(out: &Text, s: string) {
+    if isValidUtf8(s) { out.pushStr(s); return; }
+    let i = 0;
+    while i < s.len {
+        let (cp, n) = decodeRune(s, i);
+        out.pushChar(cp);
+        i += n;
+    }
+}
+
+fn dumpOperands(cx: &IrCx, body: &Body, xs: []Operand, out: &Text) {
+    for i in 0..xs.len {
+        if i > 0 { out.pushStr(", "); }
+        dumpOperand(cx, body, xs[i], out);
+    }
+}
+
+fn dumpRvalue(cx: &IrCx, body: &Body, rv: &Rvalue, out: &Text) {
+    match rv.kind {
+        RvalueKind.Simd(sm) {
+            out.add("simd.").add(simdName(sm.op));
+            match sm.op {
+                SimdOp.Shuffle(sh) {
+                    out.push('<');
+                    for i in 0..4 { out.pushU64(u64(sh.lanes[i])); }
+                    out.push('>');
+                }
+                _ {}
+            }
+            out.push('(');
+            dumpOperands(cx, body, sm.args.items[0..sm.args.len], out);
+            out.push(')');
+        }
+        RvalueKind.Use(op) { dumpOperand(cx, body, op, out); }
+        RvalueKind.Ref(r) {
+            out.push('&');
+            dumpPlace(cx, body, &r.place, out);
+        }
+        RvalueKind.Binary(b) {
+            dumpOperand(cx, body, b.lhs, out);
+            out.push(' ');
+            out.pushStr(binOpStr(b.op));
+            out.push(' ');
+            dumpOperand(cx, body, b.rhs, out);
+        }
+        RvalueKind.Unary(u) {
+            out.pushStr(unaryOpStr(u.op));
+            dumpOperand(cx, body, u.arg, out);
+        }
+        RvalueKind.Call(c) {
+            dumpOperand(cx, body, c.func, out);
+            out.push('(');
+            dumpOperands(cx, body, c.args.items[0..c.args.len], out);
+            out.push(')');
+        }
+        RvalueKind.Syscall(sc) {
+            out.pushStr("@syscall(");
+            dumpOperand(cx, body, sc.nr, out);
+            for i in 0..sc.args.len {
+                out.pushStr(", ");
+                dumpOperand(cx, body, sc.args.items[i], out);
+            }
+            out.push(')');
+        }
+        RvalueKind.Atomic(a) {
+            out.add("@").add(atomicOpName(a.op)).add(".").add(atomicOrderName(a.order)).add("(");
+            dumpOperands(cx, body, a.args.items[0..a.args.len], out);
+            out.push(')');
+        }
+        RvalueKind.Aggregate(ag) {
+            dumpTy(cx, rv.ty, out);
+            out.pushStr(" { ");
+            dumpOperands(cx, body, ag.fields.items[0..ag.fields.len], out);
+            out.pushStr(" }");
+        }
+        RvalueKind.Cast(c) {
+            dumpTy(cx, rv.ty, out);
+            out.push('(');
+            dumpOperand(cx, body, c.from, out);
+            out.push(')');
+        }
+        RvalueKind.Enum(e) {
+            let def = cx.enumDef(e.variant.enumId);
+            out.add(cx.nameStr(def.name)).add(".").add(cx.nameStr(def.variants.items[int(e.variant.index)].name));
+            match e.payload {
+                Option.Some(p) {
+                    out.push('(');
+                    dumpOperand(cx, body, p, out);
+                    out.push(')');
+                }
+                Option.None {}
+            }
+        }
+        RvalueKind.Interpolate(ip) {
+            out.push('`');
+            for i in 0..ip.parts.len {
+                match ip.parts.items[i] {
+                    InterpPart.Lit(l) {
+                        for j in 0..l.bytes.len {
+                            let b = l.bytes[j];
+                            if b >= 32 && b < 127 { out.push(b); } else { pushHexByte(out, b); }
+                        }
+                    }
+                    InterpPart.Value(op) {
+                        out.push('{');
+                        dumpOperand(cx, body, op, out);
+                        out.push('}');
+                    }
+                }
+            }
+            out.push('`');
+        }
+    }
+}
+
+/// `\xNN`, two lowercase hex digits (Rust `\\x{:02x}`).
+fn pushHexByte(out: &Text, b: u8) {
+    out.pushStr("\\x");
+    if b < 16 { out.push('0'); }
+    out.pushHex(u64(b));
+}
+
+fn dumpOperand(cx: &IrCx, body: &Body, op: Operand, out: &Text) {
+    match op {
+        Operand.Copy(p) {
+            out.pushStr("copy ");
+            dumpPlace(cx, body, &p, out);
+        }
+        Operand.Const(c) {
+            match c.kind {
+                ConstKind.Void { out.pushStr("void"); }
+                ConstKind.Bool(v) { if v { out.pushStr("true"); } else { out.pushStr("false"); } }
+                ConstKind.Int(bits) { out.pushU64(bits); }
+                ConstKind.F32Bits(bits) { out.pushStr("f32(0x"); out.pushHex(u64(bits)); out.push(')'); }
+                ConstKind.F64Bits(bits) { out.pushStr("f64(0x"); out.pushHex(bits); out.push(')'); }
+                ConstKind.FnAddr(fa) { out.pushStr(cx.nameStr(cx.func(fa.func).name)); }
+                ConstKind.Null { out.pushStr("null"); }
+                ConstKind.Bytes(bc) {
+                    out.push('"');
+                    for i in 0..bc.bytes.len {
+                        let b = bc.bytes[i];
+                        if b == '\\' { out.pushStr("\\\\"); }
+                        else if b == '"' { out.pushStr("\\\""); }
+                        else if b >= 32 && b < 127 { out.push(b); }
+                        else { pushHexByte(out, b); }
+                    }
+                    out.push('"');
+                }
+            }
+        }
+    }
+}
+
+fn dumpPlace(cx: &IrCx, body: &Body, p: &Place, out: &Text) {
+    for i in 0..p.proj.len {
+        match p.proj.items[i] { Proj.Deref { out.pushStr("(*"); } _ {} }
+    }
+    match p.root {
+        PlaceRoot.Local(l) {
+            if int(l.id.i) < body.locals.len() { out.pushStr(cx.nameStr(body.local(l.id).name)); }
+            else { out.push('_'); out.pushU64(u64(l.id.i)); }
+        }
+        PlaceRoot.Global(g) { out.pushStr(cx.nameStr(cx.global(g.id).name)); }
+    }
+    for i in 0..p.proj.len {
+        match p.proj.items[i] {
+            Proj.Deref { out.push(')'); }
+            Proj.Field(f) { out.add(".").add(cx.nameStr(cx.fieldDef(f.field).name)); }
+            Proj.Index(ix) {
+                out.push('[');
+                dumpOperand(cx, body, ix.index, out);
+                out.push(']');
+            }
+            Proj.Ptr { out.pushStr(".ptr"); }
+            Proj.Len { out.pushStr(".len"); }
+            Proj.EnumTag { out.pushStr(".tag"); }
+            Proj.Lane(l) { out.add(".").add(laneName(int(l.lane))); }
+            Proj.EnumPayload(ep) { out.pushStr(".u.v"); out.pushU64(u64(ep.variant.index)); }
+        }
+    }
+}
+
+/// `dumpTy` into a string in `arena` (Rust `ty_string`).
+pub fn tyString(cx: &IrCx, ty: Id<TyKind>, arena: &Arena): string {
+    let t = Text.new(arena);
+    dumpTy(cx, ty, &t);
+    return t.str();
+}
+
+/// A type as source spells it (`int`, `&[]u8`, `fn(int): bool`, struct names) (Rust `dump_ty`).
+pub fn dumpTy(cx: &IrCx, ty: Id<TyKind>, out: &Text) {
+    match cx.tyKind(ty) {
+        TyKind.Void { out.pushStr("void"); }
+        TyKind.Bool { out.pushStr("bool"); }
+        TyKind.Int(it) {
+            match it {
+                IntTy.I64 { out.pushStr("int"); }
+                IntTy.I8 { out.pushStr("i8"); }
+                IntTy.I16 { out.pushStr("i16"); }
+                IntTy.I32 { out.pushStr("i32"); }
+                IntTy.U8 { out.pushStr("u8"); }
+                IntTy.U16 { out.pushStr("u16"); }
+                IntTy.U32 { out.pushStr("u32"); }
+                IntTy.U64 { out.pushStr("u64"); }
+            }
+        }
+        TyKind.Float(ft) { match ft { FloatTy.F64 { out.pushStr("float"); } FloatTy.F32 { out.pushStr("f32"); } } }
+        TyKind.Half { out.pushStr("f16"); }
+        TyKind.Vec(v) { out.pushStr(vecName(v)); }
+        TyKind.Ptr { out.pushStr("ptr"); }
+        TyKind.CStr { out.pushStr("cstr"); }
+        TyKind.String { out.pushStr("string"); }
+        TyKind.Ref(r) {
+            out.push('&');
+            dumpTy(cx, r.inner, out);
+        }
+        TyKind.Array(a) {
+            out.push('[');
+            out.pushU64(a.len);
+            out.push(']');
+            dumpTy(cx, a.elem, out);
+        }
+        TyKind.Slice(sl) {
+            out.pushStr("[]");
+            dumpTy(cx, sl.elem, out);
+        }
+        TyKind.Fn(f) {
+            out.pushStr("fn(");
+            dumpTyList(cx, f.params.items[0..f.params.len], out);
+            out.push(')');
+            if f.ret != cx.common.void {
+                out.pushStr(": ");
+                dumpTy(cx, f.ret, out);
+            }
+        }
+        TyKind.Struct(st) { out.pushStr(cx.nameStr(cx.structDef(st.id).name)); }
+        TyKind.Enum(en) { out.pushStr(cx.nameStr(cx.enumDef(en.id).name)); }
+    }
+}
+
+fn writeIndent(n: int, out: &Text) {
+    for _ in 0..n { out.pushStr("    "); }
+}

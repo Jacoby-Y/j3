@@ -2,4 +2,482 @@
 //
 // Port of: j3c/src/emit/llvm.rs
 // J3: Writes into a growable `Text` and flushes to disk in chunks (`Text.flushTo`).
+// J3: Entries keep Rust's shape, `(cx, modules, opts)`, with the output appended to `out` instead of
+// returned: `emitLlvm` (whole program), `emitLlvmPart` (split dev builds: the script VM at `-O2`),
+// `emitLlvmModule` (one object per module, or per chunk of a big module). Errors are Rust's message text
+// (an arena copy); `Ok(true)` on success. The parts (`backend/llvm/*.j3`) are `extend LlvmFn` methods or
+// free fns, one Rust file each (their `Port of:` lines); every `use` of this module is here (stage 0
+// rejects a duplicate `use` across part files).
+// J3: This module may not `use j3c.backend` (`backend.j3` uses this one): `LlOpts` carries what Rust read
+// from `EmitOpts` (`target`, `cc.opt`, `cc.debug`, `cc.release`), and the `Llvm` table entry fills it.
+// J3: Rust's `emit::contains_syscall` (emit/mod.rs) is `containsSyscall` here, its only reader, and
+// `host::release_nounwind` / `target_os` are `releaseNounwind` / `isAndroid` (toolchain sits below this
+// stage). Rust's progress lines (`phase::detail`, `cli::timing`) are left to the driver's phase timer.
+// `func_weights`/`chunk_assign` (chunked per-module objects) come with the incremental build (C3).
+// J3: Fn bodies are emitted into the Session arena (`emitFuncs`): a per-fn scratch arena freed after each
+// fn crashed stage 0 split builds (wave 5, not root-caused). Rust's process-wide `STR_SEQ` (`@.bN` names)
+// is one `StrSeq` per emit call, shared by its fns.
 module j3c.backend.llvm;
+
+use j3.data.map.Map;
+use j3.data.pool.Id;
+use j3.data.set.Set;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.text.{ Text, contains, endsWith, f32FromBits, f64Bits, lastIndexOf, startsWith };
+use j3c.base.intern.{ Sym, own };
+use j3c.base.span.{ Source, Span, isNone };
+use j3c.base.text_fmt.hasLower;
+use j3c.ir.{ AbortKind, AtomicRv, BinOp, Block, Body, CallRv, ConstInit, ConstKind, EnumDef, EnumRv, EnumTy, FloatTy, Func, FuncKind,
+    GlobalDef, IntTy, InterpPart, IrCx, LocalDecl, LocalKind, Module, Operand, Place, PlaceRoot, Proj, RefTy, Rvalue, RvalueKind,
+    SimdOp, Stmt, StmtKind, StructDef, TyKind, UnaryOp, VecTy, Vis, INTERP_CAP, abiAlign, abiSize, abortCode, abortDetail, abortKinds,
+    abortMessage, atomicCasFailure, atomicOrderLlvm, binOpStr, fieldOffset, intBits, intSigned, operandTy, unaryOpStr, vecLaneLlvm,
+    vecLlvm, vecName, wrappingBin };
+use j3c.ir.names.{ pushModuleIdent, pushSanitized, pushStableTy };
+use j3c.syntax.ast.AtomicOp;
+
+/// What the LLVM printer reads from the build options.
+pub struct LlOpts {
+    /// Target triple, "" for the host (`x86_64-pc-linux-gnu`).
+    target: string;
+    /// `[emit] opt`: 0..3, `s` (-1), `z` (-2), as `backend.Opts.opt`.
+    opt: int;
+    debug: bool;
+    release: bool;
+}
+
+/// Which fns one LLVM text defines (Rust `Part`).
+pub enum PartKind {
+    Whole,
+    /// Define only `Part.funcs`; declare everything else and reference globals as external.
+    Only,
+    /// Define everything except `Part.funcs`, plus `main` and every global.
+    Except,
+}
+
+pub struct Part {
+    kind: PartKind;
+    /// The fn set of `Only`/`Except`; empty for `Whole`.
+    funcs: &Set<Id<Func>>;
+
+    fn defines(this: &Part, id: Id<Func>): bool {
+        match this.kind {
+            PartKind.Whole { return true; }
+            PartKind.Only { return this.funcs.has(id); }
+            PartKind.Except { return !this.funcs.has(id); }
+        }
+    }
+}
+
+/// One chunk of a split module: chunk number and the fns it defines (Rust `Option<(usize, &HashSet)>`).
+pub struct Chunk {
+    no: int;
+    defined: &Set<Id<Func>>;
+}
+
+/// Rust's `STR_SEQ`: the next `@.bN` byte-string global.
+pub struct StrSeq {
+    n: u64;
+}
+
+/// The whole program as one LLVM text (Rust `emit_llvm`).
+pub fn emitLlvm(cx: &IrCx, modules: []Module, opts: &LlOpts, out: &Text): Result<bool, string> {
+    let none = Set<Id<Func>>.new(cx.arena, 1);
+    let part = Part { kind: PartKind.Whole, funcs: &none };
+    return emitLlvmPart(cx, modules, opts, &part, out);
+}
+
+fn tripleOf(opts: &LlOpts): string {
+    if opts.target.len == 0 { return "x86_64-pc-linux-gnu"; }
+    return opts.target;
+}
+
+/// ` optsize` / ` optsize minsize` for `-Os` / `-Oz`.
+fn sizeAttr(opt: int): string {
+    if opt == -1 { return " optsize"; }
+    if opt == -2 { return " optsize minsize"; }
+    return "";
+}
+
+/// Unwind tables are dropped in release builds only on Linux (Rust `host::release_nounwind`).
+fn releaseNounwind(release: bool, t: string): bool {
+    if !release { return false; }
+    if hasLower(t, "windows") || hasLower(t, "apple") || hasLower(t, "darwin") || hasLower(t, "emscripten") || hasLower(t, "android") {
+        return false;
+    }
+    return hasLower(t, "linux") || hasLower(t, "freebsd") || hasLower(t, "netbsd") || hasLower(t, "openbsd");
+}
+
+/// Rust `target_os(triple) == Android` (Windows, Apple and Emscripten win first).
+fn isAndroid(t: string): bool {
+    if hasLower(t, "windows") || hasLower(t, "apple") || hasLower(t, "darwin") || hasLower(t, "emscripten") { return false; }
+    return hasLower(t, "android");
+}
+
+/// Header, types, the prelude declarations and the `use lib` bindings (shared by both entries).
+fn header(cx: &IrCx, modules: []Module, triple: string, out: &Text): Result<bool, string> {
+    out.add("; generated by j3c — LLVM printer\n");
+    out.add("target triple = \"").add(triple).add("\"\n");
+    out.add(datalayoutLine(triple));
+    out.add("%j3_string = type { ptr, i64 }\n\n");
+    emitStructTypes(cx, modules, out)?;
+    emitEnumTypes(cx, modules, out)?;
+    if containsSyscall(cx, modules) { out.add("declare i64 @syscall(i64, ...)\n"); }
+    out.add("declare void @_exit(i32) noreturn\n");
+    out.add("declare i64 @write(i32, ptr, i64)\n");
+    out.add("declare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg)\n");
+    out.add("declare <4 x float> @llvm.sqrt.v4f32(<4 x float>)\n");
+    out.add("declare <4 x float> @llvm.fabs.v4f32(<4 x float>)\n");
+    out.add("declare <4 x i32> @llvm.fptosi.sat.v4i32.v4f32(<4 x float>)\n");
+    out.add("declare i32 @snprintf(ptr noundef, i64 noundef, ptr noundef, ...)\n");
+    out.add("declare i32 @puts(ptr)\n\n");
+    out.add("@.j3_fmt_i64 = private unnamed_addr constant [5 x i8] c\"%lld\\00\"\n");
+    out.add("@.j3_fmt_f = private unnamed_addr constant [3 x i8] c\"%g\\00\"\n");
+    out.add("@.j3_fmt_s = private unnamed_addr constant [3 x i8] c\"%s\\00\"\n");
+    out.add("@.j3_true = private unnamed_addr constant [5 x i8] c\"true\\00\"\n");
+    out.add("@.j3_false = private unnamed_addr constant [6 x i8] c\"false\\00\"\n\n");
+
+    // Several modules may bind the same C function (`getenv` in two `use lib "c"` blocks);
+    // LLVM takes one declaration per symbol.
+    let declared = Set<Sym>.new(cx.arena, 16);
+    for mi in 0..modules.len {
+        let fs = modules[mi].funcs;
+        for i in 0..fs.len {
+            let func = cx.funcMut(fs.items[i]);
+            match func.kind {
+                FuncKind.Lib(lb) {
+                    if !declared.add(lb.symbol) || preludeDeclares(cx, func, lb.symbol)? { continue; }
+                    out.add("; use lib \"").add(cx.nameStr(lb.libName)).add("\"\n");
+                    out.add("declare ").add(llRet(cx, func.ty, cx.arena)?).add(" @");
+                    pushSanitized(out, cx.nameStr(lb.symbol));
+                    out.add("(").add(llParams(cx, func.ty, cx.arena)?).add(")\n");
+                }
+                FuncKind.J3(_) {}
+                FuncKind.Decl {}
+            }
+        }
+    }
+    out.push('\n');
+    return Result.Ok(true);
+}
+
+/// `@name = [linkage]global ty init, align N` of one owned global; `external` for a foreign one.
+fn globalLine(cx: &IrCx, g: &GlobalDef, external: bool, linkage: string, out: &Text): Result<bool, string> {
+    let name = globalName(cx, g, cx.arena);
+    let ty = llType(cx, g.ty, cx.arena)?;
+    if external {
+        out.add("@").add(name).add(" = external ").add(tls(g)).add("global ").add(ty).fmt(`, align {abiAlign(cx, g.ty)}`).push('\n');
+        return Result.Ok(true);
+    }
+    let pre = Text.new(cx.arena);
+    let init = "zeroinitializer";
+    match g.init {
+        Option.Some(v) { init = llConstInit(cx, g.ty, &v, name, &pre, cx.arena)?; }
+        Option.None {}
+    }
+    out.add(pre.str());
+    out.add("@").add(name).add(" = ").add(linkage).add(tls(g)).add("global ").add(ty).add(" ").add(init);
+    out.fmt(`, align {abiAlign(cx, g.ty)}`).push('\n');
+    return Result.Ok(true);
+}
+
+fn anyGlobals(modules: []Module): bool {
+    for i in 0..modules.len {
+        if modules[i].globals.len > 0 { return true; }
+    }
+    return false;
+}
+
+/// The C `main` (or `SDL_main`) definition, with the crash handler in debug x86-64 Linux builds.
+fn hostMain(cx: &IrCx, modules: []Module, triple: string, debug: bool, out: &Text): Result<bool, string> {
+    let entry = Text.new(cx.arena);
+    hostEntry(cx, modules, &entry)?;
+    let crash = debug && crashSupported(triple);
+    if crash { crashDefinitions(out); }
+    out.add("define i32 @").add(hostEntryName(triple)).add("(i32 %argc, ptr %argv) {\n");
+    if crash { crashInstall(out); }
+    let setArgs = Text.new(cx.arena);
+    if sysFunc(cx, modules, "setArgs", &setArgs) {
+        out.add("  %argc64 = sext i32 %argc to i64\n");
+        out.add("  call void @").add(setArgs.str()).add("(i64 %argc64, ptr %argv)\n");
+    }
+    out.add("  call void @").add(entry.str()).add("()\n");
+    out.add("  ret i32 0\n");
+    out.add("}\n");
+    return Result.Ok(true);
+}
+
+/// Shared fn-loop settings of one emit call.
+struct FnLoop {
+    external: bool;
+    nounwind: bool;
+    sizeAttr: string;
+    /// Packed aborts: the file table, else None.
+    abortFiles: Option<&List<string>>;
+    seq: &StrSeq;
+}
+
+/// Declare or define every J3 fn of `modules`: `defined(id)` picks which.
+fn emitFuncs(cx: &IrCx, modules: []Module, part: &Part, chunkSet: Option<&Set<Id<Func>>>, dbg: &DebugOut, lp: &FnLoop,
+        out: &Text): Result<bool, string> {
+    for mi in 0..modules.len {
+        let fs = modules[mi].funcs;
+        for i in 0..fs.len {
+            let id = fs.items[i];
+            let func = cx.funcMut(id);
+            let defines = part.defines(id);
+            match chunkSet { Option.Some(s) { defines = s.has(id); } Option.None {} }
+            match func.kind {
+                FuncKind.J3(j) {
+                    if !defines {
+                        let sig = llSigJ3(cx, func.ty, cx.arena)?;
+                        out.add("declare ").add(sig.0).add(" @");
+                        pushFuncName(out, cx, func);
+                        out.add("(").add(sig.1).add(")\n");
+                        continue;
+                    }
+                    let d: Option<&DebugOut> = Option.None;
+                    if dbg.on { d = Option.Some(dbg); }
+                    // ponytail: SSA names and per-fn buffers stay in the Session arena (about 2x the output
+                    // text); a per-fn scratch arena (freed after the fn) crashed stage 0 split builds.
+                    let body = cx.arena.new::<Body>(j.body);
+                    let f = LlvmFn.new(cx, cx.arena, body, d);
+                    f.external = lp.external;
+                    f.nounwind = lp.nounwind;
+                    f.abortFiles = lp.abortFiles;
+                    f.sizeAttr = lp.sizeAttr;
+                    f.seq = lp.seq;
+                    f.emitFunc(func, out)?;
+                    out.push('\n');
+                }
+                FuncKind.Decl {}
+                FuncKind.Lib(_) {}
+            }
+        }
+    }
+    return Result.Ok(true);
+}
+
+/// The program, defining only the fns `part` says (Rust `emit_llvm_part`).
+pub fn emitLlvmPart(cx: &IrCx, modules: []Module, opts: &LlOpts, part: &Part, out: &Text): Result<bool, string> {
+    let start = out.len();
+    let triple = tripleOf(opts);
+    header(cx, modules, triple, out)?;
+    let only = part.kind == PartKind.Only;
+    let split = part.kind != PartKind.Whole;
+    let linkage = "internal ";
+    if split { linkage = ""; }
+    for mi in 0..modules.len {
+        let gs = modules[mi].globals;
+        for i in 0..gs.len {
+            let g = cx.global(gs.items[i]);
+            globalLine(cx, &g, only, linkage, out)?;
+        }
+    }
+    if anyGlobals(modules) { out.push('\n'); }
+
+    let dbg = DebugOut.off(cx.arena);
+    if opts.debug && !only { dbg = DebugOut.prepare(cx, modules, Option.None, cx.arena); }
+    if dbg.on { out.add("declare void @llvm.dbg.declare(metadata, metadata, metadata)\n\n"); }
+    // Whole programs print every failed check through one routine; split and per-module
+    // builds keep a message per site (they exist for fast dev builds, not for size).
+    let pack = part.kind == PartKind.Whole;
+    let files = List<string>.new(cx.arena);
+    let lp = FnLoop { external: split, nounwind: releaseNounwind(opts.release, triple), sizeAttr: sizeAttr(opts.opt),
+        abortFiles: Option.None, seq: cx.arena.new::<StrSeq>(StrSeq { n: 0 }) };
+    if pack { lp.abortFiles = Option.Some(&files); }
+    emitFuncs(cx, modules, part, Option.None, &dbg, &lp, out)?;
+    if pack && files.len > 0 { abortRoutine(files.slice(), opts.debug && crashSupported(triple), out); }
+    if !only { hostMain(cx, modules, triple, opts.debug, out)?; }
+    finishText(&dbg, start, out);
+    return Result.Ok(true);
+}
+
+/// Debug metadata, then the libm note when the text uses `frem`.
+fn finishText(dbg: &DebugOut, start: int, out: &Text) {
+    if dbg.on {
+        out.push('\n');
+        out.add(CRASH_ATTRS);
+        dbg.finish(out);
+    }
+    // `frem` lowers to a libm call.
+    // ponytail: text scan for frem; flag it in the printer if this grows
+    if usesFrem(out, start) { out.add("; use lib \"m\"\n"); }
+}
+
+/// Module `index` as its own object; with `chunk`, only that chunk's fns (chunk 0 also owns the globals
+/// and `@main`) (Rust `emit_llvm_module`).
+pub fn emitLlvmModule(cx: &IrCx, modules: []Module, index: int, opts: &LlOpts, chunk: Option<Chunk>, out: &Text): Result<bool, string> {
+    let mine = modules[index];
+    let chunkNo = 0;
+    let all = Set<Id<Func>>.new(cx.arena, mine.funcs.len + 1);
+    let defined = &all;
+    match chunk {
+        Option.Some(c) { chunkNo = c.no; defined = c.defined; }
+        Option.None { for i in 0..mine.funcs.len { all.add(mine.funcs.items[i]); } }
+    }
+    let triple = tripleOf(opts);
+    let text = Text.new(cx.arena);
+    header(cx, modules, triple, &text)?;
+    for mi in 0..modules.len {
+        let gs = modules[mi].globals;
+        for i in 0..gs.len {
+            let g = cx.global(gs.items[i]);
+            let owns = chunkNo == 0 && mine.globals.contains(gs.items[i]);
+            globalLine(cx, &g, !owns, "", &text)?;
+        }
+    }
+    if anyGlobals(modules) { text.push('\n'); }
+
+    let dbg = DebugOut.off(cx.arena);
+    if opts.debug {
+        let one = cx.arena.alloc::<Module>(1);
+        one[0] = mine;
+        dbg = DebugOut.prepare(cx, one, Option.Some(defined), cx.arena);
+    }
+    if dbg.on { text.add("declare void @llvm.dbg.declare(metadata, metadata, metadata)\n\n"); }
+    // Release (ThinLTO) objects pack failed checks like a whole program, one routine and file
+    // table per object (all private, so the copies do not clash).
+    let pack = opts.release;
+    let files = List<string>.new(cx.arena);
+    let lp = FnLoop { external: true, nounwind: releaseNounwind(opts.release, triple), sizeAttr: sizeAttr(opts.opt),
+        abortFiles: Option.None, seq: cx.arena.new::<StrSeq>(StrSeq { n: 0 }) };
+    if pack { lp.abortFiles = Option.Some(&files); }
+    let whole = Set<Id<Func>>.new(cx.arena, 1);
+    let wholePart = Part { kind: PartKind.Whole, funcs: &whole };
+    emitFuncs(cx, modules, &wholePart, Option.Some(defined), &dbg, &lp, &text)?;
+    // the crash handler (and its frame walk) is only in the entry object
+    if pack && files.len > 0 { abortRoutine(files.slice(), false, &text); }
+    if index == entryModule(cx, modules)? && chunkNo == 0 { hostMain(cx, modules, triple, opts.debug, &text)?; }
+    if dbg.on {
+        text.push('\n');
+        text.add(CRASH_ATTRS);
+        dbg.finish(&text);
+    }
+    let start = out.len();
+    pruneUnused(text.str(), out);
+    if usesFrem(out, start) { out.add("; use lib \"m\"\n"); }
+    return Result.Ok(true);
+}
+
+/// C functions the module prelude declares: name, return type, parameters (Rust `PRELUDE_DECLS`).
+fn preludeDecl(name: string): Option<(string, string)> {
+    if name == "syscall" { return Option.Some(("i64", "i64, ...")); }
+    if name == "_exit" { return Option.Some(("void", "i32")); }
+    if name == "write" { return Option.Some(("i64", "i32, ptr, i64")); }
+    if name == "snprintf" { return Option.Some(("i32", "ptr, i64, ptr, ...")); }
+    if name == "puts" { return Option.Some(("i32", "ptr")); }
+    return Option.None;
+}
+
+/// True when a `use lib` binding redeclares a prelude function (LLVM takes one declaration per
+/// symbol, so the binding's is skipped). A different signature is an error naming the binding.
+fn preludeDeclares(cx: &IrCx, func: &Func, symbol: Sym): Result<bool, string> {
+    let nt = Text.new(cx.arena);
+    pushSanitized(&nt, cx.nameStr(symbol));
+    let name = nt.str();
+    let d = match preludeDecl(name) { Option.Some(d) { d } Option.None { return Result.Ok(false); } };
+    let r = llRet(cx, func.ty, cx.arena)?;
+    let p = llParams(cx, func.ty, cx.arena)?;
+    // A variadic (`snprintf`) may be bound with fixed trailing params; calls then use the variadic type.
+    let fits = p == d.1;
+    if endsWith(d.1, ", ...") {
+        let fixed = d.1[0..d.1.len - 5];
+        fits = p == fixed || (startsWith(p, fixed) && startsWith(p[fixed.len..p.len], ", "));
+    }
+    if r != d.0 || !fits {
+        let t = Text.new(cx.arena);
+        t.add("`use lib` binding `").add(name).add("` is declared as `").add(r).add(" (").add(p);
+        t.add(")`, but the emitter's own prelude declares `").add(d.0).add(" (").add(d.1).add(")`; bind it with that signature");
+        return Result.Err(t.str());
+    }
+    return Result.Ok(true);
+}
+
+/// The call type for a `use lib` binding of a variadic prelude function (`i32 (ptr, i64, ptr, ...)`),
+/// which LLVM needs spelled out at the call; None for everything else (Rust `variadic_call_ty`).
+fn variadicCallTy(cx: &IrCx, func: &Func, arena: &Arena): Option<string> {
+    match func.kind {
+        FuncKind.Lib(lb) {
+            let nt = Text.new(arena);
+            pushSanitized(&nt, cx.nameStr(lb.symbol));
+            match preludeDecl(nt.str()) {
+                Option.Some(d) {
+                    if !endsWith(d.1, "...") { return Option.None; }
+                    let t = Text.new(arena);
+                    t.add(d.0).add(" (").add(d.1).add(")");
+                    return Option.Some(t.str());
+                }
+                Option.None { return Option.None; }
+            }
+        }
+        FuncKind.J3(_) { return Option.None; }
+        FuncKind.Decl { return Option.None; }
+    }
+}
+
+/// The x86-64 datalayout for an x86-64 triple; any other triple gets none and clang fills in its own.
+fn datalayoutLine(triple: string): string {
+    if startsWith(triple, "x86_64") {
+        return "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\n";
+    }
+    return "\n";
+}
+
+/// Some J3 fn body calls `@syscall` (Rust `emit::contains_syscall`).
+fn containsSyscall(cx: &IrCx, modules: []Module): bool {
+    for mi in 0..modules.len {
+        let fs = modules[mi].funcs;
+        for i in 0..fs.len {
+            match cx.funcMut(fs.items[i]).kind {
+                FuncKind.J3(j) { if blockHasSyscall(&j.body.block) { return true; } }
+                FuncKind.Lib(_) {}
+                FuncKind.Decl {}
+            }
+        }
+    }
+    return false;
+}
+
+fn blockHasSyscall(b: &Block): bool {
+    for i in 0..b.stmts.len {
+        if stmtHasSyscall(&b.stmts.items[i]) { return true; }
+    }
+    return false;
+}
+
+fn isSyscall(rv: &Rvalue): bool {
+    match rv.kind {
+        RvalueKind.Syscall(_) { return true; }
+        _ { return false; }
+    }
+}
+
+fn stmtHasSyscall(s: &Stmt): bool {
+    match s.kind {
+        StmtKind.Assign(a) { return isSyscall(&a.rvalue); }
+        StmtKind.Expr(rv) { return isSyscall(&rv); }
+        StmtKind.Defer(d) { return blockHasSyscall(&d.body); }
+        StmtKind.Block(b) { return blockHasSyscall(&b); }
+        StmtKind.If(f) {
+            if blockHasSyscall(&f.thenBlock) { return true; }
+            match f.elseBlock { Option.Some(e) { return blockHasSyscall(&e); } Option.None { return false; } }
+        }
+        StmtKind.While(w) { return blockHasSyscall(&w.body); }
+        StmtKind.ForRange(f) { return blockHasSyscall(&f.body); }
+        StmtKind.Switch(sw) {
+            for i in 0..sw.cases.len {
+                if blockHasSyscall(&sw.cases.items[i].block) { return true; }
+            }
+            return blockHasSyscall(&sw.default);
+        }
+        _ { return false; }
+    }
+}
+
+/// `out` from byte `start` holds a ` frem ` (libm).
+fn usesFrem(out: &Text, start: int): bool {
+    let s = out.str();
+    return contains(s[start..s.len], " frem ");
+}

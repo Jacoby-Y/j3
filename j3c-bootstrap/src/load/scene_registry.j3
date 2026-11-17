@@ -1,0 +1,459 @@
+// `j3.scene3d.scripts`, made in memory from a scene `Scan`: check every attachment against its script
+// (hooks, props, params; errors point at the scene line), then write the module's source.
+//
+// Port of: j3c/src/compile/scene_scripts.rs (registry, source, ident, MODULE, LABEL)
+module j3c.load.scene_registry;
+// J3: Its own module so its `use`s stay private. Scripts are parsed into the caller's `Ast` (only their
+// props and fns are read; the nodes are left behind). Generated text equals Rust's byte for byte; Rust's
+// `{:?}` of strings and floats is `base/text_fmt` `debugStr` / `debugF64`.
+
+use j3.data.pool.{ Id, Pool };
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.text.{ Text, startsWith };
+use j3c.base.diag;
+use j3c.base.diag.Diags;
+use j3c.base.fsx;
+use j3c.base.span.{ Lines, Source };
+use j3c.base.text_fmt.{ debugF64, debugStr };
+use j3c.load.scene_scan.{ Attachment, Param, Scan, lines };
+use j3c.load.scripts_deps.{ scriptModuleParts, scriptPaths };
+use j3c.syntax.ast.{ Ast, Expr, FnItem, Item, Type, foldedLiteral };
+use j3c.syntax.parse;
+
+/// The synthesized module's name.
+pub const MODULE: string = "j3.scene3d.scripts";
+/// What diagnostics call it.
+pub const LABEL: string = "(scene scripts)";
+
+/// How a prop's value comes from a scene.
+enum PropKind { Float, Double, Int, Bool, Text, Object, Vector, Other }
+
+struct Prop {
+    name: string;
+    ty: Id<Type>;
+    default: Option<Id<Expr>>;
+}
+
+/// A script's props and hooks, from its parsed file.
+struct Shape {
+    script: string;
+    props: List<Prop>;
+    fns: List<FnItem>;
+}
+
+fn typeName(ast: &Ast, ty: Id<Type>): string {
+    match ast.ty(ty) {
+        Type.Named(n) {
+            let s = ast.str(n.name);
+            let k = s.len;
+            while k > 0 && s[k - 1] != '.' { k -= 1; }
+            return s[k..s.len];
+        }
+        _ { return ""; }
+    }
+}
+
+fn propKind(ast: &Ast, ty: Id<Type>): PropKind {
+    let n = typeName(ast, ty);
+    if n == "f32" { return PropKind.Float; }
+    if n == "f64" || n == "float" { return PropKind.Double; }
+    if n == "int" || n == "i8" || n == "i16" || n == "i32" || n == "i64" || n == "u8" || n == "u16" || n == "u32" || n == "u64" {
+        return PropKind.Int;
+    }
+    if n == "bool" { return PropKind.Bool; }
+    if n == "string" { return PropKind.Text; }
+    if n == "NodeId" { return PropKind.Object; }
+    if n == "Vec3" { return PropKind.Vector; }
+    return PropKind.Other;
+}
+
+fn kindWords(k: PropKind): string {
+    match k {
+        PropKind.Float { return "a number (` f=`)"; }
+        PropKind.Double { return "a number (` f=`)"; }
+        PropKind.Int { return "a whole number"; }
+        PropKind.Bool { return "0 or 1"; }
+        PropKind.Text { return "text (` s=`)"; }
+        PropKind.Object { return "an object (` r=<id>`)"; }
+        PropKind.Vector { return "three numbers (`.x`, `.y`, `.z`)"; }
+        PropKind.Other { return "nothing a scene can give"; }
+    }
+}
+
+fn paramFits(k: PropKind, p: &Param): bool {
+    match k {
+        PropKind.Float { return p.kind == 'f' || p.kind == ' '; }
+        PropKind.Double { return p.kind == 'f' || p.kind == ' '; }
+        PropKind.Int { return p.kind == ' '; }
+        PropKind.Bool { return p.kind == ' ' && (p.value == "0" || p.value == "1"); }
+        PropKind.Text { return p.kind == 's'; }
+        PropKind.Object { return p.kind == 'r'; }
+        PropKind.Vector { return p.kind == 'f' || p.kind == ' '; }
+        PropKind.Other { return false; }
+    }
+}
+
+/// The script's props and fns; None when its file can't be read; Err for a bad path or a parse error
+/// (rendered as Rust's `format_error`).
+fn shape(root: string, rel: string, ast: &Ast): Result<Option<Shape>, string> {
+    let arena = ast.arena;
+    let text = "";
+    match fsx.readText(path.join(root, rel, arena), arena) { Result.Ok(t) { text = t; } Result.Err(_) { return Result.Ok(Option.None); } }
+    let parts = scriptModuleParts(rel, arena)?;
+    let sources = Pool<Source>.new(arena);
+    let id = sources.add(Source { path: rel, text: text, lines: Lines.of(text, arena) });
+    let out = Shape { script: rel, props: List<Prop>.new(arena), fns: List<FnItem>.new(arena) };
+    match parse.parseScript(text, id, parts.items[0..parts.len], ast) {
+        Result.Ok(f) {
+            for i in 0..f.items.len {
+                match f.items.items[i] {
+                    Item.Props(b) {
+                        for k in 0..b.fields.len {
+                            let fd = b.fields.items[k];
+                            out.props.push(Prop { name: ast.str(fd.name.name), ty: fd.ty, default: fd.default });
+                        }
+                    }
+                    Item.Fn(fi) { out.fns.push(fi); }
+                    _ {}
+                }
+            }
+        }
+        Result.Err(e) {
+            let ds = Diags.new(arena);
+            parse.report(e, &ds);
+            let t = Text.new(arena);
+            diag.render(ds.at(0), &sources, &t);
+            return Result.Err(t.str());
+        }
+    }
+    return Result.Ok(Option.Some(out));
+}
+
+fn sceneError(out: &Text, scene: string, line: int, text: string, message: string, help: string) {
+    out.add("error: ").add(message).add("\n  --> ").add(scene).add(":");
+    out.pushInt(line);
+    out.push('\n');
+    let num = Text.new(out.arena);
+    num.pushInt(line);
+    let width = num.len();
+    if text.len > 0 {
+        for i in 0..width { out.push(' '); }
+        out.add(" |\n");
+        out.pushInt(line);
+        out.add(" | ").add(text).add("\n");
+        for i in 0..width { out.push(' '); }
+        out.add(" |\n");
+    }
+    if help.len > 0 {
+        for i in 0..width { out.push(' '); }
+        out.add(" = help: ").add(help).push('\n');
+    }
+}
+
+/// Line `line` (1-based) of the scene file, or "".
+fn sceneLine(root: string, scene: string, line: int, arena: &Arena): string {
+    match fsx.readText(path.join(root, scene, arena), arena) {
+        Result.Ok(t) {
+            let ls = lines(t, arena);
+            let i = if line > 0 { line - 1 } else { 0 };
+            if i < ls.len { return ls.items[i]; }
+            return "";
+        }
+        Result.Err(_) { return ""; }
+    }
+}
+
+fn typeText(ast: &Ast, ty: Id<Type>, t: &Text) {
+    match ast.ty(ty) {
+        Type.Named(n) { t.add(ast.str(n.name)); }
+        Type.Ref(r) { t.push('&'); typeText(ast, r.ty, t); }
+        _ { t.push('?'); }
+    }
+}
+
+/// Hooks the scene host calls must have these exact shapes.
+fn checkHook(ast: &Ast, f: &FnItem, want: []string): bool {
+    if !f.visPub || f.params.len != want.len { return false; }
+    match f.ret { Option.Some(_) { return false; } Option.None {} }
+    for i in 0..want.len {
+        let t = Text.new(ast.arena);
+        typeText(ast, f.params.items[i].ty, &t);
+        if t.str() != want[i] { return false; }
+    }
+    return true;
+}
+
+fn findShape(shapes: &List<Shape>, script: string): int {
+    for i in 0..shapes.len { if shapes.items[i].script == script { return i; } }
+    return -1;
+}
+
+fn propNames(props: &List<Prop>, t: &Text) {
+    if props.len == 0 { t.add("(none)"); return; }
+    for i in 0..props.len {
+        if i > 0 { t.add(", "); }
+        t.add("`").add(props.items[i].name).add("`");
+    }
+}
+
+fn checkAttachment(root: string, a: &Attachment, s: &Shape, scan: &Scan, ast: &Ast, errors: &Text) {
+    let arena = ast.arena;
+    for i in 0..s.fns.len {
+        let f = s.fns.items[i];
+        let fname = ast.str(f.name.name);
+        let ok = true;
+        let sig = "";
+        if fname == "start" {
+            ok = checkHook(ast, &f, ["&Scene"]);
+            sig = "pub fn start(scene: &Scene)";
+        } else if fname == "update" {
+            ok = checkHook(ast, &f, ["&Scene", "f32"]);
+            sig = "pub fn update(scene: &Scene, dt: f32)";
+        }
+        if !ok {
+            let m = Text.new(arena).add(a.script).add(" is attached here, so the scene calls its `").add(fname)
+                .add("`, which must be `").add(sig).add("`").str();
+            let h = Text.new(arena).add("change `").add(fname).add("` in ").add(a.script).add(" to `").add(sig).add("`, or rename it").str();
+            sceneError(errors, a.scene, a.line, sceneLine(root, a.scene, a.line, arena), m, h);
+        }
+    }
+    let params = scan.paramsOf(a.scene, a.id);
+    for i in 0..s.props.len {
+        let pr = s.props.items[i];
+        let kind = propKind(ast, pr.ty);
+        let dotted = Text.new(arena).add(pr.name).add(".").str();
+        let own = List<Param>.new(arena);
+        for k in 0..params.len {
+            if params.items[k].field == pr.name || startsWith(params.items[k].field, dotted) { own.push(params.items[k]); }
+        }
+        if own.len == 0 {
+            let hasDefault = match pr.default { Option.Some(_) { true } Option.None { false } };
+            if !hasDefault && !(pr.name == "node" && kind == PropKind.Object) {
+                let m = Text.new(arena).add(a.script).add(" needs prop `").add(pr.name).add("`, and this object doesn't set it").str();
+                let h = Text.new(arena);
+                h.add("set it in the inspector, or add `param.").add(pr.name).add("=<value>` to the object's line (`param.");
+                h.pushInt(a.id);
+                h.add(".").add(pr.name).add("` in a v1 file)");
+                sceneError(errors, a.scene, a.line, sceneLine(root, a.scene, a.line, arena), m, h.str());
+            }
+            continue;
+        }
+        for k in 0..own.len {
+            let p = own.items[k];
+            if !paramFits(kind, &p) {
+                let m = Text.new(arena);
+                m.add("`").add(pr.name).add("` is `");
+                typeText(ast, pr.ty, &m);
+                m.add("` in ").add(a.script).add(", so the scene must give ").add(kindWords(kind));
+                sceneError(errors, a.scene, p.line, sceneLine(root, a.scene, p.line, arena), m.str(), "");
+            }
+        }
+    }
+    for k in 0..params.len {
+        let p = params.items[k];
+        let dot = 0;
+        while dot < p.field.len && p.field[dot] != '.' { dot += 1; }
+        let base = p.field[0..dot];
+        let known = startsWith(p.field, "fx.");
+        for i in 0..s.props.len { if s.props.items[i].name == base { known = true; } }
+        if known { continue; }
+        let m = Text.new(arena).add("`").add(p.field).add("` isn't a prop of ").add(a.script).str();
+        let h = Text.new(arena);
+        h.add("props of ").add(a.script).add(": ");
+        propNames(&s.props, &h);
+        sceneError(errors, a.scene, p.line, sceneLine(root, a.scene, p.line, arena), m, h.str());
+    }
+}
+
+/// Check every attachment against its script and build the registry module's source (Rust `registry`).
+/// Err is every scene error (or the first bad script path / parse error), as Rust prints them.
+pub fn registry(root: string, scan: &Scan, ast: &Ast): Result<string, string> {
+    let arena = ast.arena;
+    let errors = Text.new(arena);
+    let shapes = List<Shape>.new(arena);
+    let known = scriptPaths(root, arena);
+    for i in 0..scan.attachments.len {
+        let a = scan.attachments.items[i];
+        if findShape(&shapes, a.script) >= 0 { continue; }
+        match shape(root, a.script, ast)? {
+            Option.Some(s) {
+                // kept sorted by path (Rust's BTreeMap order)
+                let at = shapes.len;
+                while at > 0 && a.script < shapes.items[at - 1].script { at -= 1; }
+                shapes.push(s);
+                let k = shapes.len - 1;
+                while k > at { shapes.items[k] = shapes.items[k - 1]; k -= 1; }
+                shapes.items[at] = s;
+            }
+            Option.None {
+                let help = match diag.didYouMean(a.script, known.items[0..known.len], arena) {
+                    Option.Some(sug) { Text.new(arena).add("did you mean `").add(sug).add("`?").str() }
+                    Option.None { "" }
+                };
+                let m = Text.new(arena).add("no script at ").add(a.script).str();
+                sceneError(&errors, a.scene, a.line, sceneLine(root, a.scene, a.line, arena), m, help);
+            }
+        }
+    }
+    for i in 0..scan.attachments.len {
+        let a = scan.attachments.items[i];
+        let k = findShape(&shapes, a.script);
+        if k >= 0 { checkAttachment(root, &a, &shapes.items[k], scan, ast, &errors); }
+    }
+    if errors.len() > 0 { return Result.Err(errors.str()); }
+    return Result.Ok(source(scan, &shapes, ast));
+}
+
+/// Registry names for a script path: `scripts/door.j3s` -> `scripts__door` (Rust `ident`), in `arena`.
+pub fn ident(script: string, arena: &Arena): string {
+    let s = script;
+    while s.len >= 4 && s[s.len - 4..s.len] == ".j3s" { s = s[0..s.len - 4]; }
+    let t = Text.new(arena);
+    for i in 0..s.len { if s[i] == '/' { t.add("__"); } else { t.push(s[i]); } }
+    return t.str();
+}
+
+/// Rust `literal`: a prop default as J3 source.
+fn literal(ast: &Ast, e: Id<Expr>, t: &Text) {
+    match foldedLiteral(ast, e) {
+        Expr.Int(v) { t.pushInt(v); }
+        Expr.Float(v) {
+            let f = Text.new(ast.arena);
+            debugF64(&f, v, ast.arena);
+            let s = f.str();
+            t.add(s);
+            for i in 0..s.len { if s[i] == '.' || s[i] == 'e' { return; } }
+            t.add(".0");
+        }
+        Expr.Bool(v) { t.add(if v { "true" } else { "false" }); }
+        // ponytail: Rust's `from_utf8_lossy` (invalid UTF-8 as U+FFFD) is not done; literals are UTF-8
+        Expr.String(s) { debugStr(t, s); }
+        _ { t.push('0'); }
+    }
+}
+
+fn fallback(ast: &Ast, d: Option<Id<Expr>>, zero: string, t: &Text) {
+    match d { Option.Some(e) { literal(ast, e, t); } Option.None { t.add(zero); } }
+}
+
+/// `name: <getter>` for a prop, or false for a type a scene can't set (Rust `getter`).
+fn getter(ast: &Ast, p: &Prop, t: &Text): bool {
+    let k = propKind(ast, p.ty);
+    match k {
+        PropKind.Other { return false; }
+        _ {}
+    }
+    t.add(p.name).add(": ");
+    match k {
+        PropKind.Float { t.add("scene3d.number(scene, id, "); debugStr(t, p.name); t.add(", "); fallback(ast, p.default, "0.0", t); t.push(')'); }
+        PropKind.Double { t.add("scene3d.number(scene, id, "); debugStr(t, p.name); t.add(", "); fallback(ast, p.default, "0.0", t); t.add(") as f64"); }
+        PropKind.Int {
+            t.add("scene3d.integer(scene, id, "); debugStr(t, p.name); t.add(", "); fallback(ast, p.default, "0", t);
+            t.add(") as ").add(typeName(ast, p.ty));
+        }
+        PropKind.Bool { t.add("scene3d.flag(scene, id, "); debugStr(t, p.name); t.add(", "); fallback(ast, p.default, "false", t); t.push(')'); }
+        PropKind.Text { t.add("scene3d.label(scene, id, "); debugStr(t, p.name); t.add(", "); fallback(ast, p.default, "\"\"", t); t.push(')'); }
+        // `node: NodeId` is the object the script is attached to unless the scene says otherwise.
+        PropKind.Object {
+            if p.name == "node" { t.add("NodeId { id: own(scene3d.object(scene, id, \"node\"), id) }"); }
+            else { t.add("NodeId { id: scene3d.object(scene, id, "); debugStr(t, p.name); t.add(") }"); }
+        }
+        PropKind.Vector { t.add("scene3d.vector(scene, id, "); debugStr(t, p.name); t.add(", Vec3.xyz(0, 0, 0))"); }
+        PropKind.Other {}
+    }
+    return true;
+}
+
+fn hasHook(ast: &Ast, s: &Shape, name: string): bool {
+    for i in 0..s.fns.len { if ast.str(s.fns.items[i].name.name) == name { return true; } }
+    return false;
+}
+
+fn source(scan: &Scan, shapes: &List<Shape>, ast: &Ast): string {
+    let arena = ast.arena;
+    let t = Text.new(arena);
+    t.add("// Made by j3c from the project's scenes (never written to disk).\nmodule j3.scene3d.scripts;\n\n");
+    t.add("use lib \"c\" as libc {\n    fn getenv(name: cstr): cstr;\n    fn strlen(s: cstr): int;\n}\n\n");
+    t.add("use j3.scene3d;\nuse j3.scene3d.{ Scene, NodeId };\nuse j3.math.Vec3;\n");
+    t.add("use j3.memory.Arena;\nuse j3.option.Option;\nuse j3.text.{ cstr, same };\n\n");
+    t.add("/// The scene set in j3.editor.toml.\npub const MAIN_SCENE: string = ");
+    debugStr(&t, scan.mainScene);
+    t.add(";\n\n");
+    t.add("/// The scene to run: the one the editor's Play picked (`J3_SCENE`), else `MAIN_SCENE`.\n");
+    t.add("pub fn scene(): string {\n    let raw = libc.getenv(cstr(\"J3_SCENE\"));\n    ");
+    t.add("if raw == 0 { return MAIN_SCENE; }\n    let len = libc.strlen(raw);\n    ");
+    t.add("if len < 1 { return MAIN_SCENE; }\n    return []u8 { ptr: raw as &u8, len: len } as string;\n}\n\n");
+    let ids = List<string>.new(arena);
+    for i in 0..shapes.len { ids.push(ident(shapes.items[i].script, arena)); }
+    for i in 0..shapes.len {
+        let id = ids.items[i];
+        t.add("const T__").add(id).add(" = @script(");
+        debugStr(&t, shapes.items[i].script);
+        t.add(");\n");
+        t.add("#[singleton]\nlet LIVE__").add(id).add(": []T__").add(id).add(";\n");
+        t.add("#[singleton]\nlet IDS__").add(id).add(": []int;\n");
+        t.add("#[singleton]\nlet COUNT__").add(id).add(": int;\n\n");
+    }
+    t.add("fn own(set: int, id: int): int {\n    if set == 0 { return id; }\n    return set;\n}\n\n");
+    t.add("/// Make an instance for every object with a script, then run each `start`.\npub fn start(scene: &Scene) {\n");
+    for i in 0..shapes.len { t.add("    COUNT__").add(ids.items[i]).add(" = 0;\n"); }
+    t.add("    for k in 0..scene.len {\n        let attached = scene.nodes[k].script;\n");
+    for i in 0..shapes.len {
+        t.add("        if same(attached, ");
+        debugStr(&t, shapes.items[i].script);
+        t.add(") { COUNT__").add(ids.items[i]).add(" += 1; }\n");
+    }
+    t.add("    }\n");
+    for i in 0..shapes.len {
+        let id = ids.items[i];
+        t.add("    LIVE__").add(id).add(" = scene.arena.alloc::<T__").add(id).add(">(COUNT__").add(id).add(");\n");
+        t.add("    IDS__").add(id).add(" = scene.arena.alloc::<int>(COUNT__").add(id).add(");\n");
+        t.add("    COUNT__").add(id).add(" = 0;\n");
+    }
+    t.add("    for i in 0..scene.len {\n        let id = scene.nodes[i].id;\n        let path = scene.nodes[i].script;\n");
+    for i in 0..shapes.len {
+        t.add("        if same(path, ");
+        debugStr(&t, shapes.items[i].script);
+        t.add(") { spawn__").add(ids.items[i]).add("(scene, id); }\n");
+    }
+    t.add("    }\n");
+    for i in 0..shapes.len {
+        if hasHook(ast, &shapes.items[i], "start") {
+            let id = ids.items[i];
+            t.add("    for i in 0..COUNT__").add(id).add(" { LIVE__").add(id).add("[i].start(scene); }\n");
+        }
+    }
+    t.add("}\n\n/// Run every instance's `update`.\npub fn update(scene: &Scene, dt: f32) {\n");
+    for i in 0..shapes.len {
+        if hasHook(ast, &shapes.items[i], "update") {
+            let id = ids.items[i];
+            t.add("    for i in 0..COUNT__").add(id).add(" { LIVE__").add(id).add("[i].update(scene, dt); }\n");
+        }
+    }
+    t.add("}\n");
+    for i in 0..shapes.len {
+        let s = shapes.items[i];
+        let id = ids.items[i];
+        t.add("\nfn spawn__").add(id).add("(scene: &Scene, id: int) {\n    LIVE__").add(id).add("[COUNT__").add(id).add("] = T__").add(id).add(" { ");
+        let first = true;
+        for k in 0..s.props.len {
+            let g = Text.new(arena);
+            if getter(ast, &s.props.items[k], &g) {
+                if !first { t.add(", "); }
+                t.add(g.str());
+                first = false;
+            }
+        }
+        t.add(" };\n    IDS__").add(id).add("[COUNT__").add(id).add("] = id;\n    COUNT__").add(id).add(" += 1;\n}\n");
+        // ponytail: linear scan per lookup (in the generated code, as Rust); index by id past a few thousand objects.
+        t.add("\n/// `scene.script<...>(node)` for ").add(s.script).add(".\npub fn find__").add(id)
+            .add("(scene: &Scene, node: NodeId): Option<&T__").add(id).add("> {\n    ");
+        t.add("for i in 0..COUNT__").add(id).add(" {\n        ");
+        t.add("if IDS__").add(id).add("[i] == node.id { return Option.Some(&LIVE__").add(id).add("[i]); }\n    }\n    ");
+        t.add("return Option.None;\n}\n");
+    }
+    return t.str();
+}

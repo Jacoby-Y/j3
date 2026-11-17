@@ -1,0 +1,457 @@
+// Does a type satisfy a trait? The structural check behind every bound: a generic fn or method called
+// with type args, a generic struct / enum type written with args (`Map<K, V>`), a method's `where`, a
+// trait default method's `Self`. Rust's error text, notes and helps, byte for byte.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/bounds.rs (check_bounds, method_ok, builtin_cmp, eq_needs_operator, op_of,
+// declared, line_of), check/traits.rs (with_supers, BoundReq), check/lower/defcheck.rs (unmet_bound,
+// written, with_bound: the template-side message for a type parameter)
+// J3: Rust keyed traits by `module::Name` strings; here a bound is an `Id<TraitDecl>` with the span of
+// the name where it is written (`BoundRef`). A type parameter (`Ty.Param`, the template pass) has the
+// methods of its bounds and their supertraits: Rust's placeholder struct, without making one.
+// J3: Template-side bound errors (Rust `bound_err`) are the ones whose message starts with
+// "type parameter `" (`unmetBound`, `BodyCx.boundMiss`): the template pass keeps only those.
+module j3c.sema;
+
+/// A trait named in a bound and where that name is written (Rust's bound `Ident`).
+struct BoundRef { tr: Id<TraitDecl>; span: Span; }
+
+/// One type parameter with bounds and the type it was given (Rust `BoundReq`). `param` "" = a check with
+/// no type parameter (a `dyn` conversion).
+struct BoundReq { param: string; arg: Id<Ty>; bounds: List<BoundRef>; }
+
+/// Why a type lacks a trait method (Rust `Fail`); `found` is the found signature (Wrong) or the element
+/// type lacking it (Element).
+enum FailKind { Missing, Wrong, Generic, Element }
+struct MethodFail { kind: FailKind; found: string; m: TraitMethodDecl; }
+
+/// A method of a type as the bound check sees it: its fn (`none` for a type parameter's bound method) and
+/// its signature at the type's args.
+struct MethodHit { found: bool; generic: bool; params: List<Id<Ty>>; ret: Id<Ty>; }
+
+/// `tr` and every supertrait, transitively, `tr` first (Rust `with_supers`).
+fn withSupers(cx: &SemaCx, tr: Id<TraitDecl>): List<Id<TraitDecl>> {
+    let out = List<Id<TraitDecl>>.new(cx.arena);
+    out.push(tr);
+    let i = 0;
+    while i < out.len {
+        let sup = cx.tables.traitAt(out.items[i]).supers;
+        for s in 0..sup.len { if !out.contains(sup.items[s]) { out.push(sup.items[s]); } }
+        i += 1;
+    }
+    return out;
+}
+
+/// `t` with `Self` (`Ty.TraitSelf`) replaced by `self`: a trait signature for one type.
+fn selfSubst(t: &Tables, ty: Id<Ty>, selfTy: Id<Ty>): Id<Ty> {
+    match t.ty(ty) {
+        Ty.TraitSelf { return selfTy; }
+        Ty.Ref(r) { return t.refTo(selfSubst(t, r.inner, selfTy)); }
+        Ty.Array(a) { return t.arrayOf(selfSubst(t, a.elem, selfTy), a.len); }
+        Ty.Slice(s) { return t.sliceOf(selfSubst(t, s.elem, selfTy)); }
+        Ty.Fn(f) { return t.intern(Ty.Fn(FnTy { params: selfSubstList(t, f.params, selfTy), ret: selfSubst(t, f.ret, selfTy) })); }
+        Ty.Struct(s) { return t.intern(Ty.Struct(StructTy { decl: s.decl, args: selfSubstList(t, s.args, selfTy) })); }
+        Ty.Enum(e) { return t.intern(Ty.Enum(EnumTy { decl: e.decl, args: selfSubstList(t, e.args, selfTy) })); }
+        Ty.Tuple(tu) { return t.intern(Ty.Tuple(TupleTy { elems: selfSubstList(t, tu.elems, selfTy) })); }
+        _ {}
+    }
+    return ty;
+}
+
+fn selfSubstList(t: &Tables, l: Id<TyList>, selfTy: Id<Ty>): Id<TyList> {
+    let xs = t.items(l);
+    if xs.len == 0 { return l; }
+    let out = t.arena.alloc::<Id<Ty>>(xs.len);
+    for i in 0..xs.len { out[i] = selfSubst(t, xs[i], selfTy); }
+    return t.list(out);
+}
+
+/// `ty` without its `&`s.
+fn derefAll(t: &Tables, ty: Id<Ty>): Id<Ty> {
+    let x = ty;
+    while true {
+        match t.refInner(x) { Option.Some(i) { x = i; } Option.None { break; } }
+    }
+    return x;
+}
+
+/// The trait method `name` a type parameter has through its bounds (supertraits included), first found
+/// (Rust's placeholder methods).
+fn paramMethod(cx: &SemaCx, p: ParamTy, name: Sym): Option<TraitMethodDecl> {
+    let bs = cx.tables.genericsAt(p.gen).bounds.items[p.index];
+    for i in 0..bs.len {
+        let all = withSupers(cx, bs.items[i]);
+        for k in 0..all.len {
+            let ms = cx.tables.traitAt(all.items[k]).methods;
+            for j in 0..ms.len { if ms.items[j].name == name { return Option.Some(ms.items[j]); } }
+        }
+    }
+    return Option.None;
+}
+
+/// The `#[impl]` fn giving `name` to `ty` (`ty` without `&`; Rust `TraitEnv.impls`).
+fn implFor(cx: &SemaCx, name: Sym, ty: Id<Ty>): Option<Id<FnDecl>> { return cx.tables.impls.get(ImplKey { name: name, ty: ty }); }
+
+/// The own method `name` of struct type `ty` (a generic struct's at its args); `generic` when it has type
+/// parameters of its own (a bound needs a plain one).
+fn ownMethod(cx: &SemaCx, ty: Id<Ty>, name: Sym): Option<MethodHit> {
+    let t = cx.tables;
+    let st = match t.ty(ty) { Ty.Struct(s) { s } _ { return Option.None; } };
+    let sd = t.structAt(st.decl);
+    for i in 0..sd.methods.len {
+        let fid = sd.methods.items[i];
+        let d = t.fnAt(fid);
+        if d.name != name { continue; }
+        let hit = MethodHit { found: true, generic: false, params: List<Id<Ty>>.new(cx.arena), ret: d.ret };
+        match d.gen {
+            Option.Some(g) {
+                let own = t.genericsAt(g).names.len;
+                match sd.gen { Option.Some(sg) { own -= t.genericsAt(sg).names.len; } Option.None {} }
+                if own > 0 { hit.generic = true; return Option.Some(hit); }
+                for p in 0..d.params.len { hit.params.push(subst(t, g, d.params.items[p].ty, st.args)); }
+                hit.ret = subst(t, g, d.ret, st.args);
+            }
+            Option.None { for p in 0..d.params.len { hit.params.push(d.params.items[p].ty); } }
+        }
+        return Option.Some(hit);
+    }
+    return Option.None;
+}
+
+/// Method `name` of `ty` as the bound check sees it: own method, else `#[impl]` fn, else (a type
+/// parameter) its bound method.
+fn methodOf(cx: &SemaCx, ty: Id<Ty>, name: Sym): Option<MethodHit> {
+    let t = cx.tables;
+    match t.ty(ty) {
+        Ty.Param(p) {
+            match paramMethod(cx, p, name) {
+                Option.Some(m) {
+                    let hit = MethodHit { found: true, generic: false, params: List<Id<Ty>>.new(cx.arena), ret: selfSubst(t, m.ret, ty) };
+                    for i in 0..m.params.len { hit.params.push(selfSubst(t, m.params.items[i].ty, ty)); }
+                    return Option.Some(hit);
+                }
+                Option.None { return Option.None; }
+            }
+        }
+        _ {}
+    }
+    match ownMethod(cx, ty, name) { Option.Some(h) { return Option.Some(h); } Option.None {} }
+    match implFor(cx, name, ty) {
+        Option.Some(f) {
+            let d = t.fnAt(f);
+            let hit = MethodHit { found: true, generic: false, params: List<Id<Ty>>.new(cx.arena), ret: d.ret };
+            for i in 0..d.params.len { hit.params.push(d.params.items[i].ty); }
+            return Option.Some(hit);
+        }
+        Option.None {}
+    }
+    return Option.None;
+}
+
+/// Rust `eq_needs_operator`: `==` on a struct or a payload enum needs an `operator==`.
+fn eqNeedsOp(cx: &SemaCx, ty: Id<Ty>): bool {
+    match cx.tables.ty(ty) {
+        Ty.Struct(_) { return true; }
+        Ty.Enum(e) {
+            let vs = cx.tables.enumAt(e.decl).variants;
+            for i in 0..vs.len { match vs.items[i].payload { Option.Some(_) { return true; } Option.None {} } }
+            return false;
+        }
+        _ {}
+    }
+    return false;
+}
+
+/// Rust `builtin_cmp` for the operator method `name` (`op_of`): equality on numbers, bool, string, ptr,
+/// C-like enums; order on numbers.
+fn builtinCmp(cx: &SemaCx, ty: Id<Ty>, name: string): bool {
+    let t = cx.tables;
+    if name == "operator==" || name == "operator!=" {
+        if eqNeedsOp(cx, ty) { return false; }
+        match t.ty(ty) {
+            Ty.Slice(_) { return false; }
+            Ty.Array(_) { return false; }
+            Ty.Void { return false; }
+            Ty.Param(_) { return false; }
+            Ty.Tuple(_) { return false; }
+            _ { return true; }
+        }
+    }
+    if name == "operator<" || name == "operator<=" || name == "operator>" || name == "operator>=" {
+        match t.ty(ty) {
+            Ty.Int(_) { return true; }
+            Ty.Float(_) { return true; }
+            _ {}
+        }
+    }
+    return false;
+}
+
+/// Rust `method_ok`: does `ty` have trait method `m` with the trait's signature (`Self` = `ty`)?
+fn methodOk(cx: &SemaCx, ty: Id<Ty>, m: &TraitMethodDecl): Option<MethodFail> {
+    let t = cx.tables;
+    let name = t.str(m.name);
+    // A tuple has `==` and `hash` when every element has them.
+    match t.ty(ty) {
+        Ty.Tuple(tu) {
+            if name == "operator==" || name == "hash" {
+                let es = t.items(tu.elems);
+                for i in 0..es.len {
+                    match methodOk(cx, es[i], m) {
+                        Option.Some(f) {
+                            if f.kind == FailKind.Missing { return Option.Some(MethodFail { kind: FailKind.Element, found: tyText(cx, es[i]), m: *m }); }
+                            return Option.Some(f);
+                        }
+                        Option.None {}
+                    }
+                }
+                return Option.None;
+            }
+        }
+        _ {}
+    }
+    match enumDeriveOk(cx, ty, m) { Option.Some(r) { return r; } Option.None {} }
+    let hit = match methodOf(cx, ty, m.name) {
+        Option.Some(h) { h }
+        Option.None {
+            if builtinCmp(cx, ty, name) { return Option.None; }
+            return Option.Some(MethodFail { kind: FailKind.Missing, found: "", m: *m });
+        }
+    };
+    if hit.generic { return Option.Some(MethodFail { kind: FailKind.Generic, found: "", m: *m }); }
+    let ps = hit.params;
+    let ok = ps.len > 0 && ps.len == m.params.len && hit.ret == selfSubst(t, m.ret, ty);
+    if ok {
+        match t.refInner(ps.items[0]) {
+            Option.Some(i) { ok = ps.items[0] == ty || i == ty; }
+            Option.None { ok = ps.items[0] == ty; }
+        }
+    }
+    for i in 1..ps.len {
+        if ok && ps.items[i] != selfSubst(t, m.params.items[i].ty, ty) { ok = false; }
+    }
+    if ok { return Option.None; }
+    let s = Text.new(cx.arena).add("fn ").add(name).add("(");
+    for i in 0..ps.len {
+        if i > 0 { s.add(", "); }
+        tyName(t, ps.items[i], s);
+    }
+    s.add("): ");
+    tyName(t, hit.ret, s);
+    return Option.Some(MethodFail { kind: FailKind.Wrong, found: s.str(), m: *m });
+}
+
+fn tyText(cx: &SemaCx, ty: Id<Ty>): string {
+    let s = Text.new(cx.arena);
+    tyName(cx.tables, ty, &s);
+    return s.str();
+}
+
+/// Rust `line_of`: `path:line` of `sp`.
+fn lineOf(cx: &SemaCx, sp: Span): string {
+    if isNone(sp) { return ""; }
+    let src = cx.sources.get(sp.file);
+    let t = Text.new(cx.arena).add(src.path).add(":");
+    t.pushInt(src.lines.at(sp.lo).line);
+    return t.str();
+}
+
+fn isSpace(c: u8): bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+
+/// `s` without ASCII whitespace at either end.
+fn trimWs(s: string): string {
+    let lo = 0;
+    let hi = s.len;
+    while lo < hi && isSpace(s[lo]) { lo += 1; }
+    while hi > lo && isSpace(s[hi - 1]) { hi -= 1; }
+    return s[lo..hi];
+}
+
+/// Rust `declared`: the trait method's signature as written, `fn hash(this: Self): u64`.
+fn declared(cx: &SemaCx, m: &TraitMethodDecl): string {
+    if isNone(m.span) { return cx.tables.str(m.name); }
+    let src = cx.sources.get(m.span.file).text;
+    let s = trimWs(src[int(m.span.lo)..int(m.span.hi)]);
+    while s.len > 0 && s[s.len - 1] == ';' { s = s[0..s.len - 1]; }
+    return trimWs(s);
+}
+
+/// `s` with every `from` replaced by `to` (Rust `str::replace`).
+fn replaceAll(cx: &SemaCx, s: string, from: string, to: string): string {
+    let out = Text.new(cx.arena);
+    let i = 0;
+    while i < s.len {
+        if i + from.len <= s.len && s[i..i + from.len] == from {
+            out.add(to);
+            i += from.len;
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+    return out.str();
+}
+
+/// Rust `written`: `T: Eq + Hash`, or `T` alone.
+fn writtenParam(cx: &SemaCx, p: ParamTy): string {
+    let g = cx.tables.genericsAt(p.gen);
+    let t = Text.new(cx.arena).add(cx.tables.str(g.names.items[p.index]));
+    let bs = g.bounds.items[p.index];
+    for i in 0..bs.len {
+        if i == 0 { t.add(": "); } else { t.add(" + "); }
+        t.add(cx.tables.str(cx.tables.traitAt(bs.items[i]).name));
+    }
+    return t.str();
+}
+
+/// Rust `with_bound`: `T: Eq` grown by `extra`.
+fn withBound(cx: &SemaCx, p: ParamTy, extra: string): string {
+    let w = writtenParam(cx, p);
+    if cx.tables.genericsAt(p.gen).bounds.items[p.index].len == 0 { return cat3(cx, w, ": ", extra); }
+    return cat3(cx, w, " + ", extra);
+}
+
+/// The type parameter behind `ty` (through `&`).
+fn paramOf(cx: &SemaCx, ty: Id<Ty>): Option<ParamTy> {
+    match cx.tables.ty(derefAll(cx.tables, ty)) { Ty.Param(p) { return Option.Some(p); } _ {} }
+    return Option.None;
+}
+
+fn addNote(cx: &SemaCx, d: &Diag, kind: NoteKind, msg: string) { d.notes.push(Note { kind: kind, span: noSpan(), msg: msg }); }
+
+/// Rust `unmet_bound`: a type parameter that does not meet trait `tr` (a bound of a generic it is passed to).
+fn unmetBound(cx: &SemaCx, sp: Span, p: ParamTy, tr: Id<TraitDecl>, by: string): Diag {
+    let trn = cx.tables.str(cx.tables.traitAt(tr).name);
+    let pn = cx.tables.str(cx.tables.genericsAt(p.gen).names.items[p.index]);
+    let msg = Text.new(cx.arena).add("type parameter `").add(pn).add("` does not satisfy `").add(trn).add("` (needed by ").add(by).add(")").str();
+    let d = cx.diags.make(0, Severity.Error, sp, msg);
+    addNote(cx, &d, NoteKind.Note, Text.new(cx.arena).add("`").add(pn).add("` is declared `").add(writtenParam(cx, p))
+        .add("`; a generic body may use only what its bounds give").str());
+    addNote(cx, &d, NoteKind.Help, cat3(cx, "add the bound: `", withBound(cx, p, trn), "`"));
+    return d;
+}
+
+/// Rust `check_bounds`: every bound of `reqs`; the first unmet one is the error at `sp`. `hint` is the
+/// module whose plain fns may be named in a "mark it `#[impl]`" help (None: no such help).
+fn checkBoundReqs(cx: &SemaCx, sp: Span, neededBy: string, reqs: &List<BoundReq>, hint: Option<Id<ModDecl>>): Option<Diag> {
+    let t = cx.tables;
+    for r in 0..reqs.len {
+        let req = reqs.items[r];
+        let ty = req.arg;
+        let declWord = "bound declared";
+        if req.param.len == 0 { declWord = "trait declared"; }
+        for b in 0..req.bounds.len {
+            let bound = req.bounds.items[b];
+            let trName = t.str(t.traitAt(bound.tr).name);
+            match t.ty(ty) {
+                Ty.Closure(_) {
+                    let by = byOf(cx, &req, neededBy);
+                    let d = cx.diags.make(0, Severity.Error, sp, Text.new(cx.arena).add("closure types cannot satisfy `").add(trName).add("` (needed by ").add(by).add(")").str());
+                    addNote(cx, &d, NoteKind.Note, Text.new(cx.arena).add(declWord).add(" at ").add(lineOf(cx, bound.span)).str());
+                    addNote(cx, &d, NoteKind.Help, "pass a plain `fn` value or a struct instead");
+                    return Option.Some(d);
+                }
+                _ {}
+            }
+            // `T: Ord` with `trait Ord: Eq` also needs `Eq`
+            let fails = List<MethodFail>.new(cx.arena);
+            let failed = bound.tr;
+            let supers = withSupers(cx, bound.tr);
+            for k in 0..supers.len {
+                let ms = t.traitAt(supers.items[k]).methods;
+                for j in 0..ms.len {
+                    match methodOk(cx, ty, &ms.items[j]) {
+                        Option.Some(f) {
+                            // a type without the method gets the default body
+                            let hasDefault = false;
+                            match ms.items[j].default { Option.Some(_) { hasDefault = true; } Option.None {} }
+                            if !(f.kind == FailKind.Missing && hasDefault) { fails.push(f); }
+                        }
+                        Option.None {}
+                    }
+                }
+                if fails.len > 0 { failed = supers.items[k]; break; }
+            }
+            if fails.len == 0 { continue; }
+            let by = byOf(cx, &req, neededBy);
+            let tname = tyText(cx, ty);
+            match paramOf(cx, ty) { Option.Some(p) { return Option.Some(unmetBound(cx, sp, p, bound.tr, by)); } Option.None {} }
+            let d = cx.diags.make(0, Severity.Error, sp, Text.new(cx.arena).add("`").add(tname).add("` does not satisfy `").add(trName)
+                .add("` (needed by ").add(by).add(")").str());
+            addNote(cx, &d, NoteKind.Note, Text.new(cx.arena).add(declWord).add(" at ").add(lineOf(cx, bound.span)).str());
+            let failedName = t.str(t.traitAt(failed).name);
+            if failed != bound.tr {
+                addNote(cx, &d, NoteKind.Note, Text.new(cx.arena).add("`").add(trName).add("` requires `").add(failedName)
+                    .add("` (a supertrait), which `").add(tname).add("` does not meet").str());
+            }
+            let isTuple = false;
+            match t.ty(ty) { Ty.Tuple(_) { isTuple = true; } _ {} }
+            for i in 0..fails.len {
+                let f = fails.items[i];
+                let want = declared(cx, &f.m);
+                let mn = t.str(f.m.name);
+                let n = Text.new(cx.arena);
+                match f.kind {
+                    FailKind.Missing { n.add("missing: ").add(want); }
+                    FailKind.Wrong { n.add("`").add(mn).add("` has the wrong signature: found `").add(f.found).add("`, the bound wants `").add(want).add("`"); }
+                    FailKind.Generic { n.add("`").add(mn).add("` is a generic method; a bound needs a plain one: `").add(want).add("`"); }
+                    FailKind.Element {
+                        if isTuple { n.add("a tuple has `").add(mn).add("` only when every element does; `").add(f.found).add("` does not"); }
+                        else { n.add("a derived `").add(mn).add("` needs it on every type argument; `").add(f.found).add("` does not have it"); }
+                    }
+                }
+                addNote(cx, &d, NoteKind.Note, n.str());
+            }
+            let m0 = fails.items[0].m;
+            let name = t.str(m0.name);
+            // Operators take the receiver by value; other methods usually by `&`.
+            let recv = cat3(cx, "&", tname, "");
+            if startsWith(name, "operator") { recv = tname; }
+            let decl0 = declared(cx, &m0);
+            let wantRef = replaceAll(cx, replaceAll(cx, decl0, "this: Self", cat3(cx, "this: ", recv, "")), "Self", tname);
+            let wantVal = replaceAll(cx, replaceAll(cx, decl0, "this: Self", cat3(cx, "x: ", tname, "")), "Self", tname);
+            let h = Text.new(cx.arena);
+            if isTuple {
+                h.add("give each element type `").add(name).add("` (a method, an `#[impl]` fn, or `#[derive(..)]`)");
+            } else {
+                let isStruct = false;
+                match t.ty(ty) { Ty.Struct(_) { isStruct = true; } _ {} }
+                if isStruct {
+                    h.add("add `").add(wantRef).add("` to `struct ").add(tname).add("`, or `#[impl] ").add(wantVal).add("` in a module that declares `")
+                        .add(failedName).add("` or defines `").add(tname).add("`");
+                } else {
+                    h.add("add `#[impl] ").add(wantVal).add("` in a module that declares `").add(failedName).add("`");
+                }
+            }
+            addNote(cx, &d, NoteKind.Help, h.str());
+            match hint {
+                Option.Some(m) {
+                    match lookup(cx, m, m0.name) {
+                        Option.Some(dr) {
+                            // Rust's `funcs` holds plain fns only: a generic fn of that name is no hint.
+                            if dr.kind == DeclKind.Fn && !isGenericFn(cx, dr.asFn()) {
+                                addNote(cx, &d, NoteKind.Help, Text.new(cx.arena).add("a plain fn `").add(name)
+                                    .add("` is in scope, but fns do not satisfy bounds; mark it `#[impl]`").str());
+                            }
+                        }
+                        Option.None {}
+                    }
+                }
+                Option.None {}
+            }
+            return Option.Some(d);
+        }
+    }
+    return Option.None;
+}
+
+fn isGenericFn(cx: &SemaCx, f: Id<FnDecl>): bool {
+    match cx.tables.fnAt(f).gen { Option.Some(_) { return true; } Option.None {} }
+    return false;
+}
+
+/// "`P` of `f`" (or `neededBy` alone when the request names no parameter).
+fn byOf(cx: &SemaCx, req: &BoundReq, neededBy: string): string {
+    if req.param.len == 0 { return neededBy; }
+    return Text.new(cx.arena).add("`").add(req.param).add("` of ").add(neededBy).str();
+}

@@ -2,4 +2,262 @@
 // Compiler, LSP, doc and fmt all parse through here; there is no second parser.
 //
 // Port of: j3c/src/parse/mod.rs, parse/parser/mod.rs
+// J3: Rust's `impl Parser` methods are `extend Parser { .. }` blocks, one per part file in `syntax/parse/`
+// (`.swarm-opus/11-port/contracts.md` lists which part owns which fn). Every parse fn returns
+// `Result<T, ParseError>` and propagates with `?`, as in Rust; a unit result is `Result<bool, ParseError>`
+// (`Ok(true)`), since stage 0 has no `Result<void, E>`. Rust `Expr`/`Type`/`Pat`/`Stmt` results are
+// `Id<..>` into `p.ast`. The entry fns return the first error like Rust; `report` turns it into a `Diag`.
+// J3: Error text is built with interpolation (frame strings) and copied into the arena by `err`/`errAt`
+// (AGENTS.md rule 1). Backtracking (`p.i = at`) leaves the abandoned nodes in the pools; nothing points
+// at them.
 module j3c.syntax.parse;
+
+use j3.data.pool.Id;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.text;
+use j3.text.Text;
+use j3c.base.diag.{ Diags, Severity };
+use j3c.base.intern.{ Sym, own };
+use j3c.base.span.{ Source, Span };
+use j3c.syntax.ast.{
+    ArrayLitExpr, ArrayType, AssignOpStmt, AssignStmt, Ast, AtomicExpr, AtomicOp, AtomicOrder, BinOp,
+    BinaryExpr, Block, CallExpr, CastExpr, ClosureLit, ClosureParam, ClosureType, ConstItem, DeferStmt,
+    EmbedExpr, EmbedKind, EnumItem, Expr, ExprStmt, ExtendItem, FieldExpr, FieldInit, FieldItem, File,
+    FnItem, FnType, ForEachStmt, ForStmt, GenericType, GpuStage, GpuStruct, Ident, IfExpr, IfStmt,
+    IndexExpr, InterpHole, InterpPart, InterpolateExpr, Item, JumpStmt, LabeledStmt, LetPatStmt, LetStmt,
+    LibFnDecl, LitPat, MatchArm, MatchStmt, ModLetItem, NamedType, Param, Pat, PatField, QuestionExpr,
+    RangePat, RefType, ReturnStmt, ScriptBlockItem, ScriptLetItem, ScriptLitExpr, SizeOfExpr, SliceExpr,
+    SliceFromExpr, SliceLitExpr, SliceType, Stmt, StructItem, StructLitExpr, StructPat, SyscallExpr,
+    TraitItem, TraitMethod, TryCatch, TupleExpr, TuplePat, TupleType, Type, TypePathExpr, UiChoiceExpr,
+    UnaryExpr, UnaryOp, UseItem, UseLibItem, UseLocalStmt, VariantItem, VariantPat, WhereBound, WhileStmt,
+    atomicOpAllows, atomicOpFromName, atomicOpName, atomicOpValues, atomicOrderFromName, atomicOrderName,
+    pathExpr, EmbedRead
+};
+use j3c.syntax.lex;
+use j3c.syntax.token.{
+    ATTR_DEBUG, ATTR_DERIVE, ATTR_IMPL, ATTR_SINGLETON, ATTR_THREAD, ATTR_TRY_CATCH, FN_WHERE,
+    INTRINSIC_J3UI, INTRINSIC_SCRIPT, INTRINSIC_SIZEOF, INTRINSIC_SLICE, INTRINSIC_SYSCALL,
+    INTRINSIC_UI_CHOICE, ITEM_EXTEND, ITEM_TRAIT, NameList, ParseError, SCRIPT_PROPS, SCRIPT_SHARED,
+    TYPE_BOXED, TYPE_CLOSURE, TYPE_DYN, Token, TokenKind, isIn, isJ3uiWidget, joinNames, names, operatorSrc,
+    parseError
+};
+
+/// Attributes before an item (Rust `ItemAttrs`), filled by `attrs()`.
+pub struct ItemAttrs {
+    debug: bool;
+    tryCatch: Option<TryCatch>;
+    /// `#[derive(Eq, Hash, ..)]` without `Debug` (which sets `debug`).
+    derives: List<Ident>;
+    singleton: bool;
+    thread: bool;
+    implFn: bool;
+    /// `#[shader]`, `#[shader(vertex)]`, `#[shader(fragment)]`.
+    shader: Option<GpuStage>;
+    gpuStruct: GpuStruct;
+    uniform: bool;
+    flat: bool;
+}
+
+/// The parser state over one file's tokens. `toks` ends with an `Eof` token.
+pub struct Parser {
+    toks: List<Token>;
+    i: int;
+    ast: &Ast;
+    /// First parameter name while parsing an `@j3ui` body.
+    j3uiRecv: Option<Sym>;
+    /// A script's module path (from its file path); `None` for a `.j3` file.
+    scriptModule: Option<List<Sym>>;
+    /// Trait names written as `dyn Name`, for `File.dyns`.
+    dyns: List<Sym>;
+
+    /// A parser at the first of `toks`.
+    fn new(toks: List<Token>, ast: &Ast): Parser {
+        return Parser { toks: toks, i: 0, ast: ast, j3uiRecv: Option.None, scriptModule: Option.None, dyns: List<Sym>.new(ast.arena) };
+    }
+
+    /// An identifier (or `this`) as an `Ident`, interned.
+    fn ident(this: &Parser): Result<Ident, ParseError> {
+        let tok = this.cur();
+        if tok.kind != TokenKind.Ident && tok.kind != TokenKind.This { return Result.Err(this.err("expected identifier")); }
+        this.bump();
+        return Result.Ok(Ident { name: this.ast.sym(tok.text), span: tok.span });
+    }
+
+    /// Consume a `kind` token, else fail with `message` (a missing `;` points just past the previous token).
+    fn expect(this: &Parser, kind: TokenKind, message: string): Result<Token, ParseError> {
+        if this.cur().kind == kind { return Result.Ok(this.bump()); }
+        if kind == TokenKind.Semi && this.i > 0 {
+            let end = this.toks.items[this.i - 1].span.hi;
+            return Result.Err(this.errAt(Span { file: this.cur().span.file, lo: end, hi: end + 1 }, message));
+        }
+        return Result.Err(this.err(message));
+    }
+
+    /// Consume the current token when it is `kind`.
+    fn eat(this: &Parser, kind: TokenKind): bool {
+        if this.cur().kind != kind { return false; }
+        this.bump();
+        return true;
+    }
+
+    /// True when the current token is `kind`.
+    fn at(this: &Parser, kind: TokenKind): bool { return this.cur().kind == kind; }
+
+    /// An error at the current token; `message` is copied into the arena.
+    fn err(this: &Parser, message: string): ParseError { return parseError(this.ast.arena, this.cur().span, message); }
+
+    /// An error at `span`; `message` is copied into the arena.
+    fn errAt(this: &Parser, span: Span, message: string): ParseError { return parseError(this.ast.arena, span, message); }
+
+    /// The current token.
+    fn cur(this: &Parser): Token { return this.toks.items[this.i]; }
+
+    /// The token `n` ahead (the last one, `Eof`, past the end).
+    fn look(this: &Parser, n: int): Token {
+        let i = this.i + n;
+        if i < this.toks.len { return this.toks.items[i]; }
+        return this.toks.items[this.toks.len - 1];
+    }
+
+    /// The current token, then step past it (never past `Eof`).
+    fn bump(this: &Parser): Token {
+        let t = this.toks.items[this.i];
+        if t.kind != TokenKind.Eof { this.i += 1; }
+        return t;
+    }
+
+    /// The previous token's span, `fallback` at the start.
+    fn prevEnd(this: &Parser, fallback: Span): Span {
+        if this.i == 0 { return fallback; }
+        return this.toks.items[this.i - 1].span;
+    }
+
+    /// `join(start, prevEnd(start))`: from `start` to the end of the last token consumed.
+    fn since(this: &Parser, start: Span): Span { return join(start, this.prevEnd(start)); }
+}
+
+/// `a`'s file, from `a.lo` to the later end.
+pub fn join(a: Span, b: Span): Span {
+    let hi = a.hi;
+    if b.hi > hi { hi = b.hi; }
+    return Span { file: a.file, lo: a.lo, hi: hi };
+}
+
+/// `name` at `span` (Rust `ident_at`).
+pub fn identAt(ast: &Ast, name: string, span: Span): Ident { return Ident { name: ast.sym(name), span: span }; }
+
+/// Parse one `.j3` file's text (Rust `parse`).
+pub fn parseFile(src: string, file: Id<Source>, ast: &Ast): Result<File, ParseError> {
+    let toks = lex.lex(src, file, ast.arena)?;
+    return parseTokens(toks, ast);
+}
+
+/// Parse a `.j3s` script: no `module` line, its module path is `modulePath` (Rust `parse_script`).
+pub fn parseScript(src: string, file: Id<Source>, modulePath: []string, ast: &Ast): Result<File, ParseError> {
+    let toks = lex.lex(src, file, ast.arena)?;
+    let parts = List<Sym>.new(ast.arena);
+    for i in 0..modulePath.len { parts.push(ast.sym(modulePath[i])); }
+    let p = Parser.new(toks, ast);
+    p.scriptModule = Option.Some(parts);
+    return p.file();
+}
+
+/// Parse a token list as a `.j3` file (Rust `parse_tokens`).
+pub fn parseTokens(toks: List<Token>, ast: &Ast): Result<File, ParseError> {
+    let p = Parser.new(toks, ast);
+    return p.file();
+}
+
+/// Items parsed from generated source (`#[derive]`), every span set to `at` so an error in them points at
+/// the line that asked for them (Rust `parse_items_at`).
+pub fn parseItemsAt(src: string, at: Span, ast: &Ast): Result<List<Item>, ParseError> {
+    let t = Text.new(ast.arena);
+    t.add("module derived;\n").add(src);
+    let toks = lex.lex(t.str(), at.file, ast.arena)?;
+    for i in 0..toks.len { toks.items[i].span = at; }
+    let f = parseTokens(toks, ast)?;
+    return Result.Ok(f.items);
+}
+
+/// Add `e` to `diags` as an error with no code yet (renders as Rust's `format_error`).
+pub fn report(e: ParseError, diags: &Diags) {
+    diags.add(diags.make(0, Severity.Error, e.span, e.msg));
+}
+
+/// An int literal: `Int`, or `BigInt` above `i64` max (only a `u64` takes it). Err is the message, in
+/// `arena`.
+pub fn parseInt(text: string, arena: &Arena): Result<Expr, string> {
+    let base: u64 = 10;
+    let digits = text;
+    let what = "integer";
+    if text.len >= 2 && text[0] == '0' && text[1] == 'x' { base = 16; digits = text[2..text.len]; what = "hex literal"; }
+    else if text.len >= 2 && text[0] == '0' && text[1] == 'b' { base = 2; digits = text[2..text.len]; what = "binary literal"; }
+    let max: u64 = 18446744073709551615;
+    let v: u64 = 0;
+    let ok = digits.len > 0;
+    for i in 0..digits.len {
+        let c = digits[i];
+        let d: u64 = 99;
+        if c >= '0' && c <= '9' { d = u64(c - '0'); }
+        else if c >= 'a' && c <= 'f' { d = u64(c - 'a') + 10; }
+        else if c >= 'A' && c <= 'F' { d = u64(c - 'A') + 10; }
+        if d >= base || v > (max - d) / base { ok = false; break; }
+        v = v * base + d;
+    }
+    if !ok {
+        let t = Text.new(arena);
+        t.add(what).add(" `").add(text).add("` does not fit 64 bits");
+        return Result.Err(t.str());
+    }
+    if v > 9223372036854775807 { return Result.Ok(Expr.BigInt(v)); }
+    return Result.Ok(Expr.Int(i64(v)));
+}
+
+/// The parts of an interpolated string token's text (`` `a{x}b` `` without the backticks; `span` is the
+/// token's). Byte-level, which matches Rust's char walk: `{`/`}` are ASCII.
+pub fn splitInterp(ast: &Ast, text: string, span: Span): Result<List<InterpPart>, ParseError> {
+    let parts = List<InterpPart>.new(ast.arena);
+    let lit = 0;
+    let i = 0;
+    while i < text.len {
+        if text[i] == '{' {
+            if i > lit { parts.push(InterpPart.Lit(own(ast.arena, text[lit..i]))); }
+            i += 1;
+            let holeStart = i;
+            let depth = 1;
+            while i < text.len && depth > 0 {
+                if text[i] == '{' { depth += 1; }
+                else if text[i] == '}' {
+                    depth -= 1;
+                    if depth == 0 { break; }
+                }
+                i += 1;
+            }
+            if depth != 0 { return Result.Err(parseError(ast.arena, span, "unterminated interpolate hole")); }
+            if holeStart == i { return Result.Err(parseError(ast.arena, span, "empty interpolate hole")); }
+            let e = parseHoleExpr(ast, text[holeStart..i], span, span.lo + 1 + u32(holeStart))?;
+            parts.push(InterpPart.Expr(InterpHole { expr: e }));
+            i += 1;
+            lit = i;
+            continue;
+        }
+        i += 1;
+    }
+    if text.len > lit { parts.push(InterpPart.Lit(own(ast.arena, text[lit..text.len]))); }
+    return Result.Ok(parts);
+}
+
+/// One `{hole}`: lexed alone, spans moved to `base` in the file.
+fn parseHoleExpr(ast: &Ast, src: string, span: Span, base: u32): Result<Id<Expr>, ParseError> {
+    let toks = lex.lex(src, span.file, ast.arena)?;
+    for i in 0..toks.len {
+        toks.items[i].span.lo += base;
+        toks.items[i].span.hi += base;
+    }
+    let p = Parser.new(toks, ast);
+    let e = p.expr()?;
+    if p.cur().kind != TokenKind.Eof { return Result.Err(parseError(ast.arena, span, "trailing junk in interpolate hole")); }
+    return Result.Ok(e);
+}

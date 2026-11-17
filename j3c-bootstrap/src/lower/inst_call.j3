@@ -1,0 +1,108 @@
+// Calls of generic instances: Rust lowers the arguments that fix the type arguments before it makes the
+// instance, and takes the receiver's `&` after, so the temporaries and the fn list come out in that order.
+//
+// Part of module j3c.lower.
+// Port of: check/lower/generic_fn.rs (call_generic, call_method_inferred: the order of lowering only; the
+// inference and its errors are sema's `gen_call.j3` / `gen_method.j3`)
+// J3: Which fn, which type args and every argument's type are on the typed tree; this file only replays
+// Rust's order: receiver place, the arguments lowered before the type args were known, the instance (its IR
+// fn on first use), `_thisN = &recv`, then the arguments that waited for a parameter type.
+module j3c.lower;
+
+extend FnLower {
+    /// A call of `Fn` instance `inst` whose template has type parameters of its own (a generic fn, a
+    /// trait default body, a generic method). A method of a generic struct instance with none goes the
+    /// plain way (`call`): its IR fn exists since the struct instance was made.
+    /// A generic method with written type args (`Origin.TypeArgs`): receiver place, instance, `_thisN`,
+    /// then the arguments in order.
+    // ponytail: an array given where `[]T` is wanted is turned into a slice where it is lowered; Rust's
+    // `adapt_arg` does it after every argument (differs only with a later argument that makes temporaries).
+    fn instCall(this: &FnLower, e: Id<TExpr>, callee: Callee, inst: Id<Instance>, args: &List<Id<TExpr>>): Rvalue {
+        let sp = this.spanOf(e);
+        let ret = this.tyOf(e);
+        let t = this.lw.t;
+        let ir = this.ir();
+        let fd = t.fnAt(Id<FnDecl> { i: t.instanceAt(inst).key.item.i });
+        let gen = Id<Generics> { i: 0 };
+        match fd.gen { Option.Some(g) { gen = g; } Option.None { panic("lower: an instance of a fn that is not a template"); } }
+        let parent = t.genericsAt(gen).names.len - instOwnParams(this.lw, gen);
+        let method = false;
+        match fd.recv { Option.Some(_) { method = true; } Option.None {} }
+        let ops = List<Operand>.new(this.cx.arena);
+        let done = List<bool>.new(this.cx.arena);
+        for i in 0..args.len { ops.push(this.bool(sp, false)); done.push(false); }
+        // A generic enum's derived fn is found by the left operand's type (Rust `find_op` / `impl_target`
+        // -> `enum_derived`): the instance comes before the other arguments.
+        let derived = fd.enumDerived;
+        let early = !method && !derived;
+        let written = this.lw.typed.origin(e) == Origin.TypeArgs;
+        if method && !(fd.params.len > 0 && ir.nameStr(fd.params.items[0].name) == "this") {
+            // A static generic method has its type args written: the instance first, then the arguments.
+            let sid = this.calleeFn(callee);
+            for i in 0..args.len { ops.items[i] = this.operand(args.items[i]); }
+            return Rvalue.call(sp, ret, opFnAddr(sp, ir.funcMut(sid).ty, sid), ops);
+        }
+        let recv: Option<Place> = Option.None;
+        if args.len > 0 {
+            match this.node(args.items[0]) {
+                TExpr.AddrOf(r) {
+                    if this.lw.typed.origin(args.items[0]) == Origin.AutoRef { recv = Option.Some(this.place(r.place, "recv")); done.items[0] = true; }
+                }
+                _ {}
+            }
+        }
+        for i in 0..args.len {
+            // A closure literal waits for the instance (Rust `Slot::Later`, generic_fn.rs:101).
+            if done.items[i] || this.closureIsLit(args.items[i]) { continue; }
+            if early || i == 0 || (!derived && !written && instMentionsOwn(t, gen, parent, fd.params.items[i].ty)) {
+                ops.items[i] = this.operand(args.items[i]);
+                done.items[i] = true;
+            }
+        }
+        let id = this.calleeFn(callee);
+        match recv {
+            // Rust `auto_this` TakeRef: `_thisN = &recv`.
+            Option.Some(p) { ops.items[0] = Operand.Copy(this.spill("this", Rvalue.refPlace(sp, this.tyOf(args.items[0]), p), sp)); }
+            Option.None {}
+        }
+        for i in 0..args.len {
+            if !done.items[i] { ops.items[i] = this.operand(args.items[i]); }
+        }
+        return Rvalue.call(sp, ret, opFnAddr(sp, ir.funcMut(id).ty, id), ops);
+    }
+}
+
+/// Is `inst` an instance of a template with type parameters of its own (`instCall`'s callees)?
+fn instHasOwnParams(lw: &Lw, inst: Id<Instance>): bool {
+    let key = lw.t.instanceAt(inst).key;
+    if key.kind != InstKind.Fn { return false; }
+    match lw.t.fnAt(Id<FnDecl> { i: key.item.i }).gen {
+        Option.Some(g) { return instOwnParams(lw, g) > 0; }
+        Option.None {}
+    }
+    return false;
+}
+
+/// Rust `mentions` with a method's own type parameters: does `ty` name a parameter of `gen` at index
+/// `parent` or above (the first `parent` repeat the struct's)?
+fn instMentionsOwn(t: &Tables, gen: Id<Generics>, parent: int, ty: Id<Ty>): bool {
+    match t.ty(ty) {
+        Ty.Param(p) { return p.gen == gen && p.index >= parent; }
+        Ty.Ref(r) { return instMentionsOwn(t, gen, parent, r.inner); }
+        Ty.Array(a) { return instMentionsOwn(t, gen, parent, a.elem); }
+        Ty.Slice(s) { return instMentionsOwn(t, gen, parent, s.elem); }
+        Ty.Fn(f) { return instMentionsAny(t, gen, parent, f.params) || instMentionsOwn(t, gen, parent, f.ret); }
+        Ty.Closure(c) { return instMentionsAny(t, gen, parent, c.params) || instMentionsOwn(t, gen, parent, c.ret); }
+        Ty.Struct(s) { return instMentionsAny(t, gen, parent, s.args); }
+        Ty.Enum(en) { return instMentionsAny(t, gen, parent, en.args); }
+        Ty.Tuple(tu) { return instMentionsAny(t, gen, parent, tu.elems); }
+        _ {}
+    }
+    return false;
+}
+
+fn instMentionsAny(t: &Tables, gen: Id<Generics>, parent: int, l: Id<TyList>): bool {
+    let xs = t.items(l);
+    for i in 0..xs.len { if instMentionsOwn(t, gen, parent, xs[i]) { return true; } }
+    return false;
+}

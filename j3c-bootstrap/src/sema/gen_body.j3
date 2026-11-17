@@ -1,0 +1,275 @@
+// Generic bodies: the typing of each requested `Fn` instance's own body with concrete types, its errors
+// with Rust's "while instantiating" note, and the definition-site pass over templates.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/defcheck.rs (templates checked once against their bounds, B11.1),
+// check/lower/generic_fn.rs (site_note, mod_origin_key: the "while instantiating" note),
+// check/lower/lazy.rs (instance bodies typed only when requested, B11.2), check/lower/setup.rs
+// (lower_fn's instance note), check/lower/mod.rs (the instance half of the lower_module queue),
+// emit/c_expr/names.rs (stable_ty: the instance name in the note)
+// J3: `checkTemplates` runs once before any body (`checkProgram`); `genTemplateBody` is where `typeFn`
+// sends a template; `genDrainFn` is `instances.drain`'s `Fn` work (`typeBody(cx, decl, Some(id))`, stored
+// in `Instance.body`); `genInstErrors` reports an instance body's errors.
+module j3c.sema;
+
+/// Rust `defcheck::check_defs`: every generic fn, trait default and generic-struct or generic method body
+/// typed once with its parameters as `Ty.Param` (their bounds' methods only), per module in item order.
+/// Only bound misses are kept (the Diags starting "type parameter `", `trait_bounds.unmetBound` /
+/// `trait_call.boundMiss`); every other template error is reported per instance (`genInstErrors`). A
+/// failed template goes in `Tables.defFailed`, so its instances stay quiet. Like Rust's throwaway `IrCx`,
+/// nothing the pass requests or leaves untyped survives it.
+pub fn checkTemplates(cx: &SemaCx) {
+    let t = cx.tables;
+    for i in 0..t.mods.len() {
+        let m = t.mods.idAt(i);
+        let md = t.modAt(m);
+        if md.isLib || md.isScript { continue; }
+        let si = 0;
+        let ti = 0;
+        for k in 0..md.items.len {
+            match md.items.items[k] {
+                Item.Fn(f) {
+                    if f.typeParams.len == 0 { continue; }
+                    match f.shader { Option.Some(_) { continue; } Option.None {} }
+                    match scopeOf(cx, m, f.name.name, DeclKind.Fn) {
+                        Option.Some(d) { if t.fnAt(d.asFn()).owner == m { checkTemplate(cx, d.asFn()); } }
+                        Option.None {}
+                    }
+                }
+                Item.Trait(_) {
+                    let ms = t.traitAt(md.traits.items[ti]).methods;
+                    ti += 1;
+                    for j in 0..ms.len {
+                        match ms.items[j].default { Option.Some(d) { checkTemplate(cx, d); } Option.None {} }
+                    }
+                }
+                Item.Struct(_) {
+                    let ms = t.structAt(md.structs.items[si]).methods;
+                    si += 1;
+                    for j in 0..ms.len {
+                        match t.fnAt(ms.items[j]).gen { Option.Some(_) { checkTemplate(cx, ms.items[j]); } Option.None {} }
+                    }
+                }
+                _ {}
+            }
+        }
+    }
+}
+
+/// One template's placeholder pass (Rust `check_def`), rolled back but for its bound misses.
+fn checkTemplate(cx: &SemaCx, f: Id<FnDecl>) {
+    let t = cx.tables;
+    let n0 = cx.diags.items.len;
+    let i0 = t.instances.len();
+    typeBody(cx, f, Option.None);
+    // `Map<T, V>` in the body: does the placeholder meet `Map`'s bounds? (Rust defcheck.rs:219)
+    for i in i0..t.instances.len() {
+        let id = t.instances.idAt(i);
+        if t.instanceAt(id).key.kind == InstKind.Bound { traitDrainBound(cx, id, Option.None); }
+    }
+    for i in i0..t.instances.len() { t.instMap.remove(t.instances.items.items[i].key); }
+    t.instances.items.len = i0;
+    let kept = n0;
+    for i in n0..cx.diags.items.len {
+        let d = cx.diags.items.items[i];
+        if startsWith(d.msg, "type parameter `") {
+            cx.diags.items.items[kept] = d;
+            kept += 1;
+        }
+    }
+    cx.diags.items.len = kept;
+    if kept > n0 { t.defFailed.add(f); }
+}
+
+/// `typeFn` on a template (generic fn, or any method of a generic struct): None. Templates are never
+/// lowered; their instances are typed by `genDrainFn`.
+pub fn genTemplateBody(cx: &SemaCx, f: Id<FnDecl>): Option<Id<TBody>> { return Option.None; }
+
+/// `instances.drain` for an `InstKind.Fn` instance: type its body at its args (`typeBody`), set
+/// `Instance.body`. Errors in the body are Diags (`genInstErrors`), not a failed drain: every instance
+/// is typed, as Rust lowers every queued instance. False only when the key names no fn.
+pub fn genDrainFn(cx: &SemaCx, id: Id<Instance>): bool {
+    let key = cx.tables.instanceAt(id).key;
+    if key.item.kind != DeclKind.Fn { return notPorted(cx.diags, "sema instance of a non-fn"); }
+    let f = key.item.asFn();
+    match cx.tables.fnAt(f).kind {
+        FnKind.J3 {}
+        _ { return true; }
+    }
+    let b = typeBody(cx, f, Option.Some(id));
+    cx.tables.instanceAt(id).body = b;
+    return true;
+}
+
+extend BodyCx {
+    /// The errors of instance `inst`'s body (`this.errs`, non-empty): reported with
+    /// Rust's instance note on each.
+    fn genInstErrors(this: &BodyCx, inst: Id<Instance>) {
+        // Rust `def_failed`: the template's own pass already reported it.
+        if this.cx.tables.defFailed.has(this.f) { this.errs.clear(); return; }
+        match this.instNote(inst) {
+            Option.Some(n) {
+                for i in 0..this.errs.len { this.errs.items[i] = this.note(this.errs.items[i], n); }
+            }
+            Option.None {}
+        }
+        this.flushErrs();
+    }
+
+    /// Rust `lower_fn`'s `inst_note`: a generic fn instance or a non-generic method of a generic struct
+    /// instance says where it was first requested (`site_note`); a generic method says which template it
+    /// came from when that is another module's (`while instantiating `S` (from PATH)`).
+    /// ponytail: Rust's "from" path is the module whose lowering queue reached the instance; this is the
+    /// module of the first request's file, which differs only for an instance requested by another
+    /// instance's body.
+    fn instNote(this: &BodyCx, inst: Id<Instance>): Option<string> {
+        let t = this.cx.tables;
+        let i = *t.instanceAt(inst);
+        let d = *t.fnAt(this.f);
+        let n = Text.new(this.cx.arena);
+        match d.recv {
+            Option.None {
+                n.add("while instantiating `").add(this.str(d.name)).add("<");
+                let xs = t.items(i.key.args);
+                for k in 0..xs.len {
+                    if k > 0 { n.add(","); }
+                    stableTyName(t, xs[k], &n, 0);
+                }
+                n.add(">` (called at ").add(lineOf(this.cx, i.at)).add(")");
+                return Option.Some(n.str());
+            }
+            Option.Some(s) {
+                let sd = t.structAt(s);
+                if this.ownParams(this.f) == 0 {
+                    n.add("while instantiating `").add(this.str(sd.name)).add("<");
+                    let xs = t.items(i.key.args);
+                    for k in 0..xs.len {
+                        if k > 0 { n.add(", "); }
+                        tyName(t, xs[k], &n);
+                    }
+                    n.add(">.").add(this.str(d.name)).add("` (called at ").add(lineOf(this.cx, i.at)).add(")");
+                    return Option.Some(n.str());
+                }
+                let from = "";
+                match this.modOfFile(i.at.file) {
+                    Option.Some(m) {
+                        let md = t.modAt(m);
+                        if md.files.len > 0 { from = this.cx.parsed.files.items[md.files.items[0]].path; }
+                    }
+                    Option.None {}
+                }
+                if from == this.path || from.len == 0 { return Option.None; }
+                n.add("while instantiating `").add(this.str(sd.name)).add("` (from ").add(from).add(")");
+                return Option.Some(n.str());
+            }
+        }
+        return Option.None;
+    }
+
+    /// The module that has source `file`.
+    fn modOfFile(this: &BodyCx, file: Id<Source>): Option<Id<ModDecl>> {
+        let t = this.cx.tables;
+        let files = this.cx.parsed.files;
+        for i in 0..t.mods.len() {
+            let m = t.mods.idAt(i);
+            let md = t.modAt(m);
+            for k in 0..md.files.len {
+                if files.items[md.files.items[k]].src == file { return Option.Some(m); }
+            }
+        }
+        return Option.None;
+    }
+}
+
+/// Rust `stable_ty`: type text without intern ids (`int`, `&T`, `[]T`, `fn(A,B)R`,
+/// `module_ident.Name<P=T,..>`, `module_ident.E{V:T;..}`), as instance names spell their type args. A
+/// struct or enum instance's module is the one that first made it (`Tables.tyHome`).
+fn stableTyName(t: &Tables, ty: Id<Ty>, out: &Text, depth: int) {
+    if depth > 32 { out.add("rec"); return; }
+    let d = depth + 1;
+    match t.ty(ty) {
+        Ty.Ref(r) { out.add("&"); stableTyName(t, r.inner, out, d); }
+        Ty.Array(a) {
+            out.add("[");
+            out.pushInt(i64(a.len));
+            out.add("]");
+            stableTyName(t, a.elem, out, d);
+        }
+        Ty.Slice(s) { out.add("[]"); stableTyName(t, s.elem, out, d); }
+        Ty.Fn(f) {
+            out.add("fn(");
+            let ps = t.items(f.params);
+            for i in 0..ps.len {
+                if i > 0 { out.add(","); }
+                stableTyName(t, ps[i], out, d);
+            }
+            out.add(")");
+            stableTyName(t, f.ret, out, d);
+        }
+        Ty.Struct(s) {
+            let sd = t.structAt(s.decl);
+            stableModIdent(t, instHome(t, ty, sd.owner), out);
+            out.add(".").add(t.str(sd.name));
+            let xs = t.items(s.args);
+            match sd.gen {
+                Option.Some(g) {
+                    if xs.len > 0 {
+                        out.add("<");
+                        for i in 0..xs.len {
+                            if i > 0 { out.add(","); }
+                            out.add(t.str(t.genericsAt(g).names.items[i])).add("=");
+                            stableTyName(t, xs[i], out, d);
+                        }
+                        out.add(">");
+                    }
+                }
+                Option.None {}
+            }
+        }
+        Ty.Enum(e) {
+            let ed = t.enumAt(e.decl);
+            stableModIdent(t, instHome(t, ty, ed.owner), out);
+            out.add(".").add(t.str(ed.name)).add("{");
+            for i in 0..ed.variants.len {
+                let v = ed.variants.items[i];
+                out.add(t.str(v.name));
+                match v.payload {
+                    Option.Some(p) {
+                        let pt = p;
+                        match ed.gen { Option.Some(g) { pt = subst(t, g, p, e.args); } Option.None {} }
+                        out.add(":");
+                        stableTyName(t, pt, out, d);
+                    }
+                    Option.None {}
+                }
+                out.add(";");
+            }
+            out.add("}");
+        }
+        _ { tyName(t, ty, out); }
+    }
+}
+
+/// Rust `c_ty::module_ident`: the module path's parts sanitized, joined by `_` (`mod` when empty).
+fn stableModIdent(t: &Tables, m: Id<ModDecl>, out: &Text) {
+    let parts = t.modAt(m).path;
+    if parts.len == 0 { out.add("mod"); return; }
+    for i in 0..parts.len {
+        if i > 0 { out.add("_"); }
+        let s = t.str(parts.items[i]);
+        if s.len == 0 { out.add("x"); continue; }
+        if s[0] >= '0' && s[0] <= '9' { out.add("_"); }
+        for k in 0..s.len {
+            let c = s[k];
+            if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' { out.push(c); }
+            else if (c & 0xC0) != 0x80 { out.push('_'); }
+        }
+    }
+}
+
+/// The module a struct/enum type's spelling names: where the instance was first made, else `owner`.
+fn instHome(t: &Tables, ty: Id<Ty>, owner: Id<ModDecl>): Id<ModDecl> {
+    let generic = match t.ty(ty) { Ty.Struct(s) { t.items(s.args).len > 0 } Ty.Enum(e) { t.items(e.args).len > 0 } _ { false } };
+    if generic { match t.tyHome(ty) { Option.Some(h) { return h; } Option.None {} } }
+    return owner;
+}

@@ -1,0 +1,454 @@
+// Binary operators (short-circuit, comparisons, arithmetic, user `operator..` methods and their
+// comparison fallbacks), number and char literals typed by context, and int constant folding.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/binop.rs (typing half: `abort_if_zero` and the short-circuit blocks are `lower`'s),
+// check/lower/streq.rs (`==` on strings is `BinKind.String`), check/mod.rs `bare_num`, ir/wrap.rs
+// `fold_bin`/`fold_neg` (sema cannot use `j3c.ir`)
+// J3: An untyped literal takes the other operand's type (or the destination's), exactly Rust's order of
+// `operand` calls, so the same programs type and the same ones fail.
+// J3: `#[impl]` operators (`j3.cmp`'s `operator<` on strings), tuple `==` and simd are C2b; `findOp` sees a
+// struct's own operator methods.
+module j3c.sema;
+
+extend BodyCx {
+    fn binary(this: &BodyCx, sp: Span, op: BinOp, lhs: Id<Expr>, rhs: Id<Expr>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let c = this.com();
+        match op {
+            BinOp.And { return this.shortCircuit(sp, op, lhs, rhs); }
+            BinOp.Or { return this.shortCircuit(sp, op, lhs, rhs); }
+            BinOp.Eq { return this.compare(sp, op, lhs, rhs); }
+            BinOp.Ne { return this.compare(sp, op, lhs, rhs); }
+            BinOp.Lt { return this.compare(sp, op, lhs, rhs); }
+            BinOp.Le { return this.compare(sp, op, lhs, rhs); }
+            BinOp.Gt { return this.compare(sp, op, lhs, rhs); }
+            BinOp.Ge { return this.compare(sp, op, lhs, rhs); }
+            _ {}
+        }
+        return this.arith(sp, op, lhs, rhs, want);
+    }
+
+    fn bin(this: &BodyCx, sp: Span, op: BinOp, kind: BinKind, l: Id<TExpr>, r: Id<TExpr>, t: Id<Ty>): Id<TExpr> {
+        return this.expr(TExpr.Binary(TBinary { op: op, kind: kind, lhs: l, rhs: r }), t, sp);
+    }
+
+    fn shortCircuit(this: &BodyCx, sp: Span, op: BinOp, lhs: Id<Expr>, rhs: Id<Expr>): Result<Id<TExpr>, TErr> {
+        let b = this.com().bool;
+        let l = this.operand(lhs, Option.Some(b))?;
+        let r = this.operand(rhs, Option.Some(b))?;
+        return Result.Ok(this.bin(sp, op, BinKind.ShortCircuit, l, r, b));
+    }
+
+    fn compare(this: &BodyCx, sp: Span, op: BinOp, lhs: Id<Expr>, rhs: Id<Expr>): Result<Id<TExpr>, TErr> {
+        let c = this.com();
+        let opStr = Text.new(this.cx.arena);
+        opStr.add("`").add(binOpStr(op)).add("`");
+        if this.bareNum(lhs) && !this.bareNum(rhs) {
+            let r = this.operand(rhs, Option.None)?;
+            let rt = this.exprTy(r);
+            if this.isHalf(rt) { return Result.Err(this.halfError(sp, opStr.str())); }
+            if this.isVec(rt) { return Result.Err(this.simdCompareErr(sp, op)); }
+            if this.isNumeric(rt) {
+                let l = this.operand(lhs, Option.Some(rt))?;
+                if this.exprTy(l) != rt { return Result.Err(this.err(sp, "compare type mismatch")); }
+                return Result.Ok(this.bin(sp, op, BinKind.Prim, l, r, c.bool));
+            }
+            if this.isPtrTy(rt) && this.foldIsZero(lhs) {
+                let l = this.expr(TExpr.Null, rt, this.cx.ast.exprSpan(lhs));
+                return Result.Ok(this.bin(sp, op, BinKind.Prim, l, r, c.bool));
+            }
+            return Result.Err(this.err(sp, "compare type mismatch"));
+        }
+        let l = this.operand(lhs, Option.None)?;
+        let lt = this.exprTy(l);
+        if this.isHalf(lt) { return Result.Err(this.halfError(sp, opStr.str())); }
+        if this.isVec(lt) { return Result.Err(this.simdCompareErr(sp, op)); }
+        match this.traitBinary(sp, op, l, rhs)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+        match this.findOp(sp, lt, op)? {
+            Option.Some(f) { return this.opCall(sp, f, l, rhs); }
+            Option.None {}
+        }
+        match this.tupleCompare(sp, op, l, rhs)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+        match this.operatorFallback(sp, op, l, rhs)? {
+            Option.Some(v) { return Result.Ok(v); }
+            Option.None {}
+        }
+        let r: Id<TExpr> = l;
+        if this.isPtrTy(lt) && this.foldIsZero(rhs) {
+            r = this.expr(TExpr.Null, lt, this.cx.ast.exprSpan(rhs));
+        } else {
+            r = this.operand(rhs, Option.Some(lt))?;
+        }
+        if this.exprTy(r) != lt {
+            if this.isPtrTy(this.exprTy(r)) && this.foldIsZero(lhs) {
+                let nl = this.expr(TExpr.Null, this.exprTy(r), this.cx.ast.exprSpan(lhs));
+                return Result.Ok(this.bin(sp, op, BinKind.Prim, nl, r, c.bool));
+            }
+            return Result.Err(this.err(sp, "compare type mismatch"));
+        }
+        if op == BinOp.Eq || op == BinOp.Ne {
+            if this.isDyn(lt) { return Result.Err(this.dynCompareErr(sp, op, lt)); }
+            if this.eqNeedsOperator(lt) {
+                let s = binOpStr(op);
+                let t = Text.new(this.cx.arena);
+                t.add("`").add(s).add("` does not compare structs or enums with payloads; compare the fields, or define `fn operator").add(s)
+                    .add("(this, other: T): bool` on it");
+                return Result.Err(this.err(sp, t.str()));
+            }
+            if lt == c.string { return Result.Ok(this.bin(sp, op, BinKind.String, l, r, c.bool)); }
+        }
+        if (op == BinOp.Lt || op == BinOp.Le || op == BinOp.Gt || op == BinOp.Ge) && lt == c.string {
+            let t = Text.new(this.cx.arena);
+            t.add("`").add(binOpStr(op)).add("` does not order strings; compare bytes in a loop; `==` / `!=` test equality");
+            return Result.Err(this.err(sp, t.str()));
+        }
+        return Result.Ok(this.bin(sp, op, BinKind.Prim, l, r, c.bool));
+    }
+
+    fn arith(this: &BodyCx, sp: Span, op: BinOp, lhs: Id<Expr>, rhs: Id<Expr>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let c = this.com();
+        let opStr = Text.new(this.cx.arena);
+        opStr.add("`").add(binOpStr(op)).add("`");
+        let numWant: Option<Id<Ty>> = Option.None;
+        match want { Option.Some(t) { if this.isNumeric(t) { numWant = want; } } Option.None {} }
+        if this.bareNum(lhs) && !this.bareNum(rhs) {
+            let r = this.operand(rhs, numWant)?;
+            let rt = this.exprTy(r);
+            if this.isHalf(rt) { return Result.Err(this.halfError(sp, opStr.str())); }
+            if this.isVec(rt) { return this.simdArithRev(sp, op, lhs, r); }
+            if !this.isNumeric(rt) {
+                let e = this.err(sp, "arithmetic type mismatch");
+                // Rust `find_op`: an own operator method, else an `#[impl]` one.
+                let opFn = this.findOp(sp, rt, op)?;
+                match opFn {
+                    Option.None {
+                        match operatorName(op) { Option.Some(n) { opFn = implFor(this.cx, this.sym(n), derefAll(this.cx.tables, rt)); } Option.None {} }
+                    }
+                    Option.Some(_) {}
+                }
+                match opFn {
+                    Option.Some(_) {
+                        let h = Text.new(this.cx.arena);
+                        let ts = this.tyStr(rt);
+                        h.add("`operator").add(binOpStr(op)).add("` is a method of `").add(ts).add("`, so the `").add(ts)
+                            .add("` goes on the left: put the number on the right");
+                        return Result.Err(this.help(e, h.str()));
+                    }
+                    Option.None {}
+                }
+                return Result.Err(e);
+            }
+            let l = this.operand(lhs, Option.Some(rt))?;
+            if this.exprTy(l) != rt { return Result.Err(this.err(sp, "arithmetic type mismatch")); }
+            this.intOnly(op, rt, sp)?;
+            return Result.Ok(this.bin(sp, op, BinKind.Prim, l, r, rt));
+        }
+        // Both sides untyped: the left takes the destination's numeric type.
+        let leftWant: Option<Id<Ty>> = Option.None;
+        if this.bareNum(lhs) { leftWant = numWant; }
+        let l = this.operand(lhs, leftWant)?;
+        let lt = this.exprTy(l);
+        if this.isHalf(lt) { return Result.Err(this.halfError(sp, opStr.str())); }
+        if this.isVec(lt) { return this.simdArithLhs(sp, op, l, rhs); }
+        match this.traitBinary(sp, op, l, rhs)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+        match this.findOp(sp, lt, op)? {
+            Option.Some(f) { return this.opCall(sp, f, l, rhs); }
+            Option.None {}
+        }
+        this.intOnly(op, lt, sp)?;
+        let t = c.i64;
+        if this.isNumeric(lt) {
+            t = lt;
+        } else {
+            match numWant { Option.Some(w) { t = w; } Option.None {} }
+        }
+        if lt != t { return Result.Err(this.err(sp, "arithmetic type mismatch")); }
+        // a plain name, field or index may be a vector (`2.0 * v`): no expected type
+        let plain = false;
+        match this.cx.ast.expr(rhs) {
+            Expr.Name(_) { plain = true; }
+            Expr.Field(_) { plain = true; }
+            Expr.Index(_) { plain = true; }
+            _ {}
+        }
+        let r: Id<TExpr> = l;
+        if (t == c.f32 || t == c.i32) && plain {
+            r = this.operand(rhs, Option.None)?;
+        } else {
+            r = this.operand(rhs, Option.Some(t))?;
+        }
+        match this.simdArithMixed(sp, op, l, r)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+        if this.exprTy(r) != t { return Result.Err(this.err(sp, "arithmetic type mismatch")); }
+        this.intOnly(op, t, sp)?;
+        return Result.Ok(this.bin(sp, op, BinKind.Prim, l, r, t));
+    }
+
+    /// A call to a user operator method `f(l, rhs)` (Rust's two-parameter checks).
+    fn opCall(this: &BodyCx, sp: Span, f: Id<FnDecl>, l: Id<TExpr>, rhs: Id<Expr>): Result<Id<TExpr>, TErr> {
+        let d = this.cx.tables.fnAt(f);
+        if d.params.len != 2 { return Result.Err(this.err(sp, "binary operator needs two parameters")); }
+        if this.exprTy(l) != d.params.items[0].ty { return Result.Err(this.err(sp, "operator `this` type mismatch")); }
+        let ret = d.ret;
+        let r = this.operand(rhs, Option.Some(d.params.items[1].ty))?;
+        let args = List<Id<TExpr>>.new(this.cx.arena);
+        args.push(l);
+        args.push(r);
+        return Result.Ok(this.expr(TExpr.Call(TCall { callee: Callee.Fn(FnCallee { decl: f }), args: args }), ret, sp));
+    }
+
+    /// Rust `operator_fallback`: no `!=` / `>` / `<=` / `>=` method, but `==` / `<`: `!(a == b)`, `b < a`,
+    /// `!(b < a)`, `!(a < b)`.
+    fn operatorFallback(this: &BodyCx, sp: Span, op: BinOp, l: Id<TExpr>, rhs: Id<Expr>): Result<Option<Id<TExpr>>, TErr> {
+        let base = BinOp.Lt;
+        let swap = false;
+        let negate = false;
+        match op {
+            BinOp.Ne { base = BinOp.Eq; negate = true; }
+            BinOp.Gt { swap = true; }
+            BinOp.Le { swap = true; negate = true; }
+            BinOp.Ge { negate = true; }
+            _ { return Result.Ok(Option.None); }
+        }
+        let f = match this.findOp(sp, this.exprTy(l), base)? {
+            Option.Some(f) { f }
+            Option.None { return Result.Ok(Option.None); }
+        };
+        let d = this.cx.tables.fnAt(f);
+        if d.params.len != 2 { return Result.Err(this.err(sp, "binary operator needs two parameters")); }
+        let wantL = d.params.items[0].ty;
+        let wantR = d.params.items[1].ty;
+        if swap {
+            wantL = d.params.items[1].ty;
+            wantR = d.params.items[0].ty;
+        }
+        let ret = d.ret;
+        if this.exprTy(l) != wantL { return Result.Err(this.err(sp, "operator `this` type mismatch")); }
+        let r = this.operand(rhs, Option.Some(wantR))?;
+        if negate && ret != this.com().bool {
+            return Result.Err(this.err(sp, "an operator used for a comparison fallback must return bool"));
+        }
+        let args = List<Id<TExpr>>.new(this.cx.arena);
+        if swap { args.push(r); args.push(l); } else { args.push(l); args.push(r); }
+        let call = this.expr(TExpr.Call(TCall { callee: Callee.Fn(FnCallee { decl: f }), args: args }), ret, sp);
+        if !negate { return Result.Ok(Option.Some(call)); }
+        return Result.Ok(Option.Some(this.exprFrom(Origin.OpFallback, TExpr.Unary(TUnary { op: UnaryOp.Not, operand: call }), ret, sp)));
+    }
+
+    /// Rust `find_op`: the operator method of `t` (own method; `#[impl]` fns are C2b).
+    fn findOp(this: &BodyCx, sp: Span, t: Id<Ty>, op: BinOp): Result<Option<Id<FnDecl>>, TErr> {
+        let name = match operatorName(op) {
+            Option.Some(n) { n }
+            Option.None { return Result.Ok(Option.None); }
+        };
+        let inner = t;
+        while true {
+            match this.refInner(inner) { Option.Some(x) { inner = x; } Option.None { break; } }
+        }
+        match this.structOf(inner) {
+            Option.Some(s) { return Result.Ok(this.findMethod(s, this.sym(name))); }
+            Option.None {}
+        }
+        return Result.Ok(Option.None);
+    }
+
+    /// Rust `eq_needs_operator`: a struct, or an enum with payloads.
+    fn eqNeedsOperator(this: &BodyCx, t: Id<Ty>): bool {
+        match this.ty(t) {
+            Ty.Struct(_) { return true; }
+            // Rust: a closure (stack or boxed) is a `{ fn, ctx }` struct.
+            Ty.Closure(_) { return true; }
+            Ty.Enum(e) { return !this.cLike(e.decl); }
+            _ { return false; }
+        }
+        return false;
+    }
+
+    /// An enum whose variants carry no payload.
+    fn cLike(this: &BodyCx, e: Id<EnumDecl>): bool {
+        let vs = this.cx.tables.enumAt(e).variants;
+        for i in 0..vs.len {
+            match vs.items[i].payload { Option.Some(_) { return false; } Option.None {} }
+        }
+        return true;
+    }
+
+    /// Rust `int_only`: `<< >> & | ^` take integers.
+    fn intOnly(this: &BodyCx, op: BinOp, t: Id<Ty>, sp: Span): Result<bool, TErr> {
+        let bitOp = op == BinOp.Shl || op == BinOp.Shr || op == BinOp.BitAnd || op == BinOp.BitOr || op == BinOp.BitXor;
+        if !bitOp || this.isInt(t) { return Result.Ok(true); }
+        let m = Text.new(this.cx.arena);
+        m.add("`").add(binOpStr(op)).add("` takes integers");
+        if t == this.com().bool { m.add("; use `&&` / `||` for bools"); }
+        return Result.Err(this.err(sp, m.str()));
+    }
+
+    /// Rust `bare_num`: an untyped number (a literal, `-` of one, `+ - * / %` of two).
+    fn bareNum(this: &BodyCx, e: Id<Expr>): bool {
+        match this.cx.ast.expr(e) {
+            Expr.Int(_) { return true; }
+            Expr.Char(_) { return true; }
+            Expr.Float(_) { return true; }
+            Expr.Unary(u) { return u.op == UnaryOp.Neg && this.bareNum(u.expr); }
+            Expr.Binary(b) {
+                let arith = b.op == BinOp.Add || b.op == BinOp.Sub || b.op == BinOp.Mul || b.op == BinOp.Div || b.op == BinOp.Rem;
+                return arith && this.bareNum(b.lhs) && this.bareNum(b.rhs);
+            }
+            _ { return false; }
+        }
+        return false;
+    }
+
+    fn foldIsZero(this: &BodyCx, e: Id<Expr>): bool {
+        match this.foldInt(e) { Option.Some(v) { return v == 0; } Option.None { return false; } }
+    }
+
+    /// The const a bare name means (own or `use`d); Rust reads `consts` before locals here.
+    fn intConstNamed(this: &BodyCx, name: Sym): Option<ConstVal> {
+        match this.lookupName(name) {
+            Option.Some(r) {
+                if r.kind == DeclKind.Const { return this.cx.tables.constAt(r.asConst()).value; }
+            }
+            Option.None {}
+        }
+        return Option.None;
+    }
+
+    /// Rust `fold_int`: an int known at compile time (literals, int consts, `+ - * / %`, unary `-`).
+    fn foldInt(this: &BodyCx, e: Id<Expr>): Option<i64> {
+        match this.cx.ast.expr(e) {
+            Expr.Int(v) { return Option.Some(v); }
+            Expr.Char(v) { return Option.Some(i64(v)); }
+            Expr.Field(_) {
+                match this.qualifiedConst(e) {
+                    Option.Some(c) { match c.kind { ConstPayload.Int(v) { return Option.Some(v); } _ {} } }
+                    Option.None {}
+                }
+            }
+            Expr.Name(n) {
+                match this.intConstNamed(n.name) {
+                    Option.Some(c) { match c.kind { ConstPayload.Int(v) { return Option.Some(v); } _ {} } }
+                    Option.None {}
+                }
+            }
+            Expr.Binary(b) {
+                let a = match this.foldInt(b.lhs) { Option.Some(x) { x } Option.None { return Option.None; } };
+                let c = match this.foldInt(b.rhs) { Option.Some(x) { x } Option.None { return Option.None; } };
+                if (b.op == BinOp.Div || b.op == BinOp.Rem) && c != 0 && (this.bigU64(b.lhs) || this.bigU64(b.rhs)) {
+                    if b.op == BinOp.Div { return Option.Some(i64(u64(a) / u64(c))); }
+                    return Option.Some(i64(u64(a) % u64(c)));
+                }
+                return bodyFoldBin(b.op, a, c);
+            }
+            Expr.Unary(u) {
+                if u.op == UnaryOp.Neg {
+                    match this.foldInt(u.expr) { Option.Some(x) { return Option.Some(i64(u64(0) - u64(x))); } Option.None {} }
+                }
+            }
+            _ {}
+        }
+        return Option.None;
+    }
+
+    /// Rust `big_u64`: the expression uses a `u64` const above `i64::MAX`.
+    fn bigU64(this: &BodyCx, e: Id<Expr>): bool {
+        let c: Option<ConstVal> = Option.None;
+        match this.cx.ast.expr(e) {
+            Expr.Name(n) { if !this.shadows(n.name) { c = this.intConstNamed(n.name); } }
+            Expr.Field(_) { c = this.qualifiedConst(e); }
+            Expr.Binary(b) { return this.bigU64(b.lhs) || this.bigU64(b.rhs); }
+            Expr.Unary(u) { return this.bigU64(u.expr); }
+            _ {}
+        }
+        match c {
+            Option.Some(v) {
+                match v.kind { ConstPayload.Int(i) { return v.ty == this.com().u64 && i < 0; } _ {} }
+            }
+            Option.None {}
+        }
+        return false;
+    }
+
+    /// Rust `num_from_int`: an int literal typed by `want`.
+    fn numFromInt(this: &BodyCx, sp: Span, v: i64, want: Option<Id<Ty>>): Id<TExpr> {
+        let c = this.com();
+        match want {
+            Option.Some(t) {
+                if v == 0 && this.isPtrTy(t) { return this.expr(TExpr.Null, t, sp); }
+                if this.isInt(t) { return this.intLit(u64(v), t, sp); }
+                // An f16 constant stays a float literal of type `f16`; `lower/half.j3` rounds it (Rust `half_const`).
+                if this.isHalf(t) { return this.expr(TExpr.Float(f64(v)), t, sp); }
+                if t == c.f32 { return this.expr(TExpr.Float(f64(f32(v))), t, sp); }
+                if this.isFloat(t) { return this.expr(TExpr.Float(f64(v)), t, sp); }
+            }
+            Option.None {}
+        }
+        return this.intLit(u64(v), c.i64, sp);
+    }
+
+    /// Rust `num_from_float`.
+    fn numFromFloat(this: &BodyCx, sp: Span, v: f64, want: Option<Id<Ty>>): Id<TExpr> {
+        let c = this.com();
+        match want {
+            Option.Some(t) {
+                if this.isHalf(t) { return this.expr(TExpr.Float(v), t, sp); }
+                if t == c.f32 { return this.expr(TExpr.Float(f64(f32(v))), t, sp); }
+                if this.isFloat(t) { return this.expr(TExpr.Float(v), t, sp); }
+            }
+            Option.None {}
+        }
+        return this.expr(TExpr.Float(v), c.f64, sp);
+    }
+
+    /// Rust `char_lit`: `u8` when ASCII, else a `u32` code point, or the expected int type when it fits.
+    fn charLit(this: &BodyCx, sp: Span, v: u32, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let c = this.com();
+        let t = c.u32;
+        if v < 0x80 { t = c.u8; }
+        match want { Option.Some(w) { if this.isInt(w) { t = w; } } Option.None {} }
+        let bits = 64;
+        match this.ty(t) {
+            Ty.Int(k) {
+                match k {
+                    IntKind.I8 { bits = 7; }
+                    IntKind.I16 { bits = 15; }
+                    IntKind.I32 { bits = 31; }
+                    IntKind.I64 { bits = 63; }
+                    IntKind.U8 { bits = 8; }
+                    IntKind.U16 { bits = 16; }
+                    IntKind.U32 { bits = 32; }
+                    IntKind.U64 { bits = 64; }
+                }
+            }
+            _ {}
+        }
+        if (bits < 32 && (u64(v) >> u64(bits)) != 0) || (bits == 8 && v >= 0x80) {
+            let what = "is not ASCII, so it does not fit";
+            if v < 0x80 { what = "does not fit"; }
+            let m = Text.new(this.cx.arena);
+            m.add("char literal ").add(what).add(" `").add(this.tyStr(t)).add("`");
+            return Result.Err(this.help(this.err(sp, m.str()), "a code point past ASCII is a `u32`"));
+        }
+        return Result.Ok(this.intLit(u64(v), t, sp));
+    }
+}
+
+/// Rust `ir::wrap::fold_bin`: wrapping `+ - * / %` (None for division by zero and other ops).
+fn bodyFoldBin(op: BinOp, a: i64, b: i64): Option<i64> {
+    match op {
+        BinOp.Add { return Option.Some(i64(u64(a) + u64(b))); }
+        BinOp.Sub { return Option.Some(i64(u64(a) - u64(b))); }
+        BinOp.Mul { return Option.Some(i64(u64(a) * u64(b))); }
+        BinOp.Div {
+            if b == 0 { return Option.None; }
+            if b == -1 { return Option.Some(i64(u64(0) - u64(a))); }
+            return Option.Some(a / b);
+        }
+        BinOp.Rem {
+            if b == 0 { return Option.None; }
+            if b == -1 { return Option.Some(0); }
+            return Option.Some(a % b);
+        }
+        _ {}
+    }
+    return Option.None;
+}

@@ -1,0 +1,117 @@
+// The bound requests of one use (Rust `BoundReq` lists): from a fn's written bounds (exact spans, for
+// the error text), from a template's `Generics` (the fast path of a call), from a generic struct's or
+// enum's parameters (the queued type checks), and a method's `where`.
+//
+// Part of module j3c.sema.
+// Port of: check/traits.rs (where_reqs, queue_bounds' request list), check/lower/bounds.rs
+// (check_call_bounds' request list)
+// J3: `trait_bounds.checkBoundReqs` checks them.
+module j3c.sema;
+
+/// The bound names written for parameter `name` in `typeParams`/`bounds` (parallel lists) plus `wheres`
+/// naming it, resolved in module `m` (Rust's `BoundReq.bounds` with their spans).
+fn boundRefs(cx: &SemaCx, m: Id<ModDecl>, written: &List<Ident>, wheres: &List<WhereBound>, name: Sym): List<BoundRef> {
+    let out = List<BoundRef>.new(cx.arena);
+    for i in 0..written.len {
+        match boundTrait(cx, m, written.items[i].name) {
+            Option.Some(d) { out.push(BoundRef { tr: d.asTrait(), span: written.items[i].span }); }
+            Option.None {}
+        }
+    }
+    for w in 0..wheres.len {
+        if wheres.items[w].name.name != name { continue; }
+        let bs = wheres.items[w].bounds;
+        for i in 0..bs.len {
+            match boundTrait(cx, m, bs.items[i].name) {
+                Option.Some(d) { out.push(BoundRef { tr: d.asTrait(), span: bs.items[i].span }); }
+                Option.None {}
+            }
+        }
+    }
+    return out;
+}
+
+/// Requests for type params `params` (with `bounds`) given `args[from..]`; skips params without bounds
+/// (Rust's `filter(!b.is_empty())`).
+fn reqsOf(cx: &SemaCx, m: Id<ModDecl>, params: &List<Ident>, bounds: &List<List<Ident>>, args: []Id<Ty>, from: int): List<BoundReq> {
+    let out = List<BoundReq>.new(cx.arena);
+    let none = List<WhereBound>.new(cx.arena);
+    for i in 0..params.len {
+        if i >= bounds.len || from + i >= args.len || bounds.items[i].len == 0 { continue; }
+        out.push(BoundReq { param: cx.tables.str(params.items[i].name), arg: args[from + i], bounds: boundRefs(cx, m, &bounds.items[i], &none, params.items[i].name) });
+    }
+    return out;
+}
+
+/// Rust `where_reqs`: a method's `where P: B` with the struct instance's args (`sparams` its params).
+fn whereReqs(cx: &SemaCx, m: Id<ModDecl>, wheres: &List<WhereBound>, sparams: &List<Ident>, args: []Id<Ty>): List<BoundReq> {
+    let out = List<BoundReq>.new(cx.arena);
+    let none = List<Ident>.new(cx.arena);
+    for w in 0..wheres.len {
+        let wb = wheres.items[w];
+        for i in 0..sparams.len {
+            if sparams.items[i].name != wb.name.name || i >= args.len { continue; }
+            let one = List<WhereBound>.new(cx.arena);
+            one.push(wb);
+            out.push(BoundReq { param: cx.tables.str(wb.name.name), arg: args[i], bounds: boundRefs(cx, m, &none, &one, wb.name.name) });
+        }
+    }
+    return out;
+}
+
+/// The bound requests of calling generic fn or method `f` with `xs` (InstKey order), from its written
+/// bounds: own parameters (Rust `check_call_bounds`), then a generic struct method's `where` at the
+/// struct's args (Rust `check_where`).
+fn exactReqs(cx: &SemaCx, f: Id<FnDecl>, xs: []Id<Ty>): List<BoundReq> {
+    let t = cx.tables;
+    let d = *t.fnAt(f);
+    let it = match d.item { Option.Some(x) { x } Option.None { return List<BoundReq>.new(cx.arena); } };
+    match d.recv {
+        Option.Some(s) {
+            match t.structAt(s).item {
+                Option.Some(si) {
+                    let reqs = reqsOf(cx, d.owner, &it.typeParams, &it.bounds, xs, si.typeParams.len);
+                    reqs.extend(whereReqs(cx, d.owner, &it.whereBounds, &si.typeParams, xs).slice());
+                    return reqs;
+                }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
+    return reqsOf(cx, d.owner, &it.typeParams, &it.bounds, xs, 0);
+}
+
+/// The bound requests of a call from the template's `Generics` alone (each bound at its parameter's
+/// span): own parameters first, then the bounds a method's `where` folded into its copy of a struct
+/// parameter (past the struct's own bounds, which the type's instantiation checks).
+fn genReqs(cx: &SemaCx, g: Id<Generics>, args: []Id<Ty>): List<BoundReq> {
+    let t = cx.tables;
+    let gd = t.genericsAt(g);
+    let pn = 0;
+    match gd.parent { Option.Some(p) { pn = t.genericsAt(p).names.len; } Option.None {} }
+    let out = List<BoundReq>.new(cx.arena);
+    for pass in 0..2 {
+        for i in 0..gd.names.len {
+            if i >= args.len || (pass == 0) != (i >= pn) { continue; }
+            let skip = 0;
+            if i < pn { match gd.parent { Option.Some(p) { skip = t.genericsAt(p).bounds.items[i].len; } Option.None {} } }
+            let bs = gd.bounds.items[i];
+            if bs.len <= skip { continue; }
+            let refs = List<BoundRef>.new(cx.arena);
+            for k in skip..bs.len { refs.push(BoundRef { tr: bs.items[k], span: gd.spans.items[i] }); }
+            out.push(BoundReq { param: t.str(gd.names.items[i]), arg: args[i], bounds: refs });
+        }
+    }
+    return out;
+}
+
+/// The fn whose type parameters are `g` (a scan; only on the error path).
+fn fnOfGenerics(cx: &SemaCx, g: Id<Generics>): Option<Id<FnDecl>> {
+    let t = cx.tables;
+    for i in 0..t.fns.len() {
+        let f = t.fns.idAt(i);
+        match t.fnAt(f).gen { Option.Some(x) { if x == g { return Option.Some(f); } } Option.None {} }
+    }
+    return Option.None;
+}

@@ -1,0 +1,462 @@
+// Traits, declaration side: a `TraitDecl` per trait, `#[impl]` fns renamed, `use m.Trait` imports, bound
+// names checked and resolved, trait signatures and default bodies, the supertrait-cycle, orphan and
+// duplicate-`#[impl]` rules. Also the `Generics` of every template (its bounds are traits).
+//
+// Part of module j3c.sema.
+// Port of: j3c/src/check/traits.rs (`collect_traits`, `register_trait`, `bind_traits`, `bind_list`,
+// `build_env`)
+// J3: Rust rewrote bound names to `module::Name` keys and looked traits up by key; here a bound is an
+// `Id<TraitDecl>`, so `Generics.bounds` and `TraitDecl.supers` hold ids. `declareTraits` is what
+// `checkProgram` calls (the contract's `collectTraits` stub is gone).
+// J3: A default body is a template fn `Trait.method` with the one parameter `Self: Trait` (Rust's
+// `default_fn_name` generic fn); it joins `ModDecl.fns` and `TraitMethodDecl.default`, not the scope.
+module j3c.sema;
+
+/// Rust `collect_traits` for module `m`: its traits, and `#[impl]` fns renamed `name<implN>` (several give
+/// one method name to different types).
+fn declareTraits(cx: &SemaCx, m: Id<ModDecl>): bool {
+    let md = cx.tables.modAt(m);
+    let nImpl = 0;
+    for k in 0..md.items.len {
+        match md.items.items[k] {
+            Item.Trait(t) { if !registerTrait(cx, m, &t) { return false; } }
+            Item.Fn(f) {
+                if f.isImpl {
+                    if f.typeParams.len > 0 {
+                        return failHelp(cx, f.name.span, "an `#[impl]` fn cannot be generic", "write one `#[impl]` fn per type");
+                    }
+                    if f.params.len == 0 {
+                        return failHelp(cx, f.name.span, "an `#[impl]` fn needs a first parameter: the value it implements the method for",
+                            "`#[impl] fn hash(x: int): u64 { .. }` gives `int` a method `hash`");
+                    }
+                    let t = Text.new(cx.arena).add(cx.tables.str(f.name.name)).add("<impl");
+                    t.pushInt(nImpl);
+                    t.add(">");
+                    nImpl += 1;
+                    f.name.name = cx.tables.sym(t.str());
+                    md.items.items[k] = Item.Fn(f);
+                }
+            }
+            _ {}
+        }
+    }
+    return true;
+}
+
+/// The method name an `#[impl]` fn provides: `hash` for `hash<impl0>`, `operator<` for `operator<<impl1>`.
+fn implOrig(cx: &SemaCx, renamed: Sym): Sym {
+    let s = cx.tables.str(renamed);
+    let i = s.len;
+    while i > 0 && s[i - 1] != '<' { i -= 1; }
+    if i == 0 { return renamed; }
+    return cx.tables.sym(s[0..i - 1]);
+}
+
+/// Is `name` a struct or enum written in `m`'s items (Rust's per-module `types` set)?
+fn declaresType(cx: &SemaCx, m: Id<ModDecl>, name: Sym): bool {
+    let md = cx.tables.modAt(m);
+    for k in 0..md.items.len {
+        match md.items.items[k] {
+            Item.Struct(s) { if s.name.name == name { return true; } }
+            Item.Enum(e) { if e.name.name == name { return true; } }
+            _ {}
+        }
+    }
+    return false;
+}
+
+fn registerTrait(cx: &SemaCx, m: Id<ModDecl>, t: &TraitItem): bool {
+    let name = t.name.name;
+    let ns = cx.tables.str(name);
+    match scopeOf(cx, m, name, DeclKind.Trait) {
+        Option.Some(_) { return fail(cx, t.name.span, cat3(cx, "duplicate trait `", ns, "`")); }
+        Option.None {}
+    }
+    if declaresType(cx, m, name) {
+        return failHelp(cx, t.name.span, cat3(cx, "`", ns, "` is both a trait and a type"), "traits and types share one namespace; rename one");
+    }
+    if t.methods.len == 0 {
+        return failHelp(cx, t.name.span, cat3(cx, "trait `", ns, "` has no methods"), "list at least one signature: `fn hash(this: Self): u64;`");
+    }
+    let methods = List<TraitMethodDecl>.new(cx.arena);
+    for k in 0..t.methods.len {
+        let meth = t.methods.items[k];
+        let mn = cx.tables.str(meth.name.name);
+        for o in 0..k {
+            if t.methods.items[o].name.name == meth.name.name {
+                return fail(cx, meth.name.span, cat5(cx, "duplicate method `", mn, "` in trait `", ns, "`"));
+            }
+        }
+        if !selfFirst(cx, &meth) {
+            return failNote(cx, meth.name.span, cat3(cx, "`", mn, "` must take `this: Self` or `this: &Self` first"),
+                "a trait method is called as `value.method(..)`, so its first parameter is the receiver");
+        }
+        for p in 0..meth.params.len + 1 {
+            let ty: Option<Id<Type>> = Option.None;
+            if p < meth.params.len { ty = Option.Some(meth.params.items[p].ty); } else { ty = meth.ret; }
+            match ty {
+                Option.Some(tid) {
+                    match findClosure(cx, tid) {
+                        Option.Some(at) { return failNote(cx, at, "closure types cannot appear in a trait method", "a closure cannot satisfy a bound"); }
+                        Option.None {}
+                    }
+                }
+                Option.None {}
+            }
+        }
+        methods.push(TraitMethodDecl { name: meth.name.name, span: meth.span, params: List<ParamDecl>.new(cx.arena), ret: cx.tables.common.void,
+            default: Option.None });
+    }
+    let id = cx.tables.addTrait(TraitDecl { owner: m, name: name, doc: t.doc, span: t.span, visPub: t.visPub,
+        supers: List<Id<TraitDecl>>.new(cx.arena), methods: methods, item: Option.Some(*t) });
+    cx.tables.modAt(m).traits.push(id);
+    bind(cx, m, name, refTrait(id));
+    return true;
+}
+
+/// The first parameter is `Self` or `&Self`.
+fn selfFirst(cx: &SemaCx, meth: &TraitMethod): bool {
+    if meth.params.len == 0 { return false; }
+    let ty = cx.ast.ty(meth.params.items[0].ty);
+    match ty {
+        Type.Ref(r) { ty = cx.ast.ty(r.ty); }
+        _ {}
+    }
+    match ty {
+        Type.Named(n) { return cx.tables.str(n.name) == "Self"; }
+        _ {}
+    }
+    return false;
+}
+
+/// Rust `find_closure`: the span of a closure type inside `t`.
+fn findClosure(cx: &SemaCx, id: Id<Type>): Option<Span> {
+    match cx.ast.ty(id) {
+        Type.Closure(_) { return Option.Some(cx.ast.typeSpan(id)); }
+        Type.Named(_) { return Option.None; }
+        Type.Dyn(_) { return Option.None; }
+        Type.Generic(g) { return firstClosure(cx, &g.args); }
+        Type.Ref(r) { return findClosure(cx, r.ty); }
+        Type.Slice(s) { return findClosure(cx, s.elem); }
+        Type.Array(a) { return findClosure(cx, a.elem); }
+        Type.Tuple(t) { return firstClosure(cx, &t.elems); }
+        Type.Fn(f) {
+            match firstClosure(cx, &f.params) { Option.Some(s) { return Option.Some(s); } Option.None {} }
+            match f.ret { Option.Some(r) { return findClosure(cx, r); } Option.None {} }
+        }
+    }
+    return Option.None;
+}
+
+fn firstClosure(cx: &SemaCx, xs: &List<Id<Type>>): Option<Span> {
+    for i in 0..xs.len {
+        match findClosure(cx, xs.items[i]) { Option.Some(s) { return Option.Some(s); } Option.None {} }
+    }
+    return Option.None;
+}
+
+/// Rust `bind_traits`: `use m.Trait;` imports for every module, then every bound name checked.
+fn bindTraits(cx: &SemaCx): bool {
+    let n = cx.tables.mods.len();
+    for i in 0..n {
+        let m = cx.tables.mods.idAt(i);
+        let md = cx.tables.modAt(m);
+        for k in 0..md.items.len {
+            match md.items.items[k] {
+                Item.Use(u) {
+                    // Unresolvable uses are reported by the normal use pass.
+                    match resolveTarget(cx, &u, false) {
+                        Option.Some(tg) {
+                            for j in 0..tg.names.len {
+                                let name = tg.names.items[j];
+                                match scopeOf(cx, tg.src, name, DeclKind.Trait) {
+                                    Option.Some(d) {
+                                        if !cx.tables.modAt(tg.src).exports.has(name) {
+                                            return fail(cx, u.span, cat5(cx, "`", cx.tables.str(name), "` is private in `", cx.tables.modAt(tg.src).key, "`"));
+                                        }
+                                        match scopeOf(cx, m, name, DeclKind.Trait) {
+                                            Option.Some(_) { return fail(cx, u.span, quoted(cx, "", name, " already in scope")); }
+                                            Option.None {}
+                                        }
+                                        bind(cx, m, name, d);
+                                    }
+                                    Option.None {}
+                                }
+                            }
+                        }
+                        Option.None {}
+                    }
+                }
+                _ {}
+            }
+        }
+    }
+    for i in 0..n {
+        let m = cx.tables.mods.idAt(i);
+        let md = cx.tables.modAt(m);
+        for k in 0..md.items.len {
+            match md.items.items[k] {
+                Item.Trait(t) {
+                    if !checkBounds(cx, m, &t.supers) { return false; }
+                    match scopeOf(cx, m, t.name.name, DeclKind.Trait) {
+                        Option.Some(d) { cx.tables.traitAt(d.asTrait()).supers = traitList(cx, m, &t.supers); }
+                        Option.None {}
+                    }
+                }
+                Item.Fn(f) {
+                    if f.whereBounds.len > 0 {
+                        let p = f.whereBounds.items[0].name;
+                        return failHelp(cx, p.span, "`where` is for methods of a generic struct",
+                            cat5(cx, "bound the fn's own type parameter in place: `fn ", cx.tables.str(f.name.name), "<", cx.tables.str(p.name), ": ..>(..)`"));
+                    }
+                    if !checkBoundLists(cx, m, &f.bounds) { return false; }
+                }
+                Item.Enum(e) { if !checkBoundLists(cx, m, &e.bounds) { return false; } }
+                Item.Struct(s) {
+                    if !checkBoundLists(cx, m, &s.bounds) { return false; }
+                    for j in 0..s.methods.len {
+                        let f = s.methods.items[j];
+                        if !checkBoundLists(cx, m, &f.bounds) { return false; }
+                        for w in 0..f.whereBounds.len {
+                            let wb = f.whereBounds.items[w];
+                            if !hasIdent(&s.typeParams, wb.name.name) {
+                                return failNote(cx, wb.name.span,
+                                    cat5(cx, "`where` names `", cx.tables.str(wb.name.name), "`, which is not a type parameter of `", cx.tables.str(s.name.name), "`"),
+                                    "`where` bounds a parameter of the struct for one method; a method's own parameters take bounds in `<T: ..>`");
+                            }
+                            if !checkBounds(cx, m, &wb.bounds) { return false; }
+                        }
+                    }
+                }
+                _ {}
+            }
+        }
+    }
+    return true;
+}
+
+fn hasIdent(xs: &List<Ident>, name: Sym): bool {
+    for i in 0..xs.len { if xs.items[i].name == name { return true; } }
+    return false;
+}
+
+fn checkBoundLists(cx: &SemaCx, m: Id<ModDecl>, lists: &List<List<Ident>>): bool {
+    for i in 0..lists.len { if !checkBounds(cx, m, &lists.items[i]) { return false; } }
+    return true;
+}
+
+/// Rust `bind_list`: every name is a trait in scope.
+fn checkBounds(cx: &SemaCx, m: Id<ModDecl>, bounds: &List<Ident>): bool {
+    for i in 0..bounds.len {
+        let b = bounds.items[i];
+        match boundTrait(cx, m, b.name) { Option.Some(_) { continue; } Option.None {} }
+        let bn = cx.tables.str(b.name);
+        if declaresType(cx, m, b.name) {
+            return failNote(cx, b.span, cat3(cx, "`", bn, "` is not a trait"), "a bound names a trait: `fn f<T: Hash>(..)`");
+        }
+        return failHelp(cx, b.span, cat3(cx, "unknown trait `", bn, "`"), cat5(cx, "declare `trait ", bn, " { .. }` here, or import it: `use j3.cmp.", bn, ";`"));
+    }
+    return true;
+}
+
+/// The traits `bounds` name in `m` (checked by `bindTraits`).
+fn traitList(cx: &SemaCx, m: Id<ModDecl>, bounds: &List<Ident>): List<Id<TraitDecl>> {
+    let out = List<Id<TraitDecl>>.new(cx.arena);
+    for i in 0..bounds.len {
+        match boundTrait(cx, m, bounds.items[i].name) { Option.Some(d) { out.push(d.asTrait()); } Option.None {} }
+    }
+    return out;
+}
+
+/// A template's parameter list: `params` with `bounds` (parallel lists, as the parser gives them).
+fn newGenerics(cx: &SemaCx, m: Id<ModDecl>, params: &List<Ident>, bounds: &List<List<Ident>>, parent: Option<Id<Generics>>): Id<Generics> {
+    let g = Generics { names: List<Sym>.new(cx.arena), spans: List<Span>.new(cx.arena), bounds: List<List<Id<TraitDecl>>>.new(cx.arena), parent: parent };
+    match parent {
+        Option.Some(p) {
+            let pd = cx.tables.genericsAt(p);
+            for i in 0..pd.names.len {
+                g.names.push(pd.names.items[i]);
+                g.spans.push(pd.spans.items[i]);
+                let bs = List<Id<TraitDecl>>.new(cx.arena);
+                bs.extend(pd.bounds.items[i].slice());
+                g.bounds.push(bs);
+            }
+        }
+        Option.None {}
+    }
+    for i in 0..params.len {
+        g.names.push(params.items[i].name);
+        g.spans.push(params.items[i].span);
+        if i < bounds.len { g.bounds.push(traitList(cx, m, &bounds.items[i])); } else { g.bounds.push(List<Id<TraitDecl>>.new(cx.arena)); }
+    }
+    return cx.tables.addGenerics(g);
+}
+
+/// Trait method signatures (`Self` is `Ty.TraitSelf`) and default bodies of module `m`'s traits, once the
+/// types they name are in scope.
+fn fillTraits(cx: &SemaCx, m: Id<ModDecl>): bool {
+    let md = cx.tables.modAt(m);
+    for k in 0..md.traits.len {
+        let tid = md.traits.items[k];
+        let td = *cx.tables.traitAt(tid);
+        match td.item {
+            Option.Some(t) { if !fillTrait(cx, m, tid, &td, &t) { return false; } }
+            Option.None {}
+        }
+    }
+    return true;
+}
+
+fn fillTrait(cx: &SemaCx, m: Id<ModDecl>, tid: Id<TraitDecl>, td: &TraitDecl, t: &TraitItem): bool {
+    let env = TyEnv { m: m, gen: Option.None, selfTy: Option.Some(cx.tables.common.traitSelf), plain: false };
+    for j in 0..t.methods.len {
+        let meth = t.methods.items[j];
+        let decl = td.methods.items[j];
+        for p in 0..meth.params.len {
+            match tyOf(cx, env, meth.params.items[p].ty) {
+                Option.Some(pt) { decl.params.push(ParamDecl { name: meth.params.items[p].name.name, span: meth.params.items[p].name.span, ty: pt }); }
+                Option.None { return false; }
+            }
+        }
+        match meth.ret {
+            Option.Some(r) { match tyOf(cx, env, r) { Option.Some(rt) { decl.ret = rt; } Option.None { return false; } } }
+            Option.None {}
+        }
+        match meth.body {
+            Option.Some(body) {
+                match defaultFn(cx, m, tid, t, &meth, body) { Option.Some(f) { decl.default = Option.Some(f); } Option.None { return false; } }
+            }
+            Option.None {}
+        }
+        cx.tables.traitAt(tid).methods.items[j] = decl;
+    }
+    return true;
+}
+
+/// The template fn `Trait.method` holding a default body: one parameter `Self` bounded by the trait.
+fn defaultFn(cx: &SemaCx, m: Id<ModDecl>, tid: Id<TraitDecl>, t: &TraitItem, meth: &TraitMethod, body: Block): Option<Id<FnDecl>> {
+    let name = cx.tables.sym(cat3(cx, cx.tables.str(t.name.name), ".", cx.tables.str(meth.name.name)));
+    let selfId = Ident { name: cx.tables.sym("Self"), span: t.name.span };
+    let tps = List<Ident>.new(cx.arena);
+    tps.push(selfId);
+    let bound = List<Ident>.new(cx.arena);
+    bound.push(t.name);
+    let bounds = List<List<Ident>>.new(cx.arena);
+    bounds.push(bound);
+    let item = FnItem { span: meth.span, doc: "", visPub: false, name: Ident { name: name, span: meth.name.span }, typeParams: tps,
+        bounds: bounds, whereBounds: List<WhereBound>.new(cx.arena), derived: false, isImpl: false, shader: Option.None, params: meth.params, ret: meth.ret,
+        body: body };
+    let noBounds = List<List<Ident>>.new(cx.arena);
+    let g = newGenerics(cx, m, &tps, &noBounds, Option.None);
+    cx.tables.genericsAt(g).bounds.items[0].push(tid);
+    let f = sigOf(cx, m, &item, Option.Some(g), Option.None, false)?;
+    f.defaultOf = Option.Some(tid);
+    let id = cx.tables.addFn(f);
+    cx.tables.modAt(m).fns.push(id);
+    return Option.Some(id);
+}
+
+/// Rust `build_env`'s checks, once every fn has its type: no supertrait cycle; each `#[impl]` fn in the
+/// module of the trait or of the type (orphan rule), and one per method name and type.
+fn checkTraitEnv(cx: &SemaCx): bool {
+    let n = cx.tables.mods.len();
+    for i in 0..n {
+        let md = cx.tables.modAt(cx.tables.mods.idAt(i));
+        if md.isLib { continue; }
+        for k in 0..md.traits.len {
+            let tid = md.traits.items[k];
+            let td = cx.tables.traitAt(tid);
+            for s in 0..td.supers.len {
+                if superOf(cx, td.supers.items[s], tid) {
+                    let at = td.span;
+                    match td.item { Option.Some(it) { at = it.name.span; } Option.None {} }
+                    return failNote(cx, at, cat3(cx, "trait `", cx.tables.str(td.name), "` is its own supertrait"), "supertraits cannot form a cycle");
+                }
+            }
+        }
+    }
+    let seen = List<ImplSeen>.new(cx.arena);
+    for i in 0..n {
+        let m = cx.tables.mods.idAt(i);
+        let md = cx.tables.modAt(m);
+        if md.isLib { continue; }
+        for k in 0..md.items.len {
+            match md.items.items[k] {
+                Item.Fn(f) { if f.isImpl && !checkImpl(cx, m, &f, &seen) { return false; } }
+                _ {}
+            }
+        }
+    }
+    return true;
+}
+
+/// Is `target` among `from` and its supertraits (Rust `with_supers(from).contains(target)`)?
+fn superOf(cx: &SemaCx, from: Id<TraitDecl>, target: Id<TraitDecl>): bool {
+    let todo = List<Id<TraitDecl>>.new(cx.arena);
+    todo.push(from);
+    let i = 0;
+    while i < todo.len {
+        let t = todo.items[i];
+        if t == target { return true; }
+        let sup = cx.tables.traitAt(t).supers;
+        for s in 0..sup.len { if !todo.contains(sup.items[s]) { todo.push(sup.items[s]); } }
+        i += 1;
+    }
+    return false;
+}
+
+/// One `#[impl]` fn already in the table: its method name, type and name span.
+struct ImplSeen { name: Sym; ty: Id<Ty>; span: Span; }
+
+fn checkImpl(cx: &SemaCx, m: Id<ModDecl>, f: &FnItem, seen: &List<ImplSeen>): bool {
+    let t = cx.tables;
+    let orig = implOrig(cx, f.name.name);
+    let ty = t.common.error;
+    let fid = Id<FnDecl> { i: 0 };
+    match scopeOf(cx, m, f.name.name, DeclKind.Fn) {
+        Option.Some(d) {
+            fid = d.asFn();
+            if t.fnAt(fid).params.len == 0 { return true; }
+            ty = t.fnAt(fid).params.items[0].ty;
+        }
+        Option.None { return true; }
+    }
+    let more = true;
+    while more {
+        match t.refInner(ty) { Option.Some(inner) { ty = inner; } Option.None { more = false; } }
+    }
+    let tn = Text.new(cx.arena);
+    tyName(t, ty, &tn);
+    let tyText = tn.str();
+    let on = t.str(orig);
+    let declares = false;
+    let md = t.modAt(m);
+    for k in 0..md.traits.len {
+        let ms = t.traitAt(md.traits.items[k]).methods;
+        for j in 0..ms.len { if ms.items[j].name == orig { declares = true; } }
+    }
+    let owns = false;
+    match t.ty(ty) {
+        Ty.Struct(s) { owns = t.structAt(s.decl).owner == m; }
+        Ty.Enum(e) { owns = t.enumAt(e.decl).owner == m; }
+        _ {}
+    }
+    if !declares && !owns {
+        let msg = Text.new(cx.arena).add("orphan rule: `#[impl] fn ").add(on).add("` for `").add(tyText).add("` is in neither the module that declares a trait with `")
+            .add(on).add("` nor the module that defines `").add(tyText).add("`").str();
+        return failHelp(cx, f.name.span, msg, cat3(cx, "move it into the module of the trait, or the module of `", tyText, "`"));
+    }
+    for i in 0..seen.len {
+        let s = seen.items[i];
+        if s.name == orig && s.ty == ty {
+            let src = cx.sources.get(s.span.file);
+            let at = Text.new(cx.arena).add(src.path).add(":");
+            at.pushInt(src.lines.at(s.span.lo).line);
+            return failWith(cx, f.name.span, cat5(cx, "`", on, "` is already implemented for `", tyText, "`"),
+                cat5(cx, "first `#[impl] fn ", on, "` is at ", at.str(), ""), "keep one; an own method on the type also wins over `#[impl]` fns");
+        }
+    }
+    seen.push(ImplSeen { name: orig, ty: ty, span: f.name.span });
+    t.impls.put(ImplKey { name: orig, ty: ty }, fid);
+    return true;
+}

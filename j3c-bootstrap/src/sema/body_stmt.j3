@@ -1,0 +1,378 @@
+// Statements of a fn body: `let`, `return`, assignment, `if`, loops with labels, `break`/`continue`,
+// `defer`, blocks, and the per-statement error recovery.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/stmt.rs (typing half; the IR it built is `lower`'s now)
+// J3: Rust's `loops: Vec<Option<String>>` is `BodyCx.loops` with a numeric id per loop (`TJump.target`);
+// `break 'outer` resolves to that id here, so `lower` never searches labels.
+// J3: `while` keeps its condition as an expression (`TLoop.cond`); Rust's `not`/`break` rewrite is
+// `lower`'s. `for` over a slice or array is `TStmt.ForEach` with the source place.
+module j3c.sema;
+
+extend BodyCx {
+    /// Type one statement into `out`; on error record it, put the scope back and go on (Rust
+    /// `stmt_recover`). A use of a name whose `let` failed, or one already reported unknown, is dropped.
+    fn stmtRecover(this: &BodyCx, s: Id<Stmt>, out: &TBlock) {
+        let n0 = this.scope.len;
+        let loops0 = this.loops.len;
+        match this.stmt(s) {
+            Result.Ok(id) {
+                // `use x;` only adds scope aliases (Rust `use_local`): no statement for `lower`.
+                match this.cx.ast.stmt(s) { Stmt.UseLocal(_) {} _ { out.stmts.push(id); } }
+            }
+            Result.Err(e) {
+                this.scope.len = n0;
+                this.loops.len = loops0;
+                this.pendingLabel = Option.None;
+                match this.cx.ast.stmt(s) {
+                    Stmt.Let(l) { this.poison(l.name.name); }
+                    Stmt.LetPat(l) {
+                        let me = this;
+                        patBinds(this.cx.ast, l.pat, fn(n: Ident) { me.poison(n.name); });
+                    }
+                    _ {}
+                }
+                let followOn = false;
+                match e.unknown {
+                    Option.Some(n) {
+                        followOn = this.isPoisoned(n);
+                        this.poison(n);
+                    }
+                    Option.None {}
+                }
+                if !followOn { this.errs.push(e); }
+            }
+        }
+    }
+
+    /// The statements of `b` as one scope (Rust `lower_block` / `scoped_stmts`).
+    fn scopedBlock(this: &BodyCx, b: &Block): TBlock {
+        let out = this.cx.typed.block(b.span);
+        let n0 = this.scope.len;
+        for i in 0..b.stmts.len { this.stmtRecover(b.stmts.items[i], &out); }
+        this.scope.len = n0;
+        return out;
+    }
+
+    /// Rust `stmt`: loops take the pending label and get an id; `'label:` sets it.
+    fn stmt(this: &BodyCx, s: Id<Stmt>): Result<Id<TStmt>, TErr> {
+        let isLoop = false;
+        match this.cx.ast.stmt(s) {
+            Stmt.While(_) { isLoop = true; }
+            Stmt.For(_) { isLoop = true; }
+            Stmt.ForEach(_) { isLoop = true; }
+            Stmt.Labeled(l) {
+                for i in 0..this.loops.len {
+                    match this.loops.items[i].label {
+                        Option.Some(x) {
+                            if x == l.label.name {
+                                let t = Text.new(this.cx.arena);
+                                t.add("label `'").add(this.str(x)).add("` is already used by an enclosing loop");
+                                return Result.Err(this.err(l.label.span, t.str()));
+                            }
+                        }
+                        Option.None {}
+                    }
+                }
+                this.pendingLabel = Option.Some(l.label.name);
+                return this.stmt(l.body);
+            }
+            _ {}
+        }
+        if !isLoop { return this.stmtInner(s); }
+        let label = this.pendingLabel;
+        this.pendingLabel = Option.None;
+        this.loops.push(LoopFrame { id: this.nloops, label: label });
+        this.nloops += 1;
+        let r = this.stmtInner(s);
+        this.loops.len -= 1;
+        return r;
+    }
+
+    fn loopId(this: &BodyCx): int { return this.loops.items[this.loops.len - 1].id; }
+
+    fn stmtInner(this: &BodyCx, s: Id<Stmt>): Result<Id<TStmt>, TErr> {
+        let sp = this.cx.ast.stmtSpan(s);
+        let c = this.com();
+        match this.cx.ast.stmt(s) {
+            Stmt.Let(l) {
+                if this.isDeclared(l.name.name) { return Result.Err(this.shadowErr(l.name)); }
+                let want: Option<Id<Ty>> = Option.None;
+                match l.ty {
+                    Option.Some(t) { want = Option.Some(this.resolve(t)?); }
+                    Option.None {}
+                }
+                match this.cx.ast.expr(l.value) {
+                    Expr.Zeroed {
+                        match want {
+                            Option.Some(w) {
+                                let bad = Text.new(this.cx.arena);
+                                if this.noZero(w, &bad) {
+                                    let t = Text.new(this.cx.arena);
+                                    t.add("`").add(bad.str()).add("` has no zero value");
+                                    return Result.Err(this.help(this.err(sp, t.str()),
+                                        "`let x: T;` zero-fills numbers, bools, pointers, strings, and arrays and structs of them; give this `let` a value"));
+                                }
+                                let id = this.newLocal(l.name.name, w, l.name.span, false);
+                                this.bind(l.name.name, id);
+                                return Result.Ok(this.stmtNode(TStmt.Let(TLet { local: id, init: Option.None }), sp));
+                            }
+                            Option.None {}
+                        }
+                    }
+                    _ {}
+                }
+                let v = this.rvalue(l.value, want)?;
+                let vt = this.exprTy(v);
+                match want {
+                    Option.Some(w) {
+                        if vt != w {
+                            return Result.Err(this.mismatch(this.cx.ast.exprSpan(l.value), "let type does not match initializer", vt, w));
+                        }
+                    }
+                    Option.None {}
+                }
+                let id = this.newLocal(l.name.name, vt, l.name.span, false);
+                this.bind(l.name.name, id);
+                return Result.Ok(this.stmtNode(TStmt.Let(TLet { local: id, init: Option.Some(v) }), sp));
+            }
+            Stmt.Return(r) {
+                match r.value {
+                    Option.None {
+                        if this.ret != c.void { return Result.Err(this.err(r.span, "return needs a value")); }
+                        return Result.Ok(this.stmtNode(TStmt.Return(TReturn { value: Option.None }), sp));
+                    }
+                    Option.Some(e) {
+                        if this.ret == c.void { return Result.Err(this.err(r.span, "return value in void function")); }
+                        let v = this.operand(e, Option.Some(this.ret))?;
+                        if this.exprTy(v) != this.ret {
+                            return Result.Err(this.mismatch(r.span, "return type mismatch", this.exprTy(v), this.ret));
+                        }
+                        return Result.Ok(this.stmtNode(TStmt.Return(TReturn { value: Option.Some(v) }), sp));
+                    }
+                }
+            }
+            Stmt.Assign(a) {
+                let p = this.assignTarget(a.place, a.span, false)?;
+                let pt = this.placeTy(p);
+                let v = this.rvalue(a.value, Option.Some(pt))?;
+                if this.exprTy(v) != pt { return Result.Err(this.mismatch(a.span, "assign type mismatch", this.exprTy(v), pt)); }
+                return Result.Ok(this.stmtNode(TStmt.Assign(TAssign { place: p, value: v }), sp));
+            }
+            Stmt.AssignOp(a) {
+                let p = this.assignTarget(a.place, a.span, true)?;
+                let pt = this.placeTy(p);
+                match this.traitAssignOp(sp, a.span, a.op, a.value, p)? { Option.Some(st) { return Result.Ok(st); } Option.None {} }
+                match this.findOp(a.span, pt, a.op)? {
+                    Option.Some(f) {
+                        let d = this.cx.tables.fnAt(f);
+                        if d.params.len != 2 { return Result.Err(this.err(a.span, "binary operator needs two parameters")); }
+                        let rhs = this.operand(a.value, Option.Some(d.params.items[1].ty))?;
+                        let args = List<Id<TExpr>>.new(this.cx.arena);
+                        args.push(this.load(p));
+                        args.push(rhs);
+                        let call = this.expr(TExpr.Call(TCall { callee: Callee.Fn(FnCallee { decl: f }), args: args }), d.ret, a.span);
+                        if d.ret != pt { return Result.Err(this.mismatch(a.span, "assign-op type mismatch", d.ret, pt)); }
+                        return Result.Ok(this.stmtNode(TStmt.Assign(TAssign { place: p, value: call }), sp));
+                    }
+                    Option.None {}
+                }
+                if this.isHalf(pt) {
+                    let t = Text.new(this.cx.arena);
+                    t.add("`").add(binOpStr(a.op)).add("=`");
+                    return Result.Err(this.halfError(a.span, t.str()));
+                }
+                if this.isVec(pt) { return this.simdAssignOp(sp, a.span, a.op, p, a.value); }
+                let rhs = this.operand(a.value, Option.Some(pt))?;
+                if this.exprTy(rhs) != pt {
+                    return Result.Err(this.mismatch(this.cx.ast.exprSpan(a.value), "assign-op type mismatch", this.exprTy(rhs), pt));
+                }
+                return Result.Ok(this.stmtNode(TStmt.AssignOp(TAssignOp { place: p, op: a.op, kind: BinKind.Prim, value: rhs }), sp));
+            }
+            Stmt.Expr(e) {
+                match this.cx.ast.expr(e.expr) {
+                    Expr.Match(m) { return this.patMatchStmt(sp, &m); }
+                    _ {}
+                }
+                let v = this.rvalue(e.expr, Option.None)?;
+                return Result.Ok(this.stmtNode(TStmt.Expr(TExprStmt { expr: v }), sp));
+            }
+            Stmt.If(i) {
+                let cond = this.operand(i.cond, Option.Some(c.bool))?;
+                let thenBlock = this.scopedBlock(&i.thenBlock);
+                let elseBlock: Option<TBlock> = Option.None;
+                match i.elseBlock {
+                    Option.Some(b) { elseBlock = Option.Some(this.scopedBlock(&b)); }
+                    Option.None {}
+                }
+                return Result.Ok(this.stmtNode(TStmt.If(TIfStmt { cond: cond, thenBlock: thenBlock, elseBlock: elseBlock }), sp));
+            }
+            Stmt.While(w) {
+                let id = this.loopId();
+                let cond = this.operand(w.cond, Option.Some(c.bool))?;
+                let body = this.scopedBlock(&w.body);
+                return Result.Ok(this.stmtNode(TStmt.While(TLoop { id: id, cond: cond, body: body }), sp));
+            }
+            Stmt.For(f) {
+                if this.isDeclared(f.name.name) { return Result.Err(this.shadowErr(f.name)); }
+                let id = this.loopId();
+                let start = this.operand(f.start, Option.Some(c.i64))?;
+                let end = this.operand(f.end, Option.Some(c.i64))?;
+                let n0 = this.scope.len;
+                let v = this.newLocal(f.name.name, c.i64, f.name.span, false);
+                this.bind(f.name.name, v);
+                let body = this.scopedBlock(&f.body);
+                this.scope.len = n0;
+                return Result.Ok(this.stmtNode(TStmt.ForRange(TForRange { id: id, var: v, start: start, end: end, inclusive: f.inclusive, body: body }), sp));
+            }
+            Stmt.ForEach(f) { return this.forEach(&f, sp); }
+            Stmt.UseLocal(u) { return this.useLocal(u.name, u.span); }
+            Stmt.Defer(d) {
+                let body = this.scopedBlock(&d.body);
+                return Result.Ok(this.stmtNode(TStmt.Defer(TDefer { body: body }), sp));
+            }
+            Stmt.Break(j) { return this.jump(j.label, sp, true); }
+            Stmt.Continue(j) { return this.jump(j.label, sp, false); }
+            Stmt.Match(m) { return this.patMatchStmt(m.span, &m); }
+            Stmt.LetPat(l) { return this.patLetPat(sp, &l); }
+            Stmt.Labeled(_) { return this.stmt(s); }
+            Stmt.Block(b) {
+                let body = this.scopedBlock(&b);
+                return Result.Ok(this.stmtNode(TStmt.Block(TBlockStmt { block: body }), sp));
+            }
+        }
+        return Result.Err(this.err(sp, "unreachable statement kind"));
+    }
+
+    fn shadowErr(this: &BodyCx, name: Ident): TErr {
+        let t = Text.new(this.cx.arena);
+        t.add("shadowing `").add(this.str(name.name)).add("` is a compile error");
+        return this.err(name.span, t.str());
+    }
+
+    /// The place an `=` / `op=` stores into, with Rust's temporary / read-only checks.
+    fn assignTarget(this: &BodyCx, e: Id<Expr>, sp: Span, isOp: bool): Result<Id<TPlace>, TErr> {
+        let p = this.tryPlace(e)?;
+        if this.writesTemporary(e, p) {
+            return Result.Err(this.err(this.tempSpan(e), "cannot assign to a temporary (the result of a call or expression)"));
+        }
+        if this.canAssign(p) { return Result.Ok(p); }
+        let msg = "cannot assign to this place";
+        if isOp { msg = "cannot assign-op this place"; }
+        match this.readonlyGlobal(p) {
+            Option.Some(g) { msg = g; }
+            Option.None {}
+        }
+        let er = this.err(sp, msg);
+        if isOp { return Result.Err(er); }
+        let inString = false;
+        match this.cx.ast.expr(e) {
+            Expr.Index(ix) {
+                match this.tryPlace(ix.base) {
+                    Result.Ok(bp) { inString = this.placeTy(bp) == this.com().string; }
+                    Result.Err(_) {}
+                }
+            }
+            _ {}
+        }
+        if inString {
+            return Result.Err(this.help(er, "a `string` is a read-only byte view: build or edit bytes with `j3.text` (`j3c doc j3.text`)"));
+        }
+        return Result.Err(er);
+    }
+
+    /// `break` / `continue` (`isBreak`), with an optional label.
+    fn jump(this: &BodyCx, label: Option<Ident>, sp: Span, isBreak: bool): Result<Id<TStmt>, TErr> {
+        let what = "continue";
+        if isBreak { what = "break"; }
+        let target = -1;
+        match label {
+            Option.None {
+                if this.loops.len == 0 {
+                    let t = Text.new(this.cx.arena);
+                    t.add("`").add(what).add("` outside a loop");
+                    return Result.Err(this.loopErr(sp, t.str()));
+                }
+                target = this.loopId();
+            }
+            Option.Some(l) {
+                let i = this.loops.len - 1;
+                while i >= 0 && target < 0 {
+                    match this.loops.items[i].label {
+                        Option.Some(x) { if x == l.name { target = this.loops.items[i].id; } }
+                        Option.None {}
+                    }
+                    i -= 1;
+                }
+                if target < 0 {
+                    let t = Text.new(this.cx.arena);
+                    t.add("no enclosing loop is labeled `'").add(this.str(l.name)).add("`");
+                    return Result.Err(this.loopErr(l.span, t.str()));
+                }
+            }
+        }
+        if isBreak { return Result.Ok(this.stmtNode(TStmt.Break(TJump { target: target }), sp)); }
+        return Result.Ok(this.stmtNode(TStmt.Continue(TJump { target: target }), sp));
+    }
+
+    /// Rust `for_each`: `for x in xs` / `for i, x in xs` over an array, slice or string place (a call or
+    /// literal is held in a temporary); anything else is an iterator (C2b).
+    fn forEach(this: &BodyCx, f: &ForEachStmt, sp: Span): Result<Id<TStmt>, TErr> {
+        match f.index {
+            Option.Some(i) { if this.isDeclared(i.name) { return Result.Err(this.shadowErr(i)); } }
+            Option.None {}
+        }
+        if this.isDeclared(f.name.name) { return Result.Err(this.shadowErr(f.name)); }
+        let id = this.loopId();
+        let src = this.basePlace(f.iter)?;
+        src = this.derefAll(src, sp);
+        let st = this.placeTy(src);
+        let elem = match this.elemTy(st) {
+            Option.Some(e) { e }
+            Option.None { return this.genForIter(sp, f, id, src); }
+        };
+        let kind = ForKind.Slice;
+        match this.ty(st) { Ty.Array(_) { kind = ForKind.Array; } _ {} }
+        let n0 = this.scope.len;
+        let index: Option<Id<TLocal>> = Option.None;
+        match f.index {
+            Option.Some(i) {
+                let il = this.newLocal(i.name, this.com().i64, i.span, false);
+                this.bind(i.name, il);
+                index = Option.Some(il);
+            }
+            Option.None {}
+        }
+        let v = this.newLocal(f.name.name, elem, f.name.span, false);
+        this.bind(f.name.name, v);
+        let body = this.scopedBlock(&f.body);
+        this.scope.len = n0;
+        return Result.Ok(this.stmtNode(TStmt.ForEach(TForEach { id: id, kind: kind, index: index, var: v, source: src, next: Option.None,
+            some: 0, body: body }), sp));
+    }
+}
+
+/// The source spelling of a binary operator (Rust `BinOp::as_str`).
+pub fn binOpStr(op: BinOp): string {
+    match op {
+        BinOp.Add { return "+"; }
+        BinOp.Sub { return "-"; }
+        BinOp.Mul { return "*"; }
+        BinOp.Div { return "/"; }
+        BinOp.Rem { return "%"; }
+        BinOp.Shl { return "<<"; }
+        BinOp.Shr { return ">>"; }
+        BinOp.BitAnd { return "&"; }
+        BinOp.BitOr { return "|"; }
+        BinOp.BitXor { return "^"; }
+        BinOp.Eq { return "=="; }
+        BinOp.Ne { return "!="; }
+        BinOp.Lt { return "<"; }
+        BinOp.Le { return "<="; }
+        BinOp.Gt { return ">"; }
+        BinOp.Ge { return ">="; }
+        BinOp.And { return "&&"; }
+        BinOp.Or { return "||"; }
+    }
+    return "?";
+}

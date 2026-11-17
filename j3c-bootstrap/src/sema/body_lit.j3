@@ -1,0 +1,384 @@
+// Literals with structure: struct literals (fields in declaration order, defaults filled), array and
+// slice literals, `base[a..b]`, `@slice(ptr, len)`, an array or `Text` passed where a slice or string is
+// wanted, and backtick interpolation.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/lit.rs (struct_lit, struct_lit_sid, array_lit, slice_lit, slice_rvalue, array_to_slice,
+// slice_from, embed_value), check/lower/interp.rs (typing half: interpolate, interp_operand, interp_ok, fold_interp,
+// text_to_string; the buffer filling is `lower`'s)
+// J3: A struct literal is `TExpr.StructLit` with one value per field in declaration order; a missing
+// field with a default gets the default's constant (Rust pushed the default operand). `written` keeps the
+// source order of the given fields, which Rust evaluated in that order.
+// J3: Slicing is `TExpr.SliceOf { base, start, end }`; Rust's three bounds aborts are `lower`'s.
+module j3c.sema;
+
+extend BodyCx {
+    /// Rust `struct_lit` (a generic struct's literal: `gen_call.genStructLit`).
+    fn structLit(this: &BodyCx, sp: Span, s: &StructLitExpr): Result<Id<TExpr>, TErr> {
+        if s.typeArgs.len > 0 { return this.genStructLit(sp, s); }
+        let r = match this.lookupName(s.name.name) {
+            Option.Some(r) { r }
+            Option.None {
+                let t = Text.new(this.cx.arena);
+                t.add("unknown type `").add(this.str(s.name.name)).add("`");
+                return Result.Err(this.err(s.name.span, t.str()));
+            }
+        };
+        if r.kind != DeclKind.Struct {
+            let t = Text.new(this.cx.arena);
+            if r.kind == DeclKind.Enum { t.add("`").add(this.str(s.name.name)).add("` is not a struct"); } else { t.add("unknown type `").add(this.str(s.name.name)).add("`"); }
+            return Result.Err(this.err(s.name.span, t.str()));
+        }
+        let sid = r.asStruct();
+        let sd = *this.cx.tables.structAt(sid);
+        match sd.gen { Option.Some(_) { return this.genStructLit(sp, s); } Option.None {} }
+        match sd.scriptPath { Option.Some(_) { return this.scriptStructLit(sp, sid, s); } Option.None {} }
+        let st = this.cx.tables.structTy(sid, this.cx.arena.alloc::<Id<Ty>>(0));
+        let vals = this.cx.arena.alloc::<Id<TExpr>>(sd.fields.len);
+        let set = this.cx.arena.alloc::<bool>(sd.fields.len);
+        for i in 0..set.len { set[i] = false; } // arena memory may be reused, not zeroed
+        let written = List<int>.new(this.cx.arena);
+        for k in 0..s.fields.len {
+            let fi = s.fields.items[k];
+            let idx = -1;
+            for i in 0..sd.fields.len {
+                if sd.fields.items[i].name == fi.name.name {
+                    idx = i;
+                    break;
+                }
+            }
+            if idx < 0 {
+                let t = Text.new(this.cx.arena);
+                t.add("`").add(this.str(sd.name)).add("` has no field `").add(this.str(fi.name.name)).add("`");
+                return Result.Err(this.err(fi.name.span, t.str()));
+            }
+            if set[idx] {
+                let t = Text.new(this.cx.arena);
+                t.add("duplicate field `").add(this.str(fi.name.name)).add("`");
+                return Result.Err(this.err(fi.name.span, t.str()));
+            }
+            vals[idx] = this.operand(fi.value, Option.Some(sd.fields.items[idx].ty))?;
+            set[idx] = true;
+            written.push(idx);
+        }
+        let items = List<Id<TExpr>>.new(this.cx.arena);
+        for i in 0..sd.fields.len {
+            if set[i] {
+                items.push(vals[i]);
+                continue;
+            }
+            match sd.fields.items[i].default {
+                Option.Some(d) { items.push(this.constValue(sp, d)); }
+                Option.None {
+                    let t = Text.new(this.cx.arena);
+                    t.add("missing field `").add(this.str(sd.fields.items[i].name)).add("`");
+                    return Result.Err(this.err(sp, t.str()));
+                }
+            }
+        }
+        return Result.Ok(this.expr(TExpr.StructLit(TStructLit { items: items, written: written }), st, sp));
+    }
+
+    /// Rust `embed_value`: `@embed(..)` / `@embedBytes(..)` in a body is its bytes (`string` / `[]u8`),
+    /// read by `load` into the file's `embeds` under the call's span.
+    fn embedValue(this: &BodyCx, sp: Span, kind: EmbedKind): Result<Id<TExpr>, TErr> {
+        if kind == EmbedKind.Dir {
+            return Result.Err(this.help(this.err(sp, "`@embedDir` makes a table, so it only works as a const"),
+                "write `const FILES = @embedDir(\"dir\", \"*.ext\");` and use `FILES[i].path` / `FILES[i].data`"));
+        }
+        let files = this.cx.parsed.files;
+        for i in 0..files.len {
+            let er = files.items[i].ast.embeds;
+            for j in 0..er.len {
+                if er.items[j].at == sp {
+                    let t = this.com().string;
+                    if kind == EmbedKind.Bytes { t = this.cx.tables.sliceOf(this.com().u8); }
+                    return Result.Ok(this.expr(TExpr.Str(er.items[j].files.items[0].data as string), t, sp));
+                }
+            }
+        }
+        return Result.Err(this.err(sp, "`@embed` files are read by the project loader; this file was not loaded by it"));
+    }
+
+    /// Rust `array_lit`: `[a, b]` as `[N]T`, or as a slice when one is expected.
+    fn arrayLit(this: &BodyCx, sp: Span, elems: &List<Id<Expr>>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let elem = this.com().error;
+        let asSlice = false;
+        let origin = Origin.Written;
+        match want {
+            Option.Some(w) {
+                match this.ty(w) {
+                    Ty.Array(a) {
+                        if a.len != u64(elems.len) {
+                            let t = Text.new(this.cx.arena);
+                            t.add("array literal has ");
+                            t.pushInt(elems.len);
+                            t.add(" elems, expected ");
+                            t.pushU64(a.len);
+                            return Result.Err(this.err(sp, t.str()));
+                        }
+                        elem = a.elem;
+                    }
+                    Ty.Slice(s) {
+                        asSlice = true;
+                        elem = s.elem;
+                    }
+                    _ { return Result.Err(this.err(sp, "array literal needs an array or slice type")); }
+                }
+            }
+            Option.None {
+                if elems.len == 0 { return Result.Err(this.err(sp, "cannot infer empty array")); }
+                elem = this.exprTy(this.operand(elems.items[0], Option.None)?);
+                origin = Origin.ArrayPeek;
+            }
+        }
+        match this.closureReject(sp, elem, "an array element") { Option.Some(er) { return Result.Err(er); } Option.None {} }
+        let at = this.cx.tables.arrayOf(elem, u64(elems.len));
+        let items = List<Id<TExpr>>.new(this.cx.arena);
+        for i in 0..elems.len { items.push(this.operand(elems.items[i], Option.Some(elem))?); }
+        let arr = this.exprFrom(origin, TExpr.ArrayLit(TElems { items: items }), at, sp);
+        if !asSlice { return Result.Ok(arr); }
+        return Result.Ok(this.exprFrom(Origin.ArrayLitToSlice, TExpr.SliceOf(TSliceOf { base: this.temp(arr), start: Option.None, end: Option.None }),
+            this.cx.tables.sliceOf(elem), sp));
+    }
+
+    /// Rust `slice_lit`: `[]T { ptr: p, len: n }`.
+    fn sliceLit(this: &BodyCx, sp: Span, elemTy: Id<Type>, fields: &List<FieldInit>): Result<Id<TExpr>, TErr> {
+        let elem = this.resolve(elemTy)?;
+        let st = this.cx.tables.sliceOf(elem);
+        let ptr: Option<Id<TExpr>> = Option.None;
+        let len: Option<Id<TExpr>> = Option.None;
+        for i in 0..fields.len {
+            let f = fields.items[i];
+            let name = this.str(f.name.name);
+            if name == "ptr" {
+                ptr = Option.Some(this.operand(f.value, Option.Some(this.cx.tables.refTo(elem)))?);
+            } else if name == "len" {
+                len = Option.Some(this.operand(f.value, Option.Some(this.com().i64))?);
+            } else {
+                let t = Text.new(this.cx.arena);
+                t.add("slice literal has no field `").add(name).add("`");
+                return Result.Err(this.err(f.name.span, t.str()));
+            }
+        }
+        let p = match ptr { Option.Some(x) { x } Option.None { return Result.Err(this.err(sp, "slice literal needs `ptr`")); } };
+        let n = match len { Option.Some(x) { x } Option.None { return Result.Err(this.err(sp, "slice literal needs `len`")); } };
+        return Result.Ok(this.expr(TExpr.SliceLit(TSliceLit { ptr: p, len: n }), st, sp));
+    }
+
+    /// Rust `slice_rvalue`: `base[start..end]` (bounds default to 0 and the length).
+    fn sliceRvalue(this: &BodyCx, sp: Span, base: Id<TPlace>, start: Option<Id<Expr>>, end: Option<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let p = this.derefAll(base, sp);
+        let pt = this.placeTy(p);
+        let elem = match this.elemTy(pt) {
+            Option.Some(e) { e }
+            Option.None { return Result.Err(this.err(sp, "slice of non-array/slice")); }
+        };
+        let s: Option<Id<TExpr>> = Option.None;
+        let e: Option<Id<TExpr>> = Option.None;
+        match start { Option.Some(x) { s = Option.Some(this.operand(x, Option.Some(this.com().i64))?); } Option.None {} }
+        match end { Option.Some(x) { e = Option.Some(this.operand(x, Option.Some(this.com().i64))?); } Option.None {} }
+        let t = this.cx.tables.sliceOf(elem);
+        if pt == this.com().string { t = pt; }
+        return Result.Ok(this.expr(TExpr.SliceOf(TSliceOf { base: p, start: s, end: e }), t, sp));
+    }
+
+    /// Rust `array_to_slice`: an `[N]T` place where `[]T` is wanted.
+    fn arrayToSlice(this: &BodyCx, sp: Span, p: Id<TPlace>, want: Id<Ty>): Option<Id<TExpr>> {
+        let elem = match this.ty(this.placeTy(p)) {
+            Ty.Array(a) { a.elem }
+            _ { return Option.None; }
+        };
+        match this.ty(want) {
+            Ty.Slice(s) { if s.elem != elem { return Option.None; } }
+            _ { return Option.None; }
+        }
+        return Option.Some(this.exprFrom(Origin.ArrayToSlice, TExpr.SliceOf(TSliceOf { base: p, start: Option.None, end: Option.None }), want, sp));
+    }
+
+    /// Rust `text_to_string`: a `Text` place where a `string` is wanted reads its `bytes` as a string.
+    fn textToString(this: &BodyCx, sp: Span, p: Id<TPlace>, want: Id<Ty>): Option<Id<TExpr>> {
+        if want != this.com().string { return Option.None; }
+        let s = match this.structOf(this.placeTy(p)) {
+            Option.Some(s) { s }
+            Option.None { return Option.None; }
+        };
+        if this.str(this.cx.tables.structAt(s).name) != "Text" { return Option.None; }
+        let path = this.fieldPath(s, this.sym("bytes"));
+        if path.len == 0 { return Option.None; }
+        let q = this.fieldWalk(p, &path, sp);
+        return Option.Some(this.exprFrom(Origin.TextToString, TExpr.Convert(TConvert { expr: this.load(q), kind: ConvKind.StringBytes }), want, sp));
+    }
+
+    /// Rust `slice_from`: `@slice(ptr, len)` against an expected slice type.
+    fn sliceFrom(this: &BodyCx, sp: Span, ptr: Id<Expr>, len: Id<Expr>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let st = this.com().error;
+        let elem = this.com().error;
+        let ok = false;
+        match want {
+            Option.Some(w) { match this.ty(w) { Ty.Slice(s) { st = w; elem = s.elem; ok = true; } _ {} } }
+            Option.None {}
+        }
+        if !ok { return Result.Err(this.err(sp, "`@slice` needs an expected slice type")); }
+        let pt = this.cx.tables.refTo(elem);
+        let p = this.operand(ptr, Option.None)?;
+        if this.exprTy(p) != pt {
+            if this.exprTy(p) != this.com().ptr { return Result.Err(this.err(sp, "`@slice` pointer type mismatch")); }
+            p = this.expr(TExpr.Convert(TConvert { expr: p, kind: ConvKind.PtrCast }), pt, sp);
+        }
+        let n = this.operand(len, Option.Some(this.com().i64))?;
+        return Result.Ok(this.expr(TExpr.SliceLit(TSliceLit { ptr: p, len: n }), st, sp));
+    }
+
+    /// Rust `interpolate`: constant parts fold to one string; `{s}` alone is `s`; else a frame-buffer
+    /// `Interp` node.
+    fn interpolate(this: &BodyCx, sp: Span, parts: &List<InterpPart>): Result<Id<TExpr>, TErr> {
+        let c = this.com();
+        match this.foldInterp(parts) {
+            Option.Some(s) { return Result.Ok(this.expr(TExpr.Str(s), c.string, sp)); }
+            Option.None {}
+        }
+        let out = List<TInterpPart>.new(this.cx.arena);
+        for i in 0..parts.len {
+            match parts.items[i] {
+                InterpPart.Lit(b) { out.push(TInterpPart.Lit(b)); }
+                InterpPart.Expr(h) {
+                    let v = this.interpOperand(h.expr)?;
+                    if parts.len == 1 && this.exprTy(v) == c.string { return Result.Ok(v); }
+                    out.push(TInterpPart.Value(TInterpValue { expr: v, debug: Option.None }));
+                }
+            }
+        }
+        for i in 0..out.len {
+            match out.items[i] { TInterpPart.Value(v) { this.printable(sp, this.exprTy(v.expr))?; } TInterpPart.Lit(_) {} }
+        }
+        return Result.Ok(this.expr(TExpr.Interp(TInterp { parts: out, frame: true }), c.string, sp));
+    }
+
+    /// Rust `interp_operand`: a value that can appear in a backtick string.
+    fn interpOperand(this: &BodyCx, e: Id<Expr>): Result<Id<TExpr>, TErr> {
+        let v = this.operand(e, Option.None)?;
+        let t = this.exprTy(v);
+        let sp = this.cx.ast.exprSpan(e);
+        if this.isHalf(t) { return Result.Err(this.help(this.err(sp, "an `f16` cannot appear in interpolate"), "write `{f32(x)}`")); }
+        if this.interpOk(t) { return Result.Ok(v); }
+        let er = this.err(sp, "this value cannot appear in interpolate (need primitive, string, or #[Debug])");
+        let inner = t;
+        while true {
+            match this.refInner(inner) { Option.Some(x) { inner = x; } Option.None { break; } }
+        }
+        let h = Text.new(this.cx.arena);
+        match this.ty(inner) {
+            Ty.Struct(s) { h.add("put `#[Debug]` on `struct ").add(this.str(this.cx.tables.structAt(s.decl).name)).add("`"); }
+            Ty.Enum(en) { h.add("put `#[Debug]` on `enum ").add(this.str(this.cx.tables.enumAt(en.decl).name)).add("`"); }
+            _ { return Result.Err(er); }
+        }
+        return Result.Err(this.help(er, h.str()));
+    }
+
+    /// Rust `interp_expand`'s refusal (raised after every hole is typed): something inside `t` that the
+    /// field-by-field expansion cannot print.
+    fn printable(this: &BodyCx, sp: Span, t: Id<Ty>): Result<bool, TErr> {
+        if t == this.com().string || t == this.com().bool || this.isNumeric(t) { return Result.Ok(true); }
+        let tables = this.cx.tables;
+        match this.ty(t) {
+            Ty.Ref(_) { return Result.Ok(true); }
+            Ty.Ptr { return Result.Ok(true); }
+            Ty.Tuple(tu) {
+                let es = tables.items(tu.elems);
+                for k in 0..es.len { this.printable(sp, es[k])?; }
+                return Result.Ok(true);
+            }
+            Ty.Struct(s) {
+                let sd = tables.structAt(s.decl);
+                if sd.debug {
+                    let n = sd.fields.len;
+                    for k in 0..n { this.printable(sp, fieldTyOf(tables, t, k))?; }
+                    return Result.Ok(true);
+                }
+            }
+            Ty.Array(a) { if a.len <= u64(64) { this.printable(sp, a.elem)?; return Result.Ok(true); } }
+            Ty.Enum(e) {
+                let ed = *tables.enumAt(e.decl);
+                if ed.debug {
+                    for k in 0..ed.variants.len {
+                        match ed.variants.items[k].payload {
+                            Option.Some(p) {
+                                let pt = p;
+                                match ed.gen { Option.Some(g) { pt = subst(tables, g, p, e.args); } Option.None {} }
+                                this.printable(sp, pt)?;
+                            }
+                            Option.None {}
+                        }
+                    }
+                    return Result.Ok(true);
+                }
+            }
+            _ {}
+        }
+        let m = Text.new(this.cx.arena);
+        m.add("a `").add(this.tyStr(t)).add("` inside this value cannot be printed");
+        return Result.Err(this.help(this.err(sp, m.str()),
+            "interpolate prints primitives, strings, pointers (as their type), tuples, arrays up to 64, and `#[Debug]` structs and enums"));
+    }
+
+    /// Rust `interp_ok`: primitives, strings, `#[Debug]` structs and enums, tuples.
+    fn interpOk(this: &BodyCx, t: Id<Ty>): bool {
+        if t == this.com().string || t == this.com().bool || this.isNumeric(t) { return true; }
+        match this.ty(t) {
+            Ty.Struct(s) { return this.cx.tables.structAt(s.decl).debug; }
+            Ty.Enum(e) { return this.cx.tables.enumAt(e.decl).debug; }
+            Ty.Tuple(_) { return true; }
+            _ { return false; }
+        }
+        return false;
+    }
+
+    /// Rust `fold_interp`: every part known at compile time, as one string (an arena copy).
+    fn foldInterp(this: &BodyCx, parts: &List<InterpPart>): Option<string> {
+        let t = Text.new(this.cx.arena);
+        for i in 0..parts.len {
+            match parts.items[i] {
+                InterpPart.Lit(b) { t.add(b); }
+                InterpPart.Expr(h) { if !this.foldInterpExpr(h.expr, &t) { return Option.None; } }
+            }
+        }
+        return Option.Some(t.str());
+    }
+
+    fn foldInterpExpr(this: &BodyCx, e: Id<Expr>, out: &Text): bool {
+        match this.foldInt(e) {
+            Option.Some(v) {
+                out.pushInt(v);
+                return true;
+            }
+            Option.None {}
+        }
+        match this.cx.ast.expr(e) {
+            Expr.String(b) { out.add(b); return true; }
+            Expr.Bool(v) {
+                if v { out.add("true"); } else { out.add("false"); }
+                return true;
+            }
+            Expr.Name(n) {
+                match this.intConstNamed(n.name) {
+                    Option.Some(c) {
+                        match c.kind {
+                            ConstPayload.String(s) { out.add(s); return true; }
+                            ConstPayload.Int(v) { out.pushInt(v); return true; }
+                            ConstPayload.Bool(v) {
+                                if v { out.add("true"); } else { out.add("false"); }
+                                return true;
+                            }
+                            // ponytail: Rust prints a float const with `Display` (`1.5`, `2`); not folded here yet.
+                            _ { return false; }
+                        }
+                    }
+                    Option.None {}
+                }
+            }
+            _ {}
+        }
+        return false;
+    }
+}

@@ -2,4 +2,268 @@
 //
 // Part of module j3c.backend.llvm.
 // Port of: j3c/src/emit/llvm_expr/stmt.rs
+// J3: Entries: `stmt` (exhaustive over `StmtKind`, rule 6), `boolVal`, `placePtr` (Rust returns `(ptr, ty)`).
 module j3c.backend.llvm;
+
+extend LlvmFn {
+    fn stmt(this: &LlvmFn, s: &Stmt): Result<bool, string> {
+        if this.terminated { return Result.Ok(true); }
+        this.noteSpan(s.span);
+        let cx = this.cx;
+        match s.kind {
+            StmtKind.Assign(a) {
+                let (ptr, _) = this.placePtr(&a.place)?;
+                let (v, ty) = this.rvalue(&a.rvalue)?;
+                if inMem(cx, a.place.ty) { this.copyMem(ptr, v, a.place.ty); } else { this.store(ty, v, ptr); }
+            }
+            StmtKind.AssignOp(a) {
+                let (ptr, _) = this.placePtr(&a.place)?;
+                let ll = llType(cx, a.place.ty, this.arena)?;
+                let cur = this.load(ll, ptr);
+                let (r, _) = this.operand(&a.rhs)?;
+                let out = this.binop(a.place.ty, a.place.ty, a.op, cur, r)?;
+                this.store(ll, out, ptr);
+            }
+            StmtKind.Expr(rv) { this.rvalue(&rv)?; }
+            StmtKind.Return(r) {
+                match r.value {
+                    Option.Some(v) {
+                        if this.sret {
+                            // into the caller's slot now: defers below may still change the local
+                            let (e, _) = this.operand(&v)?;
+                            this.copyMem("%ret", e, operandTy(v));
+                            this.emitDefers(-1)?;
+                            this.term("ret void");
+                        } else {
+                            let (e, ty) = this.operand(&v)?;
+                            match cx.tyKind(operandTy(v)) { TyKind.Array(_) { e = this.load(ty, e); } _ {} }
+                            let slot = this.alloca(ty);
+                            this.store(ty, e, slot);
+                            this.emitDefers(-1)?;
+                            let loaded = this.load(ty, slot);
+                            this.term(this.l().add("ret ").add(ty).add(" ").add(loaded).str());
+                        }
+                    }
+                    Option.None {
+                        this.emitDefers(-1)?;
+                        this.term("ret void");
+                    }
+                }
+            }
+            StmtKind.Break(n) {
+                this.emitDefers(int(n))?;
+                this.br(this.loopTarget(false, n)?);
+            }
+            StmtKind.Continue(n) {
+                this.emitDefers(int(n))?;
+                this.br(this.loopTarget(true, n)?);
+            }
+            StmtKind.Abort(ab) {
+                let vs = this.arena.alloc::<string>(ab.args.len);
+                for i in 0..ab.args.len {
+                    let (val, ll) = this.operand(&ab.args.items[i])?;
+                    if ll == "i64" {
+                        vs[i] = val;
+                    } else {
+                        let w = this.fresh();
+                        this.inst(this.l().add(w).add(" = sext ").add(ll).add(" ").add(val).add(" to i64").str());
+                        vs[i] = w;
+                    }
+                }
+                this.exitAbortVals(ab.kind, vs);
+            }
+            StmtKind.Div0 { this.exitAbort(AbortKind.Div0); }
+            StmtKind.Block(inner) { this.emitBlock(&inner)?; }
+            StmtKind.Defer(d) {
+                if this.frames.len > 0 { this.frames.items[this.frames.len - 1].blocks.push(d.body); }
+            }
+            StmtKind.If(f) {
+                let c = this.boolVal(&f.cond)?;
+                let t = this.label();
+                let e = this.label();
+                let j = this.label();
+                match f.elseBlock {
+                    Option.Some(_) { this.brIf(c, t, e); }
+                    Option.None { this.brIf(c, t, j); }
+                }
+                this.block(t);
+                this.emitBlock(&f.thenBlock)?;
+                if !this.terminated { this.br(j); }
+                match f.elseBlock {
+                    Option.Some(eb) {
+                        this.block(e);
+                        this.emitBlock(&eb)?;
+                        if !this.terminated { this.br(j); }
+                    }
+                    Option.None {}
+                }
+                this.block(j);
+            }
+            StmtKind.Switch(sw) {
+                let (v, ty) = this.operand(&sw.scrut)?;
+                let def = this.label();
+                let end = this.label();
+                let st = operandTy(sw.scrut);
+                let labels = List<string>.new(this.arena);
+                let line = Text.new(this.arena);
+                line.add("switch ").add(ty).add(" ").add(v).add(", label %").add(def).add(" [");
+                for i in 0..sw.cases.len {
+                    let lab = this.label();
+                    let k = this.constBits(st, ConstKind.Int(sw.cases.items[i].value))?;
+                    line.add(" ").add(ty).add(" ").add(k).add(", label %").add(lab);
+                    labels.push(lab);
+                }
+                line.add(" ]");
+                this.term(line.str());
+                for i in 0..sw.cases.len {
+                    this.block(labels.items[i]);
+                    this.emitBlock(&sw.cases.items[i].block)?;
+                    if !this.terminated { this.br(end); }
+                }
+                this.block(def);
+                this.emitBlock(&sw.default)?;
+                if !this.terminated { this.br(end); }
+                this.block(end);
+            }
+            StmtKind.While(w) {
+                let hdr = this.label();
+                let bod = this.label();
+                let end = this.label();
+                this.block(hdr);
+                let c = this.boolVal(&w.cond)?;
+                this.brIf(c, bod, end);
+                this.block(bod);
+                this.emitBlockLoop(&w.body, hdr, end)?;
+                if !this.terminated { this.br(hdr); }
+                this.block(end);
+            }
+            StmtKind.ForRange(fr) {
+                let hdr = this.label();
+                let bod = this.label();
+                let inc = this.label();
+                let fin = this.label();
+                let (ip, _) = this.placePtr(&fr.index)?;
+                let (ev, _) = this.operand(&fr.end)?;
+                this.block(hdr);
+                let iv = this.load("i64", ip);
+                let ok = this.fresh();
+                this.inst(this.l().add(ok).add(" = icmp slt i64 ").add(iv).add(", ").add(ev).str());
+                this.brIf(ok, bod, fin);
+                this.block(bod);
+                this.emitBlockLoop(&fr.body, inc, fin)?;
+                if !this.terminated { this.br(inc); }
+                this.block(inc);
+                let cur = this.load("i64", ip);
+                let nxt = this.binop(fr.index.ty, fr.index.ty, BinOp.Add, cur, "1")?;
+                this.store("i64", nxt, ip);
+                this.br(hdr);
+                this.block(fin);
+            }
+            StmtKind.InterpFill(f) { this.interpFill(&f.buf, &f.used, f.parts.slice())?; }
+        }
+        return Result.Ok(true);
+    }
+
+    /// An `i1` of a `bool` operand.
+    fn boolVal(this: &LlvmFn, op: &Operand): Result<string, string> {
+        let (v, ty) = this.operand(op)?;
+        if ty == "i1" { return Result.Ok(v); }
+        let c = this.fresh();
+        this.inst(this.l().add(c).add(" = icmp ne ").add(ty).add(" ").add(v).add(", 0").str());
+        return Result.Ok(c);
+    }
+
+    /// The address of `place` and the type stored there.
+    fn placePtr(this: &LlvmFn, place: &Place): Result<(string, Id<TyKind>), string> {
+        let cx = this.cx;
+        let ptr = "";
+        let ty = cx.common.void;
+        match place.root {
+            PlaceRoot.Local(l) {
+                match this.body {
+                    Option.Some(body) { ty = body.local(l.id).ty; }
+                    Option.None { return Result.Err("place needs a function body"); }
+                }
+                ptr = this.localPtr(l.id);
+            }
+            PlaceRoot.Global(g) {
+                let def = cx.global(g.id);
+                let t = Text.new(this.arena);
+                t.add("@").add(globalName(cx, &def, this.arena));
+                ptr = t.str();
+                ty = def.ty;
+            }
+        }
+        for i in 0..place.proj.len {
+            match place.proj.items[i] {
+                Proj.Deref {
+                    ptr = this.load("ptr", ptr);
+                    ty = match cx.refInner(ty) { Option.Some(t) { t } Option.None { return Result.Err("deref of non-ref"); } };
+                }
+                Proj.Field(fp) {
+                    let sty = llType(cx, ty, this.arena)?;
+                    let n = this.fresh();
+                    this.inst(this.l().add(n).add(" = getelementptr ").add(sty).add(", ptr ").add(ptr).fmt(`, i32 0, i32 {fp.field.index}`).str());
+                    ptr = n;
+                    ty = cx.fieldDef(fp.field).ty;
+                }
+                Proj.Index(ix) {
+                    let (idx, _) = this.operand(&ix.index)?;
+                    if isPtr(cx, ty) { return Result.Err("index of ptr"); }
+                    let elem = match cx.elemTy(ty) { Option.Some(e) { e } Option.None { return Result.Err("index elem"); } };
+                    let slice = false;
+                    match cx.tyKind(ty) { TyKind.Slice(_) { slice = true; } TyKind.String { slice = true; } _ {} }
+                    if slice {
+                        let base = this.fresh();
+                        this.inst(this.l().add(base).add(" = getelementptr %j3_string, ptr ").add(ptr).add(", i32 0, i32 0").str());
+                        let p = this.load("ptr", base);
+                        let et = llType(cx, elem, this.arena)?;
+                        let n = this.fresh();
+                        this.inst(this.l().add(n).add(" = getelementptr ").add(et).add(", ptr ").add(p).add(", i64 ").add(idx).str());
+                        ptr = n;
+                    } else {
+                        let at = llType(cx, ty, this.arena)?;
+                        let n = this.fresh();
+                        this.inst(this.l().add(n).add(" = getelementptr ").add(at).add(", ptr ").add(ptr).add(", i64 0, i64 ").add(idx).str());
+                        ptr = n;
+                    }
+                    ty = elem;
+                }
+                Proj.Ptr {
+                    let n = this.fresh();
+                    this.inst(this.l().add(n).add(" = getelementptr %j3_string, ptr ").add(ptr).add(", i32 0, i32 0").str());
+                    ptr = n;
+                    let e = match cx.elemTy(ty) { Option.Some(e) { e } Option.None { return Result.Err("ptr of non-slice"); } };
+                    ty = match cx.lookupTy(TyKind.Ref(RefTy { inner: e })) { Option.Some(t) { t } Option.None { return Result.Err("ptr of non-slice"); } };
+                }
+                Proj.Len {
+                    let n = this.fresh();
+                    this.inst(this.l().add(n).add(" = getelementptr %j3_string, ptr ").add(ptr).add(", i32 0, i32 1").str());
+                    ptr = n;
+                    ty = cx.common.int;
+                }
+                Proj.Lane(ln) {
+                    let n = this.fresh();
+                    this.inst(this.l().add(n).add(" = getelementptr i8, ptr ").add(ptr).fmt(`, i64 {u64(ln.lane) * 4}`).str());
+                    ptr = n;
+                    ty = ln.ty;
+                }
+                Proj.EnumTag {
+                    let n = this.fresh();
+                    this.inst(this.l().add(n).add(" = getelementptr i8, ptr ").add(ptr).add(", i64 0").str());
+                    ptr = n;
+                    ty = cx.common.i32;
+                }
+                Proj.EnumPayload(pp) {
+                    let off: u64 = 4;
+                    match fieldOffset(cx, ty, 1) { Option.Some(o) { off = o; } Option.None {} }
+                    let n = this.fresh();
+                    this.inst(this.l().add(n).add(" = getelementptr i8, ptr ").add(ptr).fmt(`, i64 {off}`).str());
+                    ptr = n;
+                    ty = pp.ty;
+                }
+            }
+        }
+        return Result.Ok((ptr, ty));
+    }
+}

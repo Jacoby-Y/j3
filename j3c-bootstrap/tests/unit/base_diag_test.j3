@@ -1,0 +1,157 @@
+// base/diag: Diags copies strings, the renderer's edge cases (tabs and wide chars kept as bytes, multi-line
+// spans, the 64-mark cap, line numbers past 99, CRLF, file-only and no spans, notes before helps, color),
+// the error-code table, and did-you-mean (cases from Rust `diag.rs` tests).
+module base_diag_test;
+
+use j3.data.pool.Pool;
+use j3.io.{ printLn, readFile };
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.sys.panic;
+use j3.text.{ Text, contains, lines, parseInt, startsWith };
+use j3c.base.diag.{ Diag, Diags, Note, NoteKind, Severity, didYouMean, explain, explainTo, render, title };
+use j3c.base.span.{ fileSpan, Lines, noSpan, Source, Span };
+
+fn expect(got: string, want: string, what: string) {
+    if got != want {
+        printLn(`--- {what}: got`);
+        printLn(got);
+        printLn("--- want");
+        printLn(want);
+        panic(what);
+    }
+}
+
+fn show(d: Diag, sources: &Pool<Source>, arena: &Arena): string {
+    let ds = Diags.new(arena);
+    ds.add(d);
+    let out = Text.new(arena);
+    render(ds.at(0), sources, &out);
+    return out.str();
+}
+
+fn renders(arena: &Arena) {
+    let sources = Pool<Source>.new(arena);
+    let ds = Diags.new(arena);
+    let src = "fn f() {\n\tlet é = zz;\n}\n";
+    let f = sources.add(Source { path: "t.j3", text: src, lines: Lines.of(src, arena) });
+
+    // Tab and a 2-byte char stay as bytes: the column and the pad count bytes, like Rust.
+    let d = ds.make(0, Severity.Error, Span { file: f, lo: 19, hi: 21 }, "unknown name `zz`");
+    d.notes.push(Note { kind: NoteKind.Help, span: noSpan(), msg: "H" });
+    d.notes.push(Note { kind: NoteKind.Note, span: noSpan(), msg: "N" });
+    expect(show(d, &sources, arena),
+        "error: unknown name `zz`\n  --> t.j3:2:11\n   |\n  2 | \tlet é = zz;\n   |           ^^\n   |\n   = note: N\n   = help: H\n",
+        "tab, wide char, notes before helps");
+
+    // A span over two lines marks to the end of its first line.
+    expect(show(ds.make(0, Severity.Warning, Span { file: f, lo: 10, hi: 24 }, "w"), &sources, arena),
+        "warning: w\n  --> t.j3:2:2\n   |\n  2 | \tlet é = zz;\n   |  ^^^^^^^^^^^^\n", "multi-line span");
+
+    // Line 100 is not padded; at most 64 marks.
+    let big = Text.new(arena);
+    for i in 0..99 { big.push('\n'); }
+    for i in 0..100 { big.push('x'); }
+    let g = sources.add(Source { path: "big.j3", text: big.str(), lines: Lines.of(big.str(), arena) });
+    let want = Text.new(arena);
+    want.pushStr("error: long\n  --> big.j3:100:1\n   |\n100 | ");
+    for i in 0..100 { want.push('x'); }
+    want.pushStr("\n   | ");
+    for i in 0..64 { want.push('^'); }
+    want.push('\n');
+    expect(show(ds.make(0, Severity.Error, Span { file: g, lo: 99, hi: 199 }, "long"), &sources, arena), want.str(), "64-mark cap, line 100");
+
+    // CRLF: the `\r` is not part of the shown line.
+    let crlf = "a\r\nbb\r\n";
+    let c = sources.add(Source { path: "c.j3", text: crlf, lines: Lines.of(crlf, arena) });
+    expect(show(ds.make(0, Severity.Error, Span { file: c, lo: 3, hi: 5 }, "e"), &sources, arena),
+        "error: e\n  --> c.j3:2:1\n   |\n  2 | bb\n   | ^^\n", "CRLF");
+
+    // A span past the end clamps to it (Rust `loc`), and an empty span gets one mark.
+    expect(show(ds.make(0, Severity.Error, Span { file: c, lo: 900, hi: 900 }, "e"), &sources, arena),
+        "error: e\n  --> c.j3:3:1\n   |\n  3 | \n   | ^\n", "clamped span");
+
+    expect(show(ds.make(0, Severity.Error, fileSpan(f), "e"), &sources, arena), "error: e\n  --> t.j3\n", "file span");
+    let n = ds.make(0, Severity.Error, noSpan(), "e");
+    n.notes.push(Note { kind: NoteKind.Help, span: noSpan(), msg: "h" });
+    expect(show(n, &sources, arena), "error: e\n   |\n   = help: h\n", "no span");
+
+    sys.setenv("J3C_COLOR", "1");
+    let col = Text.new(arena);
+    col.push(27);
+    col.pushStr("[1;33mwarning");
+    col.push(27);
+    col.pushStr("[0m: e\n");
+    expect(show(ds.make(0, Severity.Warning, noSpan(), "e"), &sources, arena), col.str(), "color");
+    sys.setenv("J3C_COLOR", "");
+}
+
+fn copies(arena: &Arena) {
+    let ds = Diags.new(arena);
+    let t = Text.new(arena);
+    t.pushStr("first");
+    let d = ds.make(7, Severity.Warning, noSpan(), t.str());
+    d.notes.push(Note { kind: NoteKind.Note, span: noSpan(), msg: t.str() });
+    ds.add(d);
+    if ds.hasErrors() { panic("a warning counted as an error"); }
+    t.clear();
+    t.pushStr("XXXXX");
+    if ds.at(0).msg != "first" || ds.at(0).notes.items[0].msg != "first" { panic("Diags.add did not copy strings"); }
+    ds.add(ds.make(8, Severity.Error, noSpan(), "second"));
+    if ds.count() != 2 || !ds.hasErrors() || ds.at(1).code != 8 { panic("Diags order or count"); }
+}
+
+fn table(arena: &Arena) {
+    expect(title(1), "unknown backend", "title E0001");
+    expect(title(200), "expected a token", "title E0200");
+    expect(title(9999), "", "unknown title");
+    expect(explain(9999), "", "unknown explain");
+    let e = explain(2);
+    if !startsWith(e, "j3c no longer has a C backend") || contains(e, "\n  ") { panic(`explain E0002: {e}`); }
+    // Every header in the file: well formed, strictly ascending, with a title and an explanation.
+    let text = match readFile("text/errors.txt", arena) { Result.Ok(b) { b as string } Result.Err(x) { "" } };
+    if text.len == 0 { panic("cannot read text/errors.txt"); }
+    let last = -1;
+    let count = 0;
+    let ls = lines(text);
+    for l in &ls {
+        if l.len == 0 || l[0] != 'E' { continue; }
+        let code = match parseInt(l[1..5], 10) { Option.Some(v) { v } Option.None { -1 } };
+        if code <= last || l[5] != ':' { panic(`errors.txt: bad or out-of-order header: {l}`); }
+        last = code;
+        count += 1;
+        if title(u32(code)) == "" { panic(`errors.txt: no title: {l}`); }
+        let x = Text.new(arena);
+        if !explainTo(u32(code), &x) || x.len() == 0 { panic(`errors.txt: no explanation: {l}`); }
+    }
+    if count < 50 { panic("errors.txt: expected the lexer and parser codes"); }
+}
+
+fn same(o: Option<string>, want: string): bool {
+    match o {
+        Option.Some(s) { return s == want; }
+        Option.None { return want == ""; }
+    }
+    return false;
+}
+
+fn suggest(arena: &Arena) {
+    let names: [3]string = ["start", "step", "boot"];
+    if !same(didYouMean("statr", names[0..3], arena), "start") { panic("statr"); }
+    if !same(didYouMean("stp", names[0..3], arena), "step") { panic("stp"); }
+    if !same(didYouMean("zzzz", names[0..3], arena), "") { panic("zzzz"); }
+    if !same(didYouMean("stpe", names[0..3], arena), "step") { panic("stpe (adjacent swap)"); }
+    let tie: [2]string = ["x", "yy"];
+    if !same(didYouMean("y", tie[0..2], arena), "yy") { panic("tie goes to the shared prefix"); }
+}
+
+fn main() {
+    let arena = Arena.create(1 << 20);
+    renders(&arena);
+    copies(&arena);
+    table(&arena);
+    suggest(&arena);
+    printLn("base_diag ok");
+}

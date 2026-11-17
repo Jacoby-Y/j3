@@ -1,0 +1,444 @@
+// `j3c-boot test-compiler [--compiler PATH] [-j N] [DIR|FILE...]`: run every `tests/cases/**/*.j3` (and
+// `.j3s`) against its header expectations (`expect-out:`, `expect-exit:`, `expect-err:`, `expect-warn:`,
+// `backends:`, `args:`) and print `ok` / `FAIL` per case plus a summary; exit 1 on any failure (plan 11 B9).
+//
+// Port of: (none: new in plan 11 B9; replaces Rust's compile/tests/*.rs inline-string tests over time)
+// J3: Default compiler is this binary, default dir `tests/cases` (from the cwd, else next to the binary:
+// `<exe>/../tests/cases`). Header format: `tests/cases/README.md`.
+// J3: Each case runs as `sh -c` on a copy of the file (cwd and TMPDIR = its own scratch dir under one per-run temp dir, stdout and
+// stderr to files there, `timeout -k 5 120` around the compiler so a hung program dies with its process
+// group), `-j N` at a time through `proc.waitAny`; results print in case order. The scratch dirs are removed.
+// J3: An `expect-err` case runs `check FILE`, every other case `run --headless FILE ARGS`. Errors are read from
+// the compiler's stderr (`error: MSG` or `error[E0042]: MSG`, then the first `--> path:L:C`).
+// J3: `backends:` takes `llvm` (default) and `bc`; `c` fails (removed, B8a). `bc` fails too until the compiler
+// can be told to use it on one file (stage0's `run x.j3s` with `pub fn main` builds it AOT, i.e. llvm).
+module j3c.cmd.testcompiler;
+
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.proc;
+use j3.proc.Child;
+use j3.result.Result;
+use j3.sys;
+use j3.text;
+use j3.text.Text;
+
+/// Seconds a compile + run may take before `timeout` kills it.
+const TIMEOUT = "120";
+
+/// One `expect-err:` / `expect-warn:` line: `[CODE] at L:C [MESSAGE]`. `code` "" = any; `msg` "" = any.
+/// A `code` is only checked when the compiler prints codes; until then `msg` must be given (plan 11 D1).
+pub struct Want {
+    code: string;
+    line: int;
+    col: int;
+    msg: string;
+}
+
+/// One diagnostic read from the compiler's stderr. `line`/`col` 0 when it had no `-->` line.
+pub struct Got {
+    warn: bool;
+    code: string;
+    line: int;
+    col: int;
+    msg: string;
+}
+
+/// A case file and its header. Strings are slices of the file text read into the run arena, so they
+/// live as long as the run (AGENTS.md rule 1). `bad` is a header error ("" = none): the case fails with it.
+pub struct Case {
+    name: string;
+    path: string;
+    out: List<string>;
+    hasOut: bool;
+    exit: int;
+    errs: List<Want>;
+    warns: List<Want>;
+    args: List<string>;
+    bad: string;
+}
+
+/// Parse the leading `//` block of `src` (blank lines allowed, ends at the first other line).
+pub fn parseCase(name: string, path: string, src: string, mem: &Arena): Case {
+    let c = Case { name: name, path: path, out: List<string>.new(mem), hasOut: false, exit: 0,
+        errs: List<Want>.new(mem), warns: List<Want>.new(mem), args: List<string>.new(mem), bad: "" };
+    for raw in text.lines(src) {
+        let l = text.trim(raw);
+        if l.len == 0 { continue; }
+        if !text.startsWith(l, "//") { break; }
+        let body = text.trimStart(l[2..l.len]);
+        let colon = text.find(body, ":");
+        if colon < 0 { continue; }
+        let key = body[0..colon];
+        let rest = body[colon + 1..body.len];
+        if rest.len > 0 && rest[0] == ' ' { rest = rest[1..rest.len]; }
+        if key == "expect-out" {
+            c.out.push(text.trimEnd(rest));
+            c.hasOut = true;
+        } else if key == "expect-exit" {
+            match text.parseInt(text.trim(rest), 10) {
+                Option.Some(n) { c.exit = n; }
+                Option.None { c.bad = Text.new(mem).fmt(`bad expect-exit: {rest}`).str(); }
+            }
+        } else if key == "expect-err" || key == "expect-warn" {
+            match parseWant(text.trim(rest)) {
+                Option.Some(w) { if key == "expect-err" { c.errs.push(w); } else { c.warns.push(w); } }
+                Option.None { c.bad = Text.new(mem).fmt(`bad {key} (want [CODE] at L:C [MESSAGE]): {rest}`).str(); }
+            }
+        } else if key == "backends" {
+            for b in text.split(text.trim(rest), " ") {
+                if b.len == 0 || b == "llvm" { continue; }
+                if b == "c" { c.bad = "backend c was removed (plan 11 B8a)"; }
+                else if b == "bc" { c.bad = "backend bc: no compiler flag selects it for one file yet"; }
+                else { c.bad = Text.new(mem).fmt(`unknown backend {b}`).str(); }
+            }
+        } else if key == "args" {
+            for a in text.split(text.trim(rest), " ") { if a.len > 0 { c.args.push(a); } }
+        } else if text.startsWith(key, "expect-") {
+            c.bad = Text.new(mem).fmt(`unknown header {key}`).str();
+        }
+    }
+    return c;
+}
+
+/// `[CODE] at L:C [MESSAGE]`, or None when malformed.
+pub fn parseWant(s: string): Option<Want> {
+    let w = Want { code: "", line: 0, col: 0, msg: "" };
+    let r = s;
+    let sp = text.find(r, " ");
+    if sp > 0 && r[0..sp] != "at" {
+        w.code = r[0..sp];
+        r = text.trimStart(r[sp..r.len]);
+    }
+    if !text.startsWith(r, "at ") { return Option.None; }
+    r = text.trimStart(r[3..r.len]);
+    let end = text.find(r, " ");
+    let pos = r;
+    if end >= 0 {
+        pos = r[0..end];
+        w.msg = text.trim(r[end..r.len]);
+    }
+    let c = text.find(pos, ":");
+    if c < 0 { return Option.None; }
+    match text.parseInt(pos[0..c], 10) { Option.Some(n) { w.line = n; } Option.None { return Option.None; } }
+    match text.parseInt(pos[c + 1..pos.len], 10) { Option.Some(n) { w.col = n; } Option.None { return Option.None; } }
+    return Option.Some(w);
+}
+
+/// Diagnostics in compiler stderr `err`, in order. Strings are slices of `err`.
+pub fn parseDiags(err: string, mem: &Arena): List<Got> {
+    let out = List<Got>.new(mem);
+    for raw in text.lines(err) {
+        let l = text.trimEnd(raw);
+        let warn = text.startsWith(l, "warning");
+        if warn || text.startsWith(l, "error") {
+            let colon = text.find(l, ": ");
+            if colon < 0 { continue; }
+            let head = l[0..colon];
+            let g = Got { warn: warn, code: "", line: 0, col: 0, msg: l[colon + 2..l.len] };
+            let br = text.find(head, "[");
+            if br >= 0 && text.endsWith(head, "]") { g.code = head[br + 1..head.len - 1]; }
+            else if head != "error" && head != "warning" { continue; }
+            if isCount(g.msg) { continue; }
+            out.push(g);
+            continue;
+        }
+        let t = text.trim(l);
+        if out.len > 0 && text.startsWith(t, "--> ") {
+            let g = &out.items[out.len - 1];
+            if g.line != 0 { continue; }
+            // path:L:C, and the path may hold ':' itself.
+            let c2 = text.lastIndexOf(t, ":");
+            if c2 < 0 { continue; }
+            let c1 = text.lastIndexOf(t[0..c2], ":");
+            if c1 < 0 { continue; }
+            match text.parseInt(t[c1 + 1..c2], 10) { Option.Some(n) { g.line = n; } Option.None {} }
+            match text.parseInt(t[c2 + 1..t.len], 10) { Option.Some(n) { g.col = n; } Option.None {} }
+        }
+    }
+    return out;
+}
+
+/// The summary after several errors (`error: 5 errors`, `error: 5 errors (and 3 more not shown)`) is not a
+/// diagnostic (Rust `cli/check.rs` `is_count_line`).
+pub fn isCount(msg: string): bool {
+    let m = msg;
+    let more = text.find(m, " (and ");
+    if more >= 0 { m = m[0..more]; }
+    let sp = text.find(m, " ");
+    if sp < 0 || m[sp..m.len] != " errors" { return false; }
+    match text.parseInt(m[0..sp], 10) { Option.Some(n) { return true; } Option.None { return false; } }
+}
+
+/// Whether `g` meets `w` (see `Want`).
+pub fn matches(w: &Want, g: &Got): bool {
+    if w.line != g.line || w.col != g.col { return false; }
+    if w.code.len > 0 && g.code.len > 0 && w.code != g.code { return false; }
+    if w.code.len > 0 && g.code.len == 0 && w.msg.len == 0 { return false; }
+    return w.msg.len == 0 || text.contains(g.msg, w.msg);
+}
+
+/// Why the case failed, "" when it passed. `code` is the exit of compiler + program (124/137 = timeout).
+pub fn judge(c: &Case, code: int, out: string, err: string, mem: &Arena): string {
+    if c.bad.len > 0 { return c.bad; }
+    let t = Text.new(mem);
+    if code == 124 || code == 137 { return t.fmt(`timed out after {TIMEOUT}s`).str(); }
+    let ds = parseDiags(err, mem);
+    let errs = List<Got>.new(mem);
+    let warns = List<Got>.new(mem);
+    for i in 0..ds.len { if ds.items[i].warn { warns.push(ds.items[i]); } else { errs.push(ds.items[i]); } }
+    if c.errs.len > 0 {
+        if code == 0 { return "compiled without errors, expected some"; }
+        if errs.len != c.errs.len {
+            t.fmt(`{errs.len} errors, expected {c.errs.len}`);
+            if errs.len > 0 { gotStr(&t, &errs.items[0]); }
+            return t.str();
+        }
+        for i in 0..errs.len {
+            if !matches(&c.errs.items[i], &errs.items[i]) {
+                t.fmt(`error {i + 1}: want `);
+                wantStr(&t, &c.errs.items[i]);
+                t.fmt(`, got`);
+                gotStr(&t, &errs.items[i]);
+                return t.str();
+            }
+        }
+        return "";
+    }
+    if errs.len > 0 {
+        t.fmt(`compile error:`);
+        gotStr(&t, &errs.items[0]);
+        return t.str();
+    }
+    // Expected warnings appear in order among the printed ones (others are allowed).
+    let k = 0;
+    for i in 0..c.warns.len {
+        while k < warns.len && !matches(&c.warns.items[i], &warns.items[k]) { k += 1; }
+        if k == warns.len {
+            t.fmt(`missing warning `);
+            wantStr(&t, &c.warns.items[i]);
+            return t.str();
+        }
+        k += 1;
+    }
+    if code != c.exit {
+        t.fmt(`exit {code}, expected {c.exit}`);
+        let last = lastLine(err);
+        if last.len > 0 { t.fmt(`: {last}`); }
+        return t.str();
+    }
+    if c.hasOut {
+        let i = 0;
+        for l in text.lines(out) {
+            if i >= c.out.len { return t.fmt(`extra stdout line {i + 1}: {l}`).str(); }
+            if l != c.out.items[i] {
+                return t.fmt(`stdout line {i + 1}: got "{l}", want "{c.out.items[i]}"`).str();
+            }
+            i += 1;
+        }
+        if i < c.out.len { return t.fmt(`stdout has {i} lines, want {c.out.len}`).str(); }
+    }
+    return "";
+}
+
+fn wantStr(t: &Text, w: &Want) {
+    if w.code.len > 0 { t.fmt(`{w.code} `); }
+    t.fmt(`at {w.line}:{w.col}`);
+    if w.msg.len > 0 { t.fmt(` {w.msg}`); }
+}
+
+fn gotStr(t: &Text, g: &Got) {
+    if g.code.len > 0 { t.fmt(` {g.code}`); }
+    t.fmt(` at {g.line}:{g.col} {g.msg}`);
+}
+
+fn lastLine(s: string): string {
+    let last = "";
+    for l in text.lines(s) { if text.trim(l).len > 0 { last = text.trim(l); } }
+    return last;
+}
+
+fn say(s: string) {
+    sys.write(2, s.ptr as ptr, s.len);
+}
+
+fn sayLine(s: string) {
+    say(s);
+    say("\n");
+}
+
+fn usage(): int {
+    say("usage: j3c-boot test-compiler [--compiler PATH] [-j N] [DIR|FILE...]\n");
+    return 2;
+}
+
+/// The shell line each case runs: cd to its scratch dir, temp files there, output to files, killed on timeout.
+/// Arguments: scratch dir, timeout, compiler, mode (split on spaces), case file, program args.
+const SCRIPT = "d=$1; t=$2; c=$3; m=$4; f=$5; shift 5; cd \"$d\" || exit 125; TMPDIR=\"$d\" SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy exec timeout -k 5 \"$t\" \"$c\" $m \"$f\" \"$@\" >out.txt 2>err.txt";
+
+/// Add the case files under `arg` (a dir, walked sorted) or `arg` itself to `cases`.
+fn collect(arg: string, cases: &List<Case>, mem: &Arena): bool {
+    let st = io.stat(arg);
+    let isDir = false;
+    match st { Result.Ok(e) { isDir = e.isDir; } Result.Err(e) { sayLine(Text.new(mem).fmt(`test-compiler: no such file: {arg}`).str()); return false; } }
+    if !isDir { return addCase(arg, arg, cases, mem); }
+    match io.walk(arg, "", mem) {
+        Result.Ok(es) {
+            for e in es {
+                if text.endsWith(e.name, ".j3") || text.endsWith(e.name, ".j3s") {
+                    if !addCase(e.name, path.join(arg, e.name, mem), cases, mem) { return false; }
+                }
+            }
+        }
+        Result.Err(e) { sayLine(Text.new(mem).fmt(`test-compiler: cannot list {arg}`).str()); return false; }
+    }
+    return true;
+}
+
+fn addCase(name: string, p: string, cases: &List<Case>, mem: &Arena): bool {
+    let abs = "";
+    match path.realpath(p, mem) { Option.Some(a) { abs = a; } Option.None { return false; } }
+    match io.readFile(abs, mem) {
+        Result.Ok(b) { cases.push(parseCase(name, abs, b as string, mem)); }
+        Result.Err(e) { sayLine(Text.new(mem).fmt(`test-compiler: cannot read {p}`).str()); return false; }
+    }
+    return true;
+}
+
+/// Delete `dir` and everything below it.
+fn rmTree(dir: string, mem: &Arena) {
+    match io.listDir(dir, mem) {
+        Result.Ok(es) {
+            for e in es {
+                let p = path.join(dir, e.name, mem);
+                if e.isDir && !e.isLink { rmTree(p, mem); } else { io.remove(p); }
+            }
+        }
+        Result.Err(e) {}
+    }
+    io.removeDir(dir);
+}
+
+fn readStr(p: string, mem: &Arena): string {
+    match io.readFile(p, mem) { Result.Ok(b) { return b as string; } Result.Err(e) { return ""; } }
+}
+
+/// Entry: `args` are the words after `test-compiler`. Returns the exit code.
+pub fn run(args: []string): int {
+    let mem = Arena.create(1 << 16);
+    let compiler = "";
+    let jobs = 4;
+    let roots = List<string>.new(&mem);
+    let i = 0;
+    while i < args.len {
+        let a = args[i];
+        if a == "--compiler" || a == "-j" {
+            if i + 1 >= args.len { return usage(); }
+            if a == "--compiler" { compiler = args[i + 1]; }
+            else {
+                match text.parseInt(args[i + 1], 10) { Option.Some(n) { jobs = n; } Option.None { return usage(); } }
+                if jobs < 1 { return usage(); }
+            }
+            i += 2;
+            continue;
+        }
+        if text.startsWith(a, "-") { return usage(); }
+        roots.push(a);
+        i += 1;
+    }
+    if compiler.len == 0 { compiler = "/proc/self/exe"; }
+    match path.realpath(compiler, &mem) {
+        Option.Some(p) { compiler = p; }
+        Option.None { sayLine(Text.new(&mem).fmt(`test-compiler: no compiler at {compiler}`).str()); return 2; }
+    }
+    if roots.len == 0 {
+        if io.exists("tests/cases") { roots.push("tests/cases"); }
+        else { roots.push(path.join(path.join(sys.exeDir(), "..", &mem), "tests/cases", &mem)); }
+    }
+    let cases = List<Case>.new(&mem);
+    for r in roots.slice() { if !collect(r, &cases, &mem) { return 2; } }
+    if cases.len == 0 { say("test-compiler: no cases\n"); return 2; }
+
+    let tmp = "";
+    match io.tempDir("", "j3c-test-compiler-", &mem) {
+        Result.Ok(d) { tmp = d; }
+        Result.Err(e) { say("test-compiler: cannot make a temp dir\n"); return 2; }
+    }
+    let kids = List<Child>.new(&mem);
+    let kidCase = List<int>.new(&mem);
+    let codes = mem.alloc::<int>(cases.len);
+    let done = mem.alloc::<bool>(cases.len);
+    // false = `sh` could not be started (not an exit code: 125 is also timeout's own failure).
+    let started = mem.alloc::<bool>(cases.len);
+    for k in 0..cases.len { done[k] = false; started[k] = true; }
+    let next = 0;
+    let shown = 0;
+    let running = 0;
+    let ok = 0;
+    let fail = 0;
+    while shown < cases.len {
+        while running < jobs && next < cases.len {
+            let c = &cases.items[next];
+            let dir = path.join(tmp, Text.new(&mem).fmt(`{next}`).str(), &mem);
+            io.makeDirs(dir);
+            // A copy, so the compiler sees a lone file, not the package around tests/cases.
+            let copy = path.join(dir, path.basename(c.path), &mem);
+            io.copyFile(c.path, copy);
+            let argv = List<string>.new(&mem);
+            argv.push("sh");
+            argv.push("-c");
+            argv.push(SCRIPT);
+            argv.push("sh");
+            argv.push(dir);
+            argv.push(TIMEOUT);
+            argv.push(compiler);
+            if c.errs.len > 0 { argv.push("check"); } else { argv.push("run --headless"); }
+            argv.push(copy);
+            if c.errs.len == 0 { argv.extend(c.args.slice()); }
+            match proc.start(argv.slice(), &mem) {
+                Result.Ok(ch) {
+                    ch.closeStdin();
+                    kids.push(ch);
+                    kidCase.push(next);
+                    running += 1;
+                }
+                Result.Err(e) { started[next] = false; done[next] = true; }
+            }
+            next += 1;
+        }
+        if running > 0 {
+            match proc.waitAny(kids.slice()) {
+                Result.Ok(k) {
+                    codes[kidCase.items[k]] = kids.items[k].wait();
+                    done[kidCase.items[k]] = true;
+                    running -= 1;
+                }
+                Result.Err(e) { say("test-compiler: waitAny failed\n"); return 2; }
+            }
+        }
+        // Print finished cases in order.
+        while shown < cases.len && done[shown] {
+            let c = &cases.items[shown];
+            let dir = path.join(tmp, Text.new(&mem).fmt(`{shown}`).str(), &mem);
+            let mark = mem.checkpoint();
+            let why = "could not start sh";
+            if started[shown] {
+                why = judge(c, codes[shown], readStr(path.join(dir, "out.txt", &mem), &mem),
+                    readStr(path.join(dir, "err.txt", &mem), &mem), &mem);
+            }
+            let line = Text.new(&mem);
+            if why.len == 0 { ok += 1; line.fmt(`ok {c.name}`); } else { fail += 1; line.fmt(`FAIL {c.name}: {why}`); }
+            io.printLn(line.str());
+            rmTree(dir, &mem);
+            mem.rewind(mark);
+            shown += 1;
+        }
+    }
+    rmTree(tmp, &mem);
+    io.printLn(Text.new(&mem).fmt(`test-compiler: {ok} ok, {fail} FAIL`).str());
+    mem.destroy();
+    if fail > 0 { return 1; }
+    return 0;
+}

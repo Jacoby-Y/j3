@@ -1,5 +1,200 @@
-// `<4 x float>` / `<4 x i32>` ops.
+// `vec4f` / `vec4i` as `<4 x float>` / `<4 x i32>`. Every result is a pure function of the lanes, so opt
+// levels agree bit for bit: no fast-math, min/max are `fcmp` + `select`, `sum` is `(x + y) + (z + w)`,
+// `toInt` saturates.
 //
 // Part of module j3c.backend.llvm.
 // Port of: j3c/src/emit/llvm_expr/simd.rs
+// J3: Entries: `vecBinop`, `vecUnary`, `simd` (exhaustive over `SimdOp`; returns `(value, type)`).
 module j3c.backend.llvm;
+
+const SPLAT_31 = "<i32 31, i32 31, i32 31, i32 31>";
+const SPLAT_M1 = "<i32 -1, i32 -1, i32 -1, i32 -1>";
+
+extend LlvmFn {
+    fn vecOf(this: &LlvmFn, ty: Id<TyKind>): Result<VecTy, string> {
+        match this.cx.tyKind(ty) {
+            TyKind.Vec(v) { return Result.Ok(v); }
+            _ { return Result.Err("vector op on a non-vector"); }
+        }
+    }
+
+    /// `+ - * /` (float) and `+ - * & | ^ << >>` (int) lane-wise. Int `/` is lowered lane by lane in the checker.
+    fn vecBinop(this: &LlvmFn, ty: Id<TyKind>, op: BinOp, l: string, r: string): Result<string, string> {
+        let v = this.vecOf(ty)?;
+        let t = vecLlvm(v);
+        let out = this.fresh();
+        let inst = "";
+        if v == VecTy.F32x4 {
+            match op {
+                BinOp.Add { inst = "fadd"; }
+                BinOp.Sub { inst = "fsub"; }
+                BinOp.Mul { inst = "fmul"; }
+                BinOp.Div { inst = "fdiv"; }
+                _ {}
+            }
+        } else {
+            match op {
+                BinOp.Add { inst = "add"; }
+                BinOp.Sub { inst = "sub"; }
+                BinOp.Mul { inst = "mul"; }
+                BinOp.BitAnd { inst = "and"; }
+                BinOp.BitOr { inst = "or"; }
+                BinOp.BitXor { inst = "xor"; }
+                BinOp.Shl { return Result.Ok(this.vecShift(t, "shl", out, l, r)); }
+                BinOp.Shr { return Result.Ok(this.vecShift(t, "ashr", out, l, r)); }
+                _ {}
+            }
+        }
+        if inst.len == 0 {
+            return Result.Err(Text.new(this.arena).add("`").add(binOpStr(op)).add("` on ").add(vecName(v)).str());
+        }
+        this.inst(this.l().add(out).add(" = ").add(inst).add(" ").add(t).add(" ").add(l).add(", ").add(r).str());
+        return Result.Ok(out);
+    }
+
+    /// A shift by 32 or more is poison in LLVM: mask the amount, like the scalar `i32` shift.
+    fn vecShift(this: &LlvmFn, t: string, sh: string, out: string, l: string, r: string): string {
+        let m = this.fresh();
+        this.inst(this.l().add(m).add(" = and ").add(t).add(" ").add(r).add(", ").add(SPLAT_31).str());
+        this.inst(this.l().add(out).add(" = ").add(sh).add(" ").add(t).add(" ").add(l).add(", ").add(m).str());
+        return out;
+    }
+
+    fn vecUnary(this: &LlvmFn, ty: Id<TyKind>, op: UnaryOp, a: string): Result<string, string> {
+        let v = this.vecOf(ty)?;
+        let t = vecLlvm(v);
+        let out = this.fresh();
+        if v == VecTy.F32x4 && op == UnaryOp.Neg {
+            this.inst(this.l().add(out).add(" = fneg ").add(t).add(" ").add(a).str());
+        } else if v == VecTy.I32x4 && op == UnaryOp.Neg {
+            this.inst(this.l().add(out).add(" = sub ").add(t).add(" zeroinitializer, ").add(a).str());
+        } else if v == VecTy.I32x4 && op == UnaryOp.BitNot {
+            this.inst(this.l().add(out).add(" = xor ").add(t).add(" ").add(a).add(", ").add(SPLAT_M1).str());
+        } else {
+            return Result.Err(Text.new(this.arena).add("`").add(unaryOpStr(op)).add("` on ").add(vecName(v)).str());
+        }
+        return Result.Ok(out);
+    }
+
+    fn simd(this: &LlvmFn, rv: &Rvalue, op: SimdOp, args: []Operand): Result<(string, string), string> {
+        let ll = llType(this.cx, rv.ty, this.arena)?;
+        match op {
+            SimdOp.Splat {
+                let v = this.vecOf(rv.ty)?;
+                let t = vecLlvm(v);
+                let (x, _) = this.operand(&args[0])?;
+                let a = this.fresh();
+                this.inst(this.l().add(a).add(" = insertelement ").add(t).add(" poison, ").add(vecLaneLlvm(v)).add(" ").add(x).add(", i32 0").str());
+                let out = this.fresh();
+                this.inst(this.l().add(out).add(" = shufflevector ").add(t).add(" ").add(a).add(", ").add(t)
+                    .add(" poison, <4 x i32> zeroinitializer").str());
+                return Result.Ok((out, ll));
+            }
+            SimdOp.Build {
+                let v = this.vecOf(rv.ty)?;
+                let cur = "poison";
+                for i in 0..args.len {
+                    let (x, _) = this.operand(&args[i])?;
+                    let n = this.fresh();
+                    this.inst(this.l().add(n).add(" = insertelement ").add(vecLlvm(v)).add(" ").add(cur).add(", ").add(vecLaneLlvm(v))
+                        .add(" ").add(x).fmt(`, i32 {i}`).str());
+                    cur = n;
+                }
+                return Result.Ok((cur, ll));
+            }
+            SimdOp.Min { return this.minMax(rv, true, args, ll); }
+            SimdOp.Max { return this.minMax(rv, false, args, ll); }
+            SimdOp.Sqrt {
+                let (a, _) = this.operand(&args[0])?;
+                let out = this.fresh();
+                this.inst(this.l().add(out).add(" = call <4 x float> @llvm.sqrt.v4f32(<4 x float> ").add(a).add(")").str());
+                return Result.Ok((out, ll));
+            }
+            SimdOp.Abs {
+                let v = this.vecOf(rv.ty)?;
+                let t = vecLlvm(v);
+                let (a, _) = this.operand(&args[0])?;
+                let out = this.fresh();
+                if v == VecTy.F32x4 {
+                    this.inst(this.l().add(out).add(" = call <4 x float> @llvm.fabs.v4f32(<4 x float> ").add(a).add(")").str());
+                } else {
+                    let neg = this.fresh();
+                    let lt = this.fresh();
+                    this.inst(this.l().add(neg).add(" = sub ").add(t).add(" zeroinitializer, ").add(a).str());
+                    this.inst(this.l().add(lt).add(" = icmp slt ").add(t).add(" ").add(a).add(", zeroinitializer").str());
+                    this.inst(this.l().add(out).add(" = select <4 x i1> ").add(lt).add(", ").add(t).add(" ").add(neg).add(", ")
+                        .add(t).add(" ").add(a).str());
+                }
+                return Result.Ok((out, ll));
+            }
+            SimdOp.Sum {
+                let v = this.vecOf(operandTy(args[0]))?;
+                let t = vecLlvm(v);
+                let add = if v == VecTy.F32x4 { "fadd" } else { "add" };
+                let (a, _) = this.operand(&args[0])?;
+                let s1 = this.fresh();
+                this.inst(this.l().add(s1).add(" = shufflevector ").add(t).add(" ").add(a).add(", ").add(t)
+                    .add(" poison, <4 x i32> <i32 1, i32 0, i32 3, i32 2>").str());
+                let t1 = this.fresh();
+                this.inst(this.l().add(t1).add(" = ").add(add).add(" ").add(t).add(" ").add(a).add(", ").add(s1).str());
+                let s2 = this.fresh();
+                this.inst(this.l().add(s2).add(" = shufflevector ").add(t).add(" ").add(t1).add(", ").add(t)
+                    .add(" poison, <4 x i32> <i32 2, i32 3, i32 0, i32 1>").str());
+                let t2 = this.fresh();
+                this.inst(this.l().add(t2).add(" = ").add(add).add(" ").add(t).add(" ").add(t1).add(", ").add(s2).str());
+                let out = this.fresh();
+                this.inst(this.l().add(out).add(" = extractelement ").add(t).add(" ").add(t2).add(", i32 0").str());
+                return Result.Ok((out, vecLaneLlvm(v)));
+            }
+            SimdOp.Shuffle(ix) {
+                let v = this.vecOf(rv.ty)?;
+                let t = vecLlvm(v);
+                let (a, _) = this.operand(&args[0])?;
+                let out = this.fresh();
+                let l = ix.lanes;
+                this.inst(this.l().add(out).add(" = shufflevector ").add(t).add(" ").add(a).add(", ").add(t)
+                    .fmt(` poison, <4 x i32> <i32 {l[0]}, i32 {l[1]}, i32 {l[2]}, i32 {l[3]}>`).str());
+                return Result.Ok((out, ll));
+            }
+            SimdOp.ToFloat {
+                let (a, _) = this.operand(&args[0])?;
+                let out = this.fresh();
+                this.inst(this.l().add(out).add(" = sitofp <4 x i32> ").add(a).add(" to <4 x float>").str());
+                return Result.Ok((out, ll));
+            }
+            SimdOp.ToInt {
+                let (a, _) = this.operand(&args[0])?;
+                let out = this.fresh();
+                this.inst(this.l().add(out).add(" = call <4 x i32> @llvm.fptosi.sat.v4i32.v4f32(<4 x float> ").add(a).add(")").str());
+                return Result.Ok((out, ll));
+            }
+            SimdOp.Load {
+                let (p, _) = this.operand(&args[0])?;
+                let out = this.fresh();
+                this.inst(this.l().add(out).add(" = load ").add(ll).add(", ptr ").add(p).add(", align 4").str());
+                return Result.Ok((out, ll));
+            }
+            SimdOp.Store {
+                let (p, _) = this.operand(&args[0])?;
+                let (x, xt) = this.operand(&args[1])?;
+                this.inst(this.l().add("store ").add(xt).add(" ").add(x).add(", ptr ").add(p).add(", align 4").str());
+                return Result.Ok(("undef", "void"));
+            }
+        }
+    }
+
+    fn minMax(this: &LlvmFn, rv: &Rvalue, min: bool, args: []Operand, ll: string): Result<(string, string), string> {
+        let v = this.vecOf(rv.ty)?;
+        let t = vecLlvm(v);
+        let (a, _) = this.operand(&args[0])?;
+        let (b, _) = this.operand(&args[1])?;
+        let c = this.fresh();
+        let cmp = if v == VecTy.F32x4 { "fcmp" } else { "icmp" };
+        let pred = "";
+        if v == VecTy.F32x4 { pred = if min { "olt" } else { "ogt" }; } else { pred = if min { "slt" } else { "sgt" }; }
+        this.inst(this.l().add(c).add(" = ").add(cmp).add(" ").add(pred).add(" ").add(t).add(" ").add(a).add(", ").add(b).str());
+        let out = this.fresh();
+        this.inst(this.l().add(out).add(" = select <4 x i1> ").add(c).add(", ").add(t).add(" ").add(a).add(", ").add(t).add(" ").add(b).str());
+        return Result.Ok((out, ll));
+    }
+}

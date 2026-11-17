@@ -3,3 +3,189 @@
 // Part of module j3c.toolchain.
 // Port of: j3c/src/emit/host/target.rs
 module j3c.toolchain;
+// J3: C3: `target_os` here uses `base/text_fmt` `hasLower`. Copies made before this port, to replace with
+// calls here (or move into `base` if `project`/`load`, which sit below toolchain, still need them):
+// `project/manifest.j3` `isForeignTarget`/`isAndroid`, `load/core_imports.j3` `osKind`/`archKind`.
+// J3: Rust's `OnceLock` lookups (`lld_present`, `mold_on_path`) are `#[singleton]` tri-states (0 unknown,
+//     1 yes, 2 no). j3c-boot is built for Linux only, so the host is `TargetOs.Linux`.
+
+/// What a target needs to know about its platform (Rust `TargetOs`). A new one is an arm here and a row in
+/// `releaseFlags`.
+pub enum TargetOs { Linux, Windows, Macos, Android, Web, Other }
+
+/// `""` is the host.
+pub fn targetOs(triple: string): TargetOs {
+    if triple.len == 0 { return TargetOs.Linux; }
+    if hasLower(triple, "windows") { return TargetOs.Windows; }
+    if hasLower(triple, "apple") || hasLower(triple, "darwin") { return TargetOs.Macos; }
+    if hasLower(triple, "emscripten") { return TargetOs.Web; }
+    // before Linux: `x86_64-linux-android` contains "linux"
+    if hasLower(triple, "android") { return TargetOs.Android; }
+    if hasLower(triple, "linux") || hasLower(triple, "freebsd") || hasLower(triple, "netbsd") || hasLower(triple, "openbsd") {
+        return TargetOs.Linux;
+    }
+    return TargetOs.Other;
+}
+
+/// Rust `is_host_target`: `triple` is "" or a Linux triple for this machine's CPU.
+pub fn isHostTarget(triple: string): bool {
+    return triple.len == 0 || (targetOs(triple) == TargetOs.Linux && startsWith(triple, sys.ARCH_NAME));
+}
+
+/// Clang compile flags and flags appended after the inputs and libraries (Rust `ReleaseFlags`).
+pub struct ReleaseFlags {
+    compile: List<string>;
+    link: List<string>;
+}
+
+/// Flags that shrink a shipped binary (`--release`); see Rust `release_flags` for the why of each.
+pub fn releaseFlags(os: TargetOs, lld: bool, arena: &Arena): ReleaseFlags {
+    let r = ReleaseFlags { compile: List<string>.new(arena), link: List<string>.new(arena) };
+    match os {
+        TargetOs.Linux {
+            r.link.push("-Wl,-s");
+            r.link.push("-Wl,--build-id=none");
+            r.link.push("-Wl,-z,norelro");
+            r.link.push("-Wl,--hash-style=gnu");
+            if lld {
+                r.link.push("-fuse-ld=lld");
+                r.link.push("-Wl,--icf=safe");
+            }
+            r.compile.push("-fno-asynchronous-unwind-tables");
+            r.compile.push("-fno-unwind-tables");
+        }
+        TargetOs.Windows {
+            r.link.push("-Wl,-s");
+            r.link.push("-Wl,--no-insert-timestamp");
+        }
+        TargetOs.Macos {
+            r.link.push("-Wl,-x");
+            r.link.push("-Wl,-S");
+        }
+        TargetOs.Android {
+            // Unwind tables stay: bionic's unwinder (and the NDK's crash reports) read them.
+            r.compile.push("-fno-asynchronous-unwind-tables");
+            r.link.push("-Wl,--gc-sections");
+            r.link.push("-Wl,-s");
+        }
+        TargetOs.Web {}
+        TargetOs.Other {}
+    }
+    return r;
+}
+
+#[singleton]
+let LLD_SEEN: int;
+#[singleton]
+let MOLD_SEEN: int;
+
+/// `ld.lld --version` runs, looked up once.
+pub fn lldPresent(): bool {
+    if LLD_SEEN == 0 {
+        let mem = Arena.create(1 << 12);
+        defer mem.destroy();
+        let argv: [2]string = ["ld.lld", "--version"];
+        LLD_SEEN = 2;
+        match proc.run(argv[..], "", &mem) {
+            Result.Ok(o) { if o.code == 0 { LLD_SEEN = 1; } }
+            Result.Err(_) {}
+        }
+    }
+    return LLD_SEEN == 1;
+}
+
+/// A `mold` file in a `PATH` directory, looked up once.
+pub fn moldOnPath(): bool {
+    if MOLD_SEEN == 0 {
+        let mem = Arena.create(1 << 12);
+        defer mem.destroy();
+        MOLD_SEEN = 2;
+        let it = split(sys.env("PATH"), ":");
+        while true {
+            match it.next() {
+                Option.Some(d) { if fsx.isFile(path.join(d, "mold", &mem)) { MOLD_SEEN = 1; } }
+                Option.None { break; }
+            }
+        }
+    }
+    return MOLD_SEEN == 1;
+}
+
+/// Dev links on the host use mold when it is installed (a manifest `-fuse-ld=` flag comes later and wins).
+pub fn useMold(out: &List<string>, release: bool, target: string) {
+    if !release && target.len == 0 && moldOnPath() { out.push("-fuse-ld=mold"); }
+}
+
+/// Unwind tables are dropped in release builds only where `releaseFlags` drops them.
+pub fn releaseNounwind(release: bool, triple: string): bool { return release && targetOs(triple) == TargetOs.Linux; }
+
+/// `--target=` for `target`, appended to `out`. An Android triple needs the NDK flags (`android.j3`).
+pub fn targetArgs(out: &List<string>, target: string, arena: &Arena) {
+    if targetOs(target) == TargetOs.Android {
+        androidTargetFlags(out, target, arena);
+    } else if target.len > 0 {
+        out.push(Text.new(arena).add("--target=").add(target).str());
+    }
+}
+
+/// The clang for `target`: `[emit] clang`, else the NDK's on Android, else `clang`.
+pub fn clangFor(clang: string, target: string, arena: &Arena): string {
+    if targetOs(target) == TargetOs.Android { return androidCompiler(clang, arena); }
+    if clang.len == 0 { return "clang"; }
+    return clang;
+}
+
+pub fn linkGcFlag(target: string): string {
+    if hasLower(target, "apple") || hasLower(target, "darwin") { return "-Wl,-dead_strip"; }
+    return "-Wl,--gc-sections";
+}
+
+fn foreignTarget(target: string): bool {
+    return hasLower(target, "windows") || hasLower(target, "apple") || hasLower(target, "darwin");
+}
+
+fn windowsTarget(target: string): bool { return hasLower(target, "windows"); }
+
+fn keepFlag(flag: string, target: string): bool {
+    if !windowsTarget(target) { return true; }
+    return !hasLower(flag, "rpath") && !hasLower(flag, "--disable-new-dtags");
+}
+
+/// `~/.cache/j3/sdl2-mingw/<pkg>/<arch>-w64-mingw32/lib` for every SDL package there, sorted.
+fn mingwSdlLibs(target: string, arena: &Arena): List<string> {
+    let dirs = List<string>.new(arena);
+    let home = sys.env("HOME");
+    if home.len == 0 { return dirs; }
+    let e = 0;
+    while e < target.len && target[e] != '-' { e += 1; }
+    let arch = target[0..e];
+    let root = path.join(home, ".cache/j3/sdl2-mingw", arena);
+    match io.listDir(root, arena) {
+        Result.Ok(ents) {
+            let sub = Text.new(arena).add(arch).add("-w64-mingw32/lib").str();
+            for i in 0..ents.len {
+                let p = path.join(path.join(root, ents[i].name, arena), sub, arena);
+                if fsx.isDir(p) { dirs.push(p); }
+            }
+        }
+        Result.Err(_) {}
+    }
+    // insertion sort: a handful of packages
+    for i in 1..dirs.len {
+        let j = i;
+        while j > 0 && dirs.items[j] < dirs.items[j - 1] {
+            let t = dirs.items[j];
+            dirs.items[j] = dirs.items[j - 1];
+            dirs.items[j - 1] = t;
+            j -= 1;
+        }
+    }
+    return dirs;
+}
+
+/// `-lNAME` as Windows names it: no libc/libdl to link (`None`), GL is `opengl32`.
+fn windowsLib(name: string): Option<string> {
+    if name == "c" || name == "dl" { return Option.None; }
+    if name == "GL" { return Option.Some("opengl32"); }
+    return Option.Some(name);
+}

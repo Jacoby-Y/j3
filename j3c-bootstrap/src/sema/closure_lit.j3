@@ -1,0 +1,255 @@
+// Closure literals: `fn(x: int): int { .. }` (captures by address) and boxed `fn[mem](..) { .. }`
+// (captures copied into arena `mem`), typed into a `TExpr.Closure` with its own `TBody`.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/closure.rs (closure_lit, closure_body, want_of), check/lower/closure_boxed.rs
+// (arena_arg)
+// J3: Rust lowers the body with the `Lower`'s per-body state swapped out; here `BodyCx`'s scope, locals,
+// params, loops, return type and closure flags are swapped the same way, so the body is typed by the
+// ordinary statement code. A captured name is a `use`-style alias (`bindAlias`) of a `TPlace.Capture`
+// whose `outer` is the captured place of the enclosing body. The body stops at its first failing
+// top-level statement (Rust `self.stmt(stmt)?`), and that error is the literal's.
+module j3c.sema;
+
+extend BodyCx {
+    /// Rust `closure_lit`: a `TExpr.Closure` of type `Ty.Closure` (or `Ty.Fn` when `want` is a plain fn).
+    fn closureLit(this: &BodyCx, sp: Span, lit: &ClosureLit, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let t = this.cx.tables;
+        let c = this.com();
+        if t.modAt(this.m).isScript { return Result.Err(this.closureScriptErr(sp)); }
+        let boxed = false;
+        let mem: Option<Id<TExpr>> = Option.None;
+        let alloc: Option<Id<FnDecl>> = Option.None;
+        match lit.arena {
+            Option.Some(e) {
+                boxed = true;
+                let a = this.closureArena(e)?;
+                mem = Option.Some(a.mem);
+                alloc = Option.Some(a.alloc);
+            }
+            Option.None {}
+        }
+        // Rust `want_of`: a closure signature (stack or boxed), a plain fn signature, or nothing.
+        let wantPlain = false;
+        let haveWant = false;
+        let wantParams = this.cx.arena.alloc::<Id<Ty>>(0);
+        let wantRet = c.void;
+        match want {
+            Option.Some(w) {
+                match this.ty(w) {
+                    Ty.Closure(cl) { haveWant = true; wantParams = t.items(cl.params); wantRet = cl.ret; }
+                    Ty.Fn(f) { haveWant = true; wantPlain = true; wantParams = t.items(f.params); wantRet = f.ret; }
+                    _ {}
+                }
+            }
+            Option.None {}
+        }
+        let ptys = this.cx.arena.alloc::<Id<Ty>>(lit.params.len);
+        for i in 0..lit.params.len {
+            let p = lit.params.items[i];
+            let name = this.str(p.name.name);
+            for k in 0..i {
+                if lit.params.items[k].name.name == p.name.name {
+                    return Result.Err(this.err(p.name.span, cat3(this.cx, "duplicate parameter `", name, "`")));
+                }
+            }
+            let shadows = this.isDeclared(p.name.name);
+            match this.findAlias(p.name.name) { Option.Some(_) { shadows = true; } Option.None {} }
+            if shadows {
+                return Result.Err(this.help(this.shadowErr(p.name), "a closure parameter cannot reuse the name of a variable it can see; pick another name"));
+            }
+            match p.ty {
+                Option.Some(ty) { ptys[i] = this.resolve(ty)?; }
+                Option.None {
+                    if haveWant && wantParams.len == lit.params.len {
+                        ptys[i] = wantParams[i];
+                    } else if haveWant {
+                        let m = Text.new(this.cx.arena);
+                        m.add("this closure has ");
+                        m.pushInt(lit.params.len);
+                        m.add(" parameter(s) but ");
+                        m.pushInt(wantParams.len);
+                        m.add(" expected");
+                        return Result.Err(this.err(sp, m.str()));
+                    } else {
+                        let h = Text.new(this.cx.arena);
+                        h.add("write `").add(name).add(": int` (or its type); types may be left out only where a `closure(..)` or `fn(..)` type is expected");
+                        return Result.Err(this.help(this.err(p.name.span, cat3(this.cx, "closure parameter `", name, "` needs a type here")), h.str()));
+                    }
+                }
+            }
+        }
+        let ret = c.void;
+        match lit.ret {
+            Option.Some(rt) {
+                ret = this.resolve(rt)?;
+                match this.closureReject(this.cx.ast.typeSpan(rt), ret, "returned") { Option.Some(er) { return Result.Err(er); } Option.None {} }
+            }
+            Option.None { if haveWant { ret = wantRet; } }
+        }
+
+        // Captured names, in first-use order.
+        let used = List<Sym>.new(this.cx.arena);
+        namesInBlock(this.cx.ast, &lit.body, fn(id: Ident) {
+            let seen = false;
+            for i in 0..used.len {
+                if used.items[i] == id.name { seen = true; break; }
+            }
+            if !seen { used.push(id.name); }
+        });
+        let capNames = List<Sym>.new(this.cx.arena);
+        let caps = List<Id<TPlace>>.new(this.cx.arena);
+        for i in 0..used.len {
+            let name = used.items[i];
+            let place = match this.findAlias(name) {
+                Option.Some(p) { p }
+                Option.None {
+                    match this.findLocal(name) {
+                        Option.Some(l) { this.place(TPlace.Local(LocalPlace { local: l }), this.cx.typed.local(l).ty, sp) }
+                        Option.None { continue; }
+                    }
+                }
+            };
+            if boxed {
+                let where = Text.new(this.cx.arena);
+                where.add("captured by a boxed closure (`").add(this.str(name)).add("`)");
+                match this.closureReject(sp, this.placeTy(place), where.str()) { Option.Some(er) { return Result.Err(er); } Option.None {} }
+            } else if !this.canRef(place) {
+                return Result.Err(this.err(sp, cat3(this.cx, "cannot capture `", this.str(name), "`: its address cannot be taken")));
+            }
+            capNames.push(name);
+            caps.push(place);
+        }
+        let plain = wantPlain && !boxed;
+        if plain && caps.len > 0 {
+            let m = Text.new(this.cx.arena);
+            m.add("this closure captures `").add(this.str(capNames.items[0])).add("`, so it cannot be a plain `");
+            match want { Option.Some(w) { m.add(this.tyStr(w)); } Option.None {} }
+            m.add("`");
+            return Result.Err(this.help(this.err(sp, m.str()), "take a `closure(..)` parameter instead, or stop using outer variables in the body"));
+        }
+
+        let body = this.closureBody(sp, lit, ptys, ret, &capNames, &caps)?;
+        let ty = t.fnTy(ptys, ret);
+        if !plain { ty = t.intern(Ty.Closure(ClosureTy { params: t.list(ptys), ret: ret, boxed: boxed })); }
+        return Result.Ok(this.expr(TExpr.Closure(TClosure { mem: mem, alloc: alloc, body: body, captures: caps, boxed: boxed, plain: plain }), ty, sp));
+    }
+
+    /// Rust `closure_body`: the literal's statements typed as their own body (`ret`, fresh scope, no
+    /// enclosing loops), the captured names bound to `TPlace.Capture`s.
+    fn closureBody(this: &BodyCx, sp: Span, lit: &ClosureLit, ptys: []Id<Ty>, ret: Id<Ty>, capNames: &List<Sym>, caps: &List<Id<TPlace>>): Result<Id<TBody>, TErr> {
+        let a = this.cx.arena;
+        // Every name visible out here: a new local in the body may not reuse one (Rust `closure_outer`).
+        let outer = List<Sym>.new(a);
+        outer.extend(this.closureOuter.slice());
+        for i in 0..this.scope.len { outer.push(this.scope.items[i].name); }
+        let scope0 = this.scope;
+        let locals0 = this.locals;
+        let params0 = this.params;
+        let loops0 = this.loops;
+        let label0 = this.pendingLabel;
+        let nloops0 = this.nloops;
+        let ret0 = this.ret;
+        let outer0 = this.closureOuter;
+        let in0 = this.inClosure;
+        this.scope = List<Binding>.new(a);
+        this.locals = List<Id<TLocal>>.new(a);
+        this.params = List<Id<TLocal>>.new(a);
+        this.loops = List<LoopFrame>.new(a);
+        this.pendingLabel = Option.None;
+        this.nloops = 0;
+        this.ret = ret;
+        this.closureOuter = outer;
+        this.inClosure = true;
+
+        for i in 0..lit.params.len {
+            let p = lit.params.items[i];
+            let id = this.newLocal(p.name.name, ptys[i], p.name.span, true);
+            this.params.push(id);
+            this.bind(p.name.name, id);
+        }
+        for i in 0..caps.len {
+            let o = caps.items[i];
+            this.bindAlias(capNames.items[i], this.place(TPlace.Capture(CapturePlace { index: i, outer: o }), this.placeTy(o), sp));
+        }
+        let block = this.cx.typed.block(lit.body.span);
+        let failed: Option<TErr> = Option.None;
+        for i in 0..lit.body.stmts.len {
+            let s = lit.body.stmts.items[i];
+            match this.stmt(s) {
+                Result.Ok(id) { match this.cx.ast.stmt(s) { Stmt.UseLocal(_) {} _ { block.stmts.push(id); } } }
+                Result.Err(e) { failed = Option.Some(e); break; }
+            }
+        }
+        let body = TBody { decl: this.f, params: this.params, locals: this.locals, body: block, loops: this.nloops, slots: 0 };
+
+        this.scope = scope0;
+        this.locals = locals0;
+        this.params = params0;
+        this.loops = loops0;
+        this.pendingLabel = label0;
+        this.nloops = nloops0;
+        this.ret = ret0;
+        this.closureOuter = outer0;
+        this.inClosure = in0;
+        match failed { Option.Some(e) { return Result.Err(e); } Option.None {} }
+        return Result.Ok(this.cx.typed.addBody(body));
+    }
+
+    /// Rust `arena_arg`: the `mem` of `fn[mem]` as a `&Arena` value plus `Arena.allocAligned`. A value
+    /// `Arena` place is borrowed in place (`Origin.ArenaRef`), so the allocation bumps it and not a copy.
+    fn closureArena(this: &BodyCx, e: Id<Expr>): Result<ClosureArena, TErr> {
+        let esp = this.cx.ast.exprSpan(e);
+        let place: Option<Id<TPlace>> = Option.None;
+        let op = match this.tryPlace(e) {
+            Result.Ok(p) { place = Option.Some(p); this.load(p) }
+            Result.Err(_) { this.operand(e, Option.None)? }
+        };
+        let found = this.exprTy(op);
+        let arena = found;
+        match this.refInner(found) { Option.Some(inner) { arena = inner; } Option.None {} }
+        let alloc: Option<Id<FnDecl>> = Option.None;
+        match this.structOf(arena) {
+            Option.Some(s) {
+                if this.str(this.cx.tables.structAt(s).name) == "Arena" { alloc = this.findMethod(s, this.sym("allocAligned")); }
+            }
+            Option.None {}
+        }
+        let f = match alloc {
+            Option.Some(f) { f }
+            Option.None {
+                let m = Text.new(this.cx.arena);
+                m.add("`fn[..]` takes the arena its captures are copied into: an `Arena` or `&Arena`, found `").add(this.tyStr(found)).add("`");
+                return Result.Err(this.help(this.err(esp, m.str()), "`use j3.memory.{ Arena };` and write `fn[mem](..) { .. }` with `mem: &Arena`"));
+            }
+        };
+        match place {
+            Option.Some(p) {
+                if arena == found && this.canRef(p) {
+                    op = this.exprFrom(Origin.ArenaRef, TExpr.AddrOf(PlaceRef { place: p }), this.cx.tables.refTo(arena), esp);
+                }
+            }
+            Option.None {}
+        }
+        match this.refInner(this.exprTy(op)) {
+            Option.Some(_) {}
+            Option.None {
+                return Result.Err(this.help(this.err(esp, "`fn[..]` needs an arena it can allocate from; this one cannot be borrowed"),
+                    "pass a `let` arena or a `&Arena`"));
+            }
+        }
+        return Result.Ok(ClosureArena { mem: op, alloc: f });
+    }
+
+    /// Rust `script_closure_err`.
+    fn closureScriptErr(this: &BodyCx, sp: Span): TErr {
+        return this.help(this.err(sp, "closures are not supported in .j3s scripts"),
+            "scripts run on the VM, which has no function values; move this code into a `.j3` module");
+    }
+}
+
+/// What `closureArena` found: the `&Arena` value and `Arena.allocAligned`.
+struct ClosureArena {
+    mem: Id<TExpr>;
+    alloc: Id<FnDecl>;
+}

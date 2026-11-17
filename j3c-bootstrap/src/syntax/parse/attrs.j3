@@ -2,4 +2,211 @@
 //
 // Part of module j3c.syntax.parse.
 // Port of: j3c/src/parse/parser/attrs.rs, parse/parser/shader_attrs.rs
+// J3: Rust's `&mut ItemAttrs` is `&ItemAttrs`; Rust's local closures (`arg`, `bad`) are the private
+// methods `attrArg` and `gpuBad`. Messages are built with `Text` and copied by `err`/`errAt`. Uses come
+// from `parse.j3`.
 module j3c.syntax.parse;
+
+/// Attributes with nothing set (Rust's `ItemAttrs { .. }` literal), in `arena`.
+fn noAttrs(arena: &Arena): ItemAttrs {
+    return ItemAttrs { debug: false, tryCatch: Option.None, derives: List<Ident>.new(arena), singleton: false,
+        thread: false, implFn: false, shader: Option.None, gpuStruct: GpuStruct.None, uniform: false, flat: false };
+}
+
+/// Rust `Option::is_some` (stage 0's `Option` has no methods).
+fn isSet<T>(o: Option<T>): bool {
+    match o {
+        Option.Some(_) { return true; }
+        Option.None { return false; }
+    }
+}
+
+extend Parser {
+    /// `///` lines before an item, joined with `\n` (Rust `take_doc`), in the arena.
+    fn takeDoc(this: &Parser): string {
+        if this.cur().kind != TokenKind.Doc { return ""; }
+        let t = Text.new(this.ast.arena);
+        let first = true;
+        while this.cur().kind == TokenKind.Doc {
+            if !first { t.add("\n"); }
+            first = false;
+            t.add(this.bump().text);
+        }
+        return t.str();
+    }
+
+    /// Fail when `doc` is not empty: a doc comment on something that takes none.
+    fn forbidDoc(this: &Parser, doc: string): Result<bool, ParseError> {
+        if doc.len == 0 { return Result.Ok(true); }
+        return Result.Err(this.err("doc comment must sit on a fn, struct, enum, const, let, field, or variant"));
+    }
+
+    /// `#[...]` attributes before an item.
+    fn attrs(this: &Parser): Result<ItemAttrs, ParseError> {
+        let out = noAttrs(this.ast.arena);
+        while this.cur().kind == TokenKind.Hash {
+            this.bump();
+            this.expect(TokenKind.LBracket, "expected `[` after `#`")?;
+            let name = this.ident()?;
+            let n = this.ast.str(name.name);
+            if n == ATTR_DEBUG {
+                if this.at(TokenKind.LParen) { return Result.Err(this.errAt(name.span, "`#[Debug]` takes no arguments")); }
+                out.debug = true;
+            } else if n == ATTR_DERIVE {
+                this.deriveList(&out)?;
+            } else if n == ATTR_SINGLETON {
+                if this.at(TokenKind.LParen) { return Result.Err(this.errAt(name.span, "`#[singleton]` takes no arguments")); }
+                out.singleton = true;
+            } else if n == ATTR_THREAD {
+                if this.at(TokenKind.LParen) { return Result.Err(this.errAt(name.span, "`#[thread]` takes no arguments")); }
+                out.thread = true;
+            } else if n == ATTR_IMPL {
+                if this.at(TokenKind.LParen) { return Result.Err(this.errAt(name.span, "`#[impl]` takes no arguments")); }
+                out.implFn = true;
+            } else if n == ATTR_TRY_CATCH {
+                this.expect(TokenKind.LParen, "expected `(` after `#[TryCatch`")?;
+                let success = this.ident()?;
+                this.expect(TokenKind.Comma, "expected `,` in `#[TryCatch]`")?;
+                let failure = this.ident()?;
+                this.expect(TokenKind.RParen, "expected `)` after `#[TryCatch]`")?;
+                out.tryCatch = Option.Some(TryCatch { ok: success, err: failure });
+            } else if !this.gpuAttr(n, &name, &out)? {
+                let t = Text.new(this.ast.arena);
+                t.add("unknown attribute `#[").add(n).add("]`");
+                return Result.Err(this.errAt(name.span, t.str()));
+            }
+            this.expect(TokenKind.RBracket, "expected `]` after attribute")?;
+        }
+        return Result.Ok(out);
+    }
+
+    /// `(Eq, Hash, ..)` after `#[derive`. `Debug` is the same as `#[Debug]`.
+    fn deriveList(this: &Parser, out: &ItemAttrs): Result<bool, ParseError> {
+        this.expect(TokenKind.LParen, "expected `(` after `#[derive`")?;
+        while true {
+            let d = this.ident()?;
+            let dn = this.ast.str(d.name);
+            if !isIn(dn, names(NameList.Derives)) {
+                let t = Text.new(this.ast.arena);
+                t.add("cannot derive `").add(dn).add("`; derivable: ").add(joinNames(NameList.Derives, ", ", this.ast.arena));
+                return Result.Err(this.errAt(d.span, t.str()));
+            }
+            let twice = dn == "Debug" && out.debug;
+            for i in 0..out.derives.len {
+                if out.derives.items[i].name == d.name { twice = true; }
+            }
+            if twice {
+                let t = Text.new(this.ast.arena);
+                t.add("`").add(dn).add("` is derived twice");
+                return Result.Err(this.errAt(d.span, t.str()));
+            }
+            if dn == "Debug" { out.debug = true; } else { out.derives.push(d); }
+            if !this.at(TokenKind.Comma) { break; }
+            this.bump();
+        }
+        this.expect(TokenKind.RParen, "expected `)` after the derive list")?;
+        return Result.Ok(true);
+    }
+
+    /// Fail when `a` holds an attribute `what` does not take.
+    fn forbidAttrs(this: &Parser, a: &ItemAttrs, what: string): Result<bool, ParseError> {
+        let t = Text.new(this.ast.arena);
+        if a.debug { t.add("`#[Debug]` cannot sit on `").add(what).add("`"); }
+        else if isSet(a.tryCatch) { t.add("`#[TryCatch]` cannot sit on `").add(what).add("`"); }
+        else if a.derives.len > 0 { t.add("`#[derive]` cannot sit on `").add(what).add("`; it marks a struct or enum"); }
+        else if a.singleton { t.add("`#[singleton]` cannot sit on `").add(what).add("`"); }
+        else if a.thread { t.add("`#[thread]` cannot sit on `").add(what).add("`"); }
+        else if a.implFn && what != "fn" { t.add("`#[impl]` cannot sit on `").add(what).add("`; it marks a free fn"); }
+        else { return Result.Ok(true); }
+        return Result.Err(this.err(t.str()));
+    }
+
+    /// `(name)` after a shader attribute, or nothing (Rust's `arg` closure).
+    fn attrArg(this: &Parser): Result<Option<Ident>, ParseError> {
+        if !this.at(TokenKind.LParen) {
+            let none: Option<Ident> = Option.None;
+            return Result.Ok(none);
+        }
+        this.bump();
+        let a = this.ident()?;
+        this.expect(TokenKind.RParen, "expected `)` after the attribute argument")?;
+        return Result.Ok(Option.Some(a));
+    }
+
+    /// A shader attribute named `name` (at `id`) into `out`; false when `name` is not one.
+    fn gpuAttr(this: &Parser, name: string, id: &Ident, out: &ItemAttrs): Result<bool, ParseError> {
+        if name == "shader" {
+            match this.attrArg()? {
+                Option.None { out.shader = Option.Some(GpuStage.Helper); }
+                Option.Some(a) {
+                    let an = this.ast.str(a.name);
+                    if an == "vertex" { out.shader = Option.Some(GpuStage.Vertex); }
+                    else if an == "fragment" { out.shader = Option.Some(GpuStage.Fragment); }
+                    else { return Result.Err(this.errAt(a.span, "`#[shader(..)]` takes `vertex` or `fragment`; a helper is plain `#[shader]`")); }
+                }
+            }
+        } else if name == "vertex" {
+            match this.attrArg()? {
+                Option.None { out.gpuStruct = GpuStruct.Vertex; }
+                Option.Some(a) {
+                    if this.ast.str(a.name) != "instance" { return Result.Err(this.errAt(a.span, "`#[vertex(..)]` takes `instance`")); }
+                    out.gpuStruct = GpuStruct.VertexInstance;
+                }
+            }
+        } else if name == "varying" || name == "uniform" || name == "flat" {
+            if isSet(this.attrArg()?) {
+                let t = Text.new(this.ast.arena);
+                t.add("`#[").add(name).add("]` takes no arguments");
+                return Result.Err(this.errAt(id.span, t.str()));
+            }
+            if name == "varying" { out.gpuStruct = GpuStruct.Varying; }
+            else if name == "uniform" { out.uniform = true; }
+            else { out.flat = true; }
+        } else {
+            return Result.Ok(false);
+        }
+        return Result.Ok(true);
+    }
+
+    /// `WHAT only sits on OK` at the current token (Rust's `bad` closure).
+    fn gpuBad(this: &Parser, what: string, ok: string): Result<bool, ParseError> {
+        let t = Text.new(this.ast.arena);
+        t.add(what).add(" only sits on ").add(ok);
+        return Result.Err(this.err(t.str()));
+    }
+
+    /// Fail when a shader attribute in `a` sits on the wrong kind of item.
+    fn gpuAttrSite(this: &Parser, a: &ItemAttrs): Result<bool, ParseError> {
+        let next = this.cur().kind;
+        if a.flat { return this.gpuBad("`#[flat]`", "a field of a `#[varying]` struct"); }
+        if a.uniform && next != TokenKind.Let { return this.gpuBad("`#[uniform]`", "a module `let`"); }
+        if a.gpuStruct != GpuStruct.None && next != TokenKind.Struct { return this.gpuBad("`#[vertex]` and `#[varying]`", "a `struct`"); }
+        match a.shader {
+            Option.Some(s) {
+                let fits = next == TokenKind.Fn || (next == TokenKind.Struct && s == GpuStage.Helper);
+                if !fits { return this.gpuBad("`#[shader]`", "a `fn` (or, bare, a plain GPU `struct`)"); }
+            }
+            Option.None {}
+        }
+        return Result.Ok(true);
+    }
+
+    /// `#[flat]` before a field: true when present.
+    fn fieldAttrs(this: &Parser): Result<bool, ParseError> {
+        let flat = false;
+        while this.cur().kind == TokenKind.Hash {
+            this.bump();
+            this.expect(TokenKind.LBracket, "expected `[` after `#`")?;
+            let name = this.ident()?;
+            let n = this.ast.str(name.name);
+            if n != "flat" {
+                let t = Text.new(this.ast.arena);
+                t.add("unknown field attribute `#[").add(n).add("]`; fields take `#[flat]`");
+                return Result.Err(this.errAt(name.span, t.str()));
+            }
+            flat = true;
+            this.expect(TokenKind.RBracket, "expected `]` after attribute")?;
+        }
+        return Result.Ok(flat);
+    }
+}

@@ -1,6 +1,283 @@
-// Closure literals (captures by address), boxed closures (`fn[mem]` copies captures into an arena), calls
-// through a closure, plain-fn thunks.
+// Closure literals (captures by address; boxed `fn[mem]` copies them into an arena), the closure body as
+// its own IR fn, the `closure(..)` struct of a closure type. Calls, thunks and the intrinsics:
+// `closure_call.j3`.
 //
 // Part of module j3c.lower.
-// Port of: j3c/src/check/lower/closure.rs, check/lower/closure_call.rs, check/lower/closure_boxed.rs
+// Port of: j3c/src/check/lower/closure.rs
+// J3: C2c hooks (contracts-c2c.md, owner: closures). Sema's `TClosure` carries the typed body, the captured
+// places and the `plain` / `boxed` decisions; here: Rust's entity order and names (the fn `LABEL$closureN`
+// first, then its `LABEL$closureN$ctx` struct, then the body, then the `closure(..)` struct) and the ctx
+// fill. The closure body is lowered by a second `FnLower` that starts at the enclosing fn's temp counter
+// and hands it back: Rust swaps the builder, locals, loops and return type, not the counter.
+// J3: `IrCx.closureTy` wants Rust's struct name; `ir` cannot call `ir/dump`, so `closureName` spells it.
 module j3c.lower;
+
+use j3c.ir.{ Access, Body, ClosureSig, abiAlign };
+
+/// The closure state of the fn being lowered (Rust `Lower.fn_label`, `closure_n`, and the ctx a closure
+/// body reads its captures through). Owned by this file; `FnLower.clo` is its only user.
+// J3: Field order: the enum-typed field first (stage 0 layout hazard, PORT_DEBT (a)), the bool last.
+pub struct ClosureFrame {
+    /// Inside a closure body: the access of each captured place (Rust `place.access = orig.access`).
+    access: Option<List<Access>>;
+    /// Rust `fn_label` ("" until first needed: `fnLabel`).
+    label: string;
+    /// Rust `closure_n`: closures made so far in this fn (a closure body starts again at 0).
+    n: int;
+    /// Inside a closure body with captures: the `_ctx` local id + 1 (0: none) and its ctx struct id.
+    ctx: u32;
+    ctxStruct: u32;
+    boxed: bool;
+}
+
+/// The frame of a plain fn body.
+pub fn closureFrameNone(): ClosureFrame { return ClosureFrame { access: Option.None, label: "", n: 0, ctx: 0, ctxStruct: 0, boxed: false }; }
+
+/// Rust's name of a closure struct: `closure(A, B): R`, `boxed closure(..)` when boxed.
+fn closureName(lw: &Lw, params: &List<Id<TyKind>>, ret: Id<TyKind>, boxed: bool): string {
+    let ir = lw.ir();
+    let name = Text.new(lw.cx.arena);
+    if boxed { name.add("boxed closure("); } else { name.add("closure("); }
+    for i in 0..params.len {
+        if i > 0 { name.add(", "); }
+        name.add(tyString(ir, params.items[i], lw.cx.arena));
+    }
+    name.add(")");
+    if ret != ir.common.void { name.add(": ").add(tyString(ir, ret, lw.cx.arena)); }
+    return name.str();
+}
+
+/// The `{ $f, $ctx }` struct of `closure(params): ret`, made at `span` on the current module's structs
+/// when new (Rust `closure_ty`).
+fn closureStruct(lw: &Lw, params: &List<Id<TyKind>>, ret: Id<TyKind>, boxed: bool, span: Span): Id<TyKind> {
+    let ir = lw.ir();
+    match ir.closureLookup(params, ret, boxed) { Option.Some(t) { return t; } Option.None {} }
+    let m = &lw.p.modules.items[lw.curMod];
+    return ir.closureTy(params, ret, boxed, closureName(lw, params, ret, boxed), m.name, span, &m.structs);
+}
+
+/// `Lw.irTy` for `Ty.Closure`: the struct of that signature, made here when this is its first use.
+// ponytail: Rust's span is the written type's; `irTy` has no span, and no dump or backend reads a
+// struct's span. Pass it through `irTy` if debug info ever names struct lines.
+fn closureIrTy(lw: &Lw, c: ClosureTy): Id<TyKind> {
+    let ps = List<Id<TyKind>>.new(lw.cx.arena);
+    let items = lw.t.items(c.params);
+    for k in 0..items.len { ps.push(lw.irTy(items[k])); }
+    return closureStruct(lw, &ps, lw.irTy(c.ret), c.boxed, noSpan());
+}
+
+extend FnLower {
+    /// Rust `fn_label`: `Box.push<int>`, the stem of this fn's `$closureN` names (owner struct, the IR
+    /// fn's name, then an instance's type arguments in type-parameter-name order).
+    fn fnLabel(this: &FnLower): string {
+        if this.clo.label.len > 0 { return this.clo.label; }
+        let lw = this.lw;
+        let ir = this.ir();
+        let decl = lw.typed.body(this.body).decl;
+        let fd = lw.t.fnAt(decl);
+        let fid = Id<Func> { i: 0 };
+        match this.inst {
+            Option.Some(i) { fid = Id<Func> { i: lw.instFuncs.items[int(i.i)] - 1 }; }
+            Option.None { fid = lw.funcOf(decl.i); }
+        }
+        let f = ir.funcMut(fid);
+        let s = Text.new(this.cx.arena);
+        match f.methodOf {
+            Option.Some(sid) { s.add(ir.nameStr(ir.structDef(sid).name)).add("."); }
+            Option.None {}
+        }
+        s.add(ir.nameStr(f.name));
+        match this.inst {
+            Option.Some(i) {
+                let args = lw.t.items(lw.t.instanceAt(i).key.args);
+                let names = List<Sym>.new(this.cx.arena);
+                match fd.gen {
+                    Option.Some(g) { names = lw.t.genericsAt(g).names; }
+                    Option.None {
+                        match fd.recv {
+                            Option.Some(r) { match lw.t.structAt(r).gen { Option.Some(g) { names = lw.t.genericsAt(g).names; } Option.None {} } }
+                            Option.None {}
+                        }
+                    }
+                }
+                if args.len > 0 && names.len == args.len {
+                    // Rust sorts its `HashMap<String, Ty>` keys: insertion sort over the (few) names.
+                    let order = List<int>.new(this.cx.arena);
+                    for k in 0..args.len {
+                        let at = order.len;
+                        order.push(k);
+                        while at > 0 && lw.t.str(names.items[order.items[at - 1]]) > lw.t.str(names.items[k]) {
+                            order.items[at] = order.items[at - 1];
+                            at -= 1;
+                        }
+                        order.items[at] = k;
+                    }
+                    s.add("<");
+                    for k in 0..order.len {
+                        if k > 0 { s.add(","); }
+                        s.add(tyString(ir, lw.irTy(args[order.items[k]]), this.cx.arena));
+                    }
+                    s.add(">");
+                }
+            }
+            Option.None {}
+        }
+        this.clo.label = s.str();
+        return this.clo.label;
+    }
+
+    /// Rust `closure_lit`.
+    fn closureLit(this: &FnLower, e: Id<TExpr>, c: &TClosure): Rvalue {
+        let sp = this.spanOf(e);
+        let lw = this.lw;
+        let ir = this.ir();
+        let a = this.cx.arena;
+        let tb = lw.typed.body(c.body);
+        // Rust `arena_arg` runs first: a value `Arena` is borrowed in place into `_dynN`.
+        let mem: Option<Operand> = Option.None;
+        match c.mem {
+            Option.Some(m) {
+                let borrowed = false;
+                match this.node(m) {
+                    TExpr.AddrOf(r) {
+                        if lw.typed.origin(m) == Origin.ArenaRef {
+                            let msp = this.spanOf(m);
+                            mem = Option.Some(Operand.Copy(this.spill("dyn", Rvalue.refPlace(msp, this.tyOf(m), this.place(r.place, "i")), msp)));
+                            borrowed = true;
+                        }
+                    }
+                    _ {}
+                }
+                if !borrowed { mem = Option.Some(this.operand(m)); }
+            }
+            Option.None {}
+        }
+        let ptys = List<Id<TyKind>>.new(a);
+        for i in 0..tb.params.len { ptys.push(lw.irTy(lw.typed.local(tb.params.items[i]).ty)); }
+        let ret = ir.common.void;
+        match lw.t.ty(lw.typed.exprTy(e)) {
+            Ty.Closure(cl) { ret = lw.irTy(cl.ret); }
+            Ty.Fn(f) { ret = lw.irTy(f.ret); }
+            _ { panic("lower: a closure literal that is neither a closure nor a fn"); }
+        }
+        let caps = List<Place>.new(a);
+        let access = List<Access>.new(a);
+        for i in 0..c.captures.len {
+            let pl = this.place(c.captures.items[i], "i");
+            access.push(pl.access);
+            caps.push(pl);
+        }
+
+        let n = this.clo.n;
+        this.clo.n += 1;
+        let lt = Text.new(a);
+        lt.add(this.fnLabel()).add("$closure").pushInt(n);
+        let label = lt.str();
+        let fnTy = ir.closureFnTy(&ptys, ret);
+        if c.plain { fnTy = ir.tyFn(ptys, ret); }
+        let m = &lw.p.modules.items[lw.curMod];
+        let fid = ir.allocFunc(Func { id: Id<Func> { i: 0 }, doc: "", moduleName: m.name, kind: FuncKind.Decl, name: ir.internName(label), ty: fnTy,
+            vis: Vis.Private, methodOf: Option.None, span: sp });
+        m.funcs.push(fid);
+
+        // The ctx struct: one `&T` per captured name (one `T`, a copy, when boxed).
+        let ctx: Option<Id<StructDef>> = Option.None;
+        if caps.len > 0 {
+            let fields = List<FieldDef>.new(a);
+            for i in 0..caps.len {
+                let ty = caps.items[i].ty;
+                if !c.boxed { ty = ir.tyRef(ty); }
+                let fnm = Text.new(a);
+                fnm.add("c").pushInt(i);
+                fields.push(FieldDef { name: ir.internName(fnm.str()), doc: "", ty: ty, embedded: false, default: Option.None });
+            }
+            let sn = Text.new(a);
+            sn.add(label).add("$ctx");
+            let sid = ir.allocStruct(StructDef { moduleName: m.name, name: ir.internName(sn.str()), doc: "", fields: fields, packed: false,
+                debug: false, span: sp, tyArgs: List<TyArg>.new(a), script: Option.None });
+            m.structs.push(sid);
+            ctx = Option.Some(sid);
+        }
+
+        let body = this.closureBody(sp, c, &tb, label, &ptys, ret, ctx, access);
+        instWake(lw, &body.block);
+        ir.funcMut(fid).kind = FuncKind.J3(J3Fn { body: body });
+
+        if c.plain { return Rvalue.useOp(sp, opFnAddr(sp, fnTy, fid)); }
+        let ptr = ir.common.ptr;
+        let ctxOp = opNull(sp, ptr);
+        match ctx {
+            Option.Some(sid) {
+                match mem {
+                    Option.Some(mo) {
+                        let alloc = match c.alloc { Option.Some(f) { f } Option.None { panic("lower: a boxed closure without its allocator"); } };
+                        ctxOp = this.closureBoxedCtx(sp, sid, mo, lw.funcOf(alloc.i), &caps);
+                    }
+                    Option.None {
+                        let tmp = this.tmpPlace("ctx", ir.tyStruct(sid), sp);
+                        for i in 0..caps.len {
+                            let field = this.b.field(ir, this.copyOf(tmp), FieldId { structId: sid, index: u32(i) }, sp);
+                            this.b.assign(sp, field, Rvalue.refPlace(sp, ir.tyRef(caps.items[i].ty), caps.items[i]));
+                        }
+                        let r = this.b.refTmp(ir, ir.internName("_ctxref"), tmp, sp);
+                        let cast = this.tmpPlace("ctxp", ptr, sp);
+                        this.b.assign(sp, this.copyOf(cast), Rvalue.cast(sp, ptr, r));
+                        ctxOp = Operand.Copy(cast);
+                    }
+                }
+            }
+            Option.None {}
+        }
+        let ops = List<Operand>.new(a);
+        ops.push(opFnAddr(sp, fnTy, fid));
+        ops.push(ctxOp);
+        return Rvalue.aggregate(sp, closureStruct(lw, &ptys, ret, c.boxed, sp), ops);
+    }
+
+    /// Rust `closure_body`: the literal's typed body as its own IR body. A second `FnLower` holds Rust's
+    /// swapped-out state (builder, locals, loops, return type, label, closure counter); the temp counter
+    /// carries through.
+    fn closureBody(this: &FnLower, sp: Span, c: &TClosure, tb: &TBody, label: string, ptys: &List<Id<TyKind>>, ret: Id<TyKind>,
+        ctx: Option<Id<StructDef>>, access: List<Access>): Body {
+        let lw = this.lw;
+        let ir = this.ir();
+        let a = this.cx.arena;
+        let sub = a.new::<FnLower>(FnLower { inst: this.inst, cx: this.cx, lw: lw, body: c.body, loops: List<int>.new(a),
+            defers: List<int>.new(a), b: BodyBuilder.new(a, ir.common.void), locals: Map<u32, u32>.new(a, 32), ret: ret, tmp: this.tmp,
+            clo: ClosureFrame { access: Option.Some(access), label: label, n: 0, ctx: 0, ctxStruct: 0, boxed: c.boxed } });
+        let ctxParam = Id<LocalDecl> { i: 0 };
+        if !c.plain { ctxParam = sub.b.param(ir.internName("$ctx"), ir.common.ptr, sp); }
+        for i in 0..tb.params.len {
+            let l = lw.typed.local(tb.params.items[i]);
+            let pid = sub.b.param(l.name, ptys.items[i], l.span);
+            sub.locals.put(tb.params.items[i].i, pid.i);
+        }
+        match ctx {
+            Option.Some(sid) {
+                if !c.plain {
+                    let refTy = ir.tyRef(ir.tyStruct(sid));
+                    let typed = sub.b.tmp(ir.internName("_ctx"), refTy, sp);
+                    sub.b.assign(sp, sub.b.localPlace(typed, sp), Rvalue.cast(sp, refTy, Operand.Copy(sub.b.localPlace(ctxParam, sp))));
+                    sub.clo.ctx = typed.i + 1;
+                    sub.clo.ctxStruct = sid.i;
+                }
+            }
+            Option.None {}
+        }
+        sub.stmts(&tb.body);
+        this.tmp = sub.tmp;
+        return sub.b.finish();
+    }
+
+    /// `TPlace.Capture` inside a closure body: `(*_ctx).c<index>` (dereferenced unless boxed), with the
+    /// captured place's access.
+    fn closureCapture(this: &FnLower, c: CapturePlace, sp: Span): Place {
+        if this.clo.ctx == 0 { panic("lower: a captured place outside a closure body"); }
+        let ir = this.ir();
+        let base = this.b.deref(ir, this.b.localPlace(Id<LocalDecl> { i: this.clo.ctx - 1 }, sp), sp);
+        let place = this.b.field(ir, base, FieldId { structId: Id<StructDef> { i: this.clo.ctxStruct }, index: u32(c.index) }, sp);
+        if !this.clo.boxed { place = this.b.deref(ir, place, sp); }
+        match this.clo.access { Option.Some(acc) { place.access = acc.items[c.index]; } Option.None {} }
+        return place;
+    }
+}

@@ -1,0 +1,249 @@
+// Body typing (`sema/body*`): small sources (local `use` aliases included) parsed for real, declarations made by hand (a tiny type
+// resolver below, so the test does not depend on the declaration passes), then `typeFn` and the typed
+// tree read back: literal typing from the other operand, places with auto-deref and bounds checks, loop
+// ids, `break` targets, slices, errors with follow-on suppression, the missing-`return` check.
+module sema_body_test;
+
+use j3.data.pool.Id;
+use j3.memory.List;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.{ Text, startsWith };
+use j3c.base.intern.{ Sym, own };
+use j3c.base.span.{ Lines, Source, Span, noSpan };
+use j3c.driver;
+use j3c.driver.Session;
+use j3c.load.{ Parsed, ParsedFile };
+use j3c.sema;
+use j3c.sema.{ BinKind, FieldDecl, FnDecl, FnKind, ForKind, ModDecl, ParamDecl, SemaCx, StructDecl, TBody, TExpr, TPlace, TStmt, Ty, newModDecl };
+use j3c.syntax.ast.{ Ast, BinOp, File, Item, Type };
+use j3c.syntax.parse;
+use j3c.syntax.token.ParseError;
+
+const SRC: [14]string = [
+    "fn arith(a: int, b: int): int { let c = a + b * 2; return c; }",
+    "fn lit(x: u8): bool { return x == 'a'; }",
+    "fn loops(xs: []int): int {",
+    "    let s = 0;",
+    "    for i in 0..xs.len { s += xs[i]; }",
+    "    for x in xs { s += x; }",
+    "    while s > 10 { s -= 1; break; }",
+    "    return s;",
+    "}",
+    "fn fields(p: &P): int { p.y = 3; return p.x; }",
+    "fn slices(xs: []int, n: int): int { let ys = xs[1..n]; let z = xs.len; return ys.len + z; }",
+    "fn aliased(p: &P): int { use p; y = 2; return x; }",
+    "fn bad(a: int): bool { let b = a + true; let c = b; return a; }",
+    "fn noret(a: int): int { if a > 0 { return 1; } }",
+];
+
+/// The test's stand-in for `resolveTy`: primitives, `&T`, `[]T`, and the struct `P`.
+fn testTy(cx: &SemaCx, p: Id<StructDecl>, t: Id<Type>): Id<Ty> {
+    let c = cx.tables.common;
+    match cx.ast.ty(t) {
+        Type.Named(n) {
+            let s = cx.ast.str(n.name);
+            if s == "int" { return c.i64; }
+            if s == "u8" { return c.u8; }
+            if s == "bool" { return c.bool; }
+            if s == "P" { return cx.tables.structTy(p, cx.arena.alloc::<Id<Ty>>(0)); }
+        }
+        Type.Ref(r) { return cx.tables.refTo(testTy(cx, p, r.ty)); }
+        Type.Slice(s) { return cx.tables.sliceOf(testTy(cx, p, s.elem)); }
+        _ {}
+    }
+    panic("testTy: unsupported type");
+    return c.error;
+}
+
+fn body(cx: &SemaCx, fns: &List<Id<FnDecl>>, name: string): TBody {
+    for i in 0..fns.len {
+        if cx.tables.str(cx.tables.fnAt(fns.items[i]).name) == name {
+            match cx.tables.fnAt(fns.items[i]).body {
+                Option.Some(b) { return cx.typed.body(b); }
+                Option.None { panic(`no body for {name}`); }
+            }
+        }
+    }
+    panic(`no fn {name}`);
+    return cx.typed.body(Id<TBody> { i: 0 });
+}
+
+fn main() {
+    let s = Session.new(driver.defaults());
+    let ast = s.arena.new::<Ast>(Ast.new(s.arena, &s.names));
+    let parsed = s.arena.new::<Parsed>(Parsed { ast: ast, files: List<ParsedFile>.new(s.arena), project: Option.None });
+    let cx = sema.newCx(s.arena, &s.names, &s.diags, &s.sources, parsed);
+    let t = cx.tables;
+    let c = t.common;
+    let st = Text.new(s.arena);
+    st.add("module main;\n");
+    for i in 0..SRC.len { st.add(SRC[i]).add("\n"); }
+    let src = st.str();
+    let fid = s.sources.add(Source { path: "src/main.j3", text: src, lines: Lines.of(src, s.arena) });
+    let r: Result<File, ParseError> = parse.parseFile(src, fid, ast);
+    let file = match r {
+        Result.Ok(f) { f }
+        Result.Err(e) { panic(e.msg); return; }
+    };
+
+    // Declarations by hand: module `main`, struct `P { x: int, y: int }`, one `FnDecl` per fn item.
+    let path = List<Sym>.new(s.arena);
+    let m = t.addMod(newModDecl(s.arena, "main", path));
+    let pfields = List<FieldDecl>.new(s.arena);
+    pfields.push(FieldDecl { name: t.sym("x"), doc: "", span: noSpan(), ty: c.i64, embedded: false, default: Option.None });
+    pfields.push(FieldDecl { name: t.sym("y"), doc: "", span: noSpan(), ty: c.i64, embedded: false, default: Option.None });
+    let p = t.addStruct(StructDecl { owner: m, name: t.sym("P"), doc: "", span: noSpan(), visPub: false, gen: Option.None, fields: pfields,
+        methods: List<Id<FnDecl>>.new(s.arena), packed: false, debug: false, scriptPath: Option.None,
+        propSpans: List<Span>.new(s.arena), item: Option.None });
+    let fns = List<Id<FnDecl>>.new(s.arena);
+    for i in 0..file.items.len {
+        match file.items.items[i] {
+            Item.Fn(f) {
+                let params = List<ParamDecl>.new(s.arena);
+                for k in 0..f.params.len {
+                    params.push(ParamDecl { name: f.params.items[k].name.name, span: f.params.items[k].name.span, ty: testTy(&cx, p, f.params.items[k].ty) });
+                }
+                let ret = c.void;
+                match f.ret { Option.Some(rt) { ret = testTy(&cx, p, rt); } Option.None {} }
+                let id = t.addFn(FnDecl { owner: m, name: f.name.name, doc: "", span: f.span, visPub: false, kind: FnKind.J3, libName: "", symbol: "",
+                    gen: Option.None, recv: Option.None, params: params, ret: ret, retOmitted: false, isImpl: false, implName: Option.None,
+                    defaultOf: Option.None, shader: false, enumDerived: false, item: Option.Some(f), body: Option.None });
+                fns.push(id);
+                t.modAt(m).fns.push(id);
+            }
+            _ {}
+        }
+    }
+    t.modAt(m).items = file.items; // typeModule walks items in order (Rust `lower_module`)
+    let typed = sema.typeModule(&cx, m);
+    // `bad` has errors (no body); `noret` keeps its body with the missing-return error, as in Rust.
+    if typed.bodies.len != 7 { panic(`want 7 typed bodies, got {typed.bodies.len}`); }
+
+    // arith: `let c = a + b * 2` is int all the way down; the literal took `int`.
+    let ar = body(&cx, &fns, "arith");
+    if ar.params.len != 2 || ar.body.stmts.len != 2 { panic("arith shape"); }
+    match cx.typed.stmt(ar.body.stmts.items[0]) {
+        TStmt.Let(l) {
+            if cx.typed.local(l.local).ty != c.i64 { panic("let c: int"); }
+            match l.init {
+                Option.Some(e) {
+                    match cx.typed.expr(e) {
+                        TExpr.Binary(b) {
+                            if b.op != BinOp.Add || b.kind != BinKind.Prim { panic("a + .."); }
+                            match cx.typed.expr(b.rhs) {
+                                TExpr.Binary(m2) {
+                                    match cx.typed.expr(m2.rhs) {
+                                        TExpr.Int(v) { if v != u64(2) || cx.typed.exprTy(m2.rhs) != c.i64 { panic("2: int"); } }
+                                        _ { panic("2 literal"); }
+                                    }
+                                }
+                                _ { panic("b * 2"); }
+                            }
+                        }
+                        _ { panic("let init kind"); }
+                    }
+                }
+                Option.None { panic("let init"); }
+            }
+        }
+        _ { panic("arith stmt 0"); }
+    }
+
+    // lit: `'a'` takes `u8` from the left side.
+    match cx.typed.stmt(body(&cx, &fns, "lit").body.stmts.items[0]) {
+        TStmt.Return(rs) {
+            match rs.value {
+                Option.Some(e) {
+                    match cx.typed.expr(e) {
+                        TExpr.Binary(b) {
+                            if cx.typed.exprTy(e) != c.bool || cx.typed.exprTy(b.rhs) != c.u8 { panic("x == 'a' types"); }
+                        }
+                        _ { panic("compare kind"); }
+                    }
+                }
+                Option.None { panic("return value"); }
+            }
+        }
+        _ { panic("lit stmt"); }
+    }
+
+    // loops: ids 0, 1, 2 in order; `break` leaves loop 2; `xs[i]` is a checked index; `for x in xs` is a slice loop.
+    let lo = body(&cx, &fns, "loops");
+    if lo.loops != 3 { panic("three loops"); }
+    match cx.typed.stmt(lo.body.stmts.items[1]) {
+        TStmt.ForRange(fr) {
+            if fr.id != 0 || cx.typed.local(fr.var).ty != c.i64 { panic("for range"); }
+            match cx.typed.stmt(fr.body.stmts.items[0]) {
+                TStmt.AssignOp(a) {
+                    match cx.typed.expr(a.value) {
+                        TExpr.Load(pr) {
+                            match cx.typed.place(pr.place) { TPlace.Index(ix) { if !ix.checked { panic("checked"); } } _ { panic("xs[i] place"); } }
+                        }
+                        _ { panic("xs[i] value"); }
+                    }
+                }
+                _ { panic("s += xs[i]"); }
+            }
+        }
+        _ { panic("stmt 1 is a range loop"); }
+    }
+    match cx.typed.stmt(lo.body.stmts.items[2]) {
+        TStmt.ForEach(fe) { if fe.id != 1 || fe.kind != ForKind.Slice || cx.typed.local(fe.var).ty != c.i64 { panic("for each"); } }
+        _ { panic("stmt 2 is a for-each"); }
+    }
+    match cx.typed.stmt(lo.body.stmts.items[3]) {
+        TStmt.While(w) {
+            if w.id != 2 { panic("while id"); }
+            match cx.typed.stmt(w.body.stmts.items[1]) { TStmt.Break(j) { if j.target != 2 { panic("break target"); } } _ { panic("break"); } }
+        }
+        _ { panic("stmt 3 is a while"); }
+    }
+
+    // fields: `p.y = 3` stores through the reference (`Field(Deref(p), 1)`).
+    match cx.typed.stmt(body(&cx, &fns, "fields").body.stmts.items[0]) {
+        TStmt.Assign(a) {
+            match cx.typed.place(a.place) {
+                TPlace.Field(f) {
+                    if f.index != 1 { panic("field y"); }
+                    match cx.typed.place(f.base) { TPlace.Deref(_) {} _ { panic("auto-deref"); } }
+                }
+                _ { panic("assign place"); }
+            }
+        }
+        _ { panic("fields stmt"); }
+    }
+
+    // slices: `xs[1..n]` is a `[]int` SliceOf; `xs.len` an int.
+    match cx.typed.stmt(body(&cx, &fns, "slices").body.stmts.items[0]) {
+        TStmt.Let(l) {
+            if cx.typed.local(l.local).ty != t.sliceOf(c.i64) { panic("ys: []int"); }
+            match l.init { Option.Some(e) { match cx.typed.expr(e) { TExpr.SliceOf(_) {} _ { panic("slice node"); } } } Option.None { panic("init"); } }
+        }
+        _ { panic("slices stmt"); }
+    }
+
+    // aliased: `use p;` makes `y`/`x` the places `(*p).y`/`(*p).x` and leaves no statement of its own.
+    let al = body(&cx, &fns, "aliased");
+    if al.body.stmts.len != 2 { panic("`use p;` is scope only"); }
+    match cx.typed.stmt(al.body.stmts.items[0]) {
+        TStmt.Assign(a) {
+            match cx.typed.place(a.place) {
+                TPlace.Field(f) {
+                    if f.index != 1 { panic("alias y"); }
+                    match cx.typed.place(f.base) { TPlace.Deref(_) {} _ { panic("alias through &P"); } }
+                }
+                _ { panic("alias place"); }
+            }
+        }
+        _ { panic("aliased stmt 0"); }
+    }
+
+    // bad: two errors in source order (`return a` fails in `operand`, as in Rust); `let c = b` (b's `let` failed) is a follow-on and dropped.
+    // noret: the missing-return error.
+    if s.diags.count() != 3 { panic(`want 3 diags, got {s.diags.count()}`); }
+    if !startsWith(s.diags.at(0).msg, "type mismatch: expected `") { panic(s.diags.at(0).msg); }
+    if !startsWith(s.diags.at(1).msg, "type mismatch: expected `") { panic(s.diags.at(1).msg); }
+    if !startsWith(s.diags.at(2).msg, "function `noret` can reach its end without returning `") { panic(s.diags.at(2).msg); }
+}

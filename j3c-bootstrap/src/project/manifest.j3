@@ -2,3 +2,299 @@
 //
 // Port of: j3c/src/project.rs
 module j3c.project.manifest;
+// J3: Types, `load`, `resolve` and output paths here; `parseManifest` (every key, defaults, error text) is
+// the part `project/manifest/parse.j3`. Paths are strings joined with `j3.io.path` (Rust `Path::join`
+// semantics: an absolute right side wins, nothing is normalized); `deps.parentOf` is `Path::parent`.
+// J3: `[lib]` is `Manifest.isLib` (`lib` is a keyword). Rust's `FILE_ONLY` / `HOST` statics are
+// `setFileOnly` / `setHost`. `toml_doc` (Rust `j3c golden`) comes with `cmd/golden.j3`.
+
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, find, parseInt };
+use j3c.base.fsx;
+use j3c.base.fsx.{ isDir, isFile };
+use j3c.base.text_fmt.{ hasLower, isAlpha, isDigit };
+use j3c.base.toml;
+use j3c.base.toml.{ Table, Val, asStr };
+use j3c.project.deps;
+use j3c.project.deps.{ Dep, distProvider, parentOf };
+
+pub struct Manifest {
+    root: string;
+    name: string;
+    /// `[package] bin`: the program's file name (`target/<bin>`), default `name`.
+    bin: string;
+    /// `[package] version`, default `0.1.0` (the `.deb` version).
+    version: string;
+    /// `[package] description`, default `<name>, made with j3`.
+    description: string;
+    entry: string;
+    cc: Cc;
+    emit: Emit;
+    link: Link;
+    dist: Dist;
+    android: Android;
+    /// `[ui]`: present when the project has `.j3ui` components.
+    ui: Option<Ui>;
+    /// `[dependencies]`, transitive and flat (`j3c help manifest`).
+    deps: List<Dep>;
+    /// `[lib]`: a package for other projects. No `main`; `entry` is `src/<name>.j3` (`use <name>;`).
+    isLib: bool;
+
+    fn srcDir(this: &Manifest, arena: &Arena): string { return path.join(this.root, "src", arena); }
+
+    fn outPath(this: &Manifest, arena: &Arena): string { return this.outPathFor(this.emit.primary(), arena); }
+
+    /// One target keeps `target/<bin>`. Several get `target/<triple>/<bin>`. An Android triple is always
+    /// `target/<triple>/lib<bin>.so` (the APK picks it up by ABI).
+    fn outPathFor(this: &Manifest, target: string, arena: &Arena): string {
+        let dir = path.join(this.root, "target", arena);
+        if isAndroid(target) {
+            let so = Text.new(arena).add("lib").add(this.bin).add(".so").str();
+            return path.join(path.join(dir, targetSlug(target, arena), arena), so, arena);
+        }
+        if this.emit.targets.len <= 1 { return path.join(dir, this.bin, arena); }
+        return path.join(path.join(dir, targetSlug(target, arena), arena), this.bin, arena);
+    }
+}
+
+/// `[ui]`: `dir` holds `*.j3ui`; `theme` is one global CSS file.
+pub struct Ui {
+    dir: string;
+    theme: Option<string>;
+    /// `lint = false` (`"*"`) or `lint-off = ["rule", ...]`: CSS lint rules `j3c check` skips.
+    lintOff: List<string>;
+}
+
+/// `[dist]`: `j3c build --release` also writes each of `build_outputs` into `target/dist/`.
+pub struct Dist {
+    /// `build_outputs = ["zip", "deb"]`; `zip = true` is `["zip"]`.
+    outputs: List<Output>;
+    /// Files and folders shipped beside the program. Empty means whichever of `assets`, `scripts`,
+    /// `scenes` exist.
+    include: List<string>;
+    /// `.png` or `.svg` for the app menu (`.deb`).
+    icon: Option<string>;
+    /// Menu name. Empty: the package name, title-cased.
+    title: string;
+    /// `.desktop` Categories, default `Game;`.
+    categories: string;
+    /// `Name <email>`. Empty: `$DEBFULLNAME`/`$DEBEMAIL`, else git config.
+    maintainer: string;
+    /// Extra `.deb` Depends, after the ones `[link] libs` imply.
+    depends: List<string>;
+    /// `.deb` Section, default `games`.
+    section: string;
+    /// `.deb` maintainer scripts (project-relative), copied into the control archive with mode 0755.
+    postinst: Option<string>;
+    prerm: Option<string>;
+    /// `[dist.actions] id = { name = "New Island", exec = "--new-island" }`: `.desktop` actions, in file
+    /// order. `exec` is the program's arguments.
+    actions: List<DesktopAction>;
+}
+
+/// One `[dist.actions]` entry.
+pub struct DesktopAction {
+    id: string;
+    name: string;
+    exec: string;
+}
+
+/// `[android]`: used by `build_outputs = ["apk"]`.
+pub struct Android {
+    /// Java package / application id. Default `com.j3.<name>`, sanitized.
+    package: string;
+    /// `screenOrientation` of the activity, one of `ORIENTATIONS`; default `landscape`.
+    orientation: string;
+    /// `native_libs = "dir"`: `dir/<abi>/lib*.so` ship beside `libmain.so`.
+    nativeLibs: Option<string>;
+    /// `foreground_service = "connectedDevice"` (or `"dataSync"`): declares `J3Service`. None: no service.
+    foregroundService: Option<string>;
+}
+
+/// One `[dist] build_outputs` entry.
+pub enum Output {
+    Zip,
+    Deb,
+    /// Signed debug APK from the Android triples in `[emit] target` (`dist/apk`).
+    Apk,
+    /// A dep's `[dist_outputs]` tool of this name, run by `dist/pkg`. Built-in names never become one.
+    Pkg(string),
+}
+
+/// The built-in output called `n` (Rust `Output::ALL`), else `Pkg(n)`.
+pub fn outputOf(n: string): Output {
+    if n == "zip" { return Output.Zip; }
+    if n == "deb" { return Output.Deb; }
+    if n == "apk" { return Output.Apk; }
+    return Output.Pkg(n);
+}
+
+/// The built-in names, in Rust's `Output::ALL` order, joined by `, `.
+pub const BUILTIN_OUTPUTS: string = "zip, deb, apk";
+
+pub fn outputEq(a: Output, b: Output): bool {
+    match a {
+        Output.Zip { match b { Output.Zip { return true; } _ { return false; } } }
+        Output.Deb { match b { Output.Deb { return true; } _ { return false; } } }
+        Output.Apk { match b { Output.Apk { return true; } _ { return false; } } }
+        Output.Pkg(x) { match b { Output.Pkg(y) { return x == y; } _ { return false; } } }
+    }
+}
+
+// J3: `chunks` first (stage-0 ABI hazard (a), PORT_DEBT.md: a payload enum after the bools sat at 4 mod 8).
+pub struct Emit {
+    /// `chunks = N`: objects per big module (absent = automatic, 0 = never split).
+    chunks: Option<int>;
+    /// `llvm` (default) or `c`.
+    backend: string;
+    /// `0` / `1` / `2` / `3` / `s` / `z`. LLVM default `2`; C inherits `[cc] opt`.
+    opt: string;
+    debug: bool;
+    fast: bool;
+    /// One triple, or several. Empty means the host (Linux `j3.sys`).
+    targets: List<string>;
+    cpu: string;
+    clang: string;
+    flags: List<string>;
+    /// Opt 0 reuses one object per module. Default true.
+    incremental: bool;
+    /// `incremental = "all"`: per-module objects at every opt, without cross-module inlining.
+    incrementalAll: bool;
+
+    /// First Linux (or other host) triple. If every entry is Windows or macOS, the first one.
+    fn primary(this: &Emit): string {
+        for i in 0..this.targets.len { if !isForeignTarget(this.targets.items[i]) { return this.targets.items[i]; } }
+        if this.targets.len > 0 { return this.targets.items[0]; }
+        return "";
+    }
+}
+
+pub struct Cc {
+    std: string;
+    opt: string;
+    fast: bool;
+}
+
+pub struct Link {
+    libs: List<string>;
+    search: List<string>;
+    files: List<string>;
+    flags: List<string>;
+}
+
+pub fn defaultCc(): Cc { return Cc { std: "c11", opt: "1", fast: false }; }
+
+pub fn defaultLink(arena: &Arena): Link {
+    return Link {
+        libs: List<string>.new(arena), search: List<string>.new(arena), files: List<string>.new(arena),
+        flags: List<string>.new(arena)
+    };
+}
+
+pub fn defaultEmit(arena: &Arena): Emit {
+    return Emit {
+        backend: "llvm", opt: "2", debug: true, fast: false, targets: List<string>.new(arena), cpu: "",
+        clang: "clang", flags: List<string>.new(arena), incremental: true, incrementalAll: false,
+        chunks: Option.None
+    };
+}
+
+fn isForeignTarget(target: string): bool {
+    return hasLower(target, "windows") || hasLower(target, "apple") || hasLower(target, "darwin");
+}
+
+/// Rust `emit::host::target_os(t) == Android` (Android is checked after Windows, macOS and the web).
+/// ponytail: a copy of four lines of `toolchain/target`, which sits below `project`.
+fn isAndroid(target: string): bool {
+    return hasLower(target, "android") && !isForeignTarget(target) && !hasLower(target, "emscripten");
+}
+
+/// `target` with every byte but ASCII letters, digits, `-` and `_` turned into `-` (one per byte; Rust
+/// maps per char, so a non-ASCII char of N bytes gives N dashes here). ponytail: triples are ASCII.
+pub fn targetSlug(target: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..target.len {
+        let c = target[i];
+        let keep = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+        t.push(if keep { c } else { '-' });
+    }
+    return t.str();
+}
+
+/// `j3c run --file`: a `.j3` path is that one file, even inside a project.
+#[singleton]
+let FILE_ONLY: bool;
+/// `--host` (run, check): `load` drops `[emit] target`, so an Android package builds for this machine.
+#[singleton]
+let HOST: bool;
+
+pub fn setFileOnly(on: bool) { FILE_ONLY = on; }
+pub fn setHost(on: bool) { HOST = on; }
+
+/// What a command was pointed at.
+pub enum Input {
+    Hello,
+    File(string),
+    Project(Manifest),
+}
+
+/// The manifest at `tomlPath` (a `j3.toml`); its folder is the project root.
+pub fn load(tomlPath: string, arena: &Arena): Result<Manifest, string> {
+    let text = fsx.readText(tomlPath, arena)?;
+    let root = match parentOf(tomlPath) {
+        Option.Some(r) { r }
+        Option.None { return Result.Err(Text.new(arena).add(tomlPath).add(" has no parent").str()); }
+    };
+    let m = parseManifest(text, root, arena)?;
+    if HOST { m.emit.targets = List<string>.new(arena); }
+    return Result.Ok(m);
+}
+
+/// File, directory, or `j3.toml`. Walks up from a `.j3` file to find a project. A `.j3s` path is always
+/// that script (`pub fn main`), not the project above it.
+pub fn resolve(p: string, arena: &Arena): Result<Input, string> {
+    let ext = path.ext(p);
+    if ext == ".j3s" { return Result.Ok(Input.File(p)); }
+    if FILE_ONLY && ext == ".j3" { return Result.Ok(Input.File(p)); }
+    if isDir(p) {
+        let t = path.join(p, "j3.toml", arena);
+        if isFile(t) { return Result.Ok(Input.Project(load(t, arena)?)); }
+        return Result.Err(Text.new(arena).add("no j3.toml in ").add(p).add("\n  = help: `j3c new ").add(p).add("`").str());
+    }
+    if path.basename(p) == "j3.toml" { return Result.Ok(Input.Project(load(p, arena)?)); }
+    match findTomlUp(p, arena) {
+        Option.Some(t) { return Result.Ok(Input.Project(load(t, arena)?)); }
+        Option.None {}
+    }
+    if ext == ".j3" { return Result.Ok(Input.File(p)); }
+    return Result.Err(Text.new(arena).add("not a J3 file or project: ").add(p).str());
+}
+
+/// The project in the working directory, else `Hello`.
+pub fn resolveCwd(arena: &Arena): Result<Input, string> {
+    let here = match path.realpath(".", arena) {
+        Option.Some(h) { h }
+        Option.None { return Result.Err(Text.new(arena).add("cwd: ").add(fsx.osError(sys.errno(), arena)).str()); }
+    };
+    let t = path.join(here, "j3.toml", arena);
+    if isFile(t) { return Result.Ok(Input.Project(load(t, arena)?)); }
+    return Result.Ok(Input.Hello);
+}
+
+/// The nearest `j3.toml` at or above `start` (its folder when `start` is a file).
+pub fn findTomlUp(start: string, arena: &Arena): Option<string> {
+    let dir = start;
+    if isFile(start) {
+        match parentOf(start) { Option.Some(d) { dir = d; } Option.None { return Option.None; } }
+    }
+    while true {
+        let t = path.join(dir, "j3.toml", arena);
+        if isFile(t) { return Option.Some(t); }
+        match parentOf(dir) { Option.Some(d) { dir = d; } Option.None { return Option.None; } }
+    }
+    return Option.None;
+}

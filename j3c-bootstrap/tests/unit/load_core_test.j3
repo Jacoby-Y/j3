@@ -1,0 +1,247 @@
+// `load` core: the files loaded for corpus programs (count vs `stage0/j3c` `J3C_TIMINGS`), a missing
+// module, an import cycle, `@embedDir` globbing and a bad `@embed`, path deps and a dep's wrong `module`
+// line. Every error is compared with `stage0/j3c check` on the same input, byte for byte (the stdlib path
+// in messages is stage 0's build tree, so it is swapped for ours first).
+module load_core_test;
+
+use j3.data.pool.Pool;
+use j3.io;
+use j3.io.path;
+use j3.io.printLn;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.sys.panic;
+use j3.text;
+use j3.text.{ Text, contains, endsWith, startsWith };
+use j3c.base.diag;
+use j3c.base.diag.Diags;
+use j3c.base.intern.Names;
+use j3c.base.span.{ Source, isNone };
+use j3c.load;
+use j3c.load.{ LoadCx, LoadOpts, Parsed };
+
+fn check(c: bool, what: string) { if !c { panic(what); } }
+
+fn put(dir: string, rel: string, body: string, a: &Arena) {
+    let p = path.join(dir, rel, a);
+    io.makeDirs(path.dirname(p));
+    match io.writeFile(p, body as []u8) { Result.Ok(_) {} Result.Err(_) { panic("cannot write a fixture"); } }
+}
+
+/// One load: the program (None on errors) and the errors as Rust's `check` prints them.
+struct Got {
+    prog: Option<Parsed>;
+    err: string;
+}
+
+fn loadIt(entry: string, a: &Arena): Got {
+    let names = Names.new(a);
+    let diags = Diags.new(a);
+    let sources = Pool<Source>.new(a);
+    let cx = LoadCx { arena: a, names: &names, diags: &diags, sources: &sources };
+    let prog = load.loadProgram(cx, LoadOpts { entry: entry, target: "", headless: false, release: false, dev: false });
+    let t = Text.new(a);
+    for i in 0..diags.count() {
+        let d = diags.at(i);
+        if isNone(d.span) && !contains(d.msg, "error:") && !contains(d.msg, "-->") {
+            t.add("j3c: ").add(d.msg).add("\n");
+        } else {
+            diag.render(d, &sources, &t);
+        }
+    }
+    return Got { prog: prog, err: t.str() };
+}
+
+/// `stage0/j3c check entry` (cwd = this package): stderr, with stage 0's stdlib dir replaced by ours.
+fn rust(entry: string, a: &Arena): string {
+    let o = match proc.run(["stage0/j3c", "check", entry], "", a) { Result.Ok(o) { o } Result.Err(_) { panic("cannot run stage0/j3c") } };
+    // drop the `J3C_TIMINGS` lines (`j3c:   step: 0.001s`, `j3c: check total: ..`)
+    let raw = o.errStr();
+    let keep = Text.new(a);
+    let at0 = 0;
+    while at0 < raw.len {
+        let e0 = at0;
+        while e0 < raw.len && raw[e0] != '\n' { e0 += 1; }
+        let line = raw[at0..e0];
+        let timing = startsWith(line, "j3c:   ") || startsWith(line, "j3c: check total:");
+        if !timing || startsWith(line, "j3c:   load + parse") {
+            keep.add(line);
+            if e0 < raw.len { keep.add("\n"); }
+        }
+        at0 = e0 + 1;
+    }
+    let e = keep.str();
+    let at = text.find(e, "/tmp/j3c-stage0.");
+    if at < 0 { return e; }
+    let end = text.find(e[at..e.len], "/j3c/stdlib");
+    if end < 0 { return e; }
+    return Text.new(a).add(e[0..at]).add(load.stdlibDir(a)).add(e[at + end + 11..e.len]).str();
+}
+
+/// The file count in stage 0's `load + parse (N files)` line, -1 without one.
+fn rustCount(err: string): int {
+    let at = text.find(err, "load + parse (");
+    if at < 0 { return -1; }
+    let n = 0;
+    let i = at + 14;
+    while i < err.len && err[i] >= '0' && err[i] <= '9' { n = n * 10 + int(err[i] - '0'); i += 1; }
+    return n;
+}
+
+/// `entry` loads the same number of files as stage 0 (or fails with stage 0's error).
+fn same(entry: string, a: &Arena): bool {
+    let g = loadIt(entry, a);
+    let r = rust(entry, a);
+    match g.prog {
+        Option.Some(p) {
+            let want = rustCount(r);
+            if want == p.files.len { return true; }
+            printLn(Text.new(a).add("files differ: ").add(entry).str());
+            let t = Text.new(a);
+            t.add("  ours ");
+            t.pushInt(p.files.len);
+            t.add(", stage0 ");
+            t.pushInt(want);
+            printLn(t.str());
+            return false;
+        }
+        Option.None {
+            if r == g.err || startsWith(r, g.err) { return true; }
+            printLn(Text.new(a).add("error differs: ").add(entry).add("\nours:\n").add(g.err).add("rust:\n").add(r).str());
+            return false;
+        }
+    }
+}
+
+/// The error of a failing load equals stage 0's (Rust may add a `print_hint` line after it).
+fn fails(entry: string, part: string, a: &Arena) {
+    let g = loadIt(entry, a);
+    match g.prog { Option.Some(_) { panic(Text.new(a).add("should fail: ").add(entry).str()); } Option.None {} }
+    let r = rust(entry, a);
+    if !contains(g.err, part) || !startsWith(r, g.err) {
+        printLn(Text.new(a).add("ours:\n").add(g.err).add("rust:\n").add(r).str());
+        panic(part);
+    }
+}
+
+/// Every `.j3` directly in `dir` (sorted), as entries.
+fn j3Files(dir: string, out: &List<string>, a: &Arena) {
+    let ents = match io.listDir(dir, a) { Result.Ok(e) { e } Result.Err(_) { panic(dir) } };
+    for i in 0..ents.len {
+        if !ents[i].isDir && endsWith(ents[i].name, ".j3") { out.push(path.join(dir, ents[i].name, a)); }
+    }
+}
+
+fn main() {
+    let arena = Arena.create(1 << 24);
+    let a = &arena;
+    sys.setenv("J3C_TIMINGS", "1");
+    let tmp = match io.tempDir("", "j3boot_load_", a) { Result.Ok(d) { d } Result.Err(_) { panic("no temp dir") } };
+
+    // corpus programs: same file count as Rust
+    let ins = List<string>.new(a);
+    j3Files("../speculative", &ins, a);
+    j3Files("../speculative/lang", &ins, a);
+    j3Files("../j3c/stdlib/tests", &ins, a);
+    ins.push(".");
+    ins.push("../tools/composer");
+    ins.push("../examples/scripted");
+    ins.push("../examples/3d-editor-scene");
+    ins.push("../examples/editor_village");
+    ins.push("../tools/voxel-editor");
+    // the editor (~180 files) as the project the editor build makes
+    let ed = path.join(tmp, "editor", a);
+    put(ed, "j3.toml", "[package]\nname = \"j3_editor\"\n", a);
+    let edSrc = match path.realpath("../j3c/editor/src", a) { Option.Some(p) { p } Option.None { panic("no editor src") } };
+    match proc.run(["ln", "-s", edSrc, path.join(ed, "src", a)], "", a) { Result.Ok(_) {} Result.Err(_) { panic("ln -s"); } }
+    ins.push(ed);
+    let bad = 0;
+    for i in 0..ins.len {
+        let one = Arena.create(1 << 22);
+        if !same(ins.items[i], &one) { bad += 1; }
+        one.destroy();
+    }
+    let t = Text.new(a);
+    t.add("load core: ");
+    t.pushInt(ins.len);
+    t.add(" programs, ");
+    t.pushInt(bad);
+    t.add(" differ");
+    printLn(t.str());
+    check(bad == 0, "file counts");
+
+    // a missing module
+    put(tmp, "miss/a.j3", "module m;\nuse foo.bar.baz;\nfn main() {}\n", a);
+    fails(path.join(tmp, "miss/a.j3", a), "cannot find module `foo.bar` (looked for ", a);
+    put(tmp, "miss/b.j3", "module m;\nuse nope;\nfn main() {}\n", a);
+    fails(path.join(tmp, "miss/b.j3", a), "cannot resolve `use nope`", a);
+
+    // an import cycle
+    let cyc = path.join(tmp, "cyc", a);
+    put(cyc, "j3.toml", "[package]\nname = \"cyc\"\n", a);
+    put(cyc, "src/main.j3", "module cyc.main;\nuse cyc.a;\nfn main() {}\n", a);
+    put(cyc, "src/a.j3", "module cyc.a;\nuse cyc.b;\npub fn f() {}\n", a);
+    put(cyc, "src/b.j3", "module cyc.b;\nuse cyc.c.{ g };\npub fn h() {}\n", a);
+    put(cyc, "src/c.j3", "module cyc.c;\nuse cyc.a;\npub fn g() {}\n", a);
+    fails(cyc, "import cycle: cyc.a -> cyc.b -> cyc.c -> cyc.a", a);
+
+    // @embedDir: glob on the name, subfolders walked, dot entries skipped, sorted by path
+    let em = path.join(tmp, "emb", a);
+    put(em, "j3.toml", "[package]\nname = \"emb\"\n", a);
+    put(em, "data/x.txt", "X", a);
+    put(em, "data/sub/y.txt", "YY", a);
+    put(em, "data/.h.txt", "H", a);
+    put(em, "data/z.md", "Z", a);
+    put(em, "src/main.j3", "module emb.main;\nconst T = @embedDir(\"../data\", \"*.txt\");\nconst S = @embedDir(\"data\", \"sub/*\");\nconst B = @embed(\"data/x.txt\");\nfn main() {}\n", a);
+    let g = loadIt(em, a);
+    match g.prog {
+        Option.Some(p) {
+            let f = p.files.items[0].ast;
+            check(f.embeds.len == 3, "three embeds");
+            let d0 = f.embeds.items[0].files;
+            check(d0.len == 2 && d0.items[0].name == "sub/y.txt" && d0.items[1].name == "x.txt", "embedDir names");
+            check((d0.items[0].data as string) == "YY" && (d0.items[1].data as string) == "X", "embedDir data");
+            check(endsWith(d0.items[1].disk, "src/../data/x.txt"), "embed disk path beside the file");
+            let d1 = f.embeds.items[1].files;
+            check(d1.len == 1 && d1.items[0].name == "sub/y.txt", "glob with / matches the relative path");
+            let d2 = f.embeds.items[2].files;
+            check(d2.len == 1 && d2.items[0].name == "data/x.txt" && (d2.items[0].data as string) == "X", "embed from the package root");
+        }
+        Option.None { printLn(g.err); panic("embed project should load"); }
+    }
+    check(same(em, a), "embed project vs stage0");
+    put(em, "src/main.j3", "module emb.main;\nconst T = @embed(\"nope.txt\");\nfn main() {}\n", a);
+    fails(em, "`@embed`: no file `nope.txt` (looked beside ", a);
+    put(em, "src/main.j3", "module emb.main;\nconst T = @embedDir(\"data\", \"*.png\");\nfn main() {}\n", a);
+    fails(em, "`@embedDir`: no `*.png` files under ", a);
+
+    // a path dep: `use mlib;` is its root module, `use mlib.util;` a file below it
+    let dp = path.join(tmp, "dep", a);
+    put(dp, "mlib/j3.toml", "[package]\nname = \"mlib\"\n[lib]\n", a);
+    put(dp, "mlib/src/mlib.j3", "module mlib;\npub fn one(): int { return 1; }\n", a);
+    put(dp, "mlib/src/util.j3", "module mlib.util;\npub fn two(): int { return 2; }\n", a);
+    put(dp, "mlib/src/bad.j3", "module mlib.wrong;\npub fn three(): int { return 3; }\n", a);
+    put(dp, "game/j3.toml", "[package]\nname = \"game\"\n[dependencies]\nmlib = \"../mlib\"\n", a);
+    put(dp, "game/src/main.j3", "module game.main;\nuse mlib;\nuse mlib.util.two;\nfn main() {}\n", a);
+    let game = path.join(dp, "game", a);
+    let gd = loadIt(game, a);
+    match gd.prog {
+        Option.Some(p) {
+            let seen = 0;
+            for i in 0..p.files.len {
+                let k = p.files.items[i].ast.moduleKey(p.ast);
+                if k == "mlib" || k == "mlib.util" { seen += 1; }
+            }
+            check(seen == 2, "dep modules loaded");
+        }
+        Option.None { printLn(gd.err); panic("dep project should load"); }
+    }
+    check(same(game, a), "dep project vs stage0");
+    put(dp, "game/src/main.j3", "module game.main;\nuse mlib.bad;\nfn main() {}\n", a);
+    fails(game, "imported as `mlib.bad` but says `module mlib.wrong;`", a);
+
+    printLn("load core ok");
+}

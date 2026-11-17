@@ -4,13 +4,19 @@
 set -euo pipefail
 usage() {
     cat <<'E'
-usage: tests/diff.sh MODE [--norm] [--no-coverage] [--update-known] [-j N] [files...]
-  MODE            fmt | ast | err | ir | llvm | run | self
+usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-known] [-j N] [files...]
+  MODE            fmt | ast | err | ir | llvm | glsl | ui | run | self
   --norm          ir only: renumber temps by first appearance on both sides (tests/norm_ir.awk)
+  --user          ir only: compare only the entry module (the dump's first `module` section);
+                  its known list is tests/known/ir-user.txt
+  --es            glsl only: `dump-glsl --es` (the OpenGL ES text); its known list is tests/known/glsl-es.txt
   --no-coverage   skip tools/coverage.sh (also DIFF_NO_COVERAGE=1); tools/layers.sh always runs
-  --update-known  rewrite tests/known/MODE.txt to this run's DIFF/CRASH files
+  --update-known  rewrite the known list (tests/known/MODE.txt) to this run's DIFF/CRASH files
   -j N            parallel jobs (default: core count, 4 for run)
   files           inputs instead of tests/corpus.txt (paths or project folders)
+     glsl runs `dump-glsl PATH`; ui runs `dump-ui PROJECT/ui` (the project's `.j3ui` folder).
+     ir/llvm/glsl/ui/run export J3_STDLIB=<repo>/j3c/stdlib to both sides, so stage0's build-dir stdlib path
+     stays out of the output.
 Env: DIFF_TIMEOUT seconds per command (default 30; ir/llvm 120; run 300).
      DIFF_STAGE0 / DIFF_BOOT replace the two compilers (default stage0/j3c, target/j3c-boot;
      DIFF_BOOT skips the j3c-boot rebuild).
@@ -27,10 +33,12 @@ BOOT=${DIFF_BOOT:-$boot/target/j3c-boot}
 [ $# -ge 1 ] || { usage >&2; exit 2; }
 case $1 in -h|--help) usage; exit 0 ;; esac
 mode=$1; shift
-norm=0; cov=${DIFF_NO_COVERAGE:-0}; update=0; jobs=; files=()
+norm=0; user=0; es=0; cov=${DIFF_NO_COVERAGE:-0}; update=0; jobs=; files=()
 while [ $# -gt 0 ]; do
     case $1 in
         --norm) norm=1 ;;
+        --user) user=1 ;;
+        --es) es=1 ;;
         --no-coverage) cov=1 ;;
         --update-known) update=1 ;;
         -j) [ $# -ge 2 ] || die "-j needs a number"; jobs=$2; shift ;;
@@ -41,12 +49,14 @@ while [ $# -gt 0 ]; do
 done
 case $mode in
     fmt|ast|err) to=30 ;;
-    ir|llvm) to=120 ;;
+    ir|llvm|glsl|ui) to=120 ;;
     run) to=300; : "${jobs:=4}" ;;
     self) die "self: not yet: needs stage 1 to build stage 2 (a j3c-boot that can build j3c-bootstrap)" ;;
     *) usage >&2; exit 2 ;;
 esac
 [ $norm = 0 ] || [ $mode = ir ] || die "--norm is for ir only"
+[ $user = 0 ] || [ $mode = ir ] || die "--user is for ir only"
+[ $es = 0 ] || [ $mode = glsl ] || die "--es is for glsl only"
 to=${DIFF_TIMEOUT:-$to}
 : "${jobs:=$(nproc)}"
 [ -x "$S0" ] || die "no $S0: run tools/stage0.sh --worktree"
@@ -65,6 +75,9 @@ if [ -z "${DIFF_BOOT:-}" ] && { [ ! -x "$BOOT" ] || [ -n "$(find "$boot/src" "$b
     if ! timeout 900 "$S0" build "$boot" >"$log" 2>&1; then tail -20 "$log" >&2; rm -f "$log"; die "j3c-boot build failed"; fi
     rm -f "$log"; touch "$BOOT"  # a cached build may leave the old mtime
 fi
+
+# After the build: stage0 builds j3c-boot with its own embedded stdlib.
+case $mode in ir|llvm|glsl|ui|run) export J3_STDLIB=$root/j3c/stdlib ;; esac
 
 # Inputs: corpus lines from sections naming this mode, expanded per mode.
 cd "$root"
@@ -110,6 +123,9 @@ one() {
         err) cmd=(check "$arg") ;;
         ir) cmd=(dump-ir "$arg") ;;
         llvm) cmd=(dump-llvm "$arg") ;;
+        glsl) cmd=(dump-glsl "$arg"); [ $es = 0 ] || cmd+=(--es) ;;
+        # ponytail: every UI project keeps its components in `ui/` (`[ui] dir`); read j3.toml if one moves.
+        ui) cmd=(dump-ui "$arg/ui") ;;
         run) cmd=(run --headless --frames 3 "$arg") ;;
     esac
     for who in a a2 b; do
@@ -117,6 +133,8 @@ one() {
         (cd "$cwd" && SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout -k 5 "$to" "$bin" "${cmd[@]}" \
             >"$d/$who.out" 2>"$d/$who.err" </dev/null)
         echo $? >"$d/$who.rc"
+        # ponytail: the entry module is the dump's first `module` section; later sections are imports.
+        [ $user = 1 ] && awk '/^module /{n++} n<=1' "$d/$who.out" >"$d/$who.n" && mv "$d/$who.n" "$d/$who.out"
         [ $norm = 1 ] && awk -f "$here/norm_ir.awk" "$d/$who.out" >"$d/$who.n" && mv "$d/$who.n" "$d/$who.out"
         { cat "$d/$who.out"
           if [ $mode != run ]; then echo "--- stderr"; cat "$d/$who.err"; fi
@@ -135,12 +153,14 @@ one() {
     true
 }
 export -f one
-export tmp root mode norm here S0 BOOT to
+export tmp root mode norm user es here S0 BOOT to
 
 start=$SECONDS
 echo "$inputs" | awk '{print NR; print}' | xargs -d '\n' -n2 -P "$jobs" bash -c 'one "$@"' _
 
-known=$here/known/$mode.txt
+kname=$mode; [ $user = 0 ] || kname=$mode-user   # --user compares less, so it has its own list
+[ $es = 0 ] || kname=$mode-es
+known=$here/known/$kname.txt
 knownset=$( [ -f "$known" ] && sed 's/#.*//; s/[[:space:]]*$//; /^$/d' "$known" || true )
 isknown() { grep -qxF -- "$1" <<<"$knownset"; }
 
@@ -160,16 +180,16 @@ done <<<"$inputs"
 
 if [ $update = 1 ]; then
     mkdir -p "$here/known"
-    { echo "# diff.sh $mode: known DIFF/CRASH inputs. Only ever shrinks: remove a line when its input passes."
+    { echo "# diff.sh $kname: known DIFF/CRASH inputs. Only ever shrinks: remove a line when its input passes."
       # ponytail: an existing list only shrinks; a new failure is never blessed (delete the file to reseed).
       { grep -vxF -- "$inputs" <<<"$knownset" || true
         if [ -n "$knownset" ]; then printf '%s\n' "${failing[@]+"${failing[@]}"}" | grep -xF -- "$knownset" || true
         else printf '%s\n' "${failing[@]+"${failing[@]}"}"; fi; } | sed '/^$/d' | sort -u
     } >"$known"
-    echo "diff.sh: wrote tests/known/$mode.txt" >&2
+    echo "diff.sh: wrote tests/known/$kname.txt" >&2
     [ -n "$knownset" ] || new=$nnon; fixed=()
 fi
-for f in "${fixed[@]+"${fixed[@]}"}"; do echo "fixed $f: remove it from tests/known/$mode.txt"; done
+for f in "${fixed[@]+"${fixed[@]}"}"; do echo "fixed $f: remove it from tests/known/$kname.txt"; done
 sum="diff.sh $mode: $nok ok, $ndiff DIFF, $ncrash CRASH"
 [ $nnon = 0 ] || sum="$sum, $nnon NONDET"
 echo "$sum ($((SECONDS - start)) s)"

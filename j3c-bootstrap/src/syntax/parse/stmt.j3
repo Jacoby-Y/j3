@@ -3,4 +3,260 @@
 //
 // Part of module j3c.syntax.parse.
 // Port of: j3c/src/parse/parser/stmt.rs
+// J3: The `match` half of stmt.rs (arms, patterns) is in `patterns.j3`. `let` is `stmtLet`, the
+// expression/assignment fallback `stmtExprOrAssign`, split off `stmt`. A fn returning a Rust `Stmt`
+// returns `Id<Stmt>` (added with its span); one returning a payload struct returns it with its `span`.
+// Uses come from `parse.j3`.
 module j3c.syntax.parse;
+
+extend Parser {
+    /// `{ stmts }`.
+    fn block(this: &Parser): Result<Block, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.LBrace, "expected `{`")?;
+        let stmts = List<Id<Stmt>>.new(this.ast.arena);
+        while !this.at(TokenKind.RBrace) && !this.at(TokenKind.Eof) { stmts.push(this.stmt()?); }
+        this.expect(TokenKind.RBrace, "expected `}`")?;
+        return Result.Ok(Block { span: this.since(start), stmts: stmts });
+    }
+
+    fn stmt(this: &Parser): Result<Id<Stmt>, ParseError> {
+        let doc = this.takeDoc();
+        if doc.len > 0 && !this.at(TokenKind.Let) {
+            return Result.Err(this.err("doc comment must sit on a fn, struct, enum, const, let, field, or variant"));
+        }
+        let isRecv = false;
+        match this.j3uiRecv { Option.Some(_) { isRecv = true; } Option.None {} }
+        if isRecv && this.at(TokenKind.Ident) && this.look(1).kind == TokenKind.LParen && isJ3uiWidget(this.cur().text) {
+            return this.j3uiWidgetStmt();
+        }
+        let start = this.cur().span;
+        match this.cur().kind {
+            TokenKind.LBrace {
+                let b = this.block()?;
+                return Result.Ok(this.ast.addStmt(Stmt.Block(b), b.span));
+            }
+            TokenKind.Let { return this.stmtLet(doc); }
+            TokenKind.Return {
+                this.bump();
+                let value: Option<Id<Expr>> = Option.None;
+                if !this.at(TokenKind.Semi) { value = Option.Some(this.expr()?); }
+                this.expect(TokenKind.Semi, "expected `;` after return")?;
+                let span = this.since(start);
+                return Result.Ok(this.ast.addStmt(Stmt.Return(ReturnStmt { span: span, value: value }), span));
+            }
+            TokenKind.If { return this.ifAnyStmt(); }
+            TokenKind.While {
+                let w = this.whileStmt()?;
+                return Result.Ok(this.ast.addStmt(Stmt.While(w), w.span));
+            }
+            TokenKind.For { return this.forStmt(); }
+            TokenKind.Match {
+                let m = this.matchStmt()?;
+                return Result.Ok(this.ast.addStmt(Stmt.Match(m), m.span));
+            }
+            TokenKind.Use {
+                this.bump();
+                let name = this.ident()?;
+                this.expect(TokenKind.Semi, "expected `;` after `use`")?;
+                let span = this.since(start);
+                return Result.Ok(this.ast.addStmt(Stmt.UseLocal(UseLocalStmt { span: span, name: name }), span));
+            }
+            TokenKind.Defer {
+                let d = this.deferStmt()?;
+                return Result.Ok(this.ast.addStmt(Stmt.Defer(d), d.span));
+            }
+            TokenKind.Label {
+                let label = this.labelIdent();
+                this.expect(TokenKind.Colon, "expected `:` after a loop label")?;
+                if !this.at(TokenKind.While) && !this.at(TokenKind.For) {
+                    return Result.Err(this.err("a label goes on a `while` or `for` loop"));
+                }
+                let body = this.stmt()?;
+                let span = join(start, this.ast.stmtSpan(body));
+                return Result.Ok(this.ast.addStmt(Stmt.Labeled(LabeledStmt { span: span, label: label, body: body }), span));
+            }
+            TokenKind.Break | TokenKind.Continue {
+                let isBreak = this.at(TokenKind.Break);
+                this.bump();
+                let label: Option<Ident> = Option.None;
+                if this.at(TokenKind.Label) { label = Option.Some(this.labelIdent()); }
+                this.expect(TokenKind.Semi, "expected `;` after break or continue")?;
+                let span = this.since(start);
+                if isBreak { return Result.Ok(this.ast.addStmt(Stmt.Break(JumpStmt { label: label }), span)); }
+                return Result.Ok(this.ast.addStmt(Stmt.Continue(JumpStmt { label: label }), span));
+            }
+            _ { return this.stmtExprOrAssign(); }
+        }
+    }
+
+    /// `let name: T = e;`, `let buf: T;` (zero-filled), `let P = e else { .. };`, at the `let`.
+    fn stmtLet(this: &Parser, doc: string): Result<Id<Stmt>, ParseError> {
+        let start = this.cur().span;
+        this.bump();
+        let k1 = this.look(1).kind;
+        if k1 != TokenKind.Eq && k1 != TokenKind.Colon {
+            this.forbidDoc(doc)?;
+            let p = this.pat(false)?;
+            this.expect(TokenKind.Eq, "expected `=` after a `let` pattern")?;
+            let value = this.expr()?;
+            let elseBlock: Option<Block> = Option.None;
+            if this.eat(TokenKind.Else) { elseBlock = Option.Some(this.block()?); }
+            this.expect(TokenKind.Semi, "expected `;` after let")?;
+            let span = this.since(start);
+            let lp = LetPatStmt { span: span, pat: p, value: value, elseBlock: elseBlock };
+            return Result.Ok(this.ast.addStmt(Stmt.LetPat(lp), span));
+        }
+        let name = this.ident()?;
+        let t: Option<Id<Type>> = Option.None;
+        if this.eat(TokenKind.Colon) { t = Option.Some(this.ty()?); }
+        // `let buf: [64]u8;`: zero-filled, the type says what
+        let typed = false;
+        match t { Option.Some(_) { typed = true; } Option.None {} }
+        let zeroed = typed && this.at(TokenKind.Semi);
+        if !zeroed { this.expect(TokenKind.Eq, "expected `=` in let")?; }
+        let value = if zeroed { this.ast.addExpr(Expr.Zeroed, this.since(start)) } else { this.expr()? };
+        this.expect(TokenKind.Semi, "expected `;` after let")?;
+        let span = this.since(start);
+        let ls = LetStmt { span: span, doc: doc, name: name, ty: t, value: value };
+        return Result.Ok(this.ast.addStmt(Stmt.Let(ls), span));
+    }
+
+    /// `place = e;`, `place op= e;`, or `e;`.
+    fn stmtExprOrAssign(this: &Parser): Result<Id<Stmt>, ParseError> {
+        let start = this.cur().span;
+        let place = this.expr()?;
+        if this.eat(TokenKind.Eq) {
+            let value = this.expr()?;
+            this.expect(TokenKind.Semi, "expected `;` after assign")?;
+            let span = this.since(start);
+            return Result.Ok(this.ast.addStmt(Stmt.Assign(AssignStmt { span: span, place: place, value: value }), span));
+        }
+        let op = BinOp.Rem;
+        let isOp = true;
+        match this.cur().kind {
+            TokenKind.PlusEq { op = BinOp.Add; }
+            TokenKind.MinusEq { op = BinOp.Sub; }
+            TokenKind.StarEq { op = BinOp.Mul; }
+            TokenKind.SlashEq { op = BinOp.Div; }
+            TokenKind.PercentEq { op = BinOp.Rem; }
+            TokenKind.AmpEq { op = BinOp.BitAnd; }
+            TokenKind.PipeEq { op = BinOp.BitOr; }
+            TokenKind.CaretEq { op = BinOp.BitXor; }
+            TokenKind.ShlEq { op = BinOp.Shl; }
+            TokenKind.ShrEq { op = BinOp.Shr; }
+            _ { isOp = false; }
+        }
+        if isOp {
+            this.bump();
+            let value = this.expr()?;
+            this.expect(TokenKind.Semi, "expected `;` after assign-op")?;
+            let span = this.since(start);
+            let s = AssignOpStmt { span: span, place: place, op: op, value: value };
+            return Result.Ok(this.ast.addStmt(Stmt.AssignOp(s), span));
+        }
+        this.expect(TokenKind.Semi, "expected `;` after expression")?;
+        return Result.Ok(this.ast.addStmt(Stmt.Expr(ExprStmt { expr: place }), this.ast.exprSpan(place)));
+    }
+
+    fn ifStmt(this: &Parser): Result<IfStmt, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.If, "expected `if`")?;
+        let cond = this.expr()?;
+        let thenBlock = this.block()?;
+        let elseBlock: Option<Block> = Option.None;
+        if this.eat(TokenKind.Else) {
+            if this.at(TokenKind.If) {
+                let inner = this.ifAnyStmt()?;
+                let stmts = List<Id<Stmt>>.new(this.ast.arena);
+                stmts.push(inner);
+                elseBlock = Option.Some(Block { span: this.ast.stmtSpan(inner), stmts: stmts });
+            } else {
+                elseBlock = Option.Some(this.block()?);
+            }
+        }
+        return Result.Ok(IfStmt { span: this.since(start), cond: cond, thenBlock: thenBlock, elseBlock: elseBlock });
+    }
+
+    /// The current `'name` token as an `Ident` named `name`.
+    fn labelIdent(this: &Parser): Ident {
+        let tok = this.bump();
+        return Ident { name: this.ast.sym(tok.text[1..tok.text.len]), span: tok.span };
+    }
+
+    fn whileStmt(this: &Parser): Result<WhileStmt, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.While, "expected `while`")?;
+        let cond = this.expr()?;
+        let body = this.block()?;
+        return Result.Ok(WhileStmt { span: join(start, body.span), cond: cond, body: body });
+    }
+
+    /// `for i in a..b`, `for x in xs`, `for i, x in xs`, `for (k, v) in xs`.
+    fn forStmt(this: &Parser): Result<Id<Stmt>, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.For, "expected `for`")?;
+        if this.at(TokenKind.LParen) { return this.forTuple(start); }
+        let first = this.ident()?;
+        if this.eat(TokenKind.Comma) {
+            let name = this.ident()?;
+            this.expect(TokenKind.In, "expected `in`")?;
+            let iter = this.expr()?;
+            let body = this.block()?;
+            let span = join(start, body.span);
+            let fe = ForEachStmt { span: span, index: Option.Some(first), name: name, iter: iter, body: body };
+            return Result.Ok(this.ast.addStmt(Stmt.ForEach(fe), span));
+        }
+        this.expect(TokenKind.In, "expected `in`")?;
+        let iter = this.expr()?;
+        if this.at(TokenKind.DotDot) || this.at(TokenKind.DotDotEq) {
+            let inclusive = this.at(TokenKind.DotDotEq);
+            this.bump();
+            let end = this.expr()?;
+            let body = this.block()?;
+            let span = join(start, body.span);
+            let fs = ForStmt { span: span, name: first, start: iter, end: end, inclusive: inclusive, body: body };
+            return Result.Ok(this.ast.addStmt(Stmt.For(fs), span));
+        }
+        let body = this.block()?;
+        let span = join(start, body.span);
+        let none: Option<Ident> = Option.None;
+        let fe = ForEachStmt { span: span, index: none, name: first, iter: iter, body: body };
+        return Result.Ok(this.ast.addStmt(Stmt.ForEach(fe), span));
+    }
+
+    /// `for (k, v) in xs { .. }`: each element bound to a hidden name, then destructured by a
+    /// `let (k, v) = ..;` at the top of the body.
+    fn forTuple(this: &Parser, start: Span): Result<Id<Stmt>, ParseError> {
+        let p = this.pat(false)?;
+        this.expect(TokenKind.In, "expected `in`")?;
+        let iter = this.expr()?;
+        let body = this.block()?;
+        let ps = this.ast.patSpan(p);
+        let t = Text.new(this.ast.arena);
+        t.add("$each").pushInt(i64(start.lo));
+        let name = Ident { name: this.ast.sym(t.str()), span: ps };
+        let value = this.ast.addExpr(Expr.Name(name), ps);
+        let none: Option<Block> = Option.None;
+        let lp = LetPatStmt { span: ps, pat: p, value: value, elseBlock: none };
+        body.stmts.insert(0, this.ast.addStmt(Stmt.LetPat(lp), ps));
+        let span = join(start, body.span);
+        let noIdx: Option<Ident> = Option.None;
+        let fe = ForEachStmt { span: span, index: noIdx, name: name, iter: iter, body: body };
+        return Result.Ok(this.ast.addStmt(Stmt.ForEach(fe), span));
+    }
+
+    fn deferStmt(this: &Parser): Result<DeferStmt, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.Defer, "expected `defer`")?;
+        let body = Block { span: start, stmts: List<Id<Stmt>>.new(this.ast.arena) };
+        if this.at(TokenKind.LBrace) {
+            body = this.block()?;
+        } else {
+            let s = this.stmt()?;
+            body.stmts.push(s);
+            body.span = this.ast.stmtSpan(s);
+        }
+        return Result.Ok(DeferStmt { span: join(start, body.span), body: body });
+    }
+}

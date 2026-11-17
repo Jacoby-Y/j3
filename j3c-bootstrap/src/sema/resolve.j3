@@ -1,5 +1,449 @@
-// Name resolution: a path in a module to the item it means (local, `use`d, stdlib, dependency).
+// Name resolution: the module table, what a name or path means in a module, and AST types to `Ty`.
 //
 // Part of module j3c.sema.
 // Port of: j3c/src/check/resolve.rs
+// J3: Rust had three type resolvers: `resolve_type` (consts, globals, plain enum payloads, `use lib`: no
+// generics, no closures), `resolve_type_g` (fields and signatures: generics and closures) and
+// `resolve_type_ref` (lookups only, used by bodies). Here one walk takes a `TyEnv` (`plain` picks the
+// first's rules); a template's parameters resolve to `Ty.Param` instead of being substituted, and a
+// generic type is `Ty.Struct { decl, args }` with no instance made (B11.1/2). Errors keep Rust's text.
+// J3: Rust's `types` map at a given stage is the scope's struct/enum entries at that stage: enums see
+// only the types declared before them (no imports yet), as Rust's `collect_enums` did.
 module j3c.sema;
+
+/// One `ModDecl` per module key in load order; a part file's items join the module with its key (Rust
+/// `check_files_inner`'s merge loop). False after an error.
+pub fn buildModules(cx: &SemaCx): bool {
+    let t = cx.tables;
+    for i in 0..cx.parsed.files.len {
+        let f = cx.parsed.files.items[i];
+        let key = f.ast.moduleKey(cx.ast);
+        let ks = t.sym(key);
+        if !f.ast.isScript {
+            match t.modKeys.get(ks) {
+                Option.Some(m) {
+                    let md = t.modAt(m);
+                    md.files.push(i);
+                    for k in 0..f.ast.items.len { md.items.push(f.ast.items.items[k]); }
+                    continue;
+                }
+                Option.None {}
+            }
+        }
+        let path = List<Sym>.new(cx.arena);
+        for k in 0..f.ast.moduleName.len { path.push(f.ast.moduleName.items[k].name); }
+        let d = newModDecl(cx.arena, own(cx.arena, key), path);
+        d.isScript = f.ast.isScript;
+        d.files.push(i);
+        for k in 0..f.ast.items.len { d.items.push(f.ast.items.items[k]); }
+        let m = t.addMod(d);
+        if !t.modKeys.has(ks) { t.modKeys.put(ks, m); }
+    }
+    return true;
+}
+
+/// Rust `merge_extends`: each module's `extend T { .. }` blocks into `T`'s methods.
+pub fn mergeExtends(cx: &SemaCx): bool {
+    let n = cx.tables.mods.len();
+    for i in 0..n {
+        let m = cx.tables.mods.idAt(i);
+        let md = cx.tables.modAt(m);
+        let r = merge(cx.ast, &md.items, md.key, fn(name: Sym): Option<string> { return declaredElsewhere(cx, m, name); });
+        match r {
+            Option.Some(e) { return failHelp(cx, e.span, e.message, e.help); }
+            Option.None {}
+        }
+    }
+    return true;
+}
+
+/// The key of the first module other than `m` that declares a struct or enum `name`.
+fn declaredElsewhere(cx: &SemaCx, m: Id<ModDecl>, name: Sym): Option<string> {
+    for j in 0..cx.tables.mods.len() {
+        let o = cx.tables.mods.idAt(j);
+        if o == m { continue; }
+        let od = cx.tables.modAt(o);
+        for k in 0..od.items.len {
+            match od.items.items[k] {
+                Item.Struct(s) { if s.name.name == name { return Option.Some(od.key); } }
+                Item.Enum(e) { if e.name.name == name { return Option.Some(od.key); } }
+                _ {}
+            }
+        }
+    }
+    return Option.None;
+}
+
+/// What the bare name `name` means in module `m` (own items, then `use`d names), None when unbound.
+pub fn lookup(cx: &SemaCx, m: Id<ModDecl>, name: Sym): Option<DeclRef> { return cx.tables.modAt(m).scope.get(name); }
+
+/// What a dotted path means in `m`: `alias.name` through a `use a.b` prefix or a `use lib` alias (the
+/// item `name` of that module, when `pub` there or a lib fn); otherwise what `path[0]` names, and the
+/// caller reads the rest (`Shape.Rect`, `x.field`). None when unbound or not visible.
+pub fn lookupPath(cx: &SemaCx, m: Id<ModDecl>, path: &List<Ident>): Option<DeclRef> {
+    if path.len == 0 { return Option.None; }
+    if path.len >= 2 {
+        match cx.tables.modAt(m).prefixes.get(path.items[0].name) {
+            Option.Some(src) {
+                match lookup(cx, src, path.items[1].name) {
+                    Option.Some(d) { if cx.tables.modAt(src).isLib || visible(cx, m, d) { return Option.Some(d); } }
+                    Option.None {}
+                }
+                return Option.None;
+            }
+            Option.None {}
+        }
+    }
+    return lookup(cx, m, path.items[0].name);
+}
+
+/// The context a type is resolved in.
+struct TyEnv {
+    m: Id<ModDecl>;
+    /// The template's parameters (None outside one).
+    gen: Option<Id<Generics>>;
+    /// What `Self` means (a trait's signatures: `Ty.TraitSelf`); None: `Self` is an error.
+    selfTy: Option<Id<Ty>>;
+    /// Rust `resolve_type`: no closure types, no generic types (consts, globals, plain enum payloads,
+    /// `use lib`). False: Rust `resolve_type_g` (fields and signatures).
+    plain: bool;
+}
+
+fn plainEnv(m: Id<ModDecl>): TyEnv { return TyEnv { m: m, gen: Option.None, selfTy: Option.None, plain: true }; }
+
+fn genEnv(m: Id<ModDecl>, gen: Option<Id<Generics>>): TyEnv { return TyEnv { m: m, gen: gen, selfTy: Option.None, plain: false }; }
+
+/// Rust `resolve_type` / `resolve_type_g`: the `Ty` an AST type means in module `m`, with `gen` the
+/// generic parameters in scope (None outside a template). Unknown names are a Diag and `Ty.Error`.
+pub fn resolveTy(cx: &SemaCx, m: Id<ModDecl>, gen: Option<Id<Generics>>, t: Id<Type>): Id<Ty> {
+    let env = genEnv(m, gen);
+    match tyOf(cx, env, t) {
+        Option.Some(r) { return r; }
+        Option.None { return cx.tables.common.error; }
+    }
+    return cx.tables.common.error;
+}
+
+/// The walk behind `resolveTy`; None after the error Diag.
+fn tyOf(cx: &SemaCx, env: TyEnv, id: Id<Type>): Option<Id<Ty>> {
+    let t = cx.tables;
+    let sp = cx.ast.typeSpan(id);
+    match cx.ast.ty(id) {
+        Type.Closure(c) {
+            if env.plain { closureNotHere(cx, sp, c.boxed); return Option.None; }
+            let ps = List<Id<Ty>>.new(cx.arena);
+            for i in 0..c.params.len { ps.push(tyOf(cx, env, c.params.items[i])?); }
+            let r = t.common.void;
+            match c.ret {
+                Option.Some(rt) {
+                    r = tyOf(cx, env, rt)?;
+                    if !rejectClosure(cx, cx.ast.typeSpan(rt), r, "a return type") { return Option.None; }
+                }
+                Option.None {}
+            }
+            return Option.Some(t.intern(Ty.Closure(ClosureTy { params: t.list(ps.slice()), ret: r, boxed: c.boxed })));
+        }
+        Type.Tuple(tu) {
+            let es = List<Id<Ty>>.new(cx.arena);
+            for i in 0..tu.elems.len {
+                let e = tyOf(cx, env, tu.elems.items[i])?;
+                if !rejectClosure(cx, cx.ast.typeSpan(tu.elems.items[i]), e, "a tuple element") { return Option.None; }
+                es.push(e);
+            }
+            return Option.Some(t.intern(Ty.Tuple(TupleTy { elems: t.list(es.slice()) })));
+        }
+        Type.Ref(r) {
+            let inner = tyOf(cx, env, r.ty)?;
+            if !rejectClosure(cx, sp, inner, "behind `&`") { return Option.None; }
+            return Option.Some(t.refTo(inner));
+        }
+        Type.Named(n) { return namedTy(cx, env, n.name, sp); }
+        Type.Dyn(d) { return dynTy(cx, env.m, d); }
+        Type.Generic(g) {
+            if env.plain {
+                fail(cx, sp, quoted(cx, "generic type ", g.name, " needs instantiation"));
+                return Option.None;
+            }
+            let args = List<Id<Ty>>.new(cx.arena);
+            for i in 0..g.args.len {
+                let a = tyOf(cx, env, g.args.items[i])?;
+                if !rejectClosure(cx, cx.ast.typeSpan(g.args.items[i]), a, "a generic type argument") { return Option.None; }
+                args.push(a);
+            }
+            let r = instTy(cx, env.m, g.name, args, sp)?;
+            // Outside a template this is where Rust instantiated the template and reported its errors.
+            match env.gen {
+                Option.None {
+                    if !templateErrors(cx, r) { return Option.None; }
+                    traitQueueBounds(cx, r, sp);
+                }
+                Option.Some(_) {}
+            }
+            return Option.Some(r);
+        }
+        Type.Array(a) {
+            let e = tyOf(cx, env, a.elem)?;
+            if !rejectClosure(cx, sp, e, "an array element") { return Option.None; }
+            return Option.Some(t.arrayOf(e, a.len));
+        }
+        Type.Slice(s) {
+            let e = tyOf(cx, env, s.elem)?;
+            if !rejectClosure(cx, sp, e, "a slice element") { return Option.None; }
+            return Option.Some(t.sliceOf(e));
+        }
+        Type.Fn(f) {
+            let ps = List<Id<Ty>>.new(cx.arena);
+            for i in 0..f.params.len {
+                let p = tyOf(cx, env, f.params.items[i])?;
+                if !rejectClosure(cx, cx.ast.typeSpan(f.params.items[i]), p, "a parameter of a plain `fn(..)` type") { return Option.None; }
+                ps.push(p);
+            }
+            let r = t.common.void;
+            match f.ret {
+                Option.Some(rt) {
+                    r = tyOf(cx, env, rt)?;
+                    if !env.plain && !rejectClosure(cx, cx.ast.typeSpan(rt), r, "a return type") { return Option.None; }
+                }
+                Option.None {}
+            }
+            return Option.Some(t.fnTy(ps.slice(), r));
+        }
+    }
+    return Option.None;
+}
+
+/// A bare type name: `Self`, a template parameter, a struct or enum in scope, a builtin.
+fn namedTy(cx: &SemaCx, env: TyEnv, name: Sym, sp: Span): Option<Id<Ty>> {
+    let t = cx.tables;
+    let s = t.str(name);
+    if s == "Self" {
+        match env.selfTy { Option.Some(st) { return Option.Some(st); } Option.None {} }
+    }
+    match env.gen {
+        Option.Some(g) {
+            let gd = t.genericsAt(g);
+            for i in 0..gd.names.len { if gd.names.items[i] == name { return Option.Some(t.paramTy(g, i)); } }
+        }
+        Option.None {}
+    }
+    match scopeType(cx, env.m, name) {
+        Option.Some(d) {
+            if !isTemplate(cx, d) {
+                if d.kind == DeclKind.Struct { return Option.Some(t.structTy(d.asStruct(), t.items(t.common.none))); }
+                return Option.Some(t.enumTy(d.asEnum(), t.items(t.common.none)));
+            }
+            if !env.plain {
+                fail(cx, sp, quoted(cx, "", name, " needs type arguments"));
+                return Option.None;
+            }
+        }
+        Option.None {}
+    }
+    match builtinTy(t, s) { Option.Some(b) { return Option.Some(b); } Option.None {} }
+    if s == "Self" {
+        failHelp(cx, sp, "`Self` is only valid inside a `trait` body", "write the type's own name here");
+        return Option.None;
+    }
+    fail(cx, sp, quoted(cx, "unknown type ", name, ""));
+    return Option.None;
+}
+
+/// `Name<args>`: an instance of a struct or enum template (Rust `instantiate_struct`/`_enum`, minus the
+/// instance: B11.2 makes it when a body reaches it).
+fn instTy(cx: &SemaCx, m: Id<ModDecl>, name: Sym, args: List<Id<Ty>>, sp: Span): Option<Id<Ty>> {
+    let t = cx.tables;
+    match scopeType(cx, m, name) {
+        Option.Some(d) {
+            if isTemplate(cx, d) {
+                let want = 0;
+                if d.kind == DeclKind.Struct {
+                    match t.structAt(d.asStruct()).gen { Option.Some(g) { want = t.genericsAt(g).names.len; } Option.None {} }
+                } else {
+                    match t.enumAt(d.asEnum()).gen { Option.Some(g) { want = t.genericsAt(g).names.len; } Option.None {} }
+                }
+                if want != args.len {
+                    let msg = Text.new(cx.arena).add("`").add(t.str(name)).add("` takes ");
+                    msg.pushInt(want);
+                    msg.add(" type args, got ");
+                    msg.pushInt(args.len);
+                    fail(cx, sp, msg.str());
+                    return Option.None;
+                }
+                if d.kind == DeclKind.Struct { return Option.Some(t.structTy(d.asStruct(), args.slice())); }
+                return Option.Some(t.enumTy(d.asEnum(), args.slice()));
+            }
+        }
+        Option.None {}
+    }
+    fail(cx, sp, quoted(cx, "unknown generic type ", name, ""));
+    return Option.None;
+}
+
+/// The errors Rust reported when it instantiated template `ty` (a struct: its fields, then its methods'
+/// signatures; an enum: its payloads), which declaring it left quiet (`decl_diag.tyIn`). False after the
+/// first Diag.
+// ponytail: templates named inside the template (`B<T>` in `A<T>`'s fields) and duplicate methods are not
+// re-checked here; Rust reported them on instantiation too. Add when a program needs those messages.
+fn templateErrors(cx: &SemaCx, ty: Id<Ty>): bool {
+    let t = cx.tables;
+    match t.ty(ty) {
+        Ty.Struct(st) {
+            let d = *t.structAt(st.decl);
+            match d.item {
+                Option.Some(si) {
+                    match fieldsOf(cx, genEnv(d.owner, d.gen), &si, true) { Option.Some(_) {} Option.None { return false; } }
+                    for k in 0..d.methods.len {
+                        let f = *t.fnAt(d.methods.items[k]);
+                        match f.item {
+                            Option.Some(fi) {
+                                if fi.typeParams.len == 0 {
+                                    match sigOf(cx, d.owner, &fi, f.gen, f.recv, true) { Option.Some(_) {} Option.None { return false; } }
+                                }
+                            }
+                            Option.None {}
+                        }
+                    }
+                }
+                Option.None {}
+            }
+        }
+        Ty.Enum(en) {
+            let d = *t.enumAt(en.decl);
+            match d.item { Option.Some(ei) { return fillVariants(cx, genEnv(d.owner, d.gen), en.decl, &ei, true); } Option.None {} }
+        }
+        _ {}
+    }
+    return true;
+}
+
+/// `dyn Name` (Rust `resolve_dyn`): the trait `Name` in scope.
+fn dynTy(cx: &SemaCx, m: Id<ModDecl>, id: Ident): Option<Id<Ty>> {
+    match scopeOf(cx, m, id.name, DeclKind.Trait) {
+        Option.Some(d) { return Option.Some(cx.tables.intern(Ty.Dyn(DynTy { decl: d.asTrait() }))); }
+        Option.None {}
+    }
+    let name = cx.tables.str(id.name);
+    match scopeType(cx, m, id.name) {
+        Option.Some(_) {
+            failNote(cx, id.span, cat3(cx, "`", name, "` is a type, not a trait"),
+                "`dyn` takes a trait: `dyn Backend` holds any value whose type has the trait's methods");
+            return Option.None;
+        }
+        Option.None {}
+    }
+    failHelp(cx, id.span, cat3(cx, "unknown trait `", name, "`"), cat5(cx, "declare `trait ", name, " { .. }` here, or import it: `use m.", name, ";`"));
+    return Option.None;
+}
+
+/// Rust `IrCx::builtin_named`.
+fn builtinTy(t: &Tables, s: string): Option<Id<Ty>> {
+    let c = t.common;
+    if s == "void" { return Option.Some(c.void); }
+    if s == "bool" { return Option.Some(c.bool); }
+    if s == "int" || s == "i64" { return Option.Some(c.i64); }
+    if s == "i8" { return Option.Some(c.i8); }
+    if s == "i16" { return Option.Some(c.i16); }
+    if s == "i32" { return Option.Some(c.i32); }
+    if s == "u8" { return Option.Some(c.u8); }
+    if s == "u16" { return Option.Some(c.u16); }
+    if s == "u32" { return Option.Some(c.u32); }
+    if s == "u64" { return Option.Some(c.u64); }
+    if s == "f32" { return Option.Some(c.f32); }
+    if s == "float" || s == "f64" { return Option.Some(c.f64); }
+    if s == "ptr" { return Option.Some(c.ptr); }
+    if s == "cstr" { return Option.Some(c.cstr); }
+    if s == "string" { return Option.Some(c.string); }
+    if s == "vec4f" { return Option.Some(c.vec4f); }
+    if s == "vec4i" { return Option.Some(c.vec4i); }
+    if s == "f16" { return Option.Some(c.half); }
+    return Option.None;
+}
+
+/// Rust `closure_ty::HOW`.
+const CLOSURE_HOW: string = "a closure can only be a parameter or a `let`; pass it down as a `closure(..)` parameter, or make it a `boxed closure(..)` with `fn[mem](..) { .. }` (captures copied into arena `mem`) if it must be stored";
+
+/// Rust `reject_closure`: `ty` must not be a stack closure; `place` says where it was written.
+fn rejectClosure(cx: &SemaCx, sp: Span, ty: Id<Ty>, place: string): bool {
+    match cx.tables.ty(ty) {
+        Ty.Closure(c) {
+            if !c.boxed {
+                return failHelp(cx, sp, cat3(cx, "a closure cannot be ", place, ": it points into the stack of the function that made it"), CLOSURE_HOW);
+            }
+        }
+        _ {}
+    }
+    return true;
+}
+
+/// Rust `closure_not_here`: a closure type where only `resolve_type`'s rules apply.
+fn closureNotHere(cx: &SemaCx, sp: Span, boxed: bool): bool {
+    if boxed {
+        return failWith(cx, sp, "a `boxed closure(..)` type is not allowed here",
+            "a `const` is data fixed at compile time, and a boxed closure's captures live in an arena made at run time; an enum payload or a `use lib` signature cannot hold one either",
+            "keep it in a `#[singleton] let` (assigned at startup), a struct field, a `List`, a `let`, a parameter or a return value");
+    }
+    return failHelp(cx, sp, "a closure type is not allowed here: it points into the stack of the function that made it", CLOSURE_HOW);
+}
+
+/// The source spelling of `t` for messages (Rust `ir::dump::dump_ty`: `int`, `float`, `&Foo`, a struct by
+/// its bare name, a tuple as `(A, B)`, a closure as `closure(A): R`).
+pub fn tyName(tables: &Tables, t: Id<Ty>, out: &Text) {
+    match tables.ty(t) {
+        Ty.Error { out.add("?"); }
+        Ty.Void { out.add("void"); }
+        Ty.Bool { out.add("bool"); }
+        Ty.Int(k) {
+            match k {
+                IntKind.I8 { out.add("i8"); }
+                IntKind.I16 { out.add("i16"); }
+                IntKind.I32 { out.add("i32"); }
+                IntKind.I64 { out.add("int"); }
+                IntKind.U8 { out.add("u8"); }
+                IntKind.U16 { out.add("u16"); }
+                IntKind.U32 { out.add("u32"); }
+                IntKind.U64 { out.add("u64"); }
+            }
+        }
+        Ty.Float(k) { match k { FloatKind.F32 { out.add("f32"); } FloatKind.F64 { out.add("float"); } } }
+        Ty.Half { out.add("f16"); }
+        Ty.Vec(k) { match k { VecKind.F32x4 { out.add("vec4f"); } VecKind.I32x4 { out.add("vec4i"); } } }
+        Ty.Ptr { out.add("ptr"); }
+        Ty.CStr { out.add("cstr"); }
+        Ty.String { out.add("string"); }
+        Ty.Ref(r) { out.add("&"); tyName(tables, r.inner, out); }
+        Ty.Array(a) {
+            out.add("[");
+            out.pushInt(i64(a.len));
+            out.add("]");
+            tyName(tables, a.elem, out);
+        }
+        Ty.Slice(s) { out.add("[]"); tyName(tables, s.elem, out); }
+        Ty.Fn(f) {
+            out.add("fn(");
+            tyNames(tables, f.params, out);
+            out.add(")");
+            if f.ret != tables.common.void { out.add(": "); tyName(tables, f.ret, out); }
+        }
+        Ty.Struct(s) { out.add(tables.str(tables.structAt(s.decl).name)); }
+        Ty.Enum(e) { out.add(tables.str(tables.enumAt(e.decl).name)); }
+        Ty.Tuple(tu) { out.add("("); tyNames(tables, tu.elems, out); out.add(")"); }
+        Ty.Closure(c) {
+            if c.boxed { out.add("boxed "); }
+            out.add("closure(");
+            tyNames(tables, c.params, out);
+            out.add(")");
+            if c.ret != tables.common.void { out.add(": "); tyName(tables, c.ret, out); }
+        }
+        Ty.Dyn(d) { out.add("dyn ").add(tables.str(tables.traitAt(d.decl).name)); }
+        Ty.Param(p) { out.add(tables.str(tables.genericsAt(p.gen).names.items[p.index])); }
+        Ty.TraitSelf { out.add("Self"); }
+    }
+}
+
+fn tyNames(tables: &Tables, l: Id<TyList>, out: &Text) {
+    let xs = tables.items(l);
+    for i in 0..xs.len {
+        if i > 0 { out.add(", "); }
+        tyName(tables, xs[i], out);
+    }
+}

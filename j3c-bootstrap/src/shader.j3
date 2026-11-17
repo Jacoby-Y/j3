@@ -3,5 +3,246 @@
 //
 // Port of: j3c/src/check/gpu/mod.rs, emit/glsl/mod.rs
 // J3: Rust split this over check/gpu and emit/glsl although the generator writes text while it checks; one
-// module.
+// module. It is an AST pass: it runs on the parsed files before sema builds modules (`sema.declarations`,
+// after `lint` and `prepareScripts`), deletes the shader items and turns `const P = @shader(vs, fs)` into a
+// plain `let P: Source = Source { .. }`. It sees no sema, lower or IR type (tools/layers.txt: above sema).
 module j3c.shader;
+// J3: Contract (wave 13): `.swarm-opus/11-port/contracts-c2d.md`. This file holds every `use` of the module
+// (part files have none), the types more than one part file reads, and `prepare`, the one entry sema calls.
+// The type shapes and `prepare`'s signature are frozen; chunk B (wave 14) writes `prepare`'s body here.
+
+use j3.data.map.Map;
+use j3.data.pool.{ Id, Pool };
+use j3.data.set.Set;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.text.Text;
+use j3c.base.diag.{ Diag, Diags, Note, NoteKind, Severity };
+use j3c.base.intern.{ Names, Sym, own };
+use j3c.base.span.{ Source, Span, noSpan };
+use j3c.load.{ LoadCx, Parsed, ParsedFile };
+use j3c.syntax.ast.{ Ast, BinOp, Block, ConstItem, Expr, FieldItem, File, FnItem, GpuStage, GpuStruct, Ident, Item, ModLetItem, Stmt,
+    StructItem, Type, UnaryOp, UseItem };
+
+/// One `@shader(vs, fs)` program as emitted: what `j3c dump-glsl` prints (Rust `ShaderProgram`). Every
+/// string is an arena copy.
+pub struct ShaderProgram {
+    moduleName: string;
+    name: string;
+    /// `file:line` of the const.
+    at: string;
+    vert: string;
+    frag: string;
+    uniforms: List<string>;
+    /// `ATTR_INTS` values per attribute, flat: location, components, gl type, byte offset, stride, divisor,
+    /// integer, normalized (Rust `Vec<[u32; 8]>`).
+    attribs: List<u32>;
+}
+
+/// Ints per attribute in `ShaderProgram.attribs` and in a `Source`'s `data`.
+pub const ATTR_INTS: int = 8;
+/// Attribute slots in a `Source` (the GL minimum for vertex attributes; Rust `layout::MAX_ATTRIBS`).
+pub const MAX_ATTRIBS: int = 16;
+
+/// What `prepare` hands sema: the programs in emit order (`Checked.shaders`) and the names it removed
+/// (Rust's `GONE` thread-local; sema's `explainGone` adds a help line to an "unknown" error naming one).
+pub struct Prepared {
+    programs: List<ShaderProgram>;
+    gone: List<Sym>;
+}
+
+/// Rust `gpu::prepare`: check every shader item, emit the programs, and rewrite `parsed.files[i].ast.items`
+/// for the normal checker. None after an error Diag (already added to `cx.diags`). A program with no shader
+/// item is untouched and gives two empty lists.
+pub fn prepare(cx: LoadCx, parsed: &Parsed): Option<Prepared> {
+    // J3: Wave 13 stub: no rewrite, so shader items still reach sema and fail there as before.
+    return Option.Some(Prepared { programs: List<ShaderProgram>.new(cx.arena), gone: List<Sym>.new(cx.arena) });
+}
+
+// ---- Shared types (Rust check/gpu/ty.rs, index.rs, gen.rs, builtins.rs, emit/glsl/program.rs) ----
+// The fns and methods on them live in the part file that ports the Rust file (contracts-c2d.md lists
+// each with its owner). `R<T>` in comments is `Result<T, Diag>`: the Diag is made, not yet added.
+
+/// Rust `ty::Base`.
+pub enum Base { F, I, U, B }
+
+/// A shader type (Rust `GTy`). A copy is cheap: an array's element is an arena pointer.
+pub enum GTy {
+    Void,
+    Scalar(Base),
+    Vec(GVec),
+    /// `mat2`, `mat3`, `mat4` (square, float).
+    Mat(int),
+    /// `sampler2D`; `true` is `sampler2DShadow`.
+    Sampler(bool),
+    Struct(GStruct),
+    Array(GArray),
+    /// An integer literal that has not met a type yet; takes the other operand's, or `i32`.
+    LitInt,
+    /// A float literal; `f32`.
+    LitFloat,
+}
+
+pub struct GVec {
+    base: Base;
+    /// 2, 3 or 4.
+    n: int;
+}
+
+pub struct GStruct {
+    /// `module::Name`.
+    key: string;
+    /// The emitted name.
+    glsl: string;
+}
+
+pub struct GArray {
+    elem: &GTy;
+    len: u64;
+}
+
+/// An expression's GLSL text and type (Rust's `(String, GTy)` pairs).
+pub struct Val {
+    text: string;
+    ty: GTy;
+}
+
+/// Rust `arith`'s `(String, String, GTy)`: both operand texts after coercion and the result type.
+pub struct ArithOut {
+    l: string;
+    r: string;
+    ty: GTy;
+}
+
+/// The stage a builtin exists in, and the stage a `Gen` writes (Rust `builtins::Only`).
+pub enum Only { Any, Vertex, Fragment }
+
+/// What `Index.find` asks a module for (Rust passes a closure over `GMod`).
+pub enum Has { ShaderFn, CpuFn, Struct, Const, Uniform }
+
+/// One module as the shader pass sees it (Rust `GMod`). Maps are looked up, never iterated into output.
+pub struct GMod {
+    key: string;
+    /// Shader fns (`#[shader]`, `#[shader(vertex)]`, ...) by name.
+    fns: Map<Sym, FnItem>;
+    /// Plain CPU fns, to say so when shader code calls one.
+    cpuFns: Set<Sym>;
+    /// Structs of every kind (`gpu` says which).
+    structs: Map<Sym, StructItem>;
+    consts: Map<Sym, ConstItem>;
+    uniforms: Map<Sym, ModLetItem>;
+    /// Singleton `let`s: CPU globals.
+    globals: Set<Sym>;
+    /// Name brought in by `use a.b.{ name }` -> module key.
+    imports: Map<Sym, string>;
+    /// `use a.b` -> `b` -> module key.
+    aliases: Map<Sym, string>;
+}
+
+/// Every module's items by name (Rust `Index`); built only when some file has shader code. `mods` is in
+/// file order; a span's path and text come from `sources`.
+pub struct Index {
+    arena: &Arena;
+    names: &Names;
+    ast: &Ast;
+    diags: &Diags;
+    sources: &Pool<Source>;
+    mods: List<GMod>;
+    byKey: Map<string, int>;
+}
+
+/// Rust `gen::Field`.
+pub struct GField {
+    name: Sym;
+    glsl: string;
+    ty: GTy;
+    flat: bool;
+}
+
+/// Rust `gen::SInfo`.
+pub struct SInfo {
+    kind: GpuStruct;
+    glsl: string;
+    fields: List<GField>;
+}
+
+/// One parameter of a shader fn: its type and whether it is `&T` (`inout`).
+pub struct SigParam {
+    ty: GTy;
+    inout: bool;
+}
+
+/// Rust `gen::FnSig`.
+pub struct FnSig {
+    glsl: string;
+    params: List<SigParam>;
+    ret: GTy;
+}
+
+/// Rust `gen::Local`, with its J3 name (Rust keys a map by it).
+pub struct GLocal {
+    name: Sym;
+    glsl: string;
+    ty: GTy;
+}
+
+/// The fn being written (Rust `gen::Cur`).
+pub struct Cur {
+    moduleName: string;
+    /// Innermost scope last; a scope's locals in declaration order.
+    scopes: List<List<GLocal>>;
+    ret: GTy;
+    /// `true` for a loop, `false` for a `match` (a `break` there would leave the `switch`, not the loop).
+    ctl: List<bool>;
+    inConst: bool;
+}
+
+/// A uniform a stage reaches: its J3 name and its GLSL declaration line (Rust `uniforms_out`'s pair).
+pub struct UniformOut {
+    name: string;
+    decl: string;
+}
+
+/// A const already emitted in this stage (Rust `consts_done`'s value).
+pub struct ConstDone {
+    glsl: string;
+    ty: GTy;
+}
+
+/// The generator state per stage (Rust `gen::Gen`). Chunk A reads `ix`, `stage`, `cur`, `body`, `depth`,
+/// `sinfo`, `sigs`, `stack` and calls the methods in contracts-c2d.md; the last four fields are chunk B's.
+/// Output lists are in emit order; the maps are lookups only (no hash-order output).
+pub struct Gen {
+    ix: &Index;
+    stage: Only;
+    cur: Cur;
+    body: Text;
+    depth: int;
+    structsOut: List<string>;
+    constsOut: List<string>;
+    uniformsOut: List<UniformOut>;
+    fnsOut: List<string>;
+    /// By struct key `module::Name`.
+    sinfo: Map<string, &SInfo>;
+    /// By fn key `module::name`.
+    sigs: Map<string, &FnSig>;
+    stack: List<string>;
+    constsDone: Map<string, ConstDone>;
+    taken: Map<string, string>;
+    gnames: Map<string, string>;
+    building: Set<string>;
+}
+
+/// One stage's GLSL text in a fixed section order (Rust `emit::glsl::program::StageText`); `render` is in
+/// `shader/glsl.j3`.
+pub struct StageText {
+    /// Printed as a `//` comment after `#version` (which program and stage it is).
+    title: string;
+    structs: List<string>;
+    io: List<string>;
+    uniforms: List<string>;
+    consts: List<string>;
+    fns: List<string>;
+    main: string;
+}

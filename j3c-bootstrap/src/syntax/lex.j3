@@ -1,6 +1,334 @@
 // Lexer: source bytes to tokens, with doc comments kept for `j3c doc` and comments kept for `j3c fmt`.
 //
 // Port of: j3c/src/parse/lex.rs
-// J3: Byte-level, with char literals and range match arms; Unicode identifiers via UTF-8 decode.
-// J3: Keywords come from `text/syntax/keywords.txt` (B10, embedded), the same list the textmate grammar uses.
+// J3: Byte-level: every token and error is decided by ASCII bytes, so a byte walk lands on the same
+// offsets as Rust's char walk. Non-ASCII is decoded only where Rust asks a char class (whitespace,
+// identifier start/continue: tables in `lex/chars.j3`, with `charLit`).
+// J3: Keywords come from `text/syntax/keywords.txt` (B10, embedded), the same list the textmate grammar
+// uses; `kindOf` (a few compares) runs first so most identifiers never scan the file.
+// J3: Token texts are slices of `src`; an escaped string and a char's code point are arena copies.
 module j3c.syntax.lex;
+
+use j3.data.pool.Id;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.text;
+use j3.text.Text;
+use j3c.base.span.{ Source, Span };
+use j3c.base.text_fmt.{ debugChar, hexVal, inTable, isDigit };
+use j3c.syntax.token.{ ParseError, Token, TokenKind, eof, keyword, kindOf, parseError };
+
+/// `src` as tokens ending in one `Eof`, or the first error (Rust `lex`). Token texts are slices of `src`
+/// (which must outlive them: the Session's `Source.text`) or copies in `arena`; doc comments are `Doc`
+/// tokens, plain comments are dropped (`fmt` reads them from the gaps between token spans).
+pub fn lex(src: string, file: Id<Source>, arena: &Arena): Result<List<Token>, ParseError> {
+    let l = Lexer { src: src, file: file, i: 0, toks: List<Token>.new(arena), arena: arena };
+    l.run()?;
+    return Result.Ok(l.toks);
+}
+
+struct Lexer {
+    src: string;
+    file: Id<Source>;
+    i: int;
+    toks: List<Token>;
+    arena: &Arena;
+
+    /// The byte `n` past the cursor, 0 past the end (never equal to a byte the lexer looks for).
+    fn pk(this: &Lexer, n: int): u8 {
+        if this.i + n >= this.src.len { return 0; }
+        return this.src[this.i + n];
+    }
+
+    /// The code point at the cursor and its byte length; (0, 0) at the end.
+    fn peekCp(this: &Lexer): (u32, int) {
+        if this.i >= this.src.len { return (0, 0); }
+        let b = this.src[this.i];
+        if b < 0x80 { return (u32(b), 1); }
+        return text.decodeRune(this.src, this.i);
+    }
+
+    fn span(this: &Lexer, start: int, end: int): Span {
+        return Span { file: this.file, lo: u32(start), hi: u32(end) };
+    }
+
+    fn push(this: &Lexer, kind: TokenKind, start: int, end: int, t: string) {
+        this.toks.push(Token { kind: kind, span: this.span(start, end), text: t });
+    }
+
+    fn fail(this: &Lexer, start: int, end: int, msg: string): Result<bool, ParseError> {
+        return Result.Err(parseError(this.arena, this.span(start, end), msg));
+    }
+
+    /// One byte, then `kind`.
+    fn one(this: &Lexer, kind: TokenKind, start: int) {
+        this.i += 1;
+        this.push(kind, start, this.i, "");
+    }
+
+    /// `alone`, or `withEq` when `=` follows (Rust `assign_op`); also `& | ! < > =` with one extra pair.
+    fn opEq(this: &Lexer, start: int, alone: TokenKind, withEq: TokenKind) {
+        this.i += 1;
+        if this.pk(0) == '=' {
+            this.i += 1;
+            this.push(withEq, start, this.i, "");
+        } else {
+            this.push(alone, start, this.i, "");
+        }
+    }
+
+    /// `a` doubled (`::`, `&&`, `||`) is `twice`, else `opEq` (`withEq` is `alone` when there is none).
+    fn twin(this: &Lexer, start: int, a: u8, twice: TokenKind, alone: TokenKind, withEq: TokenKind) {
+        if this.pk(1) == a {
+            this.i += 2;
+            this.push(twice, start, this.i, "");
+            return;
+        }
+        if withEq == alone { this.one(alone, start); return; }
+        this.opEq(start, alone, withEq);
+    }
+
+    fn run(this: &Lexer): Result<bool, ParseError> {
+        let src = this.src;
+        while this.i < src.len {
+            let start = this.i;
+            let c = src[start];
+            if c >= 0x80 {
+                let (cp, w) = text.decodeRune(src, start);
+                if isWhitespace(cp) { this.i += w; continue; }
+                if isIdentStart(cp) { this.ident(start); continue; }
+                let t = Text.new(this.arena);
+                t.add("unexpected character ");
+                debugChar(&t, cp);
+                return this.fail(start, start + w, t.str());
+            }
+            if isWhitespace(u32(c)) { this.i += 1; continue; }
+            if c == '/' && this.pk(1) == '/' {
+                if this.pk(2) == '/' && this.pk(3) != '/' { this.docComment(); } else { this.lineComment(); }
+                continue;
+            }
+            if c == '(' { this.one(TokenKind.LParen, start); }
+            else if c == ')' { this.one(TokenKind.RParen, start); }
+            else if c == '{' { this.one(TokenKind.LBrace, start); }
+            else if c == '}' { this.one(TokenKind.RBrace, start); }
+            else if c == '[' { this.one(TokenKind.LBracket, start); }
+            else if c == ']' { this.one(TokenKind.RBracket, start); }
+            else if c == ',' { this.one(TokenKind.Comma, start); }
+            else if c == ';' { this.one(TokenKind.Semi, start); }
+            else if c == ':' { this.twin(start, ':', TokenKind.ColonColon, TokenKind.Colon, TokenKind.Colon); }
+            else if c == '.' {
+                if this.pk(1) == '.' {
+                    if this.pk(2) == '=' { this.i += 3; this.push(TokenKind.DotDotEq, start, this.i, ""); }
+                    else { this.i += 2; this.push(TokenKind.DotDot, start, this.i, ""); }
+                } else {
+                    this.one(TokenKind.Dot, start);
+                }
+            }
+            else if c == '@' { this.one(TokenKind.At, start); }
+            else if c == '#' { this.one(TokenKind.Hash, start); }
+            else if c == '?' { this.one(TokenKind.Question, start); }
+            else if c == '&' { this.twin(start, '&', TokenKind.AndAnd, TokenKind.Amp, TokenKind.AmpEq); }
+            else if c == '^' { this.opEq(start, TokenKind.Caret, TokenKind.CaretEq); }
+            else if c == '~' { this.one(TokenKind.Tilde, start); }
+            else if c == '|' { this.twin(start, '|', TokenKind.OrOr, TokenKind.Pipe, TokenKind.PipeEq); }
+            else if c == '!' { this.opEq(start, TokenKind.Not, TokenKind.Ne); }
+            else if c == '<' && this.pk(1) == '<' && this.pk(2) == '=' { this.i += 3; this.push(TokenKind.ShlEq, start, this.i, ""); }
+            else if c == '>' && this.pk(1) == '>' && this.pk(2) == '=' { this.i += 3; this.push(TokenKind.ShrEq, start, this.i, ""); }
+            else if c == '<' { this.opEq(start, TokenKind.Lt, TokenKind.Le); }
+            else if c == '>' { this.opEq(start, TokenKind.Gt, TokenKind.Ge); }
+            else if c == '=' { this.opEq(start, TokenKind.Eq, TokenKind.EqEq); }
+            else if c == '+' { this.opEq(start, TokenKind.Plus, TokenKind.PlusEq); }
+            else if c == '-' { this.opEq(start, TokenKind.Minus, TokenKind.MinusEq); }
+            else if c == '*' { this.opEq(start, TokenKind.Star, TokenKind.StarEq); }
+            else if c == '/' { this.opEq(start, TokenKind.Slash, TokenKind.SlashEq); }
+            else if c == '%' { this.opEq(start, TokenKind.Percent, TokenKind.PercentEq); }
+            else if c == '"' { this.string(start)?; }
+            else if c == '`' { this.interpolate(start)?; }
+            else if c == '\'' { this.quote(start)?; }
+            else if isIdentStart(u32(c)) { this.ident(start); }
+            else if isDigit(c) { this.number(start)?; }
+            else {
+                let t = Text.new(this.arena);
+                t.add("unexpected character ");
+                debugChar(&t, u32(c));
+                return this.fail(start, start + 1, t.str());
+            }
+        }
+        this.toks.push(eof(this.span(src.len, src.len)));
+        return Result.Ok(true);
+    }
+
+    fn interpolate(this: &Lexer, start: int): Result<bool, ParseError> {
+        this.i += 1;
+        let inner = this.i;
+        while true {
+            if this.i >= this.src.len { return this.fail(start, this.i, "unterminated interpolate"); }
+            let c = this.src[this.i];
+            if c == '`' { break; }
+            if c == '\n' { return this.fail(start, this.i, "newline in interpolate"); }
+            this.i += 1;
+        }
+        let t = this.src[inner..this.i];
+        this.i += 1;
+        this.push(TokenKind.Interpolate, start, this.i, t);
+        return Result.Ok(true);
+    }
+
+    fn ident(this: &Lexer, start: int) {
+        let (_, w) = this.peekCp();
+        this.i += w;
+        while this.i < this.src.len {
+            let (cp, n) = this.peekCp();
+            if !isIdentContinue(cp) { break; }
+            this.i += n;
+        }
+        let t = this.src[start..this.i];
+        let kind = TokenKind.Ident;
+        // ponytail: `kindOf` first, the embedded-file scan only for the ~20 keyword spellings
+        match kindOf(t) {
+            Option.Some(_) {
+                match keyword(t) { Option.Some(k) { kind = k; } Option.None {} }
+            }
+            Option.None {}
+        }
+        this.push(kind, start, this.i, t);
+    }
+
+    fn digits(this: &Lexer) { while isDigit(this.pk(0)) { this.i += 1; } }
+
+    fn number(this: &Lexer, start: int): Result<bool, ParseError> {
+        if this.pk(0) == '0' && this.pk(1) == 'b' {
+            this.i += 2;
+            if this.pk(0) != '0' && this.pk(0) != '1' { return this.fail(start, this.i, "invalid binary literal"); }
+            while this.pk(0) == '0' || this.pk(0) == '1' { this.i += 1; }
+            this.push(TokenKind.Int, start, this.i, this.src[start..this.i]);
+            return Result.Ok(true);
+        }
+        if this.pk(0) == '0' && this.pk(1) == 'x' {
+            this.i += 2;
+            if !isHex(this.pk(0)) { return this.fail(start, this.i, "invalid hex literal"); }
+            while isHex(this.pk(0)) { this.i += 1; }
+        } else {
+            this.digits();
+            // `t.0.1` is two field accesses, not `t.` then the float `0.1`.
+            let afterDot = this.toks.len > 0 && this.toks.items[this.toks.len - 1].kind == TokenKind.Dot;
+            if !afterDot && this.pk(0) == '.' && isDigit(this.pk(1)) {
+                this.i += 1;
+                this.digits();
+                this.exponent(start)?;
+                this.push(TokenKind.Float, start, this.i, this.src[start..this.i]);
+                return Result.Ok(true);
+            }
+            if !afterDot && this.exponent(start)? {
+                this.push(TokenKind.Float, start, this.i, this.src[start..this.i]);
+                return Result.Ok(true);
+            }
+        }
+        this.push(TokenKind.Int, start, this.i, this.src[start..this.i]);
+        return Result.Ok(true);
+    }
+
+    /// `e9`, `E+10`, `e-3` after a number's digits: true when one was read. An `e` with no digit after it
+    /// (and no sign) is left alone, so `1.e` stays a field access.
+    fn exponent(this: &Lexer, start: int): Result<bool, ParseError> {
+        if this.pk(0) != 'e' && this.pk(0) != 'E' { return Result.Ok(false); }
+        let sign = this.pk(1) == '+' || this.pk(1) == '-';
+        let digitAt = 1;
+        if sign { digitAt = 2; }
+        if !isDigit(this.pk(digitAt)) {
+            if sign {
+                return this.fail(start, this.i + digitAt, "malformed float exponent: expected digits after the sign");
+            }
+            return Result.Ok(false);
+        }
+        this.i += digitAt;
+        this.digits();
+        return Result.Ok(true);
+    }
+
+    /// A `"..."` string; the token text is the unescaped bytes (a slice of `src` when nothing is escaped).
+    fn string(this: &Lexer, start: int): Result<bool, ParseError> {
+        this.i += 1;
+        let seg = this.i;
+        let esc = false;
+        let t = Text.new(this.arena);
+        while true {
+            if this.i >= this.src.len { return this.fail(start, this.i, "unterminated string"); }
+            let c = this.src[this.i];
+            if c == '"' { break; }
+            if c == '\n' { return this.fail(start, this.i, "newline in string"); }
+            if c != '\\' { this.i += 1; continue; }
+            t.add(this.src[seg..this.i]);
+            esc = true;
+            this.i += 1;
+            if this.i >= this.src.len { return this.fail(start, this.i, "unterminated string escape"); }
+            let e = this.src[this.i];
+            let (_, w) = this.peekCp();
+            this.i += w;
+            if e == '\\' { t.push('\\'); }
+            else if e == '"' { t.push('"'); }
+            else if e == 'n' { t.push('\n'); }
+            else if e == 'r' { t.push('\r'); }
+            else if e == 't' { t.push('\t'); }
+            else if e == '0' { t.push(0); }
+            else {
+                let m = Text.new(this.arena);
+                m.add("unknown string escape \\").add(this.src[this.i - w..this.i]);
+                return this.fail(this.i - 2, this.i, m.str());
+            }
+            seg = this.i;
+        }
+        let body = this.src[seg..this.i];
+        if esc { t.add(body); body = t.str(); }
+        this.i += 1;
+        // Rust's "string is not UTF-8" cannot happen: the bytes are valid source plus ASCII escapes.
+        this.push(TokenKind.String, start, this.i, body);
+        return Result.Ok(true);
+    }
+
+    /// `'a'`, `'\n'`, `'\u{1F600}'` (a `Char` token whose text is the code point in decimal), else `'rows`
+    /// (a `Label`). A char is the closing quote right after one char or one escape.
+    fn quote(this: &Lexer, start: int): Result<bool, ParseError> {
+        let r = charLit(this.src[start..this.src.len], this.arena);
+        if r.state == CHAR_OK {
+            this.i = start + r.len;
+            let t = Text.new(this.arena);
+            t.pushU64(u64(r.value));
+            this.push(TokenKind.Char, start, this.i, t.str());
+            return Result.Ok(true);
+        }
+        if r.state == CHAR_ERR { return this.fail(start, start + r.len, r.msg); }
+        this.i += 1;
+        let (cp, w) = this.peekCp();
+        if w == 0 || !isIdentStart(cp) { return this.fail(start, this.i, "unexpected character '\\''"); }
+        while this.i < this.src.len {
+            let (c2, n) = this.peekCp();
+            if !isIdentContinue(c2) { break; }
+            this.i += n;
+        }
+        if this.pk(0) == '\'' { return this.fail(start, this.i + 1, ONE_CHAR); }
+        this.push(TokenKind.Label, start, this.i, this.src[start..this.i]);
+        return Result.Ok(true);
+    }
+
+    fn docComment(this: &Lexer) {
+        let start = this.i;
+        this.i += 3;
+        if this.pk(0) == ' ' { this.i += 1; }
+        let textStart = this.i;
+        while this.i < this.src.len && this.src[this.i] != '\n' { this.i += 1; }
+        this.push(TokenKind.Doc, start, this.i, trimEnd(this.src[textStart..this.i]));
+    }
+
+    fn lineComment(this: &Lexer) {
+        while this.i < this.src.len {
+            let c = this.src[this.i];
+            this.i += 1;
+            if c == '\n' { break; }
+        }
+    }
+}
+
+
+fn isHex(b: u8): bool { return isDigit(b) || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F'); }

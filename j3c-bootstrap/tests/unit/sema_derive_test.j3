@@ -1,0 +1,115 @@
+// Derives (`sema/derive.j3`): a small program through the driver to `Stage.Sema`, then its tables read
+// back: a struct's derived methods in derive order after its own, a payload enum's `#[impl]` fns (a
+// C-like enum gets no `operator==`), a generic struct's `where` bound, a generic enum's `Enum.method`
+// template with its bound; and the text of the "derives and also defines" error.
+module sema_derive_test;
+
+use j3.io;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+use j3c.driver;
+use j3c.driver.{ Session, Stage };
+use j3c.sema.{ Checked, Tables };
+
+const SRC: [14]string = [
+    "module ders;",
+    "#[derive(Hash, Eq, Ord, Clone)]",
+    "struct Key { name: string; n: int; fn own(this: &Key): int { return 1; } }",
+    "#[derive(Eq, Hash)]",
+    "enum Shape { Dot, Rect(int, int) }",
+    "#[derive(Eq, Hash)]",
+    "enum Flag { Off, On }",
+    "#[derive(Eq)]",
+    "struct Pair<A, B> { a: A; n: int; }",
+    "#[derive(Eq, Clone)]",
+    "enum Opt<T> { Some(T), None }",
+    "fn main() {",
+    "    let a = Key { name: \"x\", n: 1 };",
+    "    let same = a == a.clone() && a.hash() == a.hash() && !(a < a) && Shape.Dot == Shape.Rect(1, 2); }",
+];
+
+const DUP: [4]string = [
+    "module dup;",
+    "#[derive(Eq)]",
+    "struct K { n: int; fn operator==(this: K, o: K): bool { return true; } }",
+    "fn main() { }",
+];
+
+/// Write `text` as `NAME.j3` in a temp dir (outside this package, whose project would otherwise load).
+fn put(name: string, lines: []string, mem: &Arena): string {
+    let text = Text.new(mem);
+    for i in 0..lines.len { text.add(lines[i]).add("\n"); }
+    let d = Text.new(mem).add(io.tempRoot()).add("/j3c-boot-sema-derive").str();
+    match io.makeDirs(d) { Result.Ok(_) {} Result.Err(_) { panic("cannot make the case dir"); } }
+    let p = Text.new(mem).add(d).add("/").add(name).add(".j3").str();
+    match io.writeFile(p, text.str() as []u8) { Result.Ok(_) {} Result.Err(_) { panic("cannot write a case"); } }
+    return p;
+}
+
+/// The names of struct `name`'s methods, joined with spaces.
+fn methods(t: &Tables, name: string): string {
+    let out = Text.new(t.arena);
+    for i in 0..t.structs.len() {
+        let sd = t.structs.get(t.structs.idAt(i));
+        if t.str(sd.name) != name { continue; }
+        for k in 0..sd.methods.len {
+            if k > 0 { out.add(" "); }
+            out.add(t.str(t.fnAt(sd.methods.items[k]).name));
+        }
+    }
+    return out.str();
+}
+
+/// How many fns of module `ders` are named `name`; `bounds`: the bound count of the last one's first
+/// type parameter (-1: not generic).
+fn countFns(t: &Tables, name: string, bounds: &int): int {
+    let n = 0;
+    for i in 0..t.fns.len() {
+        let d = t.fns.get(t.fns.idAt(i));
+        if t.str(d.name) != name || t.modAt(d.owner).key != "ders" { continue; }
+        n += 1;
+        *bounds = -1;
+        match d.gen {
+            Option.Some(g) {
+                let gd = t.genericsAt(g);
+                if gd.bounds.len > 0 { *bounds = gd.bounds.items[0].len; }
+            }
+            Option.None {}
+        }
+    }
+    return n;
+}
+
+fn main() {
+    let mem = Arena.create(1 << 12);
+    let o = driver.defaults();
+    o.entry = put("ders", SRC, &mem);
+    let s = Session.new(o);
+    if !driver.run(s, Stage.Sema) { panic("sema fails on the derive program"); }
+    let c = match s.checked { Option.Some(x) { x } Option.None { panic("no checked program"); return; } };
+    let t = c.tables;
+
+    // struct: own methods, then one per derive in the order written
+    if methods(t, "Key") != "own hash operator== operator< clone" { panic(`Key methods: {methods(t, "Key")}`); }
+    if methods(t, "Pair") != "operator==" { panic("Pair methods"); }
+
+    let b = 0;
+    // payload enum: `#[impl]` fns, renamed `name<implN>` in item order (after the module's own items)
+    if countFns(t, "operator==<impl0>", &b) != 1 || countFns(t, "hash<impl1>", &b) != 1 { panic("Shape: operator==<impl0>, hash<impl1>"); }
+    // C-like enum: `==` is native, only `hash`
+    if countFns(t, "hash<impl2>", &b) != 1 || countFns(t, "operator==<impl2>", &b) != 0 { panic("Flag: hash<impl2> only"); }
+    // generic struct (after `Key`'s): `where A: Eq` (A is in a field)
+    if countFns(t, "operator==", &b) != 2 || b != 1 { panic("Pair.operator==: A is bound by Eq"); }
+    // generic enum: templates `Opt.method`, `T: Eq` on `==`, no bound on `clone`
+    if countFns(t, "Opt.operator==", &b) != 1 || b != 1 { panic("Opt.operator==<T: Eq>"); }
+    if countFns(t, "Opt.clone", &b) != 1 || b != 0 { panic("Opt.clone<T>"); }
+
+    let o2 = driver.defaults();
+    o2.entry = put("dup", DUP, &mem);
+    let s2 = Session.new(o2);
+    if driver.run(s2, Stage.Sema) { panic("dup: sema should fail"); }
+    if s2.diags.count() == 0 || s2.diags.at(0).msg != "`K` derives `Eq` and also defines `operator==`" { panic("dup: error text"); }
+}

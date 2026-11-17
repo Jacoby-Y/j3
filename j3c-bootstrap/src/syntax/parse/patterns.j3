@@ -3,4 +3,319 @@
 //
 // Part of module j3c.syntax.parse.
 // Port of: j3c/src/parse/parser/stmt.rs (match arms), parse/parser/value.rs
+// J3: Rust's `Ok(v) if cond` arms on a backtracking attempt are a `match` then an `if`. A `Pat` is added
+// with Rust's `Pat::span()` (a `Range` spans `lo` start to `hi` end). Uses come from `parse.j3`.
 module j3c.syntax.parse;
+
+extend Parser {
+    /// `match x { arms }`.
+    fn matchStmt(this: &Parser): Result<MatchStmt, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.Match, "expected `match`")?;
+        let e = this.expr()?;
+        this.expect(TokenKind.LBrace, "expected `{` after match")?;
+        let arms = List<MatchArm>.new(this.ast.arena);
+        while !this.at(TokenKind.RBrace) && !this.at(TokenKind.Eof) { arms.push(this.matchArm()?); }
+        this.expect(TokenKind.RBrace, "expected `}` after match")?;
+        return Result.Ok(MatchStmt { span: this.since(start), expr: e, arms: arms });
+    }
+
+    /// `pat | pat if guard { body }`.
+    fn matchArm(this: &Parser): Result<MatchArm, ParseError> {
+        let start = this.cur().span;
+        let pats = this.orPats()?;
+        let guard: Option<Id<Expr>> = Option.None;
+        if this.eat(TokenKind.If) { guard = Option.Some(this.expr()?); }
+        let (body, tail) = this.armBlock()?;
+        return Result.Ok(MatchArm { span: join(start, body.span), pats: pats, guard: guard, body: body, tail: tail });
+    }
+
+    /// `A | B(x)`: an arm's alternatives.
+    fn orPats(this: &Parser): Result<List<Id<Pat>>, ParseError> {
+        let pats = List<Id<Pat>>.new(this.ast.arena);
+        pats.push(this.pat(true)?);
+        while this.eat(TokenKind.Pipe) { pats.push(this.pat(true)?); }
+        return Result.Ok(pats);
+    }
+
+    /// One pattern. `top`: an arm's own pattern, where a single name is an enum path or an int `const`
+    /// (resolved by the checker), never a binding.
+    fn pat(this: &Parser, top: bool): Result<Id<Pat>, ParseError> {
+        let start = this.cur().span;
+        let c = this.cur();
+        if c.kind == TokenKind.Ident && c.text == "_" {
+            this.bump();
+            return Result.Ok(this.ast.addPat(Pat.Wild, start));
+        }
+        if c.kind == TokenKind.LParen {
+            this.bump();
+            let elems = List<Id<Pat>>.new(this.ast.arena);
+            elems.push(this.pat(false)?);
+            while this.at(TokenKind.Comma) && this.look(1).kind != TokenKind.RParen {
+                this.bump();
+                elems.push(this.pat(false)?);
+            }
+            this.eat(TokenKind.Comma);
+            if elems.len < 2 { return Result.Err(this.errAt(start, "a tuple pattern has two or more elements")); }
+            this.expect(TokenKind.RParen, "expected `,` or `)` in a tuple pattern")?;
+            let span = this.since(start);
+            return Result.Ok(this.ast.addPat(Pat.Tuple(TuplePat { span: span, elems: elems }), span));
+        }
+        if c.kind == TokenKind.Ident && (c.text == "true" || c.text == "false") {
+            this.bump();
+            let e = this.ast.addExpr(Expr.Bool(c.text == "true"), start);
+            return Result.Ok(this.ast.addPat(Pat.Lit(LitPat { expr: e }), start));
+        }
+        if c.kind == TokenKind.String {
+            this.bump();
+            let e = this.ast.addExpr(Expr.String(own(this.ast.arena, c.text)), c.span);
+            return Result.Ok(this.ast.addPat(Pat.Lit(LitPat { expr: e }), c.span));
+        }
+        if atPatLit(c.kind) {
+            let lit = this.patLit()?;
+            return this.patLitOrRange(lit);
+        }
+        let path = this.path()?;
+        let span = this.since(start);
+        if !this.at(TokenKind.DotDotEq) { return this.patPath(start, path, top); }
+        return this.patLitOrRange(pathExpr(this.ast, path, span));
+    }
+
+    /// After a pattern's first literal or `const` path `loE`: `loE` alone, or `loE..=hi`.
+    fn patLitOrRange(this: &Parser, loE: Id<Expr>): Result<Id<Pat>, ParseError> {
+        let lo = this.ast.exprSpan(loE);
+        if !this.at(TokenKind.DotDotEq) {
+            if this.at(TokenKind.DotDot) { return Result.Err(this.err("a range pattern includes its end: write `..=`")); }
+            return Result.Ok(this.ast.addPat(Pat.Lit(LitPat { expr: loE }), lo));
+        }
+        this.bump();
+        let hiE = loE;
+        if atPatLit(this.cur().kind) {
+            hiE = this.patLit()?;
+        } else {
+            let s = this.cur().span;
+            let path = this.path()?;
+            hiE = pathExpr(this.ast, path, this.since(s));
+        }
+        let span = Span { file: lo.file, lo: lo.lo, hi: this.ast.exprSpan(hiE).hi };
+        return Result.Ok(this.ast.addPat(Pat.Range(RangePat { lo: loE, hi: hiE }), span));
+    }
+
+    /// After a pattern's path (not before `..=`): a struct pattern, a binding, or a variant.
+    fn patPath(this: &Parser, start: Span, path: List<Ident>, top: bool): Result<Id<Pat>, ParseError> {
+        if this.at(TokenKind.LBrace) && (!top || this.structPatAhead()) { return this.structPat(start, path); }
+        if path.len == 1 && !top && !this.at(TokenKind.LParen) {
+            return Result.Ok(this.ast.addPat(Pat.Bind(path.items[0]), path.items[0].span));
+        }
+        let payload = List<Id<Pat>>.new(this.ast.arena);
+        if this.eat(TokenKind.LParen) {
+            while true {
+                payload.push(this.pat(false)?);
+                if !this.at(TokenKind.Comma) || this.look(1).kind == TokenKind.RParen { break; }
+                this.bump();
+            }
+            this.eat(TokenKind.Comma);
+            this.expect(TokenKind.RParen, "expected `,` or `)` in a pattern")?;
+        }
+        let span = this.since(start);
+        return Result.Ok(this.ast.addPat(Pat.Variant(VariantPat { span: span, path: path, payload: payload }), span));
+    }
+
+    /// At an arm's `Path {`: is the `{ .. }` a struct pattern? Yes when what follows its `}` can only
+    /// follow a pattern (`{` of the body, `|`, `if`), not start the next arm.
+    fn structPatAhead(this: &Parser): bool {
+        let depth = 0;
+        let n = 0;
+        while true {
+            let k = this.look(n).kind;
+            if k == TokenKind.LBrace { depth += 1; }
+            else if k == TokenKind.RBrace {
+                depth -= 1;
+                if depth == 0 {
+                    let after = this.look(n + 1).kind;
+                    return after == TokenKind.LBrace || after == TokenKind.Pipe || after == TokenKind.If;
+                }
+            } else if k == TokenKind.Eof { return false; }
+            n += 1;
+        }
+        return false;
+    }
+
+    /// `Path { a, b: pat, .. }`, at the `{`.
+    fn structPat(this: &Parser, start: Span, path: List<Ident>): Result<Id<Pat>, ParseError> {
+        this.expect(TokenKind.LBrace, "expected `{`")?;
+        let fields = List<PatField>.new(this.ast.arena);
+        let rest = false;
+        while !this.at(TokenKind.RBrace) {
+            if this.eat(TokenKind.DotDot) {
+                rest = true;
+                break;
+            }
+            let name = this.ident()?;
+            let p = if this.eat(TokenKind.Colon) { this.pat(false)? } else { this.ast.addPat(Pat.Bind(name), name.span) };
+            fields.push(PatField { name: name, pat: p });
+            if !this.eat(TokenKind.Comma) { break; }
+        }
+        let msg = "expected `,` or `}` in a struct pattern";
+        if rest { msg = "`..` ends a struct pattern: expected `}`"; }
+        this.expect(TokenKind.RBrace, msg)?;
+        let span = this.since(start);
+        return Result.Ok(this.ast.addPat(Pat.Struct(StructPat { span: span, path: path, fields: fields, rest: rest }), span));
+    }
+
+    /// `3`, `-1`, `'a'` in a pattern.
+    fn patLit(this: &Parser): Result<Id<Expr>, ParseError> {
+        let start = this.cur().span;
+        let neg = this.eat(TokenKind.Minus);
+        let lit = this.cur();
+        let v = Expr.Int(0);
+        if lit.kind == TokenKind.Int {
+            match parseInt(lit.text, this.ast.arena) {
+                Result.Ok(x) { v = x; }
+                Result.Err(m) { return Result.Err(this.errAt(lit.span, m)); }
+            }
+        } else if lit.kind == TokenKind.Char && !neg {
+            v = Expr.Char(charCode(lit.text));
+        } else {
+            return Result.Err(this.err("expected an integer or char pattern"));
+        }
+        this.bump();
+        let span = join(start, lit.span);
+        let e = this.ast.addExpr(v, span);
+        if neg { e = this.ast.addExpr(Expr.Unary(UnaryExpr { op: UnaryOp.Neg, expr: e }), span); }
+        return Result.Ok(e);
+    }
+
+    /// `{ stmts tail }`: statements, then an optional expression with no `;` (the arm's value). A
+    /// `match` or `if let` at the end is the value; elsewhere it is a statement (Rust `value.rs`).
+    fn armBlock(this: &Parser): Result<(Block, Option<Id<Expr>>), ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.LBrace, "expected `{`")?;
+        let stmts = List<Id<Stmt>>.new(this.ast.arena);
+        let tail: Option<Id<Expr>> = Option.None;
+        while !this.at(TokenKind.RBrace) && !this.at(TokenKind.Eof) {
+            let at = this.i;
+            let k = this.cur().kind;
+            if k == TokenKind.Match || (k == TokenKind.If && this.look(1).kind == TokenKind.Let) {
+                let ms = if k == TokenKind.Match { this.matchStmt()? } else { this.ifLet()?.0 };
+                if this.at(TokenKind.RBrace) { tail = Option.Some(this.ast.addExpr(Expr.Match(ms), ms.span)); }
+                else { stmts.push(this.ast.addStmt(Stmt.Match(ms), ms.span)); }
+            } else if k == TokenKind.If {
+                // an `if` statement, else an if-expression as the value
+                match this.stmt() {
+                    Result.Ok(s) { stmts.push(s); }
+                    Result.Err(e) {
+                        let end = this.i;
+                        this.i = at;
+                        let ok = false;
+                        match this.ifExpr() {
+                            Result.Ok(v) { if this.at(TokenKind.RBrace) { tail = Option.Some(v); ok = true; } }
+                            Result.Err(_) {}
+                        }
+                        if !ok {
+                            this.i = end;
+                            return Result.Err(e);
+                        }
+                    }
+                }
+            } else if stmtStart(k) {
+                stmts.push(this.stmt()?);
+            } else {
+                let ok = false;
+                match this.expr() {
+                    Result.Ok(v) { if this.at(TokenKind.RBrace) { tail = Option.Some(v); ok = true; } }
+                    Result.Err(_) {}
+                }
+                if !ok {
+                    this.i = at;
+                    stmts.push(this.stmt()?);
+                }
+            }
+        }
+        this.expect(TokenKind.RBrace, "expected `}`")?;
+        return Result.Ok((Block { span: this.since(start), stmts: stmts }, tail));
+    }
+
+    /// `if let P = e { .. } else ..` as `match e { P { .. } _ { .. } }`; true when an `else` was written
+    /// (an if-expression needs one).
+    fn ifLet(this: &Parser): Result<(MatchStmt, bool), ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.If, "expected `if`")?;
+        this.expect(TokenKind.Let, "expected `let`")?;
+        let pats = this.orPats()?;
+        this.expect(TokenKind.Eq, "expected `=` after an `if let` pattern")?;
+        let e = this.expr()?;
+        let (body, tail) = this.armBlock()?;
+        let noGuard: Option<Id<Expr>> = Option.None;
+        let thenArm = MatchArm { span: join(start, body.span), pats: pats, guard: noGuard, body: body, tail: tail };
+        let hasElse = this.at(TokenKind.Else);
+        let elseStart = this.cur().span;
+        let elseBody = Block { span: elseStart, stmts: List<Id<Stmt>>.new(this.ast.arena) };
+        let elseTail: Option<Id<Expr>> = Option.None;
+        if hasElse {
+            this.bump();
+            let (b, t) = if this.at(TokenKind.If) { this.elseIf()? } else { this.armBlock()? };
+            elseBody = b;
+            elseTail = t;
+        }
+        let wild = List<Id<Pat>>.new(this.ast.arena);
+        wild.push(this.ast.addPat(Pat.Wild, elseStart));
+        let elseArm = MatchArm { span: join(elseStart, elseBody.span), pats: wild, guard: noGuard, body: elseBody, tail: elseTail };
+        let arms = List<MatchArm>.new(this.ast.arena);
+        arms.push(thenArm);
+        arms.push(elseArm);
+        return Result.Ok((MatchStmt { span: this.since(start), expr: e, arms: arms }, hasElse));
+    }
+
+    /// The `if ..` after an `if let`'s `else`: another `if let` (the arm's value), an `if` statement,
+    /// else an if-expression (the value).
+    fn elseIf(this: &Parser): Result<(Block, Option<Id<Expr>>), ParseError> {
+        let start = this.cur().span;
+        let empty = List<Id<Stmt>>.new(this.ast.arena);
+        if this.look(1).kind == TokenKind.Let {
+            let (m, _) = this.ifLet()?;
+            return Result.Ok((Block { span: m.span, stmts: empty }, Option.Some(this.ast.addExpr(Expr.Match(m), m.span))));
+        }
+        let at = this.i;
+        match this.ifStmt() {
+            Result.Ok(s) {
+                empty.push(this.ast.addStmt(Stmt.If(s), s.span));
+                let none: Option<Id<Expr>> = Option.None;
+                return Result.Ok((Block { span: s.span, stmts: empty }, none));
+            }
+            Result.Err(e) {
+                let end = this.i;
+                this.i = at;
+                match this.ifExpr() {
+                    Result.Ok(v) { return Result.Ok((Block { span: start, stmts: empty }, Option.Some(v))); }
+                    Result.Err(_) {
+                        this.i = end;
+                        return Result.Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// An `if` statement or an `if let` (a `Stmt.Match`).
+    fn ifAnyStmt(this: &Parser): Result<Id<Stmt>, ParseError> {
+        if this.look(1).kind == TokenKind.Let {
+            let (m, _) = this.ifLet()?;
+            return Result.Ok(this.ast.addStmt(Stmt.Match(m), m.span));
+        }
+        let s = this.ifStmt()?;
+        return Result.Ok(this.ast.addStmt(Stmt.If(s), s.span));
+    }
+}
+
+/// A pattern literal starts here: an int, `-`, or a char.
+fn atPatLit(k: TokenKind): bool { return k == TokenKind.Int || k == TokenKind.Minus || k == TokenKind.Char; }
+
+/// Tokens that always start a statement inside an arm body (never the arm's value).
+fn stmtStart(k: TokenKind): bool {
+    match k {
+        TokenKind.Let | TokenKind.Return | TokenKind.While | TokenKind.For | TokenKind.Use | TokenKind.Defer
+            | TokenKind.Label | TokenKind.Break | TokenKind.Continue | TokenKind.LBrace | TokenKind.Doc { return true; }
+        _ { return false; }
+    }
+}

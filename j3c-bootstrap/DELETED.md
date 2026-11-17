@@ -5,7 +5,6 @@ glob (`*` also crosses `/`). Every other Rust file is named on a `Port of:` line
 
 - scenefile.rs: scenes are read and written only through `j3.scene3d` (repo rule).
 - lsp/json.rs: replaced by `j3.data.json`.
-- ir/build.rs: hand-built IR from before the parser existed; tests are J3 source.
 - ir/samples.rs: hand-built IR samples; tests are J3 source.
 - ir/samples/*: the sample bodies (same reason).
 - stdlib/files.rs: the hand-kept stdlib file list; replaced by `@embedDir`.

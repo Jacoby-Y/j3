@@ -1,5 +1,349 @@
 // Items: `module`, `use`, `use lib`, `fn`, `struct`, `enum`, `const`, `let` globals, `extend`.
+// `extend` is a contextual word (an identifier followed by an identifier at item start), so a variable
+// called `extend` still parses; `syntax/extend.merge` folds the blocks into their structs.
 //
 // Part of module j3c.syntax.parse.
 // Port of: j3c/src/parse/parser/items.rs, parse/parser/extend.rs
+// J3: Rust's `match self.cur().kind` with guards is an if-chain in the same order. `use lib` names and
+// symbols are arena copies of the token text. Uses come from `parse.j3`.
 module j3c.syntax.parse;
+
+/// A derived `hash` or `<` calls the `#[impl]` fns of `j3.cmp` on `int`, `string` and the other
+/// primitives, so a module that derives them loads `j3.cmp`: `use j3.cmp.{}` names nothing, so it cannot
+/// clash with the module's own imports (Rust `derive_use`).
+fn deriveUse(ast: &Ast, moduleName: &List<Ident>, items: &List<Item>) {
+    for i in 0..items.len {
+        let ds = List<Ident>.new(ast.arena);
+        match items.items[i] {
+            Item.Struct(s) { ds = s.derives; }
+            Item.Enum(e) { ds = e.derives; }
+            _ {}
+        }
+        for j in 0..ds.len {
+            let n = ast.str(ds.items[j].name);
+            if n == "Hash" || n == "Ord" {
+                if moduleName.len == 2 && ast.str(moduleName.items[0].name) == "j3" && ast.str(moduleName.items[1].name) == "cmp" { return; }
+                let span = ds.items[0].span;
+                let path = List<Ident>.new(ast.arena);
+                path.push(identAt(ast, "j3", span));
+                path.push(identAt(ast, "cmp", span));
+                items.push(Item.Use(UseItem { span: span, path: path, names: Option.Some(List<Ident>.new(ast.arena)) }));
+                return;
+            }
+        }
+    }
+}
+
+extend Parser {
+    /// The whole file: doc, `module` line (or `scriptModule`), items.
+    fn file(this: &Parser): Result<File, ParseError> {
+        let start = this.cur().span;
+        let doc = this.takeDoc();
+        let moduleName = List<Ident>.new(this.ast.arena);
+        let isScript = false;
+        match this.scriptModule {
+            Option.Some(parts) {
+                isScript = true;
+                if this.at(TokenKind.Module) { return Result.Err(this.err("scripts can't have a `module` line; the path names it")); }
+                for i in 0..parts.len { moduleName.push(Ident { name: parts.items[i], span: start }); }
+            }
+            Option.None {
+                this.expect(TokenKind.Module, "expected `module`: a file starts with `module <name>;` (its file name, e.g. `module main;`)")?;
+                moduleName = this.path()?;
+                this.expect(TokenKind.Semi, "expected `;` after module path")?;
+            }
+        }
+        let items = List<Item>.new(this.ast.arena);
+        while !this.at(TokenKind.Eof) { items.push(this.item()?); }
+        deriveUse(this.ast, &moduleName, &items);
+        let span = this.since(start);
+        let dyns = this.dyns;
+        this.dyns = List<Sym>.new(this.ast.arena);
+        return Result.Ok(File { span: span, doc: doc, moduleName: moduleName, isScript: isScript, items: items,
+            embeds: List<EmbedRead>.new(this.ast.arena), dyns: dyns });
+    }
+
+    /// One top-level item, with its doc and attributes.
+    fn item(this: &Parser): Result<Item, ParseError> {
+        match this.scriptModule {
+            Option.Some(_) { return this.scriptItem(); }
+            Option.None {}
+        }
+        let doc = this.takeDoc();
+        let attrs = this.attrs()?;
+        let visPub = this.eat(TokenKind.Pub);
+        this.gpuAttrSite(&attrs)?;
+        let k = this.cur().kind;
+        if k == TokenKind.Use {
+            this.forbidDoc(doc)?;
+            this.forbidAttrs(&attrs, "use")?;
+            if this.look(1).kind == TokenKind.Lib {
+                if visPub { return Result.Err(this.err("`pub use lib` is not valid")); }
+                return Result.Ok(Item.UseLib(this.useLibItem()?));
+            }
+            if visPub { return Result.Err(this.err("`pub use` is not valid")); }
+            return Result.Ok(Item.Use(this.useItem()?));
+        }
+        if k == TokenKind.Const {
+            this.forbidAttrs(&attrs, "const")?;
+            return Result.Ok(Item.Const(this.constItem(visPub, doc)?));
+        }
+        if k == TokenKind.Fn {
+            this.forbidAttrs(&attrs, "fn")?;
+            let f = this.fnItem(visPub, doc)?;
+            f.isImpl = attrs.implFn;
+            f.shader = attrs.shader;
+            return Result.Ok(Item.Fn(f));
+        }
+        if k == TokenKind.Ident && this.atTraitItem() {
+            this.forbidAttrs(&attrs, "trait")?;
+            return Result.Ok(Item.Trait(this.traitItem(visPub, doc)?));
+        }
+        if k == TokenKind.Ident && this.atExtendItem() {
+            this.forbidAttrs(&attrs, "extend")?;
+            // A doc before `extend` is a part file's header (`ui/dom/*.j3` style); it documents nothing, so drop it.
+            if visPub { return Result.Err(this.err("`pub extend` is not valid; the methods are public like in a struct body")); }
+            return Result.Ok(Item.Extend(this.extendItem()?));
+        }
+        if k == TokenKind.At {
+            this.forbidAttrs(&attrs, "@j3ui")?;
+            return Result.Ok(Item.Fn(this.j3uiItem(visPub, doc)?));
+        }
+        if k == TokenKind.Struct {
+            if attrs.implFn { return Result.Err(this.err("`#[impl]` cannot sit on `struct`; it marks a free fn")); }
+            if isSet(attrs.tryCatch) { return Result.Err(this.err("`#[TryCatch]` cannot sit on `struct`")); }
+            let s = this.structItem(visPub, attrs.debug, doc)?;
+            s.derives = attrs.derives;
+            s.gpu = attrs.gpuStruct;
+            if attrs.gpuStruct == GpuStruct.None && isSet(attrs.shader) { s.gpu = GpuStruct.Plain; }
+            return Result.Ok(Item.Struct(s));
+        }
+        if k == TokenKind.Enum {
+            if attrs.implFn { return Result.Err(this.err("`#[impl]` cannot sit on `enum`; it marks a free fn")); }
+            return Result.Ok(Item.Enum(this.enumItem(visPub, attrs, doc)?));
+        }
+        if k == TokenKind.Let {
+            if attrs.uniform {
+                let l = this.modLetItem(doc, false)?;
+                if isSet(l.value) { return Result.Err(this.errAt(l.name.span, "a `#[uniform]` has no initializer; the CPU sets it by name")); }
+                l.uniform = true;
+                return Result.Ok(Item.Let(l));
+            }
+            if !attrs.singleton { return Result.Err(this.err("module `let` needs `#[singleton]`")); }
+            if attrs.debug || isSet(attrs.tryCatch) || attrs.implFn || attrs.derives.len > 0 {
+                return Result.Err(this.err("`#[singleton]` cannot mix with `#[Debug]` / `#[TryCatch]` / `#[impl]`"));
+            }
+            if visPub { return Result.Err(this.err("`pub` on singleton `let` is not used")); }
+            return Result.Ok(Item.Let(this.modLetItem(doc, attrs.thread)?));
+        }
+        this.forbidDoc(doc)?;
+        if k == TokenKind.If || k == TokenKind.While || k == TokenKind.For {
+            return Result.Err(this.err("control items cannot appear at module scope"));
+        }
+        return Result.Err(this.err("expected `use`, `const`, `fn`, `struct`, or `let`"));
+    }
+
+    /// `let name: T = v;` at module scope (`#[singleton]`, `#[uniform]`).
+    fn modLetItem(this: &Parser, doc: string, thread: bool): Result<ModLetItem, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.Let, "expected `let`")?;
+        let name = this.ident()?;
+        this.expect(TokenKind.Colon, "expected `:` after singleton name")?;
+        let ty = this.ty()?;
+        let value: Option<Id<Expr>> = Option.None;
+        if this.eat(TokenKind.Eq) { value = Option.Some(this.expr()?); }
+        this.expect(TokenKind.Semi, "expected `;` after singleton `let`")?;
+        return Result.Ok(ModLetItem { span: this.since(start), doc: doc, name: name, ty: ty, value: value, thread: thread, uniform: false });
+    }
+
+    /// `use lib "name" as alias { fn .. }`.
+    fn useLibItem(this: &Parser): Result<UseLibItem, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.Use, "expected `use`")?;
+        this.expect(TokenKind.Lib, "expected `lib`")?;
+        let libTok = this.cur();
+        if libTok.kind != TokenKind.String { return Result.Err(this.err("expected library name string")); }
+        this.bump();
+        this.expect(TokenKind.As, "expected `as` after `use lib`")?;
+        let alias = this.ident()?;
+        this.expect(TokenKind.LBrace, "expected `{` after `use lib` alias")?;
+        let decls = List<LibFnDecl>.new(this.ast.arena);
+        while !this.at(TokenKind.RBrace) && !this.at(TokenKind.Eof) { decls.push(this.libFnDecl()?); }
+        this.expect(TokenKind.RBrace, "expected `}` after `use lib`")?;
+        return Result.Ok(UseLibItem { span: this.since(start), libName: own(this.ast.arena, libTok.text), alias: alias, decls: decls });
+    }
+
+    /// `fn name(params): R = "symbol";` inside `use lib`.
+    fn libFnDecl(this: &Parser): Result<LibFnDecl, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.Fn, "expected `fn` in `use lib`")?;
+        let name = this.ident()?;
+        let params = this.paramList()?;
+        let ret: Option<Id<Type>> = Option.None;
+        if this.eat(TokenKind.Colon) { ret = Option.Some(this.ty()?); }
+        let symbol: Option<string> = Option.None;
+        if this.eat(TokenKind.Eq) {
+            let tok = this.cur();
+            if tok.kind != TokenKind.String { return Result.Err(this.err("expected symbol string after `=`")); }
+            this.bump();
+            symbol = Option.Some(own(this.ast.arena, tok.text));
+        }
+        this.expect(TokenKind.Semi, "expected `;` after lib fn")?;
+        return Result.Ok(LibFnDecl { span: this.since(start), name: name, params: params, ret: ret, symbol: symbol });
+    }
+
+    /// `struct Name<T> { fields; fn methods }` or `struct Name;`.
+    fn structItem(this: &Parser, visPub: bool, debug: bool, doc: string): Result<StructItem, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.Struct, "expected `struct`")?;
+        let name = this.ident()?;
+        let (typeParams, bounds) = this.typeParams()?;
+        let fields = List<FieldItem>.new(this.ast.arena);
+        let methods = List<FnItem>.new(this.ast.arena);
+        if !this.eat(TokenKind.Semi) {
+            this.expect(TokenKind.LBrace, "expected `{` after struct name")?;
+            while !this.at(TokenKind.RBrace) && !this.at(TokenKind.Eof) {
+                let fdoc = this.takeDoc();
+                if this.at(TokenKind.RBrace) || this.at(TokenKind.Eof) {
+                    this.forbidDoc(fdoc)?;
+                    break;
+                }
+                if this.at(TokenKind.Fn) {
+                    methods.push(this.fnItem(false, fdoc)?);
+                    continue;
+                }
+                let flat = this.fieldAttrs()?;
+                let embedded = this.eat(TokenKind.Use);
+                let fname = this.ident()?;
+                this.expect(TokenKind.Colon, "expected `:` after field name")?;
+                let fty = this.ty()?;
+                let dflt: Option<Id<Expr>> = Option.None;
+                let endSpan = this.ast.typeSpan(fty);
+                if this.eat(TokenKind.Eq) {
+                    let e = this.expr()?;
+                    dflt = Option.Some(e);
+                    endSpan = this.ast.exprSpan(e);
+                }
+                this.expect(TokenKind.Semi, "expected `;` after field")?;
+                fields.push(FieldItem { span: join(fname.span, endSpan), doc: fdoc, name: fname, ty: fty, embedded: embedded, flat: flat, default: dflt });
+            }
+            this.expect(TokenKind.RBrace, "expected `}` after struct")?;
+        }
+        return Result.Ok(StructItem { span: this.since(start), doc: doc, visPub: visPub, debug: debug, packed: false, gpu: GpuStruct.None,
+            derives: List<Ident>.new(this.ast.arena), name: name, typeParams: typeParams, bounds: bounds, fields: fields, methods: methods });
+    }
+
+    /// `enum Name<T> { A, B(T, int) }`.
+    fn enumItem(this: &Parser, visPub: bool, attrs: ItemAttrs, doc: string): Result<EnumItem, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.Enum, "expected `enum`")?;
+        let name = this.ident()?;
+        let (typeParams, bounds) = this.typeParams()?;
+        this.expect(TokenKind.LBrace, "expected `{` after enum name")?;
+        let variants = List<VariantItem>.new(this.ast.arena);
+        while !this.at(TokenKind.RBrace) && !this.at(TokenKind.Eof) {
+            let vdoc = this.takeDoc();
+            if this.at(TokenKind.RBrace) || this.at(TokenKind.Eof) {
+                this.forbidDoc(vdoc)?;
+                break;
+            }
+            let vname = this.ident()?;
+            let fields = List<Id<Type>>.new(this.ast.arena);
+            if this.eat(TokenKind.LParen) {
+                while true {
+                    fields.push(this.ty()?);
+                    if !this.at(TokenKind.Comma) || this.look(1).kind == TokenKind.RParen { break; }
+                    this.bump();
+                }
+                this.eat(TokenKind.Comma);
+                this.expect(TokenKind.RParen, "expected `,` or `)` after a variant field")?;
+            }
+            variants.push(VariantItem { span: vname.span, doc: vdoc, name: vname, fields: fields });
+            if !this.eat(TokenKind.Comma) { break; }
+        }
+        this.expect(TokenKind.RBrace, "expected `}` after enum")?;
+        return Result.Ok(EnumItem { span: this.since(start), doc: doc, visPub: visPub, debug: attrs.debug, tryCatch: attrs.tryCatch,
+            derives: attrs.derives, name: name, typeParams: typeParams, bounds: bounds, variants: variants });
+    }
+
+    /// `use a.b;` or `use a.b.{ C, D };`.
+    fn useItem(this: &Parser): Result<UseItem, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.Use, "expected `use`")?;
+        let path = this.path()?;
+        let names: Option<List<Ident>> = Option.None;
+        if this.at(TokenKind.Dot) && this.look(1).kind == TokenKind.LBrace {
+            this.bump();
+            this.bump();
+            let list = List<Ident>.new(this.ast.arena);
+            while true {
+                list.push(this.ident()?);
+                if this.eat(TokenKind.Comma) {
+                    if this.at(TokenKind.RBrace) { break; }
+                    continue;
+                }
+                break;
+            }
+            this.expect(TokenKind.RBrace, "expected `}` in use list")?;
+            names = Option.Some(list);
+        }
+        this.expect(TokenKind.Semi, "expected `;` after use")?;
+        if !isSet(names) && path.len == 0 { return Result.Err(this.errAt(start, "empty use path")); }
+        return Result.Ok(UseItem { span: this.since(start), path: path, names: names });
+    }
+
+    /// `const NAME: T = v;`.
+    fn constItem(this: &Parser, visPub: bool, doc: string): Result<ConstItem, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.Const, "expected `const`")?;
+        let name = this.ident()?;
+        let ty: Option<Id<Type>> = Option.None;
+        if this.eat(TokenKind.Colon) { ty = Option.Some(this.ty()?); }
+        this.expect(TokenKind.Eq, "expected `=` in const")?;
+        let value = this.expr()?;
+        this.expect(TokenKind.Semi, "expected `;` after const")?;
+        return Result.Ok(ConstItem { span: this.since(start), doc: doc, visPub: visPub, name: name, ty: ty, value: value });
+    }
+
+    /// `fn name<T>(params): R where .. { body }`.
+    fn fnItem(this: &Parser, visPub: bool, doc: string): Result<FnItem, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.Fn, "expected `fn`")?;
+        let name = this.fnName()?;
+        let (typeParams, bounds) = this.typeParams()?;
+        let params = this.paramList()?;
+        let ret: Option<Id<Type>> = Option.None;
+        if this.eat(TokenKind.Colon) { ret = Option.Some(this.ty()?); }
+        let whereBounds = this.whereClause()?;
+        let body = this.block()?;
+        let none: Option<GpuStage> = Option.None;
+        return Result.Ok(FnItem { span: join(start, body.span), doc: doc, visPub: visPub, name: name, typeParams: typeParams, bounds: bounds,
+            whereBounds: whereBounds, derived: false, isImpl: false, shader: none, params: params, ret: ret, body: body });
+    }
+
+    /// At `extend Name` (contextual `ITEM_EXTEND`).
+    fn atExtendItem(this: &Parser): bool {
+        return this.at(TokenKind.Ident) && this.cur().text == ITEM_EXTEND && this.look(1).kind == TokenKind.Ident;
+    }
+
+    /// `extend Name<T> { fn .. }`.
+    fn extendItem(this: &Parser): Result<ExtendItem, ParseError> {
+        let start = this.cur().span;
+        this.bump();
+        let name = this.ident()?;
+        let (typeParams, bounds) = this.typeParams()?;
+        for i in 0..bounds.len {
+            if bounds.items[i].len > 0 { return Result.Err(this.err("bounds go on the struct, not on `extend`")); }
+        }
+        this.expect(TokenKind.LBrace, "expected `{` after the type in `extend`")?;
+        let methods = List<FnItem>.new(this.ast.arena);
+        while !this.at(TokenKind.RBrace) && !this.at(TokenKind.Eof) {
+            let doc = this.takeDoc();
+            if this.at(TokenKind.Pub) { return Result.Err(this.err("methods are public already; drop `pub`")); }
+            if !this.at(TokenKind.Fn) { return Result.Err(this.err("expected `fn` in an `extend` body")); }
+            methods.push(this.fnItem(false, doc)?);
+        }
+        this.expect(TokenKind.RBrace, "expected `}` after `extend` body")?;
+        return Result.Ok(ExtendItem { span: this.since(start), name: name, typeParams: typeParams, methods: methods });
+    }
+}

@@ -1,4 +1,237 @@
 // Build phases: the two-line live status on stderr and the timing breakdown (`J3C_TIMINGS=1`).
 //
 // Port of: j3c/src/phase.rs
+// J3: Rust keeps one global state; here it is `Phases`, one per `Session` (B6: nothing global that grows).
+// Same calls as Rust (`enable`, `begin`, `detail`, `step`, `note`, `report`); `step` also times IR passes
+// for `--time-passes` (B8, new: Rust has no such flag, so its output is `report`'s format). Times are
+// milliseconds from `j3.sys.monotonicMs`. Not ported yet: `target` (multi-target builds), `set_tag`
+// (threads) and `run_ticking` (the toolchain stage owns child processes); add each with its caller.
 module j3c.base.phase;
+
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.sys.monotonicMs;
+use j3.term.tty;
+use j3.text.{ Text, f64Bits, runes, trim };
+use j3c.base.intern.own;
+
+/// The outer phases of a build in order. A name not listed (`running`) has no count.
+const OUTER: [6]string = ["parse", "check", "emit", "compile", "link", "package"];
+
+/// Inner updates closer together than this are dropped, so a fast loop does not flood stderr.
+const REDRAW_GAP_MS: int = 40;
+
+/// One report line: depth 0 outer phase, 1 step or note inside it. `secs` < 0 = no time.
+struct Rec {
+    depth: int;
+    name: string;
+    secs: f64;
+}
+
+/// Phase records and live status of one compile. Off (records and draws nothing) until `enable`.
+pub struct Phases {
+    arena: &Arena;
+    on: bool;
+    startMs: int;
+    recs: List<Rec>;
+    /// The open outer phase: its index in `recs` (-1 none) and when it began.
+    open: int;
+    openMs: int;
+    line1: Text;
+    line2: Text;
+    /// Lines on the terminal now, so the next update can move back over them.
+    drawn: int;
+    tty: bool;
+    /// -1 = never drawn.
+    lastDrawMs: int;
+    err: Text;
+
+    /// Off, allocating from `arena`.
+    fn new(arena: &Arena): Phases {
+        return Phases {
+            arena: arena, on: false, startMs: 0, recs: List<Rec>.new(arena), open: -1, openMs: 0,
+            line1: Text.new(arena), line2: Text.new(arena), drawn: 0, tty: tty.isTty(2), lastDrawMs: -1,
+            err: Text.new(arena),
+        };
+    }
+
+    /// Start recording and drawing.
+    fn enable(this: &Phases) {
+        if this.on { return; }
+        this.on = true;
+        this.startMs = monotonicMs();
+    }
+
+    /// Milliseconds since `enable`, 0 when off.
+    fn elapsedMs(this: &Phases): int {
+        if !this.on { return 0; }
+        return monotonicMs() - this.startMs;
+    }
+
+    /// Begin outer phase `name` (`parse`, `check`, `emit`, `compile`, `link`, `package`). Beginning the one
+    /// already open does nothing.
+    fn begin(this: &Phases, name: string) {
+        if !this.on { return; }
+        if this.open >= 0 && this.recs.items[this.open].name == name { return; }
+        this.close();
+        this.recs.push(Rec { depth: 0, name: own(this.arena, name), secs: -1.0 });
+        this.open = this.recs.len - 1;
+        this.openMs = monotonicMs();
+        this.line1.clear();
+        this.line1.pushStr("j3c: ");
+        for i in 0..6 {
+            if OUTER[i] == name { this.line1.fmt(`[{i + 1}/6] `); }
+        }
+        this.line1.pushStr(name);
+        this.line2.clear();
+        if this.tty {
+            this.redraw();
+        } else {
+            this.err.pushStr(this.line1.str());
+            this.err.push('\n');
+            this.err.flushTo(2);
+        }
+    }
+
+    /// Inner progress line (`module 12/271 j3.scene3d`). Not recorded.
+    fn detail(this: &Phases, msg: string) {
+        if !this.on { return; }
+        let now = monotonicMs();
+        if !this.tty {
+            // Piped output: a plain line every 2 s, only in the phases that can sit for a while.
+            let slow = this.open >= 0 && (this.recs.items[this.open].name == "compile" || this.recs.items[this.open].name == "link");
+            if slow && (this.lastDrawMs < 0 || now - this.lastDrawMs >= 2000) {
+                this.err.pushStr("      ");
+                this.err.pushStr(msg);
+                this.err.push('\n');
+                this.err.flushTo(2);
+                this.lastDrawMs = now;
+            }
+            return;
+        }
+        this.line2.clear();
+        this.line2.pushStr("      ");
+        this.line2.pushStr(msg);
+        if this.lastDrawMs >= 0 && now - this.lastDrawMs < REDRAW_GAP_MS { return; }
+        this.redraw();
+    }
+
+    /// Record step `name` (trimmed) that took `secs` inside the open phase (Rust takes seconds too).
+    fn step(this: &Phases, name: string, secs: f64) {
+        if this.on && this.open >= 0 { this.recs.push(Rec { depth: 1, name: own(this.arena, trim(name)), secs: secs }); }
+    }
+
+    /// A note line under the open phase, with no time.
+    fn note(this: &Phases, text: string) {
+        if this.on && this.open >= 0 { this.recs.push(Rec { depth: 1, name: own(this.arena, text), secs: -1.0 }); }
+    }
+
+    /// Close the open phase and append the breakdown (Rust's `report()`, byte for byte) to `out`: per record
+    /// `6 + 2 * depth` spaces, then the name padded to column 44 and the time as `{:>7.2}s`.
+    fn report(this: &Phases, out: &Text) {
+        this.close();
+        for i in 0..this.recs.len {
+            let r = this.recs.items[i];
+            let indent = 6 + 2 * r.depth;
+            out.indent(indent);
+            out.pushStr(r.name);
+            if r.secs >= 0.0 {
+                let w = 44 - indent;
+                for cp in r.name.runes() { w -= 1; }
+                for k in 0..w { out.push(' '); }
+                pushSecs(out, r.secs);
+            }
+            out.push('\n');
+        }
+    }
+
+    fn close(this: &Phases) {
+        if this.open < 0 { return; }
+        this.recs.items[this.open].secs = f64(monotonicMs() - this.openMs) / 1000.0;
+        this.open = -1;
+    }
+
+    fn redraw(this: &Phases) {
+        // A line wider than the terminal wraps, and then moving up by line count lands too low.
+        let cols = 79;
+        match tty.size(2) {
+            Option.Some(s) { cols = s.cols - 1; }
+            Option.None {}
+        }
+        if cols < 10 { cols = 10; }
+        let visible = 0;
+        if this.line1.len() > 0 { visible += 1; }
+        if this.line2.len() > 0 { visible += 1; }
+        let e = &this.err;
+        if this.drawn > 0 { e.push(27); e.fmt(`[{this.drawn}A`); }
+        let rows = this.drawn;
+        if visible > rows { rows = visible; }
+        let shown = 0;
+        for i in 0..rows {
+            e.push(27);
+            e.pushStr("[2K");
+            if shown == 0 && this.line1.len() > 0 {
+                clip(e, this.line1.str(), cols);
+                shown += 1;
+            } else if shown < visible && this.line2.len() > 0 {
+                clip(e, this.line2.str(), cols);
+                shown += 1;
+            }
+            e.push('\n');
+        }
+        if rows > visible { e.push(27); e.fmt(`[{rows - visible}A`); e.push(27); e.pushStr("[J"); }
+        e.flushTo(2);
+        this.drawn = visible;
+        this.lastDrawMs = monotonicMs();
+    }
+}
+
+/// The first `cols` code points of `s`.
+fn clip(out: &Text, s: string, cols: int) {
+    let n = 0;
+    let r = s.runes();
+    for cp in &r {
+        if n == cols {
+            out.pushStr(s[0..r.at]);
+            return;
+        }
+        n += 1;
+    }
+    out.pushStr(s);
+}
+
+/// `secs` as Rust's `{:>7.2}` then `s`: the exact binary value times 100, rounded half to even (Rust
+/// formats the exact value, so `12.345`, really 12.34499.., prints `12.34`).
+fn pushSecs(out: &Text, secs: f64) {
+    let c = hundredths(secs);
+    let whole = c / 100;
+    let frac = c % 100;
+    let digits = 1;
+    let p = whole;
+    while p >= 10 { p /= 10; digits += 1; }
+    for k in 0..4 - digits { out.push(' '); }
+    out.pushInt(whole);
+    out.push('.');
+    if frac < 10 { out.push('0'); }
+    out.pushInt(frac);
+    out.push('s');
+}
+
+/// `x * 100` rounded half to even, exactly, for 0 <= x < 2^40 (times; negative counts as 0).
+fn hundredths(x: f64): int {
+    if !(x > 0.0) { return 0; }
+    let bits = f64Bits(x);
+    let ex = int((bits >> 52) & 2047);
+    let m = bits & ((u64(1) << 52) - 1);
+    let e = -1074;
+    if ex > 0 { m = m | (u64(1) << 52); e = ex - 1075; }
+    let v = m * 100;
+    if e >= 0 { return int(v << u64(e)); }
+    if -e > 62 { return 0; }
+    let sh = u64(-e);
+    let q = v >> sh;
+    let rem = v & ((u64(1) << sh) - 1);
+    let half = u64(1) << (sh - 1);
+    if rem > half || (rem == half && (q & 1) == 1) { q += 1; }
+    return int(q);
+}

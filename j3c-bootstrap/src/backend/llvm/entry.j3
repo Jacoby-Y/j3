@@ -2,4 +2,205 @@
 //
 // Part of module j3c.backend.llvm.
 // Port of: j3c/src/emit/llvm/entry.rs, emit/llvm_crash.rs
+// J3: Entries: `abortRoutine` (Rust `abort_routine`), `hostEntry` (Rust `host_entry`, the entry symbol
+// appended to `out`), `entryModule`, `sysFunc`, `hostEntryName`; the crash handler is `crashSupported`,
+// `crashDefinitions` (Rust `definitions`), `crashInstall` (`install`), `CRASH_ATTRS` (`ATTRS`) and the
+// abort trace. Text appends to `out`; the fixed LLVM text is copied from Rust verbatim.
 module j3c.backend.llvm;
+
+/// One `[N x i8]` constant per text plus a `%j3_string` table of them (`abort_routine`'s `table`).
+fn abortTable(name: string, texts: []string, out: &Text) {
+    for i in 0..texts.len {
+        let s = texts[i];
+        out.add("@").add(name).fmt(`.s{i} = private unnamed_addr constant [{s.len} x i8] c"`);
+        for k in 0..s.len {
+            let b = s[k];
+            if (b > 32 && b < 127 && b != '"' && b != '\\') || b == ' ' {
+                out.push(b);
+            } else {
+                out.push('\\');
+                pushHex2(out, b);
+            }
+        }
+        out.add("\"\n");
+    }
+    out.add("@").add(name).fmt(` = private unnamed_addr constant [{texts.len} x %j3_string] [`);
+    for i in 0..texts.len {
+        if i > 0 { out.add(", "); }
+        out.add("%j3_string { ptr @").add(name).fmt(`.s{i}, i64 {texts[i].len}`).add(" }");
+    }
+    out.add("]\n");
+}
+
+/// `b` as two uppercase hex digits (Rust `{:02X}`).
+fn pushHex2(t: &Text, b: u8) {
+    let digits = "0123456789ABCDEF";
+    t.push(digits[int(b >> 4)]);
+    t.push(digits[int(b & 15)]);
+}
+
+/// `@j3_abort(i64 file << 40 | line << 8 | kind, i64 a, i64 b)` for the packed abort sites: prints
+/// `file:line: message`, then `a` and `b` for a kind with values, to stderr and exits 102. `trace` (debug
+/// x86-64 Linux, beside the crash handler) also prints the frame-pointer walk (Rust `abort_routine`).
+pub fn abortRoutine(files: []string, trace: bool, out: &Text) {
+    let arena = out.arena;
+    out.push('\n');
+    let fs = arena.alloc::<string>(files.len);
+    for i in 0..files.len {
+        let t = Text.new(arena);
+        t.add(files[i]).push(':');
+        fs[i] = t.str();
+    }
+    abortTable("j3_abort_files", fs, out);
+    let ks = abortKinds(arena);
+    let msg = arena.alloc::<string>(ks.len);
+    let da = arena.alloc::<string>(ks.len);
+    let db = arena.alloc::<string>(ks.len);
+    for i in 0..ks.len {
+        let t = Text.new(arena);
+        t.add(": ").add(abortMessage(ks[i]));
+        msg[i] = t.str();
+        let d = abortDetail(ks[i]);
+        da[i] = d.0;
+        db[i] = d.1;
+    }
+    abortTable("j3_abort_kinds", msg, out);
+    abortTable("j3_abort_da", da, out);
+    abortTable("j3_abort_db", db, out);
+    out.add("@j3_abort_nl = private unnamed_addr constant [1 x i8] c\"\\0A\"\n");
+    out.add(ABORT_BODY);
+    if trace { out.add(ABORT_TRACE); }
+    out.add("  call void @_exit(i32 102)\n  unreachable\n}\n");
+}
+
+const ABORT_BODY = @embed("abort_body.ll");
+
+/// The C entry symbol: `SDL_main` in an Android shared library (SDLActivity calls it), else `main`.
+fn hostEntryName(triple: string): string {
+    if isAndroid(triple) { return "SDL_main"; }
+    return "main";
+}
+
+fn isSysModule(cx: &IrCx, m: &Module): bool {
+    return m.name.len == 2 && cx.nameStr(m.name.items[0]) == "j3" && cx.nameStr(m.name.items[1]) == "sys";
+}
+
+/// Module that should define host `@main`: `j3.sys.start` if present, else the last `main`.
+fn entryModule(cx: &IrCx, modules: []Module): Result<int, string> {
+    let at = lastNamed(cx, modules, "start", true);
+    if at.0 < 0 { at = lastNamed(cx, modules, "main", false); }
+    if at.0 < 0 { return Result.Err("LLVM emit needs j3.sys.start or fn main()"); }
+    return Result.Ok(at.0);
+}
+
+/// The symbol of fn `name` in `j3.sys`, appended to `out`; false when there is none.
+fn sysFunc(cx: &IrCx, modules: []Module, name: string, out: &Text): bool {
+    for i in 0..modules.len {
+        if !isSysModule(cx, &modules[i]) { continue; }
+        let fs = modules[i].funcs;
+        for k in 0..fs.len {
+            let func = cx.funcMut(fs.items[k]);
+            if cx.nameStr(func.name) == name {
+                pushFuncName(out, cx, func);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// The symbol of the program's entry fn (`j3.sys.start`, else the last `main`), appended to `out`
+/// (Rust `host_entry`).
+pub fn hostEntry(cx: &IrCx, modules: []Module, out: &Text): Result<bool, string> {
+    let at = lastNamed(cx, modules, "start", true);
+    if at.0 < 0 { at = lastNamed(cx, modules, "main", false); }
+    if at.0 < 0 { return Result.Err("LLVM emit needs j3.sys.start or fn main()"); }
+    let func = cx.funcMut(modules[at.0].funcs.items[at.1]);
+    pushFuncName(out, cx, func);
+    return Result.Ok(true);
+}
+
+/// `(module, fn)` index of the last fn called `name` (only in `j3.sys` when `sys`), `(-1, -1)` for none.
+fn lastNamed(cx: &IrCx, modules: []Module, name: string, sys: bool): (int, int) {
+    let i = modules.len - 1;
+    while i >= 0 {
+        if !sys || isSysModule(cx, &modules[i]) {
+            let fs = modules[i].funcs;
+            let k = fs.len - 1;
+            while k >= 0 {
+                if cx.nameStr(cx.funcMut(fs.items[k]).name) == name { return (i, k); }
+                k -= 1;
+            }
+        }
+        i -= 1;
+    }
+    return (-1, -1);
+}
+
+/// The dev-build crash handler is available for `triple`: x86-64 desktop Linux (Rust `llvm_crash::supported`).
+pub fn crashSupported(triple: string): bool {
+    return contains(triple, "x86_64") && contains(triple, "linux") && !contains(triple, "android");
+}
+
+/// Function attribute group so every debug function keeps a frame pointer (Rust `ATTRS`).
+const CRASH_ATTRS: string = "attributes #0 = { \"frame-pointer\"=\"all\" }\n";
+
+/// `@name = private unnamed_addr constant [n x i8] c"text\00"` with newlines as `\0A`.
+fn crashCstr(name: string, text: string, out: &Text) {
+    out.add("@").add(name).fmt(` = private unnamed_addr constant [{text.len + 1} x i8] c"`);
+    for i in 0..text.len {
+        if text[i] == '\n' { out.add("\\0A"); } else { out.push(text[i]); }
+    }
+    out.add("\\00\"\n");
+}
+
+/// The crash handler's globals, declares and `@j3_crash` + `@j3_walk`; goes before `@main`
+/// (Rust `llvm_crash::definitions`).
+pub fn crashDefinitions(out: &Text) {
+    out.add("declare i32 @sigaction(i32, ptr, ptr)\n");
+    out.add("declare i32 @sigaltstack(ptr, ptr)\n");
+    out.add("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n");
+    out.add("declare ptr @llvm.frameaddress.p0(i32)\n");
+    crashCstr(".j3_crash_hdr", "j3 crash: signal %d\nj3 base: %p\n", out);
+    crashCstr(".j3_crash_pc", "j3 pc: %p\n", out);
+    crashCstr(".j3_crash_at", "j3 at: %p\n", out);
+    crashCstr(".j3_crash_base", "j3 base: %p\n", out);
+    out.add("@.j3_crash_stack = private global [65536 x i8] zeroinitializer, align 16\n\n");
+    // (sig, siginfo*, ucontext*): x86-64 rip lives at ucontext + 168. The first walked frame is
+    // the handler's own (its return address is the signal trampoline), so it is not printed.
+    // Rust's `\` line continuations drop the indentation of this fn's body.
+    out.add(CRASH_FN);
+    out.add(CRASH_WALK);
+}
+
+const CRASH_FN = @embed("crash_fn.ll");
+
+/// `@j3_walk(fp, skip_first)`: one `j3 at: <return address>` line per frame-pointer frame, up to 32
+/// (Rust `WALK`).
+const CRASH_WALK = @embed("crash_walk.ll");
+
+/// For a failed check (`@j3_abort`): `j3 base:` (where `@main` loaded, for `symbolize`) and the walk.
+const ABORT_TRACE = @embed("abort_trace.ll");
+
+/// Lines for the start of `@main`: an alternate stack (so stack overflow is caught) and one `sigaction`
+/// per crash signal (`struct sigaction`: handler, 128-byte mask, flags at 136) (Rust `install`).
+fn crashInstall(out: &Text) {
+    out.add("  %ss = alloca [24 x i8], align 8\n");
+    out.add("  store ptr @.j3_crash_stack, ptr %ss, align 8\n");
+    out.add("  %ssf = getelementptr i8, ptr %ss, i64 8\n");
+    out.add("  store i32 0, ptr %ssf, align 8\n");
+    out.add("  %sss = getelementptr i8, ptr %ss, i64 16\n");
+    out.add("  store i64 65536, ptr %sss, align 8\n");
+    out.add("  %sa0 = call i32 @sigaltstack(ptr %ss, ptr null)\n");
+    out.add("  %sa = alloca [152 x i8], align 8\n");
+    out.add("  call void @llvm.memset.p0.i64(ptr %sa, i8 0, i64 152, i1 false)\n");
+    out.add("  store ptr @j3_crash, ptr %sa, align 8\n");
+    out.add("  %saf = getelementptr i8, ptr %sa, i64 136\n");
+    // SA_SIGINFO | SA_ONSTACK | SA_RESETHAND
+    out.add("  store i32 -2013265916, ptr %saf, align 8\n");
+    out.add("  %sg0 = call i32 @sigaction(i32 11, ptr %sa, ptr null)\n");
+    out.add("  %sg1 = call i32 @sigaction(i32 6, ptr %sa, ptr null)\n");
+    out.add("  %sg2 = call i32 @sigaction(i32 8, ptr %sa, ptr null)\n");
+    out.add("  %sg3 = call i32 @sigaction(i32 7, ptr %sa, ptr null)\n");
+    out.add("  %sg4 = call i32 @sigaction(i32 4, ptr %sa, ptr null)\n");
+}

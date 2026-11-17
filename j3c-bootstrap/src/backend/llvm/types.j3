@@ -2,4 +2,309 @@
 //
 // Part of module j3c.backend.llvm.
 // Port of: j3c/src/emit/llvm_ty.rs, emit/llvm/types.rs
+// J3: Short type strings are returned as strings (`Result<string, string>`): a literal for scalars, an
+// arena copy otherwise; `pushLlType` appends to a `Text` instead. The struct/enum definition blocks append
+// to a `Text`. Rust `ll_sig_j3` returns `(ret, params)`. Rust's unused `is_agg` is not ported.
 module j3c.backend.llvm;
+
+/// Append `ty` as an LLVM type (Rust `ll_type`).
+pub fn pushLlType(t: &Text, cx: &IrCx, ty: Id<TyKind>): Result<bool, string> {
+    match cx.tyKind(ty) {
+        TyKind.Array(a) {
+            t.fmt(`[{a.len} x `);
+            pushLlType(t, cx, a.elem)?;
+            t.push(']');
+        }
+        TyKind.Struct(s) { t.push('%'); pushStructName(t, cx, s.id); }
+        TyKind.Enum(e) {
+            if cx.enumDef(e.id).isCLike() { t.add("i32"); } else { t.push('%'); pushEnumName(t, cx, e.id); }
+        }
+        _ { t.add(scalarLl(cx, ty)); }
+    }
+    return Result.Ok(true);
+}
+
+/// The LLVM type of a non-aggregate `ty`; "" for arrays, structs and enums.
+fn scalarLl(cx: &IrCx, ty: Id<TyKind>): string {
+    match cx.tyKind(ty) {
+        TyKind.Void { return "void"; }
+        TyKind.Bool { return "i8"; }
+        TyKind.Int(i) {
+            match intBits(i) {
+                8 { return "i8"; }
+                16 { return "i16"; }
+                32 { return "i32"; }
+                _ { return "i64"; }
+            }
+        }
+        TyKind.Float(f) { if f == FloatTy.F32 { return "float"; } return "double"; }
+        TyKind.Ptr { return "ptr"; }
+        TyKind.CStr { return "ptr"; }
+        TyKind.Ref(_) { return "ptr"; }
+        TyKind.Fn(_) { return "ptr"; }
+        TyKind.Half { return "i16"; }
+        TyKind.Vec(v) { return vecLlvm(v); }
+        TyKind.String { return "%j3_string"; }
+        TyKind.Slice(_) { return "%j3_string"; }
+        TyKind.Array(_) { return ""; }
+        TyKind.Struct(_) { return ""; }
+        TyKind.Enum(_) { return ""; }
+    }
+}
+
+/// `ty` as an LLVM type (`i64`, `ptr`, `%j3_string`, `%j3_mod_Name_3`, `[4 x i8]`) (Rust `ll_type`).
+pub fn llType(cx: &IrCx, ty: Id<TyKind>, arena: &Arena): Result<string, string> {
+    let s = scalarLl(cx, ty);
+    if s.len > 0 { return Result.Ok(s); }
+    match cx.tyKind(ty) {
+        TyKind.Enum(e) { if cx.enumDef(e.id).isCLike() { return Result.Ok("i32"); } }
+        _ {}
+    }
+    let t = Text.new(arena);
+    pushLlType(&t, cx, ty)?;
+    return Result.Ok(t.str());
+}
+
+/// Bytes above which a struct, enum or array value lives in memory, never in an SSA register.
+/// LLVM splits a first-class aggregate `load`/`store`/`ret` into one operation per scalar field,
+/// so copying a 3000-field struct that way made one 190-line function take 25 s in clang.
+const BIG: u64 = 64;
+
+/// A value copied with `memcpy` and passed to J3 functions by address (hidden `sret` result
+/// pointer, pointer parameters). `use lib` C calls keep the by-value C ABI (Rust `big`).
+fn isBig(cx: &IrCx, ty: Id<TyKind>): bool {
+    let agg = false;
+    match cx.tyKind(ty) {
+        TyKind.Struct(_) { agg = true; }
+        TyKind.Array(_) { agg = true; }
+        TyKind.Enum(e) { agg = !cx.enumDef(e.id).isCLike(); }
+        _ {}
+    }
+    return agg && abiSize(cx, ty) > BIG;
+}
+
+/// Inside a function this value is the address of its storage: every array, and every big value.
+fn inMem(cx: &IrCx, ty: Id<TyKind>): bool {
+    match cx.tyKind(ty) {
+        TyKind.Array(_) { return true; }
+        _ { return isBig(cx, ty); }
+    }
+}
+
+fn isPtr(cx: &IrCx, ty: Id<TyKind>): bool {
+    match cx.tyKind(ty) {
+        TyKind.Ref(_) { return true; }
+        TyKind.Ptr { return true; }
+        TyKind.CStr { return true; }
+        TyKind.Fn(_) { return true; }
+        _ { return false; }
+    }
+}
+
+/// Rust `c_ty::is_int`.
+fn isInt(cx: &IrCx, ty: Id<TyKind>): bool {
+    match cx.tyKind(ty) {
+        TyKind.Int(_) { return true; }
+        _ { return false; }
+    }
+}
+
+/// A signed integer type.
+fn isSignedInt(cx: &IrCx, ty: Id<TyKind>): bool {
+    match cx.tyKind(ty) {
+        TyKind.Int(i) { return intSigned(i); }
+        _ { return false; }
+    }
+}
+
+fn isFloat(cx: &IrCx, ty: Id<TyKind>): bool {
+    match cx.tyKind(ty) {
+        TyKind.Float(_) { return true; }
+        _ { return false; }
+    }
+}
+
+/// Bit width of an integer type, 64 otherwise.
+fn intWidth(cx: &IrCx, ty: Id<TyKind>): u32 {
+    match cx.tyKind(ty) {
+        TyKind.Int(i) { return intBits(i); }
+        _ { return 64; }
+    }
+}
+
+fn llRet(cx: &IrCx, fnTy: Id<TyKind>, arena: &Arena): Result<string, string> {
+    let sig = match cx.fnSig(fnTy) { Option.Some(s) { s } Option.None { return Result.Err("not a fn type"); } };
+    if sig.ret == cx.common.void { return Result.Ok("void"); }
+    return llType(cx, sig.ret, arena);
+}
+
+fn llParams(cx: &IrCx, fnTy: Id<TyKind>, arena: &Arena): Result<string, string> {
+    let sig = match cx.fnSig(fnTy) { Option.Some(s) { s } Option.None { return Result.Err("not a fn type"); } };
+    let t = Text.new(arena);
+    for i in 0..sig.params.len {
+        if i > 0 { t.add(", "); }
+        pushLlType(&t, cx, sig.params.items[i])?;
+    }
+    return Result.Ok(t.str());
+}
+
+/// `(ret, params)` LLVM text of a J3 fn type: a big result becomes a leading `ptr` it is written through
+/// (`void` return), and a big parameter is a `ptr` to a copy the callee makes. `use lib` functions keep
+/// `llRet`/`llParams` (the C ABI) (Rust `ll_sig_j3`).
+pub fn llSigJ3(cx: &IrCx, fnTy: Id<TyKind>, arena: &Arena): Result<(string, string), string> {
+    let sig = match cx.fnSig(fnTy) { Option.Some(s) { s } Option.None { return Result.Err("not a fn type"); } };
+    let ps = Text.new(arena);
+    let r = "void";
+    if sig.ret != cx.common.void {
+        if isBig(cx, sig.ret) { ps.add("ptr"); } else { r = llType(cx, sig.ret, arena)?; }
+    }
+    for i in 0..sig.params.len {
+        if ps.len() > 0 { ps.add(", "); }
+        let p = sig.params.items[i];
+        if isBig(cx, p) { ps.add("ptr"); } else { pushLlType(&ps, cx, p)?; }
+    }
+    return Result.Ok((r, ps.str()));
+}
+
+/// Every struct type of `modules`, dependencies first (Rust `emit_struct_types`).
+pub fn emitStructTypes(cx: &IrCx, modules: []Module, out: &Text): Result<bool, string> {
+    let seen = Set<Id<StructDef>>.new(cx.arena, 64);
+    let ordered = List<Id<StructDef>>.new(cx.arena);
+    // Rust first dedups the ids in module order, then visits them: the same order as one visit pass.
+    for mi in 0..modules.len {
+        let ss = modules[mi].structs;
+        for i in 0..ss.len { visitStruct(cx, ss.items[i], &seen, &ordered); }
+    }
+    for k in 0..ordered.len {
+        let id = ordered.items[k];
+        let def = cx.structDef(id);
+        out.push('%');
+        pushStructName(out, cx, id);
+        if def.packed { out.add(" = type <{ "); } else { out.add(" = type { "); }
+        for i in 0..def.fields.len {
+            if i > 0 { out.add(", "); }
+            pushLlType(out, cx, def.fields.items[i].ty)?;
+        }
+        if def.packed { out.add(" }>\n"); } else { out.add(" }\n"); }
+    }
+    if ordered.len > 0 { out.push('\n'); }
+    return Result.Ok(true);
+}
+
+fn visitStruct(cx: &IrCx, id: Id<StructDef>, seen: &Set<Id<StructDef>>, ordered: &List<Id<StructDef>>) {
+    if !seen.add(id) { return; }
+    let fields = cx.structDef(id).fields;
+    for i in 0..fields.len {
+        match cx.tyKind(fields.items[i].ty) {
+            TyKind.Struct(dep) { visitStruct(cx, dep.id, seen, ordered); }
+            TyKind.Array(a) {
+                match cx.tyKind(a.elem) {
+                    TyKind.Struct(dep) { visitStruct(cx, dep.id, seen, ordered); }
+                    _ {}
+                }
+            }
+            _ {}
+        }
+    }
+    ordered.push(id);
+}
+
+/// Every tagged-union enum type of `modules` (Rust `emit_enum_types`).
+pub fn emitEnumTypes(cx: &IrCx, modules: []Module, out: &Text): Result<bool, string> {
+    let any = false;
+    for mi in 0..modules.len {
+        let es = modules[mi].enums;
+        for i in 0..es.len {
+            let id = es.items[i];
+            if cx.enumDef(id).isCLike() { continue; }
+            any = true;
+            let ty = match cx.lookupTy(TyKind.Enum(EnumTy { id: id })) {
+                Option.Some(t) { t }
+                Option.None { return Result.Err("enum type not interned"); }
+            };
+            let sz = abiSize(cx, ty);
+            let rest: u64 = 0;
+            if sz > 4 { rest = sz - 4; }
+            out.push('%');
+            pushEnumName(out, cx, id);
+            out.add(" = type { ");
+            // a vector payload makes the enum 16-aligned: a zero-length vector array carries that alignment
+            if abiAlign(cx, ty) > 8 { out.add("[0 x <4 x float>], "); }
+            out.fmt(`i32, [{rest} x i8]`).add(" }\n");
+        }
+    }
+    if any { out.push('\n'); }
+    return Result.Ok(true);
+}
+
+/// The initializer text of global `gname`; private globals it needs (string bytes) go to `pre` first
+/// (Rust `ll_const_init`).
+pub fn llConstInit(cx: &IrCx, ty: Id<TyKind>, init: &ConstInit, gname: string, pre: &Text, arena: &Arena): Result<string, string> {
+    match *init {
+        ConstInit.Scalar(sc) {
+            match sc.value {
+                Operand.Const(c) {
+                    match c.kind {
+                        ConstKind.Bytes(b) {
+                            // A string in static data: its bytes get a private global emitted before this one.
+                            let n = 0;
+                            let ps = pre.str();
+                            for i in 0..ps.len { if ps[i] == '\n' { n += 1; } }
+                            pre.add("@.cb.").add(gname).fmt(`.{n} = private unnamed_addr constant [{b.bytes.len} x i8] `);
+                            llBytesLit(b.bytes, pre);
+                            pre.push('\n');
+                            let t = Text.new(arena);
+                            t.add("{ ptr @.cb.").add(gname).fmt(`.{n}, i64 {b.bytes.len}`).add(" }");
+                            return Result.Ok(t.str());
+                        }
+                        _ {}
+                    }
+                }
+                Operand.Copy(_) {}
+            }
+            let dummy = LlvmFn.constOnly(cx, arena);
+            return dummy.operandConst(&sc.value);
+        }
+        ConstInit.Fields(fs) {
+            let sid = match cx.tyKind(ty) { TyKind.Struct(s) { s.id } _ { return Result.Ok("zeroinitializer"); } };
+            let def = cx.structDef(sid);
+            let t = Text.new(arena);
+            t.add("{ ");
+            for i in 0..def.fields.len {
+                if i > 0 { t.add(", "); }
+                let f = def.fields.items[i];
+                let fname = cx.nameStr(f.name);
+                pushLlType(&t, cx, f.ty)?;
+                let found = false;
+                for k in 0..fs.fields.len {
+                    if fs.fields.items[k].name == fname {
+                        t.add(" ").add(llConstInit(cx, f.ty, &fs.fields.items[k].init, gname, pre, arena)?);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found { t.add(" zeroinitializer"); }
+            }
+            t.add(" }");
+            return Result.Ok(t.str());
+        }
+        ConstInit.Elems(es) {
+            let elem = match cx.tyKind(ty) { TyKind.Array(a) { a.elem } _ { return Result.Ok("zeroinitializer"); } };
+            let t = Text.new(arena);
+            t.add("[ ");
+            for i in 0..es.elems.len {
+                if i > 0 { t.add(", "); }
+                pushLlType(&t, cx, elem)?;
+                t.add(" ").add(llConstInit(cx, elem, &es.elems.items[i], gname, pre, arena)?);
+            }
+            t.add(" ]");
+            return Result.Ok(t.str());
+        }
+    }
+}
+
+/// `thread_local ` for a `#[thread]` global, else empty.
+fn tls(g: &GlobalDef): string {
+    if g.thread { return "thread_local "; }
+    return "";
+}

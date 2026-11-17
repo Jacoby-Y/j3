@@ -1,9 +1,331 @@
 // `#[derive(Eq, Hash, Ord, Clone)]` (and `#[Debug]`): field-by-field `==`, `<`, `hash`, `clone`. A struct
-// gets methods, an enum `#[impl]` fns per variant, a generic enum generic fns instantiated per instance.
+// gets methods, an enum `#[impl]` fns per variant, a generic enum generic fns `Enum.method` instantiated
+// per instance (`derive_call.enumDeriveFn`).
 //
 // Part of module j3c.sema.
 // Port of: j3c/src/check/derive.rs
-// J3: Builds typed-tree nodes directly (plan 11 B11.4), not J3 source parsed back. Each derived method is
-// an instance request (`instances`); every node's span is the derive name, so an error in a generated body
-// (a field without `hash`) still points at `#[derive(Hash)]` with Rust's text.
+// J3: Rust's route, not plan 11 B11.4's typed nodes: each method is written as J3 source and parsed with
+// `syntax.parse.parseItemsAt` (every span the derive name), then appended to the struct's methods / the
+// module's items before any name is collected. The ordinary declaration, body typing and lowering then
+// give Rust's IR temp for temp and Rust's error text for a generated body; building typed nodes would
+// have to copy all three by hand. No instance kind is involved.
 module j3c.sema;
+use j3c.syntax.parse.parseItemsAt;
+
+const DERIVE_MUL = "1099511628211";
+
+/// Rust `derive::expand` for module `m`: the methods of every `#[derive(..)]` struct, the `#[impl]` fns
+/// of every derived enum (appended to the module's items). False after an error Diag.
+pub fn expandDerives(cx: &SemaCx, m: Id<ModDecl>): bool {
+    let md = cx.tables.modAt(m);
+    let extra = List<Item>.new(cx.arena);
+    let n = md.items.len;
+    for k in 0..n {
+        match md.items.items[k] {
+            Item.Struct(s) {
+                if s.derives.len == 0 { continue; }
+                if !deriveStruct(cx, &s) { return false; }
+                md.items.items[k] = Item.Struct(s);
+            }
+            Item.Enum(e) {
+                if e.derives.len == 0 { continue; }
+                if !deriveEnum(cx, &e, &extra) { return false; }
+                md.items.items[k] = Item.Enum(e);
+            }
+            _ {}
+        }
+    }
+    for i in 0..extra.len { md.items.push(extra.items[i]); }
+    return true;
+}
+
+/// The bound for derive `d`: the trait key `j3.cmp::Eq` (Rust derive.rs:104), whatever the module's scope
+/// calls `Eq` (`decl_diag.boundTrait`).
+fn deriveBound(cx: &SemaCx, d: Ident): Ident {
+    return Ident { name: cx.tables.sym(cat3(cx, "j3.cmp", "::", cx.tables.str(d.name))), span: d.span };
+}
+
+fn deriveParse(cx: &SemaCx, src: string, d: Ident): Option<List<Item>> {
+    match parseItemsAt(src, d.span, cx.ast) {
+        Result.Ok(items) { return Option.Some(items); }
+        Result.Err(e) {
+            fail(cx, d.span, Text.new(cx.arena).add("internal: derived `").add(cx.tables.str(d.name)).add("` does not parse: ").add(e.msg).str());
+        }
+    }
+    return Option.None;
+}
+
+/// `Name` or `Name<A, B>`.
+fn deriveSelfTy(cx: &SemaCx, name: Sym, params: &List<Ident>): string {
+    let t = Text.new(cx.arena).add(cx.tables.str(name));
+    if params.len == 0 { return t.str(); }
+    t.add("<");
+    deriveParams(cx, t, params);
+    return t.add(">").str();
+}
+
+fn deriveParams(cx: &SemaCx, t: &Text, params: &List<Ident>) {
+    for i in 0..params.len {
+        if i > 0 { t.add(", "); }
+        t.add(cx.tables.str(params.items[i].name));
+    }
+}
+
+/// `h = a; h = h * P ^ b ..; return h ^ (h >> 29);` over `seed` ("" = none) then the hash expressions
+/// `parts`.
+fn deriveHash(t: &Text, seed: string, parts: &List<string>) {
+    let first = seed;
+    let from = 0;
+    if seed.len == 0 {
+        if parts.len == 0 { t.add("return u64(0);"); return; }
+        first = parts.items[0];
+        from = 1;
+    }
+    t.add("let h: u64 = ").add(first).add("; ");
+    for i in from..parts.len { t.add("h = (h * ").add(DERIVE_MUL).add(") ^ ").add(parts.items[i]).add("; "); }
+    // `h >> 29`, written as a division: the parser joins `> >` into `>>` by adjacent spans, and every span
+    // here is the derive's
+    t.add("return h ^ (h / 536870912);");
+}
+
+/// `if a < b { return true; } if b < a { return false; } `
+fn deriveLess(t: &Text, a: string, b: string) {
+    t.add("if ").add(a).add(" < ").add(b).add(" { return true; } if ").add(b).add(" < ").add(a).add(" { return false; } ");
+}
+
+/// Does a type in `tys` name type parameter `p`?
+fn deriveMentions(cx: &SemaCx, tys: &List<Id<Type>>, p: Ident): bool {
+    let one = List<Ident>.new(cx.arena);
+    one.push(p);
+    for i in 0..tys.len { if mentionsParam(cx, tys.items[i], &one) { return true; } }
+    return false;
+}
+
+fn deriveStruct(cx: &SemaCx, s: &StructItem): bool {
+    let a = cx.arena;
+    let tb = cx.tables;
+    let t = deriveSelfTy(cx, s.name.name, &s.typeParams);
+    let derives = s.derives;
+    s.derives = List<Ident>.new(a);
+    let fieldTys = List<Id<Type>>.new(a);
+    for f in 0..s.fields.len { fieldTys.push(s.fields.items[f].ty); }
+    for i in 0..derives.len {
+        let d = derives.items[i];
+        let dn = tb.str(d.name);
+        let method = "clone";
+        let src = Text.new(a);
+        if dn == "Eq" {
+            method = "operator==";
+            src.add("fn operator==(this: ").add(t).add(", other: ").add(t).add("): bool { return ");
+            if s.fields.len == 0 { src.add("true"); }
+            for f in 0..s.fields.len {
+                let fnm = tb.str(s.fields.items[f].name.name);
+                if f > 0 { src.add(" && "); }
+                src.add("this.").add(fnm).add(" == other.").add(fnm);
+            }
+            src.add("; }");
+        } else if dn == "Hash" {
+            method = "hash";
+            let parts = List<string>.new(a);
+            for f in 0..s.fields.len { parts.push(cat3(cx, "this.", tb.str(s.fields.items[f].name.name), ".hash()")); }
+            src.add("fn hash(this: &").add(t).add("): u64 { ");
+            deriveHash(&src, "", &parts);
+            src.add(" }");
+        } else if dn == "Ord" {
+            method = "operator<";
+            src.add("fn operator<(this: ").add(t).add(", other: ").add(t).add("): bool { ");
+            for f in 0..s.fields.len {
+                let fnm = tb.str(s.fields.items[f].name.name);
+                deriveLess(&src, cat3(cx, "this.", fnm, ""), cat3(cx, "other.", fnm, ""));
+            }
+            src.add("return false; }");
+        } else {
+            src.add("fn clone(this: &").add(t).add("): ").add(t).add(" { return *this; }");
+        }
+        for k in 0..s.methods.len {
+            if tb.str(s.methods.items[k].name.name) == method {
+                return failHelp(cx, d.span, Text.new(a).add("`").add(tb.str(s.name.name)).add("` derives `").add(dn).add("` and also defines `").add(method).add("`").str(),
+                    "keep one: remove the derive or the hand-written method");
+            }
+        }
+        // `Pair<A, B>`: the derived method needs the trait of every parameter a field holds
+        // (`where A: Eq, B: Eq`), so its body checks once at the definition and calls check the instance.
+        let wheres = List<WhereBound>.new(a);
+        if dn != "Clone" {
+            for p in 0..s.typeParams.len {
+                let tp = s.typeParams.items[p];
+                if !deriveMentions(cx, &fieldTys, tp) { continue; }
+                let bs = List<Ident>.new(a);
+                bs.push(deriveBound(cx, d));
+                wheres.push(WhereBound { name: Ident { name: tp.name, span: d.span }, bounds: bs });
+            }
+        }
+        let items = match deriveParse(cx, src.str(), d) { Option.Some(x) { x } Option.None { return false; } };
+        for k in 0..items.len {
+            match items.items[k] {
+                Item.Fn(f) {
+                    f.whereBounds = wheres;
+                    s.methods.push(f);
+                }
+                _ {}
+            }
+        }
+    }
+    return true;
+}
+
+/// `E.V(a0, a1)` with the binding prefix `p` (`_`: `E.V(_, _)`, a variant matched without binding); `E.V`
+/// without fields.
+fn derivePat(t: &Text, en: string, vn: string, fields: int, p: string) {
+    t.add(en).add(".").add(vn);
+    if fields == 0 { return; }
+    t.add("(");
+    for k in 0..fields {
+        if k > 0 { t.add(", "); }
+        t.add(p);
+        if p != "_" { t.pushInt(k); }
+    }
+    t.add(")");
+}
+
+/// `let rX = 0; match X { E.V(_) { rX = k; } .. }`: the variant number of `x`.
+fn deriveRank(cx: &SemaCx, t: &Text, e: &EnumItem, x: string) {
+    let en = cx.tables.str(e.name.name);
+    t.add("let r").add(x).add(" = 0; match ").add(x).add(" { ");
+    for k in 0..e.variants.len {
+        let v = e.variants.items[k];
+        derivePat(t, en, cx.tables.str(v.name.name), v.fields.len, "_");
+        t.add(" { r").add(x).add(" = ");
+        t.pushInt(k);
+        t.add("; } ");
+    }
+    t.add("}");
+}
+
+fn deriveEnum(cx: &SemaCx, e: &EnumItem, out: &List<Item>): bool {
+    let a = cx.arena;
+    let tb = cx.tables;
+    let derives = e.derives;
+    e.derives = List<Ident>.new(a);
+    let en = tb.str(e.name.name);
+    // `Opt<T>` gets generic fns `Opt.operator==<T: Eq>` (no source name has a `.`), found per instance
+    // through `enumDeriveFn`; a plain enum gets `#[impl]` fns.
+    let generic = e.typeParams.len > 0;
+    let t = deriveSelfTy(cx, e.name.name, &e.typeParams);
+    let single = e.variants.len == 1;
+    let cLike = true;
+    let payloads = List<Id<Type>>.new(a);
+    for i in 0..e.variants.len {
+        let v = e.variants.items[i];
+        if v.fields.len > 0 { cLike = false; }
+        for k in 0..v.fields.len { payloads.push(v.fields.items[k]); }
+    }
+    for i in 0..derives.len {
+        let d = derives.items[i];
+        let dn = tb.str(d.name);
+        // a C-like enum compares natively
+        if dn == "Eq" && cLike { continue; }
+        let method = "clone";
+        if dn == "Eq" { method = "operator=="; } else if dn == "Hash" { method = "hash"; } else if dn == "Ord" { method = "operator<"; }
+        let src = Text.new(a);
+        if generic {
+            src.add("fn derived<");
+            deriveParams(cx, &src, &e.typeParams);
+            src.add(">");
+        } else {
+            src.add("#[impl] fn ").add(method);
+        }
+        if dn == "Eq" {
+            src.add("(a: ").add(t).add(", b: ").add(t).add("): bool { match a { ");
+            for vi in 0..e.variants.len {
+                let v = e.variants.items[vi];
+                let vn = tb.str(v.name.name);
+                derivePat(&src, en, vn, v.fields.len, "a");
+                src.add(" { match b { ");
+                derivePat(&src, en, vn, v.fields.len, "b");
+                src.add(" { return ");
+                if v.fields.len == 0 { src.add("true"); }
+                for k in 0..v.fields.len {
+                    if k > 0 { src.add(" && "); }
+                    src.add("a");
+                    src.pushInt(k);
+                    src.add(" == b");
+                    src.pushInt(k);
+                }
+                src.add("; } ");
+                if !single { src.add("_ { return false; } "); }
+                src.add("} } ");
+            }
+            src.add("} }");
+        } else if dn == "Hash" {
+            src.add("(a: ").add(t).add("): u64 { match a { ");
+            for vi in 0..e.variants.len {
+                let v = e.variants.items[vi];
+                let parts = List<string>.new(a);
+                for k in 0..v.fields.len {
+                    let p = Text.new(a).add("a");
+                    p.pushInt(k);
+                    parts.push(p.add(".hash()").str());
+                }
+                let seed = Text.new(a).add("u64(");
+                seed.pushInt(vi + 1);
+                seed.add(") * ").add(DERIVE_MUL);
+                derivePat(&src, en, tb.str(v.name.name), v.fields.len, "a");
+                src.add(" { ");
+                deriveHash(&src, seed.str(), &parts);
+                src.add(" } ");
+            }
+            src.add("} }");
+        } else if dn == "Ord" {
+            src.add("(a: ").add(t).add(", b: ").add(t).add("): bool { ");
+            deriveRank(cx, &src, e, "a");
+            src.add(" ");
+            deriveRank(cx, &src, e, "b");
+            src.add(" if ra != rb { return ra < rb; } match a { ");
+            for vi in 0..e.variants.len {
+                let v = e.variants.items[vi];
+                let vn = tb.str(v.name.name);
+                derivePat(&src, en, vn, v.fields.len, "a");
+                src.add(" { match b { ");
+                derivePat(&src, en, vn, v.fields.len, "b");
+                src.add(" { ");
+                for k in 0..v.fields.len {
+                    let x = Text.new(a).add("a");
+                    x.pushInt(k);
+                    let y = Text.new(a).add("b");
+                    y.pushInt(k);
+                    deriveLess(&src, x.str(), y.str());
+                }
+                src.add("} ");
+                if !single { src.add("_ {} "); }
+                src.add("} } ");
+            }
+            src.add("} return false; }");
+        } else {
+            src.add("(a: ").add(t).add("): ").add(t).add(" { return a; }");
+        }
+        let items = match deriveParse(cx, src.str(), d) { Option.Some(x) { x } Option.None { return false; } };
+        if generic {
+            // every parameter a payload holds needs the trait (`Clone` copies, so none)
+            let bounds = List<List<Ident>>.new(a);
+            for p in 0..e.typeParams.len {
+                let bs = List<Ident>.new(a);
+                if dn != "Clone" && deriveMentions(cx, &payloads, e.typeParams.items[p]) { bs.push(deriveBound(cx, d)); }
+                bounds.push(bs);
+            }
+            for k in 0..items.len {
+                match items.items[k] {
+                    Item.Fn(f) {
+                        f.name.name = tb.sym(cat3(cx, en, ".", method));
+                        f.bounds = bounds;
+                        f.derived = true;
+                        items.items[k] = Item.Fn(f);
+                    }
+                    _ {}
+                }
+            }
+        }
+        for k in 0..items.len { out.push(items.items[k]); }
+    }
+    return true;
+}

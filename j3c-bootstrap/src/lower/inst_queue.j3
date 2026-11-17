@@ -1,0 +1,208 @@
+// Generic instances in IR: the IR fn of each sema `Fn` instance, made on first use in Rust's allocation
+// order (generic fn instances named `name<T,..>`, generic methods and methods of generic struct instances
+// under their own name), their bodies lowered in Rust's queue order, unused struct-instance methods
+// dropped at the end; `for x in it` over an iterator.
+//
+// Part of module j3c.lower.
+// Port of: check/lower/generic_fn.rs (generic_instance: the IR half, name `name<stable,..>`),
+// check/lower/call.rs (generic method instances: IR fn under the template's name),
+// check/resolve.rs (instantiate_struct: every non-generic method's IR fn made with the struct),
+// check/lower/lazy.rs (drop_unused; wake is `inst_wake.j3`), check/lower/mod.rs (lower_module's first-in
+// first-out batches), check/lower/for_iter.rs (for over an iterator)
+// J3: Hooks (wave 7, contracts-c2b.md). Sema has typed every instance body with concrete types
+// (`Instance.body`), so nothing here substitutes inside a body or decides a type; only a signature is
+// substituted, to make the IR fn before its body is lowered.
+// J3: Three kinds of `Fn` instance, told apart by the template (Rust keeps three tables):
+//  - a non-generic method of a generic struct instance: its IR fn is made with the struct
+//    (`instStructMethods`), shared by every module, lowered only when a body names it;
+//  - a generic method (of a plain struct or of a struct instance): one IR fn per module that calls it
+//    (Rust's `method_insts` is per module), named like the template;
+//  - a generic fn or a trait default body: one IR fn for the program, `name<stable_ty,..>`, `pub`, in the
+//    template's module by name but on the fn list of the module that first called it.
+module j3c.lower;
+
+/// The IR fn of `Fn` instance `inst`: made on first use (onto `lw.curMod`'s fn list, Rust's
+/// `ir_funcs.push`) and queued on `lw.pending`; a method of a struct instance already has one
+/// (`instStructMethods`) and is queued when the body naming it is done (`instWake`).
+fn instFn(lw: &Lw, inst: Id<Instance>): Id<Func> {
+    let idx = int(inst.i);
+    while lw.instFuncs.len <= idx { lw.instFuncs.push(0); }
+    if lw.instFuncs.items[idx] != 0 { return Id<Func> { i: lw.instFuncs.items[idx] - 1 }; }
+    let t = lw.t;
+    let ir = lw.ir();
+    let key = t.instanceAt(inst).key;
+    if key.kind != InstKind.Fn { panic("lower: a callee instance is a fn instance"); }
+    let fid = Id<FnDecl> { i: key.item.i };
+    let fd = t.fnAt(fid);
+    let gen = Id<Generics> { i: 0 };
+    match fd.gen { Option.Some(g) { gen = g; } Option.None { panic("lower: an instance of a fn that is not a template"); } }
+    let own = instOwnParams(lw, gen);
+    let all = t.items(key.args);
+    let vis = Vis.Private;
+    if fd.visPub { vis = Vis.Pub; }
+    let out = Id<Func> { i: 0 };
+    match fd.recv {
+        Option.Some(s) {
+            let st = Id<StructDef> { i: 0 };
+            match t.structAt(s).gen {
+                Option.Some(_) { st = lw.structInst(s.i, t.list(all[0..all.len - own])); }
+                Option.None { st = Id<StructDef> { i: lw.structIds.items[int(s.i)] - 1 }; }
+            }
+            if own == 0 {
+                match lw.methodFns.get(instMethodKey(st.i, fid.i)) {
+                    Option.Some(f) { out = Id<Func> { i: f }; }
+                    Option.None { panic("lower: a struct instance without its method"); }
+                }
+                if lw.lazy.has(out.i) { lw.lazy.put(out.i, inst.i + 1); }
+                lw.instFuncs.items[idx] = out.i + 1;
+                return out;
+            }
+            out = instAlloc(lw, fid, gen, key.args, fd.name, lw.p.modules.items[lw.curMod].name, vis, Option.Some(st));
+            lw.modInsts.push(inst.i);
+        }
+        Option.None {
+            // Rust spells the name from the type args before it resolves the signature.
+            let n = Text.new(lw.cx.arena);
+            n.add(ir.nameStr(fd.name)).add("<");
+            for k in 0..all.len {
+                if k > 0 { n.add(","); }
+                pushStableTy(&n, ir, lw.irTy(all[k]), 0);
+            }
+            n.add(">");
+            out = instAlloc(lw, fid, gen, key.args, ir.internName(n.str()), t.modAt(fd.owner).path, Vis.Pub, Option.None);
+        }
+    }
+    lw.instFuncs.items[idx] = out.i + 1;
+    lw.pending.push(inst);
+    return out;
+}
+
+/// `methodFns` key: IR struct id and sema fn decl index.
+fn instMethodKey(st: u32, decl: u32): u64 { return (u64(st) << 32) | u64(decl); }
+
+/// How many of `gen`'s parameters are the fn's own (a generic struct's method repeats the struct's first).
+fn instOwnParams(lw: &Lw, gen: Id<Generics>): int {
+    let g = lw.t.genericsAt(gen);
+    match g.parent {
+        Option.Some(p) { return g.names.len - lw.t.genericsAt(p).names.len; }
+        Option.None {}
+    }
+    return g.names.len;
+}
+
+/// Rust `alloc_fn` for an instance: template `fid`'s signature at `args` (parameter types, then the
+/// return type; a struct instance one of them first names is made here, before the fn), as a `Decl` fn
+/// on the current module's list.
+fn instAlloc(lw: &Lw, fid: Id<FnDecl>, gen: Id<Generics>, args: Id<TyList>, name: Sym, path: List<Sym>, vis: Vis,
+    methodOf: Option<Id<StructDef>>): Id<Func> {
+    let ir = lw.ir();
+    let fd = lw.t.fnAt(fid);
+    let params = List<Id<TyKind>>.new(lw.cx.arena);
+    for p in 0..fd.params.len { params.push(lw.irTy(subst(lw.t, gen, fd.params.items[p].ty, args))); }
+    let fty = ir.tyFn(params, lw.irTy(subst(lw.t, gen, fd.ret, args)));
+    let id = ir.allocFunc(Func { id: Id<Func> { i: 0 }, doc: fd.doc, moduleName: path, kind: FuncKind.Decl, name: name, ty: fty,
+        vis: vis, methodOf: methodOf, span: fd.span });
+    lw.p.modules.items[lw.curMod].funcs.push(id);
+    return id;
+}
+
+/// A new module starts: it makes its own generic-method instances (Rust's `method_insts` is per module).
+fn instNewModule(lw: &Lw) {
+    if lw.pending.len != 0 { panic("lower: instance bodies still queued at a module start"); }
+    for i in 0..lw.modInsts.len { lw.instFuncs.items[int(lw.modInsts.items[i])] = 0; }
+    lw.modInsts.clear();
+}
+
+/// Lower every queued instance body of the current module, first in first out; bodies queued while
+/// lowering run after (Rust's batches). `lowerMod` calls it after the module's plain bodies.
+// J3: An instance with no body (`body` None: its typing failed, sema reported it) stays a `Decl`.
+fn instLowerQueued(lw: &Lw) {
+    let k = 0;
+    while k < lw.pending.len {
+        let inst = lw.pending.items[k];
+        k += 1;
+        let slot = lw.instFuncs.items[int(inst.i)];
+        if slot == 0 { panic("lower: a queued instance without an IR fn"); }
+        let func = Id<Func> { i: slot - 1 };
+        match lw.ir().funcMut(func).kind { FuncKind.J3(_) { continue; } _ {} }
+        match lw.t.instanceAt(inst).body {
+            Option.Some(b) { lowerInto(lw, b, func, Option.Some(inst)); }
+            Option.None {}
+        }
+    }
+    lw.pending.clear();
+}
+
+/// Rust `instantiate_struct`'s method half: struct decl `i` at `args` was just made as IR struct `id`;
+/// make the IR fn (signature at `args`) of each non-generic method, in method order, onto `lw.curMod`'s
+/// list, as not yet woken.
+fn instStructMethods(lw: &Lw, i: u32, args: Id<TyList>, id: Id<StructDef>) {
+    let n = lw.t.structAt(Id<StructDecl> { i: i }).methods.len;
+    for k in 0..n {
+        let mid = lw.t.structAt(Id<StructDecl> { i: i }).methods.items[k];
+        let fd = lw.t.fnAt(mid);
+        match fd.gen {
+            Option.Some(g) {
+                if instOwnParams(lw, g) > 0 { continue; }
+                let vis = Vis.Private;
+                if fd.visPub { vis = Vis.Pub; }
+                let f = instAlloc(lw, mid, g, args, fd.name, lw.p.modules.items[lw.curMod].name, vis, Option.Some(id));
+                lw.methodFns.put(instMethodKey(id.i, mid.i), f.i);
+                lw.lazy.put(f.i, 0);
+            }
+            Option.None {}
+        }
+    }
+}
+
+/// Rust `lazy::drop_unused`: drop every never-woken struct-instance method from its module's fn list
+/// (after every module is lowered, before the tuple structs join the last module).
+fn instDropUnused(lw: &Lw) {
+    for k in 0..lw.p.modules.len {
+        let old = lw.p.modules.items[k].funcs;
+        let keep = List<Id<Func>>.new(lw.cx.arena);
+        for j in 0..old.len { if !lw.lazy.has(old.items[j].i) { keep.push(old.items[j]); } }
+        lw.p.modules.items[k].funcs = keep;
+    }
+}
+
+extend FnLower {
+    /// `for x in it` (`f.kind == ForKind.Iter`): Rust `for_iter`, `while true { o = it.next(); if o is
+    /// not Some { break } x = payload; body }`. Sema chose `next` and the `Some` variant.
+    fn instForIter(this: &FnLower, sp: Span, f: &TForEach) {
+        let ir = this.ir();
+        let isp = this.lw.typed.placeSpan(f.source);
+        let iter = this.place(f.source, "i");
+        while true {
+            match ir.refInner(iter.ty) {
+                Option.Some(_) { iter = this.b.deref(ir, iter, sp); }
+                Option.None { break; }
+            }
+        }
+        // Rust names the iterator `$it{tmp}` and takes the number.
+        this.tmp += 1;
+        let nid = this.letOf(f.var);
+        let vsp = this.lw.typed.local(f.var).span;
+        let saved = this.b.beginBlock();
+        let id = Id<Func> { i: 0 };
+        match f.next { Option.Some(c) { id = this.calleeFn(c); } Option.None { panic("lower: an iterator `for` without `next`"); } }
+        let fty = ir.funcMut(id).ty;
+        let ret = ir.common.void;
+        match ir.fnSig(fty) { Option.Some(s) { ret = s.ret; } Option.None {} }
+        let vid = VariantId { enumId: Id<EnumDef> { i: 0 }, index: u32(f.some) };
+        match ir.tyKind(ret) { TyKind.Enum(en) { vid.enumId = en.id; } _ { panic("lower: `next` returns an enum"); } }
+        let args = List<Operand>.new(this.cx.arena);
+        args.push(Operand.Copy(this.spill("this", Rvalue.refPlace(isp, ir.tyRef(iter.ty), iter), isp)));
+        let opt = this.spill("t", Rvalue.call(isp, ret, opFnAddr(isp, fty, id), args), isp);
+        let isSome = this.isVariant(this.copyOf(opt), vid, isp);
+        let done = this.eqOps(isp, isSome, this.bool(isp, false));
+        let br = this.b.beginBlock();
+        this.push(isp, StmtKind.Break(0));
+        this.pushIf(isp, done, this.b.endBlock(br), Option.None);
+        let payload = this.variantFieldPlace(this.copyOf(opt), vid, 0, isp);
+        this.b.assign(isp, this.b.localPlace(nid, vsp), Rvalue.useOp(isp, Operand.Copy(payload)));
+        this.stmts(&f.body);
+        let body = this.b.endBlock(saved);
+        this.push(sp, StmtKind.While(WhileStmt { cond: this.bool(sp, true), body: body }));
+    }
+}

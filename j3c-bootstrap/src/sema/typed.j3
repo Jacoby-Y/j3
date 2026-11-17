@@ -6,4 +6,518 @@
 // Port of: (new in plan 11 B11.1; the typing half of `check/lower/*`, whose files are on `lower/*` lines)
 // J3: Nothing in here needs the AST again: `lower`, the frame-string check and the LSP read only this.
 // Every `match` over its node kinds is exhaustive (plan 11 B7).
+// J3: Storage (contract, wave 4): one `Typed` per Session, like `Ast`. `TExpr`, `TPlace`, `TStmt`, `TPat`
+// live in pools with a span table each; expressions, places and patterns also have a type table
+// (`exprTy(id)`). Everything implicit in the source is a node here: auto-ref / auto-deref (`AddrOf`,
+// `TPlace.Deref`), numeric widening and literal typing (`Convert`, or a literal already of its final
+// type), array-to-slice, `T` to `dyn T` (`ToDyn`), field defaults filled into struct literals, `?`'s
+// early return. A user operator is a `Call`; only primitive operators stay `Binary` / `Unary`.
+// J3: Places and values are separate: a place (`TPlace`) is something with an address; reading one is
+// `TExpr.Load`, taking its address `TExpr.AddrOf`, assigning to one `TStmt.Assign`. `lower` turns them into
+// IR `Place`s and `Operand`s without deciding anything.
+// J3: Loops get a number per body (`TLoop.id`); `break`/`continue` name it (labels already resolved).
 module j3c.sema;
+
+/// Who a call goes to; decided by sema's one member lookup (B11.3).
+pub enum Callee {
+    /// A plain fn, method, `#[impl]` fn or `use lib` fn.
+    Fn(FnCallee),
+    /// A generic fn, a generic method, or a method of a generic struct instance, at its type arguments
+    /// (`Tables.instances`, `InstKind.Fn`; its typed body is `Instance.body`).
+    Inst(InstCallee),
+    /// Inside a template body typed against placeholders (the definition-site check): a method on a type
+    /// parameter (`t.hash()` with `T: Hash`). C2b: such bodies are never lowered (each instance body is
+    /// typed again with concrete types), so `lower` never meets one.
+    Bound(BoundCallee),
+    /// Through a `dyn` table: method `index` of trait `decl`; the receiver is `args[0]` (the fat pointer).
+    Dyn(DynCallee),
+    /// A fn pointer or closure value: `expr` is the callee value (`Ty.Fn` or `Ty.Closure`).
+    Value(ValueCallee),
+}
+
+pub struct FnCallee { decl: Id<FnDecl>; }
+pub struct InstCallee { inst: Id<Instance>; }
+pub struct BoundCallee { slot: int; }
+pub struct DynCallee { decl: Id<TraitDecl>; index: int; }
+pub struct ValueCallee { expr: Id<TExpr>; }
+
+/// How a `Binary` node computes (the operand types are already equal, or a shift's own rule).
+pub enum BinKind {
+    /// Primitive math, comparison, bit op on ints, floats, bools, pointers, `f16` refused earlier.
+    Prim,
+    /// `&&` / `||`: the right side runs only when needed.
+    ShortCircuit,
+    /// `==` / `!=` on `string` (Rust `streq`).
+    String,
+    /// Lane-wise on `vec4f` / `vec4i`.
+    Simd,
+}
+
+/// An explicit conversion: written `as`, or one sema inserted.
+pub enum ConvKind {
+    /// Int to a different int width or signedness.
+    IntResize,
+    IntToFloat,
+    FloatToInt,
+    FloatResize,
+    ToHalf,
+    FromHalf,
+    /// `ptr` / `&T` / `cstr` between each other.
+    PtrCast,
+    PtrToInt,
+    IntToPtr,
+    /// `[N]T` (a place's address) to `[]T`.
+    ArrayToSlice,
+    /// `string` to `[]u8` and back (same layout).
+    StringBytes,
+    /// A plain fn to a closure value (Rust's thunk).
+    FnToClosure,
+    /// `dyn Sub` to `dyn Super` (`$up.Super`).
+    DynUpcast,
+    /// An enum to its tag (`as int` on a C-like enum) and back.
+    EnumTag,
+    /// A bool to an int.
+    BoolToInt,
+    /// A `boxed closure(..)` value where a stack `closure(..)` of the same signature is wanted: the same
+    /// two words under the stack type (Rust `boxed_as_stack`; never the other way round).
+    BoxedToStack,
+}
+
+/// A typed expression; its type is `Typed.exprTy(id)`, its span `exprSpan(id)`.
+pub enum TExpr {
+    /// A poisoned expression (B11.5); `lower` never sees one (sema stops before lowering on errors).
+    Error,
+    /// An int of the node's type (bits; negative values two's-complement), `char` included.
+    Int(u64),
+    Float(f64),
+    Bool(bool),
+    /// String literal bytes (arena copy), of type `string`.
+    Str(string),
+    /// `null` of a pointer type.
+    Null,
+    /// The zero value of the node's type (a typed `let` without a value, a missing field default).
+    Zeroed,
+    /// A place read as a value.
+    Load(PlaceRef),
+    /// `&place` (written, or an auto-ref for a `this: &T` receiver).
+    AddrOf(PlaceRef),
+    Unary(TUnary),
+    Binary(TBinary),
+    Convert(TConvert),
+    Call(TCall),
+    /// Fields in declaration order, defaults filled; the struct is the node's type.
+    StructLit(TStructLit),
+    ArrayLit(TElems),
+    Tuple(TElems),
+    /// `[]T { ptr, len }`.
+    SliceLit(TSliceLit),
+    /// `base[start..end]` of an array, slice or string place (missing bounds: 0 and the length), with
+    /// Rust's three bounds checks; also an array passed where a slice is wanted (no bounds).
+    SliceOf(TSliceOf),
+    /// A variant of the node's enum type with its payload values (one per payload field).
+    EnumVal(TEnumVal),
+    /// A fn used as a value (`Ty.Fn`).
+    FnAddr(TFnAddr),
+    /// `&T` to `dyn Trait`: the data pointer plus the vtable instance of `(T, Trait)`.
+    ToDyn(TToDyn),
+    /// `if c { a } else { b }` as a value.
+    If(TIf),
+    /// A block with a final value (match arms, `if` arms with statements).
+    Block(TBlockExpr),
+    /// `match` / `if let` as a value.
+    Match(TMatch),
+    /// `e?` on a `#[TryCatch]` enum: payload of `ok`, else return the `err` variant (re-wrapped in the fn's
+    /// return enum's failure variant `retErr` when the enums differ; `retErr` -1: return the value as is).
+    Question(TQuestion),
+    /// A backtick string; `frame` when it needs the 512-byte frame buffer (the frame-string check's input).
+    Interp(TInterp),
+    /// A closure literal (`fn(..) { .. }`, boxed `fn[mem](..) { .. }`). The node's type is `Ty.Closure`, or
+    /// `Ty.Fn` when a plain fn pointer was wanted (`plain`: no captures, the value is the fn address).
+    Closure(TClosure),
+    /// `@closureFn(c)` / `@closureCtx(c)` / `@closureFrom(f, ctx)` (stdlib only).
+    ClosureOp(TClosureOp),
+    /// Hidden temporaries around an expression sema wrote itself (Rust `bind_named`: tuple `==` / `!=` and
+    /// tuple `hash()` are an expression over `$tup` names). `lower`: the operand of every `values[i]` in
+    /// order, then per local a fresh temp named by the local's name as hint (`tup` gives `_tupN`) assigned
+    /// `use(operand)`, then `body`'s rvalue (it names the locals through `TPlace.Local`).
+    LetIn(TLetIn),
+    /// `t.fmt(`..`)` on a `j3.text.Text`: every part appended to `this`; the value is `this` (`&Text`).
+    TextFmt(TTextFmt),
+    Syscall(TArgs),
+    Atomic(TAtomic),
+    /// `@sizeof(T)`, already a constant once layouts exist; kept as a node because layout is `lower`'s.
+    SizeOf(TSizeOf),
+    /// An array's `.len` (the length, of type `int`): a constant, but not a literal, so `lower` spills
+    /// it to `_tN` where an operand is wanted (Rust's `fold_int` does not fold it).
+    ArrayLen(u64),
+    /// `@v*` intrinsics and `vec4f(..)` constructors (`name` is the intrinsic).
+    Simd(TSimd),
+}
+
+pub struct PlaceRef { place: Id<TPlace>; }
+pub struct TUnary { op: UnaryOp; operand: Id<TExpr>; }
+pub struct TBinary { op: BinOp; kind: BinKind; lhs: Id<TExpr>; rhs: Id<TExpr>; }
+pub struct TConvert { expr: Id<TExpr>; kind: ConvKind; }
+pub struct TCall { callee: Callee; args: List<Id<TExpr>>; }
+pub struct TElems { items: List<Id<TExpr>>; }
+/// `items` in declaration order; `written` the field indexes in the order the source wrote them (a field
+/// not in it got its default constant). Rust evaluated the written values in written order.
+pub struct TStructLit { items: List<Id<TExpr>>; written: List<int>; }
+pub struct TSliceLit { ptr: Id<TExpr>; len: Id<TExpr>; }
+pub struct TSliceOf { base: Id<TPlace>; start: Option<Id<TExpr>>; end: Option<Id<TExpr>>; }
+pub struct TEnumVal { variant: int; payload: List<Id<TExpr>>; }
+pub struct TFnAddr { callee: Callee; }
+/// `value`: the `&T` operand (Rust `to_dyn`'s `op`; its address becomes `$data`). `vtable`: the
+/// `InstKind.Vtable` instance of `(T, the node's dyn trait)`; `Instance.resolved` holds one `Callee` per
+/// table slot, in `DynLayout.slots` order.
+pub struct TToDyn { value: Id<TExpr>; vtable: Id<Instance>; }
+pub struct TIf { cond: Id<TExpr>; thenExpr: Id<TExpr>; elseExpr: Id<TExpr>; }
+pub struct TBlockExpr { block: TBlock; value: Option<Id<TExpr>>; }
+pub struct TQuestion { expr: Id<TExpr>; ok: int; err: int; retErr: int; }
+pub struct TInterp { parts: List<TInterpPart>; frame: bool; }
+/// A closure literal's parts (Rust `closure_lit`). J3: Field order: `Option`s first, bools last (stage 0
+/// layout hazard, PORT_DEBT (a)).
+pub struct TClosure {
+    /// Boxed: the `&Arena` operand the captures are copied into (Rust `arena_arg`; a value `Arena` place
+    /// is an `AddrOf` with `Origin.ArenaRef`).
+    mem: Option<Id<TExpr>>;
+    /// Boxed: `Arena.allocAligned`.
+    alloc: Option<Id<FnDecl>>;
+    /// The literal's own typed body: `params` are the written parameters (lower adds `$ctx: ptr` first
+    /// unless `plain`), `decl` is the enclosing fn. Its return type is the node type's `ret`.
+    body: Id<TBody>;
+    /// The captured outer places in first-use order (Rust `caps`): a local or a `use x;` alias place of
+    /// the enclosing body. Capture `i` is ctx field `c<i>` (`&T`, or `T` copied when boxed); inside
+    /// `body` it is read through `TPlace.Capture { index: i }`. Empty: no ctx struct, `$ctx` is null.
+    captures: List<Id<TPlace>>;
+    boxed: bool;
+    /// A plain `fn(..)` was wanted (and nothing is captured): no `$ctx` parameter, the value is the fn's
+    /// address.
+    plain: bool;
+}
+pub enum ClosureOpKind { Fn, Ctx, From }
+/// `Fn` / `Ctx`: `args[0]` is the closure value, the node is a `ptr`. `From`: `args` are `(f, ctx)` as
+/// `ptr`s and the node's type is the closure type to build.
+pub struct TClosureOp { kind: ClosureOpKind; args: List<Id<TExpr>>; }
+pub struct TLetIn { locals: List<Id<TLocal>>; values: List<Id<TExpr>>; body: Id<TExpr>; }
+/// `this`: the receiver as `Text.pushBytes`'s first parameter (Rust `auto_this`); `push`: `Text.pushBytes`;
+/// `parts` as in `TInterp`.
+pub struct TTextFmt { this: Id<TExpr>; push: Id<FnDecl>; parts: List<TInterpPart>; }
+pub struct TArgs { items: List<Id<TExpr>>; }
+pub struct TAtomic { op: AtomicOp; order: AtomicOrder; args: List<Id<TExpr>>; }
+pub struct TSizeOf { ty: Id<Ty>; }
+/// `name` without the `@` (`vload`, `vsum`, ..; `vec4f` / `vec4i` for a constructor; `splat` for a scalar
+/// widened to the node's vector type, Rust `splat`). Every check (arity, lane types, bounds operands) is
+/// sema's; the node's type is the result type.
+pub struct TSimd { name: Sym; args: List<Id<TExpr>>; }
+
+/// Why sema made an expression node, where Rust lowered it differently from the written form (B11: lower
+/// reads this instead of guessing from spans). `Typed.origin(id)`; `Written` unless sema set another.
+pub enum Origin {
+    Written,
+    /// `AddrOf` of a method receiver for a `this: &T` parameter (Rust `auto_this`: `_thisN`).
+    AutoRef,
+    /// `SliceOf` of an array place where a slice is wanted (Rust `array_to_slice`: `_slN`).
+    ArrayToSlice,
+    /// `SliceOf` of an array literal given a slice type (Rust `array_lit`: `_aN`, `_slN`, then a use).
+    ArrayLitToSlice,
+    /// `Unary(Not, Call)` of an `operator==` used for `!=` (Rust `operator_fallback`: `_cmpN`).
+    OpFallback,
+    /// `Convert(StringBytes)` of a `Text`'s bytes where a `string` is wanted (Rust `text_to_string`: `_txtN`).
+    TextToString,
+    /// `AddrOf` of a value `Arena` place given to `fn[mem]` (Rust `arena_arg`: borrowed in place, `_dynN`).
+    ArenaRef,
+    /// `ArrayLit` with no wanted type: Rust lowered `elems[0]` once more, first, to learn the element type.
+    ArrayPeek,
+    /// A generic method call with written type args (`s.put::<int>(..)`): Rust makes the instance right
+    /// after the receiver place, before any argument (`lookup_method`, then `call_id`).
+    TypeArgs,
+    /// `Float` of a negated literal where an `f16` is wanted: Rust returns it as an rvalue (not a constant
+    /// operand), so in an operand position it is held in `_tN`.
+    NegHalf,
+    /// `Float` of a named float const (`TAU`, `m.PI`): Rust's `const_rvalue` is an rvalue, not a literal, so
+    /// in an operand position it is held in `_tN` and it is not a bare number for operand order.
+    ConstUse,
+}
+
+/// One piece of a backtick string.
+pub enum TInterpPart {
+    /// Literal bytes (arena copy).
+    Lit(string),
+    Value(TInterpValue),
+}
+
+/// A `{hole}`: printed by its type. `debug` is always None: Rust expands `#[Debug]` values inline
+/// (`lower/interp.j3` `interpExpand`), so there is no printer instance (C2c decision; the field stays
+/// for the stage 0 layout).
+pub struct TInterpValue { expr: Id<TExpr>; debug: Option<Id<Instance>>; }
+
+/// A place (something with an address); its type is `Typed.placeTy(id)`.
+pub enum TPlace {
+    Error,
+    Local(LocalPlace),
+    Global(GlobalPlace),
+    /// Field `index` of the struct (or tuple) `base`.
+    Field(FieldPlace),
+    /// `*p` for a `&T` value (written, or an auto-deref of `p.x`).
+    Deref(DerefPlace),
+    /// `base[index]`; `checked` adds the bounds check (arrays, slices, strings).
+    Index(IndexPlace),
+    /// A value stored in a fresh temporary so it has an address (`f().x`, `&5`).
+    Temp(TempPlace),
+    /// Payload field `field` of variant `variant` (after a variant test).
+    Payload(PayloadPlace),
+    /// Lane `lane` of a `vec4f` / `vec4i`.
+    Lane(LanePlace),
+    /// Inside a closure body: captured place `index` of the literal (`TClosure.captures[index]`), read
+    /// through the ctx (`(*_ctx).c<index>`, dereferenced unless boxed).
+    Capture(CapturePlace),
+    /// `.len` / `.ptr` of a slice or string, the tag of an enum.
+    Len(SubPlace),
+    Ptr(SubPlace),
+    Tag(SubPlace),
+}
+
+pub struct LocalPlace { local: Id<TLocal>; }
+pub struct GlobalPlace { global: Id<GlobalDecl>; }
+pub struct FieldPlace { base: Id<TPlace>; index: int; }
+pub struct DerefPlace { ptr: Id<TExpr>; }
+pub struct IndexPlace { base: Id<TPlace>; index: Id<TExpr>; checked: bool; }
+pub struct TempPlace { value: Id<TExpr>; }
+pub struct PayloadPlace { base: Id<TPlace>; variant: int; field: int; }
+pub struct LanePlace { base: Id<TPlace>; lane: int; }
+/// `outer`: the captured place in the enclosing body (its access is this place's, Rust `place.access =
+/// orig.access`); `lower` never lowers `outer` from inside the closure body.
+pub struct CapturePlace { index: int; outer: Id<TPlace>; }
+pub struct SubPlace { base: Id<TPlace>; }
+
+/// A typed statement; its span is `Typed.stmtSpan(id)`.
+pub enum TStmt {
+    Error,
+    /// `let x = e;` (None: zeroed).
+    Let(TLet),
+    Expr(TExprStmt),
+    Assign(TAssign),
+    /// `p += e` on a primitive (a user `operator+=` is a `Call`).
+    AssignOp(TAssignOp),
+    If(TIfStmt),
+    While(TLoop),
+    /// `for i in a..b` (`inclusive` for `..=`).
+    ForRange(TForRange),
+    /// `for x in it` over an iterator, or over a slice / array place.
+    ForEach(TForEach),
+    Match(TMatchStmt),
+    /// `let P = e;` (irrefutable) or `let P = e else { .. }`.
+    LetPat(TLetPat),
+    Return(TReturn),
+    Break(TJump),
+    Continue(TJump),
+    Defer(TDefer),
+    Block(TBlockStmt),
+}
+
+pub struct TLet { local: Id<TLocal>; init: Option<Id<TExpr>>; }
+pub struct TExprStmt { expr: Id<TExpr>; }
+pub struct TAssign { place: Id<TPlace>; value: Id<TExpr>; }
+pub struct TAssignOp { place: Id<TPlace>; op: BinOp; kind: BinKind; value: Id<TExpr>; }
+pub struct TIfStmt { cond: Id<TExpr>; thenBlock: TBlock; elseBlock: Option<TBlock>; }
+pub struct TLoop { id: int; cond: Id<TExpr>; body: TBlock; }
+pub struct TForRange { id: int; var: Id<TLocal>; start: Id<TExpr>; end: Id<TExpr>; inclusive: bool; body: TBlock; }
+
+pub enum ForKind {
+    /// `next(this: &Self): Option<T>`: `next` is the method, `some` the `Option` variant carrying `T`.
+    Iter,
+    Slice,
+    Array,
+}
+
+/// `index` is the `for i, x in xs` counter (None: `lower` makes a hidden one, Rust's `_iN`).
+/// J3: Field order works around stage 0 bug (a) in PORT_DEBT.md (`next` 8-aligned).
+pub struct TForEach { id: int; next: Option<Callee>; some: int; body: TBlock; kind: ForKind; index: Option<Id<TLocal>>; var: Id<TLocal>; source: Id<TPlace>; }
+pub struct TMatchStmt { m: TMatch; }
+/// `elseBlock` None: an irrefutable destructuring `let` (sema checked it). Field order: stage 0 bug (a).
+pub struct TLetPat { elseBlock: Option<TBlock>; pat: Id<TPat>; value: Id<TExpr>; }
+pub struct TReturn { value: Option<Id<TExpr>>; }
+pub struct TJump { target: int; }
+pub struct TDefer { body: TBlock; }
+pub struct TBlockStmt { block: TBlock; }
+
+pub struct TBlock {
+    span: Span;
+    stmts: List<Id<TStmt>>;
+}
+
+/// `match scrut { arms }`, exhaustiveness already checked by sema.
+pub struct TMatch {
+    scrut: Id<TExpr>;
+    /// An integer match lowered as one `Switch` (`pat_check.patIntArms`): sema's decision, for lower.
+    switch: bool;
+    arms: List<TArm>;
+}
+
+pub struct TArm {
+    /// The AST arm's span (an `if let` then-arm starts at `if`): lower's debug locations.
+    span: Span;
+    pat: Id<TPat>;
+    guard: Option<Id<TExpr>>;
+    body: TBlock;
+    value: Option<Id<TExpr>>;
+}
+
+/// A typed pattern; its type is `Typed.patTy(id)`.
+pub enum TPat {
+    Wild,
+    /// Binds the matched value to a new local.
+    Bind(BindPat),
+    /// Equal to a constant (int, char, bool, string).
+    Lit(TLitPat),
+    Range(TRangePat),
+    /// Variant `variant` of the scrutinee's enum; `fields` match its payload fields.
+    Variant(TVariantPat),
+    Tuple(TPats),
+    /// Struct pattern: `fields[i]` is the field index `pats[i]` matches.
+    Struct(TStructPat),
+    Or(TPats),
+}
+
+pub struct BindPat { local: Id<TLocal>; }
+pub struct TLitPat { value: Id<TExpr>; }
+pub struct TRangePat { lo: Id<TExpr>; hi: Id<TExpr>; inclusive: bool; }
+pub struct TVariantPat { variant: int; fields: List<Id<TPat>>; }
+pub struct TPats { items: List<Id<TPat>>; }
+pub struct TStructPat { fields: List<int>; pats: List<Id<TPat>>; }
+
+/// A local or parameter of one body.
+pub struct TLocal {
+    name: Sym;
+    ty: Id<Ty>;
+    span: Span;
+    param: bool;
+}
+
+/// One fn's typed body, all types concrete. A plain fn's is `FnDecl.body` (listed in its `TypedMod`); an
+/// instance's is `Instance.body` (typed by `instances.drain`, reached by `lower` through `Callee.Inst`).
+/// `slots`: `Callee.Bound` count of a placeholder-typed template body (C2b: 0 in every lowered body).
+pub struct TBody {
+    decl: Id<FnDecl>;
+    params: List<Id<TLocal>>;
+    /// Every local, params first, in order of declaration.
+    locals: List<Id<TLocal>>;
+    body: TBlock;
+    loops: int;
+    slots: int;
+}
+
+/// One module's typed bodies, declaration order (the unit `lower` takes, B5).
+pub struct TypedMod {
+    owner: Id<ModDecl>;
+    bodies: List<Id<TBody>>;
+}
+
+/// What sema hands `lower` and the tools: the tables, the typed tree, the modules in load order, `main`.
+pub struct Checked {
+    tables: &Tables;
+    typed: &Typed;
+    mods: List<TypedMod>;
+    /// `main` (Rust `cx.entry`); a library check (`Mode.Lib`) has a dummy one.
+    entry: Option<Id<FnDecl>>;
+    /// `check --autofix` edits (Rust `Program.fixes`), from `lint`.
+    fixes: List<LintFix>;
+    /// The `@shader(vs, fs)` programs `shader.prepare` emitted (Rust `Program.shaders`; `dump-glsl`).
+    shaders: List<ShaderProgram>;
+    /// Every `const X = @script("..");` (Rust `Program.script_aliases`; the bc backend, C4).
+    scriptAliases: List<ScriptAlias>;
+}
+
+/// `const name = @script("path.j3s");` in the module whose main file is `file`: `name` is `decl` there
+/// (Rust `ScriptAlias`). Made by `script.resolveScriptAliases`.
+pub struct ScriptAlias {
+    file: Id<Source>;
+    name: Sym;
+    decl: Id<StructDecl>;
+}
+
+/// The node pools of one compile. Build with `addExpr(e, ty, span)`; read with `expr(id)` (a copy).
+pub struct Typed {
+    arena: &Arena;
+    exprs: Pool<TExpr>;
+    exprSpans: Spans<TExpr>;
+    exprTys: List<Id<Ty>>;
+    exprOrigins: List<Origin>;
+    places: Pool<TPlace>;
+    placeSpans: Spans<TPlace>;
+    placeTys: List<Id<Ty>>;
+    stmts: Pool<TStmt>;
+    stmtSpans: Spans<TStmt>;
+    pats: Pool<TPat>;
+    patSpans: Spans<TPat>;
+    patTys: List<Id<Ty>>;
+    locals: Pool<TLocal>;
+    bodies: Pool<TBody>;
+    /// A generic type's bound check failed after a body (`instances.drainBodyBounds`): Rust stops there
+    /// with that one error.
+    boundFatal: bool;
+    /// Autofix edits `lint` found (Rust `lint::Fix`), copied to `Checked.fixes`.
+    fixes: List<LintFix>;
+    /// Held for `Checked` (same-named fields there): set by `declarations`.
+    shaders: List<ShaderProgram>;
+    scriptAliases: List<ScriptAlias>;
+
+    /// Empty pools in `arena`; returns a pointer into `arena`.
+    fn new(arena: &Arena): &Typed {
+        return arena.new::<Typed>(Typed { arena: arena, exprs: Pool<TExpr>.new(arena), exprSpans: Spans<TExpr>.new(arena),
+            exprTys: List<Id<Ty>>.new(arena), exprOrigins: List<Origin>.new(arena), places: Pool<TPlace>.new(arena), placeSpans: Spans<TPlace>.new(arena),
+            placeTys: List<Id<Ty>>.new(arena), stmts: Pool<TStmt>.new(arena), stmtSpans: Spans<TStmt>.new(arena),
+            pats: Pool<TPat>.new(arena), patSpans: Spans<TPat>.new(arena), patTys: List<Id<Ty>>.new(arena),
+            locals: Pool<TLocal>.new(arena), bodies: Pool<TBody>.new(arena), boundFatal: false,
+            fixes: List<LintFix>.new(arena), shaders: List<ShaderProgram>.new(arena), scriptAliases: List<ScriptAlias>.new(arena) });
+    }
+
+    fn addExpr(this: &Typed, e: TExpr, ty: Id<Ty>, sp: Span): Id<TExpr> {
+        let id = this.exprs.add(e);
+        this.exprSpans.set(id, sp);
+        this.exprTys.push(ty);
+        this.exprOrigins.push(Origin.Written);
+        return id;
+    }
+    fn setOrigin(this: &Typed, id: Id<TExpr>, o: Origin) { this.exprOrigins.items[int(id.i)] = o; }
+    fn origin(this: &Typed, id: Id<TExpr>): Origin { return this.exprOrigins.items[int(id.i)]; }
+    fn addPlace(this: &Typed, p: TPlace, ty: Id<Ty>, sp: Span): Id<TPlace> {
+        let id = this.places.add(p);
+        this.placeSpans.set(id, sp);
+        this.placeTys.push(ty);
+        return id;
+    }
+    fn addStmt(this: &Typed, s: TStmt, sp: Span): Id<TStmt> {
+        let id = this.stmts.add(s);
+        this.stmtSpans.set(id, sp);
+        return id;
+    }
+    fn addPat(this: &Typed, p: TPat, ty: Id<Ty>, sp: Span): Id<TPat> {
+        let id = this.pats.add(p);
+        this.patSpans.set(id, sp);
+        this.patTys.push(ty);
+        return id;
+    }
+    fn addLocal(this: &Typed, l: TLocal): Id<TLocal> { return this.locals.add(l); }
+    fn addBody(this: &Typed, b: TBody): Id<TBody> { return this.bodies.add(b); }
+
+    fn expr(this: &Typed, id: Id<TExpr>): TExpr { return *this.exprs.get(id); }
+    fn place(this: &Typed, id: Id<TPlace>): TPlace { return *this.places.get(id); }
+    fn stmt(this: &Typed, id: Id<TStmt>): TStmt { return *this.stmts.get(id); }
+    fn pat(this: &Typed, id: Id<TPat>): TPat { return *this.pats.get(id); }
+    fn local(this: &Typed, id: Id<TLocal>): TLocal { return *this.locals.get(id); }
+    fn body(this: &Typed, id: Id<TBody>): TBody { return *this.bodies.get(id); }
+
+    fn exprTy(this: &Typed, id: Id<TExpr>): Id<Ty> { return this.exprTys.items[int(id.i)]; }
+    fn placeTy(this: &Typed, id: Id<TPlace>): Id<Ty> { return this.placeTys.items[int(id.i)]; }
+    fn patTy(this: &Typed, id: Id<TPat>): Id<Ty> { return this.patTys.items[int(id.i)]; }
+    fn exprSpan(this: &Typed, id: Id<TExpr>): Span { return this.exprSpans.get(id); }
+    fn placeSpan(this: &Typed, id: Id<TPlace>): Span { return this.placeSpans.get(id); }
+    fn stmtSpan(this: &Typed, id: Id<TStmt>): Span { return this.stmtSpans.get(id); }
+    fn patSpan(this: &Typed, id: Id<TPat>): Span { return this.patSpans.get(id); }
+
+    /// A new empty block at `span`.
+    fn block(this: &Typed, span: Span): TBlock { return TBlock { span: span, stmts: List<Id<TStmt>>.new(this.arena) }; }
+}
+

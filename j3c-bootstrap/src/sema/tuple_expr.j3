@@ -1,0 +1,191 @@
+// Tuples in fn bodies: `(a, b)` literals, `.0` / `.1` fields, `==` / `!=` and `hash()` element by element.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/tuple.rs, check/lower/lit.rs (tuple_lit)
+// J3: C2c hooks (contracts-c2c.md, owner: tuples). Rust writes `==` / `hash` as an AST expression over
+// `$tup` temporaries and lowers that; here the same expression is typed over hidden locals and wrapped
+// in `TExpr.LetIn`, so `lower` decides nothing.
+module j3c.sema;
+// J3: A hidden local is bound in scope as `$tup<k>` (no source name can spell it) while its expression is
+// typed, and its `TLocal.name` is `tup`, the hint `lower` names the temporary with (`_tupN`).
+
+/// Multiplier between element hashes (FNV-1a's 64-bit prime); element hashes are already mixed.
+const TUPLE_HASH_MUL: i64 = 1099511628211;
+
+extend BodyCx {
+    /// Rust `tuple_lit`: `(a, b)` against an optional expected tuple type (`closureReject` each element,
+    /// "a tuple element").
+    fn tupleLit(this: &BodyCx, sp: Span, elems: &List<Id<Expr>>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let wants = List<Id<Ty>>.new(this.cx.arena);
+        match want {
+            Option.Some(w) {
+                match this.ty(w) {
+                    Ty.Tuple(tt) {
+                        let es = this.cx.tables.items(tt.elems);
+                        if es.len == elems.len { wants.extend(es); }
+                    }
+                    _ {}
+                }
+            }
+            Option.None {}
+        }
+        let items = List<Id<TExpr>>.new(this.cx.arena);
+        let tys = List<Id<Ty>>.new(this.cx.arena);
+        for i in 0..elems.len {
+            let w: Option<Id<Ty>> = Option.None;
+            if i < wants.len { w = Option.Some(wants.items[i]); }
+            let op = this.operand(elems.items[i], w)?;
+            let esp = this.cx.ast.exprSpan(elems.items[i]);
+            let t = this.exprTy(op);
+            match this.closureReject(esp, t, "a tuple element") { Option.Some(er) { return Result.Err(er); } Option.None {} }
+            if t == this.com().void { return Result.Err(this.err(esp, "a tuple element needs a value")); }
+            items.push(op);
+            tys.push(t);
+        }
+        let tt = this.cx.tables.intern(Ty.Tuple(TupleTy { elems: this.cx.tables.list(tys.slice()) }));
+        return Result.Ok(this.expr(TExpr.Tuple(TElems { items: items }), tt, sp));
+    }
+
+    /// `base.0`: field `field` of the tuple place `base` (already dereferenced), a `TPlace.Field`. A tuple
+    /// is a struct with fields `0`, `1`, .. in Rust, so a bad name is its `no_field` error.
+    fn tupleField(this: &BodyCx, base: Id<TPlace>, field: Ident): Result<Id<TPlace>, TErr> {
+        let bt = this.placeTy(base);
+        let es = match this.ty(bt) {
+            Ty.Tuple(tt) { this.cx.tables.items(tt.elems) }
+            _ { return Result.Err(this.err(field.span, "internal: not a tuple place")); }
+        };
+        let name = this.str(field.name);
+        for i in 0..es.len {
+            let n = Text.new(this.cx.arena);
+            n.pushInt(i);
+            if n.str() == name { return Result.Ok(this.place(TPlace.Field(FieldPlace { base: base, index: i }), es[i], field.span)); }
+        }
+        let t = Text.new(this.cx.arena);
+        t.add("no field `").add(name).add("` on `").add(this.tyStr(bt)).add("`");
+        let e = this.err(field.span, t.str());
+        let names = List<string>.new(this.cx.arena);
+        for i in 0..es.len {
+            let n = Text.new(this.cx.arena);
+            n.pushInt(i);
+            names.push(n.str());
+        }
+        match didYouMean(name, names.slice(), this.cx.arena) {
+            Option.Some(x) {
+                let h = Text.new(this.cx.arena);
+                h.add("did you mean `").add(x).add("`?");
+                return Result.Err(this.help(e, h.str()));
+            }
+            Option.None {}
+        }
+        return Result.Err(e);
+    }
+
+    /// Rust `binary`'s tuple case (check/lower/binop.rs:131): `l == rhs` / `l != rhs` when `l` is a tuple,
+    /// after own operators (`findOp`) and before `operatorFallback`. None: not a tuple compare.
+    fn tupleCompare(this: &BodyCx, sp: Span, op: BinOp, l: Id<TExpr>, rhs: Id<Expr>): Result<Option<Id<TExpr>>, TErr> {
+        if !(op == BinOp.Eq || op == BinOp.Ne) { return Result.Ok(Option.None); }
+        let lt = this.exprTy(l);
+        let n = match this.ty(lt) {
+            Ty.Tuple(tt) { this.cx.tables.items(tt.elems).len }
+            _ { return Result.Ok(Option.None); }
+        };
+        let r = this.operand(rhs, Option.Some(lt))?;
+        if this.exprTy(r) != lt { return Result.Err(this.err(sp, "compare type mismatch")); }
+        // Rust `tuple_eq`: `$a.0 == $b.0 && $a.1 == $b.1 ..`, negated for `!=`.
+        let n0 = this.scope.len;
+        let locals = List<Id<TLocal>>.new(this.cx.arena);
+        let values = List<Id<TExpr>>.new(this.cx.arena);
+        let a = this.tupleBind(sp, l, &locals, &values);
+        let b = this.tupleBind(sp, r, &locals, &values);
+        let ast = this.cx.ast;
+        let all = a;
+        for i in 0..n {
+            let eq = ast.addExpr(Expr.Binary(BinaryExpr { op: BinOp.Eq, lhs: this.tupleElem(sp, a, i), rhs: this.tupleElem(sp, b, i) }), sp);
+            if i == 0 { all = eq; } else { all = ast.addExpr(Expr.Binary(BinaryExpr { op: BinOp.And, lhs: all, rhs: eq }), sp); }
+        }
+        if op == BinOp.Ne { all = ast.addExpr(Expr.Unary(UnaryExpr { op: UnaryOp.Not, expr: all }), sp); }
+        let body = this.rvalue(all, Option.Some(this.com().bool));
+        this.scope.len = n0;
+        let bv = body?;
+        return Result.Ok(Option.Some(this.expr(TExpr.LetIn(TLetIn { locals: locals, values: values, body: bv }), this.exprTy(bv), sp)));
+    }
+
+    /// Rust `tuple_hash` (check/lower/call.rs:130): `recv.hash()` on a tuple (through any `&`), asked when
+    /// the receiver has no method `name` and no UFCS target. None: not a tuple `hash()`.
+    /// `h = hash(t.0); h = h * P ^ hash(t.k) ..; h ^ (h >> 29)`.
+    fn tupleHash(this: &BodyCx, sp: Span, recv: Id<TPlace>, name: Ident, args: &List<Id<Expr>>): Result<Option<Id<TExpr>>, TErr> {
+        if args.len != 0 || this.str(name.name) != "hash" { return Result.Ok(Option.None); }
+        let rt = this.placeTy(recv);
+        while true {
+            match this.refInner(rt) { Option.Some(t) { rt = t; } Option.None { break; } }
+        }
+        let n = match this.ty(rt) {
+            Ty.Tuple(tt) { this.cx.tables.items(tt.elems).len }
+            _ { return Result.Ok(Option.None); }
+        };
+        let place = this.derefAll(recv, sp);
+        let u64Ty = this.com().u64;
+        let ast = this.cx.ast;
+        let n0 = this.scope.len;
+        let locals = List<Id<TLocal>>.new(this.cx.arena);
+        let values = List<Id<TExpr>>.new(this.cx.arena);
+        let t = this.tupleBind(sp, this.load(place), &locals, &values);
+        let h = this.tupleHashOf(sp, t, 0);
+        for i in 1..n {
+            let mul = ast.addExpr(Expr.Binary(BinaryExpr { op: BinOp.Mul, lhs: h, rhs: ast.addExpr(Expr.Int(TUPLE_HASH_MUL), sp) }), sp);
+            h = ast.addExpr(Expr.Binary(BinaryExpr { op: BinOp.BitXor, lhs: mul, rhs: this.tupleHashOf(sp, t, i) }), sp);
+        }
+        let folded = this.operand(h, Option.Some(u64Ty));
+        this.scope.len = n0;
+        let fv = folded?;
+        if this.exprTy(fv) != u64Ty {
+            let m = Text.new(this.cx.arena);
+            m.add("`hash` of a tuple element returns `").add(this.tyStr(this.exprTy(fv))).add("`, not `u64`");
+            return Result.Err(this.err(sp, m.str()));
+        }
+        let locals2 = List<Id<TLocal>>.new(this.cx.arena);
+        let values2 = List<Id<TExpr>>.new(this.cx.arena);
+        let hn = this.tupleBind(sp, fv, &locals2, &values2);
+        let shr = ast.addExpr(Expr.Binary(BinaryExpr { op: BinOp.Shr, lhs: hn, rhs: ast.addExpr(Expr.Int(29), sp) }), sp);
+        let mix = ast.addExpr(Expr.Binary(BinaryExpr { op: BinOp.BitXor, lhs: hn, rhs: shr }), sp);
+        let body = this.rvalue(mix, Option.Some(u64Ty));
+        this.scope.len = n0;
+        let bv = body?;
+        let inner = this.expr(TExpr.LetIn(TLetIn { locals: locals2, values: values2, body: bv }), this.exprTy(bv), sp);
+        return Result.Ok(Option.Some(this.expr(TExpr.LetIn(TLetIn { locals: locals, values: values, body: inner }), this.exprTy(inner), sp)));
+    }
+
+    /// A multi-field variant whose payload type `p` is not a tuple (sema's own invariant: `decl_types`
+    /// makes every multi payload a `Ty.Tuple`).
+    fn tupleMultiPayload(this: &BodyCx, sp: Span, p: Id<Ty>): TErr {
+        let t = Text.new(this.cx.arena);
+        t.add("internal: multi-field payload `").add(this.tyStr(p)).add("` is not a tuple");
+        return this.err(sp, t.str());
+    }
+
+    /// Rust `bind_named`: a hidden local holding `value`, in scope under a name no source can write; the
+    /// result is the AST name expression that reads it. The caller truncates the scope afterwards.
+    fn tupleBind(this: &BodyCx, sp: Span, value: Id<TExpr>, locals: &List<Id<TLocal>>, values: &List<Id<TExpr>>): Id<Expr> {
+        let id = this.newLocal(this.sym("tup"), this.exprTy(value), sp, false);
+        let key = Text.new(this.cx.arena);
+        key.add("$tup").pushInt(int(id.i));
+        let k = this.sym(key.str());
+        this.bind(k, id);
+        locals.push(id);
+        values.push(value);
+        return this.cx.ast.addExpr(Expr.Name(Ident { name: k, span: sp }), sp);
+    }
+
+    /// `base.<i>` as AST.
+    fn tupleElem(this: &BodyCx, sp: Span, base: Id<Expr>, i: int): Id<Expr> {
+        let n = Text.new(this.cx.arena);
+        n.pushInt(i);
+        return this.cx.ast.addExpr(Expr.Field(FieldExpr { base: base, field: Ident { name: this.sym(n.str()), span: sp } }), sp);
+    }
+
+    /// `base.<i>.hash()` as AST.
+    fn tupleHashOf(this: &BodyCx, sp: Span, base: Id<Expr>, i: int): Id<Expr> {
+        let f = this.cx.ast.addExpr(Expr.Field(FieldExpr { base: this.tupleElem(sp, base, i), field: Ident { name: this.sym("hash"), span: sp } }), sp);
+        return this.cx.ast.addExpr(Expr.Call(CallExpr { func: f, typeArgs: List<Id<Type>>.new(this.cx.arena), args: List<Id<Expr>>.new(this.cx.arena) }), sp);
+    }
+}

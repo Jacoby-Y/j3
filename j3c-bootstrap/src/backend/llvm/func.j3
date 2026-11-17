@@ -2,4 +2,418 @@
 //
 // Part of module j3c.backend.llvm.
 // Port of: j3c/src/emit/llvm_expr/mod.rs
+// J3: `LlvmFn` is Rust's per-fn emitter state, field for field (Rust `String` buffers are `Text`, borrowed
+// `&mut` options are `Option<&T>`); the other parts add methods with `extend LlvmFn`. SSA names and type
+// strings a method returns are arena strings (`arena`, the Session arena, see `emitFuncs`). Rust's
+// `STR_SEQ` static counter is the `seq` field, one per emit call. One instruction line is built in `ln`
+// (`this.l().fmt(..)`) and then passed to `inst`.
+// Entries: `LlvmFn.new`, `LlvmFn.constOnly`, `emitFunc`, `llBytesLit`.
 module j3c.backend.llvm;
+
+/// The defers of one open block (Rust `DeferFrame`). Bools last (stage-0 ABI hazard (a), PORT_DEBT.md).
+pub struct DeferFrame {
+    blocks: List<Block>;
+    cont: Option<string>;
+    brk: Option<string>;
+    isLoop: bool;
+}
+
+pub struct LlvmFn {
+    cx: &IrCx;
+    arena: &Arena;
+    /// None for `constOnly` (constant initializers outside any fn).
+    body: Option<&Body>;
+    text: Text;
+    globals: Text;
+    tmp: u32;
+    frames: List<DeferFrame>;
+    dbg: Option<&DebugOut>;
+    scope: u32;
+    line: u32;
+    file: string;
+    /// Whole-program builds share one abort routine: a check site passes `file << 40 | line << 8 | kind`
+    /// and this list (the file part) is printed once by `abortRoutine`. None keeps a message per site.
+    abortFiles: Option<&List<string>>;
+    /// ` optsize` / ` optsize minsize` for `-Os` / `-Oz` objects that LTO optimizes again.
+    sizeAttr: string;
+    /// Temporary `alloca`s made while emitting the body, moved to the entry block at `entryAt`.
+    hoisted: Text;
+    entryAt: Option<int>;
+    /// Rust `STR_SEQ`: names the `@.bN` byte-string globals.
+    seq: &StrSeq;
+    /// Scratch line for `l()`.
+    ln: Text;
+    // Bools last: payload enums above stay 8-aligned (stage-0 ABI hazard (a), PORT_DEBT.md).
+    terminated: bool;
+    /// Split builds link two objects, so every definition is visible to the other one.
+    external: bool;
+    /// Release builds: no fn unwinds, so no unwind tables.
+    nounwind: bool;
+    /// The fn returns a big value through the hidden pointer `%ret`.
+    sret: bool;
+
+    fn new(cx: &IrCx, arena: &Arena, body: &Body, dbg: Option<&DebugOut>): LlvmFn {
+        let f = LlvmFn.constOnly(cx, arena);
+        f.body = Option.Some(body);
+        f.dbg = dbg;
+        return f;
+    }
+
+    fn constOnly(cx: &IrCx, arena: &Arena): LlvmFn {
+        return LlvmFn { cx: cx, arena: arena, body: Option.None, text: Text.new(arena), globals: Text.new(arena), tmp: 0,
+            terminated: false, frames: List<DeferFrame>.new(arena), dbg: Option.None, scope: 0, line: 1, file: "",
+            external: false, abortFiles: Option.None, nounwind: false, sizeAttr: "", hoisted: Text.new(arena),
+            entryAt: Option.None, sret: false, seq: arena.new::<StrSeq>(StrSeq { n: 0 }), ln: Text.new(arena) };
+    }
+}
+
+extend LlvmFn {
+    /// The scratch line, emptied.
+    fn l(this: &LlvmFn): &Text {
+        this.ln.clear();
+        return &this.ln;
+    }
+
+    /// `s` copied into the fn's arena.
+    fn keep(this: &LlvmFn, s: string): string { return own(this.arena, s); }
+
+    fn fresh(this: &LlvmFn): string {
+        let n = this.tmp;
+        this.tmp += 1;
+        // Named, not `%<n>`: labels share this counter, and strict LLVMs (the NDK's, Apple's)
+        // reject gaps in unnamed numbering.
+        return this.keep(`%t{n}`);
+    }
+
+    fn label(this: &LlvmFn): string {
+        let n = this.tmp;
+        this.tmp += 1;
+        return this.keep(`b{n}`);
+    }
+
+    /// A fresh stack slot of type `ty`, allocated once in the entry block.
+    fn alloca(this: &LlvmFn, ty: string): string {
+        let slot = this.fresh();
+        match this.entryAt {
+            Option.Some(_) { this.hoisted.add("  ").add(slot).add(" = alloca ").add(ty).push('\n'); }
+            Option.None { this.inst(this.l().add(slot).add(" = alloca ").add(ty).str()); }
+        }
+        return slot;
+    }
+
+    fn inst(this: &LlvmFn, s: string) {
+        if this.terminated { return; }
+        this.text.add("  ").add(s);
+        let id = this.dbgId();
+        if id > 0 { this.text.fmt(`, !dbg !{id}`); }
+        this.text.push('\n');
+    }
+
+    /// The `!DILocation` of the current line, 0 for none (Rust `dbg_id`; metadata id 0 is the compile unit).
+    fn dbgId(this: &LlvmFn): u32 {
+        if this.scope == 0 { return 0; }
+        let line = this.line;
+        if line < 1 { line = 1; }
+        match this.dbg {
+            Option.Some(d) { return d.location(this.scope, line); }
+            Option.None { return 0; }
+        }
+    }
+
+    fn noteSpan(this: &LlvmFn, span: Span) {
+        if isNone(span) { return; }
+        let src = match this.cx.source(span.file) { Option.Some(s) { s } Option.None { return; } };
+        this.file = src.path;
+        let line = srcLine(&src, span.lo);
+        if line > 0 { this.line = u32(line); }
+    }
+
+    fn exitAbort(this: &LlvmFn, kind: AbortKind) {
+        this.exitAbortVals(kind, this.arena.alloc::<string>(0));
+    }
+
+    /// `vals` are two `i64` SSA values shown in the message (`abortDetail`), or none.
+    fn exitAbortVals(this: &LlvmFn, kind: AbortKind, vals: []string) {
+        if this.terminated { return; }
+        let d = abortDetail(kind);
+        let a = "0";
+        let b = "0";
+        if vals.len == 2 && d.0.len > 0 { a = vals[0]; b = vals[1]; }
+        match this.abortFiles {
+            Option.Some(files) {
+                let at = files.len;
+                for i in 0..files.len {
+                    if files.items[i] == this.file { at = i; break; }
+                }
+                if at == files.len { files.push(this.file); }
+                let packed = (u64(at) << 40) | (u64(this.line) << 8) | abortCode(kind);
+                this.inst(this.l().fmt(`call void @j3_abort(i64 {packed}, i64 `).add(a).add(", i64 ").add(b).add(")").str());
+                this.inst("unreachable");
+                this.terminated = true;
+                return;
+            }
+            Option.None {}
+        }
+        if d.0.len > 0 && vals.len > 0 {
+            let fmt = Text.new(this.arena);
+            for i in 0..this.file.len {
+                if this.file[i] == '%' { fmt.add("%%"); } else { fmt.push(this.file[i]); }
+            }
+            fmt.fmt(`:{this.line}: `).add(abortMessage(kind)).add(d.0).add("%lld").add(d.1).add("%lld").push('\n');
+            fmt.push(0);
+            let p = this.bytesGlobal(fmt.str() as []u8);
+            let buf = this.alloca("[512 x i8], align 1");
+            let n = this.fresh();
+            this.inst(this.l().add(n).add(" = call i32 (ptr, i64, ptr, ...) @snprintf(ptr ").add(buf).add(", i64 512, ptr ").add(p)
+                .add(", i64 ").add(a).add(", i64 ").add(b).add(")").str());
+            let n64 = this.fresh();
+            this.inst(this.l().add(n64).add(" = sext i32 ").add(n).add(" to i64").str());
+            let w = this.fresh();
+            this.inst(this.l().add(w).add(" = call i64 @write(i32 2, ptr ").add(buf).add(", i64 ").add(n64).add(")").str());
+            this.inst("call void @_exit(i32 102)");
+            this.inst("unreachable");
+            this.terminated = true;
+            return;
+        }
+        let msg = Text.new(this.arena);
+        msg.add(this.file).fmt(`:{this.line}: `).add(abortMessage(kind)).push('\n');
+        let p = this.bytesGlobal(msg.str() as []u8);
+        let w = this.fresh();
+        this.inst(this.l().add(w).add(" = call i64 @write(i32 2, ptr ").add(p).fmt(`, i64 {msg.len()})`).str());
+        this.inst("call void @_exit(i32 102)");
+        this.inst("unreachable");
+        this.terminated = true;
+    }
+
+    fn term(this: &LlvmFn, s: string) {
+        if this.terminated { return; }
+        this.inst(s);
+        this.terminated = true;
+    }
+
+    /// `br label %name` then the target label (`term` ignores the branch after a terminator).
+    fn block(this: &LlvmFn, name: string) {
+        if !this.terminated { this.term(this.l().add("br label %").add(name).str()); }
+        this.text.add(name).add(":\n");
+        this.terminated = false;
+    }
+
+    /// `br label %name` as a terminator.
+    fn br(this: &LlvmFn, name: string) { this.term(this.l().add("br label %").add(name).str()); }
+
+    /// `br i1 c, label %t, label %e`.
+    fn brIf(this: &LlvmFn, c: string, t: string, e: string) {
+        this.term(this.l().add("br i1 ").add(c).add(", label %").add(t).add(", label %").add(e).str());
+    }
+
+    fn localPtr(this: &LlvmFn, id: Id<LocalDecl>): string { return this.keep(`%l{id.i}`); }
+
+    /// `define ... { ... }` of `func`, appended to `out` (Rust `emit_func`, which returned the text).
+    fn emitFunc(this: &LlvmFn, func: &Func, out: &Text): Result<bool, string> {
+        let body = match this.body { Option.Some(b) { b } Option.None { return Result.Err("func body missing"); } };
+        let sig = match this.cx.fnSig(func.ty) { Option.Some(s) { s } Option.None { return Result.Err("func without fn type"); } };
+        let cx = this.cx;
+        let ret = sig.ret;
+        this.sret = ret != cx.common.void && isBig(cx, ret);
+        let retLl = "void";
+        if ret != cx.common.void && !this.sret { retLl = llType(cx, ret, this.arena)?; }
+        let linkage = "";
+        if !this.external && func.vis == Vis.Private { linkage = "internal "; }
+        match this.dbg {
+            Option.Some(d) { match d.subprogram(func.id) { Option.Some(sp) { this.scope = sp; } Option.None { this.scope = 0; } } }
+            Option.None { this.scope = 0; }
+        }
+        this.noteSpan(func.span);
+        let t = &this.text;
+        t.add("define ").add(linkage).add(retLl).add(" @");
+        pushFuncName(t, cx, func);
+        t.push('(');
+        let first = true;
+        if this.sret { t.add("ptr noalias %ret"); first = false; }
+        for i in 0..sig.params.len {
+            if !first { t.add(", "); }
+            first = false;
+            let p = sig.params.items[i];
+            if isBig(cx, p) { t.add("ptr"); } else { pushLlType(t, cx, p)?; }
+            t.fmt(` %a{i}`);
+        }
+        t.add(")").add(this.sizeAttr);
+        if this.nounwind { t.add(" nounwind"); }
+        if this.scope != 0 { t.fmt(` #0 !dbg !{this.scope}`); }
+        t.add(" {\n");
+        t.add("entry:\n");
+        this.terminated = false;
+
+        let locals = body.locals.items.slice();
+        for i in 0..locals.len {
+            let decl = locals[i];
+            let ty = llType(cx, decl.ty, this.arena)?;
+            this.inst(this.l().add(this.localPtr(decl.id)).add(" = alloca ").add(ty).fmt(`, align {abiAlign(cx, decl.ty)}`).str());
+        }
+        this.entryAt = Option.Some(this.text.len());
+        this.hoisted.clear();
+        this.declareLocals(func, body);
+        for i in 0..body.params.len {
+            let id = body.params.items[i];
+            let ty = body.local(id).ty;
+            if isBig(cx, ty) {
+                // the caller passed its own storage: copy it before the body can write either
+                this.copyMem(this.localPtr(id), this.keep(`%a{i}`), ty);
+                continue;
+            }
+            let ll = llType(cx, ty, this.arena)?;
+            this.store(ll, this.keep(`%a{i}`), this.localPtr(id));
+        }
+
+        this.emitBlock(&body.block)?;
+        if !this.terminated {
+            if ret == cx.common.void { this.term("ret void"); } else { this.exitAbort(AbortKind.NoReturn); }
+        }
+        this.text.add("}\n");
+        match this.entryAt {
+            Option.Some(at) { this.text.insert(at, this.hoisted.str()); }
+            Option.None {}
+        }
+        this.entryAt = Option.None;
+        out.add(this.globals.str()).add(this.text.str());
+        this.globals.clear();
+        this.text.clear();
+        return Result.Ok(true);
+    }
+
+    /// `llvm.dbg.declare` of every named local (debug builds).
+    fn declareLocals(this: &LlvmFn, func: &Func, body: &Body) {
+        if this.scope == 0 { return; }
+        let d = match this.dbg { Option.Some(d) { d } Option.None { return; } };
+        let ptrs = List<string>.new(this.arena);
+        let vars = List<u32>.new(this.arena);
+        let locals = body.locals.items.slice();
+        for i in 0..locals.len {
+            let decl = locals[i];
+            if decl.kind == LocalKind.Tmp { continue; }
+            let name = this.cx.nameStr(decl.name);
+            if name.len == 0 { continue; }
+            let span = decl.span;
+            if isNone(span) { span = func.span; }
+            let src = match this.cx.source(span.file) { Option.Some(s) { s } Option.None { continue; } };
+            let line = srcLine(&src, span.lo);
+            if line < 1 { line = 1; }
+            let fileMd = match d.fileOf(span.file) { Option.Some(m) { m } Option.None { continue; } };
+            let v = d.localVar(this.cx, this.scope, fileMd, name, decl.ty, u32(line));
+            ptrs.push(this.localPtr(decl.id));
+            vars.push(v);
+        }
+        if d.expr == 0 { return; }
+        for i in 0..ptrs.len {
+            this.inst(this.l().add("call void @llvm.dbg.declare(metadata ptr ").add(ptrs.items[i])
+                .fmt(`, metadata !{vars.items[i]}, metadata !{d.expr})`).str());
+        }
+    }
+
+    fn store(this: &LlvmFn, ty: string, val: string, ptr: string) {
+        this.inst(this.l().add("store ").add(ty).add(" ").add(val).add(", ptr ").add(ptr).str());
+    }
+
+    /// `memcpy` of one `ty` value from `src` to `dst` (both addresses).
+    fn copyMem(this: &LlvmFn, dst: string, src: string, ty: Id<TyKind>) {
+        this.inst(this.l().add("call void @llvm.memcpy.p0.p0.i64(ptr ").add(dst).add(", ptr ").add(src)
+            .fmt(`, i64 {abiSize(this.cx, ty)}, i1 false)`).str());
+    }
+
+    fn load(this: &LlvmFn, ty: string, ptr: string): string {
+        let v = this.fresh();
+        this.inst(this.l().add(v).add(" = load ").add(ty).add(", ptr ").add(ptr).str());
+        return v;
+    }
+
+    fn emitBlockLoop(this: &LlvmFn, block: &Block, cont: string, brk: string): Result<bool, string> {
+        this.frames.push(DeferFrame { blocks: List<Block>.new(this.arena), isLoop: true, cont: Option.Some(cont), brk: Option.Some(brk) });
+        return this.blockBody(block);
+    }
+
+    fn emitBlock(this: &LlvmFn, block: &Block): Result<bool, string> {
+        this.frames.push(DeferFrame { blocks: List<Block>.new(this.arena), isLoop: false, cont: Option.None, brk: Option.None });
+        return this.blockBody(block);
+    }
+
+    /// The pushed frame's statements, its defers, then the pop.
+    fn blockBody(this: &LlvmFn, block: &Block): Result<bool, string> {
+        for i in 0..block.stmts.len { this.stmt(&block.stmts.items[i])?; }
+        this.flushCurrent()?;
+        this.frames.pop();
+        return Result.Ok(true);
+    }
+
+    fn flushCurrent(this: &LlvmFn): Result<bool, string> {
+        if this.frames.len == 0 { return Result.Ok(true); }
+        let fr = &this.frames.items[this.frames.len - 1];
+        let n = fr.blocks.len;
+        let blocks = this.arena.alloc::<Block>(n);
+        for i in 0..n { blocks[i] = fr.blocks.items[n - 1 - i]; }
+        fr.blocks.clear();
+        for i in 0..n {
+            for k in 0..blocks[i].stmts.len { this.stmt(&blocks[i].stmts.items[k])?; }
+        }
+        return Result.Ok(true);
+    }
+
+    /// Defers of every frame out to (and including) the loop `depth` levels out; `depth` < 0: all.
+    fn emitDefers(this: &LlvmFn, loopDepth: int): Result<bool, string> {
+        let blocks = List<Block>.new(this.arena);
+        let loops = 0;
+        let f = this.frames.len - 1;
+        while f >= 0 {
+            let frame = this.frames.items[f];
+            let b = frame.blocks.len - 1;
+            while b >= 0 { blocks.push(frame.blocks.items[b]); b -= 1; }
+            if frame.isLoop {
+                if loopDepth == loops { break; }
+                loops += 1;
+            }
+            f -= 1;
+        }
+        for i in 0..blocks.len {
+            for k in 0..blocks.items[i].stmts.len { this.stmt(&blocks.items[i].stmts.items[k])?; }
+        }
+        return Result.Ok(true);
+    }
+
+    fn loopTarget(this: &LlvmFn, cont: bool, depth: u32): Result<string, string> {
+        let skip = depth;
+        let f = this.frames.len - 1;
+        while f >= 0 {
+            let frame = this.frames.items[f];
+            if frame.isLoop {
+                if skip == 0 {
+                    let lab = frame.brk;
+                    if cont { lab = frame.cont; }
+                    match lab { Option.Some(l) { return Result.Ok(l); } Option.None { return Result.Err("loop frame missing label"); } }
+                }
+                skip -= 1;
+            }
+            f -= 1;
+        }
+        return Result.Err("break/continue outside a loop");
+    }
+}
+
+/// The 1-based line of byte `pos` in `src` (Rust `SourceFile::line`, `pos` clamped to the text).
+fn srcLine(src: &Source, pos: u32): int {
+    let p = pos;
+    if int(p) > src.text.len { p = u32(src.text.len); }
+    return src.lines.at(p).line;
+}
+
+/// `c"..."` text of `bytes` with LLVM escapes (Rust `ll_bytes_lit`).
+pub fn llBytesLit(bytes: []u8, out: &Text) {
+    out.add("c\"");
+    for i in 0..bytes.len {
+        let b = bytes[i];
+        if b == '\\' { out.add("\\\\"); }
+        else if b == '"' { out.add("\\22"); }
+        else if b == 0 { out.add("\\00"); }
+        else if b >= 32 && b < 127 { out.push(b); }
+        else { out.push('\\'); pushHex2(out, b); }
+    }
+    out.push('"');
+}

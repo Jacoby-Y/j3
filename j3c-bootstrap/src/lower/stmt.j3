@@ -4,4 +4,200 @@
 //
 // Part of module j3c.lower.
 // Port of: j3c/src/check/lower/stmt.rs, check/lower/zeroed.rs
+// J3: Labels, shadowing and scope are sema's (a jump names its loop's id); lower only turns the loop id into
+// Rust's depth (`Break(0)` = innermost). `match`, `let else` and `for x in iter` are C2b.
 module j3c.lower;
+
+extend FnLower {
+    /// Every statement of `b` into the current IR block (Rust `scoped_stmts`).
+    fn stmts(this: &FnLower, b: &TBlock) {
+        for i in 0..b.stmts.len { this.stmt(b.stmts.items[i]); }
+    }
+
+    /// `b` as a nested IR block (Rust `lower_block`).
+    fn block(this: &FnLower, b: &TBlock): Block {
+        let saved = this.b.beginBlock();
+        this.stmts(b);
+        return this.b.endBlock(saved);
+    }
+
+    /// Rust `stmt` / `stmt_inner`.
+    fn stmt(this: &FnLower, id: Id<TStmt>) {
+        let sp = this.lw.typed.stmtSpan(id);
+        let c = this.ir().common;
+        match this.lw.typed.stmt(id) {
+            TStmt.Let(l) {
+                match l.init {
+                    Option.Some(v) {
+                        match this.node(v) {
+                            TExpr.Zeroed { this.zeroLet(l.local, sp); return; }
+                            _ {}
+                        }
+                        let rv = this.rvalue(v);
+                        let lid = this.letOf(l.local);
+                        this.b.assign(sp, this.b.localPlace(lid, this.lw.typed.local(l.local).span), rv);
+                    }
+                    Option.None { this.zeroLet(l.local, sp); }
+                }
+            }
+            TStmt.Expr(e) { this.b.expr(this.spanOf(e.expr), this.rvalue(e.expr)); }
+            TStmt.Assign(a) {
+                let place = this.place(a.place, "i");
+                let rv = this.rvalue(a.value);
+                this.b.assign(sp, place, rv);
+            }
+            TStmt.AssignOp(a) {
+                let place = this.place(a.place, "i");
+                if a.kind == BinKind.Simd { this.simdAssignOp(sp, place, irBinOp(a.op as int), a.value); return; }
+                let rhs = this.operand(a.value);
+                let op = irBinOp(a.op as int);
+                if (op == BinOp.Div || op == BinOp.Rem) && this.isInt(place.ty) { this.abortIfZero(sp, rhs); }
+                this.b.assignOp(sp, place, op, rhs);
+            }
+            TStmt.If(s) {
+                let cond = this.operand(s.cond);
+                let thenBlock = this.block(&s.thenBlock);
+                let elseBlock: Option<Block> = Option.None;
+                match s.elseBlock { Option.Some(eb) { elseBlock = Option.Some(this.block(&eb)); } Option.None {} }
+                this.pushIf(sp, cond, thenBlock, elseBlock);
+            }
+            TStmt.While(w) {
+                this.loops.push(w.id);
+                let saved = this.b.beginBlock();
+                let cond = this.operand(w.cond);
+                let csp = this.spanOf(w.cond);
+                let not = this.tmpPlace("not", c.bool, csp);
+                this.b.assign(csp, this.copyOf(not), Rvalue { ty: c.bool, span: csp, kind: RvalueKind.Unary(UnaryRv { op: UnaryOp.Not, arg: cond }) });
+                let br = this.b.beginBlock();
+                this.push(sp, StmtKind.Break(0));
+                this.pushIf(sp, Operand.Copy(not), this.b.endBlock(br), Option.None);
+                this.stmts(&w.body);
+                let body = this.b.endBlock(saved);
+                this.push(sp, StmtKind.While(WhileStmt { cond: this.bool(sp, true), body: body }));
+                this.loops.pop();
+            }
+            TStmt.ForRange(f) {
+                this.loops.push(f.id);
+                let start = this.operand(f.start);
+                let end = this.operand(f.end);
+                if f.inclusive {
+                    let esp = this.spanOf(f.end);
+                    let inc = this.tmpPlace("inc", c.int, esp);
+                    this.b.assign(sp, this.copyOf(inc), Rvalue.binary(esp, c.int, BinOp.Add, end, this.int(esp, 1)));
+                    end = Operand.Copy(inc);
+                }
+                let vsp = this.lw.typed.local(f.var).span;
+                let index = this.b.localPlace(this.letOf(f.var), vsp);
+                this.b.assign(sp, this.copyOf(index), Rvalue.useOp(this.spanOf(f.start), start));
+                let body = this.block(&f.body);
+                this.push(sp, StmtKind.ForRange(ForRangeStmt { index: index, end: end, body: body }));
+                this.loops.pop();
+            }
+            TStmt.ForEach(f) {
+                this.loops.push(f.id);
+                if f.kind == ForKind.Iter { this.instForIter(sp, &f); } else { this.forEach(sp, f.kind, f.index, f.var, f.source, &f.body); }
+                this.loops.pop();
+            }
+            TStmt.Return(r) {
+                match r.value {
+                    Option.Some(v) { let op = this.operand(v); this.b.returnOp(sp, Option.Some(op)); }
+                    Option.None { this.b.returnOp(sp, Option.None); }
+                }
+            }
+            TStmt.Break(j) { this.push(sp, StmtKind.Break(this.depthOf(j.target))); }
+            TStmt.Continue(j) { this.push(sp, StmtKind.Continue(this.depthOf(j.target))); }
+            TStmt.Defer(d) { let body = this.block(&d.body); this.push(sp, StmtKind.Defer(DeferStmt { body: body })); }
+            TStmt.Block(b) {
+                let body = this.block(&b.block);
+                this.push(b.block.span, StmtKind.Block(body));
+            }
+            TStmt.Match(m) { this.patMatchStmt(id, &m.m); }
+            TStmt.LetPat(l) { this.patLetPat(id, &l); }
+            TStmt.Error { panic("lower: poisoned statement"); }
+        }
+    }
+
+    /// Rust's jump depth: 0 for the innermost loop.
+    fn depthOf(this: &FnLower, target: int): u32 {
+        let n = this.loops.len;
+        for k in 0..n { if this.loops.items[n - 1 - k] == target { return u32(k); } }
+        panic("lower: jump to a loop that is not open");
+        return 0;
+    }
+
+    /// `let x: T;` (Rust's `Zeroed` let): the local, then every scalar in it set to zero.
+    fn zeroLet(this: &FnLower, l: Id<TLocal>, sp: Span) {
+        let lid = this.letOf(l);
+        this.zeroFill(this.b.localPlace(lid, this.lw.typed.local(l).span), sp);
+    }
+
+    /// Rust `zero_fill`.
+    fn zeroFill(this: &FnLower, place: Place, sp: Span) {
+        let ir = this.ir();
+        let ty = place.ty;
+        let c = ir.common;
+        let scalar = this.int(sp, 0);
+        match ir.tyKind(ty) {
+            TyKind.Bool { scalar = opBool(sp, ty, false); }
+            TyKind.Int(_) { scalar = opInt(sp, ty, 0); }
+            TyKind.Float(_) { scalar = this.floatOp(sp, ty, 0.0); }
+            TyKind.Ptr { scalar = opNull(sp, ty); }
+            TyKind.CStr { scalar = opNull(sp, ty); }
+            TyKind.String { scalar = Operand.Copy(this.spill("s", Rvalue.useOp(sp, opBytes(this.cx.arena, sp, c.string, "" as []u8)), sp)); }
+            TyKind.Struct(s) {
+                let n = ir.structDef(s.id).fields.len;
+                for k in 0..n { this.zeroFill(this.b.field(ir, this.copyOf(place), FieldId { structId: s.id, index: u32(k) }, sp), sp); }
+                return;
+            }
+            TyKind.Array(a) {
+                let i = this.tmpPlace("z", c.int, sp);
+                this.b.assign(sp, this.copyOf(i), Rvalue.useOp(sp, this.int(sp, 0)));
+                let saved = this.b.beginBlock();
+                this.zeroFill(this.b.index(ir, place, Operand.Copy(this.copyOf(i)), sp), sp);
+                let body = this.b.endBlock(saved);
+                this.push(sp, StmtKind.ForRange(ForRangeStmt { index: i, end: this.int(sp, a.len), body: body }));
+                return;
+            }
+            TyKind.Half { scalar = this.halfZero(sp); }
+            _ { panic("lower: no zero value (sema checks this)"); }
+        }
+        this.b.assign(sp, place, Rvalue.useOp(sp, scalar));
+    }
+
+    /// Rust `for_each` over a slice, array or string place (an iterator: `lower/inst_queue.instForIter`).
+    fn forEach(this: &FnLower, sp: Span, kind: ForKind, index: Option<Id<TLocal>>, var: Id<TLocal>, source: Id<TPlace>, body: &TBlock) {
+        let c = this.ir().common;
+        let iter = this.place(source, "i");
+        while true {
+            match this.ir().refInner(iter.ty) {
+                Option.Some(_) { iter = this.b.deref(this.ir(), iter, sp); }
+                Option.None { break; }
+            }
+        }
+        let end = this.seqLen(iter, sp);
+        let iid = Id<LocalDecl> { i: 0 };
+        let isp = sp;
+        match index {
+            Option.Some(il) { iid = this.letOf(il); isp = this.lw.typed.local(il).span; }
+            Option.None {
+                // Rust names the hidden counter `_i{tmp}` without taking a number.
+                let t = Text.new(this.cx.arena);
+                t.add("_i").pushInt(this.tmp);
+                iid = this.b.letLocal(this.ir().internName(t.str()), c.int, sp);
+            }
+        }
+        let iplace = this.b.localPlace(iid, isp);
+        this.b.assign(sp, this.copyOf(iplace), Rvalue.useOp(sp, this.int(sp, 0)));
+        let nid = this.letOf(var);
+        let saved = this.b.beginBlock();
+        let elem = this.b.index(this.ir(), iter, Operand.Copy(this.copyOf(iplace)), sp);
+        this.b.assign(sp, this.b.localPlace(nid, this.lw.typed.local(var).span), Rvalue.useOp(sp, Operand.Copy(elem)));
+        this.stmts(body);
+        let blk = this.b.endBlock(saved);
+        this.push(sp, StmtKind.ForRange(ForRangeStmt { index: iplace, end: end, body: blk }));
+    }
+
+    fn isInt(this: &FnLower, ty: Id<TyKind>): bool {
+        match this.ir().tyKind(ty) { TyKind.Int(_) { return true; } _ { return false; } }
+    }
+}

@@ -1,0 +1,417 @@
+// One pattern against a value of one type: its checks and the names it binds (Rust `pat_test` +
+// `pat_binds`), the `TPat` it becomes once those names are locals, and the parts a compound pattern
+// looks into (variant fields, struct fields, tuple elements). Also the `|` binding rules and the arm's
+// new locals (Rust `check_or_binds`, `bind_arm`).
+//
+// Part of module j3c.sema.
+// Port of: check/lower/pat/test.rs (typing half), check/lower/pat/mod.rs (check_or_binds, bind_arm,
+// name_list), check/lower/enums.rs (variant_field_tys, enum_id_of, variant_from_path, find_variant)
+// J3: Rust tests (`pat_test`) then binds (`pat_binds`); binds never fail where the test passed, so
+// `patWalk` does both in one walk (same first error). The `TPat` is built after the arm's locals exist
+// (`patNode`, which re-reads the same lookups and cannot fail then).
+// J3: Int patterns become `TPat.Lit` (one value, also `3..=3`) or `TPat.Range` (inclusive), each end an
+// int `TExpr` of the scrutinee's type; a `const` arm is its folded value. So lower sees Rust's `Switch`
+// condition directly: an int scrutinee whose arms are all unguarded single `Lit` / `Wild`.
+module j3c.sema;
+
+/// A name a pattern binds and the type of the value it reads (Rust `Binding`, minus the place).
+struct PatBind {
+    name: Ident;
+    ty: Id<Ty>;
+}
+
+extend BodyCx {
+    /// Rust `pat_test` + `pat_binds`: `p` against a value of type `t`; its names go to `out` in order.
+    fn patWalk(this: &BodyCx, p: Id<Pat>, t: Id<Ty>, out: &List<PatBind>): Result<bool, TErr> {
+        let pat = this.cx.ast.pat(p);
+        match pat {
+            Pat.Wild { return Result.Ok(true); }
+            Pat.Bind(n) {
+                out.push(PatBind { name: n, ty: t });
+                return Result.Ok(true);
+            }
+            _ {}
+        }
+        if this.isInt(t) {
+            this.patIntRange(p, t)?;
+            return Result.Ok(true);
+        }
+        if this.patStrLit(p, t) || this.patBoolLit(p, t) { return Result.Ok(true); }
+        match pat {
+            Pat.Variant(vp) {
+                let vi = this.patVariantOf(t, &vp)?;
+                let ftys = this.patFieldTys(t, vi);
+                for k in 0..vp.payload.len { this.patWalk(vp.payload.items[k], ftys.items[k], out)?; }
+            }
+            Pat.Struct(sp) {
+                let fields = this.patStructFields(t, &sp)?;
+                for k in 0..fields.len {
+                    this.patWalk(sp.fields.items[k].pat, fieldTyOf(this.cx.tables, t, fields.items[k]), out)?;
+                }
+            }
+            Pat.Tuple(tp) {
+                let elems = this.patTupleElems(t, tp.elems.len, tp.span)?;
+                for k in 0..tp.elems.len { this.patWalk(tp.elems.items[k], elems[k], out)?; }
+            }
+            _ {
+                let m = Text.new(this.cx.arena);
+                m.add("a value pattern on a `").add(this.tyStr(t)).add("`");
+                return Result.Err(this.help(this.err(this.cx.ast.patSpan(p), m.str()),
+                    "value and range patterns match integers (`true`/`false` a bool); an enum arm is `Enum.Variant`"));
+            }
+        }
+        return Result.Ok(true);
+    }
+
+    /// The typed pattern of `p` (already checked by `patWalk`; its names are bound in scope).
+    fn patNode(this: &BodyCx, p: Id<Pat>, t: Id<Ty>): Id<TPat> {
+        let sp = this.cx.ast.patSpan(p);
+        let pat = this.cx.ast.pat(p);
+        let wild = TPat.Wild;
+        match pat {
+            Pat.Wild { return this.cx.typed.addPat(wild, t, sp); }
+            Pat.Bind(n) {
+                match this.findLocal(n.name) {
+                    Option.Some(l) { return this.cx.typed.addPat(TPat.Bind(BindPat { local: l }), t, sp); }
+                    Option.None { return this.cx.typed.addPat(wild, t, sp); }
+                }
+            }
+            _ {}
+        }
+        if this.isInt(t) {
+            match this.patIntRange(p, t) {
+                Result.Ok(r) {
+                    let lo = this.intLit(u64(r.lo.v), t, sp);
+                    if patIntEq(r.lo, r.hi) { return this.cx.typed.addPat(TPat.Lit(TLitPat { value: lo }), t, sp); }
+                    let hi = this.intLit(u64(r.hi.v), t, sp);
+                    return this.cx.typed.addPat(TPat.Range(TRangePat { lo: lo, hi: hi, inclusive: true }), t, sp);
+                }
+                Result.Err(_) { return this.cx.typed.addPat(wild, t, sp); }
+            }
+        }
+        match pat {
+            Pat.Lit(l) {
+                match this.cx.ast.expr(l.expr) {
+                    Expr.String(b) { return this.cx.typed.addPat(TPat.Lit(TLitPat { value: this.expr(TExpr.Str(b), t, sp) }), t, sp); }
+                    Expr.Bool(v) { return this.cx.typed.addPat(TPat.Lit(TLitPat { value: this.expr(TExpr.Bool(v), t, sp) }), t, sp); }
+                    _ {}
+                }
+            }
+            Pat.Variant(vp) {
+                match this.patVariantOf(t, &vp) {
+                    Result.Ok(vi) {
+                        let ftys = this.patFieldTys(t, vi);
+                        let fields = List<Id<TPat>>.new(this.cx.arena);
+                        for k in 0..vp.payload.len { fields.push(this.patNode(vp.payload.items[k], ftys.items[k])); }
+                        return this.cx.typed.addPat(TPat.Variant(TVariantPat { variant: vi, fields: fields }), t, sp);
+                    }
+                    Result.Err(_) {}
+                }
+            }
+            Pat.Struct(st) {
+                match this.patStructFields(t, &st) {
+                    Result.Ok(fields) {
+                        let pats = List<Id<TPat>>.new(this.cx.arena);
+                        for k in 0..fields.len {
+                            pats.push(this.patNode(st.fields.items[k].pat, fieldTyOf(this.cx.tables, t, fields.items[k])));
+                        }
+                        return this.cx.typed.addPat(TPat.Struct(TStructPat { fields: fields, pats: pats }), t, sp);
+                    }
+                    Result.Err(_) {}
+                }
+            }
+            Pat.Tuple(tp) {
+                match this.patTupleElems(t, tp.elems.len, tp.span) {
+                    Result.Ok(elems) {
+                        let items = List<Id<TPat>>.new(this.cx.arena);
+                        for k in 0..tp.elems.len { items.push(this.patNode(tp.elems.items[k], elems[k])); }
+                        return this.cx.typed.addPat(TPat.Tuple(TPats { items: items }), t, sp);
+                    }
+                    Result.Err(_) {}
+                }
+            }
+            _ {}
+        }
+        return this.cx.typed.addPat(wild, t, sp);
+    }
+
+    /// A string literal pattern on a `string`.
+    fn patStrLit(this: &BodyCx, p: Id<Pat>, t: Id<Ty>): bool {
+        if t != this.com().string { return false; }
+        match this.cx.ast.pat(p) {
+            Pat.Lit(l) { match this.cx.ast.expr(l.expr) { Expr.String(_) { return true; } _ {} } }
+            _ {}
+        }
+        return false;
+    }
+
+    /// `true` / `false` on a `bool`.
+    fn patBoolLit(this: &BodyCx, p: Id<Pat>, t: Id<Ty>): bool {
+        if t != this.com().bool { return false; }
+        match patBoolValue(this.cx.ast, p) { Option.Some(_) { return true; } Option.None { return false; } }
+    }
+
+    /// The variant `vp` names on a value of type `t` (Rust `enum_id_of` + `variant_pat`).
+    fn patVariantOf(this: &BodyCx, t: Id<Ty>, vp: &VariantPat): Result<int, TErr> {
+        match this.enumOf(t) {
+            Option.Some(_) {}
+            Option.None { return Result.Err(this.err(vp.span, "an enum pattern on non-enum")); }
+        }
+        return this.patVariant(t, &vp.path, vp.payload.len, vp.span);
+    }
+
+    /// Rust `variant_pat`: the variant `path` names in enum type `t`, given `given` sub-patterns.
+    fn patVariant(this: &BodyCx, t: Id<Ty>, path: &List<Ident>, given: int, sp: Span): Result<int, TErr> {
+        let en = match this.enumOf(t) { Option.Some(x) { x } Option.None { return Result.Err(this.err(sp, "an enum pattern on non-enum")); } };
+        let ed = this.cx.tables.enumAt(en);
+        let ename = this.str(ed.name);
+        if path.len != 2 { return Result.Err(this.err(sp, "match arm must be `Type.Variant`")); }
+        if this.str(path.items[0].name) != ename {
+            let m = Text.new(this.cx.arena);
+            m.add("expected `").add(ename).add("`, got `").add(this.str(path.items[0].name)).add("`");
+            return Result.Err(this.err(path.items[0].span, m.str()));
+        }
+        let vi = -1;
+        for i in 0..ed.variants.len {
+            if ed.variants.items[i].name == path.items[1].name { vi = i; break; }
+        }
+        if vi < 0 {
+            let m = Text.new(this.cx.arena);
+            m.add("unknown variant `").add(this.str(path.items[1].name)).add("`");
+            return Result.Err(this.err(sp, m.str()));
+        }
+        let n = this.patFieldTys(t, vi).len;
+        if n == given { return Result.Ok(vi); }
+        let name = Text.new(this.cx.arena);
+        for i in 0..path.len {
+            if i > 0 { name.add("."); }
+            name.add(this.str(path.items[i].name));
+        }
+        let m = Text.new(this.cx.arena);
+        if n == 0 { m.add("`").add(name.str()).add("` has no payload"); }
+        else if given == 0 && n == 1 { m.add("match arm is missing a payload: `").add(name.str()).add("(_)`"); }
+        else if given == 0 {
+            m.add("match arm is missing the payload: `").add(name.str()).add("(");
+            for i in 0..n { if i > 0 { m.add(", "); } m.add("_"); }
+            m.add(")`");
+        } else {
+            m.add("`").add(name.str()).add("` has ");
+            m.pushInt(n);
+            m.add(" field");
+            if n != 1 { m.add("s"); }
+            m.add(", the pattern gives ");
+            m.pushInt(given);
+        }
+        return Result.Err(this.err(sp, m.str()));
+    }
+
+    /// The payload type of variant `vi` of enum type `t`, at the enum's type arguments (None: no payload).
+    fn patPayloadTy(this: &BodyCx, t: Id<Ty>, vi: int): Option<Id<Ty>> {
+        match this.ty(t) {
+            Ty.Enum(e) {
+                let ed = this.cx.tables.enumAt(e.decl);
+                match ed.variants.items[vi].payload {
+                    Option.Some(p) {
+                        match ed.gen { Option.Some(g) { return Option.Some(subst(this.cx.tables, g, p, e.args)); } Option.None {} }
+                        return Option.Some(p);
+                    }
+                    Option.None {}
+                }
+            }
+            _ {}
+        }
+        return Option.None;
+    }
+
+    /// Rust `variant_field_tys`: none, the one payload, or a multi-field payload's elements.
+    fn patFieldTys(this: &BodyCx, t: Id<Ty>, vi: int): List<Id<Ty>> {
+        let out = List<Id<Ty>>.new(this.cx.arena);
+        let p = match this.patPayloadTy(t, vi) { Option.Some(x) { x } Option.None { return out; } };
+        let multi = false;
+        match this.enumOf(t) { Option.Some(en) { multi = this.cx.tables.enumAt(en).variants.items[vi].multi; } Option.None {} }
+        if !multi {
+            out.push(p);
+            return out;
+        }
+        match this.ty(p) { Ty.Tuple(tt) { out.extend(this.cx.tables.items(tt.elems)); } _ {} }
+        return out;
+    }
+
+    /// Rust `struct_pat_fields`: `S { a, b: p, .. }` on type `t`; the field index of each listed field,
+    /// in pattern order (every field listed unless `..`).
+    fn patStructFields(this: &BodyCx, t: Id<Ty>, st: &StructPat): Result<List<int>, TErr> {
+        let sid = match this.structOf(t) {
+            Option.Some(s) { s }
+            Option.None {
+                let m = Text.new(this.cx.arena);
+                // A tuple is a struct named `(A, B)` in Rust, so it gets the name mismatch below.
+                match this.ty(t) {
+                    Ty.Tuple(_) {
+                        let w = st.path.items[st.path.len - 1];
+                        m.add("expected `").add(this.tyStr(t)).add("`, got `").add(this.str(w.name)).add("`");
+                        return Result.Err(this.err(w.span, m.str()));
+                    }
+                    _ {}
+                }
+                m.add("a struct pattern on a `").add(this.tyStr(t)).add("`");
+                return Result.Err(this.err(st.span, m.str()));
+            }
+        };
+        let sd = this.cx.tables.structAt(sid);
+        let base = this.str(sd.name);
+        let written = st.path.items[st.path.len - 1];
+        if this.str(written.name) != base {
+            let m = Text.new(this.cx.arena);
+            m.add("expected `").add(base).add("`, got `").add(this.str(written.name)).add("`");
+            return Result.Err(this.err(written.span, m.str()));
+        }
+        let out = List<int>.new(this.cx.arena);
+        for i in 0..st.fields.len {
+            let name = st.fields.items[i].name;
+            let k = -1;
+            for j in 0..sd.fields.len {
+                if sd.fields.items[j].name == name.name { k = j; break; }
+            }
+            if k < 0 {
+                let m = Text.new(this.cx.arena);
+                m.add("`").add(base).add("` has no field `").add(this.str(name.name)).add("`");
+                return Result.Err(this.err(name.span, m.str()));
+            }
+            for j in 0..out.len {
+                if out.items[j] == k {
+                    let m = Text.new(this.cx.arena);
+                    m.add("field `").add(this.str(name.name)).add("` is listed twice");
+                    return Result.Err(this.err(name.span, m.str()));
+                }
+            }
+            out.push(k);
+        }
+        if !st.rest && out.len < sd.fields.len {
+            let m = Text.new(this.cx.arena);
+            m.add("struct pattern is missing ");
+            let first = true;
+            for j in 0..sd.fields.len {
+                let listed = false;
+                for q in 0..out.len { if out.items[q] == j { listed = true; } }
+                if listed { continue; }
+                if !first { m.add(", "); }
+                first = false;
+                m.add("`").add(this.str(sd.fields.items[j].name)).add("`");
+            }
+            return Result.Err(this.help(this.err(st.span, m.str()), "list them, or end the pattern with `..` to skip the rest"));
+        }
+        return Result.Ok(out);
+    }
+
+    /// Rust `tuple_pat_sid`: the element types of tuple type `t`, checking the pattern's arity.
+    fn patTupleElems(this: &BodyCx, t: Id<Ty>, given: int, sp: Span): Result<[]Id<Ty>, TErr> {
+        match this.ty(t) {
+            Ty.Tuple(tt) {
+                let elems = this.cx.tables.items(tt.elems);
+                if elems.len == given { return Result.Ok(elems); }
+                let m = Text.new(this.cx.arena);
+                m.add("`").add(this.tyStr(t)).add("` has ");
+                m.pushInt(elems.len);
+                m.add(" elements, the pattern gives ");
+                m.pushInt(given);
+                return Result.Err(this.err(sp, m.str()));
+            }
+            _ {}
+        }
+        let m = Text.new(this.cx.arena);
+        m.add("a tuple pattern on a `").add(this.tyStr(t)).add("`");
+        return Result.Err(this.err(sp, m.str()));
+    }
+
+    /// Rust `check_or_binds`: sorts each alternative's names; every `|` alternative binds the same names
+    /// with the same types.
+    fn patOrBinds(this: &BodyCx, pats: &List<Id<Pat>>, binds: &List<List<PatBind>>): Result<bool, TErr> {
+        for i in 0..binds.len {
+            let b = binds.items[i];
+            patSortBinds(this.cx.ast, &b);
+            for k in 1..b.len {
+                if b.items[k].name.name == b.items[k - 1].name.name {
+                    let m = Text.new(this.cx.arena);
+                    m.add("`").add(this.str(b.items[k].name.name)).add("` is bound twice in one pattern");
+                    return Result.Err(this.err(b.items[k].name.span, m.str()));
+                }
+            }
+        }
+        let b0 = binds.items[0];
+        for i in 1..binds.len {
+            let b = binds.items[i];
+            let same = b.len == b0.len;
+            for k in 0..b.len { if same && b.items[k].name.name != b0.items[k].name.name { same = false; } }
+            if !same {
+                let m = Text.new(this.cx.arena);
+                m.add("this alternative binds ");
+                this.patNameList(&m, &b);
+                m.add(", the first binds ");
+                this.patNameList(&m, &b0);
+                return Result.Err(this.help(this.err(this.cx.ast.patSpan(pats.items[i]), m.str()), "every `|` alternative binds the same names"));
+            }
+            for k in 0..b.len {
+                if b.items[k].ty != b0.items[k].ty {
+                    let m = Text.new(this.cx.arena);
+                    m.add("`").add(this.str(b.items[k].name.name)).add("` is `").add(this.tyStr(b.items[k].ty)).add("` here but `")
+                        .add(this.tyStr(b0.items[k].ty)).add("` in the first alternative");
+                    return Result.Err(this.err(b.items[k].name.span, m.str()));
+                }
+            }
+        }
+        return Result.Ok(true);
+    }
+
+    /// Rust `name_list`.
+    fn patNameList(this: &BodyCx, m: &Text, b: &List<PatBind>) {
+        if b.len == 0 { m.add("no names"); return; }
+        for k in 0..b.len {
+            if k > 0 { m.add(", "); }
+            m.add("`").add(this.str(b.items[k].name.name)).add("`");
+        }
+    }
+
+    /// Rust `bind_arm`: the first alternative's names (sorted) become new locals in scope.
+    fn patBindArm(this: &BodyCx, b: &List<PatBind>): Result<bool, TErr> {
+        for k in 0..b.len {
+            let n = b.items[k].name;
+            let aliased = match this.findAlias(n.name) { Option.Some(_) { true } Option.None { false } };
+            if this.isDeclared(n.name) || aliased { return Result.Err(this.shadowErr(n)); }
+            let l = this.newLocal(n.name, b.items[k].ty, n.span, false);
+            this.bind(n.name, l);
+        }
+        return Result.Ok(true);
+    }
+}
+
+/// `true` / `false` written as a pattern (Rust `bool_lit`).
+fn patBoolValue(ast: &Ast, p: Id<Pat>): Option<bool> {
+    match ast.pat(p) {
+        Pat.Lit(l) { match ast.expr(l.expr) { Expr.Bool(v) { return Option.Some(v); } _ {} } }
+        _ {}
+    }
+    return Option.None;
+}
+
+/// Stable sort by name bytes (Rust `sort_by` on `String`); a pattern binds a handful of names.
+fn patSortBinds(ast: &Ast, b: &List<PatBind>) {
+    for i in 1..b.len {
+        let x = b.items[i];
+        let j = i - 1;
+        while j >= 0 && patStrLess(ast.str(x.name.name), ast.str(b.items[j].name.name)) {
+            b.items[j + 1] = b.items[j];
+            j -= 1;
+        }
+        b.items[j + 1] = x;
+    }
+}
+
+/// Byte order of two strings.
+fn patStrLess(a: string, b: string): bool {
+    let n = a.len;
+    if b.len < n { n = b.len; }
+    for i in 0..n {
+        if a[i] != b[i] { return a[i] < b[i]; }
+    }
+    return a.len < b.len;
+}

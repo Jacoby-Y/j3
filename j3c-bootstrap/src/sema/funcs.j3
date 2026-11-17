@@ -1,5 +1,185 @@
-// Function signatures: params, `this` receivers, operators, `#[impl]` fns, extern `use lib` fns.
+// Function signatures: free fns, methods, generic fns and methods (templates), `#[impl]` fns, `use lib`
+// fns; the entry `main`; operator method names.
 //
 // Part of module j3c.sema.
-// Port of: j3c/src/check/funcs.rs
+// Port of: j3c/src/check/funcs.rs, check/generic_fn.rs (`register_generic_fn`, `import_generic_fn`)
+// J3: Rust kept generic fns and methods of generic structs as unresolved templates and allocated a `Func`
+// per instance; here every fn gets one `FnDecl` in item order (a template with its `Generics`, its
+// signature against `Ty.Param`), and instances are `instances` requests (B11.2). A method of a generic
+// struct repeats the struct's parameters in its own `Generics` (`decls.j3`), `where` bounds folded in. A
+// template's signature (and its duplicate methods) is checked quietly, as Rust checked it per instance.
+// J3: `find_method` / `find_operator` are `BodyCx.findMethod` / `findOp` in C2a; C2b folds them into the one
+// member lookup (`traits.lookupMember`, B11.3).
 module j3c.sema;
+
+/// Rust `collect_funcs`: a `FnDecl` per fn, method and `use lib` fn of `m` (item order), into `m.fns`,
+/// free fns into scope, methods into `StructDecl.methods`.
+pub fn declareFns(cx: &SemaCx, m: Id<ModDecl>): bool {
+    let t = cx.tables;
+    let md = t.modAt(m);
+    let si = 0;
+    for k in 0..md.items.len {
+        match md.items.items[k] {
+            Item.Fn(f) { if !declareFn(cx, m, &f) { return false; } }
+            Item.Struct(s) {
+                let sid = t.modAt(m).structs.items[si];
+                si += 1;
+                if !declareMethods(cx, m, sid, &s) { return false; }
+            }
+            Item.UseLib(u) { if !useLib(cx, m, &u) { return false; } }
+            _ {}
+        }
+    }
+    return true;
+}
+
+fn declareFn(cx: &SemaCx, m: Id<ModDecl>, f: &FnItem): bool {
+    let t = cx.tables;
+    match scopeOf(cx, m, f.name.name, DeclKind.Fn) {
+        Option.Some(d) { if t.fnAt(d.asFn()).owner == m { return fail(cx, f.name.span, quoted(cx, "duplicate fn ", f.name.name, "")); } }
+        Option.None {}
+    }
+    let gen: Option<Id<Generics>> = Option.None;
+    if f.typeParams.len > 0 {
+        for k in 0..f.typeParams.len {
+            let p = f.typeParams.items[k];
+            for j in 0..k {
+                if f.typeParams.items[j].name == p.name { return fail(cx, p.span, quoted(cx, "duplicate type parameter ", p.name, "")); }
+            }
+        }
+        gen = Option.Some(newGenerics(cx, m, &f.typeParams, &f.bounds, Option.None));
+    }
+    match sigOf(cx, m, f, gen, Option.None, f.typeParams.len == 0) {
+        Option.Some(d) {
+            let id = t.addFn(d);
+            t.modAt(m).fns.push(id);
+            bind(cx, m, f.name.name, refFn(id));
+            return true;
+        }
+        Option.None {}
+    }
+    return false;
+}
+
+/// The methods of struct `sid` (Rust: plain structs here, generic ones per instance).
+fn declareMethods(cx: &SemaCx, m: Id<ModDecl>, sid: Id<StructDecl>, s: &StructItem): bool {
+    let t = cx.tables;
+    let tmpl = s.typeParams.len > 0;
+    for k in 0..s.methods.len {
+        let f = s.methods.items[k];
+        for j in 0..k {
+            if !tmpl && s.methods.items[j].name.name == f.name.name {
+                return fail(cx, f.name.span, cat5(cx, "duplicate method `", t.str(f.name.name), "` on `", t.str(s.name.name), "`"));
+            }
+        }
+        let gen: Option<Id<Generics>> = Option.None;
+        match t.structAt(sid).gen {
+            Option.Some(sg) {
+                let g = newGenerics(cx, m, &f.typeParams, &f.bounds, Option.Some(sg));
+                for w in 0..f.whereBounds.len {
+                    let wb = f.whereBounds.items[w];
+                    let gd = t.genericsAt(g);
+                    for i in 0..t.genericsAt(sg).names.len {
+                        if gd.names.items[i] == wb.name.name { gd.bounds.items[i].extend(traitList(cx, m, &wb.bounds).slice()); }
+                    }
+                }
+                gen = Option.Some(g);
+            }
+            Option.None {
+                if f.typeParams.len > 0 { gen = Option.Some(newGenerics(cx, m, &f.typeParams, &f.bounds, Option.None)); }
+            }
+        }
+        match sigOf(cx, m, &f, gen, Option.Some(sid), !tmpl && f.typeParams.len == 0) {
+            Option.Some(d) {
+                let id = t.addFn(d);
+                t.structAt(sid).methods.push(id);
+                t.modAt(m).fns.push(id);
+            }
+            Option.None { return false; }
+        }
+    }
+    return true;
+}
+
+/// Rust `alloc_fn`: the signature of `f` in `m` (params and return resolved; a returned closure is an
+/// error). None after the error Diag. `loud` false (a template): quiet, failed types poisoned (`tyIn`).
+fn sigOf(cx: &SemaCx, m: Id<ModDecl>, f: &FnItem, gen: Option<Id<Generics>>, recv: Option<Id<StructDecl>>, loud: bool): Option<FnDecl> {
+    let t = cx.tables;
+    let env = genEnv(m, gen);
+    let params = List<ParamDecl>.new(cx.arena);
+    for i in 0..f.params.len {
+        let p = f.params.items[i];
+        params.push(ParamDecl { name: p.name.name, span: p.name.span, ty: tyIn(cx, env, p.ty, loud)? });
+    }
+    let ret = t.common.void;
+    match f.ret {
+        Option.Some(r) {
+            ret = tyIn(cx, env, r, loud)?;
+            if loud && !rejectClosure(cx, cx.ast.typeSpan(r), ret, "returned") { return Option.None; }
+        }
+        Option.None {}
+    }
+    let implName: Option<Sym> = Option.None;
+    if f.isImpl { implName = Option.Some(implOrig(cx, f.name.name)); }
+    let shader = false;
+    match f.shader { Option.Some(_) { shader = true; } Option.None {} }
+    let retOmitted = false;
+    match f.ret { Option.Some(_) {} Option.None { retOmitted = true; } }
+    return Option.Some(FnDecl { owner: m, name: f.name.name, doc: f.doc, span: f.span, visPub: f.visPub, kind: FnKind.J3, libName: "", symbol: "",
+        gen: gen, recv: recv, params: params, ret: ret, retOmitted: retOmitted, isImpl: f.isImpl, implName: implName, defaultOf: Option.None,
+        shader: shader, enumDerived: f.derived, item: Option.Some(*f), body: Option.None });
+}
+
+/// Rust `find_main` / `dummy_main`: the one `fn main` outside `j3.*`; when `requireMain` is false and
+/// there is none, a `FnKind.Decl` stand-in (in no module's `fns`). None after the error Diag.
+pub fn findMain(cx: &SemaCx, requireMain: bool): Option<Id<FnDecl>> {
+    let t = cx.tables;
+    let mainSym = t.sym("main");
+    let found: Option<Id<FnDecl>> = Option.None;
+    for i in 0..t.mods.len() {
+        let m = t.mods.idAt(i);
+        let md = t.modAt(m);
+        if md.isLib || md.key.len >= 3 && md.key[0..3] == "j3." { continue; }
+        match scopeOf(cx, m, mainSym, DeclKind.Fn) {
+            Option.Some(d) {
+                let fd = t.fnAt(d.asFn());
+                let generic = false;
+                match fd.gen { Option.Some(_) { generic = true; } Option.None {} }
+                if fd.owner == m && !generic {
+                    match found {
+                        Option.Some(_) { fail(cx, fileOf(cx, m), "multiple `fn main` in the program"); return Option.None; }
+                        Option.None { found = Option.Some(d.asFn()); }
+                    }
+                }
+            }
+            Option.None {}
+        }
+    }
+    match found { Option.Some(_) { return found; } Option.None {} }
+    if requireMain {
+        fail(cx, programSpan(cx), "program needs `fn main()`");
+        return Option.None;
+    }
+    let owner = Id<ModDecl> { i: 0 };
+    return Option.Some(t.addFn(FnDecl { owner: owner, name: mainSym, doc: "", span: noSpan(), visPub: false, kind: FnKind.Decl, libName: "",
+        symbol: "", gen: Option.None, recv: Option.None, params: List<ParamDecl>.new(cx.arena), ret: t.common.void, retOmitted: false,
+        isImpl: false, implName: Option.None, defaultOf: Option.None, shader: false, enumDerived: false, item: Option.None, body: Option.None }));
+}
+
+/// Rust `operator_name`: `operator+` etc. for an operator a type can define, None otherwise.
+pub fn operatorName(op: BinOp): Option<string> {
+    match op {
+        BinOp.Add { return Option.Some("operator+"); }
+        BinOp.Sub { return Option.Some("operator-"); }
+        BinOp.Mul { return Option.Some("operator*"); }
+        BinOp.Div { return Option.Some("operator/"); }
+        BinOp.Eq { return Option.Some("operator=="); }
+        BinOp.Ne { return Option.Some("operator!="); }
+        BinOp.Lt { return Option.Some("operator<"); }
+        BinOp.Le { return Option.Some("operator<="); }
+        BinOp.Gt { return Option.Some("operator>"); }
+        BinOp.Ge { return Option.Some("operator>="); }
+        _ {}
+    }
+    return Option.None;
+}

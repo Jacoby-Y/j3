@@ -1,0 +1,293 @@
+// `match` / `if let` (statement and value), destructuring `let` and `let .. else`, `?`, block values: arms
+// become an `If` chain, or one `Switch` for an int match whose arms are single values with no guards; a
+// guarded match keeps a `done` flag so a failing guard falls through to later arms.
+//
+// Part of module j3c.lower.
+// Port of: check/lower/pat/mod.rs (lowering half), check/lower/stmt.rs (let patterns),
+// check/lower/enums.rs (`question`), check/lower/expr.rs (block values)
+// J3: Hooks of contracts-c2b.md (`expr.j3` / `stmt.j3` call them). Sema has typed and checked every pattern
+// (`TPat`, exhaustiveness); the switch-or-chain choice is sema's (`TMatch.switch`, Rust's
+// `check_int_arms`). One pattern's test and bindings are in `pat_test.j3`.
+// J3: Arms lower in Rust's order (temps and locals come out the same): a `Switch` and a guarded chain first
+// to last, any other match last to first (the `if` chain is built from its end). `TMatch.arms` is in
+// source order.
+module j3c.lower;
+
+/// Where a value `match` puts its arms' values (Rust `ArmSink`): `on` false for a statement `match`;
+/// `slot` the temp, made by the first arm lowered that has a value.
+struct PatSlot {
+    slot: Option<Place>;
+    on: bool;
+}
+
+/// One lowered arm: its test (None: always matches) and its body block.
+struct PatArmOut {
+    cond: Option<Operand>;
+    body: Block;
+}
+
+extend FnLower {
+    /// `TExpr.Match` `e` as a value (Rust `match_value`): the temp its arms assign.
+    fn patMatchExpr(this: &FnLower, e: Id<TExpr>, m: &TMatch): Rvalue {
+        let sp = this.spanOf(e);
+        let sink = PatSlot { slot: Option.None, on: true };
+        this.patMatch(sp, m, &sink);
+        match sink.slot {
+            Option.Some(place) { return Rvalue.useOp(sp, Operand.Copy(place)); }
+            Option.None {}
+        }
+        panic("lower: a value `match` whose arms all leave (sema rejects it)");
+    }
+
+    /// `TExpr.Block` `e` (statements, then the value).
+    fn patBlockValue(this: &FnLower, e: Id<TExpr>, b: &TBlockExpr): Rvalue {
+        this.stmts(&b.block);
+        match b.value {
+            Option.Some(v) { return this.rvalue(v); }
+            Option.None {}
+        }
+        panic("lower: a block expression without a value (sema rejects it)");
+    }
+
+    /// `TStmt.Match` statement `s`.
+    fn patMatchStmt(this: &FnLower, s: Id<TStmt>, m: &TMatch) {
+        let sink = PatSlot { slot: Option.None, on: false };
+        this.patMatch(this.lw.typed.stmtSpan(s), m, &sink);
+    }
+
+    /// Rust `lower_match` (`sp`: the `match`'s span).
+    fn patMatch(this: &FnLower, sp: Span, m: &TMatch, sink: &PatSlot) {
+        let op = this.operand(m.scrut);
+        if m.switch { this.patSwitch(sp, m, op, sink); return; }
+        let scrut = this.materialize(op, sp);
+        let n = m.arms.len;
+        for i in 0..n {
+            match m.arms.items[i].guard { Option.Some(_) { this.patGuarded(scrut, m, sink); return; } Option.None {} }
+        }
+        let elseBlock: Option<Block> = Option.None;
+        let i = n - 1;
+        while i >= 0 {
+            let arm = &m.arms.items[i];
+            let asp = arm.span;
+            let saved = this.b.beginBlock();
+            let out = this.patArm(scrut, arm, Option.None, sink);
+            match out.cond {
+                Option.Some(cond) { this.pushIf(asp, cond, out.body, elseBlock); }
+                // an arm that always matches (`_`) is last (sema's arm order check)
+                Option.None { this.push(asp, StmtKind.Block(out.body)); }
+            }
+            elseBlock = Option.Some(this.b.endBlock(saved));
+            i -= 1;
+        }
+        match elseBlock {
+            Option.Some(b) { for k in 0..b.stmts.len { this.b.push(b.stmts.items[k]); } }
+            Option.None {}
+        }
+    }
+
+    /// Rust `lower_guarded_chain`: `done = false; if !done { if test1 { bind; if guard { done = true; body } } } ...`
+    fn patGuarded(this: &FnLower, scrut: Place, m: &TMatch, sink: &PatSlot) {
+        let sp = m.arms.items[0].span;
+        let done = this.tmpPlace("matched", this.ir().common.bool, sp);
+        this.b.assign(sp, this.copyOf(done), Rvalue.useOp(sp, this.bool(sp, false)));
+        for i in 0..m.arms.len {
+            let arm = &m.arms.items[i];
+            let asp = arm.span;
+            let saved = this.b.beginBlock();
+            let out = this.patArm(scrut, arm, Option.Some(done), sink);
+            match out.cond {
+                Option.Some(cond) { this.pushIf(asp, cond, out.body, Option.None); }
+                Option.None { this.push(asp, StmtKind.Block(out.body)); }
+            }
+            let inner = this.b.endBlock(saved);
+            let notDone = this.eqOps(asp, Operand.Copy(this.copyOf(done)), this.bool(asp, false));
+            this.pushIf(asp, notDone, inner, Option.None);
+        }
+    }
+
+    /// Rust `lower_arm`: the arm's test (in the current block) and its body block, which binds the
+    /// pattern's names, checks the guard, sets `done` (when given) and runs the arm's statements.
+    fn patArm(this: &FnLower, scrut: Place, arm: &TArm, done: Option<Place>, sink: &PatSlot): PatArmOut {
+        let asp = arm.span;
+        let alts = List<Id<TPat>>.new(this.cx.arena);
+        match this.lw.typed.pat(arm.pat) {
+            TPat.Or(o) { alts.extend(o.items.slice()); }
+            _ { alts.push(arm.pat); }
+        }
+        let tests = List<Option<Operand>>.new(this.cx.arena);
+        let binds = List<List<PatBinding>>.new(this.cx.arena);
+        let always = false;
+        for k in 0..alts.len {
+            let t = this.patTest(scrut, alts.items[k]);
+            match t { Option.Some(_) {} Option.None { always = true; } }
+            tests.push(t);
+            binds.push(this.patSortedBinds(scrut, alts.items[k]));
+        }
+        let cond: Option<Operand> = Option.None;
+        if !always {
+            for k in 0..tests.len {
+                match tests.items[k] {
+                    Option.Some(t) {
+                        match cond {
+                            Option.Some(c) {
+                                cond = Option.Some(Operand.Copy(this.spill("c", Rvalue.binary(asp, this.ir().common.bool, BinOp.Or, c, t), asp)));
+                            }
+                            Option.None { cond = Option.Some(t); }
+                        }
+                    }
+                    Option.None {}
+                }
+            }
+        }
+        let saved = this.b.beginBlock();
+        this.patBindArm(&tests, &binds);
+        match arm.guard {
+            Option.Some(g) {
+                let gc = this.operand(g);
+                let inner = this.b.beginBlock();
+                this.patArmBody(arm, asp, done, sink);
+                let thenBlock = this.b.endBlock(inner);
+                this.pushIf(this.spanOf(g), gc, thenBlock, Option.None);
+            }
+            Option.None { this.patArmBody(arm, asp, done, sink); }
+        }
+        return PatArmOut { cond: cond, body: this.b.endBlock(saved) };
+    }
+
+    /// The bindings of `pat` on `place`, sorted by name (Rust `check_or_binds`).
+    // J3: Sema made the arm's locals in name order, so a local's id is its rank.
+    fn patSortedBinds(this: &FnLower, place: Place, pat: Id<TPat>): List<PatBinding> {
+        let b = List<PatBinding>.new(this.cx.arena);
+        this.patBinds(place, pat, &b);
+        for i in 1..b.len {
+            let x = b.items[i];
+            let j = i - 1;
+            while j >= 0 && x.local.i < b.items[j].local.i {
+                b.items[j + 1] = b.items[j];
+                j -= 1;
+            }
+            b.items[j + 1] = x;
+        }
+        return b;
+    }
+
+    /// Rust `arm_body` + `arm_stmts`: `done = true`, the arm's statements, then its value into `sink`
+    /// (a statement `match`'s tail, and a diverging one, is the body's last statement).
+    fn patArmBody(this: &FnLower, arm: &TArm, asp: Span, done: Option<Place>, sink: &PatSlot) {
+        match done {
+            Option.Some(d) { this.b.assign(asp, this.copyOf(d), Rvalue.useOp(asp, this.bool(asp, true))); }
+            Option.None {}
+        }
+        this.patArmStmts(arm, sink);
+    }
+
+    fn patArmStmts(this: &FnLower, arm: &TArm, sink: &PatSlot) {
+        this.stmts(&arm.body);
+        match arm.value {
+            Option.Some(v) {
+                if !sink.on { panic("lower: an arm value in a statement `match`"); }
+                let sp = this.spanOf(v);
+                let rv = this.rvalue(v);
+                // Rust `sink_put`
+                match sink.slot {
+                    Option.Some(place) { this.b.assign(sp, this.copyOf(place), rv); }
+                    Option.None {
+                        let place = this.tmpPlace("match", rv.ty, sp);
+                        this.b.assign(sp, this.copyOf(place), rv);
+                        sink.slot = Option.Some(place);
+                    }
+                }
+            }
+            Option.None {}
+        }
+    }
+
+    /// Rust `bind_arm`: declares the arm's names and copies them in from whichever alternative matched.
+    fn patBindArm(this: &FnLower, tests: &List<Option<Operand>>, binds: &List<List<PatBinding>>) {
+        let first = binds.items[0];
+        if first.len == 0 { return; }
+        let dests = List<Place>.new(this.cx.arena);
+        for k in 0..first.len {
+            let id = this.letOf(first.items[k].local);
+            dests.push(this.b.localPlace(id, first.items[k].span));
+        }
+        if binds.len == 1 {
+            this.patCopyIn(&first, &dests);
+            return;
+        }
+        // the last alternative needs no test: one of them matched
+        let elseBlock: Option<Block> = Option.None;
+        let k = binds.len - 1;
+        while k >= 0 {
+            let alt = binds.items[k];
+            let saved = this.b.beginBlock();
+            this.patCopyIn(&alt, &dests);
+            let assigns = this.b.endBlock(saved);
+            saved = this.b.beginBlock();
+            let sp = alt.items[0].span;
+            let test: Option<Operand> = Option.None;
+            if k + 1 < binds.len { test = tests.items[k]; }
+            match test {
+                Option.Some(t) { this.pushIf(sp, t, assigns, elseBlock); }
+                Option.None { this.push(sp, StmtKind.Block(assigns)); }
+            }
+            elseBlock = Option.Some(this.b.endBlock(saved));
+            k -= 1;
+        }
+        match elseBlock {
+            Option.Some(b) { for i in 0..b.stmts.len { this.b.push(b.stmts.items[i]); } }
+            Option.None {}
+        }
+    }
+
+    fn patCopyIn(this: &FnLower, alt: &List<PatBinding>, dests: &List<Place>) {
+        for k in 0..alt.len {
+            let sp = alt.items[k].span;
+            this.b.assign(sp, this.copyOf(dests.items[k]), Rvalue.useOp(sp, Operand.Copy(this.copyOf(alt.items[k].place))));
+        }
+    }
+
+    /// Rust `lower_switch`: `match n { 1 { } -2 { } LIMIT { } _ { } }` as one `Switch`.
+    fn patSwitch(this: &FnLower, sp: Span, m: &TMatch, scrut: Operand, sink: &PatSlot) {
+        let cases = List<SwitchCase>.new(this.cx.arena);
+        let default = Block { stmts: List<Stmt>.new(this.cx.arena) };
+        for i in 0..m.arms.len {
+            let arm = &m.arms.items[i];
+            let saved = this.b.beginBlock();
+            this.patArmStmts(arm, sink);
+            let block = this.b.endBlock(saved);
+            match this.lw.typed.pat(arm.pat) {
+                TPat.Lit(l) { cases.push(SwitchCase { value: this.patInt(l.value), block: block }); }
+                _ { default = block; }
+            }
+        }
+        this.push(sp, StmtKind.Switch(SwitchStmt { scrut: scrut, cases: cases, default: default }));
+    }
+
+    /// `TStmt.LetPat` statement `s`: Rust `lower_let_pat` (always matches) / `lower_let_else`
+    /// (`if !test { else }`, then the bindings, in scope after the statement and not in the `else`).
+    fn patLetPat(this: &FnLower, s: Id<TStmt>, l: &TLetPat) {
+        let sp = this.lw.typed.stmtSpan(s);
+        let op = this.operand(l.value);
+        let scrut = this.materialize(op, sp);
+        let test = this.patTest(scrut, l.pat);
+        match l.elseBlock {
+            Option.Some(eb) {
+                match test {
+                    Option.Some(t) {
+                        let failed = this.eqOps(eb.span, t, this.bool(eb.span, false));
+                        let body = this.block(&eb);
+                        this.pushIf(eb.span, failed, body, Option.None);
+                    }
+                    Option.None {}
+                }
+            }
+            Option.None {}
+        }
+        let tests = List<Option<Operand>>.new(this.cx.arena);
+        tests.push(Option.None);
+        let binds = List<List<PatBinding>>.new(this.cx.arena);
+        binds.push(this.patSortedBinds(scrut, l.pat));
+        this.patBindArm(&tests, &binds);
+    }
+}

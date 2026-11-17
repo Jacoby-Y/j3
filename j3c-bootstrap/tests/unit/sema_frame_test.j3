@@ -1,0 +1,135 @@
+// The frame-string check (`sema/frame_str*`) and `Text.fmt` typing (`sema/fmt_text`): small programs through
+// the driver to `Stage.Sema`. Legal uses pass (a fn that only reads the string, `Text` copies, a local
+// reassigned before the return, `main` keeping one) and `t.fmt` is a `TExpr.TextFmt`; each way out of the
+// frame is one error at the backtick with Rust's text and notes (returned, stored through a param, passed
+// to a fn that keeps it two calls down, pushed on a `List`, a boxed closure capture).
+module sema_frame_test;
+
+use j3.io;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.{ Text, contains };
+use j3c.driver;
+use j3c.driver.{ Session, Stage };
+use j3c.sema.{ TExpr, TStmt };
+
+const OK: [24]string = [
+    "module ok;",
+    "use j3.io.printLn;",
+    "use j3.memory.Arena;",
+    "use j3.text.Text;",
+    "use j3.result.Result;",
+    "fn res(s: string, ok: bool): Result<string, int> { if ok { return Result.Ok(s); } return Result.Err(1); }",
+    // `?` returns only the failure payload (an int): the frame string in the scrutinee stays here
+    "fn question(n: int): Result<int, int> { let s = res(`s{n}`, true)?; return Result.Ok(s.len); }",
+    "#[singleton]",
+    "let G: string = \"\";",
+    "struct P { s: string; n: int; }",
+    "fn keep(s: string) { G = s; }",
+    "fn look(s: string): int { return s.len; }",
+    "fn read(n: int): int { return look(`r{n}`); }",
+    "fn into(t: &Text, n: int): string { t.fmt(`t={n}`); return t.str(); }",
+    "fn copy(t: &Text, n: int): string { t.pushStr(`c{n}`); return t.str(); }",
+    "fn reset(n: int): string { let s = `n={n}`; printLn(s); s = \"done\"; return s; }",
+    "fn local(n: int): int { let p = P { s: `p{n}`, n: n }; printLn(p.s); return p.n; }",
+    "fn same(s: string): string { return `{s}`; }",
+    "fn inLoop(n: int): string { let s = \"\"; for i in 0..n { s = `l{i}`; s = \"k\"; } return s; }",
+    "fn main() {",
+    "    let mem = Arena.create(4096);",
+    "    let t = Text.new(&mem);",
+    "    keep(`main {read(12)}`); printLn(into(&t, 5)); printLn(copy(&t, 6)); printLn(reset(local(7))); printLn(same(inLoop(2)));",
+    "}",
+];
+
+const BAD: [20]string = [
+    "module bad;",
+    "use j3.memory.{ Arena, List };",
+    "#[singleton]",
+    "let G: string = \"\";",
+    "struct P { name: string; n: int; }",
+    "fn keep(s: string) {",
+    "    G = s;",
+    "}",
+    "fn pass(s: string) { keep(s); }",
+    "fn ret(n: int): string { let s = `a{n}`; return s; }",
+    "fn store(p: &P, n: int) { p.name = `b{n}`; }",
+    "fn viaLocal(n: int) { let s = `c{n}`; let u = s; pass(u); }",
+    "fn list(a: &Arena, n: int): int { let l = List<string>.new(a); l.push(`d{n}`); return l.len; }",
+    "fn field(n: int): P { let p = P { name: \"\", n: 1 }; p.name = `e{n}`; return p; }",
+    "fn branch(n: int, c: bool): string {",
+    "    let s = if c { `f{n}` } else { \"z\" };",
+    "    return s;",
+    "}",
+    "fn boxed(a: &Arena, n: int): boxed closure(): int { let s = `g{n}`; return fn[a]() { return s.len; }; }",
+    "fn main() { }",
+];
+
+/// Write `lines` as `NAME.j3` in a temp dir (outside this package, whose project would otherwise load).
+fn put(name: string, lines: []string, mem: &Arena): string {
+    let text = Text.new(mem);
+    for i in 0..lines.len { text.add(lines[i]).add("\n"); }
+    let d = Text.new(mem).add(io.tempRoot()).add("/j3c-boot-sema-frame").str();
+    match io.makeDirs(d) { Result.Ok(_) {} Result.Err(_) { panic("cannot make the case dir"); } }
+    let p = Text.new(mem).add(d).add("/").add(name).add(".j3").str();
+    match io.writeFile(p, text.str() as []u8) { Result.Ok(_) {} Result.Err(_) { panic("cannot write a case"); } }
+    return p;
+}
+
+/// The frame-string error of `s` whose message contains `what`: its first note ("" for none, "?" when
+/// there is no such error).
+fn noteOf(s: &Session, what: string): string {
+    for i in 0..s.diags.count() {
+        let d = s.diags.at(i);
+        if !contains(d.msg, "a backtick string lives in this function's stack frame and cannot be ") { continue; }
+        if !contains(d.msg, what) { continue; }
+        if d.notes.len < 2 { return ""; }
+        return d.notes.items[0].msg;
+    }
+    return "?";
+}
+
+fn main() {
+    let mem = Arena.create(1 << 12);
+    let o = driver.defaults();
+    o.entry = put("ok", OK, &mem);
+    let s = Session.new(o);
+    if !driver.run(s, Stage.Sema) { panic("ok: legal frame-string uses must pass"); }
+    let c = match s.checked { Option.Some(x) { x } Option.None { panic("no checked program"); return; } };
+
+    // `t.fmt(`..`)` is a `TextFmt` node with both parts
+    let fns = &c.tables.fns;
+    let seen = false;
+    for i in 0..fns.len() {
+        let d = fns.get(fns.idAt(i));
+        if c.tables.str(d.name) != "into" { continue; }
+        match d.body {
+            Option.Some(b) {
+                match c.typed.stmt(c.typed.body(b).body.stmts.items[0]) {
+                    TStmt.Expr(e) {
+                        match c.typed.expr(e.expr) { TExpr.TextFmt(f) { seen = f.parts.len == 2; } _ {} }
+                    }
+                    _ {}
+                }
+            }
+            Option.None {}
+        }
+    }
+    if !seen { panic("ok: `t.fmt` is not a TextFmt of two parts"); }
+
+    let o2 = driver.defaults();
+    o2.entry = put("bad", BAD, &mem);
+    let s2 = Session.new(o2);
+    if driver.run(s2, Stage.Sema) { panic("bad: sema should fail"); }
+    if s2.diags.count() != 7 { panic(`bad: 7 frame-string errors, got {s2.diags.count()}`); }
+    // same line: no note. Another line: where it went, and where the callee keeps it.
+    if noteOf(s2, "cannot be returned") != "" { panic("bad: a same-line return has no note"); }
+    if noteOf(s2, "stored where it outlives the function") != "" { panic("bad: a same-line store has no note"); }
+    if !contains(noteOf(s2, "passed to `pass`, which keeps it"), "`pass` keeps it at ") { panic("bad: no keep note for `pass`"); }
+    if noteOf(s2, "passed to `List.push`, which keeps it") != "" { panic("bad: a container keeps it at the call"); }
+    let last = s2.diags.at(5);
+    if !contains(last.notes.items[0].msg, "returned at ") || !contains(last.notes.items[0].msg, "bad.j3:17") { panic("bad: the branch value's note names line 17"); }
+    let help = s2.diags.at(0).notes.items[s2.diags.at(0).notes.len - 1].msg;
+    if help != "write it into a `j3.text.Text` the caller owns: take `t: &Text`, `t.fmt(`..`)`, return `t.str()`" { panic("bad: help text"); }
+}

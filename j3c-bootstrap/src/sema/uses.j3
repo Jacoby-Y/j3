@@ -1,5 +1,222 @@
-// `use` lists: single names, groups, `use lib` C declarations, unused-import detection.
+// `use` lists: single names, groups, module prefixes, `use lib` C declarations.
 //
 // Part of module j3c.sema.
 // Port of: j3c/src/check/uses.rs
+// J3: Rust copied the imported entries between per-kind maps (`types`, `imports`, `consts`, `mod_ns`,
+// `mod_types`, `lib_ns`, `gen_names`); here an import binds the same `DeclRef` in the importer's scope and
+// a module alias is a `ModDecl.prefixes` entry (a `use lib` alias points at a lib `ModDecl`). The two
+// phases and their error order are Rust's: types before struct fields, values after fn signatures.
+// J3: Rust's did-you-mean scanned the `exports` hash set (its order varies between runs); this scans the
+// module's `pub` items in declaration order.
 module j3c.sema;
+
+/// Rust `UsePhase`: `use` lists bind type names first (before struct fields), values after fn signatures.
+pub enum UsePhase { Types, Vals }
+
+/// What a `use` names: module `src`, and either the listed `names` or (`alias`) the module itself.
+struct UseTarget {
+    src: Id<ModDecl>;
+    names: List<Sym>;
+    /// `use a.b;` naming module `a.b`: `b` becomes a prefix.
+    alias: bool;
+    /// `use a.b.{}`: loads the module only.
+    empty: bool;
+}
+
+/// Rust `use_target` plus the loaded-module lookup; None when it does not resolve (`report`: with Rust's
+/// error, else silently, as `bind_traits` skips).
+fn resolveTarget(cx: &SemaCx, u: &UseItem, report: bool): Option<UseTarget> {
+    let t = cx.tables;
+    let joined = joinIdents(cx, &u.path, u.path.len);
+    let names = List<Sym>.new(cx.arena);
+    match u.names {
+        Option.Some(ns) {
+            for i in 0..ns.len { names.push(ns.items[i].name); }
+            match t.modKeys.get(t.sym(joined)) {
+                Option.Some(src) { return Option.Some(UseTarget { src: src, names: names, alias: false, empty: ns.len == 0 }); }
+                Option.None {}
+            }
+            if report { fail(cx, u.span, cat3(cx, "module `", joined, "` was not loaded")); }
+            return Option.None;
+        }
+        Option.None {}
+    }
+    match t.modKeys.get(t.sym(joined)) {
+        Option.Some(src) { return Option.Some(UseTarget { src: src, names: names, alias: true, empty: false }); }
+        Option.None {}
+    }
+    if u.path.len >= 2 {
+        match t.modKeys.get(t.sym(joinIdents(cx, &u.path, u.path.len - 1))) {
+            Option.Some(src) {
+                names.push(u.path.items[u.path.len - 1].name);
+                return Option.Some(UseTarget { src: src, names: names, alias: false, empty: false });
+            }
+            Option.None {}
+        }
+    }
+    if report { fail(cx, u.span, cat3(cx, "cannot resolve `use ", joined, "`")); }
+    return Option.None;
+}
+
+/// The first `n` names of `path` joined with `.`.
+fn joinIdents(cx: &SemaCx, path: &List<Ident>, n: int): string {
+    let t = Text.new(cx.arena);
+    for i in 0..n {
+        if i > 0 { t.push('.'); }
+        t.add(cx.tables.str(path.items[i].name));
+    }
+    return t.str();
+}
+
+/// Rust `resolve_all_uses` for module `m`: bind each `use a.b.{ x, y }` name into its scope, `use a.b`
+/// prefixes, private-item and unknown-name errors.
+pub fn resolveUses(cx: &SemaCx, m: Id<ModDecl>, phase: UsePhase): bool {
+    let md = cx.tables.modAt(m);
+    for k in 0..md.items.len {
+        match md.items.items[k] {
+            Item.Use(u) { if !resolveUse(cx, m, &u, phase) { return false; } }
+            _ {}
+        }
+    }
+    return true;
+}
+
+fn resolveUse(cx: &SemaCx, m: Id<ModDecl>, u: &UseItem, phase: UsePhase): bool {
+    let t = cx.tables;
+    let tg = UseTarget { src: m, names: List<Sym>.new(cx.arena), alias: false, empty: true };
+    match resolveTarget(cx, u, true) { Option.Some(x) { tg = x; } Option.None { return false; } }
+    if tg.empty { return true; }
+    if tg.alias {
+        let alias = u.path.items[u.path.len - 1].name;
+        match phase {
+            UsePhase.Types {
+                if t.modAt(m).prefixes.has(alias) { return fail(cx, u.span, quoted(cx, "", alias, " already in scope")); }
+                t.modAt(m).prefixes.put(alias, tg.src);
+            }
+            UsePhase.Vals {
+                match t.modAt(m).prefixes.get(alias) {
+                    Option.Some(p) { if t.modAt(p).isLib { return fail(cx, u.span, quoted(cx, "", alias, " already in scope")); } }
+                    Option.None {}
+                }
+            }
+        }
+        return true;
+    }
+    for i in 0..tg.names.len {
+        let ok = true;
+        match phase {
+            UsePhase.Types { ok = useType(cx, m, tg.src, u, tg.names.items[i]); }
+            UsePhase.Vals { ok = useValue(cx, m, tg.src, u, tg.names.items[i]); }
+        }
+        if !ok { return false; }
+    }
+    return true;
+}
+
+fn privateIn(cx: &SemaCx, u: &UseItem, name: Sym, src: Id<ModDecl>): bool {
+    return fail(cx, u.span, cat5(cx, "`", cx.tables.str(name), "` is private in `", cx.tables.modAt(src).key, "`"));
+}
+
+/// The types phase for one listed name: a struct or enum of `src` (own or imported there) joins `m`.
+fn useType(cx: &SemaCx, m: Id<ModDecl>, src: Id<ModDecl>, u: &UseItem, name: Sym): bool {
+    match scopeType(cx, m, name) {
+        Option.Some(_) { return fail(cx, u.span, quoted(cx, "", name, " already in scope")); }
+        Option.None {}
+    }
+    match scopeType(cx, src, name) {
+        Option.Some(d) {
+            if !cx.tables.modAt(src).exports.has(name) { return privateIn(cx, u, name, src); }
+            bind(cx, m, name, d);
+        }
+        Option.None {}
+    }
+    return true;
+}
+
+/// The values phase for one listed name: a trait (bound already), a fn of `src`, a type already imported,
+/// or a const; anything else is "has no".
+fn useValue(cx: &SemaCx, m: Id<ModDecl>, src: Id<ModDecl>, u: &UseItem, name: Sym): bool {
+    let t = cx.tables;
+    let have = t.modAt(src).scope.get(name);
+    match have {
+        Option.Some(d) {
+            if d.kind == DeclKind.Trait { return true; }
+            if d.kind == DeclKind.Fn && t.fnAt(d.asFn()).owner == src {
+                if !t.modAt(src).exports.has(name) { return privateIn(cx, u, name, src); }
+                match scopeOf(cx, m, name, DeclKind.Fn) {
+                    Option.Some(_) { return fail(cx, u.span, quoted(cx, "", name, " already in scope")); }
+                    Option.None {}
+                }
+                bind(cx, m, name, d);
+                return true;
+            }
+            if isTypeRef(d) {
+                match scopeType(cx, m, name) {
+                    Option.Some(mine) { if mine == d || (isTemplate(cx, mine) && isTemplate(cx, d)) { return true; } }
+                    Option.None {}
+                }
+            }
+            if d.kind == DeclKind.Const {
+                if !t.modAt(src).exports.has(name) { return privateIn(cx, u, name, src); }
+                match scopeOf(cx, m, name, DeclKind.Const) {
+                    Option.Some(_) { return fail(cx, u.span, quoted(cx, "", name, " already in scope")); }
+                    Option.None {}
+                }
+                bind(cx, m, name, d);
+                return true;
+            }
+        }
+        Option.None {}
+    }
+    let msg = Text.new(cx.arena).add("`").add(t.modAt(src).key).add("` has no `").add(t.str(name)).add("`").str();
+    match didYouMean(t.str(name), exportNames(cx, src), cx.arena) {
+        Option.Some(s) { return failHelp(cx, u.span, msg, cat3(cx, "did you mean `", s, "`?")); }
+        Option.None {}
+    }
+    return fail(cx, u.span, msg);
+}
+
+/// A `use lib "c" as alias { fn .. }` block of `m` (Rust `collect_funcs`'s `UseLib` arm): a lib
+/// `ModDecl` for the alias, one `FnKind.Lib` `FnDecl` per declaration (owned by `m`, in `m.fns` and in
+/// the lib module's `fns` and scope).
+pub fn useLib(cx: &SemaCx, m: Id<ModDecl>, item: &UseLibItem): bool {
+    let t = cx.tables;
+    let alias = item.alias.name;
+    match t.modAt(m).prefixes.get(alias) {
+        Option.Some(p) {
+            if t.modAt(p).isLib { return fail(cx, item.alias.span, quoted(cx, "duplicate `use lib` alias ", alias, "")); }
+        }
+        Option.None {}
+    }
+    let path = List<Sym>.new(cx.arena);
+    path.push(alias);
+    let ld = newModDecl(cx.arena, t.str(alias), path);
+    ld.isLib = true;
+    let libMod = t.addMod(ld);
+    let env = plainEnv(m);
+    for i in 0..item.decls.len {
+        let d = item.decls.items[i];
+        if t.modAt(libMod).scope.has(d.name.name) { return fail(cx, d.name.span, quoted(cx, "duplicate lib fn ", d.name.name, "")); }
+        let params = List<ParamDecl>.new(cx.arena);
+        for p in 0..d.params.len {
+            match tyOf(cx, env, d.params.items[p].ty) {
+                Option.Some(pt) { params.push(ParamDecl { name: d.params.items[p].name.name, span: d.params.items[p].name.span, ty: pt }); }
+                Option.None { return false; }
+            }
+        }
+        let ret = t.common.void;
+        match d.ret { Option.Some(r) { match tyOf(cx, env, r) { Option.Some(rt) { ret = rt; } Option.None { return false; } } } Option.None {} }
+        let symbol = t.str(d.name.name);
+        match d.symbol { Option.Some(s) { symbol = s; } Option.None {} }
+        let id = t.addFn(FnDecl { owner: m, name: d.name.name, doc: "", span: d.span, visPub: false, kind: FnKind.Lib, libName: item.libName,
+            symbol: symbol, gen: Option.None, recv: Option.None, params: params, ret: ret, retOmitted: false, isImpl: false, implName: Option.None,
+            defaultOf: Option.None, shader: false, enumDerived: false, item: Option.None, body: Option.None });
+        t.modAt(libMod).scope.put(d.name.name, refFn(id));
+        // Both lists: the owner's keeps Rust's allocation order (what `lower` emits); the lib module's is
+        // the namespace bodies search (`c.dlsym`). `lower` skips `isLib` modules.
+        t.modAt(libMod).fns.push(id);
+        t.modAt(m).fns.push(id);
+    }
+    t.modAt(m).prefixes.put(alias, libMod);
+    return true;
+}

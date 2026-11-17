@@ -2,7 +2,168 @@
 // upcasts through the `$up.Super` table entry (one indirect call, no allocation).
 //
 // Part of module j3c.lower.
-// Port of: j3c/src/check/lower/dyn_call.rs, check/lower/dyn_up.rs
-// J3: The table globals and their thunks are instances sema requests on its one queue when it types the
-//     conversion (B11.2); lower only writes the pointer pair and the indirect call.
+// Port of: j3c/src/check/lower/dyn_call.rs (to_dyn, call_dyn: the IR half), check/lower/dyn_up.rs
+// (dyn_upcast), check/traits.rs (dyn_types)
+// J3: Sema decided everything (`DynLayout` slots and ups, the `InstKind.Vtable` instance's slot targets,
+// `Callee.Dyn.index`); this file writes the pointer pair and the indirect call, `dyn_table.j3` makes the
+// table struct, the thunks and the table global where Rust's `vtable` makes them (at the conversion being
+// lowered). Temps are `_dynN`.
+// J3: Rust makes every written `dyn Trait`'s fat struct before any other struct (`dyn_types`);
+// `declareDecls` calls `dynDeclare` first for the same order and ids.
 module j3c.lower;
+use j3c.sema.DeclKind;
+
+/// Rust's trait key `module::Name` of sema trait `tr`.
+fn dynKey(lw: &Lw, tr: Id<TraitDecl>): string {
+    let td = lw.t.traitAt(tr);
+    return Text.new(lw.cx.arena).add(lw.t.modAt(td.owner).key).add("::").add(lw.t.str(td.name)).str();
+}
+
+/// The `{ $data, $vt }` struct of trait `tr` (Rust `dyn_ty`).
+fn dynFat(lw: &Lw, tr: Id<TraitDecl>): Id<TyKind> {
+    let td = lw.t.traitAt(tr);
+    return lw.ir().dynTy(tr.i, lw.t.str(td.name), lw.t.modAt(td.owner).path);
+}
+
+/// Rust `dyn_types`: per module in load order, the fat-pointer struct of every trait its scope binds to
+/// a name some file wrote as `dyn Name` (`LowerCx.dyns`), each module's by name. Once, from `declareDecls`.
+fn dynDeclare(lw: &Lw) {
+    let t = lw.t;
+    // The written names, each once, sorted (a scope has a name once, so name order is Rust's (name, key)).
+    let names = List<Sym>.new(lw.cx.arena);
+    for i in 0..lw.cx.dyns.len {
+        let n = lw.cx.dyns.items[i];
+        if names.contains(n) { continue; }
+        names.push(n);
+        let b = names.len - 1;
+        while b > 0 && t.str(names.items[b]) < t.str(names.items[b - 1]) {
+            names.items[b] = names.items[b - 1];
+            names.items[b - 1] = n;
+            b -= 1;
+        }
+    }
+    if names.len == 0 { return; }
+    for m in 0..t.mods.len() {
+        let md = t.modAt(t.mods.idAt(m));
+        for k in 0..names.len {
+            match md.scope.get(names.items[k]) {
+                Option.Some(d) { if d.kind == DeclKind.Trait { dynFat(lw, Id<TraitDecl> { i: d.i }); } }
+                Option.None {}
+            }
+        }
+    }
+}
+
+/// `Lw.irTy` for `Ty.Dyn`: the `{ $data, $vt }` struct of the trait (`IrCx.dynTy`).
+fn dynIrTy(lw: &Lw, d: DynTy): Id<TyKind> { return dynFat(lw, d.decl); }
+
+/// After a module's bodies and instances (Rust check/mod.rs:420): the table globals made while lowering
+/// it (`IrCx.takeNewVtables`) join that module's globals.
+fn dynModuleDone(lw: &Lw) { lw.p.modules.items[lw.curMod].globals.extend(lw.ir().takeNewVtables().slice()); }
+
+/// After every module (Rust check/mod.rs:441): the fat-pointer and table structs
+/// (`IrCx.takeNewDynStructs`) join the last module's structs, after the tuples.
+fn dynProgramDone(lw: &Lw) {
+    if lw.p.modules.len > 0 { lw.p.modules.items[lw.p.modules.len - 1].structs.extend(lw.ir().takeNewDynStructs().slice()); }
+}
+
+/// The sema trait of `dyn` type `t` (through any `&`).
+fn dynTraitOf(lw: &Lw, t: Id<Ty>): Id<TraitDecl> {
+    let x = t;
+    while true {
+        match lw.t.ty(x) {
+            Ty.Ref(r) { x = r.inner; }
+            Ty.Dyn(d) { return d.decl; }
+            _ { panic("lower: a `dyn` node whose type is not a `dyn`"); }
+        }
+    }
+    return Id<TraitDecl> { i: 0 };
+}
+
+/// The struct id of struct type `ty` (a `dyn` fat pointer or table, a closure).
+fn structIdOf(lw: &Lw, ty: Id<TyKind>): Id<StructDef> {
+    match lw.ir().tyKind(ty) {
+        TyKind.Struct(s) { return s.id; }
+        _ { panic("lower: a `dyn` or closure type is not a struct"); }
+    }
+    return Id<StructDef> { i: 0 };
+}
+
+extend FnLower {
+    /// Rust `tmp_op`: `rv` in a fresh `_dynN`.
+    fn dynTmp(this: &FnLower, sp: Span, rv: Rvalue): Operand { return Operand.Copy(this.spill("dyn", rv, sp)); }
+
+    /// Rust `to_dyn`'s `{ data, &table }`.
+    fn dynTo(this: &FnLower, e: Id<TExpr>, d: &TToDyn): Rvalue {
+        let sp = this.spanOf(e);
+        let ir = this.ir();
+        let op = this.operand(d.value);
+        let vt = dynVtable(this.lw, sp, d.vtable);
+        let ptr = ir.common.ptr;
+        let data = this.dynTmp(sp, Rvalue.cast(sp, ptr, op));
+        let gty = ir.global(vt).ty;
+        let r = this.dynTmp(sp, Rvalue.refPlace(sp, ir.tyRef(gty), Place.global(this.cx.arena, vt, gty, letBinding(), sp)));
+        let table = this.dynTmp(sp, Rvalue.cast(sp, ptr, r));
+        let fields = List<Operand>.new(this.cx.arena);
+        fields.push(data);
+        fields.push(table);
+        return Rvalue.aggregate(sp, this.tyOf(e), fields);
+    }
+
+    /// The table entry `index` of the `dyn` value at `place` (its trait's table is `table`): the `$data`
+    /// place and the entry place, through `_dynN = &vtable T(copy place.$vt)`.
+    fn dynEntry(this: &FnLower, sp: Span, place: Place, table: Id<TyKind>, index: int, data: &Place): Place {
+        let ir = this.ir();
+        let fat = structIdOf(this.lw, place.ty);
+        *data = this.b.field(ir, this.copyOf(place), FieldId { structId: fat, index: 0 }, sp);
+        let vt = this.b.field(ir, this.copyOf(place), FieldId { structId: fat, index: 1 }, sp);
+        let tp = this.spill("dyn", Rvalue.cast(sp, ir.tyRef(table), Operand.Copy(vt)), sp);
+        return this.b.field(ir, this.b.deref(ir, tp, sp), FieldId { structId: structIdOf(this.lw, table), index: u32(index) }, sp);
+    }
+
+    /// Rust `dyn_upcast` (`ConvKind.DynUpcast`): `inner` is the `dyn Sub` (or a `&` of one).
+    fn dynUpcast(this: &FnLower, e: Id<TExpr>, inner: Id<TExpr>): Rvalue {
+        let sp = this.spanOf(e);
+        let ir = this.ir();
+        let lw = this.lw;
+        let op = this.operand(inner);
+        let place = this.spill("dyn", Rvalue.useOp(sp, op), sp);
+        while true {
+            match ir.refInner(place.ty) {
+                Option.Some(_) { place = this.b.deref(ir, place, sp); }
+                Option.None { break; }
+            }
+        }
+        let sub = dynTraitOf(lw, lw.typed.exprTy(inner));
+        let want = dynTraitOf(lw, lw.typed.exprTy(e));
+        let table = dynTable(lw, sub);
+        let lay = dynLayoutOf(lw, sub);
+        let j = -1;
+        for i in 0..lay.ups.len { if lay.ups.items[i] == want { j = i; } }
+        if j < 0 { panic("lower: a `dyn` upcast to a trait that is not a supertrait"); }
+        let data = place;
+        let entry = this.dynEntry(sp, place, table, lay.slots.len + j, &data);
+        let up = this.dynTmp(sp, Rvalue.call(sp, ir.common.ptr, Operand.Copy(entry), List<Operand>.new(this.cx.arena)));
+        let fields = List<Operand>.new(this.cx.arena);
+        fields.push(Operand.Copy(data));
+        fields.push(up);
+        return Rvalue.aggregate(sp, this.tyOf(e), fields);
+    }
+
+    /// Rust `call_dyn`: slot `d.index` of the table, the data pointer first; `args[0]` is the receiver.
+    fn dynCall(this: &FnLower, e: Id<TExpr>, d: DynCallee, args: &List<Id<TExpr>>): Rvalue {
+        let sp = this.spanOf(e);
+        let ir = this.ir();
+        let recv = match this.node(args.items[0]) {
+            TExpr.Load(r) { this.place(r.place, "recv") }
+            _ { this.spill("recv", this.rvalue(args.items[0]), sp) }
+        };
+        let table = dynTable(this.lw, d.decl);
+        let data = recv;
+        let slot = this.dynEntry(sp, recv, table, d.index, &data);
+        let ops = List<Operand>.new(this.cx.arena);
+        ops.push(Operand.Copy(data));
+        for i in 1..args.len { ops.push(this.operand(args.items[i])); }
+        return Rvalue.call(sp, this.tyOf(e), Operand.Copy(slot), ops);
+    }
+}

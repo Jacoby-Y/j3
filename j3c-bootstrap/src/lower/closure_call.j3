@@ -1,0 +1,197 @@
+// Using closures: `c(args)`, a plain fn standing in for a closure (its `NAME$thunk`), the stdlib-only
+// `@closureFn` / `@closureCtx` / `@closureFrom`, a boxed closure's ctx allocation, and a boxed closure seen
+// as a stack one.
+//
+// Part of module j3c.lower.
+// Port of: j3c/src/check/lower/closure_call.rs, check/lower/closure_boxed.rs
+// J3: C2c hooks (contracts-c2c.md, owner: closures); the literal is `closure.j3`. Sema typed everything:
+// a closure call is `Call` + `Callee.Value`, a fn as a closure `Convert(FnAddr, FnToClosure)`, a boxed
+// closure as a stack one `Convert(Load(place), BoxedToStack)` (a `TPlace.Temp` place is Rust's stored
+// rvalue, `_tN`).
+module j3c.lower;
+
+extend FnLower {
+    fn closureSigOf(this: &FnLower, ty: Id<TyKind>): ClosureSig {
+        match this.ir().closureSig(ty) {
+            Option.Some(s) { return s; }
+            Option.None { panic("lower: not a closure type"); }
+        }
+        return ClosureSig { params: List<Id<TyKind>>.new(this.cx.arena), ret: ty, ty: ty, id: Id<StructDef> { i: 0 }, boxed: false };
+    }
+
+    /// `e` is a closure literal: as a generic call's argument Rust lowers it after the instance is made
+    /// (`Slot::Later`, check/lower/generic_fn.rs:101).
+    fn closureIsLit(this: &FnLower, e: Id<TExpr>): bool {
+        match this.node(e) { TExpr.Closure(_) { return true; } _ { return false; } }
+        return false;
+    }
+
+    /// Rust `closure_intrinsic`: `@closureFn` / `@closureCtx` / `@closureFrom`.
+    fn closureOp(this: &FnLower, e: Id<TExpr>, c: &TClosureOp): Rvalue {
+        let sp = this.spanOf(e);
+        let ir = this.ir();
+        let ptr = ir.common.ptr;
+        match c.kind {
+            ClosureOpKind.From {
+                let ty = this.tyOf(e);
+                let sig = this.closureSigOf(ty);
+                let f = this.operand(c.args.items[0]);
+                let ctx = this.operand(c.args.items[1]);
+                let fp = this.spill("t", Rvalue.cast(sp, ir.closureFnTy(&sig.params, sig.ret), f), sp);
+                let ops = List<Operand>.new(this.cx.arena);
+                ops.push(Operand.Copy(fp));
+                ops.push(ctx);
+                return Rvalue.aggregate(sp, ty, ops);
+            }
+            ClosureOpKind.Fn {}
+            ClosureOpKind.Ctx {}
+        }
+        // Rust `materialize`: a copy is its place, a constant goes in `_tN`.
+        let place = match this.operand(c.args.items[0]) {
+            Operand.Copy(p) { p }
+            Operand.Const(k) { this.spill("t", Rvalue.useOp(sp, Operand.Const(k)), sp) }
+        };
+        let sid = structIdOf(this.lw, place.ty);
+        match c.kind {
+            ClosureOpKind.Fn { return Rvalue.cast(sp, ptr, Operand.Copy(this.b.field(ir, place, FieldId { structId: sid, index: 0 }, sp))); }
+            _ {}
+        }
+        return Rvalue.useOp(sp, Operand.Copy(this.b.field(ir, place, FieldId { structId: sid, index: 1 }, sp)));
+    }
+
+    /// Rust `call_closure`: `fv.$f(fv.$ctx, args)`; `fv` is the closure value (`Callee.Value`).
+    fn closureCall(this: &FnLower, e: Id<TExpr>, fv: Id<TExpr>, args: &List<Id<TExpr>>): Rvalue {
+        let sp = this.spanOf(e);
+        let ir = this.ir();
+        let place = match this.operand(fv) {
+            Operand.Copy(p) { p }
+            Operand.Const(_) { panic("lower: a closure value is never a constant"); }
+        };
+        let sid = structIdOf(this.lw, place.ty);
+        let f = this.b.field(ir, this.copyOf(place), FieldId { structId: sid, index: 0 }, sp);
+        let c = this.b.field(ir, place, FieldId { structId: sid, index: 1 }, sp);
+        let ops = List<Operand>.new(this.cx.arena);
+        ops.push(Operand.Copy(c));
+        for i in 0..args.len { ops.push(this.operand(args.items[i])); }
+        return Rvalue.call(sp, this.tyOf(e), Operand.Copy(f), ops);
+    }
+
+    /// Rust `fn_to_closure` (`ConvKind.FnToClosure`): `{ thunk, null }`; `inner` is the `FnAddr`.
+    fn closureFromFn(this: &FnLower, e: Id<TExpr>, inner: Id<TExpr>): Rvalue {
+        let sp = this.spanOf(e);
+        let ir = this.ir();
+        let want = this.tyOf(e);
+        let sig = this.closureSigOf(want);
+        let id = match this.node(inner) {
+            TExpr.FnAddr(f) { this.calleeFn(f.callee) }
+            _ { panic("lower: a fn as a closure is a fn address"); }
+        };
+        let thunk = this.closureThunk(sp, id, &sig.params, sig.ret);
+        let ops = List<Operand>.new(this.cx.arena);
+        ops.push(opFnAddr(sp, ir.closureFnTy(&sig.params, sig.ret), thunk));
+        ops.push(opNull(sp, ir.common.ptr));
+        return Rvalue.aggregate(sp, want, ops);
+    }
+
+    /// Rust `thunk_for`: `name$thunk(ctx, args..)` calling `name(args..)`; one per fn. Named in the
+    /// target fn's module, listed with the module being lowered.
+    fn closureThunk(this: &FnLower, sp: Span, id: Id<Func>, params: &List<Id<TyKind>>, ret: Id<TyKind>): Id<Func> {
+        let lw = this.lw;
+        let ir = this.ir();
+        let a = this.cx.arena;
+        match ir.closures.thunks.get(id.i) { Option.Some(t) { return Id<Func> { i: t }; } Option.None {} }
+        let void = ir.common.void;
+        let b = BodyBuilder.new(a, void);
+        b.param(ir.internName("$ctx"), ir.common.ptr, sp);
+        let args = List<Operand>.new(a);
+        for i in 0..params.len {
+            let n = Text.new(a);
+            n.add("a").pushInt(i);
+            let p = b.param(ir.internName(n.str()), params.items[i], sp);
+            args.push(Operand.Copy(b.localPlace(p, sp)));
+        }
+        let target = *ir.funcMut(id);
+        let call = Rvalue.call(sp, ret, opFnAddr(sp, target.ty, id), args);
+        if ret == void {
+            b.expr(sp, call);
+            b.returnOp(sp, Option.None);
+        } else {
+            let t = b.tmp(ir.internName("_r"), ret, sp);
+            b.assign(sp, b.localPlace(t, sp), call);
+            b.returnOp(sp, Option.Some(Operand.Copy(b.localPlace(t, sp))));
+        }
+        let body = b.finish();
+        instWake(lw, &body.block);
+        let name = Text.new(a);
+        name.add(ir.nameStr(target.name)).add("$thunk");
+        let tid = ir.allocFunc(Func { id: Id<Func> { i: 0 }, doc: "", moduleName: target.moduleName, kind: FuncKind.J3(J3Fn { body: body }),
+            name: ir.internName(name.str()), ty: ir.closureFnTy(params, ret), vis: Vis.Private, methodOf: Option.None, span: sp });
+        lw.p.modules.items[lw.curMod].funcs.push(tid);
+        ir.closures.thunks.put(id.i, tid.i);
+        return tid;
+    }
+
+    /// Rust `boxed_ctx`: allocates ctx struct `sid` from the arena and copies each captured value in;
+    /// the `ptr` to it.
+    fn closureBoxedCtx(this: &FnLower, sp: Span, sid: Id<StructDef>, mem: Operand, alloc: Id<Func>, caps: &List<Place>): Operand {
+        let ir = this.ir();
+        let c = ir.common;
+        let ctxTy = ir.tyStruct(sid);
+        let align = abiAlign(ir, ctxTy);
+        if align < 8 { align = 8; }
+        let args = List<Operand>.new(this.cx.arena);
+        args.push(mem);
+        args.push(opInt(sp, c.int, abiSize(ir, ctxTy)));
+        args.push(opInt(sp, c.int, align));
+        let raw = this.spill("t", Rvalue.call(sp, c.ptr, opFnAddr(sp, ir.funcMut(alloc).ty, alloc), args), sp);
+        let typed = this.spill("t", Rvalue.cast(sp, ir.tyRef(ctxTy), Operand.Copy(this.copyOf(raw))), sp);
+        for i in 0..caps.len {
+            let base = this.b.deref(ir, this.copyOf(typed), sp);
+            let field = this.b.field(ir, base, FieldId { structId: sid, index: u32(i) }, sp);
+            this.b.assign(sp, field, Rvalue.useOp(sp, Operand.Copy(caps.items[i])));
+        }
+        return Operand.Copy(raw);
+    }
+
+    /// Rust `boxed_as_stack` (`ConvKind.BoxedToStack`): the two words of `inner` under the stack type.
+    /// `inner` is a `Load`: of the written place (Rust's `operand` path), or of a `TPlace.Temp` holding
+    /// the value (Rust's `rvalue` path: `materialize_rv`, `_tN`).
+    fn closureBoxedToStack(this: &FnLower, e: Id<TExpr>, inner: Id<TExpr>): Rvalue {
+        let sp = this.spanOf(e);
+        let ir = this.ir();
+        let place = match this.node(inner) {
+            TExpr.Load(r) {
+                match this.lw.typed.place(r.place) {
+                    TPlace.Temp(t) { this.spill("t", this.rvalue(t.value), sp) }
+                    _ { this.place(r.place, "i") }
+                }
+            }
+            _ { panic("lower: a boxed closure seen as a stack one is read from a place"); }
+        };
+        let sid = structIdOf(this.lw, place.ty);
+        let ops = List<Operand>.new(this.cx.arena);
+        ops.push(Operand.Copy(this.b.field(ir, this.copyOf(place), FieldId { structId: sid, index: 0 }, sp)));
+        ops.push(Operand.Copy(this.b.field(ir, place, FieldId { structId: sid, index: 1 }, sp)));
+        return Rvalue.aggregate(sp, this.tyOf(e), ops);
+    }
+
+    /// The operand of `Convert(Load(place), BoxedToStack)` (`e`) when Rust's `operand` made it: the view
+    /// in `_dynN` (Rust `tmp_op`). None: `e` is something else, or the `rvalue` path's view (`_tN`).
+    fn closureBoxedOperand(this: &FnLower, e: Id<TExpr>): Option<Operand> {
+        match this.node(e) {
+            TExpr.Convert(c) {
+                if c.kind != ConvKind.BoxedToStack { return Option.None; }
+                match this.node(c.expr) {
+                    TExpr.Load(r) {
+                        match this.lw.typed.place(r.place) { TPlace.Temp(_) { return Option.None; } _ {} }
+                        let sp = this.spanOf(e);
+                        return Option.Some(Operand.Copy(this.spill("dyn", this.closureBoxedToStack(e, c.expr), sp)));
+                    }
+                    _ {}
+                }
+            }
+            _ {}
+        }
+        return Option.None;
+    }
+}

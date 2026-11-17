@@ -1,0 +1,441 @@
+// Values: an expression typed against an optional expected type, names, consts, fn values, unary
+// operators, `if` expressions, casts.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/expr.rs (operand, rvalue, rvalue_raw, const_rvalue), check/lower/half.rs
+// (half_cast, half_guard)
+// J3: Rust's `operand` and `rvalue` differ in what IR they emit (an operand is a copy or a constant, so an
+// rvalue gets a temp); both type the same way, so both return an `Id<TExpr>` and `lower` spills where
+// Rust did. `operand` checks the expected type; `rvalue` leaves that to its caller, as in Rust.
+module j3c.sema;
+
+extend BodyCx {
+    /// Rust `operand`: `e` as a value of type `want` when given (a mismatch is an error).
+    fn operand(this: &BodyCx, e: Id<Expr>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let sp = this.cx.ast.exprSpan(e);
+        match want {
+            Option.Some(w) { if this.isDyn(w) { return this.dynTo(e, w); } }
+            Option.None {}
+        }
+        match this.cx.ast.expr(e) {
+            Expr.Char(v) { return this.charLit(sp, v, want); }
+            Expr.Float(v) {
+                let f = this.numFromFloat(sp, v, want);
+                match want {
+                    Option.Some(w) {
+                        if this.exprTy(f) != w { return Result.Err(this.mismatch(sp, "type mismatch", this.exprTy(f), w)); }
+                    }
+                    Option.None {}
+                }
+                return Result.Ok(f);
+            }
+            _ {}
+        }
+        match this.foldInt(e) {
+            Option.Some(v) { return Result.Ok(this.intFolded(e, sp, v, want)); }
+            Option.None {}
+        }
+        match this.tryPlace(e) {
+            Result.Ok(p) {
+                let pt = this.placeTy(p);
+                // Rust expr.rs:35: a script instance used by value.
+                match this.scriptCopy(sp, pt) { Option.Some(err) { return Result.Err(err); } Option.None {} }
+                match want {
+                    Option.Some(w) {
+                        if pt == w { return Result.Ok(this.load(p)); }
+                        match this.arrayToSlice(sp, p, w) { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+                        match this.textToString(sp, p, w) { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+                        match this.closureBoxedPlace(sp, p, w) { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+                        return Result.Err(this.mismatch(sp, "type mismatch", pt, w));
+                    }
+                    Option.None { return Result.Ok(this.load(p)); }
+                }
+            }
+            Result.Err(_) {}
+        }
+        let v = this.rvalue(e, want)?;
+        match want {
+            Option.Some(w) {
+                if this.exprTy(v) != w { return Result.Err(this.mismatch(sp, "type mismatch", this.exprTy(v), w)); }
+            }
+            Option.None {}
+        }
+        return Result.Ok(v);
+    }
+
+    /// A folded int `v` (Rust: `0` where a pointer is wanted is `null`; a big `u64` const is a `u64`).
+    fn intFolded(this: &BodyCx, e: Id<Expr>, sp: Span, v: i64, want: Option<Id<Ty>>): Id<TExpr> {
+        match want {
+            Option.Some(w) { if v == 0 && this.isPtrTy(w) { return this.expr(TExpr.Null, w, sp); } }
+            Option.None { if this.bigU64(e) { return this.numFromInt(sp, v, Option.Some(this.com().u64)); } }
+        }
+        return this.numFromInt(sp, v, want);
+    }
+
+    /// Rust `rvalue`: `rvalue_raw`, then the boxed-closure view (`closures.closureBoxedView`).
+    fn rvalue(this: &BodyCx, e: Id<Expr>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let v = this.rvalueRaw(e, want)?;
+        return Result.Ok(this.closureBoxedView(this.cx.ast.exprSpan(e), v, want));
+    }
+
+    /// Rust `rvalue_raw`: every expression kind.
+    fn rvalueRaw(this: &BodyCx, e: Id<Expr>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let sp = this.cx.ast.exprSpan(e);
+        let c = this.com();
+        match want {
+            Option.Some(w) { if this.isDyn(w) { return this.dynTo(e, w); } }
+            Option.None {}
+        }
+        match this.cx.ast.expr(e) {
+            Expr.Char(v) { return this.charLit(sp, v, want); }
+            _ {}
+        }
+        match this.foldInt(e) {
+            Option.Some(v) { return Result.Ok(this.intFolded(e, sp, v, want)); }
+            Option.None {}
+        }
+        match this.cx.ast.expr(e) {
+            Expr.Name(n) {
+                // Rust expr.rs:89-95: a name that is a script instance place cannot be copied.
+                match this.tryPlace(e) {
+                    Result.Ok(p) { match this.scriptCopy(sp, this.placeTy(p)) { Option.Some(err) { return Result.Err(err); } Option.None {} } }
+                    Result.Err(_) {}
+                }
+                return this.nameValue(n, sp, want);
+            }
+            Expr.Bool(v) { return Result.Ok(this.expr(TExpr.Bool(v), c.bool, sp)); }
+            Expr.Int(v) { return Result.Ok(this.numFromInt(sp, v, want)); }
+            Expr.BigInt(v) {
+                match want {
+                    Option.Some(w) { if w == c.u64 { return Result.Ok(this.intLit(v, w, sp)); } }
+                    Option.None {}
+                }
+                return Result.Err(this.bigIntErr(sp, v));
+            }
+            Expr.Zeroed { return Result.Err(this.err(sp, "a zero-filled value is only a typed `let`: `let buf: [64]u8;`")); }
+            Expr.Float(v) { return Result.Ok(this.numFromFloat(sp, v, want)); }
+            Expr.Char(v) { return this.charLit(sp, v, want); }
+            Expr.StructLit(s) { return this.structLit(sp, &s); }
+            Expr.TypePath(t) {
+                let m = Text.new(this.cx.arena);
+                m.add("`").add(this.str(t.name.name)).add("` is a type, not a value");
+                return Result.Err(this.err(t.name.span, m.str()));
+            }
+            Expr.SizeOf(s) {
+                let t = this.resolve(s.ty)?;
+                return Result.Ok(this.expr(TExpr.SizeOf(TSizeOf { ty: t }), c.i64, sp));
+            }
+            Expr.UiChoice(u) { return this.uiChoice(sp, &u, want); }
+            Expr.SliceFrom(s) { return this.sliceFrom(sp, s.ptr, s.len, want); }
+            Expr.ArrayLit(a) { return this.arrayLit(sp, &a.elems, want); }
+            Expr.Tuple(t) { return this.tupleLit(sp, &t.elems, want); }
+            Expr.SliceLit(s) { return this.sliceLit(sp, s.elem, &s.fields); }
+            Expr.Index(_) {
+                let p = this.tryPlace(e)?;
+                return Result.Ok(this.load(p));
+            }
+            Expr.Slice(s) {
+                let p = this.tryPlace(s.base)?;
+                return this.sliceRvalue(sp, p, s.start, s.end);
+            }
+            Expr.String(b) { return Result.Ok(this.expr(TExpr.Str(b), c.string, sp)); }
+            Expr.Field(f) { return this.fieldValue(e, &f, sp, want); }
+            Expr.Call(call) { return this.call(sp, call.func, &call.typeArgs, &call.args, want); }
+            Expr.Syscall(s) { return this.syscall(sp, &s.args); }
+            Expr.Atomic(a) { return this.atomic(sp, a.op, a.order, &a.args); }
+            Expr.Cast(ce) {
+                let to = this.resolve(ce.ty)?;
+                let from = this.operand(ce.expr, Option.None)?;
+                return this.convert(sp, from, to);
+            }
+            Expr.Binary(b) { return this.binary(sp, b.op, b.lhs, b.rhs, want); }
+            Expr.Match(m) { return this.patMatchExpr(sp, &m, want); }
+            Expr.If(i) {
+                let cond = this.operand(i.cond, Option.Some(c.bool))?;
+                let a = this.rvalue(i.thenExpr, want)?;
+                let t = this.exprTy(a);
+                let b = this.rvalue(i.elseExpr, Option.Some(t))?;
+                if this.exprTy(b) != t { return Result.Err(this.err(sp, "if-expression branches have different types")); }
+                return Result.Ok(this.expr(TExpr.If(TIf { cond: cond, thenExpr: a, elseExpr: b }), t, sp));
+            }
+            Expr.Unary(u) { return this.unary(e, sp, u.op, u.expr, want); }
+            Expr.Interpolate(ie) { return this.interpolate(sp, &ie.parts); }
+            Expr.Question(q) { return this.patQuestion(sp, q.expr, want); }
+            Expr.ScriptType(_) { return Result.Err(this.err(sp, "a script type is not a value")); }
+            Expr.ScriptLit(l) { return this.scriptLit(sp, &l); }
+            Expr.Embed(em) { return this.embedValue(sp, em.kind); }
+            Expr.Closure(lit) { return this.closureLit(sp, &lit, want); }
+        }
+        return Result.Err(this.err(sp, "unreachable expression kind"));
+    }
+
+    /// A bare name as a value: a local, a global, a const, a fn (Rust's `ExprKind::Name` arm).
+    fn nameValue(this: &BodyCx, n: Ident, sp: Span, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        match this.findAlias(n.name) { Option.Some(p) { return Result.Ok(this.load(p)); } Option.None {} }
+        match this.findLocal(n.name) {
+            Option.Some(l) { return Result.Ok(this.load(this.place(TPlace.Local(LocalPlace { local: l }), this.cx.typed.local(l).ty, n.span))); }
+            Option.None {}
+        }
+        match this.lookupName(n.name) {
+            Option.Some(r) {
+                match r.kind {
+                    DeclKind.Global {
+                        let g = r.asGlobal();
+                        return Result.Ok(this.load(this.place(TPlace.Global(GlobalPlace { global: g }), this.cx.tables.globalAt(g).ty, n.span)));
+                    }
+                    DeclKind.Const {
+                        let cd = this.cx.tables.constAt(r.asConst());
+                        match cd.table {
+                            Option.Some(g) {
+                                return Result.Ok(this.load(this.place(TPlace.Global(GlobalPlace { global: g }), this.cx.tables.globalAt(g).ty, n.span)));
+                            }
+                            Option.None {}
+                        }
+                        match cd.value {
+                            Option.Some(v) { return Result.Ok(this.constUse(sp, v)); }
+                            Option.None {}
+                        }
+                    }
+                    // Rust keeps generic fns out of `funcs`: one named as a value is an unknown name.
+                    DeclKind.Fn {
+                        match this.cx.tables.fnAt(r.asFn()).gen { Option.None { return this.fnValue(r.asFn(), n.span, sp, want); } Option.Some(_) {} }
+                    }
+                    _ {}
+                }
+            }
+            Option.None {}
+        }
+        return Result.Err(this.unknown(n.span, "name", n.name));
+    }
+
+    /// A fn used as a value (Rust: `fn_to_closure` first, `closures.closureFromFn`).
+    fn fnValue(this: &BodyCx, f: Id<FnDecl>, nameSp: Span, sp: Span, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let ft = this.fnTyOf(f);
+        match want {
+            Option.Some(w) {
+                match this.closureFromFn(sp, f, w)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+                if w != ft { return Result.Err(this.err(nameSp, "function type does not match expected type")); }
+            }
+            Option.None {}
+        }
+        return Result.Ok(this.expr(TExpr.FnAddr(TFnAddr { callee: Callee.Fn(FnCallee { decl: f }) }), ft, sp));
+    }
+
+    /// Rust `const_rvalue`: a const's value at this use.
+    fn constValue(this: &BodyCx, sp: Span, v: ConstVal): Id<TExpr> {
+        match v.kind {
+            ConstPayload.Int(i) { return this.intLit(u64(i), v.ty, sp); }
+            ConstPayload.Float(f) {
+                if v.ty == this.com().f32 { return this.expr(TExpr.Float(f64(f32(f))), v.ty, sp); }
+                return this.expr(TExpr.Float(f), v.ty, sp);
+            }
+            ConstPayload.Bool(b) { return this.expr(TExpr.Bool(b), v.ty, sp); }
+            ConstPayload.String(s) { return this.expr(TExpr.Str(s), v.ty, sp); }
+            ConstPayload.Null { return this.expr(TExpr.Null, v.ty, sp); }
+            ConstPayload.FnAddr(f) { return this.expr(TExpr.FnAddr(TFnAddr { callee: Callee.Fn(FnCallee { decl: f.decl }) }), v.ty, sp); }
+        }
+        return this.expr(TExpr.Error, this.com().error, sp);
+    }
+
+    /// A const named in code (Rust `rvalue_raw`'s two `const_rvalue` sites): a float is marked, since
+    /// Rust's `operand` holds it in `_tN` where a float literal is a constant operand.
+    fn constUse(this: &BodyCx, sp: Span, v: ConstVal): Id<TExpr> {
+        let e = this.constValue(sp, v);
+        match v.kind { ConstPayload.Float(_) { this.cx.typed.setOrigin(e, Origin.ConstUse); } _ {} }
+        return e;
+    }
+
+    /// `base.field` as a value: `alias.CONST`, `E.V`, `arr.len` (a constant), or a field place.
+    fn fieldValue(this: &BodyCx, e: Id<Expr>, f: &FieldExpr, sp: Span, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        match this.qualifiedConst(e) {
+            Option.Some(v) { return Result.Ok(this.constUse(sp, v)); }
+            Option.None {}
+        }
+        match this.cx.ast.expr(f.base) {
+            Expr.Name(n) {
+                match this.prefixModule(n.name) {
+                    Option.Some(_) {
+                        let t = Text.new(this.cx.arena);
+                        t.add("`").add(this.str(n.name)).add("` has no pub const `").add(this.str(f.field.name)).add("`");
+                        return Result.Err(this.err(f.field.span, t.str()));
+                    }
+                    Option.None {}
+                }
+            }
+            _ {}
+        }
+        match this.enumCtor(f.base) {
+            Option.Some(en) {
+                let none = List<Id<Expr>>.new(this.cx.arena);
+                return this.constructVariant(sp, en, f.field, &none, want);
+            }
+            Option.None {}
+        }
+        if this.str(f.field.name) == "len" {
+            match this.tryPlace(f.base) {
+                Result.Ok(p) {
+                    let q = this.derefAll(p, f.field.span);
+                    match this.ty(this.placeTy(q)) {
+                        Ty.Array(a) { return Result.Ok(this.expr(TExpr.ArrayLen(a.len), this.com().i64, sp)); }
+                        _ {}
+                    }
+                }
+                Result.Err(_) {}
+            }
+        }
+        let p = this.tryPlace(e)?;
+        return Result.Ok(this.load(p));
+    }
+
+    /// Unary `-`, `~`, `!`, `&`, `*`.
+    fn unary(this: &BodyCx, e: Id<Expr>, sp: Span, op: UnaryOp, inner: Id<Expr>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let c = this.com();
+        match op {
+            UnaryOp.Neg {
+                // Rust: `-1.5` where an `f16` is expected is one `f16` constant.
+                match this.cx.ast.expr(inner) {
+                    Expr.Float(v) {
+                        match want { Option.Some(t) { if this.isHalf(t) { return Result.Ok(this.exprFrom(Origin.NegHalf, TExpr.Float(-v), t, sp)); } } Option.None {} }
+                    }
+                    _ {}
+                }
+                let a = this.operand(inner, want)?;
+                let at = this.exprTy(a);
+                if this.isHalf(at) { return Result.Err(this.halfError(sp, "unary `-`")); }
+                if !this.isNumeric(at) && !this.isVec(at) { return Result.Err(this.err(sp, "unary `-` needs a number")); }
+                return Result.Ok(this.expr(TExpr.Unary(TUnary { op: op, operand: a }), at, sp));
+            }
+            UnaryOp.BitNot {
+                let a = this.operand(inner, want)?;
+                let at = this.exprTy(a);
+                if !this.isInt(at) && at != c.vec4i { return Result.Err(this.err(sp, "unary `~` takes an integer; use `!` for bools")); }
+                return Result.Ok(this.expr(TExpr.Unary(TUnary { op: op, operand: a }), at, sp));
+            }
+            UnaryOp.Not {
+                let a = this.operand(inner, Option.Some(c.bool))?;
+                return Result.Ok(this.expr(TExpr.Unary(TUnary { op: op, operand: a }), c.bool, sp));
+            }
+            UnaryOp.Ref {
+                match this.cx.ast.expr(inner) {
+                    Expr.Name(n) {
+                        match this.lookupName(n.name) {
+                            Option.Some(r) {
+                                if r.kind == DeclKind.Const && !this.isDeclared(n.name) {
+                                    match this.cx.tables.constAt(r.asConst()).table {
+                                        Option.Some(_) {}
+                                        Option.None { return Result.Err(this.err(sp, "cannot take `&` of a const")); }
+                                    }
+                                }
+                            }
+                            Option.None {}
+                        }
+                    }
+                    _ {}
+                }
+                let p = this.tryPlace(inner)?;
+                let pt = this.placeTy(p);
+                match this.closureReject(sp, pt, "borrowed with `&`") { Option.Some(er) { return Result.Err(er); } Option.None {} }
+                if !this.canRef(p) || !this.canAssign(p) { return Result.Err(this.err(sp, "cannot take `&` of this place")); }
+                return Result.Ok(this.expr(TExpr.AddrOf(PlaceRef { place: p }), this.cx.tables.refTo(pt), sp));
+            }
+            UnaryOp.Deref {
+                let p = this.tryPlace(e)?;
+                return Result.Ok(this.load(p));
+            }
+        }
+        return Result.Err(this.err(sp, "unreachable unary"));
+    }
+
+    /// `x as T` / `T(x)`: the conversion node, with Rust's closure and f16 rules. Rust does not check
+    /// other pairs here (the IR validator does); the kind is what `lower` emits.
+    fn convert(this: &BodyCx, sp: Span, from: Id<TExpr>, to: Id<Ty>): Result<Id<TExpr>, TErr> {
+        let ft = this.exprTy(from);
+        if this.isClosure(ft) || this.isClosure(to) {
+            return Result.Err(this.help(this.err(sp, "a closure cannot be cast"),
+                "a closure carries its captures; pass it to a `closure(..)` parameter instead of converting it"));
+        }
+        if this.isHalf(to) || this.isHalf(ft) {
+            if this.cx.tables.modAt(this.m).isScript {
+                return Result.Err(this.help(this.err(sp, "f16 is not supported in scripts yet"),
+                    "scripts run on the VM; use `f32`, or move this code into a `.j3` module"));
+            }
+            let ok = false;
+            if this.isHalf(to) { ok = ft == to || this.isNumeric(ft); } else { ok = this.isFloat(to); }
+            if !ok {
+                return Result.Err(this.help(this.err(sp, "this conversion is not defined for `f16`"),
+                    "`f16(x)` takes a float or int; an `f16` converts only to `f32` or `f64`, so go through `f32(h)`"));
+            }
+        }
+        return Result.Ok(this.expr(TExpr.Convert(TConvert { expr: from, kind: this.convKind(ft, to) }), to, sp));
+    }
+
+    fn convKind(this: &BodyCx, from: Id<Ty>, to: Id<Ty>): ConvKind {
+        if this.isHalf(to) { return ConvKind.ToHalf; }
+        if this.isHalf(from) { return ConvKind.FromHalf; }
+        let fi = this.isInt(from);
+        let ti = this.isInt(to);
+        if fi && ti { return ConvKind.IntResize; }
+        if fi && this.isFloat(to) { return ConvKind.IntToFloat; }
+        if this.isFloat(from) && ti { return ConvKind.FloatToInt; }
+        if this.isFloat(from) && this.isFloat(to) { return ConvKind.FloatResize; }
+        if this.isPtrTy(from) && this.isPtrTy(to) { return ConvKind.PtrCast; }
+        if this.isPtrTy(from) && ti { return ConvKind.PtrToInt; }
+        if fi && this.isPtrTy(to) { return ConvKind.IntToPtr; }
+        if from == this.com().bool && ti { return ConvKind.BoolToInt; }
+        match this.ty(from) { Ty.Enum(_) { return ConvKind.EnumTag; } _ {} }
+        match this.ty(to) { Ty.Enum(_) { return ConvKind.EnumTag; } _ {} }
+        // ponytail: `string` <-> `[]u8` and any other same-layout pair; the IR validator rejects bad ones.
+        return ConvKind.StringBytes;
+    }
+
+    /// Rust `big_int_err`.
+    fn bigIntErr(this: &BodyCx, sp: Span, v: u64): TErr {
+        let t = Text.new(this.cx.arena);
+        t.add("integer literal `");
+        t.pushU64(v);
+        t.add("` does not fit `int`");
+        return this.help(this.err(sp, t.str()),
+            "only a `u64` holds values above 9223372036854775807: give the `let`, `const` or field the type `u64`");
+    }
+
+    /// `use j3.io;` makes `io` a prefix: the module it names (None when a local or global shadows it).
+    fn prefixModule(this: &BodyCx, name: Sym): Option<Id<ModDecl>> {
+        if this.shadows(name) { return Option.None; }
+        return this.cx.tables.modAt(this.m).prefixes.get(name);
+    }
+
+    /// Rust `shadows`: a local or global of that name hides a module alias or qualified const.
+    fn shadows(this: &BodyCx, name: Sym): bool {
+        if this.isDeclared(name) { return true; }
+        match this.globalNamed(name) { Option.Some(_) { return true; } Option.None { return false; } }
+    }
+
+    /// Rust `qualified_const`: `alias.NAME` for a `pub const` of a `use`d module.
+    fn qualifiedConst(this: &BodyCx, e: Id<Expr>): Option<ConstVal> {
+        match this.cx.ast.expr(e) {
+            Expr.Field(f) {
+                match this.cx.ast.expr(f.base) {
+                    Expr.Name(n) {
+                        match this.prefixModule(n.name) {
+                            Option.Some(pm) {
+                                match lookup(this.cx, pm, f.field.name) {
+                                    Option.Some(r) {
+                                        if r.kind == DeclKind.Const {
+                                            let cd = this.cx.tables.constAt(r.asConst());
+                                            if cd.owner == pm && cd.visPub { return cd.value; }
+                                        }
+                                    }
+                                    Option.None {}
+                                }
+                            }
+                            Option.None {}
+                        }
+                    }
+                    _ {}
+                }
+            }
+            _ {}
+        }
+        return Option.None;
+    }
+}

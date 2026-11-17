@@ -2,6 +2,213 @@
 //
 // Port of: j3c/src/lsp/proto.rs
 // J3: Framing is a parameter (`Content-Length` for LSP, one JSON line per message for MCP); dispatch is a
-// handler table `{ method, run }` each server passes in. Built on `j3.data.json` and buffered
-// `io.stdout()` (writes on `flush`); Rust's hand-rolled `json.rs` is in DELETED.md.
+// handler table `{ method, run }` each server passes in, with the server's state as a `ptr`. Built on
+// `j3.data.json` and buffered `io.stdout()` (writes on `flush`); Rust's hand-rolled `json.rs` is in DELETED.md.
+// Unlike Rust, a bad frame (missing or garbage `Content-Length`, body cut short) is not a silent end: `serve`
+// answers a -32700 error and exits 1, since the stream can't be resynced. A request with no handler gets
+// -32601, a body that isn't JSON -32700 (the loop goes on), a non-object -32600; notifications and responses
+// (no `method`) get no reply. A handler stops the loop with `Err(RpcError { code: STOP })` (LSP `exit`).
 module j3c.lsp.proto;
+
+use j3.data.json;
+use j3.data.json.{ Json, Kind };
+use j3.io.{ IoError, Reader, Writer };
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.text.{ Text, parseInt, startsWith, trim };
+
+pub enum Framing { ContentLength, Line }
+
+/// A JSON-RPC error reply (`code` per the spec: -32700 parse error, -32601 method not found, ...).
+pub struct RpcError {
+    code: int;
+    msg: string;
+}
+
+/// `RpcError.code` that ends `serve` (not a JSON-RPC code): a request gets a `null` result first.
+pub const STOP: int = 0;
+pub const PARSE_ERROR: int = -32700;
+pub const INVALID_REQUEST: int = -32600;
+pub const METHOD_NOT_FOUND: int = -32601;
+
+/// Largest `Content-Length` accepted; a bigger one is a bad frame, not a huge allocation.
+const MAX_BODY: int = 1 << 26;
+
+/// One method a server answers. `run` gets the server state, the `params` and a per-message arena;
+/// for a notification (no `id`) its result is dropped.
+pub struct Handler {
+    method: string;
+    run: fn(ptr, &Json, &Arena): Result<&Json, RpcError>;
+}
+
+/// The next message body, copied to `arena`; `None` at end of input. A bad frame is `Err`.
+pub fn readMessage(r: &Reader, framing: Framing, arena: &Arena): Result<Option<string>, IoError> {
+    match framing {
+        Framing.Line {
+            while true {
+                let line = match r.readLine(arena)? {
+                    Option.Some(l) { l }
+                    Option.None { return Result.Ok(Option.None); }
+                };
+                if trim(line).len > 0 { return Result.Ok(Option.Some(line)); }
+            }
+        }
+        Framing.ContentLength {}
+    }
+    let len = -1;
+    let headers = false;
+    while true {
+        let line = match r.readLine(arena)? {
+            Option.Some(l) { l }
+            Option.None {
+                if headers { return Result.Err(IoError.Other); }
+                return Result.Ok(Option.None);
+            }
+        };
+        if line.len == 0 {
+            if headers { break; }
+            continue;
+        }
+        headers = true;
+        if startsWith(line, "Content-Length:") {
+            len = match parseInt(trim(line[15..line.len]), 10) {
+                Option.Some(n) { n }
+                Option.None { return Result.Err(IoError.Other); }
+            };
+        }
+    }
+    if len < 0 || len > MAX_BODY { return Result.Err(IoError.Other); }
+    let body = r.readExact(len, arena)?;
+    return Result.Ok(Option.Some(body as string));
+}
+
+/// Write one message `body` with its framing (does not flush). Write errors show up at `flush`.
+pub fn writeMessage(w: &Writer, framing: Framing, body: string) {
+    match framing {
+        Framing.Line {
+            w.writeStr(body);
+            w.writeStr("\n");
+        }
+        Framing.ContentLength {
+            let digits: [20]u8;
+            let i = 20;
+            let n = body.len;
+            while true {
+                i -= 1;
+                digits[i] = (48 + n % 10) as u8;
+                n /= 10;
+                if n == 0 { break; }
+            }
+            w.writeStr("Content-Length: ");
+            w.write(digits[i..20]);
+            w.writeStr("\r\n\r\n");
+            w.writeStr(body);
+        }
+    }
+}
+
+/// Read, dispatch and answer messages until end of input (or a handler asks to stop); the exit code.
+pub fn serve(r: &Reader, w: &Writer, framing: Framing, handlers: []Handler, state: ptr): int {
+    let arena = Arena.create(1 << 16);
+    let mark = arena.checkpoint();
+    let code = 0;
+    while true {
+        arena.rewind(mark);
+        let got = match readMessage(r, framing, &arena) {
+            Result.Ok(m) { m }
+            Result.Err(_) {
+                send(w, framing, errorReply(json.null(&arena), PARSE_ERROR, "parse error: bad frame", &arena), &arena);
+                code = 1;
+                break;
+            }
+        };
+        let body = match got {
+            Option.Some(b) { b }
+            Option.None { break; }
+        };
+        if !handle(body, w, framing, handlers, state, &arena) { break; }
+    }
+    match w.flush() {
+        Result.Ok(_) {}
+        Result.Err(_) { code = 1; }
+    }
+    arena.destroy();
+    return code;
+}
+
+/// Answer one message; false when a handler asked to stop.
+fn handle(body: string, w: &Writer, framing: Framing, handlers: []Handler, state: ptr, arena: &Arena): bool {
+    let msg = match json.parseStr(body, arena) {
+        Result.Ok(m) { m }
+        Result.Err(e) {
+            let t = Text.new(arena);
+            t.fmt(`parse error: {e.msg} at byte {e.at}`);
+            send(w, framing, errorReply(json.null(arena), PARSE_ERROR, t.str(), arena), arena);
+            return true;
+        }
+    };
+    if msg.kind != Kind.Obj {
+        send(w, framing, errorReply(json.null(arena), INVALID_REQUEST, "invalid request: not an object", arena), arena);
+        return true;
+    }
+    let method = msg.get("method");
+    let isRequest = msg.has("id");
+    let id = msg.get("id");
+    if method.kind != Kind.Str {
+        // A request without a method gets an answer (else the client waits forever); a response to a
+        // request of ours (`result`/`error`) and a method-less notification get none.
+        if isRequest && !msg.has("result") && !msg.has("error") {
+            send(w, framing, errorReply(id, INVALID_REQUEST, "invalid request: no method", arena), arena);
+        }
+        return true;
+    }
+    let params = if msg.has("params") { msg.get("params") } else { json.obj(arena) };
+    for h in handlers {
+        if h.method != method.s { continue; }
+        let run = h.run;
+        match run(state, params, arena) {
+            Result.Ok(v) { if isRequest { send(w, framing, resultReply(id, v, arena), arena); } }
+            Result.Err(e) {
+                if e.code == STOP {
+                    if isRequest { send(w, framing, resultReply(id, json.null(arena), arena), arena); }
+                    return false;
+                }
+                if isRequest { send(w, framing, errorReply(id, e.code, e.msg, arena), arena); }
+            }
+        }
+        return true;
+    }
+    if isRequest {
+        let t = Text.new(arena);
+        t.pushStr("method not found: ");
+        t.pushStr(method.s);
+        send(w, framing, errorReply(id, METHOD_NOT_FOUND, t.str(), arena), arena);
+    }
+    return true;
+}
+
+fn resultReply(id: &Json, v: &Json, arena: &Arena): &Json {
+    let o = json.obj(arena);
+    o.set("jsonrpc", json.str("2.0", arena));
+    o.set("id", id);
+    o.set("result", v);
+    return o;
+}
+
+fn errorReply(id: &Json, code: int, msg: string, arena: &Arena): &Json {
+    let e = json.obj(arena);
+    e.set("code", json.num(code as f64, arena));
+    e.set("message", json.str(msg, arena));
+    let o = json.obj(arena);
+    o.set("jsonrpc", json.str("2.0", arena));
+    o.set("id", id);
+    o.set("error", e);
+    return o;
+}
+
+/// Write one reply and flush it (a client waits on each).
+fn send(w: &Writer, framing: Framing, reply: &Json, arena: &Arena) {
+    writeMessage(w, framing, json.stringify(reply, arena));
+    w.flush();
+}

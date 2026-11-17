@@ -1,0 +1,195 @@
+// simd / `@` intrinsic typing (`sema/simd_expr.j3`, `sema/intrin_call.j3`): a small program through the
+// driver to `Stage.Sema`, then its typed tree read back (a scalar side is a `splat` node under a
+// `BinKind.Simd` binary, lanes are `TPlace.Lane`, `@vload`'s type is peeked from the slice element), and
+// the error texts (equal to stage0's).
+module sema_simd_test;
+
+use j3.data.pool.Id;
+use j3.io;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+use j3c.driver;
+use j3c.driver.{ Session, Stage };
+use j3c.sema.{ BinKind, Checked, Origin, TBody, TExpr, TPlace, TStmt };
+
+const SRC: [8]string = [
+    "module vecs;",
+    "fn rev(a: vec4f): vec4f { return 2.0 * a; }",
+    "fn mixed(a: vec4i, k: i32): vec4i { return k + a; }",
+    "fn lhs(a: vec4i): vec4i { return a / 3; }",
+    "fn lane(a: vec4i): i32 { return a.z; }",
+    "fn sum(xs: []i32): i32 { let s = @vsum(@vload(xs, 0) + @vload(xs, 4)); return s; }",
+    "fn bump(a: vec4f): vec4f { let b = a; b *= 2.0; b[1] = 0.0; return b; }",
+    "fn main() { }",
+];
+
+/// One statement in `fn main` and the error it must give.
+struct Bad { code: string; msg: string; }
+
+fn bads(): [12]Bad {
+    return [
+        Bad { code: "let b = vec4i(1, 2);", msg: "`vec4i` takes 4 lanes or 1 value to splat, found 2" },
+        Bad { code: "let b = a < a;", msg: "`<` does not compare vectors" },
+        Bad { code: "let b = a + f;", msg: "`+` needs matching operands: found `vec4i` and `vec4f`" },
+        Bad { code: "let b = f & f;", msg: "`&` takes integers" },
+        Bad { code: "let b = f % f;", msg: "`%` is not defined on vectors" },
+        Bad { code: "let b = a.q;", msg: "no field `q` on a vector" },
+        Bad { code: "let b = a[4];", msg: "lane index 4 is out of range for a 4-lane vector" },
+        Bad { code: "let b = @vmin(a);", msg: "`@vmin` takes 2 arguments, found 1" },
+        Bad { code: "let b = @vsqrt(a);", msg: "`@vsqrt` takes a `vec4f`, found `vec4i`" },
+        Bad { code: "let b = @vshuffle(a, 0, 1, 2, 4);", msg: "`@vshuffle` indices must be constants 0..3" },
+        Bad { code: "let b = @vload(a, 0);", msg: "`@vload` takes an `[]f32` or `[]i32`, found `vec4i`" },
+        Bad { code: "a += f;", msg: "`+` needs matching operands: found `vec4i` and `vec4f`" },
+    ];
+}
+
+/// Write `text` as `NAME.j3` in a temp dir (outside this package, whose project would otherwise load).
+fn put(name: string, text: string, mem: &Arena): string {
+    let d = Text.new(mem).add(io.tempRoot()).add("/j3c-boot-sema-simd").str();
+    match io.makeDirs(d) { Result.Ok(_) {} Result.Err(_) { panic("cannot make the case dir"); } }
+    let p = Text.new(mem).add(d).add("/").add(name).add(".j3").str();
+    match io.writeFile(p, text as []u8) { Result.Ok(_) {} Result.Err(_) { panic("cannot write a case"); } }
+    return p;
+}
+
+fn body(c: &Checked, name: string): TBody {
+    let fns = &c.tables.fns;
+    for i in 0..fns.len() {
+        let d = fns.get(fns.idAt(i));
+        if c.tables.str(d.name) != name { continue; }
+        match d.body {
+            Option.Some(b) { return c.typed.body(b); }
+            Option.None {}
+        }
+    }
+    panic(`no typed body for {name}`);
+    return c.typed.body(Id<TBody> { i: 0 });
+}
+
+/// The value of `return e;` at statement `k` of fn `name`.
+fn returned(c: &Checked, name: string, k: int): Id<TExpr> {
+    let b = body(c, name);
+    match c.typed.stmt(b.body.stmts.items[k]) {
+        TStmt.Return(r) { match r.value { Option.Some(e) { return e; } Option.None {} } }
+        _ {}
+    }
+    panic(`{name}: statement {k} is not a return with a value`);
+    return Id<TExpr> { i: 0 };
+}
+
+fn isSplat(c: &Checked, e: Id<TExpr>): bool {
+    match c.typed.expr(e) {
+        TExpr.Simd(s) { return c.tables.str(s.name) == "splat" && s.args.len == 1; }
+        _ {}
+    }
+    return false;
+}
+
+/// `fn name` returns a `BinKind.Simd` binary; which sides are splats.
+fn arith(c: &Checked, name: string, splatL: bool, splatR: bool) {
+    match c.typed.expr(returned(c, name, 0)) {
+        TExpr.Binary(b) {
+            if b.kind != BinKind.Simd { panic(`{name}: not a simd binary`); }
+            if isSplat(c, b.lhs) != splatL || isSplat(c, b.rhs) != splatR { panic(`{name}: wrong splat sides`); }
+            if c.typed.exprTy(b.lhs) != c.typed.exprTy(b.rhs) { panic(`{name}: operand types differ`); }
+        }
+        _ { panic(`{name}: not a binary`); }
+    }
+}
+
+fn main() {
+    let mem = Arena.create(1 << 12);
+    let src = Text.new(&mem);
+    for i in 0..SRC.len { src.add(SRC[i]).add("\n"); }
+    let o = driver.defaults();
+    o.entry = put("vecs", src.str(), &mem);
+    let s = Session.new(o);
+    if !driver.run(s, Stage.Sema) { panic("sema fails on the simd program"); }
+    let c = match s.checked { Option.Some(x) { x } Option.None { panic("no checked program"); return; } };
+    let com = c.tables.common;
+
+    // the three scalar/vector orders (Rust binop.rs:198, 295, 238)
+    arith(c, "rev", true, false);
+    arith(c, "mixed", true, false);
+    arith(c, "lhs", false, true);
+
+    // `a.z` is lane 2, typed as the lane
+    match c.typed.expr(returned(c, "lane", 0)) {
+        TExpr.Load(r) {
+            match c.typed.place(r.place) {
+                TPlace.Lane(l) { if l.lane != 2 { panic("lane: `.z` is lane 2"); } }
+                _ { panic("lane: not a lane place"); }
+            }
+        }
+        _ { panic("lane: not a load"); }
+    }
+    if c.typed.exprTy(returned(c, "lane", 0)) != com.i32 { panic("lane: a vec4i lane is i32"); }
+
+    // `@vload` of an `[]i32` is a `vec4i` (peeked for the `+`), `@vsum` its lane
+    let sb = body(c, "sum");
+    match c.typed.stmt(sb.body.stmts.items[0]) {
+        TStmt.Let(l) {
+            if c.typed.local(l.local).ty != com.i32 { panic("sum: `s` is i32"); }
+            match l.init {
+                Option.Some(e) {
+                    match c.typed.expr(e) {
+                        TExpr.Simd(v) {
+                            if c.tables.str(v.name) != "vsum" { panic("sum: a vsum node"); }
+                            if c.typed.exprTy(v.args.items[0]) != com.vec4i { panic("sum: the loads are vec4i"); }
+                        }
+                        _ { panic("sum: a simd node"); }
+                    }
+                }
+                Option.None { panic("sum: init"); }
+            }
+        }
+        _ { panic("sum: a let"); }
+    }
+
+    // `b *= 2.0`: a simd assign-op whose value is the splat; `b[1] = ..` assigns lane 1
+    let bb = body(c, "bump");
+    match c.typed.stmt(bb.body.stmts.items[1]) {
+        TStmt.AssignOp(a) { if a.kind != BinKind.Simd || !isSplat(c, a.value) { panic("bump: simd assign-op of a splat"); } }
+        _ { panic("bump: an assign-op"); }
+    }
+    match c.typed.stmt(bb.body.stmts.items[2]) {
+        TStmt.Assign(a) {
+            match c.typed.place(a.place) { TPlace.Lane(l) { if l.lane != 1 { panic("bump: `[1]` is lane 1"); } } _ { panic("bump: a lane place"); } }
+        }
+        _ { panic("bump: an assign"); }
+    }
+
+    // error texts
+    let cases = bads();
+    for k in 0..cases.len {
+        let t = Text.new(&mem);
+        t.add("module bad;\nfn main() {\n    let a = vec4i(1, 2, 3, 4);\n    let f = vec4f(1.0);\n    ").add(cases[k].code).add("\n}\n");
+        let o2 = driver.defaults();
+        o2.entry = put("bad", t.str(), &mem);
+        let s2 = Session.new(o2);
+        if driver.run(s2, Stage.Sema) { panic(`bad {k}: sema should fail`); }
+        let found = false;
+        for i in 0..s2.diags.count() {
+            if s2.diags.at(i).msg == cases[k].msg { found = true; }
+        }
+        if !found { panic(`bad {k}: no error "{cases[k].msg}"`); }
+        s2.free();
+    }
+
+    // `-2.5` wanted as an `f16`: one constant, marked so `lower` holds it in `_tN` as an operand
+    let o3 = driver.defaults();
+    o3.entry = put("neg", "module neg;\nfn r(): f16 { return -2.5; }\nfn p(): f16 { return 2.5; }\nfn main() { }\n", &mem);
+    let s3 = Session.new(o3);
+    if !driver.run(s3, Stage.Sema) { panic("neg: sema fails"); }
+    let c3 = match s3.checked { Option.Some(x) { x } Option.None { panic("neg: no checked program"); return; } };
+    let negs = 0;
+    for i in 0..c3.typed.exprs.len() {
+        let id = c3.typed.exprs.idAt(i);
+        if c3.typed.origin(id) != Origin.NegHalf { continue; }
+        match c3.typed.expr(id) { TExpr.Float(v) { if v == -2.5 { negs += 1; } } _ { panic("neg: NegHalf on a non-float"); } }
+    }
+    if negs != 1 { panic(`neg: one NegHalf constant, got {negs}`); }
+}

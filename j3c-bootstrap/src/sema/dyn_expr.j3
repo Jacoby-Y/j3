@@ -1,0 +1,208 @@
+// `dyn Trait` in fn bodies: `&value` (or a `dyn Sub`) where a `dyn Trait` is wanted, `d.m(args)` through
+// the table, the `==` error, a trait's table layout and a `(type, trait)` table's slot targets.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/dyn_call.rs (to_dyn, call_dyn, dyn_table, vtable, dyn_target), check/lower/dyn_up.rs
+// (dyn_upcast's checks), check/lower/binop.rs (the `dyn` compare error)
+// J3: A trait's table layout is a `DynLayout` (`Tables.dynLayouts`, made at the first conversion or call,
+// where Rust reports its errors); a `(type, trait)` table is an `InstKind.Vtable` instance whose
+// `resolved` holds one `Callee` per slot. Its bound check, layout and targets run where the conversion
+// is typed (`dynVtable`), so every error sits at the conversion in Rust's order; the instance is born
+// `done` (`instances.drainOne` has nothing left). `lower` makes the IR (table struct, thunks, global).
+// J3: Rust's "`dyn` values are not supported in scripts" comes with script bodies (C2d).
+module j3c.sema;
+
+/// The name of trait `tr`.
+fn dynShort(cx: &SemaCx, tr: Id<TraitDecl>): string { return cx.tables.str(cx.tables.traitAt(tr).name); }
+
+extend BodyCx {
+    /// Rust `to_dyn`: `e` where `w` (a `dyn Trait`) is wanted: the value as is, `Convert(.., DynUpcast)`,
+    /// or `TExpr.ToDyn`. Called by `operand` and `rvalueRaw` before anything else.
+    fn dynTo(this: &BodyCx, e: Id<Expr>, w: Id<Ty>): Result<Id<TExpr>, TErr> {
+        let sp = this.cx.ast.exprSpan(e);
+        let t = this.cx.tables;
+        let op = this.operand(e, Option.None)?;
+        let have = this.exprTy(op);
+        if have == w { return Result.Ok(op); }
+        let want = match this.ty(w) { Ty.Dyn(d) { d.decl } _ { return Result.Err(this.mismatch(sp, "type mismatch", have, w)); } };
+        // Rust `dyn_upcast`: a `dyn Sub` (or a `&` of one) to a supertrait's `dyn`.
+        match t.ty(derefAll(t, have)) {
+            Ty.Dyn(sub) {
+                let lay = this.dynLayout(sp, sub.decl)?;
+                if !lay.ups.contains(want) {
+                    let s = dynShort(this.cx, sub.decl);
+                    let wn = dynShort(this.cx, want);
+                    let m = Text.new(this.cx.arena).add("a `dyn ").add(s).add("` is not a `dyn ").add(wn).add("`");
+                    let n = Text.new(this.cx.arena).add("a `dyn` converts only to a supertrait of its trait, and `").add(wn).add("` is not one of `").add(s).add("`'s");
+                    return Result.Err(this.note(this.err(sp, m.str()), n.str()));
+                }
+                return Result.Ok(this.expr(TExpr.Convert(TConvert { expr: op, kind: ConvKind.DynUpcast }), w, sp));
+            }
+            _ {}
+        }
+        let inner = match this.refInner(have) {
+            Option.Some(i) { i }
+            Option.None {
+                return Result.Err(this.help(this.mismatch(sp, "type mismatch", have, w),
+                    cat3(this.cx, "a `dyn ", dynShort(this.cx, want), "` is made from a reference to a value: `&value`")));
+            }
+        };
+        let vt = this.dynVtable(sp, inner, want)?;
+        return Result.Ok(this.expr(TExpr.ToDyn(TToDyn { value: op, vtable: vt }), w, sp));
+    }
+
+    /// Rust `call_dyn`: `recv.name(args)` where `recv` (through any `&`) is a `dyn`: a `Call` with
+    /// `Callee.Dyn`, the receiver first.
+    fn dynCall(this: &BodyCx, sp: Span, recv: Id<TPlace>, name: Ident, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let t = this.cx.tables;
+        let p = this.derefAll(recv, sp);
+        let tr = match this.ty(this.placeTy(p)) { Ty.Dyn(d) { d.decl } _ { return Result.Err(this.err(sp, "internal: a `dyn` type is not a struct")); } };
+        let lay = this.dynLayout(sp, tr)?;
+        let k = -1;
+        for i in 0..lay.slots.len { if k < 0 && lay.slots.items[i].name == name.name { k = i; } }
+        if k < 0 {
+            let m = Text.new(this.cx.arena).add("no method `").add(this.str(name.name)).add("` on `").add(this.tyStr(this.placeTy(p))).add("`");
+            let n = Text.new(this.cx.arena).add("a `dyn ").add(dynShort(this.cx, tr)).add("` has the trait's methods (and its supertraits'): ");
+            for i in 0..lay.slots.len {
+                if i > 0 { n.add(", "); }
+                n.add("`").add(this.str(lay.slots.items[i].name)).add("`");
+            }
+            return Result.Err(this.note(this.err(name.span, m.str()), n.str()));
+        }
+        let slot = lay.slots.items[k];
+        let m = t.traitAt(slot.from).methods.items[slot.method];
+        if m.params.len - 1 != args.len {
+            let e = Text.new(this.cx.arena).add("`").add(this.str(name.name)).add("` takes ");
+            e.pushInt(m.params.len - 1);
+            e.add(" args, got ");
+            e.pushInt(args.len);
+            return Result.Err(this.err(sp, e.str()));
+        }
+        let out = List<Id<TExpr>>.new(this.cx.arena);
+        out.push(this.load(p));
+        for i in 0..args.len { out.push(this.operand(args.items[i], Option.Some(m.params.items[i + 1].ty))?); }
+        return Result.Ok(this.expr(TExpr.Call(TCall { callee: Callee.Dyn(DynCallee { decl: tr, index: k }), args: out }), m.ret, sp));
+    }
+
+    /// Rust `binary` (check/lower/binop.rs:159): `==` / `!=` on two `dyn` values of type `t`.
+    fn dynCompareErr(this: &BodyCx, sp: Span, op: BinOp, t: Id<Ty>): TErr {
+        let m = Text.new(this.cx.arena).add("`").add(binOpStr(op)).add("` does not compare `").add(this.tyStr(t)).add("` values");
+        return this.help(this.note(this.err(sp, m.str()),
+            "two `dyn` values may point at equal data through different tables, or the reverse, so neither meaning is safe to pick"),
+            "add a method to the trait that says what equal means (`fn id(this: &Self): int;`) and compare its results");
+    }
+
+    /// Rust `dyn_table`: the layout of trait `tr`'s table: its methods, then each supertrait's (a name is
+    /// kept once). Made once per trait; a method a `dyn` cannot call is the error here, at the `dyn` use.
+    fn dynLayout(this: &BodyCx, sp: Span, tr: Id<TraitDecl>): Result<DynLayout, TErr> {
+        let t = this.cx.tables;
+        for i in 0..t.dynLayouts.len { if t.dynLayouts.items[i].decl == tr { return Result.Ok(t.dynLayouts.items[i]); } }
+        let short = dynShort(this.cx, tr);
+        let all = withSupers(this.cx, tr);
+        let slots = List<DynSlotDecl>.new(this.cx.arena);
+        for k in 0..all.len {
+            let ms = t.traitAt(all.items[k]).methods;
+            for j in 0..ms.len {
+                let m = ms.items[j];
+                let seen = false;
+                for s in 0..slots.len { if slots.items[s].name == m.name { seen = true; } }
+                if seen { continue; }
+                let mn = this.str(m.name);
+                let at = lineOf(this.cx, m.span);
+                let byRef = false;
+                if m.params.len > 0 {
+                    match t.ty(m.params.items[0].ty) { Ty.Ref(r) { byRef = r.inner == t.common.traitSelf; } _ {} }
+                }
+                if !byRef {
+                    let e = Text.new(this.cx.arena).add("`dyn ").add(short).add("` cannot call `").add(mn).add("`: it takes `this: Self` by value");
+                    let n = Text.new(this.cx.arena).add("`").add(mn).add("` is declared at ").add(at);
+                    let h = Text.new(this.cx.arena).add("a `dyn` trait's methods take `this: &Self`; or use a generic `<T: ").add(short).add(">` instead of `dyn`");
+                    return Result.Err(this.help(this.note(this.err(sp, e.str()), n.str()), h.str()));
+                }
+                // `Self` anywhere but `this`: substituting it changes the type.
+                let usesSelf = selfSubst(t, m.ret, t.common.void) != m.ret;
+                for p in 1..m.params.len { if selfSubst(t, m.params.items[p].ty, t.common.void) != m.params.items[p].ty { usesSelf = true; } }
+                if usesSelf {
+                    let e = Text.new(this.cx.arena).add("`dyn ").add(short).add("` cannot call `").add(mn).add("`: it uses `Self` outside `this`");
+                    let n = Text.new(this.cx.arena).add("`").add(mn).add("` is declared at ").add(at).add("; behind `dyn` the concrete type is not known");
+                    let h = Text.new(this.cx.arena).add("take or return a concrete type (or a `dyn`), or use a generic `<T: ").add(short).add(">` instead of `dyn`");
+                    return Result.Err(this.help(this.note(this.err(sp, e.str()), n.str()), h.str()));
+                }
+                slots.push(DynSlotDecl { name: m.name, from: all.items[k], method: j });
+            }
+        }
+        let ups = List<Id<TraitDecl>>.new(this.cx.arena);
+        for k in 1..all.len { ups.push(all.items[k]); }
+        let lay = DynLayout { decl: tr, slots: slots, ups: ups };
+        t.dynLayouts.push(lay);
+        return Result.Ok(lay);
+    }
+
+    /// Rust `vtable`: the table of `ty` for trait `tr`, one per program: the bound check, the layout, each
+    /// slot's target, then every supertrait's table for `ty`.
+    fn dynVtable(this: &BodyCx, sp: Span, ty: Id<Ty>, tr: Id<TraitDecl>): Result<Id<Instance>, TErr> {
+        let t = this.cx.tables;
+        let one = this.cx.arena.alloc::<Id<Ty>>(1);
+        one[0] = ty;
+        let key = InstKey { kind: InstKind.Vtable, item: refTrait(tr), args: t.list(one) };
+        match t.instMap.get(key) { Option.Some(id) { return Result.Ok(id); } Option.None {} }
+        let td = t.traitAt(tr);
+        let at = td.span;
+        match td.item { Option.Some(it) { at = it.name.span; } Option.None {} }
+        let bs = List<BoundRef>.new(this.cx.arena);
+        bs.push(BoundRef { tr: tr, span: at });
+        let reqs = List<BoundReq>.new(this.cx.arena);
+        reqs.push(BoundReq { param: "", arg: ty, bounds: bs });
+        match checkBoundReqs(this.cx, sp, cat3(this.cx, "`dyn ", dynShort(this.cx, tr), "`"), &reqs, Option.Some(this.m)) {
+            Option.Some(d) { return Result.Err(TErr { diag: d, unknown: Option.None }); }
+            Option.None {}
+        }
+        let lay = this.dynLayout(sp, tr)?;
+        let resolved = List<Callee>.new(this.cx.arena);
+        for i in 0..lay.slots.len { resolved.push(this.dynTarget(sp, ty, lay.slots.items[i])?); }
+        for i in 0..lay.ups.len { this.dynVtable(sp, ty, lay.ups.items[i])?; }
+        let id = request(this.cx, key, sp);
+        let inst = t.instanceAt(id);
+        inst.resolved = resolved;
+        inst.done = true;
+        return Result.Ok(id);
+    }
+
+    /// Rust `dyn_target`: what slot `slot` of `ty`'s table calls: own method, `#[impl]` fn, a generic
+    /// enum's derived fn, else the trait's default body for `ty` (the bound check said one is there).
+    fn dynTarget(this: &BodyCx, sp: Span, ty: Id<Ty>, slot: DynSlotDecl): Result<Callee, TErr> {
+        let t = this.cx.tables;
+        match t.ty(ty) {
+            Ty.Struct(st) {
+                match this.findMethodAny(st.decl, slot.name) {
+                    Option.Some(f) {
+                        match t.structAt(st.decl).gen {
+                            Option.Some(_) {
+                                this.traitCallBounds(sp, f, st.args)?;
+                                return Result.Ok(Callee.Inst(InstCallee { inst: request(this.cx, InstKey { kind: InstKind.Fn, item: refFn(f), args: st.args }, sp) }));
+                            }
+                            Option.None {
+                                match t.fnAt(f).gen { Option.Some(_) {} Option.None { return Result.Ok(Callee.Fn(FnCallee { decl: f })); } }
+                            }
+                        }
+                    }
+                    Option.None {}
+                }
+            }
+            _ {}
+        }
+        match implFor(this.cx, slot.name, ty) { Option.Some(f) { return Result.Ok(Callee.Fn(FnCallee { decl: f })); } Option.None {} }
+        match this.enumDerived(sp, ty, slot.name)? { Option.Some(i) { return Result.Ok(Callee.Inst(InstCallee { inst: i })); } Option.None {} }
+        match t.traitAt(slot.from).methods.items[slot.method].default {
+            Option.Some(f) {
+                let one = this.cx.arena.alloc::<Id<Ty>>(1);
+                one[0] = ty;
+                return Result.Ok(Callee.Inst(InstCallee { inst: this.genInstance(sp, f, t.list(one))? }));
+            }
+            Option.None {}
+        }
+        let m = Text.new(this.cx.arena).add("`").add(this.tyStr(ty)).add("` has no `").add(this.str(slot.name)).add("` to put in a `dyn ")
+            .add(dynShort(this.cx, slot.from)).add("` table");
+        return Result.Err(this.help(this.err(sp, m.str()), "built-in operators cannot be called through `dyn`; write the method on the type"));
+    }
+}

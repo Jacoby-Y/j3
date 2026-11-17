@@ -1,0 +1,220 @@
+// A parsed `j3.toml` as JSON: what package tools read (`j3c manifest --json`, plan 09), so no second TOML
+// reader is needed. Every table is included, unknown ones too.
+//
+// Port of: j3c/src/project/toml/json.rs
+module j3c.base.toml;
+// J3: Rust's recursive `Obj`/`Node` tree is a flat list of objects (`JObj`, root at 0) whose keys point at
+// a child object by index or at an entry of the `Table`. `jsonStr` is Rust's `cli::json_str` (escapes
+// U+007F..U+009F too, unlike `j3.data.json.quote`); `cmd/check` can reuse it.
+
+/// One key of a JSON object being built: a child object (`obj` >= 0) or the `Table` entry `val`.
+struct JKey {
+    key: string;
+    obj: int;
+    val: int;
+}
+
+/// One JSON object while it is built: keys in the order the file first mentions them.
+struct JObj {
+    keys: List<JKey>;
+}
+
+/// `j3c manifest --json`: TOML text as one line of JSON, every table included (unknown ones too). Errors
+/// read `j3.toml:LINE: ...`; the caller renames the file (Rust `toml_json`).
+pub fn json(text: string, arena: &Arena): Result<string, string> {
+    let t = parse(text, arena)?;
+    return toJson(&t, arena);
+}
+
+/// The object at `path` below `objs[0]` (`[a.b]` is `["a", "b"]`), made when missing.
+fn table(objs: &List<JObj>, path: &List<string>, head: string, line: int, arena: &Arena): Result<int, string> {
+    let cur = 0;
+    for p in 0..path.len {
+        let first = path.items[p];
+        let o = objs.items[cur];
+        let i = 0;
+        while i < o.keys.len && o.keys.items[i].key != first { i += 1; }
+        if i == o.keys.len {
+            objs.push(JObj { keys: List<JKey>.new(arena) });
+            o.keys.push(JKey { key: first, obj: objs.len - 1, val: -1 });
+            objs.items[cur] = o;
+        }
+        let k = o.keys.items[i];
+        if k.obj < 0 {
+            let t = Text.new(arena);
+            t.add("j3.toml:");
+            t.pushInt(line);
+            t.add(": [").add(head).add("]: `").add(first).add("` is already a value, not a table");
+            return Result.Err(t.str());
+        }
+        cur = k.obj;
+    }
+    return Result.Ok(cur);
+}
+
+/// `name` split at every `.` (`a..b` has an empty part, as Rust's `split`).
+fn splitDots(name: string, arena: &Arena): List<string> {
+    let out = List<string>.new(arena);
+    let start = 0;
+    for i in 0..name.len + 1 {
+        if i == name.len || name[i] == '.' {
+            out.push(name[start..i]);
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+/// The parsed document as JSON. Key order is the file's: tables and keys appear where the file first names
+/// them, and a key set twice keeps its last value (as `get` does). `[a.b]` nests `b` inside `a`. Quoted
+/// values are strings, string arrays are arrays, inline tables are objects of strings; a bare
+/// `true`/`false` is a bool, a bare token that is a JSON number (`2`, `-1.5`, `1e3`) is a number, and any
+/// other bare token (`llvm`, `1.2.3`, `007`) is a string.
+fn toJson(t: &Table, arena: &Arena): Result<string, string> {
+    let objs = List<JObj>.new(arena);
+    objs.push(JObj { keys: List<JKey>.new(arena) });
+    // walk headers and keys together in line order, so sub-tables and keys keep the file's order
+    let path = List<string>.new(arena);
+    let head = "";
+    let hi = 0;
+    let vi = 0;
+    while hi < t.heads.len || vi < t.vals.len {
+        if hi < t.heads.len && (vi == t.vals.len || t.heads.items[hi].line < t.lines.items[vi]) {
+            let h = t.heads.items[hi];
+            hi += 1;
+            path = splitDots(h.name, arena);
+            head = h.name;
+            table(&objs, &path, head, h.line, arena)?;
+            continue;
+        }
+        let e = t.vals.items[vi];
+        let line = t.lines.items[vi];
+        let at = table(&objs, &path, head, line, arena)?;
+        let o = objs.items[at];
+        let i = 0;
+        while i < o.keys.len && o.keys.items[i].key != e.key { i += 1; }
+        if i == o.keys.len {
+            o.keys.push(JKey { key: e.key, obj: -1, val: vi });
+            objs.items[at] = o;
+        } else if o.keys.items[i].obj < 0 {
+            o.keys.items[i].val = vi;
+        } else {
+            let m = Text.new(arena);
+            m.add("j3.toml:");
+            m.pushInt(line);
+            m.add(": [").add(head).add("] ").add(e.key).add(": already a table");
+            return Result.Err(m.str());
+        }
+        vi += 1;
+    }
+    let out = Text.new(arena);
+    writeObj(&out, &objs, 0, t);
+    return Result.Ok(out.str());
+}
+
+fn writeObj(out: &Text, objs: &List<JObj>, at: int, t: &Table) {
+    out.push('{');
+    let o = objs.items[at];
+    for i in 0..o.keys.len {
+        if i > 0 { out.push(','); }
+        let k = o.keys.items[i];
+        jsonStr(out, k.key);
+        out.push(':');
+        if k.obj >= 0 { writeObj(out, objs, k.obj, t); } else { writeVal(out, t.vals.items[k.val].val); }
+    }
+    out.push('}');
+}
+
+/// A TOML string as written, unescaped, as a JSON string.
+fn quoteToml(out: &Text, s: string) {
+    jsonStr(out, unescape(s, out.arena));
+}
+
+fn writeVal(out: &Text, v: Val) {
+    match v {
+        Val.Str(s) { quoteToml(out, s); }
+        Val.Bare(s) {
+            if s == "true" || s == "false" || isJsonNumber(s) { out.pushStr(s); } else { jsonStr(out, s); }
+        }
+        Val.List(l) {
+            out.push('[');
+            for i in 0..l.items.len {
+                if i > 0 { out.push(','); }
+                quoteToml(out, l.items.items[i]);
+            }
+            out.push(']');
+        }
+        Val.Map(m) {
+            out.push('{');
+            // a key written twice keeps its last value (at its last place)
+            let n = 0;
+            for i in 0..m.pairs.len {
+                let p = m.pairs.items[i];
+                let later = false;
+                for j in (i + 1)..m.pairs.len {
+                    if m.pairs.items[j].key == p.key { later = true; }
+                }
+                if later { continue; }
+                if n > 0 { out.push(','); }
+                n += 1;
+                jsonStr(out, p.key);
+                out.push(':');
+                quoteToml(out, p.value);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Digits from `i`; the index after them (== `i` when there are none).
+fn digitsFrom(s: string, i: int): int {
+    while i < s.len && isDigit(s[i]) { i += 1; }
+    return i;
+}
+
+/// JSON's number grammar: `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`.
+fn isJsonNumber(s: string): bool {
+    let i = if s.len > 0 && s[0] == '-' { 1 } else { 0 };
+    let start = i;
+    i = digitsFrom(s, i);
+    if i == start || (s[start] == '0' && i - start > 1) { return false; }
+    if i < s.len && s[i] == '.' {
+        let f = i + 1;
+        i = digitsFrom(s, f);
+        if i == f { return false; }
+    }
+    if i < s.len && (s[i] == 'e' || s[i] == 'E') {
+        i += 1;
+        if i < s.len && (s[i] == '+' || s[i] == '-') { i += 1; }
+        let x = i;
+        i = digitsFrom(s, x);
+        if i == x { return false; }
+    }
+    return i == s.len;
+}
+
+/// `s` as a JSON string literal (Rust `cli::json_str`): `\"`, `\\`, `\n`, `\r`, `\t`, other control
+/// characters (U+0000..U+001F, U+007F..U+009F) as `\u00xx`.
+pub fn jsonStr(out: &Text, s: string) {
+    let hex = "0123456789abcdef";
+    out.push('"');
+    let i = 0;
+    while i < s.len {
+        let (cp, n) = decodeRune(s, i);
+        let c = s[i];
+        if c == '"' { out.pushStr("\\\""); }
+        else if c == '\\' { out.pushStr("\\\\"); }
+        else if c == 10 { out.pushStr("\\n"); }
+        else if c == 13 { out.pushStr("\\r"); }
+        else if c == 9 { out.pushStr("\\t"); }
+        else if cp < 0x20 || (cp >= 0x7F && cp <= 0x9F) {
+            out.pushStr("\\u00");
+            out.push(hex[int(cp) / 16]);
+            out.push(hex[int(cp) % 16]);
+        } else {
+            for j in 0..n { out.push(s[i + j]); }
+        }
+        i += n;
+    }
+    out.push('"');
+}

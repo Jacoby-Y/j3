@@ -5,4 +5,145 @@
 // Port of: j3c/src/check/lower/binop.rs, check/lower/streq.rs, check/lower/tuple.rs
 // J3: Tuple `==`/`!=`/`hash()` are expanded element by element here. Which `operator==` applies is sema's one
 //     member lookup (B11.3), so `find_op` does not come along and the part stays under 600 lines.
+// J3: A user operator is a typed `Call` (lowered as one); a negated fallback (`!=` through `operator==`)
+// is `Unary(Not, Call)` (`expr.j3`). Tuple compares are `tuple_lower.j3`, lane-wise `vec4` math `simd.j3`.
 module j3c.lower;
+
+/// The IR op of an AST `BinOp` given `as int` (ast order: Add Sub Mul Div Rem Shl Shr BitAnd BitOr BitXor
+/// Eq Ne Lt Le Gt Ge And Or; stage 0 cannot name both enums in one module).
+fn irBinOp(n: int): BinOp {
+    if n == 0 { return BinOp.Add; }
+    if n == 1 { return BinOp.Sub; }
+    if n == 2 { return BinOp.Mul; }
+    if n == 3 { return BinOp.Div; }
+    if n == 4 { return BinOp.Rem; }
+    if n == 5 { return BinOp.Shl; }
+    if n == 6 { return BinOp.Shr; }
+    if n == 7 { return BinOp.BitAnd; }
+    if n == 8 { return BinOp.BitOr; }
+    if n == 9 { return BinOp.BitXor; }
+    if n == 10 { return BinOp.Eq; }
+    if n == 11 { return BinOp.Ne; }
+    if n == 12 { return BinOp.Lt; }
+    if n == 13 { return BinOp.Le; }
+    if n == 14 { return BinOp.Gt; }
+    if n == 15 { return BinOp.Ge; }
+    if n == 16 { return BinOp.And; }
+    return BinOp.Or;
+}
+
+/// The IR op of an AST `UnaryOp` given `as int` (`Ref`/`Deref` are places, never here).
+fn irUnary(n: int): UnaryOp {
+    if n == 0 { return UnaryOp.Neg; }
+    if n == 1 { return UnaryOp.BitNot; }
+    return UnaryOp.Not;
+}
+
+extend FnLower {
+    /// Rust `binary` for a primitive op (operators, comparisons, `&&`/`||`, string `==`).
+    fn binary(this: &FnLower, e: Id<TExpr>, astOp: int, kind: BinKind, lhs: Id<TExpr>, rhs: Id<TExpr>): Rvalue {
+        let sp = this.spanOf(e);
+        let ty = this.tyOf(e);
+        let op = irBinOp(astOp);
+        match kind {
+            BinKind.ShortCircuit { return this.shortCircuit(sp, op == BinOp.And, lhs, rhs); }
+            BinKind.Simd { return this.simdBinary(e, op, lhs, rhs); }
+            BinKind.String {}
+            BinKind.Prim {}
+        }
+        // Rust lowers the right side first when only the left is a bare number literal (it has no
+        // temporaries, so only the order of the right side's ones against a later check matters).
+        let l = this.int(sp, 0);
+        let r = l;
+        if this.bareNum(lhs) && !this.bareNum(rhs) {
+            r = this.operand(rhs);
+            l = this.operand(lhs);
+        } else {
+            l = this.operand(lhs);
+            r = this.operand(rhs);
+        }
+        if kind == BinKind.String { return this.stringEq(sp, op == BinOp.Ne, l, r); }
+        if (op == BinOp.Div || op == BinOp.Rem) && this.isInt(ty) { this.abortIfZero(sp, r); }
+        return Rvalue.binary(sp, ty, op, l, r);
+    }
+
+    /// Rust `bare_num` on the typed tree: a number literal, or `-`/arithmetic of them.
+    fn bareNum(this: &FnLower, e: Id<TExpr>): bool {
+        match this.node(e) {
+            TExpr.Int(_) { return true; }
+            // A named float const is not a literal in Rust's syntactic `bare_num`.
+            TExpr.Float(_) { return this.lw.typed.origin(e) != Origin.ConstUse; }
+            TExpr.Unary(u) { return (u.op as int) == 0 && this.bareNum(u.operand); }
+            TExpr.Binary(b) { return (b.op as int) <= 4 && this.bareNum(b.lhs) && this.bareNum(b.rhs); }
+            _ { return false; }
+        }
+    }
+
+    /// `&&` / `||`: `_scN` set in an `if` on the left side; the right side runs only in its branch.
+    fn shortCircuit(this: &FnLower, sp: Span, and: bool, lhs: Id<TExpr>, rhs: Id<TExpr>): Rvalue {
+        let l = this.operand(lhs);
+        let bt = this.ir().common.bool;
+        let place = this.tmpPlace("sc", bt, sp);
+        let saved = this.b.beginBlock();
+        if and {
+            let r = this.operand(rhs);
+            this.b.assign(sp, this.copyOf(place), Rvalue.useOp(sp, r));
+        } else {
+            this.b.assign(sp, this.copyOf(place), Rvalue.useOp(sp, this.bool(sp, true)));
+        }
+        let thenBlock = this.b.endBlock(saved);
+        saved = this.b.beginBlock();
+        if and {
+            this.b.assign(sp, this.copyOf(place), Rvalue.useOp(sp, this.bool(sp, false)));
+        } else {
+            let r = this.operand(rhs);
+            this.b.assign(sp, this.copyOf(place), Rvalue.useOp(sp, r));
+        }
+        let elseBlock = this.b.endBlock(saved);
+        this.pushIf(sp, l, thenBlock, Option.Some(elseBlock));
+        return Rvalue.useOp(sp, Operand.Copy(place));
+    }
+
+    /// Rust `abort_if_zero`: `if rhs == 0 { div0 }`.
+    fn abortIfZero(this: &FnLower, sp: Span, rhs: Operand) {
+        let bt = this.ir().common.bool;
+        let p = this.spill("dz", Rvalue.binary(sp, bt, BinOp.Eq, rhs, opInt(sp, operandTy(rhs), 0)), sp);
+        let saved = this.b.beginBlock();
+        this.push(sp, StmtKind.Div0);
+        this.pushIf(sp, Operand.Copy(p), this.b.endBlock(saved), Option.None);
+    }
+
+    /// Rust `string_eq`: same length, then byte by byte.
+    fn stringEq(this: &FnLower, sp: Span, ne: bool, l: Operand, r: Operand): Rvalue {
+        let ir = this.ir();
+        let c = ir.common;
+        let lp = this.tmpPlace("sl", c.string, sp);
+        let rp = this.tmpPlace("sr", c.string, sp);
+        this.b.assign(sp, this.copyOf(lp), Rvalue.useOp(sp, l));
+        this.b.assign(sp, this.copyOf(rp), Rvalue.useOp(sp, r));
+        let res = this.tmpPlace("se", c.bool, sp);
+        this.b.assign(sp, this.copyOf(res), Rvalue.useOp(sp, this.bool(sp, false)));
+        let llen = Operand.Copy(this.b.sliceLen(ir, this.copyOf(lp), sp));
+        let rlen = Operand.Copy(this.b.sliceLen(ir, this.copyOf(rp), sp));
+        let same = this.tmpPlace("sn", c.bool, sp);
+        this.b.assign(sp, this.copyOf(same), Rvalue.binary(sp, c.bool, BinOp.Eq, llen, rlen));
+        let saved = this.b.beginBlock();
+        this.b.assign(sp, this.copyOf(res), Rvalue.useOp(sp, this.bool(sp, true)));
+        let i = this.tmpPlace("si", c.int, sp);
+        this.b.assign(sp, this.copyOf(i), Rvalue.useOp(sp, this.int(sp, 0)));
+        let lb = Operand.Copy(this.b.index(ir, this.copyOf(lp), Operand.Copy(this.copyOf(i)), sp));
+        let rb = Operand.Copy(this.b.index(ir, this.copyOf(rp), Operand.Copy(this.copyOf(i)), sp));
+        let savedLoop = this.b.beginBlock();
+        let differ = this.tmpPlace("sd", c.bool, sp);
+        this.b.assign(sp, this.copyOf(differ), Rvalue.binary(sp, c.bool, BinOp.Ne, lb, rb));
+        let savedIf = this.b.beginBlock();
+        this.b.assign(sp, this.copyOf(res), Rvalue.useOp(sp, this.bool(sp, false)));
+        this.push(sp, StmtKind.Break(0));
+        this.pushIf(sp, Operand.Copy(differ), this.b.endBlock(savedIf), Option.None);
+        let body = this.b.endBlock(savedLoop);
+        this.push(sp, StmtKind.ForRange(ForRangeStmt { index: i, end: llen, body: body }));
+        this.pushIf(sp, Operand.Copy(same), this.b.endBlock(saved), Option.None);
+        if ne { return Rvalue { ty: c.bool, span: sp, kind: RvalueKind.Unary(UnaryRv { op: UnaryOp.Not, arg: Operand.Copy(res) }) }; }
+        return Rvalue.useOp(sp, Operand.Copy(res));
+    }
+}

@@ -6,7 +6,7 @@ compare the text. Unit checks live beside the code they cover, as `*_test.j3` fi
 
 ## `diff.sh` (plan 11 A4)
 
-`tests/diff.sh MODE [--norm] [--no-coverage] [--update-known] [-j N] [files...]`, from any folder.
+`tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-known] [-j N] [files...]`, from any folder.
 
 1. Runs `tools/coverage.sh` (skip with `--no-coverage` or `DIFF_NO_COVERAGE=1`) and `tools/layers.sh`;
    either failing stops the run (exit 2).
@@ -24,6 +24,8 @@ compare the text. Unit checks live beside the code they cover, as `*_test.j3` fi
 | `err` | `check FILE` (on a copy in a scratch folder, so no `j3.toml` above it applies) | stdout, stderr, exit code |
 | `ir` | `dump-ir PATH` (`--norm`: temps renumbered by `norm_ir.awk`, plan A6) | stdout, stderr, exit code |
 | `llvm` | `dump-llvm PATH` | stdout, stderr, exit code |
+| `glsl` | `dump-glsl PATH` (`--es`: `dump-glsl PATH --es`, the OpenGL ES text) | stdout, stderr, exit code |
+| `ui` | `dump-ui PROJECT/ui` (the J3 source generated from a project's `.j3ui` files) | stdout, stderr, exit code |
 | `run` | `run --headless --frames 3 PATH`, offscreen SDL, dummy audio | stdout, exit code |
 | `self` | not yet: needs a j3c-boot that builds j3c-bootstrap (stage 2 = stage 1) | |
 
@@ -41,6 +43,8 @@ harness, or comparing stage 2 later).
 - `known/MODE.txt`: inputs that fail today, one per line. It only shrinks: a listed input that passes
   fails the run until its line is removed. `--update-known` rewrites the list from the current run
   (keeping entries for inputs this run did not cover).
+- `known/ir-user.txt`: the known list for `ir --user` (entry module only), kept apart from the full-file `ir.txt`.
+- `known/glsl-es.txt`: the known list for `glsl --es`, kept apart from `glsl.txt`.
 
 ## Other files
 

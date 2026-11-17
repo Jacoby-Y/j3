@@ -1,0 +1,119 @@
+// The sema model (wave 4 contract): `Ty` interning (same type = same id, lists too), decl tables, the
+// instance key dedup, and a typed tree built by hand for `fn main() { let x = 1 + 2; printLn("hi"); }`
+// then read back the way `lower` will.
+module sema_model_test;
+
+use j3.data.pool.Id;
+use j3.memory.List;
+use j3.option.Option;
+use j3.sys.panic;
+use j3c.base.intern.Sym;
+use j3c.base.span.noSpan;
+use j3c.driver;
+use j3c.driver.Session;
+use j3c.sema;
+use j3c.sema.{ BinKind, Callee, FnCallee, FnDecl, FnKind, InstKey, InstKind, ModDecl, ParamDecl, PlaceRef, LocalPlace, Tables };
+use j3c.sema.{ TBinary, TCall, TExpr, TExprStmt, TLet, TLocal, TPlace, TStmt, Ty, TBody, Typed, TypedMod, newModDecl, refFn };
+use j3c.load.{ Parsed, ParsedFile };
+use j3c.syntax.ast.{ Ast, BinOp };
+
+fn fnDecl(s: &Session, t: &Tables, m: Id<ModDecl>, name: string, ret: Id<Ty>): FnDecl {
+    return FnDecl { owner: m, name: t.sym(name), doc: "", span: noSpan(), visPub: true, kind: FnKind.J3, libName: "", symbol: "",
+        gen: Option.None, recv: Option.None, params: List<ParamDecl>.new(s.arena), ret: ret, retOmitted: false, isImpl: false,
+        implName: Option.None, defaultOf: Option.None, shader: false, enumDerived: false, item: Option.None, body: Option.None };
+}
+
+fn main() {
+    let s = Session.new(driver.defaults());
+    let parsed = s.arena.new::<Parsed>(Parsed { ast: s.arena.new::<Ast>(Ast.new(s.arena, &s.names)), files: List<ParsedFile>.new(s.arena), project: Option.None });
+    let cx = sema.newCx(s.arena, &s.names, &s.diags, &s.sources, parsed);
+    let t = cx.tables;
+    let c = t.common;
+
+    // Interning: one id per type.
+    if t.intern(Ty.Int(sema.IntKind.I64)) != c.i64 || c.i64 == c.u64 { panic("primitive interning"); }
+    if t.refTo(c.u8) != t.refTo(c.u8) || t.refTo(c.u8) == t.refTo(c.i8) { panic("ref interning"); }
+    if t.arrayOf(c.u8, u64(4)) == t.arrayOf(c.u8, u64(5)) || t.sliceOf(c.u8) == t.arrayOf(c.u8, u64(0)) { panic("array/slice keys"); }
+    let two: [2]Id<Ty> = [c.i64, c.string];
+    let two2: [2]Id<Ty> = [c.i64, c.string];
+    if t.list(two[0..2]) != t.list(two2[0..2]) || t.items(t.list(two[0..2])).len != 2 { panic("list interning"); }
+    if t.fnTy(two[0..2], c.void) != t.fnTy(two2[0..2], c.void) || t.fnTy(two[0..2], c.void) == t.fnTy(two[0..1], c.void) { panic("fn types"); }
+    match t.ty(t.refTo(c.string)) {
+        Ty.Ref(r) { if r.inner != c.string { panic("ref payload"); } }
+        _ { panic("ref kind"); }
+    }
+
+    // Decls: a module with `printLn(s: string)` and `main()`.
+    let path = List<Sym>.new(s.arena);
+    path.push(t.sym("main"));
+    let m = t.addMod(newModDecl(s.arena, "main", path));
+    let pd = fnDecl(s, t, m, "printLn", c.void);
+    pd.params.push(ParamDecl { name: t.sym("s"), span: noSpan(), ty: c.string });
+    let printLn = t.addFn(pd);
+    let mainFn = t.addFn(fnDecl(s, t, m, "main", c.void));
+    t.modAt(m).fns.push(printLn);
+    t.modAt(m).fns.push(mainFn);
+    t.modAt(m).scope.put(t.sym("printLn"), refFn(printLn));
+    if t.fnAt(printLn).params.items[0].ty != c.string || !t.modAt(m).scope.has(t.sym("printLn")) { panic("decl tables"); }
+
+    // Instances: one id per key.
+    let k = InstKey { kind: InstKind.Fn, item: refFn(printLn), args: t.list(two[0..1]) };
+    let i1 = sema.request(&cx, k, noSpan());
+    let i2 = sema.request(&cx, InstKey { kind: InstKind.Fn, item: refFn(printLn), args: t.list(two2[0..1]) }, noSpan());
+    if i1 != i2 || sema.request(&cx, InstKey { kind: InstKind.Bound, item: refFn(printLn), args: k.args }, noSpan()) == i1 { panic("instance keys"); }
+
+    // The typed tree of `fn main() { let x = 1 + 2; printLn("hi"); }`.
+    let ty = Typed.new(s.arena);
+    let x = ty.addLocal(TLocal { name: t.sym("x"), ty: c.i64, span: noSpan(), param: false });
+    let one = ty.addExpr(TExpr.Int(u64(1)), c.i64, noSpan());
+    let twoE = ty.addExpr(TExpr.Int(u64(2)), c.i64, noSpan());
+    let sum = ty.addExpr(TExpr.Binary(TBinary { op: BinOp.Add, kind: BinKind.Prim, lhs: one, rhs: twoE }), c.i64, noSpan());
+    let hi = ty.addExpr(TExpr.Str("hi"), c.string, noSpan());
+    let args = List<Id<TExpr>>.new(s.arena);
+    args.push(hi);
+    let call = ty.addExpr(TExpr.Call(TCall { callee: Callee.Fn(FnCallee { decl: printLn }), args: args }), c.void, noSpan());
+    let block = ty.block(noSpan());
+    block.stmts.push(ty.addStmt(TStmt.Let(TLet { local: x, init: Option.Some(sum) }), noSpan()));
+    block.stmts.push(ty.addStmt(TStmt.Expr(TExprStmt { expr: call }), noSpan()));
+    let locals = List<Id<TLocal>>.new(s.arena);
+    locals.push(x);
+    let b = ty.addBody(TBody { decl: mainFn, params: List<Id<TLocal>>.new(s.arena), locals: locals, body: block, loops: 0, slots: 0 });
+    t.fnAt(mainFn).body = Option.Some(b);
+    let tm = TypedMod { owner: m, bodies: List<Id<TBody>>.new(s.arena) };
+    tm.bodies.push(b);
+
+    // Read it back as `lower` will: no type decisions, everything on the nodes.
+    let body = ty.body(tm.bodies.items[0]);
+    if body.body.stmts.len != 2 || ty.local(body.locals.items[0]).ty != c.i64 { panic("body shape"); }
+    match ty.stmt(body.body.stmts.items[0]) {
+        TStmt.Let(l) {
+            let init = one;
+            match l.init { Option.Some(e) { init = e; } Option.None { panic("let init"); } }
+            match ty.expr(init) {
+                TExpr.Binary(bin) {
+                    if bin.op != BinOp.Add || ty.exprTy(bin.lhs) != c.i64 { panic("binary"); }
+                    match ty.expr(bin.rhs) { TExpr.Int(v) { if v != u64(2) { panic("rhs"); } } _ { panic("rhs kind"); } }
+                }
+                _ { panic("let init kind"); }
+            }
+        }
+        _ { panic("stmt 0 kind"); }
+    }
+    match ty.stmt(body.body.stmts.items[1]) {
+        TStmt.Expr(e) {
+            match ty.expr(e.expr) {
+                TExpr.Call(cl) {
+                    match cl.callee { Callee.Fn(f) { if f.decl != printLn { panic("callee"); } } _ { panic("callee kind"); } }
+                    if cl.args.len != 1 || ty.exprTy(cl.args.items[0]) != c.string { panic("call args"); }
+                    if t.str(t.fnAt(printLn).name) != "printLn" { panic("callee name"); }
+                }
+                _ { panic("call kind"); }
+            }
+        }
+        _ { panic("stmt 1 kind"); }
+    }
+    let px = ty.addPlace(TPlace.Local(LocalPlace { local: x }), c.i64, noSpan());
+    let load = ty.addExpr(TExpr.Load(PlaceRef { place: px }), c.i64, noSpan());
+    if ty.exprTy(load) != ty.placeTy(px) { panic("place types"); }
+    s.free();
+}

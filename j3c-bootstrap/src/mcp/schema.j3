@@ -1,8 +1,266 @@
 // Tool list and argument schemas (also printed by `--tools`).
 //
 // Port of: j3c/src/mcp/schema.rs
-// J3: One tool table drives CLI, MCP and docs (plan 11 B12.3): each tool is `{ name, args (name, type,
-// default, help), help, run }`. The MCP JSON schema, `j3c -e scene --help`, `j3c -e mcp --tools` and the
-// `editor` doc page are generated from it, not a hand-written JSON string. Gate: a test diffs the
-// generated schema against the `--tools` list.
+// J3: One tool table drives CLI, MCP and docs (plan 11 B12.3): each tool is a `Tool { name, title, cli, hint,
+// args (`ToolArg`: name, type, default, help, ...), help, run }`. The MCP JSON schema (`mcpSchema`) and the
+// `j3c -e mcp --tools` reference (`cliHelp`) are generated from it, not a hand-written JSON string; the
+// `editor` doc page and `j3c -e scene --help` follow in C5. `ToolArg` carries the JSON-schema parts the Rust
+// schema uses (required, enum, items, minItems/maxItems, object properties), so the generated schema is the
+// Rust one. Gate: tests/unit/tool_schema_test.j3 compares both with stage0's `tools/list` and `--tools`.
 module j3c.mcp.schema;
+
+use j3.data.json;
+use j3.data.json.Json;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.text.{ Text, split };
+
+/// `Vec3` is an array of exactly 3 numbers, `StrList` an array of strings (shorthands for common args).
+pub enum ArgTy { Str, Int, Num, Bool, Obj, Arr, Vec3, StrList }
+
+/// MCP tool annotations.
+pub enum Hint { None, ReadOnly, Destructive }
+
+/// One tool argument (a JSON-schema property). `default` is the default as JSON text ("" = none), `help`
+/// its description ("" = none), `choices` its `enum` as `a|b|c` ("" = any). `minItems`/`maxItems` (-1 = none)
+/// and `item` belong to `Arr`; `props` to `Obj` (empty = a free-form object).
+pub struct ToolArg {
+    name: string;
+    ty: ArgTy;
+    default: string;
+    help: string;
+    required: bool;
+    choices: string;
+    minItems: int;
+    maxItems: int;
+    item: Option<&ToolArg>;
+    props: []ToolArg;
+}
+
+/// One tool: CLI subcommand and MCP tool at once. `cli` is the CLI command doing its work ("" = MCP only).
+/// `run` gets the server state, the arguments as a JSON object, an arena, and the reply text; false is an
+/// error reply.
+pub struct Tool {
+    name: string;
+    title: string;
+    cli: string;
+    hint: Hint;
+    args: []ToolArg;
+    help: string;
+    run: fn(ptr, &Json, &Arena, &Text): bool;
+}
+
+// ---- building the table: `text("scene", "help").req()`, `numList("area", 4, 4, "...")` ----
+
+pub fn arg(name: string, ty: ArgTy, help: string): ToolArg {
+    return ToolArg {
+        name: name, ty: ty, default: "", help: help, required: false, choices: "", minItems: -1, maxItems: -1,
+        item: Option.None, props: []ToolArg { ptr: 0 as &ToolArg, len: 0 },
+    };
+}
+pub fn text(name: string, help: string): ToolArg { return arg(name, ArgTy.Str, help); }
+pub fn integer(name: string, help: string): ToolArg { return arg(name, ArgTy.Int, help); }
+pub fn number(name: string, help: string): ToolArg { return arg(name, ArgTy.Num, help); }
+pub fn flag(name: string, help: string): ToolArg { return arg(name, ArgTy.Bool, help); }
+pub fn object(name: string, help: string): ToolArg { return arg(name, ArgTy.Obj, help); }
+pub fn vec3(name: string, help: string): ToolArg { return arg(name, ArgTy.Vec3, help); }
+pub fn strList(name: string, help: string): ToolArg { return arg(name, ArgTy.StrList, help); }
+
+/// An array of `item` (copied to `arena`).
+pub fn listOf(name: string, item: ToolArg, arena: &Arena, help: string): ToolArg {
+    let a = arg(name, ArgTy.Arr, help);
+    a.item = Option.Some(arena.new(item));
+    return a;
+}
+
+/// An array of numbers with `min`..`max` elements (-1 = no bound).
+pub fn numList(name: string, min: int, max: int, help: string, arena: &Arena): ToolArg {
+    let a = listOf(name, number("", ""), arena, help);
+    a.minItems = min;
+    a.maxItems = max;
+    return a;
+}
+
+pub fn req(a: ToolArg): ToolArg { a.required = true; return a; }
+pub fn def(a: ToolArg, jsonText: string): ToolArg { a.default = jsonText; return a; }
+pub fn oneOf(a: ToolArg, choices: string): ToolArg { a.choices = choices; return a; }
+pub fn most(a: ToolArg, max: int): ToolArg { a.maxItems = max; return a; }
+/// An object with these properties (copied to `arena`).
+pub fn withProps(a: ToolArg, props: []ToolArg, arena: &Arena): ToolArg { a.props = copyArgs(props, arena); return a; }
+
+/// One table entry; `args` is copied to `arena`.
+pub fn entry(name: string, title: string, cli: string, hint: Hint, help: string, args: []ToolArg,
+             run: fn(ptr, &Json, &Arena, &Text): bool, arena: &Arena): Tool {
+    return Tool { name: name, title: title, cli: cli, hint: hint, args: copyArgs(args, arena), help: help, run: run };
+}
+
+pub fn copyArgs(xs: []ToolArg, arena: &Arena): []ToolArg {
+    let out = arena.alloc::<ToolArg>(xs.len);
+    for i in 0..xs.len { out[i] = xs[i]; }
+    return out;
+}
+
+// ---- generators ----
+
+/// The MCP `tools/list` result for `tools` (`{"tools":[...]}`), built in `arena`.
+pub fn mcpSchema(tools: []Tool, arena: &Arena): &Json {
+    let list = json.arr(arena);
+    for t in tools {
+        let o = json.obj(arena);
+        o.set("name", json.str(t.name, arena));
+        o.set("title", json.str(t.title, arena));
+        o.set("description", json.str(t.help, arena));
+        let input = json.obj(arena);
+        input.set("type", json.str("object", arena));
+        addProps(input, t.args, arena);
+        o.set("inputSchema", input);
+        match t.hint {
+            Hint.None {}
+            Hint.ReadOnly { o.set("annotations", hintObj("readOnlyHint", arena)); }
+            Hint.Destructive { o.set("annotations", hintObj("destructiveHint", arena)); }
+        }
+        list.push(o);
+    }
+    let root = json.obj(arena);
+    root.set("tools", list);
+    return root;
+}
+
+fn hintObj(key: string, arena: &Arena): &Json {
+    let o = json.obj(arena);
+    o.set(key, json.boolean(true, arena));
+    return o;
+}
+
+/// `required` (when any) and `properties` of an object schema.
+fn addProps(o: &Json, args: []ToolArg, arena: &Arena) {
+    let reqd = json.arr(arena);
+    let props = json.obj(arena);
+    for a in args {
+        if a.required { reqd.push(json.str(a.name, arena)); }
+        props.set(a.name, argSchema(&a, arena));
+    }
+    if reqd.len() > 0 { o.set("required", reqd); }
+    o.set("properties", props);
+}
+
+fn argSchema(a: &ToolArg, arena: &Arena): &Json {
+    let o = json.obj(arena);
+    o.set("type", json.str(typeName(a.ty), arena));
+    match a.ty {
+        ArgTy.Vec3 {
+            o.set("items", numItem(arena));
+            o.set("minItems", json.num(3.0, arena));
+            o.set("maxItems", json.num(3.0, arena));
+        }
+        ArgTy.StrList {
+            let it = json.obj(arena);
+            it.set("type", json.str("string", arena));
+            o.set("items", it);
+        }
+        ArgTy.Arr {
+            match a.item {
+                Option.Some(it) { o.set("items", argSchema(it, arena)); }
+                Option.None {}
+            }
+        }
+        ArgTy.Obj { if a.props.len > 0 { addProps(o, a.props, arena); } }
+        ArgTy.Str {}
+        ArgTy.Int {}
+        ArgTy.Num {}
+        ArgTy.Bool {}
+    }
+    if a.minItems >= 0 { o.set("minItems", json.num(a.minItems as f64, arena)); }
+    if a.maxItems >= 0 { o.set("maxItems", json.num(a.maxItems as f64, arena)); }
+    if a.choices.len > 0 {
+        let e = json.arr(arena);
+        for c in split(a.choices, "|") { e.push(json.str(c, arena)); }
+        o.set("enum", e);
+    }
+    if a.default.len > 0 {
+        match json.parseStr(a.default, arena) {
+            Result.Ok(v) { o.set("default", v); }
+            Result.Err(_) { o.set("default", json.str(a.default, arena)); }
+        }
+    }
+    if a.help.len > 0 { o.set("description", json.str(a.help, arena)); }
+    return o;
+}
+
+fn numItem(arena: &Arena): &Json {
+    let it = json.obj(arena);
+    it.set("type", json.str("number", arena));
+    return it;
+}
+
+fn typeName(t: ArgTy): string {
+    return match t {
+        ArgTy.Str { "string" }
+        ArgTy.Int { "integer" }
+        ArgTy.Num { "number" }
+        ArgTy.Bool { "boolean" }
+        ArgTy.Obj { "object" }
+        ArgTy.Arr { "array" }
+        ArgTy.Vec3 { "array" }
+        ArgTy.StrList { "array" }
+    };
+}
+
+/// The element type name of an array argument ("" when not an array or untyped).
+fn itemTypeName(a: &ToolArg): string {
+    return match a.ty {
+        ArgTy.Vec3 { "number" }
+        ArgTy.StrList { "string" }
+        ArgTy.Arr {
+            match a.item {
+                Option.Some(it) { typeName(it.ty) }
+                Option.None { "" }
+            }
+        }
+        ArgTy.Str { "" }
+        ArgTy.Int { "" }
+        ArgTy.Num { "" }
+        ArgTy.Bool { "" }
+        ArgTy.Obj { "" }
+    };
+}
+
+/// The tool reference text (`j3c -e mcp --tools`, and later `j3c -e scene --help`), appended to `out`.
+/// Byte-equal to the Rust `tool_reference`.
+pub fn cliHelp(tools: []Tool, out: &Text) {
+    out.pushStr("MCP tools (`j3c -e mcp`), from the definitions `tools/list` sends. * marks a required argument.\n");
+    for t in tools {
+        out.push(10);
+        out.fmt(`{t.name} — {t.title}`);
+        out.push(10);
+        out.pushStr("    CLI: ");
+        out.pushStr(if t.cli.len > 0 { t.cli } else { "none; MCP only" });
+        out.push(10);
+        out.indent(4);
+        out.pushLine(t.help);
+        helpArgs(t.args, 4, out);
+    }
+}
+
+fn helpArgs(args: []ToolArg, indent: int, out: &Text) {
+    for a in args {
+        out.indent(indent);
+        out.pushStr(a.name);
+        if a.required { out.pushStr("*"); }
+        out.pushStr(": ");
+        out.pushStr(typeName(a.ty));
+        let inner = itemTypeName(&a);
+        if inner.len > 0 { out.fmt(` of {inner}`); }
+        if a.choices.len > 0 { out.fmt(` ({a.choices})`); }
+        if a.default.len > 0 { out.fmt(` = {a.default}`); }
+        if a.help.len > 0 { out.fmt(` — {a.help}`); }
+        out.push(10);
+        // An object's properties (or an array's object items) nest one level deeper.
+        if a.props.len > 0 { helpArgs(a.props, indent + 4, out); }
+        match a.item {
+            Option.Some(it) { if it.props.len > 0 { helpArgs(it.props, indent + 4, out); } }
+            Option.None {}
+        }
+    }
+}

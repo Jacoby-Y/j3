@@ -1,0 +1,191 @@
+// Git deps: clone into the package cache, check out the locked commit or the tag/rev/branch, and keep
+// the checkout under `<cache>/pkgs/<name>-<commit12>/`.
+//
+// Port of: j3c/src/project/deps.rs (git_checkout, git, pkg_dir), editor/frontend.rs (cache_root)
+module j3c.project.deps;
+// J3: A part of `project/deps.j3` (its `use`s). A checkout dir is never written after it is renamed into
+// place; with the lock and the cache present no git runs.
+
+/// `$XDG_CACHE_HOME/j3` else `~/.cache/j3` (Rust `editor::cache_root`), None without either.
+pub fn cacheRoot(arena: &Arena): Option<string> {
+    let x = sys.env("XDG_CACHE_HOME");
+    if x.len > 0 { return Option.Some(path.join(own(arena, x), "j3", arena)); }
+    let h = sys.env("HOME");
+    if h.len > 0 { return Option.Some(path.join(path.join(own(arena, h), ".cache", arena), "j3", arena)); }
+    return Option.None;
+}
+
+fn pkgDir(arena: &Arena): Result<string, string> {
+    let d = sys.env("J3_PKG_DIR");
+    if d.len > 0 { return Result.Ok(own(arena, d)); }
+    match cacheRoot(arena) {
+        Option.Some(c) { return Result.Ok(path.join(c, "pkgs", arena)); }
+        Option.None { return Result.Err("no cache directory for git deps (set HOME or J3_PKG_DIR)"); }
+    }
+}
+
+/// `git ARGS` with no prompt; its trimmed stdout. ponytail: `GIT_TERMINAL_PROMPT=0` is set for this whole
+/// process (`proc.run` takes no env), which only ever matters to other git runs.
+fn git(args: List<string>, arena: &Arena): Result<string, string> {
+    let argv = List<string>.new(arena);
+    argv.push("git");
+    argv.extend(args.items[0..args.len]);
+    sys.setenv("GIT_TERMINAL_PROMPT", "0");
+    let o = match proc.run(argv.items[0..argv.len], "", arena) {
+        Result.Ok(o) { o }
+        Result.Err(e) {
+            let errno = if e == ProcError.NotFound { 2 } else { sys.errno() };
+            let t = Text.new(arena);
+            t.add("cannot run `git` (").add(osError(errno, arena));
+            t.add("); install git, or use a path dep (`name = \"../dir\"`)");
+            return Result.Err(t.str());
+        }
+    };
+    if o.code != 0 {
+        let t = Text.new(arena);
+        t.add("`git");
+        for i in 0..args.len { t.add(" ").add(args.items[i]); }
+        t.add("` failed: ").add(trim(o.errStr()));
+        return Result.Err(t.str());
+    }
+    return Result.Ok(own(arena, trim(o.outStr())));
+}
+
+fn git2(a: string, b: string, c: string, d: string, arena: &Arena): List<string> {
+    let l = List<string>.new(arena);
+    l.push(a);
+    l.push(b);
+    if c.len > 0 { l.push(c); }
+    if d.len > 0 { l.push(d); }
+    return l;
+}
+
+/// Delete `p` and everything under it, quietly (Rust `let _ = remove_dir_all`). Symlinks are not followed.
+fn removeTree(p: string, arena: &Arena) {
+    match io.lstat(p) {
+        Result.Ok(st) {
+            if st.isLink || !st.isDir {
+                io.remove(p);
+                return;
+            }
+        }
+        Result.Err(_) { return; }
+    }
+    match io.listDir(p, arena) {
+        Result.Ok(ents) { for i in 0..ents.len { removeTree(path.join(p, ents[i].name, arena), arena); } }
+        Result.Err(_) {}
+    }
+    io.removeDir(p);
+}
+
+fn lockPush(w: &Walk, l: Locked) {
+    for i in 0..w.lockNew.len { if w.lockNew.items[i].name == l.name { return; } }
+    w.lockNew.push(l);
+}
+
+/// `at` split at its first `:` (Rust `split_once(':')`): (kind, value), kind "" when there is none.
+fn splitAt(at: string): (string, string) {
+    let i = find(at, ":");
+    if i < 0 { return ("", at); }
+    return (at[0..i], at[i + 1..at.len]);
+}
+
+fn cacheName(cache: string, name: string, commit: string, arena: &Arena): string {
+    let n = if commit.len < 12 { commit.len } else { 12 };
+    return path.join(cache, Text.new(arena).add(name).add("-").add(commit[0..n]).str(), arena);
+}
+
+/// The checkout of a git dep: from the lock and the cache when both have it, else cloned now.
+fn gitCheckout(name: string, url: string, at: string, w: &Walk, arena: &Arena): Result<string, string> {
+    let cache = pkgDir(arena)?;
+    let locked = "";
+    for i in 0..w.lockOld.len {
+        let l = w.lockOld.items[i];
+        if locked.len == 0 && l.name == name && l.git == url && l.at == at { locked = l.commit; }
+    }
+    if locked.len > 0 {
+        let dir = cacheName(cache, name, locked, arena);
+        if isDir(dir) {
+            lockPush(w, Locked { name: name, git: url, at: at, commit: locked });
+            return Result.Ok(dir);
+        }
+    }
+    if NO_FETCH {
+        return Result.Err(Text.new(arena).add("`").add(name).add("` is not downloaded yet; run `j3c fetch`").str());
+    }
+    match io.makeDirs(cache) {
+        Result.Ok(_) {}
+        Result.Err(_) { return Result.Err(Text.new(arena).add("create ").add(cache).add(": ").add(osError(sys.errno(), arena)).str()); }
+    }
+    let msg = Text.new(arena);
+    msg.add("j3c: fetching ").add(name).add(" (").add(url);
+    if at != "head" { msg.add(" ").add(at); }
+    msg.add(")\n");
+    let ms = msg.str();
+    sys.write(2, ms.ptr as ptr, ms.len);
+    let tn = Text.new(arena);
+    tn.add(".").add(name).add("-");
+    tn.pushInt(sys.getpid());
+    tn.add(".tmp");
+    let tmp = path.join(cache, tn.str(), arena);
+    removeTree(tmp, arena);
+    let commit = match cloneAt(url, at, locked, tmp, arena) {
+        Result.Ok(c) { c }
+        Result.Err(e) {
+            removeTree(tmp, arena);
+            return Result.Err(e);
+        }
+    };
+    let dir = cacheName(cache, name, commit, arena);
+    if isDir(dir) {
+        removeTree(tmp, arena);
+    } else {
+        removeTree(path.join(tmp, ".git", arena), arena);
+        match io.rename(tmp, dir) {
+            Result.Ok(_) {}
+            Result.Err(_) {
+                let t = Text.new(arena);
+                t.add("move ").add(tmp).add(" to ").add(dir).add(": ").add(osError(sys.errno(), arena));
+                return Result.Err(t.str());
+            }
+        }
+    }
+    lockPush(w, Locked { name: name, git: url, at: at, commit: commit });
+    return Result.Ok(dir);
+}
+
+/// Clone `url` into `tmp` and check out the locked commit or `at`; the commit checked out.
+fn cloneAt(url: string, at: string, locked: string, tmp: string, arena: &Arena): Result<string, string> {
+    git(git2("clone", "--quiet", url, tmp, arena), arena)?;
+    let (kind, val) = splitAt(at);
+    let hasRef = find(at, ":") >= 0;
+    let target = val;
+    if locked.len > 0 {
+        target = locked;
+    } else if hasRef && kind == "tag" {
+        target = Text.new(arena).add("refs/tags/").add(val).str();
+    } else if hasRef && kind == "branch" {
+        target = Text.new(arena).add("origin/").add(val).str();
+    }
+    if locked.len > 0 || hasRef {
+        let what = if locked.len > 0 { "locked commit" } else if hasRef { kind } else { "ref" };
+        let args = git2("-C", tmp, "rev-parse", "--verify", arena);
+        args.push("--quiet");
+        args.push(Text.new(arena).add(target).add("^{commit}").str());
+        let commit = match git(args, arena) {
+            Result.Ok(c) { c }
+            Result.Err(_) {
+                let t = Text.new(arena);
+                t.add(url).add(" has no ").add(what).add(" `").add(if hasRef { val } else { at }).add("`");
+                return Result.Err(t.str());
+            }
+        };
+        let co = git2("-C", tmp, "-c", "advice.detachedHead=false", arena);
+        co.push("checkout");
+        co.push("--quiet");
+        co.push("--detach");
+        co.push(commit);
+        git(co, arena)?;
+    }
+    return git(git2("-C", tmp, "rev-parse", "HEAD", arena), arena);
+}

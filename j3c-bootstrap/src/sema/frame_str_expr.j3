@@ -1,0 +1,450 @@
+// Values and places of `frame_str_flow`: what an expression's value may carry and how a place is
+// reached (the steps that load through a pointer, the field each step selects). Calls, closure literals
+// and `Text.fmt` are in `frame_str_call.j3`.
+//
+// Part of module j3c.sema.
+// Port of: j3c/src/check/frame_str/flow.rs (operand, steps, walk, through, address, rvalue, atomic)
+// J3: Each typed node gives what the IR `lower` makes for it would give: a struct or tuple literal keeps
+// its values per field, an array / slice / enum value flattens them, a cast from a number points anywhere,
+// `&place` is the pointer the place goes through or a pointer to the local, a backtick string with a
+// frame buffer is its `fsBuf` token. A temporary `lower` would spill (`f().x`, `*g()`, a closure's ctx)
+// is a hidden local of the state, keyed past the `TLocal` ids.
+// ponytail: hidden keys are `0x80000000 | TPlace id` and `0xc0000000 | TExpr id`: fine below 2^30 nodes and
+// 2^31 locals per compile; widen the state key to u64 when a program gets there.
+module j3c.sema;
+
+/// How a place is reached (Rust `Steps` plus the root): per projection, whether it loads through a
+/// pointer (`*r`, `xs[i]` on a slice or string) and the field it selects (-1: none).
+struct FsPlace {
+    key: u32;
+    deref: List<bool>;
+    field: List<int>;
+    global: bool;
+    /// A `#[thread]` global.
+    thread: bool;
+
+    fn step(this: &FsPlace, deref: bool, field: int) {
+        this.deref.push(deref);
+        this.field.push(field);
+    }
+
+    /// Index of the last loading step, -1 for none.
+    fn lastDeref(this: &FsPlace): int {
+        let i = this.deref.len - 1;
+        while i >= 0 {
+            if this.deref.items[i] { return i; }
+            i -= 1;
+        }
+        return -1;
+    }
+
+    /// The first field selected at or after step `from`, -1 for none.
+    fn fieldAfter(this: &FsPlace, from: int): int {
+        for i in from..this.field.len { if this.field.items[i] >= 0 { return this.field.items[i]; } }
+        return -1;
+    }
+}
+
+extend FsFlow {
+    fn noteRef(this: &FsFlow, u: int) {
+        let refs = &this.g.units.items[this.unit].refs;
+        if !refs.contains(u) { refs.push(u); }
+    }
+
+    fn localPlace(this: &FsFlow, key: u32): FsPlace {
+        let a = this.g.cx.arena;
+        return FsPlace { key: key, deref: List<bool>.new(a), field: List<int>.new(a), global: false, thread: false };
+    }
+
+    /// A slice or string: indexing it loads through its pointer.
+    fn isSeqPtr(this: &FsFlow, ty: Id<Ty>): bool {
+        match this.g.cx.tables.ty(ty) {
+            Ty.Slice(_) { return true; }
+            Ty.String { return true; }
+            _ { return false; }
+        }
+        return false;
+    }
+
+    /// Rust `steps`, on a typed place; the values it computes on the way (an index, a spilled pointer or
+    /// temporary) are evaluated here.
+    fn place(this: &FsFlow, p: Id<TPlace>, st: &FsState): FsPlace {
+        let typed = this.g.cx.typed;
+        let t = this.g.cx.tables;
+        match typed.place(p) {
+            TPlace.Error {}
+            TPlace.Local(l) { return this.localPlace(l.local.i); }
+            TPlace.Global(g) {
+                let pl = this.localPlace(0);
+                pl.global = true;
+                pl.thread = t.globalAt(g.global).thread;
+                return pl;
+            }
+            TPlace.Field(f) {
+                let pl = this.place(f.base, st);
+                pl.step(false, f.index);
+                return pl;
+            }
+            TPlace.Deref(d) {
+                match typed.expr(d.ptr) {
+                    TExpr.Load(r) {
+                        let pl = this.place(r.place, st);
+                        pl.step(true, -1);
+                        return pl;
+                    }
+                    _ {}
+                }
+                // a pointer value `lower` spills first
+                let v = this.eval(d.ptr, st);
+                let pl = this.localPlace(fsTmpKey(p.i));
+                st.set(pl.key, v);
+                pl.step(true, -1);
+                return pl;
+            }
+            TPlace.Index(ix) {
+                let pl = this.place(ix.base, st);
+                this.eval(ix.index, st);
+                pl.step(this.isSeqPtr(typed.placeTy(ix.base)), -1);
+                return pl;
+            }
+            TPlace.Temp(tp) {
+                let v = this.eval(tp.value, st);
+                let pl = this.localPlace(fsTmpKey(p.i));
+                st.set(pl.key, v);
+                return pl;
+            }
+            TPlace.Payload(pp) {
+                let pl = this.place(pp.base, st);
+                pl.step(false, -1);
+                // a multi-field payload is a struct: one more field step
+                match t.ty(typed.placeTy(pp.base)) {
+                    Ty.Enum(e) { if t.enumAt(e.decl).variants.items[pp.variant].multi { pl.step(false, pp.field); } }
+                    _ {}
+                }
+                return pl;
+            }
+            TPlace.Lane(l) {
+                let pl = this.place(l.base, st);
+                pl.step(false, -1);
+                return pl;
+            }
+            TPlace.Capture(c) {
+                // `(*_ctx).c<i>`, dereferenced unless boxed
+                let pl = this.localPlace(fsCtxKey());
+                pl.step(true, -1);
+                pl.step(false, c.index);
+                if !this.g.units.items[this.unit].boxed { pl.step(true, -1); }
+                return pl;
+            }
+            TPlace.Len(s) {
+                let pl = this.place(s.base, st);
+                pl.step(false, -1);
+                return pl;
+            }
+            TPlace.Ptr(s) {
+                let pl = this.place(s.base, st);
+                pl.step(false, -1);
+                return pl;
+            }
+            TPlace.Tag(s) {
+                let pl = this.place(s.base, st);
+                pl.step(false, -1);
+                return pl;
+            }
+        }
+        return this.localPlace(fsTmpKey(p.i));
+    }
+
+    /// Does variant `v` of enum type `ty` carry a payload that can hold a pointer?
+    fn failHasPtr(this: &FsFlow, ty: Id<Ty>, v: int): bool {
+        let t = this.g.cx.tables;
+        match t.ty(ty) {
+            Ty.Enum(e) {
+                let ed = t.enumAt(e.decl);
+                match ed.variants.items[v].payload {
+                    Option.Some(p) {
+                        match ed.gen { Option.Some(g) { return this.g.hasPtr(subst(t, g, p, e.args)); } Option.None {} }
+                        return this.g.hasPtr(p);
+                    }
+                    Option.None {}
+                }
+            }
+            _ {}
+        }
+        return false;
+    }
+
+    /// Rust `walk`: the value at `pl` after its first `upto` steps.
+    fn walk(this: &FsFlow, pl: &FsPlace, upto: int, st: &FsState): FsVal {
+        let v = st.get(pl.key);
+        if pl.global { v = fsValTok(this.g.cx.arena, fsU()); }
+        for i in 0..upto {
+            if pl.deref.items[i] {
+                v = this.derefVal(fsFlat(v), st);
+            } else if pl.field.items[i] >= 0 {
+                v = fsValOf(fsSelect(v, pl.field.items[i]));
+            } else if v.fkeys.len > 0 {
+                v = fsValOf(fsFlat(v));
+            }
+        }
+        return v;
+    }
+
+    /// Rust `deref`: what a pointer carrying `ptr` points at.
+    fn derefVal(this: &FsFlow, ptr: List<u64>, st: &FsState): FsVal {
+        let out = fsVal(this.g.cx.arena);
+        for i in 0..ptr.len {
+            let t = ptr.items[i];
+            if fsIsLoc(t) {
+                let held = st.get(fsId(t));
+                let f = fsField(t);
+                if f < 0 { fsValAdd(&out, held); } else { fsSetAddAll(&out.whole, fsSelect(held, f)); }
+            } else {
+                fsSetAdd(&out.whole, fsLoaded(t));
+            }
+        }
+        return out;
+    }
+
+    /// Rust `address`: `&pl`: the pointer `pl` goes through, else a pointer to the local.
+    fn address(this: &FsFlow, pl: &FsPlace, st: &FsState): List<u64> {
+        let k = pl.lastDeref();
+        if k >= 0 {
+            let ptr = fsFlat(this.walk(pl, k, st));
+            let slot = pl.fieldAfter(k + 1);
+            if slot < 0 { return ptr; }
+            let out = fsSet(this.g.cx.arena);
+            for i in 0..ptr.len { fsSetAdd(&out, fsAddr(ptr.items[i], slot)); }
+            return out;
+        }
+        let out = fsSet(this.g.cx.arena);
+        if pl.global {
+            out.push(fsU());
+            return out;
+        }
+        out.push(fsRefine(fsLoc(pl.key), pl.fieldAfter(0)));
+        return out;
+    }
+
+    /// What the value of `e` may carry; nothing when its type holds no pointer (Rust `operand` / `rvalue`).
+    fn eval(this: &FsFlow, e: Id<TExpr>, st: &FsState): FsVal {
+        let v = this.evalRaw(e, st);
+        if !this.g.hasPtr(this.g.cx.typed.exprTy(e)) { return fsVal(this.g.cx.arena); }
+        return v;
+    }
+
+    /// Every value of `items` flattened into one whole value.
+    fn evalAll(this: &FsFlow, items: &List<Id<TExpr>>, st: &FsState): FsVal {
+        let out = fsVal(this.g.cx.arena);
+        for i in 0..items.len { fsSetAddAll(&out.whole, fsFlat(this.eval(items.items[i], st))); }
+        return out;
+    }
+
+    fn evalRaw(this: &FsFlow, e: Id<TExpr>, st: &FsState): FsVal {
+        let g = this.g;
+        let typed = g.cx.typed;
+        let a = g.cx.arena;
+        let sp = typed.exprSpan(e);
+        let hp = g.hasPtr(typed.exprTy(e));
+        match typed.expr(e) {
+            TExpr.Error {}
+            TExpr.Int(_) {}
+            TExpr.Float(_) {}
+            TExpr.Bool(_) {}
+            TExpr.Str(_) {}
+            TExpr.Null {}
+            TExpr.Zeroed {}
+            TExpr.ArrayLen(_) {}
+            TExpr.SizeOf(_) {}
+            TExpr.Load(r) {
+                let pl = this.place(r.place, st);
+                if hp { return this.walk(&pl, pl.deref.len, st); }
+            }
+            TExpr.AddrOf(r) {
+                let pl = this.place(r.place, st);
+                return fsValOf(this.address(&pl, st));
+            }
+            TExpr.Unary(u) { return this.eval(u.operand, st); }
+            TExpr.Binary(b) {
+                let l = this.eval(b.lhs, st);
+                if b.kind == BinKind.ShortCircuit {
+                    // the right side runs in a branch
+                    let c = st.clone();
+                    this.eval(b.rhs, &c);
+                    st.join(&c);
+                    return fsVal(a);
+                }
+                let out = fsValOf(fsFlat(l));
+                fsSetAddAll(&out.whole, fsFlat(this.eval(b.rhs, st)));
+                return out;
+            }
+            TExpr.Convert(c) { return this.convert(e, c.expr, c.kind, st); }
+            TExpr.Call(c) {
+                match c.callee { Callee.Value(v) { this.eval(v.expr, st); } _ {} }
+                let vals = List<FsVal>.new(a);
+                let spans = List<Span>.new(a);
+                for i in 0..c.args.len {
+                    let arg = c.args.items[i];
+                    vals.push(this.eval(arg, st));
+                    // an auto-ref'd receiver is `_thisN`, made at the call
+                    if i == 0 && typed.origin(arg) == Origin.AutoRef { spans.push(sp); } else { spans.push(typed.exprSpan(arg)); }
+                }
+                return this.callFlow(g.calleeUnit(c.callee), &vals, &spans, sp, hp, st);
+            }
+            TExpr.StructLit(s) {
+                let out = fsVal(a);
+                for i in 0..s.items.len { fsAddField(&out, i, fsFlat(this.eval(s.items.items[i], st))); }
+                return out;
+            }
+            TExpr.Tuple(tu) {
+                let out = fsVal(a);
+                for i in 0..tu.items.len { fsAddField(&out, i, fsFlat(this.eval(tu.items.items[i], st))); }
+                return out;
+            }
+            TExpr.ArrayLit(al) { return this.evalAll(&al.items, st); }
+            TExpr.SliceLit(s) {
+                let out = fsValOf(fsFlat(this.eval(s.ptr, st)));
+                fsSetAddAll(&out.whole, fsFlat(this.eval(s.len, st)));
+                return out;
+            }
+            TExpr.SliceOf(s) {
+                // `{ &base[start], end - start }`
+                let pl = this.place(s.base, st);
+                match s.start { Option.Some(x) { this.eval(x, st); } Option.None {} }
+                match s.end { Option.Some(x) { this.eval(x, st); } Option.None {} }
+                pl.step(this.isSeqPtr(typed.placeTy(s.base)), -1);
+                return fsValOf(this.address(&pl, st));
+            }
+            TExpr.EnumVal(v) { return this.evalAll(&v.payload, st); }
+            TExpr.FnAddr(f) {
+                let u = g.calleeUnit(f.callee);
+                if u >= 0 { this.noteRef(u); }
+            }
+            TExpr.ToDyn(d) {
+                // `{ $data: the pointer, $vt: &table }`
+                let out = fsVal(a);
+                fsAddField(&out, 0, fsFlat(this.eval(d.value, st)));
+                fsAddField(&out, 1, fsValTok(a, fsU()).whole);
+                return out;
+            }
+            TExpr.If(i) {
+                this.eval(i.cond, st);
+                let c = st.clone();
+                let out = this.eval(i.thenExpr, &c);
+                fsValAdd(&out, this.eval(i.elseExpr, st));
+                st.join(&c);
+                return out;
+            }
+            TExpr.Block(b) {
+                this.block(&b.block, st);
+                if st.live { match b.value { Option.Some(v) { return this.eval(v, st); } Option.None {} } }
+            }
+            TExpr.Match(m) { return this.matchFlow(&m, st); }
+            TExpr.Question(q) {
+                // `if ok { payload } else { return failure }`
+                let v = this.eval(q.expr, st);
+                let payload = fsValClone(v);
+                if v.fkeys.len > 0 { payload = fsValOf(fsFlat(v)); }
+                if q.retErr < 0 {
+                    this.ret(v, sp, st);
+                } else if this.failHasPtr(typed.exprTy(q.expr), q.err) {
+                    // the return value is rebuilt from the failure variant's payload alone
+                    this.ret(payload, sp, st);
+                }
+                return payload;
+            }
+            TExpr.Interp(it) {
+                for i in 0..it.parts.len {
+                    match it.parts.items[i] { TInterpPart.Value(v) { this.eval(v.expr, st); } TInterpPart.Lit(_) {} }
+                }
+                if it.frame {
+                    g.units.items[this.unit].framed = true;
+                    return fsValTok(a, fsBuf(e.i));
+                }
+            }
+            TExpr.Closure(cl) { return this.closureLit(e, &cl, st); }
+            TExpr.ClosureOp(co) {
+                if co.kind == ClosureOpKind.From && co.args.len == 2 {
+                    let out = fsVal(a);
+                    fsAddField(&out, 0, fsFlat(this.eval(co.args.items[0], st)));
+                    fsAddField(&out, 1, fsFlat(this.eval(co.args.items[1], st)));
+                    return out;
+                }
+                return this.evalAll(&co.args, st);
+            }
+            TExpr.LetIn(l) {
+                let vals = List<FsVal>.new(a);
+                for i in 0..l.values.len { vals.push(this.eval(l.values.items[i], st)); }
+                for i in 0..l.locals.len { st.set(l.locals.items[i].i, vals.items[i]); }
+                return this.eval(l.body, st);
+            }
+            TExpr.TextFmt(f) { return this.textFmt(e, &f, st); }
+            TExpr.Syscall(s) {
+                this.evalAll(&s.items, st);
+                return fsValTok(a, fsU());
+            }
+            TExpr.Atomic(at) {
+                // `@atomicStore(p, v)` and friends store `v` through `p`
+                let vals = List<FsVal>.new(a);
+                for i in 0..at.args.len { vals.push(this.eval(at.args.items[i], st)); }
+                if at.op != AtomicOp.Load && vals.len >= 2 {
+                    let v = fsSet(a);
+                    for i in 1..vals.len { fsSetAddAll(&v, fsFlat(vals.items[i])); }
+                    this.storeThrough(fsFlat(vals.items[0]), -1, v, sp, fsSink(FS_STORE), st);
+                }
+                return fsValTok(a, fsU());
+            }
+            TExpr.Simd(s) { this.evalAll(&s.args, st); }
+        }
+        return fsVal(a);
+    }
+
+    /// `as` / `T(x)` and the conversions sema made explicit.
+    fn convert(this: &FsFlow, e: Id<TExpr>, inner: Id<TExpr>, kind: ConvKind, st: &FsState): FsVal {
+        let g = this.g;
+        let a = g.cx.arena;
+        let v = this.eval(inner, st);
+        match kind {
+            // the array's slice, as `SliceOf` made it
+            ConvKind.ArrayToSlice { return v; }
+            // `{ thunk, null }`; the thunk names the fn
+            ConvKind.FnToClosure {
+                match g.cx.typed.expr(inner) {
+                    TExpr.FnAddr(f) { let u = g.calleeUnit(f.callee); if u >= 0 { this.noteRef(u); } }
+                    _ {}
+                }
+                return fsVal(a);
+            }
+            // the same two words under the stack type
+            ConvKind.BoxedToStack {
+                let out = fsVal(a);
+                fsAddField(&out, 0, fsSelect(v, 0));
+                fsAddField(&out, 1, fsSelect(v, 1));
+                return out;
+            }
+            // `{ $data, the table's `$up` call }` (a call through a pointer: memory of unknown origin)
+            ConvKind.DynUpcast {
+                let out = fsVal(a);
+                fsAddField(&out, 0, fsSelect(v, 0));
+                fsAddField(&out, 1, fsValTok(a, fsU()).whole);
+                return out;
+            }
+            ConvKind.ToHalf { return fsVal(a); }
+            ConvKind.FromHalf { return fsVal(a); }
+            ConvKind.IntResize {}
+            ConvKind.IntToFloat {}
+            ConvKind.FloatToInt {}
+            ConvKind.FloatResize {}
+            ConvKind.PtrCast {}
+            ConvKind.PtrToInt {}
+            ConvKind.IntToPtr {}
+            ConvKind.StringBytes {}
+            ConvKind.EnumTag {}
+            ConvKind.BoolToInt {}
+        }
+        // Rust `Cast`: a pointer made from a number points anywhere (an allocator's memory)
+        let out = fsValOf(fsFlat(v));
+        if !g.hasPtr(g.cx.typed.exprTy(inner)) { fsSetAdd(&out.whole, fsU()); }
+        return out;
+    }
+}

@@ -1,0 +1,264 @@
+// Find every script attached in the project's scene files (`script=` on an object line, `node.<i>.script`
+// in v1), the objects' `param.` values, and the main scene named in `j3.editor.toml`.
+//
+// Port of: j3c/src/compile/scene_scripts.rs (Attachment, Scan, scan, scene_files, Scan::scripts)
+module j3c.load.scene_scan;
+// J3: Its own module so its `use`s stay private. Objects, scripts and params come from `j3.scene3d.parse`
+// (the repo's only `.j3scene` reader; Rust's `scenefile.rs` is gone). That reader keeps no line numbers,
+// and errors name the line: for a v2 file each line is also parsed alone (`"j3scene\n" + line`) so the
+// stdlib's own rules say which lines are objects (the k-th object line is node k of the whole parse);
+// v1 lines are found by their `node.<slot>.script` / `param.<id>.` prefix. Linking `j3.scene3d` pulls
+// SDL2/GL into j3c-boot as shared-library dependencies (nothing is called at run time).
+
+use j3.cmp.sortBy;
+use j3.io;
+use j3.io.DirEntry;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.scene3d;
+use j3.scene3d.Scene;
+use j3.text.{ Text, parseInt, startsWith, trim };
+use j3c.base.fsx;
+use j3c.base.intern.own;
+
+/// One object with a script.
+pub struct Attachment {
+    /// Scene file, relative to the root, `/`-separated.
+    scene: string;
+    line: int;
+    id: int;
+    script: string;
+}
+
+/// One script prop value (`param.<field>=` on a v2 object line, `param.<id>.<field>` in v1).
+pub struct Param {
+    field: string;
+    /// ' ' (int or bool), 'f', 's', or 'r' (object).
+    kind: u8;
+    value: string;
+    line: int;
+}
+
+/// The params of one object (Rust's `BTreeMap<(scene, id), Vec<Param>>` entry).
+pub struct ParamSet {
+    scene: string;
+    id: int;
+    params: List<Param>;
+}
+
+pub struct Scan {
+    attachments: List<Attachment>;
+    /// One entry per (scene, object id), in scan order.
+    params: List<ParamSet>;
+    /// `[editor] scene` from `j3.editor.toml`, or "".
+    mainScene: string;
+    arena: &Arena;
+
+    /// The params of object `id` in `scene` (empty when it sets none). ponytail: linear scan per lookup;
+    /// a map if projects grow past thousands of objects with params.
+    fn paramsOf(this: &Scan, scene: string, id: int): List<Param> {
+        for i in 0..this.params.len {
+            let p = this.params.items[i];
+            if p.id == id && p.scene == scene { return p.params; }
+        }
+        return List<Param>.new(this.arena);
+    }
+
+    /// The distinct attached script paths, sorted (Rust `Scan::scripts`).
+    fn scripts(this: &Scan, arena: &Arena): List<string> {
+        let all = List<string>.new(arena);
+        for i in 0..this.attachments.len { all.push(this.attachments.items[i].script); }
+        sortBy(all.items[0..all.len], fn(a: string, b: string): bool { return a < b; });
+        let out = List<string>.new(arena);
+        for i in 0..all.len { if out.len == 0 || out.items[out.len - 1] != all.items[i] { out.push(all.items[i]); } }
+        return out;
+    }
+}
+
+fn addParam(out: &Scan, scene: string, id: int, p: Param, arena: &Arena) {
+    for i in 0..out.params.len {
+        if out.params.items[i].id == id && out.params.items[i].scene == scene {
+            out.params.items[i].params.push(p);
+            return;
+        }
+    }
+    let ps = List<Param>.new(arena);
+    ps.push(p);
+    out.params.push(ParamSet { scene: scene, id: id, params: ps });
+}
+
+/// Every `.j3scene` below `dir`, entries in name order per folder, skipping `target`, `.git` and
+/// symlinked folders (Rust `scene_files`). `rel` is `dir` relative to the root.
+fn sceneFiles(dir: string, rel: string, out: &List<string>, arena: &Arena) {
+    match io.listDir(dir, arena) {
+        Result.Ok(ents) {
+            sortBy(ents, fn(a: DirEntry, b: DirEntry): bool { return a.name < b.name; });
+            for i in 0..ents.len {
+                let e = ents[i];
+                let r = if rel.len == 0 { e.name } else { Text.new(arena).add(rel).add("/").add(e.name).str() };
+                if e.isDir {
+                    if e.name != "target" && e.name != ".git" && !e.isLink { sceneFiles(path.join(dir, e.name, arena), r, out, arena); }
+                } else if e.name.len >= 8 && e.name[e.name.len - 8..e.name.len] == ".j3scene" {
+                    out.push(r);
+                }
+            }
+        }
+        Result.Err(_) {}
+    }
+}
+
+/// The lines of `text` as Rust `str::lines` gives them (a final `\r` dropped), in `arena`.
+pub fn lines(text: string, arena: &Arena): List<string> {
+    let out = List<string>.new(arena);
+    let start = 0;
+    for i in 0..text.len + 1 {
+        if i == text.len || text[i] == '\n' {
+            if i == text.len && start == i { break; }
+            let end = i;
+            if end > start && text[end - 1] == '\r' { end -= 1; }
+            out.push(text[start..end]);
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+/// A `param.<id>.<field>[ k]=<value>` line (the scene data section's shape, Rust `parse_v1`): its id and
+/// param, or None.
+fn paramLine(l: string, line: int, arena: &Arena): Option<(int, Param)> {
+    if !startsWith(l, "param.") { return Option.None; }
+    let rest = l[6..l.len];
+    let dot = 0;
+    while dot < rest.len && rest[dot] != '.' { dot += 1; }
+    if dot == rest.len { return Option.None; }
+    let id = 0;
+    match parseInt(rest[0..dot], 10) { Option.Some(v) { id = v; } Option.None { return Option.None; } }
+    let field = rest[dot + 1..rest.len];
+    let eq = 0;
+    while eq < field.len && field[eq] != '=' { eq += 1; }
+    if eq == field.len { return Option.None; }
+    let key = field[0..eq];
+    let name = key;
+    let kind: u8 = ' ';
+    let sp = 0;
+    while sp < key.len && key[sp] != ' ' { sp += 1; }
+    if sp < key.len {
+        name = key[0..sp];
+        // ponytail: Rust takes the first char; every kind the format writes is one ASCII byte
+        if sp + 1 < key.len { kind = key[sp + 1]; }
+    }
+    return Option.Some((id, Param { field: own(arena, name), kind: kind, value: own(arena, field[eq + 1..field.len]), line: line }));
+}
+
+/// v2: object `k` of the whole-file parse is the k-th line the stdlib reads as an object.
+fn scanV2(out: &Scan, rel: string, text: string, whole: &Scene, arena: &Arena) {
+    let ls = lines(text, arena);
+    let k = 0;
+    for n in 1..ls.len {
+        // ponytail: one small arena per line; parsing a line alone costs about one fresh `Scene`
+        let one = Arena.create(16 * 1024);
+        let t = Text.new(&one).add("j3scene\n").add(ls.items[n]).str();
+        let s = scene3d.parse(t as []u8, true, &one);
+        if s.len == 1 && k < whole.len {
+            let id = whole.nodes[k].id;
+            let data = lines(s.data.bytes as string, &one);
+            for i in 0..data.len {
+                match paramLine(data.items[i], n + 1, arena) {
+                    Option.Some(ip) { let (_, p) = ip; addParam(out, rel, id, p, arena); }
+                    Option.None {}
+                }
+            }
+            let script = whole.nodes[k].script;
+            if script.len > 0 { out.attachments.push(Attachment { scene: rel, line: n + 1, id: id, script: own(arena, script) }); }
+            k += 1;
+        }
+        one.destroy();
+    }
+}
+
+/// `node.<slot>.<field>`: the slot and field, or (-1, "").
+fn nodeKey(l: string): (int, string) {
+    if !startsWith(l, "node.") { return (-1, ""); }
+    let i = 5;
+    while i < l.len && l[i] != '.' { i += 1; }
+    if i == l.len { return (-1, ""); }
+    let slot = match parseInt(l[5..i], 10) { Option.Some(v) { v } Option.None { -1 } };
+    let f = i + 1;
+    let e = f;
+    while e < l.len && l[e] != ' ' && l[e] != '=' { e += 1; }
+    let eq = e;
+    while eq < l.len && l[eq] != '=' { eq += 1; }
+    if eq == l.len { return (-1, ""); }
+    return (slot, l[f..e]);
+}
+
+/// v1: nodes by slot from the stdlib; the line of each `node.<slot>.script` and every `param.` line.
+fn scanV1(out: &Scan, rel: string, text: string, whole: &Scene, arena: &Arena) {
+    let ls = lines(text, arena);
+    let scriptLine = arena.alloc::<int>(whole.len);
+    for i in 0..whole.len { scriptLine[i] = 0; }
+    // Rust: an object's line is the first that names its slot (or a higher one)
+    let firstLine = arena.alloc::<int>(whole.len);
+    let made = 0;
+    for n in 0..ls.len {
+        let (slot, field) = nodeKey(ls.items[n]);
+        if slot >= 0 && slot < whole.len {
+            while made <= slot { firstLine[made] = n + 1; made += 1; }
+            if field == "script" { scriptLine[slot] = n + 1; }
+        }
+    }
+    for n in 0..ls.len {
+        match paramLine(ls.items[n], n + 1, arena) {
+            Option.Some(ip) {
+                let (id, p) = ip;
+                for k in 0..whole.len {
+                    if whole.nodes[k].id == id { addParam(out, rel, id, p, arena); break; }
+                }
+            }
+            Option.None {}
+        }
+    }
+    for k in 0..whole.len {
+        let script = whole.nodes[k].script;
+        if script.len == 0 { continue; }
+        let line = scriptLine[k];
+        if line == 0 && k < made { line = firstLine[k]; }
+        out.attachments.push(Attachment { scene: rel, line: line, id: whole.nodes[k].id, script: own(arena, script) });
+    }
+}
+
+/// Every script attachment and param under `root`, and the main scene (Rust `scan`). Strings in `arena`.
+pub fn scan(root: string, arena: &Arena): Scan {
+    let out = Scan { attachments: List<Attachment>.new(arena), params: List<ParamSet>.new(arena), mainScene: "", arena: arena };
+    let files = List<string>.new(arena);
+    sceneFiles(root, "", &files, arena);
+    for i in 0..files.len {
+        let rel = files.items[i];
+        let text = "";
+        match fsx.readText(path.join(root, rel, arena), arena) { Result.Ok(t) { text = t; } Result.Err(_) { continue; } }
+        let whole = scene3d.parse(text as []u8, true, arena);
+        if startsWith(text, "j3scene") { scanV2(&out, rel, text, &whole, arena); } else { scanV1(&out, rel, text, &whole, arena); }
+    }
+    match fsx.readText(path.join(root, "j3.editor.toml", arena), arena) {
+        Result.Ok(config) {
+            let ls = lines(config, arena);
+            for n in 0..ls.len {
+                let l = ls.items[n];
+                let eq = 0;
+                while eq < l.len && l[eq] != '=' { eq += 1; }
+                if eq == l.len || trim(l[0..eq]) != "scene" { continue; }
+                let v = trim(l[eq + 1..l.len]);
+                let a = 0;
+                let b = v.len;
+                while a < b && v[a] == '"' { a += 1; }
+                while b > a && v[b - 1] == '"' { b -= 1; }
+                out.mainScene = own(arena, v[a..b]);
+                break;
+            }
+        }
+        Result.Err(_) {}
+    }
+    return out;
+}

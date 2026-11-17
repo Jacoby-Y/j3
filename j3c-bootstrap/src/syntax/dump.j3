@@ -2,6 +2,441 @@
 // against the Rust output.
 //
 // Port of: j3c/src/parse/dump.rs
-// J3: Exhaustive like `walk` (no `_` arm, plan 11 B7). Split into a `syntax/dump/` part (expressions) if
-// the port passes 600 lines.
+// J3: Exhaustive like `walk` (no `_` arm, plan 11 B7). Items, fns and types here; blocks, statements,
+// patterns and expressions in the `syntax/dump/expr.j3` part. Rust's `W` is the `W` cursor below, writing
+// into the caller's `Text` (rule 2); `Item::Props | Item::Shared` is two arms.
 module j3c.syntax.dump;
+
+use j3.data.pool.Id;
+use j3.memory.List;
+use j3.option.Option;
+use j3.text.{ Text, f64Bits };
+use j3c.syntax.ast.{ Ast, BinOp, BinaryExpr, Block, EmbedKind, Expr, FieldInit, FieldItem, File, FnItem, GpuStage, GpuStruct, Ident,
+    InterpPart, Item, MatchStmt, Param, Pat, ScriptBlockItem, Stmt, Type, UnaryOp, atomicOpName, atomicOrderName };
+
+/// `file` printed as Rust's `dump-ast` does, appended to `out` (Rust `dump`): items and statements one
+/// per line (two-space indent), expressions inline.
+pub fn dumpAst(ast: &Ast, file: &File, out: &Text) {
+    let w = W { ast: ast, out: out, depth: 0, rhs: List<Id<Expr>>.new(ast.arena) };
+    w.open("file");
+    w.doc(file.doc);
+    w.idents("module", &file.moduleName);
+    w.flag(file.isScript, "script");
+    if file.dyns.len > 0 {
+        w.out.add(" (dyns");
+        for i in 0..file.dyns.len { w.atom(ast.str(file.dyns.items[i])); }
+        w.close();
+    }
+    w.depth += 1;
+    for i in 0..file.items.len {
+        w.nl();
+        w.item(&file.items.items[i]);
+    }
+    w.depth -= 1;
+    out.add(")\n");
+}
+
+/// The operator as written.
+fn bin(op: BinOp): string {
+    match op {
+        BinOp.Add { return "+"; }
+        BinOp.Sub { return "-"; }
+        BinOp.Mul { return "*"; }
+        BinOp.Div { return "/"; }
+        BinOp.Rem { return "%"; }
+        BinOp.Shl { return "<<"; }
+        BinOp.Shr { return ">>"; }
+        BinOp.BitAnd { return "&"; }
+        BinOp.BitOr { return "|"; }
+        BinOp.BitXor { return "^"; }
+        BinOp.Eq { return "=="; }
+        BinOp.Ne { return "!="; }
+        BinOp.Lt { return "<"; }
+        BinOp.Le { return "<="; }
+        BinOp.Gt { return ">"; }
+        BinOp.Ge { return ">="; }
+        BinOp.And { return "&&"; }
+        BinOp.Or { return "||"; }
+    }
+}
+
+/// The writer: output, indent depth, and the tables names and nodes are read from.
+struct W {
+    ast: &Ast;
+    out: &Text;
+    depth: int;
+    /// Pending right operands of the binary chains being printed (`binary` in the expr part).
+    rhs: List<Id<Expr>>;
+
+    /// `(head`; a head with a leading space starts the group after a space: `" x"` writes ` (x`.
+    fn open(this: &W, head: string) {
+        if head.len > 0 && head[0] == ' ' {
+            this.out.add(" (").add(head[1..]);
+        } else {
+            this.out.add("(").add(head);
+        }
+    }
+    fn close(this: &W) { this.out.push(')'); }
+    fn nl(this: &W) {
+        this.out.push('\n');
+        for _ in 0..this.depth { this.out.add("  "); }
+    }
+    fn atom(this: &W, s: string) { this.out.add(" ").add(s); }
+    fn name(this: &W, n: Ident) { this.atom(this.ast.str(n.name)); }
+    /// The name with no space before it (right after an `open(" ")`).
+    fn bare(this: &W, n: Ident) { this.out.add(this.ast.str(n.name)); }
+    fn flag(this: &W, on: bool, s: string) {
+        if on { this.atom(s); }
+    }
+    /// `v` as `n` lowercase hex digits, zero-padded.
+    fn hex(this: &W, v: u64, n: int) {
+        let hex = "0123456789abcdef";
+        for i in 0..n { this.out.push(hex[int((v >> u64(4 * (n - 1 - i))) & 15)]); }
+    }
+    /// `"..."`: `\\ \" \n \t \r` escaped, other bytes outside 0x20..0x7e as `\xHH`.
+    fn str(this: &W, s: string) {
+        this.out.add(" \"");
+        for i in 0..s.len {
+            let b = s[i];
+            if b == '\\' { this.out.add("\\\\"); }
+            else if b == '"' { this.out.add("\\\""); }
+            else if b == '\n' { this.out.add("\\n"); }
+            else if b == '\t' { this.out.add("\\t"); }
+            else if b == '\r' { this.out.add("\\r"); }
+            else if b >= 0x20 && b <= 0x7e { this.out.push(b); }
+            else {
+                this.out.add("\\x");
+                this.hex(u64(b), 2);
+            }
+        }
+        this.out.push('"');
+    }
+    fn doc(this: &W, doc: string) {
+        if doc.len > 0 {
+            this.open(" doc");
+            this.str(doc);
+            this.close();
+        }
+    }
+    /// `(head a b)`, left out when empty (Rust `list` over idents).
+    fn idents(this: &W, head: string, xs: &List<Ident>) {
+        if xs.len > 0 {
+            this.out.add(" (").add(head);
+            for i in 0..xs.len { this.name(xs.items[i]); }
+            this.close();
+        }
+    }
+    fn path(this: &W, p: &List<Ident>) {
+        this.out.push(' ');
+        for i in 0..p.len {
+            if i > 0 { this.out.push('.'); }
+            this.bare(p.items[i]);
+        }
+    }
+    fn optTy(this: &W, t: Option<Id<Type>>) {
+        match t {
+            Option.Some(x) { this.ty(x); }
+            Option.None { this.atom("_"); }
+        }
+    }
+    fn optExpr(this: &W, e: Option<Id<Expr>>) {
+        match e {
+            Option.Some(x) { this.expr(x); }
+            Option.None { this.atom("_"); }
+        }
+    }
+    /// `(tparams (T A B) U)`; `bounds` may be shorter than `names` (`extend` has none).
+    fn tparams(this: &W, names: &List<Ident>, bounds: &List<List<Ident>>) {
+        if names.len == 0 { return; }
+        this.open(" tparams");
+        for i in 0..names.len {
+            if i < bounds.len && bounds.items[i].len > 0 {
+                let b = bounds.items[i];
+                this.open(" ");
+                this.bare(names.items[i]);
+                for j in 0..b.len { this.name(b.items[j]); }
+                this.close();
+            } else {
+                this.name(names.items[i]);
+            }
+        }
+        this.close();
+    }
+    fn params(this: &W, ps: &List<Param>) {
+        this.open(" params");
+        for i in 0..ps.len {
+            this.open(" ");
+            this.bare(ps.items[i].name);
+            this.ty(ps.items[i].ty);
+            this.close();
+        }
+        this.close();
+    }
+    fn fields(this: &W, fs: &List<FieldInit>) {
+        for i in 0..fs.len {
+            this.open(" field ");
+            this.bare(fs.items[i].name);
+            this.expr(fs.items[i].value);
+            this.close();
+        }
+    }
+    fn fieldItems(this: &W, fs: &List<FieldItem>) {
+        for i in 0..fs.len {
+            let f = fs.items[i];
+            this.nl();
+            this.open("field");
+            this.doc(f.doc);
+            this.flag(f.embedded, "embedded");
+            this.flag(f.flat, "flat");
+            this.name(f.name);
+            this.ty(f.ty);
+            match f.default {
+                Option.Some(d) { this.expr(d); }
+                Option.None {}
+            }
+            this.close();
+        }
+    }
+    fn methods(this: &W, ms: &List<FnItem>) {
+        for i in 0..ms.len {
+            this.nl();
+            this.func(&ms.items[i]);
+        }
+    }
+
+    fn item(this: &W, it: &Item) {
+        match *it {
+            Item.Use(u) {
+                this.open("use");
+                this.path(&u.path);
+                match u.names {
+                    Option.Some(ns) {
+                        this.open(" names");
+                        for i in 0..ns.len { this.name(ns.items[i]); }
+                        this.close();
+                    }
+                    Option.None {}
+                }
+            }
+            Item.UseLib(u) {
+                this.open("use-lib");
+                this.str(u.libName);
+                this.name(u.alias);
+                this.depth += 1;
+                for i in 0..u.decls.len {
+                    let d = u.decls.items[i];
+                    this.nl();
+                    this.open("lib-fn ");
+                    this.bare(d.name);
+                    this.params(&d.params);
+                    this.optTy(d.ret);
+                    match d.symbol {
+                        Option.Some(s) { this.str(s); }
+                        Option.None { this.atom("_"); }
+                    }
+                    this.close();
+                }
+                this.depth -= 1;
+            }
+            Item.Const(c) {
+                this.open("const");
+                this.doc(c.doc);
+                this.flag(c.visPub, "pub");
+                this.name(c.name);
+                this.optTy(c.ty);
+                this.expr(c.value);
+            }
+            Item.Fn(f) {
+                this.func(&f);
+                return;
+            }
+            Item.Struct(s) {
+                this.open("struct");
+                this.doc(s.doc);
+                this.flag(s.visPub, "pub");
+                this.flag(s.debug, "debug");
+                this.flag(s.packed, "packed");
+                match s.gpu {
+                    GpuStruct.None {}
+                    GpuStruct.Vertex { this.atom("vertex"); }
+                    GpuStruct.VertexInstance { this.atom("vertex-instance"); }
+                    GpuStruct.Varying { this.atom("varying"); }
+                    GpuStruct.Plain { this.atom("shader"); }
+                }
+                this.idents("derives", &s.derives);
+                this.name(s.name);
+                this.tparams(&s.typeParams, &s.bounds);
+                this.depth += 1;
+                this.fieldItems(&s.fields);
+                this.methods(&s.methods);
+                this.depth -= 1;
+            }
+            Item.Extend(e) {
+                this.open("extend");
+                this.name(e.name);
+                let none = List<List<Ident>>.new(this.ast.arena);
+                this.tparams(&e.typeParams, &none);
+                this.depth += 1;
+                this.methods(&e.methods);
+                this.depth -= 1;
+            }
+            Item.Enum(e) {
+                this.open("enum");
+                this.doc(e.doc);
+                this.flag(e.visPub, "pub");
+                this.flag(e.debug, "debug");
+                match e.tryCatch {
+                    Option.Some(tc) {
+                        this.out.add(" (try-catch");
+                        this.name(tc.ok);
+                        this.name(tc.err);
+                        this.close();
+                    }
+                    Option.None {}
+                }
+                this.idents("derives", &e.derives);
+                this.name(e.name);
+                this.tparams(&e.typeParams, &e.bounds);
+                this.depth += 1;
+                for i in 0..e.variants.len {
+                    let v = e.variants.items[i];
+                    this.nl();
+                    this.open("case");
+                    this.doc(v.doc);
+                    this.name(v.name);
+                    for j in 0..v.fields.len { this.ty(v.fields.items[j]); }
+                    this.close();
+                }
+                this.depth -= 1;
+            }
+            Item.Trait(t) {
+                this.open("trait");
+                this.doc(t.doc);
+                this.flag(t.visPub, "pub");
+                this.name(t.name);
+                this.idents("supers", &t.supers);
+                this.depth += 1;
+                for i in 0..t.methods.len {
+                    let m = t.methods.items[i];
+                    this.nl();
+                    this.open("trait-fn ");
+                    this.bare(m.name);
+                    this.params(&m.params);
+                    this.optTy(m.ret);
+                    match m.body {
+                        Option.Some(b) { this.block(&b); }
+                        Option.None { this.atom("_"); }
+                    }
+                    this.close();
+                }
+                this.depth -= 1;
+            }
+            Item.Let(l) {
+                this.open("mod-let");
+                this.doc(l.doc);
+                this.flag(l.thread, "thread");
+                this.flag(l.uniform, "uniform");
+                this.name(l.name);
+                this.ty(l.ty);
+                this.optExpr(l.value);
+            }
+            Item.Props(b) { this.scriptBlock("props", &b); }
+            Item.Shared(b) { this.scriptBlock("shared", &b); }
+            Item.State(s) {
+                this.open("state");
+                this.name(s.name);
+                this.optTy(s.ty);
+                this.expr(s.value);
+            }
+        }
+        this.close();
+    }
+
+    fn scriptBlock(this: &W, head: string, b: &ScriptBlockItem) {
+        this.open(head);
+        this.depth += 1;
+        this.fieldItems(&b.fields);
+        this.depth -= 1;
+    }
+
+    fn func(this: &W, f: &FnItem) {
+        this.open("fn");
+        this.doc(f.doc);
+        this.flag(f.visPub, "pub");
+        this.flag(f.isImpl, "impl");
+        match f.shader {
+            Option.None {}
+            Option.Some(st) {
+                match st {
+                    GpuStage.Helper { this.atom("shader"); }
+                    GpuStage.Vertex { this.atom("shader-vertex"); }
+                    GpuStage.Fragment { this.atom("shader-fragment"); }
+                }
+            }
+        }
+        this.name(f.name);
+        this.tparams(&f.typeParams, &f.bounds);
+        if f.whereBounds.len > 0 {
+            this.open(" where");
+            for i in 0..f.whereBounds.len {
+                let wb = f.whereBounds.items[i];
+                this.idents(this.ast.str(wb.name.name), &wb.bounds);
+            }
+            this.close();
+        }
+        this.params(&f.params);
+        this.optTy(f.ret);
+        this.block(&f.body);
+        this.close();
+    }
+
+    /// `(a b) ret` of a fn or closure type (Rust's `fn_like`).
+    fn fnLike(this: &W, params: &List<Id<Type>>, ret: Option<Id<Type>>) {
+        this.out.add(" (");
+        for i in 0..params.len {
+            if i > 0 { this.out.push(' '); }
+            this.tyBare(params.items[i]);
+        }
+        this.close();
+        this.optTy(ret);
+    }
+
+    fn ty(this: &W, id: Id<Type>) {
+        match this.ast.ty(id) {
+            Type.Named(n) { this.atom(this.ast.str(n.name)); }
+            Type.Generic(g) {
+                this.open(" gen ");
+                this.out.add(this.ast.str(g.name));
+                for i in 0..g.args.len { this.ty(g.args.items[i]); }
+                this.close();
+            }
+            Type.Ref(r) { this.open(" ref"); this.ty(r.ty); this.close(); }
+            Type.Array(a) {
+                this.open(" array ");
+                this.out.pushU64(a.len);
+                this.ty(a.elem);
+                this.close();
+            }
+            Type.Slice(s) { this.open(" slice"); this.ty(s.elem); this.close(); }
+            Type.Fn(f) { this.open(" fn-type"); this.fnLike(&f.params, f.ret); this.close(); }
+            Type.Closure(c) {
+                this.open(" closure-type");
+                this.flag(c.boxed, "boxed");
+                this.fnLike(&c.params, c.ret);
+                this.close();
+            }
+            Type.Tuple(t) {
+                this.open(" tuple-type");
+                for i in 0..t.elems.len { this.ty(t.elems.items[i]); }
+                this.close();
+            }
+            Type.Dyn(n) { this.open(" dyn"); this.name(n); this.close(); }
+        }
+    }
+    /// A type with no leading space (first inside a group).
+    fn tyBare(this: &W, t: Id<Type>) {
+        let at = this.out.len();
+        this.ty(t);
+        this.out.remove(at, 1);
+    }
+}

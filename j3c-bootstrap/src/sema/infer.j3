@@ -2,4 +2,415 @@
 //
 // Part of module j3c.sema.
 // Port of: j3c/src/check/infer.rs
+// J3: `inferReturns` is Rust's `infer_omitted_rets`: before any body is typed, the return type of a fn
+// written without `: T` comes from its `return`s, each typed by `peek` (types from the params and the
+// module scope only, no locals). The peek is a `BodyCx` method so it shares the typer's helpers and error
+// text; the params it binds are dead `TLocal`s (never in a `TBody`).
 module j3c.sema;
+
+/// Rust `infer_omitted_rets`: the return type of every fn of `m` written without `: T`, from its returns.
+/// False after an error Diag (Rust stops the check there).
+pub fn inferReturns(cx: &SemaCx, m: Id<ModDecl>): bool {
+    let fns = cx.tables.modAt(m).fns;
+    for i in 0..fns.len {
+        if !inferOne(cx, fns.items[i]) { return false; }
+    }
+    let structs = cx.tables.modAt(m).structs;
+    for i in 0..structs.len {
+        let methods = cx.tables.structAt(structs.items[i]).methods;
+        for k in 0..methods.len {
+            if cx.tables.fnAt(methods.items[k]).owner == m && !fns.contains(methods.items[k]) {
+                if !inferOne(cx, methods.items[k]) { return false; }
+            }
+        }
+    }
+    return true;
+}
+
+fn inferOne(cx: &SemaCx, f: Id<FnDecl>): bool {
+    let d = *cx.tables.fnAt(f);
+    if !d.retOmitted { return true; }
+    match d.kind { FnKind.J3 {} _ { return true; } }
+    match d.gen { Option.Some(_) { return true; } Option.None {} }
+    match d.recv {
+        Option.Some(s) { match cx.tables.structAt(s).gen { Option.Some(_) { return true; } Option.None {} } }
+        Option.None {}
+    }
+    let item = match d.item { Option.Some(it) { it } Option.None { return true; } };
+    let b = BodyCx.new(cx, f);
+    for i in 0..item.params.len {
+        if i < d.params.len { b.bind(item.params.items[i].name.name, b.newLocal(item.params.items[i].name.name, d.params.items[i].ty, item.params.items[i].name.span, true)); }
+    }
+    let seen: Option<Id<Ty>> = Option.None;
+    match b.collectReturnTys(&item.body, &seen) {
+        Result.Ok(_) {}
+        Result.Err(e) {
+            cx.diags.add(e.diag);
+            return false;
+        }
+    }
+    match seen {
+        Option.Some(t) { cx.tables.fnAt(f).ret = t; }
+        Option.None { cx.tables.fnAt(f).ret = cx.tables.common.void; }
+    }
+    return true;
+}
+
+/// Rust `peek_ty`: the type an expression will have, without typing it into the tree (literal typing from
+/// the other operand). None when it depends on context.
+pub fn peekTy(cx: &SemaCx, m: Id<ModDecl>, e: Id<Expr>): Option<Id<Ty>> {
+    let b = BodyCx { cx: cx, m: m, f: Id<FnDecl> { i: 0 }, ret: cx.tables.common.void, path: "", scope: List<Binding>.new(cx.arena),
+        locals: List<Id<TLocal>>.new(cx.arena), params: List<Id<TLocal>>.new(cx.arena), loops: List<LoopFrame>.new(cx.arena),
+        pendingLabel: Option.None, nloops: 0, errs: List<TErr>.new(cx.arena), poisoned: List<Sym>.new(cx.arena), gen: Option.None,
+        inst: Option.None, inClosure: false, closureOuter: List<Sym>.new(cx.arena), scriptSid: Option.None };
+    match b.peek(e) {
+        Result.Ok(t) { return Option.Some(t); }
+        Result.Err(_) { return Option.None; }
+    }
+    return Option.None;
+}
+
+extend BodyCx {
+    /// Rust `collect_return_tys`: the one type every `return` in `block` (nested blocks and arms included)
+    /// gives; a second, different one is `return type mismatch`.
+    fn collectReturnTys(this: &BodyCx, block: &Block, seen: &Option<Id<Ty>>): Result<bool, TErr> {
+        for i in 0..block.stmts.len { this.collectStmt(block.stmts.items[i], block.span, seen)?; }
+        return Result.Ok(true);
+    }
+
+    fn collectStmt(this: &BodyCx, s: Id<Stmt>, span: Span, seen: &Option<Id<Ty>>): Result<bool, TErr> {
+        match this.cx.ast.stmt(s) {
+            Stmt.Return(r) {
+                let t = this.com().void;
+                match r.value {
+                    Option.Some(e) { t = this.peek(e)?; }
+                    Option.None {}
+                }
+                match *seen {
+                    Option.None { *seen = Option.Some(t); }
+                    Option.Some(old) { if old != t { return Result.Err(this.err(r.span, "return type mismatch")); } }
+                }
+            }
+            Stmt.If(i) {
+                this.collectReturnTys(&i.thenBlock, seen)?;
+                match i.elseBlock { Option.Some(b) { this.collectReturnTys(&b, seen)?; } Option.None {} }
+            }
+            Stmt.While(w) { this.collectReturnTys(&w.body, seen)?; }
+            Stmt.For(f) { this.collectReturnTys(&f.body, seen)?; }
+            Stmt.ForEach(f) { this.collectReturnTys(&f.body, seen)?; }
+            Stmt.Defer(d) { this.collectReturnTys(&d.body, seen)?; }
+            Stmt.Block(b) { this.collectReturnTys(&b, seen)?; }
+            Stmt.Labeled(l) { this.collectStmt(l.body, l.span, seen)?; }
+            Stmt.Match(m) {
+                for i in 0..m.arms.len { this.collectReturnTys(&m.arms.items[i].body, seen)?; }
+            }
+            _ {}
+        }
+        return Result.Ok(true);
+    }
+
+    /// Rust `peek_ty`.
+    fn peek(this: &BodyCx, e: Id<Expr>): Result<Id<Ty>, TErr> {
+        let sp = this.cx.ast.exprSpan(e);
+        let c = this.com();
+        match this.cx.ast.expr(e) {
+            Expr.ScriptType(_) { return Result.Err(this.err(sp, "script type is not available here")); }
+            Expr.ScriptLit(_) { return Result.Err(this.err(sp, "script type is not available here")); }
+            Expr.Embed(em) {
+                match em.kind {
+                    EmbedKind.Dir {
+                        return Result.Err(this.help(this.err(sp, "`@embedDir` makes a table, so it only works as a const"),
+                            "write `const FILES = @embedDir(\"dir\", \"*.ext\");` and use `FILES[i].path` / `FILES[i].data`"));
+                    }
+                    EmbedKind.Bytes { return Result.Ok(this.cx.tables.sliceOf(c.u8)); }
+                    EmbedKind.Text { return Result.Ok(c.string); }
+                }
+            }
+            Expr.Closure(_) { return Result.Err(this.err(sp, "a closure's type is not known here; give the `let` or parameter a `closure(..)` type")); }
+            Expr.Int(_) { return Result.Ok(c.i64); }
+            Expr.BigInt(v) { return Result.Err(this.bigIntErr(sp, v)); }
+            Expr.Zeroed { return Result.Err(this.err(sp, "a zero-filled `let` needs a type: `let buf: [64]u8;`")); }
+            Expr.Char(v) {
+                if v < 0x80 { return Result.Ok(c.u8); }
+                return Result.Ok(c.u32);
+            }
+            Expr.Float(_) { return Result.Ok(c.f64); }
+            Expr.Bool(_) { return Result.Ok(c.bool); }
+            Expr.String(_) { return Result.Ok(c.string); }
+            Expr.Interpolate(_) { return Result.Ok(c.string); }
+            Expr.Name(n) {
+                match this.findLocal(n.name) { Option.Some(l) { return Result.Ok(this.cx.typed.local(l).ty); } Option.None {} }
+                match this.intConstNamed(n.name) { Option.Some(v) { return Result.Ok(v.ty); } Option.None {} }
+                let t = Text.new(this.cx.arena);
+                t.add("unknown name `").add(this.str(n.name)).add("`");
+                return Result.Err(this.err(n.span, t.str()));
+            }
+            Expr.StructLit(s) {
+                match this.lookupName(s.name.name) {
+                    Option.Some(r) {
+                        if r.kind == DeclKind.Struct { return Result.Ok(this.cx.tables.structTy(r.asStruct(), this.cx.arena.alloc::<Id<Ty>>(0))); }
+                        if r.kind == DeclKind.Enum { return Result.Ok(this.cx.tables.enumTy(r.asEnum(), this.cx.arena.alloc::<Id<Ty>>(0))); }
+                    }
+                    Option.None {}
+                }
+                let t = Text.new(this.cx.arena);
+                t.add("unknown type `").add(this.str(s.name.name)).add("`");
+                return Result.Err(this.err(s.name.span, t.str()));
+            }
+            Expr.Field(f) { return this.peekField(e, &f); }
+            Expr.Call(call) { return this.peekCall(sp, call.func, &call.args); }
+            Expr.Binary(b) { return this.peekBinary(b.op, b.lhs, b.rhs); }
+            Expr.Unary(u) {
+                match u.op {
+                    UnaryOp.Neg { return this.peek(u.expr); }
+                    UnaryOp.BitNot { return this.peek(u.expr); }
+                    UnaryOp.Not { return Result.Ok(c.bool); }
+                    UnaryOp.Ref { return Result.Ok(this.cx.tables.refTo(this.peek(u.expr)?)); }
+                    UnaryOp.Deref {
+                        let t = this.peek(u.expr)?;
+                        match this.refInner(t) {
+                            Option.Some(i) { return Result.Ok(i); }
+                            Option.None { return Result.Err(this.err(sp, "deref of non-ref")); }
+                        }
+                    }
+                }
+            }
+            Expr.Cast(ce) { return this.resolve(ce.ty); }
+            Expr.Question(q) {
+                let t = this.peek(q.expr)?;
+                match this.enumOf(t) {
+                    Option.Some(en) {
+                        let ed = this.cx.tables.enumAt(en);
+                        match ed.tryCatch {
+                            Option.Some(tc) {
+                                match ed.variants.items[tc.success].payload {
+                                    Option.Some(p) { return Result.Ok(p); }
+                                    Option.None { return Result.Ok(c.void); }
+                                }
+                            }
+                            Option.None { return Result.Err(this.err(this.cx.ast.exprSpan(q.expr), "`?` needs `#[TryCatch]`")); }
+                        }
+                    }
+                    Option.None { return Result.Err(this.err(this.cx.ast.exprSpan(q.expr), "`?` on non-enum")); }
+                }
+            }
+            Expr.Syscall(_) { return Result.Ok(c.i64); }
+            Expr.Atomic(a) {
+                if a.op == AtomicOp.Cas { return Result.Ok(c.bool); }
+                if a.op == AtomicOp.Store { return Result.Ok(c.i64); }
+                let p = this.peek(a.args.items[0])?;
+                match this.refInner(p) { Option.Some(i) { return Result.Ok(i); } Option.None { return Result.Ok(c.i64); } }
+            }
+            Expr.SizeOf(_) { return Result.Ok(c.i64); }
+            Expr.UiChoice(_) { return Result.Ok(c.bool); }
+            Expr.SliceFrom(_) { return Result.Err(this.err(sp, "`@slice` needs an expected type")); }
+            Expr.TypePath(t) {
+                let m = Text.new(this.cx.arena);
+                m.add("`").add(this.str(t.name.name)).add("` is a type, not a value");
+                return Result.Err(this.err(sp, m.str()));
+            }
+            Expr.SliceLit(s) { return Result.Ok(this.cx.tables.sliceOf(this.resolve(s.elem)?)); }
+            Expr.Tuple(t) {
+                let tys = this.cx.arena.alloc::<Id<Ty>>(t.elems.len);
+                for i in 0..t.elems.len { tys[i] = this.peek(t.elems.items[i])?; }
+                return Result.Ok(this.cx.tables.intern(Ty.Tuple(TupleTy { elems: this.cx.tables.list(tys) })));
+            }
+            Expr.ArrayLit(a) {
+                if a.elems.len == 0 { return Result.Err(this.err(sp, "cannot infer empty array")); }
+                return Result.Ok(this.cx.tables.arrayOf(this.peek(a.elems.items[0])?, u64(a.elems.len)));
+            }
+            Expr.Index(ix) {
+                match this.elemTy(this.peek(ix.base)?) {
+                    Option.Some(t) { return Result.Ok(t); }
+                    Option.None { return Result.Err(this.err(sp, "index of non-array/slice")); }
+                }
+            }
+            Expr.Slice(s) {
+                match this.elemTy(this.peek(s.base)?) {
+                    Option.Some(t) { return Result.Ok(this.cx.tables.sliceOf(t)); }
+                    Option.None { return Result.Err(this.err(sp, "slice of non-array/slice")); }
+                }
+            }
+            Expr.If(i) {
+                let a = this.peek(i.thenExpr)?;
+                let b = this.peek(i.elseExpr)?;
+                if a != b { return Result.Err(this.err(sp, "if-expression branches have different types")); }
+                return Result.Ok(a);
+            }
+            // the first arm value whose type is known without the arm's bindings
+            Expr.Match(m) {
+                let first: Option<TErr> = Option.None;
+                for i in 0..m.arms.len {
+                    match m.arms.items[i].tail {
+                        Option.Some(t) {
+                            match this.peek(t) {
+                                Result.Ok(ty) { return Result.Ok(ty); }
+                                Result.Err(er) { match first { Option.None { first = Option.Some(er); } Option.Some(_) {} } }
+                            }
+                        }
+                        Option.None {}
+                    }
+                }
+                match first {
+                    Option.Some(er) { return Result.Err(er); }
+                    Option.None { return Result.Err(this.err(sp, "this `match` has no arm value; write the fn's return type")); }
+                }
+            }
+        }
+        return Result.Err(this.err(sp, "unreachable expression kind"));
+    }
+
+    fn peekField(this: &BodyCx, e: Id<Expr>, f: &FieldExpr): Result<Id<Ty>, TErr> {
+        match this.cx.ast.expr(f.base) {
+            Expr.Name(n) {
+                if !this.isDeclared(n.name) {
+                    match this.qualifiedConst(e) { Option.Some(v) { return Result.Ok(v.ty); } Option.None {} }
+                }
+            }
+            _ {}
+        }
+        let bt = this.peek(f.base)?;
+        while true {
+            match this.refInner(bt) { Option.Some(i) { bt = i; } Option.None { break; } }
+        }
+        let name = this.str(f.field.name);
+        match this.ty(bt) {
+            Ty.Struct(st) {
+                let path = this.fieldPath(st.decl, f.field.name);
+                if path.len == 0 { return Result.Err(this.noField(f.field.span, st.decl, f.field.name)); }
+                let t = bt;
+                for i in 0..path.len { t = fieldTyOf(this.cx.tables, t, path.items[i]); }
+                return Result.Ok(t);
+            }
+            Ty.Array(_) { if name == "len" { return Result.Ok(this.com().i64); } }
+            Ty.String { return this.peekSliceField(f.field, this.com().u8); }
+            Ty.Slice(s) { return this.peekSliceField(f.field, s.elem); }
+            _ {}
+        }
+        let t = Text.new(this.cx.arena);
+        t.add("no field `").add(name).add("`");
+        return Result.Err(this.err(f.field.span, t.str()));
+    }
+
+    fn peekSliceField(this: &BodyCx, field: Ident, elem: Id<Ty>): Result<Id<Ty>, TErr> {
+        let name = this.str(field.name);
+        // ponytail: Rust's `ptr` is `&u8` whatever the element (its `lookup_ty(&u8)`); kept.
+        if name == "ptr" { return Result.Ok(this.cx.tables.refTo(this.com().u8)); }
+        if name == "len" { return Result.Ok(this.com().i64); }
+        let t = Text.new(this.cx.arena);
+        t.add("no field `").add(name).add("`");
+        return Result.Err(this.err(field.span, t.str()));
+    }
+
+    fn peekCall(this: &BodyCx, sp: Span, func: Id<Expr>, args: &List<Id<Expr>>): Result<Id<Ty>, TErr> {
+        let c = this.com();
+        match this.cx.ast.expr(func) {
+            Expr.Name(n) {
+                let name = this.str(n.name);
+                if name == "vec4f" { return Result.Ok(c.vec4f); }
+                if name == "vec4i" { return Result.Ok(c.vec4i); }
+                if name.len > 0 && name[0] == '@' { return this.intrinPeek(sp, n, args); }
+                if args.len == 1 {
+                    match this.convTy(name) { Option.Some(t) { return Result.Ok(t); } Option.None {} }
+                }
+            }
+            _ {}
+        }
+        let f = this.peekCallee(func)?;
+        return Result.Ok(this.cx.tables.fnAt(f).ret);
+    }
+
+    /// Rust `peek_callee`.
+    fn peekCallee(this: &BodyCx, func: Id<Expr>): Result<Id<FnDecl>, TErr> {
+        match this.cx.ast.expr(func) {
+            Expr.Name(n) {
+                match this.lookupName(n.name) {
+                    Option.Some(r) {
+                        if r.kind == DeclKind.Fn {
+                            match this.cx.tables.fnAt(r.asFn()).gen { Option.Some(_) {} Option.None { return Result.Ok(r.asFn()); } }
+                        }
+                    }
+                    Option.None {}
+                }
+                let t = Text.new(this.cx.arena);
+                t.add("unknown function `").add(this.str(n.name)).add("`");
+                return Result.Err(this.err(n.span, t.str()));
+            }
+            Expr.Field(f) {
+                match this.cx.ast.expr(f.base) {
+                    Expr.Name(n) {
+                        match this.cx.tables.modAt(this.m).prefixes.get(n.name) {
+                            Option.Some(pm) {
+                                if this.cx.tables.modAt(pm).isLib {
+                                    match this.nsFn(pm, f.field.name) {
+                                        Option.Some(fid) { return Result.Ok(fid); }
+                                        Option.None {
+                                            let t = Text.new(this.cx.arena);
+                                            t.add("`").add(this.str(n.name)).add("` has no `").add(this.str(f.field.name)).add("`");
+                                            return Result.Err(this.err(f.field.span, t.str()));
+                                        }
+                                    }
+                                }
+                            }
+                            Option.None {}
+                        }
+                    }
+                    _ {}
+                }
+                let bt = this.peek(f.base)?;
+                while true {
+                    match this.refInner(bt) { Option.Some(i) { bt = i; } Option.None { break; } }
+                }
+                match this.structOf(bt) {
+                    Option.Some(s) { match this.findMethod(s, f.field.name) { Option.Some(m) { return Result.Ok(m); } Option.None {} } }
+                    Option.None {}
+                }
+                let t = Text.new(this.cx.arena);
+                t.add("no method `").add(this.str(f.field.name)).add("`");
+                return Result.Err(this.err(f.field.span, t.str()));
+            }
+            _ {}
+        }
+        return Result.Err(this.err(this.cx.ast.exprSpan(func), "cannot call this expression"));
+    }
+
+    fn peekBinary(this: &BodyCx, op: BinOp, lhs: Id<Expr>, rhs: Id<Expr>): Result<Id<Ty>, TErr> {
+        let c = this.com();
+        let lt = this.peek(lhs)?;
+        match op {
+            BinOp.And { return Result.Ok(c.bool); }
+            BinOp.Or { return Result.Ok(c.bool); }
+            BinOp.Eq { return Result.Ok(c.bool); }
+            BinOp.Ne { return Result.Ok(c.bool); }
+            BinOp.Lt { return Result.Ok(c.bool); }
+            BinOp.Le { return Result.Ok(c.bool); }
+            BinOp.Gt { return Result.Ok(c.bool); }
+            BinOp.Ge { return Result.Ok(c.bool); }
+            _ {}
+        }
+        match operatorName(op) {
+            Option.Some(name) {
+                let inner = lt;
+                while true {
+                    match this.refInner(inner) { Option.Some(i) { inner = i; } Option.None { break; } }
+                }
+                match this.structOf(inner) {
+                    Option.Some(s) { match this.findMethod(s, this.sym(name)) { Option.Some(f) { return Result.Ok(this.cx.tables.fnAt(f).ret); } Option.None {} } }
+                    Option.None {}
+                }
+            }
+            Option.None {}
+        }
+        if this.isVec(lt) { return Result.Ok(lt); }
+        if !this.bareNum(rhs) && (lt == c.f32 || lt == c.i32 || this.bareNum(lhs)) {
+            let rt = this.peek(rhs)?;
+            if this.isVec(rt) { return Result.Ok(rt); }
+        }
+        if this.bareNum(lhs) && !this.bareNum(rhs) {
+            let rt = this.peek(rhs)?;
+            if this.isNumeric(rt) { return Result.Ok(rt); }
+        }
+        if this.isFloat(lt) { return Result.Ok(lt); }
+        return Result.Ok(c.i64);
+    }
+}

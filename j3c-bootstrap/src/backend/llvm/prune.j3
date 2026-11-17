@@ -2,4 +2,137 @@
 //
 // Part of module j3c.backend.llvm.
 // Port of: j3c/src/emit/llvm/prune.rs
+// J3: Entry: `pruneUnused(text, out)` = Rust `prune_unused(text) -> String`; the kept lines append to
+// `out`. The name sets are `Set<string>` used for membership only; the output follows the line order
+// (rule 3). The type closure walks a worklist like Rust's (its order does not change the result).
 module j3c.backend.llvm;
+
+fn nameByte(c: u8): bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '$';
+}
+
+/// Length of the name at the start of `s`.
+fn nameLen(s: string): int {
+    let n = 0;
+    while n < s.len && nameByte(s[n]) { n += 1; }
+    return n;
+}
+
+/// `@name` / `%name` tokens of an LLVM text line (`%` also matches locals, which only adds misses).
+pub fn llNames(line: string, sigil: u8, out: &Set<string>) {
+    let i = 0;
+    while i < line.len {
+        if line[i] != sigil { i += 1; continue; }
+        let rest = line[i + 1..line.len];
+        let n = nameLen(rest);
+        if n > 0 { out.add(rest[0..n]); }
+        i += 1 + n;
+    }
+}
+
+/// The name a declaration line introduces: `declare ... @f(`, `@g = external ...`, `%T = type ...`;
+/// sigil 0 for none.
+struct Decl {
+    sigil: u8;
+    name: string;
+}
+
+fn declaredName(line: string): Decl {
+    let none = Decl { sigil: 0, name: "" };
+    if startsWith(line, "declare ") {
+        let at = 0;
+        while at < line.len && line[at] != '@' { at += 1; }
+        if at == line.len { return none; }
+        let rest = line[at + 1..line.len];
+        return Decl { sigil: '@', name: rest[0..nameLen(rest)] };
+    }
+    if line.len > 0 && (line[0] == '@' || line[0] == '%') {
+        let rest = line[1..line.len];
+        let n = nameLen(rest);
+        if line[0] == '@' && startsWith(rest[n..rest.len], " = external ") { return Decl { sigil: '@', name: rest[0..n] }; }
+        if line[0] == '%' && startsWith(rest[n..rest.len], " = type ") { return Decl { sigil: '%', name: rest[0..n] }; }
+    }
+    return none;
+}
+
+/// Drop the declarations and types a per-module text never uses. Every module declares the whole
+/// program (types, `use lib` bindings, foreign globals and functions), which clang would parse for
+/// every object. A `; use lib` comment goes with the declaration under it (Rust `prune_unused`).
+pub fn pruneUnused(text: string, out: &Text) {
+    let arena = out.arena;
+    let lines = List<string>.new(arena);
+    let s = 0;
+    for i in 0..text.len {
+        if text[i] == '\n' { lines.push(text[s..i]); s = i + 1; }
+    }
+    if s < text.len { lines.push(text[s..text.len]); }
+    let decl = List<Decl>.new(arena);
+    for i in 0..lines.len { decl.push(declaredName(lines.items[i])); }
+    let used = Set<string>.new(arena, 256);
+    let types = Set<string>.new(arena, 256);
+    for i in 0..lines.len {
+        let line = lines.items[i];
+        if decl.items[i].sigil == 0 && !isLibNote(line) {
+            llNames(line, '@', &used);
+            llNames(line, '%', &types);
+        }
+    }
+    // Kept `@` declarations name types too; then close over the type lines themselves.
+    for i in 0..lines.len {
+        let d = decl.items[i];
+        if d.sigil == '@' && used.has(d.name) { llNames(lines.items[i], '%', &types); }
+    }
+    let byType = Map<string, int>.new(arena, 64);
+    for i in 0..lines.len {
+        if decl.items[i].sigil == '%' { byType.put(decl.items[i].name, i); }
+    }
+    let stack = List<string>.new(arena);
+    for i in 0..lines.len {
+        // the seed set is every name seen so far; walking each type line once covers it
+        if decl.items[i].sigil == '%' && types.has(decl.items[i].name) { stack.push(decl.items[i].name); }
+    }
+    while stack.len > 0 {
+        let t = stack.pop();
+        match byType.get(t) {
+            Option.Some(li) {
+                let line = lines.items[li];
+                let k = 0;
+                while k + 8 <= line.len && line[k..k + 8] != " = type " { k += 1; }
+                if k + 8 <= line.len {
+                    let body = line[k + 8..line.len];
+                    let j = 0;
+                    while j < body.len {
+                        if body[j] != '%' { j += 1; continue; }
+                        let n = nameLen(body[j + 1..body.len]);
+                        let name = body[j + 1..j + 1 + n];
+                        if n > 0 && byType.has(name) && types.add(name) { stack.push(name); }
+                        j += 1 + n;
+                    }
+                }
+            }
+            Option.None {}
+        }
+    }
+    for i in 0..lines.len {
+        let line = lines.items[i];
+        if isLibNote(line) {
+            if i + 1 < lines.len && decl.items[i + 1].sigil != 0 && !keepDecl(decl.items[i + 1], &used, &types) { continue; }
+        } else if !keepDecl(decl.items[i], &used, &types) {
+            continue;
+        }
+        out.add(line).push('\n');
+    }
+}
+
+fn keepDecl(d: Decl, used: &Set<string>, types: &Set<string>): bool {
+    if d.sigil == 0 { return true; }
+    if d.sigil == '@' { return used.has(d.name); }
+    return types.has(d.name);
+}
+
+/// A `; use lib "NAME"` note line.
+// ponytail: spelled without the space before the quote: stage 0's link-lib scan (Rust `host::libs_from_c`)
+// is not anchored and would read a `"; use lib "` string constant in this binary's own .ll as a library.
+fn isLibNote(line: string): bool {
+    return startsWith(line, "; use lib") && line.len > 9 && line[9] == ' ';
+}

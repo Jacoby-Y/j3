@@ -6,4 +6,414 @@
 // Port of: j3c/src/check/global_init.rs, check/embed.rs
 // J3: Constant expressions themselves are `consteval`. Part of the signatures pass (plan 11 B5): a
 // global's type and init depend only on declarations.
+// J3: A `const` table or `@embed*` const is a readonly `GlobalDecl` bound in scope (a place, as in Rust),
+// plus a `ConstDecl` whose `table` names it (docs and the const list). A boxed-closure global's type is
+// `Ty.Closure { boxed }` (Rust made its `{ fn, env }` struct here).
 module j3c.sema;
+
+/// Rust `collect_globals` + `collect_embeds`: every module `let` (item order), then `const` tables, then
+/// `@embed*` consts of `m`.
+pub fn collectGlobals(cx: &SemaCx, m: Id<ModDecl>): bool {
+    let md = cx.tables.modAt(m);
+    for k in 0..md.items.len {
+        match md.items.items[k] {
+            Item.Let(l) { if !addGlobal(cx, m, &l, false, Option.None) { return false; } }
+            _ {}
+        }
+    }
+    for k in 0..md.items.len {
+        match md.items.items[k] {
+            Item.Const(c) {
+                match cx.ast.expr(c.value) {
+                    Expr.ArrayLit(_) {
+                        match c.ty {
+                            Option.Some(ty) {
+                                let l = ModLetItem { span: c.span, doc: c.doc, name: c.name, ty: ty, value: Option.Some(c.value), thread: false, uniform: false };
+                                if !addGlobal(cx, m, &l, true, Option.Some(c)) { return false; }
+                            }
+                            Option.None { return fail(cx, c.name.span, "array const needs a type: `const NAME: [N]T = [..];`"); }
+                        }
+                    }
+                    _ {}
+                }
+            }
+            _ {}
+        }
+    }
+    for k in 0..md.items.len {
+        match md.items.items[k] {
+            Item.Const(c) {
+                match cx.ast.expr(c.value) {
+                    Expr.Embed(e) { if !addEmbed(cx, m, &c, e.kind) { return false; } }
+                    _ {}
+                }
+            }
+            _ {}
+        }
+    }
+    return true;
+}
+
+/// A global, fn or const already named `name` in `m` (Rust's `already in scope` test).
+fn valueTaken(cx: &SemaCx, m: Id<ModDecl>, name: Sym): bool {
+    match cx.tables.modAt(m).scope.get(name) {
+        Option.Some(d) {
+            if d.kind == DeclKind.Global || d.kind == DeclKind.Const { return true; }
+            if d.kind == DeclKind.Fn { return cx.tables.fnAt(d.asFn()).owner == m && isPlainFn(cx, d.asFn()); }
+        }
+        Option.None {}
+    }
+    return false;
+}
+
+fn isPlainFn(cx: &SemaCx, f: Id<FnDecl>): bool {
+    match cx.tables.fnAt(f).gen { Option.Some(_) { return false; } Option.None {} }
+    return true;
+}
+
+fn addGlobal(cx: &SemaCx, m: Id<ModDecl>, l: &ModLetItem, readonly: bool, table: Option<ConstItem>): bool {
+    let t = cx.tables;
+    if valueTaken(cx, m, l.name.name) { return fail(cx, l.name.span, quoted(cx, "", l.name.name, " already in scope")); }
+    let ty = t.common.error;
+    let boxed = false;
+    match cx.ast.ty(l.ty) { Type.Closure(c) { boxed = c.boxed && !readonly; } _ {} }
+    if boxed {
+        // A global may hold a `boxed closure(..)` (its captures are in an arena), set at run time.
+        match l.value {
+            Option.Some(v) {
+                return failWith(cx, cx.ast.exprSpan(v), "a `boxed closure(..)` global starts empty and takes no initializer",
+                    "its captures are copied into an arena made at run time",
+                    "assign it at startup: `NAME = fn[mem](..) { .. };`; calling it before that crashes");
+            }
+            Option.None {}
+        }
+        match tyOf(cx, genEnv(m, Option.None), l.ty) { Option.Some(x) { ty = x; } Option.None { return false; } }
+    } else {
+        match tyOf(cx, plainEnv(m), l.ty) { Option.Some(x) { ty = x; } Option.None { return false; } }
+    }
+    let isArray = false;
+    let isVec = false;
+    match t.ty(ty) { Ty.Array(_) { isArray = true; } Ty.Vec(_) { isVec = true; } _ {} }
+    if readonly && !isArray { return fail(cx, cx.ast.typeSpan(l.ty), "array const needs an array type `[N]T`"); }
+    let init: Option<ConstInit> = Option.None;
+    match l.value {
+        Option.Some(v) {
+            if isVec {
+                return failHelp(cx, l.name.span, "a vec4f/vec4i global cannot have an initializer yet",
+                    "declare it without a value (it starts as zeros) and assign it at startup");
+            }
+            match foldInit(cx, m, v, ty) {
+                // A read-only table stays real data even when all zero.
+                Option.Some(folded) { if readonly || !initIsZero(folded) { init = Option.Some(folded); } }
+                Option.None { return false; }
+            }
+        }
+        Option.None {}
+    }
+    let id = t.addGlobal(GlobalDecl { owner: m, name: l.name.name, doc: l.doc, span: l.span, visPub: false, ty: ty, init: init, thread: l.thread,
+        readonly: readonly, singleton: !readonly, item: Option.Some(*l) });
+    t.modAt(m).globals.push(id);
+    match table {
+        Option.Some(c) { addTableConst(cx, m, &c, ty, id); }
+        Option.None {}
+    }
+    bind(cx, m, l.name.name, refGlobal(id));
+    return true;
+}
+
+/// The `ConstDecl` of a `const` table or `@embed*` const (its value is the global `g`).
+fn addTableConst(cx: &SemaCx, m: Id<ModDecl>, c: &ConstItem, ty: Id<Ty>, g: Id<GlobalDecl>) {
+    let id = cx.tables.addConst(ConstDecl { owner: m, name: c.name.name, doc: c.doc, span: c.span, visPub: c.visPub, ty: ty, value: Option.None,
+        table: Option.Some(g), item: Option.Some(*c) });
+    cx.tables.modAt(m).consts.push(id);
+}
+
+/// Rust `fold_global_init`: an initializer expression of `m` as constant data of type `ty`. None after
+/// the error Diag.
+pub fn foldInit(cx: &SemaCx, m: Id<ModDecl>, e: Id<Expr>, ty: Id<Ty>): Option<ConstInit> {
+    let t = cx.tables;
+    let c = t.common;
+    let sp = cx.ast.exprSpan(e);
+    match cx.ast.expr(e) {
+        Expr.Char(v) { if isIntTy(cx, ty) { return Option.Some(scalar(ty, ConstPayload.Int(i64(v)))); } }
+        Expr.BigInt(v) {
+            if ty == c.u64 { return Option.Some(scalar(ty, ConstPayload.Int(i64(v)))); }
+            bigIntErr(cx, sp, v);
+            return Option.None;
+        }
+        Expr.Int(v) { return intInit(cx, ty, v, sp); }
+        Expr.Float(v) {
+            if ty == c.f32 { return Option.Some(scalar(ty, ConstPayload.Float(f64(f32(v))))); }
+            if ty == c.f64 { return Option.Some(scalar(ty, ConstPayload.Float(v))); }
+            fail(cx, sp, "singleton init type mismatch");
+            return Option.None;
+        }
+        Expr.Bool(v) {
+            if ty != c.bool { fail(cx, sp, "singleton init type mismatch"); return Option.None; }
+            return Option.Some(scalar(ty, ConstPayload.Bool(v)));
+        }
+        Expr.String(b) { if ty == c.string { return Option.Some(scalar(ty, ConstPayload.String(b))); } }
+        Expr.Interpolate(ip) {
+            if ty == c.string {
+                let s = Text.new(cx.arena);
+                for i in 0..ip.parts.len {
+                    match ip.parts.items[i] {
+                        InterpPart.Lit(b) { s.add(b); }
+                        InterpPart.Expr(_) { fail(cx, sp, "singleton init must be a constant"); return Option.None; }
+                    }
+                }
+                return Option.Some(scalar(ty, ConstPayload.String(s.str())));
+            }
+        }
+        Expr.Name(n) {
+            match constNamed(cx, m, n.name) {
+                Option.Some(v) { match v.kind { ConstPayload.Int(x) { return intInit(cx, ty, x, n.span); } _ {} } }
+                Option.None {}
+            }
+            fail(cx, n.span, "singleton init must be a constant");
+            return Option.None;
+        }
+        Expr.Unary(u) {
+            if u.op == UnaryOp.Neg {
+                let inner = foldInit(cx, m, u.expr, ty)?;
+                match inner {
+                    ConstInit.Scalar(v) {
+                        match v.kind {
+                            ConstPayload.Int(x) { return Option.Some(scalar(ty, ConstPayload.Int(i64(0) - x))); }
+                            ConstPayload.Float(x) { return Option.Some(scalar(ty, ConstPayload.Float(-x))); }
+                            _ {}
+                        }
+                    }
+                    _ {}
+                }
+                fail(cx, sp, "singleton init must be a constant");
+                return Option.None;
+            }
+        }
+        Expr.StructLit(sl) { return structInit(cx, m, &sl, ty, sp); }
+        Expr.ArrayLit(al) {
+            match t.ty(ty) {
+                Ty.Array(a) {
+                    if u64(al.elems.len) != a.len {
+                        let msg = Text.new(cx.arena).add("array length mismatch: the type has ");
+                        msg.pushInt(i64(a.len));
+                        msg.add(" elements, the literal has ");
+                        msg.pushInt(al.elems.len);
+                        fail(cx, sp, msg.str());
+                        return Option.None;
+                    }
+                    let out = List<ConstInit>.new(cx.arena);
+                    for i in 0..al.elems.len { out.push(foldInit(cx, m, al.elems.items[i], a.elem)?); }
+                    return Option.Some(ConstInit.Elems(ConstElems { items: out }));
+                }
+                _ {}
+            }
+            fail(cx, sp, "singleton init type mismatch");
+            return Option.None;
+        }
+        Expr.Field(fe) {
+            // `Tok.Let` in a table of a C-like enum: the variant's tag.
+            match t.ty(ty) {
+                Ty.Enum(en) {
+                    let d = t.enumAt(en.decl);
+                    let named = false;
+                    match cx.ast.expr(fe.base) { Expr.Name(n) { named = n.name == d.name; } _ {} }
+                    let idx = variantIndex(&d.variants, fe.field.name);
+                    if named && idx >= 0 && cLike(d) { return Option.Some(scalar(ty, ConstPayload.Int(i64(idx)))); }
+                    fail(cx, sp, "singleton init must be a constant");
+                    return Option.None;
+                }
+                _ {}
+            }
+        }
+        Expr.Call(_) { fail(cx, sp, "singleton init cannot call"); return Option.None; }
+        Expr.Syscall(_) { fail(cx, sp, "singleton init cannot call"); return Option.None; }
+        Expr.Atomic(_) { fail(cx, sp, "singleton init cannot call"); return Option.None; }
+        _ {}
+    }
+    fail(cx, sp, "singleton init must be a constant");
+    return Option.None;
+}
+
+fn scalar(ty: Id<Ty>, k: ConstPayload): ConstInit { return ConstInit.Scalar(ConstVal { pad: 0, ty: ty, kind: k }); }
+
+/// An int literal (or int const) as a `ty` global: null for `ptr`/`cstr` 0, an int, or a float.
+fn intInit(cx: &SemaCx, ty: Id<Ty>, v: i64, sp: Span): Option<ConstInit> {
+    let c = cx.tables.common;
+    if v == 0 && isPointerish(cx, ty, false) { return Option.Some(scalar(ty, ConstPayload.Null)); }
+    if isIntTy(cx, ty) { return Option.Some(scalar(ty, ConstPayload.Int(v))); }
+    if ty == c.f32 { return Option.Some(scalar(ty, ConstPayload.Float(f64(f32(v))))); }
+    if ty == c.f64 { return Option.Some(scalar(ty, ConstPayload.Float(f64(v)))); }
+    fail(cx, sp, "singleton init type mismatch");
+    return Option.None;
+}
+
+/// A struct literal: every field in declaration order, missing ones zero.
+fn structInit(cx: &SemaCx, m: Id<ModDecl>, sl: &StructLitExpr, ty: Id<Ty>, sp: Span): Option<ConstInit> {
+    let t = cx.tables;
+    match t.ty(ty) {
+        Ty.Struct(s) {
+            let d = *t.structAt(s.decl);
+            let names = List<Sym>.new(cx.arena);
+            let vals = List<ConstInit>.new(cx.arena);
+            for f in 0..d.fields.len {
+                let fd = d.fields.items[f];
+                let fty = fd.ty;
+                match d.gen { Option.Some(g) { fty = subst(t, g, fty, s.args); } Option.None {} }
+                let v = zeroInit(cx, fty);
+                for i in 0..sl.fields.len {
+                    if sl.fields.items[i].name.name == fd.name { v = foldInit(cx, m, sl.fields.items[i].value, fty)?; break; }
+                }
+                names.push(fd.name);
+                vals.push(v);
+            }
+            return Option.Some(ConstInit.Fields(ConstFields { names: names, vals: vals }));
+        }
+        _ {}
+    }
+    fail(cx, sl.name.span, "singleton init type mismatch");
+    return Option.None;
+}
+
+/// Rust `zero_init_for`: the all-zero value of `ty`.
+fn zeroInit(cx: &SemaCx, ty: Id<Ty>): ConstInit {
+    let t = cx.tables;
+    if isPointerish(cx, ty, true) { return scalar(ty, ConstPayload.Null); }
+    if ty == t.common.bool { return scalar(ty, ConstPayload.Bool(false)); }
+    if isIntTy(cx, ty) { return scalar(ty, ConstPayload.Int(0)); }
+    if isFloatTy(cx, ty) { return scalar(ty, ConstPayload.Float(0.0)); }
+    match t.ty(ty) {
+        Ty.Struct(s) {
+            let d = *t.structAt(s.decl);
+            let names = List<Sym>.new(cx.arena);
+            let vals = List<ConstInit>.new(cx.arena);
+            for f in 0..d.fields.len {
+                let fty = d.fields.items[f].ty;
+                match d.gen { Option.Some(g) { fty = subst(t, g, fty, s.args); } Option.None {} }
+                names.push(d.fields.items[f].name);
+                vals.push(zeroInit(cx, fty));
+            }
+            return ConstInit.Fields(ConstFields { names: names, vals: vals });
+        }
+        Ty.Array(a) {
+            let out = List<ConstInit>.new(cx.arena);
+            let z = zeroInit(cx, a.elem);
+            for i in 0..i64(a.len) { out.push(z); }
+            return ConstInit.Elems(ConstElems { items: out });
+        }
+        _ {}
+    }
+    return scalar(ty, ConstPayload.Int(0));
+}
+
+/// Rust `const_init_is_zero`.
+fn initIsZero(init: ConstInit): bool {
+    match init {
+        ConstInit.Scalar(v) {
+            match v.kind {
+                ConstPayload.Int(x) { return x == 0; }
+                ConstPayload.Bool(b) { return !b; }
+                ConstPayload.Null { return true; }
+                // Rust tests the bits: +0.0 only (`1.0 / -0.0` is -inf).
+                ConstPayload.Float(x) { return x == 0.0 && 1.0 / x > 0.0; }
+                _ {}
+            }
+            return false;
+        }
+        ConstInit.Fields(fs) {
+            for i in 0..fs.vals.len { if !initIsZero(fs.vals.items[i]) { return false; } }
+            return true;
+        }
+        ConstInit.Elems(es) {
+            for i in 0..es.items.len { if !initIsZero(es.items.items[i]) { return false; } }
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Rust `EnumDef::is_c_like`: no variant has a payload.
+fn cLike(d: &EnumDecl): bool {
+    for i in 0..d.variants.len { match d.variants.items[i].payload { Option.Some(_) { return false; } Option.None {} } }
+    return true;
+}
+
+/// Rust `collect_embeds` for one `const X = @embed..(..)`: a readonly global with the bytes the loader
+/// read (`@embedDir`: an array of `EmbedFile.X { path, data }` rows).
+fn addEmbed(cx: &SemaCx, m: Id<ModDecl>, c: &ConstItem, kind: EmbedKind): bool {
+    let t = cx.tables;
+    if valueTaken(cx, m, c.name.name) { return fail(cx, c.name.span, quoted(cx, "", c.name.name, " already in scope")); }
+    let sp = cx.ast.exprSpan(c.value);
+    let files = List<EmbedFile>.new(cx.arena);
+    let found = false;
+    for i in 0..cx.parsed.files.len {
+        let er = cx.parsed.files.items[i].ast.embeds;
+        for j in 0..er.len { if !found && er.items[j].at == sp { files = er.items[j].files; found = true; } }
+    }
+    if !found { return fail(cx, sp, "`@embed` files are read by the project loader; this file was not loaded by it"); }
+    let ty = t.common.string;
+    let init = scalar(ty, ConstPayload.Null);
+    let call = "@embed";
+    let tyText = "string";
+    match kind {
+        EmbedKind.Text { init = scalar(ty, ConstPayload.String(files.items[0].data as string)); }
+        EmbedKind.Bytes {
+            ty = t.sliceOf(t.common.u8);
+            init = scalar(ty, ConstPayload.String(files.items[0].data as string));
+            call = "@embedBytes";
+            tyText = "[]u8";
+        }
+        EmbedKind.Dir {
+            let sid = fileStruct(cx, m, c.name.name, sp);
+            let row = t.structTy(sid, t.items(t.common.none));
+            let rows = List<ConstInit>.new(cx.arena);
+            let pathSym = t.sym("path");
+            let dataSym = t.sym("data");
+            for i in 0..files.len {
+                let names = List<Sym>.new(cx.arena);
+                names.push(pathSym);
+                names.push(dataSym);
+                let vals = List<ConstInit>.new(cx.arena);
+                vals.push(scalar(t.common.string, ConstPayload.String(files.items[i].name)));
+                vals.push(scalar(t.common.string, ConstPayload.String(files.items[i].data as string)));
+                rows.push(ConstInit.Fields(ConstFields { names: names, vals: vals }));
+            }
+            ty = t.arrayOf(row, u64(rows.len));
+            init = ConstInit.Elems(ConstElems { items: rows });
+            call = "@embedDir";
+            tyText = "[N]{ path: string, data: string }";
+        }
+    }
+    match c.ty {
+        Option.Some(wt) {
+            match tyOf(cx, plainEnv(m), wt) {
+                Option.Some(w) {
+                    if w != ty {
+                        return failHelp(cx, cx.ast.typeSpan(wt), cat5(cx, "`", call, "` gives a `", tyText, "`"), "leave the type off: `const NAME = @embed..(..);`");
+                    }
+                }
+                Option.None { return false; }
+            }
+        }
+        Option.None {}
+    }
+    let id = t.addGlobal(GlobalDecl { owner: m, name: c.name.name, doc: c.doc, span: c.span, visPub: false, ty: ty, init: Option.Some(init),
+        thread: false, readonly: true, singleton: false, item: Option.None });
+    t.modAt(m).globals.push(id);
+    addTableConst(cx, m, c, ty, id);
+    bind(cx, m, c.name.name, refGlobal(id));
+    return true;
+}
+
+/// Rust `file_struct`: `{ path: string, data: string }`, one per `@embedDir` const (`EmbedFile.NAME`).
+fn fileStruct(cx: &SemaCx, m: Id<ModDecl>, cname: Sym, sp: Span): Id<StructDecl> {
+    let t = cx.tables;
+    let fields = List<FieldDecl>.new(cx.arena);
+    fields.push(FieldDecl { name: t.sym("path"), doc: "", span: sp, ty: t.common.string, embedded: false, default: Option.None });
+    fields.push(FieldDecl { name: t.sym("data"), doc: "", span: sp, ty: t.common.string, embedded: false, default: Option.None });
+    let id = t.addStruct(StructDecl { owner: m, name: t.sym(cat3(cx, "EmbedFile.", t.str(cname), "")), doc: "One file of an `@embedDir` table.",
+        span: sp, visPub: false, gen: Option.None, fields: fields, methods: List<Id<FnDecl>>.new(cx.arena), packed: false, debug: false,
+        scriptPath: Option.None, propSpans: List<Span>.new(cx.arena), item: Option.None });
+    t.modAt(m).structs.push(id);
+    return id;
+}

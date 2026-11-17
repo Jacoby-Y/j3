@@ -1,0 +1,156 @@
+// `dyn` typing (`sema/dyn_expr.j3`): a small program through the driver to `Stage.Sema`, then its tables
+// and typed tree read back: the table layout (own methods, then supertraits', each name once; `ups`), the
+// `Vtable` instances with one resolved target per slot (own method, default-body instance), `ToDyn`,
+// `Convert(DynUpcast)` and `Callee.Dyn` nodes; and the text of the `==` and by-value errors.
+module sema_dyn_test;
+
+use j3.data.pool.Id;
+use j3.io;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+use j3c.driver;
+use j3c.driver.{ Session, Stage };
+use j3c.sema.{ Callee, Checked, ConvKind, InstKind, TBody, TExpr, TStmt };
+
+const SRC: [16]string = [
+    "module dyns;",
+    "pub trait Named { fn name(this: &Self): string; }",
+    "pub trait Backend: Named {",
+    "    fn emit(this: &Self, n: int): int;",
+    "    fn lines(this: &Self): int { return this.emit(1) + 100; }",
+    "}",
+    "struct Llvm {",
+    "    calls: int;",
+    "    fn name(this: &Llvm): string { return \"llvm\"; }",
+    "    fn emit(this: &Llvm, n: int): int { return n * 2; }",
+    "}",
+    "fn main() {",
+    "    let l = Llvm { calls: 0 };",
+    "    let b: dyn Backend = &l;",
+    "    let up: dyn Named = b;",
+    "    let n = b.lines(); }",
+];
+
+const CMP: [5]string = [
+    "module bad;",
+    "pub trait Named { fn name(this: &Self): string; }",
+    "struct A { n: int; fn name(this: &A): string { return \"a\"; } }",
+    "fn main() { let a = A { n: 1 }; let x: dyn Named = &a; let y: dyn Named = &a;",
+    "    let same = x == y; }",
+];
+
+const BYVAL: [4]string = [
+    "module bad2;",
+    "pub trait Get { fn get(this: Self): int; }",
+    "struct A { n: int; fn get(this: A): int { return 1; } }",
+    "fn main() { let a = A { n: 1 }; let x: dyn Get = &a; }",
+];
+
+/// Write `text` as `NAME.j3` in a temp dir (outside this package, whose project would otherwise load).
+fn put(name: string, lines: []string, mem: &Arena): string {
+    let text = Text.new(mem);
+    for i in 0..lines.len { text.add(lines[i]).add("\n"); }
+    let d = Text.new(mem).add(io.tempRoot()).add("/j3c-boot-sema-dyn").str();
+    match io.makeDirs(d) { Result.Ok(_) {} Result.Err(_) { panic("cannot make the case dir"); } }
+    let p = Text.new(mem).add(d).add("/").add(name).add(".j3").str();
+    match io.writeFile(p, text.str() as []u8) { Result.Ok(_) {} Result.Err(_) { panic("cannot write a case"); } }
+    return p;
+}
+
+fn body(c: &Checked, name: string): TBody {
+    let fns = &c.tables.fns;
+    for i in 0..fns.len() {
+        let d = fns.get(fns.idAt(i));
+        if c.tables.str(d.name) != name { continue; }
+        match d.body {
+            Option.Some(b) { return c.typed.body(b); }
+            Option.None {}
+        }
+    }
+    panic(`no typed body for {name}`);
+    return c.typed.body(Id<TBody> { i: 0 });
+}
+
+/// The init of `let` statement `k` of `b`.
+fn initOf(c: &Checked, b: &TBody, k: int): TExpr {
+    match c.typed.stmt(b.body.stmts.items[k]) {
+        TStmt.Let(l) { match l.init { Option.Some(e) { return c.typed.expr(e); } Option.None {} } }
+        _ {}
+    }
+    panic("not a let with a value");
+    return initOf(c, b, k);
+}
+
+/// Does program `lines` fail in sema with an error `msg`?
+fn failsWith(name: string, lines: []string, msg: string, mem: &Arena): bool {
+    let o = driver.defaults();
+    o.entry = put(name, lines, mem);
+    let s = Session.new(o);
+    if driver.run(s, Stage.Sema) { panic(`{name}: sema should fail`); }
+    for i in 0..s.diags.count() { if s.diags.at(i).msg == msg { return true; } }
+    return false;
+}
+
+fn main() {
+    let mem = Arena.create(1 << 12);
+    let o = driver.defaults();
+    o.entry = put("dyns", SRC, &mem);
+    let s = Session.new(o);
+    if !driver.run(s, Stage.Sema) { panic("sema fails on the dyn program"); }
+    let c = match s.checked { Option.Some(x) { x } Option.None { panic("no checked program"); return; } };
+    let t = c.tables;
+
+    // layout of Backend: its methods, then Named's; one supertrait
+    let found = false;
+    for i in 0..t.dynLayouts.len {
+        let lay = t.dynLayouts.items[i];
+        if t.str(t.traitAt(lay.decl).name) != "Backend" { continue; }
+        found = true;
+        if lay.slots.len != 3 { panic("Backend: 3 slots"); }
+        if t.str(lay.slots.items[0].name) != "emit" || t.str(lay.slots.items[1].name) != "lines" || t.str(lay.slots.items[2].name) != "name" {
+            panic("Backend: slots emit, lines, name");
+        }
+        if t.str(t.traitAt(lay.slots.items[2].from).name) != "Named" { panic("Backend: name comes from Named"); }
+        if lay.ups.len != 1 || t.str(t.traitAt(lay.ups.items[0]).name) != "Named" { panic("Backend: ups = [Named]"); }
+    }
+    if !found { panic("no layout for Backend"); }
+
+    // vtables: (Llvm, Backend) and its supertrait's (Llvm, Named), born done, a target per slot
+    let tables = 0;
+    for i in 0..t.instances.len() {
+        let inst = t.instances.get(t.instances.idAt(i));
+        if inst.key.kind != InstKind.Vtable { continue; }
+        tables += 1;
+        if !inst.done { panic("a vtable instance is done when requested"); }
+        if t.str(t.traitAt(inst.key.item.asTrait()).name) == "Backend" {
+            if inst.resolved.len != 3 { panic("Backend table: 3 targets"); }
+            match inst.resolved.items[0] { Callee.Fn(_) {} _ { panic("emit: the type's own method"); } }
+            match inst.resolved.items[1] { Callee.Inst(_) {} _ { panic("lines: the default body's instance"); } }
+        } else if inst.resolved.len != 1 { panic("Named table: 1 target"); }
+    }
+    if tables != 2 { panic("two vtable instances"); }
+
+    // nodes
+    let mb = body(c, "main");
+    match initOf(c, &mb, 1) { TExpr.ToDyn(_) {} _ { panic("`&l` to dyn Backend is a ToDyn"); } }
+    match initOf(c, &mb, 2) {
+        TExpr.Convert(cv) { if cv.kind != ConvKind.DynUpcast { panic("upcast kind"); } }
+        _ { panic("dyn Backend to dyn Named is a Convert"); }
+    }
+    match initOf(c, &mb, 3) {
+        TExpr.Call(call) {
+            match call.callee {
+                Callee.Dyn(d) { if d.index != 1 || call.args.len != 1 { panic("b.lines() is slot 1 with the receiver"); } }
+                _ { panic("b.lines() goes through the table"); }
+            }
+        }
+        _ { panic("b.lines() is a call"); }
+    }
+
+    // errors
+    if !failsWith("cmp", CMP, "`==` does not compare `dyn Named` values", &mem) { panic("dyn compare error text"); }
+    if !failsWith("byval", BYVAL, "`dyn Get` cannot call `get`: it takes `this: Self` by value", &mem) { panic("by-value error text"); }
+}

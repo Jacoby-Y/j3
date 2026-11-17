@@ -1,0 +1,355 @@
+// Places: names, fields (with `use` embedding and auto-deref), indexing, `*p`, `.ptr`/`.len`, and the
+// temporaries that give a value an address; who may store into or borrow one; `use x;` aliases.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/place.rs (try_place, base_place, writes_temporary, readonly_global, global_access;
+// the bounds-check IR is `lower`'s: `IndexPlace.checked`), check/error.rs `no_field`, check/mod.rs
+// `field_path` / `embed_alias_names`, check/lower/stmt.rs `use_local`
+// J3: Rust's `Place.access` is not stored: `canAssign` / `canRef` read it off the place's shape (a local or
+// temp is a `let`, `*p` goes through a reference, a readonly global or anything inside a `string` is a
+// read-only view). Rust's `store_indirect` flag is the same walk (an index through a slice).
+module j3c.sema;
+
+extend BodyCx {
+    /// Rust `try_place`: `e` as something with an address, or why it is not one.
+    fn tryPlace(this: &BodyCx, e: Id<Expr>): Result<Id<TPlace>, TErr> {
+        let sp = this.cx.ast.exprSpan(e);
+        match this.cx.ast.expr(e) {
+            Expr.Name(n) { return this.namePlace(n); }
+            Expr.String(bytes) {
+                let s = this.expr(TExpr.Str(bytes), this.com().string, sp);
+                return Result.Ok(this.place(TPlace.Temp(TempPlace { value: s }), this.com().string, sp));
+            }
+            Expr.Index(ix) {
+                let base = this.basePlace(ix.base)?;
+                base = this.derefAll(base, sp);
+                let bt = this.placeTy(base);
+                if this.isVec(bt) { return this.simdIndexPlace(sp, base, ix.index); }
+                let elem = match this.elemTy(bt) {
+                    Option.Some(t) { t }
+                    Option.None { return Result.Err(this.err(sp, "index of non-array/slice")); }
+                };
+                let idx = this.operand(ix.index, Option.Some(this.com().i64))?;
+                return Result.Ok(this.place(TPlace.Index(IndexPlace { base: base, index: idx, checked: true }), elem, sp));
+            }
+            Expr.Field(fe) {
+                let base = this.basePlace(fe.base)?;
+                base = this.derefAll(base, fe.field.span);
+                let bt = this.placeTy(base);
+                match this.ty(bt) {
+                    Ty.Struct(st) {
+                        // Rust place.rs:139: a script's fields are private to its own methods.
+                        match this.cx.tables.structAt(st.decl).scriptPath {
+                            Option.Some(_) { match this.scriptFieldCheck(fe.field.span, st.decl) { Option.Some(err) { return Result.Err(err); } Option.None {} } }
+                            Option.None {}
+                        }
+                        let path = this.fieldPath(st.decl, fe.field.name);
+                        if path.len == 0 { return Result.Err(this.noField(fe.field.span, st.decl, fe.field.name)); }
+                        return Result.Ok(this.fieldWalk(base, &path, fe.field.span));
+                    }
+                    Ty.String { return this.sliceField(base, fe.field); }
+                    Ty.Slice(_) { return this.sliceField(base, fe.field); }
+                    Ty.Vec(_) { return this.simdFieldPlace(base, fe.field); }
+                    Ty.Tuple(_) { return this.tupleField(base, fe.field); }
+                    Ty.Param(p) { return Result.Err(this.boundMiss(fe.field.span, p, cat3(this.cx, "field `", this.str(fe.field.name), "`"), Option.None)); }
+                    _ {}
+                }
+                let t = Text.new(this.cx.arena);
+                t.add("no field `").add(this.str(fe.field.name)).add("`");
+                return Result.Err(this.err(fe.field.span, t.str()));
+            }
+            Expr.Unary(u) {
+                match u.op {
+                    UnaryOp.Deref {
+                        let inner = this.basePlace(u.expr)?;
+                        match this.refInner(this.placeTy(inner)) {
+                            Option.Some(t) { return Result.Ok(this.place(TPlace.Deref(DerefPlace { ptr: this.load(inner) }), t, sp)); }
+                            Option.None { return Result.Err(this.err(sp, "deref of non-ref")); }
+                        }
+                    }
+                    _ {}
+                }
+            }
+            _ {}
+        }
+        return Result.Err(this.err(sp, "expression is not a place"));
+    }
+
+    /// `.ptr` / `.len` of a slice or string.
+    fn sliceField(this: &BodyCx, base: Id<TPlace>, field: Ident): Result<Id<TPlace>, TErr> {
+        let name = this.str(field.name);
+        if name == "ptr" {
+            let elem = this.com().u8;
+            match this.elemTy(this.placeTy(base)) { Option.Some(e) { elem = e; } Option.None {} }
+            return Result.Ok(this.place(TPlace.Ptr(SubPlace { base: base }), this.cx.tables.refTo(elem), field.span));
+        }
+        if name == "len" { return Result.Ok(this.place(TPlace.Len(SubPlace { base: base }), this.com().i64, field.span)); }
+        let t = Text.new(this.cx.arena);
+        t.add("no field `.").add(name).add("`");
+        return Result.Err(this.err(field.span, t.str()));
+    }
+
+    /// Rust `base_place`: a place, or any other expression held in a temporary (`f().x`, `(a + b).x`).
+    fn basePlace(this: &BodyCx, e: Id<Expr>): Result<Id<TPlace>, TErr> {
+        let direct = false;
+        match this.cx.ast.expr(e) {
+            Expr.Name(_) { direct = true; }
+            Expr.String(_) { direct = true; }
+            Expr.Index(_) { direct = true; }
+            Expr.Field(_) { direct = true; }
+            Expr.Unary(u) { direct = u.op == UnaryOp.Deref; }
+            _ {}
+        }
+        if direct { return this.tryPlace(e); }
+        let v = this.rvalue(e, Option.None)?;
+        return Result.Ok(this.temp(v));
+    }
+
+    /// The value `v` in a fresh temporary.
+    fn temp(this: &BodyCx, v: Id<TExpr>): Id<TPlace> {
+        return this.place(TPlace.Temp(TempPlace { value: v }), this.exprTy(v), this.cx.typed.exprSpan(v));
+    }
+
+    /// Follow `&T` to `T` (auto-deref of `p.x`, `p[i]`, `for x in p`).
+    fn derefAll(this: &BodyCx, p: Id<TPlace>, sp: Span): Id<TPlace> {
+        let out = p;
+        while true {
+            match this.refInner(this.placeTy(out)) {
+                Option.Some(t) { out = this.place(TPlace.Deref(DerefPlace { ptr: this.load(out) }), t, sp); }
+                Option.None { return out; }
+            }
+        }
+        return out;
+    }
+
+    /// The global a bare name means: a module `let`, or a `const` array's table.
+    fn globalNamed(this: &BodyCx, name: Sym): Option<Id<GlobalDecl>> {
+        match this.lookupName(name) {
+            Option.Some(r) {
+                match r.kind {
+                    DeclKind.Global { return Option.Some(r.asGlobal()); }
+                    DeclKind.Const { return this.cx.tables.constAt(r.asConst()).table; }
+                    _ {}
+                }
+            }
+            Option.None {}
+        }
+        return Option.None;
+    }
+
+    /// Rust `Access.assign` of `p`.
+    fn canAssign(this: &BodyCx, p: Id<TPlace>): bool {
+        match this.cx.typed.place(p) {
+            TPlace.Error { return true; }
+            TPlace.Local(_) { return true; }
+            TPlace.Temp(_) { return true; }
+            TPlace.Deref(_) { return true; }
+            TPlace.Global(g) { return !this.cx.tables.globalAt(g.global).readonly; }
+            TPlace.Field(f) { return !this.scriptReadOnly(p) && this.canAssign(f.base); }
+            TPlace.Payload(f) { return this.canAssign(f.base); }
+            TPlace.Lane(f) { return this.canAssign(f.base); }
+            TPlace.Capture(c) { return this.canAssign(c.outer); }
+            TPlace.Tag(f) { return this.canAssign(f.base); }
+            TPlace.Index(f) { return this.placeTy(f.base) != this.com().string && this.canAssign(f.base); }
+            TPlace.Ptr(f) { return this.placeTy(f.base) != this.com().string && this.canAssign(f.base); }
+            TPlace.Len(f) { return this.placeTy(f.base) != this.com().string && this.canAssign(f.base); }
+        }
+        return true;
+    }
+
+    /// Rust `Access.take_ref` of `p` (false only for `const` bindings, which are never places here).
+    fn canRef(this: &BodyCx, p: Id<TPlace>): bool { return true; }
+
+    /// Rust `writes_temporary`: a store into `p` (typed from `e`) would only hit a spilled temporary
+    /// (`f().x = 1`); through a reference (`f().x` with `f(): &P`) or a slice it is real storage.
+    fn writesTemporary(this: &BodyCx, e: Id<Expr>, p: Id<TPlace>): bool {
+        if !this.rootedInTemp(e) { return false; }
+        let cur = p;
+        while true {
+            match this.cx.typed.place(cur) {
+                TPlace.Deref(_) { return false; }
+                TPlace.Field(f) { cur = f.base; }
+                TPlace.Payload(f) { cur = f.base; }
+                TPlace.Lane(f) { cur = f.base; }
+                TPlace.Tag(f) { cur = f.base; }
+                TPlace.Ptr(f) { cur = f.base; }
+                TPlace.Len(f) { cur = f.base; }
+                TPlace.Index(f) {
+                    match this.ty(this.placeTy(f.base)) { Ty.Slice(_) { return false; } _ {} }
+                    cur = f.base;
+                }
+                _ { return true; }
+            }
+        }
+        return true;
+    }
+
+    fn rootedInTemp(this: &BodyCx, e: Id<Expr>): bool {
+        match this.cx.ast.expr(e) {
+            Expr.Field(f) { return this.rootedInTemp(f.base); }
+            Expr.Index(i) { return this.rootedInTemp(i.base); }
+            Expr.Name(_) { return false; }
+            Expr.String(_) { return false; }
+            Expr.Unary(u) { return u.op != UnaryOp.Deref; }
+            _ { return true; }
+        }
+        return true;
+    }
+
+    /// Rust `temp_span`: the root of a field/index chain (`f()` in `f().x[0]`).
+    fn tempSpan(this: &BodyCx, e: Id<Expr>): Span {
+        match this.cx.ast.expr(e) {
+            Expr.Field(f) { return this.tempSpan(f.base); }
+            Expr.Index(i) { return this.tempSpan(i.base); }
+            _ { return this.cx.ast.exprSpan(e); }
+        }
+        return this.cx.ast.exprSpan(e);
+    }
+
+    /// Rust `readonly_global`: the message for a store into a const array.
+    fn readonlyGlobal(this: &BodyCx, p: Id<TPlace>): Option<string> {
+        let cur = p;
+        while true {
+            match this.cx.typed.place(cur) {
+                TPlace.Global(g) {
+                    let gd = this.cx.tables.globalAt(g.global);
+                    if !gd.readonly { return Option.None; }
+                    let t = Text.new(this.cx.arena);
+                    t.add("cannot assign into const array `").add(this.str(gd.name)).add("`");
+                    return Option.Some(t.str());
+                }
+                TPlace.Field(f) { cur = f.base; }
+                TPlace.Index(f) { cur = f.base; }
+                TPlace.Payload(f) { cur = f.base; }
+                TPlace.Lane(f) { cur = f.base; }
+                TPlace.Tag(f) { cur = f.base; }
+                TPlace.Ptr(f) { cur = f.base; }
+                TPlace.Len(f) { cur = f.base; }
+                _ { return Option.None; }
+            }
+        }
+        return Option.None;
+    }
+
+    /// Rust `field_path`: field indexes from struct `s` to field `name`, through `use` embeddings
+    /// (empty when there is none).
+    /// A bare name as a place: an alias, a local, a global.
+    fn namePlace(this: &BodyCx, n: Ident): Result<Id<TPlace>, TErr> {
+        match this.findAlias(n.name) { Option.Some(p) { return Result.Ok(p); } Option.None {} }
+        match this.findLocal(n.name) {
+            Option.Some(l) { return Result.Ok(this.place(TPlace.Local(LocalPlace { local: l }), this.cx.typed.local(l).ty, n.span)); }
+            Option.None {}
+        }
+        match this.globalNamed(n.name) {
+            Option.Some(g) { return Result.Ok(this.place(TPlace.Global(GlobalPlace { global: g }), this.cx.tables.globalAt(g).ty, n.span)); }
+            Option.None {}
+        }
+        let t = Text.new(this.cx.arena);
+        t.add("`").add(this.str(n.name)).add("` is not a place");
+        let er = this.err(n.span, t.str());
+        er.unknown = Option.Some(n.name);
+        return Result.Err(er);
+    }
+
+    /// Rust `use_local`: `use x;` brings every field of struct `x` (through `&`, and through embedded
+    /// fields) into scope as aliases of those places. Types to nothing (the aliases are scope only).
+    fn useLocal(this: &BodyCx, name: Ident, sp: Span): Result<Id<TStmt>, TErr> {
+        let base = match this.namePlace(name) {
+            Result.Ok(p) { p }
+            Result.Err(_) {
+                let t = Text.new(this.cx.arena);
+                t.add("unknown name `").add(this.str(name.name)).add("`");
+                return Result.Err(this.err(name.span, t.str()));
+            }
+        };
+        base = this.derefAll(base, sp);
+        let sid = match this.structOf(this.placeTy(base)) {
+            Option.Some(s) { s }
+            Option.None { return Result.Err(this.err(name.span, "`use` of a local only works on a struct")); }
+        };
+        let names = List<Sym>.new(this.cx.arena);
+        this.embedAliasNames(sid, &names);
+        for k in 0..names.len {
+            let n = names.items[k];
+            if this.isDeclared(n) || this.hasAlias(n) {
+                let t = Text.new(this.cx.arena);
+                t.add("shadowing `").add(this.str(n)).add("` is a compile error");
+                return Result.Err(this.err(name.span, t.str()));
+            }
+            let path = this.fieldPath(sid, n);
+            this.bindAlias(n, this.fieldWalk(base, &path, sp));
+        }
+        return Result.Ok(this.stmtNode(TStmt.Block(TBlockStmt { block: this.cx.typed.block(sp) }), sp));
+    }
+
+    fn hasAlias(this: &BodyCx, n: Sym): bool {
+        match this.findAlias(n) { Option.Some(_) { return true; } Option.None { return false; } }
+    }
+
+    /// Rust `embed_alias_names`: field names, each embedded struct's after its own name.
+    fn embedAliasNames(this: &BodyCx, s: Id<StructDecl>, out: &List<Sym>) {
+        let fields = this.cx.tables.structAt(s).fields;
+        for i in 0..fields.len {
+            out.push(fields.items[i].name);
+            if fields.items[i].embedded {
+                match this.structOf(fields.items[i].ty) { Option.Some(inner) { this.embedAliasNames(inner, out); } Option.None {} }
+            }
+        }
+    }
+
+    fn fieldPath(this: &BodyCx, s: Id<StructDecl>, name: Sym): List<int> {
+        let out = List<int>.new(this.cx.arena);
+        let fields = this.cx.tables.structAt(s).fields;
+        for i in 0..fields.len {
+            if fields.items[i].name == name {
+                out.push(i);
+                return out;
+            }
+        }
+        for i in 0..fields.len {
+            if !fields.items[i].embedded { continue; }
+            match this.structOf(fields.items[i].ty) {
+                Option.Some(inner) {
+                    let rest = this.fieldPath(inner, name);
+                    if rest.len > 0 {
+                        out.push(i);
+                        out.extend(rest.slice());
+                        return out;
+                    }
+                }
+                Option.None {}
+            }
+        }
+        return out;
+    }
+
+    /// Rust `no_field`: `no field `y` on `P``, with a near name or the list of fields.
+    fn noField(this: &BodyCx, sp: Span, s: Id<StructDecl>, name: Sym): TErr {
+        let sd = this.cx.tables.structAt(s);
+        let sname = this.str(sd.name);
+        let names = List<string>.new(this.cx.arena);
+        for i in 0..sd.fields.len { names.push(this.str(sd.fields.items[i].name)); }
+        let t = Text.new(this.cx.arena);
+        t.add("no field `").add(this.str(name)).add("` on `").add(sname).add("`");
+        let e = this.err(sp, t.str());
+        match didYouMean(this.str(name), names.slice(), this.cx.arena) {
+            Option.Some(x) {
+                let h = Text.new(this.cx.arena);
+                h.add("did you mean `").add(x).add("`?");
+                return this.help(e, h.str());
+            }
+            Option.None {}
+        }
+        let n = Text.new(this.cx.arena);
+        if names.len == 0 {
+            n.add("`").add(sname).add("` has no fields");
+            return this.note(e, n.str());
+        }
+        n.add("`").add(sname).add("` has ");
+        for i in 0..names.len {
+            if i > 0 { n.add(", "); }
+            n.add("`").add(names.items[i]).add("`");
+        }
+        return this.note(e, n.str());
+    }
+}

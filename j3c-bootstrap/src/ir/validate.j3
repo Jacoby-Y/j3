@@ -1,7 +1,434 @@
-// Well-formedness check of typed IR (types present, places valid). Runs in dev builds and tests; a failure is
-// a
-// compiler bug.
+// Well-formedness check of typed IR (types present, places valid, `Access` folded right). Runs in dev
+// builds and tests; a failure is a compiler bug.
 //
 // Port of: j3c/src/ir/validate.rs, ir/validate/places.rs
-// J3: Separate module j3c.ir.validate.
+// J3: Separate module j3c.ir.validate. Rust `Result<(), ValidateError>` is `Result<bool, ValidateError>`
+// (`Ok(true)`; stage 0 has no `Result<void, E>`). Messages are Rust's text, built in `cx.arena`.
+// `validateProgram` is the pass-table entry's call (Rust validates every module in `check`). The switch
+// duplicate check is a `Set<u64>` in `cx.arena` (Rust `HashSet`; only membership is asked, never order).
+// Matches over `StmtKind`/`RvalueKind`/`Proj`/`ConstKind` are exhaustive (rule 6).
 module j3c.ir.validate;
+
+use j3.data.pool.Id;
+use j3.data.set.Set;
+use j3.memory.List;
+use j3.option.Option;
+use j3.result.Result;
+use j3.text.Text;
+use j3c.ir.{ Access, Block, Body, ConstKind, FnTy, Func, FuncKind, InterpPart, IrCx, LocalDecl, Module, Operand, Place, PlaceRoot, Program,
+    Proj, Rvalue, RvalueKind, SimdOp, Stmt, StmtKind, TyKind, assignOpStr, letBinding, operandTy, readOnlyView, RefTy, simdName,
+    throughRef };
+use j3c.syntax.ast.{ atomicOpAllows, atomicOpValues };
+
+pub struct ValidateError {
+    message: string;
+}
+
+/// `Result<bool, ValidateError>` with `message`.
+fn fail(msg: string): Result<bool, ValidateError> { return Result.Err(ValidateError { message: msg }); }
+
+fn ok(): Result<bool, ValidateError> { return Result.Ok(true); }
+
+/// Every fn body of `m` (Rust `validate_module`).
+pub fn validateModule(cx: &IrCx, m: &Module): Result<bool, ValidateError> {
+    for i in 0..m.funcs.len {
+        let f = cx.func(m.funcs.items[i]);
+        match f.kind {
+            FuncKind.J3(j) { validateBody(cx, f.ty, &j.body)?; }
+            FuncKind.Lib(_) { declSig(cx, &f)?; }
+            FuncKind.Decl { declSig(cx, &f)?; }
+        }
+    }
+    return ok();
+}
+
+/// Every module of `prog`, in order; the first error.
+pub fn validateProgram(prog: &Program): Result<bool, ValidateError> {
+    for i in 0..prog.modules.len { validateModule(&prog.cx, &prog.modules.items[i])?; }
+    return ok();
+}
+
+fn declSig(cx: &IrCx, f: &Func): Result<bool, ValidateError> {
+    match cx.fnSig(f.ty) {
+        Option.Some(_) { return ok(); }
+        Option.None { return fail(Text.new(cx.arena).add("func ").add(cx.nameStr(f.name)).add(" does not have a fn type").str()); }
+    }
+}
+
+fn validateBody(cx: &IrCx, fnTy: Id<TyKind>, body: &Body): Result<bool, ValidateError> {
+    match cx.fnSig(fnTy) {
+        Option.Some(sig) { return validateSig(cx, sig, body); }
+        Option.None { return fail("function type is not TyKind::Fn"); }
+    }
+}
+
+fn validateSig(cx: &IrCx, sig: FnTy, body: &Body): Result<bool, ValidateError> {
+    if body.params.len != sig.params.len {
+        let t = Text.new(cx.arena).add("param count ");
+        t.pushInt(body.params.len);
+        t.pushStr(" != fn type ");
+        t.pushInt(sig.params.len);
+        return fail(t.str());
+    }
+    for i in 0..body.params.len {
+        let d = body.local(body.params.items[i]);
+        if d.ty != sig.params.items[i] { return fail(Text.new(cx.arena).add("param ").add(cx.nameStr(d.name)).add(" type mismatch").str()); }
+    }
+    for i in 0..body.locals.len() {
+        let d = body.local(Id<LocalDecl> { i: u32(i) });
+        if int(d.id.i) >= body.locals.len() { return fail("local id out of range"); }
+    }
+    return validateBlock(cx, body, &body.block, sig.ret, 0);
+}
+
+fn validateBlock(cx: &IrCx, body: &Body, b: &Block, ret: Id<TyKind>, inLoop: u32): Result<bool, ValidateError> {
+    for i in 0..b.stmts.len { validateStmt(cx, body, &b.stmts.items[i], ret, inLoop)?; }
+    return ok();
+}
+
+fn validateStmt(cx: &IrCx, body: &Body, s: &Stmt, ret: Id<TyKind>, inLoop: u32): Result<bool, ValidateError> {
+    let c = cx.common;
+    if s.ty != c.void { return fail("statement type must be void"); }
+    match s.kind {
+        StmtKind.Assign(a) {
+            validatePlace(cx, body, &a.place)?;
+            validateRvalue(cx, body, &a.rvalue)?;
+            if !a.place.access.assign { return fail("assign through a non-assignable place"); }
+            if a.place.ty != a.rvalue.ty { return fail("assign place type != rvalue type"); }
+        }
+        StmtKind.AssignOp(a) {
+            validatePlace(cx, body, &a.place)?;
+            validateOperand(cx, body, a.rhs)?;
+            if !a.place.access.assign { return fail("assign-op through a non-assignable place"); }
+            match assignOpStr(a.op) { Option.Some(_) {} Option.None { return fail("binary op cannot be used as assign-op"); } }
+            if a.place.ty != operandTy(a.rhs) { return fail("assign-op place type != rhs type"); }
+        }
+        StmtKind.Expr(rv) { validateRvalue(cx, body, &rv)?; }
+        StmtKind.Return(r) {
+            match r.value {
+                Option.None { if ret != c.void { return fail("return without value in non-void function"); } }
+                Option.Some(v) {
+                    validateOperand(cx, body, v)?;
+                    if operandTy(v) != ret { return fail("return value type != function return type"); }
+                }
+            }
+        }
+        StmtKind.Abort(ab) { validateOperands(cx, body, &ab.args)?; }
+        StmtKind.Div0 {}
+        StmtKind.Break(n) { if n >= inLoop { return fail("break/continue outside a loop"); } }
+        StmtKind.Continue(n) { if n >= inLoop { return fail("break/continue outside a loop"); } }
+        StmtKind.Block(inner) { validateBlock(cx, body, &inner, ret, inLoop)?; }
+        StmtKind.Defer(d) { validateBlock(cx, body, &d.body, ret, inLoop)?; }
+        StmtKind.If(i) {
+            validateOperand(cx, body, i.cond)?;
+            if operandTy(i.cond) != c.bool { return fail("if cond is not bool"); }
+            validateBlock(cx, body, &i.thenBlock, ret, inLoop)?;
+            match i.elseBlock { Option.Some(e) { validateBlock(cx, body, &e, ret, inLoop)?; } Option.None {} }
+        }
+        StmtKind.Switch(sw) {
+            validateOperand(cx, body, sw.scrut)?;
+            match cx.tyKind(operandTy(sw.scrut)) { TyKind.Int(_) {} _ { return fail("switch on a non-integer"); } }
+            let seen = Set<u64>.new(cx.arena, sw.cases.len);
+            for i in 0..sw.cases.len {
+                let v = sw.cases.items[i].value;
+                if !seen.add(v) {
+                    let t = Text.new(cx.arena).add("duplicate switch case ");
+                    t.pushU64(v);
+                    return fail(t.str());
+                }
+                validateBlock(cx, body, &sw.cases.items[i].block, ret, inLoop)?;
+            }
+            validateBlock(cx, body, &sw.default, ret, inLoop)?;
+        }
+        StmtKind.While(w) {
+            validateOperand(cx, body, w.cond)?;
+            if operandTy(w.cond) != c.bool { return fail("while cond is not bool"); }
+            validateBlock(cx, body, &w.body, ret, inLoop + 1)?;
+        }
+        StmtKind.ForRange(f) {
+            validatePlace(cx, body, &f.index)?;
+            validateOperand(cx, body, f.end)?;
+            if !f.index.access.assign { return fail("for index is not assignable"); }
+            if f.index.ty != c.int || operandTy(f.end) != c.int { return fail("for range is not int"); }
+            validateBlock(cx, body, &f.body, ret, inLoop + 1)?;
+        }
+        StmtKind.InterpFill(f) {
+            validatePlace(cx, body, &f.buf)?;
+            validatePlace(cx, body, &f.used)?;
+            if !f.buf.access.assign || !f.used.access.assign { return fail("interp fill needs assignable buf/used"); }
+            if f.used.ty != c.int { return fail("interp used is not int"); }
+            let isBytes = false;
+            match cx.tyKind(f.buf.ty) { TyKind.Array(a) { isBytes = a.elem == c.u8; } _ {} }
+            if !isBytes { return fail("interp buf is not [N]u8"); }
+            validateParts(cx, body, &f.parts)?;
+        }
+    }
+    return ok();
+}
+
+fn validateOperands(cx: &IrCx, body: &Body, xs: &List<Operand>): Result<bool, ValidateError> {
+    for i in 0..xs.len { validateOperand(cx, body, xs.items[i])?; }
+    return ok();
+}
+
+fn validateParts(cx: &IrCx, body: &Body, parts: &List<InterpPart>): Result<bool, ValidateError> {
+    for i in 0..parts.len {
+        match parts.items[i] { InterpPart.Value(op) { validateOperand(cx, body, op)?; } InterpPart.Lit(_) {} }
+    }
+    return ok();
+}
+
+fn validateRvalue(cx: &IrCx, body: &Body, rv: &Rvalue): Result<bool, ValidateError> {
+    let c = cx.common;
+    match rv.kind {
+        RvalueKind.Use(op) {
+            validateOperand(cx, body, op)?;
+            if operandTy(op) != rv.ty { return fail("use operand ty != rvalue ty"); }
+        }
+        RvalueKind.Ref(r) {
+            validatePlace(cx, body, &r.place)?;
+            if !r.place.access.takeRef { return fail("ref of a place that cannot be borrowed (`const`)"); }
+            let good = false;
+            match cx.refInner(rv.ty) { Option.Some(inner) { good = inner == r.place.ty; } Option.None {} }
+            if !good { return fail("ref rvalue type is not &place.ty"); }
+        }
+        RvalueKind.Binary(b) {
+            validateOperand(cx, body, b.lhs)?;
+            validateOperand(cx, body, b.rhs)?;
+        }
+        RvalueKind.Unary(u) { validateOperand(cx, body, u.arg)?; }
+        RvalueKind.Call(call) {
+            validateOperand(cx, body, call.func)?;
+            validateOperands(cx, body, &call.args)?;
+            match cx.fnSig(operandTy(call.func)) {
+                Option.Some(sig) {
+                    if sig.params.len != call.args.len { return fail("call argc mismatch"); }
+                    for i in 0..call.args.len {
+                        if operandTy(call.args.items[i]) != sig.params.items[i] {
+                            let t = Text.new(cx.arena).add("internal: call argument ");
+                            t.pushInt(i + 1);
+                            t.pushStr(" type mismatch (the checker should have caught this; please report it)");
+                            return fail(t.str());
+                        }
+                    }
+                    if sig.ret != rv.ty { return fail("call ret != rvalue ty"); }
+                }
+                Option.None { return fail("call of non-fn"); }
+            }
+        }
+        RvalueKind.Syscall(sc) {
+            validateOperand(cx, body, sc.nr)?;
+            validateOperands(cx, body, &sc.args)?;
+            if rv.ty != c.int { return fail("@syscall type must be int"); }
+        }
+        RvalueKind.Simd(sm) {
+            validateOperands(cx, body, &sm.args)?;
+            let want = 1;
+            let resultIsVec = true;
+            match sm.op {
+                SimdOp.Build { want = 4; }
+                SimdOp.Min { want = 2; }
+                SimdOp.Max { want = 2; }
+                SimdOp.Store { want = 2; resultIsVec = false; }
+                SimdOp.Sum { resultIsVec = false; }
+                _ {}
+            }
+            if sm.args.len != want { return fail(Text.new(cx.arena).add("simd.").add(simdName(sm.op)).add(" operand count").str()); }
+            let isVec = false;
+            match cx.tyKind(rv.ty) { TyKind.Vec(_) { isVec = true; } _ {} }
+            if resultIsVec != isVec { return fail(Text.new(cx.arena).add("simd.").add(simdName(sm.op)).add(" result type").str()); }
+        }
+        RvalueKind.Atomic(a) {
+            if !atomicOpAllows(a.op, a.order) { return fail("@atomic order not valid for op"); }
+            if a.args.len != atomicOpValues(a.op) + 1 { return fail("@atomic operand count"); }
+            validateOperands(cx, body, &a.args)?;
+        }
+        RvalueKind.Aggregate(ag) { validateOperands(cx, body, &ag.fields)?; }
+        RvalueKind.Enum(e) {
+            let def = cx.enumDef(e.variant.enumId);
+            if int(e.variant.index) >= def.variants.len { return fail("enum variant index oob"); }
+            let want = def.variants.items[int(e.variant.index)].payload;
+            match e.payload {
+                Option.Some(p) {
+                    match want { Option.Some(_) { validateOperand(cx, body, p)?; } Option.None { return fail("enum payload does not match variant"); } }
+                }
+                Option.None {
+                    match want { Option.Some(_) { return fail("enum payload does not match variant"); } Option.None {} }
+                }
+            }
+        }
+        RvalueKind.Cast(cs) { validateOperand(cx, body, cs.from)?; }
+        RvalueKind.Interpolate(ip) {
+            if rv.ty != c.string { return fail("interpolate type must be string"); }
+            validateParts(cx, body, &ip.parts)?;
+        }
+    }
+    return ok();
+}
+
+fn validateOperand(cx: &IrCx, body: &Body, op: Operand): Result<bool, ValidateError> {
+    match op {
+        Operand.Copy(p) { return validatePlace(cx, body, &p); }
+        Operand.Const(k) {
+            match k.kind {
+                ConstKind.FnAddr(fa) { if k.ty != cx.func(fa.func).ty { return fail("fn addr const type != func type"); } }
+                ConstKind.Void {}
+                ConstKind.Bool(_) {}
+                ConstKind.Int(_) {}
+                ConstKind.F32Bits(_) {}
+                ConstKind.F64Bits(_) {}
+                ConstKind.Null {}
+                ConstKind.Bytes(_) {}
+            }
+            return ok();
+        }
+    }
+}
+
+/// Rust `local`: the decl of `id`, or `unknown local N`.
+fn local(cx: &IrCx, body: &Body, id: Id<LocalDecl>): Result<LocalDecl, ValidateError> {
+    if int(id.i) >= body.locals.len() {
+        let t = Text.new(cx.arena).add("unknown local ");
+        t.pushU64(u64(id.i));
+        return Result.Err(ValidateError { message: t.str() });
+    }
+    return Result.Ok(body.local(id));
+}
+
+/// Root type and access of a place (Rust `validate_place`'s start).
+fn rootOf(cx: &IrCx, body: &Body, p: &Place): Result<(Id<TyKind>, Access), ValidateError> {
+    match p.root {
+        PlaceRoot.Local(l) {
+            let d = local(cx, body, l.id)?;
+            return Result.Ok((d.ty, d.access));
+        }
+        PlaceRoot.Global(g) {
+            let gd = cx.global(g.id);
+            if gd.readonly { return Result.Ok((gd.ty, readOnlyView())); }
+            return Result.Ok((gd.ty, letBinding()));
+        }
+    }
+}
+
+/// Projection chain types, then the folded `Access` (Rust `validate_place`).
+fn validatePlace(cx: &IrCx, body: &Body, p: &Place): Result<bool, ValidateError> {
+    let c = cx.common;
+    let (startTy, access0) = rootOf(cx, body, p)?;
+    let ty = startTy;
+    for i in 0..p.proj.len {
+        match p.proj.items[i] {
+            Proj.Deref {
+                match cx.refInner(ty) { Option.Some(inner) { ty = inner; } Option.None { return fail("Deref projection on non-ref type"); } }
+            }
+            Proj.Field(f) {
+                match cx.tyKind(ty) {
+                    TyKind.Struct(st) {
+                        if f.field.structId != st.id { return fail("field id does not match struct"); }
+                        let def = cx.fieldDef(f.field);
+                        if def.ty != f.ty { return fail("field projection ty != field def"); }
+                        ty = def.ty;
+                    }
+                    _ { return fail("field projection on non-struct"); }
+                }
+            }
+            Proj.Index(ix) {
+                validateOperand(cx, body, ix.index)?;
+                if operandTy(ix.index) != c.int { return fail("index is not int"); }
+                match cx.elemTy(ty) {
+                    Option.Some(elem) {
+                        if elem != ix.ty { return fail("index projection ty != elem ty"); }
+                        ty = elem;
+                    }
+                    Option.None { return fail("index projection on non-array/slice/string"); }
+                }
+            }
+            Proj.Ptr {
+                match cx.elemTy(ty) {
+                    Option.Some(elem) {
+                        match cx.lookupTy(TyKind.Ref(RefTy { inner: elem })) {
+                            Option.Some(pt) { ty = pt; }
+                            Option.None { return fail("slice ptr type &T was never interned"); }
+                        }
+                    }
+                    Option.None { return fail("Ptr projection on non-array/slice/string"); }
+                }
+            }
+            Proj.Len {
+                match cx.elemTy(ty) { Option.Some(_) { ty = c.int; } Option.None { return fail("Len projection on non-array/slice/string"); } }
+            }
+            Proj.Lane(l) {
+                let good = false;
+                match cx.vecLane(ty) { Option.Some(lt) { good = lt == l.ty && l.lane < 4; } Option.None {} }
+                if !good { return fail("Lane projection on non-vector or bad lane"); }
+                ty = l.ty;
+            }
+            Proj.EnumTag {
+                let good = false;
+                match cx.tyKind(ty) { TyKind.Enum(en) { good = !cx.enumDef(en.id).isCLike(); } _ {} }
+                if !good { return fail("EnumTag on non-tagged enum"); }
+                ty = c.i32;
+            }
+            Proj.EnumPayload(ep) {
+                match cx.tyKind(ty) {
+                    TyKind.Enum(en) {
+                        if en.id != ep.variant.enumId { return fail("EnumPayload on wrong type"); }
+                        let def = cx.enumDef(en.id);
+                        let good = false;
+                        match def.variants.items[int(ep.variant.index)].payload { Option.Some(pt) { good = pt == ep.ty; } Option.None {} }
+                        if !good { return fail("EnumPayload does not match variant"); }
+                        ty = ep.ty;
+                    }
+                    _ { return fail("EnumPayload on wrong type"); }
+                }
+            }
+        }
+    }
+    let access = foldAccess(cx, access0, p.proj.items[0..p.proj.len], startTy);
+    if ty != p.ty { return fail("place.ty does not match projections"); }
+    if access.assign != p.access.assign || access.takeRef != p.access.takeRef { return fail("place.access does not match projections"); }
+    return ok();
+}
+
+/// A string projection is a read-only view; anything else keeps `a`.
+fn viewOf(cx: &IrCx, ty: Id<TyKind>, a: Access): Access {
+    match cx.tyKind(ty) { TyKind.String { return readOnlyView(); } _ { return a; } }
+}
+
+fn foldAccess(cx: &IrCx, start: Access, projs: []Proj, startTy: Id<TyKind>): Access {
+    let access = start;
+    let ty = startTy;
+    for i in 0..projs.len {
+        match projs[i] {
+            Proj.Deref {
+                match cx.refInner(ty) { Option.Some(inner) { ty = inner; } Option.None {} }
+                access = throughRef();
+            }
+            Proj.Field(f) {
+                match cx.structDef(f.field.structId).script {
+                    Option.Some(meta) { if int(f.field.index) < meta.propSpans.len { access = readOnlyView(); } }
+                    Option.None {}
+                }
+                ty = f.ty;
+            }
+            Proj.Index(ix) {
+                access = viewOf(cx, ty, access);
+                ty = ix.ty;
+            }
+            Proj.Ptr {
+                access = viewOf(cx, ty, access);
+                match cx.elemTy(ty) {
+                    Option.Some(elem) { match cx.lookupTy(TyKind.Ref(RefTy { inner: elem })) { Option.Some(pt) { ty = pt; } Option.None {} } }
+                    Option.None {}
+                }
+            }
+            Proj.Len {
+                access = viewOf(cx, ty, access);
+                ty = cx.common.int;
+            }
+            Proj.EnumTag { ty = cx.common.i32; }
+            Proj.Lane(l) { ty = l.ty; }
+            Proj.EnumPayload(ep) { ty = ep.ty; }
+        }
+    }
+    return access;
+}

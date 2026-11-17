@@ -1,6 +1,406 @@
 // Drive the host toolchain: emit each module, run `clang`/`cc` jobs in parallel, link, run the result.
 //
-// Port of: j3c/src/emit/host.rs
-// J3: Parallel jobs with `j3.proc` spawn and `proc.waitAny`. Links by running the plan `Backend.link` returns
-// (plan 11 B8).
+// Port of: j3c/src/emit/host.rs, emit/opts.rs (the toolchain half: `EmitOpts`; the backend half is
+//     `backend.Opts`), emit/mod.rs (`compile_text`, the run half of `run_program_with`)
+// J3: Links by running the plan `Backend.link` returns (plan 11 B8) once incremental objects land.
+// J3: C2a: one clang invocation compiles and links the whole `.ll` (Rust `compile_llvm`), with Rust's argv in
+//     Rust's order (`clangArgv`, unit-tested). Not ported: `compile_llvm_split` (script VM, C4), the per-module
+//     objects and ThinLTO of `emit/incr.rs` (Rust takes that path for named outputs at opt 0/1 and release;
+//     j3c-boot always runs the one clang, same program), `compile_c`/`compile_and_run` (no C backend),
+//     `resolve_backend` (no C fallback when clang is missing: the spawn error names clang).
+// J3: Rust's `RUN_SEQ` is a `#[singleton]`; temp names use `monotonicMs` where Rust has wall-clock nanos (the
+//     name only has to be unique). The build-cache key is `xxh3_64` (Rust: `DefaultHasher`), so a stamp
+//     written by one compiler never matches the other: it rebuilds, never reuses a wrong binary.
 module j3c.toolchain;
+// J3: Every `use` of the module is here (part files have none).
+
+use j3.hash.Xxh3;
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.proc;
+use j3.proc.{ Output, ProcError };
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, contains, endsWith, find, lastIndexOf, lines, parseInt, parseU64, split, startsWith, trim };
+use j3c.backend.Opts;
+use j3c.base.fsx;
+use j3c.base.text_fmt.hasLower;
+use j3c.project.manifest.{ Manifest, targetSlug };
+
+/// Compiler and linker settings for one build (Rust `CcOpts`); strings are argv, manifest or arena copies.
+pub struct CcOpts {
+    libs: List<string>;
+    search: List<string>;
+    files: List<string>;
+    flags: List<string>;
+    std: string;
+    opt: string;
+    debug: bool;
+    /// `--release`: strip, trim the link, drop unwind tables.
+    release: bool;
+    /// The executable to write; "" for a temp file removed after the run.
+    out: string;
+}
+
+/// Rust `CcOpts::default()` (opt "", debug off; `defaultEmitOpts` sets the dev values).
+pub fn defaultCc(arena: &Arena): CcOpts {
+    return CcOpts { libs: List<string>.new(arena), search: List<string>.new(arena), files: List<string>.new(arena),
+        flags: List<string>.new(arena), std: "", opt: "", debug: false, release: false, out: "" };
+}
+
+/// Rust `CcOpts::from_manifest`: `[link]` and `[cc]`, search dirs made absolute under the root.
+pub fn ccFromManifest(m: &Manifest, arena: &Arena): CcOpts {
+    let c = defaultCc(arena);
+    c.libs = m.link.libs;
+    c.files = m.link.files;
+    c.flags = m.link.flags;
+    for i in 0..m.link.search.len {
+        let s = m.link.search.items[i];
+        c.search.push(if path.isAbs(s) { s } else { path.join(m.root, s, arena) });
+    }
+    c.std = m.cc.std;
+    c.opt = m.cc.opt;
+    c.debug = !m.cc.fast;
+    c.out = m.outPath(arena);
+    return c;
+}
+
+/// How to build one program (Rust `EmitOpts`, minus the backend choice: that is `driver.Options.emit` /
+/// `[emit] backend`, looked up with `backend.find`).
+pub struct EmitOpts {
+    cc: CcOpts;
+    /// Target triple, "" for the host.
+    target: string;
+    cpu: string;
+    clang: string;
+    flags: List<string>;
+    incremental: bool;
+    incrementalAll: bool;
+    /// `[emit] chunks`; -1 = automatic.
+    chunks: int;
+    /// The program's cwd when it runs (the package root); "" keeps j3c's.
+    cwd: string;
+}
+
+/// Rust `EmitOpts::default()`: LLVM, opt 0, debug info, host, `clang`.
+pub fn defaultEmitOpts(arena: &Arena): EmitOpts {
+    let cc = defaultCc(arena);
+    cc.debug = true;
+    cc.opt = "0";
+    return EmitOpts { cc: cc, target: "", cpu: "", clang: "clang", flags: List<string>.new(arena), incremental: true,
+        incrementalAll: false, chunks: -1, cwd: "" };
+}
+
+/// Rust `EmitOpts::from_manifest`. Err: the bad `[emit] opt` message.
+pub fn emitOptsFromManifest(m: &Manifest, arena: &Arena): Result<EmitOpts, string> {
+    let o = m.emit.opt;
+    if !(o == "0" || o == "1" || o == "2" || o == "3" || o == "s" || o == "z" || o == "S" || o == "Z") {
+        return Result.Err(Text.new(arena).add("unknown emit.opt `").add(o).add("` (want 0, 1, 2, 3, s, or z)").str());
+    }
+    let cc = ccFromManifest(m, arena);
+    cc.opt = o;
+    cc.debug = m.emit.debug && !m.emit.fast && !m.cc.fast;
+    let chunks = -1;
+    match m.emit.chunks {
+        Option.Some(n) { chunks = n; }
+        Option.None {}
+    }
+    return Result.Ok(EmitOpts { cc: cc, target: m.emit.primary(), cpu: m.emit.cpu,
+        clang: if m.emit.clang.len == 0 { "clang" } else { m.emit.clang }, flags: m.emit.flags,
+        incremental: m.emit.incremental, incrementalAll: m.emit.incrementalAll, chunks: chunks, cwd: m.root });
+}
+
+/// What every backend gets, from `e` (`[emit] opt` letters: `s` -1, `z` -2).
+pub fn backendOpts(e: &EmitOpts): Opts {
+    let o = clangOpt(e.cc.opt);
+    let n = 0;
+    if o == "s" { n = -1; } else if o == "z" { n = -2; } else {
+        match parseInt(o, 10) {
+            Option.Some(v) { n = v; }
+            Option.None {}
+        }
+    }
+    return Opts { target: e.target, opt: n, debug: e.cc.debug, release: e.cc.release };
+}
+
+/// What a finished program did (Rust `RunResult`); output is arena-copied, `stderr` symbolized.
+pub struct RunResult {
+    status: int;
+    stdout: string;
+    stderr: string;
+}
+
+#[singleton]
+let RUN_SEQ: int;
+
+/// Rust `compile_text` (LLVM) with `compile_program`'s Android check: clang the `.ll` text for `e`.
+pub fn compileText(ll: string, e: &EmitOpts, arena: &Arena): Result<string, string> {
+    if targetOs(e.target) == TargetOs.Android { androidReady(e.target)?; }
+    return compileLlvm(ll, &e.cc, e.clang, e.target, e.cpu, e.flags.items[0..e.flags.len], arena);
+}
+
+/// Rust `compile_llvm`: write `ll` to a temp `.ll`, run one `clang` for `target` (`""` host) and `cpu` that
+/// compiles and links (+ `extra` args); the executable's path, or the error text. A named output whose
+/// IR and command match its `clang.key` stamp is not rebuilt.
+pub fn compileLlvm(ll: string, cc: &CcOpts, clang: string, target: string, cpu: string, extra: []string, arena: &Arena): Result<string, string> {
+    let seq = RUN_SEQ;
+    RUN_SEQ = RUN_SEQ + 1;
+    let stamp = Text.new(arena);
+    stamp.add("j3c_");
+    stamp.pushInt(sys.getpid());
+    stamp.push('_');
+    stamp.pushInt(seq);
+    stamp.push('_');
+    stamp.pushInt(sys.monotonicMs());
+    let dir = io.tempRoot();
+    let srcPath = path.join(dir, Text.new(arena).add(stamp.str()).add(".ll").str(), arena);
+    let exePath = cc.out;
+    if exePath.len > 0 {
+        mkdirs(path.dirname(exePath), arena)?;
+    } else {
+        exePath = path.join(dir, Text.new(arena).add(stamp.str()).add(".bin").str(), arena);
+    }
+    match io.writeFile(srcPath, ll as []u8) {
+        Result.Ok(_) {}
+        Result.Err(_) { return Result.Err(Text.new(arena).add("write ").add(srcPath).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+    }
+    let timeReport = sys.env("J3C_TIME_REPORT").len > 0;
+    let argv = List<string>.new(arena);
+    match clangArgv(&argv, ll, cc, clang, target, cpu, extra, timeReport, srcPath, exePath, arena) {
+        Result.Ok(_) {}
+        Result.Err(e) {
+            discard(srcPath);
+            return Result.Err(e);
+        }
+    }
+    // A named output rebuilt from the same IR and command is already up to date.
+    let stampPath = "";
+    let key = "";
+    if cc.out.len > 0 {
+        let cd = cacheDir(cc.out, target, arena);
+        mkdirs(cd, arena)?;
+        stampPath = path.join(cd, "clang.key", arena);
+        key = buildKey(srcPath, ll, argv.items[0..argv.len], arena);
+        if fsx.isFile(exePath) {
+            match fsx.readText(stampPath, arena) {
+                Result.Ok(k) {
+                    if k == key {
+                        discard(srcPath);
+                        return Result.Ok(exePath);
+                    }
+                }
+                Result.Err(_) {}
+            }
+        }
+        discard(stampPath);
+    }
+    let started = sys.monotonicMs();
+    let out = Output { code: 0, out: "" as []u8, err: "" as []u8 };
+    match proc.run(argv.items[0..argv.len], "", arena) {
+        Result.Ok(o) { out = o; }
+        Result.Err(e) {
+            discard(srcPath);
+            return Result.Err(spawnErr(argv.items[0], e, arena));
+        }
+    }
+    if sys.env("J3C_TIMINGS").len > 0 {
+        let t = Text.new(arena);
+        t.add("j3c: clang: ");
+        pushSecs(&t, sys.monotonicMs() - started);
+        t.add("s\n");
+        sys.write(2, t.str().ptr as ptr, t.len());
+    }
+    discard(srcPath);
+    if out.code != 0 {
+        return Result.Err(Text.new(arena).add(argv.items[0]).add(" failed:\n").add(out.errStr()).str());
+    }
+    if timeReport {
+        let t = Text.new(arena);
+        t.add(out.errStr()).add("\n");
+        sys.write(2, t.str().ptr as ptr, t.len());
+    }
+    if stampPath.len > 0 {
+        match io.writeFile(stampPath, key as []u8) {
+            Result.Ok(_) {}
+            Result.Err(_) {}
+        }
+    }
+    return Result.Ok(exePath);
+}
+
+/// Rust `compile_llvm`'s `Command`, program first, into `out`: Rust's flags in Rust's order. Err: a missing
+/// library (`appendLinkArgs`).
+pub fn clangArgv(out: &List<string>, ll: string, cc: &CcOpts, clang: string, target: string, cpu: string, extra: []string, timeReport: bool, srcPath: string, exePath: string, arena: &Arena): Result<bool, string> {
+    out.push(clangFor(clang, target, arena));
+    out.push("-Wno-override-module");
+    out.push(Text.new(arena).add("-O").add(clangOpt(cc.opt)).str());
+    out.push("-ffunction-sections");
+    out.push("-fdata-sections");
+    out.push(linkGcFlag(target));
+    if cc.debug { out.push("-g"); }
+    targetArgs(out, target, arena);
+    if cpu.len > 0 { out.push(Text.new(arena).add("-mcpu=").add(cpu).str()); }
+    let rel = ReleaseFlags { compile: List<string>.new(arena), link: List<string>.new(arena) };
+    if cc.release {
+        rel = releaseFlags(targetOs(target), lldPresent(), arena);
+        for i in 0..rel.compile.len { out.push(rel.compile.items[i]); }
+    }
+    useMold(out, cc.release, target);
+    for i in 0..extra.len { out.push(extra[i]); }
+    if timeReport { out.push("-ftime-report"); }
+    out.push("-o");
+    out.push(exePath);
+    out.push(srcPath);
+    appendLinkArgs(out, cc, ll, target, arena)?;
+    for i in 0..rel.link.len { out.push(rel.link.items[i]); }
+    return Result.Ok(true);
+}
+
+/// Rust `build_key`: hash of the source and the command, leaving out the per-run temp file name.
+fn buildKey(temp: string, source: string, argv: []string, arena: &Arena): string {
+    let h = Xxh3.new();
+    h.update(source as []u8);
+    let zero: [1]u8 = [0];
+    for i in 0..argv.len {
+        if argv[i] == temp { continue; }
+        h.update(argv[i] as []u8);
+        h.update(zero[..]);
+    }
+    let v = h.finish();
+    let t = Text.new(arena);
+    let hex = Text.new(arena);
+    hex.pushHex(v);
+    for _ in hex.len()..16 { t.push('0'); }
+    t.add(hex.str());
+    return t.str();
+}
+
+/// Rust `cache_dir`: where a build output keeps its bookkeeping, `target/.j3c/<triple or host>/<exe name>/`
+/// (a per-platform folder `target/<triple>/<name>` shares the one `.j3c`; an output inside `.j3c` keeps
+/// its files beside it).
+pub fn cacheDir(out: string, target: string, arena: &Arena): string {
+    let parent = path.dirname(out);
+    let comps = split(parent, "/");
+    while true {
+        match comps.next() {
+            Option.Some(c) { if c == ".j3c" { return parent; } }
+            Option.None { break; }
+        }
+    }
+    let slug = targetSlug(target, arena);
+    let base = parent;
+    if target.len > 0 && path.basename(parent) == slug { base = path.dirname(parent); }
+    let name = path.basename(out);
+    if name.len == 0 { name = "a.out"; }
+    let sub = if target.len == 0 { "host" } else { slug };
+    return path.join(path.join(path.join(base, ".j3c", arena), sub, arena), name, arena);
+}
+
+/// Rust `run_exe_in`: run `exe` with `args` (in `cwd` with `J3_ROOT` and `J3_INSPECT` set; "" = here) and
+/// capture its output. A failed runtime check's line gets its source context, crash addresses are symbolized.
+pub fn runExe(exe: string, cwd: string, args: []string, arena: &Arena): Result<RunResult, string> {
+    let absolute = "";
+    match path.realpath(exe, arena) {
+        Option.Some(p) { absolute = p; }
+        Option.None { return Result.Err(Text.new(arena).add("run ").add(exe).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+    }
+    let root = "";
+    if cwd.len > 0 {
+        match path.realpath(cwd, arena) {
+            Option.Some(p) { root = p; }
+            Option.None { return Result.Err(Text.new(arena).add("project root ").add(cwd).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+        }
+        sys.setenv("J3_ROOT", root);
+        // a dev run lets F12 open the UI inspector (`j3.ui.inspect`); `J3_INSPECT=0` turns that off
+        let inspect = sys.env("J3_INSPECT");
+        sys.setenv("J3_INSPECT", if inspect.len == 0 { "1" } else { inspect });
+    }
+    let argv = List<string>.new(arena);
+    argv.push(absolute);
+    for i in 0..args.len { argv.push(args[i]); }
+    let run = Output { code: 0, out: "" as []u8, err: "" as []u8 };
+    match proc.startIn(argv.items[0..argv.len], root, arena) {
+        Result.Ok(c) {
+            let child = c;
+            run = child.collect("" as []u8, arena);
+        }
+        Result.Err(e) { return Result.Err(Text.new(arena).add("run ").add(exe).add(": ").add(procErrText(e, arena)).str()); }
+    }
+    let shownRoot = root;
+    if cwd.len == 0 {
+        match path.realpath(".", arena) {
+            Option.Some(p) { shownRoot = p; }
+            Option.None {}
+        }
+    }
+    let raw = run.errStr();
+    if shownRoot.len > 0 {
+        let t = Text.new(arena);
+        let it = lines(raw);
+        while true {
+            match it.next() {
+                Option.Some(l) {
+                    match abortContext(l, shownRoot, arena) {
+                        Option.Some(x) { t.add(x); }
+                        Option.None { t.add(l); }
+                    }
+                    t.push('\n');
+                }
+                Option.None { break; }
+            }
+        }
+        raw = t.str();
+    }
+    let stderr = raw;
+    match symbolize(absolute, raw, arena) {
+        Option.Some(s) { stderr = s; }
+        Option.None {}
+    }
+    return Result.Ok(RunResult { status: run.code, stdout: run.outStr(), stderr: stderr });
+}
+
+/// Rust's `io::Error` text for a program that would not start.
+fn procErrText(e: ProcError, arena: &Arena): string {
+    match e {
+        ProcError.NotFound { return fsx.osError(2, arena); }
+        ProcError.ExecFailed { return fsx.osError(13, arena); }
+        ProcError.Fail { return fsx.osError(sys.errno(), arena); }
+    }
+    return "";
+}
+
+/// Rust `clang_opt`: the clang `-O` level for a manifest/flag opt value (`""` is `0`, capitals lowered).
+pub fn clangOpt(opt: string): string {
+    if opt.len == 0 { return "0"; }
+    if opt == "S" { return "s"; }
+    if opt == "Z" { return "z"; }
+    return opt;
+}
+
+/// `mkdir -p dir`, Err as Rust's `mkdir DIR: E`.
+fn mkdirs(dir: string, arena: &Arena): Result<bool, string> {
+    match io.makeDirs(dir) {
+        Result.Ok(_) { return Result.Ok(true); }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("mkdir ").add(dir).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+    }
+}
+
+/// Remove `p` if it is there (Rust `let _ = fs::remove_file(..)`).
+pub fn discard(p: string) {
+    match io.remove(p) {
+        Result.Ok(_) {}
+        Result.Err(_) {}
+    }
+}
+
+/// `ms` as seconds with three decimals (Rust `{:.3}`).
+fn pushSecs(t: &Text, ms: int) {
+    t.pushInt(ms / 1000);
+    t.push('.');
+    let r = ms % 1000;
+    if r < 100 { t.push('0'); }
+    if r < 10 { t.push('0'); }
+    t.pushInt(r);
+}

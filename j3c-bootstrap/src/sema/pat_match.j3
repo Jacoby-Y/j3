@@ -1,0 +1,271 @@
+// Patterns: `match` as a statement and as a value (and `if let`, parsed as a match), destructuring `let`
+// and `let .. else`, `?` on `#[TryCatch]` enums; the arms typed into `TMatch` with their bindings as new
+// locals. The checks are in `pat_check.j3`, one pattern's walk in `pat_test.j3`.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/pat/mod.rs (typing half), check/lower/stmt.rs (let patterns), check/lower/enums.rs
+// (`question`)
+// J3: Hooks (contracts-c2b.md): `body_stmt` / `body_expr` call these. Results: `TStmt.Match(TMatchStmt)`,
+// `TExpr.Match(TMatch)` (arms' values in `TArm.value`), `TStmt.LetPat(TLetPat)`, `TExpr.Question`.
+// J3: Arms are typed in Rust's lowering order, so the first error and the locals' order match it: an int
+// `Switch` (`patIntArms` true) and a guarded match go first to last, any other match last to first (Rust
+// builds its `if` chain from the end). `TMatch.arms` is always in source order. An arm's names become
+// locals sorted by name (Rust `check_or_binds` sorts before `bind_arm`); every `|` alternative's `Bind`
+// names the same local. A statement `match`'s arm tail is the arm body's last statement (`value` None);
+// a value `match`'s is `TArm.value` unless it diverges (then it is a statement too).
+module j3c.sema;
+
+/// Where a value `match` puts its arms' values (Rust `ArmSink`): `on` false for a statement `match`;
+/// `has` once an arm gave a value of type `ty` (its tail at `first`, for the mismatch error).
+struct PatSink {
+    on: bool;
+    has: bool;
+    want: Option<Id<Ty>>;
+    ty: Id<Ty>;
+    first: Span;
+}
+
+extend BodyCx {
+    /// `match e { .. }` / `if let` as a statement (`sp`: the statement's span).
+    fn patMatchStmt(this: &BodyCx, sp: Span, m: &MatchStmt): Result<Id<TStmt>, TErr> {
+        let sink = PatSink { on: false, has: false, want: Option.None, ty: this.com().void, first: noSpan() };
+        let tm = this.patMatch(m, &sink)?;
+        return Result.Ok(this.stmtNode(TStmt.Match(TMatchStmt { m: tm }), sp));
+    }
+
+    /// Rust `match_value`: `match` / `if let` as a value (`if`-expression rules; a leaving arm fits).
+    fn patMatchExpr(this: &BodyCx, sp: Span, m: &MatchStmt, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let sink = PatSink { on: true, has: false, want: want, ty: this.com().void, first: noSpan() };
+        let tm = this.patMatch(m, &sink)?;
+        if !sink.has { return Result.Err(this.err(m.span, "every arm of this `match` leaves, so it has no value")); }
+        return Result.Ok(this.expr(TExpr.Match(tm), sink.ty, sp));
+    }
+
+    /// Rust `lower_match`: the scrutinee, the checks for its type, then the arms.
+    fn patMatch(this: &BodyCx, m: &MatchStmt, sink: &PatSink): Result<TMatch, TErr> {
+        let scrut = this.operand(m.expr, Option.None)?;
+        let st = this.exprTy(scrut);
+        this.patArmOrder(&m.arms)?;
+        let switch = false;
+        let isTuple = false;
+        match this.ty(st) { Ty.Tuple(_) { isTuple = true; } _ {} }
+        if this.isInt(st) {
+            switch = this.patIntArms(m, st)?;
+        } else if st == this.com().string {
+            this.patStrArms(m)?;
+        } else if isTuple {
+            this.patExhaustive(st, &m.arms, m.span)?;
+        } else {
+            match this.enumOf(st) { Option.Some(_) {} Option.None { return Result.Err(this.err(m.span, "match on non-enum")); } }
+            this.patExhaustive(st, &m.arms, m.span)?;
+        }
+        let n = m.arms.len;
+        let arms = this.cx.arena.alloc::<TArm>(n);
+        let guarded = false;
+        for i in 0..n { match m.arms.items[i].guard { Option.Some(_) { guarded = true; } Option.None {} } }
+        if switch || guarded {
+            for i in 0..n { arms[i] = this.patArm(&m.arms.items[i], st, switch, sink)?; }
+        } else {
+            let i = n - 1;
+            while i >= 0 {
+                arms[i] = this.patArm(&m.arms.items[i], st, false, sink)?;
+                i -= 1;
+            }
+        }
+        let out = List<TArm>.new(this.cx.arena);
+        for i in 0..n { out.push(arms[i]); }
+        return Result.Ok(TMatch { scrut: scrut, switch: switch, arms: out });
+    }
+
+    /// Rust `lower_arm` (`int_arm_block` when `switch`: no bindings): the pattern's checks and names, the
+    /// guard, the arm's statements and value. The arm's names leave scope after it.
+    fn patArm(this: &BodyCx, arm: &MatchArm, st: Id<Ty>, switch: bool, sink: &PatSink): Result<TArm, TErr> {
+        let n0 = this.scope.len;
+        if !switch {
+            let binds = List<List<PatBind>>.new(this.cx.arena);
+            for k in 0..arm.pats.len {
+                let b = List<PatBind>.new(this.cx.arena);
+                this.patWalk(arm.pats.items[k], st, &b)?;
+                binds.push(b);
+            }
+            this.patOrBinds(&arm.pats, &binds)?;
+            this.patBindArm(&binds.items[0])?;
+        }
+        let pat = this.patNode(arm.pats.items[0], st);
+        if arm.pats.len > 1 {
+            let items = List<Id<TPat>>.new(this.cx.arena);
+            items.push(pat);
+            for k in 1..arm.pats.len { items.push(this.patNode(arm.pats.items[k], st)); }
+            pat = this.cx.typed.addPat(TPat.Or(TPats { items: items }), st, arm.span);
+        }
+        let guard: Option<Id<TExpr>> = Option.None;
+        match arm.guard {
+            Option.Some(g) {
+                let c = this.operand(g, Option.None)?;
+                if this.exprTy(c) != this.com().bool {
+                    let msg = Text.new(this.cx.arena);
+                    msg.add("a match guard is a `bool`, found `").add(this.tyStr(this.exprTy(c))).add("`");
+                    return Result.Err(this.err(this.cx.ast.exprSpan(g), msg.str()));
+                }
+                guard = Option.Some(c);
+            }
+            Option.None {}
+        }
+        let body = this.cx.typed.block(arm.body.span);
+        let value = this.patArmStmts(arm, sink, &body)?;
+        this.scope.len = n0;
+        return Result.Ok(TArm { span: arm.span, pat: pat, guard: guard, body: body, value: value });
+    }
+
+    /// Rust `arm_stmts`: the arm's statements (an error fails the whole `match`), then its tail: a
+    /// statement in a statement `match`, the arm's value in a value one (where an arm with none must leave).
+    fn patArmStmts(this: &BodyCx, arm: &MatchArm, sink: &PatSink, out: &TBlock): Result<Option<Id<TExpr>>, TErr> {
+        for i in 0..arm.body.stmts.len {
+            let s = arm.body.stmts.items[i];
+            let id = this.stmt(s)?;
+            match this.cx.ast.stmt(s) { Stmt.UseLocal(_) {} _ { out.stmts.push(id); } }
+        }
+        let none: Option<Id<TExpr>> = Option.None;
+        match arm.tail {
+            Option.Some(t) {
+                if !sink.on || exprDiverges(this.cx.ast, t) {
+                    out.stmts.push(this.patExprStmt(t)?);
+                    return Result.Ok(none);
+                }
+                let want = sink.want;
+                if sink.has { want = Option.Some(sink.ty); }
+                let v = this.rvalue(t, want)?;
+                this.patSinkPut(sink, v, this.cx.ast.exprSpan(t))?;
+                return Result.Ok(Option.Some(v));
+            }
+            Option.None {
+                if !sink.on || leaves(this.cx.ast, &arm.body) { return Result.Ok(none); }
+                return Result.Err(this.help(this.err(arm.span, "this arm gives no value"),
+                    "end it with an expression and no `;`, or leave with `return`, `break`, `continue` or `panic`"));
+            }
+        }
+    }
+
+    /// Rust `expr_stmt`: an expression run for its effect; a `match` there is a statement `match`.
+    fn patExprStmt(this: &BodyCx, t: Id<Expr>): Result<Id<TStmt>, TErr> {
+        let sp = this.cx.ast.exprSpan(t);
+        match this.cx.ast.expr(t) {
+            Expr.Match(m) { return this.patMatchStmt(m.span, &m); }
+            _ {}
+        }
+        let v = this.rvalue(t, Option.None)?;
+        return Result.Ok(this.stmtNode(TStmt.Expr(TExprStmt { expr: v }), sp));
+    }
+
+    /// Rust `sink_put`: arm value `v` (its tail at `sp`) must match the arms before it.
+    fn patSinkPut(this: &BodyCx, sink: &PatSink, v: Id<TExpr>, sp: Span): Result<bool, TErr> {
+        let vt = this.exprTy(v);
+        if vt == this.com().void {
+            return Result.Err(this.help(this.err(sp, "this arm's value is `void`"), "a `match` used as a value needs a value from every arm that does not leave"));
+        }
+        if !sink.has {
+            sink.has = true;
+            sink.ty = vt;
+            sink.first = sp;
+            return Result.Ok(true);
+        }
+        if vt == sink.ty { return Result.Ok(true); }
+        // arms are typed last to first: the error sits on the later one in the source
+        let here = sp;
+        let hereTy = vt;
+        let there = sink.first;
+        let thereTy = sink.ty;
+        if !(sp.lo > sink.first.lo) {
+            here = sink.first;
+            hereTy = sink.ty;
+            there = sp;
+            thereTy = vt;
+        }
+        let msg = Text.new(this.cx.arena);
+        msg.add("match arms have different types: this arm is `").add(this.tyStr(hereTy)).add("`, the arm at ");
+        if !isNone(there) {
+            let src = this.cx.sources.get(there.file);
+            msg.add(src.path).add(":");
+            msg.pushInt(src.lines.at(there.lo).line);
+        }
+        msg.add(" is `").add(this.tyStr(thereTy)).add("`");
+        return Result.Err(this.err(here, msg.str()));
+    }
+
+    /// `let P = e;` (Rust `lower_let_pat`) / `let P = e else { .. };` (`lower_let_else`); `sp` the statement's.
+    fn patLetPat(this: &BodyCx, sp: Span, l: &LetPatStmt): Result<Id<TStmt>, TErr> {
+        let psp = this.cx.ast.patSpan(l.pat);
+        let refutable = !irrefutable(this.cx.ast, l.pat);
+        match l.elseBlock {
+            Option.Some(eb) {
+                if !refutable {
+                    return Result.Err(this.help(this.err(psp, "this `let` pattern always matches, so the `else` never runs"), "drop the `else`"));
+                }
+                if !leaves(this.cx.ast, &eb) {
+                    return Result.Err(this.help(this.err(eb.span, "the `else` of `let .. else` must leave"), "end it with `return`, `break`, `continue` or `panic`"));
+                }
+            }
+            Option.None {
+                if refutable {
+                    return Result.Err(this.help(this.err(psp, "this `let` pattern may not match"),
+                        "a `let` pattern is names, `_` and struct patterns; use `match` for a variant or a value"));
+                }
+            }
+        }
+        let value = this.operand(l.value, Option.None)?;
+        let elseBlock: Option<TBlock> = Option.None;
+        match l.elseBlock {
+            Option.Some(eb) {
+                // the pattern's checks, then the `else` (Rust lowers it before the bindings)
+                let b = List<PatBind>.new(this.cx.arena);
+                this.patWalk(l.pat, this.exprTy(value), &b)?;
+                elseBlock = Option.Some(this.scopedBlock(&eb));
+            }
+            Option.None {}
+        }
+        let vt = this.exprTy(value);
+        let binds = List<List<PatBind>>.new(this.cx.arena);
+        binds.push(List<PatBind>.new(this.cx.arena));
+        this.patWalk(l.pat, vt, &binds.items[0])?;
+        let pats = List<Id<Pat>>.new(this.cx.arena);
+        pats.push(l.pat);
+        this.patOrBinds(&pats, &binds)?;
+        this.patBindArm(&binds.items[0])?;
+        let pat = this.patNode(l.pat, vt);
+        return Result.Ok(this.stmtNode(TStmt.LetPat(TLetPat { elseBlock: elseBlock, pat: pat, value: value }), sp));
+    }
+
+    /// Rust `question`: `e?` on a `#[TryCatch]` enum in a fn returning one; its value is the success payload.
+    fn patQuestion(this: &BodyCx, sp: Span, inner: Id<Expr>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let op = this.operand(inner, Option.None)?;
+        let ot = this.exprTy(op);
+        let en = match this.enumOf(ot) { Option.Some(x) { x } Option.None { return Result.Err(this.err(sp, "`?` on non-enum")); } };
+        let tc = match this.cx.tables.enumAt(en).tryCatch {
+            Option.Some(x) { x }
+            Option.None { return Result.Err(this.err(sp, "`?` needs `#[TryCatch]`")); }
+        };
+        if this.ret == this.com().void { return Result.Err(this.err(sp, "`?` in a void function")); }
+        let ren = match this.enumOf(this.ret) {
+            Option.Some(x) { x }
+            Option.None { return Result.Err(this.err(sp, "enclosing `?` return on non-enum")); }
+        };
+        let rtc = match this.cx.tables.enumAt(ren).tryCatch {
+            Option.Some(x) { x }
+            Option.None { return Result.Err(this.err(sp, "enclosing fn must return a `#[TryCatch]` enum")); }
+        };
+        let okTy = this.patPayloadTy(ot, tc.success);
+        let failTy = this.patPayloadTy(ot, tc.failure);
+        let retFailTy = this.patPayloadTy(this.ret, rtc.failure);
+        let same = false;
+        match failTy {
+            Option.Some(a) { match retFailTy { Option.Some(b) { same = a == b; } Option.None {} } }
+            Option.None { match retFailTy { Option.Some(_) {} Option.None { same = true; } } }
+        }
+        if !same { return Result.Err(this.err(sp, "failure payloads must match")); }
+        let vt = this.com().void;
+        match okTy { Option.Some(x) { vt = x; } Option.None {} }
+        let retErr = rtc.failure;
+        if ot == this.ret { retErr = -1; }
+        return Result.Ok(this.expr(TExpr.Question(TQuestion { expr: op, ok: tc.success, err: tc.failure, retErr: retErr }), vt, sp));
+    }
+}

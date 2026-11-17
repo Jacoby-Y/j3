@@ -1,0 +1,174 @@
+// Debug info types: `DIBasicType` / `DIDerivedType` / `DICompositeType` of IR types, memoized per type.
+//
+// Part of module j3c.backend.llvm.
+// Port of: j3c/src/emit/llvm_expr/debug.rs (`di_type` and its helpers)
+// J3: Split from `debug.j3` for size. Metadata lines append to `DebugOut.body` in allocation order.
+module j3c.backend.llvm;
+
+extend DebugOut {
+    fn diType(this: &DebugOut, cx: &IrCx, ty: Id<TyKind>): u32 {
+        match this.tys.get(ty) { Option.Some(id) { return id; } Option.None {} }
+        let id = this.alloc();
+        this.tys.put(ty, id);
+        match cx.tyKind(ty) {
+            TyKind.Void { this.basic(id, "void", 0, 5); }
+            TyKind.Bool { this.basic(id, "bool", 8, 2); }
+            TyKind.Int(i) {
+                let name = "int";
+                let enc: u32 = 5;
+                match i {
+                    IntTy.I64 { name = "int"; }
+                    IntTy.I8 { name = "i8"; }
+                    IntTy.I16 { name = "i16"; }
+                    IntTy.I32 { name = "i32"; }
+                    IntTy.U8 { name = "u8"; enc = 7; }
+                    IntTy.U16 { name = "u16"; enc = 7; }
+                    IntTy.U32 { name = "u32"; enc = 7; }
+                    IntTy.U64 { name = "u64"; enc = 7; }
+                }
+                this.basic(id, name, intBits(i), enc);
+            }
+            TyKind.Vec(v) {
+                // 4 lanes of the lane type, as a vector-flagged array.
+                let lane = cx.common.i32;
+                if v == VecTy.F32x4 { lane = cx.common.f32; }
+                let base = this.diType(cx, lane);
+                let sub = this.alloc();
+                this.body.fmt(`!{sub} = !DISubrange(count: 4)`).push('\n');
+                let elems = this.mdList1(sub);
+                this.body.fmt(`!{id} = !DICompositeType(tag: DW_TAG_array_type, baseType: !{base}, size: 128, align: 128, flags: DIFlagVector, elements: !{elems})`).push('\n');
+            }
+            TyKind.Half { this.basic(id, "f16", 16, 4); }
+            TyKind.Float(f) { if f == FloatTy.F32 { this.basic(id, "f32", 32, 4); } else { this.basic(id, "float", 64, 4); } }
+            TyKind.Ptr { this.pointer(id, this.diType(cx, cx.common.u8)); }
+            TyKind.CStr { this.pointer(id, this.diType(cx, cx.common.u8)); }
+            TyKind.Fn(_) { this.pointer(id, this.diType(cx, cx.common.u8)); }
+            TyKind.Ref(r) { this.pointer(id, this.diType(cx, r.inner)); }
+            TyKind.String { this.pair(cx, id, "string", cx.common.u8); }
+            TyKind.Slice(s) { this.pair(cx, id, "slice", s.elem); }
+            TyKind.Array(a) {
+                let base = this.diType(cx, a.elem);
+                let sub = this.alloc();
+                this.body.fmt(`!{sub} = !DISubrange(count: {a.len})`).push('\n');
+                let elems = this.mdList1(sub);
+                let bits = abiSize(cx, ty) * 8;
+                let align = abiAlign(cx, ty) * 8;
+                this.body.fmt(`!{id} = !DICompositeType(tag: DW_TAG_array_type, baseType: !{base}, size: {bits}, align: {align}, elements: !{elems})`).push('\n');
+            }
+            TyKind.Struct(s) { this.structTy(cx, id, ty, s.id); }
+            TyKind.Enum(e) { this.enumTy(cx, id, ty, e.id); }
+        }
+        return id;
+    }
+
+    fn structTy(this: &DebugOut, cx: &IrCx, id: u32, ty: Id<TyKind>, sid: Id<StructDef>) {
+        let def = cx.structDef(sid);
+        let members = List<u32>.new(this.body.arena);
+        for i in 0..def.fields.len {
+            let f = def.fields.items[i];
+            let fname = cx.nameStr(f.name);
+            if fname.len == 0 { continue; }
+            let off = match fieldOffset(cx, ty, i) { Option.Some(o) { o } Option.None { continue; } };
+            let base = this.diType(cx, f.ty);
+            let mid = this.alloc();
+            this.body.fmt(`!{mid} = !DIDerivedType(tag: DW_TAG_member, name: `).push('"');
+            pushMdStr(&this.body, fname);
+            this.body.fmt(`", scope: !{id}, baseType: !{base}, size: {abiSize(cx, f.ty) * 8}, align: {abiAlign(cx, f.ty) * 8}, offset: {off * 8})`).push('\n');
+            members.push(mid);
+        }
+        let elems = this.empty;
+        if members.len > 0 { elems = this.mdList(members.slice()); }
+        this.body.add("!").fmt(`{id} = !DICompositeType(tag: DW_TAG_structure_type, name: `).push('"');
+        pushMdStr(&this.body, cx.nameStr(def.name));
+        this.body.fmt(`", size: {abiSize(cx, ty) * 8}, align: {abiAlign(cx, ty) * 8}, elements: !{elems})`).push('\n');
+    }
+
+    fn enumTy(this: &DebugOut, cx: &IrCx, id: u32, ty: Id<TyKind>, eid: Id<EnumDef>) {
+        let def = cx.enumDef(eid);
+        let ename = cx.nameStr(def.name);
+        if def.isCLike() { this.basic(id, ename, 32, 5); return; }
+        let tag = this.diType(cx, cx.common.i32);
+        let tagM = this.alloc();
+        this.body.fmt(`!{tagM} = !DIDerivedType(tag: DW_TAG_member, name: `).add("\"tag\"").fmt(`, scope: !{id}, baseType: !{tag}, size: 32, align: 32, offset: 0)`).push('\n');
+        let unionId = this.alloc();
+        let variants = List<u32>.new(this.body.arena);
+        let payload: u64 = 0;
+        let ua: u64 = 1;
+        for i in 0..def.variants.len {
+            let v = def.variants.items[i];
+            let p = match v.payload { Option.Some(p) { p } Option.None { continue; } };
+            let s = abiSize(cx, p);
+            if s > payload { payload = s; }
+            let pa = abiAlign(cx, p);
+            if pa > ua { ua = pa; }
+            let base = this.diType(cx, p);
+            let mid = this.alloc();
+            this.body.fmt(`!{mid} = !DIDerivedType(tag: DW_TAG_member, name: `).push('"');
+            pushMdStr(&this.body, cx.nameStr(v.name));
+            this.body.fmt(`", scope: !{unionId}, baseType: !{base}, size: {s * 8}, align: {pa * 8}, offset: 0)`).push('\n');
+            variants.push(mid);
+        }
+        let unionElems = this.empty;
+        if variants.len > 0 { unionElems = this.mdList(variants.slice()); }
+        let ubits = payload * 8;
+        let ualign = ua * 8;
+        this.body.fmt(`!{unionId} = !DICompositeType(tag: DW_TAG_union_type, name: `).add("\"payload\"")
+            .fmt(`, size: {ubits}, align: {ualign}, elements: !{unionElems})`).push('\n');
+        let poff: u64 = 4;
+        match fieldOffset(cx, ty, 1) { Option.Some(o) { poff = o; } Option.None {} }
+        let payM = this.alloc();
+        this.body.fmt(`!{payM} = !DIDerivedType(tag: DW_TAG_member, name: `).add("\"payload\"")
+            .fmt(`, scope: !{id}, baseType: !{unionId}, size: {ubits}, align: {ualign}, offset: {poff * 8})`).push('\n');
+        let two = this.body.arena.alloc::<u32>(2);
+        two[0] = tagM;
+        two[1] = payM;
+        let elems = this.mdList(two);
+        this.body.fmt(`!{id} = !DICompositeType(tag: DW_TAG_structure_type, name: `).push('"');
+        pushMdStr(&this.body, ename);
+        this.body.fmt(`", size: {abiSize(cx, ty) * 8}, align: {abiAlign(cx, ty) * 8}, elements: !{elems})`).push('\n');
+    }
+
+    fn basic(this: &DebugOut, id: u32, name: string, bits: u32, encoding: u32) {
+        this.body.fmt(`!{id} = !DIBasicType(name: `).push('"');
+        pushMdStr(&this.body, name);
+        this.body.fmt(`", size: {bits}, encoding: {encoding})`).push('\n');
+    }
+
+    fn pointer(this: &DebugOut, id: u32, base: u32) {
+        this.body.fmt(`!{id} = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !{base}, size: 64, align: 64)`).push('\n');
+    }
+
+    fn pair(this: &DebugOut, cx: &IrCx, id: u32, name: string, pointee: Id<TyKind>) {
+        let base = this.diType(cx, pointee);
+        let ptr = this.alloc();
+        this.pointer(ptr, base);
+        let len = this.diType(cx, cx.common.i64);
+        let p = this.alloc();
+        let n = this.alloc();
+        this.body.fmt(`!{p} = !DIDerivedType(tag: DW_TAG_member, name: `).add("\"ptr\"").fmt(`, scope: !{id}, baseType: !{ptr}, size: 64, align: 64, offset: 0)`).push('\n');
+        this.body.fmt(`!{n} = !DIDerivedType(tag: DW_TAG_member, name: `).add("\"len\"").fmt(`, scope: !{id}, baseType: !{len}, size: 64, align: 64, offset: 64)`).push('\n');
+        let two = this.body.arena.alloc::<u32>(2);
+        two[0] = p;
+        two[1] = n;
+        let elems = this.mdList(two);
+        this.body.fmt(`!{id} = !DICompositeType(tag: DW_TAG_structure_type, name: `).add("\"").add(name)
+            .fmt(`", size: 128, align: 64, elements: !{elems})`).push('\n');
+    }
+
+    fn mdList1(this: &DebugOut, one: u32): u32 {
+        let xs = this.body.arena.alloc::<u32>(1);
+        xs[0] = one;
+        return this.mdList(xs);
+    }
+
+    fn mdList(this: &DebugOut, ids: []u32): u32 {
+        let id = this.alloc();
+        this.body.fmt(`!{id} = !`).push('{');
+        for i in 0..ids.len {
+            if i > 0 { this.body.add(", "); }
+            this.body.fmt(`!{ids[i]}`);
+        }
+        this.body.add("}\n");
+        return id;
+    }
+}

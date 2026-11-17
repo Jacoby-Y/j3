@@ -3,9 +3,305 @@
 //
 // Port of: j3c/src/diag.rs, parse/error.rs, check/error.rs
 // J3: Rust had three error types (parse, check, diag); one list of `Diag` replaces them (plan 11 B3):
-// `struct Diag { code: u32, severity: Severity, span: Span, msg: string, notes: []Note, fix: Option<Fix> }`,
-// appended to the `Session`'s list, never thrown. Every error site gets a stable code (`E0042`) when it is
+// `Diag { code, severity, span, msg, notes: List<Note>, fix: Option<Fix> }`, appended to the `Session`'s
+// `Diags`, never thrown. Rust's `notes` and `helps` string lists are one `Note` list with a `NoteKind`.
+// Every error site gets a stable code (`E0042` is `code: 42`; 0 = not assigned yet) when it is
 // ported; a code is never reused or renumbered. Codes, titles and long explanations live in `text/errors.txt` (B10,
 // embedded; `j3c explain` reads the same file); stages raise them by code, this module defines the type. Until parity (plan 11 D1) the renderer prints exactly what Rust printed
 // (no code shown) and the driver stops after the first error. Tests and the LSP key off codes, not text.
 module j3c.base.diag;
+
+use j3.data.pool.Pool;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.sys;
+use j3.text.{ Text, runes, startsWith };
+use j3c.base.intern.own;
+use j3c.base.span.{ isNone, isWholeFile, noSpan, Source, Span };
+
+/// The error-code table (format in its header). Path relative to this file: a unit-test package that
+/// depends on j3c has its own root, so a root-relative path would not be found there.
+const ERRORS = @embed("../../text/errors.txt");
+
+pub enum Severity { Error, Warning }
+
+pub enum NoteKind { Note, Help }
+
+/// A `note:` or `help:` line under a diagnostic; `span` is `noSpan()` when it points nowhere.
+pub struct Note {
+    kind: NoteKind;
+    span: Span;
+    msg: string;
+}
+
+/// A machine-applicable edit: replace `span` with `text`.
+pub struct Fix {
+    span: Span;
+    text: string;
+    msg: string;
+}
+
+/// One diagnostic. `msg` and note strings are arena copies or static (AGENTS.md rule 1).
+pub struct Diag {
+    code: u32;
+    severity: Severity;
+    span: Span;
+    msg: string;
+    notes: List<Note>;
+    fix: Option<Fix>;
+}
+
+/// The diagnostics of one `Session`, in the order they were raised.
+pub struct Diags {
+    arena: &Arena;
+    items: List<Diag>;
+
+    /// Empty list allocating from `arena`.
+    fn new(arena: &Arena): Diags { return Diags { arena: arena, items: List<Diag>.new(arena) }; }
+
+    /// A new diagnostic with no notes and no fix (its `notes` list lives in this arena).
+    fn make(this: &Diags, code: u32, severity: Severity, span: Span, msg: string): Diag {
+        return Diag { code: code, severity: severity, span: span, msg: msg, notes: List<Note>.new(this.arena), fix: Option.None };
+    }
+
+    /// Append `d`, copying `msg`, note and fix strings into the arena (callers may pass frame strings).
+    fn add(this: &Diags, d: Diag) {
+        let c = d;
+        c.msg = own(this.arena, d.msg);
+        for i in 0..c.notes.len { c.notes.items[i].msg = own(this.arena, c.notes.items[i].msg); }
+        match d.fix {
+            Option.Some(f) { c.fix = Option.Some(Fix { span: f.span, text: own(this.arena, f.text), msg: own(this.arena, f.msg) }); }
+            Option.None {}
+        }
+        this.items.push(c);
+    }
+
+    /// Number of diagnostics.
+    fn count(this: &Diags): int { return this.items.len; }
+
+    /// True when any diagnostic is an error.
+    fn hasErrors(this: &Diags): bool {
+        for i in 0..this.items.len {
+            match this.items.items[i].severity {
+                Severity.Error { return true; }
+                Severity.Warning {}
+            }
+        }
+        return false;
+    }
+
+    /// The `i`th diagnostic (0..count), in raise order.
+    fn at(this: &Diags, i: int): &Diag { return &this.items.items[i]; }
+}
+
+/// Add the code-0 error "WHAT: not ported yet" (a stage, pass or backend the port has not reached) to
+/// `diags`; returns false so a stub can `return notPorted(...)`.
+pub fn notPorted(diags: &Diags, what: string): bool {
+    let t = Text.new(diags.arena);
+    t.add(what).add(": not ported yet");
+    diags.add(diags.make(0, Severity.Error, noSpan(), t.str()));
+    return false;
+}
+
+/// Short title of `code` from `text/errors.txt`, "" when unknown.
+pub fn title(code: u32): string {
+    let at = findEntry(code);
+    if at < 0 { return ""; }
+    let e = lineEnd(ERRORS, at);
+    return ERRORS[at + 7..e];
+}
+
+/// Long explanation of `code` (`j3c explain`), "" when unknown. Built on the frame scratch arena (a
+/// one-shot CLI is fine); a long-lived caller (LSP) uses `explainTo`.
+pub fn explain(code: u32): string {
+    let t = Text.scratch();
+    explainTo(code, t);
+    return t.str();
+}
+
+/// Append the long explanation of `code` to `out`, one line per line, each ending in `\n`; false
+/// when the code is unknown.
+pub fn explainTo(code: u32, out: &Text): bool {
+    let at = findEntry(code);
+    if at < 0 { return false; }
+    at = lineEnd(ERRORS, at) + 1;
+    while at < ERRORS.len && !isHeader(ERRORS, at) {
+        let e = lineEnd(ERRORS, at);
+        if ERRORS[at] != '#' {
+            let a = at;
+            if e - a >= 2 && ERRORS[a] == ' ' && ERRORS[a + 1] == ' ' { a += 2; }
+            out.pushStr(ERRORS[a..e]);
+            out.push('\n');
+        }
+        at = e + 1;
+    }
+    return true;
+}
+
+// ponytail: linear scan of the embedded table per lookup (titles and explanations are read on render and
+// `j3c explain`, not per token); index it once per Session if a hot path ever needs it.
+fn findEntry(code: u32): int {
+    let at = 0;
+    while at < ERRORS.len {
+        if isHeader(ERRORS, at) && headerCode(ERRORS, at) == code { return at; }
+        at = lineEnd(ERRORS, at) + 1;
+    }
+    return -1;
+}
+
+/// `E` + 4 digits + `: ` at byte `at` (a line start).
+fn isHeader(s: string, at: int): bool {
+    if at + 7 > s.len || s[at] != 'E' || s[at + 5] != ':' || s[at + 6] != ' ' { return false; }
+    for i in 1..5 {
+        if s[at + i] < '0' || s[at + i] > '9' { return false; }
+    }
+    return true;
+}
+
+fn headerCode(s: string, at: int): u32 {
+    let n: u32 = 0;
+    for i in 1..5 { n = n * 10 + u32(s[at + i] - '0'); }
+    return n;
+}
+
+fn lineEnd(s: string, at: int): int {
+    let i = at;
+    while i < s.len && s[i] != '\n' { i += 1; }
+    return i;
+}
+
+/// Render `d` exactly as Rust does (no code shown until D1), appended to `out`: `error: msg`, then for
+/// a span `  --> path:line:col`, the source line and `^` marks (byte columns, tabs kept, at most 64
+/// marks; a span over several lines marks to the end of its first), then every note, then every help.
+/// `J3C_COLOR` set colors the `error`/`warning` word.
+pub fn render(d: &Diag, sources: &Pool<Source>, out: &Text) {
+    let kind = "error";
+    let color = "[1;31m";
+    match d.severity {
+        Severity.Error {}
+        Severity.Warning { kind = "warning"; color = "[1;33m"; }
+    }
+    // ponytail: Rust tests `var_os("J3C_COLOR").is_some()`; `sys.env` cannot tell set-but-empty from unset.
+    if sys.env("J3C_COLOR") != "" {
+        out.push(27);
+        out.pushStr(color);
+        out.pushStr(kind);
+        out.push(27);
+        out.pushStr("[0m");
+    } else {
+        out.pushStr(kind);
+    }
+    out.pushStr(": ");
+    out.pushStr(d.msg);
+    out.push('\n');
+    if isWholeFile(d.span) {
+        out.pushStr("  --> ");
+        out.pushStr(sources.get(d.span.file).path);
+        out.push('\n');
+    } else if !isNone(d.span) {
+        snippet(d.span, sources.get(d.span.file), out);
+    }
+    if d.notes.len > 0 { out.pushStr("   |\n"); }
+    for i in 0..d.notes.len {
+        match d.notes.items[i].kind {
+            NoteKind.Note { out.pushStr("   = note: "); out.pushStr(d.notes.items[i].msg); out.push('\n'); }
+            NoteKind.Help {}
+        }
+    }
+    for i in 0..d.notes.len {
+        match d.notes.items[i].kind {
+            NoteKind.Note {}
+            NoteKind.Help { out.pushStr("   = help: "); out.pushStr(d.notes.items[i].msg); out.push('\n'); }
+        }
+    }
+}
+
+fn snippet(sp: Span, src: &Source, out: &Text) {
+    let n = u32(src.text.len);
+    let lo = sp.lo;
+    if lo > n { lo = n; }
+    let hi = sp.hi;
+    if hi < sp.lo + 1 { hi = sp.lo + 1; }
+    if hi > n { hi = n; }
+    let a = src.lines.at(lo);
+    let b = src.lines.at(hi);
+    out.pushStr("  --> ");
+    out.pushStr(src.path);
+    out.fmt(`:{a.line}:{a.col}`);
+    out.pushStr("\n   |\n");
+    let text = src.lines.text(src.text, a.line);
+    if a.line < 10 { out.pushStr("  "); } else if a.line < 100 { out.push(' '); }
+    out.pushInt(a.line);
+    out.pushStr(" | ");
+    out.pushStr(text);
+    out.pushStr("\n   | ");
+    let marks = 1;
+    if b.line == a.line {
+        if b.col - a.col > 1 { marks = b.col - a.col; }
+    } else if text.len - (a.col - 1) > 1 {
+        marks = text.len - (a.col - 1);
+    }
+    if marks > 64 { marks = 64; }
+    for i in 0..a.col - 1 { out.push(' '); }
+    for i in 0..marks { out.push('^'); }
+    out.push('\n');
+}
+
+/// The closest candidate to `name` (Rust `diag::did_you_mean`): edit distance (Levenshtein plus adjacent
+/// swaps, over code points) 1, or 2 when `name` is longer than 4 bytes; on a tie, one that is a prefix of
+/// `name` or has it as a prefix wins, then the earliest. `arena` holds the work rows and is rewound.
+pub fn didYouMean(name: string, candidates: []string, arena: &Arena): Option<string> {
+    if name.len == 0 || candidates.len == 0 { return Option.None; }
+    let max = 2;
+    if name.len <= 4 { max = 1; }
+    let mark = arena.checkpoint();
+    let a = codePoints(name, arena);
+    let best = -1;
+    let bestKey = 0;
+    for k in 0..candidates.len {
+        let c = candidates[k];
+        if c == name { continue; }
+        let d = editDistance(a, codePoints(c, arena), arena);
+        if d == 0 || d > max { continue; }
+        let key = d * 2;
+        if !(startsWith(c, name) || startsWith(name, c)) { key += 1; }
+        if best < 0 || key < bestKey { best = k; bestKey = key; }
+    }
+    arena.rewind(mark);
+    if best < 0 { return Option.None; }
+    return Option.Some(candidates[best]);
+}
+
+fn codePoints(s: string, arena: &Arena): List<u32> {
+    let l = List<u32>.new(arena);
+    for cp in s.runes() { l.push(cp); }
+    return l;
+}
+
+fn editDistance(a: List<u32>, b: List<u32>, arena: &Arena): int {
+    if a.len - b.len > 2 || b.len - a.len > 2 { return 3; }
+    let w = b.len + 1;
+    let prev2 = arena.alloc::<int>(w);
+    let prev = arena.alloc::<int>(w);
+    let cur = arena.alloc::<int>(w);
+    for j in 0..w { prev2[j] = 0; prev[j] = j; cur[j] = 0; }
+    for i in 0..a.len {
+        cur[0] = i + 1;
+        for j in 0..b.len {
+            let cost = 1;
+            if a.items[i] == b.items[j] { cost = 0; }
+            let v = prev[j + 1] + 1;
+            if cur[j] + 1 < v { v = cur[j] + 1; }
+            if prev[j] + cost < v { v = prev[j] + cost; }
+            if i > 0 && j > 0 && a.items[i] == b.items[j - 1] && a.items[i - 1] == b.items[j] && prev2[j - 1] + 1 < v {
+                v = prev2[j - 1] + 1;
+            }
+            cur[j + 1] = v;
+        }
+        let t = prev2;
+        prev2 = prev;
+        prev = cur;
+        cur = t;
+    }
+    return prev[b.len];
+}

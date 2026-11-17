@@ -1,0 +1,268 @@
+// Methods in generic code: a method of a generic struct instance (`list.push(x)`, `List<int>.new(a)`), a
+// generic method (`mem.new(v)`, `mem.alloc::<T>(n)`, `S.g::<T>()`), with type args written or inferred.
+// Each resolves to `(decl, type args)` (`InstRef`) and calls the instance (`gen_call.instCallId`).
+//
+// Part of module j3c.sema.
+// Port of: check/lower/call.rs (the generic paths of `call`: TypePath bases, `call_method_inferred`'s
+// caller, `lookup_method` with type args), check/lower/generic_fn.rs (call_method_inferred),
+// check/lower/mod.rs (instantiate_struct_named, resolve_type_args), check/resolve.rs (instantiate_struct's
+// checks: unknown generic type, arity, closure arguments)
+// J3: Rust made a `StructId` per generic struct instance whose `methods` held the non-generic methods
+// (concrete signatures) and `method_temps` the generic ones. Here an instance is `Ty.Struct { decl, args }`;
+// a method of it is the template `FnDecl` (its `Generics` repeats the struct's parameters first) at
+// `args ++ own type args`. "Non-generic method" means no own type parameters (`ownParams == 0`).
+module j3c.sema;
+
+/// A method resolved for a call: the template decl and its full type args (struct args, then its own).
+struct InstRef {
+    f: Id<FnDecl>;
+    args: Id<TyList>;
+}
+
+extend BodyCx {
+    /// `S.g(args)` / `S.g::<T>(args)`: generic method `g` of struct `s` called statically (Rust `call`:
+    /// `struct_id_named`, `lookup_method`, `call_id` without receiver). A generic struct named bare is no
+    /// type here (Rust's `types` holds no templates): the base is a value, so an unknown name.
+    fn genStaticCall(this: &BodyCx, sp: Span, name: Ident, s: Id<StructDecl>, g: Id<FnDecl>, typeArgs: &List<Id<Type>>, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let sd = this.cx.tables.structAt(s);
+        match sd.gen {
+            Option.Some(_) {
+                // the hook gets no base span; the call starts with the bare name
+                let at = Span { file: sp.file, lo: sp.lo, hi: sp.lo + u32(this.str(sd.name).len) };
+                return Result.Err(this.unknown(at, "name", sd.name));
+            }
+            Option.None {}
+        }
+        let targs = this.genTypeArgs(typeArgs)?;
+        let r = this.genLookup(name.span, s, this.cx.arena.alloc::<Id<Ty>>(0), name.name, targs)?;
+        return this.instCallId(sp, r.f, r.args, Option.None, args);
+    }
+
+    /// `List<int>.new(a)`: a static method of a generic struct written with its type args (`f.base` is an
+    /// `Expr.TypePath`; Rust `instantiate_struct_named`, then `lookup_method`, then `call_id`).
+    fn genTypePathCall(this: &BodyCx, sp: Span, f: &FieldExpr, typeArgs: &List<Id<Type>>, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let tp = match this.cx.ast.expr(f.base) {
+            Expr.TypePath(x) { x }
+            _ { return Result.Err(this.err(sp, "cannot call this expression")); }
+        };
+        let st = this.genStructInst(tp.name, &tp.args)?;
+        let extra = this.genTypeArgs(typeArgs)?;
+        let s = match this.ty(st) { Ty.Struct(x) { x } _ { return Result.Err(this.err(tp.name.span, "not a struct")); } };
+        let r = this.genLookup(f.field.span, s.decl, this.cx.tables.items(s.args), f.field.name, extra)?;
+        return this.instCallId(sp, r.f, r.args, Option.None, args);
+    }
+
+    /// `recv.m(args)` where `recv` (after auto-deref) is an instance of generic struct `s` (Rust `call`'s
+    /// receiver path on an instance's `StructId`): UFCS onto a plain fn when `s` has no `m`; else `#[impl]`
+    /// / trait default, generic UFCS; then the method (inferred type args, or written ones).
+    fn genInstMethodCall(this: &BodyCx, sp: Span, recv: Id<TPlace>, s: Id<StructDecl>, name: Ident, typeArgs: &List<Id<Type>>, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let rt = this.placeTy(recv);
+        while true {
+            match this.refInner(rt) { Option.Some(x) { rt = x; } Option.None { break; } }
+        }
+        let sargs = match this.ty(rt) { Ty.Struct(x) { this.cx.tables.items(x.args) } _ { this.cx.arena.alloc::<Id<Ty>>(0) } };
+        let has = false;
+        match this.findMethodAny(s, name.name) { Option.Some(_) { has = true; } Option.None {} }
+        if !has {
+            match this.ufcsTarget(name.name, this.placeTy(recv)) {
+                Option.Some(fid) { return this.callId(sp, fid, Option.Some(recv), args); }
+                Option.None {}
+            }
+            match this.traitMethodCall(sp, recv, rt, name, args)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+            match this.genUfcs(sp, name, typeArgs, recv, args)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+        }
+        if typeArgs.len == 0 {
+            match this.genInferred(sp, s, sargs, name, recv, args)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+        }
+        let targs = this.genTypeArgs(typeArgs)?;
+        let r = match this.genLookup(name.span, s, sargs, name.name, targs) {
+            Result.Ok(x) { x }
+            Result.Err(e) { return Result.Err(this.ufcsHint(e, name.name)); }
+        };
+        let call = this.instCallId(sp, r.f, r.args, Option.Some(recv), args)?;
+        if typeArgs.len > 0 { this.cx.typed.setOrigin(call, Origin.TypeArgs); }
+        return Result.Ok(call);
+    }
+
+    /// `recv.g(args)` / `recv.g::<T>(args)`: generic method `g` of a plain struct (Rust
+    /// `call_method_inferred`, else `lookup_method` with the written type args).
+    fn genMethodCall(this: &BodyCx, sp: Span, recv: Id<TPlace>, g: Id<FnDecl>, name: Ident, typeArgs: &List<Id<Type>>, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let s = match this.cx.tables.fnAt(g).recv { Option.Some(x) { x } Option.None { return Result.Err(this.err(sp, "not a method")); } };
+        let none = this.cx.arena.alloc::<Id<Ty>>(0);
+        if typeArgs.len == 0 {
+            match this.genInferred(sp, s, none, name, recv, args)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+        }
+        let targs = this.genTypeArgs(typeArgs)?;
+        let r = match this.genLookup(name.span, s, none, name.name, targs) {
+            Result.Ok(x) { x }
+            Result.Err(e) { return Result.Err(this.ufcsHint(e, name.name)); }
+        };
+        let call = this.instCallId(sp, r.f, r.args, Option.Some(recv), args)?;
+        if typeArgs.len > 0 { this.cx.typed.setOrigin(call, Origin.TypeArgs); }
+        return Result.Ok(call);
+    }
+
+    /// Rust `call_method_inferred`: generic method `name` of `s` (an instance at `sargs`) called without
+    /// `::<..>` infers its own type args from the arguments. `Ok(None)`: not (only) a generic method, or the
+    /// argument count is off, so the plain lookup reports.
+    fn genInferred(this: &BodyCx, sp: Span, s: Id<StructDecl>, sargs: []Id<Ty>, name: Ident, recv: Id<TPlace>, args: &List<Id<Expr>>): Result<Option<Id<TExpr>>, TErr> {
+        let t = this.cx.tables;
+        let f = match this.findMethodAny(s, name.name) { Option.Some(x) { x } Option.None { return Result.Ok(Option.None); } };
+        let own = this.ownParams(f);
+        if own == 0 { return Result.Ok(Option.None); }
+        let d = *t.fnAt(f);
+        if d.params.len != args.len + 1 { return Result.Ok(Option.None); }
+        let g = match d.gen { Option.Some(x) { x } Option.None { return Result.Ok(Option.None); } };
+        let ns = sargs.len;
+        let out = this.genSlots(ns + own);
+        // The struct's parameters are known: only the method's own stay `Ty.Param`s in the patterns.
+        let partial = this.cx.arena.alloc::<Id<Ty>>(ns + own);
+        for i in 0..ns { partial[i] = sargs[i]; }
+        for k in 0..own { partial[ns + k] = t.paramTy(g, ns + k); }
+        let pl = t.list(partial);
+        let slots = List<Option<Id<TExpr>>>.new(this.cx.arena);
+        for i in 0..args.len {
+            let arg = args.items[i];
+            let pt = subst(t, g, d.params.items[1 + i].ty, pl);
+            if this.bareNum(arg) || this.isClosureLit(arg) || !mentions(t, g, pt) {
+                slots.push(Option.None);
+                continue;
+            }
+            let op = this.operand(arg, Option.None)?;
+            this.bindArg(this.cx.ast.exprSpan(arg), g, pt, this.exprTy(op), out)?;
+            slots.push(Option.Some(op));
+        }
+        let targs = this.cx.arena.alloc::<Id<Ty>>(own);
+        for k in 0..own {
+            if out[ns + k] == this.com().error {
+                let help = Text.new(this.cx.arena);
+                help.add("write it: `.").add(this.str(name.name)).add("::<int>(..)`");
+                return Result.Err(this.help(this.cannotInfer(sp, g, ns + k, name.name), help.str()));
+            }
+            targs[k] = out[ns + k];
+        }
+        let r = this.genLookup(sp, s, sargs, name.name, targs)?;
+        let inst = this.genInstance(sp, r.f, r.args)?;
+        let ops = List<Id<TExpr>>.new(this.cx.arena);
+        ops.push(this.autoThis(sp, recv, subst(t, g, d.params.items[0].ty, r.args))?);
+        for i in 0..args.len {
+            let want = subst(t, g, d.params.items[1 + i].ty, r.args);
+            let op = match slots.items[i] {
+                Option.Some(x) { x }
+                Option.None { this.operand(args.items[i], Option.Some(want))? }
+            };
+            ops.push(this.adaptArg(this.cx.ast.exprSpan(args.items[i]), op, want)?);
+        }
+        return Result.Ok(Option.Some(this.expr(TExpr.Call(TCall { callee: Callee.Inst(InstCallee { inst: inst }), args: ops }), subst(t, g, d.ret, r.args), sp)));
+    }
+
+    /// Rust `lookup_method` on struct `s` at `sargs` (empty for a plain struct): no `extra` type args
+    /// means a method without own type parameters (else `no method`), `extra` names a generic method
+    /// (arity checked, bounds checked, instance at `sargs ++ extra`).
+    fn genLookup(this: &BodyCx, sp: Span, s: Id<StructDecl>, sargs: []Id<Ty>, name: Sym, extra: []Id<Ty>): Result<InstRef, TErr> {
+        let t = this.cx.tables;
+        let f = this.findMethodAny(s, name);
+        if extra.len == 0 {
+            match f {
+                Option.Some(x) {
+                    if this.ownParams(x) == 0 {
+                        // Rust `method_wheres`: a generic struct's method with `where` bounds.
+                        match t.fnAt(x).gen {
+                            Option.Some(g) {
+                                let what = Text.new(this.cx.arena);
+                                what.add("`").add(this.str(name)).add("`");
+                                this.genCallBounds(sp, what.str(), g, sargs)?;
+                            }
+                            Option.None {}
+                        }
+                        return Result.Ok(InstRef { f: x, args: t.list(sargs) });
+                    }
+                }
+                Option.None {}
+            }
+            return Result.Err(this.noMethod(sp, s, name));
+        }
+        let x = match f {
+            Option.Some(x) { x }
+            Option.None { return Result.Err(this.genNoGenericMethod(sp, name)); }
+        };
+        let own = this.ownParams(x);
+        if own == 0 { return Result.Err(this.genNoGenericMethod(sp, name)); }
+        if own != extra.len {
+            let m = Text.new(this.cx.arena);
+            m.add("`").add(this.str(name)).add("` takes ");
+            m.pushInt(own);
+            m.add(" type args, got ");
+            m.pushInt(extra.len);
+            return Result.Err(this.err(sp, m.str()));
+        }
+        let all = this.cx.arena.alloc::<Id<Ty>>(sargs.len + extra.len);
+        for i in 0..sargs.len { all[i] = sargs[i]; }
+        for i in 0..extra.len { all[sargs.len + i] = extra[i]; }
+        match t.fnAt(x).gen {
+            Option.Some(g) {
+                let what = Text.new(this.cx.arena);
+                what.add("`").add(this.str(name)).add("`");
+                this.genCallBounds(sp, what.str(), g, all)?;
+            }
+            Option.None {}
+        }
+        return Result.Ok(InstRef { f: x, args: t.list(all) });
+    }
+
+    /// The type parameters method `f` declares itself (a generic struct's method repeats the struct's
+    /// first; those are not its own).
+    fn ownParams(this: &BodyCx, f: Id<FnDecl>): int {
+        let t = this.cx.tables;
+        let d = t.fnAt(f);
+        let g = match d.gen { Option.Some(x) { x } Option.None { return 0; } };
+        let n = t.genericsAt(g).names.len;
+        match t.genericsAt(g).parent { Option.Some(p) { n -= t.genericsAt(p).names.len; } Option.None {} }
+        return n;
+    }
+
+    /// Rust `resolve_type_args`.
+    fn genTypeArgs(this: &BodyCx, typeArgs: &List<Id<Type>>): Result<[]Id<Ty>, TErr> {
+        let out = this.cx.arena.alloc::<Id<Ty>>(typeArgs.len);
+        for i in 0..typeArgs.len { out[i] = this.resolve(typeArgs.items[i])?; }
+        return Result.Ok(out);
+    }
+
+    /// Rust `instantiate_struct_named`: `Name<args>` as a struct instance type (`Name` a generic struct in
+    /// scope; arity and closure arguments checked as `resolve.instTy` does for a written type).
+    fn genStructInst(this: &BodyCx, name: Ident, typeArgs: &List<Id<Type>>): Result<Id<Ty>, TErr> {
+        let args = this.genTypeArgs(typeArgs)?;
+        let n0 = this.cx.diags.items.len;
+        for i in 0..args.len {
+            if !rejectClosure(this.cx, name.span, args[i], "a generic type argument") {
+                match this.genTakeDiags(n0) { Option.Some(e) { return Result.Err(e); } Option.None {} }
+            }
+        }
+        let isStruct = false;
+        match scopeType(this.cx, this.m, name.name) {
+            Option.Some(d) { isStruct = d.kind == DeclKind.Struct && isTemplate(this.cx, d); }
+            Option.None {}
+        }
+        if !isStruct {
+            let m = Text.new(this.cx.arena);
+            m.add("unknown generic type `").add(this.str(name.name)).add("`");
+            return Result.Err(this.err(name.span, m.str()));
+        }
+        let l = List<Id<Ty>>.new(this.cx.arena);
+        l.extend(args);
+        let r = instTy(this.cx, this.m, name.name, l, name.span);
+        match this.genTakeDiags(n0) { Option.Some(e) { return Result.Err(e); } Option.None {} }
+        let st = match r { Option.Some(x) { x } Option.None { return Result.Err(this.err(name.span, "not a struct")); } };
+        // Outside a template this is where Rust instantiated the template and reported its errors.
+        match this.gen {
+            Option.None {
+                templateErrors(this.cx, st);
+                match this.genTakeDiags(n0) { Option.Some(e) { return Result.Err(e); } Option.None {} }
+            }
+            Option.Some(_) {}
+        }
+        // Rust `queue_bounds`: also in an instance body (concrete args) and the placeholder pass.
+        traitQueueBounds(this.cx, st, name.span);
+        return Result.Ok(st);
+    }
+}

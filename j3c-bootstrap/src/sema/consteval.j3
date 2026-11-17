@@ -1,5 +1,279 @@
-// Compile-time evaluation of `const` values and tables, `@sizeof`, BigInt const expressions.
+// Compile-time evaluation of `const` values: literals, other consts, integer arithmetic (a `u64` const
+// folds unsigned), `-`, `~`, `!`.
 //
 // Part of module j3c.sema.
 // Port of: j3c/src/check/consteval.rs
+// J3: Rust's `ConstVal` map per module is the scope's `Const` entries (`ConstDecl.value`); a const names
+// only consts declared before it in its module, as in Rust (imports come later). `const` arrays are
+// tables (`globals`), `@embed*` consts too.
 module j3c.sema;
+
+/// Rust `collect_consts`: type and value of every scalar `const` of `m`, in item order.
+pub fn collectConsts(cx: &SemaCx, m: Id<ModDecl>): bool {
+    let t = cx.tables;
+    let md = t.modAt(m);
+    for k in 0..md.items.len {
+        match md.items.items[k] {
+            Item.Const(c) { if !collectConst(cx, m, &c) { return false; } }
+            _ {}
+        }
+    }
+    return true;
+}
+
+fn collectConst(cx: &SemaCx, m: Id<ModDecl>, c: &ConstItem): bool {
+    let t = cx.tables;
+    match cx.ast.expr(c.value) {
+        Expr.ScriptType(_) { return true; }
+        Expr.Embed(_) { return true; }
+        Expr.ArrayLit(_) { return true; }
+        _ {}
+    }
+    match scopeOf(cx, m, c.name.name, DeclKind.Const) {
+        Option.Some(_) { return fail(cx, c.name.span, quoted(cx, "duplicate const ", c.name.name, "")); }
+        Option.None {}
+    }
+    let isFloat = false;
+    match cx.ast.expr(c.value) { Expr.Float(_) { isFloat = true; } _ {} }
+    let val = ConstVal { pad: 0, ty: t.common.error, kind: ConstPayload.Null };
+    let done = false;
+    match c.ty {
+        Option.Some(ty) {
+            // A `u64` const folds on the 64 bits as unsigned (`/`, `%`, `>>`; literals above `i64` max).
+            match tyOf(cx, plainEnv(m), ty) {
+                Option.Some(r) {
+                    if r == t.common.u64 && !isFloat {
+                        match evalInt(cx, m, c.value, true) {
+                            Option.Some(v) { val = ConstVal { pad: 0, ty: t.common.u64, kind: ConstPayload.Int(v) }; done = true; }
+                            Option.None { return false; }
+                        }
+                    }
+                }
+                Option.None { return false; }
+            }
+        }
+        Option.None {}
+    }
+    if !done {
+        match evalConst(cx, m, c.value, Option.None) { Option.Some(v) { val = v; } Option.None { return false; } }
+        match c.ty {
+            Option.Some(ty) {
+                let want = t.common.error;
+                match tyOf(cx, plainEnv(m), ty) { Option.Some(r) { want = r; } Option.None { return false; } }
+                match coerceConst(cx, val, want) {
+                    Option.Some(v) { val = v; }
+                    Option.None { return fail(cx, c.span, "const type does not match initializer"); }
+                }
+            }
+            Option.None {}
+        }
+    }
+    let id = t.addConst(ConstDecl { owner: m, name: c.name.name, doc: c.doc, span: c.span, visPub: c.visPub, ty: val.ty, value: Option.Some(val),
+        table: Option.None, item: Option.Some(*c) });
+    t.modAt(m).consts.push(id);
+    bind(cx, m, c.name.name, refConst(id));
+    return true;
+}
+
+/// `val` as a `want` const: an int const takes any int type, a number any float type; None on a mismatch.
+fn coerceConst(cx: &SemaCx, val: ConstVal, want: Id<Ty>): Option<ConstVal> {
+    if want == val.ty { return Option.Some(val); }
+    match val.kind {
+        ConstPayload.Int(v) {
+            if isIntTy(cx, want) { return Option.Some(ConstVal { pad: 0, ty: want, kind: val.kind }); }
+            if isFloatTy(cx, want) { return Option.Some(ConstVal { pad: 0, ty: want, kind: ConstPayload.Float(f64(v)) }); }
+        }
+        ConstPayload.Float(_) { if isFloatTy(cx, want) { return Option.Some(ConstVal { pad: 0, ty: want, kind: val.kind }); } }
+        _ {}
+    }
+    return Option.None;
+}
+
+/// Rust `big_int_err`: an int literal above `i64` max where only `u64` holds it.
+fn bigIntErr(cx: &SemaCx, sp: Span, v: u64): bool {
+    let t = Text.new(cx.arena).add("integer literal `");
+    t.pushU64(v);
+    t.add("` does not fit `int`");
+    return failHelp(cx, sp, t.str(), "only a `u64` holds values above 9223372036854775807: give the `let`, `const` or field the type `u64`");
+}
+
+/// The value of const `name` in `m`, None when there is no such const.
+fn constNamed(cx: &SemaCx, m: Id<ModDecl>, name: Sym): Option<ConstVal> {
+    match scopeOf(cx, m, name, DeclKind.Const) {
+        Option.Some(d) { return cx.tables.constAt(d.asConst()).value; }
+        Option.None {}
+    }
+    return Option.None;
+}
+
+/// Rust `eval_const`: the value of a constant expression in `m`; `want` (when given) converts an int or
+/// float result to that type as a typed `const` does. None after the error Diag.
+pub fn evalConst(cx: &SemaCx, m: Id<ModDecl>, e: Id<Expr>, want: Option<Id<Ty>>): Option<ConstVal> {
+    let v = evalConstRaw(cx, m, e)?;
+    match want {
+        Option.Some(w) { match coerceConst(cx, v, w) { Option.Some(x) { return Option.Some(x); } Option.None {} } }
+        Option.None {}
+    }
+    return Option.Some(v);
+}
+
+fn evalConstRaw(cx: &SemaCx, m: Id<ModDecl>, e: Id<Expr>): Option<ConstVal> {
+    let c = cx.tables.common;
+    let sp = cx.ast.exprSpan(e);
+    match cx.ast.expr(e) {
+        Expr.Char(v) {
+            let ty = c.u32;
+            if v < u32(128) { ty = c.u8; }
+            return Option.Some(ConstVal { pad: 0, ty: ty, kind: ConstPayload.Int(i64(v)) });
+        }
+        _ {}
+    }
+    match foldedLiteral(cx.ast, e) {
+        Expr.String(b) { return Option.Some(ConstVal { pad: 0, ty: c.string, kind: ConstPayload.String(b) }); }
+        Expr.Int(v) { return Option.Some(ConstVal { pad: 0, ty: c.i64, kind: ConstPayload.Int(v) }); }
+        Expr.BigInt(v) { bigIntErr(cx, sp, v); return Option.None; }
+        Expr.Float(v) { return Option.Some(ConstVal { pad: 0, ty: c.f64, kind: ConstPayload.Float(v) }); }
+        Expr.Bool(v) { return Option.Some(ConstVal { pad: 0, ty: c.bool, kind: ConstPayload.Bool(v) }); }
+        Expr.Name(n) {
+            match constNamed(cx, m, n.name) { Option.Some(v) { return Option.Some(v); } Option.None {} }
+            fail(cx, n.span, quoted(cx, "unknown const ", n.name, ""));
+            return Option.None;
+        }
+        Expr.Binary(b) {
+            let x = evalInt(cx, m, b.lhs, false)?;
+            let y = evalInt(cx, m, b.rhs, false)?;
+            match foldBin(cx, b.op, x, y, sp, false) {
+                Fold.Val(v) { return Option.Some(ConstVal { pad: 0, ty: c.i64, kind: ConstPayload.Int(v) }); }
+                Fold.NotInt { fail(cx, sp, "const initializer must be an integer expression"); }
+                Fold.Err {}
+            }
+            return Option.None;
+        }
+        Expr.Unary(u) {
+            if u.op == UnaryOp.Neg {
+                let v = evalConstRaw(cx, m, u.expr)?;
+                match v.kind {
+                    ConstPayload.Int(n) { return Option.Some(ConstVal { pad: 0, ty: c.i64, kind: ConstPayload.Int(i64(0) - n) }); }
+                    ConstPayload.Float(n) { return Option.Some(ConstVal { pad: 0, ty: v.ty, kind: ConstPayload.Float(-n) }); }
+                    _ {}
+                }
+                fail(cx, sp, "const initializer must be a number");
+                return Option.None;
+            }
+            if u.op == UnaryOp.BitNot {
+                let v = evalConstRaw(cx, m, u.expr)?;
+                match v.kind {
+                    ConstPayload.Int(n) { return Option.Some(ConstVal { pad: 0, ty: c.i64, kind: ConstPayload.Int(n ^ i64(-1)) }); }
+                    _ {}
+                }
+                fail(cx, sp, "`~` in a const initializer needs an integer");
+                return Option.None;
+            }
+            if u.op == UnaryOp.Not {
+                let v = evalConstRaw(cx, m, u.expr)?;
+                match v.kind {
+                    ConstPayload.Bool(x) { return Option.Some(ConstVal { pad: 0, ty: c.bool, kind: ConstPayload.Bool(!x) }); }
+                    _ {}
+                }
+                fail(cx, sp, "const initializer must be a bool");
+                return Option.None;
+            }
+        }
+        Expr.Call(call) {
+            match cx.ast.expr(call.func) {
+                Expr.Name(n) {
+                    let s = cx.tables.str(n.name);
+                    if s == "vec4f" || s == "vec4i" {
+                        failHelp(cx, sp, "a vec4f/vec4i const is not supported yet", "build the vector in a function, or keep the four lanes as separate consts");
+                        return Option.None;
+                    }
+                }
+                _ {}
+            }
+        }
+        _ {}
+    }
+    fail(cx, sp, "const initializer must be an int, float, bool, or string");
+    return Option.None;
+}
+
+/// Rust `eval_int`: an integer constant expression (`unsigned`: a `u64` const). None after the Diag.
+fn evalInt(cx: &SemaCx, m: Id<ModDecl>, e: Id<Expr>, unsigned: bool): Option<i64> {
+    let sp = cx.ast.exprSpan(e);
+    match cx.ast.expr(e) {
+        Expr.Int(v) { return Option.Some(v); }
+        Expr.BigInt(v) {
+            if unsigned { return Option.Some(i64(v)); }
+            bigIntErr(cx, sp, v);
+            return Option.None;
+        }
+        Expr.Char(v) { return Option.Some(i64(v)); }
+        Expr.Name(n) {
+            match constNamed(cx, m, n.name) {
+                Option.Some(v) {
+                    match v.kind { ConstPayload.Int(x) { return Option.Some(x); } _ {} }
+                    fail(cx, n.span, quoted(cx, "", n.name, " is not an int const"));
+                    return Option.None;
+                }
+                Option.None {}
+            }
+            fail(cx, n.span, quoted(cx, "unknown const ", n.name, ""));
+            return Option.None;
+        }
+        Expr.Binary(b) {
+            let x = evalInt(cx, m, b.lhs, unsigned)?;
+            let y = evalInt(cx, m, b.rhs, unsigned)?;
+            match foldBin(cx, b.op, x, y, sp, unsigned) {
+                Fold.Val(v) { return Option.Some(v); }
+                Fold.NotInt { fail(cx, sp, "const initializer must be an integer expression"); }
+                Fold.Err {}
+            }
+            return Option.None;
+        }
+        Expr.Unary(u) {
+            if u.op == UnaryOp.Neg { return Option.Some(i64(0) - evalInt(cx, m, u.expr, unsigned)?); }
+            if u.op == UnaryOp.BitNot { return Option.Some(evalInt(cx, m, u.expr, unsigned)? ^ i64(-1)); }
+        }
+        _ {}
+    }
+    fail(cx, sp, "const initializer must be an integer expression");
+    return Option.None;
+}
+
+/// A folded binary op: the value, an op that is not integer arithmetic, or an error already reported.
+enum Fold { Val(i64), NotInt, Err }
+
+/// Rust `fold_const_bin`: `a op b` on 64 bits, wrapping; shift amounts masked to 0..63; `unsigned` makes
+/// `/`, `%` and `>>` unsigned.
+fn foldBin(cx: &SemaCx, op: BinOp, a: i64, b: i64, sp: Span, unsigned: bool): Fold {
+    let sh = u64(b) & u64(63);
+    if unsigned && (op == BinOp.Div || op == BinOp.Rem || op == BinOp.Shr) {
+        if op == BinOp.Shr { return Fold.Val(i64(u64(a) >> sh)); }
+        if b == 0 { fail(cx, sp, "division by zero in const initializer"); return Fold.Err; }
+        if op == BinOp.Div { return Fold.Val(i64(u64(a) / u64(b))); }
+        return Fold.Val(i64(u64(a) % u64(b)));
+    }
+    let min = i64(-9223372036854775807) - 1;
+    match op {
+        BinOp.Add { return Fold.Val(a + b); }
+        BinOp.Sub { return Fold.Val(a - b); }
+        BinOp.Mul { return Fold.Val(a * b); }
+        BinOp.Div {
+            if b == 0 { fail(cx, sp, "division by zero in const initializer"); return Fold.Err; }
+            if a == min && b == -1 { return Fold.Val(min); }
+            return Fold.Val(a / b);
+        }
+        BinOp.Rem {
+            if b == 0 { fail(cx, sp, "division by zero in const initializer"); return Fold.Err; }
+            if b == -1 { return Fold.Val(0); }
+            return Fold.Val(a % b);
+        }
+        BinOp.Shl { return Fold.Val(i64(u64(a) << sh)); }
+        BinOp.Shr { return Fold.Val(a >> i64(sh)); }
+        BinOp.BitAnd { return Fold.Val(a & b); }
+        BinOp.BitOr { return Fold.Val(a | b); }
+        BinOp.BitXor { return Fold.Val(a ^ b); }
+        _ {}
+    }
+    return Fold.NotInt;
+}

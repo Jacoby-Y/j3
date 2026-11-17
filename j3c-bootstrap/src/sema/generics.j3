@@ -1,8 +1,254 @@
-// Generic fns and structs: templates, type-argument inference by unification, one instance per type set.
+// Generic fns and structs: type-argument inference by unification and substitution of a template's
+// parameters.
 //
 // Part of module j3c.sema.
 // Port of: j3c/src/check/generic_fn.rs, check/lower/generic_fn.rs, check/lower/unify.rs
 // J3: A generic body is typed once against its bounds with placeholder types (plan 11 B11.1), which gives
-// the definition-site errors Rust's `defcheck` got by cloning `IrCx`. Instances come from `instances` and
-// reuse that typing with the placeholders substituted; nothing re-walks the AST.
+// the definition-site errors Rust's `defcheck` got by cloning `IrCx` (`gen_body.checkTemplates`). Each
+// instance from `instances` is then typed again with its concrete types (`gen_body.genDrainFn`), as Rust
+// re-lowers each instance; `subst` gives it the template's signature and written types at its args.
+// J3: Rust unified the written AST type (`[]T`) against the argument's type; here the template's
+// signature is already a `Ty` with `Ty.Param`s, so `unify` walks two `Ty`s. A struct or enum matches by
+// declaration (Rust matched by name).
 module j3c.sema;
+
+/// Rust `unify::Conflict`: parameter `index` was inferred as two different types.
+pub struct Conflict { index: int; first: Id<Ty>; second: Id<Ty>; }
+
+/// Rust `unify`: match `pattern` (with `Ty.Param`s of `gen`) against `actual`, recording each parameter's
+/// type in `out` (one slot per parameter, `common.error` = unknown yet). Shapes that do not line up bind
+/// nothing (the caller checks the argument against the substituted type). None on success.
+pub fn unify(tables: &Tables, gen: Id<Generics>, pattern: Id<Ty>, actual: Id<Ty>, out: []Id<Ty>): Option<Conflict> {
+    let a = tables.ty(actual);
+    match tables.ty(pattern) {
+        Ty.Param(p) {
+            if p.gen != gen || p.index >= out.len { return Option.None; }
+            let first = out[p.index];
+            if first != tables.common.error && first != actual { return Option.Some(Conflict { index: p.index, first: first, second: actual }); }
+            out[p.index] = actual;
+        }
+        Ty.Ref(r) { match a { Ty.Ref(x) { return unify(tables, gen, r.inner, x.inner, out); } _ {} } }
+        Ty.Slice(s) {
+            match a {
+                Ty.Slice(x) { return unify(tables, gen, s.elem, x.elem, out); }
+                Ty.Array(x) { return unify(tables, gen, s.elem, x.elem, out); }
+                _ {}
+            }
+        }
+        Ty.Array(s) { match a { Ty.Array(x) { return unify(tables, gen, s.elem, x.elem, out); } _ {} } }
+        // Rust binds nothing unless the lengths are equal (unify.rs:47).
+        Ty.Tuple(t) { match a { Ty.Tuple(x) { if tables.items(t.elems).len == tables.items(x.elems).len { return unifyLists(tables, gen, t.elems, x.elems, out); } } _ {} } }
+        Ty.Struct(s) { match a { Ty.Struct(x) { if s.decl == x.decl { return unifyLists(tables, gen, s.args, x.args, out); } } _ {} } }
+        Ty.Enum(s) { match a { Ty.Enum(x) { if s.decl == x.decl { return unifyLists(tables, gen, s.args, x.args, out); } } _ {} } }
+        Ty.Fn(f) {
+            match a {
+                Ty.Fn(x) {
+                    match unifyLists(tables, gen, f.params, x.params, out) { Option.Some(c) { return Option.Some(c); } Option.None {} }
+                    return unify(tables, gen, f.ret, x.ret, out);
+                }
+                _ {}
+            }
+        }
+        Ty.Closure(f) {
+            match a {
+                Ty.Closure(x) {
+                    match unifyLists(tables, gen, f.params, x.params, out) { Option.Some(c) { return Option.Some(c); } Option.None {} }
+                    return unify(tables, gen, f.ret, x.ret, out);
+                }
+                _ {}
+            }
+        }
+        _ {}
+    }
+    return Option.None;
+}
+
+/// Pairwise `unify` over the shorter of two lists (Rust `zip`).
+fn unifyLists(tables: &Tables, gen: Id<Generics>, ps: Id<TyList>, xs: Id<TyList>, out: []Id<Ty>): Option<Conflict> {
+    let p = tables.items(ps);
+    let x = tables.items(xs);
+    let n = p.len;
+    if x.len < n { n = x.len; }
+    for i in 0..n {
+        match unify(tables, gen, p[i], x[i], out) { Option.Some(c) { return Option.Some(c); } Option.None {} }
+    }
+    return Option.None;
+}
+
+/// `t` with the parameters of `gen` replaced by `args` (an instance's view of a template type).
+/// Mechanical, no lookup; sema only (lower sees concrete types). Parameters of other templates stay.
+pub fn subst(tables: &Tables, gen: Id<Generics>, t: Id<Ty>, args: Id<TyList>): Id<Ty> {
+    let xs = tables.items(args);
+    match tables.ty(t) {
+        Ty.Param(p) { if p.gen == gen && p.index < xs.len { return xs[p.index]; } }
+        Ty.Ref(r) { return tables.refTo(subst(tables, gen, r.inner, args)); }
+        Ty.Array(a) { return tables.arrayOf(subst(tables, gen, a.elem, args), a.len); }
+        Ty.Slice(s) { return tables.sliceOf(subst(tables, gen, s.elem, args)); }
+        Ty.Fn(f) { return tables.intern(Ty.Fn(FnTy { params: substList(tables, gen, f.params, args), ret: subst(tables, gen, f.ret, args) })); }
+        Ty.Struct(s) { return tables.intern(Ty.Struct(StructTy { decl: s.decl, args: substList(tables, gen, s.args, args) })); }
+        Ty.Enum(e) { return tables.intern(Ty.Enum(EnumTy { decl: e.decl, args: substList(tables, gen, e.args, args) })); }
+        Ty.Tuple(tu) { return tables.intern(Ty.Tuple(TupleTy { elems: substList(tables, gen, tu.elems, args) })); }
+        Ty.Closure(c) {
+            return tables.intern(Ty.Closure(ClosureTy { params: substList(tables, gen, c.params, args), ret: subst(tables, gen, c.ret, args), boxed: c.boxed }));
+        }
+        _ {}
+    }
+    return t;
+}
+
+fn substList(tables: &Tables, gen: Id<Generics>, l: Id<TyList>, args: Id<TyList>): Id<TyList> {
+    let xs = tables.items(l);
+    if xs.len == 0 { return l; }
+    let out = tables.arena.alloc::<Id<Ty>>(xs.len);
+    for i in 0..xs.len { out[i] = subst(tables, gen, xs[i], args); }
+    return tables.list(out);
+}
+
+/// The type of field `index` of struct type `st`; a generic struct's field at the struct's type arguments.
+fn fieldTyOf(tables: &Tables, st: Id<Ty>, index: int): Id<Ty> {
+    match tables.ty(st) {
+        Ty.Struct(s) {
+            let sd = tables.structAt(s.decl);
+            let ft = sd.fields.items[index].ty;
+            match sd.gen { Option.Some(g) { return subst(tables, g, ft, s.args); } Option.None { return ft; } }
+        }
+        _ {}
+    }
+    return tables.common.error;
+}
+
+/// Rust `mentions`: does `t` name a parameter of `gen` anywhere inside it?
+pub fn mentions(tables: &Tables, gen: Id<Generics>, t: Id<Ty>): bool {
+    match tables.ty(t) {
+        Ty.Param(p) { return p.gen == gen; }
+        Ty.Ref(r) { return mentions(tables, gen, r.inner); }
+        Ty.Array(a) { return mentions(tables, gen, a.elem); }
+        Ty.Slice(s) { return mentions(tables, gen, s.elem); }
+        Ty.Fn(f) { return mentionsList(tables, gen, f.params) || mentions(tables, gen, f.ret); }
+        Ty.Closure(c) { return mentionsList(tables, gen, c.params) || mentions(tables, gen, c.ret); }
+        Ty.Struct(s) { return mentionsList(tables, gen, s.args); }
+        Ty.Enum(e) { return mentionsList(tables, gen, e.args); }
+        Ty.Tuple(tu) { return mentionsList(tables, gen, tu.elems); }
+        _ {}
+    }
+    return false;
+}
+
+fn mentionsList(tables: &Tables, gen: Id<Generics>, l: Id<TyList>): bool {
+    let xs = tables.items(l);
+    for i in 0..xs.len { if mentions(tables, gen, xs[i]) { return true; } }
+    return false;
+}
+
+/// Rust `instantiate_struct` / `instantiate_enum`: an instance's field, payload and method signature
+/// types are made with it, so they are first made in its module (`Tables.tyHome`). Called when `id`
+/// gets its home.
+fn homeInst(t: &Tables, id: Id<Ty>) {
+    if t.types.homing > 64 { return; }
+    t.types.homing += 1;
+    match t.ty(id) {
+        Ty.Struct(s) {
+            let sd = t.structAt(s.decl);
+            match sd.gen {
+                Option.Some(g) {
+                    if t.items(s.args).len > 0 && !mentionsAnyParam(t, s.args) {
+                        for i in 0..sd.fields.len { touchTy(t, subst(t, g, sd.fields.items[i].ty, s.args)); }
+                        let own = t.genericsAt(g).names.len;
+                        for i in 0..sd.methods.len {
+                            let fd = t.fnAt(sd.methods.items[i]);
+                            let mg = match fd.gen { Option.Some(x) { x } Option.None { continue; } };
+                            if t.genericsAt(mg).names.len != own { continue; }
+                            for k in 0..fd.params.len { touchTy(t, subst(t, mg, fd.params.items[k].ty, s.args)); }
+                            touchTy(t, subst(t, mg, fd.ret, s.args));
+                        }
+                    }
+                }
+                Option.None {}
+            }
+        }
+        Ty.Enum(e) {
+            let ed = t.enumAt(e.decl);
+            match ed.gen {
+                Option.Some(g) {
+                    if t.items(e.args).len > 0 && !mentionsAnyParam(t, e.args) {
+                        for i in 0..ed.variants.len {
+                            match ed.variants.items[i].payload { Option.Some(p) { touchTy(t, subst(t, g, p, e.args)); } Option.None {} }
+                        }
+                    }
+                }
+                Option.None {}
+            }
+        }
+        _ {}
+    }
+    t.types.homing -= 1;
+}
+
+/// Does a type of `l` name a type parameter (a template's own view, never instantiated)?
+fn mentionsAnyParam(t: &Tables, l: Id<TyList>): bool {
+    let xs = t.items(l);
+    for i in 0..xs.len { if mentionsParamTy(t, xs[i]) { return true; } }
+    return false;
+}
+
+fn mentionsParamTy(t: &Tables, ty: Id<Ty>): bool {
+    match t.ty(ty) {
+        Ty.Param(_) { return true; }
+        Ty.TraitSelf { return true; }
+        Ty.Ref(r) { return mentionsParamTy(t, r.inner); }
+        Ty.Array(a) { return mentionsParamTy(t, a.elem); }
+        Ty.Slice(s) { return mentionsParamTy(t, s.elem); }
+        Ty.Fn(f) { return mentionsAnyParam(t, f.params) || mentionsParamTy(t, f.ret); }
+        Ty.Closure(c) { return mentionsAnyParam(t, c.params) || mentionsParamTy(t, c.ret); }
+        Ty.Struct(s) { return mentionsAnyParam(t, s.args); }
+        Ty.Enum(e) { return mentionsAnyParam(t, e.args); }
+        Ty.Tuple(tu) { return mentionsAnyParam(t, tu.elems); }
+        _ {}
+    }
+    return false;
+}
+
+/// `id`, and first the types it is built from, take the module being checked as home if they have none
+/// (a type first made by a template's placeholder pass or while no module was current).
+fn touchTy(t: &Tables, id: Id<Ty>) {
+    if t.types.cur == 0 || t.types.homes.items[int(id.i)] != 0 { return; }
+    match t.ty(id) {
+        Ty.Ref(r) { touchTy(t, r.inner); }
+        Ty.Array(a) { touchTy(t, a.elem); }
+        Ty.Slice(s) { touchTy(t, s.elem); }
+        Ty.Fn(f) { touchList(t, f.params); touchTy(t, f.ret); }
+        Ty.Closure(c) { touchList(t, c.params); touchTy(t, c.ret); }
+        Ty.Struct(s) { touchList(t, s.args); }
+        Ty.Enum(e) { touchList(t, e.args); }
+        Ty.Tuple(tu) { touchList(t, tu.elems); }
+        _ {}
+    }
+    t.types.homes.items[int(id.i)] = t.types.cur;
+    homeInst(t, id);
+}
+
+fn touchList(t: &Tables, l: Id<TyList>) {
+    let xs = t.items(l);
+    for i in 0..xs.len { touchTy(t, xs[i]); }
+}
+
+/// The homes Rust's signature collection gives (run after `declareFns`, which interns with no module
+/// current): first the instances the type declarations made get their method signatures' types (Rust
+/// `instantiate_struct` makes an instance's methods with it, before any fn signature is collected),
+/// then every plain fn's parameter and return types, module by module (fn ids are in that order).
+fn homeSignatures(t: &Tables) {
+    let i = 0;
+    while i < t.types.tys.len() {
+        let h = t.types.homes.items[i];
+        if h != 0 { t.types.cur = h; homeInst(t, Id<Ty> { i: u32(i) }); }
+        i += 1;
+    }
+    for k in 0..t.fns.len() {
+        let fd = t.fnAt(t.fns.idAt(k));
+        match fd.gen { Option.Some(_) { continue; } Option.None {} }
+        t.enter(fd.owner);
+        for p in 0..fd.params.len { touchTy(t, fd.params.items[p].ty); }
+        touchTy(t, fd.ret);
+    }
+    t.leave();
+}

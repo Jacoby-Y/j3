@@ -2,4 +2,198 @@
 //
 // Part of module j3c.backend.llvm.
 // Port of: j3c/src/emit/llvm_expr/rvalue.rs
+// J3: Entries return `(value, llvm type)` like Rust: `rvalue` (exhaustive over `RvalueKind`), `operand`,
+// `operandConst` (no instructions: initializers). Calls, atomics and enums are in `rvalue_call.j3`; casts
+// and aggregates in `rvalue_cast.j3`.
 module j3c.backend.llvm;
+
+extend LlvmFn {
+    fn operandConst(this: &LlvmFn, op: &Operand): Result<string, string> {
+        match *op {
+            Operand.Const(c) {
+                match c.kind {
+                    // a fn address in static data (a `dyn` method table) is the symbol itself
+                    ConstKind.FnAddr(_) { return this.constVal(c.ty, c.kind); }
+                    _ { return this.constBits(c.ty, c.kind); }
+                }
+            }
+            Operand.Copy(_) { return Result.Err("const init needs a constant"); }
+        }
+    }
+
+    fn operand(this: &LlvmFn, op: &Operand): Result<(string, string), string> {
+        let cx = this.cx;
+        match *op {
+            Operand.Copy(place) {
+                let (ptr, ty) = this.placePtr(&place)?;
+                let ll = llType(cx, ty, this.arena)?;
+                if inMem(cx, ty) { return Result.Ok((ptr, ll)); }
+                return Result.Ok((this.load(ll, ptr), ll));
+            }
+            Operand.Const(c) {
+                let ll = llType(cx, c.ty, this.arena)?;
+                let v = this.constVal(c.ty, c.kind)?;
+                if inMem(cx, c.ty) {
+                    // a constant of an in-memory type is still an address to its users
+                    let slot = this.alloca(ll);
+                    this.store(ll, v, slot);
+                    return Result.Ok((slot, ll));
+                }
+                return Result.Ok((v, ll));
+            }
+        }
+    }
+
+    fn constBits(this: &LlvmFn, ty: Id<TyKind>, kind: ConstKind): Result<string, string> {
+        match kind {
+            ConstKind.Bool(b) { if b { return Result.Ok("1"); } return Result.Ok("0"); }
+            ConstKind.Int(bits) {
+                if isSignedInt(this.cx, ty) { return Result.Ok(this.keep(`{i64(bits)}`)); }
+                // stage 0 prints a `u64` in `{..}` as signed (PORT_DEBT): pushU64 for Rust's unsigned `{bits}`
+                let t = Text.new(this.arena);
+                t.pushU64(bits);
+                return Result.Ok(t.str());
+            }
+            ConstKind.F32Bits(b) {
+                // LLVM `0x` hex is IEEE *double* bits even for `float`.
+                let t = Text.new(this.arena);
+                t.add("0x");
+                pushHex16(&t, f64Bits(f64(f32FromBits(b))), true);
+                return Result.Ok(t.str());
+            }
+            ConstKind.F64Bits(b) {
+                let t = Text.new(this.arena);
+                t.add("0x");
+                pushHex16(&t, b, true);
+                return Result.Ok(t.str());
+            }
+            ConstKind.Null { return Result.Ok("null"); }
+            ConstKind.Void { return Result.Ok("undef"); }
+            ConstKind.FnAddr(_) { return Result.Err("const init of fn/bytes not in global scalar"); }
+            ConstKind.Bytes(_) { return Result.Err("const init of fn/bytes not in global scalar"); }
+        }
+    }
+
+    fn constVal(this: &LlvmFn, ty: Id<TyKind>, kind: ConstKind): Result<string, string> {
+        match kind {
+            ConstKind.FnAddr(fa) {
+                let func = this.cx.funcMut(fa.func);
+                let t = Text.new(this.arena);
+                t.push('@');
+                match func.kind {
+                    FuncKind.Lib(lb) { pushSanitized(&t, this.cx.nameStr(lb.symbol)); }
+                    FuncKind.J3(_) { pushFuncName(&t, this.cx, func); }
+                    FuncKind.Decl { pushFuncName(&t, this.cx, func); }
+                }
+                return Result.Ok(t.str());
+            }
+            ConstKind.Bytes(b) {
+                let lit = this.bytesGlobal(b.bytes);
+                let s = this.fresh();
+                let t = this.fresh();
+                this.inst(this.l().add(s).add(" = insertvalue %j3_string poison, ptr ").add(lit).add(", 0").str());
+                this.inst(this.l().add(t).add(" = insertvalue %j3_string ").add(s).fmt(`, i64 {b.bytes.len}, 1`).str());
+                return Result.Ok(t);
+            }
+            _ { return this.constBits(ty, kind); }
+        }
+    }
+
+    fn bytesGlobal(this: &LlvmFn, bytes: []u8): string {
+        let n = this.seq.n;
+        this.seq.n += 1;
+        let name = this.keep(`@.b{n}`);
+        this.globals.add(name).fmt(` = private unnamed_addr constant [{bytes.len} x i8] `);
+        llBytesLit(bytes, &this.globals);
+        this.globals.push('\n');
+        let p = this.fresh();
+        this.inst(this.l().add(p).fmt(` = getelementptr [{bytes.len} x i8], ptr `).add(name).add(", i64 0, i64 0").str());
+        return p;
+    }
+
+    fn rvalue(this: &LlvmFn, rv: &Rvalue): Result<(string, string), string> {
+        let cx = this.cx;
+        let ll = llType(cx, rv.ty, this.arena)?;
+        match rv.kind {
+            RvalueKind.Simd(s) { return this.simd(rv, s.op, s.args.slice()); }
+            RvalueKind.Use(op) { return this.operand(&op); }
+            RvalueKind.Ref(r) {
+                let (ptr, _) = this.placePtr(&r.place)?;
+                return Result.Ok((ptr, "ptr"));
+            }
+            RvalueKind.Binary(b) {
+                let (l, _) = this.operand(&b.lhs)?;
+                let (r, _) = this.operand(&b.rhs)?;
+                return Result.Ok((this.binop(rv.ty, operandTy(b.lhs), b.op, l, r)?, ll));
+            }
+            RvalueKind.Unary(u) {
+                match cx.tyKind(rv.ty) {
+                    TyKind.Vec(_) {
+                        let (a, _) = this.operand(&u.arg)?;
+                        return Result.Ok((this.vecUnary(rv.ty, u.op, a)?, ll));
+                    }
+                    _ {}
+                }
+                let (a, at) = this.operand(&u.arg)?;
+                let v = "";
+                match u.op {
+                    UnaryOp.Not {
+                        let c = this.fresh();
+                        this.inst(this.l().add(c).add(" = icmp eq ").add(at).add(" ").add(a).add(", 0").str());
+                        v = this.fresh();
+                        this.inst(this.l().add(v).add(" = zext i1 ").add(c).add(" to i8").str());
+                    }
+                    UnaryOp.Neg {
+                        if isInt(cx, rv.ty) {
+                            v = this.binop(rv.ty, rv.ty, BinOp.Sub, "0", a)?;
+                        } else {
+                            v = this.fresh();
+                            this.inst(this.l().add(v).add(" = fneg ").add(ll).add(" ").add(a).str());
+                        }
+                    }
+                    UnaryOp.BitNot {
+                        v = this.fresh();
+                        this.inst(this.l().add(v).add(" = xor ").add(ll).add(" ").add(a).add(", -1").str());
+                    }
+                }
+                return Result.Ok((v, ll));
+            }
+            RvalueKind.Call(c) { return this.call(rv, &c, ll); }
+            RvalueKind.Syscall(sc) {
+                let (n, _) = this.operand(&sc.nr)?;
+                // every argument is evaluated; the call passes the first six, padded with 0
+                let words = List<string>.new(this.arena);
+                for i in 0..sc.args.len { words.push(this.syscallWord(&sc.args.items[i])?); }
+                let line = Text.new(this.arena);
+                let v = this.fresh();
+                line.add(v).add(" = call i64 (i64, ...) @syscall(i64 ").add(n);
+                for i in 0..words.len { if i < 6 { line.add(", i64 ").add(words.items[i]); } }
+                let k = words.len;
+                while k < 6 { line.add(", i64 0"); k += 1; }
+                line.add(")");
+                this.inst(line.str());
+                return Result.Ok((v, "i64"));
+            }
+            RvalueKind.Atomic(a) { return this.atomic(&a); }
+            RvalueKind.Aggregate(ag) { return this.aggregate(rv.ty, ag.fields.slice()); }
+            RvalueKind.Enum(e) { return this.enumValue(rv, &e, ll); }
+            RvalueKind.Cast(c) {
+                let (v, ft) = this.operand(&c.from)?;
+                return Result.Ok((this.cast(operandTy(c.from), rv.ty, v, ft, ll)?, ll));
+            }
+            RvalueKind.Interpolate(_) { return Result.Err("interpolate must be InterpFill before LLVM emit"); }
+        }
+    }
+
+    fn syscallWord(this: &LlvmFn, op: &Operand): Result<string, string> {
+        let (v, ty) = this.operand(op)?;
+        if ty == "i64" { return Result.Ok(v); }
+        let n = this.fresh();
+        if ty == "ptr" {
+            this.inst(this.l().add(n).add(" = ptrtoint ptr ").add(v).add(" to i64").str());
+        } else {
+            this.inst(this.l().add(n).add(" = sext ").add(ty).add(" ").add(v).add(" to i64").str());
+        }
+        return Result.Ok(n);
+    }
+}

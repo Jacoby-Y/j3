@@ -2,3 +2,518 @@
 //
 // Port of: j3c/src/cli/check.rs
 module j3c.cmd.check;
+// J3: `check` parses its flags like Rust, runs `driver` through `Stage.Passes` (lower + validate) and prints errors as Rust's
+// `print_fail` / `json_err` do (rendered diags; a code-0 error with no span or notes is a Rust plain-string
+// error and prints bare, `j3c: msg`). Success prints code warnings, `checked ENTRY` and the autofix hint
+// (`--json`: one line); `--autofix` applies `Checked.fixes` and checks again; `--strict` fails on a code
+// warning. Preflight, CSS and i18n lint are not ported yet. `fmt` is ported whole on top of `syntax.fmt`, one
+// scratch arena per file; `collectJ3` lists project sources with `load.scripts_deps.scriptPaths`.
+
+use j3.cmp.sortBy;
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text;
+use j3.text.{ Text, lines };
+use j3c.base.diag;
+use j3c.base.diag.{ Diag, Severity };
+use j3c.base.fsx;
+use j3c.base.span.isNone;
+use j3c.base.toml.jsonStr;
+use j3c.driver;
+use j3c.driver.{ Mode, Session, Stage };
+use j3c.load.scripts_deps.scriptPaths;
+use j3c.project.manifest;
+use j3c.project.manifest.Input;
+use j3c.sema.{ LintFix, applyFixes };
+use j3c.syntax.fmt;
+
+const CHECK_HELP = "usage: j3c check [--json] [--strict] [--autofix] [--host] [path]\n\ntypechecks the project, then reports missing libraries and files, and (with [ui]) CSS lint\nwarnings for theme.css and every component <style> (`j3c doc css`, Lint).\n  --json    one JSON object: ok/entry (and warnings / css / i18n arrays) or errors[] (the first one's fields also at the top level)\n  --autofix remove unused imports in place, re-check, and put the files back if that breaks the build\n  --strict  exit 1 on any warning: code (unused locals and imports, unreachable code), CSS lint, i18n (default: warnings only)\n  --host    ignore [emit] target and check for this machine (a host build of an Android package)\nAlso warns `file:line:col: message [i18n-missing]` when a `t(\"key\")`/`tf` key is not in the default locale or a locale has a key the default lacks (`j3c doc i18n`).\nSilence: /* j3-lint-ignore rule */ before a line, or [ui] lint = false / lint-off = [\"rule\"] in j3.toml.\n";
+
+const FMT_USAGE = "usage: j3c fmt [--write | --check] [path]";
+
+/// `j3c check [flags] [path]`; returns the exit code (Rust `check_cmd`).
+pub fn checkCmd(rest: []string): int {
+    let mem = Arena.create(1 << 12);
+    defer mem.destroy();
+    let path = "";
+    let json = false;
+    let strict = false;
+    let autofix = false;
+    let opts = driver.defaults();
+    for i in 0..rest.len {
+        let a = rest[i];
+        if a == "--json" {
+            json = true;
+        } else if a == "--autofix" || a == "--fix" {
+            autofix = true;
+        } else if a == "--strict" {
+            strict = true;
+        } else if a == "--host" {
+            opts.host = true;
+        } else if a == "--help" || a == "-h" {
+            out(CHECK_HELP);
+            return 0;
+        } else if text.startsWith(a, "-") {
+            err(Text.new(&mem).add("j3c: unknown flag `").add(a).add("`\n  = help: `j3c check [--json] [--strict] [--autofix] [path]`\n").str());
+            return 1;
+        } else if path.len == 0 {
+            path = a;
+        } else {
+            err(Text.new(&mem).add("j3c: unexpected argument `").add(a).add("`\n").str());
+            return 1;
+        }
+    }
+    opts.mode = Mode.Check;
+    opts.entry = path; // "": the project in the cwd (Hello is refused below)
+    let s = Session.new(opts);
+    defer s.free();
+    if path.len == 0 {
+        // Rust `compile_user`: no path and no `j3.toml` here is an error, not the built-in hello.
+        manifest.setHost(opts.host);
+        match manifest.resolveCwd(s.arena) {
+            Result.Ok(inp) {
+                match inp {
+                    Input.Hello { return fail("no j3.toml in the current directory\n  = help: `j3c new`\n  = help: `j3c new --app`\n  = help: `j3c guide`", json, s.arena); }
+                    Input.File(_) {}
+                    Input.Project(_) {}
+                }
+            }
+            Result.Err(e) { return fail(e, json, s.arena); }
+        }
+    }
+    // Rust's `check` lowers and validates too (`Stage.Passes`). Preflight, CSS and i18n lint come later.
+    if !driver.run(s, Stage.Passes) { return fail(failText(s), json, s.arena); }
+    if autofix && fixesOf(s).len > 0 {
+        // Rust `autofix_run`: apply, check again from disk; a result that no longer checks is put back.
+        let fixes = fixesOf(s);
+        let saved = applyAll(fixes, s.arena);
+        let again = Session.new(opts);
+        defer again.free();
+        if driver.run(again, Stage.Passes) {
+            let m = Text.new(s.arena).add("autofix: removed unused imports (");
+            m.pushInt(fixes.len);
+            m.add(" `use` line");
+            if fixes.len != 1 { m.add("s"); }
+            m.fmt(`, {saved.len} file`);
+            if saved.len != 1 { m.add("s"); }
+            err(m.add(")\n").str());
+            return report(again, path, strict, json);
+        }
+        for i in 0..saved.len {
+            match io.writeFile(saved.items[i].path, saved.items[i].text as []u8) { Result.Ok(_) {} Result.Err(_) {} }
+        }
+        err(Text.new(s.arena).add("autofix: reverted, the edited code did not check:\n").add(failText(again)).add("\n").str());
+    }
+    return report(s, path, strict, json);
+}
+
+/// The success report of a checked session (Rust `check_cmd`'s `Ok` arm): code warnings on stderr,
+/// `checked ENTRY` and the autofix hint on stdout, or under `--json` one line on stdout (Rust `check_json`;
+/// the css and i18n arrays wait for those lints); exit code 1 only under `--strict` with warnings.
+fn report(s: &Session, path: string, strict: bool, json: bool): int {
+    let wt = Text.new(s.arena);
+    let wj = Text.new(s.arena);
+    let nw = 0;
+    for i in 0..s.diags.count() {
+        let d = s.diags.at(i);
+        if isError(d) { continue; }
+        let one = Text.new(s.arena);
+        diag.render(d, &s.sources, &one);
+        if json {
+            if nw > 0 { wj.add(","); }
+            wj.add(diagJson(one.str(), "warning", s.arena));
+        }
+        wt.add(one.str()).add("\n");
+        nw += 1;
+    }
+    let entry = path;
+    if entry.len == 0 { entry = "."; }
+    match s.loaded {
+        Option.Some(p) { match p.project { Option.Some(m) { entry = m.entry; } Option.None {} } }
+        Option.None {}
+    }
+    if json {
+        let j = Text.new(s.arena).add("{\"ok\":true,\"entry\":");
+        jsonStr(j, entry);
+        if nw > 0 { j.add(",\"warnings\":[").add(wj.str()).add("]"); }
+        out(j.add("}\n").str());
+        if strict && nw > 0 { return 1; }
+        return 0;
+    }
+    err(wt.str());
+    let t = Text.new(s.arena).add("checked ").add(entry);
+    if nw == 1 { t.add(" (1 warning)"); } else if nw > 1 { t.fmt(` ({nw} warnings)`); }
+    t.add("\n");
+    let k = fixesOf(s).len;
+    if k > 0 {
+        t.add("help: run `j3c check --autofix");
+        if path.len > 0 { t.add(" ").add(path); }
+        t.add("` to remove ");
+        if k == 1 { t.add("the unused import"); } else { t.add("unused imports on "); t.pushInt(k); t.add(" `use` lines"); }
+        t.add("\n");
+    }
+    out(t.str());
+    if strict && nw > 0 { return 1; }
+    return 0;
+}
+
+/// The autofix edits of a checked session (Rust `Program.fixes`).
+fn fixesOf(s: &Session): []LintFix {
+    match s.checked {
+        Option.Some(c) { return c.fixes.slice(); }
+        Option.None { return List<LintFix>.new(s.arena).slice(); }
+    }
+}
+
+/// A file as it was before autofix edited it.
+struct SavedFile {
+    path: string;
+    text: string;
+}
+
+/// Rust `autofix_run`'s first half: every fix written to its file (files in first-fix order; one that
+/// cannot be read or written is skipped). Returns the files written, with their old text.
+fn applyAll(fixes: []LintFix, arena: &Arena): List<SavedFile> {
+    let saved = List<SavedFile>.new(arena);
+    let done = List<string>.new(arena);
+    for i in 0..fixes.len {
+        let file = fixes[i].path;
+        let seen = false;
+        for j in 0..done.len { if done.items[j] == file { seen = true; } }
+        if seen { continue; }
+        done.push(file);
+        let mine = List<LintFix>.new(arena);
+        for j in i..fixes.len { if fixes[j].path == file { mine.push(fixes[j]); } }
+        let src = match fsx.readText(file, arena) {
+            Result.Ok(x) { x }
+            Result.Err(_) { continue; }
+        };
+        match io.writeFile(file, applyFixes(src, mine.slice(), arena) as []u8) {
+            Result.Ok(_) { saved.push(SavedFile { path: file, text: src }); }
+            Result.Err(_) {}
+        }
+    }
+    return saved;
+}
+
+/// The diagnostics of a failed run as Rust's error string: rendered diags, except that a plain message
+/// (code 0, no span, no notes: a Rust `Err(String)` such as a read or manifest error) is the bare text.
+pub fn failText(s: &Session): string {
+    let t = Text.new(s.arena);
+    let shown = 0;
+    let omitted = 0;
+    for i in 0..s.diags.count() {
+        let d = s.diags.at(i);
+        if !isError(d) { continue; }
+        if shown >= MAX_SHOWN { omitted += 1; continue; }
+        if shown > 0 { t.add("\n"); }
+        shown += 1;
+        if d.code == 0 && isNone(d.span) && d.notes.len == 0 {
+            t.add(d.msg);
+        } else {
+            diag.render(d, &s.sources, &t);
+        }
+    }
+    // Rust `CheckError::render`'s footer under several errors.
+    if omitted > 0 { t.add("\n").fmt(`error: {shown} errors (and {omitted} more not shown)`).add("\n"); }
+    else if shown > 1 { t.add("\n").fmt(`error: {shown} errors`).add("\n"); }
+    return t.str();
+}
+
+/// Errors a failed check prints (Rust `MAX_ERRORS`); the rest are counted in the footer.
+const MAX_SHOWN = 20;
+
+fn isError(d: &Diag): bool {
+    match d.severity {
+        Severity.Error { return true; }
+        Severity.Warning { return false; }
+    }
+}
+
+/// Print a failure like Rust's `print_fail` (or the `--json` line); returns the exit code 1.
+fn fail(e: string, json: bool, arena: &Arena): int {
+    let (o, x) = failOutput(e, json, arena);
+    out(o);
+    err(x);
+    return 1;
+}
+
+/// What a failed `check` prints for the error string `e`: (stdout, stderr). `--json` is one line on
+/// stdout (Rust `json_err`); otherwise stderr gets `e` as Rust's `print_fail` prints it.
+pub fn failOutput(e: string, json: bool, arena: &Arena): (string, string) {
+    let t = Text.new(arena);
+    if json {
+        jsonErr(&t, e, arena);
+        return (t.add("\n").str(), "");
+    }
+    // ponytail: Rust's `print_hint` adds apt hints for missing SDL/GL/clang; no load error names them.
+    if text.contains(e, "error:") || text.contains(e, "warning:") || text.contains(e, "-->") {
+        t.add(e);
+        if !text.endsWith(e, "\n") { t.add("\n"); }
+    } else {
+        t.add("j3c: ").add(e).add("\n");
+    }
+    return ("", t.str());
+}
+
+/// The `check --json` line for a failure (Rust `json_err`): the first error's fields at the top level,
+/// every error in `errors`.
+fn jsonErr(t: &Text, e: string, arena: &Arena) {
+    let errors = List<string>.new(arena);
+    let blocks = splitBlocks(e, "error:", arena);
+    for i in 0..blocks.len {
+        if !isCountLine(blocks.items[i]) { errors.push(diagJson(blocks.items[i], "error", arena)); }
+    }
+    if errors.len == 0 { errors.push(diagJson(e, "error", arena)); }
+    let first = errors.items[0];
+    t.add("{\"ok\":false,").add(first[1..first.len - 1]).add(",\"errors\":[");
+    for i in 0..errors.len {
+        if i > 0 { t.push(','); }
+        t.add(errors.items[i]);
+    }
+    t.add("]}");
+}
+
+/// The `error: N errors` (or `error: N errors (and M more not shown)`) summary line under several errors.
+fn isCountLine(block: string): bool {
+    let t = text.trim(block);
+    if text.contains(t, "\n") || !text.startsWith(t, "error:") { return false; }
+    let r = text.trim(t[6..]);
+    let k = text.find(r, " (and ");
+    if k >= 0 { r = r[0..k]; }
+    if !text.endsWith(r, " errors") { return false; }
+    let sp = text.find(r, " ");
+    return uint(r[0..sp]) >= 0;
+}
+
+/// Rendered diagnostics, one block per `head` line (Rust `split_blocks`).
+fn splitBlocks(e: string, head: string, arena: &Arena): List<string> {
+    let starts = List<int>.new(arena);
+    let at = 0;
+    while at < e.len {
+        if text.startsWith(e[at..], head) { starts.push(at); }
+        let k = text.find(e[at..], "\n");
+        if k < 0 { at = e.len; } else { at += k + 1; }
+    }
+    let blocks = List<string>.new(arena);
+    for i in 0..starts.len {
+        let end = e.len;
+        if i + 1 < starts.len { end = starts.items[i + 1]; }
+        blocks.push(e[starts.items[i]..end]);
+    }
+    return blocks;
+}
+
+/// One rendered diagnostic as `{"severity","message","path","line","column","notes","helps"}` (Rust
+/// `diag_json`).
+fn diagJson(block: string, severity: string, arena: &Arena): string {
+    let message = "";
+    let file = "";
+    let line = 0;
+    let column = 0;
+    let notes = List<string>.new(arena);
+    let helps = List<string>.new(arena);
+    for raw in lines(block) {
+        let t = text.trim(raw);
+        if text.startsWith(t, "error:") || text.startsWith(t, "warning:") {
+            if message.len == 0 { message = text.trim(t[text.find(t, ":") + 1..]); }
+        } else if text.startsWith(t, "-->") {
+            let r = text.trim(t[3..]);
+            // Rust `split_loc`: `path:line:col`, split from the right.
+            let c2 = text.lastIndexOf(r, ":");
+            let c1 = -1;
+            if c2 >= 0 { c1 = text.lastIndexOf(r[0..c2], ":"); }
+            if c1 >= 0 && uint(r[c1 + 1..c2]) >= 0 && uint(r[c2 + 1..]) >= 0 {
+                file = r[0..c1];
+                line = uint(r[c1 + 1..c2]);
+                column = uint(r[c2 + 1..]);
+            } else if file.len == 0 {
+                file = r;
+            }
+        } else if text.startsWith(t, "= note:") {
+            notes.push(text.trim(t[7..]));
+        } else if text.startsWith(t, "= help:") {
+            helps.push(text.trim(t[7..]));
+        }
+    }
+    if message.len == 0 { message = text.trim(block); }
+    let j = Text.new(arena);
+    j.add("{\"severity\":");
+    jsonStr(&j, severity);
+    j.add(",\"message\":");
+    jsonStr(&j, message);
+    j.add(",\"path\":");
+    jsonStr(&j, file);
+    j.add(",\"line\":").pushInt(line);
+    j.add(",\"column\":").pushInt(column);
+    j.add(",\"notes\":");
+    jsonList(&j, &notes);
+    j.add(",\"helps\":");
+    jsonList(&j, &helps);
+    j.add("}");
+    return j.str();
+}
+
+fn jsonList(j: &Text, xs: &List<string>) {
+    j.push('[');
+    for i in 0..xs.len {
+        if i > 0 { j.push(','); }
+        jsonStr(j, xs.items[i]);
+    }
+    j.push(']');
+}
+
+/// `s` as a Rust `usize` parse: ASCII digits only, -1 when empty or anything else (or past int range).
+fn uint(s: string): int {
+    if s.len == 0 || s.len > 18 { return -1; }
+    let n = 0;
+    for i in 0..s.len {
+        if s[i] < '0' || s[i] > '9' { return -1; }
+        n = n * 10 + int(s[i]) - 48;
+    }
+    return n;
+}
+
+/// `j3c fmt [--write | --check] [path]` (Rust `fmt_cmd`).
+pub fn fmtCmd(rest: []string): int {
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    for i in 0..rest.len {
+        if rest[i] == "--help" || rest[i] == "-h" {
+            out(FMT_USAGE);
+            out("\n  path         a `.j3` / `.j3s` file, or a directory (default: the current one)\n  -w, --write  rewrite the files that change\n  --check      exit 1 if formatting would change a file\n");
+            return 0;
+        }
+    }
+    for i in 0..rest.len {
+        let a = rest[i];
+        if text.startsWith(a, "-") && a != "--write" && a != "-w" && a != "--check" {
+            err(Text.new(&mem).add("j3c fmt: unknown flag `").add(a).add("`; ").add(FMT_USAGE).add("\n").str());
+            return 1;
+        }
+    }
+    let write = false;
+    let check = false;
+    let path = "";
+    for i in 0..rest.len {
+        let a = rest[i];
+        if a == "--write" || a == "-w" { write = true; }
+        else if a == "--check" { check = true; }
+        else if !text.startsWith(a, "-") && path.len == 0 { path = a; }
+    }
+    let files = List<string>.new(&mem);
+    match collectJ3(path, &mem) {
+        Result.Ok(v) { files = v; }
+        Result.Err(e) { err(Text.new(&mem).add("j3c: ").add(e).add("\n").str()); return 1; }
+    }
+    if files.len == 0 {
+        err("j3c: no `.j3` or `.j3s` files to format\n");
+        return 1;
+    }
+    let dirty = 0;
+    for fi in 0..files.len {
+        let r = fmtFile(files.items[fi], path.len > 0 && files.len == 1, files.len == 1, write, check);
+        if r < 0 { return 1; }
+        dirty += r;
+    }
+    if check && dirty > 0 { return 1; }
+    return 0;
+}
+
+/// Format one file of `fmtCmd` in its own scratch arena (memory stays flat over a big folder): 1 when it
+/// needs formatting, 0 when clean, -1 on an error (already printed).
+fn fmtFile(file: string, printClean: bool, single: bool, write: bool, check: bool): int {
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    let src = "";
+    match fsx.readText(file, &mem) {
+        Result.Ok(s) { src = s; }
+        Result.Err(e) { err(Text.new(&mem).add("j3c: ").add(e).add("\n").str()); return -1; }
+    }
+    let res = "";
+    match fmt.format(src, &mem) {
+        Result.Ok(s) { res = s; }
+        Result.Err(e) { err(Text.new(&mem).add("j3c: fmt ").add(file).add(": ").add(e).add("\n").str()); return -1; }
+    }
+    if res == src {
+        if printClean && !write && !check { out(res); }
+        return 0;
+    }
+    if check {
+        err(Text.new(&mem).add("j3c: ").add(file).add(" needs formatting\n").str());
+    } else if write {
+        // ponytail: plain write like Rust's `fs::write`; error text needs `fsx.osError`.
+        match io.writeFile(file, res as []u8) {
+            Result.Ok(_) {}
+            Result.Err(_) {
+                err(Text.new(&mem).add("j3c: write ").add(file).add(": ").add(fsx.osError(sys.errno(), &mem)).add("\n").str());
+                return -1;
+            }
+        }
+    } else if single {
+        out(res);
+    } else {
+        out(Text.new(&mem).add("// --- ").add(file).add(" ---\n").str());
+        out(res);
+    }
+    return 1;
+}
+
+/// The files a path argument names ("" = the cwd, as an absolute path like Rust's `current_dir`): a file is
+/// itself; a folder with `src/` is its project sources, else every `.j3`/`.j3s` under it (Rust `collect_j3`).
+pub fn collectJ3(arg: string, arena: &Arena): Result<List<string>, string> {
+    let dir = arg;
+    if arg.len == 0 {
+        match path.realpath(".", arena) {
+            Option.Some(h) { dir = h; }
+            Option.None { return Result.Err(Text.new(arena).add("cwd: ").add(fsx.osError(sys.errno(), arena)).str()); }
+        }
+    } else if !fsx.isDir(arg) {
+        let one = List<string>.new(arena);
+        one.push(arg);
+        return Result.Ok(one);
+    }
+    if fsx.isDir(path.join(dir, "src", arena)) { return projectSources(dir, arena); }
+    return fsx.listJ3(dir, arena);
+}
+
+/// `src/**/*.j3` plus every `.j3s` under the project root, deduped and sorted (Rust `list_project_sources`).
+fn projectSources(root: string, arena: &Arena): Result<List<string>, string> {
+    let out = fsx.listJ3(path.join(root, "src", arena), arena)?;
+    let n = out.len;
+    let rels = scriptPaths(root, arena);
+    for i in 0..rels.len {
+        let p = path.join(root, rels.items[i], arena);
+        let seen = false;
+        // ponytail: O(src files x scripts) scan like Rust's `Vec::contains`; both lists are small.
+        for k in 0..n {
+            if out.items[k] == p { seen = true; break; }
+        }
+        if !seen { out.push(p); }
+    }
+    sortBy(out.items[0..out.len], fn(a: string, b: string): bool { return compLess(a, b); });
+    return Result.Ok(out);
+}
+
+/// Rust `PathBuf` order for paths that share `root` and have no `//` or `.` parts: bytes, with `/` below
+/// every other byte (component order). ponytail: `fsx.pathCmp` is private; make it pub and use it here.
+fn compLess(a: string, b: string): bool {
+    let n = if a.len < b.len { a.len } else { b.len };
+    for i in 0..n {
+        if a[i] != b[i] {
+            if a[i] == '/' { return true; }
+            if b[i] == '/' { return false; }
+            return a[i] < b[i];
+        }
+    }
+    return a.len < b.len;
+}
+
+/// Text to stdout / stderr, unbuffered (every `cmd` file prints through these).
+pub fn out(s: string) { sys.write(1, s.ptr as ptr, s.len); }
+
+pub fn err(s: string) { sys.write(2, s.ptr as ptr, s.len); }

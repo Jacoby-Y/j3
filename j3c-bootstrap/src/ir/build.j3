@@ -1,0 +1,134 @@
+// Helpers for building places and bodies: locals, projections with the right type and access, statements
+// into the current block.
+//
+// Part of module j3c.ir.
+// Port of: j3c/src/ir/build.rs
+// J3: Rust's `BodyBuilder` is used by check/lower (not only by the deleted samples), so `lower` gets it
+// here. The builder allocates lists in the arena it was made with (the Session's). Rust's `.expect(..)`
+// on a wrong type is a `panic` (a compiler bug). `beginBlock`/`endBlock` swap the current statement list
+// like Rust's `mem::take`.
+module j3c.ir;
+
+pub struct BodyBuilder {
+    arena: &Arena;
+    locals: Pool<LocalDecl>;
+    params: List<Id<LocalDecl>>;
+    stmts: List<Stmt>;
+    void: Id<TyKind>;
+
+    fn new(arena: &Arena, void: Id<TyKind>): BodyBuilder {
+        return BodyBuilder { arena: arena, locals: Pool<LocalDecl>.new(arena), params: List<Id<LocalDecl>>.new(arena),
+            stmts: List<Stmt>.new(arena), void: void };
+    }
+
+    fn allocLocal(this: &BodyBuilder, name: Sym, ty: Id<TyKind>, access: Access, kind: LocalKind, span: Span): Id<LocalDecl> {
+        let id = Id<LocalDecl> { i: u32(this.locals.len()) };
+        this.locals.add(LocalDecl { id: id, doc: "", name: name, ty: ty, access: access, kind: kind, span: span });
+        if kind == LocalKind.Param { this.params.push(id); }
+        return id;
+    }
+
+    /// Locals allocated so far; the next local id is this.
+    fn localCount(this: &BodyBuilder): u32 { return u32(this.locals.len()); }
+
+    fn param(this: &BodyBuilder, name: Sym, ty: Id<TyKind>, span: Span): Id<LocalDecl> { return this.allocLocal(name, ty, letBinding(), LocalKind.Param, span); }
+    fn tmp(this: &BodyBuilder, name: Sym, ty: Id<TyKind>, span: Span): Id<LocalDecl> { return this.allocLocal(name, ty, letBinding(), LocalKind.Tmp, span); }
+    fn letLocal(this: &BodyBuilder, name: Sym, ty: Id<TyKind>, span: Span): Id<LocalDecl> { return this.allocLocal(name, ty, letBinding(), LocalKind.Let, span); }
+
+    /// Keeps an arena copy of `doc` when it is not empty.
+    fn setDoc(this: &BodyBuilder, id: Id<LocalDecl>, doc: string) {
+        if doc.len > 0 { this.locals.get(id).doc = own(this.arena, doc); }
+    }
+
+    fn localPlace(this: &BodyBuilder, id: Id<LocalDecl>, span: Span): Place {
+        let d = this.locals.get(id);
+        return Place.local(this.arena, id, d.ty, d.access, span);
+    }
+
+    fn deref(this: &BodyBuilder, cx: &IrCx, place: Place, span: Span): Place {
+        match cx.refInner(place.ty) {
+            Option.Some(inner) { return place.project(Proj.Deref, inner, throughRef(), span); }
+            Option.None { panic("deref of non-ref type"); }
+        }
+    }
+
+    fn field(this: &BodyBuilder, cx: &IrCx, place: Place, field: FieldId, span: Span): Place {
+        let fty = cx.fieldDef(field).ty;
+        return place.project(Proj.Field(FieldProj { field: field, ty: fty }), fty, place.access, span);
+    }
+
+    fn index(this: &BodyBuilder, cx: &IrCx, place: Place, index: Operand, span: Span): Place {
+        match cx.elemTy(place.ty) {
+            Option.Some(elem) { return place.project(Proj.Index(IndexProj { index: index, ty: elem }), elem, viewAccess(cx, place), span); }
+            Option.None { panic("index of non-array/slice"); }
+        }
+    }
+
+    fn slicePtr(this: &BodyBuilder, cx: &IrCx, place: Place, span: Span): Place {
+        match cx.elemTy(place.ty) {
+            Option.Some(elem) { return place.project(Proj.Ptr, cx.tyRef(elem), viewAccess(cx, place), span); }
+            Option.None { panic("ptr of non-slice/string"); }
+        }
+    }
+
+    /// Lane `lane` (0..3) of a vector place; the lane is writable when the vector is.
+    fn vecLane(this: &BodyBuilder, cx: &IrCx, place: Place, lane: u8, span: Span): Place {
+        match cx.vecLane(place.ty) {
+            Option.Some(ty) { return place.project(Proj.Lane(LaneProj { lane: lane, ty: ty }), ty, place.access, span); }
+            Option.None { panic("lane of non-vector"); }
+        }
+    }
+
+    fn enumTag(this: &BodyBuilder, cx: &IrCx, place: Place, span: Span): Place {
+        return place.project(Proj.EnumTag, cx.common.i32, place.access, span);
+    }
+
+    fn enumPayload(this: &BodyBuilder, place: Place, variant: VariantId, ty: Id<TyKind>, span: Span): Place {
+        return place.project(Proj.EnumPayload(PayloadProj { variant: variant, ty: ty }), ty, place.access, span);
+    }
+
+    fn sliceLen(this: &BodyBuilder, cx: &IrCx, place: Place, span: Span): Place {
+        return place.project(Proj.Len, cx.common.int, viewAccess(cx, place), span);
+    }
+
+    fn push(this: &BodyBuilder, s: Stmt) { this.stmts.push(s); }
+    fn assign(this: &BodyBuilder, span: Span, place: Place, rvalue: Rvalue) { this.push(Stmt.assign(span, this.void, place, rvalue)); }
+    fn assignOp(this: &BodyBuilder, span: Span, place: Place, op: BinOp, rhs: Operand) { this.push(Stmt.assignOp(span, this.void, place, op, rhs)); }
+    fn expr(this: &BodyBuilder, span: Span, rvalue: Rvalue) { this.push(Stmt.expr(span, this.void, rvalue)); }
+    fn returnOp(this: &BodyBuilder, span: Span, value: Option<Operand>) { this.push(Stmt.returnValue(span, this.void, value)); }
+    fn ifThen(this: &BodyBuilder, span: Span, cond: Operand, thenBlock: Block) { this.push(Stmt.ifThen(span, this.void, cond, thenBlock)); }
+
+    /// `_tmp = &place`; returns `copy _tmp`. Place is bound once.
+    fn refTmp(this: &BodyBuilder, cx: &IrCx, name: Sym, place: Place, span: Span): Operand {
+        let refTy = cx.tyRef(place.ty);
+        let t = this.tmp(name, refTy, span);
+        this.assign(span, this.localPlace(t, span), Rvalue.refPlace(span, refTy, place));
+        return Operand.Copy(this.localPlace(t, span));
+    }
+
+    /// Start a nested block: returns the outer statements, to hand back to `endBlock`.
+    fn beginBlock(this: &BodyBuilder): List<Stmt> {
+        let saved = this.stmts;
+        this.stmts = List<Stmt>.new(this.arena);
+        return saved;
+    }
+
+    /// The statements since `beginBlock` as a block; the outer list is current again.
+    fn endBlock(this: &BodyBuilder, saved: List<Stmt>): Block {
+        let inner = this.stmts;
+        this.stmts = saved;
+        return Block { stmts: inner };
+    }
+
+    fn finish(this: &BodyBuilder): Body {
+        return Body { locals: this.locals, params: this.params, block: Block { stmts: this.stmts } };
+    }
+}
+
+/// A projection through a `string` is a read-only view; anything else keeps `place.access`.
+fn viewAccess(cx: &IrCx, place: Place): Access {
+    match cx.tyKind(place.ty) {
+        TyKind.String { return readOnlyView(); }
+        _ { return place.access; }
+    }
+}

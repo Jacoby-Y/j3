@@ -1,0 +1,232 @@
+// Calls, atomics, enum values, casts and aggregates as LLVM instructions.
+//
+// Part of module j3c.backend.llvm.
+// Port of: j3c/src/emit/llvm_expr/rvalue.rs (the `Call`, `Atomic`, `Enum` arms, `cast`, `aggregate`)
+// J3: Split from `rvalue.j3` for size; the arms are methods (`call`, `atomic`, `enumValue`).
+module j3c.backend.llvm;
+
+extend LlvmFn {
+    fn call(this: &LlvmFn, rv: &Rvalue, c: &CallRv, ll: string): Result<(string, string), string> {
+        let cx = this.cx;
+        let (f, _) = this.operand(&c.func)?;
+        let libFn: Option<&Func> = Option.None;
+        match c.func {
+            Operand.Const(k) {
+                match k.kind {
+                    ConstKind.FnAddr(fa) {
+                        let callee = cx.funcMut(fa.func);
+                        match callee.kind { FuncKind.Lib(_) { libFn = Option.Some(callee); } _ {} }
+                    }
+                    _ {}
+                }
+            }
+            Operand.Copy(_) {}
+        }
+        let calleeTy: Option<string> = Option.None;
+        let isLib = false;
+        match libFn {
+            Option.Some(lf) { isLib = true; calleeTy = variadicCallTy(cx, lf, this.arena); }
+            Option.None {}
+        }
+        // J3 callees take big values by address (`llSigJ3`); C takes them by value.
+        let alist = Text.new(this.arena);
+        let sret = rv.ty != cx.common.void && !isLib && isBig(cx, rv.ty);
+        let retSlot = "";
+        if sret {
+            retSlot = this.alloca(ll);
+            alist.add("ptr ").add(retSlot);
+        }
+        for i in 0..c.args.len {
+            let a = c.args.items[i];
+            let (v, t) = this.operand(&a)?;
+            if alist.len() > 0 { alist.add(", "); }
+            let aty = operandTy(a);
+            if !isLib && isBig(cx, aty) {
+                alist.add("ptr ").add(v);
+                continue;
+            }
+            if inMem(cx, aty) { v = this.load(t, v); }
+            alist.add(t).add(" ").add(v);
+        }
+        if sret {
+            this.inst(this.l().add("call void ").add(f).add("(").add(alist.str()).add(")").str());
+            return Result.Ok((retSlot, ll));
+        }
+        if rv.ty == cx.common.void {
+            this.inst(this.l().add("call void ").add(f).add("(").add(alist.str()).add(")").str());
+            return Result.Ok(("undef", "void"));
+        }
+        let v = this.fresh();
+        let cty = ll;
+        match calleeTy { Option.Some(t) { cty = t; } Option.None {} }
+        this.inst(this.l().add(v).add(" = call ").add(cty).add(" ").add(f).add("(").add(alist.str()).add(")").str());
+        if inMem(cx, rv.ty) {
+            // Array and big rvalues use storage addresses inside a function.
+            let slot = this.alloca(ll);
+            this.store(ll, v, slot);
+            return Result.Ok((slot, ll));
+        }
+        return Result.Ok((v, ll));
+    }
+
+    fn atomic(this: &LlvmFn, a: &AtomicRv): Result<(string, string), string> {
+        let cx = this.cx;
+        let (p, _) = this.operand(&a.args.items[0])?;
+        let vals = List<string>.new(this.arena);
+        for i in 1..a.args.len {
+            let (v, _) = this.operand(&a.args.items[i])?;
+            vals.push(v);
+        }
+        // The pointee type; a bare `ptr` is an `int` cell.
+        let valTy = cx.common.int;
+        match cx.refInner(operandTy(a.args.items[0])) { Option.Some(t) { valTy = t; } Option.None {} }
+        let t = llType(cx, valTy, this.arena)?;
+        let al = abiAlign(cx, valTy);
+        let o = atomicOrderLlvm(a.order);
+        match a.op {
+            AtomicOp.Load {
+                let v = this.fresh();
+                this.inst(this.l().add(v).add(" = load atomic ").add(t).add(", ptr ").add(p).add(" ").add(o).fmt(`, align {al}`).str());
+                return Result.Ok((v, t));
+            }
+            AtomicOp.Store {
+                this.inst(this.l().add("store atomic ").add(t).add(" ").add(vals.items[0]).add(", ptr ").add(p).add(" ").add(o)
+                    .fmt(`, align {al}`).str());
+                return Result.Ok(("0", "i64"));
+            }
+            AtomicOp.Add { return this.atomicRmw("add", p, t, vals.items[0], o); }
+            AtomicOp.Sub { return this.atomicRmw("sub", p, t, vals.items[0], o); }
+            AtomicOp.Xchg { return this.atomicRmw("xchg", p, t, vals.items[0], o); }
+            AtomicOp.Cas {
+                let r = this.fresh();
+                let f = atomicOrderLlvm(atomicCasFailure(a.order));
+                this.inst(this.l().add(r).add(" = cmpxchg ptr ").add(p).add(", ").add(t).add(" ").add(vals.items[0]).add(", ").add(t).add(" ")
+                    .add(vals.items[1]).add(" ").add(o).add(" ").add(f).str());
+                let ok = this.fresh();
+                this.inst(this.l().add(ok).add(" = extractvalue { ").add(t).add(", i1 } ").add(r).add(", 1").str());
+                let z = this.fresh();
+                this.inst(this.l().add(z).add(" = zext i1 ").add(ok).add(" to i8").str());
+                return Result.Ok((z, "i8"));
+            }
+        }
+    }
+
+    fn atomicRmw(this: &LlvmFn, k: string, p: string, t: string, val: string, o: string): Result<(string, string), string> {
+        let v = this.fresh();
+        this.inst(this.l().add(v).add(" = atomicrmw ").add(k).add(" ptr ").add(p).add(", ").add(t).add(" ").add(val).add(" ").add(o).str());
+        return Result.Ok((v, t));
+    }
+
+    fn enumValue(this: &LlvmFn, rv: &Rvalue, e: &EnumRv, ll: string): Result<(string, string), string> {
+        let cx = this.cx;
+        if cx.enumDef(e.variant.enumId).isCLike() { return Result.Ok((this.keep(`{e.variant.index}`), "i32")); }
+        let slot = this.alloca(ll);
+        this.inst(this.l().fmt(`store i32 {e.variant.index}, ptr `).add(slot).str());
+        match e.payload {
+            Option.Some(p) {
+                let (v, vt) = this.operand(&p)?;
+                let off: u64 = 4;
+                match fieldOffset(cx, rv.ty, 1) { Option.Some(o) { off = o; } Option.None {} }
+                let pp = this.fresh();
+                this.inst(this.l().add(pp).add(" = getelementptr i8, ptr ").add(slot).fmt(`, i64 {off}`).str());
+                // an in-memory operand is its address (`aggregate` does the same for fields)
+                if inMem(cx, operandTy(p)) { this.copyMem(pp, v, operandTy(p)); } else { this.store(vt, v, pp); }
+            }
+            Option.None {}
+        }
+        if inMem(cx, rv.ty) { return Result.Ok((slot, ll)); }
+        return Result.Ok((this.load(ll, slot), ll));
+    }
+
+    fn cast(this: &LlvmFn, from: Id<TyKind>, to: Id<TyKind>, v: string, ft: string, tt: string): Result<string, string> {
+        let cx = this.cx;
+        if ft == tt && from == to { return Result.Ok(v); }
+        match this.halfCast(from, to, v, ft)? { Option.Some(r) { return Result.Ok(r); } Option.None {} }
+        if ft == tt { return Result.Ok(v); }
+        let n = this.fresh();
+        if isPtr(cx, from) && isPtr(cx, to) { return Result.Ok(v); }
+        if isPtr(cx, from) && tt == "i64" {
+            this.inst(this.l().add(n).add(" = ptrtoint ptr ").add(v).add(" to i64").str());
+            return Result.Ok(n);
+        }
+        if ft == "i64" && isPtr(cx, to) {
+            this.inst(this.l().add(n).add(" = inttoptr i64 ").add(v).add(" to ptr").str());
+            return Result.Ok(n);
+        }
+        let op = "";
+        if isInt(cx, from) && isInt(cx, to) {
+            if intWidth(cx, to) > intWidth(cx, from) {
+                if isSignedInt(cx, from) { op = "sext"; } else { op = "zext"; }
+            } else {
+                op = "trunc";
+            }
+        } else if isInt(cx, from) && isFloat(cx, to) {
+            if isSignedInt(cx, from) { op = "sitofp"; } else { op = "uitofp"; }
+        } else if isFloat(cx, from) && isInt(cx, to) {
+            if isSignedInt(cx, to) { op = "fptosi"; } else { op = "fptoui"; }
+        } else if isFloat(cx, from) && isFloat(cx, to) {
+            if tt == "double" { op = "fpext"; } else { op = "fptrunc"; }
+        } else if isStrLike(cx, from) && isStrLike(cx, to) {
+            return Result.Ok(v);
+        } else {
+            // a C-like enum's tag (`int(tok)`): tags are never negative, so zero-extend
+            let fb = ibits(ft);
+            let tb = ibits(tt);
+            if fb < 0 || tb < 0 {
+                let t = Text.new(this.arena);
+                t.add("cast ").add(ft).add(" -> ").add(tt).add(" not in LLVM emit");
+                return Result.Err(t.str());
+            }
+            if tb > fb { op = "zext"; } else { op = "trunc"; }
+        }
+        this.inst(this.l().add(n).add(" = ").add(op).add(" ").add(ft).add(" ").add(v).add(" to ").add(tt).str());
+        return Result.Ok(n);
+    }
+
+    fn aggregate(this: &LlvmFn, ty: Id<TyKind>, fields: []Operand): Result<(string, string), string> {
+        let cx = this.cx;
+        let ll = llType(cx, ty, this.arena)?;
+        if isStrLike(cx, ty) {
+            let (p, _) = this.operand(&fields[0])?;
+            let (n, _) = this.operand(&fields[1])?;
+            let a = this.fresh();
+            let b = this.fresh();
+            this.inst(this.l().add(a).add(" = insertvalue %j3_string poison, ptr ").add(p).add(", 0").str());
+            this.inst(this.l().add(b).add(" = insertvalue %j3_string ").add(a).add(", i64 ").add(n).add(", 1").str());
+            return Result.Ok((b, "%j3_string"));
+        }
+        let agg = false;
+        match cx.tyKind(ty) { TyKind.Struct(_) { agg = true; } TyKind.Array(_) { agg = true; } _ {} }
+        if !agg { return Result.Err("aggregate of this type"); }
+        let slot = this.alloca(ll);
+        for i in 0..fields.len {
+            let (v, vt) = this.operand(&fields[i])?;
+            let p = this.fresh();
+            this.inst(this.l().add(p).add(" = getelementptr ").add(ll).add(", ptr ").add(slot).fmt(`, i32 0, i32 {i}`).str());
+            let fty = operandTy(fields[i]);
+            if inMem(cx, fty) { this.copyMem(p, v, fty); } else { this.store(vt, v, p); }
+        }
+        if inMem(cx, ty) { return Result.Ok((slot, ll)); }
+        return Result.Ok((this.load(ll, slot), ll));
+    }
+}
+
+/// `string` or a slice (both `%j3_string`).
+fn isStrLike(cx: &IrCx, ty: Id<TyKind>): bool {
+    if ty == cx.common.string { return true; }
+    match cx.tyKind(ty) {
+        TyKind.Slice(_) { return true; }
+        _ { return false; }
+    }
+}
+
+/// The width of an LLVM `iN` type name, -1 for anything else (Rust `t.strip_prefix('i')...parse::<u32>()`).
+fn ibits(t: string): int {
+    if t.len < 2 || t[0] != 'i' { return -1; }
+    let n = 0;
+    for i in 1..t.len {
+        if t[i] < '0' || t[i] > '9' { return -1; }
+        n = n * 10 + int(t[i] - '0');
+    }
+    return n;
+}

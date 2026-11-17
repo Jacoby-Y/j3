@@ -1,0 +1,498 @@
+// Calls: plain fns, `alias.f()` through a `use`d module or `use lib` namespace, `T(x)` conversions,
+// `S.f()` static methods, `x.m()` methods with auto-ref / auto-deref of the receiver, UFCS, fn-pointer
+// values, `panic` with its location, `@syscall`, `@atomic*` (enum constructors: `body_variant.j3`).
+//
+// Part of module j3c.sema.
+// Port of: check/lower/call.rs (call, call_id, call_fn_op, this_adjust, auto_this, receiver_place, syscall,
+// atomic, lookup_method's plain case), check/lower/ufcs.rs
+// J3: The receiver adjustment is explicit: `AddrOf(recv)` for a `this: &T` method on a value place,
+// `Load(Deref(recv))` for a `this: T` method on `&T` (Rust `ThisAdjust`). C2b hooks (contracts-c2b.md):
+// generic fns, methods and enums go to `gen_call.j3` (`gen*`), trait defaults / `#[impl]` / bound
+// methods to `trait_call.j3` (`traitMethodCall`). C2c hooks (contracts-c2c.md): `@` intrinsics, vector
+// constructors, `dyn` calls, `Text.fmt`, tuple `hash()`, closure calls.
+module j3c.sema;
+
+extend BodyCx {
+    fn call(this: &BodyCx, sp: Span, func: Id<Expr>, typeArgs: &List<Id<Type>>, args: &List<Id<Expr>>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        match this.cx.ast.expr(func) {
+            Expr.Field(f) {
+                match this.enumCtor(f.base) {
+                    Option.Some(en) { return this.constructVariant(sp, en, f.field, args, want); }
+                    Option.None {}
+                }
+                return this.callField(sp, &f, typeArgs, args);
+            }
+            Expr.Name(n) { return this.callName(sp, n, typeArgs, args, want); }
+            _ {}
+        }
+        return Result.Err(this.err(this.cx.ast.exprSpan(func), "cannot call this expression"));
+    }
+
+    /// `f(args)`: intrinsics, conversions, a fn in scope, a fn-pointer local.
+    fn callName(this: &BodyCx, sp: Span, n: Ident, typeArgs: &List<Id<Type>>, args: &List<Id<Expr>>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let name = this.str(n.name);
+        if name.len > 0 && name[0] == '@' {
+            match this.simdIntrinsic(sp, n, args, want)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+            return this.closureIntrinsic(sp, n, args, want);
+        }
+        if name == "vec4f" || name == "vec4i" { return this.simdCtor(sp, n, args); }
+        // Rust call.rs:28: a bare call in a script method is a call on `this` when the script has that method.
+        match this.scriptThisCall(sp, n, args)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+        if args.len == 1 {
+            match this.convTy(name) {
+                Option.Some(to) {
+                    let from = this.operand(args.items[0], Option.None)?;
+                    return this.convert(sp, from, to);
+                }
+                Option.None {}
+            }
+        }
+        match this.lookupName(n.name) {
+            Option.Some(r) {
+                if r.kind == DeclKind.Fn {
+                    let f = r.asFn();
+                    match this.cx.tables.fnAt(f).gen { Option.Some(_) { return this.genCall(sp, n, f, typeArgs, args); } Option.None {} }
+                    return this.callId(sp, f, Option.None, args);
+                }
+            }
+            Option.None {}
+        }
+        match this.findAlias(n.name) { Option.Some(p) { return this.callValue(sp, this.load(p), args); } Option.None {} }
+        match this.findLocal(n.name) {
+            Option.Some(l) {
+                let p = this.place(TPlace.Local(LocalPlace { local: l }), this.cx.typed.local(l).ty, n.span);
+                return this.callValue(sp, this.load(p), args);
+            }
+            Option.None {}
+        }
+        match this.closureGlobalCall(sp, n, args)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+        return Result.Err(this.unknown(n.span, "function", n.name));
+    }
+
+    /// `base.f(args)`: a namespace fn, a static method, or a method on the receiver `base`.
+    fn callField(this: &BodyCx, sp: Span, f: &FieldExpr, typeArgs: &List<Id<Type>>, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        match this.cx.ast.expr(f.base) {
+            Expr.Name(n) {
+                match this.cx.tables.modAt(this.m).prefixes.get(n.name) {
+                    Option.Some(pm) {
+                        match this.nsFn(pm, f.field.name) {
+                            Option.Some(fid) {
+                                match this.cx.tables.fnAt(fid).gen { Option.Some(_) { return this.genCall(sp, f.field, fid, typeArgs, args); } Option.None {} }
+                                return this.callId(sp, fid, Option.None, args);
+                            }
+                            Option.None {}
+                        }
+                        let t = Text.new(this.cx.arena);
+                        t.add("`").add(this.str(n.name)).add("` has no `").add(this.str(f.field.name)).add("`");
+                        let e = this.err(f.field.span, t.str());
+                        let cands = this.nsFnNames(pm);
+                        match didYouMean(this.str(f.field.name), cands.slice(), this.cx.arena) {
+                            Option.Some(s) {
+                                let h = Text.new(this.cx.arena);
+                                h.add("did you mean `").add(this.str(n.name)).add(".").add(s).add("`?");
+                                return Result.Err(this.help(e, h.str()));
+                            }
+                            Option.None {}
+                        }
+                        return Result.Err(e);
+                    }
+                    Option.None {}
+                }
+                if !this.isDeclared(n.name) {
+                    match this.lookupName(n.name) {
+                        Option.Some(r) {
+                            if r.kind == DeclKind.Struct {
+                                match this.genericMethod(r.asStruct(), f.field.name) {
+                                    Option.Some(g) { return this.genStaticCall(sp, f.field, r.asStruct(), g, typeArgs, args); }
+                                    Option.None {}
+                                }
+                                if typeArgs.len > 0 { return Result.Err(this.genNoGenericMethod(f.field.span, f.field.name)); }
+                                let fid = this.lookupMethod(r.asStruct(), f.field.name, f.field.span)?;
+                                return this.callId(sp, fid, Option.None, args);
+                            }
+                        }
+                        Option.None {}
+                    }
+                }
+            }
+            Expr.TypePath(_) { return this.genTypePathCall(sp, f, typeArgs, args); }
+            _ {}
+        }
+        let recv = this.receiverPlace(f.base)?;
+        let rt = this.placeTy(recv);
+        while true {
+            match this.refInner(rt) { Option.Some(t) { rt = t; } Option.None { break; } }
+        }
+        if this.isDyn(rt) { return this.dynCall(sp, recv, f.field, args); }
+        let sid = this.structOf(rt);
+        let has = false;
+        match sid {
+            Option.Some(s) {
+                match this.cx.tables.structAt(s).gen { Option.Some(_) { return this.genInstMethodCall(sp, recv, s, f.field, typeArgs, args); } Option.None {} }
+                if this.str(f.field.name) == "fmt" && args.len == 1 {
+                    match this.cx.ast.expr(args.items[0]) {
+                        Expr.Interpolate(ie) { if this.isText(s) { return this.fmtText(sp, recv, s, &ie.parts); } }
+                        _ {}
+                    }
+                }
+                match this.findMethodAny(s, f.field.name) { Option.Some(_) { has = true; } Option.None {} }
+            }
+            Option.None {}
+        }
+        if !has {
+            match this.ufcsTarget(f.field.name, this.placeTy(recv)) {
+                Option.Some(fid) { return this.callId(sp, fid, Option.Some(recv), args); }
+                Option.None {}
+            }
+            match this.tupleHash(sp, recv, f.field, args)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+            match this.traitMethodCall(sp, recv, rt, f.field, args)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+            match this.genUfcs(sp, f.field, typeArgs, recv, args)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+        }
+        match sid {
+            Option.Some(s) {
+                // Rust call.rs:160: `scene.script::<T>(node)` is the registry's `find` for that script.
+                match this.sceneScriptCall(sp, recv, s, f.field, typeArgs, args)? { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+                match this.genericMethod(s, f.field.name) {
+                    Option.Some(g) { return this.genMethodCall(sp, recv, g, f.field, typeArgs, args); }
+                    Option.None {}
+                }
+                if typeArgs.len > 0 { return Result.Err(this.genNoGenericMethod(f.field.span, f.field.name)); }
+                match this.lookupMethod(s, f.field.name, f.field.span) {
+                    Result.Ok(fid) { return this.callId(sp, fid, Option.Some(recv), args); }
+                    Result.Err(e) { return Result.Err(this.ufcsHint(e, f.field.name)); }
+                }
+            }
+            Option.None {
+                match this.ty(rt) {
+                    Ty.Param(p) { return Result.Err(this.boundMiss(f.field.span, p, cat3(this.cx, "method `", this.str(f.field.name), "`"), Option.Some(f.field.name))); }
+                    _ {}
+                }
+                let t = Text.new(this.cx.arena);
+                t.add("no method `").add(this.str(f.field.name)).add("` on `").add(this.tyStr(rt)).add("`");
+                return Result.Err(this.ufcsHint(this.err(f.field.span, t.str()), f.field.name));
+            }
+        }
+        return Result.Err(this.err(sp, "unreachable call"));
+    }
+
+    /// Rust `call_id`: a call to `f` (with `recv` as `this`), `panic(msg)` with its location.
+    fn callId(this: &BodyCx, sp: Span, f: Id<FnDecl>, recv: Option<Id<TPlace>>, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        match recv {
+            Option.None {
+                if args.len == 1 {
+                    match this.panicAtFor(f) {
+                        Option.Some(at) { return this.panicCall(sp, at, args.items[0]); }
+                        Option.None {}
+                    }
+                }
+            }
+            Option.Some(_) {}
+        }
+        let d = *this.cx.tables.fnAt(f);
+        let out = List<Id<TExpr>>.new(this.cx.arena);
+        let first = 0;
+        match recv {
+            Option.Some(r) {
+                if d.params.len == 0 { return Result.Err(this.err(sp, "method has no `this` parameter")); }
+                out.push(this.autoThis(sp, r, d.params.items[0].ty)?);
+                first = 1;
+            }
+            Option.None {}
+        }
+        if d.params.len - first != args.len {
+            let name = this.str(d.name);
+            let t = Text.new(this.cx.arena);
+            t.add("`").add(name).add("` takes ");
+            t.pushInt(d.params.len - first);
+            t.add(" args, got ");
+            t.pushInt(args.len);
+            let n = Text.new(this.cx.arena);
+            n.add("fn ").add(name).add("(");
+            for i in first..d.params.len {
+                if i > first { n.add(", "); }
+                n.add(this.tyStr(d.params.items[i].ty));
+            }
+            n.add(")");
+            if d.ret != this.com().void { n.add(": ").add(this.tyStr(d.ret)); }
+            return Result.Err(this.note(this.err(sp, t.str()), n.str()));
+        }
+        for i in 0..args.len { out.push(this.operand(args.items[i], Option.Some(d.params.items[first + i].ty))?); }
+        return Result.Ok(this.expr(TExpr.Call(TCall { callee: Callee.Fn(FnCallee { decl: f }), args: out }), d.ret, sp));
+    }
+
+    /// Rust `call_fn_op`: calling a fn-pointer value (a closure value: `closures.closureCall`).
+    fn callValue(this: &BodyCx, sp: Span, fv: Id<TExpr>, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let ft = this.exprTy(fv);
+        if this.isClosure(ft) { return this.closureCall(sp, fv, args); }
+        let sig = match this.ty(ft) {
+            Ty.Fn(s) { s }
+            _ { return Result.Err(this.err(sp, "not a function")); }
+        };
+        let ps = this.cx.tables.items(sig.params);
+        if ps.len != args.len {
+            let t = Text.new(this.cx.arena);
+            t.add("takes ");
+            t.pushInt(ps.len);
+            t.add(" args, got ");
+            t.pushInt(args.len);
+            return Result.Err(this.err(sp, t.str()));
+        }
+        let out = List<Id<TExpr>>.new(this.cx.arena);
+        for i in 0..args.len { out.push(this.operand(args.items[i], Option.Some(ps[i]))?); }
+        return Result.Ok(this.expr(TExpr.Call(TCall { callee: Callee.Value(ValueCallee { expr: fv }), args: out }), sig.ret, sp));
+    }
+
+    /// The `panicAt` next to `j3.sys.panic`, when `f` is that `panic`.
+    fn panicAtFor(this: &BodyCx, f: Id<FnDecl>): Option<Id<FnDecl>> {
+        let d = this.cx.tables.fnAt(f);
+        if this.str(d.name) != "panic" { return Option.None; }
+        match d.recv { Option.Some(_) { return Option.None; } Option.None {} }
+        let md = this.cx.tables.modAt(d.owner);
+        if md.key != "j3.sys" { return Option.None; }
+        let at = this.sym("panicAt");
+        for i in 0..md.fns.len {
+            if this.cx.tables.fnAt(md.fns.items[i]).name == at { return Option.Some(md.fns.items[i]); }
+        }
+        return Option.None;
+    }
+
+    /// `panic(msg)` as `panicAt(file, line, msg)`: the last two path parts and the call's line.
+    fn panicCall(this: &BodyCx, sp: Span, at: Id<FnDecl>, msg: Id<Expr>): Result<Id<TExpr>, TErr> {
+        let c = this.com();
+        let line = 0;
+        if !isNone(sp) { line = this.cx.sources.get(sp.file).lines.at(sp.lo).line; }
+        let p = this.path;
+        let cut = 0;
+        let seps = 0;
+        let i = p.len - 1;
+        while i >= 0 && seps < 2 {
+            if p[i] == '/' || p[i] == '\\' {
+                seps += 1;
+                if seps == 2 { cut = i + 1; }
+            }
+            i -= 1;
+        }
+        let short = Text.new(this.cx.arena);
+        for k in cut..p.len {
+            if p[k] == '\\' { short.push('/'); } else { short.push(p[k]); }
+        }
+        let args = List<Id<TExpr>>.new(this.cx.arena);
+        args.push(this.expr(TExpr.Str(short.str()), c.string, sp));
+        args.push(this.intLit(u64(line), c.i64, sp));
+        args.push(this.operand(msg, Option.Some(c.string))?);
+        let ret = this.cx.tables.fnAt(at).ret;
+        return Result.Ok(this.expr(TExpr.Call(TCall { callee: Callee.Fn(FnCallee { decl: at }), args: args }), ret, sp));
+    }
+
+    /// Rust `auto_this`: the receiver place as the first parameter of type `want`.
+    fn autoThis(this: &BodyCx, sp: Span, recv: Id<TPlace>, want: Id<Ty>): Result<Id<TExpr>, TErr> {
+        let have = this.placeTy(recv);
+        if have == want { return Result.Ok(this.load(recv)); }
+        match this.refInner(want) {
+            Option.Some(inner) {
+                if inner == have {
+                    if !this.canRef(recv) { return Result.Err(this.err(sp, "cannot take `&` of this receiver")); }
+                    return Result.Ok(this.exprFrom(Origin.AutoRef, TExpr.AddrOf(PlaceRef { place: recv }), want, sp));
+                }
+            }
+            Option.None {}
+        }
+        match this.refInner(have) {
+            Option.Some(inner) {
+                if inner == want { return Result.Ok(this.load(this.place(TPlace.Deref(DerefPlace { ptr: this.load(recv) }), want, sp))); }
+            }
+            Option.None {}
+        }
+        return Result.Err(this.err(sp, "method receiver type mismatch"));
+    }
+
+    /// Rust `this_adjust` as a yes/no.
+    fn thisFits(this: &BodyCx, have: Id<Ty>, want: Id<Ty>): bool {
+        if have == want { return true; }
+        match this.refInner(want) { Option.Some(i) { if i == have { return true; } } Option.None {} }
+        match this.refInner(have) { Option.Some(i) { if i == want { return true; } } Option.None {} }
+        return false;
+    }
+
+    /// Rust `receiver_place`: a place, or the value in a temporary.
+    fn receiverPlace(this: &BodyCx, e: Id<Expr>): Result<Id<TPlace>, TErr> {
+        match this.tryPlace(e) {
+            Result.Ok(p) { return Result.Ok(p); }
+            Result.Err(_) {}
+        }
+        let v = this.operand(e, Option.None)?;
+        return Result.Ok(this.temp(v));
+    }
+
+    /// A method `name` of struct `s` (own or `extend`ed), generic ones included.
+    fn findMethodAny(this: &BodyCx, s: Id<StructDecl>, name: Sym): Option<Id<FnDecl>> {
+        let ms = this.cx.tables.structAt(s).methods;
+        for i in 0..ms.len {
+            if this.cx.tables.fnAt(ms.items[i]).name == name { return Option.Some(ms.items[i]); }
+        }
+        return Option.None;
+    }
+
+    /// A non-generic method `name` of struct `s` (Rust `methods`; generic ones are `method_temps`).
+    fn findMethod(this: &BodyCx, s: Id<StructDecl>, name: Sym): Option<Id<FnDecl>> {
+        match this.findMethodAny(s, name) {
+            Option.Some(f) {
+                match this.cx.tables.fnAt(f).gen { Option.Some(_) { return Option.None; } Option.None { return Option.Some(f); } }
+            }
+            Option.None {}
+        }
+        return Option.None;
+    }
+
+    /// Rust `lookup_method` without type arguments.
+    fn lookupMethod(this: &BodyCx, s: Id<StructDecl>, name: Sym, sp: Span): Result<Id<FnDecl>, TErr> {
+        match this.findMethod(s, name) {
+            Option.Some(f) {
+                // Rust `script_method_visible`: another script's private method.
+                match this.scriptMethodVisible(s, f, name, sp) { Option.Some(e) { return Result.Err(e); } Option.None {} }
+                return Result.Ok(f);
+            }
+            Option.None {}
+        }
+        return Result.Err(this.noMethod(sp, s, name));
+    }
+
+    /// Rust `no_method`: `no method `m` on `S`` with a near method name.
+    fn noMethod(this: &BodyCx, sp: Span, s: Id<StructDecl>, name: Sym): TErr {
+        let sd = this.cx.tables.structAt(s);
+        let names = List<string>.new(this.cx.arena);
+        for i in 0..sd.methods.len { names.push(this.str(this.cx.tables.fnAt(sd.methods.items[i]).name)); }
+        let t = Text.new(this.cx.arena);
+        t.add("no method `").add(this.str(name)).add("` on `").add(this.str(sd.name)).add("`");
+        let e = this.err(sp, t.str());
+        match didYouMean(this.str(name), names.slice(), this.cx.arena) {
+            Option.Some(x) {
+                let h = Text.new(this.cx.arena);
+                h.add("did you mean `").add(x).add("`?");
+                return this.help(e, h.str());
+            }
+            Option.None {}
+        }
+        return e;
+    }
+
+    /// Rust `ufcs_target`: `x.f(args)` as `f(x, args)` for a visible fn `f` whose first parameter takes `x`.
+    fn ufcsTarget(this: &BodyCx, name: Sym, recv: Id<Ty>): Option<Id<FnDecl>> {
+        let f = match this.lookupName(name) {
+            Option.Some(r) {
+                if r.kind != DeclKind.Fn { return Option.None; }
+                r.asFn()
+            }
+            Option.None { return Option.None; }
+        };
+        let d = this.cx.tables.fnAt(f);
+        match d.gen { Option.Some(_) { return Option.None; } Option.None {} }
+        if d.params.len == 0 { return Option.None; }
+        if this.thisFits(recv, d.params.items[0].ty) { return Option.Some(f); }
+        return Option.None;
+    }
+
+    /// Rust `ufcs_hint`.
+    fn ufcsHint(this: &BodyCx, e: TErr, name: Sym): TErr {
+        match this.lookupName(name) {
+            Option.Some(r) {
+                if r.kind == DeclKind.Fn {
+                    let d = this.cx.tables.fnAt(r.asFn());
+                    if d.params.len > 0 {
+                        let h = Text.new(this.cx.arena);
+                        h.add("or a visible fn `").add(this.str(name)).add("` whose first parameter takes the receiver (it takes `")
+                            .add(this.tyStr(d.params.items[0].ty)).add("`)");
+                        return this.help(e, h.str());
+                    }
+                }
+            }
+            Option.None {}
+        }
+        return e;
+    }
+
+    /// `j3.text.Text`.
+    fn isText(this: &BodyCx, s: Id<StructDecl>): bool {
+        let sd = this.cx.tables.structAt(s);
+        return this.str(sd.name) == "Text" && this.cx.tables.modAt(sd.owner).key == "j3.text";
+    }
+
+    /// A fn of namespace module `pm` (`use j3.io;` then `io.f`, or a `use lib` alias): its own `pub` fns.
+    fn nsFn(this: &BodyCx, pm: Id<ModDecl>, name: Sym): Option<Id<FnDecl>> {
+        let md = this.cx.tables.modAt(pm);
+        for i in 0..md.fns.len {
+            let d = this.cx.tables.fnAt(md.fns.items[i]);
+            if d.name == name && bodyNoRecv(d) && (d.visPub || md.isLib) { return Option.Some(md.fns.items[i]); }
+        }
+        return Option.None;
+    }
+
+    fn nsFnNames(this: &BodyCx, pm: Id<ModDecl>): List<string> {
+        let out = List<string>.new(this.cx.arena);
+        let md = this.cx.tables.modAt(pm);
+        for i in 0..md.fns.len {
+            let d = this.cx.tables.fnAt(md.fns.items[i]);
+            if bodyNoRecv(d) && (d.visPub || md.isLib) { out.push(this.str(d.name)); }
+        }
+        return out;
+    }
+
+    /// Rust `conv_ty`: the type a one-argument conversion call `T(x)` names.
+    fn convTy(this: &BodyCx, name: string): Option<Id<Ty>> {
+        let c = this.com();
+        if name == "i8" { return Option.Some(c.i8); }
+        if name == "i16" { return Option.Some(c.i16); }
+        if name == "i32" { return Option.Some(c.i32); }
+        if name == "i64" || name == "int" { return Option.Some(c.i64); }
+        if name == "u8" { return Option.Some(c.u8); }
+        if name == "u16" { return Option.Some(c.u16); }
+        if name == "u32" { return Option.Some(c.u32); }
+        if name == "u64" { return Option.Some(c.u64); }
+        if name == "f16" { return Option.Some(c.half); }
+        if name == "f32" { return Option.Some(c.f32); }
+        if name == "f64" || name == "float" { return Option.Some(c.f64); }
+        return Option.None;
+    }
+
+    /// Rust `syscall`: `@syscall(nr, args..)`, an `int`.
+    fn syscall(this: &BodyCx, sp: Span, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        if args.len == 0 { return Result.Err(this.err(sp, "@syscall needs a number")); }
+        let out = List<Id<TExpr>>.new(this.cx.arena);
+        out.push(this.operand(args.items[0], Option.Some(this.com().i64))?);
+        for i in 1..args.len { out.push(this.operand(args.items[i], Option.None)?); }
+        return Result.Ok(this.expr(TExpr.Syscall(TArgs { items: out }), this.com().i64, sp));
+    }
+
+    /// Rust `atomic`: `@atomicOp(p, ..)` on a `&int`-like cell (a bare `ptr` is an `int` cell).
+    fn atomic(this: &BodyCx, sp: Span, op: AtomicOp, order: AtomicOrder, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let c = this.com();
+        let out = List<Id<TExpr>>.new(this.cx.arena);
+        out.push(this.operand(args.items[0], Option.None)?);
+        let vt = c.i64;
+        match this.refInner(this.exprTy(out.items[0])) { Option.Some(t) { vt = t; } Option.None {} }
+        let ok = false;
+        let addSub = op == AtomicOp.Add || op == AtomicOp.Sub;
+        match this.ty(vt) {
+            Ty.Int(k) { ok = k == IntKind.I64 || k == IntKind.I32 || k == IntKind.U32 || k == IntKind.U64; }
+            Ty.Bool { ok = !addSub; }
+            Ty.Ptr { ok = !addSub; }
+            _ {}
+        }
+        if !ok {
+            let t = Text.new(this.cx.arena);
+            t.add("`@").add(atomicOpName(op)).add("` cannot work on `").add(this.tyStr(vt)).add("`");
+            return Result.Err(this.help(this.err(this.cx.ast.exprSpan(args.items[0]), t.str()),
+                "use a `&int`, `&i32`, `&u32` or `&u64`; `bool` and `ptr` take load, store, exchange and cas only"));
+        }
+        for i in 1..args.len { out.push(this.operand(args.items[i], Option.Some(vt))?); }
+        let t = vt;
+        if op == AtomicOp.Cas { t = c.bool; } else if op == AtomicOp.Store { t = c.i64; }
+        return Result.Ok(this.expr(TExpr.Atomic(TAtomic { op: op, order: order, args: out }), t, sp));
+    }
+}
+
+/// A free fn (not a method).
+fn bodyNoRecv(d: &FnDecl): bool {
+    match d.recv { Option.Some(_) { return false; } Option.None { return true; } }
+    return true;
+}

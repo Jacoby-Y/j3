@@ -2,4 +2,162 @@
 //
 // Part of module j3c.syntax.parse.
 // Port of: j3c/src/parse/parser/script_ui.rs
+// J3: Rust's guarded `match self.cur().kind` is an if-chain in the same order. Statements come back as
+// `Id<Stmt>` (span = Rust `stmt_span`). Uses come from `parse.j3`.
 module j3c.syntax.parse;
+
+extend Parser {
+    /// A top-level item of a `.j3s` script.
+    fn scriptItem(this: &Parser): Result<Item, ParseError> {
+        let doc = this.takeDoc();
+        if this.at(TokenKind.Module) { return Result.Err(this.err("scripts can't have a `module` line; the path names it")); }
+        let visPub = this.eat(TokenKind.Pub);
+        let k = this.cur().kind;
+        if k == TokenKind.Use && this.look(1).kind == TokenKind.Lib {
+            return Result.Err(this.err("scripts can't use `use lib`; import a J3 wrapper"));
+        }
+        if k == TokenKind.Use && !visPub {
+            this.forbidDoc(doc)?;
+            return Result.Ok(Item.Use(this.useItem()?));
+        }
+        if k == TokenKind.Const && !visPub { return Result.Ok(Item.Const(this.constItem(false, doc)?)); }
+        if k == TokenKind.Fn { return Result.Ok(Item.Fn(this.fnItem(visPub, doc)?)); }
+        if k == TokenKind.Struct { return Result.Ok(Item.Struct(this.structItem(visPub, false, doc)?)); }
+        if k == TokenKind.Enum { return Result.Ok(Item.Enum(this.enumItem(visPub, noAttrs(this.ast.arena), doc)?)); }
+        if k == TokenKind.Ident && !visPub && this.cur().text == SCRIPT_PROPS {
+            this.forbidDoc(doc)?;
+            return Result.Ok(Item.Props(this.scriptBlock(SCRIPT_PROPS)?));
+        }
+        if k == TokenKind.Ident && !visPub && this.cur().text == SCRIPT_SHARED {
+            this.forbidDoc(doc)?;
+            return Result.Ok(Item.Shared(this.scriptBlock(SCRIPT_SHARED)?));
+        }
+        if k == TokenKind.Ident && this.atExtendItem() {
+            return Result.Err(this.err("scripts can't use `extend`; put the methods in the struct body"));
+        }
+        if k == TokenKind.Ident && this.atTraitItem() {
+            return Result.Err(this.err("traits live in .j3 modules; scripts cannot declare them"));
+        }
+        if k == TokenKind.Let && !visPub {
+            this.forbidDoc(doc)?;
+            return Result.Ok(Item.State(this.scriptLet()?));
+        }
+        return Result.Err(this.err("scripts allow only `use`, `const`, `props`, `shared`, `let`, `fn`, `struct`, and `enum` at top level"));
+    }
+
+    /// `props { .. }` / `shared { .. }` (`label` names it in errors).
+    fn scriptBlock(this: &Parser, label: string): Result<ScriptBlockItem, ParseError> {
+        let start = this.cur().span;
+        let name = this.ident()?;
+        if this.ast.str(name.name) != label {
+            let t = Text.new(this.ast.arena);
+            t.add("expected `").add(label).add("`");
+            return Result.Err(this.errAt(name.span, t.str()));
+        }
+        let open = Text.new(this.ast.arena);
+        open.add("expected `{` after `").add(label).add("`");
+        this.expect(TokenKind.LBrace, open.str())?;
+        let fields = List<FieldItem>.new(this.ast.arena);
+        while !this.at(TokenKind.RBrace) && !this.at(TokenKind.Eof) {
+            let doc = this.takeDoc();
+            let fname = this.ident()?;
+            this.expect(TokenKind.Colon, "expected `:` after script field")?;
+            let ty = this.ty()?;
+            let dflt: Option<Id<Expr>> = Option.None;
+            if this.eat(TokenKind.Eq) { dflt = Option.Some(this.expr()?); }
+            this.expect(TokenKind.Semi, "expected `;` after script field")?;
+            fields.push(FieldItem { span: this.since(fname.span), doc: doc, name: fname, ty: ty, embedded: false, flat: false, default: dflt });
+        }
+        let close = Text.new(this.ast.arena);
+        close.add("expected `}` after `").add(label).add("`");
+        this.expect(TokenKind.RBrace, close.str())?;
+        return Result.Ok(ScriptBlockItem { span: this.since(start), fields: fields });
+    }
+
+    /// A script's top-level `let` (`Item.State`).
+    fn scriptLet(this: &Parser): Result<ScriptLetItem, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.Let, "expected `let`")?;
+        let name = this.ident()?;
+        let ty: Option<Id<Type>> = Option.None;
+        if this.eat(TokenKind.Colon) { ty = Option.Some(this.ty()?); }
+        this.expect(TokenKind.Eq, "script state `let` needs a literal initializer")?;
+        let value = this.expr()?;
+        this.expect(TokenKind.Semi, "expected `;` after script state")?;
+        return Result.Ok(ScriptLetItem { span: this.since(start), name: name, ty: ty, value: value });
+    }
+
+    /// `@j3ui fn ..`.
+    fn j3uiItem(this: &Parser, visPub: bool, doc: string): Result<FnItem, ParseError> {
+        let start = this.cur().span;
+        this.expect(TokenKind.At, "expected `@j3ui`")?;
+        let kind = this.ident()?;
+        if this.ast.str(kind.name) != "j3ui" {
+            let t = Text.new(this.ast.arena);
+            t.add("unknown intrinsic `@").add(this.ast.str(kind.name)).add("`");
+            return Result.Err(this.errAt(kind.span, t.str()));
+        }
+        let name = this.fnName()?;
+        let params = this.paramList()?;
+        if params.len == 0 { return Result.Err(this.errAt(name.span, "`@j3ui` needs a Ui receiver as its first parameter")); }
+        let saved = this.j3uiRecv;
+        this.j3uiRecv = Option.Some(params.items[0].name.name);
+        let body = this.block()?;
+        this.j3uiRecv = saved;
+        let ret: Option<Id<Type>> = Option.None;
+        let shader: Option<GpuStage> = Option.None;
+        return Result.Ok(FnItem { span: join(start, body.span), doc: doc, visPub: visPub, name: name,
+            typeParams: List<Ident>.new(this.ast.arena), bounds: List<List<Ident>>.new(this.ast.arena),
+            whereBounds: List<WhereBound>.new(this.ast.arena), derived: false, isImpl: false, shader: shader, params: params, ret: ret, body: body });
+    }
+
+    /// A widget call statement inside an `@j3ui` body.
+    fn j3uiWidgetStmt(this: &Parser): Result<Id<Stmt>, ParseError> {
+        let recv = this.ast.sym("");
+        match this.j3uiRecv {
+            Option.Some(r) { recv = r; }
+            Option.None { return Result.Err(this.err("`@j3ui` widget outside a component")); }
+        }
+        let start = this.cur().span;
+        let name = this.ident()?;
+        let args = this.args()?;
+        if this.at(TokenKind.LBrace) {
+            let body = this.block()?;
+            return this.j3uiCloser(recv, name, args, body, join(start, body.span));
+        }
+        this.expect(TokenKind.Semi, "expected `;` after widget")?;
+        let span = this.since(start);
+        return Result.Ok(this.ast.addStmt(Stmt.Expr(ExprStmt { expr: this.methodCall(recv, name, args, span) }), span));
+    }
+
+    /// A widget with a body: the call, the body, then its closer (`end`, `popId`, or an `if`).
+    fn j3uiCloser(this: &Parser, recv: Sym, name: Ident, args: List<Id<Expr>>, body: Block, span: Span): Result<Id<Stmt>, ParseError> {
+        let call = this.methodCall(recv, name, args, name.span);
+        let widget = this.ast.str(name.name);
+        let closer = "";
+        if isIn(widget, names(NameList.J3uiEnd)) { closer = "end"; }
+        else if isIn(widget, names(NameList.J3uiPop)) { closer = "popId"; }
+        if closer.len > 0 {
+            let fin = this.methodCall(recv, identAt(this.ast, closer, name.span), List<Id<Expr>>.new(this.ast.arena), name.span);
+            let stmts = List<Id<Stmt>>.new(this.ast.arena);
+            stmts.push(this.ast.addStmt(Stmt.Expr(ExprStmt { expr: call }), name.span));
+            for i in 0..body.stmts.len { stmts.push(body.stmts.items[i]); }
+            stmts.push(this.ast.addStmt(Stmt.Expr(ExprStmt { expr: fin }), name.span));
+            return Result.Ok(this.ast.addStmt(Stmt.Block(Block { span: span, stmts: stmts }), span));
+        }
+        if isIn(widget, names(NameList.J3uiIf)) {
+            let none: Option<Block> = Option.None;
+            return Result.Ok(this.ast.addStmt(Stmt.If(IfStmt { span: span, cond: call, thenBlock: body, elseBlock: none }), span));
+        }
+        let t = Text.new(this.ast.arena);
+        t.add("`").add(widget).add("` does not take a body");
+        return Result.Err(this.errAt(name.span, t.str()));
+    }
+
+    /// `recv.name(args)` at `span`.
+    fn methodCall(this: &Parser, recv: Sym, name: Ident, args: List<Id<Expr>>, span: Span): Id<Expr> {
+        let base = this.ast.addExpr(Expr.Name(Ident { name: recv, span: name.span }), name.span);
+        let field = this.ast.addExpr(Expr.Field(FieldExpr { base: base, field: name }), name.span);
+        return this.ast.addExpr(Expr.Call(CallExpr { func: field, typeArgs: List<Id<Type>>.new(this.ast.arena), args: args }), span);
+    }
+}

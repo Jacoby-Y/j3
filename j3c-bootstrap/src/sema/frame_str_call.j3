@@ -1,0 +1,156 @@
+// Calls of `frame_str_flow`: a known callee's summary applied to the argument values, a closure literal's
+// captures, and `Text.fmt`'s parts.
+//
+// Part of module j3c.sema.
+// Port of: check/frame_str/flow/call.rs
+// J3: Split from `frame_str_expr.j3` (file size); same model, see its header.
+module j3c.sema;
+
+extend FsFlow {
+    /// Rust `Flow::call`: unit `u`'s summary applied to the argument values `vals` (`spans`: where each
+    /// argument is; `rsp`: the call). `u` -1: an unknown callee keeps nothing, its result points anywhere.
+    fn callFlow(this: &FsFlow, u: int, vals: &List<FsVal>, spans: &List<Span>, rsp: Span, hp: bool, st: &FsState): FsVal {
+        let g = this.g;
+        let a = g.cx.arena;
+        if u < 0 {
+            if hp { return fsValTok(a, fsU()); }
+            return fsVal(a);
+        }
+        this.noteRef(u);
+        if !g.has.items[u] { return fsVal(a); }
+        let sum = g.sums.items[u];
+        let container = g.isContainer(u);
+        for i in 0..sum.into.len {
+            let it = sum.into.items[i];
+            let v = this.arg(vals, u, it.src, st);
+            let target = this.arg(vals, u, it.dst, st);
+            let sink = FsSink { kind: FS_CALL, unit: u, keep: rsp, hasKeep: container };
+            this.storeThrough(target, int(it.slot) - 1, v, this.argSpan(spans, it.src, rsp), sink, st);
+        }
+        for i in 0..sum.esc.len {
+            let t = sum.esc.items[i];
+            // a container method (`List.push`) is kept where it is called, not inside the container
+            let keep = sum.site.items[i];
+            if container { keep = rsp; }
+            let v = this.arg(vals, u, t, st);
+            let sink = FsSink { kind: FS_CALL, unit: u, keep: keep, hasKeep: true };
+            let seen = fsSet(a);
+            this.escape(v, this.argSpan(spans, t, rsp), sink, keep, st, &seen);
+        }
+        if !hp { return fsVal(a); }
+        let res = fsVal(a);
+        for i in 0..sum.ret.len {
+            let r = sum.ret.items[i];
+            let v = this.arg(vals, u, r.tok, st);
+            if r.slot == 0 { fsSetAddAll(&res.whole, v); } else { fsAddField(&res, int(r.slot) - 1, v); }
+        }
+        if sum.retU { fsSetAdd(&res.whole, fsU()); }
+        return res;
+    }
+
+    /// Where the argument of param token `t` is written.
+    fn argSpan(this: &FsFlow, spans: &List<Span>, t: u64, rsp: Span): Span {
+        let j = int(fsId(t));
+        if j < spans.len && this.g.located(spans.items[j]) { return spans.items[j]; }
+        return rsp;
+    }
+
+    /// Rust `arg`: unit `u`'s param token `t` as the caller sees it: the argument, a field address in what
+    /// it points at, or the value in a field (of a by-value struct, or of what a pointer points at).
+    fn arg(this: &FsFlow, vals: &List<FsVal>, u: int, t: u64, st: &FsState): List<u64> {
+        let j = int(fsId(t));
+        if j >= vals.len { return fsSet(this.g.cx.arena); }
+        let v = vals.items[j];
+        let f = fsField(t);
+        if f < 0 { return fsFlat(v); }
+        if fsIsAddr(t) {
+            let flat = fsFlat(v);
+            let out = fsSet(this.g.cx.arena);
+            for i in 0..flat.len { fsSetAdd(&out, fsAddr(flat.items[i], f)); }
+            return out;
+        }
+        if this.g.structLike(this.g.paramTy(u, j)) { return fsSelect(v, f); }
+        return fsSelect(this.derefVal(fsFlat(v), st), f);
+    }
+
+    /// A closure literal (Rust `closure_lit`): its body is a unit of its own; the value is `{ fn, ctx }`,
+    /// the ctx a local struct of `&captured` (stack), or arena memory the captures are copied into (boxed).
+    fn closureLit(this: &FsFlow, e: Id<TExpr>, cl: &TClosure, st: &FsState): FsVal {
+        let g = this.g;
+        let a = g.cx.arena;
+        let typed = g.cx.typed;
+        let sp = typed.exprSpan(e);
+        this.noteRef(g.addUnit(cl.body, true, cl.plain, cl.boxed));
+        let out = fsVal(a);
+        if cl.plain || cl.captures.len == 0 { return out; }
+        if cl.boxed {
+            // `raw = mem.allocAligned(size, align)`, then each capture's value stored through it
+            let raw = fsValTok(a, fsU());
+            let vals = List<FsVal>.new(a);
+            match cl.mem { Option.Some(m) { vals.push(this.eval(m, st)); } Option.None {} }
+            let spans = List<Span>.new(a);
+            match cl.alloc {
+                Option.Some(f) { raw = this.callFlow(g.calleeUnit(Callee.Fn(FnCallee { decl: f })), &vals, &spans, sp, true, st); }
+                Option.None {}
+            }
+            let target = fsFlat(raw);
+            for i in 0..cl.captures.len {
+                let c = cl.captures.items[i];
+                let pl = this.place(c, st);
+                if !g.hasPtr(typed.placeTy(c)) { continue; }
+                this.storeThrough(target, i, fsFlat(this.walk(&pl, pl.deref.len, st)), sp, fsSink(FS_STORE), st);
+            }
+            fsAddField(&out, 1, target);
+            return out;
+        }
+        let key = fsCloKey(e.i);
+        st.remove(key);
+        for i in 0..cl.captures.len {
+            let pl = this.place(cl.captures.items[i], st);
+            let add = fsVal(a);
+            fsAddField(&add, i, this.address(&pl, st));
+            st.add(key, add);
+        }
+        fsAddField(&out, 1, fsValTok(a, fsLoc(key)).whole);
+        return out;
+    }
+
+    /// `t.fmt(`..`)` (Rust `text_fmt`): every part goes through `Text.pushBytes(this, bytes)`; a string (or
+    /// a string inside an expanded value) is passed as it is, a number through a scratch buffer.
+    // ponytail: an expanded struct's strings are passed as the whole value's tokens, not field by field
+    // (Rust narrows a param token to the field); the same unless `pushBytes` kept its argument.
+    fn textFmt(this: &FsFlow, e: Id<TExpr>, f: &TTextFmt, st: &FsState): FsVal {
+        let g = this.g;
+        let a = g.cx.arena;
+        let typed = g.cx.typed;
+        let sp = typed.exprSpan(e);
+        let me = this.eval(f.this, st);
+        let push = g.calleeUnit(Callee.Fn(FnCallee { decl: f.push }));
+        let spans = List<Span>.new(a);
+        spans.push(sp);
+        spans.push(sp);
+        let pushed = false;
+        for i in 0..f.parts.len {
+            match f.parts.items[i] {
+                TInterpPart.Lit(_) {}
+                TInterpPart.Value(v) {
+                    let pv = this.eval(v.expr, st);
+                    if fsValEmpty(pv) { continue; }
+                    let vals = List<FsVal>.new(a);
+                    vals.push(fsValClone(me));
+                    vals.push(fsValOf(fsFlat(pv)));
+                    spans.items[1] = typed.exprSpan(v.expr);
+                    this.callFlow(push, &vals, &spans, sp, false, st);
+                    pushed = true;
+                }
+            }
+        }
+        if !pushed {
+            let vals = List<FsVal>.new(a);
+            vals.push(fsValClone(me));
+            vals.push(fsVal(a));
+            this.callFlow(push, &vals, &spans, sp, false, st);
+        }
+        return me;
+    }
+}

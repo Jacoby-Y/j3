@@ -2,4 +2,251 @@
 //
 // Part of module j3c.ir.
 // Port of: j3c/src/ir/cx.rs
+// J3: Pools in the Session arena; ids are `Id<T>` (rule 4). Names are the Session's `Names` (Rust's cx had
+// its own table): `internName`/`nameStr` go there. Source files are the Session's `Pool<Source>`
+// (`source(id)`), so Rust `add_file`/`SourceFile`/`file_index` are gone; `.j3ui` line mapping (Rust
+// `locator`) comes with the UI port (C4).
+// J3: Type interning keys a `Map<string, Id<TyKind>>` by a canonical byte key of the `TyKind` (`tyKey`),
+// built in one reused `Text`, so lookups allocate nothing. The map is never iterated: printed order is
+// the `tys` pool (rule 3).
+// J3: Rust check-only fields (`inst_sites`, `bound_queue`, `lazy_methods`, `placeholders`,
+// `method_wheres`, `lower_warnings`, `frame_interps`) belong to the redesigned `sema` (B11) and are not
+// here. `closures` (`ir/closure.j3`) and `dyns` (`ir/dyn_ty.j3`) are C2c slots; tuple structs are `lower`'s
+// (`Lw.tupleTy`, sema interns the type); `embeds` (build stamp, C3) is added when ported.
+// Accessors return copies; `*Mut` return a pointer that is valid until the next `alloc*` of that kind.
 module j3c.ir;
+
+/// Builtin types interned once in `IrCx.new`.
+pub struct CommonTys {
+    void: Id<TyKind>;
+    bool: Id<TyKind>;
+    i8: Id<TyKind>;
+    i16: Id<TyKind>;
+    i32: Id<TyKind>;
+    i64: Id<TyKind>;
+    u8: Id<TyKind>;
+    u16: Id<TyKind>;
+    u32: Id<TyKind>;
+    u64: Id<TyKind>;
+    f32: Id<TyKind>;
+    f64: Id<TyKind>;
+    /// Alias of i64. Same interned type as `i64`.
+    int: Id<TyKind>;
+    /// Alias of f64. Same interned type as `f64`.
+    float: Id<TyKind>;
+    ptr: Id<TyKind>;
+    cstr: Id<TyKind>;
+    string: Id<TyKind>;
+    vec4f: Id<TyKind>;
+    vec4i: Id<TyKind>;
+    f16: Id<TyKind>;
+}
+
+pub struct IrCx {
+    arena: &Arena;
+    names: &Names;
+    sources: &Pool<Source>;
+    tys: Pool<TyKind>;
+    tyMap: Map<string, Id<TyKind>>;
+    keyBuf: Text;
+    structs: Pool<StructDef>;
+    enums: Pool<EnumDef>;
+    funcs: Pool<Func>;
+    globals: Pool<GlobalDef>;
+    common: CommonTys;
+    /// The program's `fn main` (root module), once `sema` has found it.
+    entry: Option<Id<Func>>;
+    /// Closure structs by signature and fn thunks (Rust `closures`; `ir/closure.j3`).
+    closures: ClosureTables;
+    /// `dyn` fat-pointer structs, table structs and table globals (Rust `dyns`; `ir/dyn_ty.j3`).
+    dyns: DynTables;
+
+    /// Empty tables in `arena` with the builtin types interned (same order as Rust, so `Ty` numbers match).
+    fn new(arena: &Arena, names: &Names, sources: &Pool<Source>): IrCx {
+        let z = Id<TyKind> { i: 0 };
+        let cx = IrCx { arena: arena, names: names, sources: sources, tys: Pool<TyKind>.new(arena),
+            tyMap: Map<string, Id<TyKind>>.new(arena, 256), keyBuf: Text.new(arena), structs: Pool<StructDef>.new(arena),
+            enums: Pool<EnumDef>.new(arena), funcs: Pool<Func>.new(arena), globals: Pool<GlobalDef>.new(arena),
+            common: CommonTys { void: z, bool: z, i8: z, i16: z, i32: z, i64: z, u8: z, u16: z, u32: z, u64: z, f32: z,
+                f64: z, int: z, float: z, ptr: z, cstr: z, string: z, vec4f: z, vec4i: z, f16: z },
+            entry: Option.None, closures: closureTablesNew(arena), dyns: dynTablesNew(arena) };
+        let c = &cx.common;
+        c.void = cx.internTy(TyKind.Void);
+        c.bool = cx.internTy(TyKind.Bool);
+        c.i8 = cx.internTy(TyKind.Int(IntTy.I8));
+        c.i16 = cx.internTy(TyKind.Int(IntTy.I16));
+        c.i32 = cx.internTy(TyKind.Int(IntTy.I32));
+        c.i64 = cx.internTy(TyKind.Int(IntTy.I64));
+        c.u8 = cx.internTy(TyKind.Int(IntTy.U8));
+        c.u16 = cx.internTy(TyKind.Int(IntTy.U16));
+        c.u32 = cx.internTy(TyKind.Int(IntTy.U32));
+        c.u64 = cx.internTy(TyKind.Int(IntTy.U64));
+        c.f32 = cx.internTy(TyKind.Float(FloatTy.F32));
+        c.f64 = cx.internTy(TyKind.Float(FloatTy.F64));
+        c.ptr = cx.internTy(TyKind.Ptr);
+        c.cstr = cx.internTy(TyKind.CStr);
+        c.string = cx.internTy(TyKind.String);
+        c.vec4f = cx.internTy(TyKind.Vec(VecTy.F32x4));
+        c.vec4i = cx.internTy(TyKind.Vec(VecTy.I32x4));
+        c.f16 = cx.internTy(TyKind.Half);
+        c.int = c.i64;
+        c.float = c.f64;
+        return cx;
+    }
+
+    /// The builtin type spelled `name` in source.
+    fn builtinNamed(this: &IrCx, name: string): Option<Id<TyKind>> {
+        let c = this.common;
+        if name == "void" { return Option.Some(c.void); }
+        if name == "bool" { return Option.Some(c.bool); }
+        if name == "int" || name == "i64" { return Option.Some(c.int); }
+        if name == "i8" { return Option.Some(c.i8); }
+        if name == "i16" { return Option.Some(c.i16); }
+        if name == "i32" { return Option.Some(c.i32); }
+        if name == "u8" { return Option.Some(c.u8); }
+        if name == "u16" { return Option.Some(c.u16); }
+        if name == "u32" { return Option.Some(c.u32); }
+        if name == "u64" { return Option.Some(c.u64); }
+        if name == "f32" { return Option.Some(c.f32); }
+        if name == "float" || name == "f64" { return Option.Some(c.float); }
+        if name == "ptr" { return Option.Some(c.ptr); }
+        if name == "cstr" { return Option.Some(c.cstr); }
+        if name == "string" { return Option.Some(c.string); }
+        if name == "vec4f" { return Option.Some(c.vec4f); }
+        if name == "vec4i" { return Option.Some(c.vec4i); }
+        if name == "f16" { return Option.Some(c.f16); }
+        return Option.None;
+    }
+
+    fn internName(this: &IrCx, s: string): Sym { return this.names.intern(s); }
+    fn nameStr(this: &IrCx, name: Sym): string { return this.names.str(name); }
+
+    fn internTy(this: &IrCx, kind: TyKind): Id<TyKind> {
+        let k = tyKey(&this.keyBuf, kind);
+        match this.tyMap.get(k) {
+            Option.Some(ty) { return ty; }
+            Option.None {}
+        }
+        let ty = this.tys.add(kind);
+        this.tyMap.put(own(this.arena, k), ty);
+        return ty;
+    }
+
+    fn lookupTy(this: &IrCx, kind: TyKind): Option<Id<TyKind>> { return this.tyMap.get(tyKey(&this.keyBuf, kind)); }
+    fn tyKind(this: &IrCx, ty: Id<TyKind>): TyKind { return *this.tys.get(ty); }
+
+    fn tyRef(this: &IrCx, inner: Id<TyKind>): Id<TyKind> { return this.internTy(TyKind.Ref(RefTy { inner: inner })); }
+    fn tySlice(this: &IrCx, elem: Id<TyKind>): Id<TyKind> { return this.internTy(TyKind.Slice(SliceTy { elem: elem })); }
+    fn tyArray(this: &IrCx, elem: Id<TyKind>, len: u64): Id<TyKind> { return this.internTy(TyKind.Array(ArrayTy { elem: elem, len: len })); }
+    /// `params` is kept when the type is new: pass a list nothing else grows.
+    fn tyFn(this: &IrCx, params: List<Id<TyKind>>, ret: Id<TyKind>): Id<TyKind> { return this.internTy(TyKind.Fn(FnTy { params: params, ret: ret })); }
+    fn tyStruct(this: &IrCx, id: Id<StructDef>): Id<TyKind> { return this.internTy(TyKind.Struct(StructTy { id: id })); }
+    fn tyEnum(this: &IrCx, id: Id<EnumDef>): Id<TyKind> { return this.internTy(TyKind.Enum(EnumTy { id: id })); }
+
+    fn allocStruct(this: &IrCx, def: StructDef): Id<StructDef> { return this.structs.add(def); }
+    fn structDef(this: &IrCx, id: Id<StructDef>): StructDef { return *this.structs.get(id); }
+    fn structDefMut(this: &IrCx, id: Id<StructDef>): &StructDef { return this.structs.get(id); }
+    fn fieldDef(this: &IrCx, id: FieldId): FieldDef { return this.structs.get(id.structId).field(id); }
+
+    fn allocEnum(this: &IrCx, def: EnumDef): Id<EnumDef> { return this.enums.add(def); }
+    fn enumDef(this: &IrCx, id: Id<EnumDef>): EnumDef { return *this.enums.get(id); }
+    fn enumDefMut(this: &IrCx, id: Id<EnumDef>): &EnumDef { return this.enums.get(id); }
+
+    /// Stores `func` with its `id` set to the new handle.
+    fn allocFunc(this: &IrCx, func: Func): Id<Func> {
+        let f = func;
+        f.id = Id<Func> { i: u32(this.funcs.len()) };
+        return this.funcs.add(f);
+    }
+    fn func(this: &IrCx, id: Id<Func>): Func { return *this.funcs.get(id); }
+    fn funcMut(this: &IrCx, id: Id<Func>): &Func { return this.funcs.get(id); }
+
+    /// Stores `def` with its `id` set to the new handle.
+    fn allocGlobal(this: &IrCx, def: GlobalDef): Id<GlobalDef> {
+        let g = def;
+        g.id = Id<GlobalDef> { i: u32(this.globals.len()) };
+        return this.globals.add(g);
+    }
+    fn global(this: &IrCx, id: Id<GlobalDef>): GlobalDef { return *this.globals.get(id); }
+
+    /// Every entity in id order (Rust `funcs()` etc.); the slices die on the next `alloc*`.
+    fn allFuncs(this: &IrCx): []Func { return this.funcs.items.slice(); }
+    fn allStructs(this: &IrCx): []StructDef { return this.structs.items.slice(); }
+    fn allEnums(this: &IrCx): []EnumDef { return this.enums.items.slice(); }
+    fn allGlobals(this: &IrCx): []GlobalDef { return this.globals.items.slice(); }
+
+    fn refInner(this: &IrCx, ty: Id<TyKind>): Option<Id<TyKind>> {
+        match this.tyKind(ty) {
+            TyKind.Ref(r) { return Option.Some(r.inner); }
+            _ { return Option.None; }
+        }
+    }
+
+    /// Lane type of a `vec4f` / `vec4i`.
+    fn vecLane(this: &IrCx, ty: Id<TyKind>): Option<Id<TyKind>> {
+        match this.tyKind(ty) {
+            TyKind.Vec(v) {
+                match v {
+                    VecTy.F32x4 { return Option.Some(this.common.f32); }
+                    VecTy.I32x4 { return Option.Some(this.common.i32); }
+                }
+            }
+            _ { return Option.None; }
+        }
+    }
+
+    fn elemTy(this: &IrCx, ty: Id<TyKind>): Option<Id<TyKind>> {
+        match this.tyKind(ty) {
+            TyKind.Array(a) { return Option.Some(a.elem); }
+            TyKind.Slice(s) { return Option.Some(s.elem); }
+            TyKind.String { return Option.Some(this.common.u8); }
+            _ { return Option.None; }
+        }
+    }
+
+    /// `(params, ret)` of a fn type.
+    fn fnSig(this: &IrCx, ty: Id<TyKind>): Option<FnTy> {
+        match this.tyKind(ty) {
+            TyKind.Fn(f) { return Option.Some(f); }
+            _ { return Option.None; }
+        }
+    }
+
+    /// The source file of `id` (Rust `file`); None for `NO_FILE` or an id this session never loaded.
+    fn source(this: &IrCx, id: Id<Source>): Option<Source> {
+        if int(id.i) >= this.sources.len() { return Option.None; }
+        return Option.Some(*this.sources.get(id));
+    }
+}
+
+/// The interning key of `k`, built in `t` (cleared first); valid until `t` changes.
+fn tyKey(t: &Text, k: TyKind): string {
+    t.clear();
+    match k {
+        TyKind.Void { t.add("v"); }
+        TyKind.Bool { t.add("b"); }
+        TyKind.Int(i) { if intSigned(i) { keyNum(t, "i", u64(intBits(i))); } else { keyNum(t, "u", u64(intBits(i))); } }
+        TyKind.Float(f) { if f == FloatTy.F32 { t.add("f32"); } else { t.add("f64"); } }
+        TyKind.Ptr { t.add("p"); }
+        TyKind.CStr { t.add("c"); }
+        TyKind.String { t.add("s"); }
+        TyKind.Ref(r) { keyNum(t, "&", u64(r.inner.i)); }
+        TyKind.Array(a) { keyNum(t, "[", u64(a.elem.i)); keyNum(t, ";", a.len); }
+        TyKind.Slice(s) { keyNum(t, "]", u64(s.elem.i)); }
+        TyKind.Fn(f) {
+            t.add("(");
+            for i in 0..f.params.len { keyNum(t, ",", u64(f.params.items[i].i)); }
+            keyNum(t, ")", u64(f.ret.i));
+        }
+        TyKind.Struct(s) { keyNum(t, "S", u64(s.id.i)); }
+        TyKind.Enum(e) { keyNum(t, "E", u64(e.id.i)); }
+        TyKind.Half { t.add("h"); }
+        TyKind.Vec(v) { if v == VecTy.F32x4 { t.add("v4f"); } else { t.add("v4i"); } }
+    }
+    return t.str();
+}
+
+fn keyNum(t: &Text, tag: string, n: u64) {
+    t.add(tag);
+    t.pushU64(n);
+}

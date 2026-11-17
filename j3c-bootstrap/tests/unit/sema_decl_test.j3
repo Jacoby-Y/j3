@@ -1,0 +1,172 @@
+// Sema declarations (`sema/resolve`, `uses`, `decl_types`, `decl_traits`, `funcs`, `consteval`, `globals`):
+// a program with generic structs, `where`, generic enums, multi-field variants, bounds, `use lib`, a `u64`
+// const fold, a const table, a `#[singleton]` and an unused template with bad types (quiet, as in Rust) is
+// declared for real (stdlib included) and its decl tables read back; then declaration errors (one per case, written under `$TMPDIR`) are compared byte for byte
+// with `stage0/j3c check PATH` (exit 1, same stderr).
+module sema_decl_test;
+
+use j3.data.pool.Id;
+use j3.io;
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.proc;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+use j3c.cmd.check;
+use j3c.driver;
+use j3c.driver.{ Session, Stage };
+use j3c.sema;
+use j3c.load.Parsed;
+use j3c.sema.{ ConstInit, ConstPayload, DeclKind, DeclRef, FnKind, ModDecl, SemaCx, Ty, UsePhase, tyName };
+
+const POS: string = "module pos;\nuse j3.cmp.Eq;\nuse lib \"c\" as c { fn puts(s: cstr): i32; }\nconst BIG: u64 = 18446744073709551615 / 2;\nconst N: int = 3 * 4 + 1;\nconst TABLE: [3]int = [1, 2, 3];\n#[singleton] let G: int = N;\nstruct Box<T> { v: T; n: int = 7; fn get(this: &Box<T>): T where T: Eq { return this.v; } }\nenum Opt<T> { Some(T), None }\nenum Pair { Two(int, string), One(u8) }\nfn first<T: Eq>(xs: []T): T { return xs[0]; }\nstruct Unused<T> { x: T; y: Zq; fn f(this: &Unused<T>, z: Zr) {} }\nfn main() {}\n";
+
+/// Declaration errors: (file name, source). Each stops sema at one error, before any body.
+const BAD: [28]string = [
+    "dup_type", "struct A { x: int; }\nstruct A { y: int; }",
+    "dup_fn", "fn f() {}\nfn f() {}",
+    "unk_field", "struct A { x: Foo; }",
+    "gen_argc", "struct B<T> { x: T; }\nstruct A { b: B<int, int>; }",
+    "unk_bound", "fn f<T: Zork>(x: T) {}",
+    "const_div0", "const A: int = 4 / 0;",
+    "const_big", "const A: int = 18446744073709551615;",
+    "use_unknown", "use j3.io.{ printLnn };",
+    "recursive", "struct A { a: A; }",
+    "impl_orphan", "#[impl]\nfn hash(x: int): u64 { return 0; }",
+    "global_call", "#[singleton] let G: int = f();\nfn f(): int { return 1; }",
+    "where_notparam", "struct A<T> { x: T; fn f(this: A<T>) where U: Eq {} }",
+    "template_used", "struct A<T> { x: T; y: Zq; }\nfn g(a: A<int>) {}",
+    "template_method", "struct A<T> { x: T; fn f(this: A<T>, v: Zq) {} }\nfn g(a: A<int>) {}",
+];
+
+fn put(dir: string, name: string, text: string, mem: &Arena): string {
+    match io.makeDirs(dir) { Result.Ok(_) {} Result.Err(_) { panic("cannot make the case dir"); } }
+    let p = Text.new(mem).add(dir).add("/").add(name).add(".j3").str();
+    match io.writeFile(p, text as []u8) { Result.Ok(_) {} Result.Err(_) { panic("cannot write a case"); } }
+    return p;
+}
+
+fn tyStr(cx: &SemaCx, t: Id<Ty>): string {
+    let out = Text.new(cx.arena);
+    tyName(cx.tables, t, &out);
+    return out.str();
+}
+
+fn want(what: string, got: string, exp: string) {
+    if got != exp { panic(`{what}: got {got}, want {exp}`); }
+}
+
+fn find(cx: &SemaCx, m: Id<ModDecl>, name: string): DeclRef {
+    match sema.lookup(cx, m, cx.tables.sym(name)) {
+        Option.Some(d) { return d; }
+        Option.None { panic(`not declared: {name}`); }
+    }
+    return DeclRef { kind: DeclKind.Module, i: 0 };
+}
+
+fn positive(dir: string, mem: &Arena) {
+    let o = driver.defaults();
+    o.entry = put(dir, "pos", POS, mem);
+    let s = Session.new(o);
+    if !driver.run(s, Stage.Load) { panic("pos.j3 does not load"); }
+    let parsed = match s.loaded { Option.Some(p) { s.arena.new::<Parsed>(p) } Option.None { panic("no program"); return; } };
+    let cx = sema.newCx(s.arena, &s.names, &s.diags, &s.sources, parsed);
+    if !sema.declarations(&cx) { panic(check.failText(s)); }
+    let t = cx.tables;
+    let m = Id<ModDecl> { i: 0 };
+    for i in 0..t.mods.len() { if t.modAt(t.mods.idAt(i)).key == "pos" { m = t.mods.idAt(i); } }
+
+    let bx = t.structAt(find(&cx, m, "Box").asStruct());
+    want("Box.v", tyStr(&cx, bx.fields.items[0].ty), "T");
+    want("Box.n", tyStr(&cx, bx.fields.items[1].ty), "int");
+    match bx.fields.items[1].default {
+        Option.Some(v) { match v.kind { ConstPayload.Int(x) { if x != 7 { panic("Box.n default"); } } _ { panic("Box.n default kind"); } } }
+        Option.None { panic("Box.n has no default"); }
+    }
+    let get = t.fnAt(bx.methods.items[0]);
+    want("get.this", tyStr(&cx, get.params.items[0].ty), "&Box");
+    want("get.ret", tyStr(&cx, get.ret), "T");
+    match get.gen {
+        Option.Some(g) { if t.genericsAt(g).bounds.items[0].len != 1 { panic("get: `where T: Eq` not folded in"); } }
+        Option.None { panic("get is not a template"); }
+    }
+
+    let opt = t.enumAt(find(&cx, m, "Opt").asEnum());
+    match opt.variants.items[0].payload { Option.Some(p) { want("Opt.Some", tyStr(&cx, p), "T"); } Option.None { panic("Opt.Some payload"); } }
+    let pair = t.enumAt(find(&cx, m, "Pair").asEnum());
+    if !pair.variants.items[0].multi { panic("Pair.Two is not multi"); }
+    match pair.variants.items[0].payload { Option.Some(p) { want("Pair.Two", tyStr(&cx, p), "(int, string)"); } Option.None { panic("Pair.Two payload"); } }
+
+    let first = t.fnAt(find(&cx, m, "first").asFn());
+    want("first.xs", tyStr(&cx, first.params.items[0].ty), "[]T");
+    want("first.ret", tyStr(&cx, first.ret), "T");
+
+    let big = t.constAt(find(&cx, m, "BIG").asConst());
+    want("BIG ty", tyStr(&cx, big.ty), "u64");
+    match big.value {
+        Option.Some(v) { match v.kind { ConstPayload.Int(x) { if x != 9223372036854775807 { panic("BIG folded signed"); } } _ { panic("BIG kind"); } } }
+        Option.None { panic("BIG has no value"); }
+    }
+
+    let lm = t.modAt(m).prefixes.get(t.sym("c"));
+    match lm {
+        Option.Some(l) {
+            let puts = t.fnAt(find(&cx, l, "puts").asFn());
+            if puts.kind != FnKind.Lib || puts.libName != "c" { panic("puts is not a lib fn of \"c\""); }
+            want("puts.ret", tyStr(&cx, puts.ret), "i32");
+        }
+        Option.None { panic("no `c` lib prefix"); }
+    }
+
+    // Globals come after `main` and the value uses (`checkProgram`'s order).
+    match sema.findMain(&cx, true) { Option.Some(_) {} Option.None { panic("no main"); } }
+    if !sema.resolveUses(&cx, m, UsePhase.Vals) || !sema.collectGlobals(&cx, m) { panic(check.failText(s)); }
+    let g = t.globalAt(find(&cx, m, "G").asGlobal());
+    match g.init {
+        Option.Some(ConstInit.Scalar(v)) { match v.kind { ConstPayload.Int(x) { if x != 13 { panic("G init"); } } _ { panic("G kind"); } } }
+        _ { panic("G init shape"); }
+    }
+    let tab = t.globalAt(find(&cx, m, "TABLE").asGlobal());
+    want("TABLE ty", tyStr(&cx, tab.ty), "[3]int");
+    if !tab.readonly { panic("TABLE is not readonly"); }
+    match tab.init { Option.Some(ConstInit.Elems(es)) { if es.items.len != 3 { panic("TABLE rows"); } } _ { panic("TABLE init shape"); } }
+    s.free();
+}
+
+/// Sema on `path` in-process vs `stage0/j3c check path`; false on a difference.
+fn same(path: string): bool {
+    let o = driver.defaults();
+    o.entry = path;
+    let s = Session.new(o);
+    defer s.free();
+    if driver.run(s, Stage.Sema) { panic(Text.new(s.arena).add("passes sema, expected an error: ").add(path).str()); }
+    let (out, err) = check.failOutput(check.failText(s), false, s.arena);
+    match proc.run(["stage0/j3c", "check", path], "", s.arena) {
+        Result.Ok(p) {
+            if p.code == 1 && p.outStr() == out && p.errStr() == err { return true; }
+            printLn(Text.new(s.arena).add("DIFF ").add(path).str());
+            printLn("--- stage0");
+            printLn(p.errStr());
+            printLn("--- ours");
+            printLn(err);
+        }
+        Result.Err(_) { panic("cannot run stage0/j3c"); }
+    }
+    return false;
+}
+
+fn main() {
+    let mem = Arena.create(1 << 12);
+    let dir = Text.new(&mem).add(io.tempRoot()).add("/j3c-boot-sema-decl").str();
+    positive(dir, &mem);
+    let fails = 0;
+    let i = 0;
+    while i < BAD.len {
+        let src = Text.new(&mem).add("module ").add(BAD[i]).add(";\n").add(BAD[i + 1]).add("\nfn main() {}\n").str();
+        if !same(put(dir, BAD[i], src, &mem)) { fails += 1; }
+        i += 2;
+    }
+    if fails > 0 { panic(`{fails} declaration error case(s) differ from stage0`); }
+}

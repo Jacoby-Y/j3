@@ -1,0 +1,181 @@
+// `vec4f` / `vec4i` in fn bodies: constructors, lane-wise arithmetic with scalar splat, lane places
+// (`v.x`, `v[2]`), the comparison error.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/simd.rs (vec_ctor, splat, vec_rhs, vec_arith, vec_lane_place, vec_index_place,
+// vec_field_place, vec_cmp_error, no_scripts; `vec_int_div` is all IR: `lower/simd.j3`)
+// J3: C2c hooks (contracts-c2c.md, owner: simd/f16/intrinsics). Results are `TExpr.Simd` (`splat`, the
+// constructors), `TExpr.Binary` with `BinKind.Simd`, `TStmt.AssignOp` with `BinKind.Simd`, `TPlace.Lane`.
+// J3: A scalar operand of a vector op is wrapped in `TExpr.Simd { name: "splat" }` (type: the vector), so
+// both sides of a `BinKind.Simd` node have the node's type. `lower` evaluates both inner operands first,
+// then the splats (Rust `vec_arith`'s order).
+module j3c.sema;
+
+/// The operands of a vector op after `vecArith`'s checks (scalars splatted).
+struct VecPair { l: Id<TExpr>; r: Id<TExpr>; ty: Id<Ty>; }
+
+extend BodyCx {
+    /// Rust `IrCx::vec_lane` on a vector type: `f32` / `i32`.
+    fn simdLaneTy(this: &BodyCx, vt: Id<Ty>): Id<Ty> {
+        if vt == this.com().vec4f { return this.com().f32; }
+        return this.com().i32;
+    }
+
+    /// `TExpr.Simd` node `name(args)` of type `t`.
+    fn simdNode(this: &BodyCx, sp: Span, name: string, args: List<Id<TExpr>>, t: Id<Ty>): Id<TExpr> {
+        return this.expr(TExpr.Simd(TSimd { name: this.sym(name), args: args }), t, sp);
+    }
+
+    /// Rust `no_scripts`: scripts run on the VM, which has no vector registers or ops.
+    fn simdNoScripts(this: &BodyCx, sp: Span): Result<bool, TErr> {
+        if this.cx.tables.modAt(this.m).isScript {
+            return Result.Err(this.help(this.err(sp, "vec4f is not supported in scripts yet"),
+                "scripts run on the VM; use four `f32` values, or move this code into a `.j3` module"));
+        }
+        return Result.Ok(true);
+    }
+
+    /// Rust `vec_ctor`: `vec4f(a, b, c, d)` / `vec4f(x)`; same for `vec4i`.
+    fn simdCtor(this: &BodyCx, sp: Span, n: Ident, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        this.simdNoScripts(sp)?;
+        let name = this.str(n.name);
+        let vt = this.com().vec4f;
+        if name == "vec4i" { vt = this.com().vec4i; }
+        let lane = this.simdLaneTy(vt);
+        if args.len != 1 && args.len != 4 {
+            let m = Text.new(this.cx.arena);
+            m.add("`").add(name).add("` takes 4 lanes or 1 value to splat, found ");
+            m.pushInt(args.len);
+            let h = Text.new(this.cx.arena);
+            h.add("write `").add(name).add("(x, y, z, w)` or `").add(name).add("(x)`");
+            return Result.Err(this.help(this.err(sp, m.str()), h.str()));
+        }
+        let ops = List<Id<TExpr>>.new(this.cx.arena);
+        for i in 0..args.len {
+            let o = this.operand(args.items[i], Option.Some(lane))?;
+            if this.exprTy(o) != lane {
+                return Result.Err(this.mismatch(this.cx.ast.exprSpan(args.items[i]), cat3(this.cx, "`", name, "` lane"), this.exprTy(o), lane));
+            }
+            ops.push(o);
+        }
+        return Result.Ok(this.simdNode(sp, name, ops, vt));
+    }
+
+    /// Rust `vec_cmp_error`: a comparison with a vector operand.
+    fn simdCompareErr(this: &BodyCx, sp: Span, op: BinOp): TErr {
+        return this.help(this.err(sp, cat3(this.cx, "`", binOpStr(op), "` does not compare vectors")),
+            "compare lanes (`a.x < b.x`) or use `@vmin` / `@vmax`; there are no lane masks yet");
+    }
+
+    /// Rust `vec_rhs`: the right operand of a vector op: a literal takes the lane type, anything else
+    /// keeps its own.
+    fn simdRhs(this: &BodyCx, rhs: Id<Expr>, vt: Id<Ty>): Result<Id<TExpr>, TErr> {
+        if this.bareNum(rhs) { return this.operand(rhs, Option.Some(this.simdLaneTy(vt))); }
+        return this.operand(rhs, Option.None);
+    }
+
+    /// Rust `splat`: scalar `x` in all four lanes of a `vt`.
+    fn simdSplat(this: &BodyCx, sp: Span, vt: Id<Ty>, x: Id<TExpr>): Id<TExpr> {
+        let a = List<Id<TExpr>>.new(this.cx.arena);
+        a.push(x);
+        return this.simdNode(sp, "splat", a, vt);
+    }
+
+    /// Rust `vec_arith`'s checks: `l op r` where at least one side is a vector; a scalar of the lane type
+    /// is splatted.
+    fn simdOperands(this: &BodyCx, sp: Span, op: BinOp, l0: Id<TExpr>, r0: Id<TExpr>): Result<VecPair, TErr> {
+        let vt = this.exprTy(r0);
+        if this.isVec(this.exprTy(l0)) { vt = this.exprTy(l0); }
+        let lane = this.simdLaneTy(vt);
+        let l = l0;
+        let r = r0;
+        if this.exprTy(l) == lane { l = this.simdSplat(sp, vt, l); }
+        if this.exprTy(r) == lane { r = this.simdSplat(sp, vt, r); }
+        let lt = this.exprTy(l);
+        let rt = this.exprTy(r);
+        let sym = binOpStr(op);
+        if lt != vt || rt != vt {
+            let m = Text.new(this.cx.arena);
+            m.add("`").add(sym).add("` needs matching operands: found `").add(this.tyStr(lt)).add("` and `").add(this.tyStr(rt)).add("`");
+            let e = this.err(sp, m.str());
+            if this.isVec(lt) && this.isVec(rt) { return Result.Err(this.help(e, "convert with `@vfloat` (vec4i to vec4f) or `@vint` (vec4f to vec4i)")); }
+            return Result.Err(this.help(e, cat3(this.cx, "a scalar operand must be `", this.tyStr(lane), "`")));
+        }
+        let isF = vt == this.com().vec4f;
+        let arith = op == BinOp.Add || op == BinOp.Sub || op == BinOp.Mul || op == BinOp.Div;
+        let bits = op == BinOp.Shl || op == BinOp.Shr || op == BinOp.BitAnd || op == BinOp.BitOr || op == BinOp.BitXor;
+        if bits && isF { return Result.Err(this.help(this.err(sp, cat3(this.cx, "`", sym, "` takes integers")), "use `vec4i`")); }
+        if !arith && !bits { return Result.Err(this.err(sp, cat3(this.cx, "`", sym, "` is not defined on vectors"))); }
+        return Result.Ok(VecPair { l: l, r: r, ty: vt });
+    }
+
+    /// Rust `vec_arith`.
+    fn simdArith(this: &BodyCx, sp: Span, op: BinOp, l: Id<TExpr>, r: Id<TExpr>): Result<Id<TExpr>, TErr> {
+        let p = this.simdOperands(sp, op, l, r)?;
+        return Result.Ok(this.bin(sp, op, BinKind.Simd, p.l, p.r, p.ty));
+    }
+
+    /// Rust `binary` (check/lower/binop.rs:198): bare number `lhs`, vector `r`: `lhs` typed as the lane,
+    /// then `vec_arith`.
+    fn simdArithRev(this: &BodyCx, sp: Span, op: BinOp, lhs: Id<Expr>, r: Id<TExpr>): Result<Id<TExpr>, TErr> {
+        let l = this.operand(lhs, Option.Some(this.simdLaneTy(this.exprTy(r))))?;
+        return this.simdArith(sp, op, l, r);
+    }
+
+    /// Rust `binary` (binop.rs:238): vector `l`: `vec_rhs(rhs)`, then `vec_arith`.
+    fn simdArithLhs(this: &BodyCx, sp: Span, op: BinOp, l: Id<TExpr>, rhs: Id<Expr>): Result<Id<TExpr>, TErr> {
+        let r = this.simdRhs(rhs, this.exprTy(l))?;
+        return this.simdArith(sp, op, l, r);
+    }
+
+    /// Rust `binary` (binop.rs:295): scalar `l`, already typed `r`; `vec_arith` when `r` is a vector
+    /// whose lane type is `l`'s. None: not that case (the caller reports the mismatch).
+    fn simdArithMixed(this: &BodyCx, sp: Span, op: BinOp, l: Id<TExpr>, r: Id<TExpr>): Result<Option<Id<TExpr>>, TErr> {
+        let rt = this.exprTy(r);
+        if !this.isVec(rt) || this.simdLaneTy(rt) != this.exprTy(l) { return Result.Ok(Option.None); }
+        return Result.Ok(Option.Some(this.simdArith(sp, op, l, r)?));
+    }
+
+    /// Rust `stmt` (check/lower/stmt.rs:198): `p op= value` on a vector place `p`; `sp` is the statement,
+    /// `asp` the assign-op's span.
+    fn simdAssignOp(this: &BodyCx, sp: Span, asp: Span, op: BinOp, p: Id<TPlace>, value: Id<Expr>): Result<Id<TStmt>, TErr> {
+        let r = this.simdRhs(value, this.placeTy(p))?;
+        let pair = this.simdOperands(asp, op, this.load(p), r)?;
+        return Result.Ok(this.stmtNode(TStmt.AssignOp(TAssignOp { place: p, op: op, kind: BinKind.Simd, value: pair.r }), sp));
+    }
+
+    /// Rust `vec_lane_place`.
+    fn simdLanePlace(this: &BodyCx, base: Id<TPlace>, lane: int, sp: Span): Id<TPlace> {
+        return this.place(TPlace.Lane(LanePlace { base: base, lane: lane }), this.simdLaneTy(this.placeTy(base)), sp);
+    }
+
+    /// Rust `vec_index_place`: `base[index]` on a vector place (a constant 0..3).
+    fn simdIndexPlace(this: &BodyCx, sp: Span, base: Id<TPlace>, index: Id<Expr>): Result<Id<TPlace>, TErr> {
+        let isp = this.cx.ast.exprSpan(index);
+        match this.foldInt(index) {
+            Option.Some(k) {
+                if k >= 0 && k < 4 { return Result.Ok(this.simdLanePlace(base, int(k), sp)); }
+                let m = Text.new(this.cx.arena);
+                m.add("lane index ");
+                m.pushInt(int(k));
+                m.add(" is out of range for a 4-lane vector");
+                return Result.Err(this.help(this.err(isp, m.str()), "lanes are 0..3, or `.x .y .z .w`"));
+            }
+            Option.None {}
+        }
+        return Result.Err(this.help(this.err(isp, "a vector index must be a constant 0..3"),
+            "write `v.x`, `v[2]`; to pick a lane at run time, store the lanes in an array"));
+    }
+
+    /// Rust `vec_field_place`: `base.x` on a vector place.
+    fn simdFieldPlace(this: &BodyCx, base: Id<TPlace>, field: Ident): Result<Id<TPlace>, TErr> {
+        let name = this.str(field.name);
+        let lanes = "xyzw";
+        if name.len == 1 {
+            for k in 0..4 {
+                if lanes[k] == name[0] { return Result.Ok(this.simdLanePlace(base, k, field.span)); }
+            }
+        }
+        return Result.Err(this.help(this.err(field.span, cat3(this.cx, "no field `", name, "` on a vector")), "lanes are `.x .y .z .w`"));
+    }
+}

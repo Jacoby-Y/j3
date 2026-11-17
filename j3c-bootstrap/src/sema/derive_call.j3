@@ -1,0 +1,119 @@
+// Derived members in fn bodies: the instance of a generic enum's derived `Enum.method` fn for one enum
+// instance (`Opt<int>.hash()`, `Opt<string> == ..`), and whether such an instance meets a trait method.
+//
+// Part of module j3c.sema.
+// Port of: check/lower/bounds.rs (enum_derived, method_ok's derived-enum case, impl_target's derived
+// half), check/traits.rs (`TraitEnv.enum_derives`)
+// J3: Rust kept a table `(method, enum span) -> generic fn`; here the fn is looked up by its name
+// `Enum.method` in the enum's module scope (no source name has a `.`).
+module j3c.sema;
+
+/// The generic fn `Enum.name` that `#[derive(..)]` wrote for the generic enum of instance type `ty` (Rust
+/// `enum_derives.get`). None when `ty` is not such an instance or has no derived `name`.
+fn enumDeriveFn(cx: &SemaCx, ty: Id<Ty>, name: Sym): Option<Id<FnDecl>> {
+    let t = cx.tables;
+    let e = match t.ty(ty) { Ty.Enum(x) { x } _ { return Option.None; } };
+    let ed = t.enumAt(e.decl);
+    match ed.gen { Option.Some(_) {} Option.None { return Option.None; } }
+    match scopeOf(cx, ed.owner, t.sym(cat3(cx, t.str(ed.name), ".", t.str(name))), DeclKind.Fn) {
+        Option.Some(d) { if t.fnAt(d.asFn()).owner == ed.owner { return Option.Some(d.asFn()); } }
+        Option.None {}
+    }
+    return Option.None;
+}
+
+/// Rust `method_ok`'s derived-enum case: `Some(result)` when `ty` is a generic enum instance with a
+/// derived `m` (there when its type args meet the derive's bounds), None when the caller goes on.
+fn enumDeriveOk(cx: &SemaCx, ty: Id<Ty>, m: &TraitMethodDecl): Option<Option<MethodFail>> {
+    let t = cx.tables;
+    let f = match enumDeriveFn(cx, ty, m.name) { Option.Some(x) { x } Option.None { return Option.None; } };
+    let g = match t.fnAt(f).gen { Option.Some(x) { x } Option.None { return Option.None; } };
+    let args = match t.ty(ty) { Ty.Enum(e) { t.items(e.args) } _ { return Option.None; } };
+    let gd = t.genericsAt(g);
+    for i in 0..args.len {
+        if i >= gd.bounds.len || gd.bounds.items[i].len == 0 { continue; }
+        let bs = List<BoundRef>.new(cx.arena);
+        for k in 0..gd.bounds.items[i].len { bs.push(BoundRef { tr: gd.bounds.items[i].items[k], span: m.span }); }
+        let reqs = List<BoundReq>.new(cx.arena);
+        reqs.push(BoundReq { param: t.str(gd.names.items[i]), arg: args[i], bounds: bs });
+        match checkBoundReqs(cx, m.span, "", &reqs, Option.None) {
+            Option.Some(_) { return Option.Some(Option.Some(MethodFail { kind: FailKind.Element, found: tyText(cx, args[i]), m: *m })); }
+            Option.None {}
+        }
+    }
+    return Option.Some(Option.None);
+}
+
+extend BodyCx {
+    /// Rust `enum_derived`: the instance of the derived `name` for generic enum instance `ty`, after its
+    /// bounds. `Ok(None)` when `ty` is not such an instance.
+    fn enumDerived(this: &BodyCx, sp: Span, ty: Id<Ty>, name: Sym): Result<Option<Id<Instance>>, TErr> {
+        let t = this.cx.tables;
+        let f = match enumDeriveFn(this.cx, ty, name) { Option.Some(x) { x } Option.None { return Result.Ok(Option.None); } };
+        let g = match t.fnAt(f).gen { Option.Some(x) { x } Option.None { return Result.Ok(Option.None); } };
+        let args = match t.ty(ty) { Ty.Enum(e) { e.args } _ { return Result.Ok(Option.None); } };
+        let by = Text.new(this.cx.arena).add("the derived `").add(this.str(name)).add("` of `").add(this.tyStr(ty)).add("`").str();
+        this.traitGenBounds(sp, by, g, t.items(args))?;
+        return Result.Ok(Option.Some(this.genInstance(sp, f, args)?));
+    }
+
+    /// `enumDerived` as an operator fn (Rust `impl_target` through `find_op`): `t` is the operand type,
+    /// which the fn's first parameter must take.
+    fn enumDerivedOp(this: &BodyCx, sp: Span, t: Id<Ty>, name: Sym): Result<Option<OpFn>, TErr> {
+        let tb = this.cx.tables;
+        let inner = derefAll(tb, t);
+        let inst = match this.enumDerived(sp, inner, name)? { Option.Some(x) { x } Option.None { return Result.Ok(Option.None); } };
+        let key = tb.instanceAt(inst).key;
+        let d = *tb.fnAt(key.item.asFn());
+        let g = match d.gen { Option.Some(x) { x } Option.None { return Result.Ok(Option.None); } };
+        if d.params.len == 0 || !this.thisFits(t, subst(tb, g, d.params.items[0].ty, key.args)) { return Result.Ok(Option.None); }
+        let of = OpFn { callee: Callee.Inst(InstCallee { inst: inst }), params: List<Id<Ty>>.new(this.cx.arena), ret: subst(tb, g, d.ret, key.args) };
+        for i in 0..d.params.len { of.params.push(subst(tb, g, d.params.items[i].ty, key.args)); }
+        return Result.Ok(Option.Some(of));
+    }
+
+    /// `recv.name(args)` on a generic enum instance `rt` with a derived `name` (Rust `impl_target`'s
+    /// derived half, then `call_id`). `Ok(None)`: not one.
+    fn enumDerivedCall(this: &BodyCx, sp: Span, recv: Id<TPlace>, rt: Id<Ty>, name: Ident, args: &List<Id<Expr>>): Result<Option<Id<TExpr>>, TErr> {
+        match enumDeriveFn(this.cx, rt, name.name) { Option.Some(_) {} Option.None { return Result.Ok(Option.None); } }
+        let of = match this.enumDerivedOp(sp, this.placeTy(recv), name.name)? { Option.Some(x) { x } Option.None { return Result.Ok(Option.None); } };
+        if of.params.len - 1 != args.len {
+            // Rust `call_id`: the instance's name (`Opt.hash<int>`) and its signature as a note.
+            let full = Text.new(this.cx.arena);
+            match of.callee {
+                Callee.Inst(ic) {
+                    let key = this.cx.tables.instanceAt(ic.inst).key;
+                    full.add(this.str(this.cx.tables.fnAt(key.item.asFn()).name)).add("<");
+                    let xs = this.cx.tables.items(key.args);
+                    for k in 0..xs.len {
+                        if k > 0 { full.add(","); }
+                        stableTyName(this.cx.tables, xs[k], &full, 0);
+                    }
+                    full.add(">");
+                }
+                _ { full.add(this.str(name.name)); }
+            }
+            let e = Text.new(this.cx.arena).add("`").add(full.str()).add("` takes ");
+            e.pushInt(of.params.len - 1);
+            e.add(" args, got ");
+            e.pushInt(args.len);
+            let n = Text.new(this.cx.arena).add("fn ").add(full.str()).add("(");
+            for i in 1..of.params.len {
+                if i > 1 { n.add(", "); }
+                n.add(this.tyStr(of.params.items[i]));
+            }
+            n.add(")");
+            if of.ret != this.com().void { n.add(": ").add(this.tyStr(of.ret)); }
+            return Result.Err(this.note(this.err(sp, e.str()), n.str()));
+        }
+        let out = List<Id<TExpr>>.new(this.cx.arena);
+        out.push(this.autoThis(sp, recv, of.params.items[0])?);
+        for i in 0..args.len {
+            let want = of.params.items[i + 1];
+            let v = this.operand(args.items[i], Option.Some(want))?;
+            if this.exprTy(v) != want { return Result.Err(this.mismatch(this.cx.ast.exprSpan(args.items[i]), "type mismatch", this.exprTy(v), want)); }
+            out.push(v);
+        }
+        return Result.Ok(Option.Some(this.expr(TExpr.Call(TCall { callee: of.callee, args: out }), of.ret, sp)));
+    }
+}

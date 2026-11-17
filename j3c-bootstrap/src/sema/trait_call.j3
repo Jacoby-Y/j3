@@ -1,0 +1,379 @@
+// Traits, use side in bodies: `#[impl]` fns and trait default methods as method calls, bound methods of a
+// type parameter (the template pass: `Callee.Bound`), user and `#[impl]` operators (`j3.cmp`'s
+// `operator<` on strings) and a generic struct instance's operator methods (`Callee.Inst`), and the bound
+// checks of a call (`traitCallBounds`, what `gen_call` runs before requesting an instance).
+//
+// Part of module j3c.sema.
+// Port of: check/lower/bounds.rs (check_call_bounds, check_where, call_default, impl_target),
+// check/lower/binop.rs (find_op's `#[impl]` half, op_where, operator_fallback through `#[impl]` fns),
+// check/lower/stmt.rs (assign-op through `find_op`), check/lower/defcheck.rs (bound_miss / miss: what a
+// type parameter lacks)
+// J3: Hooks (contracts-c2b.md): `body_call` / `body_binop` / `body_stmt` call these before their plain
+// paths; `Ok(None)` = not mine, the caller goes on. A plain struct's own operator method stays the
+// caller's (`findOp`); a type parameter's methods are its bounds' (`trait_bounds.paramMethod`).
+// J3: The bound queue (`traitQueueBounds` / `traitDrainBound`) is `trait_queue.j3`.
+module j3c.sema;
+
+/// An operator fn as the operator paths see it: who is called, its parameter types and return type at
+/// this instance (Rust's `fn_sig` of the found fn).
+struct OpFn { callee: Callee; params: List<Id<Ty>>; ret: Id<Ty>; }
+
+extend BodyCx {
+    /// Rust `check_call_bounds` + `check_where`: the bounds of generic fn or method `f` called with `args`
+    /// (InstKey order). A method of a generic struct: its own parameters' bounds, then its `where` at the
+    /// struct's args. Needed by "`name`". `Err` = Rust's bound error.
+    fn traitCallBounds(this: &BodyCx, sp: Span, f: Id<FnDecl>, args: Id<TyList>): Result<bool, TErr> {
+        let reqs = exactReqs(this.cx, f, this.cx.tables.items(args));
+        if reqs.len == 0 { return Result.Ok(true); }
+        match checkBoundReqs(this.cx, sp, cat3(this.cx, "`", this.str(this.cx.tables.fnAt(f).name), "`"), &reqs, Option.Some(this.m)) {
+            Option.Some(diag) { return Result.Err(TErr { diag: diag, unknown: Option.None }); }
+            Option.None {}
+        }
+        return Result.Ok(true);
+    }
+
+    /// `traitCallBounds` for a caller that holds the template's `Generics` `g` (`gen_call.genCallBounds`):
+    /// `args` in InstKey order, `what` names the callee (`` `f` ``). Checked from `g` (own parameters'
+    /// bounds, then the `where` part of a generic struct's parameters); on a failure the owning fn's
+    /// written bounds give the error its exact "bound declared at" line.
+    fn traitGenBounds(this: &BodyCx, sp: Span, what: string, g: Id<Generics>, args: []Id<Ty>): Result<bool, TErr> {
+        let reqs = genReqs(this.cx, g, args);
+        if reqs.len == 0 { return Result.Ok(true); }
+        let first = match checkBoundReqs(this.cx, sp, what, &reqs, Option.Some(this.m)) {
+            Option.Some(d) { d }
+            Option.None { return Result.Ok(true); }
+        };
+        match fnOfGenerics(this.cx, g) {
+            Option.Some(f) {
+                let exact = exactReqs(this.cx, f, args);
+                match checkBoundReqs(this.cx, sp, what, &exact, Option.Some(this.m)) { Option.Some(d) { first = d; } Option.None {} }
+            }
+            Option.None {}
+        }
+        return Result.Err(TErr { diag: first, unknown: Option.None });
+    }
+
+    /// `recv.name(args)` after own methods failed (`rt` is `recv`'s type after auto-deref): a type
+    /// parameter's bound method, else the `#[impl]` fn (Rust `impl_target`), else a trait default body
+    /// (Rust `call_default`). `Ok(None)`: no such member; the caller tries generic UFCS, then words the
+    /// error (`boundMiss` for a type parameter: Rust `no_method`).
+    fn traitMethodCall(this: &BodyCx, sp: Span, recv: Id<TPlace>, rt: Id<Ty>, name: Ident, args: &List<Id<Expr>>): Result<Option<Id<TExpr>>, TErr> {
+        match this.ty(rt) {
+            Ty.Param(p) {
+                match paramMethod(this.cx, p, name.name) {
+                    Option.Some(m) { return Result.Ok(Option.Some(this.boundCall(sp, recv, rt, &m, args)?)); }
+                    // Rust: no placeholder method, so on to `call_default` and generic UFCS; the miss is
+                    // the caller's `no method` (`body_call.callField`).
+                    Option.None {}
+                }
+            }
+            _ {}
+        }
+        match implFor(this.cx, name.name, rt) {
+            Option.Some(f) {
+                let d = this.cx.tables.fnAt(f);
+                if this.thisFits(this.placeTy(recv), d.params.items[0].ty) { return Result.Ok(Option.Some(this.callId(sp, f, Option.Some(recv), args)?)); }
+            }
+            Option.None {}
+        }
+        match this.enumDerivedCall(sp, recv, rt, name, args)? { Option.Some(v) { return Result.Ok(Option.Some(v)); } Option.None {} }
+        return this.callDefault(sp, name, recv, rt, args);
+    }
+
+    /// A call of bound method `m` on a type parameter receiver (template pass; never lowered): Rust's
+    /// `call_id` on the placeholder's bodiless method.
+    fn boundCall(this: &BodyCx, sp: Span, recv: Id<TPlace>, rt: Id<Ty>, m: &TraitMethodDecl, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let t = this.cx.tables;
+        let ps = List<Id<Ty>>.new(this.cx.arena);
+        for i in 0..m.params.len { ps.push(selfSubst(t, m.params.items[i].ty, rt)); }
+        let ret = selfSubst(t, m.ret, rt);
+        if ps.len - 1 != args.len {
+            let name = this.str(m.name);
+            let e = Text.new(this.cx.arena).add("`").add(name).add("` takes ");
+            e.pushInt(ps.len - 1);
+            e.add(" args, got ");
+            e.pushInt(args.len);
+            let n = Text.new(this.cx.arena).add("fn ").add(name).add("(");
+            for i in 1..ps.len {
+                if i > 1 { n.add(", "); }
+                n.add(this.tyStr(ps.items[i]));
+            }
+            n.add(")");
+            if ret != this.com().void { n.add(": ").add(this.tyStr(ret)); }
+            return Result.Err(this.note(this.err(sp, e.str()), n.str()));
+        }
+        let out = List<Id<TExpr>>.new(this.cx.arena);
+        out.push(this.autoThis(sp, recv, ps.items[0])?);
+        for i in 0..args.len { out.push(this.operand(args.items[i], Option.Some(ps.items[i + 1]))?); }
+        return Result.Ok(this.expr(TExpr.Call(TCall { callee: Callee.Bound(BoundCallee { slot: 0 }), args: out }), ret, sp));
+    }
+
+    /// Rust `call_default`: `x.m(..)` where `x`'s type has no `m` but a trait it meets has a default body
+    /// for `m`: that body's instance for the type. `Ok(None)` when no trait has a default `m`.
+    fn callDefault(this: &BodyCx, sp: Span, name: Ident, recv: Id<TPlace>, rt: Id<Ty>, args: &List<Id<Expr>>): Result<Option<Id<TExpr>>, TErr> {
+        let t = this.cx.tables;
+        let ns = this.str(name.name);
+        let by = cat3(this.cx, "the default `", ns, "`");
+        let met = List<Id<FnDecl>>.new(this.cx.arena);
+        let metNames = List<string>.new(this.cx.arena);
+        let firstErr: Option<Diag> = Option.None;
+        let any = false;
+        for i in 0..t.traits.len() {
+            let tid = t.traits.idAt(i);
+            let td = t.traitAt(tid);
+            let def: Option<Id<FnDecl>> = Option.None;
+            for k in 0..td.methods.len { if td.methods.items[k].name == name.name { def = td.methods.items[k].default; } }
+            let f = match def { Option.Some(x) { x } Option.None { continue; } };
+            any = true;
+            let at = td.span;
+            match td.item { Option.Some(it) { at = it.name.span; } Option.None {} }
+            let bs = List<BoundRef>.new(this.cx.arena);
+            bs.push(BoundRef { tr: tid, span: at });
+            let reqs = List<BoundReq>.new(this.cx.arena);
+            reqs.push(BoundReq { param: "Self", arg: rt, bounds: bs });
+            match checkBoundReqs(this.cx, sp, by, &reqs, Option.None) {
+                Option.Some(d) { match firstErr { Option.None { firstErr = Option.Some(d); } Option.Some(_) {} } }
+                Option.None { met.push(f); metNames.push(t.str(td.name)); }
+            }
+        }
+        if !any { return Result.Ok(Option.None); }
+        if met.len == 1 { return Result.Ok(Option.Some(this.defaultCall(sp, met.items[0], recv, rt, args)?)); }
+        if met.len == 0 {
+            match firstErr { Option.Some(d) { return Result.Err(TErr { diag: d, unknown: Option.None }); } Option.None {} }
+            return Result.Ok(Option.None);
+        }
+        let m = Text.new(this.cx.arena).add("`").add(ns).add("` is ambiguous: ");
+        for i in 0..metNames.len {
+            if i > 0 { m.add(", "); }
+            m.add("`").add(metNames.items[i]).add("`");
+        }
+        m.add(" all give `").add(this.tyStr(rt)).add("` a default `").add(ns).add("`");
+        return Result.Err(this.help(this.err(sp, m.str()), cat3(this.cx, "define `", ns, "` on the type to choose")));
+    }
+
+    /// The call of default body `f` (template `Trait.m` over `Self`) with `Self` = `rt`: its instance
+    /// (Rust `call_generic` with the receiver).
+    fn defaultCall(this: &BodyCx, sp: Span, f: Id<FnDecl>, recv: Id<TPlace>, rt: Id<Ty>, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let t = this.cx.tables;
+        let d = *t.fnAt(f);
+        let given = args.len + 1;
+        if given != d.params.len {
+            let e = Text.new(this.cx.arena).add("takes ");
+            e.pushInt(d.params.len);
+            e.add(" args, got ");
+            e.pushInt(given);
+            return Result.Err(this.err(sp, e.str()));
+        }
+        let one = this.cx.arena.alloc::<Id<Ty>>(1);
+        one[0] = rt;
+        let targs = t.list(one);
+        let g = match d.gen { Option.Some(x) { x } Option.None { return Result.Err(this.err(sp, "not a function")); } };
+        let inst = this.genInstance(sp, f, targs)?;
+        let out = List<Id<TExpr>>.new(this.cx.arena);
+        out.push(this.autoThis(sp, recv, subst(t, g, d.params.items[0].ty, targs))?);
+        for i in 0..args.len {
+            let want = subst(t, g, d.params.items[i + 1].ty, targs);
+            let v = this.operand(args.items[i], Option.Some(want))?;
+            if this.exprTy(v) != want { return Result.Err(this.mismatch(this.cx.ast.exprSpan(args.items[i]), "type mismatch", this.exprTy(v), want)); }
+            out.push(v);
+        }
+        return Result.Ok(this.expr(TExpr.Call(TCall { callee: Callee.Inst(InstCallee { inst: inst }), args: out }), subst(t, g, d.ret, targs), sp));
+    }
+
+    /// Rust `bound_miss` / `miss`: `what` (a method, operator or field) used on type parameter `p` whose
+    /// bounds do not give it; `method` is the trait method that would (`operator<` for `>`; None: a field).
+    fn boundMiss(this: &BodyCx, sp: Span, p: ParamTy, what: string, by: Option<Sym>): TErr {
+        let t = this.cx.tables;
+        let w = writtenParam(this.cx, p);
+        let bounds = "it has no bounds";
+        if t.genericsAt(p.gen).bounds.items[p.index].len > 0 {
+            let i = 0;
+            while i + 1 < w.len && !(w[i] == ':' && w[i + 1] == ' ') { i += 1; }
+            bounds = cat3(this.cx, "its bounds `", w[i + 2..w.len], "` do not give it");
+        }
+        let pn = t.str(t.genericsAt(p.gen).names.items[p.index]);
+        let e = this.err(sp, Text.new(this.cx.arena).add("type parameter `").add(pn).add("` has no ").add(what).add(": ").add(bounds).str());
+        let method = match by {
+            Option.Some(m) { m }
+            Option.None {
+                return this.help(this.note(e, "a bound gives a type parameter methods only, never fields"),
+                    "call a trait method instead, or take a concrete type");
+            }
+        };
+        let givers = List<string>.new(this.cx.arena);
+        for i in 0..t.traits.len() {
+            let td = t.traitAt(t.traits.idAt(i));
+            for k in 0..td.methods.len {
+                if td.methods.items[k].name == method {
+                    let n = t.str(td.name);
+                    if !givers.contains(n) { givers.push(n); }
+                }
+            }
+        }
+        if givers.len == 0 {
+            return this.help(e, Text.new(this.cx.arena).add("declare a trait with `fn ").add(t.str(method)).add("(this: Self, ..)` and add it: `")
+                .add(withBound(this.cx, p, "Trait")).add("`").str());
+        }
+        sort(givers.slice());
+        let h = Text.new(this.cx.arena).add("add the bound: ");
+        for i in 0..givers.len {
+            if i > 0 { h.add(" or "); }
+            h.add("`").add(withBound(this.cx, p, givers.items[i])).add("`");
+        }
+        return this.help(e, h.str());
+    }
+
+    /// `l OP rhs` (compare and arithmetic) before the plain `findOp`: a type parameter's bound operator, a
+    /// generic struct instance's operator method, an `#[impl]` operator, and the comparison fallbacks
+    /// through them. `Ok(None)`: the caller goes on (a plain struct's own operator is the caller's).
+    fn traitBinary(this: &BodyCx, sp: Span, op: BinOp, l: Id<TExpr>, rhs: Id<Expr>): Result<Option<Id<TExpr>>, TErr> {
+        let name = match operatorName(op) { Option.Some(n) { this.sym(n) } Option.None { return Result.Ok(Option.None); } };
+        let lt = this.exprTy(l);
+        let cmp = op == BinOp.Eq || op == BinOp.Ne || op == BinOp.Lt || op == BinOp.Le || op == BinOp.Gt || op == BinOp.Ge;
+        match this.opFnOf(sp, lt, name)? {
+            Option.Some(of) { return Result.Ok(Option.Some(this.opCallSig(sp, &of, l, rhs)?)); }
+            Option.None {}
+        }
+        if this.plainOwnOp(lt, name) || !cmp { return Result.Ok(Option.None); }
+        match this.ty(lt) { Ty.Tuple(_) { if op == BinOp.Eq || op == BinOp.Ne { return Result.Ok(Option.None); } } _ {} }
+        let base = BinOp.Lt;
+        let swap = false;
+        let negate = false;
+        match op {
+            BinOp.Ne { base = BinOp.Eq; negate = true; }
+            BinOp.Gt { swap = true; }
+            BinOp.Le { swap = true; negate = true; }
+            BinOp.Ge { negate = true; }
+            BinOp.Eq { base = BinOp.Eq; }
+            _ {}
+        }
+        let baseName = this.sym("operator<");
+        if base == BinOp.Eq { baseName = this.sym("operator=="); }
+        if op != BinOp.Eq && op != BinOp.Lt {
+            if this.plainOwnOp(lt, baseName) { return Result.Ok(Option.None); }
+            match this.opFnOf(sp, lt, baseName)? {
+                Option.Some(of) { return Result.Ok(Option.Some(this.fallbackSig(sp, &of, swap, negate, l, rhs)?)); }
+                Option.None {}
+            }
+        }
+        match paramOf(this.cx, lt) {
+            Option.Some(p) { return Result.Err(this.boundMiss(sp, p, cat3(this.cx, "`", binOpStr(op), "`"), Option.Some(baseName))); }
+            Option.None {}
+        }
+        return Result.Ok(Option.None);
+    }
+
+    /// `place OP= value` before the plain `findOp`: as `traitBinary`, returning the whole statement (`sp`
+    /// its span, `asp` the assignment's). `Ok(None)`: the caller goes on.
+    fn traitAssignOp(this: &BodyCx, sp: Span, asp: Span, op: BinOp, value: Id<Expr>, p: Id<TPlace>): Result<Option<Id<TStmt>>, TErr> {
+        let name = match operatorName(op) { Option.Some(n) { this.sym(n) } Option.None { return Result.Ok(Option.None); } };
+        let pt = this.placeTy(p);
+        let of = match this.opFnOf(asp, pt, name)? { Option.Some(x) { x } Option.None { return Result.Ok(Option.None); } };
+        if of.params.len != 2 { return Result.Err(this.err(asp, "binary operator needs two parameters")); }
+        let rhs = this.operand(value, Option.Some(of.params.items[1]))?;
+        let args = List<Id<TExpr>>.new(this.cx.arena);
+        args.push(this.load(p));
+        args.push(rhs);
+        let call = this.expr(TExpr.Call(TCall { callee: of.callee, args: args }), of.ret, asp);
+        if of.ret != pt { return Result.Err(this.mismatch(asp, "assign-op type mismatch", of.ret, pt)); }
+        return Result.Ok(Option.Some(this.stmtNode(TStmt.Assign(TAssign { place: p, value: call }), sp)));
+    }
+
+    /// A plain (non-generic) struct's own method `name` on `t` (through `&`): the caller's `findOp` path.
+    fn plainOwnOp(this: &BodyCx, t: Id<Ty>, name: Sym): bool {
+        match this.structOf(derefAll(this.cx.tables, t)) {
+            Option.Some(s) {
+                match this.cx.tables.structAt(s).gen { Option.Some(_) { return false; } Option.None {} }
+                match this.findMethod(s, name) { Option.Some(_) { return true; } Option.None {} }
+            }
+            Option.None {}
+        }
+        return false;
+    }
+
+    /// Rust `find_op` minus a plain struct's own method: a type parameter's bound method, a generic
+    /// struct instance's method (its `where` checked: Rust `op_where`), else the `#[impl]` fn whose first
+    /// parameter takes `t`.
+    fn opFnOf(this: &BodyCx, sp: Span, t: Id<Ty>, name: Sym): Result<Option<OpFn>, TErr> {
+        let tb = this.cx.tables;
+        let inner = derefAll(tb, t);
+        match tb.ty(inner) {
+            Ty.Param(p) {
+                match paramMethod(this.cx, p, name) {
+                    Option.Some(m) {
+                        let of = OpFn { callee: Callee.Bound(BoundCallee { slot: 0 }), params: List<Id<Ty>>.new(this.cx.arena), ret: selfSubst(tb, m.ret, inner) };
+                        for i in 0..m.params.len { of.params.push(selfSubst(tb, m.params.items[i].ty, inner)); }
+                        return Result.Ok(Option.Some(of));
+                    }
+                    Option.None { return Result.Ok(Option.None); }
+                }
+            }
+            Ty.Struct(st) {
+                match tb.structAt(st.decl).gen {
+                    Option.Some(_) {
+                        match this.findMethodAny(st.decl, name) {
+                            Option.Some(f) {
+                                match ownMethod(this.cx, inner, name) {
+                                    Option.Some(hit) {
+                                        if !hit.generic {
+                                            this.traitCallBounds(sp, f, st.args)?;
+                                            let inst = request(this.cx, InstKey { kind: InstKind.Fn, item: refFn(f), args: st.args }, sp);
+                                            return Result.Ok(Option.Some(OpFn { callee: Callee.Inst(InstCallee { inst: inst }), params: hit.params, ret: hit.ret }));
+                                        }
+                                    }
+                                    Option.None {}
+                                }
+                            }
+                            Option.None {}
+                        }
+                    }
+                    Option.None {}
+                }
+            }
+            _ {}
+        }
+        match implFor(this.cx, name, inner) {
+            Option.Some(f) {
+                let d = tb.fnAt(f);
+                if !this.thisFits(t, d.params.items[0].ty) { return Result.Ok(Option.None); }
+                let of = OpFn { callee: Callee.Fn(FnCallee { decl: f }), params: List<Id<Ty>>.new(this.cx.arena), ret: d.ret };
+                for i in 0..d.params.len { of.params.push(d.params.items[i].ty); }
+                return Result.Ok(Option.Some(of));
+            }
+            Option.None {}
+        }
+        return this.enumDerivedOp(sp, t, name);
+    }
+
+    /// `opCall` for an `OpFn` (Rust's two-parameter checks).
+    fn opCallSig(this: &BodyCx, sp: Span, of: &OpFn, l: Id<TExpr>, rhs: Id<Expr>): Result<Id<TExpr>, TErr> {
+        if of.params.len != 2 { return Result.Err(this.err(sp, "binary operator needs two parameters")); }
+        if this.exprTy(l) != of.params.items[0] { return Result.Err(this.err(sp, "operator `this` type mismatch")); }
+        let r = this.operand(rhs, Option.Some(of.params.items[1]))?;
+        let args = List<Id<TExpr>>.new(this.cx.arena);
+        args.push(l);
+        args.push(r);
+        return Result.Ok(this.expr(TExpr.Call(TCall { callee: of.callee, args: args }), of.ret, sp));
+    }
+
+    /// `operatorFallback` for an `OpFn`: `!(a == b)`, `b < a`, `!(b < a)`, `!(a < b)`.
+    fn fallbackSig(this: &BodyCx, sp: Span, of: &OpFn, swap: bool, negate: bool, l: Id<TExpr>, rhs: Id<Expr>): Result<Id<TExpr>, TErr> {
+        if of.params.len != 2 { return Result.Err(this.err(sp, "binary operator needs two parameters")); }
+        let wantL = of.params.items[0];
+        let wantR = of.params.items[1];
+        if swap {
+            wantL = of.params.items[1];
+            wantR = of.params.items[0];
+        }
+        if this.exprTy(l) != wantL { return Result.Err(this.err(sp, "operator `this` type mismatch")); }
+        let r = this.operand(rhs, Option.Some(wantR))?;
+        if negate && of.ret != this.com().bool {
+            return Result.Err(this.err(sp, "an operator used for a comparison fallback must return bool"));
+        }
+        let args = List<Id<TExpr>>.new(this.cx.arena);
+        if swap { args.push(r); args.push(l); } else { args.push(l); args.push(r); }
+        let call = this.expr(TExpr.Call(TCall { callee: of.callee, args: args }), of.ret, sp);
+        if !negate { return Result.Ok(call); }
+        return Result.Ok(this.exprFrom(Origin.OpFallback, TExpr.Unary(TUnary { op: UnaryOp.Not, operand: call }), of.ret, sp));
+    }
+}

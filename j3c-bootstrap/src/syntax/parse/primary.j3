@@ -3,4 +3,376 @@
 //
 // Part of module j3c.syntax.parse.
 // Port of: j3c/src/parse/parser/primary.rs, parse/parser/embed.rs
+// J3: The `@name(..)` intrinsics are `primaryAt`, split off `primary`. Literal bytes, script and embed
+// paths are arena copies (`own`). Error text with a name in it is built in a `Text` (no backtick escape
+// in an interpolated string). Uses come from `parse.j3`.
 module j3c.syntax.parse;
+
+extend Parser {
+    /// A primary followed by calls, fields, indexing, slices, `?`.
+    fn postfix(this: &Parser): Result<Id<Expr>, ParseError> {
+        let e = this.primary()?;
+        while true {
+            let k = this.cur().kind;
+            let es = this.ast.exprSpan(e);
+            if k == TokenKind.Dot {
+                this.bump();
+                // `t.0`: a tuple element (or a multi-field variant payload's field).
+                let field = Ident { name: this.ast.sym(""), span: es };
+                if this.at(TokenKind.Int) && allDigits(this.cur().text) {
+                    let tok = this.bump();
+                    field = Ident { name: this.ast.sym(tok.text), span: tok.span };
+                } else {
+                    field = this.ident()?;
+                }
+                e = this.ast.addExpr(Expr.Field(FieldExpr { base: e, field: field }), join(es, field.span));
+                if this.at(TokenKind.ColonColon) { e = this.turbofishCall(e)?; }
+            } else if k == TokenKind.ColonColon {
+                e = this.turbofishCall(e)?;
+            } else if k == TokenKind.LParen {
+                let a = this.args()?;
+                let call = CallExpr { func: e, typeArgs: List<Id<Type>>.new(this.ast.arena), args: a };
+                e = this.ast.addExpr(Expr.Call(call), this.since(es));
+            } else if k == TokenKind.Question {
+                this.bump();
+                e = this.ast.addExpr(Expr.Question(QuestionExpr { expr: e }), this.since(es));
+            } else if k == TokenKind.LBracket {
+                e = this.indexOrSlice(e)?;
+            } else if k == TokenKind.LBrace {
+                let path = "";
+                let isScript = false;
+                match this.ast.expr(e) {
+                    Expr.ScriptType(p) { path = p; isScript = true; }
+                    _ {}
+                }
+                if !isScript { break; }
+                let fields = this.scriptLitFields()?;
+                e = this.ast.addExpr(Expr.ScriptLit(ScriptLitExpr { path: path, fields: fields }), this.since(es));
+            } else {
+                break;
+            }
+        }
+        return Result.Ok(e);
+    }
+
+    /// `base[i]`, `base[a..b]`, `base[..b]`, `base[a..]`, `base[:]`, at the `[`.
+    fn indexOrSlice(this: &Parser, base: Id<Expr>): Result<Id<Expr>, ParseError> {
+        let bs = this.ast.exprSpan(base);
+        let none: Option<Id<Expr>> = Option.None;
+        this.bump();
+        if this.eat(TokenKind.Colon) {
+            this.expect(TokenKind.RBracket, "expected `]` after `:`")?;
+            return Result.Ok(this.ast.addExpr(Expr.Slice(SliceExpr { base: base, start: none, end: none }), this.since(bs)));
+        }
+        if this.eat(TokenKind.DotDot) {
+            let end = this.sliceEnd()?;
+            return Result.Ok(this.ast.addExpr(Expr.Slice(SliceExpr { base: base, start: none, end: end }), this.since(bs)));
+        }
+        let first = this.expr()?;
+        if this.eat(TokenKind.DotDot) {
+            let end = this.sliceEnd()?;
+            let sl = SliceExpr { base: base, start: Option.Some(first), end: end };
+            return Result.Ok(this.ast.addExpr(Expr.Slice(sl), this.since(bs)));
+        }
+        this.expect(TokenKind.RBracket, "expected `]` after index")?;
+        return Result.Ok(this.ast.addExpr(Expr.Index(IndexExpr { base: base, index: first }), this.since(bs)));
+    }
+
+    /// After `..` in a slice: the end (none before `]`), then the `]`.
+    fn sliceEnd(this: &Parser): Result<Option<Id<Expr>>, ParseError> {
+        let end: Option<Id<Expr>> = Option.None;
+        if !this.at(TokenKind.RBracket) { end = Option.Some(this.expr()?); }
+        this.expect(TokenKind.RBracket, "expected `]` after slice")?;
+        return Result.Ok(end);
+    }
+
+    fn primary(this: &Parser): Result<Id<Expr>, ParseError> {
+        let tok = this.cur();
+        match tok.kind {
+            TokenKind.Fn { return this.closureLit(); }
+            TokenKind.Ident | TokenKind.This { return this.primaryName(tok); }
+            TokenKind.Int {
+                this.bump();
+                match parseInt(tok.text, this.ast.arena) {
+                    Result.Ok(v) { return Result.Ok(this.ast.addExpr(v, tok.span)); }
+                    Result.Err(m) { return Result.Err(this.errAt(tok.span, m)); }
+                }
+            }
+            TokenKind.Char {
+                this.bump();
+                return Result.Ok(this.ast.addExpr(Expr.Char(charCode(tok.text)), tok.span));
+            }
+            TokenKind.Float {
+                this.bump();
+                match text.parseF64(tok.text) {
+                    Option.Some(v) { return Result.Ok(this.ast.addExpr(Expr.Float(v), tok.span)); }
+                    Option.None {
+                        let t = Text.new(this.ast.arena);
+                        t.add("invalid float `").add(tok.text).add("`");
+                        return Result.Err(this.errAt(tok.span, t.str()));
+                    }
+                }
+            }
+            TokenKind.String {
+                this.bump();
+                return Result.Ok(this.ast.addExpr(Expr.String(own(this.ast.arena, tok.text)), tok.span));
+            }
+            TokenKind.Interpolate {
+                this.bump();
+                let parts = splitInterp(this.ast, tok.text, tok.span)?;
+                return Result.Ok(this.ast.addExpr(Expr.Interpolate(InterpolateExpr { parts: parts }), tok.span));
+            }
+            TokenKind.At { return this.primaryAt(); }
+            TokenKind.LParen {
+                this.bump();
+                let first = this.expr()?;
+                if !this.at(TokenKind.Comma) {
+                    this.expect(TokenKind.RParen, "expected `)`")?;
+                    return Result.Ok(first);
+                }
+                // `(a, b)`: a tuple; `(a)` stays a parenthesized expression.
+                let elems = List<Id<Expr>>.new(this.ast.arena);
+                elems.push(first);
+                while this.eat(TokenKind.Comma) {
+                    if this.at(TokenKind.RParen) { break; }
+                    elems.push(this.expr()?);
+                }
+                if elems.len < 2 {
+                    return Result.Err(this.err("a tuple has two or more elements; drop the `,` for a parenthesized expression"));
+                }
+                this.expect(TokenKind.RParen, "expected `)` after tuple elements")?;
+                return Result.Ok(this.ast.addExpr(Expr.Tuple(TupleExpr { elems: elems }), this.since(tok.span)));
+            }
+            TokenKind.LBracket { return this.primaryBracket(); }
+            TokenKind.If { return this.ifExpr(); }
+            TokenKind.Match {
+                let m = this.matchStmt()?;
+                return Result.Ok(this.ast.addExpr(Expr.Match(m), m.span));
+            }
+            _ { return Result.Err(this.err("expected expression")); }
+        }
+    }
+
+    /// A name, `true`/`false`, `Name<T>.x` (a type path), or a struct literal `Name<T> { .. }`.
+    fn primaryName(this: &Parser, tok: Token): Result<Id<Expr>, ParseError> {
+        this.bump();
+        if tok.text == "true" { return Result.Ok(this.ast.addExpr(Expr.Bool(true), tok.span)); }
+        if tok.text == "false" { return Result.Ok(this.ast.addExpr(Expr.Bool(false), tok.span)); }
+        let name = Ident { name: this.ast.sym(tok.text), span: tok.span };
+        if this.at(TokenKind.Lt) {
+            let saved = this.i;
+            match this.typeArgs() {
+                Result.Ok(targs) {
+                    if this.at(TokenKind.Dot) {
+                        return Result.Ok(this.ast.addExpr(Expr.TypePath(TypePathExpr { name: name, args: targs }), this.since(name.span)));
+                    }
+                    if this.looksLikeStructLit() { return this.structLit(name, targs); }
+                    this.i = saved;
+                }
+                Result.Err(_) { this.i = saved; }
+            }
+        }
+        if this.looksLikeStructLit() { return this.structLit(name, List<Id<Type>>.new(this.ast.arena)); }
+        return Result.Ok(this.ast.addExpr(Expr.Name(name), tok.span));
+    }
+
+    /// `[a, b]`, or `[]T { ptr: p, len: n }`, at the `[`.
+    fn primaryBracket(this: &Parser): Result<Id<Expr>, ParseError> {
+        let start = this.cur().span;
+        this.bump();
+        if this.eat(TokenKind.RBracket) {
+            let elem = this.ty()?;
+            if !this.looksLikeStructLit() { return Result.Err(this.err("expected `{ ptr, len }` after `[]T`")); }
+            this.expect(TokenKind.LBrace, "expected `{` in slice literal")?;
+            let fields = this.fieldInits("expected `:` after field name")?;
+            this.expect(TokenKind.RBrace, "expected `}` after slice literal")?;
+            return Result.Ok(this.ast.addExpr(Expr.SliceLit(SliceLitExpr { elem: elem, fields: fields }), this.since(start)));
+        }
+        let elems = List<Id<Expr>>.new(this.ast.arena);
+        if !this.at(TokenKind.RBracket) {
+            while true {
+                elems.push(this.expr()?);
+                if this.eat(TokenKind.Comma) {
+                    if this.at(TokenKind.RBracket) { break; }
+                    continue;
+                }
+                break;
+            }
+        }
+        this.expect(TokenKind.RBracket, "expected `]` after array literal")?;
+        return Result.Ok(this.ast.addExpr(Expr.ArrayLit(ArrayLitExpr { elems: elems }), this.since(start)));
+    }
+
+    /// `@name(..)`: an intrinsic, at the `@`.
+    fn primaryAt(this: &Parser): Result<Id<Expr>, ParseError> {
+        let start = this.bump().span;
+        let name = this.ident()?;
+        let n = this.ast.str(name.name);
+        if n == INTRINSIC_SYSCALL {
+            let a = this.args()?;
+            return Result.Ok(this.ast.addExpr(Expr.Syscall(SyscallExpr { args: a }), this.since(start)));
+        }
+        match atomicOpFromName(n) {
+            Option.Some(op) {
+                let a = this.args()?;
+                let order = this.atomicOrder(op, &a, name.span)?;
+                return Result.Ok(this.ast.addExpr(Expr.Atomic(AtomicExpr { op: op, order: order, args: a }), this.since(start)));
+            }
+            Option.None {}
+        }
+        if isIn(n, names(NameList.IntrinsicClosures)) || isIn(n, names(NameList.IntrinsicSimd)) || isIn(n, names(NameList.IntrinsicGpu)) {
+            let a = this.args()?;
+            let t = Text.new(this.ast.arena);
+            t.add("@").add(n);
+            let func = this.ast.addExpr(Expr.Name(Ident { name: this.ast.sym(t.str()), span: name.span }), name.span);
+            let call = CallExpr { func: func, typeArgs: List<Id<Type>>.new(this.ast.arena), args: a };
+            return Result.Ok(this.ast.addExpr(Expr.Call(call), this.since(start)));
+        }
+        if n == INTRINSIC_UI_CHOICE {
+            this.expect(TokenKind.LParen, "expected `(` after `@uiChoice`")?;
+            let set = this.ty()?;
+            this.expect(TokenKind.Comma, "expected `,` after candidate-set type")?;
+            let value = this.expr()?;
+            this.expect(TokenKind.Comma, "expected `,` after selector")?;
+            let index = this.expr()?;
+            this.expect(TokenKind.RParen, "expected `)` after `@uiChoice`")?;
+            return Result.Ok(this.ast.addExpr(Expr.UiChoice(UiChoiceExpr { set: set, value: value, index: index }), this.since(start)));
+        }
+        if n == INTRINSIC_SIZEOF {
+            this.expect(TokenKind.LParen, "expected `(` after `@sizeof`")?;
+            let t = this.ty()?;
+            this.expect(TokenKind.RParen, "expected `)` after `@sizeof`")?;
+            return Result.Ok(this.ast.addExpr(Expr.SizeOf(SizeOfExpr { ty: t }), this.since(start)));
+        }
+        if n == INTRINSIC_SLICE {
+            let a = this.args()?;
+            if a.len != 2 { return Result.Err(this.errAt(name.span, "`@slice` takes a pointer and a length")); }
+            let sf = SliceFromExpr { ptr: a.items[0], len: a.items[1] };
+            return Result.Ok(this.ast.addExpr(Expr.SliceFrom(sf), this.since(start)));
+        }
+        if isIn(n, names(NameList.IntrinsicEmbed)) { return this.embed(n, start); }
+        if n == INTRINSIC_SCRIPT {
+            this.expect(TokenKind.LParen, "expected `(` after `@script`")?;
+            let p = this.cur();
+            if p.kind != TokenKind.String { return Result.Err(this.err("`@script` path must be a string literal")); }
+            this.bump();
+            if !text.endsWith(p.text, ".j3s") { return Result.Err(this.errAt(p.span, "`@script` path must end in `.j3s`")); }
+            this.expect(TokenKind.RParen, "expected `)` after `@script` path")?;
+            return Result.Ok(this.ast.addExpr(Expr.ScriptType(own(this.ast.arena, p.text)), this.since(start)));
+        }
+        let t = Text.new(this.ast.arena);
+        t.add("unknown intrinsic `@").add(n).add("`");
+        return Result.Err(this.errAt(name.span, t.str()));
+    }
+
+    /// At `Name {` that starts a struct literal (not a block).
+    fn looksLikeStructLit(this: &Parser): bool {
+        if !this.at(TokenKind.LBrace) { return false; }
+        let k = this.look(1).kind;
+        if k == TokenKind.RBrace { return true; }
+        if k == TokenKind.Ident || k == TokenKind.This { return this.look(2).kind == TokenKind.Colon; }
+        return false;
+    }
+
+    /// `f::<T>(args)` after `f`.
+    fn turbofishCall(this: &Parser, func: Id<Expr>): Result<Id<Expr>, ParseError> {
+        this.expect(TokenKind.ColonColon, "expected `::`")?;
+        let targs = this.typeArgs()?;
+        if !this.at(TokenKind.LParen) { return Result.Err(this.err("turbofish needs a call")); }
+        let a = this.args()?;
+        let call = CallExpr { func: func, typeArgs: targs, args: a };
+        return Result.Ok(this.ast.addExpr(Expr.Call(call), this.since(this.ast.exprSpan(func))));
+    }
+
+    /// `{ a: 1, b }` after `Name<T>`.
+    fn structLit(this: &Parser, name: Ident, typeArgs: List<Id<Type>>): Result<Id<Expr>, ParseError> {
+        this.expect(TokenKind.LBrace, "expected `{` in struct literal")?;
+        let fields = this.fieldInits("expected `:` after field name")?;
+        this.expect(TokenKind.RBrace, "expected `}` after struct literal")?;
+        let sl = StructLitExpr { name: name, typeArgs: typeArgs, fields: fields };
+        return Result.Ok(this.ast.addExpr(Expr.StructLit(sl), this.since(name.span)));
+    }
+
+    /// `{ prop: value }` after `@script("p")`.
+    fn scriptLitFields(this: &Parser): Result<List<FieldInit>, ParseError> {
+        this.expect(TokenKind.LBrace, "expected `{` after `@script` type")?;
+        let fields = this.fieldInits("expected `:` after prop name")?;
+        this.expect(TokenKind.RBrace, "expected `}` after script literal")?;
+        return Result.Ok(fields);
+    }
+
+    /// `name: value, ..` up to (not including) the `}`; a trailing `,` is allowed.
+    fn fieldInits(this: &Parser, colonMsg: string): Result<List<FieldInit>, ParseError> {
+        let fields = List<FieldInit>.new(this.ast.arena);
+        if this.at(TokenKind.RBrace) { return Result.Ok(fields); }
+        while true {
+            let field = this.ident()?;
+            this.expect(TokenKind.Colon, colonMsg)?;
+            let value = this.expr()?;
+            fields.push(FieldInit { name: field, value: value });
+            if this.eat(TokenKind.Comma) {
+                if this.at(TokenKind.RBrace) { break; }
+                continue;
+            }
+            break;
+        }
+        return Result.Ok(fields);
+    }
+
+    /// `@embed*(..)` after the name (`name` is `embed`, `embedBytes` or `embedDir`; `start` the `@`).
+    fn embed(this: &Parser, name: string, start: Span): Result<Id<Expr>, ParseError> {
+        let kind = EmbedKind.Dir;
+        if name == "embed" { kind = EmbedKind.Text; }
+        else if name == "embedBytes" { kind = EmbedKind.Bytes; }
+        let t = Text.new(this.ast.arena);
+        t.add("expected `(` after `@").add(name).add("`");
+        this.expect(TokenKind.LParen, t.str())?;
+        let path = this.embedArg(name, "path")?;
+        let glob = "";
+        if kind == EmbedKind.Dir {
+            this.expect(TokenKind.Comma, "expected `,` and a file pattern after the `@embedDir` folder")?;
+            glob = this.embedArg(name, "pattern")?;
+        }
+        let t2 = Text.new(this.ast.arena);
+        t2.add("expected `)` after `@").add(name).add("` arguments");
+        this.expect(TokenKind.RParen, t2.str())?;
+        return Result.Ok(this.ast.addExpr(Expr.Embed(EmbedExpr { kind: kind, path: path, glob: glob }), this.since(start)));
+    }
+
+    /// One string-literal argument of `@embed*`, an arena copy.
+    fn embedArg(this: &Parser, name: string, what: string): Result<string, ParseError> {
+        let tok = this.cur();
+        if tok.kind != TokenKind.String {
+            let t = Text.new(this.ast.arena);
+            t.add("`@").add(name).add("` ").add(what).add(" must be a string literal");
+            return Result.Err(this.err(t.str()));
+        }
+        this.bump();
+        if tok.text.len == 0 {
+            let t = Text.new(this.ast.arena);
+            t.add("`@").add(name).add("` ").add(what).add(" is empty");
+            return Result.Err(this.errAt(tok.span, t.str()));
+        }
+        return Result.Ok(own(this.ast.arena, tok.text));
+    }
+}
+
+/// True when `s` is only ASCII digits (an empty `s` too, as Rust's `all`).
+fn allDigits(s: string): bool {
+    for i in 0..s.len {
+        if s[i] < '0' || s[i] > '9' { return false; }
+    }
+    return true;
+}
+
+/// A `Char` token's text (its decimal code point) as the value; 0 when it does not read (Rust
+/// `parse().unwrap_or(0)`).
+fn charCode(s: string): u32 {
+    match text.parseU64(s, 10) {
+        Option.Some(v) {
+            if v > 4294967295 { return 0; }
+            return u32(v);
+        }
+        Option.None { return 0; }
+    }
+}

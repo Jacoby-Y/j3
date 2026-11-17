@@ -3,3 +3,157 @@
 // Part of module j3c.lower.
 // Port of: j3c/src/check/lower/simd.rs
 module j3c.lower;
+use j3c.ir.{ ShuffleLanes, SimdOp };
+// J3: C2c hooks (contracts-c2c.md, owner: simd/f16/intrinsics). Sema checked everything
+// (`sema/simd_expr.j3`, `sema/intrin_call.j3`); here the `_vN` temporaries (Rust `simd_tmp`), the
+// int-division guard and the `@vload` / `@vstore` bounds checks.
+// J3: A scalar side of a vector op arrives as `TExpr.Simd { name: "splat" }`: both inner operands are
+// lowered first, then the splats (`_vN`), as Rust's `vec_arith` got its operands already lowered.
+
+extend FnLower {
+    /// Rust `simd_tmp`: `rv` in a fresh `_vN`.
+    fn simdTmp(this: &FnLower, sp: Span, rv: Rvalue): Operand { return Operand.Copy(this.spill("v", rv, sp)); }
+
+    /// The scalar under a `splat` node (Some), or None when `e` is a vector expression itself.
+    fn simdSplatArg(this: &FnLower, e: Id<TExpr>): Option<Id<TExpr>> {
+        match this.node(e) {
+            TExpr.Simd(s) { if this.lw.t.str(s.name) == "splat" { return Option.Some(s.args.items[0]); } }
+            _ {}
+        }
+        return Option.None;
+    }
+
+    /// `e` as a vector operand of type `vt`: `x` itself, or a splatted scalar `x` in `_vN`.
+    fn simdSide(this: &FnLower, sp: Span, vt: Id<TyKind>, splat: bool, x: Operand): Operand {
+        if !splat { return x; }
+        let a = List<Operand>.new(this.cx.arena);
+        a.push(x);
+        return this.simdTmp(sp, Rvalue.simd(sp, vt, SimdOp.Splat, a));
+    }
+
+    /// Rust `vec_arith` after its checks: `l op r` on two `vt` operands.
+    fn simdArith(this: &FnLower, sp: Span, vt: Id<TyKind>, op: BinOp, l: Operand, r: Operand): Rvalue {
+        if op == BinOp.Div && vt == this.ir().common.vec4i { return this.simdIntDiv(sp, vt, l, r); }
+        return Rvalue.binary(sp, vt, op, l, r);
+    }
+
+    /// Rust `vec_int_div`: each lane divides like a scalar `i32` (zero divisor aborts, `MIN / -1` wraps).
+    fn simdIntDiv(this: &FnLower, sp: Span, vt: Id<TyKind>, l0: Operand, r0: Operand): Rvalue {
+        let ir = this.ir();
+        let l = this.simdPlaceOf(this.bindOperand(l0, sp), sp);
+        let r = this.simdPlaceOf(this.bindOperand(r0, sp), sp);
+        let lanes = List<Operand>.new(this.cx.arena);
+        for k in 0..4 {
+            let lp = this.b.vecLane(ir, this.copyOf(l), u8(k), sp);
+            let rp = this.b.vecLane(ir, this.copyOf(r), u8(k), sp);
+            this.abortIfZero(sp, Operand.Copy(this.copyOf(rp)));
+            lanes.push(this.simdTmp(sp, Rvalue.binary(sp, ir.common.i32, BinOp.Div, Operand.Copy(lp), Operand.Copy(rp))));
+        }
+        return Rvalue.simd(sp, vt, SimdOp.Build, lanes);
+    }
+
+    /// Rust `materialize`: the operand's place, a constant in `_tN` first.
+    fn simdPlaceOf(this: &FnLower, op: Operand, sp: Span): Place {
+        match op {
+            Operand.Copy(p) { return p; }
+            Operand.Const(_) {}
+        }
+        return this.spill("t", Rvalue.useOp(sp, op), sp);
+    }
+
+    /// Rust `vec_arith`: `TExpr.Binary` with `BinKind.Simd` (`op` is the IR op).
+    fn simdBinary(this: &FnLower, e: Id<TExpr>, op: BinOp, lhs: Id<TExpr>, rhs: Id<TExpr>): Rvalue {
+        let sp = this.spanOf(e);
+        let li = lhs;
+        let ri = rhs;
+        let ls = false;
+        let rs = false;
+        match this.simdSplatArg(lhs) { Option.Some(x) { li = x; ls = true; } Option.None {} }
+        match this.simdSplatArg(rhs) { Option.Some(x) { ri = x; rs = true; } Option.None {} }
+        // Rust `binary` (binop.rs:194): a bare number on the left is lowered after the right side.
+        let l = this.int(sp, 0);
+        let r = l;
+        if this.bareNum(li) && !this.bareNum(ri) {
+            r = this.operand(ri);
+            l = this.operand(li);
+        } else {
+            l = this.operand(li);
+            r = this.operand(ri);
+        }
+        let vt = this.tyOf(e);
+        l = this.simdSide(sp, vt, ls, l);
+        r = this.simdSide(sp, vt, rs, r);
+        return this.simdArith(sp, vt, op, l, r);
+    }
+
+    /// `TStmt.AssignOp` with `BinKind.Simd`: `place = place op value` (Rust check/lower/stmt.rs:198).
+    fn simdAssignOp(this: &FnLower, sp: Span, place: Place, op: BinOp, value: Id<TExpr>) {
+        let vi = value;
+        let splat = false;
+        match this.simdSplatArg(value) { Option.Some(x) { vi = x; splat = true; } Option.None {} }
+        let r = this.simdSide(sp, place.ty, splat, this.operand(vi));
+        let rv = this.simdArith(sp, place.ty, op, Operand.Copy(this.copyOf(place)), r);
+        this.b.assign(sp, place, rv);
+    }
+
+    /// Rust `vec_lane_place`: `TPlace.Lane`.
+    fn simdLane(this: &FnLower, l: LanePlace, sp: Span): Place {
+        return this.b.vecLane(this.ir(), this.place(l.base, "i"), u8(l.lane), sp);
+    }
+
+    /// Rust `vec_mem` after its checks: `args[0]` is `&xs`, `args[1]` the index; bounds checks on `i` and
+    /// `i + 3`, then `&xs[i]` in `_vN`.
+    fn simdMem(this: &FnLower, sp: Span, s: &TSimd): Operand {
+        let ir = this.ir();
+        let int = ir.common.int;
+        let place = this.b.localPlace(Id<LocalDecl> { i: 0 }, sp);
+        match this.node(s.args.items[0]) {
+            TExpr.AddrOf(r) { place = this.place(r.place, "i"); }
+            _ { panic("lower: @vload / @vstore without its slice place"); }
+        }
+        let idx = this.bindOperand(this.operand(s.args.items[1]), sp);
+        let len = this.seqLen(place, sp);
+        this.boundsCheck(sp, idx, len);
+        let last = this.simdTmp(sp, Rvalue.binary(sp, int, BinOp.Add, idx, opInt(sp, int, 3)));
+        this.boundsCheck(sp, last, len);
+        let lane = this.b.index(ir, this.copyOf(place), idx, sp);
+        return this.simdTmp(sp, Rvalue.refPlace(sp, ir.tyRef(lane.ty), lane));
+    }
+
+    /// `TExpr.Simd`: an intrinsic (Rust `simd_intrinsic`), a constructor (`vec_ctor`) or a splat.
+    fn simdOp(this: &FnLower, e: Id<TExpr>, s: &TSimd): Rvalue {
+        let sp = this.spanOf(e);
+        let ty = this.tyOf(e);
+        let name = this.lw.t.str(s.name);
+        let ops = List<Operand>.new(this.cx.arena);
+        if name == "vload" || name == "vstore" {
+            ops.push(this.simdMem(sp, s));
+            if name == "vload" { return Rvalue.simd(sp, ty, SimdOp.Load, ops); }
+            ops.push(this.operand(s.args.items[2]));
+            return Rvalue.simd(sp, ty, SimdOp.Store, ops);
+        }
+        if name == "vshuffle" {
+            ops.push(this.operand(s.args.items[0]));
+            let ix = ShuffleLanes { lanes: [0, 0, 0, 0] };
+            for k in 0..4 {
+                match this.node(s.args.items[k + 1]) {
+                    TExpr.Int(v) { ix.lanes[k] = u8(v); }
+                    _ { panic("lower: @vshuffle index is not a constant"); }
+                }
+            }
+            return Rvalue.simd(sp, ty, SimdOp.Shuffle(ix), ops);
+        }
+        for i in 0..s.args.len { ops.push(this.operand(s.args.items[i])); }
+        let op = SimdOp.Build;
+        if name == "splat" || ((name == "vec4f" || name == "vec4i") && ops.len == 1) { op = SimdOp.Splat; }
+        else if name == "vmin" { op = SimdOp.Min; }
+        else if name == "vmax" { op = SimdOp.Max; }
+        else if name == "vsqrt" { op = SimdOp.Sqrt; }
+        else if name == "vabs" { op = SimdOp.Abs; }
+        else if name == "vsum" { op = SimdOp.Sum; }
+        else if name == "vfloat" { op = SimdOp.ToFloat; }
+        else if name == "vint" { op = SimdOp.ToInt; }
+        else if name != "vec4f" && name != "vec4i" { panic("lower: unknown simd op"); }
+        return Rvalue.simd(sp, ty, op, ops);
+    }
+}

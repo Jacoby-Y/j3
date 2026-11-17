@@ -1,0 +1,160 @@
+// Typing errors of a fn body: `TErr` builders (`err`, `help`, `note`, `notYet`), Rust's `mismatch` /
+// `unknown` / `half_error` / `loop_err` texts, and written-type resolution as a typing step (`resolve`).
+//
+// Part of module j3c.sema.
+// Port of: check/lower/mod.rs (mismatch, unknown), check/lower/half.rs (half_error), check/lower/closure.rs
+// (loop_err)
+// J3: Split from `body.j3` (wave 10, the 600-line limit). `mismatch` asks `closure_expr.closureMismatch`
+// first (C2c hook, contracts-c2c.md).
+module j3c.sema;
+
+extend BodyCx {
+
+    /// A plain error at `sp` (`msg` copied).
+    fn err(this: &BodyCx, sp: Span, msg: string): TErr {
+        return TErr { diag: this.cx.diags.make(0, Severity.Error, sp, own(this.cx.arena, msg)), unknown: Option.None };
+    }
+    fn help(this: &BodyCx, e: TErr, msg: string): TErr {
+        let out = e;
+        out.diag.notes.push(Note { kind: NoteKind.Help, span: noSpan(), msg: own(this.cx.arena, msg) });
+        return out;
+    }
+    fn note(this: &BodyCx, e: TErr, msg: string): TErr {
+        let out = e;
+        out.diag.notes.push(Note { kind: NoteKind.Note, span: noSpan(), msg: own(this.cx.arena, msg) });
+        return out;
+    }
+    /// A C2d construct (scripts, ui) not typed yet: `WHAT: not ported yet` at `sp`.
+    fn notYet(this: &BodyCx, sp: Span, what: string): TErr {
+        let t = Text.new(this.cx.arena);
+        t.add(what).add(": not ported yet");
+        return this.err(sp, t.str());
+    }
+    /// Rust `zero_fill`'s error half: the first part of `t` (fields and elements in order) with no zero
+    /// value, named in `out` as Rust's IR type prints. A closure is a `{ fn, ctx }` struct there, a `dyn`
+    /// two pointers; a generic parameter is judged per instance.
+    fn noZero(this: &BodyCx, t: Id<Ty>, out: &Text): bool {
+        match this.ty(t) {
+            Ty.Struct(s) {
+                let n = this.cx.tables.structAt(s.decl).fields.len;
+                for i in 0..n { if this.noZero(fieldTyOf(this.cx.tables, t, i), out) { return true; } }
+                return false;
+            }
+            Ty.Tuple(tu) {
+                let es = this.cx.tables.items(tu.elems);
+                for i in 0..es.len { if this.noZero(es[i], out) { return true; } }
+                return false;
+            }
+            Ty.Array(a) { return this.noZero(a.elem, out); }
+            Ty.Closure(c) {
+                out.add("fn(ptr");
+                let ps = this.cx.tables.items(c.params);
+                for i in 0..ps.len { out.add(", ").add(this.tyStr(ps[i])); }
+                out.add(")");
+                if c.ret != this.com().void { out.add(": ").add(this.tyStr(c.ret)); }
+                return true;
+            }
+            Ty.Void { out.add(this.tyStr(t)); return true; }
+            Ty.Vec(_) { out.add(this.tyStr(t)); return true; }
+            Ty.Ref(_) { out.add(this.tyStr(t)); return true; }
+            Ty.Slice(_) { out.add(this.tyStr(t)); return true; }
+            Ty.Fn(_) { out.add(this.tyStr(t)); return true; }
+            Ty.Enum(_) { out.add(this.tyStr(t)); return true; }
+            _ { return false; }
+        }
+        return false;
+    }
+
+    /// Rust `mismatch`: `WHAT: expected `W`, found `H`` with the f16 / numeric help.
+    fn mismatch(this: &BodyCx, sp: Span, what: string, have: Id<Ty>, want: Id<Ty>): TErr {
+        match this.closureMismatch(sp, have, want) { Option.Some(e) { return e; } Option.None {} }
+        let w = this.tyStr(want);
+        let h = this.tyStr(have);
+        let t = Text.new(this.cx.arena);
+        t.add(what).add(": expected `").add(w).add("`, found `").add(h).add("`");
+        let e = this.err(sp, t.str());
+        if this.isHalf(have) || this.isHalf(want) {
+            return this.help(e, "`f16` is storage only: convert with `f32(x)` to compute, `f16(y)` to store");
+        }
+        if this.isNumeric(have) && this.isNumeric(want) {
+            let hint = Text.new(this.cx.arena);
+            hint.add("numbers never convert by themselves: write `").add(w).add("(x)`");
+            return this.help(e, hint.str());
+        }
+        return e;
+    }
+
+    /// Rust `unknown`: `unknown KIND `NAME`` with a did-you-mean over locals and the module scope.
+    fn unknown(this: &BodyCx, sp: Span, kind: string, name: Sym): TErr {
+        let t = Text.new(this.cx.arena);
+        t.add("unknown ").add(kind).add(" `").add(this.str(name)).add("`");
+        let e = this.err(sp, t.str());
+        e.unknown = Option.Some(name);
+        let cands = List<string>.new(this.cx.arena);
+        for i in 0..this.scope.len { cands.push(this.str(this.scope.items[i].name)); }
+        let sc = &this.cx.tables.modAt(this.m).scope;
+        let outer = List<string>.new(this.cx.arena);
+        for i in 0..sc.cap {
+            if sc.live(i) && this.nameCandidate(sc.valAt(i)) { outer.push(this.str(sc.keyAt(i))); }
+        }
+        // ponytail: Rust offers its HashMap keys in hash order; sorted names keep ties deterministic.
+        sort::<string>(outer.slice());
+        cands.extend(outer.slice());
+        match didYouMean(this.str(name), cands.slice(), this.cx.arena) {
+            Option.Some(s) {
+                let h = Text.new(this.cx.arena);
+                h.add("did you mean `").add(s).add("`?");
+                return this.help(e, h.str());
+            }
+            Option.None {}
+        }
+        return e;
+    }
+
+    /// A module-scope name Rust offered as a did-you-mean: non-generic fns and types, consts without a
+    /// table, globals (not traits, modules or templates).
+    fn nameCandidate(this: &BodyCx, d: DeclRef): bool {
+        match d.kind {
+            DeclKind.Fn { match this.cx.tables.fnAt(d.asFn()).gen { Option.Some(_) { return false; } Option.None { return true; } } }
+            DeclKind.Struct { return !isTemplate(this.cx, d); }
+            DeclKind.Enum { return !isTemplate(this.cx, d); }
+            DeclKind.Const { match this.cx.tables.constAt(d.asConst()).table { Option.Some(_) { return false; } Option.None { return true; } } }
+            DeclKind.Global { return true; }
+            DeclKind.Trait { return false; }
+            DeclKind.Module { return false; }
+        }
+        return false;
+    }
+
+    /// Rust `half_error`.
+    fn halfError(this: &BodyCx, sp: Span, what: string): TErr {
+        let t = Text.new(this.cx.arena);
+        t.add(what).add(" is not defined on `f16` (storage only)");
+        return this.help(this.err(sp, t.str()), "convert with `f32(x)` first, then convert back with `f16(y)`");
+    }
+
+    /// Rust `loop_err`.
+    fn loopErr(this: &BodyCx, sp: Span, msg: string): TErr {
+        let e = this.err(sp, msg);
+        if !this.inClosure { return e; }
+        return this.help(this.note(e, "a closure body is its own function; `break` and `continue` cannot leave it"),
+            "loop inside the closure, or return a value and let the caller decide");
+    }
+
+    /// `resolveTy` as a typing step: a Diag it raises becomes this statement's error (in source order).
+    fn resolve(this: &BodyCx, t: Id<Type>): Result<Id<Ty>, TErr> {
+        let n0 = this.cx.diags.items.len;
+        let r = this.instTy(resolveTy(this.cx, this.m, this.gen, t));
+        if this.cx.diags.items.len > n0 {
+            let first = this.cx.diags.items.items[n0];
+            for i in n0 + 1..this.cx.diags.items.len {
+                this.errs.push(TErr { diag: this.cx.diags.items.items[i], unknown: Option.None });
+            }
+            this.cx.diags.items.len = n0;
+            return Result.Err(TErr { diag: first, unknown: Option.None });
+        }
+        // `resolveTy` queues bound checks only outside a template; a template or instance body does here.
+        match this.gen { Option.Some(_) { traitQueueBoundsIn(this.cx, r, this.cx.ast.typeSpan(t)); } Option.None {} }
+        return Result.Ok(r);
+    }
+}

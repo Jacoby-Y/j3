@@ -2,4 +2,168 @@
 //
 // Part of module j3c.backend.llvm.
 // Port of: j3c/src/emit/llvm_expr/interp.rs
+// J3: Entry: `interpFill` (`StmtKind.InterpFill`); helpers `interpMemcpy`, `interpValue`, `interpSnprintf`.
 module j3c.backend.llvm;
+
+extend LlvmFn {
+    /// Fill `buf` from `parts`, storing the byte count in `used`; abort past `INTERP_CAP`.
+    fn interpFill(this: &LlvmFn, buf: &Place, used: &Place, parts: []InterpPart): Result<bool, string> {
+        let (bp, _) = this.placePtr(buf)?;
+        let (up, _) = this.placePtr(used)?;
+        for i in 0..parts.len {
+            match parts[i] {
+                InterpPart.Lit(lit) { this.interpMemcpy(bp, up, lit.bytes); }
+                InterpPart.Value(op) {
+                    let (e, et) = this.operand(&op)?;
+                    this.interpValue(bp, up, e, operandTy(op), et)?;
+                }
+            }
+        }
+        return Result.Ok(true);
+    }
+
+    /// `used + n <= cap` else abort, then the bytes at `buf + used`.
+    fn interpMemcpy(this: &LlvmFn, buf: string, used: string, bytes: []u8) {
+        let u = this.load("i64", used);
+        let sum = this.fresh();
+        this.inst(this.l().add(sum).add(" = add i64 ").add(u).fmt(`, {bytes.len}`).str());
+        let ok = this.fresh();
+        this.inst(this.l().add(ok).add(" = icmp sle i64 ").add(sum).fmt(`, {INTERP_CAP}`).str());
+        let t = this.label();
+        let e = this.label();
+        this.brIf(ok, t, e);
+        this.block(e);
+        this.exitAbort(AbortKind.Fmt);
+        this.block(t);
+        let dst = this.fresh();
+        this.inst(this.l().add(dst).add(" = getelementptr i8, ptr ").add(buf).add(", i64 ").add(u).str());
+        if bytes.len > 0 {
+            let src = this.bytesGlobal(bytes);
+            this.inst(this.l().add("call void @llvm.memcpy.p0.p0.i64(ptr ").add(dst).add(", ptr ").add(src).fmt(`, i64 {bytes.len}, i1 false)`).str());
+        }
+        this.store("i64", sum, used);
+    }
+
+    fn interpText(this: &LlvmFn, buf: string, used: string, a: string, b: string) {
+        let t = Text.new(this.arena);
+        t.add(a).add(b);
+        this.interpMemcpy(buf, used, t.str() as []u8);
+    }
+
+    fn interpValue(this: &LlvmFn, buf: string, used: string, e: string, ty: Id<TyKind>, et: string): Result<bool, string> {
+        let cx = this.cx;
+        if ty == cx.common.string {
+            let p = this.fresh();
+            let n = this.fresh();
+            this.inst(this.l().add(p).add(" = extractvalue %j3_string ").add(e).add(", 0").str());
+            this.inst(this.l().add(n).add(" = extractvalue %j3_string ").add(e).add(", 1").str());
+            let u = this.load("i64", used);
+            let sum = this.fresh();
+            this.inst(this.l().add(sum).add(" = add i64 ").add(u).add(", ").add(n).str());
+            let ok = this.fresh();
+            this.inst(this.l().add(ok).add(" = icmp sle i64 ").add(sum).fmt(`, {INTERP_CAP}`).str());
+            let t = this.label();
+            let bad = this.label();
+            this.brIf(ok, t, bad);
+            this.block(bad);
+            this.exitAbort(AbortKind.Fmt);
+            this.block(t);
+            let dst = this.fresh();
+            this.inst(this.l().add(dst).add(" = getelementptr i8, ptr ").add(buf).add(", i64 ").add(u).str());
+            this.inst(this.l().add("call void @llvm.memcpy.p0.p0.i64(ptr ").add(dst).add(", ptr ").add(p).add(", i64 ").add(n).add(", i1 false)").str());
+            this.store("i64", sum, used);
+            return Result.Ok(true);
+        }
+        if ty == cx.common.bool {
+            let c = this.fresh();
+            this.inst(this.l().add(c).add(" = icmp ne i8 ").add(e).add(", 0").str());
+            let p = this.fresh();
+            this.inst(this.l().add(p).add(" = select i1 ").add(c).add(", ptr @.j3_true, ptr @.j3_false").str());
+            this.interpSnprintf(buf, used, "@.j3_fmt_s", "ptr", p);
+            return Result.Ok(true);
+        }
+        if isInt(cx, ty) {
+            let val = e;
+            if et != "i64" {
+                let n = this.fresh();
+                let op = "zext";
+                if isSignedInt(cx, ty) { op = "sext"; }
+                this.inst(this.l().add(n).add(" = ").add(op).add(" ").add(et).add(" ").add(e).add(" to i64").str());
+                val = n;
+            }
+            this.interpSnprintf(buf, used, "@.j3_fmt_i64", "i64", val);
+            return Result.Ok(true);
+        }
+        if isFloat(cx, ty) {
+            let val = e;
+            if et != "double" {
+                let n = this.fresh();
+                this.inst(this.l().add(n).add(" = fpext ").add(et).add(" ").add(e).add(" to double").str());
+                val = n;
+            }
+            this.interpSnprintf(buf, used, "@.j3_fmt_f", "double", val);
+            return Result.Ok(true);
+        }
+        match cx.tyKind(ty) {
+            TyKind.Struct(s) {
+                let def = cx.structDef(s.id);
+                if !def.debug { return Result.Err("interpolate of non-#[Debug] struct"); }
+                this.interpText(buf, used, cx.nameStr(def.name), " { ");
+                for i in 0..def.fields.len {
+                    let field = def.fields.items[i];
+                    if i > 0 { this.interpMemcpy(buf, used, ", " as []u8); }
+                    this.interpText(buf, used, cx.nameStr(field.name), ": ");
+                    let ll = llType(cx, ty, this.arena)?;
+                    let slot = this.alloca(ll);
+                    this.store(ll, e, slot);
+                    let fp = this.fresh();
+                    this.inst(this.l().add(fp).add(" = getelementptr ").add(ll).add(", ptr ").add(slot).fmt(`, i32 0, i32 {i}`).str());
+                    let ft = llType(cx, field.ty, this.arena)?;
+                    let fv = this.load(ft, fp);
+                    this.interpValue(buf, used, fv, field.ty, ft)?;
+                }
+                this.interpMemcpy(buf, used, " }" as []u8);
+                return Result.Ok(true);
+            }
+            _ {}
+        }
+        return Result.Err("interpolate of this type is not implemented");
+    }
+
+    /// `snprintf` of one value at `buf + used`, aborting when the room runs out.
+    fn interpSnprintf(this: &LlvmFn, buf: string, used: string, fmt: string, vty: string, val: string) {
+        let u = this.load("i64", used);
+        let room = this.fresh();
+        this.inst(this.l().add(room).fmt(` = sub i64 {INTERP_CAP}, `).add(u).str());
+        let ok = this.fresh();
+        this.inst(this.l().add(ok).add(" = icmp sgt i64 ").add(room).add(", 0").str());
+        let t = this.label();
+        let bad = this.label();
+        this.brIf(ok, t, bad);
+        this.block(bad);
+        this.exitAbort(AbortKind.Fmt);
+        this.block(t);
+        let dst = this.fresh();
+        this.inst(this.l().add(dst).add(" = getelementptr i8, ptr ").add(buf).add(", i64 ").add(u).str());
+        let w = this.fresh();
+        this.inst(this.l().add(w).add(" = call i32 (ptr, i64, ptr, ...) @snprintf(ptr ").add(dst).add(", i64 ").add(room).add(", ptr ")
+            .add(fmt).add(", ").add(vty).add(" ").add(val).add(")").str());
+        let wi = this.fresh();
+        this.inst(this.l().add(wi).add(" = sext i32 ").add(w).add(" to i64").str());
+        let badw = this.fresh();
+        this.inst(this.l().add(badw).add(" = icmp slt i64 ").add(wi).add(", 0").str());
+        let ge = this.fresh();
+        this.inst(this.l().add(ge).add(" = icmp sge i64 ").add(wi).add(", ").add(room).str());
+        let fail = this.fresh();
+        this.inst(this.l().add(fail).add(" = or i1 ").add(badw).add(", ").add(ge).str());
+        let ok2 = this.label();
+        let bad2 = this.label();
+        this.brIf(fail, bad2, ok2);
+        this.block(bad2);
+        this.exitAbort(AbortKind.Fmt);
+        this.block(ok2);
+        let sum = this.fresh();
+        this.inst(this.l().add(sum).add(" = add i64 ").add(u).add(", ").add(wi).str());
+        this.store("i64", sum, used);
+    }
+}

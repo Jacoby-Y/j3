@@ -15,3 +15,186 @@
 //   after the first one until parity.
 // - Read-only query functions here (type at span, members, definition of) are what tools use (B2).
 module j3c.sema;
+// J3: Contract (wave 4): `.swarm-opus/11-port/contracts-c2a-sema.md`. This file holds every `use` of the
+// module (part files have none: a `use` repeated across parts is an error in stage 0), `SemaCx`, and
+// `checkProgram`, the one entry the driver calls. Its body is the stage order below, run module by module.
+// J3: Stage order (Rust `check_files_inner`, declarations only before any body): lint, script prepare,
+//     shader prepare (`j3c.shader.prepare`: both rewrite the parsed files, contracts-c2d.md), modules (`resolve.buildModules`), extend merge, derives, traits, exports, struct/enum names, uses
+//     (types), struct fields, enum variants, occurs, embeds, consts, fn signatures, `main`, uses (values),
+//     globals, omitted returns; then bodies (`body.typeModule`, demand-driven: a template's body is typed
+//     against placeholders, an instance only when a typed body asks for it), `instances.drain`, frame
+//     strings. **Declarations only** until a body asks: a generic struct/enum/fn from the stdlib (`List<T>`,
+//     `Option`, `alloc<T>`) is a template with `Ty.Param`s; nothing is instantiated by being declared.
+// J3: After `main` is found it is bound in every module that has no `main` of its own (Rust `lower_module`
+// added it to each module's fns), so `j3.sys.start` can call it.
+
+use j3.data.map.Map;
+use j3.data.pool.{ Id, Pool };
+use j3.data.set.Set;
+use j3.cmp.{ mix, sort };
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.text.{ Text, startsWith };
+use j3c.base.text_fmt.debugStr;
+use j3c.base.diag.{ Diag, Diags, Note, NoteKind, Severity, didYouMean, notPorted };
+use j3c.base.ids.Spans;
+use j3c.base.intern.{ Names, Sym, own };
+use j3c.base.span.{ Lines, Source, Span, fileSpan, isNone, noSpan };
+use j3c.load.{ LoadCx, Parsed, ParsedFile };
+use j3c.shader.{ Prepared, ShaderProgram, prepare };
+use j3c.syntax.ast.{ ArrayLitExpr, Ast, AtomicOp, AtomicOrder, BinaryExpr, BinOp, Block, CallExpr, ConstItem, EmbedExpr, EmbedFile, EmbedKind,
+    ClosureLit, ClosureParam, EmbedRead, GpuStruct, ScriptBlockItem, ScriptLetItem, ScriptLitExpr, UiChoiceExpr, EnumItem, Expr, FieldExpr, FieldInit, FieldItem, File, FnItem, ForEachStmt, Ident, InterpPart, InterpolateExpr, Item, LetPatStmt,
+    LibFnDecl, LitPat, MatchArm, MatchStmt, ModLetItem, Param, Pat, PatField, RangePat, Stmt, StructItem, StructLitExpr, StructPat, TraitItem,
+    TraitMethod, TryCatch, TupleExpr, TuplePat, Type, TypePathExpr, UnaryExpr, UnaryOp, UseItem, UseLibItem, VariantItem, VariantPat, WhereBound,
+    atomicOpName, foldedLiteral, irrefutable, pathExpr };
+use j3c.syntax.extend.{ ExtendErr, merge };
+use j3c.syntax.flow.{ diverges, exprDiverges, leaves };
+use j3c.syntax.walk.patBinds;
+
+/// What every sema stage reads and writes: the session's arena, names, diagnostics and sources, the
+/// loaded program, and the two sema stores (B5: no global state; per-module inputs are parameters).
+pub struct SemaCx {
+    arena: &Arena;
+    names: &Names;
+    diags: &Diags;
+    sources: &Pool<Source>;
+    parsed: &Parsed;
+    ast: &Ast;
+    tables: &Tables;
+    typed: &Typed;
+}
+
+/// A context over `parsed` with fresh tables and typed tree in `arena`.
+pub fn newCx(arena: &Arena, names: &Names, diags: &Diags, sources: &Pool<Source>, parsed: &Parsed): SemaCx {
+    return SemaCx { arena: arena, names: names, diags: diags, sources: sources, parsed: parsed, ast: parsed.ast,
+        tables: Tables.new(arena, names), typed: Typed.new(arena) };
+}
+
+/// Rust `check_files` / `check_files_lib` (`requireMain` false): resolve and type the whole program.
+/// None after an error Diag. Declarations stop at the first error, as Rust's do.
+pub fn checkProgram(cx: &SemaCx, requireMain: bool): Option<Checked> {
+    let r = checkAll(cx, requireMain);
+    explainGone(cx);
+    return r;
+}
+
+/// Rust `gpu::explain_gone` (check/mod.rs:247, over every error of the run): an "unknown function" /
+/// "unknown name" error that names an item `shader.prepare` removed gets the reason as a help line.
+fn explainGone(cx: &SemaCx) {
+    let gone = cx.tables.gone;
+    if gone.len == 0 { return; }
+    for i in 0..cx.diags.items.len {
+        let msg = cx.diags.items.items[i].msg;
+        if !startsWith(msg, "unknown function") && !startsWith(msg, "unknown name") { continue; }
+        // The name is the text between the first two backticks.
+        let lo = 0;
+        while lo < msg.len && msg[lo] != '`' { lo += 1; }
+        let hi = lo + 1;
+        while hi < msg.len && msg[hi] != '`' { hi += 1; }
+        if hi >= msg.len { continue; }
+        let name = msg[lo + 1..hi];
+        for k in 0..gone.len {
+            if cx.tables.str(gone.items[k]) != name { continue; }
+            let t = Text.new(cx.arena);
+            t.add("`").add(name).add("` is a shader item (`#[shader]` or `#[uniform]`); shader code only runs on the GPU, and a uniform is set from CPU code by name with GL calls");
+            cx.diags.items.items[i].notes.push(Note { kind: NoteKind.Help, span: noSpan(), msg: t.str() });
+            break;
+        }
+    }
+}
+
+fn checkAll(cx: &SemaCx, requireMain: bool): Option<Checked> {
+    if !declarations(cx) { return Option.None; }
+    let entry = findMain(cx, requireMain);
+    let n = cx.tables.mods.len();
+    match entry {
+        // Every module without its own `main` sees the entry (Rust `lower_module`): `j3.sys.start` calls it.
+        Option.Some(e) { for i in 0..n { bind(cx, cx.tables.mods.idAt(i), cx.tables.sym("main"), refFn(e)); } }
+        Option.None { return Option.None; }
+    }
+    for i in 0..n {
+        let m = cx.tables.mods.idAt(i);
+        if !cx.tables.modAt(m).isLib && !resolveUses(cx, m, UsePhase.Vals) { return Option.None; }
+    }
+    for i in 0..n {
+        let m = cx.tables.mods.idAt(i);
+        if !cx.tables.modAt(m).isLib && !collectGlobals(cx, m) { return Option.None; }
+    }
+    for i in 0..n {
+        let m = cx.tables.mods.idAt(i);
+        if !cx.tables.modAt(m).isLib && !inferReturns(cx, m) { return Option.None; }
+    }
+    // Bound checks of instances the signatures made (Rust `drain_bounds` before bodies), then every
+    // template's placeholder pass (Rust `defcheck::check_defs`: its errors lead, B11.1).
+    if !drainBounds(cx) { return Option.None; }
+    let d0 = cx.diags.items.len;
+    cx.tables.leave();
+    checkTemplates(cx);
+    // Bodies (B11.1): each module typed, then the instances its bodies asked for (Rust `lower_module`'s
+    // one queue), errors gathered (B11.5). Instances drain even after body errors: Rust reports instance
+    // errors alongside the others.
+    let mods = List<TypedMod>.new(cx.arena);
+    let drained = true;
+    for i in 0..n {
+        let m = cx.tables.mods.idAt(i);
+        if cx.tables.modAt(m).isLib { continue; }
+        mods.push(typeModule(cx, m));
+        if cx.typed.boundFatal || bodyErrorCount(cx) >= MAX_BODY_ERRORS { break; }
+        if !drainFor(cx, Option.Some(m)) { drained = false; break; }
+    }
+    // Bound checks still queued after the last body.
+    if drained && !cx.diags.hasErrors() { drained = drainBodyBounds(cx, Option.None); }
+    // Rust `drain_bounds(..)?`: a type bound failing after a body is the run's only error.
+    if cx.typed.boundFatal {
+        let d = cx.diags.items.items[cx.diags.items.len - 1];
+        cx.diags.items.len = d0;
+        cx.diags.add(d);
+        return Option.None;
+    }
+    if cx.diags.hasErrors() || !drained { return Option.None; }
+    let checked = Checked { tables: cx.tables, typed: cx.typed, mods: mods, entry: entry, fixes: cx.typed.fixes,
+        shaders: cx.typed.shaders, scriptAliases: cx.typed.scriptAliases };
+    // Rust `frame_str::check` (check/mod.rs:430), after every body and instance is typed.
+    if !checkFrameStrings(cx, &checked) { return Option.None; }
+    return Option.Some(checked);
+}
+
+/// The declaration stages up to the trait table (Rust `check_files_inner` up to `build_env`), in Rust's
+/// order; each runs over every module before the next starts. False after the first error. Public for
+/// tools and tests that want the decl tables without typing bodies.
+pub fn declarations(cx: &SemaCx): bool {
+    // Rust `lint::lint` (check/mod.rs:261): first, on the parsed files, so its warnings lead.
+    lint(cx);
+    // Rust `script::prepare` then `gpu::prepare` (check/mod.rs:262-263): both rewrite `cx.parsed.files[i].ast.items`
+    // before any module is built, so everything below sees plain items.
+    if !prepareScripts(cx) { return false; }
+    match prepare(LoadCx { arena: cx.arena, names: cx.names, diags: cx.diags, sources: cx.sources }, cx.parsed) {
+        Option.Some(p) {
+            cx.typed.shaders = p.programs;
+            cx.tables.gone = p.gone;
+        }
+        Option.None { return false; }
+    }
+    if !buildModules(cx) || !mergeExtends(cx) { return false; }
+    let n = cx.tables.mods.len();
+    // Rust `derive::expand` (check/mod.rs:326): after the extend merge, before any name is collected.
+    for i in 0..n { if !expandDerives(cx, cx.tables.enter(cx.tables.mods.idAt(i))) { return false; } }
+    for i in 0..n { if !declareTraits(cx, cx.tables.enter(cx.tables.mods.idAt(i))) { return false; } }
+    for i in 0..n { collectExports(cx, cx.tables.enter(cx.tables.mods.idAt(i))); }
+    if !bindTraits(cx) { return false; }
+    for i in 0..n { if !declareTypes(cx, cx.tables.enter(cx.tables.mods.idAt(i))) { return false; } }
+    // Rust `script::resolve_aliases` (check/mod.rs:341): after every struct name, before the enums.
+    if !resolveScriptAliases(cx) { return false; }
+    for i in 0..n { if !fillEnums(cx, cx.tables.enter(cx.tables.mods.idAt(i))) { return false; } }
+    for i in 0..n { if !resolveUses(cx, cx.tables.enter(cx.tables.mods.idAt(i)), UsePhase.Types) { return false; } }
+    for i in 0..n { if !fillStructs(cx, cx.tables.enter(cx.tables.mods.idAt(i))) { return false; } }
+    if !checkOccurs(cx) { return false; }
+    for i in 0..n { if !checkEmbeds(cx, cx.tables.enter(cx.tables.mods.idAt(i))) { return false; } }
+    for i in 0..n { if !collectConsts(cx, cx.tables.enter(cx.tables.mods.idAt(i))) { return false; } }
+    // `use lib` namespaces join `mods` from here on (`ModDecl.isLib`); the source modules are the first `n`.
+    cx.tables.leave();
+    for i in 0..n { if !declareFns(cx, cx.tables.mods.idAt(i)) { return false; } }
+    homeSignatures(cx.tables);
+    return checkTraitEnv(cx);
+}

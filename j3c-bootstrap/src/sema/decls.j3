@@ -1,0 +1,436 @@
+// The program-wide declaration tables: modules, structs, enums, fns, globals, consts, traits, generic
+// parameter lists and instances, each a `Pool` addressed by `Id` (plan 11 B4), plus the `Ty` interner.
+// One `Tables` per Session; the signature passes fill it, body typing and `lower` read it.
+//
+// Part of module j3c.sema.
+// Port of: (new in plan 11 B11; replaces Rust's per-module `ModData` maps in check/mod.rs and the
+// struct/enum/fn/global vectors of `IrCx`, which sema no longer shares with the IR)
+// J3: Registration order is declaration order, module by module in load order, as Rust allocates
+// `StructId`/`FuncId`: `lower` walks these pools (and `ModDecl`'s ordered lists) to emit IR in Rust's order,
+// which `diff.sh ir --norm` / `llvm` compare exactly for C2a.
+// J3: A decl holds a copy of its AST item (`item`, None for generated decls: tuples, `dyn` structs,
+// derives, script structs) so body typing never searches the files again. `xAt(id)` returns a pointer for
+// in-place filling (fields after names); it dies on the next add to that pool, so don't keep it.
+// J3: A name in scope is a `DeclRef` (kind + raw index), one flat value, so a scope is a `Map<Sym, DeclRef>`.
+module j3c.sema;
+
+/// What a name in a module scope refers to.
+pub enum DeclKind { Struct, Enum, Fn, Global, Const, Trait, Module }
+
+/// A resolved name: `kind` says which pool `i` indexes.
+pub struct DeclRef {
+    kind: DeclKind;
+    i: u32;
+
+    fn operator==(this: DeclRef, o: DeclRef): bool { return this.kind == o.kind && this.i == o.i; }
+    fn hash(this: DeclRef): u64 { return mix(u64(this.i) ^ (u64(declKindTag(this.kind)) << u64(32))); }
+
+    fn asStruct(this: DeclRef): Id<StructDecl> { return Id<StructDecl> { i: this.i }; }
+    fn asEnum(this: DeclRef): Id<EnumDecl> { return Id<EnumDecl> { i: this.i }; }
+    fn asFn(this: DeclRef): Id<FnDecl> { return Id<FnDecl> { i: this.i }; }
+    fn asGlobal(this: DeclRef): Id<GlobalDecl> { return Id<GlobalDecl> { i: this.i }; }
+    fn asConst(this: DeclRef): Id<ConstDecl> { return Id<ConstDecl> { i: this.i }; }
+    fn asTrait(this: DeclRef): Id<TraitDecl> { return Id<TraitDecl> { i: this.i }; }
+    fn asModule(this: DeclRef): Id<ModDecl> { return Id<ModDecl> { i: this.i }; }
+}
+
+fn declKindTag(k: DeclKind): int {
+    match k {
+        DeclKind.Struct { return 0; }
+        DeclKind.Enum { return 1; }
+        DeclKind.Fn { return 2; }
+        DeclKind.Global { return 3; }
+        DeclKind.Const { return 4; }
+        DeclKind.Trait { return 5; }
+        DeclKind.Module { return 6; }
+    }
+    return 0;
+}
+
+pub fn refStruct(id: Id<StructDecl>): DeclRef { return DeclRef { kind: DeclKind.Struct, i: id.i }; }
+pub fn refEnum(id: Id<EnumDecl>): DeclRef { return DeclRef { kind: DeclKind.Enum, i: id.i }; }
+pub fn refFn(id: Id<FnDecl>): DeclRef { return DeclRef { kind: DeclKind.Fn, i: id.i }; }
+pub fn refGlobal(id: Id<GlobalDecl>): DeclRef { return DeclRef { kind: DeclKind.Global, i: id.i }; }
+pub fn refConst(id: Id<ConstDecl>): DeclRef { return DeclRef { kind: DeclKind.Const, i: id.i }; }
+pub fn refTrait(id: Id<TraitDecl>): DeclRef { return DeclRef { kind: DeclKind.Trait, i: id.i }; }
+pub fn refModule(id: Id<ModDecl>): DeclRef { return DeclRef { kind: DeclKind.Module, i: id.i }; }
+
+/// One module (Rust `ModData`): its part files merged, its scope, and its items in declaration order.
+pub struct ModDecl {
+    /// `a.b.c` (Rust `module_key`), an arena copy.
+    key: string;
+    path: List<Sym>;
+    /// Indexes into `Parsed.files`: the module file, then its part files, in load order.
+    files: List<int>;
+    /// Every item of the module file and its part files, in load order, `extend` blocks merged into their
+    /// structs and `#[impl]` fns renamed (Rust `ModData.ast.items` after `merge_extends`/`collect_traits`).
+    items: List<Item>;
+    isScript: bool;
+    /// A `use lib "c" { .. }` namespace (its fns only), not a source module.
+    isLib: bool;
+    /// Bare names visible here: own items, then `use`d ones (Rust `funcs`, `types`, `structs`, `consts`,
+    /// `globals`, `imports`, `traits`).
+    scope: Map<Sym, DeclRef>;
+    /// `use j3.game` makes `game` a prefix: `game.poll()`, `game.Key` (Rust `mod_ns`/`mod_types`/`lib_ns`).
+    prefixes: Map<Sym, Id<ModDecl>>;
+    /// Names this module makes `pub` (Rust `exports`).
+    exports: Set<Sym>;
+    structs: List<Id<StructDecl>>;
+    enums: List<Id<EnumDecl>>;
+    fns: List<Id<FnDecl>>;
+    globals: List<Id<GlobalDecl>>;
+    consts: List<Id<ConstDecl>>;
+    traits: List<Id<TraitDecl>>;
+}
+
+/// The type parameters of one template (`fn f<T: Eq, U>`, `struct Box<T>`, a generic struct's method).
+/// A method of a generic struct has its own `Generics`: the struct's parameters first (copied, so its
+/// signature names them as `Param(method gen, i)`), then its own; instance args are struct args ++ own args.
+pub struct Generics {
+    names: List<Sym>;
+    spans: List<Span>;
+    /// Bounds per parameter (`T: Eq + Hash`), a method's `where T: Eq` folded into its copy of `T`.
+    bounds: List<List<Id<TraitDecl>>>;
+    /// A generic struct's method: the struct's `Generics` (whose first parameters it repeats).
+    parent: Option<Id<Generics>>;
+}
+
+/// A struct (Rust `StructDef` before layout). A generic one is a template: field types use `Ty.Param`.
+pub struct StructDecl {
+    owner: Id<ModDecl>;
+    name: Sym;
+    doc: string;
+    span: Span;
+    visPub: bool;
+    gen: Option<Id<Generics>>;
+    fields: List<FieldDecl>;
+    /// Own and `extend`ed methods, declaration order.
+    methods: List<Id<FnDecl>>;
+    packed: bool;
+    debug: bool;
+    /// A `.j3s` script's struct: its path (arena copy) and property spans (Rust `ScriptMeta`).
+    scriptPath: Option<string>;
+    propSpans: List<Span>;
+    item: Option<StructItem>;
+}
+
+// J3: Field order (and `pad`) work around stage 0 bug (a) in PORT_DEBT.md: payload-enum fields at 8-aligned
+// offsets, bools last, LLVM size a multiple of 8.
+pub struct FieldDecl {
+    doc: string;
+    /// `hp: int = 100` (a checked literal).
+    default: Option<ConstVal>;
+    name: Sym;
+    span: Span;
+    ty: Id<Ty>;
+    /// `use Base;` embedding.
+    embedded: bool;
+}
+
+/// An enum. `payload` of a multi-field variant is a `Ty.Tuple` with `multi` set (Rust `VariantDef`).
+pub struct EnumDecl {
+    owner: Id<ModDecl>;
+    name: Sym;
+    doc: string;
+    span: Span;
+    visPub: bool;
+    gen: Option<Id<Generics>>;
+    variants: List<VariantDecl>;
+    /// `#[TryCatch(Ok, Err)]`: variant indexes for `?`.
+    tryCatch: Option<TryCatchDecl>;
+    debug: bool;
+    item: Option<EnumItem>;
+}
+
+pub struct VariantDecl {
+    name: Sym;
+    doc: string;
+    span: Span;
+    payload: Option<Id<Ty>>;
+    multi: bool;
+}
+
+pub struct TryCatchDecl { success: int; failure: int; }
+
+/// Rust `FuncKind`: a J3 body, a `use lib` C fn, a body-less declaration (`dummy_main`, shader stubs), or a
+/// compiler-made fn (derive, script, `dyn` thunk) whose typed body sema builds directly.
+pub enum FnKind { J3, Lib, Decl, Generated }
+
+/// A fn signature (Rust `Func` minus the body; `lower` makes the IR `Func`).
+// J3: Field order (and `pad`) work around stage 0 bug (a) in PORT_DEBT.md: payload-enum fields at 8-aligned
+// offsets, bools last, LLVM size a multiple of 8.
+pub struct FnDecl {
+    doc: string;
+    /// `FnKind.Lib`: library and C symbol (arena copies).
+    libName: string;
+    symbol: string;
+    params: List<ParamDecl>;
+    item: Option<FnItem>;
+    owner: Id<ModDecl>;
+    /// The bare name (`len`, `operator==`); the IR symbol is `lower`'s business.
+    name: Sym;
+    span: Span;
+    kind: FnKind;
+    gen: Option<Id<Generics>>;
+    /// A method: its struct (Rust `method_of`).
+    recv: Option<Id<StructDecl>>;
+    ret: Id<Ty>;
+    /// `#[impl]`: a free fn giving a type a trait method; `implName` is the method name it provides.
+    implName: Option<Sym>;
+    /// A trait's default body, copied per type that uses it.
+    defaultOf: Option<Id<TraitDecl>>;
+    /// Set by body typing (`body.typeFn`); a template's body is typed once against `Ty.Param`.
+    body: Option<Id<TBody>>;
+    visPub: bool;
+    /// No `: T` written; `infer` fills `ret` (Rust `infer_omitted_rets`).
+    retOmitted: bool;
+    isImpl: bool;
+    /// `#[shader]`: GPU code, typed but never lowered for the CPU.
+    shader: bool;
+    /// A generic enum's derived fn `Enum.method` (Rust `TraitEnv.enum_derives`): found by the operand's
+    /// type, so a call makes its instance right after the first argument (`lower/inst_call.j3`).
+    enumDerived: bool;
+}
+
+pub struct ParamDecl {
+    name: Sym;
+    span: Span;
+    ty: Id<Ty>;
+}
+
+/// A module `let` / `#[singleton] let` / `const` table / `@embed` const (Rust `GlobalDef`).
+// J3: Field order works around a stage 0 layout bug: stage 0 places an enum (`Option<..>` with a payload)
+// at an 8-byte offset while LLVM places it at 4, so a by-value copy overran the slot (memcpy 208 into
+// 200). Keep each enum field at an 8-aligned offset and the bools last.
+pub struct GlobalDecl {
+    owner: Id<ModDecl>;
+    name: Sym;
+    doc: string;
+    span: Span;
+    ty: Id<Ty>;
+    /// None: zeroed.
+    init: Option<ConstInit>;
+    item: Option<ModLetItem>;
+    visPub: bool;
+    thread: bool;
+    readonly: bool;
+    singleton: bool;
+}
+
+/// A `const` (Rust `ConstVal` in `ModData.consts`); a `const` array is also a readonly `GlobalDecl` (`table`).
+// J3: Field order (and `pad`) work around stage 0 bug (a) in PORT_DEBT.md: payload-enum fields at 8-aligned
+// offsets, bools last, LLVM size a multiple of 8.
+pub struct ConstDecl {
+    doc: string;
+    value: Option<ConstVal>;
+    item: Option<ConstItem>;
+    owner: Id<ModDecl>;
+    name: Sym;
+    span: Span;
+    ty: Id<Ty>;
+    table: Option<Id<GlobalDecl>>;
+    visPub: bool;
+}
+
+/// A compile-time value (Rust `ConstVal` / `ConstPayload`, plus what global inits need of `Operand`).
+// J3: Field order (and `pad`) work around stage 0 bug (a) in PORT_DEBT.md: payload-enum fields at 8-aligned
+// offsets, bools last, LLVM size a multiple of 8.
+pub struct ConstVal {
+    kind: ConstPayload;
+    ty: Id<Ty>;
+    pad: u32;
+}
+
+pub enum ConstPayload {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    /// Bytes, an arena copy.
+    String(string),
+    Null,
+    /// A fn's address (a `fn` value in a global).
+    FnAddr(ConstFn),
+}
+
+pub struct ConstFn { decl: Id<FnDecl>; }
+
+/// A global's initial value (Rust `ConstInit`).
+pub enum ConstInit {
+    Scalar(ConstVal),
+    Fields(ConstFields),
+    Elems(ConstElems),
+}
+
+pub struct ConstFields {
+    names: List<Sym>;
+    vals: List<ConstInit>;
+}
+
+pub struct ConstElems { items: List<ConstInit>; }
+
+/// A trait: signatures (with `Ty.TraitSelf`), supertraits, default bodies.
+pub struct TraitDecl {
+    owner: Id<ModDecl>;
+    name: Sym;
+    doc: string;
+    span: Span;
+    visPub: bool;
+    supers: List<Id<TraitDecl>>;
+    methods: List<TraitMethodDecl>;
+    item: Option<TraitItem>;
+}
+
+pub struct TraitMethodDecl {
+    name: Sym;
+    span: Span;
+    params: List<ParamDecl>;
+    ret: Id<Ty>;
+    /// The default body as a template fn (`FnDecl.defaultOf` set), None when the type must provide it.
+    default: Option<Id<FnDecl>>;
+}
+
+/// One method of a `dyn` trait's table (Rust `DynSlot`): method `method` of trait `from` (the trait itself
+/// or a supertrait; a name is kept once, first wins). Its table entry type is `fn(ptr, P..): R`.
+pub struct DynSlotDecl {
+    name: Sym;
+    from: Id<TraitDecl>;
+    /// Index into `from`'s `TraitDecl.methods`.
+    method: int;
+}
+
+/// A `dyn` trait's table layout (Rust `DynTable`), made by sema at the first conversion or call
+/// (`dyn_*.j3`; its errors are raised there): table field `i` is `slots[i]`, then `ups[j]` is field
+/// `slots.len + j` (`$up.Trait: fn(): ptr`). `Callee.Dyn.index` and a `Vtable` instance's `resolved`
+/// follow `slots`; `lower` reads the same layout and decides nothing.
+pub struct DynLayout {
+    decl: Id<TraitDecl>;
+    slots: List<DynSlotDecl>;
+    /// Every supertrait, transitively, in Rust `with_supers` order without the trait itself.
+    ups: List<Id<TraitDecl>>;
+}
+
+/// What an instance is (B11.2): a generic fn or generic-struct method body, a `dyn` vtable, an `#[impl]` /
+/// `where` bound check.
+pub enum InstKind { Fn, Vtable, Bound }
+
+/// `(kind, item, type args)`: `item` is an `Id<FnDecl>` for Fn, `Id<TraitDecl>` for Vtable,
+/// `Id<StructDecl>`/`Id<EnumDecl>` (by `DeclRef`) for Bound. `args` follow the item's `Generics`: a
+/// generic fn's own parameters; a generic struct's method (generic or not) the struct's args, then its own;
+/// a Bound key the generic struct's or enum's args (`trait_queue.j3`). Instance ids are keys only: IR identity, names and
+/// order are `lower`'s (contracts-c2b.md).
+pub struct InstKey {
+    kind: InstKind;
+    item: DeclRef;
+    args: Id<TyList>;
+
+    fn operator==(this: InstKey, o: InstKey): bool { return this.kind == o.kind && this.item == o.item && this.args == o.args; }
+    fn hash(this: InstKey): u64 { return mix(this.item.hash() ^ mix(u64(this.args.i))); }
+}
+
+/// `Tables.impls` key: an `#[impl]` method name and the type it is for.
+pub struct ImplKey {
+    name: Sym;
+    ty: Id<Ty>;
+
+    fn operator==(this: ImplKey, o: ImplKey): bool { return this.name == o.name && this.ty == o.ty; }
+    fn hash(this: ImplKey): u64 { return mix(this.name.hash() ^ mix(u64(this.ty.i))); }
+}
+
+/// One requested instance. `resolved`: for `InstKind.Vtable` the target of each table slot, in
+/// `DynLayout.slots` order (a `Callee.Fn` or `Callee.Inst`: own method, `#[impl]` fn, derived fn, or the
+/// trait default's instance; Rust `dyn_target`); unused for `Fn` (each instance has its own typed `body`;
+/// `Callee.Bound` lives only in a template's placeholder pass, which is never lowered). A `Vtable` key is
+/// `item` = the trait, `args` = `[the type]`; requesting it also requests one per supertrait (`ups`).
+pub struct Instance {
+    key: InstKey;
+    /// The first request: errors in the instance (a bound not met) point here, as Rust's do.
+    at: Span;
+    resolved: List<Callee>;
+    /// `InstKind.Fn`: the instance's own typed body (concrete types), set by `drain`; None for a `Lib`/
+    /// `Decl` fn or after an error.
+    body: Option<Id<TBody>>;
+    /// Drained: `body` is set (Fn) or the bound check ran (Bound).
+    done: bool;
+    /// A generic fn instance: the requesting body's depth + 1 (Rust `inst_sites` depth, for MAX_DEPTH);
+    /// 0 for every other instance, as in Rust.
+    depth: int;
+}
+
+/// Every sema table of one compile (B4). Made once per Session by `Tables.new`.
+pub struct Tables {
+    arena: &Arena;
+    names: &Names;
+    types: TyPool;
+    common: CommonTys;
+    mods: Pool<ModDecl>;
+    structs: Pool<StructDecl>;
+    enums: Pool<EnumDecl>;
+    fns: Pool<FnDecl>;
+    globals: Pool<GlobalDecl>;
+    consts: Pool<ConstDecl>;
+    traits: Pool<TraitDecl>;
+    generics: Pool<Generics>;
+    instances: Pool<Instance>;
+    instMap: Map<InstKey, Id<Instance>>;
+    /// Source modules by key (`resolve.buildModules`); `use lib` namespaces are not in it.
+    modKeys: Map<Sym, Id<ModDecl>>;
+    /// `#[impl]` fns by (method name, type without `&`), filled by `decl_traits.checkImpl` (Rust
+    /// `TraitEnv.impls`).
+    impls: Map<ImplKey, Id<FnDecl>>;
+    /// Templates whose definition-site pass failed (`gen_body.checkTemplates`, Rust `def_failed`): their
+    /// instances' errors would repeat it, so they stay quiet.
+    defFailed: Set<Id<FnDecl>>;
+    /// `dyn` table layouts in the order sema made them (C2c; looked up by `decl`, a short list).
+    dynLayouts: List<DynLayout>;
+    /// Names `shader.prepare` removed (shader fns, uniforms, varying structs; Rust's `GONE`), for
+    /// `sema.explainGone`. Empty when the program has no shader code.
+    gone: List<Sym>;
+
+    /// Empty tables in `arena` with the primitives interned. Returns a pointer into `arena`.
+    fn new(arena: &Arena, names: &Names): &Tables {
+        let t = arena.new::<Tables>(Tables { arena: arena, names: names, types: TyPool.new(arena), common: CommonTys {
+            error: Id<Ty> { i: 0 }, void: Id<Ty> { i: 0 }, bool: Id<Ty> { i: 0 }, i8: Id<Ty> { i: 0 }, i16: Id<Ty> { i: 0 },
+            i32: Id<Ty> { i: 0 }, i64: Id<Ty> { i: 0 }, u8: Id<Ty> { i: 0 }, u16: Id<Ty> { i: 0 }, u32: Id<Ty> { i: 0 },
+            u64: Id<Ty> { i: 0 }, f32: Id<Ty> { i: 0 }, f64: Id<Ty> { i: 0 }, half: Id<Ty> { i: 0 }, vec4f: Id<Ty> { i: 0 },
+            vec4i: Id<Ty> { i: 0 }, ptr: Id<Ty> { i: 0 }, cstr: Id<Ty> { i: 0 }, string: Id<Ty> { i: 0 },
+            traitSelf: Id<Ty> { i: 0 }, none: Id<TyList> { i: 0 } },
+            mods: Pool<ModDecl>.new(arena), structs: Pool<StructDecl>.new(arena), enums: Pool<EnumDecl>.new(arena),
+            fns: Pool<FnDecl>.new(arena), globals: Pool<GlobalDecl>.new(arena), consts: Pool<ConstDecl>.new(arena),
+            traits: Pool<TraitDecl>.new(arena), generics: Pool<Generics>.new(arena), instances: Pool<Instance>.new(arena),
+            instMap: Map<InstKey, Id<Instance>>.new(arena, 64), modKeys: Map<Sym, Id<ModDecl>>.new(arena, 64),
+            impls: Map<ImplKey, Id<FnDecl>>.new(arena, 16), defFailed: Set<Id<FnDecl>>.new(arena, 16),
+            dynLayouts: List<DynLayout>.new(arena), gone: List<Sym>.new(arena) });
+        t.common = commonTys(t);
+        return t;
+    }
+
+    fn sym(this: &Tables, s: string): Sym { return this.names.intern(s); }
+    fn str(this: &Tables, s: Sym): string { return this.names.str(s); }
+
+    fn addMod(this: &Tables, d: ModDecl): Id<ModDecl> { return this.mods.add(d); }
+    fn addStruct(this: &Tables, d: StructDecl): Id<StructDecl> { return this.structs.add(d); }
+    fn addEnum(this: &Tables, d: EnumDecl): Id<EnumDecl> { return this.enums.add(d); }
+    fn addFn(this: &Tables, d: FnDecl): Id<FnDecl> { return this.fns.add(d); }
+    fn addGlobal(this: &Tables, d: GlobalDecl): Id<GlobalDecl> { return this.globals.add(d); }
+    fn addConst(this: &Tables, d: ConstDecl): Id<ConstDecl> { return this.consts.add(d); }
+    fn addTrait(this: &Tables, d: TraitDecl): Id<TraitDecl> { return this.traits.add(d); }
+    fn addGenerics(this: &Tables, g: Generics): Id<Generics> { return this.generics.add(g); }
+
+    fn modAt(this: &Tables, id: Id<ModDecl>): &ModDecl { return this.mods.get(id); }
+    fn structAt(this: &Tables, id: Id<StructDecl>): &StructDecl { return this.structs.get(id); }
+    fn enumAt(this: &Tables, id: Id<EnumDecl>): &EnumDecl { return this.enums.get(id); }
+    fn fnAt(this: &Tables, id: Id<FnDecl>): &FnDecl { return this.fns.get(id); }
+    fn globalAt(this: &Tables, id: Id<GlobalDecl>): &GlobalDecl { return this.globals.get(id); }
+    fn constAt(this: &Tables, id: Id<ConstDecl>): &ConstDecl { return this.consts.get(id); }
+    fn traitAt(this: &Tables, id: Id<TraitDecl>): &TraitDecl { return this.traits.get(id); }
+    fn genericsAt(this: &Tables, id: Id<Generics>): &Generics { return this.generics.get(id); }
+    fn instanceAt(this: &Tables, id: Id<Instance>): &Instance { return this.instances.get(id); }
+}
+
+/// An empty module named `key` / `path` (arena copies by the caller).
+pub fn newModDecl(arena: &Arena, key: string, path: List<Sym>): ModDecl {
+    return ModDecl { key: key, path: path, files: List<int>.new(arena), items: List<Item>.new(arena), isScript: false, isLib: false,
+        scope: Map<Sym, DeclRef>.new(arena, 16), prefixes: Map<Sym, Id<ModDecl>>.new(arena, 8), exports: Set<Sym>.new(arena, 16),
+        structs: List<Id<StructDecl>>.new(arena), enums: List<Id<EnumDecl>>.new(arena), fns: List<Id<FnDecl>>.new(arena),
+        globals: List<Id<GlobalDecl>>.new(arena), consts: List<Id<ConstDecl>>.new(arena), traits: List<Id<TraitDecl>>.new(arena) };
+}

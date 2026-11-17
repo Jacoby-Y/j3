@@ -1,0 +1,180 @@
+// `@name(..)` calls: the simd intrinsics (`@vload`, `@vsum`, ..) typed here; every other `@name` is
+// `closures.closureIntrinsic`'s (Rust's order, check/lower/call.rs:19-24).
+//
+// Part of module j3c.sema.
+// Port of: check/lower/simd.rs (simd_intrinsic, vec_arg, arity, vec_mem), check/infer.rs (the `@v*` arm of
+// peek_ty's call case)
+// J3: C2c hooks (contracts-c2c.md, owner: simd/f16/intrinsics). `@sizeof`, `@slice`, `@syscall`, `@atomic*`
+// and `@embed*` are their own AST nodes and never come here.
+// J3: The node is `TExpr.Simd { name (no `@`), args }`. `vshuffle`: `args[1..5]` are `TExpr.Int` lane
+// indices (folded). `vload` / `vstore`: `args[0]` is `TExpr.AddrOf` of the dereferenced array or slice
+// place, `args[1]` the `int` index (`lower` makes the bounds checks and the `&lane`), `args[2]` the vector.
+module j3c.sema;
+
+extend BodyCx {
+    /// Rust `arity`.
+    fn intrinArity(this: &BodyCx, sp: Span, name: string, args: &List<Id<Expr>>, n: int): Result<bool, TErr> {
+        if args.len == n { return Result.Ok(true); }
+        let m = Text.new(this.cx.arena);
+        m.add("`@").add(name).add("` takes ");
+        m.pushInt(n);
+        m.add(" argument");
+        if n != 1 { m.add("s"); }
+        m.add(", found ");
+        m.pushInt(args.len);
+        return Result.Err(this.err(sp, m.str()));
+    }
+
+    /// Rust `vec_arg`: a vector operand; `want` (when not None) is the one vector type allowed.
+    fn intrinVecArg(this: &BodyCx, name: string, arg: Id<Expr>, want: Option<Id<Ty>>): Result<Id<TExpr>, TErr> {
+        let o = this.operand(arg, Option.None)?;
+        let t = this.exprTy(o);
+        let m = Text.new(this.cx.arena);
+        if !this.isVec(t) {
+            m.add("`@").add(name).add("` takes a vector, found `").add(this.tyStr(t)).add("`");
+            return Result.Err(this.err(this.cx.ast.exprSpan(arg), m.str()));
+        }
+        match want {
+            Option.Some(w) {
+                if t != w {
+                    m.add("`@").add(name).add("` takes a `").add(this.tyStr(w)).add("`, found `").add(this.tyStr(t)).add("`");
+                    return Result.Err(this.err(this.cx.ast.exprSpan(arg), m.str()));
+                }
+            }
+            Option.None {}
+        }
+        return Result.Ok(o);
+    }
+
+    /// Rust `vec_mem`: `xs[i..i+4]` of an `[]f32` / `[]i32` (or array): pushes `&xs` and the index on
+    /// `out` and returns the vector type the element picks.
+    fn intrinVecMem(this: &BodyCx, name: string, xs: Id<Expr>, i: Id<Expr>, store: bool, out: &List<Id<TExpr>>): Result<Id<Ty>, TErr> {
+        let c = this.com();
+        let xsp = this.cx.ast.exprSpan(xs);
+        let place = this.basePlace(xs)?;
+        place = this.derefAll(place, xsp);
+        let pt = this.placeTy(place);
+        let vt = c.vec4f;
+        let ok = false;
+        match this.ty(pt) {
+            Ty.Slice(s) { if s.elem == c.f32 { ok = true; } else if s.elem == c.i32 { ok = true; vt = c.vec4i; } }
+            Ty.Array(a) { if a.elem == c.f32 { ok = true; } else if a.elem == c.i32 { ok = true; vt = c.vec4i; } }
+            _ {}
+        }
+        if !ok {
+            let m = Text.new(this.cx.arena);
+            m.add("`@").add(name).add("` takes an `[]f32` or `[]i32`, found `").add(this.tyStr(pt)).add("`");
+            return Result.Err(this.help(this.err(xsp, m.str()), "the slice's element type picks `vec4f` or `vec4i`"));
+        }
+        if store && !this.canAssign(place) { return Result.Err(this.err(xsp, "cannot store into this slice")); }
+        let idx = this.operand(i, Option.Some(c.i64))?;
+        if this.exprTy(idx) != c.i64 {
+            return Result.Err(this.mismatch(this.cx.ast.exprSpan(i), cat3(this.cx, "`@", name, "` index"), this.exprTy(idx), c.i64));
+        }
+        out.push(this.expr(TExpr.AddrOf(PlaceRef { place: place }), this.cx.tables.refTo(pt), xsp));
+        out.push(idx);
+        return Result.Ok(vt);
+    }
+
+    /// Rust `simd_intrinsic`: `@n(args)` when `n` (with its `@`) is in `INTRINSIC_SIMD`, a `TExpr.Simd`.
+    /// None: not a simd intrinsic (the caller goes on to `closureIntrinsic`).
+    fn simdIntrinsic(this: &BodyCx, sp: Span, n: Ident, args: &List<Id<Expr>>, want: Option<Id<Ty>>): Result<Option<Id<TExpr>>, TErr> {
+        let full = this.str(n.name);
+        let name = full[1..full.len];
+        if !isSimdIntrinsic(name) { return Result.Ok(Option.None); }
+        this.simdNoScripts(sp)?;
+        let c = this.com();
+        let ops = List<Id<TExpr>>.new(this.cx.arena);
+        let ty = c.void;
+        if name == "vmin" || name == "vmax" {
+            this.intrinArity(sp, name, args, 2)?;
+            let a = this.intrinVecArg(name, args.items[0], Option.None)?;
+            let b = this.operand(args.items[1], Option.None)?;
+            ty = this.exprTy(a);
+            if this.exprTy(b) != ty {
+                let e = this.mismatch(this.cx.ast.exprSpan(args.items[1]), cat3(this.cx, "`@", name, "` operand"), this.exprTy(b), ty);
+                return Result.Err(this.help(e, cat3(this.cx, "both operands must be vectors of one type; splat a scalar with `", this.tyStr(ty), "(x)`")));
+            }
+            ops.push(a);
+            ops.push(b);
+        } else if name == "vsqrt" || name == "vint" {
+            this.intrinArity(sp, name, args, 1)?;
+            ops.push(this.intrinVecArg(name, args.items[0], Option.Some(c.vec4f))?);
+            ty = c.vec4f;
+            if name == "vint" { ty = c.vec4i; }
+        } else if name == "vabs" || name == "vsum" {
+            this.intrinArity(sp, name, args, 1)?;
+            let a = this.intrinVecArg(name, args.items[0], Option.None)?;
+            ty = this.exprTy(a);
+            if name == "vsum" { ty = this.simdLaneTy(ty); }
+            ops.push(a);
+        } else if name == "vfloat" {
+            this.intrinArity(sp, name, args, 1)?;
+            ops.push(this.intrinVecArg(name, args.items[0], Option.Some(c.vec4i))?);
+            ty = c.vec4f;
+        } else if name == "vshuffle" {
+            this.intrinArity(sp, name, args, 5)?;
+            let a = this.intrinVecArg(name, args.items[0], Option.None)?;
+            ty = this.exprTy(a);
+            ops.push(a);
+            for k in 1..5 {
+                let e = args.items[k];
+                let v: i64 = -1;
+                match this.foldInt(e) { Option.Some(x) { v = x; } Option.None {} }
+                if v < 0 || v > 3 {
+                    return Result.Err(this.help(this.err(this.cx.ast.exprSpan(e), "`@vshuffle` indices must be constants 0..3"),
+                        "write `@vshuffle(v, 3, 2, 1, 0)`"));
+                }
+                ops.push(this.intLit(u64(v), c.i64, this.cx.ast.exprSpan(e)));
+            }
+        } else if name == "vload" {
+            this.intrinArity(sp, name, args, 2)?;
+            ty = this.intrinVecMem(name, args.items[0], args.items[1], false, &ops)?;
+        } else {
+            this.intrinArity(sp, name, args, 3)?;
+            let vt = this.intrinVecMem(name, args.items[0], args.items[1], true, &ops)?;
+            let v = this.operand(args.items[2], Option.None)?;
+            if this.exprTy(v) != vt { return Result.Err(this.mismatch(this.cx.ast.exprSpan(args.items[2]), "`@vstore` value", this.exprTy(v), vt)); }
+            ops.push(v);
+        }
+        return Result.Ok(Option.Some(this.simdNode(sp, name, ops, ty)));
+    }
+
+    /// `infer.peekCall`: the result type of `@n(args)` without typing it (Rust `peek_ty`'s `@v*` arm; any
+    /// other `@name` is `peek_callee`'s unknown function).
+    fn intrinPeek(this: &BodyCx, sp: Span, n: Ident, args: &List<Id<Expr>>): Result<Id<Ty>, TErr> {
+        let c = this.com();
+        let full = this.str(n.name);
+        let name = full[1..full.len];
+        if !isSimdIntrinsic(name) { return Result.Err(this.err(n.span, cat3(this.cx, "unknown function `", full, "`"))); }
+        if name == "vsqrt" || name == "vfloat" { return Result.Ok(c.vec4f); }
+        if name == "vint" { return Result.Ok(c.vec4i); }
+        if name == "vstore" { return Result.Ok(c.void); }
+        if args.len == 0 { return Result.Err(this.err(sp, cat3(this.cx, "`@", name, "` is missing an argument"))); }
+        let t = this.peek(args.items[0])?;
+        if name == "vsum" {
+            if !this.isVec(t) { return Result.Err(this.err(sp, "`@vsum` takes a vector")); }
+            return Result.Ok(this.simdLaneTy(t));
+        }
+        if name == "vload" {
+            while true {
+                match this.refInner(t) { Option.Some(i) { t = i; } Option.None { break; } }
+            }
+            match this.elemTy(t) {
+                Option.Some(e) {
+                    if e == c.f32 { return Result.Ok(c.vec4f); }
+                    if e == c.i32 { return Result.Ok(c.vec4i); }
+                }
+                Option.None {}
+            }
+            return Result.Err(this.err(sp, "`@vload` takes an `[]f32` or `[]i32`"));
+        }
+        return Result.Ok(t);
+    }
+}
+
+/// `name` (no `@`) is in Rust's `INTRINSIC_SIMD` (`syntax/token.j3`).
+fn isSimdIntrinsic(name: string): bool {
+    return name == "vmin" || name == "vmax" || name == "vsqrt" || name == "vabs" || name == "vsum" || name == "vshuffle"
+        || name == "vfloat" || name == "vint" || name == "vload" || name == "vstore";
+}

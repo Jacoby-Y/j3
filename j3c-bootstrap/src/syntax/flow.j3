@@ -2,3 +2,164 @@
 //
 // Port of: j3c/src/parse/flow.rs
 module j3c.syntax.flow;
+// J3: Labels are `Sym`s (`Option<Sym>`, None = an unlabeled loop). Rust's `_` arms stay: a new statement
+// kind does not leave a block by default.
+
+use j3.data.pool.Id;
+use j3.option.Option;
+use j3c.base.intern.Sym;
+use j3c.syntax.ast.{ Ast, Block, Expr, MatchStmt, Stmt, WhileStmt };
+
+/// True when control never runs off the end of `block` (out of the function).
+pub fn diverges(ast: &Ast, block: &Block): bool { return anyDiverges(ast, block, false); }
+
+/// True when control never reaches the end of `block`: it returns, exits, or jumps with `break`/`continue`
+/// (a `match` arm of type "never", the `else` of `let .. else`).
+pub fn leaves(ast: &Ast, block: &Block): bool { return anyDiverges(ast, block, true); }
+
+/// An arm tail that never gives a value: `panic(..)`, or a `match` whose arms all leave.
+pub fn exprDiverges(ast: &Ast, e: Id<Expr>): bool { return exprLeaves(ast, e, true); }
+
+fn anyDiverges(ast: &Ast, block: &Block, jumps: bool): bool {
+    for i in 0..block.stmts.len {
+        if stmtDiverges(ast, block.stmts.items[i], jumps) { return true; }
+    }
+    return false;
+}
+
+fn exprLeaves(ast: &Ast, e: Id<Expr>, jumps: bool): bool {
+    match ast.expr(e) {
+        Expr.Match(m) { return matchDiverges(ast, &m, jumps); }
+        _ { return isExitCall(ast, e); }
+    }
+}
+
+// enum matches list every variant and int matches need `_`, so the arms cover every case
+fn matchDiverges(ast: &Ast, m: &MatchStmt, jumps: bool): bool {
+    if m.arms.len == 0 { return false; }
+    for i in 0..m.arms.len {
+        let a = m.arms.items[i];
+        let leavesArm = anyDiverges(ast, &a.body, jumps);
+        if !leavesArm {
+            match a.tail {
+                Option.Some(t) { leavesArm = exprLeaves(ast, t, jumps); }
+                Option.None {}
+            }
+        }
+        if !leavesArm { return false; }
+    }
+    return true;
+}
+
+fn stmtDiverges(ast: &Ast, id: Id<Stmt>, jumps: bool): bool {
+    match ast.stmt(id) {
+        Stmt.Return(_) { return true; }
+        Stmt.Break(_) { return jumps; }
+        Stmt.Continue(_) { return jumps; }
+        Stmt.If(s) {
+            match s.elseBlock {
+                Option.Some(e) { return anyDiverges(ast, &s.thenBlock, jumps) && anyDiverges(ast, &e, jumps); }
+                Option.None { return false; }
+            }
+        }
+        Stmt.Match(m) { return matchDiverges(ast, &m, jumps); }
+        Stmt.While(w) { return endless(ast, &w, Option.None); }
+        Stmt.Labeled(l) {
+            match ast.stmt(l.body) {
+                Stmt.While(w) { return endless(ast, &w, Option.Some(l.label.name)); }
+                _ { return false; }
+            }
+        }
+        Stmt.Block(b) { return anyDiverges(ast, &b, jumps); }
+        Stmt.Expr(e) { return exprLeaves(ast, e.expr, jumps); }
+        _ { return false; }
+    }
+}
+
+/// `while true { .. }` with no `break` that leaves it.
+fn endless(ast: &Ast, w: &WhileStmt, label: Option<Sym>): bool {
+    match ast.expr(w.cond) {
+        Expr.Bool(b) { return b && !breaksOut(ast, &w.body, 0, label); }
+        _ { return false; }
+    }
+}
+
+/// A `break` in `block` that leaves the loop `depth` levels out (0 = the loop owning `block`).
+fn breaksOut(ast: &Ast, block: &Block, depth: int, label: Option<Sym>): bool {
+    for i in 0..block.stmts.len {
+        if stmtBreaks(ast, block.stmts.items[i], depth, label) { return true; }
+    }
+    return false;
+}
+
+fn optBreaks(ast: &Ast, b: Option<Block>, depth: int, label: Option<Sym>): bool {
+    match b {
+        Option.Some(x) { return breaksOut(ast, &x, depth, label); }
+        Option.None { return false; }
+    }
+}
+
+fn stmtBreaks(ast: &Ast, id: Id<Stmt>, depth: int, label: Option<Sym>): bool {
+    match ast.stmt(id) {
+        Stmt.Break(j) {
+            match j.label {
+                Option.None { return depth == 0; }
+                Option.Some(l) {
+                    match label {
+                        Option.Some(want) { return l.name == want; }
+                        Option.None { return false; }
+                    }
+                }
+            }
+        }
+        Stmt.If(s) { return breaksOut(ast, &s.thenBlock, depth, label) || optBreaks(ast, s.elseBlock, depth, label); }
+        Stmt.Match(m) { return matchBreaks(ast, &m, depth, label); }
+        Stmt.Expr(e) {
+            match ast.expr(e.expr) {
+                Expr.Match(m) { return matchBreaks(ast, &m, depth, label); }
+                _ { return false; }
+            }
+        }
+        Stmt.LetPat(l) { return optBreaks(ast, l.elseBlock, depth, label); }
+        Stmt.Block(b) { return breaksOut(ast, &b, depth, label); }
+        Stmt.Defer(d) { return breaksOut(ast, &d.body, depth, label); }
+        Stmt.While(w) { return breaksOut(ast, &w.body, depth + 1, label); }
+        Stmt.For(f) { return breaksOut(ast, &f.body, depth + 1, label); }
+        Stmt.ForEach(f) { return breaksOut(ast, &f.body, depth + 1, label); }
+        Stmt.Labeled(l) { return stmtBreaks(ast, l.body, depth, label); }
+        _ { return false; }
+    }
+}
+
+fn matchBreaks(ast: &Ast, m: &MatchStmt, depth: int, label: Option<Sym>): bool {
+    for i in 0..m.arms.len {
+        let a = m.arms.items[i];
+        if breaksOut(ast, &a.body, depth, label) { return true; }
+        match a.tail {
+            Option.Some(t) {
+                match ast.expr(t) {
+                    Expr.Match(tm) { if matchBreaks(ast, &tm, depth, label) { return true; } }
+                    _ {}
+                }
+            }
+            Option.None {}
+        }
+    }
+    return false;
+}
+
+/// `panic(..)`, `sys.panic(..)`, `exit(..)`: calls that never come back.
+fn isExitCall(ast: &Ast, e: Id<Expr>): bool {
+    let name = "";
+    match ast.expr(e) {
+        Expr.Call(c) {
+            match ast.expr(c.func) {
+                Expr.Name(n) { name = ast.str(n.name); }
+                Expr.Field(f) { name = ast.str(f.field.name); }
+                _ { return false; }
+            }
+        }
+        _ { return false; }
+    }
+    return name == "panic" || name == "panicAt" || name == "exit";
+}

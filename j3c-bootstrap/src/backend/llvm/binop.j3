@@ -2,4 +2,156 @@
 //
 // Part of module j3c.backend.llvm.
 // Port of: j3c/src/emit/llvm_expr/binop.rs
+// J3: Entries: `binop` (value of `l op r`; vectors go to `vecBinop`), `wrapInt`.
 module j3c.backend.llvm;
+
+extend LlvmFn {
+    fn binop(this: &LlvmFn, resultTy: Id<TyKind>, lhsTy: Id<TyKind>, op: BinOp, l: string, r: string): Result<string, string> {
+        let cx = this.cx;
+        match cx.tyKind(resultTy) { TyKind.Vec(_) { return this.vecBinop(resultTy, op, l, r); } _ {} }
+        let ll = llType(cx, resultTy, this.arena)?;
+        let v = this.fresh();
+        let ipred = "";
+        let fpred = "";
+        match op {
+            BinOp.Eq { ipred = "eq"; fpred = "oeq"; }
+            BinOp.Ne { ipred = "ne"; fpred = "une"; }
+            BinOp.Lt { ipred = "slt"; fpred = "olt"; }
+            BinOp.Le { ipred = "sle"; fpred = "ole"; }
+            BinOp.Gt { ipred = "sgt"; fpred = "ogt"; }
+            BinOp.Ge { ipred = "sge"; fpred = "oge"; }
+            _ {}
+        }
+        if ipred.len > 0 {
+            if isPtr(cx, lhsTy) {
+                this.inst(this.l().add(v).add(" = icmp ").add(ipred).add(" ptr ").add(l).add(", ").add(r).str());
+            } else if isFloat(cx, lhsTy) {
+                let ft = llType(cx, lhsTy, this.arena)?;
+                this.inst(this.l().add(v).add(" = fcmp ").add(fpred).add(" ").add(ft).add(" ").add(l).add(", ").add(r).str());
+            } else {
+                let it = llType(cx, lhsTy, this.arena)?;
+                let pred = ipred;
+                if isInt(cx, lhsTy) && !isSignedInt(cx, lhsTy) {
+                    match op {
+                        BinOp.Lt { pred = "ult"; }
+                        BinOp.Le { pred = "ule"; }
+                        BinOp.Gt { pred = "ugt"; }
+                        BinOp.Ge { pred = "uge"; }
+                        _ {}
+                    }
+                }
+                this.inst(this.l().add(v).add(" = icmp ").add(pred).add(" ").add(it).add(" ").add(l).add(", ").add(r).str());
+            }
+            let z = this.fresh();
+            this.inst(this.l().add(z).add(" = zext i1 ").add(v).add(" to i8").str());
+            return Result.Ok(z);
+        }
+        if isFloat(cx, resultTy) {
+            let inst = "";
+            match op {
+                BinOp.Add { inst = "fadd"; }
+                BinOp.Sub { inst = "fsub"; }
+                BinOp.Mul { inst = "fmul"; }
+                BinOp.Div { inst = "fdiv"; }
+                BinOp.Rem { inst = "frem"; }
+                _ { return Result.Err("bad float op"); }
+            }
+            this.inst(this.l().add(v).add(" = ").add(inst).add(" ").add(ll).add(" ").add(l).add(", ").add(r).str());
+            return Result.Ok(v);
+        }
+        if op == BinOp.And || op == BinOp.Or {
+            let inst = "or";
+            if op == BinOp.And { inst = "and"; }
+            this.inst(this.l().add(v).add(" = ").add(inst).add(" i8 ").add(l).add(", ").add(r).str());
+            return Result.Ok(v);
+        }
+        if wrappingBin(op) && isInt(cx, resultTy) { return this.wrapInt(resultTy, op, l, r); }
+        let inst = "";
+        match op {
+            BinOp.Add { inst = "add"; }
+            BinOp.Sub { inst = "sub"; }
+            BinOp.Mul { inst = "mul"; }
+            BinOp.BitAnd { inst = "and"; }
+            BinOp.BitOr { inst = "or"; }
+            BinOp.BitXor { inst = "xor"; }
+            BinOp.Shl { inst = "shl"; }
+            BinOp.Shr { inst = "lshr"; }
+            _ {
+                let t = Text.new(this.arena);
+                t.add("binop ").add(binOpStr(op));
+                return Result.Err(t.str());
+            }
+        }
+        this.inst(this.l().add(v).add(" = ").add(inst).add(" ").add(ll).add(" ").add(l).add(", ").add(r).str());
+        return Result.Ok(v);
+    }
+
+    /// Integer `op` with J3's wrap and divide-by-zero rule (`ir/wrap.j3`).
+    fn wrapInt(this: &LlvmFn, ty: Id<TyKind>, op: BinOp, l: string, r: string): Result<string, string> {
+        let cx = this.cx;
+        let ll = llType(cx, ty, this.arena)?;
+        let signed = isSignedInt(cx, ty);
+        let bits = intWidth(cx, ty);
+        match op {
+            BinOp.Div { return this.wrapDiv(ll, signed, bits, true, l, r); }
+            BinOp.Rem { return this.wrapDiv(ll, signed, bits, false, l, r); }
+            _ {}
+        }
+        let inst = "";
+        match op {
+            BinOp.Add { inst = "add"; }
+            BinOp.Sub { inst = "sub"; }
+            BinOp.Mul { inst = "mul"; }
+            BinOp.Shl { inst = "shl"; }
+            BinOp.Shr { if signed { inst = "ashr"; } else { inst = "lshr"; } }
+            _ { return Result.Err("wrap op"); }
+        }
+        let amount = r;
+        if op == BinOp.Shl || op == BinOp.Shr {
+            // a shift by the width or more is poison in LLVM: mask the amount, like C and Rust release
+            amount = this.fresh();
+            this.inst(this.l().add(amount).add(" = and ").add(ll).add(" ").add(r).fmt(`, {bits - 1}`).str());
+        }
+        let v = this.fresh();
+        this.inst(this.l().add(v).add(" = ").add(inst).add(" ").add(ll).add(" ").add(l).add(", ").add(amount).str());
+        return Result.Ok(v);
+    }
+
+    /// `/` (`div`) or `%`: signed `MIN / -1` wraps to `MIN` (`% -1` to 0) instead of trapping.
+    fn wrapDiv(this: &LlvmFn, ll: string, signed: bool, bits: u32, div: bool, l: string, r: string): Result<string, string> {
+        if !signed {
+            let inst = "urem";
+            if div { inst = "udiv"; }
+            let v = this.fresh();
+            this.inst(this.l().add(v).add(" = ").add(inst).add(" ").add(ll).add(" ").add(l).add(", ").add(r).str());
+            return Result.Ok(v);
+        }
+        let min = "-9223372036854775808";
+        if bits == 8 { min = "-128"; } else if bits == 16 { min = "-32768"; } else if bits == 32 { min = "-2147483648"; }
+        let ismin = this.fresh();
+        let ism1 = this.fresh();
+        let ov = this.fresh();
+        this.inst(this.l().add(ismin).add(" = icmp eq ").add(ll).add(" ").add(l).add(", ").add(min).str());
+        this.inst(this.l().add(ism1).add(" = icmp eq ").add(ll).add(" ").add(r).add(", -1").str());
+        this.inst(this.l().add(ov).add(" = and i1 ").add(ismin).add(", ").add(ism1).str());
+        let ovBb = this.label();
+        let normBb = this.label();
+        let join = this.label();
+        this.brIf(ov, ovBb, normBb);
+        this.block(ovBb);
+        let wrapped = "0";
+        if div { wrapped = min; }
+        this.br(join);
+        this.block(normBb);
+        let norm = this.fresh();
+        let inst = "srem";
+        if div { inst = "sdiv"; }
+        this.inst(this.l().add(norm).add(" = ").add(inst).add(" ").add(ll).add(" ").add(l).add(", ").add(r).str());
+        this.br(join);
+        this.block(join);
+        let v = this.fresh();
+        this.inst(this.l().add(v).add(" = phi ").add(ll).add(" [ ").add(wrapped).add(", %").add(ovBb).add(" ], [ ").add(norm).add(", %")
+            .add(normBb).add(" ]").str());
+        return Result.Ok(v);
+    }
+}

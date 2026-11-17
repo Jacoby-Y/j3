@@ -1,10 +1,443 @@
-// Typing fn bodies into the typed tree: blocks, locals, `let`/`let else`, control flow, `defer`, labels,
-// expressions, literals (via `infer`), operators and calls (via the member lookup in `traits`), closures
-// and their captures, patterns and `match` exhaustiveness.
+// Typing fn bodies into the typed tree: blocks, locals, `let`, control flow, `defer`, labels, expressions,
+// literals (via `infer`), operators and calls (own methods, `findOp`, UFCS). Closures, patterns, `match`
+// exhaustiveness and the trait member lookup are later milestones (see the C2a note below).
 //
 // Part of module j3c.sema.
-// Port of: (new in plan 11 B11.1; replaces the type decisions spread over `check/lower/*`)
+// Port of: check/lower/mod.rs (Lower state, missing_return, mismatch/unknown/no_method), check/lower/setup.rs
+// (lower_fn: params, per-statement recovery, error collection), check/lower/half.rs (the f16 rules)
 // J3: One pass per fn, given `&AllSigs` (plan 11 B5). Generic bodies are typed once with bound-only
-// placeholder types (no `IrCx` clone, no throwaway lowering). Split into `body_*.j3` parts at real seams
-// (statements, expressions, calls, patterns) as it passes 600 lines.
+// placeholder types (no `IrCx` clone, no throwaway lowering). Split into `body_*.j3` parts at real seams:
+// `body_stmt` (statements), `body_expr` (values), `body_place` (places), `body_call` (calls, methods),
+// `body_binop` (operators, number literals, const folding), `body_lit` (struct/array/slice literals,
+// slicing, casts, interpolation).
+// J3: The typer mirrors Rust's `Lower` (same checks, same order, same messages) but builds `Typed` nodes
+// instead of IR: Rust's `operand`/`rvalue` are `BodyCx.operand`/`rvalue` (both return an `Id<TExpr>`;
+// `lower` spills to temps where Rust did), `try_place` is `tryPlace`. A place's access (Rust
+// `Place.access`) is computed from its shape (`canAssign`/`canRef`), not stored.
+// J3: Errors are `TErr` (a `Diag` plus Rust's `unknown` name for follow-on suppression); a failed statement
+// is dropped and the next one typed (B11.5, Rust `stmt_recover`); a fn with errors gets no body and its
+// Diags go to the session in source order, deduplicated (Rust `gather_errors`; the renderer caps them).
+// J3: Scope is a stack of `Binding`s, locals and `use x;` aliases (a block truncates it back), so Rust's
+// `locals.clone()` / `aliases.clone()` per block is gone. Names outside the body resolve through
+// `resolve.lookup` (the module scope).
+// J3: C2a (plain code): closures, tuples, `dyn`, simd and scripts stop at a `not ported yet` error
+// (`notYet`) at the expression that needs them. C2b (contracts-c2b.md): generics, traits and patterns go
+// through hooks in `gen_*.j3`, `trait_*.j3`, `pat_*.j3`; an instance body is typed by `typeBody` with
+// `BodyCx.inst` set (every type substituted, so its typed body is concrete).
+// C2c (contracts-c2c.md): tuples, closures, simd/intrinsics, `Text.fmt`, `dyn` and derive go through hooks
+// in `tuple_*.j3`, `closures.j3`, `simd_*.j3` / `intrin_*.j3`, `fmt_*.j3`, `dyn_*.j3`, `derive*.j3`. The
+// error builders and `resolve` are in `body_err.j3`.
 module j3c.sema;
+
+/// Errors kept per run; past this the rest are usually follow-ons (Rust `MAX_ERRORS`).
+const MAX_BODY_ERRORS = 20;
+
+/// A typing error: the Diag to report and, for `unknown name` / `not a place`, the name (a later error
+/// about the same name in this fn is a follow-on and dropped). `silent`: already reported elsewhere.
+pub struct TErr {
+    diag: Diag;
+    unknown: Option<Sym>;
+}
+
+/// An enclosing loop: its id in this body and its `'label`.
+struct LoopFrame {
+    id: int;
+    label: Option<Sym>;
+}
+
+/// A name in scope inside the body: a local, or (`alias` set) a field brought in by `use x;` (Rust
+/// `aliases`: a place, not a copy; `local` is unused then).
+struct Binding {
+    name: Sym;
+    local: Id<TLocal>;
+    alias: Option<Id<TPlace>>;
+}
+
+/// Per-fn typing state (Rust `Lower`, minus the IR builder).
+pub struct BodyCx {
+    cx: &SemaCx;
+    /// The module whose scope outside names resolve in.
+    m: Id<ModDecl>;
+    f: Id<FnDecl>;
+    ret: Id<Ty>;
+    /// The fn's module file (Rust `self.path`, for `panic` locations).
+    path: string;
+    scope: List<Binding>;
+    locals: List<Id<TLocal>>;
+    params: List<Id<TLocal>>;
+    loops: List<LoopFrame>;
+    /// Set by `'label:` for the loop statement that follows it.
+    pendingLabel: Option<Sym>;
+    nloops: int;
+    errs: List<TErr>;
+    /// Names whose `let` failed or that were reported unknown.
+    poisoned: List<Sym>;
+    /// The fn's type parameters (`FnDecl.gen`): written types in the body resolve against them.
+    gen: Option<Id<Generics>>;
+    /// Typing instance `inst` of a template (C2b): every resolved type is substituted (`instTy`) with its
+    /// args, so the body's types are concrete. None for a plain fn and for the placeholder pass.
+    inst: Option<Id<Instance>>;
+    /// Typing a closure body: `break`/`continue` cannot leave it.
+    inClosure: bool;
+    /// Typing a closure body: every name visible outside it (Rust `closure_outer`), which a new local may
+    /// not shadow (`isDeclared`). Empty outside a closure.
+    closureOuter: List<Sym>;
+    /// Typing a method of this `.j3s` script struct (Rust `script_sid`; set by `scriptEnter`). Its props
+    /// are the struct's first `propSpans.len` fields (Rust `script_props`).
+    scriptSid: Option<Id<StructDecl>>;
+
+    fn new(cx: &SemaCx, f: Id<FnDecl>): BodyCx {
+        let d = cx.tables.fnAt(f);
+        let path = "";
+        // Rust's `self.path` is the module's main file, also for fns in its part files.
+        let md = cx.tables.modAt(d.owner);
+        if md.files.len > 0 { path = cx.parsed.files.items[md.files.items[0]].path; }
+        else if !isNone(d.span) { path = cx.sources.get(d.span.file).path; }
+        return BodyCx { cx: cx, m: d.owner, f: f, ret: d.ret, path: path, scope: List<Binding>.new(cx.arena),
+            locals: List<Id<TLocal>>.new(cx.arena), params: List<Id<TLocal>>.new(cx.arena), loops: List<LoopFrame>.new(cx.arena),
+            pendingLabel: Option.None, nloops: 0, errs: List<TErr>.new(cx.arena), poisoned: List<Sym>.new(cx.arena),
+            gen: d.gen, inst: Option.None, inClosure: false, closureOuter: List<Sym>.new(cx.arena),
+            scriptSid: Option.None };
+    }
+
+    /// `t` as this body sees it: a template type at the instance's args (`generics.subst`), else `t`.
+    fn instTy(this: &BodyCx, t: Id<Ty>): Id<Ty> {
+        match this.inst {
+            Option.Some(i) {
+                match this.gen { Option.Some(g) { return subst(this.cx.tables, g, t, this.cx.tables.instanceAt(i).key.args); } Option.None {} }
+            }
+            Option.None {}
+        }
+        return t;
+    }
+
+    // ---- types ----
+
+    fn com(this: &BodyCx): CommonTys { return this.cx.tables.common; }
+    fn ty(this: &BodyCx, t: Id<Ty>): Ty { return this.cx.tables.ty(t); }
+    fn isInt(this: &BodyCx, t: Id<Ty>): bool {
+        match this.ty(t) { Ty.Int(_) { return true; } _ { return false; } }
+    }
+    fn isFloat(this: &BodyCx, t: Id<Ty>): bool {
+        match this.ty(t) { Ty.Float(_) { return true; } _ { return false; } }
+    }
+    fn isNumeric(this: &BodyCx, t: Id<Ty>): bool { return this.isInt(t) || this.isFloat(t); }
+    fn isHalf(this: &BodyCx, t: Id<Ty>): bool { return t == this.com().half; }
+    fn isVec(this: &BodyCx, t: Id<Ty>): bool {
+        match this.ty(t) { Ty.Vec(_) { return true; } _ { return false; } }
+    }
+    /// Rust `is_ptr_ty`: `ptr`, `cstr`, `&T`.
+    fn isPtrTy(this: &BodyCx, t: Id<Ty>): bool {
+        match this.ty(t) {
+            Ty.Ptr { return true; }
+            Ty.CStr { return true; }
+            Ty.Ref(_) { return true; }
+            _ { return false; }
+        }
+    }
+    fn isClosure(this: &BodyCx, t: Id<Ty>): bool {
+        match this.ty(t) { Ty.Closure(_) { return true; } _ { return false; } }
+    }
+    fn isDyn(this: &BodyCx, t: Id<Ty>): bool {
+        match this.ty(t) { Ty.Dyn(_) { return true; } _ { return false; } }
+    }
+    fn refInner(this: &BodyCx, t: Id<Ty>): Option<Id<Ty>> { return this.cx.tables.refInner(t); }
+    /// Rust `elem_ty`: the element of an array, slice or `string` (`u8`).
+    fn elemTy(this: &BodyCx, t: Id<Ty>): Option<Id<Ty>> {
+        match this.ty(t) {
+            Ty.Array(a) { return Option.Some(a.elem); }
+            Ty.Slice(s) { return Option.Some(s.elem); }
+            Ty.String { return Option.Some(this.com().u8); }
+            _ { return Option.None; }
+        }
+    }
+    /// Field path `path` (`fieldPath`) from struct place `p`, field types at the struct's type arguments.
+    fn fieldWalk(this: &BodyCx, p: Id<TPlace>, path: &List<int>, sp: Span): Id<TPlace> {
+        let q = p;
+        for i in 0..path.len {
+            let ft = fieldTyOf(this.cx.tables, this.placeTy(q), path.items[i]);
+            q = this.place(TPlace.Field(FieldPlace { base: q, index: path.items[i] }), ft, sp);
+        }
+        return q;
+    }
+    fn structOf(this: &BodyCx, t: Id<Ty>): Option<Id<StructDecl>> {
+        match this.ty(t) { Ty.Struct(s) { return Option.Some(s.decl); } _ { return Option.None; } }
+    }
+    fn enumOf(this: &BodyCx, t: Id<Ty>): Option<Id<EnumDecl>> {
+        match this.ty(t) { Ty.Enum(e) { return Option.Some(e.decl); } _ { return Option.None; } }
+    }
+    /// The `fn(..): R` type of a declared fn.
+    fn fnTyOf(this: &BodyCx, f: Id<FnDecl>): Id<Ty> {
+        let d = this.cx.tables.fnAt(f);
+        let ps = this.cx.arena.alloc::<Id<Ty>>(d.params.len);
+        for i in 0..d.params.len { ps[i] = d.params.items[i].ty; }
+        return this.cx.tables.fnTy(ps, d.ret);
+    }
+    /// The type's source spelling (Rust `ty_str` / `dump_ty`).
+    fn tyStr(this: &BodyCx, t: Id<Ty>): string {
+        let out = Text.new(this.cx.arena);
+        tyName(this.cx.tables, t, &out);
+        return out.str();
+    }
+    fn str(this: &BodyCx, s: Sym): string { return this.cx.tables.str(s); }
+    fn sym(this: &BodyCx, s: string): Sym { return this.cx.tables.sym(s); }
+
+    // ---- nodes ----
+
+    fn expr(this: &BodyCx, e: TExpr, t: Id<Ty>, sp: Span): Id<TExpr> { return this.cx.typed.addExpr(e, t, sp); }
+    /// A node sema made where Rust lowered something other than the written form (`Origin`).
+    fn exprFrom(this: &BodyCx, o: Origin, e: TExpr, t: Id<Ty>, sp: Span): Id<TExpr> {
+        let id = this.cx.typed.addExpr(e, t, sp);
+        this.cx.typed.setOrigin(id, o);
+        return id;
+    }
+    fn place(this: &BodyCx, p: TPlace, t: Id<Ty>, sp: Span): Id<TPlace> { return this.cx.typed.addPlace(p, t, sp); }
+    fn stmtNode(this: &BodyCx, s: TStmt, sp: Span): Id<TStmt> { return this.cx.typed.addStmt(s, sp); }
+    fn exprTy(this: &BodyCx, e: Id<TExpr>): Id<Ty> { return this.cx.typed.exprTy(e); }
+    fn placeTy(this: &BodyCx, p: Id<TPlace>): Id<Ty> { return this.cx.typed.placeTy(p); }
+    /// The value of place `p`.
+    fn load(this: &BodyCx, p: Id<TPlace>): Id<TExpr> {
+        return this.expr(TExpr.Load(PlaceRef { place: p }), this.placeTy(p), this.cx.typed.placeSpan(p));
+    }
+    fn intLit(this: &BodyCx, v: u64, t: Id<Ty>, sp: Span): Id<TExpr> { return this.expr(TExpr.Int(v), t, sp); }
+
+    // ---- scope ----
+
+    fn findLocal(this: &BodyCx, name: Sym): Option<Id<TLocal>> {
+        let i = this.scope.len - 1;
+        while i >= 0 {
+            let b = this.scope.items[i];
+            if b.name == name {
+                match b.alias { Option.Some(_) {} Option.None { return Option.Some(b.local); } }
+            }
+            i -= 1;
+        }
+        return Option.None;
+    }
+    /// The place a `use x;` alias names (Rust `aliases.get`).
+    fn findAlias(this: &BodyCx, name: Sym): Option<Id<TPlace>> {
+        let i = this.scope.len - 1;
+        while i >= 0 {
+            let b = this.scope.items[i];
+            if b.name == name {
+                match b.alias { Option.Some(_) { return b.alias; } Option.None {} }
+            }
+            i -= 1;
+        }
+        return Option.None;
+    }
+    /// Rust `is_declared`: a name a new local would shadow (in this body, or outside the closure being
+    /// typed).
+    fn isDeclared(this: &BodyCx, name: Sym): bool {
+        match this.findLocal(name) { Option.Some(_) { return true; } Option.None {} }
+        for i in 0..this.closureOuter.len {
+            if this.closureOuter.items[i] == name { return true; }
+        }
+        return false;
+    }
+    /// A new local (not yet in scope).
+    fn newLocal(this: &BodyCx, name: Sym, t: Id<Ty>, sp: Span, param: bool): Id<TLocal> {
+        let id = this.cx.typed.addLocal(TLocal { name: name, ty: t, span: sp, param: param });
+        this.locals.push(id);
+        return id;
+    }
+    fn bind(this: &BodyCx, name: Sym, id: Id<TLocal>) { this.scope.push(Binding { name: name, local: id, alias: Option.None }); }
+    fn bindAlias(this: &BodyCx, name: Sym, p: Id<TPlace>) {
+        this.scope.push(Binding { name: name, local: Id<TLocal> { i: 0 }, alias: Option.Some(p) });
+    }
+    /// A name outside the body (module scope, `use`d names); `main` is the program's everywhere (Rust
+    /// adds it to every module's `funcs`, for `j3.sys.start`).
+    fn lookupName(this: &BodyCx, name: Sym): Option<DeclRef> {
+        let r = lookup(this.cx, this.m, name);
+        match r { Option.Some(_) { return r; } Option.None {} }
+        if this.str(name) != "main" { return r; }
+        let t = this.cx.tables;
+        for i in 0..t.mods.len() {
+            let m = t.mods.idAt(i);
+            let md = t.modAt(m);
+            if md.isLib || md.key == "j3" || startsWith(md.key, "j3.") { continue; }
+            match md.scope.get(name) {
+                Option.Some(d) {
+                    if d.kind == DeclKind.Fn && t.fnAt(d.asFn()).owner == m { return Option.Some(d); }
+                }
+                Option.None {}
+            }
+        }
+        return r;
+    }
+    fn isPoisoned(this: &BodyCx, name: Sym): bool {
+        for i in 0..this.poisoned.len {
+            if this.poisoned.items[i] == name { return true; }
+        }
+        return false;
+    }
+    fn poison(this: &BodyCx, name: Sym) {
+        if !this.isPoisoned(name) { this.poisoned.push(name); }
+    }
+}
+
+/// Type the bodies of module `m` into the typed tree, in item order (Rust `lower_module`'s queue): each
+/// non-generic fn, and each non-generic method of a non-generic struct. A failed fn records its Diags and
+/// the next one is typed (B11.5). Skipped once `MAX_BODY_ERRORS` errors are out: Rust stops lowering
+/// modules there; the renderer shows the first `MAX_BODY_ERRORS` and counts the rest.
+/// ponytail: Rust counts failed fns (`errs.len()`), this counts error Diags; they differ only when a
+/// later module has errors after 20+ in earlier ones (exact needs a per-session counter).
+pub fn typeModule(cx: &SemaCx, m: Id<ModDecl>): TypedMod {
+    let out = TypedMod { owner: m, bodies: List<Id<TBody>>.new(cx.arena) };
+    cx.tables.enter(m);
+    if bodyErrorCount(cx) >= MAX_BODY_ERRORS { return out; }
+    let md = cx.tables.modAt(m);
+    let items = md.items;
+    let fns = md.fns;
+    let structs = md.structs;
+    for k in 0..items.len {
+        match items.items[k] {
+            Item.Fn(f) {
+                if f.typeParams.len == 0 { bodyTypeInto(cx, findFn(cx, &fns, f.span), &out); }
+            }
+            Item.Struct(st) {
+                if st.typeParams.len > 0 { continue; }
+                for i in 0..structs.len {
+                    let sd = cx.tables.structAt(structs.items[i]);
+                    if sd.name != st.name.name { continue; }
+                    let methods = sd.methods;
+                    for q in 0..st.methods.len {
+                        if st.methods.items[q].typeParams.len == 0 { bodyTypeInto(cx, findFn(cx, &methods, st.methods.items[q].span), &out); }
+                    }
+                    break;
+                }
+            }
+            _ {}
+        }
+    }
+    return out;
+}
+
+/// The decl of `fns` declared at `sp`.
+fn findFn(cx: &SemaCx, fns: &List<Id<FnDecl>>, sp: Span): Option<Id<FnDecl>> {
+    for i in 0..fns.len {
+        let d = cx.tables.fnAt(fns.items[i]);
+        if d.span.file == sp.file && d.span.lo == sp.lo && d.span.hi == sp.hi { return Option.Some(fns.items[i]); }
+    }
+    return Option.None;
+}
+
+fn bodyTypeInto(cx: &SemaCx, f: Option<Id<FnDecl>>, out: &TypedMod) {
+    let id = match f { Option.Some(x) { x } Option.None { return; } };
+    if cx.typed.boundFatal { return; }
+    match cx.tables.fnAt(id).body {
+        Option.Some(_) { return; }
+        Option.None {}
+    }
+    match typeFn(cx, id) {
+        Option.Some(b) {
+            out.bodies.push(b);
+            drainBodyBounds(cx, Option.Some(out.owner));
+        }
+        Option.None {}
+    }
+}
+
+fn bodyErrorCount(cx: &SemaCx): int {
+    let n = 0;
+    for i in 0..cx.diags.count() {
+        match cx.diags.at(i).severity { Severity.Error { n += 1; } Severity.Warning {} }
+    }
+    return n;
+}
+
+/// Type one fn's body (sets `FnDecl.body`); None for `Lib`/`Decl` fns or after an error. A template
+/// (generic fn, method of a generic struct) goes to `gen_body.genTemplateBody` (C2b: its placeholder pass;
+/// stub None).
+pub fn typeFn(cx: &SemaCx, f: Id<FnDecl>): Option<Id<TBody>> {
+    let d = *cx.tables.fnAt(f);
+    match d.kind {
+        FnKind.J3 {}
+        _ { return Option.None; }
+    }
+    match d.gen { Option.Some(_) { return genTemplateBody(cx, f); } Option.None {} }
+    match d.recv {
+        Option.Some(s) {
+            match cx.tables.structAt(s).gen { Option.Some(_) { return genTemplateBody(cx, f); } Option.None {} }
+        }
+        Option.None {}
+    }
+    let r = typeBody(cx, f, Option.None);
+    match r { Option.Some(id) { cx.tables.fnAt(f).body = Option.Some(id); } Option.None {} }
+    return r;
+}
+
+/// The typing of one `J3` fn's body: `inst` None for a plain fn (Rust `lower_fn`), Some for an instance
+/// of template `f` (C2b, `gen_body.genDrainFn`: params, return and every written type at the instance's
+/// args; the caller stores the result in `Instance.body`). Does not set `FnDecl.body`. None after an
+/// error (the instance case reports through `gen_body.genInstErrors`).
+pub fn typeBody(cx: &SemaCx, f: Id<FnDecl>, inst: Option<Id<Instance>>): Option<Id<TBody>> {
+    let d = *cx.tables.fnAt(f);
+    let item = match d.item {
+        Option.Some(it) { it }
+        Option.None { return Option.None; }
+    };
+    let b = BodyCx.new(cx, f);
+    b.inst = inst;
+    b.ret = b.instTy(d.ret);
+    for i in 0..item.params.len {
+        let p = item.params.items[i];
+        let t = cx.tables.common.error;
+        if i < d.params.len { t = b.instTy(d.params.items[i].ty); }
+        if b.isDeclared(p.name.name) {
+            let msg = Text.new(cx.arena);
+            msg.add("duplicate parameter `").add(cx.tables.str(p.name.name)).add("`");
+            b.errs.push(b.err(p.name.span, msg.str()));
+            b.flushErrs();
+            return Option.None;
+        }
+        let id = b.newLocal(p.name.name, t, p.name.span, true);
+        b.params.push(id);
+        b.bind(p.name.name, id);
+    }
+    // Rust `setup.rs:215-243`: a script method sees its struct's fields as bare names.
+    b.scriptEnter();
+    let body = cx.typed.block(item.body.span);
+    for i in 0..item.body.stmts.len { b.stmtRecover(item.body.stmts.items[i], &body); }
+    if b.errs.len > 0 {
+        match inst {
+            Option.Some(i) { b.genInstErrors(i); }
+            Option.None { b.flushErrs(); }
+        }
+        b.errs.clear();
+        return Option.None;
+    }
+    b.missingReturn(&d, &item);
+    return Option.Some(cx.typed.addBody(TBody { decl: f, params: b.params, locals: b.locals, body: body, loops: b.nloops, slots: 0 }));
+}
+
+extend BodyCx {
+    /// Rust `missing_return`: a non-void fn whose body can run off its end.
+    fn missingReturn(this: &BodyCx, d: &FnDecl, item: &FnItem) {
+        if this.cx.tables.modAt(this.m).isScript || d.shader || isNone(item.body.span) { return; }
+        if item.body.span.lo == 0 && item.body.span.hi == 0 { return; }
+        if this.ret == this.com().void || diverges(this.cx.ast, &item.body) { return; }
+        let end = item.body.span.hi;
+        if end < item.body.span.lo + 1 { end = item.body.span.lo + 1; }
+        let at = Span { file: item.body.span.file, lo: end - 1, hi: end };
+        let t = Text.new(this.cx.arena);
+        t.add("function `").add(this.str(d.name)).add("` can reach its end without returning `").add(this.tyStr(this.ret)).add("`");
+        this.errs.push(this.help(this.err(at, t.str()), "end every path with `return ...;` (or `panic(..)` where it cannot happen)"));
+        this.flushErrs();
+    }
+
+    /// Move this fn's errors to the session in order, skipping exact repeats (Rust `gather_errors`; the
+    /// cap at `MAX_BODY_ERRORS` and the `N errors (and M more not shown)` line are the renderer's).
+    fn flushErrs(this: &BodyCx) {
+        for i in 0..this.errs.len {
+            let d = this.errs.items[i].diag;
+            let dup = false;
+            for k in 0..this.cx.diags.count() {
+                let o = this.cx.diags.at(k);
+                if o.span.file == d.span.file && o.span.lo == d.span.lo && o.span.hi == d.span.hi && o.msg == d.msg { dup = true; }
+            }
+            if !dup { this.cx.diags.add(d); }
+        }
+        this.errs.clear();
+    }
+}

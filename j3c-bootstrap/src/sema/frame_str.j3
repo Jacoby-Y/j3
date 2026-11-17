@@ -3,8 +3,427 @@
 // another param) over the call graph to a fixed point; the errors and their text.
 //
 // Part of module j3c.sema.
-// Port of: j3c/src/check/frame_str/mod.rs, check/frame_str/val.rs
+// Port of: j3c/src/check/frame_str/mod.rs
 // J3: Runs on the typed tree, after `instances` drains (plan 11 B11.6), not on lowered IR as in Rust: which
-// interpolations need a frame buffer is a typing fact, so the check stays in sema and `lower` stays a
-// dumb walk. Same rules, same error text. The per-fn dataflow is `frame_str_flow`.
+// interpolations need a frame buffer is a typing fact (`TInterp.frame`), so the check stays in sema and
+// `lower` stays a dumb walk. Same rules, same error text. The per-fn dataflow is `frame_str_flow` (statements)
+// and `frame_str_expr` (values, places, calls); a value is `frame_str_val`.
+// J3: A unit is one typed body: a plain fn, a `Fn` instance, or a closure literal's body (found while its
+// enclosing body is walked). Rust's `FuncId` order (which fixes the order of several errors) is unit order:
+// module bodies in load order, then instances, then closure bodies as found.
+// J3: Rust's `fn_refs` over the IR is the callees and closure bodies the first walk of a body meets
+// (`FsUnit.refs`). ponytail: a callee named only after a `return` in the same block is missed (the walk
+// stops there); it then has no summary, as if unreachable. Collect refs with a plain tree walk if that
+// ever shows.
 module j3c.sema;
+
+/// One param token a result may carry: (0 for the whole result, else result field + 1, token).
+struct FsRet {
+    tok: u64;
+    slot: u32;
+}
+
+/// (stored, pointer, field + 1 or 0 for the whole): one param's data stored where another param points.
+struct FsInto {
+    src: u64;
+    dst: u64;
+    slot: u32;
+}
+
+/// What a fn does with its params (Rust `Summary`); every list sorted, `site[i]` is where `esc[i]` is kept.
+struct FsSum {
+    esc: List<u64>;
+    site: List<Span>;
+    ret: List<FsRet>;
+    into: List<FsInto>;
+    /// The result may point at memory of unknown origin.
+    retU: bool;
+}
+
+fn fsSum(a: &Arena): FsSum {
+    return FsSum { esc: List<u64>.new(a), site: List<Span>.new(a), ret: List<FsRet>.new(a), into: List<FsInto>.new(a), retU: false };
+}
+
+fn fsSumEq(a: &FsSum, b: &FsSum): bool {
+    if a.retU != b.retU || a.esc.len != b.esc.len || a.ret.len != b.ret.len || a.into.len != b.into.len { return false; }
+    for i in 0..a.esc.len {
+        if a.esc.items[i] != b.esc.items[i] || !(a.site.items[i] == b.site.items[i]) { return false; }
+    }
+    for i in 0..a.ret.len {
+        if a.ret.items[i].tok != b.ret.items[i].tok || a.ret.items[i].slot != b.ret.items[i].slot { return false; }
+    }
+    for i in 0..a.into.len {
+        let x = a.into.items[i];
+        let y = b.into.items[i];
+        if x.src != y.src || x.dst != y.dst || x.slot != y.slot { return false; }
+    }
+    return true;
+}
+
+const FS_RETURN = 0;
+const FS_STORE = 1;
+const FS_CALL = 2;
+
+/// Where frame data went (Rust `Sink`): `FS_CALL` is "passed to `unit`, which keeps it at `keep`".
+struct FsSink {
+    kind: int;
+    unit: int;
+    keep: Span;
+    hasKeep: bool;
+}
+
+fn fsSink(kind: int): FsSink { return FsSink { kind: kind, unit: -1, keep: noSpan(), hasKeep: false }; }
+
+/// One analyzed body. `closure`: a closure literal's (`decl` is the enclosing fn); its params are `$ctx`
+/// first unless `plain`, and a capture is read through `$ctx` (by value when `boxed`).
+struct FsUnit {
+    body: Id<TBody>;
+    decl: Id<FnDecl>;
+    /// Units this body names (callees, fns used as values, closure bodies), in first-seen order.
+    refs: List<int>;
+    closure: bool;
+    plain: bool;
+    boxed: bool;
+    /// Has a frame string.
+    framed: bool;
+}
+
+/// The whole check's state (Rust `Ctx` and the tables of `check`).
+struct FrameStr {
+    cx: &SemaCx;
+    units: List<FsUnit>;
+    /// Unit of each `TBody` id, -1 for none.
+    unitOf: List<int>;
+    sums: List<FsSum>;
+    has: List<bool>;
+    /// `hasPtr` by `Ty` id: 0 not asked, 1 no, 2 yes.
+    ptrMemo: List<u8>;
+    /// The unit of the program's `fn main` (-1 for none): its frame lasts the run.
+    entry: int;
+    errs: List<Diag>;
+
+    fn unitFor(this: &FrameStr, b: Id<TBody>): int {
+        let i = int(b.i);
+        if i >= this.unitOf.len { return -1; }
+        return this.unitOf.items[i];
+    }
+
+    fn addUnit(this: &FrameStr, body: Id<TBody>, closure: bool, plain: bool, boxed: bool): int {
+        let known = this.unitFor(body);
+        if known >= 0 { return known; }
+        let a = this.cx.arena;
+        let i = int(body.i);
+        while this.unitOf.len <= i { this.unitOf.push(-1); }
+        let u = this.units.len;
+        this.unitOf.items[i] = u;
+        this.units.push(FsUnit { body: body, decl: this.cx.typed.body(body).decl, refs: List<int>.new(a), closure: closure, plain: plain,
+            boxed: boxed, framed: false });
+        this.sums.push(fsSum(a));
+        this.has.push(false);
+        return u;
+    }
+
+    /// The unit a callee names when it is a J3 body we have (Rust `known`), else -1 (a fn value, closure,
+    /// `dyn` slot, C fn: assumed to keep nothing).
+    fn calleeUnit(this: &FrameStr, c: Callee): int {
+        let t = this.cx.tables;
+        match c {
+            Callee.Fn(f) {
+                match t.fnAt(f.decl).body { Option.Some(b) { return this.unitFor(b); } Option.None {} }
+            }
+            Callee.Inst(ic) {
+                match t.instanceAt(ic.inst).body { Option.Some(b) { return this.unitFor(b); } Option.None {} }
+            }
+            Callee.Bound(_) {}
+            Callee.Dyn(_) {}
+            Callee.Value(_) {}
+        }
+        return -1;
+    }
+
+    /// Rust `has_ptr`: can a value of `ty` hold a pointer (a string, slice, reference, raw pointer, a
+    /// closure or `dyn` value, or a struct / tuple / enum of them)?
+    fn hasPtr(this: &FrameStr, ty: Id<Ty>): bool {
+        let i = int(ty.i);
+        while this.ptrMemo.len <= i { this.ptrMemo.push(0); }
+        if this.ptrMemo.items[i] != 0 { return this.ptrMemo.items[i] == 2; }
+        // a type reaches itself only through a reference, which answers `true` before recursing
+        this.ptrMemo.items[i] = 1;
+        let b = this.hasPtrRaw(ty);
+        // `subst` below may have grown the type pool, never past `i`
+        if b { this.ptrMemo.items[i] = 2; }
+        return b;
+    }
+
+    fn hasPtrRaw(this: &FrameStr, ty: Id<Ty>): bool {
+        let t = this.cx.tables;
+        match t.ty(ty) {
+            Ty.Ptr { return true; }
+            Ty.CStr { return true; }
+            Ty.String { return true; }
+            Ty.Ref(_) { return true; }
+            Ty.Slice(_) { return true; }
+            // Rust: a `{ fn, ctx }` / `{ $data, $vt }` struct
+            Ty.Closure(_) { return true; }
+            Ty.Dyn(_) { return true; }
+            Ty.Array(a) { return this.hasPtr(a.elem); }
+            Ty.Tuple(tu) {
+                let es = t.items(tu.elems);
+                for k in 0..es.len { if this.hasPtr(es[k]) { return true; } }
+                return false;
+            }
+            Ty.Struct(s) {
+                let n = t.structAt(s.decl).fields.len;
+                for k in 0..n { if this.hasPtr(fieldTyOf(t, ty, k)) { return true; } }
+                return false;
+            }
+            Ty.Enum(e) {
+                let ed = *t.enumAt(e.decl);
+                for k in 0..ed.variants.len {
+                    match ed.variants.items[k].payload {
+                        Option.Some(p) {
+                            let pt = p;
+                            match ed.gen { Option.Some(g) { pt = subst(t, g, p, e.args); } Option.None {} }
+                            if this.hasPtr(pt) { return true; }
+                        }
+                        Option.None {}
+                    }
+                }
+                return false;
+            }
+            Ty.Error { return false; }
+            Ty.Void { return false; }
+            Ty.Bool { return false; }
+            Ty.Int(_) { return false; }
+            Ty.Float(_) { return false; }
+            Ty.Half { return false; }
+            Ty.Vec(_) { return false; }
+            Ty.Fn(_) { return false; }
+            Ty.Param(_) { return false; }
+            Ty.TraitSelf { return false; }
+        }
+        return false;
+    }
+
+    /// A struct value in the IR (a field token reads it without a load): a struct, tuple, closure or `dyn`.
+    fn structLike(this: &FrameStr, ty: Id<Ty>): bool {
+        match this.cx.tables.ty(ty) {
+            Ty.Struct(_) { return true; }
+            Ty.Tuple(_) { return true; }
+            Ty.Closure(_) { return true; }
+            Ty.Dyn(_) { return true; }
+            _ { return false; }
+        }
+        return false;
+    }
+
+    /// 1 when unit `u`'s first IR param is the closure `$ctx`.
+    fn ctxParams(this: &FrameStr, u: int): int {
+        let d = this.units.items[u];
+        if d.closure && !d.plain { return 1; }
+        return 0;
+    }
+
+    /// The type of IR param `j` of unit `u` (`ptr` for a closure's `$ctx`, void past the end).
+    fn paramTy(this: &FrameStr, u: int, j: int): Id<Ty> {
+        let off = this.ctxParams(u);
+        if j < off { return this.cx.tables.common.ptr; }
+        let params = this.cx.typed.body(this.units.items[u].body).params;
+        if j - off >= params.len { return this.cx.tables.common.void; }
+        return this.cx.typed.local(params.items[j - off]).ty;
+    }
+
+    fn paramCount(this: &FrameStr, u: int): int {
+        return this.ctxParams(u) + this.cx.typed.body(this.units.items[u].body).params.len;
+    }
+
+    /// A method of a generic struct instance (`List<T>.push`, `Map<K, V>.put`).
+    fn isContainer(this: &FrameStr, u: int): bool {
+        let t = this.cx.tables;
+        let d = this.units.items[u];
+        if d.closure { return false; }
+        match t.fnAt(d.decl).recv {
+            Option.Some(s) { match t.structAt(s).gen { Option.Some(_) { return true; } Option.None {} } }
+            Option.None {}
+        }
+        return false;
+    }
+
+    fn fnName(this: &FrameStr, u: int): string {
+        let t = this.cx.tables;
+        let fd = t.fnAt(this.units.items[u].decl);
+        let out = Text.new(this.cx.arena);
+        match fd.recv { Option.Some(s) { out.add(t.str(t.structAt(s).name)).add("."); } Option.None {} }
+        out.add(t.str(fd.name));
+        return out.str();
+    }
+
+    fn lineOf(this: &FrameStr, s: Span): int {
+        return this.cx.sources.get(s.file).lines.at(s.lo).line;
+    }
+
+    /// A span with a place in a file (not `noSpan()`, not a whole-file span).
+    fn located(this: &FrameStr, s: Span): bool { return !isNone(s) && s.lo != 0xffffffff; }
+
+    fn sameLine(this: &FrameStr, a: Span, b: Span): bool {
+        return this.located(a) && this.located(b) && a.file == b.file && this.lineOf(a) == this.lineOf(b);
+    }
+
+    /// `path:line` of `s` appended to `out`.
+    fn loc(this: &FrameStr, s: Span, out: &Text) {
+        out.add(this.cx.sources.get(s.file).path).add(":").pushInt(this.lineOf(s));
+    }
+
+    /// Rust `Ctx::error`: the backtick string at `span` reaches `sink` at `at`.
+    fn error(this: &FrameStr, span: Span, at: Span, sink: FsSink) {
+        let a = this.cx.arena;
+        let msg = Text.new(a);
+        msg.add("a backtick string lives in this function's stack frame and cannot be ");
+        if sink.kind == FS_RETURN { msg.add("returned"); }
+        if sink.kind == FS_STORE { msg.add("stored where it outlives the function"); }
+        if sink.kind == FS_CALL { msg.add("passed to `").add(this.fnName(sink.unit)).add("`, which keeps it"); }
+        let d = this.cx.diags.make(0, Severity.Error, span, msg.str());
+        if !this.sameLine(span, at) && this.located(at) {
+            let n = Text.new(a);
+            if sink.kind == FS_RETURN { n.add("returned"); }
+            if sink.kind == FS_STORE { n.add("stored"); }
+            if sink.kind == FS_CALL { n.add("passed to `").add(this.fnName(sink.unit)).add("`"); }
+            n.add(" at ");
+            this.loc(at, &n);
+            d.notes.push(Note { kind: NoteKind.Note, span: noSpan(), msg: n.str() });
+        }
+        if sink.kind == FS_CALL && sink.hasKeep && !this.sameLine(span, sink.keep) && this.located(sink.keep) {
+            let n = Text.new(a);
+            n.add("`").add(this.fnName(sink.unit)).add("` keeps it at ");
+            this.loc(sink.keep, &n);
+            d.notes.push(Note { kind: NoteKind.Note, span: noSpan(), msg: n.str() });
+        }
+        d.notes.push(Note { kind: NoteKind.Help, span: noSpan(),
+            msg: "write it into a `j3.text.Text` the caller owns: take `t: &Text`, `t.fmt(`..`)`, return `t.str()`" });
+        // Rust `gather_errors`: one error per (place, message) over the whole program
+        for i in 0..this.errs.len {
+            if this.errs.items[i].span == span && this.errs.items[i].msg == d.msg { return; }
+        }
+        this.errs.push(d);
+    }
+
+    /// One walk of unit `u`'s body; its summary.
+    fn flow(this: &FrameStr, u: int, report: bool): FsSum {
+        let a = this.cx.arena;
+        let fl = FsFlow { g: this, unit: u, out: fsSum(a), reported: List<Span>.new(a), loopIds: List<int>.new(a),
+            loopBrk: List<FsState>.new(a), loopCont: List<FsState>.new(a), entry: u == this.entry, report: report };
+        fl.run();
+        return fl.out;
+    }
+}
+
+/// Does the program hold a backtick string that needs a frame buffer?
+fn fsAnyFrame(typed: &Typed): bool {
+    for i in 0..typed.exprs.len() {
+        match *typed.exprs.get(typed.exprs.idAt(i)) {
+            TExpr.Interp(it) { if it.frame { return true; } }
+            _ {}
+        }
+    }
+    return false;
+}
+
+/// Rust `frame_str::check`: no frame string outlives its fn, over the typed bodies of `checked` (and
+/// every drained instance body). False after an error Diag.
+pub fn checkFrameStrings(cx: &SemaCx, checked: &Checked): bool {
+    if !fsAnyFrame(cx.typed) { return true; }
+    let a = cx.arena;
+    let t = cx.tables;
+    let g = FrameStr { cx: cx, units: List<FsUnit>.new(a), unitOf: List<int>.new(a), sums: List<FsSum>.new(a), has: List<bool>.new(a),
+        ptrMemo: List<u8>.new(a), entry: -1, errs: List<Diag>.new(a) };
+    for i in 0..checked.mods.len {
+        let bodies = checked.mods.items[i].bodies;
+        for k in 0..bodies.len { g.addUnit(bodies.items[k], false, false, false); }
+    }
+    for i in 0..t.instances.len() {
+        match t.instanceAt(t.instances.idAt(i)).body { Option.Some(b) { g.addUnit(b, false, false, false); } Option.None {} }
+    }
+    match checked.entry {
+        Option.Some(f) { match t.fnAt(f).body { Option.Some(b) { g.entry = g.unitFor(b); } Option.None {} } }
+        Option.None {}
+    }
+    // the first walk of every body finds what it names, its closure bodies (new units) and its frame strings
+    let i = 0;
+    while i < g.units.len {
+        g.flow(i, false);
+        i += 1;
+    }
+    let n = g.units.len;
+    let framed = List<int>.new(a);
+    for u in 0..n { if g.units.items[u].framed { framed.push(u); } }
+    if framed.len == 0 { return true; }
+    // only what the fns with a frame buffer can call needs a summary; callees go first, and a changed
+    // summary re-runs the fns that call it, to a fixed point (recursion included)
+    let post = List<int>.new(a);
+    let seen = List<bool>.new(a);
+    let queued = List<bool>.new(a);
+    let callers = List<List<int>>.new(a);
+    for u in 0..n {
+        seen.push(false);
+        queued.push(false);
+        callers.push(List<int>.new(a));
+    }
+    let stack = List<int>.new(a);
+    let left = List<int>.new(a);
+    for r in 0..framed.len {
+        let root = framed.items[r];
+        if seen.items[root] { continue; }
+        seen.items[root] = true;
+        stack.push(root);
+        left.push(g.units.items[root].refs.len);
+        while stack.len > 0 {
+            let top = stack.len - 1;
+            let cur = stack.items[top];
+            if left.items[top] == 0 {
+                post.push(cur);
+                stack.pop();
+                left.pop();
+                continue;
+            }
+            left.items[top] -= 1;
+            let c = g.units.items[cur].refs.items[left.items[top]];
+            callers.items[c].push(cur);
+            if !seen.items[c] {
+                seen.items[c] = true;
+                stack.push(c);
+                left.push(g.units.items[c].refs.len);
+            }
+        }
+    }
+    let work = List<int>.new(a);
+    let k = post.len - 1;
+    while k >= 0 {
+        let u = post.items[k];
+        let ptrs = false;
+        for j in 0..g.paramCount(u) { if g.hasPtr(g.paramTy(u, j)) { ptrs = true; } }
+        if ptrs {
+            work.push(u);
+            queued.items[u] = true;
+        }
+        k -= 1;
+    }
+    while work.len > 0 {
+        let u = work.pop();
+        queued.items[u] = false;
+        let out = g.flow(u, false);
+        if g.has.items[u] && fsSumEq(&g.sums.items[u], &out) { continue; }
+        g.sums.items[u] = out;
+        g.has.items[u] = true;
+        let cs = callers.items[u];
+        for j in 0..cs.len {
+            let c = cs.items[j];
+            if !queued.items[c] {
+                queued.items[c] = true;
+                work.push(c);
+            }
+        }
+    }
+    for r in 0..framed.len { g.flow(framed.items[r], true); }
+    for e in 0..g.errs.len { cx.diags.add(g.errs.items[e]); }
+    return g.errs.len == 0;
+}

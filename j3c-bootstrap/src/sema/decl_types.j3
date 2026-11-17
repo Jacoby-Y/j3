@@ -1,0 +1,423 @@
+// Struct and enum declarations: names, field types and defaults, variant payloads and `#[TryCatch]`, the
+// recursive-field and embedding rules.
+//
+// Part of module j3c.sema.
+// Port of: j3c/src/check/types.rs, check/field_default.rs
+// J3: Rust stage order, as in `check_files_inner`: struct names (every module), then enums one by one
+// (names and plain payloads together, so a payload sees only the types declared before it and no imports,
+// Rust's `collect_enums`), then `use` types, then fields (`fillStructs`, which also fills the payloads of
+// generic enums and the trait signatures, once imports are in scope).
+// J3: A template's fields and payloads are resolved once, against `Ty.Param`, quietly: Rust resolved them
+// per instance, so an unused template with a bad field type compiles. Its errors are reported where Rust
+// instantiated it (`resolve.templateErrors`), a failed field is `Ty.Error` until then.
+module j3c.sema;
+
+/// Rust `collect_struct_names`: a `StructDecl` (and its `Generics`) per struct item of `m`, in item order,
+/// into `m`'s scope.
+pub fn declareTypes(cx: &SemaCx, m: Id<ModDecl>): bool {
+    let md = cx.tables.modAt(m);
+    for k in 0..md.items.len {
+        match md.items.items[k] {
+            Item.Struct(s) {
+                match scopeType(cx, m, s.name.name) {
+                    Option.Some(_) { return fail(cx, s.name.span, quoted(cx, "duplicate type ", s.name.name, "")); }
+                    Option.None {}
+                }
+                let gen: Option<Id<Generics>> = Option.None;
+                if s.typeParams.len > 0 { gen = Option.Some(newGenerics(cx, m, &s.typeParams, &s.bounds, Option.None)); }
+                let id = cx.tables.addStruct(StructDecl { owner: m, name: s.name.name, doc: s.doc, span: s.span, visPub: s.visPub, gen: gen,
+                    fields: List<FieldDecl>.new(cx.arena), methods: List<Id<FnDecl>>.new(cx.arena), packed: s.packed, debug: s.debug,
+                    scriptPath: Option.None, propSpans: List<Span>.new(cx.arena), item: Option.Some(s) });
+                cx.tables.modAt(m).structs.push(id);
+                bind(cx, m, s.name.name, refStruct(id));
+            }
+            _ {}
+        }
+    }
+    return true;
+}
+
+/// Rust `collect_enums`: an `EnumDecl` per enum item of `m`, in item order; a plain enum's payloads and
+/// `#[TryCatch]` right away (Rust's `resolve_type` rules), a generic one's in `fillStructs`.
+pub fn fillEnums(cx: &SemaCx, m: Id<ModDecl>): bool {
+    let md = cx.tables.modAt(m);
+    for k in 0..md.items.len {
+        match md.items.items[k] {
+            Item.Enum(e) {
+                match scopeType(cx, m, e.name.name) {
+                    Option.Some(_) { return fail(cx, e.name.span, quoted(cx, "duplicate type ", e.name.name, "")); }
+                    Option.None {}
+                }
+                let gen: Option<Id<Generics>> = Option.None;
+                if e.typeParams.len > 0 { gen = Option.Some(newGenerics(cx, m, &e.typeParams, &e.bounds, Option.None)); }
+                let id = cx.tables.addEnum(EnumDecl { owner: m, name: e.name.name, doc: e.doc, span: e.span, visPub: e.visPub, gen: gen,
+                    variants: List<VariantDecl>.new(cx.arena), tryCatch: Option.None, debug: e.debug,
+                    item: Option.Some(e) });
+                cx.tables.modAt(m).enums.push(id);
+                bind(cx, m, e.name.name, refEnum(id));
+                if e.typeParams.len == 0 && !fillVariants(cx, plainEnv(m), id, &e, true) { return false; }
+            }
+            _ {}
+        }
+    }
+    return true;
+}
+
+/// Variant payloads (two or more fields: a `Ty.Tuple`, `multi`) and `#[TryCatch]` of enum `id`; a
+/// template's quietly (`loud` false, see `tyIn`).
+fn fillVariants(cx: &SemaCx, env: TyEnv, id: Id<EnumDecl>, e: &EnumItem, loud: bool): bool {
+    let t = cx.tables;
+    let vs = List<VariantDecl>.new(cx.arena);
+    for i in 0..e.variants.len {
+        let v = e.variants.items[i];
+        let fields = List<Id<Ty>>.new(cx.arena);
+        for j in 0..v.fields.len {
+            match tyIn(cx, env, v.fields.items[j], loud) {
+                Option.Some(ft) {
+                    if loud && !env.plain && !rejectClosure(cx, cx.ast.typeSpan(v.fields.items[j]), ft, "an enum payload") { return false; }
+                    fields.push(ft);
+                }
+                Option.None { return false; }
+            }
+        }
+        let payload: Option<Id<Ty>> = Option.None;
+        if fields.len == 1 { payload = Option.Some(fields.items[0]); }
+        if fields.len > 1 { payload = Option.Some(t.intern(Ty.Tuple(TupleTy { elems: t.list(fields.slice()) }))); }
+        vs.push(VariantDecl { name: v.name.name, doc: v.doc, span: v.span, payload: payload, multi: fields.len > 1 });
+    }
+    t.enumAt(id).variants = vs;
+    match e.tryCatch {
+        Option.Some(tc) {
+            let ok = variantIndex(&vs, tc.ok.name);
+            if ok < 0 { return fail(cx, tc.ok.span, quoted(cx, "`#[TryCatch]` unknown variant ", tc.ok.name, "")); }
+            let er = variantIndex(&vs, tc.err.name);
+            if er < 0 { return fail(cx, tc.err.span, quoted(cx, "`#[TryCatch]` unknown variant ", tc.err.name, "")); }
+            t.enumAt(id).tryCatch = Option.Some(TryCatchDecl { success: ok, failure: er });
+        }
+        Option.None {}
+    }
+    return true;
+}
+
+fn variantIndex(vs: &List<VariantDecl>, name: Sym): int {
+    for i in 0..vs.len { if vs.items[i].name == name { return i; } }
+    return -1;
+}
+
+/// Rust `fill_struct_fields`: field types and defaults of every struct of `m` (templates against
+/// `Ty.Param`), plus generic enum payloads and trait signatures (see the header).
+pub fn fillStructs(cx: &SemaCx, m: Id<ModDecl>): bool {
+    if !fillTraits(cx, m) { return false; }
+    let md = cx.tables.modAt(m);
+    let si = 0;
+    let ei = 0;
+    for k in 0..md.items.len {
+        match md.items.items[k] {
+            Item.Struct(s) {
+                let id = md.structs.items[si];
+                si += 1;
+                if !fillFields(cx, m, id, &s) { return false; }
+            }
+            Item.Enum(e) {
+                let id = md.enums.items[ei];
+                ei += 1;
+                if e.typeParams.len > 0 && !fillVariants(cx, genEnv(m, cx.tables.enumAt(id).gen), id, &e, false) { return false; }
+            }
+            _ {}
+        }
+    }
+    return true;
+}
+
+fn fillFields(cx: &SemaCx, m: Id<ModDecl>, id: Id<StructDecl>, s: &StructItem): bool {
+    let t = cx.tables;
+    if s.typeParams.len > 0 {
+        // Rust checks a template's defaults here; the rest waited for an instance.
+        for i in 0..s.fields.len {
+            let f = s.fields.items[i];
+            match f.default {
+                Option.Some(e) {
+                    let sp = cx.ast.exprSpan(e);
+                    if mentionsParam(cx, f.ty, &s.typeParams) { return fail(cx, sp, "default on a generic field"); }
+                    match cx.ast.expr(e) {
+                        Expr.Int(_) {}
+                        Expr.Char(_) {}
+                        Expr.Float(_) {}
+                        Expr.Bool(_) {}
+                        _ { return fail(cx, sp, "field default must be a literal"); }
+                    }
+                }
+                Option.None {}
+            }
+        }
+    }
+    match fieldsOf(cx, genEnv(m, t.structAt(id).gen), s, s.typeParams.len == 0) {
+        Option.Some(fs) { t.structAt(id).fields = fs; }
+        Option.None { return false; }
+    }
+    return true;
+}
+
+/// The fields of struct item `s` in `env`. `loud` false (a template): every check is quiet, a field that
+/// fails is `Ty.Error`, and the result is never None (see `tyIn`).
+fn fieldsOf(cx: &SemaCx, env: TyEnv, s: &StructItem, loud: bool): Option<List<FieldDecl>> {
+    let t = cx.tables;
+    let fields = List<FieldDecl>.new(cx.arena);
+    for i in 0..s.fields.len {
+        let f = s.fields.items[i];
+        for j in 0..i {
+            if loud && s.fields.items[j].name.name == f.name.name {
+                fail(cx, f.name.span, quoted(cx, "duplicate field ", f.name.name, ""));
+                return Option.None;
+            }
+        }
+        let ty = tyIn(cx, env, f.ty, loud)?;
+        if loud && isArena(cx, ty) {
+            failHelp(cx, f.name.span, "do not store Arena by value; keep one `let` header and pass `&Arena`", "after Arena.create, only `&Arena`");
+            return Option.None;
+        }
+        if loud && !rejectClosure(cx, cx.ast.typeSpan(f.ty), ty, "a struct field") { return Option.None; }
+        let def: Option<ConstVal> = Option.None;
+        match f.default {
+            Option.Some(e) {
+                if mentionsParam(cx, f.ty, &s.typeParams) {
+                    if loud { fail(cx, cx.ast.exprSpan(e), "default on a generic field"); return Option.None; }
+                } else {
+                    let n0 = cx.diags.count();
+                    match literalDefault(cx, ty, e) {
+                        Option.Some(v) { def = Option.Some(v); }
+                        Option.None { if loud { return Option.None; } dropSince(cx, n0); }
+                    }
+                }
+            }
+            Option.None {}
+        }
+        fields.push(FieldDecl { name: f.name.name, doc: f.doc, span: f.span, ty: ty, embedded: f.embedded, default: def });
+    }
+    return Option.Some(fields);
+}
+
+/// Rust `is_arena_header`: `j3.memory.Arena` by value.
+fn isArena(cx: &SemaCx, ty: Id<Ty>): bool {
+    match cx.tables.ty(ty) {
+        Ty.Struct(s) {
+            let d = cx.tables.structAt(s.decl);
+            return cx.tables.str(d.name) == "Arena" && cx.tables.modAt(d.owner).key == "j3.memory";
+        }
+        _ {}
+    }
+    return false;
+}
+
+/// Rust `mentions_type_param`.
+fn mentionsParam(cx: &SemaCx, id: Id<Type>, params: &List<Ident>): bool {
+    match cx.ast.ty(id) {
+        Type.Named(n) { return hasIdent(params, n.name); }
+        Type.Generic(g) {
+            if hasIdent(params, g.name) { return true; }
+            return anyMentions(cx, &g.args, params);
+        }
+        Type.Ref(r) { return mentionsParam(cx, r.ty, params); }
+        Type.Slice(s) { return mentionsParam(cx, s.elem, params); }
+        Type.Array(a) { return mentionsParam(cx, a.elem, params); }
+        Type.Tuple(t) { return anyMentions(cx, &t.elems, params); }
+        Type.Dyn(_) { return false; }
+        Type.Fn(f) {
+            if anyMentions(cx, &f.params, params) { return true; }
+            match f.ret { Option.Some(r) { return mentionsParam(cx, r, params); } Option.None {} }
+        }
+        Type.Closure(c) {
+            if anyMentions(cx, &c.params, params) { return true; }
+            match c.ret { Option.Some(r) { return mentionsParam(cx, r, params); } Option.None {} }
+        }
+    }
+    return false;
+}
+
+fn anyMentions(cx: &SemaCx, xs: &List<Id<Type>>, params: &List<Ident>): bool {
+    for i in 0..xs.len { if mentionsParam(cx, xs.items[i], params) { return true; } }
+    return false;
+}
+
+/// Rust `literal_default`: a field default checked against the field type `ty`.
+fn literalDefault(cx: &SemaCx, ty: Id<Ty>, e: Id<Expr>): Option<ConstVal> {
+    let c = cx.tables.common;
+    let sp = cx.ast.exprSpan(e);
+    match foldedLiteral(cx.ast, e) {
+        Expr.Bool(v) {
+            if ty == c.bool { return Option.Some(ConstVal { pad: 0, ty: ty, kind: ConstPayload.Bool(v) }); }
+        }
+        Expr.BigInt(v) {
+            if ty == c.u64 { return Option.Some(ConstVal { pad: 0, ty: ty, kind: ConstPayload.Int(i64(v)) }); }
+            bigIntErr(cx, sp, v);
+            return Option.None;
+        }
+        Expr.Int(v) {
+            if v == 0 && isPointerish(cx, ty, true) { return Option.Some(ConstVal { pad: 0, ty: ty, kind: ConstPayload.Null }); }
+            if isIntTy(cx, ty) { return Option.Some(ConstVal { pad: 0, ty: ty, kind: ConstPayload.Int(v) }); }
+            if ty == c.f32 { return Option.Some(ConstVal { pad: 0, ty: ty, kind: ConstPayload.Float(f64(f32(v))) }); }
+            if ty == c.f64 { return Option.Some(ConstVal { pad: 0, ty: ty, kind: ConstPayload.Float(f64(v)) }); }
+        }
+        Expr.Float(v) {
+            if ty == c.f32 { return Option.Some(ConstVal { pad: 0, ty: ty, kind: ConstPayload.Float(f64(f32(v))) }); }
+            if ty == c.f64 { return Option.Some(ConstVal { pad: 0, ty: ty, kind: ConstPayload.Float(v) }); }
+        }
+        Expr.String(b) {
+            if ty == c.string { return Option.Some(ConstVal { pad: 0, ty: ty, kind: ConstPayload.String(b) }); }
+            fail(cx, sp, "field default must be a literal");
+            return Option.None;
+        }
+        _ {
+            fail(cx, sp, "field default must be a literal");
+            return Option.None;
+        }
+    }
+    fail(cx, sp, "field default type mismatch");
+    return Option.None;
+}
+
+fn isIntTy(cx: &SemaCx, ty: Id<Ty>): bool {
+    match cx.tables.ty(ty) { Ty.Int(_) { return true; } _ {} }
+    return false;
+}
+
+fn isFloatTy(cx: &SemaCx, ty: Id<Ty>): bool {
+    match cx.tables.ty(ty) { Ty.Float(_) { return true; } _ {} }
+    return false;
+}
+
+/// `ptr`, `cstr` (and `&T` when `refs`): what `0` means null for.
+fn isPointerish(cx: &SemaCx, ty: Id<Ty>, refs: bool): bool {
+    match cx.tables.ty(ty) {
+        Ty.Ptr { return true; }
+        Ty.CStr { return true; }
+        Ty.Ref(_) { return refs; }
+        _ {}
+    }
+    return false;
+}
+
+/// Rust `check_all_occurs`: a struct or enum that holds itself by value (through fields, arrays, tuples,
+/// payloads) is an error at its declaration.
+pub fn checkOccurs(cx: &SemaCx): bool {
+    let t = cx.tables;
+    for i in 0..t.mods.len() {
+        let md = t.modAt(t.mods.idAt(i));
+        for k in 0..md.structs.len {
+            let sid = md.structs.items[k];
+            let d = t.structAt(sid);
+            match d.gen { Option.Some(_) { continue; } Option.None {} }
+            let root = t.structTy(sid, t.items(t.common.none));
+            let seen = List<Id<Ty>>.new(cx.arena);
+            for f in 0..d.fields.len {
+                if occurs(cx, d.fields.items[f].ty, root, &seen) {
+                    return fail(cx, d.span, quoted(cx, "recursive field ", d.fields.items[f].name, " must go through `&` or `ptr`"));
+                }
+            }
+        }
+        for k in 0..md.enums.len {
+            let eid = md.enums.items[k];
+            let d = t.enumAt(eid);
+            match d.gen { Option.Some(_) { continue; } Option.None {} }
+            let root = t.enumTy(eid, t.items(t.common.none));
+            let seen = List<Id<Ty>>.new(cx.arena);
+            for v in 0..d.variants.len {
+                match d.variants.items[v].payload {
+                    Option.Some(p) {
+                        if occurs(cx, p, root, &seen) {
+                            return fail(cx, d.span, quoted(cx, "recursive field ", d.variants.items[v].name, " must go through `&` or `ptr`"));
+                        }
+                    }
+                    Option.None {}
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/// Rust `occurs_value`: does `ty` hold `root` by value? `visiting` breaks cycles through other types.
+fn occurs(cx: &SemaCx, ty: Id<Ty>, root: Id<Ty>, visiting: &List<Id<Ty>>): bool {
+    let t = cx.tables;
+    match t.ty(ty) {
+        Ty.Struct(s) {
+            if ty == root { return true; }
+            if visiting.contains(ty) { return false; }
+            visiting.push(ty);
+            let d = t.structAt(s.decl);
+            for f in 0..d.fields.len {
+                let ft = d.fields.items[f].ty;
+                match d.gen { Option.Some(g) { ft = subst(t, g, ft, s.args); } Option.None {} }
+                if occurs(cx, ft, root, visiting) { return true; }
+            }
+            visiting.pop();
+        }
+        Ty.Enum(e) {
+            if ty == root { return true; }
+            if visiting.contains(ty) { return false; }
+            visiting.push(ty);
+            let d = t.enumAt(e.decl);
+            for v in 0..d.variants.len {
+                match d.variants.items[v].payload {
+                    Option.Some(p) {
+                        let pt = p;
+                        match d.gen { Option.Some(g) { pt = subst(t, g, p, e.args); } Option.None {} }
+                        if occurs(cx, pt, root, visiting) { return true; }
+                    }
+                    Option.None {}
+                }
+            }
+            visiting.pop();
+        }
+        Ty.Array(a) { return occurs(cx, a.elem, root, visiting); }
+        Ty.Tuple(tu) {
+            let es = t.items(tu.elems);
+            for i in 0..es.len { if occurs(cx, es[i], root, visiting) { return true; } }
+        }
+        _ {}
+    }
+    return false;
+}
+
+/// Rust `check_embed_clashes`: each `use` field of `m`'s structs is a struct, and its fields (and theirs)
+/// clash with no other field name.
+pub fn checkEmbeds(cx: &SemaCx, m: Id<ModDecl>): bool {
+    let t = cx.tables;
+    let md = t.modAt(m);
+    for k in 0..md.structs.len {
+        let d = t.structAt(md.structs.items[k]);
+        match d.gen { Option.Some(_) { continue; } Option.None {} }
+        let names = List<Sym>.new(cx.arena);
+        let from = List<Sym>.new(cx.arena);
+        for f in 0..d.fields.len { names.push(d.fields.items[f].name); from.push(d.fields.items[f].name); }
+        for f in 0..d.fields.len {
+            let fd = d.fields.items[f];
+            if !fd.embedded { continue; }
+            let inner = List<Sym>.new(cx.arena);
+            match t.ty(fd.ty) {
+                Ty.Struct(s) { embedNames(cx, s.decl, &inner); }
+                _ { return fail(cx, d.span, cat3(cx, "`use ", t.str(fd.name), "` must be a struct")); }
+            }
+            for p in 0..inner.len {
+                let at = names.indexOf(inner.items[p]);
+                if at >= 0 {
+                    return fail(cx, d.span, cat5(cx, "promoted field `", t.str(inner.items[p]), "` clashes with `", t.str(from.items[at]), "`"));
+                }
+                names.push(inner.items[p]);
+                from.push(fd.name);
+            }
+        }
+    }
+    return true;
+}
+
+/// Rust `embed_names`: a struct's field names, embedded ones' fields after each.
+fn embedNames(cx: &SemaCx, sid: Id<StructDecl>, out: &List<Sym>) {
+    let d = cx.tables.structAt(sid);
+    for f in 0..d.fields.len {
+        out.push(d.fields.items[f].name);
+        if d.fields.items[f].embedded {
+            match cx.tables.ty(d.fields.items[f].ty) { Ty.Struct(s) { embedNames(cx, s.decl, out); } _ {} }
+        }
+    }
+}

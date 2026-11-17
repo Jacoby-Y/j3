@@ -1,0 +1,311 @@
+// Generic calls, use side: generic fn calls (`first(xs)`, `f::<int>(..)`), UFCS onto a generic fn
+// (`xs.first()`), and the shared pieces of every generic call: type-argument inference (`bindArg` over
+// `generics.unify`), argument adaptation, the instance request (`genInstance`) and the call node on an
+// instance (`instCallId`). Methods of generic structs and generic methods are `gen_method.j3`; enum
+// constructors, struct literals and `for` over an iterator are `gen_lit.j3`.
+//
+// Part of module j3c.sema.
+// Port of: check/generic_fn.rs (the template side is `funcs.declareFn`), check/lower/generic_fn.rs
+// (call_generic, bind_arg, adapt_arg, generic_instance, line_of), check/lower/ufcs.rs (generic UFCS),
+// check/lower/unify.rs (the error text; the walk is `generics.unify`)
+// J3: Rust matched the written AST parameter type (`Named(n) if tps.contains(n)`, `mentions`); here the
+// template signature is already a `Ty` with `Ty.Param`s of the fn's `Generics`, so "names `T`" is
+// `generics.mentions` and "is `T`" is a `Ty.Param` of that `Generics`. An inferred slot not bound yet is
+// `common.error` (Rust: missing from the `HashMap`).
+// J3: Each call requests `InstKey { Fn, fn, args }` (`instances.request`, B11.2) and builds `Callee.Inst`
+// with the parameter and return types substituted (`generics.subst`); the instance body is typed by
+// `gen_body.genDrainFn`. Rust allocated the IR fn here (`alloc_fn`, named `f<stable_ty,..>`); lower does.
+module j3c.sema;
+
+/// Rust `generic_fn::MAX_DEPTH`: an instance whose type args nest deeper than this is a runaway recursion.
+const GEN_MAX_DEPTH = 32;
+
+extend BodyCx {
+    /// A generic method `name` of struct `s` (Rust `method_temps`; for a generic struct every method).
+    fn genericMethod(this: &BodyCx, s: Id<StructDecl>, name: Sym): Option<Id<FnDecl>> {
+        match this.findMethodAny(s, name) {
+            Option.Some(f) { match this.cx.tables.fnAt(f).gen { Option.Some(_) { return Option.Some(f); } Option.None {} } }
+            Option.None {}
+        }
+        return Option.None;
+    }
+
+    /// `f(args)` / `f::<T>(args)` for generic fn `f` named `n` (Rust `call_generic`).
+    fn genCall(this: &BodyCx, sp: Span, n: Ident, f: Id<FnDecl>, typeArgs: &List<Id<Type>>, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        return this.genCallFn(sp, n.name, f, typeArgs, Option.None, args);
+    }
+
+    /// `recv.f(args)` where no method `f` exists and the visible `f` is a generic fn (Rust `call` ending in
+    /// `generic_named` + `call_generic` with the receiver). `Ok(None)`: not a generic UFCS call.
+    fn genUfcs(this: &BodyCx, sp: Span, name: Ident, typeArgs: &List<Id<Type>>, recv: Id<TPlace>, args: &List<Id<Expr>>): Result<Option<Id<TExpr>>, TErr> {
+        match this.lookupName(name.name) {
+            Option.Some(r) {
+                if r.kind != DeclKind.Fn { return Result.Ok(Option.None); }
+                let f = r.asFn();
+                match this.cx.tables.fnAt(f).gen { Option.Some(_) {} Option.None { return Result.Ok(Option.None); } }
+                return Result.Ok(Option.Some(this.genCallFn(sp, name.name, f, typeArgs, Option.Some(recv), args)?));
+            }
+            Option.None {}
+        }
+        return Result.Ok(Option.None);
+    }
+
+    /// Rust `call_generic`: infer the type args of generic fn `f` (written `typeArgs` first, then the
+    /// receiver, the typed arguments, a bare number's default), request the instance, check each argument
+    /// against its substituted parameter.
+    fn genCallFn(this: &BodyCx, sp: Span, name: Sym, f: Id<FnDecl>, typeArgs: &List<Id<Type>>, recv: Option<Id<TPlace>>, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let t = this.cx.tables;
+        let d = *t.fnAt(f);
+        let g = match d.gen { Option.Some(x) { x } Option.None { return Result.Err(this.err(sp, "not a generic function")); } };
+        let skip = 0;
+        match recv { Option.Some(_) { skip = 1; } Option.None {} }
+        if args.len + skip != d.params.len {
+            let m = Text.new(this.cx.arena);
+            m.add("takes ");
+            m.pushInt(d.params.len);
+            m.add(" args, got ");
+            m.pushInt(args.len + skip);
+            return Result.Err(this.err(sp, m.str()));
+        }
+        let ntp = t.genericsAt(g).names.len;
+        let out = this.genSlots(ntp);
+        if typeArgs.len > 0 {
+            if typeArgs.len != ntp {
+                let m = Text.new(this.cx.arena);
+                m.add("`").add(this.str(name)).add("` takes ");
+                m.pushInt(ntp);
+                m.add(" type args, got ");
+                m.pushInt(typeArgs.len);
+                return Result.Err(this.err(sp, m.str()));
+            }
+            for i in 0..ntp { out[i] = this.resolve(typeArgs.items[i])?; }
+        }
+        match recv {
+            Option.Some(r) {
+                // A receiver is adjusted (`&`, deref) to the first parameter, so match through that.
+                let p = d.params.items[0].ty;
+                let a = this.placeTy(r);
+                match this.refInner(p) {
+                    Option.Some(inner) { match this.refInner(a) { Option.Some(_) {} Option.None { p = inner; } } }
+                    Option.None { match this.refInner(a) { Option.Some(inner) { a = inner; } Option.None {} } }
+                }
+                this.bindArg(sp, g, p, a, out)?;
+            }
+            Option.None {}
+        }
+        let slots = List<Option<Id<TExpr>>>.new(this.cx.arena);
+        for i in 0..args.len {
+            let arg = args.items[i];
+            let pt = d.params.items[skip + i].ty;
+            if this.bareNum(arg) || this.isClosureLit(arg) {
+                slots.push(Option.None);
+                continue;
+            }
+            // No `T` in the parameter, or `T` already fixed by an earlier arg: a plain destination type.
+            let want: Option<Id<Ty>> = Option.None;
+            match this.genParamOf(g, pt) {
+                Option.Some(k) { if out[k] != this.com().error { want = Option.Some(out[k]); } }
+                Option.None { if !mentions(t, g, pt) { want = Option.Some(pt); } }
+            }
+            let op = this.operand(arg, want)?;
+            this.bindArg(this.cx.ast.exprSpan(arg), g, pt, this.exprTy(op), out)?;
+            slots.push(Option.Some(op));
+        }
+        // A closure literal's written types (`fn(v: int): f32 {..}`) also bind what its parameter names.
+        for i in 0..args.len { this.closureBindArg(g, d.params.items[skip + i].ty, args.items[i], out)?; }
+        // `maxOf(1, 2)`: with nothing else to go on, a bare number takes its default type.
+        for i in 0..args.len {
+            match slots.items[i] { Option.Some(_) { continue; } Option.None {} }
+            if !this.bareNum(args.items[i]) { continue; }
+            match this.genParamOf(g, d.params.items[skip + i].ty) {
+                Option.Some(k) {
+                    if out[k] == this.com().error {
+                        let op = this.operand(args.items[i], Option.None)?;
+                        out[k] = this.exprTy(op);
+                        slots.items[i] = Option.Some(op);
+                    }
+                }
+                Option.None {}
+            }
+        }
+        for k in 0..ntp {
+            if out[k] != this.com().error { continue; }
+            let tp = this.str(t.genericsAt(g).names.items[k]);
+            let help = Text.new(this.cx.arena);
+            help.add("pass a value whose type is (or contains) `").add(tp).add("`, or write it: `").add(this.str(name)).add("::<int>(..)`");
+            return Result.Err(this.help(this.cannotInfer(sp, g, k, name), help.str()));
+        }
+        let what = Text.new(this.cx.arena);
+        what.add("`").add(this.str(name)).add("`");
+        this.genCallBounds(sp, what.str(), g, out)?;
+        let targs = t.list(out);
+        let inst = this.genInstance(sp, f, targs)?;
+        let ops = List<Id<TExpr>>.new(this.cx.arena);
+        match recv {
+            Option.Some(r) { ops.push(this.autoThis(sp, r, subst(t, g, d.params.items[0].ty, targs))?); }
+            Option.None {}
+        }
+        for i in 0..args.len {
+            let want = subst(t, g, d.params.items[skip + i].ty, targs);
+            let arg = args.items[i];
+            let op = match slots.items[i] {
+                Option.Some(x) { x }
+                Option.None { this.operand(arg, Option.Some(want))? }
+            };
+            ops.push(this.adaptArg(this.cx.ast.exprSpan(arg), op, want)?);
+        }
+        return Result.Ok(this.expr(TExpr.Call(TCall { callee: Callee.Inst(InstCallee { inst: inst }), args: ops }), subst(t, g, d.ret, targs), sp));
+    }
+
+    /// `n` inference slots, all unbound (`common.error`).
+    fn genSlots(this: &BodyCx, n: int): []Id<Ty> {
+        let out = this.cx.arena.alloc::<Id<Ty>>(n);
+        for i in 0..n { out[i] = this.com().error; }
+        return out;
+    }
+
+    /// The index of `t` when it is parameter `k` of `g` (Rust `Named(n) if tps.contains(n)`).
+    fn genParamOf(this: &BodyCx, g: Id<Generics>, t: Id<Ty>): Option<int> {
+        match this.ty(t) { Ty.Param(p) { if p.gen == g { return Option.Some(p.index); } } _ {} }
+        return Option.None;
+    }
+
+    /// `fn(..) {..}` written as an argument.
+    fn isClosureLit(this: &BodyCx, e: Id<Expr>): bool {
+        match this.cx.ast.expr(e) { Expr.Closure(_) { return true; } _ { return false; } }
+        return false;
+    }
+
+    /// Rust `cannot infer type parameter `T` of `name`` with where `T` is declared (help added by caller).
+    fn cannotInfer(this: &BodyCx, sp: Span, g: Id<Generics>, k: int, name: Sym): TErr {
+        let gd = this.cx.tables.genericsAt(g);
+        let tp = this.str(gd.names.items[k]);
+        let m = Text.new(this.cx.arena);
+        m.add("cannot infer type parameter `").add(tp).add("` of `").add(this.str(name)).add("`");
+        let n = Text.new(this.cx.arena);
+        n.add("`").add(tp).add("` is declared at ").add(lineOf(this.cx, gd.spans.items[k]));
+        return this.note(this.err(sp, m.str()), n.str());
+    }
+
+    /// Rust `bind_arg`: `unify` with its conflict as an error at `sp`.
+    fn bindArg(this: &BodyCx, sp: Span, g: Id<Generics>, p: Id<Ty>, a: Id<Ty>, out: []Id<Ty>): Result<bool, TErr> {
+        match unify(this.cx.tables, g, p, a, out) {
+            Option.Some(c) {
+                let m = Text.new(this.cx.arena);
+                m.add("`").add(this.str(this.cx.tables.genericsAt(g).names.items[c.index])).add("` is both `").add(this.tyStr(c.first))
+                    .add("` and `").add(this.tyStr(c.second)).add("`");
+                return Result.Err(this.help(this.err(sp, m.str()), "every use of one type parameter must be the same type; convert one argument"));
+            }
+            Option.None {}
+        }
+        return Result.Ok(true);
+    }
+
+    /// Rust `adapt_arg`: an argument typed without a destination, checked against the instance's parameter.
+    fn adaptArg(this: &BodyCx, sp: Span, op: Id<TExpr>, want: Id<Ty>): Result<Id<TExpr>, TErr> {
+        if this.exprTy(op) == want { return Result.Ok(op); }
+        match this.cx.typed.expr(op) {
+            TExpr.Load(r) {
+                match this.arrayToSlice(sp, r.place, want) { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+                match this.textToString(sp, r.place, want) { Option.Some(v) { return Result.Ok(v); } Option.None {} }
+            }
+            _ {}
+        }
+        return Result.Err(this.mismatch(sp, "type mismatch", this.exprTy(op), want));
+    }
+
+    /// Rust `generic_instance` / `lookup_method`'s instance: the instance of `f` at `args`, requested at `sp`
+    /// (one per key across modules; its body is typed when the queue drains). A new generic fn instance
+    /// is one deeper than the body asking for it; past GEN_MAX_DEPTH it errs (Rust's runaway check).
+    fn genInstance(this: &BodyCx, sp: Span, f: Id<FnDecl>, args: Id<TyList>): Result<Id<Instance>, TErr> {
+        let t = this.cx.tables;
+        let key = InstKey { kind: InstKind.Fn, item: refFn(f), args: args };
+        match t.instMap.get(key) { Option.Some(id) { return Result.Ok(id); } Option.None {} }
+        let depth = 0;
+        match t.fnAt(f).recv {
+            Option.Some(_) {}
+            Option.None {
+                depth = 1;
+                match this.inst { Option.Some(i) { depth += t.instanceAt(i).depth; } Option.None {} }
+            }
+        }
+        if depth > GEN_MAX_DEPTH {
+            let name = this.str(t.fnAt(f).name);
+            let m = Text.new(this.cx.arena);
+            m.add("`").add(name).add("` instantiates itself with ever-deeper types");
+            let n = Text.new(this.cx.arena);
+            n.pushInt(GEN_MAX_DEPTH);
+            n.add(" nested instances so far, e.g. `").add(name).add("<List<T>>` called from `").add(name).add("<T>`");
+            return Result.Err(this.help(this.note(this.err(sp, m.str()), n.str()), "make the recursive call use the same type arguments"));
+        }
+        let id = request(this.cx, key, sp);
+        t.instanceAt(id).depth = depth;
+        return Result.Ok(id);
+    }
+
+    /// Rust `call_id` on an instance: `f` at type args `targs` (its `Generics` order), `recv` as `this`.
+    /// Same checks and messages as `callId`, with the parameter and return types substituted.
+    fn instCallId(this: &BodyCx, sp: Span, f: Id<FnDecl>, targs: Id<TyList>, recv: Option<Id<TPlace>>, args: &List<Id<Expr>>): Result<Id<TExpr>, TErr> {
+        let t = this.cx.tables;
+        let d = *t.fnAt(f);
+        let g = match d.gen { Option.Some(x) { x } Option.None { return this.callId(sp, f, recv, args); } };
+        let inst = this.genInstance(sp, f, targs)?;
+        let ps = List<Id<Ty>>.new(this.cx.arena);
+        for i in 0..d.params.len { ps.push(subst(t, g, d.params.items[i].ty, targs)); }
+        let ret = subst(t, g, d.ret, targs);
+        let out = List<Id<TExpr>>.new(this.cx.arena);
+        let first = 0;
+        match recv {
+            Option.Some(r) {
+                if ps.len == 0 { return Result.Err(this.err(sp, "method has no `this` parameter")); }
+                out.push(this.autoThis(sp, r, ps.items[0])?);
+                first = 1;
+            }
+            Option.None {}
+        }
+        if ps.len - first != args.len {
+            let name = this.str(d.name);
+            let m = Text.new(this.cx.arena);
+            m.add("`").add(name).add("` takes ");
+            m.pushInt(ps.len - first);
+            m.add(" args, got ");
+            m.pushInt(args.len);
+            let n = Text.new(this.cx.arena);
+            n.add("fn ").add(name).add("(");
+            for i in first..ps.len {
+                if i > first { n.add(", "); }
+                n.add(this.tyStr(ps.items[i]));
+            }
+            n.add(")");
+            if ret != this.com().void { n.add(": ").add(this.tyStr(ret)); }
+            return Result.Err(this.note(this.err(sp, m.str()), n.str()));
+        }
+        for i in 0..args.len { out.push(this.operand(args.items[i], Option.Some(ps.items[first + i]))?); }
+        return Result.Ok(this.expr(TExpr.Call(TCall { callee: Callee.Inst(InstCallee { inst: inst }), args: out }), ret, sp));
+    }
+
+    /// The bound checks of a generic call (Rust `check_call_bounds`: each argument meets its parameter's
+    /// bounds). `what` names the callee (`` `f` ``). The check is `trait_call.traitGenBounds`.
+    fn genCallBounds(this: &BodyCx, sp: Span, what: string, g: Id<Generics>, args: []Id<Ty>): Result<bool, TErr> {
+        return this.traitGenBounds(sp, what, g, args);
+    }
+
+    /// Rust `lookup_method`'s `no generic method `name`` (`x.m::<T>()` / `S.m::<T>()` where `m` is no
+    /// generic method). Also `body_call.callField`'s.
+    fn genNoGenericMethod(this: &BodyCx, sp: Span, name: Sym): TErr {
+        let m = Text.new(this.cx.arena);
+        m.add("no generic method `").add(this.str(name)).add("`");
+        return this.err(sp, m.str());
+    }
+
+    /// The Diags `resolve.tyOf`-style helpers raised since `n0`, as this statement's error (as `resolve`).
+    fn genTakeDiags(this: &BodyCx, n0: int): Option<TErr> {
+        if this.cx.diags.items.len <= n0 { return Option.None; }
+        let first = this.cx.diags.items.items[n0];
+        for i in n0 + 1..this.cx.diags.items.len {
+            this.errs.push(TErr { diag: this.cx.diags.items.items[i], unknown: Option.None });
+        }
+        this.cx.diags.items.len = n0;
+        return Option.Some(TErr { diag: first, unknown: Option.None });
+    }
+}

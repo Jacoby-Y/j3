@@ -1,9 +1,303 @@
-// Type expressions to sema's `Ty`: structs, enums, generics, arrays, slices, pointers, closures, tuples,
-// `dyn`, `use` embedding; struct field defaults (`hp: int = 100`, a literal checked against the field
-// type, refused on a type-parameter field).
+// Sema's types: `Ty` (every type the checker distinguishes), the `TyList` interner and `CommonTys`.
 //
 // Part of module j3c.sema.
-// Port of: j3c/src/check/types.rs, check/field_default.rs
+// Port of: (new in plan 11 B11; sema's own type table, replacing check's use of `ir::ty`)
 // J3: `Ty` is interned in a sema pool (`Id<Ty>`, equality is id equality) and defined here; `lower` maps it
 // to an `ir` type (layers.txt puts `ir` below sema).
+// J3: Contract (wave 4, `.swarm-opus/11-port/contracts-c2a-sema.md`). Every type Rust's checker can name
+// has a variant, generics/closures/tuples/`dyn`/simd/f16 included, so later chunks fill code without
+// changing the enum. Rust lowers closures, tuples and `dyn` to structs inside `check`; here they stay their
+// own `Ty` until `lower` maps them.
+// J3: A generic declaration is typed once against `Ty.Param` placeholders (B11.1); an instance is
+// `Ty.Struct { decl, args }` / `Ty.Enum { decl, args }` with non-empty `args`, made on demand
+// (`instances`). Type resolution is `resolve.resolveTy`; the struct/enum declaration passes are
+// `decl_types`.
 module j3c.sema;
+
+/// Integer widths (Rust `ir::ty::IntTy`); `int` is `I64`, `char` literals take the other side's width.
+pub enum IntKind { I8, I16, I32, I64, U8, U16, U32, U64 }
+
+/// Rust `FloatTy`; `float` is `F64`.
+pub enum FloatKind { F32, F64 }
+
+/// `vec4f` / `vec4i` (Rust `VecTy`): 4 lanes, 16 bytes, align 16.
+pub enum VecKind { F32x4, I32x4 }
+
+/// A type. Interned: build one with `Tables.intern` (or the helpers), compare `Id<Ty>`s with `==`.
+pub enum Ty {
+    /// A poisoned item or expression (B11.5): no further errors are reported about it.
+    Error,
+    Void,
+    Bool,
+    Int(IntKind),
+    Float(FloatKind),
+    /// `f16`: storage only.
+    Half,
+    Vec(VecKind),
+    /// Untyped address (`ptr`), FFI / stdlib only.
+    Ptr,
+    /// `cstr` (`char*`), `use lib` only.
+    CStr,
+    /// The `string` lang item (read-only `[]u8` view).
+    String,
+    /// `&T`.
+    Ref(RefTy),
+    /// `[N]T`.
+    Array(ArrayTy),
+    /// `[]T`.
+    Slice(SliceTy),
+    /// `fn(A, B): R`, a plain fn pointer.
+    Fn(FnTy),
+    /// A struct; a generic one with its type arguments (empty `args` for a plain struct or a template).
+    Struct(StructTy),
+    Enum(EnumTy),
+    /// `(A, B)`, two or more elements (Rust: an anonymous `tuple.*` struct made in `check`).
+    Tuple(TupleTy),
+    /// `closure(A): R`, or `fn[mem](A): R` when `boxed` (Rust: a `{ fn, env }` struct).
+    Closure(ClosureTy),
+    /// `dyn Trait` (Rust: a `{ $data, $vt }` struct).
+    Dyn(DynTy),
+    /// A generic parameter `T` of a fn, struct, enum or method, inside its template (B11.1).
+    Param(ParamTy),
+    /// `Self` inside a trait's method signatures and default bodies.
+    TraitSelf,
+}
+
+pub struct RefTy { inner: Id<Ty>; }
+pub struct ArrayTy { elem: Id<Ty>; len: u64; }
+pub struct SliceTy { elem: Id<Ty>; }
+pub struct FnTy { params: Id<TyList>; ret: Id<Ty>; }
+pub struct StructTy { decl: Id<StructDecl>; args: Id<TyList>; }
+pub struct EnumTy { decl: Id<EnumDecl>; args: Id<TyList>; }
+pub struct TupleTy { elems: Id<TyList>; }
+pub struct ClosureTy { params: Id<TyList>; ret: Id<Ty>; boxed: bool; }
+pub struct DynTy { decl: Id<TraitDecl>; }
+/// Parameter `index` of the parameter list `gen` (`Tables.generics`).
+pub struct ParamTy { gen: Id<Generics>; index: int; }
+
+/// An interned list of types (params, type arguments, tuple elements); `Tables.list` / `Tables.items`.
+pub struct TyList { items: []Id<Ty>; }
+
+/// The interner key of a `Ty`: tag plus up to two ids and a number, so equal types hash equal.
+struct TyKey {
+    tag: int;
+    a: u32;
+    b: u32;
+    n: u64;
+
+    fn operator==(this: TyKey, o: TyKey): bool { return this.tag == o.tag && this.a == o.a && this.b == o.b && this.n == o.n; }
+    fn hash(this: TyKey): u64 { return mix(u64(this.tag) ^ mix(u64(this.a) ^ mix(u64(this.b) ^ mix(this.n)))); }
+}
+
+/// The interner key of a `TyList`: the element ids.
+struct TyListKey {
+    items: []Id<Ty>;
+
+    fn operator==(this: TyListKey, o: TyListKey): bool {
+        if this.items.len != o.items.len { return false; }
+        for i in 0..this.items.len {
+            if this.items[i] != o.items[i] { return false; }
+        }
+        return true;
+    }
+    fn hash(this: TyListKey): u64 {
+        let h = mix(u64(this.items.len));
+        for i in 0..this.items.len { h = mix(h ^ u64(this.items[i].i)); }
+        return h;
+    }
+}
+
+/// The primitive types, interned when the `Tables` are made (Rust `CommonTys`).
+pub struct CommonTys {
+    error: Id<Ty>;
+    void: Id<Ty>;
+    bool: Id<Ty>;
+    i8: Id<Ty>;
+    i16: Id<Ty>;
+    i32: Id<Ty>;
+    i64: Id<Ty>;
+    u8: Id<Ty>;
+    u16: Id<Ty>;
+    u32: Id<Ty>;
+    u64: Id<Ty>;
+    f32: Id<Ty>;
+    f64: Id<Ty>;
+    half: Id<Ty>;
+    vec4f: Id<Ty>;
+    vec4i: Id<Ty>;
+    ptr: Id<Ty>;
+    cstr: Id<Ty>;
+    string: Id<Ty>;
+    traitSelf: Id<Ty>;
+    /// The empty `TyList` (args of a plain struct or enum).
+    none: Id<TyList>;
+}
+
+/// The type pool and its interner (part of `Tables`).
+pub struct TyPool {
+    tys: Pool<Ty>;
+    map: Map<TyKey, Id<Ty>>;
+    lists: Pool<TyList>;
+    listMap: Map<TyListKey, Id<TyList>>;
+    /// Per type: the module being checked when it was first interned, as `Id<ModDecl>.i + 1` (0: none).
+    /// Rust names a struct/enum instance after that module (`Tables.tyHome`).
+    homes: List<u32>;
+    /// The module being checked now, same encoding (`Tables.enter`).
+    cur: u32;
+    /// `homeInst` nesting.
+    homing: int;
+
+    fn new(arena: &Arena): TyPool {
+        return TyPool { tys: Pool<Ty>.new(arena), map: Map<TyKey, Id<Ty>>.new(arena, 256), lists: Pool<TyList>.new(arena),
+            listMap: Map<TyListKey, Id<TyList>>.new(arena, 256), homes: List<u32>.new(arena), cur: 0, homing: 0 };
+    }
+}
+
+fn intKindTag(k: IntKind): u64 {
+    match k {
+        IntKind.I8 { return 0; }
+        IntKind.I16 { return 1; }
+        IntKind.I32 { return 2; }
+        IntKind.I64 { return 3; }
+        IntKind.U8 { return 4; }
+        IntKind.U16 { return 5; }
+        IntKind.U32 { return 6; }
+        IntKind.U64 { return 7; }
+    }
+    return 0;
+}
+
+/// The interner key of `t` (exhaustive: a new variant fails to compile here first).
+fn tyKey(t: Ty): TyKey {
+    match t {
+        Ty.Error { return TyKey { tag: 0, a: 0, b: 0, n: 0 }; }
+        Ty.Void { return TyKey { tag: 1, a: 0, b: 0, n: 0 }; }
+        Ty.Bool { return TyKey { tag: 2, a: 0, b: 0, n: 0 }; }
+        Ty.Int(k) { return TyKey { tag: 3, a: 0, b: 0, n: intKindTag(k) }; }
+        Ty.Float(k) {
+            let n = u64(0);
+            match k { FloatKind.F32 {} FloatKind.F64 { n = 1; } }
+            return TyKey { tag: 4, a: 0, b: 0, n: n };
+        }
+        Ty.Half { return TyKey { tag: 5, a: 0, b: 0, n: 0 }; }
+        Ty.Vec(k) {
+            let n = u64(0);
+            match k { VecKind.F32x4 {} VecKind.I32x4 { n = 1; } }
+            return TyKey { tag: 6, a: 0, b: 0, n: n };
+        }
+        Ty.Ptr { return TyKey { tag: 7, a: 0, b: 0, n: 0 }; }
+        Ty.CStr { return TyKey { tag: 8, a: 0, b: 0, n: 0 }; }
+        Ty.String { return TyKey { tag: 9, a: 0, b: 0, n: 0 }; }
+        Ty.Ref(r) { return TyKey { tag: 10, a: r.inner.i, b: 0, n: 0 }; }
+        Ty.Array(r) { return TyKey { tag: 11, a: r.elem.i, b: 0, n: r.len }; }
+        Ty.Slice(r) { return TyKey { tag: 12, a: r.elem.i, b: 0, n: 0 }; }
+        Ty.Fn(r) { return TyKey { tag: 13, a: r.params.i, b: r.ret.i, n: 0 }; }
+        Ty.Struct(r) { return TyKey { tag: 14, a: r.decl.i, b: r.args.i, n: 0 }; }
+        Ty.Enum(r) { return TyKey { tag: 15, a: r.decl.i, b: r.args.i, n: 0 }; }
+        Ty.Tuple(r) { return TyKey { tag: 16, a: r.elems.i, b: 0, n: 0 }; }
+        Ty.Closure(r) {
+            let n = u64(0);
+            if r.boxed { n = 1; }
+            return TyKey { tag: 17, a: r.params.i, b: r.ret.i, n: n };
+        }
+        Ty.Dyn(r) { return TyKey { tag: 18, a: r.decl.i, b: 0, n: 0 }; }
+        Ty.Param(r) { return TyKey { tag: 19, a: r.gen.i, b: 0, n: u64(r.index) }; }
+        Ty.TraitSelf { return TyKey { tag: 20, a: 0, b: 0, n: 0 }; }
+    }
+    return TyKey { tag: 0, a: 0, b: 0, n: 0 };
+}
+
+extend Tables {
+    /// The one id of `t` (made on first sight).
+    fn intern(this: &Tables, t: Ty): Id<Ty> {
+        let k = tyKey(t);
+        match this.types.map.get(k) {
+            Option.Some(id) {
+                // First made by a template's placeholder pass (no module: Rust's works on a copy).
+                touchTy(this, id);
+                return id;
+            }
+            Option.None {}
+        }
+        let id = this.types.tys.add(t);
+        this.types.map.put(k, id);
+        this.types.homes.push(this.types.cur);
+        if this.types.cur != 0 { homeInst(this, id); }
+        return id;
+    }
+
+    /// Module `m` is the one being checked from here on (declarations, then its bodies and instances).
+    fn enter(this: &Tables, m: Id<ModDecl>): Id<ModDecl> {
+        this.types.cur = m.i + 1;
+        return m;
+    }
+
+    /// No module is being checked (the templates' placeholder passes).
+    fn leave(this: &Tables) { this.types.cur = 0; }
+
+    /// The module that was being checked when `id` was first made (Rust: where a struct or enum instance
+    /// was instantiated, which its stable name spells). None for the types made before any module.
+    fn tyHome(this: &Tables, id: Id<Ty>): Option<Id<ModDecl>> {
+        let h = this.types.homes.items[int(id.i)];
+        if h == 0 { return Option.None; }
+        return Option.Some(Id<ModDecl> { i: h - 1 });
+    }
+
+    /// The type behind `id` (a copy).
+    fn ty(this: &Tables, id: Id<Ty>): Ty { return *this.types.tys.get(id); }
+
+    /// The one id of the list `items` (copied into the arena on first sight).
+    fn list(this: &Tables, items: []Id<Ty>): Id<TyList> {
+        match this.types.listMap.get(TyListKey { items: items }) {
+            Option.Some(id) { return id; }
+            Option.None {}
+        }
+        let own = this.arena.alloc::<Id<Ty>>(items.len);
+        for i in 0..items.len { own[i] = items[i]; }
+        let id = this.types.lists.add(TyList { items: own });
+        this.types.listMap.put(TyListKey { items: own }, id);
+        return id;
+    }
+
+    /// The elements of a `TyList`.
+    fn items(this: &Tables, id: Id<TyList>): []Id<Ty> { return this.types.lists.get(id).items; }
+
+    fn refTo(this: &Tables, inner: Id<Ty>): Id<Ty> { return this.intern(Ty.Ref(RefTy { inner: inner })); }
+    fn sliceOf(this: &Tables, elem: Id<Ty>): Id<Ty> { return this.intern(Ty.Slice(SliceTy { elem: elem })); }
+    fn arrayOf(this: &Tables, elem: Id<Ty>, len: u64): Id<Ty> { return this.intern(Ty.Array(ArrayTy { elem: elem, len: len })); }
+    fn fnTy(this: &Tables, params: []Id<Ty>, ret: Id<Ty>): Id<Ty> {
+        return this.intern(Ty.Fn(FnTy { params: this.list(params), ret: ret }));
+    }
+    fn structTy(this: &Tables, decl: Id<StructDecl>, args: []Id<Ty>): Id<Ty> {
+        return this.intern(Ty.Struct(StructTy { decl: decl, args: this.list(args) }));
+    }
+    fn enumTy(this: &Tables, decl: Id<EnumDecl>, args: []Id<Ty>): Id<Ty> {
+        return this.intern(Ty.Enum(EnumTy { decl: decl, args: this.list(args) }));
+    }
+    fn paramTy(this: &Tables, gen: Id<Generics>, index: int): Id<Ty> {
+        return this.intern(Ty.Param(ParamTy { gen: gen, index: index }));
+    }
+
+    /// `&T` to `T`, else None (Rust `ref_inner`).
+    fn refInner(this: &Tables, t: Id<Ty>): Option<Id<Ty>> {
+        match this.ty(t) {
+            Ty.Ref(r) { return Option.Some(r.inner); }
+            _ {}
+        }
+        return Option.None;
+    }
+
+    fn isError(this: &Tables, t: Id<Ty>): bool { return t == this.common.error; }
+}
+
+/// Intern the primitives (called once by `Tables.new`).
+fn commonTys(t: &Tables): CommonTys {
+    let none = t.list(t.arena.alloc::<Id<Ty>>(0));
+    return CommonTys { error: t.intern(Ty.Error), void: t.intern(Ty.Void), bool: t.intern(Ty.Bool),
+        i8: t.intern(Ty.Int(IntKind.I8)), i16: t.intern(Ty.Int(IntKind.I16)), i32: t.intern(Ty.Int(IntKind.I32)),
+        i64: t.intern(Ty.Int(IntKind.I64)), u8: t.intern(Ty.Int(IntKind.U8)), u16: t.intern(Ty.Int(IntKind.U16)),
+        u32: t.intern(Ty.Int(IntKind.U32)), u64: t.intern(Ty.Int(IntKind.U64)), f32: t.intern(Ty.Float(FloatKind.F32)),
+        f64: t.intern(Ty.Float(FloatKind.F64)), half: t.intern(Ty.Half), vec4f: t.intern(Ty.Vec(VecKind.F32x4)),
+        vec4i: t.intern(Ty.Vec(VecKind.I32x4)), ptr: t.intern(Ty.Ptr), cstr: t.intern(Ty.CStr), string: t.intern(Ty.String),
+        traitSelf: t.intern(Ty.TraitSelf), none: none };
+}

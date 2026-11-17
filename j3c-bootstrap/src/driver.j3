@@ -8,9 +8,411 @@
 //     flag is one field plus the code that reads it, never another entry point.
 // J3: One arena per `Session` (B6): a compile allocates only there, and the session is dropped whole when a
 //     newer one replaces it (LSP, MCP and editor helpers run for hours). Memo entries that outlive it are
-//     copied into a size-capped cache arena.
+//     copied into a size-capped cache arena. `Session.new` returns a pointer into the session's own arena;
+//     `free` unmaps it, so the pointer is dead after.
+// J3: `Options` strings are argv or static text (they outlive every session); anything else is copied in.
 // J3: Stage functions take explicit inputs (B5): load one file, sema one module given its deps' signatures,
 //     lower one module given all signatures, one object per module. No global state, so the
 //     `(stage, module, input hash)` memo table can be added after parity without reshaping them.
 // J3: Holds the ordered IR pass list (`ir/passes.j3` has the runner): only this stage sees `ir` and `devmode`.
+//     Order is Rust's: validate (in check), fast (end of load_and_check), devmode (devrun, after bytecode).
+// J3: `run` walks `STAGES` (one row per `Stage`). Load is real (C1: `load.loadProgram`, the program in
+//     `Session.loaded`); sema and lower call their entries (C2); passes run `ir/passes.j3` (validate is
+//     real, fast and devmode are not-ported stubs); backend (C2a) works out the build settings
+//     (`Session.emit`, Rust `emit_opts`) and emits the `.ll` text into `Session.ll`; link (C2a) runs clang
+//     through `toolchain` and leaves the program's path in `Session.exe`. A not-ported stage adds a code-0
+//     error "STAGE: not ported yet" and returns false, which stops the walk.
+// J3: `Options` covers compile.rs's entry-point params (entry, target, headless = GameBackend::Headless,
+//     Mode Lib = !require_main, Mode Dev = load_and_check_with(dev), Tool = compile_tool) and the build/run
+//     flags that reach the compiler (`--fast`, `--release`, `--emit`, `--opt`, `--file`, `--host`, `--hot`,
+//     plus the new `--dump-after`, `--time-passes`). `--frames`/`--screenshot`/`--splash` are env for the
+//     program, not compiler options.
 module j3c.driver;
+
+use j3.data.pool.Pool;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.text.Text;
+use j3c.backend;
+use j3c.base.diag.{ Diags, Severity, notPorted };
+use j3c.base.intern.{ Names, Sym };
+use j3c.base.phase.Phases;
+use j3c.base.span.{ Source, noSpan };
+use j3c.ir.{ Pass, PassCx, Program, runPasses };
+use j3c.ir.dump;
+use j3c.ir.validate;
+use j3c.load;
+use j3c.load.{ LoadCx, LoadOpts, Parsed };
+use j3c.lower;
+use j3c.lower.LowerCx;
+use j3c.project.manifest;
+use j3c.sema;
+use j3c.sema.Checked;
+use j3c.toolchain;
+use j3c.toolchain.{ EmitOpts, defaultEmitOpts };
+
+pub enum Mode { Build, Check, Lib, Tool, Dev }
+
+/// Pipeline stages in order; `run` stops after the one it is given.
+pub enum Stage { Load, Sema, Lower, Passes, Backend, Link }
+
+/// Everything a command can ask of the compiler. One field per flag.
+pub struct Options {
+    /// Entry file, project dir or `j3.toml`; "" for the project in the cwd, else the built-in hello.
+    entry: string;
+    /// Target triple, "" for the host.
+    target: string;
+    mode: Mode;
+    headless: bool;
+    fast: bool;
+    /// `--opt LEVEL` (`0`..`3`, `s`, `z`), "" for the manifest's (Rust `cli::OPT`).
+    opt: string;
+    debug: bool;
+    /// Backend name (`llvm`, `bc`), "" for the manifest's.
+    emit: string;
+    /// `--dump-after=PASS`, "" for none.
+    dumpAfter: string;
+    timePasses: bool;
+    /// `--release`: opt s, no `-g`, stripped, no unwind tables (Rust `cli::RELEASE`).
+    release: bool;
+    /// `--file`: a `.j3` entry is built alone even inside a project (`project::FILE_ONLY`).
+    fileOnly: bool;
+    /// `--host`: ignore the manifest's `[emit] targets` (`project::HOST`).
+    host: bool;
+    /// `run --hot`: rebuild and reload on change (`cli::HOT`).
+    hot: bool;
+    /// The command runs the program after the link (`run`): an Android target is refused, and a program
+    /// without a manifest output path goes to a temp file (`build` writes `target/a.out`).
+    run: bool;
+}
+
+/// Defaults: check the project in the cwd, dev settings.
+pub fn defaults(): Options {
+    return Options { entry: ".", target: "", mode: Mode.Check, headless: false, fast: false, opt: "", debug: true, emit: "", dumpAfter: "", timePasses: false, release: false, fileOnly: false, host: false, hot: false,
+        run: false };
+}
+
+/// One compile. Everything it allocates is in `arena`.
+pub struct Session {
+    opts: Options;
+    arena: &Arena;
+    names: Names;
+    diags: Diags;
+    sources: Pool<Source>;
+    phases: Phases;
+    /// The parsed module graph, after `Stage.Load`.
+    loaded: Option<Parsed>;
+    /// Sema's output (tables + typed tree), after `Stage.Sema`.
+    checked: Option<&Checked>;
+    /// The lowered IR, after `Stage.Lower` (the passes change it in place).
+    program: Option<&Program>;
+    /// Build settings (Rust `EmitOpts`), set by `Stage.Backend`.
+    emit: EmitOpts;
+    /// The backend's output (`.ll` text), after `Stage.Backend`.
+    ll: string;
+    /// The built program, after `Stage.Link`.
+    exe: string;
+    /// Stages already run (`stageIndex` of the last + 1): a second `run` resumes after them.
+    done: int;
+
+    /// A new session in its own arena.
+    fn new(opts: Options): &Session {
+        let a = Arena.create(1 << 16);
+        // The arena lives inside itself: copy it into its own first cell, then allocate only through that.
+        let cell = a.alloc::<Arena>(1);
+        cell[0] = a;
+        let ap = &cell[0];
+        let s = ap.new::<Session>(Session { opts: opts, arena: ap, names: Names.new(ap), diags: Diags.new(ap), sources: Pool<Source>.new(ap), phases: Phases.new(ap), loaded: Option.None,
+            checked: Option.None, program: Option.None, emit: defaultEmitOpts(ap), ll: "", exe: "", done: 0 });
+        if opts.timePasses { s.phases.enable(); }
+        return s;
+    }
+
+    /// Release everything the session allocated, the session itself included. `this` is dead after.
+    fn free(this: &Session) {
+        let a = *this.arena;
+        a.destroy();
+    }
+}
+
+/// The IR passes in order (validate, fast, devmode), allocated in `arena`. A new pass is one entry.
+pub fn passes(arena: &Arena): []Pass {
+    let ps = arena.alloc::<Pass>(3);
+    ps[0] = Pass { name: "validate", cond: fn(cx: &PassCx): bool { return cx.validate; }, run: validatePass };
+    ps[1] = Pass { name: "fast", cond: fn(cx: &PassCx): bool { return cx.fast; }, run: fastPass };
+    ps[2] = Pass { name: "devmode", cond: fn(cx: &PassCx): bool { return cx.dev && cx.scripts; }, run: devPass };
+    return ps;
+}
+
+/// Rust `check/mod.rs`: `validate_module` on every module; the first failure is an error (a compiler bug).
+fn validatePass(cx: &PassCx, prog: &Program) {
+    match validate.validateProgram(prog) {
+        Result.Ok(_) {}
+        Result.Err(e) { cx.diags.add(cx.diags.make(0, Severity.Error, noSpan(), e.message)); }
+    }
+}
+// J3: C2 ports ir/fast.rs (strip_aborts) here.
+fn fastPass(cx: &PassCx, prog: &Program) { notPorted(cx.diags, "IR pass fast"); }
+// J3: C4 calls devmode (compile/dev.rs `lower`) here.
+fn devPass(cx: &PassCx, prog: &Program) { notPorted(cx.diags, "IR pass devmode"); }
+
+/// The pass context for `s` (flags from its `Options`); `dump` runs after `--dump-after`'s pass.
+pub fn passCx(s: &Session, dump: fn(&PassCx, &Program)): PassCx {
+    let dev = false;
+    match s.opts.mode {
+        Mode.Dev { dev = true; }
+        Mode.Build {}
+        Mode.Check {}
+        Mode.Lib {}
+        Mode.Tool {}
+    }
+    // J3: `scripts` is set from the loaded files (any `.j3s`) once load is ported (C1).
+    // Rust validates in every check (`check/mod.rs`), release or not.
+    return PassCx { dev: dev, fast: s.opts.fast, validate: true, scripts: false, dumpAfter: s.opts.dumpAfter,
+        timePasses: s.opts.timePasses, arena: s.arena, diags: &s.diags, phases: &s.phases, dump: dump };
+}
+
+/// Run the IR passes of `s` on `prog`; false on an error.
+pub fn runIr(s: &Session, prog: &Program): bool {
+    let cx = passCx(s, dumpToStdout);
+    return runPasses(passes(s.arena), &cx, prog);
+}
+
+/// `--dump-after`: the IR text of `prog` on stdout.
+fn dumpToStdout(cx: &PassCx, prog: &Program) {
+    let t = Text.new(cx.arena);
+    dump.dumpProgram(prog, &t);
+    t.flushTo(1);
+}
+
+/// One row of the pipeline: `run` false (or an error Diag) stops the walk. `phase` is the Rust `phase.rs`
+/// `OUTER` name the stage runs under (lower and the passes run inside Rust's `check`; clang's `compile`
+/// is part of link here), so `[n/6]` progress and `--time-passes` match `compilation.log`.
+struct Step {
+    phase: string;
+    run: fn(&Session): bool;
+}
+
+/// Run the pipeline up to and including `upTo`, resuming after the stages an earlier call ran (so `run`
+/// can stop after `Passes`, print warnings, then go on to `Link`); false when a diagnostic is an error.
+pub fn run(s: &Session, upTo: Stage): bool {
+    // One row per `Stage`, in its order.
+    let steps: [6]Step = [
+        Step { phase: "parse", run: loadStage },
+        Step { phase: "check", run: semaStage },
+        Step { phase: "check", run: lowerStage },
+        Step { phase: "check", run: passesStage },
+        Step { phase: "emit", run: backendStage },
+        Step { phase: "compile", run: linkStage },
+    ];
+    let last = stageIndex(upTo);
+    for i in s.done..last + 1 {
+        s.phases.begin(steps[i].phase); // a repeated name continues the open phase
+        let f = steps[i].run;
+        if !f(s) || s.diags.hasErrors() { return false; }
+        s.done = i + 1;
+    }
+    return !s.diags.hasErrors();
+}
+
+fn stageIndex(st: Stage): int {
+    match st {
+        Stage.Load { return 0; }
+        Stage.Sema { return 1; }
+        Stage.Lower { return 2; }
+        Stage.Passes { return 3; }
+        Stage.Backend { return 4; }
+        Stage.Link { return 5; }
+    }
+    return 0;
+}
+
+// The stage rows. Each port replaces one body (see the header for which chunk).
+
+/// Rust `load_input` + `compile_input` + the load half of `load_and_check_with`: the parsed program goes
+/// to `s.loaded`; errors (resolve, read, parse, imports, cycles) are in `s.diags`.
+fn loadStage(s: &Session): bool {
+    // Rust keeps `--host` / `--file` in `project` statics; the manifest code reads them there.
+    manifest.setHost(s.opts.host);
+    manifest.setFileOnly(s.opts.fileOnly);
+    let dev = false;
+    match s.opts.mode {
+        Mode.Dev { dev = true; }
+        Mode.Build {}
+        Mode.Check {}
+        Mode.Lib {}
+        Mode.Tool {}
+    }
+    let cx = LoadCx { arena: s.arena, names: &s.names, diags: &s.diags, sources: &s.sources };
+    let lo = LoadOpts { entry: s.opts.entry, target: s.opts.target, headless: s.opts.headless, release: s.opts.release, dev: dev };
+    match load.loadProgram(cx, lo) {
+        Option.Some(p) {
+            s.loaded = Option.Some(p);
+            return true;
+        }
+        Option.None { return false; }
+    }
+}
+/// Rust `check_files` (`check_files_lib` for `Mode.Lib`): sema over `s.loaded`, result in `s.checked`.
+fn semaStage(s: &Session): bool {
+    match s.loaded {
+        Option.Some(p) {
+            let parsed = s.arena.new::<Parsed>(p);
+            let cx = sema.newCx(s.arena, &s.names, &s.diags, &s.sources, parsed);
+            match sema.checkProgram(&cx, s.opts.mode != Mode.Lib) {
+                Option.Some(c) {
+                    s.checked = Option.Some(s.arena.new::<Checked>(c));
+                    return true;
+                }
+                Option.None { return false; }
+            }
+        }
+        Option.None { return false; }
+    }
+}
+
+/// `lower` over `s.checked` (B11.1: a walk, no type decisions), the IR program in `s.program`.
+fn lowerStage(s: &Session): bool {
+    match s.checked {
+        Option.Some(c) {
+            let dyns = List<Sym>.new(s.arena);
+            match s.loaded {
+                Option.Some(p) { for i in 0..p.files.len { dyns.extend(p.files.items[i].ast.dyns.slice()); } }
+                Option.None {}
+            }
+            let cx = LowerCx { arena: s.arena, names: &s.names, diags: &s.diags, checked: c, dyns: dyns };
+            match lower.lowerProgram(&cx) {
+                Option.Some(p) {
+                    // lower builds over an empty source pool (LowerCx has none): debug info and panic lines read these
+                    p.cx.sources = &s.sources;
+                    s.program = Option.Some(s.arena.new::<Program>(p));
+                    return true;
+                }
+                Option.None { return false; }
+            }
+        }
+        Option.None { return false; }
+    }
+}
+
+/// The IR pass list (validate, fast, devmode) on `s.program`.
+fn passesStage(s: &Session): bool {
+    match s.program {
+        Option.Some(p) { return runIr(s, p); }
+        Option.None { return false; }
+    }
+}
+
+/// `dump-ir`: the text of `s.program` (Rust `ir::dump`) into `out`, after `run(s, Stage.Passes)`.
+pub fn dumpIr(s: &Session, out: &Text): bool {
+    match s.program {
+        Option.Some(p) {
+            dump.dumpProgram(p, out);
+            return true;
+        }
+        Option.None { return false; }
+    }
+}
+
+/// `dump-llvm`: the `.ll` text of `s.program` from the LLVM backend into `out`, after `Stage.Passes` (Rust
+/// `dump_ll_prog`: always LLVM, the build settings or the defaults when they are bad).
+pub fn emitLlvm(s: &Session, out: &Text): bool {
+    let e = toolchain.defaultEmitOpts(s.arena);
+    match emitOpts(s) {
+        Result.Ok(x) { e = x; }
+        Result.Err(_) {}
+    }
+    return emitWith(s, "llvm", &e, out);
+}
+
+/// Rust `cli::emit_opts`: the manifest's `[emit]`/`[cc]`/`[link]` (or the defaults for a single file), then
+/// `--opt`, `--fast` and `--release`. `build` of a program with no manifest writes `target/a.out`.
+pub fn emitOpts(s: &Session): Result<EmitOpts, string> {
+    let e = toolchain.defaultEmitOpts(s.arena);
+    match s.loaded {
+        Option.Some(p) {
+            match p.project {
+                Option.Some(m) { e = toolchain.emitOptsFromManifest(&m, s.arena)?; }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
+    if s.opts.opt.len > 0 { e.cc.opt = s.opts.opt; }
+    if s.opts.fast { e.cc.debug = false; }
+    if s.opts.release {
+        e.cc.release = true;
+        e.cc.debug = false;
+        e.incremental = false;
+        if s.opts.opt.len == 0 { e.cc.opt = "s"; }
+    }
+    if !s.opts.run && e.cc.out.len == 0 { e.cc.out = "target/a.out"; }
+    return Result.Ok(e);
+}
+
+/// Emit `s.program` with the backend `name` into `out`; false with Diags.
+fn emitWith(s: &Session, name: string, e: &EmitOpts, out: &Text): bool {
+    match s.program {
+        Option.Some(p) {
+            match backend.find(name, noSpan(), &s.diags) {
+                Option.Some(b) {
+                    let o = toolchain.backendOpts(e);
+                    return b.emit(p, &o, out, &s.diags);
+                }
+                Option.None { return false; }
+            }
+        }
+        Option.None { return false; }
+    }
+}
+
+/// Rust `emit_opts` + `emit_text`: the build settings into `s.emit`, the backend's text into `s.ll`. The
+/// backend is `--emit`, else `[emit] backend`, else LLVM.
+fn backendStage(s: &Session): bool {
+    match emitOpts(s) {
+        Result.Ok(e) { s.emit = e; }
+        Result.Err(x) { return fail(s, x); }
+    }
+    let name = s.opts.emit;
+    if name.len == 0 {
+        name = "llvm";
+        match s.loaded {
+            Option.Some(p) {
+                match p.project {
+                    Option.Some(m) { name = m.emit.backend; }
+                    Option.None {}
+                }
+            }
+            Option.None {}
+        }
+    }
+    let t = Text.new(s.arena);
+    if !emitWith(s, name, &s.emit, &t) { return false; }
+    s.ll = t.str();
+    return true;
+}
+
+/// Rust `compile_program` (the clang half) and `run_loaded`'s Android refusal: the program's path in `s.exe`.
+/// A cross build's error names its target (Rust `link_built`).
+fn linkStage(s: &Session): bool {
+    if s.opts.run && toolchain.targetOs(s.emit.target) == toolchain.TargetOs.Android {
+        return fail(s, "this is an Android target, which can't run on this machine; build an apk to run it on a device or emulator, or `j3c run --host` for a host build of the same source");
+    }
+    match toolchain.compileText(s.ll, &s.emit, s.arena) {
+        Result.Ok(p) {
+            s.exe = p;
+            return true;
+        }
+        Result.Err(x) {
+            if s.emit.target.len == 0 { return fail(s, x); }
+            return fail(s, Text.new(s.arena).add("target ").add(s.emit.target).add(":\n").add(x).str());
+        }
+    }
+}
+
+/// A plain error (code 0, no span: Rust's `Err(String)`); false.
+fn fail(s: &Session, msg: string): bool {
+    s.diags.add(s.diags.make(0, Severity.Error, noSpan(), msg));
+    return false;
+}

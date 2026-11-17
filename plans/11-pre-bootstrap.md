@@ -506,3 +506,59 @@ is rebuilt from the tag once it exists.
   - [x] 4 A7 + B notes: stubs `lower`, `ir`, `devmode`, `shader`, `backend`, `toolchain`, `cache`, `main`, new `driver.j3`, new `ir/passes.j3`
   - [x] 5 A7 + B notes: tool stubs (`cmd`, `pkgtool`, `doc`, `lsp`, `mcp`, `scene`, `editor`, `assets`, `dist`, `textmate`); A8 `PORT_DEBT.md`, A10 + B7 `AGENTS.md`, A12 README note
 - [x] After wave 1: rebuilt `stage0/j3c` (`--worktree`, dirty), gate PASS; `known/{fmt,ast,err,ir,llvm}.txt` seeded.
+
+## Waves (Part B run, `.swarm-opus/11-pre-bootstrap-b/`): port-independent skeletons
+
+Real, compiling, unit-tested J3 for the B pieces that need no ported stage. Anything needing the parser,
+sema, lowering or Rust-exact rendering stays a stub for Part C.
+
+- Wave 0 (contracts): unit-test pattern + `tests/unit.sh`, reachability from `main.j3`, signatures for
+  `base/{diag,ids,span,intern,phase}`, `driver`, `ir/passes`, `backend`, `cmd/testcompiler`, tool table,
+  JSON-RPC loop; `text/errors.txt` + `text/syntax/keywords.txt` formats.
+  - [x] w0 (unit tests run as throwaway packages under target/unit/; main.j3 `use`s modules for reachability; @embed paths file-relative; `Spans<T>`)
+- Wave 1 (4 parallel):
+  - [x] 1 B3/B4/B10 `base` (diag list + code table, ids/span side table, intern, phase) + the two data files filled
+  - [x] 2 B1/B6/B8/B8a `driver` Session/Options/run, `ir/passes` table, `backend` table
+  - [x] 3 B9 `test-compiler` runner (against stage0 now) + first `tests/cases/`
+  - [x] 4 B12.3/B12.4 tool table + generators, JSON-RPC loop
+
+## Waves (Part C run, `.swarm-opus/11-port/`)
+
+### Milestone C1: `base` (what load needs), `syntax` with `fmt` and `dump-ast`, `load` — DONE (fmt/ast 508/508, parse errors clean, scale in budget, review fixes applied)
+- Wave 0 (contracts): complete AST + token types, Parser struct/cursor/errors, cross-part parser signatures,
+  lex/fmt/dump/walk/toml/fsx entry signatures, `fmt`/`dump-ast`/`check` command wiring.
+  - [x] w0 (one Ast per Session, Expr/Stmt/Type/Pat in Pools + Spans; payload structs per variant (stage0 limit); parse core real; fmt/dump-ast/check wired)
+- [x] Wave 1 (3 parallel, isolated worktrees; `diff.sh fmt` 500/500 ok, known/fmt.txt empty): lex + fmt (gate: `diff.sh fmt` clean); dump + walk (unit tests
+  on hand-built ASTs vs stage0 `dump-ast`); base toml + fsx + syntax flow + extend.
+- [x] Wave 2 (isolated; `diff.sh ast` 503/503, known/ast.txt empty): the whole parser (one chunk: the halves can't be tested apart; gate `diff.sh ast`),
+  load core, load scripts + scene scripts.
+- [x] Wave 3 (shared worktree): load core, load scripts + scene scripts, driver/check, dump depth fix, A11 scale check (within budget). `diff.sh err`: parse errors clean.
+  (Chunk lists written when wave 1 is done.)
+
+### Milestone C2a: plain code end to end (sema redesign start, lower, ir, LLVM, minimal toolchain) — DONE (gate rescoped: user-module ir parity 8/8; llvm samples exact; run ok stdlib-free; review fixes applied)
+Corpus: `.swarm-opus/11-port/c2a-corpus.txt`. Even `printLn` pulls in generic stdlib declarations, so sema
+resolves generic declarations from the start and leaves bodies uninstantiated unless demanded.
+- [x] Wave 4 (contracts, 2 isolated): IR data model ported as is (+ cx tables, abi); `Ty` + typed tree + all stage signatures + command wiring.
+- [x] Wave 5: sema declarations; sema bodies (typed tree); IR dump + validate; toolchain + run/build/dump commands.
+- [x] Wave 6 (shared worktree): `lower`; LLVM backend. Gate: `ir --norm`, `llvm`, `run` exact on the C2a corpus.
+
+### Milestone C2b: generics, traits/bounds/operators, patterns/match — DONE (gate rescoped: entry-module ir 13/13, run 13/13, check 13/13; full-file ir/llvm parity moved to C2c; review fixes applied)
+Gate: full-file `ir --norm`, `llvm`, `run` exact on `.swarm-opus/11-port/c2b-corpus.txt`; C1/C2a gates green.
+- [x] Wave 7 (contracts, 1 agent): typed-tree nodes for instances/patterns/trait calls, instantiation queue API, dispatch hooks to gen_/trait_/pat_ sema parts and inst_/pat_ lower parts, last stage0 layout pads.
+- [x] Wave 8 (3 sema agents, shared worktree): generics + instantiation queue; traits/bounds/operators/UFCS; patterns/match/`?`.
+- [x] Wave 9 (shared worktree): lower instances + trait calls; lower patterns/match; integration. Gate rescoped: entry-module ir, run and check exact on the C2b corpus; full-file ir/llvm parity moves to C2c (needs tuples, closures, frame strings, simd in the stdlib).
+
+### Milestone C2c: tuples, closures, frame strings, simd/f16, dyn, derive, lint — DONE (full-file ir/llvm/run/check 25/25; unit 64; err 26/0; review fixes applied)
+Gate: full-file `ir --norm`, `llvm`, `run` exact and `check` same on the C2b and C2c corpus files; `Typed.untyped` empty; staging deleted.
+- [x] Wave 10 (contracts, 1 agent): hooks from the shared sema/lower files into per-feature part files, IR table stubs, order rules, `contracts-c2c.md`.
+- [x] Wave 11 (5 agents, shared worktree, one feature each end to end): tuples + lint; closures; simd/f16/intrinsics; frame strings/Text.fmt; dyn + derive.
+- [x] Wave 12 (integration): full-file parity, delete the untyped-fn staging, C2b review leftovers, shrink known lists.
+
+### Milestone C2d: gpu/shader + `dump-glsl`, script AOT, `@uiChoice`, `--fast`
+Gate: `diff.sh glsl` exact; full-file `ir --norm`, `llvm` exact on the C2d corpus; C2c gate stays green; `notYet` deleted. Survey: `.swarm-opus/11-port/survey-c2d.md`. (`.j3ui` is C2e; the script VM stays in C4.)
+- [ ] Wave 13 (contracts, 1 agent): layer move, prepare call sites, hooks for the 4 `notYet` sites, shader shared types, `dump-glsl`/`dump-ui` wiring, `diff.sh` `glsl`/`ui` modes, float-const fix, `contracts-c2d.md`, `c2d-corpus.txt`.
+- [ ] Wave 14 (4 agents, shared worktree): shader types/expressions; shader generator + `dump-glsl`; scripts AOT + `@uiChoice`; `--fast` + driver.
+- [ ] Wave 15 (integration): full-file parity on the C2d corpus and the other non-`.j3ui` entries, shrink known lists, delete `notYet`.
+
+### Milestone C2e: `.j3ui` (markup parser, gen, span map, `dump-ui`)
+Gate: `diff.sh ui` exact on the UI projects, then full-file `ir --norm`, `llvm`. Partition after C2d.

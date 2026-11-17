@@ -1,0 +1,256 @@
+// What a value may carry, for `frame_str_flow`: a sorted set of tokens (a param's data, the frame buffer of a
+// backtick string, a pointer to a local, memory of unknown origin), kept per first-level field for a struct
+// value so a local struct holding a `&Css` and a frame string does not mix the two. Plus the locals' values
+// at one point of a body (`FsState`).
+//
+// Part of module j3c.sema.
+// Port of: j3c/src/check/frame_str/val.rs, check/frame_str/flow.rs (State)
+// J3: A token is a bare `u64` (Rust `Tok(u64)`, same bits) and a set a sorted `List<u64>`: no payload enums
+// in these structs (stage 0 layout hazard, PORT_DEBT (a)). A struct copy shares its lists' buffers, so a
+// value is changed only by the fn that made it; `FsState.get` and `fsValClone` hand out fresh copies.
+// J3: Rust's `HashMap<u32, SVal>` state is two parallel lists sorted by key (equality and joins walk them
+// in order; a body's pointer-carrying locals are few).
+module j3c.sema;
+
+// J3: Functions, not typed consts: stage 0 gives a typed const used in an expression the type `int`.
+fn fsFieldMask(): u64 { return u64(0x1fffffff); }
+fn fsAddrBit(): u64 { return u64(1) << 61; }
+fn fsKindMask(): u64 { return u64(3) << 62; }
+fn fsKLoc(): u64 { return u64(1) << 62; }
+fn fsKF(): u64 { return u64(2) << 62; }
+/// Memory of unknown origin (a global, an allocator, a C call): a store there is kept.
+fn fsU(): u64 { return u64(3) << 62; }
+/// The hidden local of a spilled temporary (`TPlace` id `i`), of a stack closure's ctx (`TExpr` id `i`), and
+/// inside a closure body the `_ctx` local (the `$ctx` param as `&ctx`).
+fn fsTmpKey(i: u32): u32 { return u32(0x80000000) | i; }
+fn fsCloKey(i: u32): u32 { return u32(0xc0000000) | i; }
+fn fsCtxKey(): u32 { return u32(0xffffffff); }
+
+fn fsParam(j: int): u64 { return u64(j); }
+/// The frame buffer of backtick string `x` (its `TExpr` id).
+fn fsBuf(x: u32): u64 { return fsKF() | u64(x); }
+fn fsLoc(x: u32): u64 { return fsKLoc() | u64(x); }
+fn fsIsParam(t: u64): bool { return (t & fsKindMask()) == u64(0); }
+fn fsIsFrame(t: u64): bool { return (t & fsKindMask()) == fsKF(); }
+fn fsIsLoc(t: u64): bool { return (t & fsKindMask()) == fsKLoc(); }
+fn fsId(t: u64): u32 { return u32(t & u64(0xffffffff)); }
+/// The field a token is narrowed to, -1 for none.
+fn fsField(t: u64): int { return int((t >> 32) & fsFieldMask()) - 1; }
+
+/// Narrowed to field `f`, unless already narrowed (deeper fields are not tracked).
+fn fsRefine(t: u64, f: int): u64 {
+    if (fsIsParam(t) || fsIsLoc(t)) && fsField(t) < 0 && u64(f) < fsFieldMask() { return t | (u64(f + 1) << 32); }
+    return t;
+}
+
+/// A pointer to field `f` of what this pointer points at (`&this.f` from `this`).
+fn fsAddr(t: u64, f: int): u64 {
+    let r = fsRefine(t, f);
+    if r != t && fsIsParam(r) { return r | fsAddrBit(); }
+    return r;
+}
+
+fn fsIsAddr(t: u64): bool { return fsIsParam(t) && (t & fsAddrBit()) != u64(0); }
+
+/// The value at the address this token is (a field address loads to the field's value).
+fn fsLoaded(t: u64): u64 {
+    if fsIsAddr(t) { return t ^ fsAddrBit(); }
+    return t;
+}
+
+/// Without its field: the param or local itself.
+fn fsBase(t: u64): u64 { return t & (fsKindMask() | u64(0xffffffff)); }
+
+fn fsSet(a: &Arena): List<u64> { return List<u64>.new(a); }
+
+fn fsSetAdd(s: &List<u64>, t: u64) {
+    let i = 0;
+    while i < s.len && s.items[i] < t { i += 1; }
+    if i < s.len && s.items[i] == t { return; }
+    s.insert(i, t);
+}
+
+fn fsSetAddAll(s: &List<u64>, o: List<u64>) {
+    for i in 0..o.len { fsSetAdd(s, o.items[i]); }
+}
+
+fn fsSetHas(s: List<u64>, t: u64): bool {
+    for i in 0..s.len { if s.items[i] == t { return true; } }
+    return false;
+}
+
+fn fsSetEq(a: List<u64>, b: List<u64>): bool {
+    if a.len != b.len { return false; }
+    for i in 0..a.len { if a.items[i] != b.items[i] { return false; } }
+    return true;
+}
+
+fn fsSetCopy(s: List<u64>): List<u64> {
+    let out = List<u64>.new(s.arena);
+    out.extend(s.slice());
+    return out;
+}
+
+/// A value (Rust `SVal`): what it carries as a whole, plus per field of a struct value (`fkeys` sorted,
+/// `fsets[i]` never empty).
+struct FsVal {
+    whole: List<u64>;
+    fkeys: List<int>;
+    fsets: List<List<u64>>;
+}
+
+fn fsVal(a: &Arena): FsVal { return FsVal { whole: List<u64>.new(a), fkeys: List<int>.new(a), fsets: List<List<u64>>.new(a) }; }
+
+/// Rust `SVal::of`: `set` as a whole value (copied).
+fn fsValOf(set: List<u64>): FsVal {
+    let v = fsVal(set.arena);
+    v.whole.extend(set.slice());
+    return v;
+}
+
+fn fsValTok(a: &Arena, t: u64): FsVal {
+    let v = fsVal(a);
+    v.whole.push(t);
+    return v;
+}
+
+fn fsValClone(v: FsVal): FsVal {
+    let out = fsVal(v.whole.arena);
+    out.whole.extend(v.whole.slice());
+    for i in 0..v.fkeys.len {
+        out.fkeys.push(v.fkeys.items[i]);
+        out.fsets.push(fsSetCopy(v.fsets.items[i]));
+    }
+    return out;
+}
+
+fn fsValEmpty(v: FsVal): bool {
+    if v.whole.len > 0 { return false; }
+    for i in 0..v.fsets.len { if v.fsets.items[i].len > 0 { return false; } }
+    return true;
+}
+
+fn fsValEq(a: FsVal, b: FsVal): bool {
+    if !fsSetEq(a.whole, b.whole) || a.fkeys.len != b.fkeys.len { return false; }
+    for i in 0..a.fkeys.len {
+        if a.fkeys.items[i] != b.fkeys.items[i] || !fsSetEq(a.fsets.items[i], b.fsets.items[i]) { return false; }
+    }
+    return true;
+}
+
+/// Everything, fields included.
+fn fsFlat(v: FsVal): List<u64> {
+    let out = fsSetCopy(v.whole);
+    for i in 0..v.fsets.len { fsSetAddAll(&out, v.fsets.items[i]); }
+    return out;
+}
+
+/// What reading field `f` of this value gives.
+fn fsSelect(v: FsVal, f: int): List<u64> {
+    let out = List<u64>.new(v.whole.arena);
+    for i in 0..v.whole.len { fsSetAdd(&out, fsRefine(v.whole.items[i], f)); }
+    for i in 0..v.fkeys.len {
+        if v.fkeys.items[i] == f { fsSetAddAll(&out, v.fsets.items[i]); }
+    }
+    return out;
+}
+
+fn fsAddField(v: &FsVal, f: int, s: List<u64>) {
+    if s.len == 0 { return; }
+    let i = 0;
+    while i < v.fkeys.len && v.fkeys.items[i] < f { i += 1; }
+    if i < v.fkeys.len && v.fkeys.items[i] == f {
+        fsSetAddAll(&v.fsets.items[i], s);
+        return;
+    }
+    v.fkeys.insert(i, f);
+    v.fsets.insert(i, fsSetCopy(s));
+}
+
+fn fsValAdd(v: &FsVal, o: FsVal) {
+    fsSetAddAll(&v.whole, o.whole);
+    for i in 0..o.fkeys.len { fsAddField(v, o.fkeys.items[i], o.fsets.items[i]); }
+}
+
+/// Locals' values at one point (Rust `State`); `live` false after a `return` / `break` / `continue`.
+/// A key is a `TLocal` id, or a hidden temporary's (`frame_str_place`).
+struct FsState {
+    keys: List<u32>;
+    vals: List<FsVal>;
+    live: bool;
+
+    /// Index of `x`, or where it goes (`this.keys.len` at the end).
+    fn slot(this: &FsState, x: u32): int {
+        let i = 0;
+        while i < this.keys.len && this.keys.items[i] < x { i += 1; }
+        return i;
+    }
+
+    /// What local `x` holds (a fresh copy; empty when nothing).
+    fn get(this: &FsState, x: u32): FsVal {
+        let i = this.slot(x);
+        if i < this.keys.len && this.keys.items[i] == x { return fsValClone(this.vals.items[i]); }
+        return fsVal(this.keys.arena);
+    }
+
+    fn add(this: &FsState, x: u32, v: FsVal) {
+        if fsValEmpty(v) { return; }
+        let i = this.slot(x);
+        if i < this.keys.len && this.keys.items[i] == x {
+            fsValAdd(&this.vals.items[i], v);
+            return;
+        }
+        this.keys.insert(i, x);
+        this.vals.insert(i, fsValClone(v));
+    }
+
+    fn remove(this: &FsState, x: u32) {
+        let i = this.slot(x);
+        if i < this.keys.len && this.keys.items[i] == x {
+            this.keys.remove(i);
+            this.vals.remove(i);
+        }
+    }
+
+    /// A whole-local store: `x` holds `v` and nothing else.
+    fn set(this: &FsState, x: u32, v: FsVal) {
+        this.remove(x);
+        this.add(x, v);
+    }
+
+    fn clone(this: &FsState): FsState {
+        let out = fsState(this.keys.arena, this.live);
+        for i in 0..this.keys.len {
+            out.keys.push(this.keys.items[i]);
+            out.vals.push(fsValClone(this.vals.items[i]));
+        }
+        return out;
+    }
+
+    /// `this = o` (a deep copy).
+    fn assign(this: &FsState, o: &FsState) {
+        let c = o.clone();
+        this.keys = c.keys;
+        this.vals = c.vals;
+        this.live = c.live;
+    }
+
+    fn join(this: &FsState, o: &FsState) {
+        if !o.live { return; }
+        if !this.live {
+            this.assign(o);
+            return;
+        }
+        for i in 0..o.keys.len { this.add(o.keys.items[i], o.vals.items[i]); }
+    }
+
+    fn eq(this: &FsState, o: &FsState): bool {
+        if this.live != o.live || this.keys.len != o.keys.len { return false; }
+        for i in 0..this.keys.len {
+            if this.keys.items[i] != o.keys.items[i] || !fsValEq(this.vals.items[i], o.vals.items[i]) { return false; }
+        }
+        return true;
+    }
+}
+
+fn fsState(a: &Arena, live: bool): FsState { return FsState { keys: List<u32>.new(a), vals: List<FsVal>.new(a), live: live }; }

@@ -1,0 +1,243 @@
+// `match` on an int or a string: arm values fit the type, ranges, overlaps, the `_` arm; whether the match
+// lowers as one `Switch` (`TMatch.switch`).
+//
+// Part of module j3c.sema.
+// Port of: check/lower/pat/check.rs (check_int_arms, check_str_arms, int ranges)
+// J3: Rust's `i128` arm values are `PatInt` (an i64, or `big`: a u64 above `i64::MAX` in its bits); every
+// value a pattern can name fits one of the two, and `patIntLess` orders them as numbers.
+module j3c.sema;
+
+extend BodyCx {
+    /// Rust `check_int_arms`: every value fits, no two unguarded arms overlap, an unguarded `_` exists.
+    /// True when Rust lowers it as one `Switch` (single values, no ranges, no `|`, no guards).
+    fn patIntArms(this: &BodyCx, m: &MatchStmt, t: Id<Ty>): Result<bool, TErr> {
+        let seen = List<PatSeen>.new(this.cx.arena);
+        let switch = true;
+        let hasWild = false;
+        for i in 0..m.arms.len {
+            let arm = m.arms.items[i];
+            let guarded = match arm.guard { Option.Some(_) { true } Option.None { false } };
+            switch = switch && !guarded && arm.pats.len == 1;
+            for k in 0..arm.pats.len {
+                let p = arm.pats.items[k];
+                match this.cx.ast.pat(p) {
+                    Pat.Wild {
+                        if !guarded { hasWild = true; }
+                        continue;
+                    }
+                    _ {}
+                }
+                let r = this.patIntRange(p, t)?;
+                switch = switch && patIntEq(r.lo, r.hi);
+                if !guarded { seen.push(PatSeen { r: r, span: this.cx.ast.patSpan(p) }); }
+            }
+        }
+        // stable sort by (lo, span start)
+        for i in 1..seen.len {
+            let x = seen.items[i];
+            let j = i - 1;
+            while j >= 0 && patSeenLess(&x, &seen.items[j]) {
+                seen.items[j + 1] = seen.items[j];
+                j -= 1;
+            }
+            seen.items[j + 1] = x;
+        }
+        for i in 1..seen.len {
+            let a = seen.items[i - 1];
+            let b = seen.items[i];
+            if patIntLess(a.r.hi, b.r.lo) { continue; }
+            let aFirst = a.span.lo <= b.span.lo;
+            let first = a.r;
+            let second = b.r;
+            let later = b.span;
+            if !aFirst { first = b.r; second = a.r; later = a.span; }
+            let msg = Text.new(this.cx.arena);
+            if patIntEq(a.r.lo, a.r.hi) && patIntEq(b.r.lo, b.r.hi) {
+                msg.add("duplicate match arm `");
+                patIntPush(&msg, a.r.lo);
+                msg.add("`");
+            } else {
+                msg.add("match arm `");
+                patRangePush(&msg, second);
+                msg.add("` overlaps `");
+                patRangePush(&msg, first);
+                msg.add("`");
+            }
+            return Result.Err(this.err(later, msg.str()));
+        }
+        if !hasWild {
+            return Result.Err(this.help(this.err(m.span, "a `match` on an integer needs a `_` arm"), "integers can't be listed exhaustively; add `_ { }`"));
+        }
+        return Result.Ok(switch);
+    }
+
+    /// Rust `check_str_arms`: each arm a string literal or `_`, no literal twice (unguarded), an unguarded `_`.
+    fn patStrArms(this: &BodyCx, m: &MatchStmt): Result<bool, TErr> {
+        let seen = List<string>.new(this.cx.arena);
+        let hasWild = false;
+        for i in 0..m.arms.len {
+            let arm = m.arms.items[i];
+            let guarded = match arm.guard { Option.Some(_) { true } Option.None { false } };
+            for k in 0..arm.pats.len {
+                let p = arm.pats.items[k];
+                let lit: Option<string> = Option.None;
+                let litSpan = this.cx.ast.patSpan(p);
+                match this.cx.ast.pat(p) {
+                    Pat.Wild {
+                        if !guarded { hasWild = true; }
+                        continue;
+                    }
+                    Pat.Lit(l) {
+                        match this.cx.ast.expr(l.expr) {
+                            Expr.String(b) { lit = Option.Some(b); litSpan = this.cx.ast.exprSpan(l.expr); }
+                            _ {}
+                        }
+                    }
+                    _ {}
+                }
+                let b = match lit {
+                    Option.Some(x) { x }
+                    Option.None {
+                        return Result.Err(this.help(this.err(this.cx.ast.patSpan(p), "a `string` match arm is a string literal or `_`"),
+                            "bind the string with `_ { }` and test it with an `if`"));
+                    }
+                };
+                if guarded { continue; }
+                for q in 0..seen.len {
+                    if seen.items[q] == b {
+                        let msg = Text.new(this.cx.arena);
+                        msg.add("duplicate match arm `");
+                        debugStr(&msg, b);
+                        msg.add("`");
+                        return Result.Err(this.err(litSpan, msg.str()));
+                    }
+                }
+                seen.push(b);
+            }
+        }
+        if !hasWild {
+            return Result.Err(this.help(this.err(m.span, "a `match` on a `string` needs a `_` arm"), "strings can't be listed exhaustively; add `_ { }`"));
+        }
+        return Result.Ok(true);
+    }
+
+    /// Rust `int_pat_range`: the values int pattern `p` matches on type `t` (a literal, a `const`, `lo..=hi`).
+    fn patIntRange(this: &BodyCx, p: Id<Pat>, t: Id<Ty>): Result<PatRange, TErr> {
+        let sp = this.cx.ast.patSpan(p);
+        match this.cx.ast.pat(p) {
+            Pat.Lit(l) {
+                let v = this.patIntEnd(l.expr, t)?;
+                return Result.Ok(PatRange { lo: v, hi: v });
+            }
+            Pat.Variant(vp) {
+                if vp.payload.len > 0 { return Result.Err(this.err(vp.span, "an integer match arm has no payload")); }
+                let v = this.patIntEnd(pathExpr(this.cx.ast, vp.path, vp.span), t)?;
+                return Result.Ok(PatRange { lo: v, hi: v });
+            }
+            Pat.Range(r) {
+                let a = this.patIntEnd(r.lo, t)?;
+                let b = this.patIntEnd(r.hi, t)?;
+                if patIntLess(b, a) {
+                    let msg = Text.new(this.cx.arena);
+                    msg.add("empty range `");
+                    patIntPush(&msg, a);
+                    msg.add("..=");
+                    patIntPush(&msg, b);
+                    msg.add("`: its start is past its end");
+                    return Result.Err(this.err(sp, msg.str()));
+                }
+                return Result.Ok(PatRange { lo: a, hi: b });
+            }
+            Pat.Struct(st) { return Result.Err(this.err(st.span, "a struct pattern on an integer")); }
+            Pat.Tuple(tp) { return Result.Err(this.err(tp.span, "a tuple pattern on an integer")); }
+            Pat.Bind(n) { return Result.Err(this.err(n.span, "an integer match arm is an int literal or an int `const`")); }
+            Pat.Wild { return Result.Err(this.err(sp, "`_` has no value")); }
+        }
+        return Result.Err(this.err(sp, "unreachable pattern kind"));
+    }
+
+    /// One end of an int pattern: a literal or int `const`, fitting type `t`.
+    fn patIntEnd(this: &BodyCx, e: Id<Expr>, t: Id<Ty>): Result<PatInt, TErr> {
+        let sp = this.cx.ast.exprSpan(e);
+        // a `u64` const holds its bits in an i64: above `i64::MAX` it reads back negative
+        let c: Option<ConstVal> = Option.None;
+        match this.cx.ast.expr(e) {
+            Expr.Name(n) { c = this.intConstNamed(n.name); }
+            Expr.Field(_) { c = this.qualifiedConst(e); }
+            _ {}
+        }
+        let u64Const = false;
+        match c { Option.Some(cv) { u64Const = cv.ty == this.com().u64; } Option.None {} }
+        let v = PatInt { v: 0, big: false };
+        match this.cx.ast.expr(e) {
+            Expr.BigInt(x) { v = PatInt { v: i64(x), big: i64(x) < 0 }; }
+            _ {
+                match this.foldInt(e) {
+                    Option.Some(x) { v = PatInt { v: x, big: u64Const && x < 0 }; }
+                    Option.None { return Result.Err(this.err(sp, "an integer match arm is an int literal or an int `const`")); }
+                }
+            }
+        }
+        if !this.patIntFits(v, t) {
+            let msg = Text.new(this.cx.arena);
+            msg.add("match arm `");
+            patIntPush(&msg, v);
+            msg.add("` does not fit `").add(this.tyStr(t)).add("`");
+            return Result.Err(this.err(sp, msg.str()));
+        }
+        return Result.Ok(v);
+    }
+
+    /// `v` is a value of int type `t`.
+    fn patIntFits(this: &BodyCx, v: PatInt, t: Id<Ty>): bool {
+        let bits = 64;
+        let signed = true;
+        match this.ty(t) {
+            Ty.Int(k) {
+                match k {
+                    IntKind.I8 { bits = 8; }
+                    IntKind.I16 { bits = 16; }
+                    IntKind.I32 { bits = 32; }
+                    IntKind.I64 { bits = 64; }
+                    IntKind.U8 { bits = 8; signed = false; }
+                    IntKind.U16 { bits = 16; signed = false; }
+                    IntKind.U32 { bits = 32; signed = false; }
+                    IntKind.U64 { bits = 64; signed = false; }
+                }
+            }
+            _ {}
+        }
+        if v.big { return !signed && bits == 64; }
+        if bits == 64 { return signed || v.v >= 0; }
+        if signed {
+            let half = i64(1) << (bits - 1);
+            return v.v >= 0 - half && v.v <= half - 1;
+        }
+        return v.v >= 0 && v.v <= (i64(1) << bits) - 1;
+    }
+}
+
+fn patIntLess(a: PatInt, b: PatInt): bool {
+    if a.big != b.big { return b.big; }
+    if a.big { return u64(a.v) < u64(b.v); }
+    return a.v < b.v;
+}
+
+fn patIntEq(a: PatInt, b: PatInt): bool { return a.v == b.v && a.big == b.big; }
+
+fn patSeenLess(a: &PatSeen, b: &PatSeen): bool {
+    if patIntEq(a.r.lo, b.r.lo) { return a.span.lo < b.span.lo; }
+    return patIntLess(a.r.lo, b.r.lo);
+}
+
+fn patIntPush(t: &Text, v: PatInt) {
+    if v.big { t.pushU64(u64(v.v)); } else { t.pushInt(v.v); }
+}
+
+/// Rust `range_str`.
+fn patRangePush(t: &Text, r: PatRange) {
+    patIntPush(t, r.lo);
+    if patIntEq(r.lo, r.hi) { return; }
+    t.add("..=");
+    patIntPush(t, r.hi);
+}

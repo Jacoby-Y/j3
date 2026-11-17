@@ -1,0 +1,117 @@
+// Generics in sema (`sema/gen_*.j3`): a program using generic fns (inferred, explicit, UFCS), generic
+// struct literals and methods, generic methods, `Option` constructors, `for` over an iterator and the
+// stdlib's `List`/`Arena` types; every requested `Fn` instance gets its own
+// concrete typed body (`Instance.body`). Then Rust's generic error texts, the instance note included.
+module sema_gen_test;
+
+use j3.io;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.{ Text, contains };
+use j3c.base.diag.render;
+use j3c.driver;
+use j3c.driver.{ Session, Stage };
+use j3c.sema.{ Checked, InstKind, Ty };
+
+const GOOD: [24]string = [
+    "module good;",
+    "use j3.memory.{ Arena, List };",
+    "use j3.option.Option;",
+    "struct Counter { n: int; lim: int;",
+    "    fn next(this: &Counter): Option<int> { if this.n >= this.lim { return Option.None; } this.n += 1; return Option.Some(this.n); }",
+    "}",
+    "struct Wrap<T> { v: T;",
+    "    fn get(this: &Wrap<T>): T { return this.v; }",
+    "    fn map<U>(this: &Wrap<T>, u: U): Wrap<U> { return Wrap<U> { v: u }; }",
+    "}",
+    "fn firstOr<T>(xs: []T, d: T): T { if xs.len == 0 { return d; } return xs[0]; }",
+    "fn twice<T>(x: T): int { return 2; }",
+    "fn main() {",
+    "    let mem = Arena.create(1 << 12);",
+    "    let l = List<int>.new(&mem);",
+    "    l.push(3);",
+    "    let p = mem.new(Counter { n: 0, lim: 3 });",
+    "    let buf = mem.alloc::<u8>(16);",
+    "    let w = Wrap<int> { v: 5 };",
+    "    let s = w.map(\"hi\").get();",
+    "    let total = 0;",
+    "    for v in *p { total += v; }",
+    "    let a = firstOr(l.slice(), 9) + l.slice().firstOr(1) + twice::<f32>(1.5) + buf.len + w.get();",
+    "}",
+];
+
+const BAD: [6]string = [
+    "module b;\nfn none<T>(): int { return 0; }\nfn main() { let a = none(); }\n",
+    "module b;\nfn pick<T>(a: []T, b: []T): int { return 0; }\nfn main() { let x: [1]int = [1]; let y: [1]string = [\"a\"]; let a = pick(x, y); }\n",
+    "module b;\nuse j3.option.Option;\nfn main() { let a = Option.Some(1); }\n",
+    "module b;\nfn inc<T>(a: T): T { return a + 1; }\nfn main() { let b = inc(\"x\"); }\n",
+    "module b;\nstruct Box<T> { v: T; fn bump(this: &Box<T>): T { return this.v + 1; } }\nfn main() { let b = Box<string> { v: \"a\" }; let c = b.bump(); }\n",
+    "module b;\nstruct It { n: int; }\nfn mk(): It { return It { n: 1 }; }\nfn main() { for x in mk() { } }\n",
+];
+
+const WANT: [6]string = [
+    "cannot infer type parameter `T` of `none`",
+    "`T` is both `int` and `string`",
+    "`Option` needs an expected type",
+    "while instantiating `inc<string>` (called at ",
+    "while instantiating `Box<string>.bump` (called at ",
+    "`for` over `It`, which has no `next` method",
+];
+
+/// Write `text` as `NAME.j3` in a temp dir (outside this package, whose project would otherwise load).
+fn put(name: string, text: string, mem: &Arena): string {
+    let d = Text.new(mem).add(io.tempRoot()).add("/j3c-boot-sema-gen").str();
+    match io.makeDirs(d) { Result.Ok(_) {} Result.Err(_) { panic("cannot make the case dir"); } }
+    let p = Text.new(mem).add(d).add("/").add(name).add(".j3").str();
+    match io.writeFile(p, text as []u8) { Result.Ok(_) {} Result.Err(_) { panic("cannot write a case"); } }
+    return p;
+}
+
+fn session(path: string): &Session {
+    let o = driver.defaults();
+    o.entry = path;
+    return Session.new(o);
+}
+
+fn good(mem: &Arena) {
+    let src = Text.new(mem);
+    for i in 0..GOOD.len { src.add(GOOD[i]).add("\n"); }
+    let s = session(put("good", src.str(), mem));
+    if !driver.run(s, Stage.Sema) {
+        let out = Text.new(mem);
+        for i in 0..s.diags.count() { render(s.diags.at(i), &s.sources, &out); }
+        panic(`generic program fails sema:\n{out.str()}`);
+    }
+    let c = match s.checked { Option.Some(x) { x } Option.None { panic("no checked program"); return; } };
+    let fns = 0;
+    for i in 0..c.tables.instances.len() {
+        let inst = *c.tables.instances.get(c.tables.instances.idAt(i));
+        if inst.key.kind != InstKind.Fn { continue; }
+        fns += 1;
+        let b = match inst.body { Option.Some(x) { x } Option.None { panic("an instance has no typed body"); return; } };
+        // concrete: no parameter type survives in an instance's locals
+        let tb = c.typed.body(b);
+        for k in 0..tb.locals.len {
+            match c.tables.ty(c.typed.local(tb.locals.items[k]).ty) { Ty.Param(_) { panic("a type parameter in an instance body"); } _ {} }
+        }
+    }
+    if fns < 6 { panic("expected the generic calls to request their instances"); }
+}
+
+fn bad(mem: &Arena) {
+    for i in 0..BAD.len {
+        let s = session(put("bad", BAD[i], mem));
+        if driver.run(s, Stage.Sema) { panic(`bad case {i} passes sema`); }
+        let out = Text.new(mem);
+        for k in 0..s.diags.count() { render(s.diags.at(k), &s.sources, &out); }
+        if !contains(out.str(), WANT[i]) { panic(`bad case {i}: want {WANT[i]}, got:\n{out.str()}`); }
+    }
+}
+
+fn main() {
+    let mem = Arena.create(1 << 12);
+    good(&mem);
+    bad(&mem);
+}
