@@ -6,7 +6,7 @@ compare the text. Unit checks live beside the code they cover, as `*_test.j3` fi
 
 ## `diff.sh` (plan 11 A4)
 
-`tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-known] [-j N] [files...]`, from any folder.
+`tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-known] [--list] [-j N] [files...]`, from any folder.
 
 1. Runs `tools/coverage.sh` (skip with `--no-coverage` or `DIFF_NO_COVERAGE=1`) and `tools/layers.sh`;
    either failing stops the run (exit 2).
@@ -27,7 +27,12 @@ compare the text. Unit checks live beside the code they cover, as `*_test.j3` fi
 | `glsl` | `dump-glsl PATH` (`--es`: `dump-glsl PATH --es`, the OpenGL ES text) | stdout, stderr, exit code |
 | `ui` | `dump-ui PROJECT/ui` (the J3 source generated from a project's `.j3ui` files) | stdout, stderr, exit code |
 | `run` | `run --headless --frames 3 PATH`, offscreen SDL, dummy audio | stdout without the `J3STATS` / `J3UISTATS` timing lines, exit code |
-| `self` | not yet: needs a j3c-boot that builds j3c-bootstrap (stage 2 = stage 1) | |
+| `self` | stage 1 (`j3c-boot`) builds stage 2 from a scratch copy of `j3c-bootstrap/{j3.toml,src,text}` under `<repo>/target/self.PID/` (never in place), then `DIFF_STAGE0=stage1 DIFF_BOOT=stage2` over `fmt`, `ast`, `err`, `ui`, `glsl`, `glsl --es`, `ir --norm` and `llvm` (one input per call) | one summary line per comparison, then `diff.sh self: N ok, N failed` |
+
+
+`run` removes a project's `target/.j3c` (stamps and objects) before each of the three runs and after the last, so no
+compiler reuses another's build and the corpus keeps no object folders. `--list` prints the expanded inputs and exits.
+A known-list line with a `# skip: CAUSE` comment is never run (`tls_live_test.j3`: network).
 
 Exit: 0 when every input is `ok` or listed as known, 1 on a new failure, a `NONDET`, or a known input
 that now passes, 2 on a setup error. `DIFF_STAGE0` / `DIFF_BOOT` swap either compiler (testing the

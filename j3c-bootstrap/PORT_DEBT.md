@@ -75,3 +75,6 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
   `known/ui.txt` for good); add them when Rust widens the span to the char.
 - Open (C2e review r1#5): `ui/scan.j3` `scan` takes `extra` (unsaved editor buffers, Rust's overlay paths) and
   ignores it; the LSP milestone has to merge them in.
+- Open (C3 contracts, wave 19): `gen::before_build` (Rust `gen.rs:148`, called from `build_inner`, `run_user`, `run_loaded`,
+  `unchanged_project`) is the no-op `cmd/gen.j3` `beforeBuild` until C5: j3c-boot does not run a project's stale
+  `assets/gen/*.j3` generators before a build (`examples/editor_village` is the one corpus project with any).

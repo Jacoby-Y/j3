@@ -568,6 +568,6 @@ Gate: `diff.sh ui` exact on the UI projects and `tests/bad-ui`, then full-file `
 
 ### Milestone C3: toolchain rest, object cache, `build`, `run`, self-build
 Gate: whole-corpus `diff.sh run` clean (leftovers in `known/run.txt` with causes), `diff.sh self` (stage 2 = stage 1). Survey: `.swarm-opus/11-port/survey-c3.md`.
-- [ ] Wave 19 (contracts, 1 agent): cache API, driver cache-or-one-clang choice, `cmd/stamp.j3`, command routes, `diff.sh self` skeleton, `known/run.txt`, `contracts-c3.md`, `c3-corpus.txt`.
+- [x] Wave 19 (contracts, 1 agent): cache API, driver cache-or-one-clang choice, `cmd/stamp.j3`, command routes, `diff.sh self` skeleton, `known/run.txt`, `contracts-c3.md`, `c3-corpus.txt`.
 - [ ] Wave 20 (4 agents, shared worktree): object cache; toolchain rest + preflight; `build` stamps, multi-target, log, `size`; `run`, commands, driver, harness.
 - [ ] Wave 21 (integration): self LLVM exact, whole-corpus run by tier, `diff.sh self`.
