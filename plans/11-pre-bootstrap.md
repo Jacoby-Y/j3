@@ -573,3 +573,8 @@ Gate: whole-corpus `diff.sh run` clean (leftovers in `known/run.txt` with causes
 - [x] Wave 19 (contracts, 1 agent): cache API, driver cache-or-one-clang choice, `cmd/stamp.j3`, command routes, `diff.sh self` skeleton, `known/run.txt`, `contracts-c3.md`, `c3-corpus.txt`.
 - [x] Wave 20 (4 agents, shared worktree): object cache; toolchain rest + preflight; `build` stamps, multi-target, log, `size`; `run`, commands, driver, harness.
 - [x] Wave 21 (integration): self LLVM exact, whole-corpus run by tier, `diff.sh self`.
+
+### Milestone C4: bytecode backend, dev mode, dev runner, package commands, `--hot`
+- [x] Wave 22 (contracts): bc op table, Bc* types, devmode/devrun/pkg stubs, `diff.sh bc`, c4 corpus.
+- [ ] Wave 23 (5 chunks): A bc module + encode + dump-bc; B bc codegen; C devmode pass; D dev runner + run wiring; E pkg commands, pkgtool, --hot.
+- [ ] Wave 24 (integration): `.j3sb` byte-equal on the corpus, dev-mode run, self.

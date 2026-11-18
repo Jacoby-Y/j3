@@ -5,7 +5,7 @@ set -euo pipefail
 usage() {
     cat <<'E'
 usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-known] [--list] [-j N] [files...]
-  MODE            fmt | ast | err | ir | llvm | glsl | ui | run | self
+  MODE            fmt | ast | err | ir | llvm | glsl | ui | run | bc | self
   --norm          ir only: renumber temps by first appearance on both sides (tests/norm_ir.awk)
   --user          ir only: compare only the entry module (the dump's first `module` section);
                   its known list is tests/known/ir-user.txt
@@ -25,11 +25,16 @@ usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-kno
      as that project; a file outside any project builds to a temp file, writes no stamps and runs in a scratch cwd). An input whose line in
      tests/known/run.txt has a `# skip: CAUSE` comment is never run (network). A line with `# nondet: CAUSE`
      runs, and a NONDET (or any other outcome) of it does not fail the run.
+     bc: every compiler works on its own scratch copy (never the tree: `run` and `dump-bc` write `target/j3s/`
+     and `scripts/target/`). A project input runs `run --headless --frames 3 .` (dev mode: scripts on the VM) and
+     compares the exit code and the set of `*.j3sb` files with their sha256 (not stdout: timings); a `.j3s` file
+     input runs `dump-bc` on it in a copy of its project (or of its folder when that project is j3c-bootstrap)
+     and compares stdout, stderr, exit code and the written `.j3sb`.
      self: stage 1 (j3c-boot) builds a scratch copy of j3c-bootstrap/{j3.toml,src,text} under <repo>/target/
      (never in place: that would overwrite the running binary); stage 2 is then compared with stage 1 on
      fmt, ast, err, ui, glsl, ir --norm and llvm (one input per call). SELF_BUILD_TIMEOUT seconds (default 1800).
      SELF_LLVM=A:B: only llvm inputs A..B of `llvm --list` (the other modes only when A is 1), to run it in pieces.
-Env: DIFF_TIMEOUT seconds per command (default 30; ir/llvm 120; run 300).
+Env: DIFF_TIMEOUT seconds per command (default 30; ir/llvm 120; run, bc 300).
      DIFF_STAGE0 / DIFF_BOOT replace the two compilers (default stage0/j3c, target/j3c-boot;
      DIFF_BOOT skips the j3c-boot rebuild).
 E
@@ -63,7 +68,7 @@ done
 case $mode in
     fmt|ast|err) to=30 ;;
     ir|llvm|glsl|ui) to=120 ;;
-    run) to=300; : "${jobs:=4}" ;;
+    run|bc) to=300; : "${jobs:=4}" ;;
     self) to=0 ;;
     *) usage >&2; exit 2 ;;
 esac
@@ -135,7 +140,7 @@ if [ $mode = self ]; then
 fi
 
 # After the build: stage0 builds j3c-boot with its own embedded stdlib.
-case $mode in ir|llvm|glsl|ui|run) export J3_STDLIB=$root/j3c/stdlib ;; esac
+case $mode in ir|llvm|glsl|ui|run|bc) export J3_STDLIB=$root/j3c/stdlib ;; esac
 
 # Inputs: corpus lines from sections naming this mode, expanded per mode.
 cd "$root"
@@ -217,7 +222,21 @@ one() {
         # ponytail: every UI project keeps its components in `ui/` (`[ui] dir`); read j3.toml if one moves.
         ui) cmd=(dump-ui "$arg/ui") ;;
         run) cmd=(run --headless --frames 3 "$arg") ;;
+        bc) ;;
     esac
+    # bc: the folder copied per compiler run ($bsrc) and what runs in the copy. A file belongs to the nearest
+    # `j3.toml` above it; j3c-bootstrap's own (tests/cases/scripts/tool.j3s) is too big to copy: its folder then.
+    local bsrc=
+    if [ $mode = bc ]; then
+        if [ -d "$root/$f" ]; then bsrc=$root/$f; cmd=(run --headless --frames 3 .)
+        else
+            bsrc=$(dirname "$root/$f")
+            while [ ! -f "$bsrc/j3.toml" ] && [ "$bsrc" != "$root" ] && [ "$bsrc" != / ]; do bsrc=$(dirname "$bsrc"); done
+            # ponytail: one named exception; list others here if a corpus file sits in another huge project.
+            if [ ! -f "$bsrc/j3.toml" ] || [ "$bsrc" = "$boot" ]; then bsrc=$(dirname "$root/$f"); fi
+            local rel=$root/$f; cmd=(dump-bc "${rel#"$bsrc"/}")
+        fi
+    fi
     # run: the project the input builds in. A folder is its own; a file belongs to the nearest `j3.toml`
     # above it (`j3c run FILE` builds that project); a file outside any project builds to a temp file and
     # leaves nothing behind.
@@ -234,6 +253,10 @@ one() {
         local bin=$S0; [ $who = b ] && bin=$BOOT
         # Each compiler builds from nothing: no stamp or object of the other one (or of an earlier run).
         [ -z "$proj" ] || rm -rf "$proj/target/.j3c"
+        if [ -n "$bsrc" ]; then
+            rm -rf "$d/w"; mkdir -p "$d/w"; cwd=$d/w
+            (cd "$bsrc" && tar cf - --exclude=./target .) | (cd "$d/w" && tar xf -)
+        fi
         (cd "$cwd" && SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout -k 5 "$to" "$bin" "${cmd[@]}" \
             >"$d/$who.out" 2>"$d/$who.err" </dev/null)
         echo $? >"$d/$who.rc"
@@ -241,6 +264,13 @@ one() {
         [ $user = 1 ] && awk '/^module /{n++} n<=1' "$d/$who.out" >"$d/$who.n" && mv "$d/$who.n" "$d/$who.out"
         # ponytail: a windowed program's `J3STATS` / `J3UISTATS` lines are frame timings; dropped whole (their
         # counters go too). Keep the counter fields if a paint-count difference ever needs catching here.
+        # bc: the bytecode files the run wrote, by content (a project's stdout is not compared: timings).
+        if [ -n "$bsrc" ]; then
+            [ -d "$root/$f" ] && : >"$d/$who.out"
+            { echo "--- j3sb"; (cd "$d/w" && find . -name '*.j3sb' -type f | LC_ALL=C sort | xargs -r sha256sum); } >>"$d/$who.out"
+            [ -d "$root/$f" ] && : >"$d/$who.err"
+            rm -rf "$d/w"
+        fi
         [ $mode = run ] && sed -i '/^J3STATS \|^J3UISTATS /d' "$d/$who.out"
         # ponytail: tests print their own timings (`29 us per frame`, `5.233 ms`): the number before a time unit
         # is masked. A test whose result is a duration would be hidden by this; none in the corpus.
@@ -268,7 +298,7 @@ one() {
     true
 }
 export -f one
-export tmp root mode norm user es here S0 BOOT to
+export tmp root boot mode norm user es here S0 BOOT to
 
 start=$SECONDS
 echo "$inputs" | awk '{print NR; print}' | xargs -d '\n' -n2 -P "$jobs" bash -c 'one "$@"' _
