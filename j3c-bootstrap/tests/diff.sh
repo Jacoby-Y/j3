@@ -5,7 +5,7 @@ set -euo pipefail
 usage() {
     cat <<'E'
 usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-known] [--list] [-j N] [files...]
-  MODE            fmt | ast | err | ir | llvm | glsl | ui | run | bc | self
+  MODE            fmt | ast | err | ir | llvm | glsl | ui | run | bc | tool | self
   --norm          ir only: renumber temps by first appearance on both sides (tests/norm_ir.awk)
   --user          ir only: compare only the entry module (the dump's first `module` section);
                   its known list is tests/known/ir-user.txt
@@ -15,7 +15,7 @@ usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-kno
   --list          print the expanded inputs, one per line, and exit (nothing runs)
   -j N            parallel jobs (default J3_TEST_JOBS, else half the cores; llvm a quarter: each job
                   holds up to ~1 GB of memory and three dumps of up to ~80 MB on disk)
-  files           inputs instead of tests/corpus.txt (paths or project folders)
+  files           inputs instead of tests/corpus.txt (paths or project folders; tool: case files)
      glsl runs `dump-glsl PATH`; ui runs `dump-ui PROJECT/ui` (the project's `.j3ui` folder).
      tests/bad-ui/NAME is a UI project with one error: ui compares the `dump-ui` error text, and err takes
      such a folder (any folder with a `j3.toml`) as one case, `check .` in a scratch copy.
@@ -32,11 +32,20 @@ usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-kno
      fails, stderr without the `[n/6]` lines (the refusal text); a `.j3s` file
      input runs `dump-bc` on it in a copy of its project (or of its folder when that project is j3c-bootstrap)
      and compares stdout, stderr, exit code and the written `.j3sb`.
+     tool: the inputs are cases, one per line of tests/tool/*.txt (id STEM/NAME, STEM = the file's name):
+       NAME<TAB>PROJECT|-<TAB>ARGV[<TAB>OPTION]...   (`#` lines and blank lines skipped)
+     ARGV is split like xargs (quotes group words). Each compiler run gets a fresh scratch copy of PROJECT
+     (repo-relative, `target/` left out; `-` = an empty folder) as its cwd and compares stdout, stderr, the exit
+     code and the OPTION files. OPTIONs: stdin=FILE (relative to tests/tool/; default /dev/null), out=GLOB (each
+     matching file: text, or sha256 when binary, with its mode; `**` recurses), unpack=GLOB (a .zip/.deb/.tar.gz
+     compared by its member list and unpacked files), mask=SED (`sed -E` on everything compared), env=K=V (`@ROOT@`
+     is the repo), timeout=SECONDS. Built-in masks: the scratch path -> $DIR, `docs  XXXXXXXX` -> `docs  ID`, the MCP
+     `serverInfo` version, timings (`5.2 ms` -> `N ms`).
      self: stage 1 (j3c-boot) builds a scratch copy of j3c-bootstrap/{j3.toml,src,text} under <repo>/target/
      (never in place: that would overwrite the running binary); stage 2 is then compared with stage 1 on
      fmt, ast, err, ui, glsl, ir --norm and llvm (one input per call). SELF_BUILD_TIMEOUT seconds (default 1800).
      SELF_LLVM=A:B: only llvm inputs A..B of `llvm --list` (the other modes only when A is 1), to run it in pieces.
-Env: DIFF_TIMEOUT seconds per command (default 30; ir/llvm 120; run, bc 300).
+Env: DIFF_TIMEOUT seconds per command (default 30; ir/llvm 120; tool 60; run, bc 300).
      DIFF_STAGE0 / DIFF_BOOT replace the two compilers (default stage0/j3c, target/j3c-boot;
      DIFF_BOOT skips the j3c-boot rebuild).
 E
@@ -71,6 +80,7 @@ case $mode in
     fmt|ast|err) to=30 ;;
     ir|llvm|glsl|ui) to=120 ;;
     run|bc) to=300 ;;
+    tool) to=60 ;;
     self) to=0 ;;
     *) usage >&2; exit 2 ;;
 esac
@@ -165,8 +175,21 @@ expand() {
            else find "$p" \( -name target -o -name node_modules \) -prune -o -name j3.toml -print | sed 's|/j3.toml$||' | sort; fi ;;
     esac
 }
+# tool: the case ids of the case files (tests/tool/*.txt, or the files given), checked for shape.
+toolcases() {
+    local f
+    for f in "$@"; do
+        [ -f "$f" ] || die "tool: no case file $f"
+        [ "$(dirname "$(realpath "$f")")" = "$here/tool" ] || die "tool: case files live in tests/tool/ ($f)"
+        awk -F '\t' -v s="$(basename "$f" .txt)" -v f="$f" '/^#/ || /^[[:space:]]*$/ { next }
+            NF < 3 || $1 !~ /^[A-Za-z0-9_.-]+$/ { print "diff.sh: " f ":" NR ": want NAME<TAB>PROJECT<TAB>ARGV[<TAB>OPTION]..." > "/dev/stderr"; exit 2 }
+            { print s "/" $1 }' "$f" || exit 2
+    done
+}
 inputs=$(
-    if [ ${#files[@]} -gt 0 ]; then
+    if [ $mode = tool ]; then
+        if [ ${#files[@]} -gt 0 ]; then toolcases "${files[@]}"; else toolcases "$here"/tool/*.txt; fi
+    elif [ ${#files[@]} -gt 0 ]; then
         for f in "${files[@]}"; do expand "$f"; done
     else
         on=0
@@ -180,6 +203,7 @@ inputs=$(
     fi | awk '!seen[$0]++'
 )
 [ -n "$inputs" ] || die "no inputs for $mode"
+[ $mode != tool ] || [ -z "$(sort <<<"$inputs" | uniq -d)" ] || die "tool: case names repeat: $(sort <<<"$inputs" | uniq -d | tr '\n' ' ')"
 
 kname=$mode; [ $user = 0 ] || kname=$mode-user   # --user compares less, so it has its own list
 [ $es = 0 ] || kname=$mode-es
@@ -212,9 +236,79 @@ projof() {
     [ ! -f "$p/j3.toml" ] || echo "$p"
 }
 
+# unpacked ARCHIVE: its members and unpacked files (mode, sha256, path), times left out (tool `unpack=`).
+unpacked() {
+    local f=$1 x t; x=$(mktemp -d)
+    case $f in
+        *.zip) unzip -Z1 "$f" | LC_ALL=C sort; unzip -qq "$f" -d "$x" ;;
+        *.deb) ar t "$f"; t=$(realpath "$f"); (cd "$x" && ar x "$t")
+               for t in "$x"/*.tar*; do
+                   echo "--- $(basename "$t")"; tar -tvf "$t" | awk '{ print $1, $2, $3, $6 }'
+                   mkdir -p "$t.d"; tar xf "$t" -C "$t.d"; rm -f "$t"
+               done ;;
+        *.tar.gz|*.tgz) tar -tvzf "$f" | awk '{ print $1, $2, $3, $6 }'; tar xzf "$f" -C "$x" ;;
+        *) echo "unpack: not an archive this knows: $f" ;;
+    esac
+    # ponytail: paths with spaces or newlines print as they are; no archive in the corpus has one.
+    (cd "$x" && find . -type f | LC_ALL=C sort | while IFS= read -r p; do
+        echo "$(stat -c %a "$p") $(sha256sum <"$p" | cut -c1-64) $p"; done)
+    rm -rf "$x"
+}
+
+# one_tool IDX ID: one tool case (tests/tool/STEM.txt, line NAME) on both compilers, each in a fresh scratch copy.
+one_tool() {
+    local d=$tmp/$1 stem=${2%%/*} name=${2#*/} line who o g f
+    mkdir -p "$d"
+    line=$(awk -F '\t' -v n="$name" '!/^#/ && $1 == n' "$here/tool/$stem.txt" | head -1)
+    local -a col args envs=() outs=() masks=() unpacks=()
+    # a tab is IFS white space (runs of it would merge empty columns): split on \x1f instead
+    IFS=$'\x1f' read -ra col <<<"${line//$'\t'/$'\x1f'}"
+    local proj=${col[1]-} stdin=/dev/null tmo=$to
+    mapfile -d '' -t args < <(printf '%s' "${col[2]-}" | xargs -r printf '%s\0')
+    for o in "${col[@]:3}"; do
+        case $o in
+            stdin=*) stdin=$here/tool/${o#stdin=} ;;
+            out=*) outs+=("${o#out=}") ;;
+            unpack=*) unpacks+=("${o#unpack=}") ;;
+            mask=*) masks+=(-e "${o#mask=}") ;;
+            env=*) envs+=("${o#env=}"); envs[-1]=${envs[-1]//@ROOT@/$root} ;;
+            timeout=*) tmo=${o#timeout=} ;;
+            *) echo CRASH >"$d/status"; echo "harness: unknown option $o in tests/tool/$stem.txt" >"$d/detail"; return ;;
+        esac
+    done
+    for who in a a2 b; do
+        local bin=$S0; [ $who = b ] && bin=$BOOT
+        rm -rf "$d/w"; mkdir -p "$d/w"
+        [ "$proj" = - ] || (cd "$root/$proj" && tar cf - --exclude=./target .) | (cd "$d/w" && tar xf -)
+        (cd "$d/w" && env "${envs[@]+"${envs[@]}"}" SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
+            timeout -k 5 "$tmo" "$bin" "${args[@]+"${args[@]}"}" <"$stdin" >"$d/$who.out" 2>"$d/$who.err")
+        echo $? >"$d/$who.rc"
+        { cat "$d/$who.out"; echo "--- stderr"; cat "$d/$who.err"; echo "--- exit $(cat "$d/$who.rc")"
+          (cd "$d/w" && shopt -s globstar nullglob
+           for g in "${outs[@]+"${outs[@]}"}"; do
+               for f in $g; do
+                   [ -f "$f" ] || continue
+                   echo "--- out $f $(stat -c %a "$f")"
+                   if [ ! -s "$f" ] || grep -Iq . "$f"; then cat "$f"; else sha256sum <"$f" | cut -c1-64; fi
+               done
+           done
+           for g in "${unpacks[@]+"${unpacks[@]}"}"; do for f in $g; do echo "--- unpack $f"; unpacked "$f"; done; done)
+        } | sed -E -e "s|$d/w|\$DIR|g" -e 's/(docs +)[0-9a-f]{8}/\1ID/g' \
+              -e 's/("serverInfo":\{"name":"j3c","version":)"[^"]*"/\1"V"/g' \
+              -e 's/[0-9]+(\.[0-9]+)? (us|ms|ns|s)\b/N \2/g' ${masks[@]+"${masks[@]}"} >"$d/$who.txt"
+        rm -rf "$d/w" "$d/$who.out" "$d/$who.err"
+    done
+}
+
 # one IDX FILE: run both compilers, write $tmp/IDX/{status,detail}.
 one() {
     set +e
+    if [ $mode = tool ]; then
+        one_tool "$1" "$2"
+        if [ ! -f "$tmp/$1/status" ]; then verdict "$tmp/$1"; fi
+        rm -f "$tmp/$1"/*.txt "$tmp/$1"/*.rc
+        return
+    fi
     local d=$tmp/$1 f=$2 cwd=$root arg=$2 who
     mkdir -p "$d"
     if [ $mode = err ] && [ -d "$root/$f" ]; then
@@ -301,27 +395,34 @@ one() {
           echo "--- exit $(cat "$d/$who.rc")"; } >"$d/$who.txt"
         rm -f "$d/$who.out"   # disk: only the .txt is compared
     done
-    local ra rb; ra=$(cat "$d/a.rc"); rb=$(cat "$d/b.rc")
+    verdict "$d"
+    [ -z "$proj" ] || rm -rf "$proj/target/.j3c" "$proj/target/j3s"
+    # Only status and detail are read after this; dumps of a whole corpus would fill the disk.
+    rm -rf "$d/w" "$d"/*.out "$d"/*.err "$d"/*.txt "$d"/*.rc
+    true
+}
+# verdict DIR: status and detail from DIR/{a,a2,b}.{txt,rc} (stage0 twice, then j3c-boot).
+verdict() {
+    local d=$1 ra rb; ra=$(cat "$d/a.rc"); rb=$(cat "$d/b.rc")
     if ! cmp -s "$d/a.txt" "$d/a2.txt"; then
         echo NONDET >"$d/status"; diff -u --label stage0-run1 --label stage0-run2 "$d/a.txt" "$d/a2.txt" | head -40 >"$d/detail"
     elif { [ "$rb" -ge 124 ] && [ "$rb" != "$ra" ]; } || { [ "$rb" != 0 ] && [ "$ra" = 0 ]; }; then
-        echo CRASH >"$d/status"; { echo "j3c-boot exit $rb (stage0 exit $ra)"; grep -v '^j3c: \[\| modules compiled$' "$d/b.err" | tail -8; } >"$d/detail"
+        echo CRASH >"$d/status"
+        { echo "j3c-boot exit $rb (stage0 exit $ra)"
+          if [ -f "$d/b.err" ]; then grep -v '^j3c: \[\| modules compiled$' "$d/b.err" | tail -8
+          else sed -n '/^--- stderr$/,/^--- exit/p' "$d/b.txt" | sed '1d;$d' | tail -8; fi; } >"$d/detail"
     elif cmp -s "$d/a.txt" "$d/b.txt"; then
         echo ok >"$d/status"
     else
         echo DIFF >"$d/status"; diff -u --label stage0 --label j3c-boot "$d/a.txt" "$d/b.txt" | head -40 >"$d/detail"
     fi
-    [ -z "$proj" ] || rm -rf "$proj/target/.j3c" "$proj/target/j3s"
-    # Only status and detail are read after this; dumps of a whole corpus would fill the disk.
-    rm -rf "$d/w" "$d"/*.out "$d"/*.err "$d"/*.txt "$d"/*.rc
-    true
 }
 # job LINE: the inputs of one job line, one after another.
 job() {
     local a k; IFS=$'\t' read -ra a <<<"$1"
     for ((k = 0; k < ${#a[@]}; k += 2)); do one "${a[k]}" "${a[k+1]}"; done
 }
-export -f one projof job
+export -f one projof job verdict one_tool unpacked
 export tmp root boot mode norm user es here S0 BOOT to
 
 start=$SECONDS
