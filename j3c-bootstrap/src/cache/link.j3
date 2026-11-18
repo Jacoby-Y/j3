@@ -1,0 +1,146 @@
+// The clang command of one object, the link over all of them, the `.libs` notes and the sweep.
+//
+// Part of module j3c.cache.
+// Port of: j3c/src/emit/incr.rs (`clang_obj`'s command, `link_objs`, `lib_notes`, `sweep_stale`,
+//     `module_label`)
+module j3c.cache;
+
+fn timings(): bool { return sys.env("J3C_TIMINGS").len > 0; }
+
+fn eprint(t: &Text) { sys.write(2, t.str().ptr as ptr, t.len()); }
+
+/// Rust `module_label`: the module path joined by `.` (`mod` when empty), `/` as `_`: the object's file stem.
+pub fn moduleLabel(cx: &IrCx, m: &Module, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..m.name.len {
+        if i > 0 { t.push('.'); }
+        let part = cx.nameStr(m.name.items[i]);
+        for k in 0..part.len { t.push(if part[k] == '/' { '_' } else { part[k] }); }
+    }
+    if t.len() == 0 { t.add("mod"); }
+    return t.str();
+}
+
+/// Rust `lib_notes`: the `use lib "..."` lines of a module's text (trimmed), plus libm when it has `frem`.
+pub fn libNotes(ll: string, arena: &Arena): string {
+    let s = Text.new(arena);
+    let it = lines(ll);
+    while true {
+        match it.next() {
+            Option.Some(l) { if contains(l, "use lib \"") { s.add(trim(l)).push('\n'); } }
+            Option.None { break; }
+        }
+    }
+    if contains(ll, " frem ") && !contains(s.str(), "use lib \"m\"") { s.add("; use lib \"m\"\n"); }
+    return s.str();
+}
+
+/// Rust `clang_obj`'s `Command`, program first: compile `llPath` to `obj`.
+pub fn objArgv(out: &List<string>, obj: string, llPath: string, e: &EmitOpts, thin: bool, arena: &Arena) {
+    out.push(toolchain.clangFor(e.clang, e.target, arena));
+    out.push("-c");
+    out.push("-Wno-override-module");
+    out.push(Text.new(arena).add("-O").add(toolchain.clangOpt(e.cc.opt)).str());
+    out.push("-ffunction-sections");
+    out.push("-fdata-sections");
+    if e.cc.debug { out.push("-g"); }
+    if thin { out.push("-flto=thin"); }
+    if e.cc.release {
+        let rel = toolchain.releaseFlags(TargetOs.Linux, toolchain.lldPresent(), arena);
+        for i in 0..rel.compile.len { out.push(rel.compile.items[i]); }
+    }
+    toolchain.targetArgs(out, e.target, arena);
+    if e.cpu.len > 0 { out.push(Text.new(arena).add("-mcpu=").add(e.cpu).str()); }
+    for i in 0..e.flags.len { out.push(e.flags.items[i]); }
+    if sys.env("J3C_TIME_REPORT").len > 0 { out.push("-ftime-report"); }
+    out.push("-o");
+    out.push(obj);
+    out.push(llPath);
+}
+
+/// Rust `link_objs`' `Command`, program first: `objs` in the order given (module order, parts in chunk
+/// order), then the libraries the `notes` name. Err: a missing library.
+pub fn linkArgv(out: &List<string>, objs: []string, exe: string, e: &EmitOpts, thin: bool, notes: string, arena: &Arena): Result<bool, string> {
+    let cc = &e.cc;
+    out.push(toolchain.clangFor(e.clang, e.target, arena));
+    out.push(toolchain.linkGcFlag(e.target));
+    toolchain.targetArgs(out, e.target, arena);
+    toolchain.useMold(out, cc.release || thin, e.target);
+    if thin {
+        let cache = path.join(toolchain.cacheDir(exe, e.target, arena), "thinlto", arena);
+        // Per-module objects lose the internal-linkage inlining bonus a whole program gets, so opt 2 links
+        // at O3: a one-caller generic like `List.push` inlines again.
+        let ltoOpt = if cc.opt == "2" { "3" } else { toolchain.clangOpt(cc.opt) };
+        out.push("-flto=thin");
+        out.push(Text.new(arena).add("-O").add(ltoOpt).str());
+        if toolchain.lldPresent() {
+            if !cc.release { out.push("-fuse-ld=lld"); } // release gets it from `releaseFlags`
+            out.push(Text.new(arena).add("-Wl,--thinlto-cache-dir=").add(cache).str());
+        } else {
+            out.push("-fuse-ld=mold");
+            out.push(Text.new(arena).add("-Wl,-plugin-opt,cache-dir=").add(cache).str());
+            let j = Text.new(arena);
+            j.fmt(`-Wl,-plugin-opt,jobs={jobCap()}`);
+            out.push(j.str());
+        }
+    }
+    out.push("-o");
+    out.push(exe);
+    for i in 0..objs.len { out.push(objs[i]); }
+    toolchain.appendLinkArgs(out, cc, notes, e.target, arena)?;
+    if cc.release {
+        let rel = toolchain.releaseFlags(TargetOs.Linux, toolchain.lldPresent(), arena);
+        for i in 0..rel.link.len { out.push(rel.link.items[i]); }
+    }
+    return Result.Ok(true);
+}
+
+/// Rust `available_parallelism`: how many clang processes run side by side.
+fn jobCap(): int {
+    let n = threadsys.cores();
+    return if n < 1 { 1 } else { n };
+}
+
+/// Rust `link_objs`: link `objs` into `exe`.
+fn linkObjs(objs: []string, exe: string, e: &EmitOpts, thin: bool, notes: string, phases: &Phases, arena: &Arena): Result<bool, string> {
+    let argv = List<string>.new(arena);
+    linkArgv(&argv, objs, exe, e, thin, notes, arena)?;
+    phases.begin("link");
+    let started = sys.monotonicMs();
+    let clang = argv.items[0];
+    match toolchain.runTicking(argv.slice(), "linking", phases, arena) {
+        Result.Ok(o) {
+            if timings() {
+                let t = Text.new(arena);
+                t.add("j3c: link: ");
+                pushSecs(&t, sys.monotonicMs() - started, 3);
+                t.add("s\n");
+                eprint(&t);
+            }
+            if o.code != 0 { return Result.Err(Text.new(arena).add(clang).add(" link failed:\n").add(o.errStr()).str()); }
+        }
+        Result.Err(x) { return Result.Err(toolchain.spawnErr(clang, x, arena)); }
+    }
+    return Result.Ok(true);
+}
+
+/// Rust `sweep_stale`: drop objects whose key is no longer the module's. Everything a current module wrote
+/// starts with one of `keep` (`label-key.`): its .o, .libs, .parts and pN.o.
+pub fn sweepStale(dir: string, keep: []string, arena: &Arena) {
+    match io.listDir(dir, arena) {
+        Result.Ok(ents) {
+            for i in 0..ents.len {
+                let name = ents[i].name;
+                let kept = false;
+                for k in 0..keep.len {
+                    if startsWith(name, keep[k]) { kept = true; break; }
+                }
+                if kept { continue; }
+                if endsWith(name, ".o") || endsWith(name, ".libs") || endsWith(name, ".ll") || endsWith(name, ".parts") || endsWith(name, ".err") || endsWith(name, ".job") {
+                    toolchain.discard(path.join(dir, name, arena));
+                }
+            }
+        }
+        Result.Err(_) {}
+    }
+}

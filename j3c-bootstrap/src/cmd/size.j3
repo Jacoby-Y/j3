@@ -1,13 +1,249 @@
 // `j3c size`: sections, code per module and the biggest fns of a dev build.
 //
 // Port of: j3c/src/cli/build.rs (`size_cmd`, `symbol_owners`)
+// J3: Reads the binary with `llvm-size`/`size` and `llvm-nm`/`nm` (`j3.proc`), then checks the same sources
+//     (`Stage.Passes`) to map each linker symbol back to its module and fn (`symbolOwners`: a symbol cannot
+//     be split into module and name, both can hold `_`). Rows are a `List` sorted stably (size down, then
+//     module name / `nm` order); the `Map`s are lookups only.
 module j3c.cmd.size;
 
-use j3c.cmd.check.err;
+use j3.cmp.sortBy;
+use j3.data.map.Map;
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.proc;
+use j3.result.Result;
+use j3.text.{ Text, isSpace, lines, parseInt, startsWith };
+use j3c.backend.llvm.funcName;
+use j3c.base.fsx;
+use j3c.cmd.check.{ err, failText, out };
+use j3c.cmd.run.printFail;
+use j3c.driver;
+use j3c.driver.{ Mode, Session, Stage };
+use j3c.ir.Program;
+use j3c.project.manifest;
+use j3c.project.manifest.Input;
 
-/// `j3c size [path]` (Rust `size_cmd`): exit code.
+/// A size with a name: a fn symbol, or a module's total.
+struct Row {
+    size: int;
+    name: string;
+}
+
+/// Where a linker symbol came from (Rust `(module, label)`); methods are labelled `Struct.name`.
+pub struct Owner {
+    sym: string;
+    owner: string;
+    label: string;
+}
+
+/// Rust `symbol_owners`: one entry per fn of `prog`, in id order, named as the LLVM backend names it.
+pub fn symbolOwners(prog: &Program, arena: &Arena): List<Owner> {
+    let cx = &prog.cx;
+    let res = List<Owner>.new(arena);
+    for i in 0..cx.funcs.len() {
+        let f = cx.funcs.get(cx.funcs.idAt(i));
+        let m = Text.new(arena);
+        for k in 0..f.moduleName.len {
+            if k > 0 { m.add("."); }
+            m.add(cx.nameStr(f.moduleName.items[k]));
+        }
+        let label = Text.new(arena);
+        match f.methodOf {
+            Option.Some(sid) { label.add(cx.nameStr(cx.structDef(sid).name)).add("."); }
+            Option.None {}
+        }
+        label.add(cx.nameStr(f.name));
+        res.push(Owner { sym: funcName(cx, f, arena), owner: m.str(), label: label.str() });
+    }
+    return res;
+}
+
+/// The whitespace-separated words of `l`.
+fn words(l: string, arena: &Arena): List<string> {
+    let res = List<string>.new(arena);
+    let i = 0;
+    while i < l.len {
+        while i < l.len && isSpace(l[i]) { i += 1; }
+        let a = i;
+        while i < l.len && !isSpace(l[i]) { i += 1; }
+        if i > a { res.push(l[a..i]); }
+    }
+    return res;
+}
+
+/// stdout of the first of `names` that runs `NAME args.. exe` with exit code 0.
+fn tool(names: []string, args: []string, exe: string, arena: &Arena): Option<string> {
+    for i in 0..names.len {
+        let argv = List<string>.new(arena);
+        argv.push(names[i]);
+        for k in 0..args.len { argv.push(args[k]); }
+        argv.push(exe);
+        match proc.run(argv.items[0..argv.len], "", arena) {
+            Result.Ok(o) { if o.code == 0 { return Option.Some(o.outStr()); } }
+            Result.Err(_) {}
+        }
+    }
+    return Option.None;
+}
+
+/// `  {size:>9}  {name}\n`
+fn row(t: &Text, size: int, name: string) {
+    let d = Text.new(t.arena);
+    d.pushInt(size);
+    t.add("  ");
+    for _ in d.len()..9 { t.push(' '); }
+    t.add(d.str()).add("  ").add(name).add("\n");
+}
+
+/// Rust `Path::with_extension("exe")`.
+fn withExe(p: string, arena: &Arena): string {
+    let e = path.ext(path.basename(p));
+    return Text.new(arena).add(p[0..p.len - e.len]).add(".exe").str();
+}
+
+/// `j3c size [path] [--target T]` (Rust `size_cmd`): exit code.
 pub fn sizeCmd(rest: []string): int {
-    // STUB C
-    err("j3c-boot: size: not ported yet\n");
-    return 1;
+    let mem = Arena.create(1 << 12);
+    defer mem.destroy();
+    let p = "";
+    let hasPath = false;
+    let target = "";
+    let i = 0;
+    while i < rest.len {
+        if rest[i] == "--target" {
+            i += 1;
+            target = if i < rest.len { rest[i] } else { "" };
+        } else if !startsWith(rest[i], "-") && !hasPath {
+            p = rest[i];
+            hasPath = true;
+        }
+        i += 1;
+    }
+    let m = match (if hasPath { manifest.resolve(p, &mem) } else { manifest.resolveCwd(&mem) }) {
+        Result.Ok(inp) {
+            match inp {
+                Input.Project(x) { x }
+                Input.Hello { err("j3c size: needs a project (a directory with j3.toml)\n"); return 1; }
+                Input.File(_) { err("j3c size: needs a project (a directory with j3.toml)\n"); return 1; }
+            }
+        }
+        Result.Err(e) { printFail(e, &mem); return 1; }
+    };
+    let exe = if target.len == 0 { m.outPath(&mem) } else { m.outPathFor(target, &mem) };
+    if !fsx.isFile(exe) && fsx.isFile(withExe(exe, &mem)) { exe = withExe(exe, &mem); }
+    let bytes = match io.stat(exe) {
+        Result.Ok(st) { st.size }
+        Result.Err(_) {
+            err(Text.new(&mem).add("j3c size: ").add(exe).add(" is not built; run `j3c build` first\n").str());
+            return 1;
+        }
+    };
+    let t = Text.new(&mem);
+    t.add(exe).add("  ");
+    t.pushInt(bytes);
+    t.add(" bytes\n");
+    let sizeTools: [2]string = ["llvm-size", "size"];
+    match tool(sizeTools[..], sizeTools[0..0], exe, &mem) {
+        Option.Some(s) {
+            // `text data bss dec hex file`: code and read-only data, initialised data, zeroed memory.
+            let n = 0;
+            for l in lines(s) {
+                if n == 1 {
+                    let w = words(l, &mem);
+                    if w.len >= 3 {
+                        t.add("code+rodata ").add(w.items[0]).add("  data ").add(w.items[1]).add("  bss ").add(w.items[2]).add(" (bss is memory, not file size)\n");
+                    }
+                }
+                n += 1;
+            }
+        }
+        Option.None {}
+    }
+    out(t.str());
+    t.clear();
+    let nmTools: [2]string = ["llvm-nm", "nm"];
+    let nmArgs: [2]string = ["-S", "--defined-only"];
+    let nm = match tool(nmTools[..], nmArgs[..], exe, &mem) {
+        Option.Some(s) { s }
+        Option.None { err("j3c size: `llvm-nm` or `nm` not found\n"); return 0; }
+    };
+    let funcs = List<Row>.new(&mem);
+    for l in lines(nm) {
+        let w = words(l, &mem);
+        if w.len != 4 { continue; }
+        let name = w.items[3];
+        while name.len > 0 && name[0] == '_' { name = name[1..name.len]; }
+        let kind = w.items[2];
+        if (kind == "t" || kind == "T") && startsWith(name, "j3_") {
+            let size = 0;
+            match parseInt(w.items[1], 16) {
+                Option.Some(v) { size = v; }
+                Option.None {}
+            }
+            funcs.push(Row { size: size, name: name });
+        }
+    }
+    if funcs.len == 0 {
+        out("no symbols (stripped): build without --release to see code per module\n");
+        return 0;
+    }
+    // A symbol cannot be split back into module and name (both can hold `_`), so each one is looked up in
+    // the program that the same sources make.
+    let o = driver.defaults();
+    o.entry = p;
+    o.entryGiven = hasPath;
+    o.mode = Mode.Build;
+    let s = Session.new(o);
+    defer s.free();
+    if !driver.run(s, Stage.Passes) {
+        printFail(failText(s), s.arena);
+        return 1;
+    }
+    let owners = List<Owner>.new(&mem);
+    match s.program {
+        Option.Some(prog) { owners = symbolOwners(prog, s.arena); }
+        Option.None {}
+    }
+    let bySym = Map<string, int>.new(s.arena, 1024);
+    for k in 0..owners.len { bySym.put(owners.items[k].sym, k); }
+    // Rust: a `BTreeMap` by module name, then a stable sort by size, biggest first.
+    let groups = List<Row>.new(s.arena);
+    let byModule = Map<string, int>.new(s.arena, 64);
+    for k in 0..funcs.len {
+        let from = "(not in these sources)";
+        match bySym.get(funcs.items[k].name) {
+            Option.Some(at) { from = owners.items[at].owner; }
+            Option.None {}
+        }
+        match byModule.get(from) {
+            Option.Some(at) { groups.items[at].size += funcs.items[k].size; }
+            Option.None {
+                byModule.put(from, groups.len);
+                groups.push(Row { size: funcs.items[k].size, name: from });
+            }
+        }
+    }
+    sortBy(groups.items[0..groups.len], fn(a: Row, b: Row): bool { return a.name < b.name; });
+    sortBy(groups.items[0..groups.len], fn(a: Row, b: Row): bool { return a.size > b.size; });
+    let r = Text.new(s.arena);
+    r.add("code per module (stdlib modules are j3.*):\n");
+    for k in 0..groups.len {
+        if k < 12 { row(&r, groups.items[k].size, groups.items[k].name); }
+    }
+    sortBy(funcs.items[0..funcs.len], fn(a: Row, b: Row): bool { return a.size > b.size; });
+    r.add("biggest functions:\n");
+    for k in 0..funcs.len {
+        if k >= 15 { break; }
+        let shown = funcs.items[k].name;
+        match bySym.get(shown) {
+            Option.Some(at) { shown = Text.new(s.arena).add(owners.items[at].owner).add(".").add(owners.items[at].label).str(); }
+            Option.None {}
+        }
+        row(&r, funcs.items[k].size, shown);
+    }
+    out(r.str());
+    return 0;
 }

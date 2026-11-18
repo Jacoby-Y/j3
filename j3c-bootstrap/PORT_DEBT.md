@@ -66,8 +66,6 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
 - Rust quirk (not copied): "did you mean" ties follow Rust `HashMap` order (C2c review r2#7); the port sorts candidates.
 - Open (C2c review r3#3): a `validate` failure in j3c-boot is rendered as a plain driver error, not Rust's ICE text; no
   corpus file reaches it.
-- Open (C2d gate): `run --fast` in j3c-boot does not print the build-step note `clang -O0 whole program (one
-  invocation, links too)` on stderr (Rust `emit/host.rs:195`); stdout and rc are the same.
 - Rust bug not copied (C2e review r1#2, r2 note): a `.j3ui` error whose span ends at a non-ASCII byte makes stage0 die
   with an internal compiler error (rc 70, `src/diag.rs:58`, "end byte index N is not a char boundary"); j3c-boot
   prints the proper error, rc 1. Repro, each as the only line of `ui/Main.j3ui` under `dump-ui ui`: `<div é="1">`,
@@ -78,3 +76,20 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
 - Open (C3 contracts, wave 19): `gen::before_build` (Rust `gen.rs:148`, called from `build_inner`, `run_user`, `run_loaded`,
   `unchanged_project`) is the no-op `cmd/gen.j3` `beforeBuild` until C5: j3c-boot does not run a project's stale
   `assets/gen/*.j3` generators before a build (`examples/editor_village` is the one corpus project with any).
+- Open (C3 wave 20, for C4): `cmd/stamp.j3` `StampFlags` has no `--emit` field, so the backend is not in
+  `inputs.<kind>.key` (it is in `src.key` through `Options.emit`). Only LLVM builds today and `build` / `run` skip
+  the stat shortcut for `--emit c`; add the field when the `bc` backend lands.
+- Not copied (C3, by decision): the compiler id stamp is `~/.cache/j3/compiler-boot.id` (Rust: `compiler.id`). Its
+  text is `size sec.nsec` (`fsx.statNs`, x86-64 Linux; seconds elsewhere); sharing Rust's file would make each compiler
+  re-hash itself after the other ran. Object and stamp keys are `xxh3_64`, never equal to Rust's.
+- Not copied (C3, by decision): the object cache's job pool is forked worker processes (`cache/jobs.j3`: emit +
+  clang per missed module, reaped with `proc.waitAny`), where Rust has pool threads (`emit/incr.rs`). The Session
+  arena is single-threaded; measured 9 s against 62 s serial for the self build. The time note keeps Rust's words
+  (`N modules on W threads`). Two j3c-boot runs on one project race like Rust's (no `io.flock` on the cache dir yet).
+- Open (C3 wave 20, for C5): `version --verbose` prints `docs: not in j3c-boot yet` (Rust hashes its doc and help
+  sources, `stdlib::docs_id`) and its own path on the `binary` line; the other lines are equal.
+- Open (C3 wave 20, for C5): no C fallback when clang is missing (`resolve_backend`); `opensslLibDir` and
+  `clangAvailable` have no caller yet (apk, doctor); Android builds are checked by argv only.
+- Stage-0 quirk (C3 wave 20; listed here, not a miscompile): a top-level fn named `less` in a file that calls
+  `j3.cmp.sortBy` shadows `sortBy`'s `less` parameter when the instance is lowered (the `MergedEnv` rule above):
+  a type error inside `cmp.j3`. Workaround: do not name a top-level fn `less` (or any stdlib generic's parameter name).

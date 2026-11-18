@@ -1,0 +1,142 @@
+// Rust emit/incr/tests.rs `chunks_define_each_function_once`: split in three chunks, every fn of a module
+// of `speculative/01_basics.j3` is defined by exactly one chunk and `@main` by exactly one object; a whole
+// module declares only what it uses. Also `chunkAssign`'s order rule and `splitPlan`'s thresholds.
+module cache_chunks_test;
+
+use j3.cmp.sortBy;
+use j3.data.pool.Id;
+use j3.data.set.Set;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.{ Text, find, lines, startsWith };
+use j3c.backend.llvm.{ Chunk, LlOpts, chunkAssign, emitLlvmModule, funcWeights };
+use j3c.cache;
+use j3c.driver;
+use j3c.driver.{ Mode, Session, Stage };
+use j3c.ir.Func;
+use j3c.toolchain.defaultEmitOpts;
+
+/// The symbol a `define`/`declare` line names (the text between the first `@` and the next `@` or `(`).
+fn symbol(line: string): string {
+    let at = find(line, "@");
+    if at < 0 { return ""; }
+    let rest = line[at + 1..line.len];
+    let end = find(rest, "@");
+    if end >= 0 { rest = rest[0..end]; }
+    let paren = find(rest, "(");
+    return if paren >= 0 { rest[0..paren] } else { rest };
+}
+
+/// The fns `ll` defines, `main` counted apart.
+fn defines(ll: string, out: &List<string>): int {
+    let mains = 0;
+    let it = lines(ll);
+    while true {
+        match it.next() {
+            Option.Some(l) {
+                if !startsWith(l, "define ") { continue; }
+                if symbol(l) == "main" { mains += 1; } else { out.push(symbol(l)); }
+            }
+            Option.None { break; }
+        }
+    }
+    return mains;
+}
+
+fn count(s: string, part: string): int {
+    let n = 0;
+    let at = 0;
+    while at < s.len {
+        let i = find(s[at..s.len], part);
+        if i < 0 { break; }
+        n += 1;
+        at += i + part.len;
+    }
+    return n;
+}
+
+fn main() {
+    let a = Arena.create(1 << 16);
+    defer a.destroy();
+    let got = chunkAssign([5, 9, 0, 9, 1], 2, &a);
+    // 9 (index 1) -> chunk 0, 9 (index 3) -> chunk 1, 5 -> chunk 0 (tie: lower index), 1 -> chunk 1, 0 -> chunk 1
+    let want = [0, 0, 1, 1, 1];
+    for i in 0..5 { if got.items[i] != want[i] { panic("chunkAssign order"); } }
+    if chunkAssign([1, 2], 0, &a).items[1] != 0 { panic("chunkAssign with no chunk"); }
+
+    let o = driver.defaults();
+    o.entry = "../speculative/01_basics.j3";
+    o.mode = Mode.Build;
+    let s = Session.new(o);
+    if !driver.run(s, Stage.Passes) { panic("01_basics does not check"); }
+    let mem = s.arena;
+    let lo = LlOpts { target: "", opt: 0, debug: true, release: false };
+    let mains = 0;
+    match s.program {
+        Option.Some(p) {
+            let modules = p.modules.slice();
+            for index in 0..modules.len {
+                let m = &modules[index];
+                let w = funcWeights(&p.cx, m, mem);
+                if w.len != m.funcs.len { panic("one weight per fn"); }
+                let part = chunkAssign(w.slice(), 3, mem);
+                let defs = List<string>.new(mem);
+                for n in 0..3 {
+                    let set = Set<Id<Func>>.new(mem, 16);
+                    for i in 0..m.funcs.len { if part.items[i] == n { set.add(m.funcs.items[i]); } }
+                    let ll = Text.new(mem);
+                    match emitLlvmModule(&p.cx, modules, index, &lo, Option.Some(Chunk { no: n, defined: &set }), &ll) {
+                        Result.Ok(_) {}
+                        Result.Err(e) { panic(e); }
+                    }
+                    mains += defines(ll.str(), &defs);
+                }
+                let whole = Text.new(mem);
+                match emitLlvmModule(&p.cx, modules, index, &lo, Option.None, &whole) {
+                    Result.Ok(_) {}
+                    Result.Err(e) { panic(e); }
+                }
+                // Only what the module uses is declared.
+                let it = lines(whole.str());
+                while true {
+                    match it.next() {
+                        Option.Some(l) {
+                            if !startsWith(l, "declare ") { continue; }
+                            let name = symbol(l);
+                            let t = Text.new(mem).add("@").add(name);
+                            let uses = count(whole.str(), Text.new(mem).add(t.str()).add("(").str())
+                                + count(whole.str(), Text.new(mem).add(t.str()).add(",").str())
+                                + count(whole.str(), Text.new(mem).add(t.str()).add(" ").str());
+                            if uses <= 1 { panic(Text.new(mem).add("unused declare: ").add(l).str()); }
+                        }
+                        Option.None { break; }
+                    }
+                }
+                let all = List<string>.new(mem);
+                defines(whole.str(), &all);
+                sortBy(all.slice(), fn(x: string, y: string): bool { return x < y; });
+                sortBy(defs.slice(), fn(x: string, y: string): bool { return x < y; });
+                if all.len != defs.len { panic(Text.new(mem).add("chunks define another fn count than the whole module: ").add(cache.moduleLabel(&p.cx, m, mem)).str()); }
+                for i in 0..all.len { if all.items[i] != defs.items[i] { panic(Text.new(mem).add("defined twice or never: ").add(all.items[i]).str()); } }
+
+                // `[emit] chunks = 0` turns the split off; a plan defines each sized fn once.
+                let e = defaultEmitOpts(mem);
+                let plan = cache.splitPlan(&p.cx, m, whole.str(), &e, mem);
+                let planned = 0;
+                for k in 0..plan.len { planned += plan.items[k].len(); }
+                if plan.len == 1 || planned > all.len || (plan.len > 0 && planned == 0) { panic("splitPlan sets"); }
+                e.chunks = 0;
+                if cache.splitPlan(&p.cx, m, whole.str(), &e, mem).len != 0 { panic("chunks = 0 still splits"); }
+            }
+        }
+        Option.None { panic("no program"); }
+    }
+    if mains != 1 { panic("main is not defined exactly once"); }
+
+    // `define` blocks are sized by symbol.
+    let sizes = cache.defineSizes("x\ndefine void @f(i32 %a) {\n  ret void\n}\ndefine i32 @g() {\n}\n", mem);
+    if sizes.getOr("f", 0) != 38 || sizes.getOr("g", 0) != 20 || sizes.len != 2 { panic("defineSizes"); }
+    s.free();
+}

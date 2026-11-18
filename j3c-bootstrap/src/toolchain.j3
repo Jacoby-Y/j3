@@ -8,12 +8,19 @@
 //     objects and ThinLTO of `emit/incr.rs` (Rust takes that path for named outputs at opt 0/1 and release;
 //     j3c-boot always runs the one clang, same program), `compile_c`/`compile_and_run` (no C backend),
 //     `resolve_backend` (no C fallback when clang is missing: the spawn error names clang).
+// J3: `compileText` / `compileLlvm` have no `Phases` (frozen signatures); `compileTextWith` /
+//     `compileLlvmWith` take the Session's, for Rust's inner status line (`clang -O0 whole program ..`, the
+//     tick every 2 s) and the `clang skipped` note. Rust's `detail("hashing IR ..")` is made for every
+//     build (after the cache folder for a named output), under the phase the driver has open (`compile`;
+//     Rust still has `emit`).
 // J3: Rust's `RUN_SEQ` is a `#[singleton]`; temp names use `monotonicMs` where Rust has wall-clock nanos (the
 //     name only has to be unique). The build-cache key is `xxh3_64` (Rust: `DefaultHasher`), so a stamp
 //     written by one compiler never matches the other: it rebuilds, never reuses a wrong binary.
 module j3c.toolchain;
 // J3: Every `use` of the module is here (part files have none).
 
+use j3.cmp.sortBy;
+use j3.data.pool.Id;
 use j3.hash.Xxh3;
 use j3.io;
 use j3.io.path;
@@ -25,9 +32,13 @@ use j3.result.Result;
 use j3.sys;
 use j3.text.{ Text, contains, endsWith, find, lastIndexOf, lines, parseInt, parseU64, split, startsWith, trim };
 use j3c.backend.Opts;
+use j3c.base.diag;
+use j3c.base.diag.{ Diag, Note, NoteKind, Severity };
 use j3c.base.fsx;
+use j3c.base.phase.Phases;
+use j3c.base.span.{ Span, noSpan };
 use j3c.base.text_fmt.hasLower;
-use j3c.ir.Program;
+use j3c.ir.{ Block, ConstKind, Func, FuncKind, IrCx, LocalDecl, Operand, PlaceRoot, Program, Rvalue, RvalueKind, StmtKind };
 use j3c.project.manifest.{ Manifest, targetSlug };
 
 /// Compiler and linker settings for one build (Rust `CcOpts`); strings are argv, manifest or arena copies.
@@ -138,14 +149,74 @@ let RUN_SEQ: int;
 
 /// Rust `compile_text` (LLVM) with `compile_program`'s Android check: clang the `.ll` text for `e`.
 pub fn compileText(ll: string, e: &EmitOpts, arena: &Arena): Result<string, string> {
-    if targetOs(e.target) == TargetOs.Android { androidReady(e.target)?; }
-    return compileLlvm(ll, &e.cc, e.clang, e.target, e.cpu, e.flags.items[0..e.flags.len], arena);
+    let off = Phases.new(arena);
+    return compileTextWith(ll, e, &off, arena);
+}
+
+/// `compileText` drawing its progress on `phases` (the Session's).
+pub fn compileTextWith(ll: string, e: &EmitOpts, phases: &Phases, arena: &Arena): Result<string, string> {
+    if targetOs(e.target) == TargetOs.Android { androidReady(e.target, arena)?; }
+    return compileLlvmWith(ll, &e.cc, e.clang, e.target, e.cpu, e.flags.items[0..e.flags.len], phases, arena);
+}
+
+/// Rust `clang_available`: `clang --version` runs and succeeds.
+pub fn clangAvailable(clang: string, arena: &Arena): bool {
+    let argv: [2]string = [clang, "--version"];
+    match proc.run(argv[..], "", arena) {
+        Result.Ok(o) { return o.code == 0; }
+        Result.Err(_) { return false; }
+    }
+}
+
+/// Rust `phase::run_ticking`: run `argv` to the end like `proc.run`, updating the inner status line with
+/// the seconds so far, so one long clang or link call is not silent.
+pub fn runTicking(argv: []string, what: string, phases: &Phases, arena: &Arena): Result<Output, ProcError> {
+    let child = proc.start(argv, arena)?;
+    child.closeStdin();
+    let started = sys.monotonicMs();
+    let out = Text.new(arena);
+    let err = Text.new(arena);
+    let buf = arena.alloc::<u8>(65536);
+    let line = Text.new(arena);
+    let none: [2]i32 = [0, 0];
+    while true {
+        // Both pipes are drained while it runs, so neither fills and stalls it.
+        match child.tryRead(buf) {
+            Option.Some(n) { if n > 0 { out.pushBytes(buf[0..n]); } }
+            Option.None {}
+        }
+        match child.tryReadErr(buf) {
+            Option.Some(n) { if n > 0 { err.pushBytes(buf[0..n]); } }
+            Option.None {}
+        }
+        match child.tryWait() {
+            Option.Some(_) { break; }
+            Option.None {}
+        }
+        line.clear();
+        line.add(what).add(": ");
+        line.pushInt((sys.monotonicMs() - started) / 1000);
+        line.push('s');
+        phases.detail(line.str());
+        // Short polls: a fast link (mold, ~30 ms) should not wait out a long tick.
+        sys.pollFds(&none[0] as ptr, 0, 5);
+    }
+    let rest = child.collect("" as []u8, arena);
+    out.pushBytes(rest.out);
+    err.pushBytes(rest.err);
+    return Result.Ok(Output { code: rest.code, out: out.bytes, err: err.bytes });
 }
 
 /// Rust `compile_llvm`: write `ll` to a temp `.ll`, run one `clang` for `target` (`""` host) and `cpu` that
 /// compiles and links (+ `extra` args); the executable's path, or the error text. A named output whose
 /// IR and command match its `clang.key` stamp is not rebuilt.
 pub fn compileLlvm(ll: string, cc: &CcOpts, clang: string, target: string, cpu: string, extra: []string, arena: &Arena): Result<string, string> {
+    let off = Phases.new(arena);
+    return compileLlvmWith(ll, cc, clang, target, cpu, extra, &off, arena);
+}
+
+/// `compileLlvm` drawing its progress on `phases`.
+pub fn compileLlvmWith(ll: string, cc: &CcOpts, clang: string, target: string, cpu: string, extra: []string, phases: &Phases, arena: &Arena): Result<string, string> {
     let seq = RUN_SEQ;
     RUN_SEQ = RUN_SEQ + 1;
     let stamp = Text.new(arena);
@@ -183,12 +254,15 @@ pub fn compileLlvm(ll: string, cc: &CcOpts, clang: string, target: string, cpu: 
         let cd = cacheDir(cc.out, target, arena);
         mkdirs(cd, arena)?;
         stampPath = path.join(cd, "clang.key", arena);
+        phases.detail("hashing IR for the build cache key");
         key = buildKey(srcPath, ll, argv.items[0..argv.len], arena);
         if fsx.isFile(exePath) {
             match fsx.readText(stampPath, arena) {
                 Result.Ok(k) {
                     if k == key {
                         discard(srcPath);
+                        phases.begin("compile");
+                        phases.note("clang skipped: same IR and command as the last build");
                         return Result.Ok(exePath);
                     }
                 }
@@ -196,10 +270,15 @@ pub fn compileLlvm(ll: string, cc: &CcOpts, clang: string, target: string, cpu: 
             }
         }
         discard(stampPath);
+    } else {
+        phases.detail("hashing IR for the build cache key");
     }
+    let what = Text.new(arena).add("clang -O").add(clangOpt(cc.opt)).add(" whole program (one invocation, links too)").str();
+    phases.begin("compile");
+    phases.detail(what);
     let started = sys.monotonicMs();
     let out = Output { code: 0, out: "" as []u8, err: "" as []u8 };
-    match proc.run(argv.items[0..argv.len], "", arena) {
+    match runTicking(argv.items[0..argv.len], what, phases, arena) {
         Result.Ok(o) { out = o; }
         Result.Err(e) {
             discard(srcPath);
@@ -209,7 +288,7 @@ pub fn compileLlvm(ll: string, cc: &CcOpts, clang: string, target: string, cpu: 
     if sys.env("J3C_TIMINGS").len > 0 {
         let t = Text.new(arena);
         t.add("j3c: clang: ");
-        pushSecs(&t, sys.monotonicMs() - started);
+        pushSecs(&t, sys.monotonicMs() - started, 3);
         t.add("s\n");
         sys.write(2, t.str().ptr as ptr, t.len());
     }
@@ -269,13 +348,16 @@ fn buildKey(temp: string, source: string, argv: []string, arena: &Arena): string
         h.update(argv[i] as []u8);
         h.update(zero[..]);
     }
-    let v = h.finish();
-    let t = Text.new(arena);
+    return hex16(h.finish(), arena);
+}
+
+/// `v` as 16 lower-case hex digits, zero padded.
+pub fn hex16(v: u64, arena: &Arena): string {
     let hex = Text.new(arena);
     hex.pushHex(v);
+    let t = Text.new(arena);
     for _ in hex.len()..16 { t.push('0'); }
-    t.add(hex.str());
-    return t.str();
+    return t.add(hex.str()).str();
 }
 
 /// Rust `cache_dir`: where a build output keeps its bookkeeping, `target/.j3c/<triple or host>/<exe name>/`
@@ -381,7 +463,7 @@ pub fn clangOpt(opt: string): string {
 }
 
 /// `mkdir -p dir`, Err as Rust's `mkdir DIR: E`.
-fn mkdirs(dir: string, arena: &Arena): Result<bool, string> {
+pub fn mkdirs(dir: string, arena: &Arena): Result<bool, string> {
     match io.makeDirs(dir) {
         Result.Ok(_) { return Result.Ok(true); }
         Result.Err(_) { return Result.Err(Text.new(arena).add("mkdir ").add(dir).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
@@ -396,8 +478,16 @@ pub fn discard(p: string) {
     }
 }
 
-/// `ms` as seconds with three decimals (Rust `{:.3}`).
-fn pushSecs(t: &Text, ms: int) {
+/// `ms` as seconds with `places` (2 or 3) decimals, rounded (Rust `{:.2}` / `{:.3}`).
+pub fn pushSecs(t: &Text, ms: int, places: int) {
+    if places == 2 {
+        let c = (ms + 5) / 10;
+        t.pushInt(c / 100);
+        t.push('.');
+        if c % 100 < 10 { t.push('0'); }
+        t.pushInt(c % 100);
+        return;
+    }
     t.pushInt(ms / 1000);
     t.push('.');
     let r = ms % 1000;

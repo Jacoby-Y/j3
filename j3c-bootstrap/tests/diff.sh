@@ -21,11 +21,14 @@ usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-kno
      ir/llvm/glsl/ui/run export J3_STDLIB=<repo>/j3c/stdlib to both sides, so stage0's build-dir stdlib path
      stays out of the output.
      run: a project's `target/.j3c` (stamps, objects) is removed before each compiler and after the last, so
-     neither reuses the other's build and nothing is left in the corpus. An input whose line in
-     tests/known/run.txt has a `# skip: CAUSE` comment is never run (network).
+     neither reuses the other's build and nothing is left in the corpus (a file input inside a project counts
+     as that project; a file outside any project builds to a temp file, writes no stamps and runs in a scratch cwd). An input whose line in
+     tests/known/run.txt has a `# skip: CAUSE` comment is never run (network). A line with `# nondet: CAUSE`
+     runs, and a NONDET (or any other outcome) of it does not fail the run.
      self: stage 1 (j3c-boot) builds a scratch copy of j3c-bootstrap/{j3.toml,src,text} under <repo>/target/
      (never in place: that would overwrite the running binary); stage 2 is then compared with stage 1 on
      fmt, ast, err, ui, glsl, ir --norm and llvm (one input per call). SELF_BUILD_TIMEOUT seconds (default 1800).
+     SELF_LLVM=A:B: only llvm inputs A..B of `llvm --list` (the other modes only when A is 1), to run it in pieces.
 Env: DIFF_TIMEOUT seconds per command (default 30; ir/llvm 120; run 300).
      DIFF_STAGE0 / DIFF_BOOT replace the two compilers (default stage0/j3c, target/j3c-boot;
      DIFF_BOOT skips the j3c-boot rebuild).
@@ -105,12 +108,27 @@ if [ $mode = self ]; then
     [ ! "$boot/target/j3c-boot" -nt "$scratch/start" ] || die "self: the build wrote j3c-bootstrap/target/j3c-boot"
     export DIFF_STAGE0=$BOOT DIFF_BOOT=$stage2 DIFF_NO_COVERAGE=1
     bad=0; n=0
-    sub() { n=$((n + 1)); "$0" "$@" | tail -1 || bad=$((bad + 1)); }
-    for m in fmt ast err ui glsl; do sub $m; done
-    sub glsl --es
-    sub ir --norm
+    # A clean comparison prints its summary line; a failed one prints everything (the DIFF/CRASH detail).
+    sub() {
+        n=$((n + 1))
+        if "$0" "$@" >"$scratch/sub.out" 2>&1; then tail -1 "$scratch/sub.out"
+        else bad=$((bad + 1)); echo "FAILED: diff.sh $*"; cat "$scratch/sub.out"; fi
+    }
+    # SELF_LLVM=A:B runs only llvm inputs A..B of the list (1-based), and the other modes only when A is 1:
+    # a full `self` in pieces, for callers with a time cap per command.
+    la=1; lb=999999
+    if [ -n "${SELF_LLVM:-}" ]; then la=${SELF_LLVM%%:*}; lb=${SELF_LLVM##*:}; fi
+    if [ "$la" -le 1 ]; then
+        for m in fmt ast err ui glsl; do sub $m; done
+        sub glsl --es
+        sub ir --norm
+    fi
     # llvm: one input per call (a whole-corpus llvm run fills /tmp).
-    while IFS= read -r f; do sub llvm "$f"; done < <("$0" llvm --list)
+    li=0
+    while IFS= read -r f; do
+        li=$((li + 1))
+        if [ $li -ge "$la" ] && [ $li -le "$lb" ]; then sub llvm "$f"; fi
+    done < <("$0" llvm --list)
     echo "diff.sh self: $((n - bad)) ok, $bad failed (of $n comparisons)"
     [ $bad = 0 ] || exit 1
     exit 0
@@ -162,6 +180,10 @@ if [ -n "$skipset" ]; then
     [ -z "$skipped" ] || sed "s|^|skip |" <<<"$skipped" >&$((list + 1))
     [ -n "$inputs" ] || die "every input for $mode is skipped"
 fi
+# `PATH  # nondet: CAUSE`: the oracle's own output changes run to run (timings, pids). The input still runs (a
+# j3c-boot crash on it would show as CRASH when stage0's two runs agree), but no outcome of it fails the run.
+nondetset=$( [ -f "$known" ] && sed -n 's/[[:space:]]*#[[:space:]]*nondet:.*//p' "$known" || true )
+isnondet() { [ -n "$nondetset" ] && grep -qxF -- "$1" <<<"$nondetset"; }
 if [ $list = 1 ]; then echo "$inputs"; exit 0; fi
 # run builds in the project's own target/: never j3c-bootstrap itself (the running binary lives there).
 [ $mode != run ] || ! grep -qxF j3c-bootstrap <<<"$inputs" || die "run: j3c-bootstrap is not a run input (use self)"
@@ -196,10 +218,22 @@ one() {
         ui) cmd=(dump-ui "$arg/ui") ;;
         run) cmd=(run --headless --frames 3 "$arg") ;;
     esac
+    # run: the project the input builds in. A folder is its own; a file belongs to the nearest `j3.toml`
+    # above it (`j3c run FILE` builds that project); a file outside any project builds to a temp file and
+    # leaves nothing behind.
+    local proj=
+    if [ $mode = run ]; then
+        proj=$root/$f; [ -d "$proj" ] || proj=$(dirname "$proj")
+        while [ ! -f "$proj/j3.toml" ] && [ "$proj" != "$root" ] && [ "$proj" != / ]; do proj=$(dirname "$proj"); done
+        [ -f "$proj/j3.toml" ] || proj=
+        # A lone file runs in a scratch cwd: what it writes by relative path dies with $d/w
+        # (j3c/stdlib/tests/win_io_test.j3 makes `C:\j3_win_io_test\...` folders in the cwd on Linux).
+        if [ -z "$proj" ]; then mkdir -p "$d/w"; cwd=$d/w; cmd=(run --headless --frames 3 "$root/$f"); fi
+    fi
     for who in a a2 b; do
         local bin=$S0; [ $who = b ] && bin=$BOOT
         # Each compiler builds from nothing: no stamp or object of the other one (or of an earlier run).
-        [ $mode != run ] || [ ! -d "$root/$f" ] || rm -rf "$root/$f/target/.j3c"
+        [ -z "$proj" ] || rm -rf "$proj/target/.j3c"
         (cd "$cwd" && SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout -k 5 "$to" "$bin" "${cmd[@]}" \
             >"$d/$who.out" 2>"$d/$who.err" </dev/null)
         echo $? >"$d/$who.rc"
@@ -208,6 +242,11 @@ one() {
         # ponytail: a windowed program's `J3STATS` / `J3UISTATS` lines are frame timings; dropped whole (their
         # counters go too). Keep the counter fields if a paint-count difference ever needs catching here.
         [ $mode = run ] && sed -i '/^J3STATS \|^J3UISTATS /d' "$d/$who.out"
+        # ponytail: tests print their own timings (`29 us per frame`, `5.233 ms`): the number before a time unit
+        # is masked. A test whose result is a duration would be hidden by this; none in the corpus.
+        [ $mode = run ] && sed -i -E 's/[0-9]+(\.[0-9]+)? (us|ms|ns|s)\b/N \2/g' "$d/$who.out"
+        # ponytail: thread-race counters (a11y_inbox_test: `full N times, woke N`); add patterns here, not entries.
+        [ $mode = run ] && sed -i -E 's/full [0-9]+ times, woke [0-9]+/full N times, woke N/' "$d/$who.out"
         [ $norm = 1 ] && awk -f "$here/norm_ir.awk" "$d/$who.out" >"$d/$who.n" && mv "$d/$who.n" "$d/$who.out"
         { cat "$d/$who.out"
           if [ $mode != run ]; then echo "--- stderr"; cat "$d/$who.err"; fi
@@ -217,13 +256,13 @@ one() {
     if ! cmp -s "$d/a.txt" "$d/a2.txt"; then
         echo NONDET >"$d/status"; diff -u --label stage0-run1 --label stage0-run2 "$d/a.txt" "$d/a2.txt" | head -40 >"$d/detail"
     elif { [ "$rb" -ge 124 ] && [ "$rb" != "$ra" ]; } || { [ "$rb" != 0 ] && [ "$ra" = 0 ]; }; then
-        echo CRASH >"$d/status"; { echo "j3c-boot exit $rb (stage0 exit $ra)"; head -5 "$d/b.err"; } >"$d/detail"
+        echo CRASH >"$d/status"; { echo "j3c-boot exit $rb (stage0 exit $ra)"; grep -v '^j3c: \[\| modules compiled$' "$d/b.err" | tail -8; } >"$d/detail"
     elif cmp -s "$d/a.txt" "$d/b.txt"; then
         echo ok >"$d/status"
     else
         echo DIFF >"$d/status"; diff -u --label stage0 --label j3c-boot "$d/a.txt" "$d/b.txt" | head -40 >"$d/detail"
     fi
-    [ $mode != run ] || [ ! -d "$root/$f" ] || rm -rf "$root/$f/target/.j3c"
+    [ -z "$proj" ] || rm -rf "$proj/target/.j3c"
     # Only status and detail are read after this; dumps of a whole corpus would fill the disk.
     rm -rf "$d/w" "$d"/*.out "$d"/*.err "$d"/*.txt "$d"/*.rc
     true
@@ -238,10 +277,12 @@ nok=0; ndiff=0; ncrash=0; nnon=0; new=0; fixed=(); failing=(); i=0
 while IFS= read -r f; do
     i=$((i + 1)); st=$(cat "$tmp/$i/status" 2>/dev/null || echo CRASH)
     case $st in
-        ok) nok=$((nok + 1)); echo "ok $f"; if isknown "$f"; then fixed+=("$f"); fi; continue ;;
+        ok) nok=$((nok + 1)); echo "ok $f"; if isknown "$f" && ! isnondet "$f"; then fixed+=("$f"); fi; continue ;;
         DIFF) ndiff=$((ndiff + 1)) ;;
         CRASH) ncrash=$((ncrash + 1)) ;;
-        NONDET) nnon=$((nnon + 1)); new=$((new + 1)); echo "NONDET $f (stage0 printed different text on two runs)"
+        NONDET) nnon=$((nnon + 1))
+                if isnondet "$f"; then echo "NONDET $f (known)"; continue; fi
+                new=$((new + 1)); echo "NONDET $f (stage0 printed different text on two runs)"
                 sed 's/^/    /' "$tmp/$i/detail"; continue ;;
     esac
     echo "$st $f"; failing+=("$f")
@@ -254,6 +295,8 @@ if [ $update = 1 ]; then
     { echo "# diff.sh $kname: known DIFF/CRASH inputs. Only ever shrinks: remove a line when its input passes."
       # ponytail: an existing list only shrinks; a new failure is never blessed (delete the file to reseed).
       { grep -vxF -- "$inputs" <<<"$knownset" || true
+        # a `# nondet:` entry passes or is NONDET, so it is in neither list above: keep it
+        [ -z "$nondetset" ] || echo "$nondetset"
         if [ -n "$knownset" ]; then printf '%s\n' "${failing[@]+"${failing[@]}"}" | grep -xF -- "$knownset" || true
         else printf '%s\n' "${failing[@]+"${failing[@]}"}"; fi; } | sed '/^$/d' | sort -u |
         # a kept entry keeps its `# cause` / `# skip:` comment

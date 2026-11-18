@@ -460,6 +460,8 @@ report), then `./build.sh` (installs only the Rust `j3c`, see A3).
 
 ## Part D: after parity (behaviour changes, now allowed)
 
+0. Speed baseline (after C5, before C6): time j3c-boot vs stage0 on the same inputs (self build cold/warm, the editor, a big game, `check` on the corpus, `doc`/`lsp` startup) and write the numbers down. Measure only; tuning is a separate pass, except fixes that are obvious or already listed here.
+
 1. Several errors per run, with codes shown and `j3c explain` (B3, B10).
 2. The memo table and finer cache keys (B5), parallel `lower`. The LSP switches to per-module rechecks
    (B12.5) once this lands.
@@ -566,8 +568,8 @@ Gate: `diff.sh ui` exact on the UI projects and `tests/bad-ui`, then full-file `
 - [x] Wave 17 (4 agents, shared worktree): markup front end; generator core; tree walk (elements, control, components, slots); attributes + `ui.j3` surface + error cases.
 - [x] Wave 18 (integration): `diff.sh ui` by tier, then ir/llvm on the 62 projects, span-map error cases.
 
-### Milestone C3: toolchain rest, object cache, `build`, `run`, self-build
+### Milestone C3: toolchain rest, object cache, `build`, `run`, self-build — DONE (whole-corpus run 220/220; diff.sh self 229/0; llvm j3c-bootstrap exact; cache 0-clang rebuild; review 0 must-fix, 11 should-fix fixed; run.txt nondet entry gone)
 Gate: whole-corpus `diff.sh run` clean (leftovers in `known/run.txt` with causes), `diff.sh self` (stage 2 = stage 1). Survey: `.swarm-opus/11-port/survey-c3.md`.
 - [x] Wave 19 (contracts, 1 agent): cache API, driver cache-or-one-clang choice, `cmd/stamp.j3`, command routes, `diff.sh self` skeleton, `known/run.txt`, `contracts-c3.md`, `c3-corpus.txt`.
-- [ ] Wave 20 (4 agents, shared worktree): object cache; toolchain rest + preflight; `build` stamps, multi-target, log, `size`; `run`, commands, driver, harness.
-- [ ] Wave 21 (integration): self LLVM exact, whole-corpus run by tier, `diff.sh self`.
+- [x] Wave 20 (4 agents, shared worktree): object cache; toolchain rest + preflight; `build` stamps, multi-target, log, `size`; `run`, commands, driver, harness.
+- [x] Wave 21 (integration): self LLVM exact, whole-corpus run by tier, `diff.sh self`.

@@ -1,0 +1,171 @@
+// Android lookup (the 4 tests of emit/android.rs) and clang's argv for the macOS, Web and Android triples
+// (Windows is in toolchain_argv_test). Argv only: no cross link is ever run.
+module toolchain_cross_test;
+
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.sys.panic;
+use j3.text.{ Text, contains };
+use j3c.toolchain.{ androidAbi, androidLibName, androidReady, clangArgv, clangAvailable, defaultEmitOpts, findNdk, highestVersionDir,
+    sdkRootIn, sdlLibDir, sdlRoot };
+
+fn main() {
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    let tmp = Text.new(&mem).add(io.tempRoot()).add("/j3c-boot-cross-").fmt(`{sys.getpid()}`).str();
+    rmrf(tmp, &mem);
+    abiAndSdl(&mem);
+    ndkOrder(tmp, &mem);
+    highest(tmp, &mem);
+    expect(androidLibName("GL"), "GLESv3");
+    expect(androidLibName("SDL2"), "SDL2");
+    expect(androidLibName("SDL2_ttf"), "SDL2_ttf");
+    argvs(tmp, &mem);
+    rmrf(tmp, &mem);
+    if clangAvailable("not-a-real-clang", &mem) { panic("clangAvailable"); }
+}
+
+fn expect(got: string, want: string) {
+    if got != want {
+        let mem = Arena.create(1 << 12);
+        panic(Text.new(&mem).add("got:  ").add(got).add("\nwant: ").add(want).str());
+    }
+}
+
+fn rmrf(dir: string, mem: &Arena) {
+    let argv: [3]string = ["rm", "-rf", dir];
+    match proc.run(argv[..], "", mem) {
+        Result.Ok(_) {}
+        Result.Err(_) { panic("rm -rf"); }
+    }
+}
+
+fn mkdirs(dir: string) {
+    match io.makeDirs(dir) {
+        Result.Ok(_) {}
+        Result.Err(_) { panic(dir); }
+    }
+}
+
+/// `<root>/ndk/<ver>` with a host toolchain folder, as Rust's `fake_ndk`.
+fn fakeNdk(root: string, ver: string, mem: &Arena): string {
+    let p = path.join(path.join(root, "ndk", mem), ver, mem);
+    mkdirs(path.join(p, "toolchains/llvm/prebuilt/linux-x86_64/bin", mem));
+    return p;
+}
+
+/// Rust `triple_maps_to_abi_and_sdl_dir`.
+fn abiAndSdl(mem: &Arena) {
+    expect(androidAbi("aarch64-linux-android"), "arm64-v8a");
+    expect(androidAbi("x86_64-linux-android"), "x86_64");
+    expect(androidAbi("AArch64-linux-android"), "arm64-v8a");
+    expect(androidAbi("armv7-linux-androideabi"), "");
+    expect(sdlLibDir("aarch64-linux-android", "/c", mem), "/c/arm64-v8a/lib");
+    expect(sdlLibDir("armv7-linux-androideabi", "/c", mem), "");
+    expect(sdlRoot("/x", "/h", mem), "/x");
+    expect(sdlRoot("", "/h", mem), "/h/.cache/j3/android/sdl");
+    expect(sdlRoot("", "", mem), "");
+}
+
+/// Rust `ndk_lookup_order`.
+fn ndkOrder(tmp: string, mem: &Arena) {
+    let sdk = path.join(tmp, "sdk", mem);
+    fakeNdk(sdk, "9.0.1", mem);
+    let high = fakeNdk(sdk, "27.2.12479018", mem);
+    fakeNdk(sdk, "26.1.1", mem);
+    let home = path.join(tmp, "h", mem);
+    let a = fakeNdk(path.join(tmp, "a", mem), "1", mem);
+    let b = fakeNdk(path.join(tmp, "b", mem), "1", mem);
+    // NDK_HOME wins, then NDK_ROOT, then the highest under ANDROID_HOME (numeric, so 27 > 9)
+    expect(findNdk(a, b, sdk, mem), a);
+    expect(findNdk("", b, sdk, mem), b);
+    expect(findNdk("/nonexist", "", sdk, mem), high);
+    // a newer folder that is no NDK is passed over
+    mkdirs(path.join(sdk, "ndk/99.0", mem));
+    expect(findNdk("", "", sdk, mem), high);
+    // ANDROID_HOME defaults to ~/Android/Sdk
+    let def = fakeNdk(path.join(home, "Android/Sdk", mem), "5.0", mem);
+    expect(findNdk("", "", sdkRootIn("", home, mem), mem), def);
+    expect(findNdk("", "", sdkRootIn("/nonexist", home, mem), mem), "");
+    expect(findNdk("", "", sdkRootIn("", "", mem), mem), "");
+}
+
+/// Rust `highest_version_dir_is_numeric_and_skips_names`.
+fn highest(tmp: string, mem: &Arena) {
+    let d = path.join(tmp, "hvd", mem);
+    mkdirs(path.join(d, "9.0.0", mem));
+    mkdirs(path.join(d, "27.1.1", mem));
+    mkdirs(path.join(d, "27.2.12479018", mem));
+    mkdirs(path.join(d, "not-a-version", mem));
+    mkdirs(path.join(d, "only/abc", mem));
+    expect(highestVersionDir(d, mem), path.join(d, "27.2.12479018", mem));
+    expect(highestVersionDir(path.join(d, "only", mem), mem), "");
+}
+
+fn joined(argv: &List<string>, mem: &Arena): string {
+    let t = Text.new(mem);
+    for i in 0..argv.len {
+        if i > 0 { t.push(' '); }
+        t.add(argv.items[i]);
+    }
+    return t.str();
+}
+
+fn argvs(tmp: string, mem: &Arena) {
+    let none = List<string>.new(mem);
+    // macOS: ld64's dead strip, `-l` passed through, no rpath-link, no mold.
+    let m = defaultEmitOpts(mem);
+    m.cc.libs.push("GL");
+    m.cc.search.push("/opt/libs");
+    let a = List<string>.new(mem);
+    match clangArgv(&a, "", &m.cc, "clang", "arm64-apple-darwin", "", none.items[0..0], false, "a.ll", "a", mem) {
+        Result.Ok(_) {}
+        Result.Err(x) { panic(x); }
+    }
+    expect(joined(&a, mem), "clang -Wno-override-module -O0 -ffunction-sections -fdata-sections -Wl,-dead_strip -g --target=arm64-apple-darwin -o a a.ll -L/opt/libs -lGL");
+
+    // Web (emscripten): only the target; a release adds no linker flag.
+    let w = defaultEmitOpts(mem);
+    w.cc.release = true;
+    w.cc.debug = false;
+    w.cc.opt = "z";
+    let b = List<string>.new(mem);
+    match clangArgv(&b, "; use lib \"m\"\n", &w.cc, "", "wasm64-unknown-emscripten", "", none.items[0..0], false, "a.ll", "a.js", mem) {
+        Result.Ok(_) {}
+        Result.Err(x) { panic(x); }
+    }
+    expect(joined(&b, mem), "clang -Wno-override-module -Oz -ffunction-sections -fdata-sections -Wl,--gc-sections --target=wasm64-unknown-emscripten -o a.js a.ll -lm");
+
+    // Android: the NDK's clang and sysroot, API level, a shared library, the SDL cache, GL as GLES 3.
+    let ndk = fakeNdk(path.join(tmp, "argv", mem), "1", mem);
+    let host = path.join(ndk, "toolchains/llvm/prebuilt/linux-x86_64", mem);
+    sys.setenv("ANDROID_NDK_HOME", ndk);
+    sys.setenv("J3_SDL_CACHE", "/c");
+    let d = defaultEmitOpts(mem);
+    d.cc.libs.push("GL");
+    let c = List<string>.new(mem);
+    match clangArgv(&c, "", &d.cc, "clang", "aarch64-linux-android", "", none.items[0..0], false, "a.ll", "liba.so", mem) {
+        Result.Ok(_) {}
+        Result.Err(x) { panic(x); }
+    }
+    expect(joined(&c, mem), Text.new(mem).add(host).add("/bin/clang -Wno-override-module -O0 -ffunction-sections -fdata-sections -Wl,--gc-sections -g --target=aarch64-linux-android26 --sysroot=")
+        .add(host).add("/sysroot -fPIC -o liba.so a.ll -shared -Wl,--no-undefined -L/c/arm64-v8a/lib -ldl -lm -llog -lGLESv3").str());
+    // `ready`: the SDL cache is checked after the triple, the NDK first.
+    readyErr("aarch64-linux-android", "SDL for Android (arm64-v8a) is not built: run tools/android/build-sdl.sh", mem);
+    readyErr("armv7-linux-androideabi", "unsupported Android target `armv7-linux-androideabi` (use aarch64-linux-android or x86_64-linux-android)", mem);
+    sys.setenv("ANDROID_NDK_HOME", "");
+    sys.setenv("ANDROID_NDK_ROOT", "");
+    sys.setenv("ANDROID_HOME", "/nonexist");
+    readyErr("aarch64-linux-android", "no Android NDK found: set ANDROID_NDK_HOME or ANDROID_NDK_ROOT, or install one under $ANDROID_HOME/ndk (see `j3c doc android`)", mem);
+}
+
+fn readyErr(triple: string, want: string, mem: &Arena) {
+    match androidReady(triple, mem) {
+        Result.Ok(_) { panic("androidReady passed"); }
+        Result.Err(e) { expect(e, want); }
+    }
+}

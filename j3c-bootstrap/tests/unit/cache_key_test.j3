@@ -1,0 +1,139 @@
+// Object keys (Rust emit/incr/tests.rs `const_global_values_change_module_key`,
+// `vector_ops_change_module_key`): a const array's values and vector ops change the module's key text.
+// Also: every option of `objectKey` changes the key, the layout digest follows embedded types across
+// modules, and the `.parts` / part paths are Rust's.
+module cache_key_test;
+
+use j3.io;
+use j3.io.path;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.sys.panic;
+use j3.text.{ Text, contains };
+use j3c.cache;
+use j3c.driver;
+use j3c.driver.{ Mode, Session, Stage };
+use j3c.toolchain.defaultEmitOpts;
+
+/// The key text of module `m` of `src` (written to `dir/main.j3`), copied into `mem`.
+fn keyText(dir: string, src: string, mem: &Arena): string {
+    let entry = Text.new(mem).add(dir).add("/main.j3").str();
+    match io.writeFile(entry, src as []u8) { Result.Ok(_) {} Result.Err(_) { panic("write main.j3"); } }
+    let o = driver.defaults();
+    o.entry = entry;
+    o.mode = Mode.Build;
+    let s = Session.new(o);
+    if !driver.run(s, Stage.Passes) { panic(Text.new(mem).add("does not check:\n").add(src).str()); }
+    let out = Text.new(mem);
+    match s.program {
+        Option.Some(p) {
+            let found = false;
+            for i in 0..p.modules.len {
+                if cache.moduleLabel(&p.cx, &p.modules.items[i], s.arena) == "m" {
+                    cache.moduleIr(&p.cx, &p.modules.items[i], &out);
+                    found = true;
+                }
+            }
+            if !found {
+                let t = Text.new(mem).add("no module m:");
+                for i in 0..p.modules.len { t.add(" ").add(cache.moduleLabel(&p.cx, &p.modules.items[i], s.arena)); }
+                panic(t.str());
+            }
+        }
+        Option.None { panic("no program"); }
+    }
+    s.free();
+    return out.str();
+}
+
+fn constSrc(s: string, n: string, mem: &Arena): string {
+    return Text.new(mem).add("module m;\nconst S: [2]string = [\"").add(s).add("\", \"x\"];\nconst N: [1]int = [").add(n)
+        .add("];\nfn main() { let a = S[0]; let b = N[0]; }\n").str();
+}
+
+fn simdSrc(body: string, mem: &Arena): string {
+    return Text.new(mem).add("module m;\nfn f(a: vec4f, b: vec4f, i: vec4i): vec4f { ").add(body).add(" }\nfn main() {}\n").str();
+}
+
+fn main() {
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    let dir = Text.new(&mem);
+    // Absolute: a relative `../target/..` entry would load as part of the package in the cwd.
+    match path.realpath("..", &mem) {
+        Option.Some(p) { dir.add(p); }
+        Option.None { panic("realpath .."); }
+    }
+    dir.add("/target/cache_key.").pushInt(sys.getpid());
+    match io.makeDirs(dir.str()) { Result.Ok(_) {} Result.Err(_) { panic("make the scratch dir"); } }
+    let d = dir.str();
+
+    let base = keyText(d, constSrc("AAA", "1", &mem), &mem);
+    if base != keyText(d, constSrc("AAA", "1", &mem), &mem) { panic("the key text of one source differs between two compiles"); }
+    if base == keyText(d, constSrc("BBB", "1", &mem), &mem) { panic("a const string value is not in the key"); }
+    if base == keyText(d, constSrc("AAA", "2", &mem), &mem) { panic("a const int value is not in the key"); }
+
+    let vmin = keyText(d, simdSrc("return @vmin(a, b);", &mem), &mem);
+    if vmin == keyText(d, simdSrc("return @vmax(a, b);", &mem), &mem) { panic("vmin vs vmax"); }
+    if keyText(d, simdSrc("return @vshuffle(a, 0, 1, 2, 3);", &mem), &mem) == keyText(d, simdSrc("return @vshuffle(a, 0, 1, 3, 2);", &mem), &mem) { panic("shuffle order"); }
+    if vmin == keyText(d, simdSrc("return @vfloat(i);", &mem), &mem) { panic("vmin vs vfloat"); }
+
+    // A struct of another module embedded in a type this module names is in this module's layout text.
+    let two = "module m;\nuse j3.option.Option;\nstruct Inner { a: int; }\nstruct Outer { use inner: Inner; b: int; e: Option<int>; }\nfn f(o: &Outer): int { return o.a + o.b; }\nfn main() {}\n";
+    let o = driver.defaults();
+    o.entry = Text.new(&mem).add(d).add("/main.j3").str();
+    o.mode = Mode.Build;
+    match io.writeFile(o.entry, two as []u8) { Result.Ok(_) {} Result.Err(_) { panic("write main.j3"); } }
+    let s = Session.new(o);
+    if !driver.run(s, Stage.Passes) { panic("layout sample does not check"); }
+    match s.program {
+        Option.Some(p) {
+            let l = cache.layoutDigest(&p.cx, p.modules.slice(), s.arena);
+            if l.texts.len != l.needles.len || l.texts.len != l.deps.len || l.texts.len < 3 { panic("layout entries"); }
+            let named = cache.layoutsFor(&l, "x: Outer;", s.arena);
+            if !contains(named, "m.Outer|false|inner:true:") || !contains(named, "m.Inner|false|a:false:int,") { panic(named); }
+            if !contains(named, "Some") { panic("Outer's Option<int> field does not pull the enum's layout in"); }
+            if contains(cache.layoutsFor(&l, "x: Inner;", s.arena), "m.Outer") { panic("Inner does not embed Outer"); }
+            if cache.layoutsFor(&l, "no type here", s.arena).len != 0 { panic("no name, no layout"); }
+
+            // Every option is in the key; the same input gives the same 16 hex digits.
+            let e = defaultEmitOpts(s.arena);
+            e.cc.out = "target/x";
+            let k = cache.objectKey("text", &e, &l, s.arena);
+            if k.len != 16 || k != cache.objectKey("text", &e, &l, s.arena) { panic("key is not stable"); }
+            if k == cache.objectKey("text2", &e, &l, s.arena) { panic("text"); }
+            if k == cache.objectKey("x: Outer;", &e, &l, s.arena) { panic("layout"); }
+            let e2 = defaultEmitOpts(s.arena); e2.cc.opt = "1";
+            if k == cache.objectKey("text", &e2, &l, s.arena) { panic("opt"); }
+            e2 = defaultEmitOpts(s.arena); e2.cc.debug = false;
+            if k == cache.objectKey("text", &e2, &l, s.arena) { panic("debug"); }
+            e2 = defaultEmitOpts(s.arena); e2.cc.release = true;
+            if k == cache.objectKey("text", &e2, &l, s.arena) { panic("release"); }
+            e2 = defaultEmitOpts(s.arena); e2.target = "aarch64-unknown-linux-gnu";
+            if k == cache.objectKey("text", &e2, &l, s.arena) { panic("target"); }
+            e2 = defaultEmitOpts(s.arena); e2.cpu = "native";
+            if k == cache.objectKey("text", &e2, &l, s.arena) { panic("cpu"); }
+            e2 = defaultEmitOpts(s.arena); e2.flags.push("-fno-plt");
+            if k == cache.objectKey("text", &e2, &l, s.arena) { panic("flags"); }
+            e2 = defaultEmitOpts(s.arena); e2.clang = "clang-18";
+            if k == cache.objectKey("text", &e2, &l, s.arena) { panic("clang"); }
+            e2 = defaultEmitOpts(s.arena); e2.chunks = 2;
+            if k == cache.objectKey("text", &e2, &l, s.arena) { panic("chunks"); }
+        }
+        Option.None { panic("no program"); }
+    }
+    if cache.compilerId(s.arena) == 0 || cache.compilerId(s.arena) != cache.compilerId(s.arena) { panic("compilerId"); }
+
+    if cache.partsFile("d/j3.game-0123.o", s.arena) != "d/j3.game-0123.parts" { panic(cache.partsFile("d/j3.game-0123.o", s.arena)); }
+    if cache.partPath("d/j3.game-0123.o", 2, s.arena) != "d/j3.game-0123.p2.o" { panic(cache.partPath("d/j3.game-0123.o", 2, s.arena)); }
+    if cache.partsOf("d/none-0.o", s.arena) != 0 { panic("partsOf of nothing"); }
+    let obj = Text.new(&mem).add(d).add("/a-1.o").str();
+    match io.writeFile(cache.partsFile(obj, &mem), "3\n" as []u8) { Result.Ok(_) {} Result.Err(_) { panic("write .parts"); } }
+    if cache.partsOf(obj, &mem) != 3 { panic("partsOf"); }
+    s.free();
+    // ponytail: `rm -rf` for the scratch dir; `j3.io` has no recursive remove
+    match proc.run(["rm", "-rf", d], "", &mem) { Result.Ok(_) {} Result.Err(_) { panic("remove the scratch dir"); } }
+}

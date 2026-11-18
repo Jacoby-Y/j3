@@ -26,13 +26,18 @@ compare the text. Unit checks live beside the code they cover, as `*_test.j3` fi
 | `llvm` | `dump-llvm PATH` | stdout, stderr, exit code |
 | `glsl` | `dump-glsl PATH` (`--es`: `dump-glsl PATH --es`, the OpenGL ES text) | stdout, stderr, exit code |
 | `ui` | `dump-ui PROJECT/ui` (the J3 source generated from a project's `.j3ui` files) | stdout, stderr, exit code |
-| `run` | `run --headless --frames 3 PATH`, offscreen SDL, dummy audio | stdout without the `J3STATS` / `J3UISTATS` timing lines, exit code |
+| `run` | `run --headless --frames 3 PATH`, offscreen SDL, dummy audio | stdout without the `J3STATS` / `J3UISTATS` timing lines and with the number before ` us` / ` ms` / ` ns` / ` s` masked (tests print their timings), exit code |
 | `self` | stage 1 (`j3c-boot`) builds stage 2 from a scratch copy of `j3c-bootstrap/{j3.toml,src,text}` under `<repo>/target/self.PID/` (never in place), then `DIFF_STAGE0=stage1 DIFF_BOOT=stage2` over `fmt`, `ast`, `err`, `ui`, `glsl`, `glsl --es`, `ir --norm` and `llvm` (one input per call) | one summary line per comparison, then `diff.sh self: N ok, N failed` |
 
 
 `run` removes a project's `target/.j3c` (stamps and objects) before each of the three runs and after the last, so no
-compiler reuses another's build and the corpus keeps no object folders. `--list` prints the expanded inputs and exits.
+compiler reuses another's build and the corpus keeps no object folders. A file input inside a project (a `j3.toml`
+above it) builds that project, so its folder is cleared the same way; a file outside any project builds to a temp
+file, writes no stamps and runs in a scratch cwd (what it writes by relative path is removed). `self` prints one summary line per clean comparison and the whole output (the DIFF /
+CRASH detail) of a failed one. `--list` prints the expanded inputs and exits.
 A known-list line with a `# skip: CAUSE` comment is never run (`tls_live_test.j3`: network).
+A line with `# nondet: CAUSE` names an input whose stage0 output changes from run to run (timings): it runs, and
+no outcome of it fails the run.
 
 Exit: 0 when every input is `ok` or listed as known, 1 on a new failure, a `NONDET`, or a known input
 that now passes, 2 on a setup error. `DIFF_STAGE0` / `DIFF_BOOT` swap either compiler (testing the

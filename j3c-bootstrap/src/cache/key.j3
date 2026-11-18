@@ -2,6 +2,12 @@
 //
 // Part of module j3c.cache.
 // Port of: j3c/src/emit/incr/key.rs
+// J3: Hashes are `xxh3_64` (Rust: `DefaultHasher`), so a key never equals Rust's. The constant text the
+// key walk adds (Rust: `{kind:?}`) is this file's own format: it only has to be stable and to change when
+// the value changes.
+// J3: `compilerId` keeps its stamp in `<cache>/compiler-boot.id`, not Rust's `compiler.id`: sharing the file would make
+// each compiler re-hash itself after the other ran. The stamp is `size sec.nsec` (`fsx.statNs`; seconds only
+// off x86-64 Linux).
 module j3c.cache;
 
 /// Layout text of every struct and enum, with which other entries each one names (Rust `Layouts`).
@@ -10,29 +16,255 @@ pub struct Layouts {
     texts: List<string>;
     needles: List<string>;
     deps: List<List<int>>;
+    /// Type name -> its entries (a lookup only; several modules may share a name).
+    byNeedle: Map<string, List<int>>;
 }
 
-/// Rust `compiler_id`: hash of this binary, cached in `~/.cache/j3/compiler.id` by size + mtime. Also in
-/// every stamp of `cmd/stamp.j3`.
+#[singleton]
+let COMPILER_ID: u64;
+
+/// Rust `version_id`: the id when the binary cannot be read.
+fn versionId(): u64 { return xxh3_64("j3c-boot" as []u8); }
+
+/// Rust `compiler_id`: hash of this binary, cached in `~/.cache/j3/compiler-boot.id` by size + mtime. Also
+/// in every stamp of `cmd/stamp.j3`.
 pub fn compilerId(arena: &Arena): u64 {
-    // STUB A
-    return 0;
+    if COMPILER_ID == 0 { COMPILER_ID = readCompilerId(arena); }
+    return COMPILER_ID;
+}
+
+fn readCompilerId(arena: &Arena): u64 {
+    let exe = "/proc/self/exe";
+    let stamp = Text.new(arena);
+    match fsx.statNs(exe, arena) {
+        Option.Some(st) { stamp.fmt(`{st.0} {st.1}.{st.2}`); }
+        Option.None {
+            match io.stat(exe) {
+                Result.Ok(e) { stamp.fmt(`{e.size} {e.mtime}`); }
+                Result.Err(_) { return versionId(); }
+            }
+        }
+    }
+    let file = "";
+    match cacheRoot(arena) {
+        Option.Some(d) { file = path.join(d, "compiler-boot.id", arena); }
+        Option.None {}
+    }
+    if file.len > 0 {
+        match fsx.readText(file, arena) {
+            Result.Ok(c) {
+                let line = trim(c);
+                let sp = lastIndexOf(line, " ");
+                if sp > 0 && line[0..sp] == stamp.str() {
+                    match parseU64(line[sp + 1..line.len], 16) {
+                        Option.Some(id) { if id != 0 { return id; } }
+                        Option.None {}
+                    }
+                }
+            }
+            Result.Err(_) {}
+        }
+    }
+    // The binary is tens of megabytes: read it into its own arena, not the Session's.
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    let id: u64 = 0;
+    match io.readFile(exe, &mem) {
+        Result.Ok(b) { id = xxh3_64(b); }
+        Result.Err(_) { return versionId(); }
+    }
+    if id == 0 { id = 1; }
+    if file.len > 0 {
+        match io.makeDirs(path.dirname(file)) {
+            Result.Ok(_) {}
+            Result.Err(_) {}
+        }
+        let t = Text.new(arena);
+        t.add(stamp.str()).add(" ").add(hex16(id, arena)).add("\n");
+        match io.writeFile(file, t.str() as []u8) {
+            Result.Ok(_) {}
+            Result.Err(_) {}
+        }
+    }
+    return id;
+}
+
+/// One hashed field, closed with a 0 byte so `("ab", "c")` differs from `("a", "bc")`.
+fn hashStr(h: &Xxh3, s: string) {
+    let zero: [1]u8 = [0];
+    h.update(s as []u8);
+    h.update(zero[..]);
 }
 
 /// Rust `object_key`: 16 hex digits over chunks, the layout digest of the types `text` names, `text`, opt,
 /// debug, release, target, cpu, flags, clang and `compilerId`.
 pub fn objectKey(text: string, e: &EmitOpts, layouts: &Layouts, arena: &Arena): string {
-    // STUB A
-    return "";
+    let h = Xxh3.new();
+    let t = Text.new(arena);
+    t.fmt(`{e.chunks}`);
+    hashStr(&h, t.str());
+    hashStr(&h, layoutsFor(layouts, text, arena));
+    hashStr(&h, text);
+    hashStr(&h, e.cc.opt);
+    hashStr(&h, if e.cc.debug { "g" } else { "" });
+    hashStr(&h, if e.cc.release { "r" } else { "" });
+    hashStr(&h, e.target);
+    hashStr(&h, e.cpu);
+    for i in 0..e.flags.len { hashStr(&h, e.flags.items[i]); }
+    hashStr(&h, "");
+    hashStr(&h, e.clang);
+    t.clear();
+    t.pushHex(compilerId(arena));
+    hashStr(&h, t.str());
+    return hex16(h.finish(), arena);
+}
+
+/// A byte of a name token (Rust `tokens`: alphanumeric or `_`; every non-ASCII byte counts, so a name is
+/// never cut).
+fn isTokenByte(b: u8): bool {
+    return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b >= 128;
+}
+
+/// Push the layout entries named by the tokens of `s` onto `stack`.
+fn pushNamed(l: &Layouts, s: string, stack: &List<int>) {
+    let i = 0;
+    while i < s.len {
+        if !isTokenByte(s[i]) { i += 1; continue; }
+        let start = i;
+        while i < s.len && isTokenByte(s[i]) { i += 1; }
+        let at = l.byNeedle.find(s[start..i]);
+        if at < 0 { continue; }
+        let hits = l.byNeedle.valAt(at);
+        for k in 0..hits.len { stack.push(hits.items[k]); }
+    }
 }
 
 /// Rust `layout_digest`: one entry per struct and enum, in module order then declaration order.
 pub fn layoutDigest(cx: &IrCx, modules: []Module, arena: &Arena): Layouts {
-    // STUB A
-    return Layouts { texts: List<string>.new(arena), needles: List<string>.new(arena), deps: List<List<int>>.new(arena) };
+    let l = Layouts { texts: List<string>.new(arena), needles: List<string>.new(arena), deps: List<List<int>>.new(arena),
+        byNeedle: Map<string, List<int>>.new(arena, 256) };
+    for mi in 0..modules.len {
+        let label = moduleLabel(cx, &modules[mi], arena);
+        for i in 0..modules[mi].structs.len {
+            let def = cx.structDef(modules[mi].structs.items[i]);
+            let s = Text.new(arena);
+            s.add(label).add(".").add(cx.nameStr(def.name)).add(if def.packed { "|true|" } else { "|false|" });
+            for j in 0..def.fields.len {
+                let f = def.fields.items[j];
+                s.add(cx.nameStr(f.name)).add(if f.embedded { ":true:" } else { ":false:" });
+                pushStableTy(&s, cx, f.ty, 0);
+                s.push(',');
+            }
+            l.needles.push(cx.nameStr(def.name));
+            l.texts.push(s.str());
+        }
+        for i in 0..modules[mi].enums.len {
+            let def = cx.enumDef(modules[mi].enums.items[i]);
+            let s = Text.new(arena);
+            s.add(label).add(".").add(cx.nameStr(def.name)).add("|");
+            for j in 0..def.variants.len {
+                let v = def.variants.items[j];
+                s.add(cx.nameStr(v.name));
+                match v.payload {
+                    Option.Some(p) { pushStableTy(&s, cx, p, 0); }
+                    Option.None {}
+                }
+                s.push(',');
+            }
+            l.needles.push(cx.nameStr(def.name));
+            l.texts.push(s.str());
+        }
+    }
+    for i in 0..l.needles.len {
+        let hits = l.byNeedle.getOrPut(l.needles.items[i], List<int>.new(arena));
+        hits.push(i);
+    }
+    for i in 0..l.texts.len {
+        let d = List<int>.new(arena);
+        pushNamed(&l, l.texts.items[i], &d);
+        l.deps.push(d);
+    }
+    return l;
 }
 
-/// Rust `module_ir`: the stable IR text of one module (no ids that change between compiles) into `out`.
+/// Rust `Layouts::for_module`: layout text of the types `moduleText` names, closed over embedded types, in
+/// entry order joined by `;`.
+pub fn layoutsFor(l: &Layouts, moduleText: string, arena: &Arena): string {
+    let seen = List<bool>.new(arena);
+    for _ in 0..l.texts.len { seen.push(false); }
+    let stack = List<int>.new(arena);
+    pushNamed(l, moduleText, &stack);
+    while stack.len > 0 {
+        let i = stack.pop();
+        if seen.items[i] { continue; }
+        seen.items[i] = true;
+        let d = l.deps.items[i];
+        for k in 0..d.len { stack.push(d.items[k]); }
+    }
+    let out = Text.new(arena);
+    let any = false;
+    for i in 0..seen.len {
+        if !seen.items[i] { continue; }
+        if any { out.push(';'); }
+        any = true;
+        out.add(l.texts.items[i]);
+    }
+    return out.str();
+}
+
+/// Rust `module_ir`: the stable IR text of one module (no ids that change between compiles) into `out`:
+/// the IR dump, type arguments and field types, globals with their initializers, each fn's symbol, local
+/// types and constants.
 pub fn moduleIr(cx: &IrCx, m: &Module, out: &Text) {
-    // STUB A
+    dumpModule(cx, m, out);
+    for i in 0..m.structs.len {
+        let def = cx.structDef(m.structs.items[i]);
+        for j in 0..def.tyArgs.len {
+            out.add(def.tyArgs.items[j].name).push('=');
+            pushStableTy(out, cx, def.tyArgs.items[j].ty, 0);
+            out.push(';');
+        }
+        for j in 0..def.fields.len {
+            pushStableTy(out, cx, def.fields.items[j].ty, 0);
+            out.push(';');
+        }
+    }
+    for i in 0..m.enums.len {
+        let def = cx.enumDef(m.enums.items[i]);
+        for j in 0..def.variants.len {
+            match def.variants.items[j].payload {
+                Option.Some(p) {
+                    pushStableTy(out, cx, p, 0);
+                    out.push(';');
+                }
+                Option.None {}
+            }
+        }
+    }
+    for i in 0..m.globals.len {
+        let g = cx.global(m.globals.items[i]);
+        out.add(cx.nameStr(g.name)).push(':');
+        pushStableTy(out, cx, g.ty, 0);
+        match g.init {
+            Option.Some(init) { hashInit(cx, &init, out); }
+            Option.None {}
+        }
+        out.push(';');
+    }
+    for i in 0..m.funcs.len {
+        let f = cx.func(m.funcs.items[i]);
+        pushFuncName(out, cx, &f);
+        out.push(';');
+        match f.kind {
+            FuncKind.J3(jf) {
+                for k in 0..jf.body.locals.len() {
+                    pushStableTy(out, cx, jf.body.local(Id<LocalDecl> { i: u32(k) }).ty, 0);
+                    out.push(';');
+                }
+                hashBlock(cx, &jf.body.block, out);
+            }
+            FuncKind.Lib(_) {}
+            FuncKind.Decl {}
+        }
+    }
 }

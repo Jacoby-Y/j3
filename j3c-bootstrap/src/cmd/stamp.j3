@@ -3,16 +3,36 @@
 //
 // Port of: j3c/src/cli/build.rs (`source_key`, `source_stamp`, `up_to_date`, `mark_built`, `mark_inputs`,
 //     `inputs_key`, `unchanged_project`)
-// J3: Contracts (wave 19): chunk C fills every `// STUB C`; `cmd/build.j3` (C) and `cmd/run.j3` (D) call them.
-//     Keys are `xxh3_64` with `cache.compilerId` in every one. Must not `use j3c.cmd.run` or `j3c.cmd.build`
-//     (they import this module).
+// J3: `cmd/build.j3` and `cmd/run.j3` call these. Keys are `xxh3_64` (Rust: `DefaultHasher`, so a stamp of one
+//     compiler never matches the other's: it rebuilds) with `cache.compilerId` in every one, where Rust's
+//     `source_key` has the binary's size and mtime. `EmitOpts` is hashed field by field (Rust: its `Debug`
+//     text); the backend, which Rust keeps in `EmitOpts`, is `Options.emit` here and is in `sourceKey` only
+//     (`StampFlags` has no `--emit`). Rust's `INPUTS` mutex is the `#[singleton]` `INPUTS`; its strings live
+//     in the arena `unchangedProject` was given, which must outlive the `markInputs` call (the command's).
+// J3: Must not `use j3c.cmd.run` or `j3c.cmd.build` (they import this module).
+// ponytail: file times come from a raw `newfstatat` (Linux x86-64; `j3.io.stat` has whole seconds only, and a
+//     save in the second of the last build must still rebuild). Other hosts: add nanoseconds to `j3.sys.statAt`.
 module j3c.cmd.stamp;
 
-use j3.memory.Arena;
+use j3.cmp.sortBy;
+use j3.hash.Xxh3;
+use j3.io;
+use j3.io.DirEntry;
+use j3.io.path;
+use j3.memory.{ Arena, List };
 use j3.option.Option;
+use j3.result.Result;
+use j3.text.{ Text, startsWith };
+use j3c.base.fsx;
+use j3c.cache;
+use j3c.cmd.gen;
 use j3c.driver.Session;
-use j3c.project.manifest.Manifest;
-use j3c.toolchain.EmitOpts;
+use j3c.load.usingOverride;
+use j3c.project.manifest;
+use j3c.project.manifest.{ Input, Manifest };
+use j3c.syntax.ast.EmbedFile;
+use j3c.toolchain;
+use j3c.toolchain.{ EmitOpts, TargetOs, hex16 };
 
 /// The flags `unchangedProject` needs (Rust reads them from `cli` statics); callers copy them from `RunFlags`.
 pub struct StampFlags {
@@ -30,34 +50,323 @@ pub struct Unchanged {
     e: EmitOpts;
 }
 
+/// Rust `INPUTS`: the `inputs.<kind>.key` of this build (stamp path, key, project root), taken before
+/// parsing and written once the output matches it.
+struct Inputs {
+    set: bool;
+    stamp: string;
+    key: string;
+    root: string;
+}
+
+#[singleton]
+let INPUTS: Inputs;
+
+// Hash feeding: a string with a 0 byte after it, an int as 8 bytes, so neighbours cannot run together.
+fn hStr(h: &Xxh3, s: string) {
+    let zero: [1]u8 = [0];
+    h.update(s as []u8);
+    h.update(zero[..]);
+}
+
+fn hInt(h: &Xxh3, v: int) {
+    let b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0];
+    let x = u64(v);
+    for i in 0..8 { b[i] = u8((x >> u64(i * 8)) & 255); }
+    h.update(b[..]);
+}
+
+fn hBool(h: &Xxh3, v: bool) { hInt(h, if v { 1 } else { 0 }); }
+
+fn hList(h: &Xxh3, l: &List<string>) {
+    hInt(h, l.len);
+    for i in 0..l.len { hStr(h, l.items[i]); }
+}
+
+/// Every field of `e` (Rust hashes `format!("{opts:?}")`).
+fn hOpts(h: &Xxh3, e: &EmitOpts) {
+    hList(h, &e.cc.libs);
+    hList(h, &e.cc.search);
+    hList(h, &e.cc.files);
+    hList(h, &e.cc.flags);
+    hStr(h, e.cc.std);
+    hStr(h, e.cc.opt);
+    hBool(h, e.cc.debug);
+    hBool(h, e.cc.release);
+    hStr(h, e.cc.out);
+    hStr(h, e.target);
+    hStr(h, e.cpu);
+    hStr(h, e.clang);
+    hList(h, &e.flags);
+    hBool(h, e.incremental);
+    hBool(h, e.incrementalAll);
+    hInt(h, e.chunks);
+    hStr(h, e.cwd);
+}
+
+/// Every file an `@embed*` of the program read, in load order.
+fn embedFiles(s: &Session, arena: &Arena): List<EmbedFile> {
+    let out = List<EmbedFile>.new(arena);
+    match s.loaded {
+        Option.Some(p) {
+            for i in 0..p.files.len {
+                let es = &p.files.items[i].ast.embeds;
+                for j in 0..es.len {
+                    for k in 0..es.items[j].files.len { out.push(es.items[j].files.items[k]); }
+                }
+            }
+        }
+        Option.None {}
+    }
+    return out;
+}
+
+/// `--fast`, or the manifest's `[cc] fast` / `[emit] fast`.
+fn fastOf(s: &Session): bool {
+    if s.opts.fast { return true; }
+    match s.loaded {
+        Option.Some(p) {
+            match p.project {
+                Option.Some(m) { return m.cc.fast || m.emit.fast; }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
+    return false;
+}
+
 /// Rust `source_key`: 16 hex digits over every loaded source (path + text), the embeds, `e`, fast mode and
-/// this binary. After `Stage.Passes`.
+/// this binary. After `Stage.Load`.
 pub fn sourceKey(s: &Session, e: &EmitOpts): string {
-    // STUB C
-    return "";
+    let h = Xxh3.new();
+    let srcs = s.sources.items.slice();
+    hInt(&h, srcs.len);
+    for i in 0..srcs.len {
+        hStr(&h, srcs[i].path);
+        hInt(&h, srcs[i].text.len);
+        h.update(srcs[i].text as []u8);
+    }
+    // Rust `hash_embeds`: a fixed order (disk path, then name), path and bytes.
+    let files = embedFiles(s, s.arena);
+    sortBy(files.items[0..files.len], fn(a: EmbedFile, b: EmbedFile): bool {
+        if a.disk != b.disk { return a.disk < b.disk; }
+        return a.name < b.name;
+    });
+    hInt(&h, files.len);
+    for i in 0..files.len {
+        hStr(&h, files.items[i].disk);
+        hInt(&h, files.items[i].data.len);
+        h.update(files.items[i].data);
+    }
+    hOpts(&h, e);
+    hStr(&h, s.opts.emit);
+    hBool(&h, fastOf(s));
+    hInt(&h, int(cache.compilerId(s.arena)));
+    return hex16(h.finish(), s.arena);
+}
+
+/// Rust `source_stamp`: `src.key` in the output's cache folder (made here); "" without an output path.
+fn sourceStamp(e: &EmitOpts, arena: &Arena): string {
+    if e.cc.out.len == 0 { return ""; }
+    let dir = toolchain.cacheDir(e.cc.out, e.target, arena);
+    io.makeDirs(dir);
+    if !fsx.isDir(dir) { return ""; }
+    return path.join(dir, "src.key", arena);
+}
+
+/// The file at `p` holds exactly `key`.
+fn holds(p: string, key: string, arena: &Arena): bool {
+    match fsx.readText(p, arena) {
+        Result.Ok(k) { return k == key; }
+        Result.Err(_) { return false; }
+    }
+}
+
+fn exists(p: string): bool {
+    match io.stat(p) {
+        Result.Ok(_) { return true; }
+        Result.Err(_) { return false; }
+    }
 }
 
 /// Rust `up_to_date`: the output exists and its `src.key` equals `sourceKey`, so emit and clang are skipped.
 pub fn upToDate(s: &Session, e: &EmitOpts): bool {
-    // STUB C
-    return false;
+    let stamp = sourceStamp(e, s.arena);
+    if stamp.len == 0 { return false; }
+    return exists(e.cc.out) && holds(stamp, sourceKey(s, e), s.arena);
 }
 
 /// Rust `mark_built`: write `src.key`, then `markInputs`.
 pub fn markBuilt(s: &Session, e: &EmitOpts) {
-    // STUB C
+    let stamp = sourceStamp(e, s.arena);
+    if stamp.len > 0 { io.writeFile(stamp, sourceKey(s, e) as []u8); }
+    markInputs(s);
+}
+
+/// `p` at or below `root` (both real paths, whole components): the part below it, else None.
+fn below(p: string, root: string): Option<string> {
+    if p == root { return Option.Some(""); }
+    if root == "/" && startsWith(p, "/") { return Option.Some(p[1..p.len]); }
+    if p.len > root.len && startsWith(p, root) && p[root.len] == '/' { return Option.Some(p[root.len + 1..p.len]); }
+    return Option.None;
+}
+
+/// The stat walk of `inputsKey` sees the file `disk`: it is under `root`, not under `target/` and in no
+/// dot folder (nor a dot file).
+pub fn covered(disk: string, root: string, arena: &Arena): bool {
+    let p = match path.realpath(disk, arena) {
+        Option.Some(x) { x }
+        Option.None { return false; }
+    };
+    let rel = match below(p, root) {
+        Option.Some(x) { x }
+        Option.None { return false; }
+    };
+    let first = true;
+    let at = 0;
+    while at <= rel.len {
+        let end = at;
+        while end < rel.len && rel[end] != '/' { end += 1; }
+        let c = rel[at..end];
+        if first && c == "target" { return false; }
+        if c.len > 0 && c[0] == '.' { return false; }
+        first = false;
+        at = end + 1;
+    }
+    return true;
 }
 
 /// Rust `mark_inputs`: write the `inputs.<kind>.key` remembered by `unchangedProject`, unless an `@embed`
 /// read a file the stat walk does not cover (outside the root, under `target/` or a dot folder).
 pub fn markInputs(s: &Session) {
-    // STUB C
+    if !INPUTS.set { return; }
+    INPUTS.set = false;
+    let root = INPUTS.root;
+    match path.realpath(root, s.arena) {
+        Option.Some(r) { root = r; }
+        Option.None {}
+    }
+    // Only from this project's own program (a process may build several).
+    let own = false;
+    let srcs = s.sources.items.slice();
+    for i in 0..srcs.len {
+        if own { break; }
+        match path.realpath(srcs[i].path, s.arena) {
+            Option.Some(p) {
+                match below(p, root) {
+                    Option.Some(_) { own = true; }
+                    Option.None {}
+                }
+            }
+            Option.None {}
+        }
+    }
+    if !own { return; }
+    let files = embedFiles(s, s.arena);
+    for i in 0..files.len {
+        if !covered(files.items[i].disk, root, s.arena) { return; }
+    }
+    io.writeFile(INPUTS.stamp, INPUTS.key as []u8);
+}
+
+/// Size and modification time (seconds, nanoseconds) of `p`, following symlinks; false when it cannot be read
+/// (always off x86-64 Linux: no shortcut there).
+fn statInto(h: &Xxh3, p: string, size: bool, arena: &Arena): bool {
+    match fsx.statNs(p, arena) {
+        Option.Some(st) {
+            if size { hInt(h, st.0); }
+            hInt(h, st.1);
+            hInt(h, st.2);
+            return true;
+        }
+        Option.None { return false; }
+    }
+}
+
+/// Rust `inputs_key`: stat-only key of the project: every file and folder under the root (path, size,
+/// mtime), except `target/` and dot folders, plus the emit options, fast mode and this j3c. None (no
+/// shortcut) when `J3_STDLIB` is set or something cannot be read.
+pub fn inputsKey(m: &Manifest, e: &EmitOpts, fast: bool, arena: &Arena): Option<string> {
+    if usingOverride() { return Option.None; }
+    let h = Xxh3.new();
+    let stack = List<string>.new(arena);
+    stack.push(m.root);
+    while stack.len > 0 {
+        let dir = stack.items[stack.len - 1];
+        stack.len -= 1;
+        hStr(&h, dir);
+        if !statInto(&h, dir, false, arena) { return Option.None; }
+        let entries = match io.listDir(dir, arena) {
+            Result.Ok(es) { es }
+            Result.Err(_) { return Option.None; }
+        };
+        // by name, byte order (`listDir` is in directory order)
+        sortBy(entries, fn(a: DirEntry, b: DirEntry): bool { return a.name < b.name; });
+        for i in 0..entries.len {
+            let name = entries[i].name;
+            let p = path.join(dir, name, arena);
+            // Rust `file_type` does not follow a link: a link to a folder counts as a file.
+            if entries[i].isDir && !entries[i].isLink {
+                if !startsWith(name, ".") && !(dir == m.root && name == "target") { stack.push(p); }
+                continue;
+            }
+            hStr(&h, p);
+            if !statInto(&h, p, true, arena) { return Option.None; }
+        }
+    }
+    hOpts(&h, e);
+    hBool(&h, fast);
+    hInt(&h, int(cache.compilerId(arena)));
+    return Option.Some(hex16(h.finish(), arena));
+}
+
+/// Rust `cli::emit_opts` for a manifest alone: `[emit]`/`[cc]`/`[link]`, then `--opt`, `--fast`, `--release`
+/// (what `driver.emitOpts` gives a single-target project with the same flags).
+fn flagOpts(m: &Manifest, f: &StampFlags, arena: &Arena): Result<EmitOpts, string> {
+    let e = toolchain.emitOptsFromManifest(m, arena)?;
+    if f.opt.len > 0 { e.cc.opt = f.opt; }
+    if f.fast { e.cc.debug = false; }
+    if f.release {
+        e.cc.release = true;
+        e.cc.debug = false;
+        e.incremental = false;
+        if f.opt.len == 0 { e.cc.opt = "s"; }
+    }
+    if e.cc.out.len == 0 { e.cc.out = "target/a.out"; }
+    return Result.Ok(e);
 }
 
 /// Rust `unchanged_project`: a single-target, non-Android project whose files (stat only) have not changed
 /// since its output was built: parse and check can be skipped. Remembers this build's key for `markInputs`
 /// and calls `gen.beforeBuild`. `kind` is "build" or "run". Always None when `J3_STDLIB` is set.
 pub fn unchangedProject(f: &StampFlags, kind: string, arena: &Arena): Option<Unchanged> {
-    // STUB C
+    let r = if f.hasPath { manifest.resolve(f.path, arena) } else { manifest.resolveCwd(arena) };
+    let m = match r {
+        Result.Ok(inp) {
+            match inp {
+                Input.Project(x) { x }
+                Input.Hello { return Option.None; }
+                Input.File(_) { return Option.None; }
+            }
+        }
+        Result.Err(_) { return Option.None; }
+    };
+    if m.emit.targets.len > 1 { return Option.None; }
+    let e = match flagOpts(&m, f, arena) {
+        Result.Ok(x) { x }
+        Result.Err(_) { return Option.None; }
+    };
+    if toolchain.targetOs(e.target) == TargetOs.Android { return Option.None; }
+    gen.beforeBuild(m.root);
+    let fast = f.fast || m.cc.fast || m.emit.fast;
+    let key = match inputsKey(&m, &e, fast, arena) {
+        Option.Some(k) { k }
+        Option.None { return Option.None; }
+    };
+    let stamp = path.join(toolchain.cacheDir(e.cc.out, e.target, arena), Text.new(arena).add("inputs.").add(kind).add(".key").str(), arena);
+    let same = exists(e.cc.out) && holds(stamp, key, arena);
+    INPUTS = Inputs { set: true, stamp: stamp, key: key, root: m.root };
+    if same { return Option.Some(Unchanged { m: m, e: e }); }
     return Option.None;
 }

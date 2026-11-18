@@ -3,11 +3,342 @@
 // Part of module j3c.toolchain.
 // Port of: j3c/src/preflight.rs
 module j3c.toolchain;
+// J3: Rust's closure over the walk is `Probe` (the state) plus `visitCall`. The string locals of a body are
+//     a list searched from the end (Rust: a `HashMap`, where a later assign replaces an earlier one). A
+//     literal path is used as its bytes (Rust: `from_utf8_lossy`). The `j3.toml` diagnostic has no `Source`
+//     in the Session, so its `  --> path` line is written here.
+
+/// One loader of `j3.game` (Rust `Api`).
+struct Api {
+    linkName: string;
+    soname: string;
+    /// Index of the path argument, -1 when the call loads no file.
+    pathArg: int;
+    /// Missing library or file aborts the process.
+    fatal: bool;
+}
+
+/// A local assigned a string literal.
+struct StrLocal {
+    id: Id<LocalDecl>;
+    bytes: []u8;
+}
+
+/// What the walk of one program needs and gathers.
+struct Probe {
+    cx: &IrCx;
+    arena: &Arena;
+    search: List<string>;
+    root: string;
+    probeLibs: bool;
+    /// The string locals of the body being walked.
+    literals: List<StrLocal>;
+    seen: List<string>;
+    out: &Text;
+}
 
 /// Rust `preflight::check`: a missing host library, or a missing file passed as a literal path to a
 /// font/image/audio loader, is the rendered error text (`run` prints it through `printFail`, rc 1, before the
 /// build). A foreign target skips the library probe. `m` is `Parsed.project`.
 pub fn preflight(prog: &Program, m: Option<Manifest>, arena: &Arena): Result<bool, string> {
-    // STUB B
-    return Result.Ok(true);
+    let out = Text.new(arena);
+    let p = Probe { cx: &prog.cx, arena: arena, search: List<string>.new(arena), root: assetRoot(prog, m),
+        probeLibs: true, literals: List<StrLocal>.new(arena), seen: List<string>.new(arena), out: &out };
+    let libs = linkLibs(&prog.cx, arena);
+    let toml = "j3.toml";
+    match m {
+        Option.Some(man) {
+            for i in 0..man.link.search.len {
+                let dir = man.link.search.items[i];
+                p.search.push(if path.isAbs(dir) { dir } else { path.join(man.root, dir, arena) });
+            }
+            p.probeLibs = !foreignTarget(man.emit.primary());
+            for i in 0..man.link.libs.len { pushNew(&libs, man.link.libs.items[i]); }
+            toml = path.join(man.root, "j3.toml", arena);
+        }
+        Option.None {}
+    }
+    if p.probeLibs {
+        for i in 0..libs.len {
+            let l = libs.items[i];
+            if hostLibPresent(l, &p.search) { continue; }
+            if once(&p, Text.new(arena).add("lib:").add(l).str()) { libDiag(&p, toml, l); }
+        }
+    }
+    let funcs = prog.cx.allFuncs();
+    for i in 0..funcs.len {
+        match funcs[i].kind {
+            FuncKind.J3(f) {
+                match prog.cx.source(funcs[i].span.file) {
+                    Option.Some(file) {
+                        if contains(file.path, "stdlib/j3/") { continue; }
+                    }
+                    Option.None { continue; }
+                }
+                p.literals.clear();
+                stringLocals(&f.body.block, &p.literals);
+                walkBlock(&f.body.block, &p);
+            }
+            FuncKind.Lib(_) {}
+            FuncKind.Decl {}
+        }
+    }
+    if out.len() == 0 { return Result.Ok(true); }
+    return Result.Err(out.str());
+}
+
+/// Rust `push_once`: true the first time `key` is seen.
+fn once(p: &Probe, key: string): bool {
+    for i in 0..p.seen.len { if p.seen.items[i] == key { return false; } }
+    p.seen.push(key);
+    return true;
+}
+
+/// Rust `Diagnostic::render` of an error at `span` with one optional help and one optional note, appended
+/// to the report (a diagnostic always ends its line). `toml` non-empty: the `  --> path` of a file that is
+/// not a source.
+fn report(p: &Probe, span: Span, msg: string, help: Option<string>, note: string, toml: string) {
+    let d = Diag { code: 0, severity: Severity.Error, span: span, msg: msg, notes: List<Note>.new(p.arena), fix: Option.None };
+    if note.len > 0 { d.notes.push(Note { kind: NoteKind.Note, span: noSpan(), msg: note }); }
+    match help {
+        Option.Some(h) { d.notes.push(Note { kind: NoteKind.Help, span: noSpan(), msg: h }); }
+        Option.None {}
+    }
+    if toml.len == 0 {
+        diag.render(&d, p.cx.sources, p.out);
+        return;
+    }
+    let t = Text.new(p.arena);
+    diag.render(&d, p.cx.sources, &t);
+    let s = t.str();
+    let nl = find(s, "\n") + 1;
+    p.out.add(s[0..nl]).add("  --> ").add(toml).add("\n").add(s[nl..s.len]);
+}
+
+/// Rust `lib_diag`.
+fn libDiag(p: &Probe, toml: string, name: string) {
+    let msg = Text.new(p.arena).add("cannot find library `").add(name).add("`").str();
+    report(p, noSpan(), msg, failureHint(msg, p.arena), "j3c check does not run the program; this library is required to link it", toml);
+}
+
+/// Rust `call_lib_diag`.
+fn callLibDiag(p: &Probe, span: Span, name: string, api: Api) {
+    let msg = Text.new(p.arena).add("`").add(name);
+    if api.fatal {
+        msg.add("` panics unless `").add(api.soname).add("` is installed");
+    } else {
+        msg.add("` returns an empty handle because `").add(api.soname).add("` is not installed");
+    }
+    report(p, span, msg.str(), failureHint(api.soname, p.arena), softNote(api), "");
+}
+
+/// Rust `call_file_diag`.
+fn callFileDiag(p: &Probe, span: Span, name: string, api: Api, file: string) {
+    let msg = Text.new(p.arena).add("`").add(name);
+    msg.add(if api.fatal { "` panics because `" } else { "` returns an empty handle because `" }).add(file).add("` is not a file");
+    report(p, span, msg.str(), Option.Some("paths are relative to the project directory; put the file there or change the path"), softNote(api), "");
+}
+
+/// The note of a load that fails without stopping the program.
+fn softNote(api: Api): string {
+    return if api.fatal { "" } else { "the process keeps running, and this load draws nothing" };
+}
+
+/// Rust `asset_root`: the project root, else the folder of the first fn outside `j3.*` that has a file.
+fn assetRoot(prog: &Program, m: Option<Manifest>): string {
+    match m {
+        Option.Some(man) { return man.root; }
+        Option.None {}
+    }
+    let funcs = prog.cx.allFuncs();
+    for i in 0..funcs.len {
+        let owner = funcs[i].moduleName;
+        if owner.len > 0 && prog.cx.nameStr(owner.items[0]) == "j3" { continue; }
+        match prog.cx.source(funcs[i].span.file) {
+            Option.Some(file) { return path.dirname(file.path); }
+            Option.None {}
+        }
+    }
+    return ".";
+}
+
+/// Rust `link_libs`: every `use lib` name but `m`, first seen first.
+fn linkLibs(cx: &IrCx, arena: &Arena): List<string> {
+    let libs = List<string>.new(arena);
+    let funcs = cx.allFuncs();
+    for i in 0..funcs.len {
+        match funcs[i].kind {
+            FuncKind.Lib(l) {
+                let name = cx.nameStr(l.libName);
+                if name != "m" { pushNew(&libs, name); }
+            }
+            FuncKind.J3(_) {}
+            FuncKind.Decl {}
+        }
+    }
+    return libs;
+}
+
+/// Rust `api`: the loader `module.name` is, if it is one.
+fn apiOf(owner: string, name: string): Option<Api> {
+    if owner != "j3.game" { return Option.None; }
+    let font = Api { linkName: "SDL2_ttf", soname: "libSDL2_ttf-2.0.so.0", pathArg: 0, fatal: false };
+    let image = Api { linkName: "SDL2_image", soname: "libSDL2_image-2.0.so.0", pathArg: 0, fatal: false };
+    let sound = Api { linkName: "SDL2_mixer", soname: "libSDL2_mixer-2.0.so.0", pathArg: 0, fatal: false };
+    if name == "loadFont" { font.fatal = true; return Option.Some(font); }
+    if name == "tryLoadFont" || name == "tryLoadFontC" { return Option.Some(font); }
+    if name == "loadTexture" { image.fatal = true; return Option.Some(image); }
+    if name == "tryLoadTexture" || name == "tryLoadTextureC" || name == "loadRgba" { return Option.Some(image); }
+    if name == "loadSound" || name == "loadMusic" { sound.fatal = true; return Option.Some(sound); }
+    if name == "tryLoadSound" || name == "tryLoadSoundC" || name == "tryLoadMusic" || name == "tryLoadMusicC" { return Option.Some(sound); }
+    if name == "setVolume" || name == "setMusicVolume" || name == "stop" || name == "stopMusic" {
+        sound.pathArg = -1;
+        sound.fatal = true;
+        return Option.Some(sound);
+    }
+    return Option.None;
+}
+
+/// Rust `literal_bytes`: the string an argument is, when it is a literal or a local assigned one.
+fn literalBytes(op: Operand, locals: &List<StrLocal>): Option<[]u8> {
+    match op {
+        Operand.Const(c) {
+            match c.kind {
+                ConstKind.Bytes(b) { return Option.Some(b.bytes); }
+                _ { return Option.None; }
+            }
+        }
+        Operand.Copy(place) {
+            if place.proj.len > 0 { return Option.None; }
+            match place.root {
+                PlaceRoot.Local(l) {
+                    let i = locals.len - 1;
+                    while i >= 0 {
+                        if locals.items[i].id == l.id { return Option.Some(locals.items[i].bytes); }
+                        i -= 1;
+                    }
+                }
+                PlaceRoot.Global(_) {}
+            }
+        }
+    }
+    return Option.None;
+}
+
+/// Rust `collect_string_locals`: every `local = "literal"` of `block` and the blocks inside it.
+fn stringLocals(block: &Block, out: &List<StrLocal>) {
+    for i in 0..block.stmts.len {
+        match block.stmts.items[i].kind {
+            StmtKind.Assign(a) {
+                if a.place.proj.len > 0 { continue; }
+                match a.place.root {
+                    PlaceRoot.Local(l) {
+                        match a.rvalue.kind {
+                            RvalueKind.Use(op) {
+                                match op {
+                                    Operand.Const(c) {
+                                        match c.kind {
+                                            ConstKind.Bytes(b) { out.push(StrLocal { id: l.id, bytes: b.bytes }); }
+                                            _ {}
+                                        }
+                                    }
+                                    Operand.Copy(_) {}
+                                }
+                            }
+                            _ {}
+                        }
+                    }
+                    PlaceRoot.Global(_) {}
+                }
+            }
+            StmtKind.If(s) {
+                stringLocals(&s.thenBlock, out);
+                match s.elseBlock {
+                    Option.Some(b) { stringLocals(&b, out); }
+                    Option.None {}
+                }
+            }
+            StmtKind.While(s) { stringLocals(&s.body, out); }
+            StmtKind.ForRange(s) { stringLocals(&s.body, out); }
+            StmtKind.Defer(s) { stringLocals(&s.body, out); }
+            StmtKind.Block(b) { stringLocals(&b, out); }
+            StmtKind.Switch(s) {
+                for k in 0..s.cases.len { stringLocals(&s.cases.items[k].block, out); }
+                stringLocals(&s.default, out);
+            }
+            _ {}
+        }
+    }
+}
+
+/// Rust `walk_block` / `walk_stmt`: `visitCall` on the rvalue of every assign and expression statement.
+fn walkBlock(block: &Block, p: &Probe) {
+    for i in 0..block.stmts.len {
+        match block.stmts.items[i].kind {
+            StmtKind.Assign(a) { visitCall(p, &a.rvalue); }
+            StmtKind.Expr(rv) { visitCall(p, &rv); }
+            StmtKind.If(s) {
+                walkBlock(&s.thenBlock, p);
+                match s.elseBlock {
+                    Option.Some(b) { walkBlock(&b, p); }
+                    Option.None {}
+                }
+            }
+            StmtKind.While(s) { walkBlock(&s.body, p); }
+            StmtKind.ForRange(s) { walkBlock(&s.body, p); }
+            StmtKind.Defer(s) { walkBlock(&s.body, p); }
+            StmtKind.Block(b) { walkBlock(&b, p); }
+            StmtKind.Switch(s) {
+                for k in 0..s.cases.len { walkBlock(&s.cases.items[k].block, p); }
+                walkBlock(&s.default, p);
+            }
+            _ {}
+        }
+    }
+}
+
+/// The body of Rust `collect`'s closure: a call of a `j3.game` loader whose library is missing, or whose
+/// literal path is not a file under the asset root, is reported once.
+fn visitCall(p: &Probe, rv: &Rvalue) {
+    match rv.kind {
+        RvalueKind.Call(call) {
+            let id = Id<Func> { i: 0 };
+            match call.func {
+                Operand.Const(c) {
+                    match c.kind {
+                        ConstKind.FnAddr(f) { id = f.func; }
+                        _ { return; }
+                    }
+                }
+                Operand.Copy(_) { return; }
+            }
+            let called = p.cx.func(id);
+            let owner = Text.new(p.arena);
+            for i in 0..called.moduleName.len {
+                if i > 0 { owner.push('.'); }
+                owner.add(p.cx.nameStr(called.moduleName.items[i]));
+            }
+            let name = p.cx.nameStr(called.name);
+            match apiOf(owner.str(), name) {
+                Option.Some(api) {
+                    // Image loads fall back to the J3 PNG decoder, so SDL2_image is optional.
+                    if p.probeLibs && api.linkName != "SDL2_image" && !hostLibPresent(api.linkName, &p.search) {
+                        if once(p, Text.new(p.arena).add("call:").add(name).add(":").add(api.soname).str()) { callLibDiag(p, rv.span, name, api); }
+                    }
+                    if api.pathArg < 0 || api.pathArg >= call.args.len { return; }
+                    match literalBytes(call.args.items[api.pathArg], &p.literals) {
+                        Option.Some(bytes) {
+                            let text = bytes as string;
+                            if text.len == 0 { return; }
+                            if fsx.isFile(if path.isAbs(text) { text } else { path.join(p.root, text, p.arena) }) { return; }
+                            if once(p, Text.new(p.arena).add("file:").add(name).add(":").add(text).str()) { callFileDiag(p, rv.span, name, api, text); }
+                        }
+                        Option.None {}
+                    }
+                }
+                Option.None {}
+            }
+        }
+        _ {}
+    }
 }

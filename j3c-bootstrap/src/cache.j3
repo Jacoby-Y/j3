@@ -2,39 +2,170 @@
 //
 // Port of: j3c/src/emit/incr.rs
 // J3: Lock the cache dir with `io.flock` so two j3c runs don't race.
-// J3: Contracts (wave 19, contracts-c3.md): signatures only; chunk A fills every `// STUB A`. Decisions:
-//     keys are `j3.hash` `xxh3_64` (Rust: `DefaultHasher`), so an object or stamp written by one compiler never
-//     matches the other; clang jobs are processes (`j3.proc.start` + `waitAny`, a job cap), never threads (the
-//     Session arena is single-threaded); nothing written or put on the link line follows hash-map order
-//     (objects link in module order).
+// J3: Decisions (contracts-c3.md): keys are `j3.hash` `xxh3_64` (Rust: `DefaultHasher`), so an object or
+//     stamp written by one compiler never matches the other; nothing written or put on the link line
+//     follows hash-map order (objects link in module order, parts in chunk order).
+// J3: Rust emits and compiles on a thread pool; here each miss is a forked worker process (`cache/jobs.j3`),
+//     at most `jobCap()` at once, reaped with `proc.waitAny`.
+// J3: The driver leaves `emit` open when it calls `compile`: the key pass is a step of `emit`, then
+//     `compile` and `link` are begun here (Rust `status("compiling")` / `status("linking")`).
 // J3: Every `use` of the module is here (part files have none).
 module j3c.cache;
 
+use j3.cmp.sortBy;
+use j3.data.map.Map;
 use j3.data.pool.Id;
 use j3.data.set.Set;
+use j3.hash.{ Xxh3, xxh3_64 };
+use j3.io;
+use j3.io.path;
 use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.proc;
+use j3.proc.Child;
 use j3.result.Result;
-use j3.text.Text;
+use j3.sys;
+use j3.text.{ Text, contains, endsWith, find, lastIndexOf, lines, parseInt, parseU64, startsWith, trim };
+use j3.threadsys;
+use j3c.backend.llvm.{ Chunk, LlOpts, chunkAssign, emitLlvmModule, funcName, pushFuncName };
+use j3c.base.fsx;
 use j3c.base.phase.Phases;
-use j3c.ir.{ Func, IrCx, Module, Program };
-use j3c.toolchain.EmitOpts;
+use j3c.ir.{ Block, ConstInit, ConstKind, Func, FuncKind, InterpPart, IrCx, LocalDecl, Module, Operand, Program, Rvalue, RvalueKind,
+    SimdOp, Stmt, StmtKind, simdName };
+use j3c.ir.dump.dumpModule;
+use j3c.ir.names.pushStableTy;
+use j3c.project.deps.cacheRoot;
+use j3c.syntax.ast.{ atomicOpName, atomicOrderName };
+use j3c.toolchain;
+use j3c.toolchain.{ EmitOpts, TargetOs, hex16, mkdirs, pushSecs };
 
 /// Rust `incr::enabled`: per-module objects at opt 0/1 (or `incremental = "all"`) with a named output.
 pub fn enabled(e: &EmitOpts): bool {
-    // STUB A
-    return false;
+    return e.incremental && (e.incrementalAll || e.cc.opt == "" || e.cc.opt == "0" || e.cc.opt == "1") && e.cc.out.len > 0;
 }
 
 /// Rust `incr::thin_lto`: release or opt 2/3/s/z on the Linux host with lld or mold (`J3C_NO_THINLTO` off).
 pub fn thinLto(e: &EmitOpts): bool {
-    // STUB A
-    return false;
+    let o = e.cc.opt;
+    // `incremental = false` (one clang) and `"all"` (per-module, no LTO) opt out below release.
+    return (e.cc.release || (e.incremental && !e.incrementalAll && (o == "2" || o == "3" || o == "s" || o == "z")))
+        && toolchain.isHostTarget(e.target)
+        && sys.PLATFORM == sys.PLATFORM_LINUX
+        && e.cc.out.len > 0
+        && (toolchain.lldPresent() || toolchain.moldOnPath())
+        && sys.env("J3C_NO_THINLTO").len == 0;
+}
+
+#[singleton]
+let LAST_BUILT: int;
+
+/// How many modules the last `compile` of this process had to build (0 = every object was cached).
+pub fn lastBuilt(): int { return LAST_BUILT; }
+
+/// One module of the build. `parts` > 0: it was split, its objects are `partPath(obj, 0..parts)`.
+struct Unit {
+    index: int;
+    parts: int;
+    label: string;
+    obj: string;
+    libs: string;
+    note: string;
+    /// Length of the module's key text: a rough cost.
+    cost: int;
+    emitMs: int;
+    clangMs: int;
+    miss: bool;
 }
 
 /// Rust `incr::compile`: emit, compile (cached, costliest module first, parallel clang) and link `prog`;
 /// the executable's path or the error text. Called by `driver.linkStage` when `enabled` or `thinLto`;
 /// timing notes go through `phases`.
 pub fn compile(prog: &Program, e: &EmitOpts, phases: &Phases, arena: &Arena): Result<string, string> {
-    // STUB A
-    return Result.Err("object cache: not ported yet (chunk A)");
+    let exe = e.cc.out;
+    if exe.len == 0 { return Result.Err("incremental build needs an output path"); }
+    if toolchain.targetOs(e.target) == TargetOs.Android { toolchain.androidReady(e.target, arena)?; }
+    let cx = &prog.cx;
+    let modules = prog.modules.slice();
+    if path.dirname(exe).len > 0 { mkdirs(path.dirname(exe), arena)?; }
+    // One folder per output and target, or each build's sweep deletes the other's objects. ThinLTO
+    // objects get their own folder, or an optimized build sweeps away the dev objects.
+    let thin = thinLto(e);
+    let top = toolchain.cacheDir(exe, e.target, arena);
+    let dir = path.join(top, if thin { "obj-thin" } else { "obj" }, arena);
+    mkdirs(dir, arena)?;
+    // This link replaces the output, so a whole-program build (`--release`) must not trust its old key.
+    toolchain.discard(path.join(top, "clang.key", arena));
+
+    phases.detail("hashing modules against the object cache");
+    let keyStart = sys.monotonicMs();
+    let layouts = layoutDigest(cx, modules, arena);
+    let units = List<Unit>.new(arena);
+    // `label-key.` of every current module, for the sweep.
+    let keep = List<string>.new(arena);
+    let text = Text.new(arena);
+    let misses = 0;
+    for index in 0..modules.len {
+        let label = moduleLabel(cx, &modules[index], arena);
+        text.clear();
+        moduleIr(cx, &modules[index], &text);
+        let key = objectKey(text.str(), e, &layouts, arena);
+        let stem = Text.new(arena).add(label).add("-").add(key).add(".").str();
+        let obj = path.join(dir, Text.new(arena).add(stem).add("o").str(), arena);
+        let libs = path.join(dir, Text.new(arena).add(stem).add("libs").str(), arena);
+        let parts = partsOf(obj, arena);
+        let hit = fsx.isFile(libs);
+        if hit {
+            if parts > 0 {
+                for n in 0..parts {
+                    if !fsx.isFile(partPath(obj, n, arena)) { hit = false; }
+                }
+            } else {
+                hit = fsx.isFile(obj);
+            }
+        }
+        keep.push(stem);
+        let note = "";
+        if hit {
+            if timings() { eprint(Text.new(arena).add("j3c: cached ").add(label).add("\n")); }
+            match io.readFile(libs, arena) {
+                Result.Ok(b) { note = b as string; }
+                Result.Err(_) {}
+            }
+        } else {
+            misses += 1;
+        }
+        units.push(Unit { index: index, parts: parts, label: label, obj: obj, libs: libs, note: note, cost: text.len(),
+            emitMs: 0, clangMs: 0, miss: !hit });
+    }
+    LAST_BUILT = misses;
+    let keyMs = sys.monotonicMs() - keyStart;
+    phases.step("  emit: hash modules", f64(keyMs) / 1000.0);
+    if timings() {
+        let t = Text.new(arena);
+        t.add("j3c:   emit: hash modules: ");
+        pushSecs(&t, keyMs, 3);
+        t.add("s\n");
+        eprint(&t);
+    }
+    phases.begin("compile");
+    let n = Text.new(arena);
+    n.fmt(`{units.len - misses} of {units.len} modules cached, {misses} to build`);
+    phases.note(n.str());
+
+    if misses > 0 { runJobs(cx, modules, &units, misses, e, thin, phases, arena)?; }
+
+    let notes = Text.new(arena);
+    let objs = List<string>.new(arena);
+    for i in 0..units.len {
+        let u = units.items[i];
+        notes.add(u.note);
+        if u.parts > 0 {
+            for k in 0..u.parts { objs.push(partPath(u.obj, k, arena)); }
+        } else {
+            objs.push(u.obj);
+        }
+    }
+    linkObjs(objs.slice(), exe, e, thin, notes.str(), phases, arena)?;
+    sweepStale(dir, keep.slice(), arena);
+    return Result.Ok(exe);
 }

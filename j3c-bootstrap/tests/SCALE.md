@@ -46,3 +46,26 @@ Rust time or RSS above 4x the Rust RSS.
   vs Rust's 38). A scratch arena per parsed file for its tokens is the first lever if sema's numbers need it.
 
 **Verdict: within budget (parse wall at most 2.3x, RSS at most 1.6x of Rust); C2 is not blocked.**
+
+## After C3 (self build through the object cache)
+
+Stage 1 (`target/j3c-boot`, built by stage0, dev: opt 0) builds stage 2 from a scratch copy of `j3c-bootstrap`
+(`{j3.toml,src,text}` under `<repo>/target/`, what `diff.sh self` does): 97 modules, 271 clang jobs.
+
+| Build of the scratch copy | Wall | Peak RSS | Notes |
+|---|---|---|---|
+| j3c-boot (stage 1), cache cold | 9.0 s | 1292 MB | every module emitted and compiled in forked workers, 24 cores |
+| j3c-boot (stage 1), cache warm (nothing changed) | 1.6 s | 691 MB | parse + check, then `up to date`; no clang, no link |
+| stage0 (Rust), cache cold | 2.8 s | 868 MB | same copy |
+| stage0 (Rust), cache warm | 0.8 s | 365 MB | same copy |
+
+- Date: 2026-11-18, same machine, `/usr/bin/time -f "%e %M"` (the RSS is the largest single process: the parent,
+  whose workers are forks of it). One run each. Ratio to Rust: 3.2x wall and 1.5x RSS cold, 2.0x and 1.9x warm.
+- A comment-only edit of one module recompiles nothing (the key is the module's IR text); adding a fn to one
+  module recompiles that module only (`tests/unit/cache_build_test.j3`).
+- `diff.sh self` (stage 2 = stage 1): fmt 586, ast 586, err 161, ui 221, glsl 4, glsl --es 4, ir --norm 222 and
+  222 llvm inputs (one per call), 229 comparisons, 0 failed, about 14 minutes in all (run as `SELF_LLVM=1:90`,
+  `91:160`, `161:222`). `dump-llvm j3c-bootstrap` is byte-equal between the stages (78.7 MB).
+- Where the time goes: emission inside the workers (about 31 s of cpu at opt 0), key pass 1.1 s. Stage 1 is a dev
+  build; a release-built stage 1 is the first lever.
+

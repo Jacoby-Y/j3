@@ -3,28 +3,209 @@
 // Part of module j3c.toolchain.
 // Port of: j3c/src/emit/android.rs
 module j3c.toolchain;
-// J3: C2a has the entries the host toolchain calls; the NDK/SDL lookup (`ndk`, `sdl_dir`, `abi`) is not
-//     ported, so `androidReady` refuses every Android build with one line and the flags name no sysroot.
+// J3: Rust's `Option<PathBuf>` is a string here, "" for None. `sys.env` cannot tell an unset variable from
+//     an empty one, so an empty `HOME` counts as unset (Rust would join onto ""). Rust looks the NDK up once
+//     (`OnceLock`); here every call looks again (a few `listDir`s, only on Android builds).
 
-/// Rust `API_LEVEL`: the minimum Android API the triple is compiled for.
-const API_LEVEL: string = "24";
+/// Rust `API_LEVEL`: the `--target=<triple><API_LEVEL>` level and the minimum the packaged app declares.
+const API_LEVEL: string = "26";
 
-/// Rust `target_flags`: compile and link flags for an Android triple, in place of plain `--target=`.
+/// NDK pieces a compile or link needs (Rust `Ndk`).
+pub struct Ndk {
+    clang: string;
+    sysroot: string;
+}
+
+/// One `<sdk>/ndk/<version>` folder: its dotted version as numbers, and its path.
+struct VerDir {
+    key: List<u64>;
+    path: string;
+}
+
+/// `s` starts with `p` (lower case), ignoring ASCII case in `s`.
+fn startsLower(s: string, p: string): bool {
+    if s.len < p.len { return false; }
+    for i in 0..p.len {
+        let c = s[i];
+        if c >= 'A' && c <= 'Z' { c = c + 32; }
+        if c != p[i] { return false; }
+    }
+    return true;
+}
+
+/// Rust `abi`: Android ABI name (APK `lib/<abi>/`, SDL cache folder) for a triple; "" when unsupported.
+pub fn androidAbi(triple: string): string {
+    if startsLower(triple, "aarch64") { return "arm64-v8a"; }
+    if startsLower(triple, "x86_64") { return "x86_64"; }
+    return "";
+}
+
+/// Rust `sdl_root`: root of the SDL build cache, `env` (`J3_SDL_CACHE`), else `<home>/.cache/j3/android/sdl`.
+pub fn sdlRoot(env: string, home: string, arena: &Arena): string {
+    if env.len > 0 { return env; }
+    if home.len == 0 { return ""; }
+    return path.join(home, ".cache/j3/android/sdl", arena);
+}
+
+/// Rust `sdl_lib_dir`: `<root>/<abi>/lib`, where `tools/android/build-sdl.sh` puts the SDL libraries.
+pub fn sdlLibDir(triple: string, root: string, arena: &Arena): string {
+    let abi = androidAbi(triple);
+    if abi.len == 0 { return ""; }
+    return path.join(path.join(root, abi, arena), "lib", arena);
+}
+
+/// Rust `openssl_lib_dir`: `<root>/<abi>/lib` of the OpenSSL cache (`J3_OPENSSL_CACHE`, else
+/// `~/.cache/j3/android/openssl`).
+pub fn opensslLibDir(triple: string, arena: &Arena): string {
+    let root = sys.env("J3_OPENSSL_CACHE");
+    if root.len == 0 {
+        let home = sys.env("HOME");
+        if home.len == 0 { return ""; }
+        root = path.join(home, ".cache/j3/android/openssl", arena);
+    }
+    return sdlLibDir(triple, root, arena);
+}
+
+/// Rust `sdk_root`: `ANDROID_HOME` when set and non-empty, else `<HOME>/Android/Sdk`; "" when neither.
+pub fn sdkRoot(arena: &Arena): string { return sdkRootIn(sys.env("ANDROID_HOME"), sys.env("HOME"), arena); }
+
+/// `sdkRoot` with the environment passed in (Rust `sdk_root_in`).
+pub fn sdkRootIn(androidHome: string, home: string, arena: &Arena): string {
+    if androidHome.len > 0 { return androidHome; }
+    if home.len == 0 { return ""; }
+    return path.join(home, "Android/Sdk", arena);
+}
+
+/// Rust `find_ndk`: the NDK root, `ndkHome` (`ANDROID_NDK_HOME`), then `ndkRoot` (`ANDROID_NDK_ROOT`), then
+/// the highest valid `<sdk>/ndk/*`. An empty or invalid entry falls through to the next. "" = none.
+pub fn findNdk(ndkHome: string, ndkRoot: string, sdk: string, arena: &Arena): string {
+    if ndkHome.len > 0 && prebuilt(ndkHome, arena).len > 0 { return ndkHome; }
+    if ndkRoot.len > 0 && prebuilt(ndkRoot, arena).len > 0 { return ndkRoot; }
+    if sdk.len == 0 { return ""; }
+    // Highest first; an invalid newer folder is passed over, which `highestVersionDir` cannot do.
+    let v = versionDirs(path.join(sdk, "ndk", arena), arena);
+    let i = v.len - 1;
+    while i >= 0 {
+        if prebuilt(v.items[i].path, arena).len > 0 { return v.items[i].path; }
+        i -= 1;
+    }
+    return "";
+}
+
+/// `name` as dotted numbers (`27.2.12479018`), each a `u64` as Rust parses one (a leading `+` is allowed).
+fn versionKey(name: string, arena: &Arena): Option<List<u64>> {
+    let key = List<u64>.new(arena);
+    let it = split(name, ".");
+    while true {
+        match it.next() {
+            Option.Some(p) {
+                let digits = if p.len > 1 && p[0] == '+' { p[1..p.len] } else { p };
+                match parseU64(digits, 10) {
+                    Option.Some(n) { key.push(n); }
+                    Option.None { return Option.None; }
+                }
+            }
+            Option.None { break; }
+        }
+    }
+    return Option.Some(key);
+}
+
+/// Rust's `(Vec<u64>, PathBuf)` order: the numbers first (a prefix sorts before the longer one), then the path.
+fn verLess(a: VerDir, b: VerDir): bool {
+    let n = if a.key.len < b.key.len { a.key.len } else { b.key.len };
+    for i in 0..n {
+        if a.key.items[i] != b.key.items[i] { return a.key.items[i] < b.key.items[i]; }
+    }
+    if a.key.len != b.key.len { return a.key.len < b.key.len; }
+    return a.path < b.path;
+}
+
+/// Rust `version_dirs`: subfolders of `parent` named as dotted numbers, lowest version first.
+fn versionDirs(parent: string, arena: &Arena): List<VerDir> {
+    let v = List<VerDir>.new(arena);
+    match io.listDir(parent, arena) {
+        Result.Ok(ents) {
+            for i in 0..ents.len {
+                if !ents[i].isDir { continue; }
+                match versionKey(ents[i].name, arena) {
+                    Option.Some(k) { v.push(VerDir { key: k, path: path.join(parent, ents[i].name, arena) }); }
+                    Option.None {}
+                }
+            }
+        }
+        Result.Err(_) {}
+    }
+    sortBy(v.items[0..v.len], fn(a: VerDir, b: VerDir): bool { return verLess(a, b); });
+    return v;
+}
+
+/// Rust `highest_version_dir`: the subfolder of `parent` with the highest dotted version, compared
+/// numerically (`27.2.12479018` beats `27.1.1` and `9.0.0`). Non-version names are ignored. "" = none.
+pub fn highestVersionDir(parent: string, arena: &Arena): string {
+    let v = versionDirs(parent, arena);
+    if v.len == 0 { return ""; }
+    return v.items[v.len - 1].path;
+}
+
+/// Rust `prebuilt`: `<ndk>/toolchains/llvm/prebuilt/<host>`, the first host folder (by name) with a `bin`.
+fn prebuilt(ndk: string, arena: &Arena): string {
+    let dir = path.join(ndk, "toolchains/llvm/prebuilt", arena);
+    let hosts = List<string>.new(arena);
+    match io.listDir(dir, arena) {
+        Result.Ok(ents) { for i in 0..ents.len { hosts.push(path.join(dir, ents[i].name, arena)); } }
+        Result.Err(_) { return ""; }
+    }
+    sortBy(hosts.items[0..hosts.len], fn(a: string, b: string): bool { return a < b; });
+    for i in 0..hosts.len {
+        if fsx.isDir(path.join(hosts.items[i], "bin", arena)) { return hosts.items[i]; }
+    }
+    return "";
+}
+
+/// Rust `ndk`: the NDK on this machine, from the environment.
+pub fn ndk(arena: &Arena): Option<Ndk> {
+    let root = findNdk(sys.env("ANDROID_NDK_HOME"), sys.env("ANDROID_NDK_ROOT"), sdkRoot(arena), arena);
+    if root.len == 0 { return Option.None; }
+    let host = prebuilt(root, arena);
+    if host.len == 0 { return Option.None; }
+    return Option.Some(Ndk { clang: path.join(path.join(host, "bin", arena), "clang", arena), sysroot: path.join(host, "sysroot", arena) });
+}
+
+/// Rust `sdl_dir`: SDL lib dir for `triple` on this machine (`J3_SDL_CACHE` overrides the root); "" = none.
+pub fn sdlDir(triple: string, arena: &Arena): string {
+    let root = sdlRoot(sys.env("J3_SDL_CACHE"), sys.env("HOME"), arena);
+    if root.len == 0 { return ""; }
+    return sdlLibDir(triple, root, arena);
+}
+
+/// Rust `target_flags`: compile and link flags for an Android triple, in place of plain `--target=`. With
+/// no NDK found only the target is named; `androidReady` reports the missing NDK first.
 pub fn androidTargetFlags(out: &List<string>, triple: string, arena: &Arena) {
     out.push(Text.new(arena).add("--target=").add(triple).add(API_LEVEL).str());
+    match ndk(arena) {
+        Option.Some(n) { out.push(Text.new(arena).add("--sysroot=").add(n.sysroot).str()); }
+        Option.None {}
+    }
     out.push("-fPIC");
 }
 
 /// Rust `compiler`: an explicit `[emit] clang` (plain `clang` counts as unset), else the NDK's.
 pub fn androidCompiler(explicit: string, arena: &Arena): string {
     if explicit.len > 0 && explicit != "clang" { return explicit; }
+    match ndk(arena) {
+        Option.Some(n) { return n.clang; }
+        Option.None {}
+    }
     return "clang";
 }
 
 /// Rust `link_flags`: a shared library with every symbol resolved at build time.
-pub fn androidLinkFlags(out: &List<string>, triple: string) {
+pub fn androidLinkFlags(out: &List<string>, triple: string, arena: &Arena) {
     out.push("-shared");
     out.push("-Wl,--no-undefined");
+    let d = sdlDir(triple, arena);
+    if d.len > 0 { out.push(Text.new(arena).add("-L").add(d).str()); }
     out.push("-ldl");
     out.push("-lm");
     out.push("-llog");
@@ -36,7 +217,19 @@ pub fn androidLibName(name: string): string {
     return name;
 }
 
-/// Rust `ready`: Err (one line) when this machine can't build for `triple`.
-pub fn androidReady(triple: string): Result<bool, string> {
-    return Result.Err("Android builds are not ported to j3c-boot yet: use stage0 j3c");
+/// Rust `ready`: Err (one line), before anything is built, when the NDK or the SDL cache is missing.
+pub fn androidReady(triple: string, arena: &Arena): Result<bool, string> {
+    match ndk(arena) {
+        Option.Some(_) {}
+        Option.None { return Result.Err("no Android NDK found: set ANDROID_NDK_HOME or ANDROID_NDK_ROOT, or install one under $ANDROID_HOME/ndk (see `j3c doc android`)"); }
+    }
+    let abi = androidAbi(triple);
+    if abi.len == 0 {
+        return Result.Err(Text.new(arena).add("unsupported Android target `").add(triple).add("` (use aarch64-linux-android or x86_64-linux-android)").str());
+    }
+    let d = sdlDir(triple, arena);
+    if d.len == 0 || !fsx.isFile(path.join(d, "libSDL2.so", arena)) {
+        return Result.Err(Text.new(arena).add("SDL for Android (").add(abi).add(") is not built: run tools/android/build-sdl.sh").str());
+    }
+    return Result.Ok(true);
 }

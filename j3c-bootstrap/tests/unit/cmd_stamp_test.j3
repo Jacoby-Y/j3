@@ -1,0 +1,117 @@
+// Build stamps: `src.key` skips emit and clang, `inputs.<kind>.key` skips the parse; an edit, other flags
+// or `J3_STDLIB` turn the shortcut off; an `@embed` outside the stat walk is never covered.
+module cmd_stamp_test;
+
+use j3.io;
+use j3.io.path;
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.sys.panic;
+use j3.text.Text;
+use j3c.base.fsx;
+use j3c.cmd.stamp;
+use j3c.cmd.stamp.StampFlags;
+use j3c.driver;
+use j3c.driver.{ Mode, Session, Stage };
+use j3c.toolchain;
+
+fn put(p: string, s: string) {
+    match io.writeFile(p, s as []u8) { Result.Ok(_) {} Result.Err(_) { panic(p); } }
+}
+
+fn session(dir: string, release: bool): &Session {
+    let o = driver.defaults();
+    o.entry = dir;
+    o.mode = Mode.Build;
+    o.release = release;
+    return Session.new(o);
+}
+
+fn unchanged(f: &StampFlags, kind: string, mem: &Arena): bool {
+    match stamp.unchangedProject(f, kind, mem) {
+        Option.Some(_) { return true; }
+        Option.None { return false; }
+    }
+}
+
+fn main() {
+    let mem = Arena.create(1 << 14);
+    defer mem.destroy();
+    sys.setenv("J3C_COMPILATION_TRACKING", "0");
+    // scratch project under the repo-root target/ (cwd is j3c-bootstrap/), removed at the end
+    let t = Text.new(&mem);
+    t.add("../target/unit-stamp-");
+    t.pushInt(sys.getpid());
+    let dir = t.str();
+    let rm: [3]string = ["rm", "-rf", dir];
+    proc.run(rm[..], "", &mem);
+    io.makeDirs(Text.new(&mem).add(dir).add("/src").str());
+    io.makeDirs(Text.new(&mem).add(dir).add("/.hid").str());
+    io.makeDirs(Text.new(&mem).add(dir).add("/target").str());
+    put(Text.new(&mem).add(dir).add("/j3.toml").str(), "[package]\nname = \"stampt\"\nentry = \"src/main.j3\"\n");
+    let main = Text.new(&mem).add(dir).add("/src/main.j3").str();
+    put(main, "module stampt;\nfn main(): int { return 1; }\n");
+    put(Text.new(&mem).add(dir).add("/.hid/x").str(), "x");
+    put(Text.new(&mem).add(dir).add("/target/x").str(), "x");
+
+    let f = StampFlags { path: dir, hasPath: true, fast: false, release: false, opt: "" };
+    if unchanged(&f, "build", &mem) { panic("unchanged before any build"); }
+    let s = session(dir, false);
+    if !driver.run(s, Stage.Passes) { panic("check"); }
+    let e = match driver.emitOpts(s) { Result.Ok(x) { x } Result.Err(m) { panic(m); } };
+    if stamp.upToDate(s, &e) { panic("up to date before the build"); }
+    if !driver.run(s, Stage.Link) { panic("build"); }
+    stamp.markBuilt(s, &e);
+    if !stamp.upToDate(s, &e) { panic("not up to date after markBuilt"); }
+    // (copied: the session's arena goes with `s.free()`)
+    let key = Text.new(&mem).add(stamp.sourceKey(s, &e)).str();
+    if key.len != 16 || key != stamp.sourceKey(s, &e) { panic("sourceKey is not 16 stable digits"); }
+    let cdir = toolchain.cacheDir(Text.new(&mem).add(e.cc.out).str(), Text.new(&mem).add(e.target).str(), &mem);
+    if !fsx.isFile(Text.new(&mem).add(cdir).add("/src.key").str()) { panic("no src.key"); }
+    if !fsx.isFile(Text.new(&mem).add(cdir).add("/inputs.build.key").str()) { panic("no inputs.build.key"); }
+    s.free();
+
+    // the stat-only shortcut: per command kind, per flag set
+    match stamp.unchangedProject(&f, "build", &mem) {
+        Option.Some(u) { if !fsx.isFile(u.e.cc.out) { panic("unchanged output path"); } }
+        Option.None { panic("changed right after a build"); }
+    }
+    if unchanged(&f, "run", &mem) { panic("`run` shares the `build` stamp"); }
+    let rel = StampFlags { path: dir, hasPath: true, fast: false, release: true, opt: "" };
+    if unchanged(&rel, "build", &mem) { panic("--release shares the dev stamp"); }
+
+    // the options are in the source key
+    let sr = session(dir, true);
+    if !driver.run(sr, Stage.Passes) { panic("check --release"); }
+    let er = match driver.emitOpts(sr) { Result.Ok(x) { x } Result.Err(m) { panic(m); } };
+    if stamp.sourceKey(sr, &er) == key || stamp.upToDate(sr, &er) { panic("--release has the dev key"); }
+    sr.free();
+
+    // an edit of the same size, at once (same second): both shortcuts are off
+    put(main, "module stampt;\nfn main(): int { return 2; }\n");
+    if unchanged(&f, "build", &mem) { panic("unchanged after an edit"); }
+    let s2 = session(dir, false);
+    if !driver.run(s2, Stage.Passes) { panic("check 2"); }
+    let e2 = match driver.emitOpts(s2) { Result.Ok(x) { x } Result.Err(m) { panic(m); } };
+    if stamp.upToDate(s2, &e2) { panic("up to date after an edit"); }
+    // an up-to-date `src.key` alone lets `markInputs` write this build's inputs key
+    stamp.markBuilt(s2, &e2);
+    if !unchanged(&f, "build", &mem) { panic("changed after markBuilt"); }
+    s2.free();
+
+    // what the stat walk covers (an `@embed` elsewhere keeps `inputs.key` unwritten)
+    let root = match path.realpath(dir, &mem) { Option.Some(r) { r } Option.None { panic("realpath"); } };
+    if !stamp.covered(main, root, &mem) { panic("src/main.j3 is covered"); }
+    if stamp.covered(Text.new(&mem).add(dir).add("/.hid/x").str(), root, &mem) { panic("a dot folder is not covered"); }
+    if stamp.covered(Text.new(&mem).add(dir).add("/target/x").str(), root, &mem) { panic("target/ is not covered"); }
+    if stamp.covered("j3.toml", root, &mem) { panic("a file outside the root is not covered"); }
+    if stamp.covered(Text.new(&mem).add(dir).add("/nope").str(), root, &mem) { panic("a missing file is not covered"); }
+
+    // J3_STDLIB: never a shortcut
+    sys.setenv("J3_STDLIB", "/nowhere");
+    if unchanged(&f, "build", &mem) { panic("shortcut with J3_STDLIB set"); }
+    proc.run(rm[..], "", &mem);
+}

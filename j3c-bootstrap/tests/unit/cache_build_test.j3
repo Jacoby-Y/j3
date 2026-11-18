@@ -1,0 +1,194 @@
+// The object cache end to end, on a scratch copy of `tests/proj/merged_names` under the repo-root
+// `target/`: the first build compiles every module, the second none, a one-module edit only that module;
+// the objects on disk are exactly this build's (`sweepStale`), in the `obj` folder. Also the argv of one
+// object and of the link (host, ThinLTO flags).
+module cache_build_test;
+
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.sys.panic;
+use j3.text.{ Text, contains, endsWith, startsWith };
+use j3c.base.fsx;
+use j3c.cache;
+use j3c.driver;
+use j3c.driver.{ Mode, Session, Stage };
+use j3c.toolchain;
+use j3c.toolchain.defaultEmitOpts;
+
+/// Build the project at `dir`; how many modules were compiled and how many it has.
+fn build(dir: string): (int, int) {
+    let o = driver.defaults();
+    o.entry = dir;
+    o.mode = Mode.Build;
+    let s = Session.new(o);
+    if !driver.run(s, Stage.Link) || s.diags.hasErrors() { panic("the scratch project does not build"); }
+    if !cache.enabled(&s.emit) || cache.thinLto(&s.emit) { panic("a dev build of a project uses per-module objects"); }
+    let n = 0;
+    match s.program {
+        Option.Some(p) { n = p.modules.len; }
+        Option.None {}
+    }
+    s.free();
+    return (cache.lastBuilt(), n);
+}
+
+fn runOut(exe: string, mem: &Arena): string {
+    match proc.run([exe], "", mem) {
+        Result.Ok(o) { return o.outStr(); }
+        Result.Err(_) { panic("cannot run the built program"); }
+    }
+    return "";
+}
+
+/// File names in `dir` ending in `ext`.
+fn count(dir: string, ext: string, mem: &Arena): int {
+    let n = 0;
+    match io.listDir(dir, mem) {
+        Result.Ok(es) { for i in 0..es.len { if endsWith(es[i].name, ext) { n += 1; } } }
+        Result.Err(_) { panic(Text.new(mem).add("no folder ").add(dir).str()); }
+    }
+    return n;
+}
+
+/// The repo root, absolute (a relative `../target/..` entry would load as part of the package in the cwd).
+fn root(mem: &Arena): string {
+    match path.realpath("..", mem) {
+        Option.Some(p) { return p; }
+        Option.None { panic("realpath .."); }
+    }
+    return "";
+}
+
+fn write(p: string, s: string) {
+    match io.writeFile(p, s as []u8) { Result.Ok(_) {} Result.Err(_) { panic("write"); } }
+}
+
+fn main() {
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    argv(&mem);
+    let d = Text.new(&mem);
+    d.add(root(&mem)).add("/target/cache_build.").pushInt(sys.getpid());
+    let dir = d.str();
+    let src = Text.new(&mem).add(dir).add("/src").str();
+    match io.makeDirs(src) { Result.Ok(_) {} Result.Err(_) { panic("make the scratch dir"); } }
+    let files = ["j3.toml", "src/main.j3", "src/gen.j3", "src/box.j3"];
+    for i in 0..4 {
+        let from = Text.new(&mem).add("tests/proj/merged_names/").add(files[i]).str();
+        match io.copyFile(from, Text.new(&mem).add(dir).add("/").add(files[i]).str()) { Result.Ok(_) {} Result.Err(_) { panic(from); } }
+    }
+    let exe = Text.new(&mem).add(dir).add("/target/merged_names").str();
+    let obj = Text.new(&mem).add(dir).add("/target/.j3c/host/merged_names/obj").str();
+    let box = Text.new(&mem).add(dir).add("/src/box.j3").str();
+
+    let first = build(dir);
+    if first.1 < 3 || first.0 != first.1 { panic("the first build compiles every module"); }
+    if runOut(exe, &mem) != "140 10010 100\n" { panic(runOut(exe, &mem)); }
+    // A split module has `.pN.o` objects and a `.parts` file instead of its `.o`.
+    let objects = count(obj, ".o", &mem);
+    if objects < first.1 || count(obj, ".libs", &mem) != first.1 || count(obj, ".ll", &mem) != 0 || count(obj, ".err", &mem) != 0 || count(obj, ".job", &mem) != 0 { panic("one .libs per module, its objects, nothing else"); }
+
+    let second = build(dir);
+    if second.0 != 0 { panic("the second build compiles 0 modules"); }
+    if runOut(exe, &mem) != "140 10010 100\n" { panic("relinked program"); }
+
+    write(box, "module merged_names.box;\npub fn get(): int { return 101; }\n");
+    let third = build(dir);
+    if third.0 != 1 { panic(Text.new(&mem).add("a one-module edit recompiles only it, got ").fmt(`{third.0}`).str()); }
+    if runOut(exe, &mem) != "141 10010 101\n" { panic(runOut(exe, &mem)); }
+    if count(obj, ".o", &mem) != objects || count(obj, ".libs", &mem) != first.1 { panic("the stale object of the edited module was not swept"); }
+
+    // A module whose text names a library: its `.libs` note reaches the link.
+    write(box, "module merged_names.box;\nuse lib \"c\" as c { fn abs(x: i32): i32; }\npub fn get(): int { return 100 + int(c.abs(0)); }\n");
+    let fourth = build(dir);
+    if fourth.0 != 1 { panic("the edit with a lib call recompiles one module"); }
+    if runOut(exe, &mem) != "140 10010 100\n" { panic(runOut(exe, &mem)); }
+
+    // A clang that fails: Rust's error text, no child left behind, and the objects of the last good build
+    // are still there for the next one (a failed build sweeps nothing).
+    let toml = Text.new(&mem).add(dir).add("/j3.toml").str();
+    write(toml, "[package]\nname = \"merged_names\"\nentry = \"src/main.j3\"\n\n[emit]\nclang = \"/bin/false\"\n");
+    let o = driver.defaults();
+    o.entry = dir;
+    o.mode = Mode.Build;
+    let s = Session.new(o);
+    if driver.run(s, Stage.Link) { panic("a failing clang is a failed build"); }
+    let msg = Text.new(&mem);
+    for i in 0..s.diags.items.len { msg.add(s.diags.items.items[i].msg); }
+    if !contains(msg.str(), "/bin/false failed on ") { panic(msg.str()); }
+    s.free();
+    if count(obj, ".ll", &mem) != 0 || count(obj, ".err", &mem) != 0 || count(obj, ".job", &mem) != 0 { panic("a failed build leaves no .ll, .err or .job"); }
+    write(toml, "[package]\nname = \"merged_names\"\nentry = \"src/main.j3\"\n");
+    if build(dir).0 != 0 { panic("the objects of the last good build survive a failed one"); }
+
+    // Stale files of other keys go, other files stay.
+    write(Text.new(&mem).add(obj).add("/old-0123456789abcdef.o").str(), "x");
+    write(Text.new(&mem).add(obj).add("/old-0123456789abcdef.parts").str(), "2");
+    write(Text.new(&mem).add(obj).add("/keep.txt").str(), "x");
+    let keep = ["nothing-here."];
+    let before = count(obj, ".o", &mem);
+    cache.sweepStale(obj, keep[0..0], &mem);
+    if count(obj, ".o", &mem) != 0 || count(obj, ".parts", &mem) != 0 || count(obj, ".txt", &mem) != 1 || before != objects + 1 { panic("sweepStale"); }
+
+    // ponytail: `rm -rf` for the scratch dir; `j3.io` has no recursive remove
+    match proc.run(["rm", "-rf", dir], "", &mem) { Result.Ok(_) {} Result.Err(_) { panic("remove the scratch dir"); } }
+}
+
+fn has(xs: &List<string>, x: string): bool {
+    for i in 0..xs.len { if xs.items[i] == x { return true; } }
+    return false;
+}
+
+/// The commands of one object and of the link.
+fn argv(mem: &Arena) {
+    let e = defaultEmitOpts(mem);
+    e.cc.out = "target/app";
+    e.cpu = "native";
+    e.flags.push("-fno-plt");
+    let a = List<string>.new(mem);
+    cache.objArgv(&a, "d/m-1.o", "d/m-1.ll", &e, false, mem);
+    let want = ["clang", "-c", "-Wno-override-module", "-O0", "-ffunction-sections", "-fdata-sections", "-g", "-mcpu=native", "-fno-plt", "-o", "d/m-1.o", "d/m-1.ll"];
+    if a.len != 12 { panic("objArgv length"); }
+    for i in 0..12 { if a.items[i] != want[i] { panic(a.items[i]); } }
+    a.clear();
+    cache.objArgv(&a, "d/m-1.o", "d/m-1.ll", &e, true, mem);
+    if a.items[7] != "-flto=thin" { panic("thin objects are compiled with -flto=thin"); }
+
+    // Objects keep the order given; the libs the notes name follow them.
+    let objs = ["d/a-1.o", "d/b-2.p0.o", "d/b-2.p1.o"];
+    let l = List<string>.new(mem);
+    match cache.linkArgv(&l, objs[..], "target/app", &e, false, "; use lib \"m\"\n", mem) {
+        Result.Ok(_) {}
+        Result.Err(x) { panic(x); }
+    }
+    let at = -1;
+    for i in 0..l.len { if l.items[i] == "-o" { at = i; } }
+    if at < 1 || l.items[0] != "clang" || l.items[at + 1] != "target/app" || l.items[at + 2] != "d/a-1.o" || l.items[at + 3] != "d/b-2.p0.o" || l.items[at + 4] != "d/b-2.p1.o" { panic("link order"); }
+    if !has(&l, "-lm") || has(&l, "-flto=thin") { panic("link libs"); }
+    l.clear();
+    e.cc.opt = "2";
+    match cache.linkArgv(&l, objs[..], "target/app", &e, true, "", mem) {
+        Result.Ok(_) {}
+        Result.Err(x) { panic(x); }
+    }
+    if !has(&l, "-flto=thin") || !has(&l, "-O3") { panic("a ThinLTO link of opt 2 runs at O3"); }
+    let cacheFlag = false;
+    for i in 0..l.len { if contains(l.items[i], "target/.j3c/host/app/thinlto") { cacheFlag = true; } }
+    if !cacheFlag { panic("the ThinLTO cache dir is beside the objects"); }
+
+    if cache.enabled(&e) { panic("opt 2 is not per-module unless incremental = all"); }
+    e.incrementalAll = true;
+    if !cache.enabled(&e) || cache.thinLto(&e) { panic("incremental = all"); }
+    e = defaultEmitOpts(mem);
+    if cache.enabled(&e) { panic("no named output, no cache"); }
+    e.cc.out = "target/app";
+    if !cache.enabled(&e) { panic("opt 0 with an output"); }
+    e.incremental = false;
+    if cache.enabled(&e) || cache.thinLto(&e) { panic("incremental = false"); }
+    if cache.libNotes("a\n  ; use lib \"SDL2\"\nx = frem double\n", mem) != "; use lib \"SDL2\"\n; use lib \"m\"\n" { panic(cache.libNotes("a\n  ; use lib \"SDL2\"\nx = frem double\n", mem)); }
+}
