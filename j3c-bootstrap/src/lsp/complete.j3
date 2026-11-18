@@ -6,11 +6,25 @@
 // (label, kind) keeping the first, caps 200 on an empty prefix. Results are in the caller's `arena`.
 module j3c.lsp.complete;
 
+use j3.cmp.sortBy;
+use j3.data.pool.Id;
+use j3.io.path;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
-use j3c.base.span.Span;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.{ Text, contains, endsWith, find, startsWith, trim };
+use j3c.base.intern.own;
+use j3c.base.span.{ Source, Span, isNone };
 use j3c.driver.Session;
 use j3c.load.Overlay;
+use j3c.lsp.query;
+use j3c.sema;
+use j3c.sema.{ Checked, Export, ExportKind, FnDecl, FnKind, ModDecl, StructDecl, Ty, TyList };
+use j3c.syntax.ast.{ Ast, Item, ScriptBlockItem };
+use j3c.syntax.parse;
+use j3c.syntax.token;
+use j3c.syntax.token.NameList;
 
 /// One completion item (Rust `complete::Completion`; `kind` is the LSP CompletionItemKind).
 pub struct Completion {
@@ -50,17 +64,121 @@ pub struct ImportEdit {
 }
 
 /// Rust `complete_at`: completion at `offset` of `src` (the buffer of `path`) on a checked Session. → LSPS
-pub fn completeAt(s: &Session, path: string, src: string, offset: u32, arena: &Arena): List<Completion> { return List<Completion>.new(arena); } // STUB LSPQ
+pub fn completeAt(s: &Session, path: string, src: string, offset: u32, arena: &Arena): List<Completion> {
+    return completeWith(s, path, src, src, offset, arena);
+}
 
 /// Rust `complete_buffer`: `.j3s` paths first, else analyze with `overlays`, else the heal path (blank the
-/// line, recheck), else disk. → LSPS
-pub fn completeBuffer(path: string, overlays: []Overlay, src: string, offset: u32, arena: &Arena): List<Completion> { return List<Completion>.new(arena); } // STUB LSPQ
+/// line to the same length, recheck), else disk. Each Session is freed before returning. → LSPS
+pub fn completeBuffer(path: string, overlays: []Overlay, src: string, offset: u32, arena: &Arena): List<Completion> {
+    match scriptPathPrefix(src, int(offset), arena) {
+        Option.Some(prefix) { return scriptPathItems(path, prefix, arena); }
+        Option.None {}
+    }
+    match query.analyze(path, overlays) {
+        Result.Ok(s) {
+            let r = completeAt(s, path, src, offset, arena);
+            s.free();
+            return r;
+        }
+        Result.Err(_) {}
+    }
+    // The healed buffer and its overlay list only live through the recheck.
+    let tmp = Arena.create(1 << 12);
+    defer tmp.destroy();
+    let healed = blankLine(src, offset, &tmp);
+    if healed != src {
+        match query.analyze(path, setOverlay(overlays, path, healed, &tmp)) {
+            Result.Ok(s) {
+                let r = completeWith(s, path, src, healed, offset, arena);
+                s.free();
+                return r;
+            }
+            Result.Err(_) {}
+        }
+    }
+    match query.analyze(path, List<Overlay>.new(&tmp).slice()) {
+        Result.Ok(s) {
+            let r = completeAt(s, path, src, offset, arena);
+            s.free();
+            return r;
+        }
+        Result.Err(_) {}
+    }
+    return List<Completion>.new(arena);
+}
 
-/// Rust `member_items`: members of `base` for `base.prefix` (the `.j3ui` bridge). → LSPU
-pub fn memberItems(s: &Session, path: string, offset: u32, base: string, prefix: string, arena: &Arena): List<Completion> { return List<Completion>.new(arena); } // STUB LSPQ
+/// Rust `set_overlay`: `overlays` with the one for `p` (same path, or same canonical path) replaced by `src`,
+/// or `src` added; in `arena`.
+fn setOverlay(overlays: []Overlay, p: string, src: string, arena: &Arena): []Overlay {
+    let out = List<Overlay>.new(arena);
+    let canon = match path.realpath(p, arena) { Option.Some(q) { q } Option.None { p } };
+    let done = false;
+    for i in 0..overlays.len {
+        let o = overlays[i];
+        if !done {
+            let oc = match path.realpath(o.path, arena) { Option.Some(q) { q } Option.None { o.path } };
+            if o.path == p || oc == canon {
+                o.text = src;
+                done = true;
+            }
+        }
+        out.push(o);
+    }
+    if !done { out.push(Overlay { path: p, text: src }); }
+    return out.slice();
+}
 
-/// Rust `signature`: at most 8, deduplicated by label, `this` skipped. → LSPS, LSPU
-pub fn signature(s: &Session, path: string, src: string, offset: u32, arena: &Arena): Option<SignatureHelp> { return Option.None; } // STUB LSPQ
-
-/// Rust `symbols`: the outline of `path`. → LSPS
-pub fn symbols(s: &Session, path: string, arena: &Arena): List<Symbol> { return List<Symbol>.new(arena); } // STUB LSPQ
+/// Rust `complete_with`: completion where `lex` is the buffer as typed and `spanned` the text the Session
+/// checked (the healed buffer, or the same); sema's locals and file items only when they agree.
+fn completeWith(s: &Session, path: string, lex: string, spanned: string, offset: u32, arena: &Arena): List<Completion> {
+    let off = int(offset);
+    match scriptPathPrefix(lex, off, arena) {
+        Option.Some(prefix) { return scriptPathItems(path, prefix, arena); }
+        Option.None {}
+    }
+    if lexicalMode(lex, off) != LexMode.Code { return List<Completion>.new(arena); }
+    match attrPrefix(lex, off, s.arena) {
+        Option.Some(prefix) { return keyed(token.names(NameList.Attributes), prefix, 14, "attribute", "4", arena); }
+        Option.None {}
+    }
+    let pa = prefixOf(lex, off, s.arena);
+    if pa.at > 0 && pa.at <= lex.len && lex[pa.at - 1] == '@' { return keyed(token.names(NameList.Intrinsics), pa.prefix, 3, "intrinsic", "4", arena); }
+    match useAt(lex, off, s.arena) {
+        Option.Some(u) {
+            if u.isLib { return List<Completion>.new(arena); }
+            return completeUse(s, &u, arena);
+        }
+        Option.None {}
+    }
+    match scriptPropItems(s, path, lex, pa.at, pa.prefix, arena) {
+        Option.Some(items) { return items; }
+        Option.None {}
+    }
+    let file = query.fileOf(s, path);
+    let trusted = match file { Option.Some(f) { s.sources.get(f).text == spanned && lex.len == spanned.len } Option.None { false } };
+    match pa.receiver {
+        Option.Some(base) {
+            match file {
+                Option.Some(f) { return members(s, f, offset, base, pa.prefix, trusted, arena); }
+                Option.None { return List<Completion>.new(arena); }
+            }
+        }
+        Option.None {}
+    }
+    let out = List<Completion>.new(arena);
+    if trusted {
+        match file {
+            Option.Some(f) {
+                pushLocals(s, f, offset, pa.prefix, &out, arena);
+                pushScriptNames(s, f, pa.prefix, &out, arena);
+                pushFileItems(s, f, pa.prefix, &out, arena);
+            }
+            Option.None {}
+        }
+    }
+    pushImports(s, lex, pa.prefix, &out, arena);
+    pushBuiltins(s, pa.prefix, &out, arena);
+    pushKeywords(pa.prefix, &out, arena);
+    return finish(pa.prefix, out);
+}

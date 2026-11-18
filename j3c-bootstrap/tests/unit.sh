@@ -24,13 +24,14 @@ one() {
     local n=$1 f=tests/unit/${1}_test.j3 d=target/unit/$1 r=0
     mkdir -p "$d"; rm -f "$d/rc"
     printf '[package]\nname = "%s_test"\nentry = "../../../%s"\n\n[dependencies]\nj3c = "../../.."\n' "$n" "$f" >"$d/j3.toml"
-    local log=$d/log.txt
+    local log=$d/log.txt t=300
+    case $n in load_core) t=900 ;; esac   # 163 stage0 runs: ~4 min alone, more under parallel load
     if [ ! -f "$f" ]; then
         echo "no such test: $f" >"$log"; r=1
     elif ! timeout 300 "$S0" build "$d" >"$log" 2>&1; then
         r=1
     else
-        SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout 300 "$d/target/${n}_test" >"$log" 2>&1 </dev/null || r=1
+        SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy timeout "$t" "$d/target/${n}_test" >"$log" 2>&1 </dev/null || r=1
     fi
     echo $r >"$d/rc"
 }

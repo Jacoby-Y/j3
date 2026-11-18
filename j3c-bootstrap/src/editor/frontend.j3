@@ -1,27 +1,280 @@
 // Locate this binary and the editor sources (`J3_EDITOR_SRC`), build the editor program per version.
 //
-// Port of: j3c/src/editor/frontend.rs
+// Port of: j3c/src/editor/frontend.rs, (editor/mod.rs `FRONTEND`)
 // J3: Builds through `driver.run()` in-process (plan 11 B12.6) into `~/.cache/j3/editor-boot/<xxh3>`, never
 // Rust's `~/.cache/j3/editor` (its `cleanup_frontends` deletes hash folders it does not know). Only the
 // windowed editor and `render` use it; headless scene ops run in-process (B12.1).
 // J3: `note_open` and `project_lock` (only `j3c editor` takes them) are in `editor.j3`.
+// J3: The sources are `j3c/editor/src/**/*.j3` by `@embedDir` (Rust's hand-kept `FRONTEND` list). The key is
+// `xxh3_64` (Rust `DefaultHasher`) over each (name, text), this binary's size and mtime (seconds and ns), and
+// the `J3_STDLIB` files when that overrides the stdlib. The build's diagnostics go to stderr (an MCP server
+// keeps stdout for the protocol).
+// J3: Rust holds a shared `flock` on the build's `in-use.lock` for as long as the caller runs it; `j3.io` has
+// only exclusive locks and `build` returns a path, so the lock is held while publishing and cleaning up.
+// ponytail: a cleanup in another process can then delete a build that is running (only after 3 newer builds).
 module j3c.editor.frontend;
 
-use j3.memory.Arena;
+use j3.cmp.sortBy;
+use j3.hash.Xxh3;
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use j3c.base.fsx;
+use j3c.base.intern.own;
+use j3c.driver;
+use j3c.driver.{ Mode, Session, Stage };
+use j3c.load;
+use j3c.project.deps;
+use j3c.toolchain;
 
 /// The editor UI font (Rust `editor::FONT`): written beside the built editor and into `new --template ui`.
 pub const FONT = @embedBytes("../../../j3c/editor/font.ttf");
 
-/// Rust `editor::host_exe`: this binary's path. → IMG (gen runs `run --file` with it), EDDEV
-pub fn hostExe(arena: &Arena): Result<string, string> { return Result.Err("editor: not ported yet"); } // STUB SCENE
+/// The editor program's sources (Rust `FRONTEND`), by path below `src/`.
+const SOURCES = @embedDir("../../../j3c/editor/src", "*.j3");
+
+const TOML: string = "[package]\nname = \"j3_editor\"\nentry = \"src/main.j3\"\n\n[link]\nlibs = [\"SDL2\", \"GL\"]\n";
+
+fn ioErr(arena: &Arena): string { return fsx.osError(sys.errno(), arena); }
+
+/// Rust `editor::host_exe`: this binary's path; `/proc/self/exe` once a rebuild replaced the file on disk (the
+/// running, old binary still opens there). → IMG (gen runs `run --file` with it), EDDEV
+pub fn hostExe(arena: &Arena): Result<string, string> {
+    match path.realpath("/proc/self/exe", arena) {
+        Option.Some(p) { if fsx.isFile(p) { return Result.Ok(p); } }
+        Option.None {}
+    }
+    return Result.Ok("/proc/self/exe");
+}
 
 /// The cache root `~/.cache/j3` (Rust `editor::cache_root`), None without a home. → IMG (doctor), ASSETS, MCP
-pub fn cacheRoot(arena: &Arena): Option<string> { return Option.None; } // STUB SCENE
+pub fn cacheRoot(arena: &Arena): Option<string> { return deps.cacheRoot(arena); }
 
 /// This compiler's editor cache, `<cacheRoot>/editor-boot` (Rust `cache_dir`: `editor`). → MCP (`open-project`), EDDEV
-pub fn cacheDir(arena: &Arena): Option<string> { return Option.None; } // STUB SCENE
+pub fn cacheDir(arena: &Arena): Option<string> {
+    match cacheRoot(arena) { Option.Some(r) { return Option.Some(path.join(r, "editor-boot", arena)); } Option.None { return Option.None; } }
+}
 
-/// Rust `editor::frontend`: build (or reuse) the editor program for this version under a lock; Ok = its path. → EDDEV
-pub fn build(arena: &Arena): Result<string, string> { return Result.Err("editor frontend: not ported yet"); } // STUB SCENE
+/// One source file of the editor program.
+struct Src {
+    name: string;
+    text: string;
+}
+
+fn walkSrc(root: string, dir: string, out: &List<Src>, arena: &Arena): Result<bool, string> {
+    let ents = match io.listDir(dir, arena) {
+        Result.Ok(e) { e }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("J3_EDITOR_SRC ").add(dir).add(": ").add(ioErr(arena)).str()); }
+    };
+    for i in 0..ents.len {
+        let p = path.join(dir, ents[i].name, arena);
+        if ents[i].isDir { walkSrc(root, p, out, arena)?; continue; }
+        if path.ext(ents[i].name) != ".j3" { continue; }
+        let text = match io.readFile(p, arena) {
+            Result.Ok(b) { b as string }
+            Result.Err(_) { return Result.Err(Text.new(arena).add("J3_EDITOR_SRC ").add(p).add(": ").add(ioErr(arena)).str()); }
+        };
+        out.push(Src { name: p[root.len + 1..p.len], text: text });
+    }
+    return Result.Ok(true);
+}
+
+/// The sources: `J3_EDITOR_SRC` from disk, else the embedded copy; sorted by name.
+fn sources(arena: &Arena): Result<List<Src>, string> {
+    let out = List<Src>.new(arena);
+    let dir = sys.env("J3_EDITOR_SRC");
+    if dir.len > 0 {
+        let d = own(arena, dir);
+        while d.len > 1 && d[d.len - 1] == '/' { d = d[0..d.len - 1]; }
+        walkSrc(d, d, &out, arena)?;
+        sortBy(out.items[0..out.len], fn(a: Src, b: Src): bool { return a.name < b.name || (a.name == b.name && a.text < b.text); });
+        return Result.Ok(out);
+    }
+    for i in 0..SOURCES.len { out.push(Src { name: SOURCES[i].path, text: SOURCES[i].data }); }
+    return Result.Ok(out);
+}
+
+fn hashLen(h: &Xxh3, s: string) {
+    let n: [1]int = [s.len];
+    h.update(@slice(&n[0] as ptr as &u8, 8));
+    h.update(s as []u8);
+}
+
+/// Every file's path and bytes under `dir`, in a stable order (Rust `hash_dir`).
+fn hashDir(h: &Xxh3, dir: string, arena: &Arena) {
+    let ents = match io.listDir(dir, arena) { Result.Ok(e) { e } Result.Err(_) { return; } };
+    let names = List<string>.new(arena);
+    for i in 0..ents.len { names.push(ents[i].name); }
+    sortBy(names.items[0..names.len], fn(a: string, b: string): bool { return a < b; });
+    for i in 0..names.len {
+        let p = path.join(dir, names.items[i], arena);
+        hashLen(h, p);
+        if fsx.isDir(p) {
+            hashDir(h, p, arena);
+        } else {
+            match io.readFile(p, arena) { Result.Ok(b) { hashLen(h, b as string); } Result.Err(_) {} }
+        }
+    }
+}
+
+/// Make the first free `<key>.tmp-<pid>-<n>` folder in `cache`.
+fn reserve(cache: string, key: string, arena: &Arena): Result<string, string> {
+    for attempt in 0..100 {
+        let t = Text.new(arena);
+        t.add(key).add(".tmp-").fmt(`{sys.getpid()}`).add("-");
+        t.pushInt(attempt);
+        let p = path.join(cache, t.str(), arena);
+        if io.exists(p) { continue; }
+        match io.makeDirs(p) {
+            Result.Ok(_) { return Result.Ok(p); }
+            Result.Err(_) { return Result.Err(Text.new(arena).add("editor build directory: ").add(ioErr(arena)).str()); }
+        }
+    }
+    return Result.Err("could not reserve an editor build directory");
+}
+
+/// Write the sources, font and `j3.toml` into `temp` and build it in-process to `temp/target/j3_editor`.
+fn buildIn(temp: string, srcs: &List<Src>, arena: &Arena): Result<bool, string> {
+    for i in 0..srcs.len {
+        let f = path.join(path.join(temp, "src", arena), srcs.items[i].name, arena);
+        toolchain.mkdirs(path.dirname(f), arena)?;
+        match io.writeFile(f, srcs.items[i].text as []u8) { Result.Ok(_) {} Result.Err(_) { return Result.Err(ioErr(arena)); } }
+    }
+    match io.writeFile(path.join(temp, "font.ttf", arena), FONT) { Result.Ok(_) {} Result.Err(_) { return Result.Err(ioErr(arena)); } }
+    match io.writeFile(path.join(temp, "j3.toml", arena), TOML as []u8) { Result.Ok(_) {} Result.Err(_) { return Result.Err(ioErr(arena)); } }
+    let opts = driver.defaults();
+    opts.entry = temp;
+    opts.mode = Mode.Build;
+    let s = Session.new(opts);
+    defer s.free();
+    if !driver.run(s, Stage.Link) {
+        let e = driver.failText(s);
+        sys.write(2, e.ptr as ptr, e.len);
+        if e.len > 0 && e[e.len - 1] != '\n' { sys.write(2, "\n".ptr as ptr, 1); }
+        return Result.Err("editor build failed");
+    }
+    if !fsx.isFile(path.join(temp, "target/j3_editor", arena)) { return Result.Err("editor build did not produce target/j3_editor"); }
+    return Result.Ok(true);
+}
+
+/// Rust `editor::frontend`: build (or reuse) the editor program for this version; Ok = its path. → EDDEV
+pub fn build(arena: &Arena): Result<string, string> {
+    let host = hostExe(arena)?;
+    let srcs = sources(arena)?;
+    let h = Xxh3.new();
+    for i in 0..srcs.len {
+        hashLen(&h, srcs.items[i].name);
+        hashLen(&h, srcs.items[i].text);
+    }
+    match fsx.statNs(host, arena) {
+        Option.Some(st) {
+            let (size, sec, ns) = st;
+            let n: [3]int = [size, sec, ns];
+            h.update(@slice(&n[0] as ptr as &u8, 24));
+        }
+        Option.None { return Result.Err(Text.new(arena).add(host).add(": ").add(ioErr(arena)).str()); }
+    }
+    if load.usingOverride() { hashDir(&h, load.stdlibDir(arena), arena); }
+    let cache = match cacheDir(arena) { Option.Some(c) { c } Option.None { return Result.Err("no XDG_CACHE_HOME or HOME for the editor build"); } };
+    toolchain.mkdirs(cache, arena)?;
+    let key = toolchain.hex16(h.finish(), arena);
+    let dir = path.join(cache, key, arena);
+    let exe = path.join(dir, "target/j3_editor", arena);
+    if !fsx.isFile(exe) {
+        let temp = reserve(cache, key, arena)?;
+        match buildIn(temp, &srcs, arena) {
+            Result.Ok(_) {}
+            Result.Err(e) {
+                fsx.removeTree(temp, arena);
+                return Result.Err(e);
+            }
+        }
+        match io.rename(temp, dir) {
+            Result.Ok(_) {}
+            Result.Err(_) {
+                let e = ioErr(arena);
+                fsx.removeTree(temp, arena);
+                // Another launch published the same build first.
+                if !fsx.isFile(exe) { return Result.Err(Text.new(arena).add("publish editor build: ").add(e).str()); }
+            }
+        }
+    }
+    let lock = match io.lockFile(path.join(dir, "in-use.lock", arena)) {
+        Result.Ok(l) { l }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("editor cache lock: ").add(ioErr(arena)).str()); }
+    };
+    cleanup(cache, dir, arena);
+    lock.unlock();
+    return Result.Ok(exe);
+}
+
+/// One finished build in the cache: its folder and its exe's mtime.
+struct Built {
+    time: int;
+    dir: string;
+}
+
+fn isHex16(name: string): bool {
+    if name.len != 16 { return false; }
+    for i in 0..16 {
+        let c = name[i];
+        if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) { return false; }
+    }
+    return true;
+}
+
+fn hasTmp(name: string): bool {
+    if name.len < 5 { return false; }
+    for i in 0..name.len - 4 { if name[i..i + 5] == ".tmp-" { return true; } }
+    return false;
+}
+
+fn nowSecs(): int {
+    let ts: [2]int = [0, 0];
+    // CLOCK_REALTIME = 0, Linux amd64 `clock_gettime` = 228
+    if @syscall(228, 0, &ts[0] as ptr) < 0 { return 0; }
+    return ts[0];
+}
+
+/// Rust `cleanup_frontends`: keep the 3 newest builds, the current one, and any another process has locked;
+/// drop `.tmp-` folders over an hour old (a build killed before its own cleanup ran).
+pub fn cleanup(cache: string, current: string, arena: &Arena) {
+    let ents = match io.listDir(cache, arena) { Result.Ok(e) { e } Result.Err(_) { return; } };
+    let now = nowSecs();
+    let builds = List<Built>.new(arena);
+    for i in 0..ents.len {
+        let name = ents[i].name;
+        let p = path.join(cache, name, arena);
+        if hasTmp(name) {
+            if now - ents[i].mtime > 60 * 60 { fsx.removeTree(p, arena); }
+            continue;
+        }
+        if !isHex16(name) { continue; }
+        match io.stat(path.join(p, "target/j3_editor", arena)) {
+            Result.Ok(st) { builds.push(Built { time: st.mtime, dir: p }); }
+            Result.Err(_) {}
+        }
+    }
+    sortBy(builds.items[0..builds.len], fn(a: Built, b: Built): bool { return a.time > b.time; });
+    for i in 0..builds.len {
+        let p = builds.items[i].dir;
+        if i < 3 || p == current { continue; }
+        match io.tryLockFile(path.join(p, "in-use.lock", arena)) {
+            Result.Ok(l) {
+                match l {
+                    Option.Some(lock) {
+                        // Recheck after locking: a launch that found the exe missing rebuilds it itself.
+                        if fsx.isFile(path.join(p, "target/j3_editor", arena)) { fsx.removeTree(p, arena); }
+                        lock.unlock();
+                    }
+                    Option.None {}
+                }
+            }
+            Result.Err(_) {}
+        }
+    }
+}

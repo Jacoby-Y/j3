@@ -1,4 +1,426 @@
-// `.deb` with menu entry and icon, built without dpkg tools.
+// `.deb` with menu entry and icon, built without dpkg tools: `tar` (the CLI, as Rust) plus a hand-written `ar`.
+// Layout: `/opt/<name>/` (staged by `dist`), launcher `/usr/bin/<name>`, `.desktop` entry, icon; the
+// control text, launcher and desktop entry are byte-equal with Rust's.
 //
 // Port of: j3c/src/dist/deb.rs
+// J3: The `ar` member time is the mtime of the `control.tar.gz` just written (Rust `SystemTime::now()`):
+//     `j3.sys` has no wall clock. The harness never compares it (`ar t`).
 module j3c.dist.deb;
+
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, endsWith, lines, startsWith, trim };
+use j3c.base.fsx;
+use j3c.dist.fs;
+use j3c.project.manifest.Manifest;
+
+/// Sizes the hicolor theme looks in; any other size goes to `pixmaps` by absolute path.
+const HICOLOR: [13]int = [16, 22, 24, 32, 36, 48, 64, 72, 96, 128, 192, 256, 512];
+
+/// Rust `build`: the `.deb` from `stage/root/opt/<name>/` (already holding the program `exe`); its path.
+pub fn build(m: &Manifest, triple: string, stage: string, exe: string, dist: string, arena: &Arena): Result<string, string> {
+    let root = path.join(stage, "root", arena);
+    let name = m.name;
+    let program = path.basename(exe);
+    if program.len == 0 { return Result.Err("no program name"); }
+    fs.setMode(exe, 493, arena)?;
+
+    write(path.join(path.join(root, "usr/bin", arena), name, arena), launcher(name, program, arena), 493, arena)?;
+
+    let icon = name;
+    match m.dist.icon {
+        Option.Some(rel) { icon = installIcon(path.join(m.root, rel, arena), name, root, arena)?; }
+        Option.None {
+            // No `[dist] icon`: the J3 logo.
+            let png = Text.new(arena).add(name).add(".png").str();
+            fs.writeBytes(path.join(path.join(root, "usr/share/pixmaps", arena), png, arena), fs.logoPng(), arena)?;
+            fs.writeBytes(path.join(path.join(root, "usr/share/icons/hicolor/256x256/apps", arena), png, arena), fs.logoPng(), arena)?;
+        }
+    }
+    let desk = Text.new(arena).add(name).add(".desktop").str();
+    write(path.join(path.join(root, "usr/share/applications", arena), desk, arena), desktop(m, icon, arena), 420, arena)?;
+
+    let pkg = packageName(name, arena);
+    let arch = debArch(triple);
+    let control = path.join(stage, "control", arena);
+    let t = Text.new(arena);
+    t.add("Package: ").add(pkg).add("\nVersion: ").add(m.version).add("\nArchitecture: ").add(arch);
+    t.add("\nMaintainer: ").add(maintainer(m, arena)).add("\nInstalled-Size: ");
+    t.pushInt((treeSize(root, arena) + 1023) / 1024);
+    t.add("\n");
+    let deps = depends(m, exe, arena);
+    if deps.len > 0 {
+        t.add("Depends: ");
+        for i in 0..deps.len {
+            if i > 0 { t.add(", "); }
+            t.add(deps.items[i]);
+        }
+        t.add("\n");
+    }
+    t.add("Section: ").add(m.dist.section).add("\nPriority: optional\nDescription: ").add(firstLine(m.description, name)).add("\n");
+    write(path.join(control, "control", arena), t.str(), 420, arena)?;
+    maintScript(m, control, "postinst", m.dist.postinst, arena)?;
+    maintScript(m, control, "prerm", m.dist.prerm, arena)?;
+
+    normalizeModes(root, arena)?;
+    let controlTar = path.join(stage, "control.tar.gz", arena);
+    let dataTar = path.join(stage, "data.tar.gz", arena);
+    tar(control, controlTar, arena)?;
+    tar(root, dataTar, arena)?;
+    let deb = path.join(dist, Text.new(arena).add(pkg).add("_").add(m.version).add("_").add(arch).add(".deb").str(), arena);
+    let now = 0;
+    match io.stat(controlTar) {
+        Result.Ok(st) { now = st.mtime; }
+        Result.Err(_) {}
+    }
+    let bytes = List<u8>.new(arena);
+    let names: [3]string = ["debian-binary", "control.tar.gz", "data.tar.gz"];
+    let ctl = fs.read(controlTar, arena)?;
+    let data = fs.read(dataTar, arena)?;
+    let datas: [3][]u8 = ["2.0\n" as []u8, ctl, data];
+    ar(&bytes, names[..], datas[..], now, arena);
+    fs.writeRaw(deb, bytes.items[0..bytes.len], arena)?;
+    return Result.Ok(deb);
+}
+
+/// `[dist] postinst` / `prerm`: the project file copied into the control folder, mode 0755.
+fn maintScript(m: &Manifest, control: string, file: string, rel: Option<string>, arena: &Arena): Result<bool, string> {
+    match rel {
+        Option.Some(r) {
+            let src = path.join(m.root, r, arena);
+            let text = match io.readFile(src, arena) {
+                Result.Ok(b) { b as string }
+                Result.Err(_) {
+                    return Result.Err(Text.new(arena).add("[dist] ").add(file).add(": ").add(src).add(": ").add(fsx.osError(sys.errno(), arena)).str());
+                }
+            };
+            write(path.join(control, file, arena), text, 493, arena)?;
+        }
+        Option.None {}
+    }
+    return Result.Ok(true);
+}
+
+/// The first line of `s` (Rust `lines().next()`), `none` when `s` has none.
+fn firstLine(s: string, none: string): string {
+    for l in lines(s) { return l; }
+    return none;
+}
+
+/// Rust `launcher`: `/usr/bin/<name>` runs the program from a per-user folder linking to `/opt/<name>`.
+pub fn launcher(name: string, program: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    t.add("#!/bin/sh\n# ").add(name).add(" reads data and writes saves relative to its working directory, so run it from\n");
+    t.add("# a per-user folder that links to the installed files.\nset -e\napp=/opt/").add(name).add("\n");
+    t.add("dir=\"${XDG_DATA_HOME:-$HOME/.local/share}/").add(name).add("\"\nmkdir -p \"$dir\"\n");
+    t.add("for f in \"$app\"/*; do ln -sfn \"$f\" \"$dir/${f##*/}\"; done\ncd \"$dir\"\n");
+    t.add("export SDL_VIDEO_X11_WMCLASS=").add(name).add(" SDL_VIDEO_WAYLAND_WMCLASS=").add(name).add("\n");
+    t.add("exec \"$app/").add(program).add("\" \"$@\"\n");
+    return t.str();
+}
+
+/// Rust `desktop`: the menu entry, with `[dist.actions]` as desktop actions.
+pub fn desktop(m: &Manifest, icon: string, arena: &Arena): string {
+    let title = if m.dist.title.len == 0 { titleCase(m.name, arena) } else { m.dist.title };
+    let t = Text.new(arena);
+    t.add("[Desktop Entry]\nType=Application\nName=").add(title).add("\nComment=").add(firstLine(m.description, ""));
+    t.add("\nExec=/usr/bin/").add(m.name).add("\nIcon=").add(icon).add("\nTerminal=false\nCategories=").add(m.dist.categories);
+    t.add("\nStartupWMClass=").add(m.name).add("\n");
+    let acts = &m.dist.actions;
+    if acts.len > 0 {
+        t.add("Actions=");
+        for i in 0..acts.len { t.add(acts.items[i].id).add(";"); }
+        t.add("\n");
+        for i in 0..acts.len {
+            let a = acts.items[i];
+            t.add("\n[Desktop Action ").add(a.id).add("]\nName=").add(a.name).add("\nExec=/usr/bin/").add(m.name);
+            if a.exec.len > 0 { t.add(" ").add(a.exec); }
+            t.add("\n");
+        }
+    }
+    return t.str();
+}
+
+/// Rust `install_icon`: the icon into the theme folders; the desktop file's `Icon=` value.
+fn installIcon(src: string, name: string, root: string, arena: &Arena): Result<string, string> {
+    let bytes = match io.readFile(src, arena) {
+        Result.Ok(b) { b }
+        Result.Err(_) {
+            return Result.Err(Text.new(arena).add("[dist] icon: read ").add(src).add(": ").add(fsx.osError(sys.errno(), arena)).str());
+        }
+    };
+    let ext = lower(extOf(src), arena);
+    let share = path.join(root, "usr/share", arena);
+    if ext == "svg" {
+        let to = path.join(share, Text.new(arena).add("icons/hicolor/scalable/apps/").add(name).add(".svg").str(), arena);
+        fs.writeBytes(to, bytes, arena)?;
+        return Result.Ok(name);
+    }
+    if ext == "png" {
+        let w = -1;
+        let h = -1;
+        match pngSize(bytes) {
+            Option.Some(s) { w = s.0; h = s.1; }
+            Option.None { return Result.Err(Text.new(arena).add("[dist] icon: ").add(src).add(" is not a PNG").str()); }
+        }
+        let png = Text.new(arena).add(name).add(".png").str();
+        fs.writeBytes(path.join(path.join(share, "pixmaps", arena), png, arena), bytes, arena)?;
+        let listed = false;
+        for i in 0..13 { if HICOLOR[i] == w { listed = true; } }
+        if w == h && listed {
+            fs.writeBytes(path.join(share, Text.new(arena).add("icons/hicolor/").fmt(`{w}x{h}`).add("/apps/").add(png).str(), arena), bytes, arena)?;
+            return Result.Ok(name);
+        }
+        let msg = Text.new(arena).add("j3c: dist: icon is ").fmt(`{w}x{h}`).add("; a square 256x256 or 512x512 PNG looks best in menus\n");
+        msg.flushTo(2);
+        return Result.Ok(Text.new(arena).add("/usr/share/pixmaps/").add(png).str());
+    }
+    return Result.Err(Text.new(arena).add("[dist] icon: ").add(src).add(" must be a .png or .svg").str());
+}
+
+/// Rust `Path::extension`: after the last `.` of the file name, "" when none (or a leading dot only).
+fn extOf(p: string): string {
+    let b = path.basename(p);
+    let i = b.len - 1;
+    while i > 0 {
+        if b[i] == '.' { return b[i + 1..b.len]; }
+        i -= 1;
+    }
+    return "";
+}
+
+fn lower(s: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..s.len {
+        let c = s[i];
+        t.push(if c >= 'A' && c <= 'Z' { c + 32 } else { c });
+    }
+    return t.str();
+}
+
+/// Rust `png_size`: width and height from the IHDR chunk; None when `b` is not a PNG.
+pub fn pngSize(b: []u8): Option<(int, int)> {
+    let sig: [8]u8 = [137, 80, 78, 71, 13, 10, 26, 10];
+    if b.len < 24 { return Option.None; }
+    for i in 0..8 { if b[i] != sig[i] { return Option.None; } }
+    if b[12] != 'I' || b[13] != 'H' || b[14] != 'D' || b[15] != 'R' { return Option.None; }
+    return Option.Some((be32(b, 16), be32(b, 20)));
+}
+
+fn be32(b: []u8, i: int): int { return ((int(b[i]) * 256 + int(b[i + 1])) * 256 + int(b[i + 2])) * 256 + int(b[i + 3]); }
+
+/// Rust `package_name`: lowercase `[a-z0-9+.-]`, `_` becomes `-`.
+pub fn packageName(name: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..name.len {
+        let c = name[i];
+        if c >= 'A' && c <= 'Z' { c = c + 32; }
+        if c == '_' { c = '-'; }
+        if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.' { t.push(c); }
+    }
+    return t.str();
+}
+
+/// Rust `deb_arch`: the Debian architecture of a triple (the host when empty).
+pub fn debArch(triple: string): string {
+    let t = if triple.len == 0 { sys.ARCH_NAME } else { firstPart(triple, '-') };
+    if t == "x86_64" { return "amd64"; }
+    if t == "aarch64" || t == "arm64" { return "arm64"; }
+    if t == "i386" || t == "i586" || t == "i686" || t == "x86" { return "i386"; }
+    if t == "armv7" || t == "armv7l" || t == "arm" { return "armhf"; }
+    if t == "riscv64" || t == "riscv64gc" { return "riscv64"; }
+    return t;
+}
+
+fn firstPart(s: string, sep: u8): string {
+    for i in 0..s.len { if s[i] == sep { return s[0..i]; } }
+    return s;
+}
+
+/// Rust `title_case`: words split on `-` and `_`, each first letter upper-cased, joined by spaces.
+pub fn titleCase(name: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    let start = true;
+    for i in 0..name.len {
+        let c = name[i];
+        if c == '-' || c == '_' {
+            start = true;
+            continue;
+        }
+        if start {
+            if t.len() > 0 { t.push(' '); }
+            if c >= 'a' && c <= 'z' { c = c - 32; }
+            start = false;
+        }
+        t.push(c);
+    }
+    return t.str();
+}
+
+/// Rust `maintainer`: `[dist] maintainer`, else `$DEBFULLNAME <$DEBEMAIL>`, else git's user, else
+/// `<name> <nobody@localhost>`.
+fn maintainer(m: &Manifest, arena: &Arena): string {
+    if m.dist.maintainer.len > 0 { return m.dist.maintainer; }
+    // ponytail: `sys.env` cannot tell unset from empty; Rust takes a set-but-empty pair too.
+    let n = sys.env("DEBFULLNAME");
+    let e = sys.env("DEBEMAIL");
+    if n.len > 0 && e.len > 0 { return Text.new(arena).add(n).add(" <").add(e).add(">").str(); }
+    let gn = git(m.root, "user.name", arena);
+    let ge = git(m.root, "user.email", arena);
+    if gn.len > 0 && ge.len > 0 { return Text.new(arena).add(gn).add(" <").add(ge).add(">").str(); }
+    return Text.new(arena).add(m.name).add(" <nobody@localhost>").str();
+}
+
+/// `git config KEY` in `root`, trimmed; "" when it fails or is empty.
+fn git(root: string, key: string, arena: &Arena): string {
+    let argv: [3]string = ["git", "config", key];
+    match proc.startIn(argv[..], root, arena) {
+        Result.Ok(c) {
+            let o = c.collect("" as []u8, arena);
+            if o.code == 0 { return trim(o.outStr()); }
+        }
+        Result.Err(_) {}
+    }
+    return "";
+}
+
+/// Rust `depends`: Debian packages for the libraries the program loads (`objdump -p` NEEDED, else
+/// `[link] libs`), then `[dist] depends`.
+fn depends(m: &Manifest, exe: string, arena: &Arena): List<string> {
+    let needed = fs.objdumpP(exe, "NEEDED", arena);
+    let libs = List<string>.new(arena);
+    if needed.len == 0 {
+        for i in 0..m.link.libs.len { libs.push(m.link.libs.items[i]); }
+    } else {
+        for i in 0..needed.len { libs.push(libStem(needed.items[i])); }
+    }
+    let out = List<string>.new(arena);
+    for i in 0..libs.len {
+        let p = libPackage(libs.items[i]);
+        if p.len == 0 {
+            Text.new(arena).add("j3c: dist: no Debian package known for `").add(libs.items[i]).add("`; add it to [dist] depends\n").flushTo(2);
+        } else if !has(&out, p) {
+            out.push(p);
+        }
+    }
+    for i in 0..m.dist.depends.len { if !has(&out, m.dist.depends.items[i]) { out.push(m.dist.depends.items[i]); } }
+    return out;
+}
+
+fn has(l: &List<string>, s: string): bool {
+    for i in 0..l.len { if l.items[i] == s { return true; } }
+    return false;
+}
+
+/// Rust `lib_stem`: `libSDL2_ttf-2.0.so.0` is `SDL2_ttf`, `libGL.so.1` is `GL`.
+pub fn libStem(soname: string): string {
+    let s = if startsWith(soname, "lib") { soname[3..soname.len] } else { soname };
+    for i in 0..s.len {
+        if i + 3 <= s.len && s[i] == '.' && s[i + 1] == 's' && s[i + 2] == 'o' {
+            s = s[0..i];
+            break;
+        }
+    }
+    if endsWith(s, "-2.0") { return s[0..s.len - 4]; }
+    return s;
+}
+
+/// Rust `lib_package`: the Debian package of a library stem, "" when unknown.
+pub fn libPackage(l: string): string {
+    if l == "SDL2" { return "libsdl2-2.0-0"; }
+    if l == "SDL2_image" { return "libsdl2-image-2.0-0"; }
+    if l == "SDL2_mixer" { return "libsdl2-mixer-2.0-0"; }
+    if l == "SDL2_ttf" { return "libsdl2-ttf-2.0-0"; }
+    if l == "GL" { return "libgl1"; }
+    if l == "c" || l == "m" || l == "pthread" || l == "dl" || l == "rt" || startsWith(l, "ld-linux") { return "libc6"; }
+    return "";
+}
+
+/// Rust `tar`: `tar -czf out -C dir .` with every file owned by root (GNU tar, else bsdtar flags).
+fn tar(dir: string, out: string, arena: &Arena): Result<bool, string> {
+    let gnu: [9]string = ["tar", "--owner=0", "--group=0", "--numeric-owner", "-czf", out, "-C", dir, "."];
+    let bsd: [10]string = ["tar", "--uid", "0", "--gid", "0", "-czf", out, "-C", dir, "."];
+    let err = "";
+    for k in 0..2 {
+        let argv = if k == 0 { gnu[..] } else { bsd[..] };
+        match proc.run(argv, "", arena) {
+            Result.Ok(o) {
+                if o.code == 0 { return Result.Ok(true); }
+                err = o.errStr();
+            }
+            Result.Err(_) { return Result.Err(Text.new(arena).add("run tar: ").add(fsx.osError(2, arena)).add(" (install `tar`)").str()); }
+        }
+    }
+    return Result.Err(Text.new(arena).add("tar failed:\n").add(err).str());
+}
+
+/// Rust `ar`: `!<arch>\n`, then per member a 60-byte header (`mtime` = `now`) and the data padded to an
+/// even length.
+pub fn ar(out: &List<u8>, names: []string, datas: [][]u8, now: int, arena: &Arena) {
+    pushStr(out, "!<arch>\n");
+    for i in 0..names.len {
+        let h = Text.new(arena);
+        pad(&h, names[i], 16);
+        pad(&h, Text.new(arena).fmt(`{now}`).str(), 12);
+        pad(&h, "0", 6);
+        pad(&h, "0", 6);
+        pad(&h, "100644", 8);
+        pad(&h, Text.new(arena).fmt(`{datas[i].len}`).str(), 10);
+        h.add("`\n");
+        pushStr(out, h.str());
+        for k in 0..datas[i].len { out.push(datas[i][k]); }
+        if datas[i].len % 2 == 1 { out.push('\n'); }
+    }
+}
+
+fn pad(t: &Text, s: string, w: int) {
+    t.add(s);
+    for k in s.len..w { t.push(' '); }
+}
+
+fn pushStr(out: &List<u8>, s: string) { for i in 0..s.len { out.push(s[i]); } }
+
+/// Rust `normalize_modes`: folders and programs 0755, everything else 0644.
+fn normalizeModes(p: string, arena: &Arena): Result<bool, string> {
+    let m = fs.modeOf(p, arena);
+    if m < 0 && !fsx.isDir(p) && !fsx.isFile(p) {
+        return Result.Err(Text.new(arena).add("stat ").add(p).add(": ").add(fsx.osError(sys.errno(), arena)).str());
+    }
+    if fsx.isDir(p) {
+        fs.setMode(p, 493, arena)?;
+        match io.listDir(p, arena) {
+            Result.Ok(ents) { for i in 0..ents.len { normalizeModes(path.join(p, ents[i].name, arena), arena)?; } }
+            Result.Err(_) { return Result.Err(Text.new(arena).add("read ").add(p).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+        }
+    } else {
+        fs.setMode(p, if m >= 0 && (m & 73) != 0 { 493 } else { 420 }, arena)?;
+    }
+    return Result.Ok(true);
+}
+
+/// Rust `tree_size`: the bytes of every file under `p` (a file: its own size).
+fn treeSize(p: string, arena: &Arena): int {
+    match io.listDir(p, arena) {
+        Result.Ok(ents) {
+            let n = 0;
+            for i in 0..ents.len { n += treeSize(path.join(p, ents[i].name, arena), arena); }
+            return n;
+        }
+        Result.Err(_) {}
+    }
+    match io.stat(p) {
+        Result.Ok(st) { return st.size; }
+        Result.Err(_) { return 0; }
+    }
+}
+
+/// Rust `write`: the file (parent made), then its mode.
+fn write(p: string, text: string, mode: int, arena: &Arena): Result<bool, string> {
+    fs.writeBytes(p, text as []u8, arena)?;
+    return fs.setMode(p, mode, arena);
+}

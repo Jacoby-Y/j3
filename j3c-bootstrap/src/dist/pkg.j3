@@ -2,4 +2,222 @@
 // its last stdout line (a folder) joins the build's "wrote" list.
 //
 // Port of: j3c/src/dist/pkg.rs
+// J3: The tool is started here (fork + execve, its stdout on a pipe, stderr inherited), not through
+//     `pkgtool.run` (stdio inherited) or `j3.proc` (always pipes stderr too). Each stdout line is echoed as it
+//     arrives. As in `pkgtool`, the tool env is `setenv` on this process before the fork.
 module j3c.dist.pkg;
+
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, trim };
+use j3c.base.fsx;
+use j3c.base.intern.own;
+use j3c.pkgtool;
+use j3c.pkgtool.ToolCmd;
+use j3c.project.deps.distProvider;
+use j3c.project.manifest.{ Manifest, Output };
+
+/// One built program (Rust `(triple, exe)`); `triple` "" is the host.
+pub struct Built {
+    triple: string;
+    exe: string;
+}
+
+/// Rust's `(String, i32)` error: the message and `j3c build`'s exit code.
+pub struct Fail {
+    msg: string;
+    code: int;
+}
+
+fn fail(msg: string, code: int): Result<bool, Fail> { return Result.Err(Fail { msg: msg, code: code }); }
+
+/// Rust `run_all`: every `Pkg` output in `build_outputs` order. `stages` are the kept `<name>/` folders
+/// (`Built` with the folder as `exe`), `dist` the absolute `target/dist`; folders a tool names join `out`.
+pub fn runAll(m: &Manifest, built: []Built, stages: []Built, dist: string, out: &List<string>, arena: &Arena): Result<bool, Fail> {
+    // A built-in wins over a dep's output of the same name.
+    let all: [3]string = ["zip", "deb", "apk"];
+    for k in 0..3 {
+        let named = false;
+        for i in 0..m.dist.outputs.len {
+            match m.dist.outputs.items[i] {
+                Output.Zip { named = named || k == 0; }
+                Output.Deb { named = named || k == 1; }
+                Output.Apk { named = named || k == 2; }
+                Output.Pkg(_) {}
+            }
+        }
+        let (di, _) = distProvider(&m.deps, all[k]);
+        if named && di >= 0 {
+            let t = Text.new(arena).add("j3c: warning: dist.build_outputs: `").add(all[k]).add("` is built in; package `");
+            t.add(m.deps.items[di].name).add("`'s [dist_outputs] ").add(all[k]).add(" does not run\n");
+            t.flushTo(2);
+        }
+    }
+    for i in 0..m.dist.outputs.len {
+        match m.dist.outputs.items[i] {
+            Output.Pkg(name) { runOne(m, name, built, stages, dist, out, arena)?; }
+            Output.Zip {}
+            Output.Deb {}
+            Output.Apk {}
+        }
+    }
+    return Result.Ok(true);
+}
+
+fn runOne(m: &Manifest, name: string, built: []Built, stages: []Built, dist: string, out: &List<string>, arena: &Arena): Result<bool, Fail> {
+    // `Manifest` load checked every name (`project::check_outputs`).
+    let (di, ti) = distProvider(&m.deps, name);
+    if di < 0 { return fail(Text.new(arena).add("dist output `").add(name).add("`: no package provides it").str(), 1); }
+    let dep = &m.deps.items[di];
+    let tool = &dep.distOutputs.items[ti];
+    let args = List<string>.new(arena);
+    args.push("--dist");
+    args.push(dist);
+    for i in 0..built.len {
+        args.push("--built");
+        args.push(Text.new(arena).add(built[i].triple).add("=").add(absolute(built[i].exe, arena)).str());
+    }
+    for i in 0..stages.len {
+        args.push("--stage");
+        args.push(Text.new(arena).add(stages[i].triple).add("=").add(stages[i].exe).str());
+    }
+    args.push("--name");
+    args.push(m.name);
+    args.push("--version");
+    args.push(m.version);
+    // Packaging runs only under `--release` (Rust `cli::RELEASE`).
+    args.push("--release");
+    let label = Text.new(arena).add("dist output `").add(name).add("` (package `").add(dep.name).add("`, ").add(tool.file).add(")").str();
+    let c = match pkgtool.command(m, dep, tool, args.items[0..args.len], args.items[0..0], arena) {
+        Result.Ok(x) { x }
+        Result.Err(e) { return fail(e, 1); }
+    };
+    let last = "";
+    let status = spawnEcho(&c, &last, arena);
+    if status < 0 { return fail(Text.new(arena).add(label).add(": ").add(fsx.osError(0 - status, arena)).str(), 1); }
+    let code = 0;
+    let sig = status % 128;
+    if sig == 0 {
+        code = (status / 256) % 256;
+    } else {
+        Text.new(arena).add("j3c: ").add(dep.name).add(":").add(tool.name).fmt(` killed by signal {sig}`).add("\n").flushTo(2);
+        code = 128 + sig;
+    }
+    if code != 0 { return fail(Text.new(arena).add(label).fmt(` failed with exit code {code}`).str(), code); }
+    if last.len > 0 {
+        let folder = path.join(m.root, trim(last), arena);
+        if fsx.isDir(folder) {
+            out.push(folder);
+        } else {
+            Text.new(arena).add("j3c: warning: ").add(label).add(": last stdout line is not a folder, not listed: ").add(trim(last)).add("\n").flushTo(2);
+        }
+    }
+    return Result.Ok(true);
+}
+
+/// Rust `std::path::absolute`: `p` joined onto the working directory when relative.
+pub fn absolute(p: string, arena: &Arena): string {
+    if path.isAbs(p) { return p; }
+    match path.realpath(".", arena) {
+        Option.Some(cwd) { return path.join(cwd, p, arena); }
+        Option.None { return p; }
+    }
+}
+
+/// Start `c` with its stdout on a pipe, echo each line (without `\r`/`\n`) to stdout as it comes, keep the
+/// last non-blank one in `last`, and wait: the raw `waitpid` status, or `-errno` when it could not start.
+fn spawnEcho(c: &ToolCmd, last: &string, arena: &Arena): int {
+    for i in 0..c.env.len {
+        let kv = c.env.items[i];
+        let eq = 0;
+        while eq < kv.len && kv[eq] != '=' { eq += 1; }
+        sys.setenv(own(arena, kv[0..eq]), kv[eq + 1..kv.len]);
+    }
+    // everything the child touches is built before fork: it must not allocate
+    let cpath = cstr(c.argv.items[0], arena);
+    if !sys.canExec(cpath.ptr as ptr) { return 0 - sys.errno(); }
+    let cargv = arena.alloc::<int>(c.argv.len + 1);
+    for i in 0..c.argv.len { cargv[i] = cstr(c.argv.items[i], arena).ptr as int; }
+    cargv[c.argv.len] = 0;
+    let ccwd = cstr(c.cwd, arena);
+    let envp = sys.environ();
+    let errp: [2]i32 = [0, 0];
+    let outp: [2]i32 = [0, 0];
+    if sys.pipe(errp[..], sys.O_CLOEXEC) < 0 { return 0 - sys.errno(); }
+    if sys.pipe(outp[..], sys.O_CLOEXEC) < 0 {
+        let e = sys.errno();
+        sys.close(int(errp[0]));
+        sys.close(int(errp[1]));
+        return 0 - e;
+    }
+    let pid = sys.fork();
+    if pid < 0 {
+        let e = sys.errno();
+        sys.close(int(errp[0]));
+        sys.close(int(errp[1]));
+        sys.close(int(outp[0]));
+        sys.close(int(outp[1]));
+        return 0 - e;
+    }
+    if pid == 0 {
+        let ce: [1]i32 = [0];
+        // dup2 clears close-on-exec on fd 1
+        if sys.dup2(int(outp[1]), 1) < 0 || sys.chdir(ccwd.ptr as ptr) < 0 {
+            ce[0] = i32(sys.errno());
+        } else {
+            ce[0] = i32(0 - sys.execve(cpath.ptr as ptr, cargv.ptr as ptr, envp));
+        }
+        sys.write(int(errp[1]), &ce[0] as ptr, 4);
+        sys.exit(127);
+    }
+    sys.close(int(errp[1]));
+    sys.close(int(outp[1]));
+    let buf = arena.alloc::<u8>(65536);
+    let line = Text.new(arena);
+    let echo = Text.new(arena);
+    while true {
+        let n = sys.read(int(outp[0]), buf.ptr as ptr, buf.len);
+        if n < 0 && sys.errno() == sys.EINTR { continue; }
+        if n <= 0 { break; }
+        for k in 0..n {
+            if buf[k] == '\n' {
+                endLine(&line, &echo, last, arena);
+            } else {
+                line.push(buf[k]);
+            }
+        }
+        echo.flushTo(1);
+    }
+    if line.len() > 0 { endLine(&line, &echo, last, arena); }
+    echo.flushTo(1);
+    sys.close(int(outp[0]));
+    let ce: [1]i32 = [0];
+    let got = sys.read(int(errp[0]), &ce[0] as ptr, 4);
+    sys.close(int(errp[0]));
+    let st: i32 = 0;
+    while sys.waitpid(pid, &st, 0) < 0 {
+        if sys.errno() != sys.EINTR { return 0 - sys.errno(); }
+    }
+    if got == 4 { return 0 - int(ce[0]); }
+    return int(st);
+}
+
+/// One finished stdout line: echoed (Rust `trim_end_matches(['\n', '\r'])`), remembered when not blank.
+fn endLine(line: &Text, echo: &Text, last: &string, arena: &Arena) {
+    let s = line.str();
+    let e = s.len;
+    while e > 0 && s[e - 1] == '\r' { e -= 1; }
+    echo.add(s[0..e]).add("\n");
+    if trim(s[0..e]).len > 0 { *last = own(arena, s[0..e]); }
+    line.clear();
+}
+
+fn cstr(s: string, arena: &Arena): []u8 {
+    let b = arena.alloc::<u8>(s.len + 1);
+    for i in 0..s.len { b[i] = s[i]; }
+    b[s.len] = 0;
+    return b;
+}

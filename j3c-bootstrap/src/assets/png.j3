@@ -1,11 +1,15 @@
-// PNG encode (real filtering, `base/deflate`), decode, shrink, base64: byte-equal with Rust's output, so
+// PNG encode (per-row filters, `base/deflate`), decode, shrink, base64: byte-equal with Rust's output, so
 // `-e imgdiff --out` and the MCP render thumbnails compare.
 //
 // Port of: j3c/src/png.rs
+// J3: The DEFLATE halves, adler32 and crc32 are `base/deflate`. Rust's `decode` returns `(w, h, px)`; here an
+// `Image`. ponytail: CRC and Adler aren't checked; 16-bit, interlaced and low-bit-depth PNGs are None (Rust).
 module j3c.assets.png;
 
 use j3.memory.{ Arena, List };
 use j3.option.Option;
+use j3.text.Text;
+use j3c.base.deflate;
 
 /// A decoded image: `px` is RGBA, `w * h * 4` bytes.
 pub struct Image {
@@ -14,14 +18,273 @@ pub struct Image {
     h: int;
 }
 
-/// Rust `encode_rgba`: a PNG of `rgba` (`w * h * 4` bytes). → DIST (deb icon)
-pub fn encodeRgba(w: int, h: int, rgba: []u8, arena: &Arena): List<u8> { return List<u8>.new(arena); } // STUB IMG
+const SIG: [8]u8 = [137, 80, 78, 71, 13, 10, 26, 10];
+const B64: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/// Above this a row or image size is refused (Rust's `checked_mul` on `usize`).
+const BIG: int = 1 << 60;
 
-/// Rust `compact`: the same image re-encoded smaller, None when it isn't a PNG this can read. → MCP (render)
-pub fn compact(png: []u8, arena: &Arena): Option<List<u8>> { return Option.None; } // STUB IMG
+/// The chunks `compact` and `decode` read. `hasIhdr` last (stage-0 layout rule).
+struct Chunks {
+    z: List<u8>;
+    ihdr: []u8;
+    plte: []u8;
+    trns: []u8;
+    hasIhdr: bool;
+}
 
-/// Rust `base64` (standard alphabet, padded). → MCP
-pub fn base64(data: []u8, arena: &Arena): string { return ""; } // STUB IMG
+fn be32(p: []u8, at: int): int {
+    return (int(p[at]) << 24) | (int(p[at + 1]) << 16) | (int(p[at + 2]) << 8) | int(p[at + 3]);
+}
 
-/// Rust `decode`: 8-bit RGB/RGBA/grey PNG to RGBA; None otherwise. → ASSETS (gltf textures)
-pub fn decode(png: []u8, arena: &Arena): Option<Image> { return Option.None; } // STUB IMG
+fn kindIs(p: []u8, at: int, k: string): bool {
+    return p[at] == k[0] && p[at + 1] == k[1] && p[at + 2] == k[2] && p[at + 3] == k[3];
+}
+
+/// The signature checked and the chunks up to IEND collected (IDAT joined); None on a short chunk.
+fn readChunks(png: []u8, arena: &Arena): Option<Chunks> {
+    if png.len < 8 { return Option.None; }
+    for i in 0..8 { if png[i] != SIG[i] { return Option.None; } }
+    let empty: []u8 = png[0..0];
+    let c = Chunks { z: List<u8>.new(arena), ihdr: empty, plte: empty, trns: empty, hasIhdr: false };
+    let at = 8;
+    while at + 12 <= png.len {
+        let len = be32(png, at);
+        if at + 8 + len > png.len { return Option.None; }
+        let data = png[at + 8..at + 8 + len];
+        if kindIs(png, at + 4, "IHDR") {
+            c.ihdr = data;
+            c.hasIhdr = true;
+        } else if kindIs(png, at + 4, "PLTE") {
+            c.plte = data;
+        } else if kindIs(png, at + 4, "tRNS") {
+            c.trns = data;
+        } else if kindIs(png, at + 4, "IDAT") {
+            c.z.extend(data);
+        } else if kindIs(png, at + 4, "IEND") {
+            break;
+        }
+        at += 12 + len;
+    }
+    return Option.Some(c);
+}
+
+/// `(row + 1) * h` when it fits, else -1.
+fn rawSize(row: int, h: int): int {
+    if h > 0 && row + 1 > BIG / h { return -1; }
+    return (row + 1) * h;
+}
+
+/// Rust `compact`: the image re-encoded smaller, None when it isn't an 8-bit RGBA, non-interlaced PNG like
+/// `Canvas.savePng` writes (then use it as is). → MCP (render)
+pub fn compact(png: []u8, arena: &Arena): Option<List<u8>> {
+    let c = readChunks(png, arena)?;
+    let ih = c.ihdr;
+    if !c.hasIhdr || ih.len != 13 || ih[8] != 8 || ih[9] != 6 || ih[12] != 0 { return Option.None; }
+    let w = be32(ih, 0);
+    let h = be32(ih, 4);
+    let row = w * 4;
+    let cap = rawSize(row, h);
+    if cap < 0 || c.z.len < 2 { return Option.None; }
+    let raw = deflate.inflate(c.z.items[2..c.z.len], cap, arena)?;
+    if raw.len != cap { return Option.None; }
+    let f = refilter(raw.items[0..raw.len], row, h, arena)?;
+    return Option.Some(writePng(ih, f.items[0..f.len], arena));
+}
+
+/// Rust `encode_rgba`: an 8-bit RGBA PNG of `rgba` (`w * h * 4` bytes), filtered and compressed like
+/// `compact`. → DIST (deb icon)
+pub fn encodeRgba(w: int, h: int, rgba: []u8, arena: &Arena): List<u8> {
+    let row = w * 4;
+    let raw = List<u8>.new(arena);
+    raw.reserve((row + 1) * h);
+    let at = 0;
+    let y = 0;
+    while y < h && at < rgba.len {
+        let end = at + row;
+        if end > rgba.len { end = rgba.len; }
+        raw.push(0);
+        raw.extend(rgba[at..end]);
+        at = end;
+        y += 1;
+    }
+    let ihdr: [13]u8 = [u8((w >> 24) & 255), u8((w >> 16) & 255), u8((w >> 8) & 255), u8(w & 255),
+        u8((h >> 24) & 255), u8((h >> 16) & 255), u8((h >> 8) & 255), u8(h & 255), 8, 6, 0, 0, 0];
+    match refilter(raw.items[0..raw.len], row, h, arena) {
+        Option.Some(f) { return writePng(ihdr[..], f.items[0..f.len], arena); }
+        Option.None { return writePng(ihdr[..], raw.items[0..raw.len], arena); }
+    }
+}
+
+fn writePng(ihdr: []u8, filtered: []u8, arena: &Arena): List<u8> {
+    let z = List<u8>.new(arena);
+    z.push(0x78);
+    z.push(0x01);
+    let d = deflate.deflateFixed(filtered, arena);
+    z.extend(d.items[0..d.len]);
+    pushBe32(&z, deflate.adler32(filtered));
+    let out = List<u8>.new(arena);
+    out.extend(SIG[..]);
+    chunk(&out, "IHDR", ihdr);
+    chunk(&out, "IDAT", z.items[0..z.len]);
+    chunk(&out, "IEND", ihdr[0..0]);
+    return out;
+}
+
+fn pushBe32(out: &List<u8>, v: int) {
+    out.push(u8((v >> 24) & 255));
+    out.push(u8((v >> 16) & 255));
+    out.push(u8((v >> 8) & 255));
+    out.push(u8(v & 255));
+}
+
+fn chunk(out: &List<u8>, kind: string, data: []u8) {
+    pushBe32(out, data.len);
+    out.extend(kind as []u8);
+    out.extend(data);
+    pushBe32(out, deflate.crcEnd(deflate.crcUpdate(deflate.crcUpdate(0xffffffff, kind as []u8), data)));
+}
+
+/// Rust `base64`: standard alphabet, padded. → MCP
+pub fn base64(data: []u8, arena: &Arena): string {
+    let t = Text.new(arena);
+    let tab = B64;
+    let i = 0;
+    while i < data.len {
+        let left = data.len - i;
+        let n = int(data[i]) << 16;
+        if left > 1 { n = n | (int(data[i + 1]) << 8); }
+        if left > 2 { n = n | int(data[i + 2]); }
+        t.push(tab[(n >> 18) & 63]);
+        t.push(tab[(n >> 12) & 63]);
+        t.push(if left > 1 { tab[(n >> 6) & 63] } else { '=' });
+        t.push(if left > 2 { tab[n & 63] } else { '=' });
+        i += 3;
+    }
+    return t.str();
+}
+
+/// `|(x - y) as i8|` (wrapping byte difference).
+fn absI8(x: int): int { return if x < 128 { x } else { 256 - x }; }
+
+fn sub8(x: u8, y: int): int { return (int(x) - y) & 255; }
+
+/// Rust `refilter`: rows with filter 0 (as canvas writes them) re-filtered with whichever of None, Sub, or Up
+/// gives the smallest sum of `|byte as i8|`, ties to the first. None when a row has another filter.
+fn refilter(raw: []u8, row: int, h: int, arena: &Arena): Option<List<u8>> {
+    let out = List<u8>.new(arena);
+    out.reserve(raw.len);
+    for y in 0..h {
+        let base = y * (row + 1);
+        if raw[base] != 0 { return Option.None; }
+        let cur = base + 1;
+        let up = base - row;
+        let cn = 0;
+        let cs = 0;
+        let cu = 0;
+        for i in 0..row {
+            let x = raw[cur + i];
+            let a = if i >= 4 { int(raw[cur + i - 4]) } else { 0 };
+            let b = if y > 0 { int(raw[up + i]) } else { 0 };
+            cn += absI8(int(x));
+            cs += absI8(sub8(x, a));
+            cu += absI8(sub8(x, b));
+        }
+        let kind = 0;
+        if cs < cn { kind = 1; }
+        if cu < (if kind == 1 { cs } else { cn }) { kind = 2; }
+        out.push(u8(kind));
+        for i in 0..row {
+            let x = raw[cur + i];
+            if kind == 0 {
+                out.push(x);
+            } else if kind == 1 {
+                out.push(u8(sub8(x, if i >= 4 { int(raw[cur + i - 4]) } else { 0 })));
+            } else {
+                out.push(u8(sub8(x, if y > 0 { int(raw[up + i]) } else { 0 })));
+            }
+        }
+    }
+    return Option.Some(out);
+}
+
+/// Rust `decode`: RGBA8 pixels of an 8-bit, non-interlaced PNG (gray, RGB, palette, gray+alpha, RGBA), or
+/// None. → ASSETS (gltf textures), `cmd/imgdiff`
+pub fn decode(png: []u8, arena: &Arena): Option<Image> {
+    let c = readChunks(png, arena)?;
+    let ih = c.ihdr;
+    if !c.hasIhdr || ih.len != 13 || ih[8] != 8 || ih[12] != 0 { return Option.None; }
+    let ctype = int(ih[9]);
+    let ch = 0;
+    if ctype == 0 || ctype == 3 {
+        ch = 1;
+    } else if ctype == 2 {
+        ch = 3;
+    } else if ctype == 4 {
+        ch = 2;
+    } else if ctype == 6 {
+        ch = 4;
+    } else {
+        return Option.None;
+    }
+    let w = be32(ih, 0);
+    let h = be32(ih, 4);
+    let row = w * ch;
+    let cap = rawSize(row, h);
+    if cap < 0 || c.z.len < 2 { return Option.None; }
+    let rl = deflate.inflate(c.z.items[2..c.z.len], cap, arena)?;
+    if rl.len != cap { return Option.None; }
+    let raw = rl.items[0..rl.len];
+    unfilter(raw, row, h, ch)?;
+    let out = List<u8>.new(arena);
+    out.reserve(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let p = y * (row + 1) + 1 + x * ch;
+            if ctype == 0 {
+                out.push(raw[p]); out.push(raw[p]); out.push(raw[p]); out.push(255);
+            } else if ctype == 2 {
+                out.push(raw[p]); out.push(raw[p + 1]); out.push(raw[p + 2]); out.push(255);
+            } else if ctype == 3 {
+                let k = int(raw[p]);
+                if k * 3 + 3 > c.plte.len { return Option.None; }
+                out.push(c.plte[k * 3]); out.push(c.plte[k * 3 + 1]); out.push(c.plte[k * 3 + 2]);
+                out.push(if k < c.trns.len { c.trns[k] } else { 255 });
+            } else if ctype == 4 {
+                out.push(raw[p]); out.push(raw[p]); out.push(raw[p]); out.push(raw[p + 1]);
+            } else {
+                out.push(raw[p]); out.push(raw[p + 1]); out.push(raw[p + 2]); out.push(raw[p + 3]);
+            }
+        }
+    }
+    return Option.Some(Image { px: out, w: w, h: h });
+}
+
+/// Undo the per-row filters of `raw` in place; None on an unknown filter.
+fn unfilter(raw: []u8, row: int, h: int, ch: int): Option<bool> {
+    for y in 0..h {
+        let base = y * (row + 1);
+        let f = raw[base];
+        if f > 4 && row > 0 { return Option.None; }
+        for i in 0..row {
+            let a = if i >= ch { int(raw[base + 1 + i - ch]) } else { 0 };
+            let b = if y > 0 { int(raw[base - row + i]) } else { 0 };
+            let c = if y > 0 && i >= ch { int(raw[base - row + i - ch]) } else { 0 };
+            let pred = 0;
+            if f == 1 {
+                pred = a;
+            } else if f == 2 {
+                pred = b;
+            } else if f == 3 {
+                pred = (a + b) / 2;
+            } else if f == 4 {
+                let p = a + b - c;
+                let pa = if p > a { p - a } else { a - p };
+                let pb = if p > b { p - b } else { b - p };
+                let pc = if p > c { p - c } else { c - p };
+                pred = if pa <= pb && pa <= pc { a } else if pb <= pc { b } else { c };
+            }
+            raw[base + 1 + i] = u8((int(raw[base + 1 + i]) + pred) & 255);
+        }
+    }
+    return Option.Some(true);
+}

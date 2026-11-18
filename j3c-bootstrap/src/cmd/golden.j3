@@ -1,9 +1,578 @@
-// `j3c golden`: headless golden states from `golden.toml`, `--bless`.
+// `j3c golden <dir> [name...] [--bless]`: headless golden test of a project, states from `<dir>/golden.toml`
+// (`[defaults]`, `[state.NAME]`, `[check.NAME]`, each with an optional `NAME.env` table). Each run is
+// `j3c run . --headless [--frames N]` with a fixed step, in a child process in its own process group, killed
+// with the group past its timeout.
 //
 // Port of: j3c/src/golden.rs
+// J3: `spawn` is Rust's `Command` for this and `cmd/gen` (env changes, cwd, stdin `/dev/null`, output to a file
+// or to pipes, optional own process group): `j3.proc` takes no env and always runs in this group. The child
+// gets an envp built before `fork` (no allocation after it). `setsid` stands in for `process_group(0)`. A child
+// that ends by a signal has no code, as Rust's `ExitStatus::code` (it reads as "timed out").
+// J3: With no `<dir>` (only `--bless`) Rust panics on `pos[0]`; here the usage error, exit 2.
 module j3c.cmd.golden;
 
-use j3c.base.diag;
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.proc.Child;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, find, lines, startsWith };
+use j3c.base.fsx;
+use j3c.base.toml;
+use j3c.base.toml.{ Entry, Head, Pair, Table };
+use j3c.cmd.imgdiff;
 
-/// `j3c golden ...`: the exit code.
-pub fn goldenCmd(rest: []string): int { return diag.notPortedCmd("golden"); } // STUB IMG
+const HELP: string = "usage: j3c golden <dir> [name...] [--bless]\n  Runs each [[state]] of <dir>/golden.toml headless, captures target/golden/<name>.png and compares it\n  with golden/<name>.png (PASS/FAIL per state; exit 1 on any FAIL). Names run only those states.\n  --bless copies the captures over the goldens (only the named states, else all). [[check]] runs execute\n  only without --bless. Format and recipe: `j3c doc testing`.\n";
+const KEYS: [6]string = ["frame", "tol", "max", "frames", "timeout", "text"];
+const U32_MAX: int = 4294967295;
+
+/// One table of `golden.toml` (Rust `Tbl`): `kind` is "defaults", "state" or "check".
+pub struct Tbl {
+    kv: List<Pair>;
+    env: List<Pair>;
+    kind: string;
+    name: string;
+
+    fn get(this: &Tbl, k: string): Option<string> {
+        for i in 0..this.kv.len { if this.kv.items[i].key == k { return Option.Some(this.kv.items[i].value); } }
+        return Option.None;
+    }
+}
+
+/// A child to start (Rust `Command`): stdin is `/dev/null`; stdout and stderr go to `out` (an open fd), or to
+/// two pipes when `out` is -1. `env` is set over the inherited environment after `unset` is taken out of it.
+pub struct Spawn {
+    argv: List<string>;
+    env: List<Pair>;
+    unset: List<string>;
+    cwd: string;
+    out: int;
+    /// Its own process group (Rust `process_group(0)`), so a kill reaches what it starts.
+    group: bool;
+}
+
+fn put(s: string) { sys.write(1, s.ptr as ptr, s.len); }
+fn eput(s: string) { sys.write(2, s.ptr as ptr, s.len); }
+
+fn isKey(k: string): bool {
+    for i in 0..KEYS.len { if KEYS[i] == k { return true; } }
+    return false;
+}
+
+fn splitDots(s: string, arena: &Arena): List<string> {
+    let out = List<string>.new(arena);
+    let st = 0;
+    for i in 0..s.len + 1 {
+        if i == s.len || s[i] == '.' {
+            out.push(s[st..i]);
+            st = i + 1;
+        }
+    }
+    return out;
+}
+
+fn lineErr(line: int, msg: string, arena: &Arena): string {
+    return Text.new(arena).add("golden.toml:").fmt(`{line}`).add(": ").add(msg).str();
+}
+
+fn findTbl(out: &List<Tbl>, kind: string, name: string): int {
+    for i in 0..out.len { if out.items[i].kind == kind && out.items[i].name == name { return i; } }
+    return -1;
+}
+
+fn newTbl(kind: string, name: string, arena: &Arena): Tbl {
+    return Tbl { kv: List<Pair>.new(arena), env: List<Pair>.new(arena), kind: kind, name: name };
+}
+
+/// Rust `parse`: the tables in file order, `[defaults]` first (always there); Err names the line.
+pub fn parse(src: string, arena: &Arena): Result<List<Tbl>, string> {
+    let doc = Table { vals: List<Entry>.new(arena), heads: List<Head>.new(arena), lines: List<int>.new(arena) };
+    match toml.parse(src, arena) {
+        Result.Ok(d) { doc = d; }
+        Result.Err(e) {
+            let at = find(e, "j3.toml:");
+            if at < 0 { return Result.Err(e); }
+            return Result.Err(Text.new(arena).add(e[0..at]).add("golden.toml:").add(e[at + 8..e.len]).str());
+        }
+    }
+    let vals = List<string>.new(arena);
+    for i in 0..doc.vals.len {
+        let e = doc.vals.items[i];
+        match toml.asStr(e.val) {
+            Option.Some(v) { vals.push(v); }
+            Option.None {
+                return Result.Err(lineErr(doc.lines.items[i], Text.new(arena).add("`").add(e.key).add("` must be a string or number").str(), arena));
+            }
+        }
+    }
+    let out = List<Tbl>.new(arena);
+    out.push(newTbl("defaults", "", arena));
+    for i in 0..doc.heads.len {
+        let h = doc.heads.items[i].name;
+        let line = doc.heads.items[i].line;
+        for j in 0..i {
+            if doc.heads.items[j].name == h { return Result.Err(lineErr(line, Text.new(arena).add("[").add(h).add("] appears twice").str(), arena)); }
+        }
+        let p = splitDots(h, arena);
+        let k = p.items[0];
+        let sc = k == "state" || k == "check";
+        if p.len == 1 && k == "defaults" {
+        } else if p.len == 2 && sc && p.items[1].len > 0 {
+            out.push(newTbl(k, p.items[1], arena));
+        } else if p.len == 3 && sc && p.items[2] == "env" && findTbl(&out, k, p.items[1]) >= 0 {
+        } else {
+            return Result.Err(lineErr(line, Text.new(arena).add("unknown section [").add(h)
+                .add("] (want [defaults], [state.NAME], [check.NAME], or NAME.env under them)").str(), arena));
+        }
+    }
+    for i in 0..doc.vals.len {
+        let sec = doc.vals.items[i].section;
+        let k = doc.vals.items[i].key;
+        let v = vals.items[i];
+        let line = doc.lines.items[i];
+        let p = splitDots(sec, arena);
+        if p.items[0] == "defaults" {
+            if k == "text" || !isKey(k) {
+                return Result.Err(lineErr(line, Text.new(arena).add("unknown key `").add(k).add("` in [defaults] (want frame, tol, max, frames, timeout)").str(), arena));
+            }
+            out.items[0].kv.push(Pair { key: k, value: v });
+            continue;
+        }
+        let t = &out.items[findTbl(&out, p.items[0], p.items[1])];
+        if p.len == 3 {
+            t.env.push(Pair { key: k, value: v });
+            continue;
+        }
+        if !isKey(k) {
+            return Result.Err(lineErr(line, Text.new(arena).add("unknown key `").add(k).add("` in [").add(sec)
+                .add("] (want frame, tol, max, frames, timeout, text)").str(), arena));
+        }
+        if k != "text" && imgdiff.parseUint(v, U32_MAX) < 0 {
+            return Result.Err(lineErr(line, Text.new(arena).add("`").add(k).add("` wants a whole number, not `").add(v).add("`").str(), arena));
+        }
+        match t.get(k) {
+            Option.Some(_) { return Result.Err(lineErr(line, Text.new(arena).add("`").add(k).add("` is set twice in [").add(sec).add("]").str(), arena)); }
+            Option.None {}
+        }
+        t.kv.push(Pair { key: k, value: v });
+    }
+    // a duplicate name across kinds would make `j3c golden NAME` ambiguous
+    for i in 1..out.len {
+        let t = out.items[i];
+        for j in 1..i {
+            if out.items[j].name == t.name {
+                let want = Text.new(arena).add(t.kind).add(".").add(t.name).str();
+                let line = 0;
+                for k in 0..doc.heads.len {
+                    if doc.heads.items[k].name == want {
+                        line = doc.heads.items[k].line;
+                        break;
+                    }
+                }
+                return Result.Err(lineErr(line, Text.new(arena).add("the name `").add(t.name).add("` is used twice").str(), arena));
+            }
+        }
+    }
+    return Result.Ok(out);
+}
+
+/// Rust `judge`: the verdict for one image state. `captured` false is Rust's `None` (no capture); `d` is the
+/// differing pixel count or the compare error.
+pub fn judge(goldExists: bool, captured: bool, d: Result<int, string>, max: int, arena: &Arena): Result<bool, string> {
+    if !captured { return Result.Err("no capture: the run wrote no image (see target/golden/<name>.log)"); }
+    if !goldExists { return Result.Err("no golden yet: look at target/golden/<name>.png, then `j3c golden <dir> --bless`"); }
+    match d {
+        Result.Ok(n) {
+            if n > max { return Result.Err(Text.new(arena).fmt(`{n} pixels differ`).str()); }
+            return Result.Ok(true);
+        }
+        Result.Err(e) { return Result.Err(e); }
+    }
+}
+
+/// Rust `judge_check`: a check run passes at rc 0 with no line starting `FAIL`; `rc` None = timed out.
+pub fn judgeCheck(rc: Option<int>, out: string, arena: &Arena): Result<bool, string> {
+    let code = 0;
+    match rc {
+        Option.Some(c) { code = c; }
+        Option.None { return Result.Err("timed out"); }
+    }
+    for l in lines(out) {
+        if startsWith(l, "FAIL") { return Result.Err(Text.new(arena).add(l).str()); }
+    }
+    if code != 0 { return Result.Err(Text.new(arena).fmt(`rc {code}`).str()); }
+    return Result.Ok(true);
+}
+
+fn cstr(s: string, arena: &Arena): []u8 {
+    let t = Text.new(arena);
+    t.add(s);
+    t.push(0);
+    return t.str() as []u8;
+}
+
+/// True when the C string at `p` is `KEY=...`.
+fn envIs(p: int, key: string): bool {
+    for k in 0..key.len {
+        let b = *(((p + k) as ptr) as &u8);
+        if b != key[k] { return false; }
+    }
+    return *(((p + key.len) as ptr) as &u8) == '=';
+}
+
+/// The child's envp (pointers to C strings, 0-terminated): the inherited entries minus `unset` and every key
+/// `env` sets, then `env` (the last value of a key wins).
+fn envp(sp: &Spawn, arena: &Arena): []int {
+    let keep = List<int>.new(arena);
+    let ep = sys.environ() as int;
+    if ep != 0 {
+        let i = 0;
+        while true {
+            let p = *(((ep + i * 8) as ptr) as &int);
+            if p == 0 { break; }
+            let drop = false;
+            for k in 0..sp.unset.len { if envIs(p, sp.unset.items[k]) { drop = true; } }
+            for k in 0..sp.env.len { if envIs(p, sp.env.items[k].key) { drop = true; } }
+            if !drop { keep.push(p); }
+            i += 1;
+        }
+    }
+    for k in 0..sp.env.len {
+        let key = sp.env.items[k].key;
+        let later = false;
+        for j in k + 1..sp.env.len { if sp.env.items[j].key == key { later = true; } }
+        if !later { keep.push(cstr(Text.new(arena).add(key).add("=").add(sp.env.items[k].value).str(), arena).ptr as int); }
+    }
+    keep.push(0);
+    return keep.items[0..keep.len];
+}
+
+/// Start `sp`: the running child (its `stdout`/`stderr` are pipe ends, or -1 with `out` set), or Err with the
+/// errno that kept it from starting (`fork`, `chdir` or `execve`; the child sends it back over a close-on-exec
+/// pipe).
+pub fn spawn(sp: &Spawn, arena: &Arena): Result<Child, int> {
+    // everything the child touches is built before fork: it must not allocate
+    let cpath = cstr(sp.argv.items[0], arena);
+    let cargv = arena.alloc::<int>(sp.argv.len + 1);
+    for i in 0..sp.argv.len { cargv[i] = cstr(sp.argv.items[i], arena).ptr as int; }
+    cargv[sp.argv.len] = 0;
+    let ccwd = cstr(sp.cwd, arena);
+    let env = envp(sp, arena);
+    let devnull = cstr("/dev/null", arena);
+    let nul = sys.open(devnull.ptr as ptr, sys.O_RDONLY + sys.O_CLOEXEC);
+    if nul < 0 { return Result.Err(0 - nul); }
+    let fe: [2]i32 = [0, 0];
+    let fo: [2]i32 = [-1, -1];
+    let fr: [2]i32 = [-1, -1];
+    if sys.pipe(fe[..], sys.O_CLOEXEC) < 0 || (sp.out < 0 && (sys.pipe(fo[..], sys.O_CLOEXEC) < 0 || sys.pipe(fr[..], sys.O_CLOEXEC) < 0)) {
+        let e = sys.errno();
+        sys.close(nul);
+        return Result.Err(e);
+    }
+    let pid = sys.fork();
+    if pid == 0 {
+        if sp.group { sys.setsid(); }
+        sys.dup2(nul, 0);
+        if sp.out >= 0 {
+            sys.dup2(sp.out, 1);
+            sys.dup2(sp.out, 2);
+        } else {
+            sys.dup2(int(fo[1]), 1);
+            sys.dup2(int(fr[1]), 2);
+        }
+        let ce: [1]i32 = [0];
+        if sys.chdir(ccwd.ptr as ptr) < 0 { ce[0] = i32(sys.errno()); } else { ce[0] = i32(0 - sys.execve(cpath.ptr as ptr, cargv.ptr as ptr, env.ptr as ptr)); }
+        sys.write(int(fe[1]), &ce[0] as ptr, 4);
+        sys.exit(127);
+    }
+    let forkErr = if pid < 0 { sys.errno() } else { 0 };
+    sys.close(nul);
+    sys.close(int(fe[1]));
+    if sp.out < 0 {
+        sys.close(int(fo[1]));
+        sys.close(int(fr[1]));
+    }
+    let ce: [1]i32 = [0];
+    let got = if pid < 0 { 0 } else { sys.read(int(fe[0]), &ce[0] as ptr, 4) };
+    sys.close(int(fe[0]));
+    if pid < 0 || got == 4 {
+        if sp.out < 0 {
+            sys.close(int(fo[0]));
+            sys.close(int(fr[0]));
+        }
+        if pid < 0 { return Result.Err(forkErr); }
+        let st: i32 = 0;
+        sys.waitpid(pid, &st, 0);
+        return Result.Err(int(ce[0]));
+    }
+    return Result.Ok(Child { pid: pid, stdin: -1, stdout: int(fo[0]), stderr: int(fr[0]) });
+}
+
+fn sleepMs(ms: int) {
+    let none: [1]i64 = [0];
+    sys.pollFds(&none[0] as ptr, 0, ms);
+}
+
+/// Rust `wait_or_kill`: the child's exit code; past `limitMs` it and its process group are killed: None (also
+/// when it ended by a signal).
+pub fn waitOrKill(pid: int, limitMs: int): Option<int> {
+    let start = sys.monotonicMs();
+    while true {
+        let st: i32 = 0;
+        let r = sys.waitpid(pid, &st, sys.WNOHANG);
+        if r == pid {
+            let s = int(st);
+            if (s & 127) != 0 { return Option.None; }
+            return Option.Some((s >> 8) & 255);
+        }
+        if r < 0 && sys.errno() != sys.EINTR { return Option.None; }
+        if r == 0 && sys.monotonicMs() - start > limitMs {
+            sys.kill(0 - pid, sys.SIGKILL);
+            sys.kill(pid, sys.SIGKILL);
+            sys.waitpid(pid, &st, 0);
+            return Option.None;
+        }
+        sleepMs(50);
+    }
+    return Option.None;
+}
+
+/// This binary (Rust `current_exe`, "j3c" when unknown).
+fn selfExe(arena: &Arena): string {
+    match path.realpath("/proc/self/exe", arena) {
+        Option.Some(p) { return p; }
+        Option.None { return "j3c"; }
+    }
+}
+
+fn numOf(t: &Tbl, d: &Tbl, k: string, dflt: int): int {
+    let v = match t.get(k) { Option.Some(x) { x } Option.None { match d.get(k) { Option.Some(x) { x } Option.None { "" } } } };
+    let n = imgdiff.parseUint(v, 1 << 62);
+    return if n < 0 { dflt } else { n };
+}
+
+/// Rust `run`: one `j3c run . --headless` of `t` in `dir`, output to `target/golden/NAME.log`: the exit code
+/// (None: timed out and killed, or ended by a signal) and the log text.
+fn runOne(dir: string, t: &Tbl, d: &Tbl, name: string, frames: int, capture: string, capFrame: int, arena: &Arena): (Option<int>, string) {
+    let log = path.join(dir, Text.new(arena).add("target/golden/").add(name).add(".log").str(), arena);
+    let clog = cstr(log, arena);
+    let fd = sys.openMode(clog.ptr as ptr, sys.O_WRONLY + sys.O_CREAT + sys.O_TRUNC + sys.O_CLOEXEC, 420);
+    let sp = Spawn { argv: List<string>.new(arena), env: List<Pair>.new(arena), unset: List<string>.new(arena), cwd: dir,
+        out: fd, group: true };
+    sp.argv.push(selfExe(arena));
+    sp.argv.push("run");
+    sp.argv.push(".");
+    sp.argv.push("--headless");
+    if frames >= 0 {
+        sp.argv.push("--frames");
+        sp.argv.push(Text.new(arena).fmt(`{frames}`).str());
+    }
+    sp.env.push(Pair { key: "SDL_VIDEODRIVER", value: "offscreen" });
+    sp.env.push(Pair { key: "SDL_AUDIODRIVER", value: "dummy" });
+    sp.env.push(Pair { key: "__GL_SHADER_DISK_CACHE", value: "0" });
+    sp.env.push(Pair { key: "J3_FIXED_DT", value: "0.016" });
+    // an inherited one must not leak in; the toml may set them
+    sp.unset.push("J3_CAPTURE");
+    sp.unset.push("J3_STEADY");
+    sp.env.extend(d.env.items[0..d.env.len]);
+    sp.env.extend(t.env.items[0..t.env.len]);
+    if capture.len > 0 { sp.env.push(Pair { key: "J3_CAPTURE", value: Text.new(arena).add(capture).fmt(`:{capFrame}`).str() }); }
+    let tv = match t.get("timeout") { Option.Some(x) { x } Option.None { match d.get("timeout") { Option.Some(x) { x } Option.None { "" } } } };
+    let secs = imgdiff.parseUint(tv, 1 << 40);
+    if secs < 0 { secs = 300; }
+    // ponytail: no log file (it could not be created) leaves the child on this process's stdout, as Rust
+    if fd < 0 { sp.out = 1; }
+    match spawn(&sp, arena) {
+        Result.Ok(ch) {
+            if fd >= 0 { sys.close(fd); }
+            let rc = waitOrKill(ch.pid, secs * 1000);
+            let text = match fsx.readText(log, arena) { Result.Ok(s) { s } Result.Err(_) { "" } };
+            return (rc, text);
+        }
+        Result.Err(_) {
+            if fd >= 0 { sys.close(fd); }
+            return (Option.Some(127), "could not start j3c");
+        }
+    }
+}
+
+fn exists(p: string): bool { return io.exists(p); }
+
+fn readOr(p: string, arena: &Arena): string {
+    match fsx.readText(p, arena) {
+        Result.Ok(s) { return s; }
+        Result.Err(_) { return ""; }
+    }
+}
+
+/// `j3c golden ...`: the exit code (Rust `cmd`).
+pub fn goldenCmd(rest: []string): int {
+    let help = rest.len == 0;
+    for i in 0..rest.len { if rest[i] == "--help" || rest[i] == "-h" { help = true; } }
+    if help {
+        put(HELP);
+        return if rest.len == 0 { 2 } else { 0 };
+    }
+    let arena = Arena.create(1 << 20);
+    defer arena.destroy();
+    let a = &arena;
+    let bless = false;
+    let pos = List<string>.new(a);
+    for i in 0..rest.len {
+        if rest[i] == "--bless" { bless = true; }
+        if !startsWith(rest[i], "--") { pos.push(rest[i]); }
+    }
+    if pos.len == 0 {
+        put(HELP);
+        return 2;
+    }
+    let dir = pos.items[0];
+    let src = "";
+    match fsx.readText(path.join(dir, "golden.toml", a), a) {
+        Result.Ok(s) { src = s; }
+        Result.Err(_) {
+            eput(Text.new(a).add("j3c golden: no golden.toml in ").add(dir).add("\n").str());
+            return 2;
+        }
+    }
+    let tables = List<Tbl>.new(a);
+    match parse(src, a) {
+        Result.Ok(t) { tables = t; }
+        Result.Err(e) {
+            eput(Text.new(a).add("j3c golden: ").add(e).add("\n").str());
+            return 2;
+        }
+    }
+    let d = &tables.items[0];
+    for i in 1..pos.len {
+        let n = pos.items[i];
+        let found = false;
+        for j in 1..tables.len { if tables.items[j].name == n { found = true; } }
+        if !found {
+            eput(Text.new(a).add("j3c golden: no state or check named `").add(n).add("`\n").str());
+            return 2;
+        }
+    }
+    io.makeDirs(path.join(dir, "target/golden", a));
+    io.makeDirs(path.join(dir, "golden", a));
+    let fail = false;
+    for ti in 1..tables.len {
+        let t = &tables.items[ti];
+        let name = t.name;
+        if pos.len > 1 {
+            let named = false;
+            for i in 1..pos.len { if pos.items[i] == name { named = true; } }
+            if !named { continue; }
+        }
+        if t.kind == "check" {
+            if bless { continue; }
+            let fr = match t.get("frames") { Option.Some(x) { imgdiff.parseUint(x, U32_MAX) } Option.None { -1 } };
+            let (rc, out) = runOne(dir, t, d, name, fr, "", 0, a);
+            match judgeCheck(rc, out, a) {
+                Result.Ok(_) { put(Text.new(a).add("PASS ").add(name).add("\n").str()); }
+                Result.Err(e) {
+                    put(Text.new(a).add("FAIL ").add(name).add(" (").add(e).add("; target/golden/").add(name).add(".log)\n").str());
+                    fail = true;
+                }
+            }
+            continue;
+        }
+        if t.kind != "state" { continue; }
+        if stateRun(dir, t, d, name, bless, a) { fail = true; }
+    }
+    return if fail { 1 } else { 0 };
+}
+
+/// One `[state.NAME]`: capture, then bless or compare; prints its line(s). True when it failed.
+fn stateRun(dir: string, t: &Tbl, d: &Tbl, name: string, bless: bool, a: &Arena): bool {
+    let frame = numOf(t, d, "frame", 30);
+    let png = Text.new(a).add("target/golden/").add(name).add(".png").str();
+    io.remove(path.join(dir, png, a));
+    let text = t.get("text");
+    match text { Option.Some(x) { io.remove(path.join(dir, x, a)); } Option.None {} }
+    let (rc, _log) = runOne(dir, t, d, name, numOf(t, d, "frames", frame + 2), png, frame, a);
+    match rc {
+        Option.Some(_) {}
+        Option.None {
+            put(Text.new(a).add("FAIL ").add(name).add(" (timed out and killed; target/golden/").add(name).add(".log)\n").str());
+            return true;
+        }
+    }
+    let gold = path.join(dir, Text.new(a).add("golden/").add(name).add(".png").str(), a);
+    let cap = path.join(dir, png, a);
+    let tol = numOf(t, d, "tol", 0);
+    let fail = false;
+    if bless {
+        let ok = false;
+        if exists(cap) {
+            ok = imgdiff.copyFile(cap, gold, a);
+        }
+        if ok {
+            put(Text.new(a).add("blessed ").add(name).add("\n").str());
+        } else {
+            put(Text.new(a).add("FAIL ").add(name).add(" (no capture to bless)\n").str());
+            fail = true;
+        }
+        match text {
+            Option.Some(x) {
+                let to = path.join(dir, Text.new(a).add("golden/").add(name).add(".txt").str(), a);
+                if !imgdiff.copyFile(path.join(dir, x, a), to, a) {
+                    put(Text.new(a).add("FAIL ").add(name).add(" (the run wrote no ").add(x).add(" to bless)\n").str());
+                    fail = true;
+                }
+            }
+            Option.None {}
+        }
+        return fail;
+    }
+    let captured = exists(cap);
+    let goldOk = exists(gold);
+    let dr: Result<int, string> = Result.Ok(0);
+    if captured && goldOk {
+        let dp = path.join(dir, Text.new(a).add("target/golden/").add(name).add(".diff.png").str(), a);
+        match imgdiff.diff(gold, cap, tol, Option.Some(dp), a) {
+            Result.Ok(c) { dr = Result.Ok(c.count); }
+            Result.Err(f) { dr = Result.Err(f.msg); }
+        }
+    }
+    let r = judge(goldOk, captured, dr, numOf(t, d, "max", 0), a);
+    match r {
+        Result.Ok(_) {
+            match text {
+                Option.Some(x) {
+                    let ga = readOr(path.join(dir, Text.new(a).add("golden/").add(name).add(".txt").str(), a), a);
+                    let gb = readOr(path.join(dir, x, a), a);
+                    if ga != gb {
+                        let n = 1;
+                        let la = lines(ga);
+                        let lb = lines(gb);
+                        while true {
+                            match la.next() {
+                                Option.Some(p) {
+                                    match lb.next() {
+                                        Option.Some(q) { if p != q { break; } n += 1; }
+                                        Option.None { break; }
+                                    }
+                                }
+                                Option.None { break; }
+                            }
+                        }
+                        r = Result.Err(Text.new(a).add(x).add(" differs from golden/").add(name).fmt(`.txt at line {n}`).str());
+                    }
+                }
+                Option.None {}
+            }
+        }
+        Result.Err(_) {}
+    }
+    match r {
+        Result.Ok(_) { put(Text.new(a).add("PASS ").add(name).add("\n").str()); }
+        Result.Err(e) {
+            put(Text.new(a).add("FAIL ").add(name).add(" (").add(e).add(")\n").str());
+            fail = true;
+        }
+    }
+    return fail;
+}

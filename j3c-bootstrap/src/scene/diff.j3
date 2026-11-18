@@ -1,13 +1,33 @@
 // `scene diff` against git HEAD, one line per object (scenes read via `j3.scene3d`).
 //
-// Port of: j3c/src/scene/diff.rs
-// J3: `{:.2}` through `base/fixed.pushFixed`.
+// Port of: j3c/src/scene/diff.rs, (scenefile.rs `Object::fields`, `num`, `trimmed`)
+// J3: `{:.2}` through `base/fixed.pushFixed`. Objects come from `scene3d.parse` (Rust `scenefile::parse`, which
+// is gone: DELETED.md), so values are its f32s widened to f64 where Rust parsed f64s; `{:.2}` / six-place text
+// can differ from Rust's on a value that sits on a rounding edge in f32. Params are the scene's
+// `param.<id>.<field>` data lines, whose values are Rust's `literal` text.
+// J3: Rust looks paths up in HashMaps and sorts field keys in a BTreeMap; here lists, with the keys sorted by
+// bytes (the same order). ponytail: path matching is a linear scan per object; a map if scenes reach many
+// thousands of objects.
 module j3c.scene.diff;
 
+use lib "m" as libm {
+    fn sqrt(x: f64): f64;
+}
+
+use j3.cmp.sortBy;
+use j3.io.path;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
+use j3.proc;
 use j3.result.Result;
+use j3.scene3d;
+use j3.scene3d.Node;
+use j3.sys;
 use j3.text.Text;
+use j3c.base.fixed.pushFixed;
+use j3c.base.fsx;
+use j3c.base.intern.own;
+use j3c.scene.ops;
 
 /// Rust `scene::Diff`.
 pub struct Diff {
@@ -18,8 +38,343 @@ pub struct Diff {
     against: string;
 }
 
+/// One object of a scene file: its `Parent/Child` path (`#2`, `#3` for repeats), position and fields.
+struct Obj {
+    path: string;
+    x: f64;
+    y: f64;
+    z: f64;
+    /// `key` / `value` pairs (Rust `Object::fields`), sorted by key.
+    keys: List<string>;
+    vals: List<string>;
+}
+
+/// Rust `trimmed`: `places` decimals, trailing zeros and `.` dropped, `-0` as `0`.
+fn trimmed(t: &Text, x: f64, places: int, arena: &Arena) {
+    let s = Text.new(arena);
+    pushFixed(&s, x, places);
+    let v = s.str();
+    let e = v.len;
+    let dot = false;
+    for i in 0..v.len { if v[i] == '.' { dot = true; } }
+    if dot {
+        while e > 0 && v[e - 1] == '0' { e -= 1; }
+        if e > 0 && v[e - 1] == '.' { e -= 1; }
+    }
+    let r = v[0..e];
+    if r == "-0" || r.len == 0 { t.push('0'); } else { t.add(r); }
+}
+
+fn num(x: f32, arena: &Arena): string {
+    let t = Text.new(arena);
+    trimmed(&t, f64(x), 6, arena);
+    return t.str();
+}
+
+fn vec(a: f32, b: f32, c: f32, arena: &Arena): string {
+    return Text.new(arena).add(num(a, arena)).add(",").add(num(b, arena)).add(",").add(num(c, arena)).str();
+}
+
+fn put(o: &Obj, k: string, v: string) {
+    o.keys.push(k);
+    o.vals.push(v);
+}
+
+fn kindWord(k: int): string {
+    if k == scene3d.MESH { return "mesh"; }
+    if k == scene3d.CAMERA { return "camera"; }
+    if k == scene3d.INSTANCE { return "place"; }
+    if k == scene3d.LIGHT { return "light"; }
+    return "group";
+}
+
+/// Rust `Object::fields`: what differs from a fresh object and applies to its kind, v2 spelling.
+fn fields(o: &Obj, n: &Node, params: &List<string>, arena: &Arena) {
+    put(o, "kind", kindWord(n.kind));
+    put(o, "name", n.name);
+    let deg = 57.29577951308232;
+    let rot = Text.new(arena);
+    trimmed(&rot, f64(n.rotation.x) * deg, 3, arena);
+    rot.push(',');
+    trimmed(&rot, f64(n.rotation.y) * deg, 3, arena);
+    rot.push(',');
+    trimmed(&rot, f64(n.rotation.z) * deg, 3, arena);
+    if rot.str() != "0,0,0" { put(o, "rot", rot.str()); }
+    let scale = vec(n.scale.x, n.scale.y, n.scale.z, arena);
+    if scale != "1,1,1" { put(o, "scale", scale); }
+    let mesh = n.kind == scene3d.MESH;
+    let inst = n.kind == scene3d.INSTANCE;
+    if mesh && n.asset.len > 0 { put(o, "asset", n.asset); }
+    if mesh && n.material.len > 0 { put(o, "material", n.material); }
+    if mesh && n.texture.len > 0 { put(o, "texture", n.texture); }
+    if inst && n.scene.len > 0 { put(o, "scene", n.scene); }
+    let tint = vec(n.tint.x, n.tint.y, n.tint.z, arena);
+    if (mesh || inst) && tint != "1,1,1" { put(o, "tint", tint); }
+    if n.kind == scene3d.LIGHT {
+        let color = vec(n.color.x, n.color.y, n.color.z, arena);
+        if color != vec(1.0, 0.9, 0.75, arena) { put(o, "color", color); }
+        if num(n.range, arena) != "8" { put(o, "range", num(n.range, arena)); }
+    }
+    if n.kind == scene3d.CAMERA {
+        if num(n.fov, arena) != "60" { put(o, "fov", num(n.fov, arena)); }
+        if num(n.near, arena) != num(0.15, arena) { put(o, "near", num(n.near, arena)); }
+        if num(n.far, arena) != "200" { put(o, "far", num(n.far, arena)); }
+        if n.effects.len > 0 { put(o, "fx", n.effects); }
+    }
+    if mesh && n.alpha != 0 {
+        let t = Text.new(arena);
+        t.pushInt(n.alpha);
+        put(o, "alpha", t.str());
+    }
+    if mesh && n.alpha != 0 && num(n.opacity, arena) != "1" { put(o, "opacity", num(n.opacity, arena)); }
+    if mesh && n.doubleSided { put(o, "doubleSided", "1"); }
+    if n.script.len > 0 { put(o, "script", n.script); }
+    if n.tags.len > 0 { put(o, "tags", n.tags); }
+    for i in 0..params.len / 2 { put(o, params.items[2 * i], params.items[2 * i + 1]); }
+}
+
+/// `param.<id>.<field>[ k]=<value>` data lines of object `id`, as `param.<field>`, value pairs.
+fn paramsOf(data: string, id: int, arena: &Arena): List<string> {
+    let out = List<string>.new(arena);
+    let pre = Text.new(arena);
+    pre.add("param.");
+    pre.pushInt(id);
+    pre.push('.');
+    let p = pre.str();
+    let a = 0;
+    for i in 0..data.len + 1 {
+        if i < data.len && data[i] != '\n' { continue; }
+        let l = data[a..i];
+        a = i + 1;
+        if l.len <= p.len || l[0..p.len] != p { continue; }
+        let rest = l[p.len..l.len];
+        let eq = 0;
+        while eq < rest.len && rest[eq] != '=' { eq += 1; }
+        if eq == rest.len { continue; }
+        let key = rest[0..eq];
+        let sp = 0;
+        while sp < key.len && key[sp] != ' ' { sp += 1; }
+        out.push(Text.new(arena).add("param.").add(key[0..sp]).str());
+        out.push(own(arena, rest[eq + 1..rest.len]));
+    }
+    return out;
+}
+
+/// Rust `scene_objects`: every object of the scene text with its path; same-path objects get `#2`, `#3`, ...
+/// in file order. Strings in `arena`.
+fn sceneObjects(text: string, arena: &Arena): List<Obj> {
+    let out = List<Obj>.new(arena);
+    let mem = Arena.create(64 * 1024 + text.len * 4);
+    let s = scene3d.parse(own(&mem, text) as []u8, true, &mem);
+    let data = s.data.bytes as string;
+    let seen = List<string>.new(arena);
+    for k in 0..s.len {
+        let n = s.nodes[k];
+        // the path, leaf first, up to 64 names (Rust's cap on a parent cycle)
+        let names = List<string>.new(arena);
+        names.push(n.name);
+        let parent = n.parent;
+        while parent != 0 && names.len < 64 {
+            let slot = scene3d.index(&s, parent);
+            if slot < 0 { break; }
+            names.push(s.nodes[slot].name);
+            parent = s.nodes[slot].parent;
+        }
+        let t = Text.new(arena);
+        let i = names.len - 1;
+        while i >= 0 {
+            t.add(names.items[i]);
+            if i > 0 { t.push('/'); }
+            i -= 1;
+        }
+        let base = t.str();
+        let count = 1;
+        for j in 0..seen.len { if seen.items[j] == base { count += 1; } }
+        seen.push(base);
+        let p = base;
+        if count > 1 {
+            let q = Text.new(arena);
+            q.add(base).push('#');
+            q.pushInt(count);
+            p = q.str();
+        }
+        let o = Obj { path: p, x: f64(n.position.x), y: f64(n.position.y), z: f64(n.position.z), keys: List<string>.new(arena), vals: List<string>.new(arena) };
+        let node = n;
+        node.name = own(arena, n.name);
+        node.asset = own(arena, n.asset);
+        node.material = own(arena, n.material);
+        node.texture = own(arena, n.texture);
+        node.scene = own(arena, n.scene);
+        node.effects = own(arena, n.effects);
+        node.script = own(arena, n.script);
+        node.tags = own(arena, n.tags);
+        let ps = paramsOf(data, n.id, arena);
+        fields(&o, &node, &ps, arena);
+        sortFields(&o);
+        out.push(o);
+    }
+    mem.destroy();
+    return out;
+}
+
+/// Sort `o`'s pairs by key, stably (Rust collects them into a BTreeMap: a repeated key keeps the last value).
+fn sortFields(o: &Obj) {
+    let n = o.keys.len;
+    for i in 1..n {
+        let k = o.keys.items[i];
+        let v = o.vals.items[i];
+        let j = i;
+        while j > 0 && k < o.keys.items[j - 1] {
+            o.keys.items[j] = o.keys.items[j - 1];
+            o.vals.items[j] = o.vals.items[j - 1];
+            j -= 1;
+        }
+        o.keys.items[j] = k;
+        o.vals.items[j] = v;
+    }
+}
+
+/// The value of `key` in sorted pairs (the last of repeats), or None.
+fn lookup(o: &Obj, key: string): Option<string> {
+    let i = o.keys.len - 1;
+    while i >= 0 {
+        if o.keys.items[i] == key { return Option.Some(o.vals.items[i]); }
+        i -= 1;
+    }
+    return Option.None;
+}
+
+fn show(t: &Text, o: &Obj) {
+    pushFixed(t, o.x, 2);
+    t.push(',');
+    pushFixed(t, o.y, 2);
+    t.push(',');
+    pushFixed(t, o.z, 2);
+}
+
+fn find(objs: &List<Obj>, p: string): int {
+    for i in 0..objs.len { if objs.items[i].path == p { return i; } }
+    return -1;
+}
+
 /// Rust `scene::diff`: `rel` against `old` (a project-relative scene) or git HEAD. → MCP (`scene_diff`)
-pub fn diff(root: string, rel: string, old: Option<string>, arena: &Arena): Result<Diff, string> { return Result.Err("scene diff: not ported yet"); } // STUB SCENE
+pub fn diff(root: string, rel: string, old: Option<string>, arena: &Arena): Result<Diff, string> {
+    let now = match fsx.readText(path.join(root, rel, arena), arena) {
+        Result.Ok(t) { t }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("read ").add(rel).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+    };
+    let before = "";
+    let against = "git HEAD";
+    match old {
+        Option.Some(o) {
+            let r = ops.sceneRel(root, Option.Some(o), arena)?;
+            match fsx.readText(path.join(root, r, arena), arena) {
+                Result.Ok(t) { before = t; }
+                Result.Err(_) { return Result.Err(Text.new(arena).add("read ").add(r).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+            }
+            against = r;
+        }
+        Option.None {
+            let argv: [3]string = ["git", "show", Text.new(arena).add("HEAD:./").add(rel).str()];
+            match proc.startIn(argv[..], root, arena) {
+                Result.Ok(c) {
+                    let o = c.collect("" as []u8, arena);
+                    // Not in HEAD yet: everything is new.
+                    if o.code == 0 { before = o.outStr(); }
+                }
+                Result.Err(_) { return Result.Err(Text.new(arena).add("run git: ").add(fsx.osError(sys.errno(), arena)).str()); }
+            }
+        }
+    }
+    let was = sceneObjects(before, arena);
+    let is = sceneObjects(now, arena);
+    let d = Diff { against: own(arena, against), added: List<string>.new(arena), removed: List<string>.new(arena), moved: List<string>.new(arena), changed: List<string>.new(arena) };
+    for i in 0..is.len {
+        let o = &is.items[i];
+        let k = find(&was, o.path);
+        if k < 0 {
+            let t = Text.new(arena);
+            t.add(o.path).add(" at ");
+            show(&t, o);
+            d.added.push(t.str());
+            continue;
+        }
+        let w = &was.items[k];
+        let dx = w.x - o.x;
+        let dy = w.y - o.y;
+        let dz = w.z - o.z;
+        let dist = libm.sqrt(dx * dx + dy * dy + dz * dz);
+        if dist > 0.01 {
+            let t = Text.new(arena);
+            t.add(o.path).push(' ');
+            show(&t, w);
+            t.add(" -> ");
+            show(&t, o);
+            t.add(" (");
+            pushFixed(&t, dist, 2);
+            t.add(" m)");
+            d.moved.push(t.str());
+        }
+        let keys = List<string>.new(arena);
+        for j in 0..w.keys.len { keys.push(w.keys.items[j]); }
+        for j in 0..o.keys.len { keys.push(o.keys.items[j]); }
+        sortBy(keys.items[0..keys.len], fn(a: string, b: string): bool { return a < b; });
+        let f = Text.new(arena);
+        let any = false;
+        for j in 0..keys.len {
+            let key = keys.items[j];
+            if j > 0 && key == keys.items[j - 1] { continue; }
+            let x = lookup(w, key);
+            let y = lookup(o, key);
+            let xs = match x { Option.Some(v) { v } Option.None { "(default)" } };
+            let ys = match y { Option.Some(v) { v } Option.None { "(default)" } };
+            let differ = match x {
+                Option.Some(a) { match y { Option.Some(b) { a != b } Option.None { true } } }
+                Option.None { match y { Option.Some(_) { true } Option.None { false } } }
+            };
+            if !differ { continue; }
+            if any { f.add(", "); }
+            any = true;
+            f.add(key).add(" ").add(xs).add(" -> ").add(ys);
+        }
+        if any { d.changed.push(Text.new(arena).add(o.path).add(": ").add(f.str()).str()); }
+    }
+    for i in 0..was.len {
+        let w = &was.items[i];
+        if find(&is, w.path) >= 0 { continue; }
+        let t = Text.new(arena);
+        t.add(w.path).add(" at ");
+        show(&t, w);
+        d.removed.push(t.str());
+    }
+    return Result.Ok(d);
+}
 
 /// Rust `Diff::text`: counts, then up to `cap` lines. → MCP
-pub fn text(d: &Diff, cap: int, out: &Text) {} // STUB SCENE
+pub fn text(d: &Diff, cap: int, out: &Text) {
+    out.pushInt(d.added.len);
+    out.add(" added, ");
+    out.pushInt(d.removed.len);
+    out.add(" removed, ");
+    out.pushInt(d.moved.len);
+    out.add(" moved, ");
+    out.pushInt(d.changed.len);
+    out.add(" changed since ").add(d.against).add("\n");
+    let all = d.added.len + d.removed.len + d.moved.len + d.changed.len;
+    let shown = 0;
+    let lists: [4]&List<string> = [&d.added, &d.removed, &d.moved, &d.changed];
+    let marks: [4]string = ["+ ", "- ", "~ ", "* "];
+    for k in 0..4 {
+        let l = lists[k];
+        for i in 0..l.len {
+            if shown >= cap { break; }
+            out.add(marks[k]).add(l.items[i]).add("\n");
+            shown += 1;
+        }
+    }
+    if all > cap {
+        out.add("... and ");
+        out.pushInt(all - cap);
+        out.add(" more\n");
+    }
+}

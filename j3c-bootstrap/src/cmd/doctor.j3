@@ -1,9 +1,152 @@
-// `j3c doctor`: is this machine ready?
+// `j3c doctor`: is this machine ready to build and run J3 programs? One table of checks, one line each, exit 1
+// when a required one is missing. Linux names; other OSes say what is unchecked.
 //
 // Port of: j3c/src/doctor.rs
+// J3: The check table is data (`CHECKS`), in Rust's order. ponytail: a tool that ends by a signal prints
+// `exit status: 128+N` (`j3.proc` folds the signal into the code) where Rust prints `signal: N (SIGx)`.
 module j3c.cmd.doctor;
 
-use j3c.base.diag;
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, lines, trim };
+use j3c.base.fsx;
+use j3c.editor.frontend;
+use j3c.project.config.J3C_VERSION;
+use j3c.toolchain.hostLibPresent;
 
-/// `j3c doctor ...`: the exit code.
-pub fn doctorCmd(rest: []string): int { return diag.notPortedCmd("doctor"); } // STUB IMG
+/// How a check looks (Rust `Probe`).
+enum Probe {
+    /// A program on PATH; the first line of `<it> --version` is the detail.
+    Tool,
+    /// A shared library the linker can find (`[link] libs` name).
+    Lib,
+    File,
+    CacheWritable,
+}
+
+struct Check {
+    what: string;
+    /// The tool, library or file the probe looks for.
+    arg: string;
+    /// Debian/Ubuntu package.
+    apt: string;
+    probe: Probe;
+    required: bool;
+}
+
+const N: int = 10; // `checks().len`
+
+fn checks(): [10]Check {
+    return [
+        Check { what: "clang (compiles and links every program)", arg: "clang", apt: "clang", probe: Probe.Tool, required: true },
+        Check { what: "ld (linker clang calls)", arg: "ld", apt: "binutils", probe: Probe.Tool, required: true },
+        Check { what: "SDL2 (windows, input, audio)", arg: "SDL2", apt: "libsdl2-2.0-0", probe: Probe.Lib, required: true },
+        Check { what: "libGL (3D, .j3ui, paint)", arg: "GL", apt: "libgl1", probe: Probe.Lib, required: true },
+        Check { what: "SDL2_ttf (text)", arg: "SDL2_ttf", apt: "libsdl2-ttf-2.0-0", probe: Probe.Lib, required: false },
+        Check { what: "SDL2_image (loadTexture)", arg: "SDL2_image", apt: "libsdl2-image-2.0-0", probe: Probe.Lib, required: false },
+        Check { what: "SDL2_mixer (sounds, music)", arg: "SDL2_mixer", apt: "libsdl2-mixer-2.0-0", probe: Probe.Lib, required: false },
+        Check { what: "DejaVu Sans (editor UI font; J3_EDITOR_FONT overrides)", arg: "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            apt: "fonts-dejavu-core", probe: Probe.File, required: false },
+        Check { what: "Noto Color Emoji (emoji fallback in text)", arg: "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+            apt: "fonts-noto-color-emoji", probe: Probe.File, required: false },
+        Check { what: "~/.cache/j3 writable (editor, incremental builds)", arg: "", apt: "", probe: Probe.CacheWritable, required: true }
+    ];
+}
+
+/// `j3c doctor ...`: the exit code (Rust `cmd`; arguments are ignored).
+pub fn doctorCmd(rest: []string): int {
+    let arena = Arena.create(1 << 16);
+    defer arena.destroy();
+    let a = &arena;
+    let t = Text.new(a);
+    t.add("j3c ").add(J3C_VERSION).add(" doctor\n");
+    let linux = sys.PLATFORM == sys.PLATFORM_LINUX;
+    if !linux { t.add("note: only Linux is checked; on this OS the library, font, and package lines are skipped\n"); }
+    let missingRequired = false;
+    let apt = List<string>.new(a);
+    let cs = checks();
+    for i in 0..N {
+        let c = cs[i];
+        let osSpecific = match c.probe { Probe.Lib { true } Probe.File { true } Probe.Tool { false } Probe.CacheWritable { false } };
+        if osSpecific && !linux {
+            t.add("  skip     ").add(c.what).add("\n");
+            continue;
+        }
+        match probe(&c, a) {
+            Result.Ok(detail) {
+                t.add("  ok       ").add(c.what);
+                if detail.len > 0 { t.add(": ").add(detail); }
+                t.add("\n");
+            }
+            Result.Err(why) {
+                t.add("  ").add(if c.required { "MISSING " } else { "optional" }).add(" ").add(c.what).add(": ").add(why);
+                if c.apt.len > 0 && linux { t.add(" (sudo apt install ").add(c.apt).add(")"); }
+                t.add("\n");
+                if c.required { missingRequired = true; }
+                if c.apt.len > 0 { apt.push(c.apt); }
+            }
+        }
+    }
+    if apt.len > 0 && linux {
+        t.add("all at once (Debian/Ubuntu): sudo apt install");
+        for i in 0..apt.len { t.add(" ").add(apt.items[i]); }
+        t.add("\n");
+    }
+    t.add(if missingRequired { "not ready: a required item is missing\n" } else { "ready\n" });
+    let s = t.str();
+    sys.write(1, s.ptr as ptr, s.len);
+    return if missingRequired { 1 } else { 0 };
+}
+
+fn probe(c: &Check, a: &Arena): Result<string, string> {
+    match c.probe {
+        Probe.Tool {
+            let argv: [2]string = [c.arg, "--version"];
+            match proc.run(argv[..], "", a) {
+                Result.Ok(o) {
+                    if o.code == 0 {
+                        for l in lines(o.outStr()) { return Result.Ok(trim(l)); }
+                        return Result.Ok("");
+                    }
+                    let m = Text.new(a);
+                    m.add("`").add(c.arg).add(" --version` exited exit status: ");
+                    m.pushInt(o.code);
+                    return Result.Err(m.str());
+                }
+                Result.Err(_) { return Result.Err("not on PATH"); }
+            }
+        }
+        Probe.Lib {
+            let none = List<string>.new(a);
+            if hostLibPresent(c.arg, &none) { return Result.Ok(""); }
+            return Result.Err("not found");
+        }
+        Probe.File {
+            if fsx.isFile(c.arg) { return Result.Ok(""); }
+            return Result.Err(Text.new(a).add("no ").add(c.arg).str());
+        }
+        Probe.CacheWritable {
+            let dir = "";
+            match frontend.cacheRoot(a) {
+                Option.Some(d) { dir = d; }
+                Option.None { return Result.Err("no XDG_CACHE_HOME or HOME"); }
+            }
+            match io.makeDirs(dir) {
+                Result.Ok(_) {}
+                Result.Err(_) { return Result.Err(Text.new(a).add(dir).add(": ").add(fsx.osError(sys.errno(), a)).str()); }
+            }
+            let p = path.join(dir, Text.new(a).fmt(`.doctor-{sys.getpid()}`).str(), a);
+            match io.writeFile(p, "" as []u8) {
+                Result.Ok(_) {}
+                Result.Err(_) { return Result.Err(Text.new(a).add(dir).add(": ").add(fsx.osError(sys.errno(), a)).str()); }
+            }
+            io.remove(p);
+            return Result.Ok(dir);
+        }
+    }
+}

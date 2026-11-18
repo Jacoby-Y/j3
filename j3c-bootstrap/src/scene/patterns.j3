@@ -1,13 +1,379 @@
 // `add` request parsing: shapes, mesh assets, placed scenes; `place` ring/stairs/spiral/wall as `add` batches.
 //
 // Port of: j3c/src/scene/patterns.rs
+// J3: f64 trig and rounding come from libm (`round` is half away from zero, as Rust's); `to_radians` /
+// `to_degrees` multiply by Rust's constants. Numbers print as Rust's `{}` through `disp` (`pushF64`).
+// ponytail: `pushF64` switches to an exponent from 1e17 up where Rust does not; pieces are never that far out.
+// J3: Rust looks options up in a HashMap (a repeated key: the last wins; the unknown-option error names one at
+// random when there are several); here the first unknown one in argument order is named.
 module j3c.scene.patterns;
 
+use lib "m" as libm {
+    fn cos(x: f64): f64;
+    fn sin(x: f64): f64;
+    fn tan(x: f64): f64;
+    fn atan2(y: f64, x: f64): f64;
+    fn sqrt(x: f64): f64;
+    fn round(x: f64): f64;
+}
+
 use j3.memory.{ Arena, List };
+use j3.option.Option;
 use j3.result.Result;
+use j3.text.{ Text, parseF64, trim };
+use j3c.base.fixed.pushFixed;
+use j3c.base.intern.own;
+
+/// Built-in shapes an `add` takes as its kind (Rust `SHAPES`).
+pub const SHAPES: [9]string = ["cube", "sphere", "cylinder", "cone", "capsule", "torus", "quad", "plane", "sky"];
+/// The `-e scene` ops `patternRequests` builds (Rust `PATTERNS`).
+pub const PATTERNS: [4]string = ["ring", "stairs", "spiral", "wall"];
+
+/// True when `op` is one of `PATTERNS`.
+pub fn isPattern(op: string): bool {
+    for i in 0..PATTERNS.len { if PATTERNS[i] == op { return true; } }
+    return false;
+}
+
+fn endsWith(s: string, suf: string): bool { return s.len >= suf.len && s[s.len - suf.len..s.len] == suf; }
 
 /// Rust `scene::add_what`: `what` (a shape, a mesh file, a scene) as `add` request args. → MCP
-pub fn addWhat(what: string, arena: &Arena): Result<List<string>, string> { return Result.Err("scene: not ported yet"); } // STUB SCENE
+pub fn addWhat(what: string, arena: &Arena): Result<List<string>, string> {
+    let req = List<string>.new(arena);
+    req.push("add");
+    let w = own(arena, what);
+    if endsWith(w, ".j3scene") {
+        req.push("instance");
+        req.push(Text.new(arena).add("scene=").add(w).str());
+    } else if endsWith(w, ".j3mesh") || (w.len >= 8 && w[0..8] == "builtin:") {
+        req.push("mesh");
+        req.push(Text.new(arena).add("asset=").add(w).str());
+    } else {
+        for i in 0..SHAPES.len {
+            if SHAPES[i] == w {
+                req.push(w);
+                return Result.Ok(req);
+            }
+        }
+        return Result.Err(Text.new(arena).add("`").add(w).add("`: expected a .j3scene, .j3mesh, builtin: asset, or shape").str());
+    }
+    return Result.Ok(req);
+}
+
+/// Rust `f64` `{}` (shortest digits that read back; see the header for the exponent ceiling).
+fn disp(t: &Text, x: f64) { t.pushF64(x); }
+
+/// Rust's piece number: thousandths, `0` for zero (and `-0`).
+fn thou(t: &Text, x: f64) {
+    let r = libm.round(x * 1000.0) / 1000.0;
+    if r == 0.0 { t.push('0'); } else { disp(t, r); }
+}
+
+fn rad(deg: f64): f64 { return deg * (3.141592653589793 / 180.0); }
+fn deg(rad: f64): f64 { return rad * (180.0 / 3.141592653589793); }
+fn fract(x: f64): f64 { return x - f64(int(x)); }
+
+/// The options of one pattern call (Rust's `opts` map and its `nums` / `one` closures).
+struct Opts {
+    keys: List<string>;
+    vals: List<string>;
+    op: string;
+    arena: &Arena;
+}
+
+fn get(o: &Opts, key: string): Option<string> {
+    let i = o.keys.len - 1;
+    while i >= 0 {
+        if o.keys.items[i] == key { return Option.Some(o.vals.items[i]); }
+        i -= 1;
+    }
+    return Option.None;
+}
+
+fn has(o: &Opts, key: string): bool {
+    match get(o, key) { Option.Some(_) { return true; } Option.None { return false; } }
+}
+
+fn wantText(key: string, want: int, arena: &Arena): Text {
+    let t = Text.new(arena);
+    t.add(key).add(": expected ");
+    t.pushInt(want);
+    t.add(" number(s)");
+    return t;
+}
+
+/// Rust `nums`: `want` comma-separated numbers under `key`, else `def` (an error when `required`).
+fn nums(o: &Opts, key: string, want: int, def: []f64, required: bool): Result<[]f64, string> {
+    match get(o, key) {
+        Option.Some(v) {
+            // ponytail: a counted slice, not a `List<f64>` (stage0 trips on that instance here)
+            let count = 1;
+            for i in 0..v.len { if v[i] == ',' { count += 1; } }
+            let n = o.arena.alloc::<f64>(count);
+            let k = 0;
+            let j = 0;
+            for i in 0..v.len + 1 {
+                if i == v.len || v[i] == ',' {
+                    match parseF64(trim(v[k..i])) {
+                        Option.Some(x) { n[j] = x; j += 1; }
+                        Option.None { return Result.Err(wantText(key, want, o.arena).str()); }
+                    }
+                    k = i + 1;
+                }
+            }
+            if count != want {
+                let t = wantText(key, want, o.arena);
+                t.add(", got ");
+                t.pushInt(count);
+                return Result.Err(t.str());
+            }
+            return Result.Ok(n);
+        }
+        Option.None {
+            if required { return Result.Err(Text.new(o.arena).add(o.op).add(" needs ").add(key).str()); }
+            let c = o.arena.alloc::<f64>(def.len);
+            for i in 0..def.len { c[i] = def[i]; }
+            return Result.Ok(c);
+        }
+    }
+}
+
+/// Rust `one`: a single number, `key` required when `required`.
+fn one(o: &Opts, key: string, def: f64, required: bool): Result<f64, string> {
+    let d: [1]f64 = [def];
+    let v = nums(o, key, 1, d[..], required)?;
+    return Result.Ok(v[0]);
+}
+
+/// Rust `piece`: one `add` request for `what` at `pos`, turned `yaw` degrees, scaled `size`.
+fn piece(o: &Opts, pos: [3]f64, yaw: f64, size: [3]f64, defaultName: string): Result<List<string>, string> {
+    let a = o.arena;
+    let what = match get(o, "what") { Option.Some(w) { w } Option.None { "cube" } };
+    let req = addWhat(what, a)?;
+    let t = Text.new(a);
+    t.add("pos=");
+    thou(&t, pos[0]); t.push(','); thou(&t, pos[1]); t.push(','); thou(&t, pos[2]);
+    req.push(t.str());
+    t = Text.new(a);
+    t.add("rot=0,");
+    thou(&t, yaw);
+    t.add(",0");
+    req.push(t.str());
+    t = Text.new(a);
+    t.add("scale=");
+    thou(&t, size[0]); t.push(','); thou(&t, size[1]); t.push(','); thou(&t, size[2]);
+    req.push(t.str());
+    let name = match get(o, "name") { Option.Some(n) { n } Option.None { defaultName } };
+    req.push(Text.new(a).add("name=").add(name).str());
+    match get(o, "parent") { Option.Some(p) { req.push(Text.new(a).add("parent=").add(p).str()); } Option.None {} }
+    return Result.Ok(req);
+}
+
+/// The options `op` takes besides what, name, parent (Rust `known`), in `arena`.
+fn known(op: string, arena: &Arena): List<string> {
+    let k = List<string>.new(arena);
+    let all = if op == "ring" { "center radius count y size face arc" }
+        else if op == "stairs" { "from dir steps rise run width solid" }
+        else if op == "spiral" { "center radius steps rise turn start thickness width depth y" }
+        else { "from to height thickness door y" };
+    let a = 0;
+    for i in 0..all.len + 1 {
+        if i == all.len || all[i] == ' ' {
+            k.push(all[a..i]);
+            a = i + 1;
+        }
+    }
+    return k;
+}
 
 /// Rust `scene::pattern_requests`: `place OP key=value...` as one `add` request per object. → MCP
-pub fn patternRequests(op: string, kv: []string, arena: &Arena): Result<List<List<string>>, string> { return Result.Err("scene: not ported yet"); } // STUB SCENE
+pub fn patternRequests(op: string, kv: []string, arena: &Arena): Result<List<List<string>>, string> {
+    let o = Opts { keys: List<string>.new(arena), vals: List<string>.new(arena), op: own(arena, op), arena: arena };
+    for i in 0..kv.len {
+        let a = kv[i];
+        let eq = 0;
+        while eq < a.len && a[eq] != '=' { eq += 1; }
+        if eq == a.len { return Result.Err(Text.new(arena).add(a).add(": expected key=value").str()); }
+        o.keys.push(own(arena, a[0..eq]));
+        o.vals.push(own(arena, a[eq + 1..a.len]));
+    }
+    if !isPattern(op) {
+        return Result.Err(Text.new(arena).add("unknown pattern ").add(op).add("; expected one of ring, stairs, spiral, wall").str());
+    }
+    let ks = known(op, arena);
+    for i in 0..o.keys.len {
+        let k = o.keys.items[i];
+        let ok = k == "what" || k == "name" || k == "parent";
+        for j in 0..ks.len { if ks.items[j] == k { ok = true; } }
+        if !ok {
+            let t = Text.new(arena);
+            t.add(op).add(": unknown option ").add(k).add("; options: ");
+            for j in 0..ks.len { if j > 0 { t.add(", "); } t.add(ks.items[j]); }
+            t.add(", what, name, parent");
+            return Result.Err(t.str());
+        }
+    }
+    let reqs = List<List<string>>.new(arena);
+    if op == "ring" { ring(&o, &reqs)?; }
+    else if op == "stairs" { stairs(&o, &reqs)?; }
+    else if op == "spiral" { spiral(&o, &reqs)?; }
+    else { wall(&o, &reqs)?; }
+    if reqs.len > 2000 {
+        let t = Text.new(arena);
+        t.add(op).add(" makes ");
+        t.pushInt(reqs.len);
+        t.add(" pieces; at most 2000");
+        return Result.Err(t.str());
+    }
+    return Result.Ok(reqs);
+}
+
+fn ring(o: &Opts, reqs: &List<List<string>>): Result<bool, string> {
+    let zero: [2]f64 = [0.0, 0.0];
+    let none: [3]f64 = [0.0, 0.0, 0.0];
+    let c = nums(o, "center", 2, zero[..], false)?;
+    let r = one(o, "radius", 0.0, true)?;
+    let nf = one(o, "count", 0.0, true)?;
+    if nf < 1.0 || nf > 2000.0 || fract(nf) != 0.0 { return Result.Err("count: a whole number from 1 to 2000"); }
+    let n = int(nf);
+    let y = one(o, "y", 0.0, false)?;
+    let face = match get(o, "face") { Option.Some(f) { f } Option.None { "tangent" } };
+    let a0 = 0.0;
+    let a1 = 360.0;
+    let full = true;
+    if has(o, "arc") {
+        let a = nums(o, "arc", 2, none[..], true)?;
+        a0 = a[0];
+        a1 = a[1];
+        full = false;
+    }
+    let step = if full { (a1 - a0) / f64(n) } else if n > 1 { (a1 - a0) / f64(n - 1) } else { 0.0 };
+    let sd: [3]f64 = [1.0, 3.0, 0.0];
+    let s = nums(o, "size", 3, sd[..], false)?;
+    let size: [3]f64 = [s[0], s[1], s[2]];
+    if face == "tangent" && size[2] == 0.0 {
+        // Neighbours overlap at the outer edge, so the wall has no slits.
+        let st = if step < 0.0 { 0.0 - step } else { step };
+        size[2] = 2.0 * (r + size[0]) * libm.tan(rad(st) / 2.0);
+    }
+    if size[2] == 0.0 { size[2] = 1.0; }
+    for i in 0..n {
+        let t = a0 + step * f64(i);
+        let tr = rad(t);
+        let pos: [3]f64 = [c[0] + r * libm.cos(tr), y + size[1] / 2.0, c[1] + r * libm.sin(tr)];
+        // Local +x outward for tangent; local +z outward (out) or inward (in).
+        let yaw = 0.0;
+        if face == "tangent" { yaw = 0.0 - t; }
+        else if face == "out" { yaw = 90.0 - t; }
+        else if face == "in" { yaw = -90.0 - t; }
+        else { return Result.Err(Text.new(o.arena).add("face ").add(face).add(": expected tangent, out, or in").str()); }
+        reqs.push(piece(o, pos, yaw, size, "RingPiece")?);
+    }
+    return Result.Ok(true);
+}
+
+fn stairs(o: &Opts, reqs: &List<List<string>>): Result<bool, string> {
+    let none: [3]f64 = [0.0, 0.0, 0.0];
+    let from = nums(o, "from", 3, none[..], true)?;
+    let dir = match get(o, "dir") { Option.Some(d) { d } Option.None { "z" } };
+    let dx = 0.0;
+    let dz = 0.0;
+    if dir == "x" { dx = 1.0; }
+    else if dir == "-x" { dx = -1.0; }
+    else if dir == "z" { dz = 1.0; }
+    else if dir == "-z" { dz = -1.0; }
+    else { return Result.Err(Text.new(o.arena).add("dir ").add(dir).add(": expected x, -x, z, or -z").str()); }
+    let steps = one(o, "steps", 0.0, true)?;
+    if steps < 1.0 || steps > 500.0 || fract(steps) != 0.0 { return Result.Err("steps: a whole number from 1 to 500"); }
+    let rise = one(o, "rise", 0.4, false)?;
+    let run = one(o, "run", 1.0, false)?;
+    let width = one(o, "width", 2.5, false)?;
+    let solid = match get(o, "solid") { Option.Some(v) { v == "true" } Option.None { true } };
+    for i in 0..int(steps) {
+        let top = from[1] + rise * f64(i + 1);
+        let h = if solid { rise * f64(i + 1) } else { rise };
+        let along = run * (f64(i) + 0.5);
+        let pos: [3]f64 = [from[0] + dx * along, top - h / 2.0, from[2] + dz * along];
+        let size: [3]f64 = [width, h, run];
+        if dx != 0.0 { size[0] = run; size[2] = width; }
+        reqs.push(piece(o, pos, 0.0, size, "Stair")?);
+    }
+    return Result.Ok(true);
+}
+
+fn spiral(o: &Opts, reqs: &List<List<string>>): Result<bool, string> {
+    let zero: [2]f64 = [0.0, 0.0];
+    let c = nums(o, "center", 2, zero[..], false)?;
+    let r = one(o, "radius", 0.0, true)?;
+    let steps = one(o, "steps", 0.0, true)?;
+    if steps < 1.0 || steps > 500.0 || fract(steps) != 0.0 { return Result.Err("steps: a whole number from 1 to 500"); }
+    let rise = one(o, "rise", 0.4, false)?;
+    let turn = one(o, "turn", 20.0, false)?;
+    let start = one(o, "start", 0.0, false)?;
+    let thick = one(o, "thickness", 0.6, false)?;
+    let width = one(o, "width", 2.0, false)?;
+    let depth = one(o, "depth", 1.2, false)?;
+    let y = one(o, "y", 0.0, false)?;
+    for i in 0..int(steps) {
+        let t = start + turn * f64(i);
+        let tr = rad(t);
+        let top = y + rise * f64(i + 1);
+        let pos: [3]f64 = [c[0] + r * libm.cos(tr), top - thick / 2.0, c[1] + r * libm.sin(tr)];
+        let size: [3]f64 = [width, thick, depth];
+        reqs.push(piece(o, pos, 0.0 - t, size, "SpiralStep")?);
+    }
+    return Result.Ok(true);
+}
+
+/// A run along the wall from `s0` to `s1`, bottom `b0` to top `b1` (Rust's `seg` closure).
+fn seg(o: &Opts, reqs: &List<List<string>>, w: []f64, s0: f64, s1: f64, b0: f64, b1: f64): Result<bool, string> {
+    // w: a.x, a.z, ux, uz, y, yaw, thickness
+    if s1 - s0 < 0.001 || b1 - b0 < 0.001 { return Result.Ok(true); }
+    let m = (s0 + s1) / 2.0;
+    let pos: [3]f64 = [w[0] + w[2] * m, w[4] + (b0 + b1) / 2.0, w[1] + w[3] * m];
+    let size: [3]f64 = [s1 - s0, b1 - b0, w[6]];
+    reqs.push(piece(o, pos, w[5], size, "Wall")?);
+    return Result.Ok(true);
+}
+
+fn wall(o: &Opts, reqs: &List<List<string>>): Result<bool, string> {
+    let none: [3]f64 = [0.0, 0.0, 0.0];
+    let a = nums(o, "from", 2, none[..], true)?;
+    let b = nums(o, "to", 2, none[..], true)?;
+    let h = one(o, "height", 3.0, false)?;
+    let t = one(o, "thickness", 1.5, false)?;
+    let y = one(o, "y", 0.0, false)?;
+    let dx = b[0] - a[0];
+    let dz = b[1] - a[1];
+    let len = libm.sqrt(dx * dx + dz * dz);
+    if len < 0.01 { return Result.Err("wall: from and to are the same point"); }
+    let yaw = 0.0 - deg(libm.atan2(dz, dx));
+    let w: [8]f64 = [a[0], a[1], dx / len, dz / len, y, yaw, t, 0.0];
+    if !has(o, "door") {
+        seg(o, reqs, w[..], 0.0, len, 0.0, h)?;
+        return Result.Ok(true);
+    }
+    let d = nums(o, "door", 3, none[..], true)?;
+    let dw = d[0];
+    let dh = d[1];
+    let at = d[2];
+    if at - dw / 2.0 < 0.0 || at + dw / 2.0 > len || dh > h {
+        let m = Text.new(o.arena);
+        m.add("door ");
+        disp(&m, dw);
+        m.add(" wide, ");
+        disp(&m, dh);
+        m.add(" high at ");
+        disp(&m, at);
+        m.add(" does not fit a wall ");
+        pushFixed(&m, len, 2);
+        m.add(" long and ");
+        disp(&m, h);
+        m.add(" high");
+        return Result.Err(m.str());
+    }
+    seg(o, reqs, w[..], 0.0, at - dw / 2.0, 0.0, h)?;
+    seg(o, reqs, w[..], at + dw / 2.0, len, 0.0, h)?;
+    seg(o, reqs, w[..], at - dw / 2.0, at + dw / 2.0, dh, h)?;
+    return Result.Ok(true);
+}

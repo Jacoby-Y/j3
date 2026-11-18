@@ -3,16 +3,29 @@
 // Port of: j3c/src/lsp/query.rs
 // J3: Asks the read-only query functions of `sema` (`sema/query.j3`: by name, as Rust's `ident_at` + `find_*`;
 // plan 11 B2, B12.5) over `Session.checked` instead of walking checker internals. No `use j3c.lower`. A name
-// defined twice may resolve to another match than Rust's fn-table order (B12.5, PORT_DEBT "not copied").
-// J3: Results are allocated in the caller's `arena` (they outlive the Session). Columns are bytes, as Rust.
+// defined twice may resolve to another match than Rust's fn-table order, and a generic template shows its
+// parameter names where Rust shows an instance's types (B12.5, PORT_DEBT "not copied").
+// J3: Results are allocated in the caller's `arena` (they outlive the Session); scratch work goes in the
+// Session's. Columns are bytes, as Rust. `analyze` is Rust `analyze_path`: `Mode.Lib` (no `main` needed, a
+// `.j3s` entry loads as itself), checked to `Stage.Sema`.
 module j3c.lsp.query;
 
+use j3.data.pool.Id;
+use j3.io.path;
 use j3.memory.Arena;
 use j3.option.Option;
 use j3.result.Result;
-use j3c.base.span.Span;
-use j3c.driver.Session;
+use j3.text.{ Text, contains, endsWith, find };
+use j3c.base.intern.own;
+use j3c.base.span.{ Source, Span, isNone, isWholeFile };
+use j3c.driver;
+use j3c.driver.{ Mode, Session, Stage };
 use j3c.load.Overlay;
+use j3c.sema;
+use j3c.sema.{ Checked, Export, FnDecl, StructDecl, TraitDoc, TyList };
+use j3c.syntax.fmt;
+use j3c.syntax.lex;
+use j3c.syntax.token.TokenKind;
 
 pub struct Hover {
     text: string;
@@ -36,21 +49,394 @@ pub struct LspRange {
     end: LspPos;
 }
 
-/// Rust `query::analyze`: a fresh `Mode.Check` Session of the program around `path` with `overlays`, checked to
-/// `Stage.Sema` (the caller frees it). Err = the check failed (the Session is freed). → LSPS, LSPU
-pub fn analyze(path: string, overlays: []Overlay): Result<&Session, string> { return Result.Err("lsp: not ported yet"); } // STUB LSPQ
+/// An identifier under the cursor (Rust `ident_at`'s `(String, Span)`); `name` points into the source.
+pub struct Ident {
+    name: string;
+    span: Span;
+}
+
+/// Rust `query::analyze`: a fresh `Mode.Lib` Session of the program around `path` with `overlays`, checked to
+/// `Stage.Sema` (the caller frees it). Err = the check failed (the Session is freed; the text is fixed, the
+/// diagnostics died with it). → LSPS, LSPU
+pub fn analyze(path: string, overlays: []Overlay): Result<&Session, string> {
+    let o = driver.defaults();
+    o.entry = path;
+    o.entryGiven = true;
+    o.mode = Mode.Lib;
+    o.overlays = Option.Some(overlays);
+    let s = Session.new(o);
+    if driver.run(s, Stage.Sema) {
+        match s.checked { Option.Some(_) { return Result.Ok(s); } Option.None {} }
+    }
+    s.free();
+    return Result.Err("the check failed");
+}
+
+/// The checked tables of `s` (None when the check did not finish).
+pub fn checkedOf(s: &Session): Option<&Checked> { return s.checked; }
+
+/// Rust `file_by_path` (`paths_eq`: the same text, else the same canonical path).
+pub fn fileOf(s: &Session, p: string): Option<Id<Source>> {
+    let c = s.checked?;
+    match sema.fileByPath(c, &s.sources, p) { Option.Some(f) { return Option.Some(f); } Option.None {} }
+    let canon = path.realpath(p, s.arena)?;
+    for i in 0..s.sources.len() {
+        let id = s.sources.idAt(i);
+        match path.realpath(s.sources.get(id).path, s.arena) {
+            Option.Some(q) { if q == canon { return Option.Some(id); } }
+            Option.None {}
+        }
+    }
+    return Option.None;
+}
 
 /// Rust `query::hover`: markdown `\`\`\`j3\n<kind> name: ty\n\`\`\`` then the doc. → LSPS, LSPU
-pub fn hover(s: &Session, path: string, offset: u32, arena: &Arena): Option<Hover> { return Option.None; } // STUB LSPQ
+pub fn hover(s: &Session, p: string, offset: u32, arena: &Arena): Option<Hover> {
+    let c = s.checked?;
+    let file = fileOf(s, p)?;
+    let src = s.sources.get(file).text;
+    match charHover(s, src, file, offset, arena) { Option.Some(h) { return Option.Some(h); } Option.None {} }
+    let id = identAt(src, file, offset)?;
+    let name = id.name;
+    let span = id.span;
+    let t = Text.new(arena);
+    if name == "dyn" {
+        let n = afterDyn(src, span)?;
+        let td = findTraitDoc(s, file, n)?;
+        traitHover(&td, true, &t);
+        return Option.Some(Hover { text: t.str(), span: span });
+    }
+    match sema.findLocal(c, file, offset, name) {
+        Option.Some(l) {
+            let loc = c.typed.locals.get(l);
+            t.add("```j3\n").add(if loc.param { "param" } else { "let" }).add(" ").add(name).add(": ");
+            sema.tyString(c, loc.ty, &t);
+            t.add("\n```");
+            withDoc(&t, loc.doc);
+            return Option.Some(Hover { text: t.str(), span: loc.span });
+        }
+        Option.None {}
+    }
+    if endsWith(s.sources.get(file).path, ".j3s") {
+        match scriptIn(c, file) {
+            Option.Some(sid) {
+                let sd = c.tables.structAt(sid);
+                for k in 0..sd.fields.len {
+                    let f = sd.fields.items[k];
+                    if c.tables.str(f.name) != name { continue; }
+                    t.add("```j3\n").add(if k < sd.propSpans.len { "prop" } else { "state" }).add(" ").add(name).add(": ");
+                    sema.tyString(c, f.ty, &t);
+                    t.add("\n```");
+                    return Option.Some(Hover { text: t.str(), span: span });
+                }
+                let gs = &c.tables.globals;
+                for k in 0..gs.len() {
+                    let g = gs.get(gs.idAt(k));
+                    if g.span.file != file || c.tables.str(g.name) != name { continue; }
+                    t.add("```j3\nshared ").add(name).add(": ");
+                    sema.tyString(c, g.ty, &t);
+                    t.add("\n```");
+                    return Option.Some(Hover { text: t.str(), span: span });
+                }
+            }
+            Option.None {}
+        }
+    }
+    match aliasAt(c, file, name) {
+        Option.Some(sid) {
+            scriptHover(c, sid, &t);
+            return Option.Some(Hover { text: t.str(), span: span });
+        }
+        Option.None {}
+    }
+    match sema.lookupFn(c, name, file) {
+        Option.Some(f) {
+            let fd = c.tables.fnAt(f);
+            t.add("```j3\n");
+            sema.sigTextAt(c, f, recvArgs(c, f), &t);
+            t.add("\n```\n");
+            let mp = c.tables.modAt(fd.owner).key;
+            if mp.len > 0 { t.add("*").add(mp).add(".").add(name).add("*"); }
+            withDoc(&t, fd.doc);
+            return Option.Some(Hover { text: t.str(), span: span });
+        }
+        Option.None {}
+    }
+    match sema.findStruct(c, name) {
+        Option.Some(sid) {
+            let sd = c.tables.structAt(sid);
+            match sd.scriptPath {
+                Option.Some(_) {
+                    scriptHover(c, sid, &t);
+                    return Option.Some(Hover { text: t.str(), span: span });
+                }
+                Option.None {}
+            }
+            t.add("```j3\nstruct ").add(c.tables.str(sd.name)).add("\n```\n").add(c.tables.modAt(sd.owner).key);
+            withDoc(&t, sd.doc);
+            return Option.Some(Hover { text: t.str(), span: span });
+        }
+        Option.None {}
+    }
+    match sema.findEnum(c, name) {
+        Option.Some(eid) {
+            let ed = c.tables.enumAt(eid);
+            t.add("```j3\nenum ").add(c.tables.str(ed.name)).add("\n```\n").add(c.tables.modAt(ed.owner).key);
+            withDoc(&t, ed.doc);
+            return Option.Some(Hover { text: t.str(), span: span });
+        }
+        Option.None {}
+    }
+    match findTraitDoc(s, file, name) {
+        Option.Some(td) {
+            traitHover(&td, false, &t);
+            return Option.Some(Hover { text: t.str(), span: span });
+        }
+        Option.None {}
+    }
+    match sema.findGlobal(c, name) {
+        Option.Some(gid) {
+            let g = c.tables.globalAt(gid);
+            t.add("```j3\nlet ").add(c.tables.str(g.name)).add(": ");
+            sema.tyString(c, g.ty, &t);
+            t.add("\n```");
+            withDoc(&t, g.doc);
+            return Option.Some(Hover { text: t.str(), span: span });
+        }
+        Option.None {}
+    }
+    match findConstDoc(s, src, name) {
+        Option.Some(e) {
+            t.add("```j3\nconst ").add(name).add("\n```\n*").add(e.modPath).add("*");
+            withDoc(&t, e.doc);
+            return Option.Some(Hover { text: t.str(), span: span });
+        }
+        Option.None {}
+    }
+    match sema.findField(c, name) {
+        Option.Some(sid) {
+            let sd = c.tables.structAt(sid);
+            for k in 0..sd.fields.len {
+                let f = sd.fields.items[k];
+                if c.tables.str(f.name) != name { continue; }
+                t.add("```j3\n").add(c.tables.str(sd.name)).add(".").add(name).add(": ");
+                sema.fieldTyString(c, sid, k, &t);
+                t.add("\n```");
+                withDoc(&t, f.doc);
+                return Option.Some(Hover { text: t.str(), span: span });
+            }
+        }
+        Option.None {}
+    }
+    t.add("`").add(name).add("`");
+    return Option.Some(Hover { text: t.str(), span: span });
+}
 
 /// Rust `query::definition`. → LSPS, LSPU
-pub fn definition(s: &Session, path: string, offset: u32, arena: &Arena): Option<Location> { return Option.None; } // STUB LSPQ
+pub fn definition(s: &Session, p: string, offset: u32, arena: &Arena): Option<Location> {
+    let c = s.checked?;
+    let file = fileOf(s, p)?;
+    let src = s.sources.get(file).text;
+    match scriptPathAt(src, offset) {
+        Option.Some(rel) {
+            for i in 0..s.sources.len() {
+                let id = s.sources.idAt(i);
+                let fp = s.sources.get(id).path;
+                if pathEndsWith(fp, rel) { return Option.Some(Location { path: own(arena, fp), span: Span { file: id, lo: 0, hi: 0 } }); }
+            }
+        }
+        Option.None {}
+    }
+    let id = identAt(src, file, offset)?;
+    let name = id.name;
+    if name == "dyn" { name = afterDyn(src, id.span)?; }
+    match aliasAt(c, file, name) { Option.Some(sid) { return locOf(s, c.tables.structAt(sid).span, arena); } Option.None {} }
+    match sema.findLocal(c, file, offset, name) { Option.Some(l) { return locOf(s, c.typed.locals.get(l).span, arena); } Option.None {} }
+    match sema.lookupFn(c, name, file) { Option.Some(f) { return locOf(s, c.tables.fnAt(f).span, arena); } Option.None {} }
+    match sema.findStruct(c, name) { Option.Some(x) { return locOf(s, c.tables.structAt(x).span, arena); } Option.None {} }
+    match sema.findEnum(c, name) { Option.Some(x) { return locOf(s, c.tables.enumAt(x).span, arena); } Option.None {} }
+    match findTraitDoc(s, file, name) { Option.Some(td) { return locOf(s, td.span, arena); } Option.None {} }
+    match sema.findGlobal(c, name) { Option.Some(x) { return locOf(s, c.tables.globalAt(x).span, arena); } Option.None {} }
+    return Option.None;
+}
 
-/// Rust `query::format_file` (`syntax.fmt`). → LSPS
-pub fn formatFile(src: string, arena: &Arena): Result<string, string> { return Result.Err("lsp: not ported yet"); } // STUB LSPQ
+/// The type arguments a method of a generic struct is shown at: the struct's first instance (Rust's first
+/// func of that name is an instance's), else none.
+pub fn recvArgs(c: &Checked, f: Id<FnDecl>): Id<TyList> {
+    match c.tables.fnAt(f).recv {
+        Option.Some(r) {
+            match c.tables.structAt(r).gen { Option.Some(_) { return sema.firstInstance(c, r); } Option.None {} }
+        }
+        Option.None {}
+    }
+    return c.tables.common.none;
+}
+
+/// The script struct declared in `file` (a `.j3s`), if any.
+pub fn scriptIn(c: &Checked, file: Id<Source>): Option<Id<StructDecl>> {
+    let ss = &c.tables.structs;
+    for i in 0..ss.len() {
+        let sd = ss.get(ss.idAt(i));
+        if sd.span.file != file { continue; }
+        match sd.scriptPath { Option.Some(_) { return Option.Some(ss.idAt(i)); } Option.None {} }
+    }
+    return Option.None;
+}
+
+/// `const name = @script("..");` in `file`: the script struct it names.
+fn aliasAt(c: &Checked, file: Id<Source>, name: string): Option<Id<StructDecl>> {
+    for i in 0..c.scriptAliases.len {
+        let a = c.scriptAliases.items[i];
+        if a.file == file && c.tables.str(a.name) == name { return Option.Some(a.decl); }
+    }
+    return Option.None;
+}
+
+/// Rust `script_hover`: the script's props (required or default) and its `pub fn`s.
+fn scriptHover(c: &Checked, sid: Id<StructDecl>, t: &Text) {
+    let sd = c.tables.structAt(sid);
+    t.add("```j3\nscript ").add(c.tables.str(sd.name)).add("\n");
+    let n = sd.propSpans.len;
+    if n > sd.fields.len { n = sd.fields.len; }
+    for k in 0..n {
+        let f = sd.fields.items[k];
+        t.add("  prop ").add(c.tables.str(f.name)).add(": ");
+        sema.tyString(c, f.ty, t);
+        match f.default { Option.Some(_) { t.add(" (default)\n"); } Option.None { t.add(" (required)\n"); } }
+    }
+    let fns = &c.tables.fns;
+    for i in 0..fns.len() {
+        let fd = fns.get(fns.idAt(i));
+        if !fd.visPub { continue; }
+        match fd.recv {
+            Option.Some(r) {
+                if r != sid { continue; }
+                t.add("  pub fn ").add(c.tables.str(fd.name)).add("(");
+                for k in 1..fd.params.len {
+                    if k > 1 { t.add(", "); }
+                    sema.tyString(c, fd.params.items[k].ty, t);
+                }
+                t.add(")");
+                if fd.ret != c.tables.common.void { t.add(": "); sema.tyString(c, fd.ret, t); }
+                t.add("\n");
+            }
+            Option.None {}
+        }
+    }
+    t.add("```");
+}
+
+/// Rust `script_path_at`: the path inside `@script("..")` under `offset`.
+pub fn scriptPathAt(src: string, offset: u32): Option<string> {
+    let tag = "@script";
+    let base = 0;
+    while base < src.len {
+        let at = find(src[base..], tag);
+        if at < 0 { return Option.None; }
+        let after = base + at + tag.len;
+        let q = find(src[after..], "\"");
+        if q < 0 { return Option.None; }
+        let start = after + q + 1;
+        let e = find(src[start..], "\"");
+        if e < 0 { return Option.None; }
+        let end = start + e;
+        if int(offset) >= start && int(offset) <= end { return Option.Some(src[start..end]); }
+        base = base + at + 1;
+    }
+    return Option.None;
+}
+
+/// Rust `Path::ends_with`: the components of `p` end with those of `rel` (`./` and empty parts skipped).
+fn pathEndsWith(p: string, rel: string): bool {
+    let r = rel;
+    while r.len >= 2 && r[0] == '.' && r[1] == '/' { r = r[2..]; }
+    if r.len == 0 { return false; }
+    if !endsWith(p, r) { return false; }
+    return p.len == r.len || p[p.len - r.len - 1] == '/';
+}
+
+/// Rust `query::format_file` (`fmt::format_src`). → LSPS
+pub fn formatFile(src: string, arena: &Arena): Result<string, string> { return fmt.format(src, arena); }
+
+/// Rust `diag::loc`: 1-based line and byte column of `off` (clamped to `src`).
+fn loc(src: string, off: u32): LspPos {
+    let n = int(off);
+    if n > src.len { n = src.len; }
+    let line = 1;
+    let lineStart = 0;
+    for i in 0..n {
+        if src[i] == '\n' { line += 1; lineStart = i + 1; }
+    }
+    return LspPos { line: u32(line), col: u32(n - lineStart + 1) };
+}
 
 /// Rust `query::range_of`: `span` as LSP lines and byte columns in `src`. → LSPS, LSPU
-pub fn rangeOf(src: string, span: Span): LspRange { return LspRange { start: LspPos { line: 0, col: 0 }, end: LspPos { line: 0, col: 0 } }; } // STUB LSPQ
+pub fn rangeOf(src: string, span: Span): LspRange {
+    let a = loc(src, span.lo);
+    let b = loc(src, span.hi);
+    return LspRange { start: LspPos { line: a.line - 1, col: a.col - 1 }, end: LspPos { line: b.line - 1, col: b.col - 1 } };
+}
 
 /// Rust `query::offset_at`: the byte offset of (line, col) in `src`, clamped. → LSPS, LSPU
-pub fn offsetAt(src: string, line: u32, col: u32): u32 { return 0; } // STUB LSPQ
+pub fn offsetAt(src: string, line: u32, col: u32): u32 {
+    let n = u32(src.len);
+    if line == 0 { return if col < n { col } else { n }; }
+    let cur = u32(0);
+    for i in 0..src.len {
+        if src[i] == '\n' {
+            cur += 1;
+            if cur == line {
+                let at = u32(i + 1) + col;
+                return if at < n { at } else { n };
+            }
+        }
+    }
+    return n;
+}
+
+/// Rust `ident_at`: the identifier at (or just before) `offset`.
+pub fn identAt(src: string, file: Id<Source>, offset: u32): Option<Ident> {
+    if src.len == 0 { return Option.None; }
+    let i = int(offset);
+    if i > src.len - 1 { i = src.len - 1; }
+    if !isIdentByte(src[i]) {
+        if i > 0 && isIdentByte(src[i - 1]) { i -= 1; } else { return Option.None; }
+    }
+    let lo = i;
+    while lo > 0 && isIdentByte(src[lo - 1]) { lo -= 1; }
+    let hi = i + 1;
+    while hi < src.len && isIdentByte(src[hi]) { hi += 1; }
+    return Option.Some(Ident { name: src[lo..hi], span: Span { file: file, lo: u32(lo), hi: u32(hi) } });
+}
+
+fn isIdentByte(b: u8): bool {
+    return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_';
+}
+
+/// Rust `find_const`: a `const` named `name`, the one whose module `src` mentions first.
+fn findConstDoc(s: &Session, src: string, name: string): Option<Export> {
+    let c = s.checked?;
+    let all = sema.constDocs(c, s.arena);
+    let first: Option<Export> = Option.None;
+    let found = false;
+    for i in 0..all.len {
+        let e = all.items[i];
+        if e.name != name { continue; }
+        if contains(src, e.modPath) { return Option.Some(e); }
+        if !found { first = Option.Some(e); found = true; }
+    }
+    return first;
+}
+
+/// Rust `with_doc`: a blank line, then `doc`, when there is one.
+fn withDoc(t: &Text, doc: string) {
+    if doc.len == 0 { return; }
+    if t.len() == 0 || t.str()[t.len() - 1] != '\n' { t.add("\n"); }
+    t.add("\n").add(doc);
+}
+
+/// Rust `loc_of`: a span's file path and the span (None for a span with no position).
+fn locOf(s: &Session, span: Span, arena: &Arena): Option<Location> {
+    if isNone(span) || isWholeFile(span) { return Option.None; }
+    return Option.Some(Location { path: own(arena, s.sources.get(span.file).path), span: span });
+}

@@ -1,0 +1,125 @@
+// `cmd/golden` (Rust `golden.rs` tests): parse, malformed lines, verdicts, and a hung child whose own child
+// dies with its process group.
+module golden_test;
+
+use j3.io;
+use j3.io.printLn;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.sys.panic;
+use j3.text.{ Text, startsWith, trim };
+use j3c.base.toml.Pair;
+use j3c.cmd.golden;
+use j3c.cmd.golden.{ Spawn, Tbl };
+
+fn errOf(src: string, a: &Arena): string {
+    match golden.parse(src, a) {
+        Result.Ok(_) { return ""; }
+        Result.Err(e) { return e; }
+    }
+}
+
+fn starts(src: string, want: string, a: &Arena) {
+    let e = errOf(src, a);
+    if !startsWith(e, want) {
+        printLn(`got {e}`);
+        printLn(`want {want}`);
+        panic("parse error differs");
+    }
+}
+
+fn isOk(r: Result<bool, string>): bool {
+    match r { Result.Ok(_) { return true; } Result.Err(_) { return false; } }
+}
+
+fn errText(r: Result<bool, string>): string {
+    match r { Result.Ok(_) { return ""; } Result.Err(e) { return e; } }
+}
+
+fn getOr(t: &Tbl, k: string): string {
+    match t.get(k) { Option.Some(v) { return v; } Option.None { return "-"; } }
+}
+
+fn main() {
+    let a = Arena.create(1 << 20);
+    // parses_defaults_states_and_env
+    match golden.parse("[defaults]\nframe = 4 # x\n[state.a]\ntol = 2\n[state.a.env]\nA = \"1\"\nB = \"x, y\"\n[check.c]\n[state.d-e]\n", &a) {
+        Result.Ok(t) {
+            if t.len != 4 { panic("want 4 tables"); }
+            if getOr(&t.items[0], "frame") != "4" { panic("defaults frame"); }
+            if t.items[1].kind != "state" || t.items[1].name != "a" || getOr(&t.items[1], "tol") != "2" { panic("state.a"); }
+            let env = t.items[1].env;
+            if env.len != 2 || env.items[0].key != "A" || env.items[0].value != "1" || env.items[1].key != "B" || env.items[1].value != "x, y" { panic("state.a.env"); }
+            if t.items[2].kind != "check" || t.items[3].name != "d-e" { panic("kinds"); }
+        }
+        Result.Err(e) { printLn(e); panic("parse failed"); }
+    }
+    // malformed_files_name_the_line
+    starts("[state.a]\nfram = 3\n", "golden.toml:2: unknown key `fram`", &a);
+    starts("[state.a]\n[state.b]\n[state.a]\n", "golden.toml:3: [state.a] appears twice", &a);
+    starts("[state.a]\n[check.a]\n", "golden.toml:2: the name `a` is used twice", &a);
+    starts("[state.a]\ntol = \"x\n", "golden.toml:2:", &a);
+    starts("[state.a]\ntol = high\n", "golden.toml:2: `tol` wants a whole number", &a);
+    starts("[state.a]\ntol = [\"1\"]\n", "golden.toml:2:", &a);
+    starts("[stat.a]\n", "golden.toml:1: unknown section", &a);
+    starts("[state.a]\ntol = 1\ntol = 2\n", "golden.toml:3: `tol` is set twice", &a);
+    starts("[defaults]\ntext = \"x\"\n", "golden.toml:2: unknown key `text` in [defaults]", &a);
+    starts("[state.a.env]\n", "golden.toml:1: unknown section [state.a.env]", &a);
+    // verdicts
+    if !isOk(golden.judge(true, true, Result.Ok(0), 0, &a)) { panic("judge 0"); }
+    if errText(golden.judge(true, true, Result.Ok(3), 2, &a)) != "3 pixels differ" { panic("judge 3>2"); }
+    if !isOk(golden.judge(true, true, Result.Ok(3), 3, &a)) { panic("judge 3<=3"); }
+    if !startsWith(errText(golden.judge(false, true, Result.Ok(0), 0, &a)), "no golden yet") { panic("judge no golden"); }
+    if isOk(golden.judge(true, false, Result.Ok(0), 0, &a)) { panic("judge no capture"); }
+    if isOk(golden.judge(true, true, Result.Err("size differs"), 0, &a)) { panic("judge size"); }
+    if !isOk(golden.judgeCheck(Option.Some(0), "PASS a\n", &a)) { panic("check pass"); }
+    if errText(golden.judgeCheck(Option.Some(0), "x\nFAIL b\n", &a)) != "FAIL b" { panic("check FAIL line"); }
+    if errText(golden.judgeCheck(Option.Some(1), "", &a)) != "rc 1" { panic("check rc"); }
+    if isOk(golden.judgeCheck(Option.None, "", &a)) { panic("check timeout"); }
+    // a_hung_child_and_its_children_are_killed (pid file in target/, cwd = j3c-bootstrap/)
+    let pidFile = "target/unit/golden/kill_test.pid";
+    let sp = Spawn { argv: List<string>.new(&a), env: List<Pair>.new(&a), unset: List<string>.new(&a), cwd: ".", out: 1, group: true };
+    sp.argv.push("/bin/sh");
+    sp.argv.push("-c");
+    sp.argv.push(`sleep 30 & echo $! > {pidFile}; wait`);
+    sp.env.push(Pair { key: "J3_GOLDEN_TEST", value: "1" });
+    match golden.spawn(&sp, &a) {
+        Result.Ok(ch) {
+            let none: [1]i64 = [0];
+            sys.pollFds(&none[0] as ptr, 0, 300);
+            match golden.waitOrKill(ch.pid, 100) { Option.Some(_) { panic("hung child not killed"); } Option.None {} }
+        }
+        Result.Err(_) { panic("cannot start sh"); }
+    }
+    let none: [1]i64 = [0];
+    sys.pollFds(&none[0] as ptr, 0, 200);
+    let pid = match io.readFile(pidFile, &a) { Result.Ok(b) { trim(b as string) } Result.Err(_) { "" } };
+    if pid.len == 0 { panic("no pid file"); }
+    let st = match io.readFile(Text.new(&a).add("/proc/").add(pid).add("/stat").str(), &a) { Result.Ok(b) { b as string } Result.Err(_) { "" } };
+    let zombie = false;
+    for i in 0..st.len - 1 { if st.len > 1 && st[i] == ')' && st[i + 1] == ' ' && i + 2 < st.len && st[i + 2] == 'Z' { zombie = true; } }
+    if st.len > 0 && !zombie { printLn(st); panic("grandchild still alive"); }
+    io.remove(pidFile);
+    // the env change reaches the child; the exec failure comes back as an errno
+    let bad = Spawn { argv: List<string>.new(&a), env: List<Pair>.new(&a), unset: List<string>.new(&a), cwd: ".", out: -1, group: false };
+    bad.argv.push("/nonexistent/j3c");
+    match golden.spawn(&bad, &a) { Result.Ok(_) { panic("spawned a missing program"); } Result.Err(e) { if e != 2 { panic("want ENOENT"); } } }
+    let echo = Spawn { argv: List<string>.new(&a), env: List<Pair>.new(&a), unset: List<string>.new(&a), cwd: "/", out: -1, group: false };
+    echo.argv.push("/bin/sh");
+    echo.argv.push("-c");
+    echo.argv.push("echo \"$J3_GOLDEN_X:$HOME_UNSET_X:$(pwd)\"; echo e >&2");
+    echo.env.push(Pair { key: "J3_GOLDEN_X", value: "old" });
+    echo.env.push(Pair { key: "J3_GOLDEN_X", value: "new" });
+    sys.setenv("HOME_UNSET_X", "leak");
+    echo.unset.push("HOME_UNSET_X");
+    match golden.spawn(&echo, &a) {
+        Result.Ok(ch) {
+            let o = ch.collect("" as []u8, &a);
+            if o.outStr() != "new::/\n" || o.errStr() != "e\n" || o.code != 0 { printLn(o.outStr()); panic("env/cwd/pipes differ"); }
+        }
+        Result.Err(_) { panic("cannot start sh"); }
+    }
+    a.destroy();
+}

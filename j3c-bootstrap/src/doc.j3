@@ -3,15 +3,459 @@
 // Port of: j3c/src/doc/mod.rs, (stdlib/mod.rs `docs_id`, `provenance`)
 // J3: One module in parts (`doc/load`, `pages`, `render`, `search`): Rust's `doc/*` use `super::*` with cycles.
 // J3: Verbatim pages (`doc/pages/*.md`) stay `@embed`ded from `j3c/src/doc/pages/` until C6; prose that is Rust
-// code today (`lang`, `j3ui` pages) moves to `text/doc/`. The `docs` id hashes this binary's embedded stdlib and
-// page text (Rust hashes its own `.rs` sources too, so the ids never match: `tests/diff.sh tool` masks it).
+// code today (`lang`, `j3ui` pages, the usage text) moves to `text/doc/`. The `docs` id hashes this binary's
+// embedded stdlib and page text (Rust hashes its own `.rs` sources too, so the ids never match: `tests/diff.sh
+// tool` masks it).
+// J3: `GUIDES` is one string per page, its name then its aliases, space-separated (stage 0 has no ragged const
+// tables). Recipes come from `cmd/guide` (NEW).
 module j3c.doc;
 
-use j3.memory.Arena;
+use j3.cmp.sortBy;
+use j3.data.pool.{ Id, Pool };
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text;
+use j3.text.{ Text, contains, endsWith, startsWith, trim, trimEnd };
 use j3c.base.diag;
+use j3c.base.diag.{ Diags, Severity };
+use j3c.base.fsx;
+use j3c.base.intern.{ Names, Sym };
+use j3c.base.span.{ Source, Span };
+use j3c.cmd.guide;
+use j3c.load;
+use j3c.load.scene_registry;
+use j3c.load.scene_scan;
+use j3c.load.scene_scan.Scan;
+use j3c.project.manifest;
+use j3c.project.manifest.{ Input, Manifest };
+use j3c.syntax.ast.{ Ast, EnumItem, Expr, FieldItem, File, FnItem, Ident, Item, Param, StructItem, Type };
+use j3c.syntax.extend;
+use j3c.syntax.parse;
+use j3c.syntax.token;
+use j3c.syntax.token.{ NameList, ParseError };
+use j3c.ui.icons;
+
+/// Stdlib files that are not modules a game reads (platform variants, build-only files).
+const HIDDEN: [23]string = ["game_headless.j3", "build_release.j3", "sys_windows.j3", "sys_macos.j3", "sys_android.j3",
+    "apkassets.j3", "netsys.j3", "netsys_windows.j3", "netsys_macos.j3", "netsys_android.j3", "threadsys.j3",
+    "threadsys_windows.j3", "threadsys_android.j3", "sys_web.j3", "netsys_web.j3", "threadsys_web.j3", "winsys.j3",
+    "proc_windows.j3", "instance_windows.j3", "pty_windows.j3", "watch_windows.j3", "watch_other.j3", "hotkey_windows.j3"];
+
+/// Public so the runtime or editor can reach them, but not what a game calls (module key prefixes).
+const INTERNAL: [4]string = ["j3.scene3d.editor.", "j3.j2.", "j3.script", "j3.gfx.urp.shaders"];
+
+/// Guide pages by name, then aliases, so `docCmd` and `search` share one list (Rust `GUIDES`).
+const GUIDES: [16]string = ["lang", "j3ui", "j3ui-immediate @j3ui", "css",
+    "testing test headless golden goldens imgdiff", "editor", "urp", "threads thread", "term terminal tui",
+    "i18n locale locales translation l10n", "ship dist deb packaging release",
+    "packages package deps dependencies lib lock git pkg commands dist_outputs tools", "android apk",
+    "steam steamworks", "j2 mods modding", "shaders shader glsl"];
+
+/// The generated scripts module (`load/scene_scripts.j3` `SCENE_MODULE`).
+const SCRIPTS_MODULE: string = "j3.scene3d.scripts";
+
+fn out(s: string) { sys.write(1, s.ptr as ptr, s.len); }
+fn errOut(s: string) { sys.write(2, s.ptr as ptr, s.len); }
 
 /// `j3c doc [...]`: Rust `doc::cmd`.
-pub fn docCmd(rest: []string): int { return diag.notPortedCmd("doc"); } // STUB DOC
+pub fn docCmd(rest: []string): int {
+    let mem = Arena.create(1 << 20);
+    defer mem.destroy();
+    let a = &mem;
+    let args = List<string>.new(a);
+    let short = false;
+    for i in 0..rest.len {
+        let x = rest[i];
+        if x == "--help" || x == "-h" { out(USAGE_TXT); return 0; }
+        if x == "--short" || x == "-s" { short = true; continue; }
+        if startsWith(x, "-") {
+            errOut(Text.new(a).add("j3c: unknown flag `").add(x).add("`\n").str());
+            return 1;
+        }
+        args.push(x);
+    }
+    let r = run(args, short, a);
+    match r {
+        Result.Ok(s) {
+            out(s);
+            if !endsWith(s, "\n") { out("\n"); }
+            return 0;
+        }
+        Result.Err(e) {
+            errOut(Text.new(a).add("j3c: ").add(e).add("\n").str());
+            return 1;
+        }
+    }
+}
 
-/// Rust `stdlib::docs_id`: 8 lower-case hex digits (FNV-1a 64 `>> 32`, printed with `pushHex`). → `cmd/info` (version --verbose)
-pub fn docsId(arena: &Arena): string { return "00000000"; } // STUB DOC
+/// What `j3c doc ARGS [--short]` prints (Ok, stdout) or its error (Err, after `j3c: `), in `arena`.
+pub fn docText(args: []string, short: bool, arena: &Arena): Result<string, string> {
+    let l = List<string>.new(arena);
+    for i in 0..args.len { l.push(args[i]); }
+    return run(l, short, arena);
+}
+
+/// The text of guide page `name` (or an alias), if there is one (Rust `guide`).
+pub fn guideText(name: string, arena: &Arena): Option<string> {
+    let g = guideIndex(name);
+    if g < 0 { return Option.None; }
+    return Option.Some(guidePage(g, arena));
+}
+
+/// What `docCmd` prints for `args` (Rust `cmd`'s `match`).
+fn run(args: List<string>, short: bool, a: &Arena): Result<string, string> {
+    let n = args.len;
+    if n == 0 { return index(a); }
+    let x = args.items[0];
+    let g = guideIndex(x);
+    if n == 1 && g >= 0 {
+        let page = guidePage(g, a);
+        return Result.Ok(if short { toc(x, page, a) } else { page });
+    }
+    if n == 2 && g >= 0 { return guideSection(x, g, args.items[1], a); }
+    if x == "icons" || x == "icon" {
+        if n == 1 { return Result.Ok(iconsPage("", a)); }
+        if n == 2 { return Result.Ok(iconsPage(args.items[1], a)); }
+    }
+    if x == "recipes" || x == "recipe" {
+        if n == 1 { return Result.Ok(guide.recipeIndex(a)); }
+        if n == 2 { return guide.recipe(args.items[1], a); }
+    }
+    if n == 2 && x == "search" { return search(args.items[1], a); }
+    if n == 1 && endsWith(x, ".j3s") {
+        let px = newPx(a);
+        return scriptDoc(&px, x);
+    }
+    if n == 1 { return lookup(x, Option.None, short, a); }
+    if n == 2 { return lookup(x, Option.Some(args.items[1]), short, a); }
+    return Result.Err(trimEnd(USAGE_TXT));
+}
+
+/// The first space-separated word of `s`.
+fn firstWord(s: string): string {
+    let k = text.find(s, " ");
+    return if k < 0 { s } else { s[0..k] };
+}
+
+/// The `GUIDES` index naming `name` (a page or an alias), or -1.
+fn guideIndex(name: string): int {
+    for g in 0..GUIDES.len {
+        let s = GUIDES[g];
+        let i = 0;
+        while i < s.len {
+            let e = i;
+            while e < s.len && s[e] != ' ' { e += 1; }
+            if s[i..e] == name { return g; }
+            i = e + 1;
+        }
+    }
+    return -1;
+}
+
+/// The text of guide page `g` (Rust `guide`).
+fn guidePage(g: int, a: &Arena): string {
+    let name = firstWord(GUIDES[g]);
+    if name == "lang" { return langPage(a); }
+    if name == "j3ui" { return J3UI_PAGE; }
+    if name == "j3ui-immediate" { return j3uiPage(a); }
+    if name == "css" { return CSS_PAGE; }
+    if name == "testing" { return TESTING_PAGE; }
+    if name == "editor" { return editorPage(a); }
+    if name == "urp" { return urpPage(a); }
+    if name == "threads" { return THREADS_PAGE; }
+    if name == "term" { return TERM_PAGE; }
+    if name == "i18n" { return I18N_PAGE; }
+    if name == "ship" { return SHIP_PAGE; }
+    if name == "packages" { return PACKAGES_PAGE; }
+    if name == "shaders" { return SHADERS_PAGE; }
+    if name == "steam" { return STEAM_PAGE; }
+    if name == "j2" { return J2_PAGE; }
+    return ANDROID_PAGE;
+}
+
+/// A guide page section: its name and byte range.
+pub struct Section {
+    name: string;
+    lo: int;
+    hi: int;
+}
+
+/// A guide page cut at its headings, covering the whole page in order (Rust `sections`; `heading` says what a
+/// heading is). A markdown page (the editor README, URP) is cut at its `#` headings only.
+pub fn sections(txt: string, a: &Arena): List<Section> {
+    let all = List<Section>.new(a);
+    all.push(Section { name: "intro", lo: 0, hi: 0 });
+    let at = 0;
+    let fence = false;
+    let markdown = contains(txt, "\n## ") || contains(txt, "\n### ");
+    while at < txt.len {
+        let e = at;
+        while e < txt.len && txt[e] != '\n' { e += 1; }
+        let next = if e < txt.len { e + 1 } else { e };
+        let l = trimEnd(txt[at..e]);
+        if startsWith(l, "```") { fence = !fence; }
+        if !fence && !(markdown && !startsWith(l, "#")) {
+            let name = heading(l, a);
+            if name.len > 0 {
+                all.items[all.len - 1].hi = at;
+                all.push(Section { name: name, lo: at, hi: at });
+            }
+        }
+        at = next;
+    }
+    all.items[all.len - 1].hi = at;
+    let kept = List<Section>.new(a);
+    for i in 0..all.len { if all.items[i].hi > all.items[i].lo { kept.push(all.items[i]); } }
+    return kept;
+}
+
+/// The section name `l` starts, or "" (Rust `heading`; its `Some("")` cannot happen on a trimmed line).
+fn heading(l: string, a: &Arena): string {
+    if startsWith(l, "#") {
+        let i = 0;
+        while i < l.len && l[i] == '#' { i += 1; }
+        if i < l.len && l[i] == ' ' { return trim(l[i + 1..l.len]); }
+    }
+    let up = upperFirst(l);
+    if !up && !startsWith(l, "- ") { return ""; }
+    let last = if l.len > 0 { l[l.len - 1] } else { 0 };
+    if l.len <= 45 && last != '.' && last != ',' && last != ';' && up { return trimColons(l); }
+    if l.len <= 70 && last == ':' && up { return trimColons(l); }
+    let dbl = text.find(l, "  ");
+    if dbl >= 0 {
+        let word = l[0..dbl];
+        if upperFirst(word) && allLetters(word, false, "") { return word; }
+    }
+    let lead = if startsWith(l, "- ") { l[2..l.len] } else { l };
+    let end = -1;
+    let pats: [3]string = [". ", ": ", " ("];
+    for i in 0..3 {
+        let k = text.find(lead, pats[i]);
+        if k >= 0 && (end < 0 || k < end) { end = k; }
+    }
+    if end < 0 { return ""; }
+    let name = lead[0..end];
+    let words = 1;
+    for i in 0..name.len { if name[i] == ' ' { words += 1; } }
+    if upperFirst(name) && allLetters(name, true, " /-'") && words <= 5 { return name; }
+    return "";
+}
+
+fn upperFirst(s: string): bool { return s.len > 0 && s[0] >= 'A' && s[0] <= 'Z'; }
+
+fn trimColons(s: string): string {
+    let e = s.len;
+    while e > 0 && s[e - 1] == ':' { e -= 1; }
+    return s[0..e];
+}
+
+/// The number of lines of `s` (Rust `lines().count()`).
+fn lineCount(s: string): int {
+    let n = 0;
+    for i in 0..s.len { if s[i] == '\n' { n += 1; } }
+    if s.len > 0 && s[s.len - 1] != '\n' { n += 1; }
+    return n;
+}
+
+/// `j3c doc css --short`: one line per section (Rust `toc`).
+fn toc(page: string, txt: string, a: &Arena): string {
+    let t = Text.new(a);
+    t.add(page).add(": `j3c doc ").add(page).add(" <section>` prints one (a prefix is enough)\n");
+    let secs = sections(txt, a);
+    for i in 0..secs.len {
+        let s = secs.items[i];
+        t.add("    ");
+        padTo(&t, s.name, 40);
+        t.add(" ").pushInt(lineCount(txt[s.lo..s.hi]));
+        t.add(" lines\n");
+    }
+    return t.str();
+}
+
+/// `j3c doc css layout`: the sections whose name starts with `want`, else those containing it.
+fn guideSection(page: string, g: int, want: string, a: &Arena): Result<string, string> {
+    let txt = guidePage(g, a);
+    let w = lower(want, a);
+    let all = sections(txt, a);
+    let t = Text.new(a);
+    for pass in 0..2 {
+        for i in 0..all.len {
+            let n = lower(all.items[i].name, a);
+            let hit = if pass == 0 { startsWith(n, w) } else { contains(n, w) };
+            if hit { t.add(txt[all.items[i].lo..all.items[i].hi]); }
+        }
+        if t.len() > 0 { return Result.Ok(t.str()); }
+    }
+    return Result.Err(Text.new(a).add("no section `").add(want).add("` in `").add(page).add("`\n").add(toc(page, txt, a)).str());
+}
+
+/// `<icon name>` names, packed into lines; `word` keeps the names that contain it (Rust `icons_page`).
+fn iconsPage(word: string, a: &Arena): string {
+    let t = Text.new(a);
+    t.add("<icon name=\"...\"> takes a Bootstrap Icons id (https://icons.getbootstrap.com, v1.11.3, MIT) or the\nname of an .svg in the project's icons/ folder (it wins over a Bootstrap name). 1em square, colored by\n`color`; size it with `font-size` or `width`/`height`. `j3c doc j3ui icons` has the details.\n");
+    match icons.loadDir("icons", a) {
+        Result.Ok(own) {
+            if own.len > 0 {
+                t.add("This project's icons/:");
+                for i in 0..own.len { t.add(" ").add(own.items[i].name); }
+                t.add("\n");
+            }
+        }
+        Result.Err(_) {}
+    }
+    let names = bootstrapNames(word, a);
+    t.add("\n").pushInt(names.len);
+    if word.len == 0 { t.add(" Bootstrap names (`j3c doc icons <word>` filters):\n"); }
+    else { t.add(" Bootstrap names containing `").add(word).add("`:\n"); }
+    let line = Text.new(a);
+    for i in 0..names.len {
+        let n = names.items[i];
+        if line.len() > 0 && line.len() + n.len + 2 > 100 {
+            t.add(trimEnd(line.str())).add("\n");
+            line.clear();
+        }
+        line.add(n).add("  ");
+    }
+    t.add(trimEnd(line.str())).add("\n");
+    return t.str();
+}
+
+fn isInternal(key: string): bool {
+    for i in 0..INTERNAL.len { if startsWith(key, INTERNAL[i]) { return true; } }
+    return false;
+}
+
+/// Rust `stdlib::provenance`.
+fn provenance(t: &Text, a: &Arena) {
+    if load.usingOverride() { t.add("stdlib from J3_STDLIB=").add(load.stdlibDir(a)).add(", docs ").add(docsId(a)); }
+    else { t.add("stdlib embedded, docs ").add(docsId(a)); }
+}
+
+/// `j3c doc`: tasks, then every stdlib module (Rust `index`).
+fn index(a: &Arena): Result<string, string> {
+    let t = Text.new(a);
+    t.add("j3c doc — from this j3c build (");
+    provenance(&t, a);
+    t.add(")\n\n").add(TASKS).add("stdlib modules (`j3c doc <module>`):\n");
+    let internal = Text.new(a);
+    let files = stdlibFiles(a)?;
+    let scratch = Arena.create(1 << 24);
+    let mark = scratch.checkpoint();
+    for f in 0..files.len {
+        scratch.rewind(mark);
+        let px = newPx(&scratch);
+        let m = loadStdlib(&px, files.items[f])?;
+        if isInternal(m.key) {
+            internal.add(if internal.len() > 0 { " " } else { "" }).add(m.key);
+            continue;
+        }
+        // First sentence only; `j3c doc <module>` prints the rest, thread rules included.
+        let head = Text.new(&scratch);
+        let d = m.file.doc;
+        let i = 0;
+        while i < d.len {
+            let e = i;
+            while e < d.len && d[e] != '\n' { e += 1; }
+            let l = trim(d[i..e]);
+            if l.len == 0 { break; }
+            head.add(if head.len() > 0 { " " } else { "" }).add(l);
+            i = e + 1;
+        }
+        let h = head.str();
+        let k = text.find(h, ". ");
+        let first = trim(if k < 0 { h } else { h[0..k + 2] });
+        t.add("    ");
+        padTo(&t, m.key, 26);
+        t.add(" ");
+        snippet(&t, first, 90);
+        t.add("\n");
+    }
+    scratch.destroy();
+    t.add("internal (not for games): ").add(internal.str()).add("\n\n");
+    t.add("every page and kind of query: `j3c doc --help`\n");
+    return Result.Ok(t.str());
+}
+
+/// A module, a module item, or a bare name (Rust `lookup`).
+fn lookup(query: string, item: Option<string>, short: bool, a: &Arena): Result<string, string> {
+    let px = newPx(a);
+    let found = match resolve(&px, query) {
+        Result.Ok(f) { f }
+        Result.Err(e) {
+            match item {
+                Option.Some(_) { return Result.Err(e); }
+                Option.None {
+                    match byName(trim(query), a) {
+                        Option.Some(r) { return r; }
+                        Option.None { return Result.Err(e); }
+                    }
+                }
+            }
+        }
+    };
+    let it = match item { Option.Some(s) { Option.Some(s) } Option.None { found.item } };
+    let none = match it { Option.Some(_) { false } Option.None { true } };
+    if short && none { return Result.Ok(shortView(found.m, a)); }
+    return renderModule(found.m, it, a);
+}
+
+/// `j3c doc drawText`: the module that has it, or the choices when several do (Rust `by_name`).
+fn byName(name: string, a: &Arena): Option<Result<string, string>> {
+    let files = match stdlibFiles(a) { Result.Ok(f) { f } Result.Err(_) { return Option.None; } };
+    let mods = List<string>.new(a);
+    let quals = List<string>.new(a);
+    let dot = Text.new(a).add(".").add(name).str();
+    let scratch = Arena.create(1 << 24);
+    let mark = scratch.checkpoint();
+    for f in 0..files.len {
+        scratch.rewind(mark);
+        let px = newPx(&scratch);
+        let m = match loadStdlib(&px, files.items[f]) { Result.Ok(m) { m } Result.Err(_) { continue; } };
+        let syms = symbols(m, &scratch);
+        for i in 0..syms.len {
+            let q = syms.items[i].qual;
+            if q == name || endsWith(q, dot) {
+                mods.push(Text.new(a).add(m.key).str());
+                quals.push(Text.new(a).add(q).str());
+            }
+        }
+    }
+    scratch.destroy();
+    if mods.len == 0 { return Option.None; }
+    if mods.len == 1 { return Option.Some(lookup(mods.items[0], Option.Some(quals.items[0]), false, a)); }
+    let t = Text.new(a);
+    t.add("`").add(name).add("` is in more than one place:\n");
+    for i in 0..mods.len { t.add("    j3c doc ").add(mods.items[i]).add(" ").add(quals.items[i]).add("\n"); }
+    return Option.Some(Result.Ok(t.str()));
+}
+
+/// Rust `stdlib::docs_id`: 8 lower-case hex digits (FNV-1a 64 `>> 32`) over the embedded stdlib (each name then
+/// its source) and every page this binary prints. → `cmd/info` (version --verbose)
+pub fn docsId(arena: &Arena): string {
+    let h: u64 = 0xcbf29ce484222325;
+    let prime: u64 = 0x100000001b3;
+    let texts = List<string>.new(arena);
+    let names = load.stdlibNames(arena);
+    for i in 0..names.len {
+        texts.push(names.items[i]);
+        match load.stdlibFile(names.items[i]) { Option.Some(s) { texts.push(s); } Option.None {} }
+    }
+    pageTexts(&texts);
+    texts.push(guide.manifestText());
+    texts.push(guide.recipeIndex(arena));
+    let rs = guide.recipes(arena);
+    for i in 0..rs.len { texts.push(rs.items[i].text); }
+    for i in 0..texts.len {
+        let s = texts.items[i];
+        for k in 0..s.len { h = (h ^ u64(s[k])) * prime; }
+    }
+    let hex = Text.new(arena);
+    hex.pushHex(h >> 32);
+    let t = Text.new(arena);
+    for i in hex.len()..8 { t.push('0'); }
+    return t.add(hex.str()).str();
+}

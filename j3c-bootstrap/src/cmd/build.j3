@@ -11,15 +11,15 @@
 //     project is checked once for the primary target first (its warnings) and every target is tried even
 //     after one fails. ponytail: that first session stays alive during the loop (it owns the manifest);
 //     free it first if a multi-target build of a big project runs short of memory.
-// J3: The targets' inner stderr lines carry no `[triple]` tag (Rust `phase::set_tag`): they run one after
-//     the other here, so the lines of one target never mix with another's.
+// J3: Each target's session tags its inner stderr lines (`Phases.setTag`) and opens its report with
+//     `target TRIPLE` (`Phases.target`), as Rust's threads do; the reports are joined for the log.
 // J3: `compilation.log` (`config.logCompile`) when tracking is on; Rust's `LAST_ERR` is the last text this
-//     command gave `printFail`. `phase::target` is not in `base/phase.j3`: its `target TRIPLE` report line
-//     is written here.
-// J3: Not ported yet: `[dist] build_outputs` packaging (`package`, `dist.rs`, C5): refused before the build.
+//     command gave `printFail`.
+// J3: `[dist] build_outputs` (Rust `package`): under `--release` only, after the output is built or found up
+//     to date, through `dist.package`; it prints the paths written.
 module j3c.cmd.build;
 
-use j3.memory.Arena;
+use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.result.Result;
 use j3.text.Text;
@@ -32,11 +32,12 @@ use j3c.cmd.run.{ noFlags, noHello, peelRun, printWarnings, refuseLib, sessionFo
 use j3c.cmd.stamp;
 use j3c.cmd.stamp.{ StampFlags, Unchanged };
 use j3c.driver;
+use j3c.dist;
+use j3c.dist.pkg.Built;
 use j3c.driver.{ Session, Stage };
 use j3c.project.config;
 use j3c.project.config.Compile;
-use j3c.project.manifest;
-use j3c.project.manifest.{ Input, Manifest };
+use j3c.project.manifest.Manifest;
 use j3c.toolchain;
 use j3c.toolchain.{ EmitOpts, TargetOs };
 
@@ -47,6 +48,8 @@ struct Log {
     lastErr: string;
     /// `phase.report` of each target's session (several targets only).
     phases: Text;
+    /// `--release`: `[dist] build_outputs` run.
+    release: bool;
 }
 
 /// `printFail`, remembered for the log.
@@ -68,22 +71,6 @@ pub fn buildCmd(rest: []string): int {
     let refused = refuseLib(f.path, "build", &mem);
     if refused != 0 { return refused; }
     // J3: `--host`/`--file` are `run` flags in Rust (`take_run_flags`); `build` keeps the manifest's targets.
-    let r = if !f.hasPath { manifest.resolveCwd(&mem) } else { manifest.resolve(f.path, &mem) };
-    match r {
-        Result.Ok(inp) {
-            match inp {
-                Input.Project(m) {
-                    if f.release && m.dist.outputs.len > 0 {
-                        err("j3c-boot: build: [dist] build_outputs packaging is not ported yet\n");
-                        return 1;
-                    }
-                }
-                Input.Hello {}
-                Input.File(_) {}
-            }
-        }
-        Result.Err(_) {}
-    }
     let sf = StampFlags { path: f.path, hasPath: f.hasPath, fast: f.fast, release: f.release, opt: f.opt };
     // `--emit c` is an error (B8a) even when the output is up to date: no shortcut for it.
     let unchanged: Option<Unchanged> = Option.None;
@@ -96,7 +83,8 @@ pub fn buildCmd(rest: []string): int {
             ph.begin("parse");
             ph.begin("up to date");
             out(Text.new(&mem).add(u.e.cc.out).add("\n").str());
-            return 0;
+            let one: [1]Built = [Built { triple: u.e.target, exe: u.e.cc.out }];
+            return package(&u.m, one[..], f.release, &ph, Option.None, &mem);
         }
         Option.None {}
     }
@@ -104,7 +92,7 @@ pub fn buildCmd(rest: []string): int {
     defer s.free();
     s.phases.begin("parse");
     if !noHello(s, f.hasPath) { return 1; }
-    let log = Log { mem: &mem, lastErr: "", phases: Text.new(&mem) };
+    let log = Log { mem: &mem, lastErr: "", phases: Text.new(&mem), release: f.release };
     // Rust `build_loaded`: warnings once the check (through lower and validate) is clean, before the
     // backend and clang, so a failed link still shows them.
     let c = Compile { root: "", opt: "", backend: "", target: "", modules: 0, secs: 0.0, phases: "", ok: false, lastErr: "" };
@@ -170,19 +158,27 @@ fn buildInner(s: &Session, e: &EmitOpts, m: Option<Manifest>, log: &Log): int {
     }
     if !androidOk(e.target, log) { return 1; }
     if targets <= 1 {
+        let exe = e.cc.out;
         if stamp.upToDate(s, e) {
             stamp.markInputs(s);
             s.phases.begin("up to date");
             out(Text.new(s.arena).add(e.cc.out).add("\n").str());
-            return 0;
+        } else {
+            if !driver.run(s, Stage.Link) {
+                fail(log, failText(s));
+                return 1;
+            }
+            exe = s.exe;
+            out(Text.new(s.arena).add(s.exe).add("\n").str());
+            stamp.markBuilt(s, e);
         }
-        if !driver.run(s, Stage.Link) {
-            fail(log, failText(s));
-            return 1;
+        match m {
+            Option.Some(x) {
+                let one: [1]Built = [Built { triple: e.target, exe: own(log.mem, exe) }];
+                return package(&x, one[..], log.release, &s.phases, Option.Some(log), log.mem);
+            }
+            Option.None { return 0; }
         }
-        out(Text.new(s.arena).add(s.exe).add("\n").str());
-        stamp.markBuilt(s, e);
-        return 0;
     }
     let failed = false;
     match m {
@@ -190,10 +186,39 @@ fn buildInner(s: &Session, e: &EmitOpts, m: Option<Manifest>, log: &Log): int {
             for i in 0..targets {
                 if !buildTarget(s, x.emit.targets.items[i], log) { failed = true; }
             }
+            if failed { return 1; }
+            let outs = List<Built>.new(log.mem);
+            for i in 0..targets {
+                let t = x.emit.targets.items[i];
+                outs.push(Built { triple: t, exe: x.outPathFor(t, log.mem) });
+            }
+            return package(&x, outs.items[0..outs.len], log.release, &s.phases, Option.Some(log), log.mem);
         }
         Option.None {}
     }
     return if failed { 1 } else { 0 };
+}
+
+/// Rust `package`: `[dist] build_outputs` on a `--release` build (phase `package`), each path written printed;
+/// the failure's own exit code otherwise. 0 with no outputs or without `--release`.
+fn package(m: &Manifest, built: []Built, release: bool, ph: &Phases, log: Option<&Log>, mem: &Arena): int {
+    if m.dist.outputs.len == 0 || !release { return 0; }
+    ph.begin("package");
+    match dist.package(m, built, mem) {
+        Result.Ok(paths) {
+            let t = Text.new(mem);
+            for i in 0..paths.len { t.add(paths.items[i]).add("\n"); }
+            out(t.str());
+            return 0;
+        }
+        Result.Err(f) {
+            match log {
+                Option.Some(l) { fail(l, f.msg); }
+                Option.None { printFail(f.msg, mem); }
+            }
+            return f.code;
+        }
+    }
 }
 
 /// Rust `android::ready` for an Android triple; false after printing why not.
@@ -216,14 +241,14 @@ fn buildTarget(first: &Session, triple: string, log: &Log): bool {
     let s = Session.new(o);
     defer s.free();
     s.phases.enable();
+    s.phases.setTag(triple);
+    s.phases.target(triple);
     let ok = driver.run(s, Stage.Link);
     if ok {
         out(Text.new(s.arena).add(s.exe).add("\n").str());
     } else {
         fail(log, failText(s));
     }
-    // Rust `phase::target`: a depth 0 line with no time, then the target's phases.
-    log.phases.add("      target ").add(triple).add("\n");
     s.phases.report(&log.phases);
     return ok;
 }

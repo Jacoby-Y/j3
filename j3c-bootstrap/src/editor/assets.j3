@@ -1,12 +1,37 @@
 // Script props and assets the inspector shows; the catalog every scene op reads; imports and editor events.
 //
-// Port of: j3c/src/editor/assets.rs, (cli/mod.rs `script_props_cmd`)
+// Port of: j3c/src/editor/assets.rs, (cli/mod.rs `script_props_cmd`), (editor/mod.rs `scene_path`)
 // J3: The catalog bytes equal Rust's (`target/j3-editor/catalog`); script props come from the port's parser.
+// J3: `mainScene` is Rust's `editor::scene_path` (`scene/ops.scenePath` calls it: `scene/ops` uses this module,
+// so this one cannot use it back). A default float prints as Rust's `{}` through `pushF64` / `pushF32`
+// (ponytail: those switch to an exponent below 1e-4 or from 1e17 up, where Rust writes every digit).
 module j3c.editor.assets;
 
+use j3.cmp.sortBy;
+use j3.data.pool.Pool;
+use j3.io;
+use j3.io.path;
 use j3.memory.{ Arena, List };
+use j3.option.Option;
 use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, parseF64, parseInt, trim };
+use j3c.assets.gltf;
 use j3c.base.diag;
+use j3c.base.diag.Diags;
+use j3c.base.fsx;
+use j3c.base.intern.Names;
+use j3c.base.intern.own;
+use j3c.base.span.Source;
+use j3c.base.text_fmt.debugStr;
+use j3c.cmd.check.printFail;
+use j3c.load.scripts_deps.scriptPaths;
+use j3c.project.manifest;
+use j3c.project.manifest.Input;
+use j3c.scene.rename.renameV2;
+use j3c.syntax.ast.{ Ast, Expr, Item, Type, foldedLiteral };
+use j3c.syntax.parse;
+use j3c.syntax.token.keyword;
 
 /// One prop of a scene script the inspector edits (Rust `ScriptProp`).
 pub struct ScriptProp {
@@ -18,41 +43,502 @@ pub struct ScriptProp {
     required: bool;
 }
 
+fn ioErr(arena: &Arena): string { return fsx.osError(sys.errno(), arena); }
+
 /// `j3c -e script-props <path.j3s>`: the props as JSON (Rust `script_props_cmd`).
-pub fn scriptPropsCmd(rest: []string): int { return diag.notPortedCmd("-e script-props"); } // STUB SCENE
+pub fn scriptPropsCmd(rest: []string): int {
+    if rest.len == 0 {
+        let u = "usage: j3c -e script-props <path.j3s>\n";
+        sys.write(2, u.ptr as ptr, u.len);
+        return 1;
+    }
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    let root = match manifest.resolveCwd(&mem) {
+        Result.Ok(i) { match i { Input.Project(m) { m.root } _ { "." } } }
+        Result.Err(_) { "." }
+    };
+    match scriptProps(root, rest[0], &mem) {
+        Result.Ok(props) {
+            let t = Text.new(&mem);
+            t.push('[');
+            for i in 0..props.len {
+                let p = props.items[i];
+                if i > 0 { t.push(','); }
+                t.add("{\"name\":");
+                debugStr(&t, p.name);
+                t.add(",\"type\":");
+                debugStr(&t, p.kind);
+                t.add(",\"default\":");
+                debugStr(&t, p.default);
+                t.add(",\"required\":").add(if p.required { "true" } else { "false" }).add("}");
+            }
+            t.add("]\n");
+            sys.write(1, t.str().ptr as ptr, t.len());
+            return 0;
+        }
+        Result.Err(e) {
+            printFail(e, &mem);
+            return 1;
+        }
+    }
+}
 
-/// Rust `script_props`. → MCP
-pub fn scriptProps(root: string, rel: string, arena: &Arena): Result<List<ScriptProp>, string> { return Result.Err("script props: not ported yet"); } // STUB SCENE
+/// The inspector type of a prop's type name (its last `.` part), or "" for one it cannot edit.
+fn kindOf(ty: string): string {
+    let k = ty.len;
+    while k > 0 && ty[k - 1] != '.' { k -= 1; }
+    let t = ty[k..ty.len];
+    if t == "f32" || t == "f64" || t == "float" { return "f32"; }
+    if t == "int" || t == "i8" || t == "i16" || t == "i32" || t == "i64" || t == "u8" || t == "u16" || t == "u32" || t == "u64" { return "int"; }
+    if t == "bool" { return "bool"; }
+    if t == "string" { return "string"; }
+    if t == "Vec3" { return "vec3"; }
+    if t == "NodeId" { return "object"; }
+    return "";
+}
 
-/// Rust `generate_catalog`: `target/j3-editor/catalog` (assets + script props). → EDDEV, MCP
-pub fn generateCatalog(root: string, arena: &Arena): Result<bool, string> { return Result.Err("catalog: not ported yet"); } // STUB SCENE
+/// Rust `script_props`: the props of the script at `rel` (e.g. `scripts/door.j3s`) the editor can set. → MCP
+pub fn scriptProps(root: string, rel: string, arena: &Arena): Result<List<ScriptProp>, string> {
+    let text = match io.readFile(path.join(root, rel, arena), arena) {
+        Result.Ok(b) { b as string }
+        Result.Err(_) { return Result.Err(Text.new(arena).add(rel).add(": ").add(ioErr(arena)).str()); }
+    };
+    // `script` + the path without `.j3s`, split on `/` (Rust: no checks)
+    let parts = List<string>.new(arena);
+    parts.push("script");
+    let r = rel;
+    while r.len >= 4 && r[r.len - 4..r.len] == ".j3s" { r = r[0..r.len - 4]; }
+    let a = 0;
+    for i in 0..r.len + 1 {
+        if i == r.len || r[i] == '/' {
+            parts.push(own(arena, r[a..i]));
+            a = i + 1;
+        }
+    }
+    let names = Names.new(arena);
+    let ast = Ast.new(arena, &names);
+    let sources = Pool<Source>.new(arena);
+    let id = sources.add(Source.of(own(arena, rel), text, arena));
+    let out = List<ScriptProp>.new(arena);
+    match parse.parseScript(text, id, parts.slice(), &ast) {
+        Result.Ok(f) {
+            for i in 0..f.items.len {
+                match f.items.items[i] {
+                    Item.Props(b) {
+                        for k in 0..b.fields.len {
+                            let fd = b.fields.items[k];
+                            let ty = match ast.ty(fd.ty) { Type.Named(n) { ast.str(n.name) } _ { continue; } };
+                            let kind = kindOf(ty);
+                            if kind.len == 0 { continue; }
+                            let name = own(arena, ast.str(fd.name.name));
+                            let def = Text.new(arena);
+                            let hasDefault = false;
+                            match fd.default {
+                                Option.Some(e) {
+                                    hasDefault = true;
+                                    match foldedLiteral(&ast, e) {
+                                        Expr.Int(v) { def.pushInt(v); }
+                                        Expr.Float(v) { def.pushF64(v); }
+                                        Expr.Bool(v) { def.add(if v { "true" } else { "false" }); }
+                                        // ponytail: Rust's `from_utf8_lossy` (invalid UTF-8 as U+FFFD) is not done
+                                        Expr.String(s) { def.add(s); }
+                                        _ {}
+                                    }
+                                }
+                                Option.None {}
+                            }
+                            // `node: NodeId` falls back to the object the script is attached to.
+                            out.push(ScriptProp { name: name, kind: kind, default: def.str(), required: !hasDefault && !(kind == "object" && name == "node") });
+                        }
+                    }
+                    _ {}
+                }
+            }
+        }
+        Result.Err(e) {
+            let ds = Diags.new(arena);
+            parse.report(e, &ds);
+            let t = Text.new(arena);
+            diag.render(ds.at(0), &sources, &t);
+            return Result.Err(t.str());
+        }
+    }
+    return Result.Ok(out);
+}
 
-/// Rust `generate_assets_catalog`: the asset list part only. → EDDEV, MCP (`import`, `asset_fetch`)
-pub fn generateAssetsCatalog(root: string, arena: &Arena): Result<bool, string> { return Result.Err("catalog: not ported yet"); } // STUB SCENE
+fn write(p: string, text: string, arena: &Arena): Result<bool, string> {
+    match io.writeFile(p, text as []u8) { Result.Ok(_) { return Result.Ok(true); } Result.Err(_) { return Result.Err(ioErr(arena)); } }
+}
 
-/// Rust `append_event`: one line onto `target/j3-editor/events` (the open editor reads it). → EDDEV, MCP
-pub fn appendEvent(root: string, line: string, arena: &Arena) {} // STUB SCENE
+fn mkdirs(dir: string, arena: &Arena): Result<bool, string> {
+    match io.makeDirs(dir) { Result.Ok(_) { return Result.Ok(true); } Result.Err(_) { return Result.Err(ioErr(arena)); } }
+}
 
-/// Rust `event`: a `KIND\tSCENE\tMESSAGE` event. → EDDEV, MCP
-pub fn event(root: string, kind: string, scene: string, message: string, arena: &Arena) {} // STUB SCENE
+/// Rust `generate_catalog`: `target/j3-editor/catalog`, every `.j3s` in the project and the props the
+/// inspector edits (a script that doesn't parse is listed with no props). → EDDEV, MCP
+pub fn generateCatalog(root: string, arena: &Arena): Result<bool, string> {
+    let scripts = scriptPaths(root, arena);
+    let t = Text.new(arena);
+    t.add("catalog.count=");
+    t.pushInt(scripts.len);
+    t.push('\n');
+    for i in 0..scripts.len {
+        let rel = scripts.items[i];
+        let props = match scriptProps(root, rel, arena) { Result.Ok(p) { p } Result.Err(_) { List<ScriptProp>.new(arena) } };
+        let c = Text.new(arena);
+        c.add("catalog.");
+        c.pushInt(i);
+        c.push('.');
+        let pre = c.str();
+        t.add(pre).add("name s=").add(rel).push('\n');
+        t.add(pre).add("count=");
+        t.pushInt(props.len);
+        t.push('\n');
+        for j in 0..props.len {
+            let p = props.items[j];
+            let q = Text.new(arena);
+            q.add(pre);
+            q.pushInt(j);
+            q.push('.');
+            let pp = q.str();
+            t.add(pp).add("name s=").add(p.name).push('\n');
+            t.add(pp).add("type s=").add(p.kind).push('\n');
+            t.add(pp).add("default s=").add(p.default).push('\n');
+            t.add(pp).add("required=").add(if p.required { "1" } else { "0" }).push('\n');
+            if p.kind == "int" {
+                t.add(pp).add("value=");
+                t.pushInt(match parseInt(p.default, 10) { Option.Some(v) { v } Option.None { 0 } });
+                t.push('\n');
+            } else if p.kind == "f32" {
+                t.add(pp).add("value f=");
+                t.pushF32(match parseF64(p.default) { Option.Some(v) { f32(v) } Option.None { f32(0.0) } });
+                t.push('\n');
+            } else if p.kind == "bool" {
+                t.add(pp).add("value=").add(if p.default == "true" { "1" } else { "0" }).push('\n');
+            } else if p.kind == "vec3" {
+                t.add(pp).add("x f=0\n").add(pp).add("y f=0\n").add(pp).add("z f=0\n");
+            }
+        }
+    }
+    let dir = path.join(root, "target/j3-editor", arena);
+    mkdirs(dir, arena)?;
+    return write(path.join(dir, "catalog", arena), t.str(), arena);
+}
 
-/// Rust `import_asset`: a model (`gltf.import`), image or scene file into the project; Ok = files written. → MCP, EDDEV
-pub fn importAsset(root: string, scene: string, raw: string, bake: bool, arena: &Arena): Result<List<string>, string> { return Result.Err("import: not ported yet"); } // STUB SCENE
+/// Rust `collect_assets`: mesh, image, scene, material and effect files under `dir`, root-relative.
+fn collectAssets(root: string, dir: string, out: &List<string>, arena: &Arena): Result<bool, string> {
+    if !io.exists(dir) { return Result.Ok(true); }
+    let ents = match io.listDir(dir, arena) { Result.Ok(e) { e } Result.Err(_) { return Result.Err(ioErr(arena)); } };
+    for i in 0..ents.len {
+        let p = path.join(dir, ents[i].name, arena);
+        // Rust `DirEntry::file_type`: a symlink is not a folder here
+        if ents[i].isDir && !ents[i].isLink {
+            collectAssets(root, p, out, arena)?;
+            continue;
+        }
+        let name = ents[i].name;
+        let k = name.len - 1;
+        while k > 0 && name[k] != '.' { k -= 1; }
+        if k <= 0 { continue; }
+        let e = Text.new(arena);
+        for j in k + 1..name.len { e.push(if name[j] >= 'A' && name[j] <= 'Z' { name[j] + 32 } else { name[j] }); }
+        let ext = e.str();
+        if ext == "j3mesh" || ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "j3scene" || ext == "j3mat" || ext == "j3fx" {
+            out.push(p[root.len + 1..p.len]);
+        }
+    }
+    return Result.Ok(true);
+}
 
-/// Rust `keep_import`: move an imported fragment into the project's scene folder. → MCP, EDDEV
-pub fn keepImport(root: string, fragment: string, source: string, arena: &Arena): Result<string, string> { return Result.Err("import: not ported yet"); } // STUB SCENE
+/// Rust `asset_file`: `rel` as a file under the project's `assets/` or `scenes/`, refusing anything that
+/// could point outside them.
+fn assetFile(root: string, rel: string, arena: &Arena): Result<string, string> {
+    let ok = (rel.len >= 7 && rel[0..7] == "assets/") || (rel.len >= 7 && rel[0..7] == "scenes/");
+    let a = 0;
+    for i in 0..rel.len + 1 {
+        if i < rel.len && rel[i] == '\\' { ok = false; }
+        if i == rel.len || rel[i] == '/' {
+            let p = rel[a..i];
+            if p.len == 0 || p == "." || p == ".." { ok = false; }
+            a = i + 1;
+        }
+    }
+    if !ok { return Result.Err(Text.new(arena).add("`").add(rel).add("` isn't a path under assets/ or scenes/").str()); }
+    return Result.Ok(path.join(root, rel, arena));
+}
 
-/// Rust `import_name`: the object name an import of `source` gets. → MCP, EDDEV
-pub fn importName(source: string, arena: &Arena): string { return ""; } // STUB SCENE
+/// The value of the first `key = value` line of `config`, trimmed (Rust `lines().filter_map(split_once('='))
+/// .find(key)`), or None.
+pub fn tomlValue(config: string, key: string): Option<string> {
+    let a = 0;
+    for i in 0..config.len + 1 {
+        if i < config.len && config[i] != '\n' { continue; }
+        let l = config[a..i];
+        if l.len > 0 && l[l.len - 1] == '\r' { l = l[0..l.len - 1]; }
+        a = i + 1;
+        let eq = 0;
+        while eq < l.len && l[eq] != '=' { eq += 1; }
+        if eq < l.len && trim(l[0..eq]) == key { return Option.Some(trim(l[eq + 1..l.len])); }
+    }
+    return Option.None;
+}
 
-/// Rust `is_main_scene`. → EDDEV
-pub fn isMainScene(root: string, rel: string, arena: &Arena): bool { return false; } // STUB SCENE
+/// Rust `editor::scene_path`: the project's main scene file (`root` joined with `j3.editor.toml`'s `scene`).
+pub fn mainScene(root: string, arena: &Arena): Result<string, string> {
+    let config = match io.readFile(path.join(root, "j3.editor.toml", arena), arena) {
+        Result.Ok(b) { b as string }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("read j3.editor.toml: ").add(ioErr(arena)).str()); }
+    };
+    let v = match tomlValue(config, "scene") { Option.Some(v) { v } Option.None { return Result.Err("j3.editor.toml: missing scene path"); } };
+    if v.len < 2 || v[0] != '"' || v[v.len - 1] != '"' { return Result.Err("j3.editor.toml: scene path must be quoted"); }
+    let rel = v[1..v.len - 1];
+    if path.isAbs(rel) || hasDotDot(rel) { return Result.Err("scene must be a project-relative path"); }
+    return Result.Ok(path.join(root, own(arena, rel), arena));
+}
 
-/// Rust `rename_asset`: rename and fix references; Ok = files changed. → EDDEV
-pub fn renameAsset(root: string, old: string, newName: string, arena: &Arena): Result<int, string> { return Result.Err("assets: not ported yet"); } // STUB SCENE
+fn hasDotDot(p: string): bool {
+    let a = 0;
+    for i in 0..p.len + 1 {
+        if i == p.len || p[i] == '/' {
+            if p[a..i] == ".." { return true; }
+            a = i + 1;
+        }
+    }
+    return false;
+}
 
-/// Rust `delete_asset`. → EDDEV
-pub fn deleteAsset(root: string, rel: string, arena: &Arena): Result<string, string> { return Result.Err("assets: not ported yet"); } // STUB SCENE
+/// Rust `is_main_scene` (paths compared as Rust's `Path ==`: by parts). → EDDEV
+pub fn isMainScene(root: string, rel: string, arena: &Arena): bool {
+    match mainScene(root, arena) {
+        Result.Ok(m) { return path.normalize(m, arena) == path.normalize(path.join(root, rel, arena), arena); }
+        Result.Err(_) { return false; }
+    }
+}
 
-/// Rust `create_script`: a new `scripts/NAME.j3s`; Ok = its path. → EDDEV
-pub fn createScript(root: string, name: string, arena: &Arena): Result<string, string> { return Result.Err("assets: not ported yet"); } // STUB SCENE
+/// Replace `p` with `text` through `<p without its extension>.j3tmp` (Rust `with_extension` + rename).
+fn replaceFile(p: string, text: string, arena: &Arena): Result<bool, string> {
+    let k = p.len - 1;
+    while k > 0 && p[k] != '.' && p[k] != '/' { k -= 1; }
+    let stem = if k > 0 && p[k] == '.' && p[k - 1] != '/' { p[0..k] } else { p };
+    let temp = Text.new(arena).add(stem).add(".j3tmp").str();
+    write(temp, text, arena)?;
+    match io.rename(temp, p) { Result.Ok(_) { return Result.Ok(true); } Result.Err(_) { return Result.Err(ioErr(arena)); } }
+}
+
+fn extOf(p: string): string {
+    let n = path.basename(p);
+    let k = n.len - 1;
+    while k > 0 && n[k] != '.' { k -= 1; }
+    if k <= 0 { return ""; }
+    return n[k + 1..n.len];
+}
+
+/// Rust `rename_asset`: rename or move asset `old` to `newName`, and point every scene file's references at
+/// it; Ok = how many scene files changed. → EDDEV
+pub fn renameAsset(root: string, old: string, newName: string, arena: &Arena): Result<int, string> {
+    let from = assetFile(root, old, arena)?;
+    let to = assetFile(root, newName, arena)?;
+    if !fsx.isFile(from) { return Result.Err(Text.new(arena).add(old).add(" doesn't exist").str()); }
+    if io.exists(to) { return Result.Err(Text.new(arena).add(newName).add(" already exists").str()); }
+    if extOf(from) != extOf(to) { return Result.Err("Keep the file extension when renaming"); }
+    if isMainScene(root, old, arena) { return Result.Err("That's the scene in j3.editor.toml; change it there first"); }
+    mkdirs(path.dirname(to), arena)?;
+    match io.rename(from, to) { Result.Ok(_) {} Result.Err(_) { return Result.Err(ioErr(arena)); } }
+    let scenes = List<string>.new(arena);
+    collectAssets(root, path.join(root, "assets", arena), &scenes, arena)?;
+    collectAssets(root, path.join(root, "scenes", arena), &scenes, arena)?;
+    let oldValue = Text.new(arena).add(" s=").add(old).str();
+    let changed = 0;
+    for i in 0..scenes.len {
+        let s = scenes.items[i];
+        if s.len < 8 || s[s.len - 8..s.len] != ".j3scene" { continue; }
+        let p = path.join(root, s, arena);
+        let text = match fsx.readText(p, arena) { Result.Ok(t) { t } Result.Err(_) { continue; } };
+        if text.len >= 7 && text[0..7] == "j3scene" {
+            match renameV2(text, old, newName, arena) {
+                Option.Some(out) {
+                    replaceFile(p, out, arena)?;
+                    changed += 1;
+                }
+                Option.None {}
+            }
+            continue;
+        }
+        // Node paths and asset fields are whole values, so only exact matches change.
+        let hit = false;
+        let out = Text.new(arena);
+        let a = 0;
+        for k in 0..text.len + 1 {
+            if k < text.len && text[k] != '\n' { continue; }
+            let line = text[a..k];
+            if line.len > 0 && line[line.len - 1] == '\r' { line = line[0..line.len - 1]; }
+            a = k + 1;
+            if k == text.len && line.len == 0 { break; }
+            let ends = line.len >= oldValue.len && line[line.len - oldValue.len..line.len] == oldValue;
+            if ends && ((line.len >= 5 && line[0..5] == "node.") || (line.len >= 6 && line[0..6] == "param.")) {
+                hit = true;
+                out.add(line[0..line.len - oldValue.len]).add(" s=").add(newName).push('\n');
+            } else {
+                out.add(line).push('\n');
+            }
+        }
+        if hit {
+            replaceFile(p, out.str(), arena)?;
+            changed += 1;
+        }
+    }
+    generateAssetsCatalog(root, arena)?;
+    return Result.Ok(changed);
+}
+
+/// Rust `delete_asset`: move asset `rel` into `target/j3-editor/trash/` (recoverable by hand; references stay
+/// and show as missing); Ok = where it went. → EDDEV
+pub fn deleteAsset(root: string, rel: string, arena: &Arena): Result<string, string> {
+    let from = assetFile(root, rel, arena)?;
+    if !fsx.isFile(from) { return Result.Err(Text.new(arena).add(rel).add(" doesn't exist").str()); }
+    if isMainScene(root, rel, arena) { return Result.Err("That's the scene in j3.editor.toml; change it there first"); }
+    let trash = path.join(root, "target/j3-editor/trash", arena);
+    mkdirs(trash, arena)?;
+    let name = path.basename(from);
+    let to = path.join(trash, name, arena);
+    let n = 2;
+    while io.exists(to) {
+        let t = Text.new(arena);
+        t.pushInt(n);
+        t.add("-").add(name);
+        to = path.join(trash, t.str(), arena);
+        n += 1;
+    }
+    match io.rename(from, to) { Result.Ok(_) {} Result.Err(_) { return Result.Err(ioErr(arena)); } }
+    generateAssetsCatalog(root, arena)?;
+    return Result.Ok(to[root.len + 1..to.len]);
+}
+
+/// Rust `generate_assets_catalog`: `target/j3-editor/assets-catalog`, the asset list part only. → EDDEV, MCP
+pub fn generateAssetsCatalog(root: string, arena: &Arena): Result<bool, string> {
+    let all = List<string>.new(arena);
+    collectAssets(root, path.join(root, "assets", arena), &all, arena)?;
+    collectAssets(root, path.join(root, "scenes", arena), &all, arena)?;
+    sortBy(all.items[0..all.len], fn(a: string, b: string): bool { return a < b; });
+    let t = Text.new(arena);
+    t.add("assets.count=");
+    t.pushInt(all.len);
+    t.push('\n');
+    for i in 0..all.len {
+        t.add("assets.");
+        t.pushInt(i);
+        t.add(".path s=").add(all.items[i]).push('\n');
+    }
+    let dir = path.join(root, "target/j3-editor", arena);
+    mkdirs(dir, arena)?;
+    return write(path.join(dir, "assets-catalog", arena), t.str(), arena);
+}
+
+/// Rust `create_script`: `scripts/<name>.j3s` with a `props` block and the two hooks the scene calls; Ok = its
+/// path. → EDDEV
+pub fn createScript(root: string, name: string, arena: &Arena): Result<string, string> {
+    let ok = name.len > 0 && !(name[0] >= '0' && name[0] <= '9');
+    for i in 0..name.len {
+        let c = name[i];
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') { ok = false; }
+    }
+    match keyword(name) { Option.Some(_) { ok = false; } Option.None {} }
+    if !ok { return Result.Err("script name must be a J3 identifier"); }
+    let rel = Text.new(arena).add("scripts/").add(name).add(".j3s").str();
+    let p = path.join(root, rel, arena);
+    if io.exists(p) { return Result.Err(Text.new(arena).add(rel).add(" already exists").str()); }
+    mkdirs(path.join(root, "scripts", arena), arena)?;
+    write(p, "use j3.scene3d.{ Scene, NodeId };\n\nprops {\n    node: NodeId;\n}\n\npub fn start(scene: &Scene) {\n}\n\npub fn update(scene: &Scene, dt: f32) {\n}\n", arena)?;
+    generateCatalog(root, arena)?;
+    return Result.Ok(rel);
+}
+
+/// `s` with line breaks and tabs as spaces (Rust's `clean` closure).
+fn clean(t: &Text, s: string) {
+    for i in 0..s.len { t.push(if s[i] == '\n' || s[i] == '\r' || s[i] == '\t' { u8(' ') } else { s[i] }); }
+}
+
+/// Rust `event`: a `KIND\tSCENE\tMESSAGE` line on the log the editor polls. → EDDEV, MCP
+pub fn event(root: string, kind: string, scene: string, message: string, arena: &Arena) {
+    let t = Text.new(arena);
+    t.add(kind).push('\t');
+    clean(&t, scene);
+    t.push('\t');
+    clean(&t, message);
+    t.push('\n');
+    appendEvent(root, t.str(), arena);
+}
+
+/// Rust `import_event`: the import event carries its own fragment name, so queued imports never share a file.
+pub fn importEvent(root: string, scene: string, file: string, message: string, arena: &Arena) {
+    let t = Text.new(arena);
+    t.add("import\t");
+    clean(&t, scene);
+    t.push('\t');
+    t.add(file).push('\t');
+    clean(&t, message);
+    t.push('\n');
+    appendEvent(root, t.str(), arena);
+}
+
+/// Rust `append_event`: one small `O_APPEND` write onto `target/j3-editor/events` (lines from two threads
+/// never interleave). → EDDEV, MCP
+pub fn appendEvent(root: string, line: string, arena: &Arena) {
+    // O_WRONLY | O_CREAT | O_APPEND, 0644
+    let fd = io.openPath(path.join(root, "target/j3-editor/events", arena), 1 + 64 + 1024, 420);
+    if fd < 0 { return; }
+    sys.write(fd, line.ptr as ptr, line.len);
+    sys.close(fd);
+}
+
+/// Rust `keep_import`: move an import's scene out of `target/` into `assets/imported/<name>.j3scene`, named
+/// after the source file; Ok = that project-relative path. → MCP, EDDEV
+pub fn keepImport(root: string, fragment: string, source: string, arena: &Arena): Result<string, string> {
+    let base = importName(source, arena);
+    let dir = path.join(root, "assets/imported", arena);
+    mkdirs(dir, arena)?;
+    let name = Text.new(arena).add(base).add(".j3scene").str();
+    let n = 2;
+    while io.exists(path.join(dir, name, arena)) {
+        let t = Text.new(arena);
+        t.add(base).push('_');
+        t.pushInt(n);
+        t.add(".j3scene");
+        name = t.str();
+        n += 1;
+    }
+    match io.rename(fragment, path.join(dir, name, arena)) { Result.Ok(_) {} Result.Err(_) { return Result.Err(ioErr(arena)); } }
+    return Result.Ok(Text.new(arena).add("assets/imported/").add(name).str());
+}
+
+/// Rust `import_name`: the base name `keepImport` gives `source` (its file stem, every char but ASCII
+/// letters, digits, `_` and `-` as `_`). → MCP, EDDEV
+pub fn importName(source: string, arena: &Arena): string {
+    let n = path.basename(source);
+    // Rust `file_stem`: before the last `.`, unless that dot leads the name
+    let k = n.len - 1;
+    while k > 0 && n[k] != '.' { k -= 1; }
+    let stem = if k > 0 { n[0..k] } else { n };
+    if stem.len == 0 || n == ".." { stem = "model"; }
+    let t = Text.new(arena);
+    for i in 0..stem.len {
+        let c = stem[i];
+        if (c & 0xC0) == 0x80 { continue; }
+        let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+        t.push(if ok { c } else { u8('_') });
+    }
+    return t.str();
+}
+
+/// Rust `import_asset`: a `.gltf`/`.glb` model (`gltf.import`; `bake` see there) or a `.j3mesh` into the
+/// project; Ok = files written. → MCP, EDDEV
+pub fn importAsset(root: string, scene: string, raw: string, bake: bool, arena: &Arena): Result<List<string>, string> {
+    let r = trim(raw);
+    if r.len == 0 { return Result.Err("enter an asset path first"); }
+    let source = if path.isAbs(r) { own(arena, r) } else { path.join(root, r, arena) };
+    let ext = extOf(source);
+    if ext == "gltf" || ext == "glb" { return gltf.import(root, scene, source, bake, arena); }
+    if ext == "j3mesh" { return gltf.importMesh(root, scene, source, arena); }
+    return Result.Err("expected .gltf, .glb, or .j3mesh");
+}

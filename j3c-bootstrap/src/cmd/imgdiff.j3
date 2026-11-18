@@ -1,9 +1,218 @@
-// `j3c -e imgdiff`: compare two PNGs with a tolerance.
+// `j3c -e imgdiff a.png b.png [--tol N] [--max N] [--out diff.png]`: golden compare. Prints the number of
+// pixels where any channel differs by more than `tol`; exits 1 when that is above `max` (default 0) or the
+// sizes differ. Same rule as `j3.gfx.canvas.diff`.
 //
 // Port of: j3c/src/imgdiff.rs
+// J3: `diff` is also `j3c golden`'s compare (`cmd/golden`). `parseUint` is Rust's `str::parse` for unsigned
+// numbers (`+` allowed, digits only, no overflow), shared with `cmd/golden`. `writeFile` / `copyFile` give files
+// Rust's modes (`j3.io` makes 0644 and copies no mode; `tests/diff.sh tool` compares modes): a new file is
+// `0666 & ~umask`, a copy takes its source's mode (raw `newfstatat` / `fchmodat`, x86-64 Linux; ponytail: other
+// hosts keep `j3.io`'s modes).
 module j3c.cmd.imgdiff;
 
-use j3c.base.diag;
+use j3.io;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use j3c.assets.png;
+use j3c.assets.png.Image;
+
+const USAGE: string = "usage: j3c -e imgdiff a.png b.png [--tol N] [--max N] [--out diff.png]\n";
+const HELP: string = "  Counts pixels where any channel differs by more than --tol (default 0, per channel 0-255).\n  Exit 0: count <= --max (default 0). Exit 1: more, or sizes differ. Exit 2: usage or unreadable PNG.\n  --out writes a diff image (changed pixels red). Capture frames with `j3c doc testing`.\n";
+/// Rust `usize::MAX` for `--max` (no count reaches it).
+const NO_MAX: int = 1 << 62;
+
+/// Rust `diff`'s `Ok((count, total))`.
+pub struct Count {
+    count: int;
+    total: int;
+}
+
+/// Rust `diff`'s `Err((exit code, message))`: 2 unreadable, 1 sizes differ.
+pub struct Fail {
+    msg: string;
+    rc: int;
+}
+
+fn out(s: string) { sys.write(1, s.ptr as ptr, s.len); }
+fn err(s: string) { sys.write(2, s.ptr as ptr, s.len); }
+
+/// Rust `s.parse::<uN>()`: an optional `+`, then one or more ASCII digits, at most `max`; -1 otherwise.
+pub fn parseUint(s: string, max: int): int {
+    let i = 0;
+    if s.len > 0 && s[0] == '+' { i = 1; }
+    if i >= s.len { return -1; }
+    let v = 0;
+    while i < s.len {
+        let c = s[i];
+        if c < '0' || c > '9' { return -1; }
+        let d = int(c - '0');
+        if v > (max - d) / 10 { return -1; }
+        v = v * 10 + d;
+        i += 1;
+    }
+    return v;
+}
+
+/// Rust `s.parse::<i32>()` for `--tol`: the value, or -1 when it does not parse (a negative value is refused
+/// by the caller either way).
+fn parseTol(s: string): int {
+    if s.len > 1 && s[0] == '-' {
+        let m = parseUint(s[1..s.len], 2147483648);
+        if m < 0 || s[1] == '+' { return -1; }
+        return if m == 0 { 0 } else { -1 };
+    }
+    return parseUint(s, 2147483647);
+}
 
 /// `j3c -e imgdiff ...`: the exit code.
-pub fn imgdiffCmd(rest: []string): int { return diag.notPortedCmd("-e imgdiff"); } // STUB IMG
+pub fn imgdiffCmd(rest: []string): int {
+    for i in 0..rest.len {
+        if rest[i] == "--help" || rest[i] == "-h" {
+            out(USAGE);
+            out(HELP);
+            return 0;
+        }
+    }
+    let arena = Arena.create(1 << 20);
+    defer arena.destroy();
+    let files = List<string>.new(&arena);
+    let tol = 0;
+    let max = 0;
+    let outPath: Option<string> = Option.None;
+    let i = 0;
+    while i < rest.len {
+        let a = rest[i];
+        let next = if i + 1 < rest.len { rest[i + 1] } else { "" };
+        let has = i + 1 < rest.len;
+        if a == "--tol" {
+            tol = if has { parseTol(next) } else { -1 };
+            if has { i += 1; }
+        } else if a == "--max" {
+            max = if has { parseUint(next, NO_MAX) } else { NO_MAX };
+            if max < 0 { max = NO_MAX; }
+            if has { i += 1; }
+        } else if a == "--out" {
+            outPath = if has { Option.Some(next) } else { Option.None };
+            if has { i += 1; }
+        } else {
+            files.push(a);
+        }
+        i += 1;
+    }
+    if files.len != 2 || tol < 0 {
+        err(USAGE);
+        return 2;
+    }
+    match diff(files.items[0], files.items[1], tol, outPath, &arena) {
+        Result.Ok(c) {
+            out(Text.new(&arena).fmt(`{c.count} of {c.total} pixels differ (tol {tol})`).add("\n").str());
+            return if c.count > max { 1 } else { 0 };
+        }
+        Result.Err(f) {
+            let line = Text.new(&arena).add(f.msg).add("\n").str();
+            if f.rc == 2 { err(line); } else { out(line); }
+            return f.rc;
+        }
+    }
+}
+
+fn load(p: string, arena: &Arena): Option<Image> {
+    match io.readFile(p, arena) {
+        Result.Ok(b) { return png.decode(b, arena); }
+        Result.Err(_) { return Option.None; }
+    }
+}
+
+/// Rust `diff`: differing pixel count and total; Err for unreadable files (2) or differing sizes (1). With
+/// `outPath`, writes the diff image (changed pixels red, the rest `a`'s red channel / 4 as grey). → golden
+pub fn diff(fa: string, fb: string, tol: int, outPath: Option<string>, arena: &Arena): Result<Count, Fail> {
+    let ia = load(fa, arena);
+    let ib = load(fb, arena);
+    let a = Image { px: List<u8>.new(arena), w: 0, h: 0 };
+    let b = a;
+    match ia {
+        Option.Some(x) { a = x; }
+        Option.None { return Result.Err(Fail { msg: "imgdiff: could not read both PNGs", rc: 2 }); }
+    }
+    match ib {
+        Option.Some(x) { b = x; }
+        Option.None { return Result.Err(Fail { msg: "imgdiff: could not read both PNGs", rc: 2 }); }
+    }
+    if a.w != b.w || a.h != b.h {
+        let m = Text.new(arena).fmt(`size differs: {a.w}x{a.h} vs {b.w}x{b.h}`).str();
+        return Result.Err(Fail { msg: m, rc: 1 });
+    }
+    let n = a.px.len;
+    let d = arena.alloc::<u8>(n);
+    let count = 0;
+    let i = 0;
+    while i + 4 <= n {
+        let bad = false;
+        for k in 0..4 {
+            let x = int(a.px.items[i + k]) - int(b.px.items[i + k]);
+            if x > tol || 0 - x > tol { bad = true; }
+        }
+        if bad {
+            count += 1;
+            d[i] = 255;
+            d[i + 1] = 0;
+            d[i + 2] = 0;
+        } else {
+            let g = a.px.items[i] / 4;
+            d[i] = g;
+            d[i + 1] = g;
+            d[i + 2] = g;
+        }
+        d[i + 3] = 255;
+        i += 4;
+    }
+    match outPath {
+        Option.Some(p) {
+            let enc = png.encodeRgba(a.w, a.h, d, arena);
+            if !writeFile(p, enc.items[0..enc.len], arena) { err(Text.new(arena).add("imgdiff: could not write ").add(p).add("\n").str()); }
+        }
+        Option.None {}
+    }
+    return Result.Ok(Count { count: count, total: a.w * a.h });
+}
+
+fn cpath(p: string, arena: &Arena): []u8 {
+    let t = Text.new(arena);
+    t.add(p);
+    t.push(0);
+    return t.str() as []u8;
+}
+
+/// Rust `fs::write`: create or truncate `p` (new files `0666 & ~umask`) and write `data`; false on failure.
+pub fn writeFile(p: string, data: []u8, arena: &Arena): bool {
+    let fd = sys.openMode(cpath(p, arena).ptr as ptr, sys.O_WRONLY + sys.O_CREAT + sys.O_TRUNC + sys.O_CLOEXEC, 438);
+    if fd < 0 { return false; }
+    let at = 0;
+    while at < data.len {
+        let n = sys.write(fd, (data.ptr as int + at) as ptr, data.len - at);
+        if n <= 0 {
+            sys.close(fd);
+            return false;
+        }
+        at += n;
+    }
+    return sys.close(fd) >= 0;
+}
+
+/// Rust `fs::copy`: the bytes and the permission bits of `from`; false on failure.
+pub fn copyFile(from: string, to: string, arena: &Arena): bool {
+    match io.copyFile(from, to) {
+        Result.Ok(_) {}
+        Result.Err(_) { return false; }
+    }
+    if sys.PLATFORM == sys.PLATFORM_LINUX && sys.ARCH == sys.ARCH_X86_64 {
+        let buf: [18]int = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // newfstatat(AT_FDCWD, from, buf, 0): st_mode u32 @24; fchmodat(AT_FDCWD, to, mode, 0)
+        if @syscall(262, -100, cpath(from, arena).ptr as ptr, &buf[0] as ptr, 0) < 0 { return false; }
+        if @syscall(268, -100, cpath(to, arena).ptr as ptr, buf[3] % 4294967296 % 4096, 0) < 0 { return false; }
+    }
+    return true;
+}

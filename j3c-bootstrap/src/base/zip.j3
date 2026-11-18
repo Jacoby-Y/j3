@@ -1,11 +1,113 @@
 // Read a zip archive (downloaded asset packs): stored and deflated entries, path escapes refused.
 //
-// Port of: j3c/src/online/pack.rs (`unzip`)
+// Port of: j3c/src/online/pack.rs (`unzip`), j3c/src/online.rs (`safe_rel`)
 // J3: Rust writes no zip: `dist.rs` and `dist/apk.rs` run the `zip` CLI, and so does the port.
+// J3: Deflate goes through `j3.gfx.canvas.inflate` (zlib framing: the raw stream gets a 2-byte dummy header;
+//     it never reads the adler32 trailer), which fills exactly the entry's stated size, as Rust's check does.
 module j3c.base.zip;
 
+use j3.gfx.canvas;
+use j3.io;
+use j3.io.path;
 use j3.memory.Arena;
 use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use j3c.base.fsx;
+
+const BAD: string = "not a zip file (zip64 isn't supported)";
+
+fn u16at(z: []u8, i: int): int {
+    if i < 0 || i + 2 > z.len { return -1; }
+    return int(z[i]) + int(z[i + 1]) * 256;
+}
+
+fn u32at(z: []u8, i: int): int {
+    if i < 0 || i + 4 > z.len { return -1; }
+    return ((int(z[i + 3]) * 256 + int(z[i + 2])) * 256 + int(z[i + 1])) * 256 + int(z[i]);
+}
+
+fn sig(z: []u8, i: int, c: u8, d: u8): bool { return i >= 0 && i + 4 <= z.len && z[i] == 0x50 && z[i + 1] == 0x4b && z[i + 2] == c && z[i + 3] == d; }
+
+/// Rust `online::safe_rel`: Err `unsafe path `REL` in download` for an empty, absolute, `\`, `:` or `..` path.
+pub fn safeRel(rel: string, arena: &Arena): Result<string, string> {
+    let bad = rel.len == 0 || rel[0] == '/';
+    let seg = 0;
+    for i in 0..rel.len + 1 {
+        if i < rel.len && (rel[i] == '\\' || rel[i] == ':') { bad = true; }
+        if i == rel.len || rel[i] == '/' {
+            if rel[seg..i] == ".." { bad = true; }
+            seg = i + 1;
+        }
+    }
+    if bad { return Result.Err(Text.new(arena).add("unsafe path `").add(rel).add("` in download").str()); }
+    return Result.Ok(rel);
+}
 
 /// Rust `online::pack::unzip`: extract `zip` into `dir`; Ok = files written. Refuses an entry that leaves `dir`. → ASSETS
-pub fn unzip(zip: []u8, dir: string, arena: &Arena): Result<int, string> { return Result.Err("unzip: not ported yet"); } // STUB DIST
+pub fn unzip(zip: []u8, dir: string, arena: &Arena): Result<int, string> {
+    // the end-of-central-directory record, searched backwards over the last 64 KiB + 22 bytes
+    let eocd = -1;
+    let i = zip.len - 22;
+    let tries = 0;
+    while i >= 0 && tries < 65536 + 22 {
+        if sig(zip, i, 5, 6) {
+            eocd = i;
+            break;
+        }
+        i -= 1;
+        tries += 1;
+    }
+    if eocd < 0 { return Result.Err(BAD); }
+    let count = u16at(zip, eocd + 10);
+    let at = u32at(zip, eocd + 16);
+    if count < 0 || at < 0 || count == 0xffff || at == 0xffffffff { return Result.Err(BAD); }
+    let written = 0;
+    for n in 0..count {
+        if !sig(zip, at, 1, 2) { return Result.Err(BAD); }
+        let method = u16at(zip, at + 10);
+        let csize = u32at(zip, at + 20);
+        let size = u32at(zip, at + 24);
+        let nlen = u16at(zip, at + 28);
+        let elen = u16at(zip, at + 30);
+        let clen = u16at(zip, at + 32);
+        let local = u32at(zip, at + 42);
+        if method < 0 || csize < 0 || size < 0 || nlen < 0 || elen < 0 || clen < 0 || local < 0 { return Result.Err(BAD); }
+        if at + 46 + nlen > zip.len { return Result.Err(BAD); }
+        // ponytail: names are taken as bytes (Rust decodes them lossily as UTF-8)
+        let name = zip[at + 46..at + 46 + nlen] as string;
+        at += 46 + nlen + elen + clen;
+        if nlen > 0 && name[nlen - 1] == '/' { continue; }
+        safeRel(name, arena)?;
+        let ln = u16at(zip, local + 26);
+        let le = u16at(zip, local + 28);
+        if ln < 0 || le < 0 { return Result.Err(BAD); }
+        let start = local + 30 + ln + le;
+        if start + csize > zip.len { return Result.Err(BAD); }
+        let data = zip[start..start + csize];
+        let bytes = data;
+        if method == 8 {
+            let z = arena.alloc::<u8>(csize + 2);
+            for k in 0..csize { z[k + 2] = data[k]; }
+            let outb = arena.alloc::<u8>(size);
+            if !canvas.inflate(z, outb, arena) { return Result.Err(Text.new(arena).add(name).add(": bad compressed data").str()); }
+            bytes = outb;
+        } else if method != 0 {
+            return Result.Err(Text.new(arena).add(name).fmt(`: zip method {method} isn't supported`).str());
+        }
+        let dest = path.join(dir, name, arena);
+        let parent = path.dirname(dest);
+        if parent.len > 0 {
+            match io.makeDirs(parent) {
+                Result.Ok(_) {}
+                Result.Err(_) { return Result.Err(fsx.osError(sys.errno(), arena)); }
+            }
+        }
+        match io.writeFile(dest, bytes) {
+            Result.Ok(_) {}
+            Result.Err(_) { return Result.Err(Text.new(arena).add(dest).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+        }
+        written += 1;
+    }
+    return Result.Ok(written);
+}

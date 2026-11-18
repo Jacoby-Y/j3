@@ -2,4 +2,319 @@
 //
 // Part of module j3c.lsp.complete.
 // Port of: j3c/src/lsp/complete/items.rs
+// J3: Every item's strings are copied into the result arena by `item`; lookups and type text are scratch in
+// the Session's arena. `KEYWORDS` (Rust `scan::KEYWORDS`) lives here with its one reader. Builtin type words
+// are `keywords.txt`'s `type` lines (`token.wordsOf`), attributes and intrinsics `token.names` (Rust
+// `parse/syntax.rs`).
 module j3c.lsp.complete;
+
+/// A completion item (Rust `item`): every string copied into `arena`, sort key `SORT_label`.
+fn item(label: string, kind: int, detail: string, doc: string, sort: string, commitDot: bool, arena: &Arena): Completion {
+    return Completion { label: own(arena, label), detail: own(arena, detail), insert: "", documentation: own(arena, doc),
+        sort: Text.new(arena).add(sort).add("_").add(label).str(), kind: kind, snippet: false, commitDot: commitDot };
+}
+
+/// Rust `finish`: sort by (sortText, label), drop a repeat of the item before it with the same (label, kind),
+/// keep 200 on an empty prefix.
+fn finish(prefix: string, out: List<Completion>): List<Completion> {
+    sortBy(out.items[0..out.len], fn(a: Completion, b: Completion): bool {
+        if a.sort != b.sort { return a.sort < b.sort; }
+        return a.label < b.label;
+    });
+    let n = 0;
+    for i in 0..out.len {
+        if n > 0 && out.items[n - 1].label == out.items[i].label && out.items[n - 1].kind == out.items[i].kind { continue; }
+        out.items[n] = out.items[i];
+        n += 1;
+    }
+    out.len = n;
+    if prefix.len == 0 && out.len > 200 { out.len = 200; }
+    return out;
+}
+
+/// `ty` as text (scratch, in the Session's arena).
+fn tyStr(s: &Session, ty: Id<Ty>): string {
+    let t = Text.new(s.arena);
+    sema.tyString(checked(s), ty, &t);
+    return t.str();
+}
+
+/// `f`'s type as text (`fn(A): R`, scratch); a generic struct's method at its first instance.
+fn sigStr(s: &Session, f: Id<FnDecl>): string { return sigStrAt(s, f, query.recvArgs(checked(s), f)); }
+
+/// `f`'s type with its struct's parameters at `args`.
+fn sigStrAt(s: &Session, f: Id<FnDecl>, args: Id<TyList>): string {
+    let t = Text.new(s.arena);
+    sema.sigTextAt(checked(s), f, args, &t);
+    return t.str();
+}
+
+/// The checked tables of a Session that `query.analyze` returned (always there).
+fn checked(s: &Session): &Checked {
+    match s.checked { Option.Some(c) { return c; } Option.None { panic("lsp: a Session without a check"); } }
+}
+
+fn modKey(c: &Checked, m: Id<ModDecl>): string { return c.tables.modAt(m).key; }
+
+/// Rust `push_locals`: the locals of the body around `offset` (a closure's own inside one).
+fn pushLocals(s: &Session, file: Id<Source>, offset: u32, prefix: string, out: &List<Completion>, arena: &Arena) {
+    let c = checked(s);
+    let b = match sema.bodyAt(c, file, offset, s.arena) { Option.Some(b) { b } Option.None { return; } };
+    let ls = c.typed.bodies.get(b).locals;
+    for i in 0..ls.len {
+        let l = c.typed.locals.get(ls.items[i]);
+        let name = c.tables.str(l.name);
+        if !isIdentName(name) || !startsWith(name, prefix) { continue; }
+        out.push(item(name, 6, tyStr(s, l.ty), l.doc, "0", false, arena));
+    }
+}
+
+/// Rust `push_script_names`: inside a `.j3s`, its props and state, `shared` names and script fns.
+fn pushScriptNames(s: &Session, file: Id<Source>, prefix: string, out: &List<Completion>, arena: &Arena) {
+    let c = checked(s);
+    let sid = match query.scriptIn(c, file) { Option.Some(x) { x } Option.None { return; } };
+    let sd = c.tables.structAt(sid);
+    for k in 0..sd.fields.len {
+        let f = sd.fields.items[k];
+        let name = c.tables.str(f.name);
+        if !startsWith(name, prefix) { continue; }
+        let d = Text.new(s.arena).add(if k < sd.propSpans.len { "prop" } else { "state" }).add(": ").add(tyStr(s, f.ty)).str();
+        out.push(item(name, 6, d, f.doc, "1", false, arena));
+    }
+    let gs = &c.tables.globals;
+    for i in 0..gs.len() {
+        let g = gs.get(gs.idAt(i));
+        let name = c.tables.str(g.name);
+        if g.span.file != file || !startsWith(name, prefix) { continue; }
+        out.push(item(name, 6, Text.new(s.arena).add("shared: ").add(tyStr(s, g.ty)).str(), g.doc, "1", false, arena));
+    }
+    let fns = &c.tables.fns;
+    for i in 0..fns.len() {
+        let fd = fns.get(fns.idAt(i));
+        if !isMethodOf(fd, sid) { continue; }
+        let name = c.tables.str(fd.name);
+        if !startsWith(name, prefix) { continue; }
+        out.push(item(name, 3, Text.new(s.arena).add("script fn: ").add(sigStr(s, fns.idAt(i))).str(), fd.doc, "1", false, arena));
+    }
+}
+
+/// `fd` is a method of `sid` (Rust `func.method_of == Some(sid)`).
+fn isMethodOf(fd: &FnDecl, sid: Id<StructDecl>): bool {
+    match fd.recv { Option.Some(r) { return r == sid; } Option.None { return false; } }
+}
+
+fn isFree(fd: &FnDecl): bool {
+    match fd.recv { Option.Some(_) { return false; } Option.None { return true; } }
+}
+
+/// Rust `push_file_items`: the fns, structs, enums and globals declared in `file`.
+fn pushFileItems(s: &Session, file: Id<Source>, prefix: string, out: &List<Completion>, arena: &Arena) {
+    let c = checked(s);
+    let t = c.tables;
+    for i in 0..t.fns.len() {
+        let fd = t.fns.get(t.fns.idAt(i));
+        if fd.span.file != file || !isFree(fd) { continue; }
+        let name = t.str(fd.name);
+        if !isIdentName(name) || !startsWith(name, prefix) { continue; }
+        out.push(item(name, 3, sigStr(s, t.fns.idAt(i)), fd.doc, "1", false, arena));
+    }
+    for i in 0..t.structs.len() {
+        let sd = t.structs.get(t.structs.idAt(i));
+        let name = t.str(sd.name);
+        if sd.span.file == file && isIdentName(name) && startsWith(name, prefix) { out.push(item(name, 22, "struct", sd.doc, "1", false, arena)); }
+    }
+    for i in 0..t.enums.len() {
+        let ed = t.enums.get(t.enums.idAt(i));
+        let name = t.str(ed.name);
+        if ed.span.file == file && isIdentName(name) && startsWith(name, prefix) { out.push(item(name, 13, "enum", ed.doc, "1", false, arena)); }
+    }
+    for i in 0..t.globals.len() {
+        let g = t.globals.get(t.globals.idAt(i));
+        let name = t.str(g.name);
+        if g.span.file == file && isIdentName(name) && startsWith(name, prefix) { out.push(item(name, 6, tyStr(s, g.ty), g.doc, "1", false, arena)); }
+    }
+}
+
+/// Rust `push_imports`: the names the file's `use` lines bring in, and its module aliases.
+fn pushImports(s: &Session, src: string, prefix: string, out: &List<Completion>, arena: &Arena) {
+    let uses = usesOf(s, src, s.arena);
+    let exports = sema.programExports(checked(s), s.arena);
+    for i in 0..uses.imports.len {
+        let modName = uses.imports.items[i].first;
+        let name = uses.imports.items[i].second;
+        if !startsWith(name, prefix) { continue; }
+        match exportNamed(&exports, modName, name) {
+            Option.Some(e) {
+                let k = exportItem(s, &e);
+                out.push(item(name, k.kind, k.detail, exportDoc(s, &e), "2", false, arena));
+            }
+            Option.None { out.push(item(name, 3, "", modName, "2", false, arena)); }
+        }
+    }
+    for i in 0..uses.aliases.len {
+        let alias = uses.aliases.items[i].first;
+        if startsWith(alias, prefix) { out.push(item(alias, 9, "module", uses.aliases.items[i].second, "2", true, arena)); }
+    }
+}
+
+/// The export `module.name`, if any.
+fn exportNamed(exports: &List<Export>, modName: string, name: string): Option<Export> {
+    for i in 0..exports.len {
+        if exports.items[i].modPath == modName && exports.items[i].name == name { return Option.Some(exports.items[i]); }
+    }
+    return Option.None;
+}
+
+/// Rust `push_exports`: what module `path` exports, when it is a module of the program. → LSPU (`completeUse`)
+fn pushExports(s: &Session, path: []string, prefix: string, commitDot: bool, out: &List<Completion>, arena: &Arena) {
+    if path.len == 0 { return; }
+    let t = Text.new(s.arena);
+    for i in 0..path.len {
+        if i > 0 { t.add("."); }
+        t.add(path[i]);
+    }
+    let modName = t.str();
+    let keys = moduleKeys(s, s.arena);
+    if !keys.contains(modName) { return; }
+    let exports = sema.programExports(checked(s), s.arena);
+    for i in 0..exports.len {
+        let e = exports.items[i];
+        if e.modPath != modName || !startsWith(e.name, prefix) { continue; }
+        let k = exportItem(s, &e);
+        out.push(item(e.name, k.kind, k.detail, exportDoc(s, &e), "2", commitDot, arena));
+    }
+}
+
+/// Rust `push_builtins`: the built-in type words, `true` and `false`.
+fn pushBuiltins(s: &Session, prefix: string, out: &List<Completion>, arena: &Arena) {
+    let types = token.wordsOf("type", s.arena);
+    for i in 0..types.len { if startsWith(types[i], prefix) { out.push(item(types[i], 22, "type", "", "3", false, arena)); } }
+    let lits: [2]string = ["true", "false"];
+    for i in 0..2 { if startsWith(lits[i], prefix) { out.push(item(lits[i], 21, "bool", "", "3", false, arena)); } }
+}
+
+/// Rust `scan::KEYWORDS`: (label, insert) pairs; an insert with `$` is a snippet.
+const KEYWORDS: [46]string = [
+    "module", "module ${1:name};",
+    "use", "use ${1:j3.io}.${2:name};",
+    "pub", "pub ",
+    "fn", "fn ${1:name}($2) {\n    $0\n}",
+    "struct", "struct ${1:Name} {\n    $0\n}",
+    "trait", "trait ${1:Name} {\n    fn ${2:name}(this: Self): ${3:int};\n}",
+    "dyn", "dyn ${1:Trait}",
+    "where", "where ${1:T}: ${2:Eq}",
+    "boxed", "boxed closure(${1:int}): ${2:int}",
+    "extend", "extend ${1:Type} {\n    fn ${2:name}(this: &${1:Type}) {\n        $0\n    }\n}",
+    "enum", "enum ${1:Name} {\n    ${2:A},\n}",
+    "const", "const ${1:NAME}: ${2:int} = ${3:0};",
+    "let", "let ${1:name} = $0;",
+    "if", "if ${1:cond} {\n    $0\n}",
+    "else", "else {\n    $0\n}",
+    "while", "while ${1:cond} {\n    $0\n}",
+    "for", "for ${1:i} in ${2:0}..${3:n} {\n    $0\n}",
+    "in", "in ",
+    "match", "match ${1:value} {\n    ${2:_} => { $0 }\n}",
+    "return", "return $0;",
+    "break", "break;",
+    "continue", "continue;",
+    "defer", "defer $0;",
+];
+
+/// Rust `push_keywords`.
+fn pushKeywords(prefix: string, out: &List<Completion>, arena: &Arena) {
+    let k = 0;
+    while k < KEYWORDS.len {
+        let label = KEYWORDS[k];
+        let insert = KEYWORDS[k + 1];
+        k += 2;
+        if !startsWith(label, prefix) { continue; }
+        let snippet = contains(insert, "$");
+        out.push(Completion { label: own(arena, label), detail: if snippet { "snippet" } else { "keyword" }, insert: if snippet { own(arena, insert) } else { "" },
+            documentation: "", sort: Text.new(arena).add("4_").add(label).str(), kind: if snippet { 15 } else { 14 }, snippet: snippet, commitDot: false });
+    }
+}
+
+/// Rust `keyed`: the words of `names` starting with `prefix`, finished.
+fn keyed(names: []string, prefix: string, kind: int, detail: string, sort: string, arena: &Arena): List<Completion> {
+    let out = List<Completion>.new(arena);
+    for i in 0..names.len { if startsWith(names[i], prefix) { out.push(item(names[i], kind, detail, "", sort, false, arena)); } }
+    return finish(prefix, out);
+}
+
+/// Rust `export_item`'s `(kind, detail)`.
+struct KindDetail {
+    detail: string;
+    kind: int;
+}
+
+/// Rust `export_item`: an export's completion kind and detail. → LSPU
+fn exportItem(s: &Session, e: &Export): KindDetail {
+    let c = checked(s);
+    match e.kind {
+        ExportKind.Fn {
+            match funcInModule(s, e.modPath, e.name) {
+                Option.Some(f) { return KindDetail { detail: sigStr(s, f), kind: 3 }; }
+                Option.None { return KindDetail { detail: "fn", kind: 3 }; }
+            }
+        }
+        ExportKind.Struct { return KindDetail { detail: "struct", kind: 22 }; }
+        ExportKind.Enum { return KindDetail { detail: "enum", kind: 13 }; }
+        ExportKind.Const {
+            let gs = &c.tables.globals;
+            for i in 0..gs.len() {
+                let g = gs.get(gs.idAt(i));
+                if c.tables.str(g.name) == e.name && modKey(c, g.owner) == e.modPath { return KindDetail { detail: tyStr(s, g.ty), kind: 21 }; }
+            }
+            return KindDetail { detail: "const", kind: 21 };
+        }
+    }
+    return KindDetail { detail: "", kind: 0 };
+}
+
+/// Rust `export_doc`: the doc, the module in backticks, then up to 12 fields or variants. → LSPU
+fn exportDoc(s: &Session, e: &Export): string {
+    let c = checked(s);
+    let t = Text.new(s.arena);
+    if e.doc.len > 0 { t.add(e.doc).add("\n\n"); }
+    t.add("`").add(e.modPath).add("`");
+    match e.kind {
+        ExportKind.Struct {
+            let ss = &c.tables.structs;
+            for i in 0..ss.len() {
+                let sd = ss.get(ss.idAt(i));
+                if c.tables.str(sd.name) != e.name || modKey(c, sd.owner) != e.modPath { continue; }
+                for k in 0..sd.fields.len {
+                    if k == 12 { break; }
+                    t.add("\n").add(c.tables.str(sd.fields.items[k].name)).add(": ").add(tyStr(s, sd.fields.items[k].ty));
+                }
+                break;
+            }
+        }
+        ExportKind.Enum {
+            let es = &c.tables.enums;
+            for i in 0..es.len() {
+                let ed = es.get(es.idAt(i));
+                if c.tables.str(ed.name) != e.name || modKey(c, ed.owner) != e.modPath { continue; }
+                for k in 0..ed.variants.len {
+                    if k == 12 { break; }
+                    t.add("\n").add(c.tables.str(ed.variants.items[k].name));
+                }
+                break;
+            }
+        }
+        ExportKind.Fn {}
+        ExportKind.Const {}
+    }
+    return t.str();
+}
+
+/// Rust `func_in_module`: the free fn `name` of `module`. → LSPU
+fn funcInModule(s: &Session, modName: string, name: string): Option<Id<FnDecl>> {
+    let c = checked(s);
+    let fns = &c.tables.fns;
+    for i in 0..fns.len() {
+        let fd = fns.get(fns.idAt(i));
+        if isFree(fd) && c.tables.str(fd.name) == name && modKey(c, fd.owner) == modName { return Option.Some(fns.idAt(i)); }
+    }
+    return Option.None;
+}

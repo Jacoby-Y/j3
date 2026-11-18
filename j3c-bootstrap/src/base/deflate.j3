@@ -1,7 +1,337 @@
-// DEFLATE compression for PNG writing: fixed Huffman codes, greedy LZ77 with one candidate per hash (Rust's
-// XOR hash `(a<<10 ^ b<<5 ^ c) & 0x7fff`), zlib header `78 01`, adler32; plus crc32. Byte-equal with Rust.
+// DEFLATE for PNG: the compressor (fixed Huffman codes, greedy LZ77 with one candidate per hash, Rust's XOR
+// hash `(a<<10 ^ b<<5 ^ c) & 0x7fff`), the decoder (stored, fixed and dynamic blocks, zlib's `puff`), adler32
+// and crc32. The compressor's bytes equal Rust's.
 //
-// Port of: j3c/src/png.rs (compressor half)
-// J3: `j3.gfx.canvas` has a private `deflateFixed` with another hash (other bytes), so the port keeps its own.
-// Move to the stdlib once both agree.
+// Port of: j3c/src/png.rs (`inflate`, `Bits`, `deflate_fixed`, `adler32`, `crc32`, the length/distance tables)
+// J3: `j3.gfx.canvas` has a private `deflateFixed` with another hash (other bytes) and an `inflate` into a
+// fixed buffer, so the port keeps its own. Move to the stdlib once both agree. Values are `int` (bit buffers
+// fit in 64 bits); crc and adler are 32-bit values in an `int`.
 module j3c.base.deflate;
+
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+
+const LEN_BASE: [29]int = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEN_EXTRA: [29]int = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE: [30]int = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA: [30]int = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const ORDER: [19]int = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+const WINDOW: int = 32768;
+
+/// Bits written least significant first (Rust `Bits`).
+struct Out {
+    out: List<u8>;
+    acc: int;
+    n: int;
+}
+
+/// `count` bits of `v`, least significant first.
+fn put(b: &Out, v: int, count: int) {
+    b.acc = b.acc | (v << b.n);
+    b.n += count;
+    while b.n >= 8 {
+        b.out.push(u8(b.acc & 255));
+        b.acc = b.acc >> 8;
+        b.n -= 8;
+    }
+}
+
+/// A Huffman code, which DEFLATE stores most significant bit first.
+fn code(b: &Out, c: int, len: int) {
+    let r = 0;
+    for i in 0..len { r = (r << 1) | ((c >> i) & 1); }
+    put(b, r, len);
+}
+
+fn literal(b: &Out, sym: int) {
+    if sym <= 143 {
+        code(b, 0x30 + sym, 8);
+    } else if sym <= 255 {
+        code(b, 0x190 + sym - 144, 9);
+    } else if sym <= 279 {
+        code(b, sym - 256, 7);
+    } else {
+        code(b, 0xC0 + sym - 280, 8);
+    }
+}
+
+fn hash3(d: []u8, i: int): int { return ((int(d[i]) << 10) ^ (int(d[i + 1]) << 5) ^ int(d[i + 2])) & 0x7fff; }
+
+/// Rust `deflate_fixed`: one fixed-Huffman block with greedy LZ77 over a 32 KiB window (raw DEFLATE, no
+/// zlib header). ponytail: one hash candidate per position, as Rust.
+pub fn deflateFixed(data: []u8, arena: &Arena): List<u8> {
+    let b = Out { out: List<u8>.new(arena), acc: 0, n: 0 };
+    b.out.reserve(data.len / 4 + 16);
+    put(&b, 1, 1);
+    put(&b, 1, 2);
+    let head = arena.alloc::<int>(1 << 15);
+    for k in 0..head.len { head[k] = -1; }
+    let i = 0;
+    while i < data.len {
+        let best = 0;
+        let dist = 0;
+        if i + 3 <= data.len {
+            let h = hash3(data, i);
+            let cand = head[h];
+            head[h] = i;
+            if cand >= 0 && i - cand <= WINDOW {
+                let max = data.len - i;
+                if max > 258 { max = 258; }
+                let l = 0;
+                while l < max && data[cand + l] == data[i + l] { l += 1; }
+                if l >= 3 {
+                    best = l;
+                    dist = i - cand;
+                }
+            }
+        }
+        if best == 0 {
+            literal(&b, int(data[i]));
+            i += 1;
+            continue;
+        }
+        let li = 28;
+        while LEN_BASE[li] > best { li -= 1; }
+        literal(&b, 257 + li);
+        put(&b, best - LEN_BASE[li], LEN_EXTRA[li]);
+        let di = 29;
+        while DIST_BASE[di] > dist { di -= 1; }
+        code(&b, di, 5);
+        put(&b, dist - DIST_BASE[di], DIST_EXTRA[di]);
+        // Index the skipped positions so later matches can find them.
+        let stop = i + best;
+        let lim = if data.len >= 2 { data.len - 2 } else { 0 };
+        if stop > lim { stop = lim; }
+        let k = i + 1;
+        while k < stop {
+            head[hash3(data, k)] = k;
+            k += 1;
+        }
+        i += best;
+    }
+    literal(&b, 256);
+    if b.n > 0 { put(&b, 0, 8 - b.n); }
+    return b.out;
+}
+
+/// Rust `adler32`.
+pub fn adler32(data: []u8): int {
+    let a = 1;
+    let b = 0;
+    let i = 0;
+    while i < data.len {
+        let end = i + 5552;
+        if end > data.len { end = data.len; }
+        while i < end {
+            a += int(data[i]);
+            b += a;
+            i += 1;
+        }
+        a = a % 65521;
+        b = b % 65521;
+    }
+    return (b << 16) | a;
+}
+
+/// One more part of a crc32 (Rust `crc32` over several parts): start with `0xffffffff`, end with
+/// `crcEnd`.
+pub fn crcUpdate(crc: int, data: []u8): int {
+    let c = crc;
+    for i in 0..data.len {
+        c = c ^ int(data[i]);
+        for _k in 0..8 {
+            c = if (c & 1) != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+        }
+    }
+    return c;
+}
+
+/// The finished crc32 of `crcUpdate`'s running value.
+pub fn crcEnd(crc: int): int { return crc ^ 0xffffffff; }
+
+/// Input read least significant bit first (Rust `inflate::In`).
+struct In {
+    z: []u8;
+    at: int;
+    buf: int;
+    cnt: int;
+}
+
+/// `n` bits, or -1 past the end of the input.
+fn bits(s: &In, n: int): int {
+    while s.cnt < n {
+        if s.at >= s.z.len { return -1; }
+        s.buf = s.buf | (int(s.z[s.at]) << s.cnt);
+        s.at += 1;
+        s.cnt += 8;
+    }
+    let v = s.buf & ((1 << n) - 1);
+    s.buf = s.buf >> n;
+    s.cnt -= n;
+    return v;
+}
+
+/// A canonical Huffman code as `puff` keeps it: codes per length, symbols in code order.
+struct Huff {
+    count: []int;
+    symbol: []int;
+}
+
+fn build(lens: []int, arena: &Arena): Option<Huff> {
+    let count = arena.alloc::<int>(16);
+    for i in 0..16 { count[i] = 0; }
+    for i in 0..lens.len { count[lens[i]] += 1; }
+    let left = 1;
+    for len in 1..16 {
+        left = left * 2 - count[len];
+        if left < 0 { return Option.None; }
+    }
+    let offs = arena.alloc::<int>(16);
+    for i in 0..16 { offs[i] = 0; }
+    for len in 1..15 { offs[len + 1] = offs[len] + count[len]; }
+    let symbol = arena.alloc::<int>(lens.len);
+    for i in 0..lens.len { symbol[i] = 0; }
+    for s in 0..lens.len {
+        let l = lens[s];
+        if l != 0 {
+            symbol[offs[l]] = s;
+            offs[l] += 1;
+        }
+    }
+    count[0] = 0;
+    return Option.Some(Huff { count: count, symbol: symbol });
+}
+
+/// The next symbol, -1 on a bad code or the end of the input.
+fn decodeSym(s: &In, h: &Huff): int {
+    let c = 0;
+    let first = 0;
+    let index = 0;
+    for len in 1..16 {
+        let bit = bits(s, 1);
+        if bit < 0 { return -1; }
+        c = c | bit;
+        let count = h.count[len];
+        if c - count < first {
+            let at = index + c - first;
+            if at < 0 || at >= h.symbol.len { return -1; }
+            return h.symbol[at];
+        }
+        index += count;
+        first = (first + count) << 1;
+        c = c << 1;
+    }
+    return -1;
+}
+
+/// The literal and distance codes of one compressed block (kind 1 fixed, 2 dynamic).
+struct Codes {
+    lit: Huff;
+    dist: Huff;
+}
+
+fn blockCodes(s: &In, kind: int, arena: &Arena): Option<Codes> {
+    if kind == 1 {
+        let l = arena.alloc::<int>(288);
+        for i in 0..288 { l[i] = if i < 144 { 8 } else if i < 256 { 9 } else if i < 280 { 7 } else { 8 }; }
+        let d = arena.alloc::<int>(30);
+        for i in 0..30 { d[i] = 5; }
+        let lit = build(l, arena)?;
+        let dist = build(d, arena)?;
+        return Option.Some(Codes { lit: lit, dist: dist });
+    }
+    let a = bits(s, 5);
+    let b = bits(s, 5);
+    let c = bits(s, 4);
+    if a < 0 || b < 0 || c < 0 { return Option.None; }
+    let nlen = a + 257;
+    let ndist = b + 1;
+    let ncode = c + 4;
+    let cl = arena.alloc::<int>(19);
+    for i in 0..19 { cl[i] = 0; }
+    for i in 0..ncode {
+        let v = bits(s, 3);
+        if v < 0 { return Option.None; }
+        cl[ORDER[i]] = v;
+    }
+    let ch = build(cl, arena)?;
+    let lens = List<int>.new(arena);
+    while lens.len < nlen + ndist {
+        let sym = decodeSym(s, &ch);
+        if sym < 0 { return Option.None; }
+        let v = 0;
+        let n = 1;
+        if sym <= 15 {
+            v = sym;
+        } else if sym == 16 {
+            if lens.len == 0 { return Option.None; }
+            v = lens.last();
+            let e = bits(s, 2);
+            if e < 0 { return Option.None; }
+            n = 3 + e;
+        } else if sym == 17 {
+            let e = bits(s, 3);
+            if e < 0 { return Option.None; }
+            n = 3 + e;
+        } else {
+            let e = bits(s, 7);
+            if e < 0 { return Option.None; }
+            n = 11 + e;
+        }
+        for _k in 0..n { lens.push(v); }
+    }
+    if lens.len != nlen + ndist || lens.items[256] == 0 { return Option.None; }
+    let lit = build(lens.items[0..nlen], arena)?;
+    let dist = build(lens.items[nlen..lens.len], arena)?;
+    return Option.Some(Codes { lit: lit, dist: dist });
+}
+
+/// Rust `inflate`: raw DEFLATE (no zlib header) decoded; None on bad data or past `cap` output bytes, so a
+/// tiny crafted file can't eat memory. ponytail: bit-at-a-time Huffman decode, as Rust.
+pub fn inflate(z: []u8, cap: int, arena: &Arena): Option<List<u8>> {
+    let s = In { z: z, at: 0, buf: 0, cnt: 0 };
+    let out = List<u8>.new(arena);
+    while true {
+        let last = bits(&s, 1);
+        let kind = bits(&s, 2);
+        if last < 0 || kind < 0 { return Option.None; }
+        if kind == 0 {
+            s.buf = 0;
+            s.cnt = 0;
+            if s.at + 2 > z.len { return Option.None; }
+            let len = int(z[s.at]) | (int(z[s.at + 1]) << 8);
+            if out.len + len > cap { return Option.None; }
+            if s.at + 4 + len > z.len { return Option.None; }
+            out.extend(z[s.at + 4..s.at + 4 + len]);
+            s.at += 4 + len;
+        } else if kind <= 2 {
+            let codes = blockCodes(&s, kind, arena)?;
+            while true {
+                let sym = decodeSym(&s, &codes.lit);
+                if sym < 0 { return Option.None; }
+                if sym < 256 {
+                    if out.len >= cap { return Option.None; }
+                    out.push(u8(sym));
+                    continue;
+                }
+                if sym == 256 { break; }
+                let li = sym - 257;
+                if li >= 29 { return Option.None; }
+                let le = bits(&s, LEN_EXTRA[li]);
+                if le < 0 { return Option.None; }
+                let len = LEN_BASE[li] + le;
+                let di = decodeSym(&s, &codes.dist);
+                if di < 0 || di >= 30 { return Option.None; }
+                let de = bits(&s, DIST_EXTRA[di]);
+                if de < 0 { return Option.None; }
+                let d = DIST_BASE[di] + de;
+                if d > out.len || out.len + len > cap { return Option.None; }
+                for _k in 0..len { out.push(out.items[out.len - d]); }
+            }
+        } else {
+            return Option.None;
+        }
+        if last == 1 { return Option.Some(out); }
+    }
+    return Option.None;
+}

@@ -3,3 +3,508 @@
 // Part of module j3c.doc.
 // Port of: j3c/src/doc/render.rs
 module j3c.doc;
+// J3: Rust's `Filter` enum is a plain struct (`kind` + up to two names); `Cx` carries the module. Output goes
+// straight into one `Text`. Also `scriptDoc` (Rust `doc/mod.rs` `script_doc`), which renders a `.j3s`.
+
+const F_ALL: int = 0;
+/// A top-level item, a type, or any member with this name.
+const F_NAME: int = 1;
+/// `Type.member`.
+const F_MEMBER: int = 2;
+
+/// Which items to show (Rust `Filter`).
+struct Filter {
+    kind: int;
+    a: string;
+    b: string;
+
+    fn top(this: &Filter, name: string): bool {
+        if this.kind == F_ALL { return true; }
+        return this.kind == F_NAME && this.a == name;
+    }
+
+    /// Whether a type shows all of itself.
+    fn whole(this: &Filter, ty: string): bool {
+        return this.kind == F_ALL || (this.kind == F_NAME && this.a == ty);
+    }
+
+    fn member(this: &Filter, ty: string, member: string): bool {
+        return this.whole(ty) || (this.kind == F_NAME && this.a == member)
+            || (this.kind == F_MEMBER && this.a == ty && this.b == member);
+    }
+}
+
+fn parseFilter(item: Option<string>): Filter {
+    match item {
+        Option.Some(s) {
+            let k = text.find(s, ".");
+            if k < 0 { return Filter { kind: F_NAME, a: s, b: "" }; }
+            return Filter { kind: F_MEMBER, a: s[0..k], b: s[k + 1..s.len] };
+        }
+        Option.None { return Filter { kind: F_ALL, a: "", b: "" }; }
+    }
+}
+
+/// What rendering needs besides the item (Rust `Cx`).
+struct Cx {
+    m: &Module;
+    filter: Filter;
+
+    fn str(this: &Cx, s: Sym): string { return this.m.ast.str(s); }
+
+    /// `at file:line` under an item, only when one item was asked for.
+    fn at(this: &Cx, out: &Text, sp: Span, indent: string) {
+        let m = this.m;
+        if this.filter.kind == F_ALL || m.origin.len == 0 { return; }
+        let end = if int(sp.lo) < m.src.len { int(sp.lo) } else { m.src.len };
+        let from = 0;
+        let origin = m.origin;
+        let k = m.parts.len - 1;
+        while k >= 0 {
+            if m.parts.items[k].start <= end { from = m.parts.items[k].start; origin = m.parts.items[k].origin; break; }
+            k -= 1;
+        }
+        let line = 1;
+        for i in from..end { if m.src[i] == '\n' { line += 1; } }
+        out.add(indent).add("at ").add(origin).add(":").pushInt(line);
+        if m.embedded { out.add(" (embedded in j3c)"); }
+        out.push('\n');
+    }
+}
+
+/// A literal's text as written, or `...` when it is long (Rust `expr_text`).
+fn exprText(ast: &Ast, src: string, e: Id<Expr>): string {
+    let sp = ast.exprSpan(e);
+    let lo = int(sp.lo);
+    let hi = int(sp.hi);
+    let t = if lo <= hi && hi <= src.len { trim(src[lo..hi]) } else { "" };
+    if t.len == 0 || t.len > 60 || text.find(t, "\n") >= 0 { return "..."; }
+    return t;
+}
+
+/// Generated helpers (`find__scripts_door`) are public to the compiler, not to readers.
+fn shown(name: string): bool { return text.find(name, "__") < 0; }
+
+/// `j3c doc <module> [item]` (Rust `render_module`).
+fn renderModule(m: &Module, item: Option<string>, a: &Arena): Result<string, string> {
+    let filter = parseFilter(item);
+    if filter.kind == F_NAME {
+        let syms = symbols(m, a);
+        let quals = List<string>.new(a);
+        let dotted = Text.new(a).add(".").add(filter.a).str();
+        for i in 0..syms.len {
+            let q = syms.items[i].qual;
+            if q == filter.a || endsWith(q, dotted) { quals.push(q); }
+        }
+        if quals.len > 1 {
+            let t = Text.new(a);
+            t.add("`").add(filter.a).add("` names more than one item in ").add(m.key).add(":\n");
+            for i in 0..quals.len { t.add("    j3c doc ").add(m.key).add(" ").add(quals.items[i]).add("\n"); }
+            return Result.Ok(t.str());
+        }
+    }
+    let cx = Cx { m: m, filter: filter };
+    let out = Text.new(a);
+    out.add("module ").add(m.key).add("\n");
+    let scanned = match m.scan { Option.Some(_) { true } Option.None { false } };
+    if scanned { out.add("    Made by j3c from this project's scenes when a program uses it; never written to disk.\n"); }
+    if filter.kind == F_ALL { pushDoc(&out, m.file.doc, "    "); }
+    out.push('\n');
+    let hits = 0;
+    for i in 0..m.file.items.len { hits += renderItem(&out, &cx, &m.file.items.items[i], a); }
+    if filter.kind == F_ALL {
+        match m.scan { Option.Some(scan) { attached(&out, &scan, a); } Option.None {} }
+    }
+    match item {
+        Option.Some(it) {
+            if hits == 0 {
+                return Result.Err(Text.new(a).add("no public item `").add(it).add("` in ").add(m.key)
+                    .add("\n  = help: `j3c doc ").add(m.key).add(" --short` lists its names").str());
+            }
+        }
+        Option.None {}
+    }
+    return Result.Ok(out.str());
+}
+
+/// The scripts module's source: which scene objects carry which script (Rust `attached`).
+fn attached(out: &Text, scan: &Scan, a: &Arena) {
+    let scripts = scan.scripts(a);
+    if scripts.len == 0 {
+        out.add("No scene attaches a script yet (`script=scripts/x.j3s` on an object line).\n");
+        return;
+    }
+    out.add("attached scripts (one instance per object; find one with\n    `const Spin = @script(\"scripts/spin.j3s\");` then `scene.script::<Spin>(node)`)\n");
+    for s in 0..scripts.len {
+        out.add("    ").add(scripts.items[s]).add("\n");
+        for i in 0..scan.attachments.len {
+            let at = scan.attachments.items[i];
+            if at.script != scripts.items[s] { continue; }
+            out.add("        ").add(at.scene).add(":").pushInt(at.line);
+            out.add("  object #").pushInt(at.id);
+            out.push('\n');
+        }
+    }
+}
+
+/// One top-level item; how many items and members it showed (Rust `render_item`).
+fn renderItem(out: &Text, cx: &Cx, item: &Item, a: &Arena): int {
+    let ast = cx.m.ast;
+    match *item {
+        Item.Fn(f) {
+            let name = cx.str(f.name.name);
+            if !f.visPub || !shown(name) || !cx.filter.top(name) { return 0; }
+            pushFn(out, ast, &f, "", "");
+            cx.at(out, f.span, "    ");
+            return 1;
+        }
+        Item.Const(c) {
+            let name = cx.str(c.name.name);
+            if !c.visPub || !shown(name) || !cx.filter.top(name) { return 0; }
+            out.add("const ").add(name);
+            match c.ty { Option.Some(t) { out.add(": "); tyStr(out, ast, t); } Option.None {} }
+            out.add(" = ").add(exprText(ast, cx.m.src, c.value)).add("\n");
+            pushDoc(out, c.doc, "    ");
+            cx.at(out, c.span, "    ");
+            out.push('\n');
+            return 1;
+        }
+        Item.Trait(t) {
+            let name = cx.str(t.name.name);
+            if !t.visPub || !cx.filter.top(name) { return 0; }
+            out.add("trait ").add(name);
+            for i in 0..t.supers.len { out.add(if i == 0 { ": " } else { " + " }).add(cx.str(t.supers.items[i].name)); }
+            out.add("\n");
+            pushDoc(out, t.doc, "    ");
+            for i in 0..t.methods.len {
+                let m = t.methods.items[i];
+                out.add("    fn ").add(cx.str(m.name.name)).add("(");
+                pushParams(out, ast, &m.params);
+                out.add(")");
+                match m.ret { Option.Some(r) { out.add(": "); tyStr(out, ast, r); } Option.None {} }
+                match m.body { Option.Some(_) { out.add(" { default }"); } Option.None {} }
+                out.add("\n");
+            }
+            cx.at(out, t.span, "    ");
+            return 1;
+        }
+        Item.Struct(s) { if !s.visPub { return 0; } return renderStruct(out, cx, &s, a); }
+        Item.Enum(e) { if !e.visPub { return 0; } return renderEnum(out, cx, &e); }
+        _ { return 0; }
+    }
+}
+
+fn renderStruct(out: &Text, cx: &Cx, s: &StructItem, a: &Arena): int {
+    let ast = cx.m.ast;
+    let name = cx.str(s.name.name);
+    let whole = cx.filter.whole(name);
+    let nf = 0;
+    let nm = 0;
+    for i in 0..s.fields.len { if cx.filter.member(name, cx.str(s.fields.items[i].name.name)) { nf += 1; } }
+    for i in 0..s.methods.len { if cx.filter.member(name, cx.str(s.methods.items[i].name.name)) { nm += 1; } }
+    if !whole && nf == 0 && nm == 0 { return 0; }
+    let ot = Text.new(a);
+    ot.add(name);
+    typeParams(&ot, ast, &s.typeParams, &s.bounds);
+    let owner = ot.str();
+    out.add("struct ").add(owner).add("\n");
+    if whole {
+        pushDoc(out, s.doc, "    ");
+        cx.at(out, s.span, "    ");
+    }
+    for i in 0..s.fields.len {
+        let f = s.fields.items[i];
+        if !cx.filter.member(name, cx.str(f.name.name)) { continue; }
+        out.add("    ");
+        if f.embedded { out.add("use "); }
+        out.add(cx.str(f.name.name)).add(": ");
+        tyStr(out, ast, f.ty);
+        match f.default { Option.Some(d) { out.add(" = ").add(exprText(ast, cx.m.src, d)); } Option.None {} }
+        out.add("\n");
+        pushDoc(out, f.doc, "        ");
+        if !whole { cx.at(out, f.span, "        "); }
+    }
+    for i in 0..s.methods.len {
+        if !cx.filter.member(name, cx.str(s.methods.items[i].name.name)) { continue; }
+        pushFn(out, ast, &s.methods.items[i], owner, "    ");
+        if !whole { cx.at(out, s.methods.items[i].span, "        "); }
+    }
+    out.push('\n');
+    return 1 + nf + nm;
+}
+
+fn renderEnum(out: &Text, cx: &Cx, e: &EnumItem): int {
+    let ast = cx.m.ast;
+    let name = cx.str(e.name.name);
+    let whole = cx.filter.whole(name);
+    let nv = 0;
+    for i in 0..e.variants.len { if cx.filter.member(name, cx.str(e.variants.items[i].name.name)) { nv += 1; } }
+    if !whole && nv == 0 { return 0; }
+    out.add("enum ").add(name);
+    typeParams(out, ast, &e.typeParams, &e.bounds);
+    out.add("\n");
+    if whole {
+        pushDoc(out, e.doc, "    ");
+        cx.at(out, e.span, "    ");
+    }
+    for i in 0..e.variants.len {
+        let v = e.variants.items[i];
+        if !cx.filter.member(name, cx.str(v.name.name)) { continue; }
+        out.add("    ").add(cx.str(v.name.name));
+        if v.fields.len > 0 {
+            out.add("(");
+            for k in 0..v.fields.len {
+                if k > 0 { out.add(", "); }
+                tyStr(out, ast, v.fields.items[k]);
+            }
+            out.add(")");
+        }
+        out.add("\n");
+        pushDoc(out, v.doc, "        ");
+        if !whole { cx.at(out, v.span, "        "); }
+    }
+    out.push('\n');
+    return 1 + nv;
+}
+
+/// `j3c doc <module> --short`: every public name on a screen or so (Rust `short_view`).
+fn shortView(m: &Module, a: &Arena): string {
+    let ast = m.ast;
+    let out = Text.new(a);
+    out.add("module ").add(m.key);
+    let first = firstLine(m.file.doc);
+    if first.len > 0 { out.add(" — ").add(first); }
+    out.add("\n\n");
+    let fns = List<string>.new(a);
+    let consts = List<string>.new(a);
+    let types = Text.new(a);
+    for i in 0..m.file.items.len {
+        match m.file.items.items[i] {
+            Item.Fn(f) { if f.visPub && shown(ast.str(f.name.name)) { fns.push(ast.str(f.name.name)); } }
+            Item.Const(c) { if c.visPub && shown(ast.str(c.name.name)) { consts.push(ast.str(c.name.name)); } }
+            Item.Trait(t) {
+                if t.visPub {
+                    let ns = List<string>.new(a);
+                    for k in 0..t.methods.len { ns.push(Text.new(a).add(ast.str(t.methods.items[k].name.name)).add("()").str()); }
+                    wrap(&types, Text.new(a).add("trait ").add(ast.str(t.name.name)).str(), &ns);
+                }
+            }
+            Item.Struct(s) {
+                if s.visPub {
+                    let ns = List<string>.new(a);
+                    for k in 0..s.fields.len { ns.push(ast.str(s.fields.items[k].name.name)); }
+                    for k in 0..s.methods.len { ns.push(Text.new(a).add(ast.str(s.methods.items[k].name.name)).add("()").str()); }
+                    wrap(&types, Text.new(a).add("struct ").add(ast.str(s.name.name)).str(), &ns);
+                }
+            }
+            Item.Enum(e) {
+                if e.visPub {
+                    let ns = List<string>.new(a);
+                    for k in 0..e.variants.len { ns.push(ast.str(e.variants.items[k].name.name)); }
+                    wrap(&types, Text.new(a).add("enum ").add(ast.str(e.name.name)).str(), &ns);
+                }
+            }
+            _ {}
+        }
+    }
+    if fns.len > 0 { wrap(&out, "fn", &fns); }
+    if consts.len > 0 { wrap(&out, "const", &consts); }
+    out.add(types.str());
+    out.add("\nsignatures and comments: `j3c doc ").add(m.key).add("`; one name: `j3c doc ").add(m.key).add(" <name>`\n");
+    return out.str();
+}
+
+/// `label: a b c` wrapped at 100 columns under a hanging indent (Rust `wrap`).
+fn wrap(out: &Text, label: string, names: &List<string>) {
+    out.add(label).add(":");
+    let col = label.len + 1;
+    for i in 0..names.len {
+        let n = names.items[i];
+        if col + 1 + n.len > 100 {
+            out.add("\n   ");
+            col = 3;
+        }
+        out.push(' ');
+        out.add(n);
+        col += 1 + n.len;
+    }
+    out.push('\n');
+}
+
+/// `name: T, ...`.
+fn pushParams(out: &Text, ast: &Ast, ps: &List<Param>) {
+    for i in 0..ps.len {
+        if i > 0 { out.add(", "); }
+        out.add(ast.str(ps.items[i].name.name)).add(": ");
+        tyStr(out, ast, ps.items[i].ty);
+    }
+}
+
+/// A fn signature and its doc (Rust `push_fn`); `owner` "" for a free fn.
+fn pushFn(out: &Text, ast: &Ast, f: &FnItem, owner: string, indent: string) {
+    out.add(indent);
+    if f.isImpl { out.add("#[impl] "); }
+    out.add("fn ");
+    if owner.len > 0 { out.add(owner).add("."); }
+    out.add(ast.str(f.name.name));
+    typeParams(out, ast, &f.typeParams, &f.bounds);
+    out.add("(");
+    pushParams(out, ast, &f.params);
+    out.add(")");
+    match f.ret { Option.Some(r) { out.add(": "); tyStr(out, ast, r); } Option.None {} }
+    out.push('\n');
+    pushDoc(out, f.doc, Text.new(ast.arena).add(indent).add("    ").str());
+}
+
+/// `<T, U: A + B>`, or nothing (Rust `type_params`).
+fn typeParams(out: &Text, ast: &Ast, ps: &List<Ident>, bounds: &List<List<Ident>>) {
+    if ps.len == 0 { return; }
+    out.add("<");
+    for i in 0..ps.len {
+        if i > 0 { out.add(", "); }
+        out.add(ast.str(ps.items[i].name));
+        if i < bounds.len && bounds.items[i].len > 0 {
+            let b = bounds.items[i];
+            out.add(": ");
+            for k in 0..b.len {
+                if k > 0 { out.add(" + "); }
+                out.add(ast.str(b.items[k].name));
+            }
+        }
+    }
+    out.add(">");
+}
+
+/// A type as written (Rust `ty_str`).
+fn tyStr(out: &Text, ast: &Ast, id: Id<Type>) {
+    match ast.ty(id) {
+        Type.Named(n) { out.add(ast.str(n.name)); }
+        Type.Generic(g) {
+            out.add(ast.str(g.name)).add("<");
+            tyList(out, ast, &g.args);
+            out.add(">");
+        }
+        Type.Ref(r) { out.add("&"); tyStr(out, ast, r.ty); }
+        Type.Array(t) { out.add("[").pushU64(t.len); out.add("]"); tyStr(out, ast, t.elem); }
+        Type.Slice(t) { out.add("[]"); tyStr(out, ast, t.elem); }
+        Type.Tuple(t) { out.add("("); tyList(out, ast, &t.elems); out.add(")"); }
+        Type.Dyn(d) { out.add("dyn ").add(ast.str(d.name)); }
+        Type.Fn(f) { fnTy(out, ast, "fn", &f.params, f.ret); }
+        Type.Closure(c) { fnTy(out, ast, if c.boxed { "boxed closure" } else { "closure" }, &c.params, c.ret); }
+    }
+}
+
+fn tyList(out: &Text, ast: &Ast, ts: &List<Id<Type>>) {
+    for i in 0..ts.len {
+        if i > 0 { out.add(", "); }
+        tyStr(out, ast, ts.items[i]);
+    }
+}
+
+fn fnTy(out: &Text, ast: &Ast, word: string, ps: &List<Id<Type>>, ret: Option<Id<Type>>) {
+    out.add(word).add("(");
+    tyList(out, ast, ps);
+    out.add(")");
+    match ret { Option.Some(r) { out.add(": "); tyStr(out, ast, r); } Option.None {} }
+}
+
+/// `text` cut to about `n` chars at a word boundary, then `…` (Rust `snippet`).
+fn snippet(out: &Text, s: string, n: int) {
+    if charCount(s) <= n { out.add(s); return; }
+    let end = 0;
+    let k = 0;
+    while end < s.len && k < n {
+        end += 1;
+        while end < s.len && (s[end] & 0xC0) == 0x80 { end += 1; }
+        k += 1;
+    }
+    let cut = s[0..end];
+    let sp = cut.len - 1;
+    while sp >= 0 && cut[sp] != ' ' { sp -= 1; }
+    out.add(if sp >= 0 { cut[0..sp] } else { cut }).add("…");
+}
+
+/// Each non-blank line of `doc`, trimmed, under `indent` (Rust `push_doc`).
+fn pushDoc(out: &Text, doc: string, indent: string) {
+    let i = 0;
+    while i < doc.len {
+        let e = i;
+        while e < doc.len && doc[e] != '\n' { e += 1; }
+        let l = trim(doc[i..e]);
+        i = e + 1;
+        if l.len == 0 { continue; }
+        out.add(indent).add(l).add("\n");
+    }
+}
+
+/// The first non-blank line of `doc`, trimmed ("" when none).
+fn firstLine(doc: string): string {
+    let i = 0;
+    while i < doc.len {
+        let e = i;
+        while e < doc.len && doc[e] != '\n' { e += 1; }
+        let l = trim(doc[i..e]);
+        if l.len > 0 { return l; }
+        i = e + 1;
+    }
+    return "";
+}
+
+/// `j3c doc scripts/door.j3s`: props, shared, state, public calls (Rust `script_doc`).
+fn scriptDoc(px: &Px, query: string): Result<string, string> {
+    let a = px.arena;
+    let src = fsx.readText(query, a)?;
+    let mp: [2]string = ["script", "doc"];
+    let id = px.sources.add(Source.of(query, src, a));
+    let file = match parse.parseScript(src, id, mp[..], px.ast) {
+        Result.Ok(f) { f }
+        Result.Err(e) { return Result.Err(parseErr(px, e)); }
+    };
+    let ast = px.ast;
+    let out = Text.new(a);
+    out.add("script ").add(query).add("\n\n");
+    let state = Text.new(a);
+    let calls = Text.new(a);
+    for i in 0..file.items.len {
+        match file.items.items[i] {
+            Item.Props(b) {
+                out.add("props: set by whoever makes an instance; read-only inside the script\n");
+                scriptFields(&out, ast, &b.fields, src, true);
+            }
+            Item.Shared(b) {
+                out.add("shared: one value for every instance; only the script reads or writes it\n");
+                scriptFields(&out, ast, &b.fields, src, false);
+            }
+            Item.State(s) {
+                state.add("    ").add(ast.str(s.name.name));
+                match s.ty { Option.Some(t) { state.add(": "); tyStr(&state, ast, t); } Option.None {} }
+                state.add(" = ").add(exprText(ast, src, s.value)).add("\n");
+            }
+            Item.Fn(f) { if f.visPub { pushFn(&calls, ast, &f, "", "    "); } }
+            _ {}
+        }
+    }
+    if state.len() > 0 {
+        out.add("state: each instance's own; private to the script\n").add(state.str()).add("\n");
+    }
+    out.add("public calls: `instance.name(...)` from J3 (outside code can't read fields)\n");
+    if calls.len() == 0 { out.add("    (none)\n"); }
+    out.add(calls.str());
+    return Result.Ok(out.str());
+}
+
+/// A script's `props` / `shared` fields (Rust `push_script_fields`).
+fn scriptFields(out: &Text, ast: &Ast, fields: &List<FieldItem>, src: string, props: bool) {
+    for i in 0..fields.len {
+        let f = fields.items[i];
+        out.add("    ").add(ast.str(f.name.name)).add(": ");
+        tyStr(out, ast, f.ty);
+        match f.default {
+            Option.Some(e) { out.add(" = ").add(exprText(ast, src, e)); }
+            Option.None { if props { out.add(" (required)"); } }
+        }
+        out.add("\n");
+        pushDoc(out, f.doc, "        ");
+    }
+    out.add("\n");
+}

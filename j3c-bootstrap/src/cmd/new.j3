@@ -1,13 +1,34 @@
 // `j3c new` (`--app`, `--lib`, `--template fps|ui`).
 //
-// Port of: j3c/src/scaffold.rs
+// Port of: j3c/src/scaffold.rs, (helptext/mod.rs `components_files`)
 // J3: Template text moves to embedded files under `text/new/` instead of Rust string constants (plan 11 B10).
 // Part `cmd/new/templates.j3`: the editor project templates (Rust `editor/templates.rs`, `scaffold/templates.rs`).
+// J3: Two module-name rules, as Rust: `moduleName` (scaffold: Unicode letters and digits, lowercased) and
+// `editorModuleName` (editor: ASCII only). `--template fps` prints the absolute root (Rust joins the cwd).
+// J3: Rust `char::to_lowercase` is `lowerRune`: ASCII, Latin-1, Latin Extended-A, Greek and Cyrillic capitals.
+// ponytail: other scripts keep their case; add ranges (or a rustc-printed table) if a name needs them.
 module j3c.cmd.new;
 
+use j3.io;
+use j3.io.path;
 use j3.memory.{ Arena, List };
+use j3.option.Option;
 use j3.result.Result;
-use j3c.base.diag;
+use j3.sys;
+use j3.text.{ Text, contains, decodeRune, endsWith, lines, replace, startsWith };
+use j3c.base.fsx;
+use j3c.base.text_fmt.{ isAlpha, isDigit };
+use j3c.base.toml;
+use j3c.cmd.check.{ err, out };
+use j3c.project.config.J3C_VERSION;
+use j3c.scene.ops;
+use j3c.syntax.fmt;
+use j3c.syntax.lex;
+use j3c.syntax.token;
+
+const USAGE = @embed("../../text/new/usage.txt");
+/// Rust `editor::FONT` (`editor/frontend.FONT` is not importable as a const under stage 0).
+const FONT = @embedBytes("../../../j3c/editor/font.ttf");
 
 /// One file of a generated project: project-relative path and contents (Rust `(&str, String)`).
 pub struct FileText {
@@ -16,13 +37,401 @@ pub struct FileText {
 }
 
 /// `j3c new NAME [--app|--lib|--template fps|ui]`: Rust `scaffold::cmd`.
-pub fn newCmd(rest: []string): int { return diag.notPortedCmd("new"); } // STUB NEW
+pub fn newCmd(rest: []string): int {
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    let app = false;
+    let isLib = false;
+    let template = "";
+    let name = "";
+    let named = false;
+    let i = 0;
+    while i < rest.len {
+        let a = rest[i];
+        i += 1;
+        if a == "--template" {
+            let t = if i < rest.len { rest[i] } else { "" };
+            i += 1;
+            if t != "fps" && t != "ui" {
+                err(Text.new(&mem).add("j3c: unknown template `").add(t).add("`\n  = help: templates: fps, ui\n").str());
+                return 1;
+            }
+            template = t;
+        } else if a == "--app" {
+            app = true;
+        } else if a == "--lib" {
+            isLib = true;
+        } else if a == "--help" || a == "-h" {
+            out(USAGE);
+            return 0;
+        } else if startsWith(a, "-") {
+            err(Text.new(&mem).add("j3c: unknown flag `").add(a).add("`\n  = help: `j3c new --help`\n").str());
+            return 1;
+        } else if !named {
+            name = a;
+            named = true;
+        } else {
+            err(Text.new(&mem).add("j3c: unexpected argument `").add(a).add("`\n").str());
+            return 1;
+        }
+    }
+    let t = Text.new(&mem);
+    if isLib {
+        if app || template != "" {
+            err("j3c: `--lib` goes alone (a package has no window or main)\n");
+            return 1;
+        }
+        let made = List<string>.new(&mem);
+        match createLib(name, named, &made, &mem) {
+            Result.Ok(lr) {
+                t.add(lr.root).add("\n");
+                for k in 0..made.len { t.add("  ").add(made.items[k]).add("\n"); }
+                t.add("next: j3c check; j3c run examples/demo\n");
+                let m = lr.name;
+                t.add("use it: [dependencies] ").add(m).add(" = \"path/to/").add(m);
+                t.add("\" (or { git = \"URL\", tag = \"v0.1.0\" }), then `use ").add(m).add(";`\n");
+                out(t.str());
+                return 0;
+            }
+            Result.Err(e) { return fail(e, &mem); }
+        }
+    }
+    if template != "" {
+        if app {
+            err("j3c: `--app` and `--template` don't go together\n");
+            return 1;
+        }
+        let ui = template == "ui";
+        let made = if ui { createUi(name, named, &mem) } else { createFps(name, named, &mem) };
+        match made {
+            Result.Ok(root) {
+                t.add(root).add("\n");
+                if ui {
+                    t.add("next: j3c check; j3c run --frames 30 --screenshot shot.png --headless\n");
+                } else {
+                    t.add("next: j3c check; j3c editor to edit scenes/main.j3scene\n");
+                }
+                out(t.str());
+                return 0;
+            }
+            Result.Err(e) { return fail(e, &mem); }
+        }
+    }
+    match create(name, named, app, &mem) {
+        Result.Ok(lr) {
+            t.add(lr.root).add("\n  j3.toml\n  src/main.j3\n  AGENTS.md\n  CLAUDE.md\n");
+            let dir = match fileName(lr.root) {
+                Option.Some(d) { d }
+                Option.None { "" }
+            };
+            if dir != lr.name { t.add("  module ").add(lr.name).add("\n"); }
+            t.add(if app { "next: j3c check   (run needs SDL2)\n" } else { "next: j3c check\n" });
+            out(t.str());
+            return 0;
+        }
+        Result.Err(e) { return fail(e, &mem); }
+    }
+}
+
+fn fail(e: string, arena: &Arena): int {
+    err(Text.new(arena).add("j3c: ").add(e).add("\n").str());
+    return 1;
+}
+
+/// Where a project went and its module name.
+struct Made {
+    root: string;
+    name: string;
+}
+
+/// Rust `scaffold::create`: the hello (or `--app` window) project.
+fn create(name: string, named: bool, app: bool, arena: &Arena): Result<Made, string> {
+    let loc = locate(name, named, arena)?;
+    let root = loc.root;
+    let mname = moduleName(loc.name, arena);
+    if fsx.isFile(path.join(root, "j3.toml", arena)) || fsx.isFile(path.join(root, "src/main.j3", arena))
+        || fsx.isFile(path.join(root, "AGENTS.md", arena)) {
+        return Result.Err(Text.new(arena).add("j3.toml, src/main.j3, or AGENTS.md already exists in ").add(root).str());
+    }
+    mkdirs(path.join(root, "src", arena), arena)?;
+    let toml = if app { appToml(mname, arena) } else { helloToml(mname, arena) };
+    let main = formatTemplate(if app { appMain(mname, arena) } else { helloMain(mname, arena) }, arena)?;
+    writeAs(path.join(root, "j3.toml", arena), toml, "j3.toml", arena)?;
+    writeAs(path.join(root, "src/main.j3", arena), main, "src/main.j3", arena)?;
+    writeAgentFiles(root, false, arena)?;
+    return Result.Ok(Made { root: root, name: mname });
+}
+
+/// Rust `scaffold::create_ui`: the `components` recipe project (`--template ui`), its font, plus AGENTS.md.
+fn createUi(name: string, named: bool, arena: &Arena): Result<string, string> {
+    let loc = locate(name, named, arena)?;
+    let root = loc.root;
+    if fsx.isFile(path.join(root, "j3.toml", arena)) || fsx.isFile(path.join(root, "AGENTS.md", arena)) {
+        return Result.Err(Text.new(arena).add("j3.toml or AGENTS.md already exists in ").add(root).str());
+    }
+    let files = componentsFiles(moduleName(loc.name, arena), arena);
+    for i in 0..files.len {
+        let p = path.join(root, files.items[i].path, arena);
+        mkdirs(path.dirname(p), arena)?;
+        writeAs(p, files.items[i].text, files.items[i].path, arena)?;
+    }
+    // The editor's own font, so text draws out of the box. Swap it for yours at the same path.
+    mkdirs(path.join(root, "assets", arena), arena)?;
+    writeAs(path.join(root, "assets/font.ttf", arena), FONT as string, "assets/font.ttf", arena)?;
+    writeAs(path.join(root, "assets/LICENSE-DejaVu.txt", arena), LICENSE_DEJAVU, "assets/LICENSE-DejaVu.txt", arena)?;
+    writeAgentFiles(root, false, arena)?;
+    let agents = path.join(root, "AGENTS.md", arena);
+    let text = match fsx.readText(agents, arena) {
+        Result.Ok(t) { t }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("read AGENTS.md: ").add(lastError(arena)).str()); }
+    };
+    writeAs(agents, Text.new(arena).add(text).add("\n").add(UI_COMPONENTS).str(), "AGENTS.md", arena)?;
+    return Result.Ok(root);
+}
+
+/// Rust `scaffold::create_fps`: the editor project with the first-person main, at an absolute root.
+fn createFps(name: string, named: bool, arena: &Arena): Result<string, string> {
+    let loc = locate(name, named, arena)?;
+    let root = loc.root;
+    if !path.isAbs(root) {
+        let cwd = match path.realpath(".", arena) {
+            Option.Some(c) { c }
+            Option.None { return Result.Err(Text.new(arena).add("cwd: ").add(lastError(arena)).str()); }
+        };
+        root = path.join(cwd, root, arena);
+    }
+    let agents = path.join(root, "AGENTS.md", arena);
+    if fsx.isFile(agents) { return Result.Err(Text.new(arena).add("AGENTS.md already exists in ").add(root).str()); }
+    mkdirs(root, arena)?;
+    createProject(root, true, arena)?;
+    return Result.Ok(root);
+}
+
+/// Rust `scaffold::create_lib`: a package (`[lib]`, `src/<name>.j3`, `examples/demo`); in a project with a
+/// `j3.toml` only `[lib]` and the missing files are added. `made` gets what was written.
+fn createLib(name: string, named: bool, made: &List<string>, arena: &Arena): Result<Made, string> {
+    let loc = locate(name, named, arena)?;
+    let root = loc.root;
+    let tomlPath = path.join(root, "j3.toml", arena);
+    let mname = "";
+    if fsx.isFile(tomlPath) {
+        let text = match fsx.readText(tomlPath, arena) {
+            Result.Ok(t) { t }
+            Result.Err(_) { return Result.Err(Text.new(arena).add("read j3.toml: ").add(lastError(arena)).str()); }
+        };
+        mname = match toml.str(text, "package", "name", arena) {
+            Option.Some(m) { m }
+            Option.None { return Result.Err("j3.toml has no [package] name"); }
+        };
+        if mname != moduleName(mname, arena) {
+            return Result.Err(Text.new(arena).add("package name `").add(mname).add("` is not a module name (letters, digits, `_`); rename it in j3.toml first").str());
+        }
+        let hasLib = false;
+        for l in lines(text) { if lex.trimEnd(lex.trimStart(l)) == "[lib]" { hasLib = true; } }
+        if !hasLib {
+            let t = Text.new(arena).add(text).add(if endsWith(text, "\n") { "" } else { "\n" });
+            t.add("\n# A package: `use ").add(mname).add(";` loads src/").add(mname).add(".j3 (`j3c doc packages`).\n[lib]\n");
+            writeAs(tomlPath, t.str(), "j3.toml", arena)?;
+            made.push("j3.toml (+ [lib])");
+        }
+    } else {
+        mname = moduleName(loc.name, arena);
+        mkdirs(root, arena)?;
+        writeAs(tomlPath, fill(LIB_TOML, mname, arena), "j3.toml", arena)?;
+        made.push("j3.toml");
+    }
+    let files = List<FileText>.new(arena);
+    files.push(file(Text.new(arena).add("src/").add(mname).add(".j3").str(), fill(LIB_MAIN, mname, arena)));
+    files.push(file("examples/demo/j3.toml", fill(LIB_DEMO_TOML, mname, arena)));
+    files.push(file("examples/demo/src/main.j3", fill(LIB_DEMO_MAIN, mname, arena)));
+    files.push(file("README.md", fill(LIB_README, mname, arena)));
+    for i in 0..files.len {
+        let rel = files.items[i].path;
+        let p = path.join(root, rel, arena);
+        if exists(p) { continue; }
+        let text = files.items[i].text;
+        if endsWith(rel, ".j3") { text = formatTemplate(text, arena)?; }
+        mkdirs(path.dirname(p), arena)?;
+        writeAs(p, text, rel, arena)?;
+        made.push(rel);
+    }
+    if !exists(path.join(root, "AGENTS.md", arena)) {
+        writeAgentFiles(root, false, arena)?;
+        made.push("AGENTS.md");
+    }
+    return Result.Ok(Made { root: root, name: mname });
+}
+
+/// Rust `locate`: the root and its package label (`root` is `Made.root`, the label `Made.name`).
+fn locate(name: string, named: bool, arena: &Arena): Result<Made, string> {
+    if !named || name == "." {
+        let cwd = match path.realpath(".", arena) {
+            Option.Some(c) { c }
+            Option.None { return Result.Err(Text.new(arena).add("cwd: ").add(lastError(arena)).str()); }
+        };
+        match fileName(cwd) {
+            Option.Some(n) { return Result.Ok(Made { root: cwd, name: n }); }
+            Option.None { return Result.Err("current directory has no name\n  = help: `j3c new mygame`"); }
+        }
+    }
+    match fileName(name) {
+        Option.Some(n) { return Result.Ok(Made { root: name, name: n }); }
+        Option.None { return Result.Err(Text.new(arena).add("`").add(name).add("` has no package name").str()); }
+    }
+}
+
+/// Rust `Path::file_name`: the last part of `p` when it is a name; trailing `/` and `.` parts are skipped,
+/// `..`, the root and "" give None. A view into `p`.
+fn fileName(p: string): Option<string> {
+    let end = p.len;
+    while true {
+        while end > 0 && p[end - 1] == '/' { end -= 1; }
+        if end > 0 && p[end - 1] == '.' && (end == 1 || p[end - 2] == '/') {
+            if end == 1 { return Option.None; }
+            end -= 1;
+            continue;
+        }
+        break;
+    }
+    if end == 0 { return Option.None; }
+    let start = end;
+    while start > 0 && p[start - 1] != '/' { start -= 1; }
+    let seg = p[start..end];
+    if seg == ".." { return Option.None; }
+    return Option.Some(seg);
+}
+
+/// Rust `scaffold::module_name`: a directory label to a module name (`my-game`, `My Game` → `my_game`).
+fn moduleName(raw: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    let gap = false;
+    let i = 0;
+    while i < raw.len {
+        let r = decodeRune(raw, i);
+        let c = r.0;
+        i += r.1;
+        if c != '_' && lex.isIdentContinue(c) {
+            if gap && t.len() > 0 { t.add("_"); }
+            gap = false;
+            lowerRune(&t, c);
+        } else {
+            gap = true;
+        }
+    }
+    let o = t.str();
+    let e = o.len;
+    while e > 0 && o[e - 1] == '_' { e -= 1; }
+    o = o[0..e];
+    if o.len > 0 {
+        let c = decodeRune(o, 0).0;
+        if c == '_' || !lex.isIdentStart(c) { o = Text.new(arena).add("_").add(o).str(); }
+    }
+    let blank = true;
+    for k in 0..o.len { if o[k] != '_' { blank = false; } }
+    if blank { return "game"; }
+    if isKeyword(o) { return Text.new(arena).add(o).add("_").str(); }
+    return o;
+}
+
+/// Rust `char::to_lowercase` of `c` onto `t` (the ranges named in the header; others unchanged).
+fn lowerRune(t: &Text, c: u32) {
+    let l = c;
+    if (c >= 'A' && c <= 'Z') || (c >= 0xC0 && c <= 0xDE && c != 0xD7) || (c >= 0x391 && c <= 0x3AB && c != 0x3A2)
+        || (c >= 0x410 && c <= 0x42F) {
+        l = c + 32;
+    } else if c >= 0x400 && c <= 0x40F {
+        l = c + 80;
+    } else if c == 0x130 {
+        t.add("i");
+        l = 0x307;
+    } else if c == 0x178 {
+        l = 0xFF;
+    } else if (c >= 0x100 && c <= 0x137 && c % 2 == 0) || (c >= 0x139 && c <= 0x148 && c % 2 == 1)
+        || (c >= 0x14A && c <= 0x177 && c % 2 == 0) || (c >= 0x179 && c <= 0x17E && c % 2 == 1) {
+        l = c + 1;
+    }
+    t.pushChar(l);
+}
+
+/// `name` is a J3 keyword (Rust `parse::keyword(..).is_some()`).
+fn isKeyword(name: string): bool {
+    match token.keyword(name) {
+        Option.Some(_) { return true; }
+        Option.None { return false; }
+    }
+}
+
+/// Rust `Path::exists`.
+fn exists(p: string): bool {
+    match io.stat(p) {
+        Result.Ok(_) { return true; }
+        Result.Err(_) { return false; }
+    }
+}
+
+/// Rust's `io::Error` text for the last failed call.
+fn lastError(arena: &Arena): string { return fsx.osError(sys.errno(), arena); }
+
+/// Rust `fs::create_dir_all` (mode 0777 less the umask, as Rust; `io.makeDirs` makes 0755); Err `mkdir: E`.
+fn mkdirs(dir: string, arena: &Arena): Result<bool, string> {
+    if dir.len == 0 || fsx.isDir(dir) { return Result.Ok(true); }
+    let parent = path.dirname(dir);
+    if parent != dir { mkdirs(parent, arena)?; }
+    let r = sys.mkdir(cpath(dir, arena), 511);
+    if r < 0 && !fsx.isDir(dir) { return Result.Err(Text.new(arena).add("mkdir: ").add(fsx.osError(0 - r, arena)).str()); }
+    return Result.Ok(true);
+}
+
+/// NUL-terminated copy of `p`.
+fn cpath(p: string, arena: &Arena): ptr {
+    let c = Text.new(arena);
+    c.add(p);
+    c.push(0);
+    return c.str().ptr as ptr;
+}
+
+/// Rust `fs::write`: create (mode 0666 less the umask, as Rust; `io.writeFile` makes 0644) or truncate `p`.
+/// Err is the bare error text (Rust `e.to_string()`).
+fn put(p: string, data: []u8, arena: &Arena): Result<bool, string> {
+    let fd = sys.openMode(cpath(p, arena), sys.O_WRONLY + sys.O_CREAT + sys.O_TRUNC + sys.O_CLOEXEC, 438);
+    if fd < 0 { return Result.Err(fsx.osError(0 - fd, arena)); }
+    let n = sys.write(fd, data.ptr as ptr, data.len);
+    sys.close(fd);
+    if n < 0 { return Result.Err(fsx.osError(0 - n, arena)); }
+    if n != data.len { return Result.Err("failed to write whole buffer"); }
+    return Result.Ok(true);
+}
+
+/// Write `text`; Err `write LABEL: E`.
+fn writeAs(p: string, text: string, label: string, arena: &Arena): Result<bool, string> {
+    match put(p, text as []u8, arena) {
+        Result.Ok(_) { return Result.Ok(true); }
+        Result.Err(e) { return Result.Err(Text.new(arena).add("write ").add(label).add(": ").add(e).str()); }
+    }
+}
+
+/// `fmt` a template's source; Err `fmt template: E`.
+fn formatTemplate(src: string, arena: &Arena): Result<string, string> {
+    match fmt.format(src, arena) {
+        Result.Ok(s) { return Result.Ok(s); }
+        Result.Err(e) { return Result.Err(Text.new(arena).add("fmt template: ").add(e).str()); }
+    }
+}
 
 /// Rust `scaffold::app_main`: the `--app` `src/main.j3` for module `name` (before `fmt`). → recipes
-pub fn appMain(name: string, arena: &Arena): string { return ""; } // STUB NEW
+pub fn appMain(name: string, arena: &Arena): string { return fill(APP_MAIN, name, arena); }
 
 /// Rust `scaffold::app_toml`: the `--app` `j3.toml`. → recipes
-pub fn appToml(name: string, arena: &Arena): string { return ""; } // STUB NEW
+pub fn appToml(name: string, arena: &Arena): string { return fill(APP_TOML, name, arena); }
 
 /// Rust `helptext::components_files`: the `components` recipe project (`--template ui`) for module `name`.
-pub fn componentsFiles(name: string, arena: &Arena): List<FileText> { return List<FileText>.new(arena); } // STUB NEW
+/// Rust replaces `mygame` (not a placeholder) in the recipe files.
+pub fn componentsFiles(name: string, arena: &Arena): List<FileText> {
+    let l = List<FileText>.new(arena);
+    l.push(file("j3.toml", sub(COMPONENTS_TOML, "mygame", name, arena)));
+    l.push(file("ui/Screen.j3ui", sub(COMPONENTS_SCREEN, "mygame", name, arena)));
+    l.push(file("ui/theme.css", COMPONENTS_THEME));
+    l.push(file("src/state.j3", sub(COMPONENTS_STATE, "mygame", name, arena)));
+    l.push(file("src/main.j3", sub(COMPONENTS_MAIN, "mygame", name, arena)));
+    return l;
+}

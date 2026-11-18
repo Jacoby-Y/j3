@@ -1,5 +1,203 @@
 // Signature help and the document outline.
 //
 // Part of module j3c.lsp.complete.
-// Port of: j3c/src/lsp/complete/mod.rs (`signature`, `symbols`)
+// Port of: j3c/src/lsp/complete/mod.rs (`signature`, `symbols`), lsp/complete/items.rs (`params_of`, `sig_label`)
+// J3: A `.j3s` outline parses the file again (`parse.parseScript`, an `Ast` in the Session's arena), as Rust.
 module j3c.lsp.complete;
+
+/// Rust `signature`: the fns the call around `offset` may be (methods of the receiver's struct, of a struct
+/// named like it, module fns, free fns in scope), at most 8, one per label, `this` left out. → LSPS, LSPU
+pub fn signature(s: &Session, path: string, src: string, offset: u32, arena: &Arena): Option<SignatureHelp> {
+    if lexicalMode(src, int(offset)) != LexMode.Code { return Option.None; }
+    let call = findCall(src, int(offset), s.arena)?;
+    let c = checked(s);
+    let file = query.fileOf(s, path);
+    let trusted = match file { Option.Some(f) { s.sources.get(f).text == src } Option.None { false } };
+    let found = List<Found>.new(s.arena);
+    match call.receiver {
+        Option.Some(recv) {
+            if trusted {
+                match file {
+                    Option.Some(f) {
+                        match sema.findLocal(c, f, offset, recv) {
+                            Option.Some(l) {
+                                match sema.structOf(c, c.typed.locals.get(l).ty) {
+                                    Option.Some(sid) { pushMethods(s, sid, call.name, f, &found); }
+                                    Option.None {}
+                                }
+                            }
+                            Option.None {}
+                        }
+                    }
+                    Option.None {}
+                }
+            }
+            if found.len == 0 { pushMethodsNamed(s, recv, call.name, file, &found); }
+            if found.len == 0 { pushModuleFns(s, recv, call.name, &found); }
+        }
+        Option.None {}
+    }
+    if found.len == 0 { pushFreeFns(s, path, src, call.name, &found); }
+    if found.len == 0 { return Option.None; }
+    let sigs = List<Signature>.new(arena);
+    for i in 0..found.len {
+        let fd = c.tables.fnAt(found.items[i].f);
+        let params = paramsOf(s, found.items[i].f, arena);
+        if found.items[i].method && params.len > 0 && startsWith(params.items[0], "this:") { params.remove(0); }
+        let label = sigLabel(c.tables.str(fd.name), params.slice(), retOf(s, found.items[i].f), arena);
+        let dup = false;
+        for k in 0..sigs.len { if sigs.items[k].label == label { dup = true; } }
+        if dup { continue; }
+        let doc = if fd.doc.len == 0 { modKey(c, fd.owner) } else { fd.doc };
+        sigs.push(Signature { params: params, label: label, documentation: own(arena, doc) });
+        if sigs.len == 8 { break; }
+    }
+    let n = u32(0);
+    if sigs.len > 0 { n = u32(sigs.items[0].params.len); }
+    let active = u32(0);
+    if n > 0 { active = if call.commas < n - 1 { call.commas } else { n - 1 }; }
+    return Option.Some(SignatureHelp { signatures: sigs, active: active });
+}
+
+/// Rust `params_of` (its params half): `name: ty` per parameter of a fn with a body, the types alone for a
+/// `use lib` fn or a body-less declaration. Strings in `arena`.
+fn paramsOf(s: &Session, f: Id<FnDecl>, arena: &Arena): List<string> {
+    let c = checked(s);
+    let fd = c.tables.fnAt(f);
+    let named = fd.kind == FnKind.J3 || fd.kind == FnKind.Generated;
+    let out = List<string>.new(arena);
+    for i in 0..fd.params.len {
+        let p = fd.params.items[i];
+        let t = Text.new(arena);
+        let name = c.tables.str(p.name);
+        if named && name.len > 0 { t.add(name).add(": "); }
+        sema.tyStringAt(c, p.ty, fd.gen, query.recvArgs(c, f), &t);
+        out.push(t.str());
+    }
+    return out;
+}
+
+/// Rust `params_of` (its return half): the return type, "" for `void`.
+fn retOf(s: &Session, f: Id<FnDecl>): string {
+    let c = checked(s);
+    let fd = c.tables.fnAt(f);
+    if fd.ret == c.tables.common.void { return ""; }
+    let t = Text.new(s.arena);
+    sema.tyStringAt(c, fd.ret, fd.gen, query.recvArgs(c, f), &t);
+    return t.str();
+}
+
+/// Rust `sig_label`: `fn name(a: A, b: B): R`.
+fn sigLabel(name: string, params: []string, ret: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    t.add("fn ").add(name).add("(");
+    for i in 0..params.len {
+        if i > 0 { t.add(", "); }
+        t.add(params[i]);
+    }
+    t.add(")");
+    if ret.len > 0 { t.add(": ").add(ret); }
+    return t.str();
+}
+
+/// One outline entry, strings copied into `arena`.
+fn sym(name: string, kind: int, container: string, span: Span, arena: &Arena): Symbol {
+    return Symbol { name: own(arena, name), container: own(arena, container), span: span, kind: kind };
+}
+
+/// Rust `symbols`: the outline of `path`: structs (fields), enums (variants), fns, globals in source order;
+/// a `.j3s` lists its `props`, `shared`, state, fns and consts. → LSPS
+pub fn symbols(s: &Session, path: string, arena: &Arena): List<Symbol> {
+    let out = List<Symbol>.new(arena);
+    let file = match query.fileOf(s, path) { Option.Some(f) { f } Option.None { return out; } };
+    let source = s.sources.get(file);
+    if endsWith(source.path, ".j3s") {
+        scriptSymbols(s, file, &out, arena);
+        return out;
+    }
+    let c = checked(s);
+    let t = c.tables;
+    for i in 0..t.structs.len() {
+        let sd = t.structs.get(t.structs.idAt(i));
+        if sd.span.file != file || isNone(sd.span) { continue; }
+        let name = t.str(sd.name);
+        if !isIdentName(name) { continue; }
+        out.push(sym(name, 23, "", sd.span, arena));
+        for k in 0..sd.fields.len {
+            let fname = t.str(sd.fields.items[k].name);
+            if fname.len > 0 { out.push(sym(fname, 8, name, sd.span, arena)); }
+        }
+    }
+    for i in 0..t.enums.len() {
+        let ed = t.enums.get(t.enums.idAt(i));
+        if ed.span.file != file || isNone(ed.span) { continue; }
+        let name = t.str(ed.name);
+        if !isIdentName(name) { continue; }
+        out.push(sym(name, 10, "", ed.span, arena));
+        for k in 0..ed.variants.len { out.push(sym(t.str(ed.variants.items[k].name), 22, name, ed.span, arena)); }
+    }
+    for i in 0..t.fns.len() {
+        let fd = t.fns.get(t.fns.idAt(i));
+        if fd.span.file != file || isNone(fd.span) { continue; }
+        let name = t.str(fd.name);
+        if !isIdentName(name) { continue; }
+        match fd.recv {
+            Option.Some(r) { out.push(sym(name, 6, t.str(t.structAt(r).name), fd.span, arena)); }
+            Option.None { out.push(sym(name, 12, "", fd.span, arena)); }
+        }
+    }
+    for i in 0..t.globals.len() {
+        let g = t.globals.get(t.globals.idAt(i));
+        if g.span.file != file || isNone(g.span) { continue; }
+        let name = t.str(g.name);
+        if isIdentName(name) { out.push(sym(name, 13, "", g.span, arena)); }
+    }
+    sortBy(out.items[0..out.len], fn(a: Symbol, b: Symbol): bool {
+        if a.span.lo != b.span.lo { return a.span.lo < b.span.lo; }
+        return a.name < b.name;
+    });
+    let n = 0;
+    for i in 0..out.len {
+        if n > 0 {
+            let p = out.items[n - 1];
+            let q = out.items[i];
+            if p.name == q.name && p.kind == q.kind && p.container == q.container && p.span.lo == q.span.lo { continue; }
+        }
+        out.items[n] = out.items[i];
+        n += 1;
+    }
+    out.len = n;
+    return out;
+}
+
+/// The outline of a `.j3s` (Rust parses it as module `script.outline`); nothing when it does not parse.
+fn scriptSymbols(s: &Session, file: Id<Source>, out: &List<Symbol>, arena: &Arena) {
+    let src = s.sources.get(file).text;
+    let ast = s.arena.new::<Ast>(Ast.new(s.arena, &s.names));
+    let modName: [2]string = ["script", "outline"];
+    let f = match parse.parseScript(src, file, modName, ast) { Result.Ok(f) { f } Result.Err(_) { return; } };
+    for i in 0..f.items.len {
+        match f.items.items[i] {
+            Item.Props(b) { blockSymbols(s, src, &b, out, arena); }
+            Item.Shared(b) { blockSymbols(s, src, &b, out, arena); }
+            Item.State(st) { out.push(sym(s.names.str(st.name.name), 8, "state", st.span, arena)); }
+            Item.Fn(fi) { out.push(sym(s.names.str(fi.name.name), 12, "", fi.span, arena)); }
+            Item.Const(ci) { out.push(sym(s.names.str(ci.name.name), 14, "", ci.span, arena)); }
+            Item.Use(_) {}
+            Item.UseLib(_) {}
+            Item.Struct(_) {}
+            Item.Extend(_) {}
+            Item.Enum(_) {}
+            Item.Trait(_) {}
+            Item.Let(_) {}
+        }
+    }
+}
+
+/// A `props { .. }` / `shared { .. }` block (named by the word it starts with) and its fields.
+fn blockSymbols(s: &Session, src: string, b: &ScriptBlockItem, out: &List<Symbol>, arena: &Arena) {
+    let name = "shared";
+    if int(b.span.lo) <= src.len && startsWith(src[int(b.span.lo)..], "props") { name = "props"; }
+    out.push(sym(name, 3, "", b.span, arena));
+    for k in 0..b.fields.len { out.push(sym(s.names.str(b.fields.items[k].name.name), 8, name, b.fields.items[k].span, arena)); }
+}

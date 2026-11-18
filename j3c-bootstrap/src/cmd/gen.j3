@@ -1,10 +1,34 @@
-// `j3c -e gen`: run mesh generator scripts.
+// `j3c -e gen`: run a project's mesh generator scripts. Each `assets/gen/<name>.j3` is a J3 program that builds
+// a mesh with `j3.gfx.meshgen` and saves it to `meshgen.output(...)`, which is `assets/gen/<name>.j3mesh` here. A
+// script runs again only when it (or j3c) changed. Builds run them first (`beforeBuild`).
 //
 // Port of: j3c/src/gen.rs
+// J3: Stamps (`target/j3-editor/gen/<name>.stamp`) are `xxh3_64` of the script, this binary's size and mtime
+// (and `J3_STDLIB` with its `meshgen.j3` mtime when set); Rust's are SipHash, so the two compilers never
+// share a stamp: each reruns the scripts once after the other. The script runs through `cmd/golden.spawn`
+// (env, cwd, stdin `/dev/null`). `findRoot` is a copy of `scene/ops.findRoot` (Rust `scene::find_root`):
+// `scene/ops` runs gen before a render, so this module must not import it.
 module j3c.cmd.gen;
 
+use j3.hash.Xxh3;
+use j3.io;
+use j3.io.path;
 use j3.memory.{ Arena, List };
-use j3c.base.diag;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, trim };
+use j3c.base.fsx;
+use j3c.base.toml.Pair;
+use j3c.cmd.golden;
+use j3c.cmd.golden.Spawn;
+use j3c.editor.frontend;
+use j3c.load.{ stdlibDir, usingOverride };
+use j3c.toolchain.{ hex16, mkdirs };
+
+const HELP: string = "usage: j3c -e gen [--project DIR] [--force]\n\nRuns each assets/gen/<name>.j3 that changed since its last run; it writes\nassets/gen/<name>.j3mesh through j3.gfx.meshgen. render, play, and build run it too.\nA script reruns when its own file or j3c changes, not when another project module\nit imports changes: run --force after editing one. --force runs them all.\nExample and API: `j3c doc recipes meshgen`, `j3c doc j3.gfx.meshgen`.\n";
+/// Set while a generator runs, so building it doesn't run the generators again.
+const RUNNING: string = "J3_GEN_RUNNING";
 
 /// What one `runAll` did (Rust `gen::Report`).
 pub struct GenReport {
@@ -16,16 +40,219 @@ pub struct GenReport {
     scripts: int;
 }
 
+fn put(s: string) { sys.write(1, s.ptr as ptr, s.len); }
+fn eput(s: string) { sys.write(2, s.ptr as ptr, s.len); }
+
 /// `j3c -e gen [--force] [--project DIR]`: Rust `gen::cmd`.
-pub fn genCmd(rest: []string): int { return diag.notPortedCmd("-e gen"); } // STUB IMG
+pub fn genCmd(rest: []string): int {
+    let arena = Arena.create(1 << 20);
+    defer arena.destroy();
+    let a = &arena;
+    let project = ".";
+    let force = false;
+    let i = 0;
+    while i < rest.len {
+        let arg = rest[i];
+        if arg == "--help" || arg == "-h" {
+            put(HELP);
+            return 0;
+        } else if arg == "--force" {
+            force = true;
+        } else if arg == "--project" {
+            if i + 1 >= rest.len {
+                eput("j3c -e gen: --project needs a directory\n");
+                return 1;
+            }
+            project = rest[i + 1];
+            i += 1;
+        } else {
+            eput(Text.new(a).add("j3c -e gen: unknown argument `").add(arg).add("`\n").str());
+            return 1;
+        }
+        i += 1;
+    }
+    let root = "";
+    match findRoot(project, a) {
+        Result.Ok(r) { root = r; }
+        Result.Err(e) {
+            eput(Text.new(a).add("j3c -e gen: ").add(e).add("\n").str());
+            return 1;
+        }
+    }
+    let report = runAll(root, force, a);
+    let t = Text.new(a);
+    for k in 0..report.made.len { t.add("made ").add(report.made.items[k]).add("\n"); }
+    if report.made.len == 0 && report.failed.len == 0 { t.fmt(`{report.scripts} generator(s), all up to date`).add("\n"); }
+    let e = Text.new(a);
+    for k in 0..report.failed.len { e.add(report.failed.items[k]).add("\n"); }
+    // Rust prints the made lines, then the failures, then the summary; the summary only comes without either
+    put(t.str());
+    eput(e.str());
+    return if report.failed.len == 0 { 0 } else { 1 };
+}
 
-/// Rust `gen::run_all`: run every stale (or, `force`, every) `assets/gen/*.j3` under `root`, sorted. → MCP (`gen` tool),
-/// EDDEV (`editor` start)
+/// Rust `scene::find_root`: `start` (made absolute, `.` parts dropped) or the nearest folder above it with a
+/// `j3.toml`.
+fn findRoot(start: string, arena: &Arena): Result<string, string> {
+    let abs = start;
+    if !path.isAbs(start) {
+        match path.realpath(".", arena) {
+            Option.Some(cwd) { abs = path.join(cwd, start, arena); }
+            Option.None { return Result.Err("cannot read the current directory"); }
+        }
+    }
+    abs = components(abs, arena);
+    let at = abs;
+    while true {
+        if fsx.isFile(path.join(at, "j3.toml", arena)) { return Result.Ok(at); }
+        if at == "/" || at.len == 0 { break; }
+        at = path.dirname(at);
+        if at.len == 0 { at = "/"; }
+    }
+    return Result.Err(Text.new(arena).add("no j3.toml in ").add(abs).add(" or above it").str());
+}
+
+/// Rust `path.components().collect()`: repeated `/` and `.` parts dropped (`..` kept), no trailing `/`.
+fn components(p: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    let i = 0;
+    while i < p.len {
+        while i < p.len && p[i] == '/' { i += 1; }
+        let s = i;
+        while i < p.len && p[i] != '/' { i += 1; }
+        let part = p[s..i];
+        if part.len == 0 || part == "." { continue; }
+        t.add("/").add(part);
+    }
+    if t.len() == 0 { return "/"; }
+    return t.str();
+}
+
+/// `assets/gen/*.j3` under `root` (Rust `Path::extension` is `j3`), sorted by name.
+fn scripts(root: string, arena: &Arena): List<string> {
+    let out = List<string>.new(arena);
+    match io.listDir(path.join(root, "assets/gen", arena), arena) {
+        Result.Ok(ents) {
+            for i in 0..ents.len {
+                let n = ents[i].name;
+                if n.len > 3 && n[n.len - 3] == '.' && n[n.len - 2] == 'j' && n[n.len - 1] == '3' { out.push(n); }
+            }
+        }
+        Result.Err(_) {}
+    }
+    // a few names: insertion sort by bytes (all in one folder, so Rust's path order)
+    for i in 1..out.len {
+        let k = i;
+        while k > 0 && out.items[k] < out.items[k - 1] {
+            let x = out.items[k];
+            out.items[k] = out.items[k - 1];
+            out.items[k - 1] = x;
+            k -= 1;
+        }
+    }
+    return out;
+}
+
+/// What a script's output depends on: its text, and the j3c (with its stdlib) that runs it.
+fn key(script: string, host: string, arena: &Arena): string {
+    let h = Xxh3.new();
+    h.update(script as []u8);
+    match fsx.statNs(host, arena) {
+        Option.Some(st) { h.update(Text.new(arena).fmt(`|{st.0}|{st.1}.{st.2}`).str() as []u8); }
+        Option.None {}
+    }
+    if usingOverride() {
+        h.update(Text.new(arena).add("|").add(sys.env("J3_STDLIB")).str() as []u8);
+        match fsx.statNs(path.join(stdlibDir(arena), "j3/gfx/meshgen.j3", arena), arena) {
+            Option.Some(st) { h.update(Text.new(arena).fmt(`|{st.1}.{st.2}`).str() as []u8); }
+            Option.None {}
+        }
+    }
+    return hex16(h.finish(), arena);
+}
+
+/// `p`'s modification time (seconds, nanoseconds), or (-1, -1) when it is not there.
+fn mtime(p: string, arena: &Arena): (int, int) {
+    match fsx.statNs(p, arena) {
+        Option.Some(st) { return (st.1, st.2); }
+        Option.None { return (-1, -1); }
+    }
+}
+
+/// Rust `gen::run_all`: run every stale (or, `force`, every) `assets/gen/*.j3` under `root`, sorted. → MCP
+/// (`gen` tool), EDDEV (`editor` start). ponytail: scripts that `use` other project files aren't tracked
+/// (Rust too); edit the script or --force.
 pub fn runAll(root: string, force: bool, arena: &Arena): GenReport {
-    return GenReport { made: List<string>.new(arena), failed: List<string>.new(arena), scripts: 0 };
-} // STUB IMG
+    let r = match path.realpath(root, arena) { Option.Some(p) { p } Option.None { root } };
+    let list = scripts(r, arena);
+    let report = GenReport { made: List<string>.new(arena), failed: List<string>.new(arena), scripts: list.len };
+    if list.len == 0 { return report; }
+    let host = "";
+    match frontend.hostExe(arena) {
+        Result.Ok(h) { host = h; }
+        Result.Err(e) {
+            report.failed.push(Text.new(arena).add("j3c -e gen: ").add(e).str());
+            return report;
+        }
+    }
+    let stamps = path.join(r, "target/j3-editor/gen", arena);
+    mkdirs(stamps, arena);
+    for i in 0..list.len {
+        let file = list.items[i];
+        let name = file[0..file.len - 3];
+        let relScript = Text.new(arena).add("assets/gen/").add(name).add(".j3").str();
+        let relOut = Text.new(arena).add("assets/gen/").add(name).add(".j3mesh").str();
+        let script = path.join(r, relScript, arena);
+        let outPath = path.join(r, relOut, arena);
+        let text = match fsx.readText(script, arena) { Result.Ok(s) { s } Result.Err(_) { "" } };
+        let want = key(text, host, arena);
+        let stamp = path.join(stamps, Text.new(arena).add(name).add(".stamp").str(), arena);
+        if !force && fsx.isFile(outPath) {
+            match fsx.readText(stamp, arena) {
+                Result.Ok(s) { if s == want { continue; } }
+                Result.Err(_) {}
+            }
+        }
+        let before = mtime(outPath, arena);
+        let sp = Spawn { argv: List<string>.new(arena), env: List<Pair>.new(arena), unset: List<string>.new(arena), cwd: r,
+            out: -1, group: false };
+        sp.argv.push(host);
+        sp.argv.push("run");
+        sp.argv.push("--file");
+        sp.argv.push(script);
+        sp.env.push(Pair { key: "J3_GEN_OUT", value: outPath });
+        sp.env.push(Pair { key: RUNNING, value: "1" });
+        match golden.spawn(&sp, arena) {
+            Result.Ok(ch) {
+                let o = ch.collect("" as []u8, arena);
+                let after = mtime(outPath, arena);
+                if o.code == 0 && after.0 >= 0 && (after.0 != before.0 || after.1 != before.1) {
+                    io.writeFile(stamp, want as []u8);
+                    report.made.push(relOut);
+                } else if o.code == 0 {
+                    report.failed.push(Text.new(arena).add(relScript).add(": ran but wrote nothing to ").add(relOut)
+                        .add("; end the script with b.save(meshgen.output(\"").add(relOut).add("\"))").str());
+                } else {
+                    let log = Text.new(arena).add(o.outStr()).add(o.errStr()).str();
+                    report.failed.push(Text.new(arena).add(relScript).add(": ").add(trim(log)).str());
+                }
+            }
+            Result.Err(e) {
+                report.failed.push(Text.new(arena).add(relScript).add(": ").add(fsx.osError(e, arena)).str());
+            }
+        }
+    }
+    return report;
+}
 
-/// Rust `gen::before_build`: run the project's stale `assets/gen/*.j3` generators before a build (not under
-/// `J3_GEN_RUNNING`, so a generator's own build does not recurse).
-// J3: A no-op until C5 (PORT_DEBT.md): a project whose generated meshes are not on disk builds without them.
-pub fn beforeBuild(root: string) {} // STUB IMG
+/// Rust `gen::before_build`: make the project's stale meshes before a build, and say (on stderr) which scripts
+/// failed. Nothing under `J3_GEN_RUNNING`, so a generator's own build does not recurse.
+pub fn beforeBuild(root: string) {
+    if sys.env(RUNNING).len > 0 { return; }
+    let arena = Arena.create(1 << 20);
+    defer arena.destroy();
+    let r = runAll(root, false, &arena);
+    let t = Text.new(&arena);
+    for i in 0..r.failed.len { t.add("warning: mesh generator failed: ").add(r.failed.items[i]).add("\n"); }
+    eput(t.str());
+}

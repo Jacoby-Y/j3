@@ -6,13 +6,33 @@
 // J3: `runTool` loads `scene3d.read` + the catalog and calls `j3_editor.tool.apply` (`j3c/editor/src/tool.j3`), the
 // same code the editor runs, and stores the scene when the reply is ok and it changed (B12.1). `render` stays an
 // offscreen subprocess of the editor program built by `editor/frontend` (a GL crash must not kill a server).
+// J3: The tool code reads paths relative to the cwd (the catalog, asset files, `split` output), as the Rust
+// subprocess did with `current_dir(root)`: `runTool` changes into `root` around the call and back. Each call
+// gets its own arena (freed after; the reply is copied out) and rewinds the process scratch arena the tool uses.
+// J3: A child's environment is set through `env K=V ... PROGRAM` (`j3.proc` takes no env; nothing leaks into
+// this process). A child's status prints as Rust's `exit status: N` (a signal shows as 128 + N).
 module j3c.scene.ops;
 
-use j3.memory.{ Arena, List };
+use j3.cmp.sortBy;
+use j3.data.save;
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List, rewindScratch };
 use j3.option.Option;
+use j3.proc;
 use j3.result.Result;
-use j3_editor.tool; // unused until SCENE: proves the `j3_editor` dependency builds into j3c-boot
-use j3c.scene.reply.Reply;
+use j3.scene3d;
+use j3.sys;
+use j3.text.{ Text, trim };
+use j3_editor.tool;
+use j3c.base.fsx;
+use j3c.base.intern.own;
+use j3c.base.text_fmt.debugStr;
+use j3c.editor.assets;
+use j3c.editor.frontend;
+use j3c.scene.history;
+use j3c.scene.reply;
+use j3c.scene.reply.{ Reply, at };
 
 /// Rust `scene::BATCH` (`\x1e`): the byte joining the requests of one batch (one file write, one editor undo step).
 pub const BATCH: u8 = 0x1e;
@@ -23,36 +43,444 @@ pub struct Rendered {
     text: string;
 }
 
-/// Rust `scene::find_root`: the project folder at or above `start` (`j3.editor.toml` or `j3.toml`). → MCP, IMG (gen)
-pub fn findRoot(start: string, arena: &Arena): Result<string, string> { return Result.Err("scene: not ported yet"); } // STUB SCENE
+/// Ops that change the scene, so an undo backup is taken first (Rust `CHANGES`).
+const CHANGES: [10]string = ["add", "set", "delete", "ground", "ontop", "scatter", "fmt", "apply", "split", "inline"];
+
+fn ioErr(arena: &Arena): string { return fsx.osError(sys.errno(), arena); }
+
+/// The parts of `p` without empty and `.` ones (Rust `Path::components`, `..` kept).
+fn parts(p: string, arena: &Arena): List<string> {
+    let out = List<string>.new(arena);
+    let a = 0;
+    for i in 0..p.len + 1 {
+        if i == p.len || p[i] == '/' {
+            let c = p[a..i];
+            if c.len > 0 && c != "." { out.push(c); }
+            a = i + 1;
+        }
+    }
+    return out;
+}
+
+fn joinParts(ps: &List<string>, from: int, to: int, abs: bool, arena: &Arena): string {
+    let t = Text.new(arena);
+    if abs { t.push('/'); }
+    for i in from..to {
+        if i > from { t.push('/'); }
+        t.add(ps.items[i]);
+    }
+    let s = t.str();
+    if s.len == 0 { return "."; }
+    return s;
+}
+
+/// The cwd (Rust `current_dir`), in `arena`.
+pub fn cwd(arena: &Arena): Result<string, string> {
+    match path.realpath(".", arena) { Option.Some(d) { return Result.Ok(d); } Option.None { return Result.Err(ioErr(arena)); } }
+}
+
+/// Rust `scene::find_root`: the project folder at or above `start` (one with a `j3.toml`). → MCP, IMG (gen)
+pub fn findRoot(start: string, arena: &Arena): Result<string, string> {
+    let s = if path.isAbs(start) { start } else { path.join(cwd(arena)?, start, arena) };
+    let ps = parts(s, arena);
+    let n = ps.len;
+    while true {
+        let at = joinParts(&ps, 0, n, true, arena);
+        if fsx.isFile(path.join(at, "j3.toml", arena)) { return Result.Ok(at); }
+        if n == 0 { break; }
+        n -= 1;
+    }
+    return Result.Err(Text.new(arena).add("no j3.toml in ").add(joinParts(&ps, 0, ps.len, true, arena)).add(" or above it").str());
+}
 
 /// Rust `scene::scene_rel`: `scene` checked, or the project's scene (`j3.editor.toml`). → MCP
-pub fn sceneRel(root: string, scene: Option<string>, arena: &Arena): Result<string, string> { return Result.Err("scene: not ported yet"); } // STUB SCENE
+pub fn sceneRel(root: string, scene: Option<string>, arena: &Arena): Result<string, string> {
+    let rel = "";
+    match scene {
+        Option.Some(s) {
+            if path.isAbs(s) {
+                let rp = parts(root, arena);
+                let sp = parts(s, arena);
+                let inside = sp.len >= rp.len;
+                for i in 0..rp.len { if inside && sp.items[i] != rp.items[i] { inside = false; } }
+                if !inside { return Result.Err(Text.new(arena).add(s).add(" is outside the project").str()); }
+                for i in rp.len..sp.len {
+                    if sp.items[i] == ".." { return Result.Err(Text.new(arena).add(s).add(": scene paths stay inside the project").str()); }
+                }
+                rel = if sp.len == rp.len { "" } else { joinParts(&sp, rp.len, sp.len, false, arena) };
+            } else {
+                let sp = parts(s, arena);
+                for i in 0..sp.len {
+                    if sp.items[i] == ".." { return Result.Err(Text.new(arena).add(s).add(": scene paths stay inside the project").str()); }
+                }
+                rel = own(arena, s);
+            }
+        }
+        Option.None {
+            let main = scenePath(root, arena)?;
+            let mp = parts(main, arena);
+            let rp = parts(root, arena);
+            rel = joinParts(&mp, rp.len, mp.len, false, arena);
+        }
+    }
+    while rel.len >= 2 && rel[0..2] == "./" { rel = rel[2..rel.len]; }
+    if rel.len < 8 || rel[rel.len - 8..rel.len] != ".j3scene" { return Result.Err(Text.new(arena).add(rel).add(": expected a .j3scene file").str()); }
+    return Result.Ok(rel);
+}
+
+fn walkScenes(root: string, dir: string, out: &List<string>, arena: &Arena) {
+    match io.listDir(dir, arena) {
+        Result.Ok(ents) {
+            for i in 0..ents.len {
+                let p = path.join(dir, ents[i].name, arena);
+                if ents[i].isDir {
+                    walkScenes(root, p, out, arena);
+                } else if path.ext(ents[i].name) == ".j3scene" && ents[i].name[0] != '.' {
+                    out.push(p[root.len + 1..p.len]);
+                }
+            }
+        }
+        Result.Err(_) {}
+    }
+}
 
 /// Rust `scene::all_scenes`: every `scenes/**/*.j3scene`, sorted. → MCP (`check`)
-pub fn allScenes(root: string, arena: &Arena): Result<List<string>, string> { return Result.Err("scene: not ported yet"); } // STUB SCENE
+pub fn allScenes(root: string, arena: &Arena): Result<List<string>, string> {
+    let out = List<string>.new(arena);
+    walkScenes(root, path.join(root, "scenes", arena), &out, arena);
+    sortBy(out.items[0..out.len], fn(a: string, b: string): bool { return a < b; });
+    if out.len == 0 { return Result.Err("no scenes under scenes/"); }
+    return Result.Ok(out);
+}
+
+/// `s` without leading `./` (Rust `trim_start_matches("./")`).
+fn noDot(s: string): string {
+    while s.len >= 2 && s[0..2] == "./" { s = s[2..s.len]; }
+    return s;
+}
 
 /// Rust `scene::placed_scenes`: every scene another scene places, sorted (Rust: a HashSet). → MCP
-pub fn placedScenes(root: string, arena: &Arena): List<string> { return List<string>.new(arena); } // STUB SCENE
+pub fn placedScenes(root: string, arena: &Arena): List<string> {
+    let out = List<string>.new(arena);
+    let files = match allScenes(root, arena) { Result.Ok(f) { f } Result.Err(_) { List<string>.new(arena) } };
+    for i in 0..files.len {
+        let file = files.items[i];
+        match io.readFile(path.join(root, file, arena), arena) {
+            Result.Ok(bytes) {
+                let mem = Arena.create(64 * 1024 + bytes.len * 4);
+                let s = scene3d.parse(bytes, true, &mem);
+                for k in 0..s.len {
+                    let n = s.nodes[k];
+                    let placed = noDot(trim(n.scene));
+                    if n.kind != scene3d.INSTANCE || placed.len == 0 || placed == file { continue; }
+                    let seen = false;
+                    for j in 0..out.len { if out.items[j] == placed { seen = true; } }
+                    if !seen { out.push(own(arena, placed)); }
+                }
+                mem.destroy();
+            }
+            Result.Err(_) {}
+        }
+    }
+    sortBy(out.items[0..out.len], fn(a: string, b: string): bool { return a < b; });
+    return out;
+}
 
-/// Rust `scene::check_scene`: the `check` op on one scene plus the project's check script. → MCP
-pub fn checkScene(root: string, rel: string, placed: []string, arena: &Arena): Result<Reply, string> { return Result.Err("scene: not ported yet"); } // STUB SCENE
+/// Rust `check_args`: `check`, or `check part` for a scene other scenes place that is not the main scene.
+pub fn checkArgs(root: string, rel: string, placed: []string, arena: &Arena): List<string> {
+    let out = List<string>.new(arena);
+    out.push("check");
+    let r = noDot(rel);
+    let isPlaced = false;
+    for i in 0..placed.len { if placed[i] == r { isPlaced = true; } }
+    if isPlaced && !assets.isMainScene(root, rel, arena) { out.push("part"); }
+    return out;
+}
+
+/// Rust `scene::check_scene`: the `check` op on one scene plus the project's check script (`check =` in
+/// `j3.editor.toml`, run as `j3c run <script> <rel>` from the root: its `error: ` / `warning: ` lines become
+/// issues). → MCP
+pub fn checkScene(root: string, rel: string, placed: []string, arena: &Arena): Result<Reply, string> {
+    let args = checkArgs(root, rel, placed, arena);
+    let r = runTool(root, rel, args.slice(), arena)?;
+    let script = match configValue(root, "check", arena) { Option.Some(s) { s } Option.None { return Result.Ok(r); } };
+    let exe = frontend.hostExe(arena)?;
+    let argv: [4]string = [exe, "run", script, rel];
+    let o = match proc.startIn(argv[..], root, arena) {
+        Result.Ok(c) { c.collect("" as []u8, arena) }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("run check script ").add(script).add(": ").add(ioErr(arena)).str()); }
+    };
+    let found = false;
+    let a = 0;
+    let text = o.outStr();
+    for i in 0..text.len + 1 {
+        if i < text.len && text[i] != '\n' { continue; }
+        let l = text[a..i];
+        if l.len > 0 && l[l.len - 1] == '\r' { l = l[0..l.len - 1]; }
+        a = i + 1;
+        if i == text.len && l.len == 0 { break; }
+        let sev = "";
+        let msg = "";
+        if l.len >= 7 && l[0..7] == "error: " { sev = "error"; msg = l[7..l.len]; }
+        else if l.len >= 9 && l[0..9] == "warning: " { sev = "warning"; msg = l[9..l.len]; }
+        else { continue; }
+        found = true;
+        r.lines.push(issue(sev, Text.new(arena).add(msg).add(" (").add(script).add(")").str(), arena));
+    }
+    if o.code != 0 && !found {
+        // the last 12 stderr lines that are not `j3c: ` notes (unless they say error), joined by ` | `
+        let err = o.errStr();
+        let keep = List<string>.new(arena);
+        a = 0;
+        for i in 0..err.len + 1 {
+            if i < err.len && err[i] != '\n' { continue; }
+            let l = err[a..i];
+            if l.len > 0 && l[l.len - 1] == '\r' { l = l[0..l.len - 1]; }
+            a = i + 1;
+            if i == err.len && l.len == 0 { break; }
+            if !(l.len >= 5 && l[0..5] == "j3c: ") || has(l, "error") { keep.push(l); }
+        }
+        let m = Text.new(arena);
+        m.add("check script ").add(script).add(" failed (");
+        status(&m, o.code);
+        m.add("): ");
+        let from = if keep.len > 12 { keep.len - 12 } else { 0 };
+        for i in from..keep.len {
+            if i > from { m.add(" | "); }
+            m.add(keep.items[i]);
+        }
+        r.lines.push(issue("error", m.str(), arena));
+    }
+    return Result.Ok(r);
+}
+
+fn has(s: string, part: string): bool {
+    if part.len > s.len { return false; }
+    for i in 0..s.len - part.len + 1 { if s[i..i + part.len] == part { return true; } }
+    return false;
+}
+
+fn issue(sev: string, msg: string, arena: &Arena): List<string> {
+    let l = List<string>.new(arena);
+    l.push("issue");
+    l.push(sev);
+    l.push("0");
+    l.push(msg);
+    return l;
+}
+
+/// Rust `ExitStatus` as text (see the header).
+pub fn status(t: &Text, code: int) {
+    t.add("exit status: ");
+    t.pushInt(code);
+}
+
+fn batchStr(arena: &Arena): string {
+    let b = arena.alloc::<u8>(1);
+    b[0] = BATCH;
+    return b as string;
+}
+
+/// Rust `scene::request_text`: `args` as the tool's request line (tabs refused); a lone `BATCH` argument
+/// splits requests. → MCP (live editor)
+pub fn requestText(args: []string, arena: &Arena): Result<string, string> {
+    let sep = batchStr(arena);
+    let t = Text.new(arena);
+    for i in 0..args.len {
+        let a = args[i];
+        if a == sep {
+            t.add(sep);
+            continue;
+        }
+        for k in 0..a.len {
+            let c = a[k];
+            if c == '\t' || c == '\n' || c == '\r' || c == BATCH {
+                let m = Text.new(arena);
+                m.add("argument ");
+                debugStr(&m, a);
+                m.add(" has a tab or line break");
+                return Result.Err(m.str());
+            }
+        }
+        if t.len() > 0 && t.str()[t.len() - 1] != BATCH { t.push('\t'); }
+        t.add(a);
+    }
+    return Result.Ok(t.str());
+}
+
+/// True when a part of `request` (split on `BATCH`) is an op in `CHANGES`.
+fn changes(request: string): bool {
+    let a = 0;
+    for i in 0..request.len + 1 {
+        if i < request.len && request[i] != BATCH { continue; }
+        let e = a;
+        while e < i && request[e] != '\t' { e += 1; }
+        for k in 0..CHANGES.len { if CHANGES[k] == request[a..e] { return true; } }
+        a = i + 1;
+    }
+    return false;
+}
+
+/// The request run in-process as the editor's `cli` mode does (`tool.j3` `cli`), in `root` (the cwd). Ok is
+/// (reply text, ok).
+fn applyHere(rel: string, request: string, arena: &Arena): (string, bool) {
+    let mem = Arena.create(4 * 1024 * 1024);
+    let scene = scene3d.read(rel, &mem);
+    let catalog = save.load("target/j3-editor/catalog", &mem);
+    let out = Text.new(&mem);
+    let ok = true;
+    let isCheck = request.len >= 5 && request[0..5] == "check";
+    let isAdd = request.len > 3 && request[0..4] == "add\t";
+    if !scene.found && !isCheck && !isAdd {
+        out.add("err\tscene file ").add(rel).add(" does not exist\n");
+        ok = false;
+    } else {
+        // Stats count what gets drawn, placed scenes included.
+        if request == "stats" { scene3d.expand(&scene, rel); }
+        let result = tool.apply(&scene, &catalog, rel, request, &out);
+        ok = result.ok;
+        // A failed request may have changed the scene partway; the file keeps its old contents.
+        if result.ok && result.changed && !scene3d.store(&scene, rel) {
+            out.add("err\tcould not write the scene file\n");
+            ok = false;
+        }
+    }
+    let text = own(arena, out.str());
+    mem.destroy();
+    rewindScratch();
+    return (text, ok);
+}
 
 /// Rust `scene::run_tool`: one request (`args[0]` is the op; a `BATCH`-joined list for batches) on the file at
-/// `rel`, with an undo backup first for a changing op. → MCP
-pub fn runTool(root: string, rel: string, args: []string, arena: &Arena): Result<Reply, string> { return Result.Err("scene: not ported yet"); } // STUB SCENE
+/// `rel`, with an undo backup first for a changing op (dropped again when nothing changed). → MCP
+pub fn runTool(root: string, rel: string, args: []string, arena: &Arena): Result<Reply, string> {
+    let request = requestText(args, arena)?;
+    // Keep the script catalog current so props and checks match the scripts.
+    if fsx.isFile(path.join(root, "j3.editor.toml", arena)) {
+        match io.makeDirs(path.join(root, "target/j3-editor", arena)) { Result.Ok(_) {} Result.Err(_) { return Result.Err(ioErr(arena)); } }
+        assets.generateCatalog(root, arena)?;
+    }
+    let saved = if changes(request) { history.backup(root, rel, arena) } else { Option.None };
+    let back = cwd(arena)?;
+    if sys.chdir(proc.cString(root, arena).ptr as ptr) < 0 {
+        return Result.Err(Text.new(arena).add("run scene tool: ").add(ioErr(arena)).str());
+    }
+    let (text, ok) = applyHere(rel, request, arena);
+    sys.chdir(proc.cString(back, arena).ptr as ptr);
+    // A request that changed nothing leaves no undo step.
+    match saved {
+        Option.Some(b) {
+            let now = io.readFile(path.join(root, rel, arena), arena);
+            let was = io.readFile(b, arena);
+            match now {
+                Result.Ok(x) { match was { Result.Ok(y) { if x as string == y as string { io.remove(b); } } Result.Err(_) {} } }
+                Result.Err(_) {}
+            }
+        }
+        Option.None {}
+    }
+    return Result.Ok(reply.parse(text, ok, arena));
+}
 
-/// Rust `scene::request_text`: `args` as the tool's request line (tabs refused). → MCP (live editor)
-pub fn requestText(args: []string, arena: &Arena): Result<string, string> { return Result.Err("scene: not ported yet"); } // STUB SCENE
-
-/// Rust `scene::apply_args`: `scene_apply` lines (+ parent) as request args. → MCP
-pub fn applyArgs(text: string, parent: Option<string>, arena: &Arena): Result<List<string>, string> { return Result.Err("scene: not ported yet"); } // STUB SCENE
+/// Rust `scene::apply_args`: `scene_apply` lines (+ parent) as request args; line breaks travel as byte 31
+/// because a request is one tab-separated line. → MCP
+pub fn applyArgs(text: string, parent: Option<string>, arena: &Arena): Result<List<string>, string> {
+    for i in 0..text.len {
+        if text[i] == '\t' || text[i] == 0x1e || text[i] == 0x1f { return Result.Err("the object lines have a tab or control character"); }
+    }
+    let e = text.len;
+    while e > 0 && (text[e - 1] == ' ' || text[e - 1] == '\t' || text[e - 1] == '\n' || text[e - 1] == '\r' || text[e - 1] == 11 || text[e - 1] == 12) { e -= 1; }
+    let t = Text.new(arena);
+    t.add("lines=");
+    let i = 0;
+    while i < e {
+        if text[i] == '\r' && i + 1 < e && text[i + 1] == '\n' { t.push(0x1f); i += 2; continue; }
+        t.push(if text[i] == '\n' { u8(0x1f) } else { text[i] });
+        i += 1;
+    }
+    let args = List<string>.new(arena);
+    args.push("apply");
+    args.push(t.str());
+    match parent { Option.Some(p) { args.push(Text.new(arena).add("parent=").add(p).str()); } Option.None {} }
+    return Result.Ok(args);
+}
 
 /// Rust `scene::render`: render `rel` with `opts` (`out=`, `at=`, ...) through the editor program. → MCP
-pub fn render(root: string, rel: string, opts: []string, arena: &Arena): Result<Rendered, string> { return Result.Err("scene: not ported yet"); } // STUB SCENE
+pub fn render(root: string, rel: string, opts: []string, arena: &Arena): Result<Rendered, string> {
+    let all = List<string>.new(arena);
+    let hasOut = false;
+    for i in 0..opts.len {
+        let o = opts[i];
+        for k in 0..o.len {
+            if o[k] == '\t' || o[k] == '\n' || o[k] == '\r' {
+                let m = Text.new(arena);
+                m.add("option ");
+                debugStr(&m, o);
+                m.add(" has a tab or line break");
+                return Result.Err(m.str());
+            }
+        }
+        all.push(o);
+        if !hasOut && o.len >= 4 && o[0..4] == "out=" {
+            hasOut = true;
+            let p = o[4..o.len];
+            let ps = parts(p, arena);
+            let up = false;
+            for j in 0..ps.len { if ps.items[j] == ".." { up = true; } }
+            if path.isAbs(p) || up { return Result.Err("out must be a path inside the project"); }
+            match io.makeDirs(path.dirname(path.join(root, p, arena))) { Result.Ok(_) {} Result.Err(_) { return Result.Err(ioErr(arena)); } }
+        }
+    }
+    if !hasOut {
+        match io.makeDirs(path.join(root, "target/j3-editor", arena)) { Result.Ok(_) {} Result.Err(_) { return Result.Err(ioErr(arena)); } }
+        all.push("out=target/j3-editor/render.png");
+    }
+    let exe = frontend.build(arena)?;
+    let req = Text.new(arena);
+    req.add("J3_TOOL=");
+    for i in 0..all.len {
+        if i > 0 { req.push(9); }
+        req.add(all.items[i]);
+    }
+    let argv = List<string>.new(arena);
+    argv.push("env");
+    argv.push("J3_EDITOR_MODE=render");
+    argv.push(Text.new(arena).add("J3_EDITOR_SCENE=").add(rel).str());
+    argv.push(req.str());
+    // No display needed: SDL's offscreen driver draws through EGL.
+    if sys.env("SDL_VIDEODRIVER").len == 0 { argv.push("SDL_VIDEODRIVER=offscreen"); }
+    argv.push(exe);
+    let o = match proc.startIn(argv.slice(), root, arena) {
+        Result.Ok(c) { c.collect("" as []u8, arena) }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("run renderer: ").add(ioErr(arena)).str()); }
+    };
+    let r = reply.parse(o.outStr(), o.code == 0, arena);
+    match reply.error(&r, arena) { Option.Some(e) { return Result.Err(e); } Option.None {} }
+    for i in 0..r.lines.len {
+        let l = &r.lines.items[i];
+        if l.items[0] != "ok" { continue; }
+        if r.ok { return Result.Ok(Rendered { png: at(l, 1), text: at(l, 2) }); }
+        break;
+    }
+    let m = Text.new(arena);
+    m.add("renderer failed (");
+    status(&m, o.code);
+    m.add("): ").add(trim(o.errStr()));
+    return Result.Err(m.str());
+}
 
-/// Rust `editor::config_value`: `key = "value"` from the project's `j3.editor.toml`. → MCP (project notes), EDDEV
-pub fn configValue(root: string, key: string, arena: &Arena): Option<string> { return Option.None; } // STUB SCENE
+/// Rust `editor::config_value`: a quoted `key = "value"` from the project's `j3.editor.toml` (any section),
+/// if present and non-empty. → MCP (project notes), EDDEV
+pub fn configValue(root: string, key: string, arena: &Arena): Option<string> {
+    let config = match io.readFile(path.join(root, "j3.editor.toml", arena), arena) { Result.Ok(b) { b as string } Result.Err(_) { return Option.None; } };
+    match assets.tomlValue(config, key) {
+        Option.Some(v) {
+            if v.len <= 2 || v[0] != '"' || v[v.len - 1] != '"' { return Option.None; }
+            return Option.Some(v[1..v.len - 1]);
+        }
+        Option.None { return Option.None; }
+    }
+}
 
 /// Rust `editor::scene_path`: the project's main scene file. → EDDEV
-pub fn scenePath(root: string, arena: &Arena): Result<string, string> { return Result.Err("scene: not ported yet"); } // STUB SCENE
+pub fn scenePath(root: string, arena: &Arena): Result<string, string> { return assets.mainScene(root, arena); }

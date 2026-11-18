@@ -1,5 +1,348 @@
 // CSS lint for `j3c check`.
 //
-// Port of: j3c/src/csslint.rs
-// J3: Calls `j3.ui.css` in-process; Rust had to compile and run a J3 helper (`csslint_main.j3`) for this.
+// Port of: j3c/src/csslint.rs, j3c/src/csslint_main.j3
+// J3: Calls `j3.ui.css` in-process; Rust had to compile and run a J3 helper (`csslint_main.j3`) for this, through a
+// spec file. Here the facts go straight into `ElFact`s and the sheets into one `Css` (all sources parsed first, then
+// the facts, as the helper reads its spec), in a scratch arena freed at the end; the returned lines are copies in
+// the caller's arena. The helper's own failures (build, run) have no counterpart; read and `scan` errors are the
+// `Err` that `check` prints as `note: css lint skipped: E`.
+// J3: Warning order is Rust's: the parser's warnings, then `j3.ui.csslint`'s, then a stable sort by (file as read:
+// theme then components, line, col), with the `style:X="revert"` warnings first in the list as Rust's `found`.
 module j3c.cmd.csslint;
+
+use j3.cmp.sortBy;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.result.Result;
+use j3.option.Option;
+use j3.text;
+use j3.text.Text;
+use j3.ui.css.{ Css, Warning };
+use j3.ui.csslint.{ ElFact, lint };
+use j3.ui.cssparse.parseAt;
+use j3c.base.fsx;
+use j3c.project.manifest.Manifest;
+use j3c.syntax.lex.{ isWhitespace, trimEnd, trimStart };
+use j3c.ui.markup;
+use j3c.ui.markup.{ Attr, Node, Part, Value };
+use j3c.ui.scan;
+
+/// The rules `j3.ui.csslint` and this file report (the `[rule]` at the end of a warning).
+const RULES: [8]string = ["never-matches", "ellipsis-without-overflow", "offset-without-position", "duplicate-decl", "undefined-var", "broad-has", "has-before-combinator", "style-revert"];
+
+/// One style source: the theme (scope 0) or a component's `<style>`.
+struct CssSource {
+    scope: int;
+    shown: string;
+    line0: int;
+    css: string;
+}
+
+/// One element the markup can create (Rust's spec `E` line); `tag` "*" is any.
+struct RawFact {
+    words: List<string>;
+    scope: int;
+    tag: string;
+}
+
+/// A file as read (Rust's `texts`): theme, then components.
+struct ShownText {
+    shown: string;
+    text: string;
+}
+
+/// One warning before filtering (Rust's `found` tuple).
+struct Found {
+    file: string;
+    msg: string;
+    line: int;
+    col: int;
+}
+
+/// 1-based line and byte column of `at` in `t` (Rust `line_col`).
+fn lineCol(t: string, at: int): (int, int) {
+    let a = if at < t.len { at } else { t.len };
+    let line = 1;
+    let start = 0;
+    for i in 0..a {
+        if t[i] == '\n' { line += 1; start = i + 1; }
+    }
+    return (line, a - start + 1);
+}
+
+/// `s` split at Rust `char::is_whitespace` runs, each piece pushed with `prefix` (byte 1 becomes `*`).
+fn splitWords(s: string, prefix: string, out: &List<string>, a: &Arena) {
+    let i = 0;
+    let lo = -1;
+    while i <= s.len {
+        let ws = true;
+        let n = 1;
+        if i < s.len {
+            let (c, k) = text.decodeRune(s, i);
+            ws = isWhitespace(c);
+            n = k;
+        }
+        if ws {
+            if lo >= 0 {
+                let w = Text.new(a).add(prefix);
+                for j in lo..i { if s[j] == 1 { w.push('*'); } else { w.push(s[j]); } }
+                out.push(w.str());
+                lo = -1;
+            }
+        } else if lo < 0 {
+            lo = i;
+        }
+        i += n;
+    }
+}
+
+/// The class words of an attribute value: `a b{x}` gives `a`, `b*`; `{x}` alone gives `*` (Rust `words`).
+fn words(v: &Value, out: &List<string>, prefix: string, a: &Arena) {
+    match *v {
+        Value.None {}
+        Value.Expr(_) { out.push(Text.new(a).add(prefix).add("*").str()); }
+        Value.Str(ps) {
+            let s = Text.new(a);
+            for i in 0..ps.items.len {
+                match ps.items.items[i] {
+                    Part.Lit(l) { s.add(l); }
+                    Part.Hole(_) { s.push(1); }
+                }
+            }
+            splitWords(s.str(), prefix, out, a);
+        }
+    }
+}
+
+fn elementWords(attrs: &List<Attr>, a: &Arena): List<string> {
+    let w = List<string>.new(a);
+    for i in 0..attrs.len {
+        let at = attrs.items[i];
+        if at.name == "class" {
+            words(&at.value, &w, "", a);
+        } else if text.startsWith(at.name, "class:") {
+            w.push(at.name[6..at.name.len]);
+        } else if at.name == "id" {
+            words(&at.value, &w, "#", a);
+        }
+    }
+    return w;
+}
+
+/// The single literal of a quoted value (Rust `[Part::Lit(l)]`), else None.
+fn onlyLit(v: &Value): Option<string> {
+    match *v {
+        Value.Str(ps) {
+            if ps.items.len != 1 { return Option.None; }
+            match ps.items.items[0] {
+                Part.Lit(l) { return Option.Some(l); }
+                Part.Hole(_) { return Option.None; }
+            }
+        }
+        Value.None { return Option.None; }
+        Value.Expr(_) { return Option.None; }
+    }
+}
+
+/// One fact per element the markup can create; a component use that passes a class is an element of unknown
+/// tag (Rust `facts`). `style:X="revert"` warnings go to `found`.
+fn facts(nodes: &List<Node>, scope: int, src: string, shown: string, out: &List<RawFact>, found: &List<Found>, a: &Arena) {
+    for i in 0..nodes.len {
+        match nodes.items[i] {
+            Node.Elem(e) {
+                for k in 0..e.attrs.len {
+                    let at = e.attrs.items[k];
+                    if !text.startsWith(at.name, "style:") { continue; }
+                    match onlyLit(&at.value) {
+                        Option.Some(l) {
+                            let v = trimEnd(trimStart(l));
+                            if v == "revert" || v == "revert-layer" {
+                                let (line, col) = lineCol(src, at.range.lo);
+                                let m = Text.new(a).add("`").add(at.name).add("=\"").add(v);
+                                m.add("\"` acts as `unset` (inline styles have no tag defaults to roll back to) [style-revert]");
+                                found.push(Found { file: shown, msg: m.str(), line: line, col: col });
+                            }
+                        }
+                        Option.None {}
+                    }
+                }
+                let w = elementWords(&e.attrs, a);
+                // `<component this of>` is a use of a component picked at run time
+                if e.comp || e.tag == "component" {
+                    if w.len > 0 { out.push(RawFact { words: w, scope: scope, tag: "*" }); }
+                } else if e.tag != "slot" {
+                    out.push(RawFact { words: w, scope: scope, tag: e.tag });
+                }
+                facts(&e.children, scope, src, shown, out, found, a);
+            }
+            Node.If(n) {
+                for b in 0..n.branches.len { facts(&n.branches.items[b].nodes, scope, src, shown, out, found, a); }
+            }
+            Node.Each(n) { facts(&n.body, scope, src, shown, out, found, a); }
+            Node.Let(_) {}
+            Node.Text(_) {}
+        }
+    }
+}
+
+/// Is `rule` at `line` of `t` silenced by a `j3-lint-ignore` comment on that line or the one before (Rust `ignored`)?
+fn ignored(t: string, line: int, rule: string): bool {
+    let ls = text.lines(t);
+    let n = 0;
+    for l in ls {
+        n += 1;
+        if n != line - 1 && n != line { continue; }
+        let at = text.find(l, "j3-lint-ignore");
+        if at < 0 { continue; }
+        let rest = l[at + 14..l.len];
+        let end = text.find(rest, "*/");
+        if end >= 0 { rest = rest[0..end]; }
+        let any = false;
+        let i = 0;
+        let lo = -1;
+        while i <= rest.len {
+            let sep = true;
+            let k = 1;
+            if i < rest.len {
+                let (c, m) = text.decodeRune(rest, i);
+                sep = isWhitespace(c) || c == ',';
+                k = m;
+            }
+            if sep {
+                if lo >= 0 {
+                    any = true;
+                    if rest[lo..i] == rule { return true; }
+                    lo = -1;
+                }
+            } else if lo < 0 {
+                lo = i;
+            }
+            i += k;
+        }
+        if !any { return true; }
+    }
+    return false;
+}
+
+/// Where `file` was read (`texts` index), or past the end.
+fn readAt(texts: &List<ShownText>, file: string): int {
+    for i in 0..texts.len { if texts.items[i].shown == file { return i; } }
+    return 1 << 40;
+}
+
+/// `warning: file:line:col: message [rule]` lines for the project's theme and component styles (none without
+/// `[ui]`), in `arena` (Rust `lint_project`).
+pub fn lintProject(m: &Manifest, arena: &Arena): Result<List<string>, string> {
+    let res = List<string>.new(arena);
+    let u = match m.ui {
+        Option.Some(u) { u }
+        Option.None { return Result.Ok(res); }
+    };
+    for i in 0..u.lintOff.len { if u.lintOff.items[i] == "*" { return Result.Ok(res); } }
+    let mem = Arena.create(1 << 20);
+    defer mem.destroy();
+    let a = &mem;
+    let sources = List<CssSource>.new(a);
+    let texts = List<ShownText>.new(a);
+    let raw = List<RawFact>.new(a);
+    let found = List<Found>.new(a);
+    match u.theme {
+        Option.Some(t) {
+            let p = path.join(m.root, t, a);
+            let css = match fsx.readText(p, a) {
+                Result.Ok(x) { x }
+                Result.Err(e) { return Result.Err(Text.new(arena).add("read ").add(t).add(e[5 + p.len..e.len]).str()); }
+            };
+            texts.push(ShownText { shown: t, text: css });
+            sources.push(CssSource { scope: 0, shown: t, line0: 0, css: css });
+        }
+        Option.None {}
+    }
+    let dir = path.join(m.root, u.dir, a);
+    let none = List<string>.new(a);
+    let files = match scan.scan(dir, u.dir, &none, a) {
+        Result.Ok(f) { f }
+        Result.Err(e) { return Result.Err(Text.new(arena).add(e).str()); }
+    };
+    let uid = 0;
+    for i in 0..files.len {
+        let f = files.items[i];
+        let src = match fsx.readText(f.path, a) {
+            Result.Ok(x) { x }
+            Result.Err(e) { return Result.Err(Text.new(arena).add(e).str()); }
+        };
+        // a markup error is `j3c check`'s to report (it ran first)
+        let mk = match markup.parse(src, a, &uid) {
+            Result.Ok(x) { x }
+            Result.Err(_) { continue; }
+        };
+        let scope = i + 1;
+        match mk.style {
+            Option.Some(r) {
+                let top = r.lo;
+                while top < r.hi && src[top] == '\n' { top += 1; }
+                let hi = r.hi;
+                while hi > top && src[hi - 1] == '\n' { hi -= 1; }
+                let line0 = 0;
+                for k in 0..top { if src[k] == '\n' { line0 += 1; } }
+                sources.push(CssSource { scope: scope, shown: f.shown, line0: line0, css: src[top..hi] });
+            }
+            Option.None {}
+        }
+        facts(&mk.nodes, scope, src, f.shown, &raw, &found, a);
+        texts.push(ShownText { shown: f.shown, text: src });
+    }
+    if sources.len == 0 && raw.len == 0 { return Result.Ok(res); }
+    // the helper program (`csslint_main.j3`), in-process
+    let css = Css.new(a);
+    css.lintOn = true;
+    for i in 0..sources.len {
+        let s = sources.items[i];
+        parseAt(&css, s.css, s.shown, s.scope, s.line0);
+    }
+    let els = List<ElFact>.new(a);
+    for i in 0..raw.len {
+        let r = raw.items[i];
+        els.push(ElFact { scope: r.scope, tag: if r.tag == "*" { -1 } else { css.intern(r.tag) }, words: r.words });
+    }
+    let ws = List<Warning>.new(a);
+    for i in 0..css.warns.len { ws.push(css.warns.items[i]); }
+    lint(&css, &els, &ws);
+    for i in 0..ws.len {
+        let w = ws.items[i];
+        // the helper's output went through a line split: a message ends at its first newline
+        let msg = w.msg;
+        let nl = text.find(msg, "\n");
+        if nl >= 0 { msg = msg[0..nl]; }
+        found.push(Found { file: w.file, msg: msg, line: w.line, col: w.col });
+    }
+    // by file (as read: theme, then components), line, column
+    let sorted = found.items[0..found.len];
+    sortBy(sorted, fn(x: Found, y: Found): bool {
+        let ax = readAt(&texts, x.file);
+        let ay = readAt(&texts, y.file);
+        if ax != ay { return ax < ay; }
+        if x.line != y.line { return x.line < y.line; }
+        return x.col < y.col;
+    });
+    for i in 0..sorted.len {
+        let f = sorted[i];
+        let rule = "";
+        for k in 0..RULES.len {
+            if text.endsWith(f.msg, Text.new(a).add(" [").add(RULES[k]).add("]").str()) { rule = RULES[k]; break; }
+        }
+        if rule.len > 0 {
+            let off = false;
+            for k in 0..u.lintOff.len { if u.lintOff.items[k] == rule { off = true; } }
+            if off { continue; }
+            let at = readAt(&texts, f.file);
+            if at < texts.len && ignored(texts.items[at].text, f.line, rule) { continue; }
+        }
+        let t = Text.new(arena).add("warning: ").add(f.file).add(":");
+        t.pushInt(f.line);
+        t.add(":");
+        t.pushInt(f.col);
+        res.push(t.add(": ").add(f.msg).str());
+    }
+    return Result.Ok(res);
+}

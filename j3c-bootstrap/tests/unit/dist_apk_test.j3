@@ -1,0 +1,198 @@
+// dist/apk (Rust apk.rs tests): versionCode, the manifest and Java texts, native_libs, asset names and listing,
+// uses_tls, and `build` against a fake SDK, JDK and `zip` (scripts that log their argv): the argv of every
+// tool in order, the staged files, the stamp, and the stage folder removed afterwards.
+module dist_apk_test;
+
+use j3.io;
+use j3.io.path;
+use j3.option.Option;
+use j3.memory.{ Arena, List };
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.sys.panic;
+use j3.text.{ Text, contains, startsWith };
+use j3c.base.fsx;
+use j3c.dist.apk;
+use j3c.dist.pkg.Built;
+use j3c.project.manifest.{ Manifest, parseManifest };
+
+fn put(p: string, s: string) {
+    let i = p.len - 1;
+    while i > 0 && p[i] != '/' { i -= 1; }
+    io.makeDirs(p[0..i]);
+    match io.writeFile(p, s as []u8) { Result.Ok(_) {} Result.Err(_) { panic(p); } }
+}
+
+fn sh(cmd: string, mem: &Arena) {
+    let argv: [3]string = ["sh", "-c", cmd];
+    match proc.run(argv[..], "", mem) {
+        Result.Ok(o) { if o.code != 0 { panic(o.errStr()); } }
+        Result.Err(_) { panic("sh"); }
+    }
+}
+
+fn want(s: string, part: string) { if !contains(s, part) { panic(part); } }
+
+fn main() {
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    let base = Text.new(&mem).add("../target/unit-dist-apk-").fmt(`{sys.getpid()}`).str();
+    sh(Text.new(&mem).add("rm -rf ").add(base).str(), &mem);
+    io.makeDirs(base);
+    // absolute, so the expected argv below has clean paths
+    base = match path.realpath(base, &mem) { Option.Some(p) { p } Option.None { panic("realpath"); } };
+    let root = Text.new(&mem).add(base).add("/game").str();
+    put(Text.new(&mem).add(root).add("/src/main.j3").str(), "");
+
+    // version codes
+    let vc = fn(v: string, a: &Arena): int { match apk.versionCode(v, a) { Result.Ok(n) { return n; } Result.Err(e) { return -1; } } };
+    if vc("0.1.0", &mem) != 1000 || vc("1.2.3", &mem) != 1002003 || vc("1.2.3-beta", &mem) != 1002003 || vc("2", &mem) != 2000000 { panic("versionCode"); }
+    if vc("1.1000.0", &mem) != -1 || vc("2000.0.0", &mem) != -1 || vc("1.2.", &mem) != -1 || vc("", &mem) != -1 { panic("versionCode limits"); }
+    match apk.versionCode("x.1.0", &mem) {
+        Result.Ok(_) { panic("x.1.0"); }
+        Result.Err(e) { if e != "apk: [package] version `x.1.0` has no versionCode: use MAJOR.MINOR.PATCH numbers (major < 2000, minor and patch < 1000)" { panic(e); } }
+    }
+
+    // manifest and Java
+    let m = match parseManifest("[package]\nname = \"my-game\"\nversion = \"1.2.3\"\n[dist]\ntitle = \"Me & <You>\"\n[android]\norientation = \"portrait\"\n", root, &mem) {
+        Result.Ok(x) { x }
+        Result.Err(e) { panic(e); }
+    };
+    let x = apk.manifestXml(&m, 1002003, true, &mem);
+    let wants: [14]string = ["package=\"com.j3.my_game\"", "android:versionCode=\"1002003\"", "android:versionName=\"1.2.3\"",
+        "android:minSdkVersion=\"26\" android:targetSdkVersion=\"35\"", "android:glEsVersion=\"0x00030000\" android:required=\"true\"",
+        "android:label=\"Me &amp; &lt;You&gt;\"", "android:icon=\"@mipmap/ic_launcher\"", "android:extractNativeLibs=\"true\"",
+        "android:hasCode=\"true\"", "@android:style/Theme.NoTitleBar.Fullscreen", "android:name=\".J3Activity\"",
+        "android:screenOrientation=\"portrait\"", "android:exported=\"true\"", "android.intent.category.LAUNCHER"];
+    for i in 0..14 { want(x, wants[i]); }
+    if contains(apk.manifestXml(&m, 1, false, &mem), "android:icon") { panic("icon without one"); }
+    if !contains(x, "android.permission.POST_NOTIFICATIONS") || contains(x, "J3Service") { panic("service"); }
+    let fg = match parseManifest("[package]\nname = \"my-game\"\n[android]\nforeground_service = \"connectedDevice\"\n", root, &mem) {
+        Result.Ok(y) { y }
+        Result.Err(e) { panic(e); }
+    };
+    let xf = apk.manifestXml(&fg, 1, true, &mem);
+    let fw: [5]string = ["FOREGROUND_SERVICE_CONNECTED_DEVICE", "CHANGE_NETWORK_STATE", "WAKE_LOCK", "android:name=\".J3Service\"", "foregroundServiceType=\"connectedDevice\""];
+    for i in 0..5 { want(xf, fw[i]); }
+    want(apk.serviceJava("com.j3.my_game", "dataSync", &mem), "startForeground(ID, n, 1)");
+    let j = apk.activityJava("com.j3.my_game", false, &mem);
+    if !contains(j, "HAS_SERVICE = false") || contains(j, "@PKG@") || contains(j, "@LIBS@") || !startsWith(j, "package com.j3.my_game;") { panic(j); }
+    want(j, "extends org.libsdl.app.SDLActivity");
+    want(j, "\"SDL2\", \"SDL2_image\", \"SDL2_mixer\", \"SDL2_ttf\", \"main\"");
+    want(j, "setenv(\"J3_NATIVE_LIB_DIR\", getApplicationInfo().nativeLibraryDir, true)");
+
+    // native_libs
+    let nd = Text.new(&mem).add(base).add("/native").str();
+    match apk.nativeLibs(nd, &mem) { Result.Ok(l) { if l.len != 0 { panic("missing dir"); } } Result.Err(e) { panic(e); } }
+    put(Text.new(&mem).add(nd).add("/libb.so").str(), "");
+    put(Text.new(&mem).add(nd).add("/liba.so").str(), "");
+    match apk.nativeLibs(nd, &mem) {
+        Result.Ok(l) { if l.len != 2 || l.items[0] != Text.new(&mem).add(nd).add("/liba.so").str() { panic("native order"); } }
+        Result.Err(e) { panic(e); }
+    }
+    let bads: [3]string = ["stockfish", "libmain.so", "libSDL2.so"];
+    for i in 0..3 {
+        let p = Text.new(&mem).add(nd).add("/").add(bads[i]).str();
+        put(p, "");
+        match apk.nativeLibs(nd, &mem) { Result.Ok(_) { panic(bads[i]); } Result.Err(e) { want(e, "native_libs"); } }
+        io.remove(p);
+    }
+
+    // asset names, listing and stamp
+    let rels: [2]string = ["assets/a.png", "scenes/x/y.j3scene"];
+    if apk.j3assets(rels[..], "abc", &mem) != "j3assets 1 abc\nassets/a.png\nscenes/x/y.j3scene\n" { panic("j3assets"); }
+    let badRels: [9]string = ["a/../b", "a\\b", "x.tmp", "j3assets.stamp", "j3assets.txt", "a//b", "", "a\nb", "./a"];
+    for i in 0..9 { if apk.validRel(badRels[i]) { panic(badRels[i]); } }
+    if !apk.validRel("assets/j3assets.txt.png") || !apk.validRel("a/b c/d.txt") { panic("valid names"); }
+    put(Text.new(&mem).add(root).add("/assets/b.txt").str(), "b");
+    put(Text.new(&mem).add(root).add("/assets/sub/a.txt").str(), "a");
+    put(Text.new(&mem).add(root).add("/assets/skip.tmp").str(), "t");
+    let inc: [1]string = ["assets"];
+    match apk.collectAssets(root, inc[..], &mem) {
+        Result.Ok(l) { if l.len != 2 || l.items[0].triple != "assets/b.txt" || l.items[1].triple != "assets/sub/a.txt" { panic("collect"); } }
+        Result.Err(e) { panic(e); }
+    }
+    let nope: [1]string = ["nope"];
+    match apk.collectAssets(root, nope[..], &mem) { Result.Ok(_) { panic("nope"); } Result.Err(e) { want(e, "does not exist"); } }
+
+    // uses_tls
+    let so = Text.new(&mem).add(base).add("/libgame.so").str();
+    put(so, "xxOPENSSL_init_sslyy");
+    match apk.usesTls(so, &mem) { Result.Ok(b) { if !b { panic("tls"); } } Result.Err(e) { panic(e); } }
+    put(so, "xxOPENSSL_init_ssxx");
+    match apk.usesTls(so, &mem) { Result.Ok(b) { if b { panic("no tls"); } } Result.Err(e) { panic(e); } }
+    if apk.path(&m, &mem) != Text.new(&mem).add(root).add("/target/dist/my-game-1.2.3.apk").str() { panic(apk.path(&m, &mem)); }
+
+    // build with fake tools: each logs `NAME ARGS` to $LOG; d8 writes classes.dex
+    fakeBuild(base, so, &m, &mem);
+    sh(Text.new(&mem).add("rm -rf ").add(base).str(), &mem);
+}
+
+/// `NAME`'s fake: logs `NAME ARGS` (zip: also its cwd's files and `assets/j3assets.txt`); d8 writes classes.dex,
+/// javac one class file.
+fn fake(file: string, name: string, extra: string, mem: &Arena) {
+    put(file, Text.new(mem).add("#!/bin/sh\necho \"").add(name).add(" $*\" >>\"$LOG\"\n").add(extra).str());
+    sh(Text.new(mem).add("chmod +x ").add(file).str(), mem);
+}
+
+fn fakeBuild(base: string, so: string, m: &Manifest, mem: &Arena) {
+    let sdk = Text.new(mem).add(base).add("/sdk").str();
+    let bt = Text.new(mem).add(sdk).add("/build-tools/35.0.0").str();
+    let jar = Text.new(mem).add(sdk).add("/platforms/android-35/android.jar").str();
+    put(jar, "jar");
+    io.makeDirs(Text.new(mem).add(sdk).add("/build-tools/9.0.0").str());
+    fake(Text.new(mem).add(bt).add("/aapt2").str(), "aapt2", "", mem);
+    fake(Text.new(mem).add(bt).add("/zipalign").str(), "zipalign", "", mem);
+    fake(Text.new(mem).add(bt).add("/apksigner").str(), "apksigner", "", mem);
+    fake(Text.new(mem).add(bt).add("/d8").str(), "d8", "o=; p=; for a; do [ \"$p\" = --output ] && o=$a; p=$a; done; : >\"$o/classes.dex\"\n", mem);
+    let jdk = Text.new(mem).add(base).add("/jdk").str();
+    fake(Text.new(mem).add(jdk).add("/bin/javac").str(), "javac", "d=; p=; for a; do [ \"$p\" = -d ] && d=$a; p=$a; done; mkdir -p \"$d/org\"; : >\"$d/org/A.class\"\n", mem);
+    fake(Text.new(mem).add(jdk).add("/bin/keytool").str(), "keytool", "", mem);
+    let bin = Text.new(mem).add(base).add("/bin").str();
+    fake(Text.new(mem).add(bin).add("/zip").str(), "zip", "echo \"cwd $PWD\" >>\"$LOG\"; find . -type f | LC_ALL=C sort >>\"$LOG\"; cat assets/j3assets.txt >>\"$LOG\"\n", mem);
+    let sdl = Text.new(mem).add(base).add("/sdl").str();
+    put(Text.new(mem).add(sdl).add("/java/org/libsdl/app/SDLB.java").str(), "");
+    put(Text.new(mem).add(sdl).add("/java/org/libsdl/app/SDLA.java").str(), "");
+    put(Text.new(mem).add(sdl).add("/java/org/libsdl/app/notes.txt").str(), "");
+    let libs: [4]string = ["SDL2", "SDL2_image", "SDL2_mixer", "SDL2_ttf"];
+    for i in 0..4 { put(Text.new(mem).add(sdl).add("/arm64-v8a/lib/lib").add(libs[i]).add(".so").str(), "so"); }
+    let log = Text.new(mem).add(base).add("/log.txt").str();
+    sys.setenv("ANDROID_HOME", sdk);
+    sys.setenv("J3_SDL_CACHE", sdl);
+    sys.setenv("JAVA_HOME", jdk);
+    sys.setenv("HOME", Text.new(mem).add(base).add("/home").str());
+    sys.setenv("PATH", Text.new(mem).add(bin).add(":").add(sys.env("PATH")).str());
+    sys.setenv("LOG", log);
+    let built: [1]Built = [Built { triple: "aarch64-linux-android", exe: so }];
+    let inc: [1]string = ["assets"];
+    let out = match apk.build(m, built[..], inc[..], mem) {
+        Result.Ok(p) { p }
+        Result.Err(e) { panic(e); }
+    };
+    let root = m.root;
+    let stage = Text.new(mem).add(root).add("/target/.j3c/apk").str();
+    if out != Text.new(mem).add(root).add("/target/dist/my-game-1.2.3.apk").str() { panic(out); }
+    if fsx.isDir(stage) { panic("stage left behind"); }
+    let got = match fsx.readText(log, mem) { Result.Ok(t) { t } Result.Err(e) { panic(e); } };
+    let w = Text.new(mem);
+    w.add("javac --release 8 -nowarn -Xlint:-options -cp ").add(jar).add(" -d ").add(stage).add("/classes ");
+    w.add(stage).add("/gen/com/j3/my_game/J3Activity.java ").add(stage).add("/gen/com/j3/my_game/J3Service.java ");
+    w.add(sdl).add("/java/org/libsdl/app/SDLA.java ").add(sdl).add("/java/org/libsdl/app/SDLB.java\n");
+    w.add("d8 --release --min-api 26 --lib ").add(jar).add(" --output ").add(stage).add("/dex ").add(stage).add("/classes/org/A.class\n");
+    w.add("aapt2 compile --dir ").add(stage).add("/res -o ").add(stage).add("/res.zip\n");
+    w.add("aapt2 link -I ").add(jar).add(" --manifest ").add(stage).add("/AndroidManifest.xml -o ").add(stage).add("/base.apk ").add(stage).add("/res.zip\n");
+    w.add("zip -q -X -r ").add(stage).add("/base.apk classes.dex lib assets\ncwd ").add(stage).add("/root\n");
+    w.add("./assets/assets/b.txt\n./assets/assets/sub/a.txt\n./assets/j3assets.txt\n./classes.dex\n");
+    w.add("./lib/arm64-v8a/libSDL2.so\n./lib/arm64-v8a/libSDL2_image.so\n./lib/arm64-v8a/libSDL2_mixer.so\n./lib/arm64-v8a/libSDL2_ttf.so\n./lib/arm64-v8a/libmain.so\n");
+    w.add("j3assets 1 7ba90d5513585216\nassets/b.txt\nassets/sub/a.txt\n");
+    w.add("zipalign -p -f 4 ").add(stage).add("/base.apk ").add(stage).add("/aligned.apk\n");
+    let ks = Text.new(mem).add(base).add("/home/.android/debug.keystore").str();
+    w.add("keytool -genkeypair -noprompt -keystore ").add(ks).add(" -alias androiddebugkey -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname CN=Android Debug,O=Android,C=US\n");
+    w.add("apksigner sign --ks ").add(ks).add(" --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android --out ").add(out).add(" ").add(stage).add("/aligned.apk\n");
+    if got != w.str() {
+        io.writeFile(Text.new(mem).add(base).add("/../unit-dist-apk-want.txt").str(), w.str() as []u8);
+        io.writeFile(Text.new(mem).add(base).add("/../unit-dist-apk-got.txt").str(), got as []u8);
+        panic("fake build argv differ: target/unit-dist-apk-{want,got}.txt");
+    }
+}

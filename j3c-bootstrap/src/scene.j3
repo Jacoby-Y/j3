@@ -9,10 +9,26 @@
 // `j3.instance` (B12.2) needs an edit in the frozen `j3c/editor/src` and is deferred. Tool args and help come
 // from the one tool table below (`tools`, types in `mcp/schema`, B12.3): one entry per MCP tool, in the Rust `TOOLS` order (the `--tools` text follows it). Each `run` is a
 // named fn in `mcp/ops.j3` (the MCP server's `run_tool` arms); `-e scene` itself goes through `scene/ops`.
+// J3: The `-e scene` / `-e render` usage texts are Rust's `USAGE` / `RENDER_USAGE`, embedded from
+// `scene/usage.txt` and `scene/render_usage.txt` (each ends in the newline `println!` adds).
 module j3c.scene;
 
+use j3.data.json;
+use j3.data.json.Json;
 use j3.memory.{ Arena, List };
-use j3c.base.diag;
+use j3.io.path;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use j3c.base.fsx;
+use j3c.scene.diff;
+use j3c.scene.history;
+use j3c.scene.ops;
+use j3c.scene.ops.BATCH;
+use j3c.scene.patterns;
+use j3c.scene.reply;
+use j3c.scene.reply.Reply;
 use j3c.mcp.ops.{ assetFetch, assetOnlineSearch, assetSearch, check, console, gen, import, place, play, render, sceneAdd, sceneAddMany,
     sceneApply, sceneDelete, sceneDiff, sceneFmt, sceneGet, sceneInline, sceneList, sceneSet, sceneSplit, sceneStats, undo };
 use j3c.mcp.schema.{ Hint, Tool, def, entry, flag, integer, listOf, most, number, numList, object, oneOf, req, strList, text, vec3, withProps };
@@ -233,8 +249,266 @@ pub fn tools(arena: &Arena): []Tool {
     return t.slice();
 }
 
+const USAGE = @embed("scene/usage.txt");
+const RENDER_USAGE = @embed("scene/render_usage.txt");
+
+fn out(s: string) { sys.write(1, s.ptr as ptr, s.len); }
+fn err(s: string) { sys.write(2, s.ptr as ptr, s.len); }
+
 /// `j3c -e scene OP ...` (Rust `scene::cmd`): the exit code.
-pub fn sceneCmd(rest: []string): int { return diag.notPortedCmd("-e scene"); } // STUB SCENE
+pub fn sceneCmd(rest: []string): int {
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    match execute(rest, &mem) {
+        Result.Ok(code) { return code; }
+        Result.Err(e) {
+            err(Text.new(&mem).add("j3c -e scene: ").add(e).add("\n").str());
+            return 1;
+        }
+    }
+}
+
+fn jsonList(v: &List<string>, arena: &Arena): &Json {
+    let a = json.arr(arena);
+    for i in 0..v.len { a.push(json.str(v.items[i], arena)); }
+    return a;
+}
+
+fn put(o: &Json, key: string, v: &Json) {
+    o.keys.push(key);
+    o.items.push(v);
+}
+
+fn printJson(j: &Json, arena: &Arena) {
+    let t = Text.new(arena);
+    json.write(j, &t);
+    t.push('\n');
+    out(t.str());
+}
+
+fn printText(r: &Reply, arena: &Arena) {
+    let t = Text.new(arena);
+    reply.toText(r, &t);
+    out(t.str());
+}
+
+/// Every byte of stdin.
+fn readStdin(arena: &Arena): Result<string, string> {
+    let t = Text.new(arena);
+    let buf = arena.alloc::<u8>(65536);
+    while true {
+        let n = sys.read(0, buf.ptr as ptr, buf.len);
+        if n < 0 { return Result.Err(fsx.osError(sys.errno(), arena)); }
+        if n == 0 { break; }
+        t.pushBytes(buf[0..n]);
+    }
+    return Result.Ok(t.str());
+}
+
+fn sceneOpt(s: string, given: bool): Option<string> {
+    if given { return Option.Some(s); }
+    return Option.None;
+}
+
+/// Rust `scene::execute`.
+fn execute(rest: []string, mem: &Arena): Result<int, string> {
+    let project = ".";
+    let scene = "";
+    let hasScene = false;
+    let asJson = false;
+    let all = false;
+    let args = List<string>.new(mem);
+    let i = 0;
+    while i < rest.len {
+        let a = rest[i];
+        if a == "--help" || a == "-h" {
+            out(USAGE);
+            return Result.Ok(0);
+        } else if a == "--project" {
+            if i + 1 >= rest.len { return Result.Err("--project needs a directory"); }
+            i += 1;
+            project = rest[i];
+        } else if a == "--scene" {
+            if i + 1 >= rest.len { return Result.Err("--scene needs a file"); }
+            i += 1;
+            scene = rest[i];
+            hasScene = true;
+        } else if a == "--json" {
+            asJson = true;
+        } else if a == "--all" {
+            all = true;
+        } else {
+            args.push(a);
+        }
+        i += 1;
+    }
+    if args.len == 0 {
+        out(USAGE);
+        return Result.Ok(2);
+    }
+    let root = ops.findRoot(project, mem)?;
+    let op = args.items[0];
+    if op == "diff" {
+        if args.len > 2 { return Result.Err("diff takes at most one scene to compare with"); }
+        let rel = ops.sceneRel(root, sceneOpt(scene, hasScene), mem)?;
+        let d = diff.diff(root, rel, if args.len > 1 { Option.Some(args.items[1]) } else { Option.None }, mem)?;
+        if asJson {
+            let o = json.obj(mem);
+            put(o, "ok", json.boolean(true, mem));
+            put(o, "scene", json.str(rel, mem));
+            put(o, "against", json.str(d.against, mem));
+            put(o, "added", jsonList(&d.added, mem));
+            put(o, "removed", jsonList(&d.removed, mem));
+            put(o, "moved", jsonList(&d.moved, mem));
+            put(o, "changed", jsonList(&d.changed, mem));
+            printJson(o, mem);
+        } else {
+            let t = Text.new(mem);
+            diff.text(&d, 50, &t);
+            out(t.str());
+        }
+        return Result.Ok(0);
+    }
+    if patterns.isPattern(op) {
+        let rel = ops.sceneRel(root, sceneOpt(scene, hasScene), mem)?;
+        let reqs = patterns.patternRequests(op, args.items[1..args.len], mem)?;
+        let sep = mem.alloc::<u8>(1);
+        sep[0] = BATCH;
+        let flat = List<string>.new(mem);
+        for k in 0..reqs.len {
+            if k > 0 { flat.push(sep as string); }
+            for j in 0..reqs.items[k].len { flat.push(reqs.items[k].items[j]); }
+        }
+        let r = ops.runTool(root, rel, flat.slice(), mem)?;
+        if asJson {
+            printJson(reply.toJson("add", rel, &r, mem), mem);
+        } else if r.ok {
+            let t = Text.new(mem);
+            t.add("added ");
+            t.pushInt(reqs.len);
+            t.add(" pieces in one step\n");
+            out(t.str());
+        } else {
+            printText(&r, mem);
+        }
+        return Result.Ok(if r.ok { 0 } else { 1 });
+    }
+    if op == "apply" {
+        // apply [parent=OBJECT] FILE|-   (the object lines, as `get` prints them)
+        let parent: Option<string> = Option.None;
+        let source = "";
+        let hasSource = false;
+        for k in 0..args.len {
+            let a = args.items[k];
+            let isParent = a.len >= 7 && a[0..7] == "parent=";
+            match parent { Option.None { if isParent { parent = Option.Some(a[7..a.len]); } } Option.Some(_) {} }
+            if k > 0 && !isParent && !hasSource { source = a; hasSource = true; }
+        }
+        if !hasSource { return Result.Err("apply needs a file of object lines, or - for stdin"); }
+        let text = "";
+        if source == "-" {
+            text = readStdin(mem)?;
+        } else {
+            match fsx.readText(source, mem) { Result.Ok(t) { text = t; } Result.Err(e) { return Result.Err(e); } }
+        }
+        let rel = ops.sceneRel(root, sceneOpt(scene, hasScene), mem)?;
+        let lines = ops.applyArgs(text, parent, mem)?;
+        let r = ops.runTool(root, rel, lines.slice(), mem)?;
+        if asJson { printJson(reply.toJson("apply", rel, &r, mem), mem); } else { printText(&r, mem); }
+        return Result.Ok(if r.ok { 0 } else { 1 });
+    }
+    if args.len == 1 && op == "undo" {
+        let msg = history.undo(root, ops.sceneRel(root, sceneOpt(scene, hasScene), mem)?, mem)?;
+        out(Text.new(mem).add(msg).add("\n").str());
+        return Result.Ok(0);
+    }
+    let scenes = List<string>.new(mem);
+    if all {
+        if op != "check" && op != "stats" { return Result.Err("--all only works with check and stats"); }
+        scenes = ops.allScenes(root, mem)?;
+    } else {
+        scenes.push(ops.sceneRel(root, sceneOpt(scene, hasScene), mem)?);
+    }
+    let isCheck = args.len == 1 && op == "check";
+    let placed = if isCheck { ops.placedScenes(root, mem) } else { List<string>.new(mem) };
+    let failed = false;
+    let outputs = List<&Json>.new(mem);
+    for k in 0..scenes.len {
+        let rel = scenes.items[k];
+        let r = if isCheck { ops.checkScene(root, rel, placed.slice(), mem)? } else { ops.runTool(root, rel, args.slice(), mem)? };
+        if !r.ok { failed = true; }
+        for j in 0..r.lines.len {
+            let l = &r.lines.items[j];
+            if l.items[0] == "issue" && reply.at(l, 1) == "error" { failed = true; }
+        }
+        if asJson {
+            outputs.push(reply.toJson(op, rel, &r, mem));
+        } else {
+            if scenes.len > 1 { out(Text.new(mem).add(rel).add(":\n").str()); }
+            printText(&r, mem);
+        }
+    }
+    if asJson {
+        if outputs.len == 1 {
+            printJson(outputs.items[0], mem);
+        } else {
+            let a = json.arr(mem);
+            for k in 0..outputs.len { a.push(outputs.items[k]); }
+            printJson(a, mem);
+        }
+    }
+    return Result.Ok(if failed { 1 } else { 0 });
+}
 
 /// `j3c -e render ...` (Rust `scene::render_cmd`): the exit code.
-pub fn renderCmd(rest: []string): int { return diag.notPortedCmd("-e render"); } // STUB SCENE
+pub fn renderCmd(rest: []string): int {
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    match renderRun(rest, &mem) {
+        Result.Ok(code) { return code; }
+        Result.Err(e) {
+            err(Text.new(&mem).add("j3c -e render: ").add(e).add("\n").str());
+            return 1;
+        }
+    }
+}
+
+/// The `--flag` → `key=` table of `-e render` (Rust's match arms; `--ortho` takes no value).
+const RENDER_FLAGS: [13]string = ["camera", "view", "size", "select", "focus", "out", "at", "yaw", "pitch", "fov", "views", "hide", "ambient"];
+
+fn renderRun(rest: []string, mem: &Arena): Result<int, string> {
+    let project = ".";
+    let scene = "";
+    let hasScene = false;
+    let opts = List<string>.new(mem);
+    let i = 0;
+    while i < rest.len {
+        let a = rest[i];
+        if a == "--help" || a == "-h" {
+            out(RENDER_USAGE);
+            return Result.Ok(0);
+        }
+        if a == "--ortho" {
+            opts.push("ortho=true");
+            i += 1;
+            continue;
+        }
+        let known = a == "--project" || a == "--scene";
+        let key = "";
+        for k in 0..RENDER_FLAGS.len {
+            if a.len == RENDER_FLAGS[k].len + 2 && a[0..2] == "--" && a[2..a.len] == RENDER_FLAGS[k] { key = RENDER_FLAGS[k]; known = true; }
+        }
+        if !known { return Result.Err(Text.new(mem).add("unknown argument `").add(a).add("`").str()); }
+        if i + 1 >= rest.len { return Result.Err(Text.new(mem).add(a).add(" needs a value").str()); }
+        let v = rest[i + 1];
+        i += 2;
+        if a == "--project" { project = v; }
+        else if a == "--scene" { scene = v; hasScene = true; }
+        else { opts.push(Text.new(mem).add(key).add("=").add(v).str()); }
+    }
+    let root = ops.findRoot(project, mem)?;
+    let rel = ops.sceneRel(root, sceneOpt(scene, hasScene), mem)?;
+    let r = ops.render(root, rel, opts.slice(), mem)?;
+    out(Text.new(mem).add(path.join(root, r.png, mem)).add("\n").str());
+    return Result.Ok(0);
+}

@@ -1,5 +1,256 @@
-// Member completion after `x.`: struct fields, methods, UFCS free fns, module fns (sema-backed).
+// Member completion after `x.`: struct fields, methods, UFCS free fns, module fns (sema-backed); the module
+// key helpers `completeUse` shares.
 //
 // Part of module j3c.lsp.complete.
-// Port of: j3c/src/lsp/complete/mod.rs (member half), lsp/complete/items.rs (`push_struct_members`, `push_methods*`)
+// Port of: j3c/src/lsp/complete/mod.rs (member half, `module_keys`, `child_segments`, `module_tail`,
+// `parent_doc`, `unknown_name`), lsp/complete/items.rs (`push_struct_members`, `push_methods*`, `push_*_fns`)
+// J3: Rust's tuples are anonymous structs with fields `0`, `1`; here a tuple local's elements are listed the
+// same way from its `Ty.Tuple`. A generic struct's members show the local's type arguments, else its first
+// instance's (Rust lists only the methods its instances made; B12.5).
 module j3c.lsp.complete;
+
+/// A fn a signature can show; `method` = called on a receiver (its `this` is left out).
+struct Found {
+    f: Id<FnDecl>;
+    method: bool;
+}
+
+/// Rust `members`: what follows `base.` typed as `prefix` at `offset` of `file`.
+fn members(s: &Session, file: Id<Source>, offset: u32, base: string, prefix: string, trusted: bool, arena: &Arena): List<Completion> {
+    let c = checked(s);
+    let out = List<Completion>.new(arena);
+    if trusted {
+        match sema.findLocal(c, file, offset, base) {
+            Option.Some(l) {
+                let ty = c.typed.locals.get(l).ty;
+                match sema.structOf(c, ty) {
+                    Option.Some(sid) {
+                        pushStructMembers(s, sid, sema.structArgs(c, ty), file, prefix, &out, arena);
+                        return finish(prefix, out);
+                    }
+                    Option.None {}
+                }
+                if pushTupleMembers(s, ty, prefix, &out, arena) { return finish(prefix, out); }
+            }
+            Option.None {}
+        }
+    }
+    match sema.findStruct(c, base) {
+        Option.Some(sid) {
+            pushStructMembers(s, sid, sema.firstInstance(c, sid), file, prefix, &out, arena);
+            if out.len > 0 { return finish(prefix, out); }
+        }
+        Option.None {}
+    }
+    match sema.findEnum(c, base) {
+        Option.Some(eid) {
+            let vs = c.tables.enumAt(eid).variants;
+            for i in 0..vs.len {
+                let name = c.tables.str(vs.items[i].name);
+                if startsWith(name, prefix) { out.push(item(name, 20, "variant", "", "2", false, arena)); }
+            }
+            if out.len > 0 { return finish(prefix, out); }
+        }
+        Option.None {}
+    }
+    let fns = &c.tables.fns;
+    for i in 0..fns.len() {
+        let fd = fns.get(fns.idAt(i));
+        if !isFree(fd) || !moduleTail(modKey(c, fd.owner), base) { continue; }
+        if !fd.visPub && fd.span.file != file { continue; }
+        let name = c.tables.str(fd.name);
+        if !isIdentName(name) || !startsWith(name, prefix) { continue; }
+        let doc = if fd.doc.len == 0 { modKey(c, fd.owner) } else { fd.doc };
+        out.push(item(name, 3, sigStr(s, fns.idAt(i)), doc, "2", false, arena));
+    }
+    let exports = sema.programExports(c, s.arena);
+    for i in 0..exports.len {
+        let e = exports.items[i];
+        let isEnum = e.kind == ExportKind.Enum;
+        if !isEnum && e.kind != ExportKind.Struct { continue; }
+        if !moduleTail(e.modPath, base) || !startsWith(e.name, prefix) { continue; }
+        let doc = if e.doc.len == 0 { e.modPath } else { e.doc };
+        out.push(item(e.name, if isEnum { 13 } else { 22 }, if isEnum { "enum" } else { "struct" }, doc, "2", false, arena));
+    }
+    return finish(prefix, out);
+}
+
+/// Rust `member_items`: members of `base` for `base.prefix` (the `.j3ui` bridge). → LSPU
+pub fn memberItems(s: &Session, path: string, offset: u32, base: string, prefix: string, arena: &Arena): List<Completion> {
+    match query.fileOf(s, path) {
+        Option.Some(f) { return members(s, f, offset, base, prefix, true, arena); }
+        Option.None { return List<Completion>.new(arena); }
+    }
+}
+
+/// Rust `push_struct_members`: fields, then methods; of a script struct outside its own file only the
+/// `pub fn`s. A generic struct's member types are shown at `args`.
+fn pushStructMembers(s: &Session, sid: Id<StructDecl>, args: Id<TyList>, file: Id<Source>, prefix: string, out: &List<Completion>, arena: &Arena) {
+    let c = checked(s);
+    let sd = c.tables.structAt(sid);
+    let isScript = match sd.scriptPath { Option.Some(_) { true } Option.None { false } };
+    let outside = isScript && sd.span.file != file;
+    if !outside {
+        for k in 0..sd.fields.len {
+            let f = sd.fields.items[k];
+            let name = c.tables.str(f.name);
+            if name.len == 0 || !startsWith(name, prefix) { continue; }
+            let ft = Text.new(s.arena);
+            sema.tyStringAt(c, f.ty, sd.gen, args, &ft);
+            out.push(item(name, 5, ft.str(), f.doc, "2", false, arena));
+        }
+    }
+    let fns = &c.tables.fns;
+    for i in 0..fns.len() {
+        let fd = fns.get(fns.idAt(i));
+        if !isMethodOf(fd, sid) || (outside && !fd.visPub) { continue; }
+        let name = c.tables.str(fd.name);
+        if !isIdentName(name) || !startsWith(name, prefix) { continue; }
+        out.push(item(name, 2, sigStrAt(s, fns.idAt(i), args), fd.doc, "2", false, arena));
+    }
+}
+
+/// A tuple's elements as Rust's tuple struct fields `0`, `1`, .. (`&` stripped); false when `ty` is no tuple.
+fn pushTupleMembers(s: &Session, ty: Id<Ty>, prefix: string, out: &List<Completion>, arena: &Arena): bool {
+    let c = checked(s);
+    let t = ty;
+    while true {
+        match c.tables.ty(t) {
+            Ty.Ref(r) { t = r.inner; }
+            Ty.Tuple(tu) {
+                let es = c.tables.items(tu.elems);
+                for i in 0..es.len {
+                    let name = Text.new(s.arena);
+                    name.pushInt(i);
+                    if startsWith(name.str(), prefix) { out.push(item(name.str(), 5, tyStr(s, es[i]), "", "2", false, arena)); }
+                }
+                return true;
+            }
+            _ { return false; }
+        }
+    }
+    return false;
+}
+
+/// Rust `push_methods`: the methods `name` of `sid` (a script's private ones only inside its file).
+fn pushMethods(s: &Session, sid: Id<StructDecl>, name: string, file: Id<Source>, out: &List<Found>) {
+    let c = checked(s);
+    let sd = c.tables.structAt(sid);
+    let isScript = match sd.scriptPath { Option.Some(_) { true } Option.None { false } };
+    let fns = &c.tables.fns;
+    for i in 0..fns.len() {
+        let fd = fns.get(fns.idAt(i));
+        if !isMethodOf(fd, sid) || c.tables.str(fd.name) != name { continue; }
+        if isScript && sd.span.file != file && !fd.visPub { continue; }
+        out.push(Found { f: fns.idAt(i), method: true });
+    }
+}
+
+/// Rust `push_methods_named`: the methods `method` of every struct named `structName`.
+fn pushMethodsNamed(s: &Session, structName: string, method: string, file: Option<Id<Source>>, out: &List<Found>) {
+    let c = checked(s);
+    let f = match file { Option.Some(x) { x } Option.None { Id<Source> { i: 0 } } };
+    let ss = &c.tables.structs;
+    for i in 0..ss.len() {
+        if c.tables.str(ss.get(ss.idAt(i)).name) == structName { pushMethods(s, ss.idAt(i), method, f, out); }
+    }
+}
+
+/// Rust `push_module_fns`: free fns `name` of a module whose key ends in `base`.
+fn pushModuleFns(s: &Session, base: string, name: string, out: &List<Found>) {
+    let c = checked(s);
+    let fns = &c.tables.fns;
+    for i in 0..fns.len() {
+        let fd = fns.get(fns.idAt(i));
+        if !isFree(fd) || c.tables.str(fd.name) != name { continue; }
+        if moduleTail(modKey(c, fd.owner), base) { out.push(Found { f: fns.idAt(i), method: false }); }
+    }
+}
+
+/// Rust `push_free_fns`: free fns `name` declared here, imported by a `use` line, or exported.
+fn pushFreeFns(s: &Session, path: string, src: string, name: string, out: &List<Found>) {
+    let c = checked(s);
+    let file = query.fileOf(s, path);
+    let uses = usesOf(s, src, s.arena);
+    let exports = sema.programExports(c, s.arena);
+    let fns = &c.tables.fns;
+    for i in 0..fns.len() {
+        let fd = fns.get(fns.idAt(i));
+        if !isFree(fd) || c.tables.str(fd.name) != name { continue; }
+        let modName = modKey(c, fd.owner);
+        let here = match file { Option.Some(f) { fd.span.file == f } Option.None { false } };
+        let imported = false;
+        for k in 0..uses.imports.len {
+            if uses.imports.items[k].first == modName && uses.imports.items[k].second == name { imported = true; }
+        }
+        let exported = false;
+        if fd.visPub {
+            match exportNamed(&exports, modName, name) { Option.Some(_) { exported = true; } Option.None {} }
+        }
+        if here || imported || exported { out.push(Found { f: fns.idAt(i), method: false }); }
+    }
+}
+
+/// Rust `module_keys`: every module's dotted name, sorted, once each. → LSPU
+fn moduleKeys(s: &Session, arena: &Arena): List<string> {
+    let c = checked(s);
+    let keys = List<string>.new(arena);
+    for i in 0..c.tables.mods.len() {
+        let md = c.tables.modAt(c.tables.mods.idAt(i));
+        if md.isLib || md.key.len == 0 || keys.contains(md.key) { continue; }
+        keys.push(md.key);
+    }
+    sortBy(keys.items[0..keys.len], fn(a: string, b: string): bool { return a < b; });
+    return keys;
+}
+
+/// Rust `child_segments`: the next name after `parent.` in each module key, once each, in key order. → LSPU
+fn childSegments(modules: []string, parent: []string, arena: &Arena): List<string> {
+    let pre = Text.new(arena);
+    for i in 0..parent.len { pre.add(parent[i]).add("."); }
+    let prefix = pre.str();
+    let out = List<string>.new(arena);
+    for i in 0..modules.len {
+        let m = modules[i];
+        if parent.len > 0 {
+            if !startsWith(m, prefix) { continue; }
+            m = m[prefix.len..];
+        }
+        let e = 0;
+        while e < m.len && m[e] != '.' { e += 1; }
+        let seg = m[0..e];
+        if seg.len > 0 && !out.contains(seg) { out.push(seg); }
+    }
+    return out;
+}
+
+/// Rust `module_tail`: `module` is `base` or ends in `.base`.
+fn moduleTail(modName: string, base: string): bool {
+    if modName == base { return true; }
+    return modName.len > base.len && endsWith(modName, base) && modName[modName.len - base.len - 1] == '.';
+}
+
+/// Rust `parent_doc`: `a.b.seg`. → LSPU
+fn parentDoc(path: []string, seg: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..path.len { t.add(path[i]).add("."); }
+    return t.add(seg).str();
+}
+
+/// Rust `unknown_name`: the name in "unknown KIND `name`" (first line of a message). → LSPU
+fn unknownName(msg: string): Option<string> {
+    let line = msg;
+    let nl = find(msg, "\n");
+    if nl >= 0 { line = msg[0..nl]; }
+    if !startsWith(line, "unknown ") { return Option.None; }
+    let rest = line[8..];
+    let sp = find(rest, " ");
+    if sp < 0 { return Option.None; }
+    rest = trim(rest[sp + 1..]);
+    if !startsWith(rest, "`") { return Option.None; }
+    rest = rest[1..];
+    let e = find(rest, "`");
+    let name = if e < 0 { rest } else { rest[0..e] };
+    if name.len == 0 { return Option.None; }
+    return Option.Some(name);
+}

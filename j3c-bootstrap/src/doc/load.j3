@@ -3,3 +3,401 @@
 // Part of module j3c.doc.
 // Port of: j3c/src/doc/load.rs
 module j3c.doc;
+// J3: A `Px` is one parse context (names, AST pools, sources) in one arena. Commands that read every stdlib
+// file (index, search, a bare name) keep one scratch arena and rewind it after each file (contracts-c5 rule 6:
+// never one arena per file); what they keep is copied out first. A loaded `Module` is a pointer into its `Px`
+// arena (stage-0 bug (b): no big struct out of a `match` arm).
+// J3: Paths are Rust's: `stdlibDir()/j3/<name>` keys the embedded files (`load.stdlibFile`), `J3_STDLIB` reads
+// the disk instead. The file order is Rust's `Path` order of the names without `.j3` (by component).
+
+/// One parse context: what `parse` and the error renderer need, all in `arena`.
+struct Px {
+    arena: &Arena;
+    names: &Names;
+    ast: &Ast;
+    sources: &Pool<Source>;
+}
+
+/// A fresh context in `a`.
+fn newPx(a: &Arena): Px {
+    let names = a.new(Names.new(a));
+    let ast = a.new(Ast.new(a, names));
+    return Px { arena: a, names: names, ast: ast, sources: a.new(Pool<Source>.new(a)) };
+}
+
+/// Where a part file appended to a module's source starts, and its origin.
+struct PartAt {
+    origin: string;
+    start: int;
+}
+
+/// A parsed module and where its source came from (Rust `Module`).
+struct Module {
+    /// `j3.scene3d.scripts`: the scene attachments it was made from.
+    scan: Option<Scan>;
+    file: File;
+    ast: &Ast;
+    key: string;
+    src: string;
+    /// Where `at` lines point; empty for generated source.
+    origin: string;
+    /// Part files appended to `src`.
+    parts: List<PartAt>;
+    embedded: bool;
+}
+
+/// A module and the rest of the query as an item (Rust `resolve`'s pair).
+struct Found {
+    item: Option<string>;
+    m: &Module;
+}
+
+/// `j3/` under the stdlib directory.
+fn j3Dir(a: &Arena): string { return path.join(load.stdlibDir(a), "j3", a); }
+
+/// Embedded source when `p` is `stdlibDir()/j3/<file>` and `J3_STDLIB` is unset (Rust `stdlib::embedded`).
+fn embeddedSrc(p: string, a: &Arena): Option<string> {
+    if load.usingOverride() { return Option.None; }
+    match load.stripPrefix(p, j3Dir(a), a) {
+        Option.Some(name) { return load.stdlibFile(name); }
+        Option.None { return Option.None; }
+    }
+}
+
+fn isEmbedded(p: string, a: &Arena): bool {
+    match embeddedSrc(p, a) { Option.Some(_) { return true; } Option.None { return false; } }
+}
+
+/// Embedded source, or the file on disk (Rust `read_source`).
+fn readSource(p: string, a: &Arena): Result<string, string> {
+    match embeddedSrc(p, a) { Option.Some(s) { return Result.Ok(s); } Option.None {} }
+    return fsx.readText(p, a);
+}
+
+/// `p` without a final `.j3` (Rust `with_extension("")` on these paths).
+fn noExt(p: string): string { return if endsWith(p, ".j3") { p[0..p.len - 3] } else { p }; }
+
+/// Rust `Path` order: component by component, a prefix first.
+fn pathBefore(x: string, y: string): bool {
+    let i = 0;
+    let j = 0;
+    while true {
+        if i >= x.len || j >= y.len { return i >= x.len && j < y.len; }
+        let e = i;
+        while e < x.len && x[e] != '/' { e += 1; }
+        let f = j;
+        while f < y.len && y[f] != '/' { f += 1; }
+        if x[i..e] != y[j..f] { return x[i..e] < y[j..f]; }
+        i = e + 1;
+        j = f + 1;
+    }
+    return false;
+}
+
+/// Every `.j3` below `dir` (Rust `read_dir_j3` / `collect_j3`): the embedded names, or the disk with `J3_STDLIB`.
+fn readDirJ3(dir: string, a: &Arena): Result<List<string>, string> {
+    let out = List<string>.new(a);
+    if !load.usingOverride() {
+        let names = load.stdlibNames(a);
+        for i in 0..names.len { out.push(path.join(dir, names.items[i], a)); }
+        return Result.Ok(out);
+    }
+    collectJ3(dir, &out, a)?;
+    return Result.Ok(out);
+}
+
+fn collectJ3(dir: string, out: &List<string>, a: &Arena): Result<bool, string> {
+    let ents = match io.listDir(dir, a) {
+        Result.Ok(es) { es }
+        Result.Err(_) { return Result.Err(Text.new(a).add("read ").add(dir).add(": ").add(fsx.osError(sys.errno(), a)).str()); }
+    };
+    for i in 0..ents.len {
+        let p = path.join(dir, ents[i].name, a);
+        if ents[i].isDir {
+            collectJ3(p, out, a)?;
+        } else if isJ3File(ents[i].name) {
+            out.push(p);
+        }
+    }
+    return Result.Ok(true);
+}
+
+/// Rust `Path::extension() == Some("j3")` (a leading `.` starts no extension).
+fn isJ3File(name: string): bool { return name.len > 3 && endsWith(name, ".j3"); }
+
+/// The documented stdlib files, `j3/game` before `j3/game/anim` (Rust `stdlib_files`).
+fn stdlibFiles(a: &Arena): Result<List<string>, string> {
+    let files = readDirJ3(j3Dir(a), a)?;
+    sortBy(files.items[0..files.len], fn(x: string, y: string): bool { return pathBefore(noExt(x), noExt(y)); });
+    let out = List<string>.new(a);
+    for i in 0..files.len {
+        let p = files.items[i];
+        if isHidden(path.basename(p)) || isPart(p, a) { continue; }
+        out.push(p);
+    }
+    return Result.Ok(out);
+}
+
+fn isHidden(name: string): bool {
+    for i in 0..HIDDEN.len { if HIDDEN[i] == name { return true; } }
+    return false;
+}
+
+/// The folder holding `p` ("" for a bare name).
+fn dirOf(p: string): string {
+    let k = p.len - 1;
+    while k >= 0 && p[k] != '/' { k -= 1; }
+    return if k < 0 { "" } else { p[0..k] };
+}
+
+/// True for `ui/dom/tree.j3` when it says `module j3.ui.dom;`: a part of `ui/dom.j3`, documented there.
+fn isPart(p: string, a: &Arena): bool {
+    let main = Text.new(a).add(dirOf(p)).add(".j3").str();
+    if main == p || !(isEmbedded(main, a) || fsx.isFile(main)) { return false; }
+    let x = match readSource(p, a) { Result.Ok(s) { s } Result.Err(_) { return false; } };
+    let y = match readSource(main, a) { Result.Ok(s) { s } Result.Err(_) { return false; } };
+    let lx = moduleLine(x);
+    return lx.len > 0 && lx == moduleLine(y);
+}
+
+/// The `module` line of a source file, "" when it has none (Rust `module_line`).
+fn moduleLine(src: string): string {
+    let i = 0;
+    while i < src.len {
+        let e = i;
+        while e < src.len && src[e] != '\n' { e += 1; }
+        let l = src[i..e];
+        if startsWith(l, "module ") { return if endsWith(l, "\r") { l[0..l.len - 1] } else { l }; }
+        i = e + 1;
+    }
+    return "";
+}
+
+/// The `*.j3` files of folder `dir` (a module path without `.j3`): embedded when under the stdlib and
+/// `J3_STDLIB` is unset, else on disk; sorted (Rust `stdlib::parts`).
+fn partsOf(dir: string, a: &Arena): List<string> {
+    let out = List<string>.new(a);
+    if !load.usingOverride() {
+        let j3 = j3Dir(a);
+        match load.stripPrefix(dir, j3, a) {
+            Option.Some(rel) {
+                let pre = Text.new(a).add(rel).add("/").str();
+                let names = load.stdlibNames(a);
+                for i in 0..names.len {
+                    let n = names.items[i];
+                    if startsWith(n, pre) && text.find(n[pre.len..n.len], "/") < 0 { out.push(path.join(j3, n, a)); }
+                }
+                return out;
+            }
+            Option.None {}
+        }
+    }
+    match io.listDir(dir, a) {
+        Result.Ok(ents) {
+            for i in 0..ents.len { if !ents[i].isDir && isJ3File(ents[i].name) { out.push(path.join(dir, ents[i].name, a)); } }
+        }
+        Result.Err(_) {}
+    }
+    sortBy(out.items[0..out.len], fn(x: string, y: string): bool { return x < y; });
+    return out;
+}
+
+/// `p` below `base`, else `p` (Rust `strip_prefix(..).unwrap_or(p).display()`).
+fn originOf(p: string, base: string, a: &Arena): string {
+    match load.stripPrefix(p, base, a) { Option.Some(r) { return r; } Option.None { return p; } }
+}
+
+/// `src` with the files of the folder beside `p` that name the same module appended, each part's `module`
+/// line blanked so the text parses as one file; `parts` gets where each starts (Rust `with_parts`).
+fn withParts(p: string, src: string, base: string, parts: &List<PartAt>, a: &Arena): Result<string, string> {
+    let main = moduleLine(src);
+    let t = Text.new(a);
+    t.add(src);
+    let files = partsOf(noExt(p), a);
+    for f in 0..files.len {
+        let part = files.items[f];
+        let txt = readSource(part, a)?;
+        if moduleLine(txt) != main { continue; }
+        t.push('\n');
+        parts.push(PartAt { origin: originOf(part, base, a), start: t.len() });
+        let i = 0;
+        while i < txt.len {
+            let e = i;
+            while e < txt.len && txt[e] != '\n' { e += 1; }
+            if startsWith(txt[i..e], "module ") {
+                for k in i..e { t.push(' '); }
+            } else {
+                t.add(txt[i..e]);
+            }
+            if e < txt.len { t.push('\n'); }
+            i = e + 1;
+        }
+    }
+    return Result.Ok(t.str());
+}
+
+/// A stdlib module with its parts (Rust `load_stdlib`).
+fn loadStdlib(px: &Px, p: string): Result<&Module, string> {
+    let a = px.arena;
+    let base = load.stdlibDir(a);
+    let parts = List<PartAt>.new(a);
+    let src = withParts(p, readSource(p, a)?, base, &parts, a)?;
+    return finish(px, p, src, originOf(p, base, a), parts, isEmbedded(p, a));
+}
+
+/// Parse `src` and wrap it as a module.
+fn finish(px: &Px, p: string, src: string, origin: string, parts: List<PartAt>, embedded: bool): Result<&Module, string> {
+    let file = parseText(px, p, src)?;
+    let key = file.moduleKey(px.ast);
+    return Result.Ok(px.arena.new(Module { scan: Option.None, file: file, ast: px.ast, key: key, src: src, origin: origin,
+        parts: parts, embedded: embedded }));
+}
+
+/// The project in the working directory (Rust `here`).
+fn here(a: &Arena): Option<&Manifest> {
+    match manifest.resolveCwd(a) {
+        Result.Ok(inp) {
+            match inp {
+                Input.Project(m) { return Option.Some(a.new(m)); }
+                _ { return Option.None; }
+            }
+        }
+        Result.Err(_) { return Option.None; }
+    }
+}
+
+/// `j3.scene3d.scripts`, made the way the compiler makes it: from this project's scenes.
+fn scriptsModule(px: &Px): Result<&Module, string> {
+    match here(px.arena) {
+        Option.Some(m) { return scriptsAt(px, m.root); }
+        Option.None {
+            return Result.Err(Text.new(px.arena).add("`").add(SCRIPTS_MODULE)
+                .add("` is made from a project's scenes, so run this in a project directory (one with j3.toml)\n  = help: `j3c doc lang` (Scripts) explains it").str());
+        }
+    }
+}
+
+fn scriptsAt(px: &Px, root: string): Result<&Module, string> {
+    let a = px.arena;
+    let scan = scene_scan.scan(root, a);
+    let src = scene_registry.registry(root, &scan, px.ast)?;
+    let id = px.sources.add(Source.of("(scene scripts)", src, a));
+    let file = match parse.parseFile(src, id, px.ast) {
+        Result.Ok(f) { f }
+        Result.Err(e) { return Result.Err(parseErr(px, e)); }
+    };
+    return Result.Ok(a.new(Module { scan: Option.Some(scan), file: file, ast: px.ast, key: SCRIPTS_MODULE, src: src,
+        origin: "", parts: List<PartAt>.new(a), embedded: false }));
+}
+
+/// `a.b.c` from `ps[lo..hi]`, joined by `sep`.
+fn joinParts(ps: &List<string>, lo: int, hi: int, sep: string, a: &Arena): string {
+    let t = Text.new(a);
+    for i in lo..hi {
+        if i > lo { t.add(sep); }
+        t.add(ps.items[i]);
+    }
+    return t.str();
+}
+
+/// `ps[lo..]` as a new list.
+fn tailOf(ps: &List<string>, lo: int, a: &Arena): List<string> {
+    let out = List<string>.new(a);
+    for i in lo..ps.len { out.push(ps.items[i]); }
+    return out;
+}
+
+/// A module by its dotted name: the generated scripts module, the stdlib (`j3.` optional), then the project
+/// in this directory (Rust `open_module`).
+fn openModule(px: &Px, ps: &List<string>): Result<Option<&Module>, string> {
+    let a = px.arena;
+    let key = joinParts(ps, 0, ps.len, ".", a);
+    if key == SCRIPTS_MODULE || key == "scene3d.scripts" { return Result.Ok(Option.Some(scriptsModule(px)?)); }
+    let lo = if ps.items[0] == "j3" { 1 } else { 0 };
+    if lo < ps.len {
+        let p = path.join(j3Dir(a), Text.new(a).add(joinParts(ps, lo, ps.len, "/", a)).add(".j3").str(), a);
+        if !isHidden(path.basename(p)) && (isEmbedded(p, a) || fsx.isFile(p)) { return Result.Ok(Option.Some(loadStdlib(px, p)?)); }
+    }
+    if ps.items[0] == "j3" { return Result.Ok(Option.None); }
+    let m = match here(a) { Option.Some(m) { m } Option.None { return Result.Ok(Option.None); } };
+    let tries = List<string>.new(a);
+    tries.push(load.joinMod(m.srcDir(a), *ps, a));
+    if ps.len > 1 {
+        for i in 0..m.deps.len {
+            if ps.items[0] == m.deps.items[i].name {
+                tries.insert(0, load.joinMod(m.deps.items[i].root, tailOf(ps, 1, a), a));
+                break;
+            }
+        }
+        if ps.items[0] == m.name { tries.push(load.joinMod(m.srcDir(a), tailOf(ps, 1, a), a)); }
+    }
+    for i in 0..tries.len {
+        let p = tries.items[i];
+        if !fsx.isFile(p) { continue; }
+        let parts = List<PartAt>.new(a);
+        let src = withParts(p, fsx.readText(p, a)?, m.root, &parts, a)?;
+        return Result.Ok(Option.Some(finish(px, p, src, originOf(p, m.root, a), parts, false)?));
+    }
+    return Result.Ok(Option.None);
+}
+
+/// The longest module prefix of `query`, and the rest as an item (Rust `resolve`).
+fn resolve(px: &Px, query: string): Result<Found, string> {
+    let a = px.arena;
+    let q = trim(query);
+    let ps = List<string>.new(a);
+    let i = 0;
+    while i <= q.len {
+        let e = i;
+        while e < q.len && q[e] != '.' { e += 1; }
+        if e > i { ps.push(q[i..e]); }
+        i = e + 1;
+    }
+    if ps.len == 0 { return Result.Err("missing module\n  = help: `j3c doc`"); }
+    let end = ps.len;
+    while end >= 1 {
+        let head = List<string>.new(a);
+        for k in 0..end { head.push(ps.items[k]); }
+        match openModule(px, &head)? {
+            Option.Some(m) {
+                let item: Option<string> = if end < ps.len { Option.Some(joinParts(&ps, end, ps.len, ".", a)) } else { Option.None };
+                return Result.Ok(Found { item: item, m: m });
+            }
+            Option.None {}
+        }
+        end -= 1;
+    }
+    return Result.Err(Text.new(a).add("no module `").add(q)
+        .add("`\n  = help: `j3c doc` lists them; `j3c doc search <word>` finds a name").str());
+}
+
+/// Rust `parse::format_error`: the error rendered against its source.
+fn parseErr(px: &Px, e: ParseError): string {
+    let d = Diags.new(px.arena);
+    parse.report(e, &d);
+    let t = Text.new(px.arena);
+    diag.render(d.at(0), px.sources, &t);
+    return t.str();
+}
+
+/// Parse a module's text and fold its `extend` blocks in (Rust `parse_file`).
+fn parseText(px: &Px, p: string, src: string): Result<File, string> {
+    let a = px.arena;
+    let id = px.sources.add(Source.of(p, src, a));
+    let file = match parse.parseFile(src, id, px.ast) {
+        Result.Ok(f) { f }
+        Result.Err(e) { return Result.Err(parseErr(px, e)); }
+    };
+    let key = file.moduleKey(px.ast);
+    match extend.merge(px.ast, &file.items, key, fn(s: Sym): Option<string> { return Option.None; }) {
+        Option.Some(e) {
+            let d = Diags.new(a);
+            d.add(d.make(0, Severity.Error, e.span, e.message));
+            let t = Text.new(a);
+            diag.render(d.at(0), px.sources, &t);
+            return Result.Err(t.str());
+        }
+        Option.None {}
+    }
+    return Result.Ok(file);
+}

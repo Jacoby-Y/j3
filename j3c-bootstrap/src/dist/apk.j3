@@ -1,10 +1,574 @@
-// Debug-signed APK: staging, `javac`/`d8`/`aapt2`/`zip`/`zipalign`/`apksigner` (the CLIs, as Rust).
+// Debug-signed APK of every Android triple: staging, `javac`/`d8`/`aapt2`/`zip`/`zipalign`/`apksigner` (the CLIs,
+// as Rust; `keytool` for a missing debug keystore). `lib/<abi>/libmain.so` with SDL, `assets/` with
+// `j3assets.txt` (its stamp: FNV-1a 64 of every path, length and bytes).
 //
 // Port of: j3c/src/dist/apk.rs
+// J3: The Java templates stay `@embed`ded from `j3c/src/dist/apk/` until C6 (contracts-c5 "Verbatim text").
+// J3: `API_LEVEL` is a copy of `toolchain/android.j3`'s private const (Ownership request: make it `pub`).
 module j3c.dist.apk;
 
-use j3.memory.Arena;
+use j3.io;
+use j3.io.path.{ basename, dirname, isAbs, join, realpath };
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, endsWith, replace, startsWith };
+use j3.cmp.sortBy;
+use j3c.base.fsx;
+use j3c.dist.fs;
+use j3c.dist.pkg.Built;
 use j3c.project.manifest.Manifest;
+use j3c.toolchain;
 
-/// Rust `apk::path`: where the project's `.apk` is written. → EDDEV (`-e android run`)
-pub fn path(m: &Manifest, arena: &Arena): string { return ""; } // STUB DIST
+const TARGET_SDK: string = "35";
+const API_LEVEL: string = "26";
+/// The libraries `J3Activity.getLibraries()` loads, in order; `main` is the project's.
+const SDL_LIBS: [4]string = ["SDL2", "SDL2_image", "SDL2_mixer", "SDL2_ttf"];
+const ACTIVITY_JAVA: string = @embed("../../../j3c/src/dist/apk/J3Activity.java");
+const SERVICE_JAVA: string = @embed("../../../j3c/src/dist/apk/J3Service.java");
+
+/// Rust `apk::path`: where the project's `.apk` is written, `target/dist/<name>-<version>.apk`. → EDDEV
+pub fn path(m: &Manifest, arena: &Arena): string {
+    return join(m.root, Text.new(arena).add("target/dist/").add(m.name).add("-").add(m.version).add(".apk").str(), arena);
+}
+
+/// Rust `build`: the APK from `libs` (`lib<name>.so` of each Android triple); `include` are the asset folders.
+pub fn build(m: &Manifest, libs: []Built, include: []string, arena: &Arena): Result<string, string> {
+    if libs.len == 0 {
+        return Result.Err("apk: [dist] build_outputs has `apk` but [emit] target has no Android triple: add \"aarch64-linux-android\" to [emit] target");
+    }
+    let t = findTools(arena)?;
+    let code = versionCode(m.version, arena)?;
+    // Absolute: `zip` runs inside the staged root, so a relative path would resolve there.
+    let stage = absolute(join(m.root, "target/.j3c/apk", arena), arena);
+    fsx.removeTree(stage, arena);
+    let res = buildIn(m, libs, include, &t, code, stage, arena);
+    fsx.removeTree(stage, arena);
+    return res;
+}
+
+fn absolute(p: string, arena: &Arena): string {
+    if isAbs(p) { return p; }
+    match realpath(".", arena) {
+        Option.Some(cwd) { return join(cwd, p, arena); }
+        Option.None { return p; }
+    }
+}
+
+/// SDK tools: `bin` is the highest `build-tools/<version>`, `jar` is `android-35/android.jar`.
+struct Tools {
+    bin: string;
+    jar: string;
+}
+
+fn findTools(arena: &Arena): Result<Tools, string> {
+    let sdk = toolchain.sdkRoot(arena);
+    if sdk.len == 0 { return Result.Err("apk: HOME is not set"); }
+    let bin = toolchain.highestVersionDir(join(sdk, "build-tools", arena), arena);
+    if bin.len == 0 || !fsx.isFile(join(bin, "aapt2", arena)) {
+        return Result.Err(Text.new(arena).add("apk: no Android build-tools under ").add(sdk).add(": install them (sdkmanager \"build-tools;35.0.0\") or set ANDROID_HOME").str());
+    }
+    let jar = join(sdk, Text.new(arena).add("platforms/android-").add(TARGET_SDK).add("/android.jar").str(), arena);
+    if !fsx.isFile(jar) {
+        return Result.Err(Text.new(arena).add("apk: ").add(jar).add(" is missing: sdkmanager \"platforms;android-").add(TARGET_SDK).add("\"").str());
+    }
+    return Result.Ok(Tools { bin: bin, jar: jar });
+}
+
+/// An argv being built (Rust `Command` args).
+fn argv(arena: &Arena, first: string): List<string> {
+    let l = List<string>.new(arena);
+    l.push(first);
+    return l;
+}
+
+fn pushAll(l: &List<string>, xs: []string) { for i in 0..xs.len { l.push(xs[i]); } }
+
+fn buildIn(m: &Manifest, libs: []Built, include: []string, t: &Tools, code: int, stage: string, arena: &Arena): Result<string, string> {
+    let pkg = m.android.package;
+    let root = join(stage, "root", arena);
+    let gen = join(stage, "gen", arena);
+    let classes = join(stage, "classes", arena);
+    let dex = join(stage, "dex", arena);
+    let res = join(stage, "res", arena);
+    fs.mkdirs(root, arena)?;
+    fs.mkdirs(classes, arena)?;
+    fs.mkdirs(dex, arena)?;
+    fs.mkdirs(res, arena)?;
+
+    // Java: SDL's sources plus the activity -> classes.dex.
+    let sdlRoot = toolchain.sdlRoot(sys.env("J3_SDL_CACHE"), sys.env("HOME"), arena);
+    if sdlRoot.len == 0 { return Result.Err("apk: HOME is not set"); }
+    let sdlJava = join(sdlRoot, "java/org/libsdl/app", arena);
+    if !fsx.isDir(sdlJava) {
+        return Result.Err(Text.new(arena).add("apk: SDL's Java sources are missing (").add(sdlJava).add("): run tools/android/build-sdl.sh").str());
+    }
+    let dots = Text.new(arena);
+    for i in 0..pkg.len { dots.push(if pkg[i] == '.' { '/' } else { pkg[i] }); }
+    let actDir = join(gen, dots.str(), arena);
+    let service = m.android.foregroundService;
+    let hasService = false;
+    let kind = "";
+    match service {
+        Option.Some(k) { hasService = true; kind = k; }
+        Option.None {}
+    }
+    let actFile = join(actDir, "J3Activity.java", arena);
+    let svcFile = join(actDir, "J3Service.java", arena);
+    write(actFile, activityJava(pkg, hasService, arena), arena)?;
+    write(svcFile, serviceJava(pkg, kind, arena), arena)?;
+    let javac = argv(arena, javaTool("javac", arena));
+    let jflags: [5]string = ["--release", "8", "-nowarn", "-Xlint:-options", "-cp"];
+    pushAll(&javac, jflags[..]);
+    javac.push(t.jar);
+    javac.push("-d");
+    javac.push(classes);
+    javac.push(actFile);
+    javac.push(svcFile);
+    let sdl = List<string>.new(arena);
+    let java = list(sdlJava, arena)?;
+    for i in 0..java.len { if endsWith(java[i], ".java") { sdl.push(java[i]); } }
+    sortBy(sdl.items[0..sdl.len], fn(a: string, b: string): bool { return a < b; });
+    pushAll(&javac, sdl.items[0..sdl.len]);
+    run(&javac, "javac", "install a JDK 17 or newer, or set JAVA_HOME", "", arena)?;
+    let classFiles = List<string>.new(arena);
+    walk(classes, &classFiles, arena)?;
+    sortBy(classFiles.items[0..classFiles.len], fn(a: string, b: string): bool { return a < b; });
+    let d8 = argv(arena, join(t.bin, "d8", arena));
+    let dflags: [4]string = ["--release", "--min-api", API_LEVEL, "--lib"];
+    pushAll(&d8, dflags[..]);
+    d8.push(t.jar);
+    d8.push("--output");
+    d8.push(dex);
+    pushAll(&d8, classFiles.items[0..classFiles.len]);
+    run(&d8, "d8", "needs a JDK on PATH or JAVA_HOME", "", arena)?;
+    match fs.copyRaw(join(dex, "classes.dex", arena), join(root, "classes.dex", arena), arena) {
+        Result.Ok(_) {}
+        Result.Err(e) { return Result.Err(Text.new(arena).add("copy classes.dex: ").add(e).str()); }
+    }
+
+    // aapt2: manifest (+ icon) -> base.apk
+    let icon = true;
+    let mipmap = join(res, "mipmap", arena);
+    let launcherPng = join(mipmap, "ic_launcher.png", arena);
+    match m.dist.icon {
+        Option.Some(rel) {
+            if endsWith(lower(rel, arena), ".png") {
+                let src = join(m.root, rel, arena);
+                fs.mkdirs(mipmap, arena)?;
+                match fs.copyRaw(src, launcherPng, arena) {
+                    Result.Ok(_) {}
+                    Result.Err(e) { return Result.Err(Text.new(arena).add("[dist] icon: copy ").add(src).add(": ").add(e).str()); }
+                }
+            } else {
+                Text.new(arena).add("j3c: dist: the APK icon must be a .png; ").add(rel).add(" is left out\n").flushTo(2);
+                icon = false;
+            }
+        }
+        Option.None {
+            // No `[dist] icon`: the J3 logo.
+            fs.mkdirs(mipmap, arena)?;
+            fs.writeRaw(launcherPng, fs.logoPng(), arena)?;
+        }
+    }
+    let manifest = join(stage, "AndroidManifest.xml", arena);
+    write(manifest, manifestXml(m, code, icon, arena), arena)?;
+    let base = join(stage, "base.apk", arena);
+    let link = argv(arena, join(t.bin, "aapt2", arena));
+    let lflags: [2]string = ["link", "-I"];
+    pushAll(&link, lflags[..]);
+    link.push(t.jar);
+    link.push("--manifest");
+    link.push(manifest);
+    link.push("-o");
+    link.push(base);
+    if icon {
+        let compiled = join(stage, "res.zip", arena);
+        let c = argv(arena, join(t.bin, "aapt2", arena));
+        c.push("compile");
+        c.push("--dir");
+        c.push(res);
+        c.push("-o");
+        c.push(compiled);
+        run(&c, "aapt2 compile", "", "", arena)?;
+        link.push(compiled);
+    }
+    run(&link, "aapt2 link", "", "", arena)?;
+
+    // Native libraries and assets, then added to base.apk (aapt2's own entries stay as they are).
+    for i in 0..libs.len {
+        let triple = libs[i].triple;
+        let so = libs[i].exe;
+        let abi = toolchain.androidAbi(triple);
+        if abi.len == 0 {
+            return Result.Err(Text.new(arena).add("apk: unsupported Android target `").add(triple).add("` (use aarch64-linux-android or x86_64-linux-android)").str());
+        }
+        let dir = join(join(root, "lib", arena), abi, arena);
+        fs.mkdirs(dir, arena)?;
+        copyFix(so, join(dir, "libmain.so", arena), "build it first: the .so is missing", arena)?;
+        let from = toolchain.sdlLibDir(triple, sdlRoot, arena);
+        for k in 0..4 {
+            let name = Text.new(arena).add("lib").add(SDL_LIBS[k]).add(".so").str();
+            copyFix(join(from, name, arena), join(dir, name, arena), "run tools/android/build-sdl.sh", arena)?;
+        }
+        if usesTls(so, arena)? {
+            let ossl = toolchain.opensslLibDir(triple, arena);
+            if ossl.len == 0 { return Result.Err("apk: HOME is not set"); }
+            let ssl: [2]string = ["libssl.so", "libcrypto.so"];
+            for k in 0..2 {
+                copyFix(join(ossl, ssl[k], arena), join(dir, ssl[k], arena), "the app uses j3.net.tls: run tools/android/build-openssl.sh", arena)?;
+            }
+        }
+        match m.android.nativeLibs {
+            Option.Some(extra) {
+                let found = nativeLibs(join(join(m.root, extra, arena), abi, arena), arena)?;
+                for k in 0..found.len { copyFix(found.items[k], join(dir, basename(found.items[k]), arena), "", arena)?; }
+            }
+            Option.None {}
+        }
+    }
+    let assets = join(root, "assets", arena);
+    fs.mkdirs(assets, arena)?;
+    let files = collectAssets(m.root, include, arena)?;
+    let h = FNV_START;
+    let rels = List<string>.new(arena);
+    for i in 0..files.len {
+        let rel = files.items[i].triple;
+        let p = files.items[i].exe;
+        let bytes = fs.read(p, arena)?;
+        h = fnv(h, rel as []u8);
+        let n: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0];
+        let len = bytes.len;
+        for k in 0..8 {
+            n[k] = u8(len % 256);
+            len = len / 256;
+        }
+        h = fnv(h, n[..]);
+        h = fnv(h, bytes);
+        let to = join(assets, rel, arena);
+        fs.mkdirs(dirname(to), arena)?;
+        fs.writeRaw(to, bytes, arena)?;
+        rels.push(rel);
+    }
+    let hex = Text.new(arena);
+    hex.pushHex(h);
+    let stamp = Text.new(arena);
+    for k in hex.len()..16 { stamp.push('0'); }
+    stamp.add(hex.str());
+    write(join(assets, "j3assets.txt", arena), j3assets(rels.items[0..rels.len], stamp.str(), arena), arena)?;
+    let zip = argv(arena, "zip");
+    let zflags: [7]string = ["-q", "-X", "-r", base, "classes.dex", "lib", "assets"];
+    pushAll(&zip, zflags[..]);
+    run(&zip, "zip", "install `zip`", root, arena)?;
+
+    // zipalign must come after every entry is added, signing last.
+    let aligned = join(stage, "aligned.apk", arena);
+    let za = argv(arena, join(t.bin, "zipalign", arena));
+    let aflags: [5]string = ["-p", "-f", "4", base, aligned];
+    pushAll(&za, aflags[..]);
+    run(&za, "zipalign", "", "", arena)?;
+    let ks = keystore(arena)?;
+    let out = path(m, arena);
+    toolchain.discard(out);
+    let sign = argv(arena, join(t.bin, "apksigner", arena));
+    let sflags: [12]string = ["sign", "--ks", ks, "--ks-key-alias", "androiddebugkey", "--ks-pass", "pass:android", "--key-pass",
+        "pass:android", "--out", out, aligned];
+    pushAll(&sign, sflags[..]);
+    run(&sign, "apksigner", "needs a JDK on PATH or JAVA_HOME", "", arena)?;
+    toolchain.discard(Text.new(arena).add(out).add(".idsig").str());
+    return Result.Ok(out);
+}
+
+/// Rust `native_libs`: the `lib*.so` files in `dir` (none when that folder is missing), sorted. Android only
+/// extracts `lib*.so` names, and `libmain.so` or an SDL name would replace ours.
+pub fn nativeLibs(dir: string, arena: &Arena): Result<List<string>, string> {
+    let out = List<string>.new(arena);
+    if !fsx.isDir(dir) { return Result.Ok(out); }
+    let ents = list(dir, arena)?;
+    for i in 0..ents.len {
+        let p = ents[i];
+        let name = basename(p);
+        let taken = name == "libmain.so";
+        for k in 0..4 { if name == Text.new(arena).add("lib").add(SDL_LIBS[k]).add(".so").str() { taken = true; } }
+        if !fsx.isFile(p) || !startsWith(name, "lib") || !endsWith(name, ".so") || taken {
+            return Result.Err(Text.new(arena).add("apk: [android] native_libs: ").add(p).add(" must be a lib<name>.so file, not libmain.so or an SDL library").str());
+        }
+        out.push(p);
+    }
+    sortBy(out.items[0..out.len], fn(a: string, b: string): bool { return a < b; });
+    return Result.Ok(out);
+}
+
+/// Rust `java_tool`: `$JAVA_HOME/bin/<name>` when it exists, else `<name>` from PATH.
+fn javaTool(name: string, arena: &Arena): string {
+    let home = sys.env("JAVA_HOME");
+    if home.len > 0 {
+        let p = join(join(home, "bin", arena), name, arena);
+        if fsx.isFile(p) { return p; }
+    }
+    return name;
+}
+
+/// Rust `keystore`: `~/.android/debug.keystore`, created with `keytool` when missing.
+fn keystore(arena: &Arena): Result<string, string> {
+    let home = sys.env("HOME");
+    if home.len == 0 { return Result.Err("apk: HOME is not set"); }
+    let ks = join(home, ".android/debug.keystore", arena);
+    if !fsx.isFile(ks) {
+        fs.mkdirs(dirname(ks), arena)?;
+        let k = argv(arena, javaTool("keytool", arena));
+        let kflags: [18]string = ["-genkeypair", "-noprompt", "-keystore", ks, "-alias", "androiddebugkey", "-storepass", "android",
+            "-keypass", "android", "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000", "-dname",
+            "CN=Android Debug,O=Android,C=US"];
+        pushAll(&k, kflags[..]);
+        run(&k, "keytool", "install a JDK, or set JAVA_HOME", "", arena)?;
+    }
+    return Result.Ok(ks);
+}
+
+/// Rust `run`: `cmd` without stdin, output captured (in `cwd`, "" = here); failure shows both streams.
+/// `fix` is added to a spawn error.
+fn run(cmd: &List<string>, what: string, fix: string, cwd: string, arena: &Arena): Result<bool, string> {
+    match proc.startIn(cmd.items[0..cmd.len], cwd, arena) {
+        Result.Ok(c) {
+            let o = c.collect("" as []u8, arena);
+            if o.code == 0 { return Result.Ok(true); }
+            let t = Text.new(arena).add("apk: ").add(what).add(" failed (");
+            if o.code > 128 && o.code < 160 { t.fmt(`signal: {o.code - 128}`); } else { t.fmt(`exit status: {o.code}`); }
+            return Result.Err(t.add("):\n").add(o.outStr()).add(o.errStr()).str());
+        }
+        Result.Err(_) {
+            let t = Text.new(arena).add("apk: run ").add(what).add(": ").add(fsx.osError(2, arena));
+            if fix.len > 0 { t.add(" (").add(fix).add(")"); }
+            return Result.Err(t.str());
+        }
+    }
+}
+
+fn write(p: string, text: string, arena: &Arena): Result<bool, string> {
+    fs.mkdirs(dirname(p), arena)?;
+    return fs.writeRaw(p, text as []u8, arena);
+}
+
+fn copyFix(from: string, to: string, fix: string, arena: &Arena): Result<bool, string> {
+    match fs.copyRaw(from, to, arena) {
+        Result.Ok(_) { return Result.Ok(true); }
+        Result.Err(e) { return Result.Err(Text.new(arena).add("apk: copy ").add(from).add(": ").add(e).add(" (").add(fix).add(")").str()); }
+    }
+}
+
+/// The entries of `dir` as paths (read order).
+fn list(dir: string, arena: &Arena): Result<[]string, string> {
+    match io.listDir(dir, arena) {
+        Result.Ok(ents) {
+            let out = arena.alloc::<string>(ents.len);
+            for i in 0..ents.len { out[i] = join(dir, ents[i].name, arena); }
+            return Result.Ok(out);
+        }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("read ").add(dir).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+    }
+}
+
+/// Rust `walk`: every file under `dir`, following symlinks.
+fn walk(dir: string, out: &List<string>, arena: &Arena): Result<bool, string> {
+    let ents = list(dir, arena)?;
+    for i in 0..ents.len {
+        if fsx.isDir(ents[i]) { walk(ents[i], out, arena)?; } else { out.push(ents[i]); }
+    }
+    return Result.Ok(true);
+}
+
+/// Rust `version_code`: `major * 1_000_000 + minor * 1_000 + patch` from the leading digits of the first
+/// three dot parts (missing parts are 0). Minor and patch below 1000, major below 2000.
+pub fn versionCode(version: string, arena: &Arena): Result<int, string> {
+    let maxes: [3]int = [2000, 1000, 1000];
+    let total = 0;
+    let at = 0;
+    for k in 0..3 {
+        // the k-th dot part, "0" past the end (Rust `split('.').next().unwrap_or("0")`)
+        let part = "0";
+        if at <= version.len {
+            let e = at;
+            while e < version.len && version[e] != '.' { e += 1; }
+            part = version[at..e];
+            at = e + 1;
+        }
+        let v = 0;
+        let digits = 0;
+        let bad = false;
+        while digits < part.len && part[digits] >= '0' && part[digits] <= '9' {
+            v = v * 10 + int(part[digits] - '0');
+            if v >= 4294967296 { bad = true; }
+            digits += 1;
+        }
+        if digits == 0 || bad || v >= maxes[k] {
+            return Result.Err(Text.new(arena).add("apk: [package] version `").add(version).add("` has no versionCode: use MAJOR.MINOR.PATCH numbers (major < ").fmt(`{maxes[k]}`).add(", minor and patch < 1000)").str());
+        }
+        total = total * 1000 + v;
+    }
+    return Result.Ok(total);
+}
+
+fn lower(s: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..s.len { t.push(if s[i] >= 'A' && s[i] <= 'Z' { s[i] + 32 } else { s[i] }); }
+    return t.str();
+}
+
+fn xmlEscape(s: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..s.len {
+        let c = s[i];
+        if c == '&' { t.add("&amp;"); } else if c == '<' { t.add("&lt;"); } else if c == '>' { t.add("&gt;"); } else if c == '"' { t.add("&quot;"); } else { t.push(c); }
+    }
+    return t.str();
+}
+
+/// Rust `manifest_xml`: `AndroidManifest.xml` (touchscreen and gamepad optional, vibrate, internet,
+/// notifications; the foreground service when `[android] foreground_service` is set).
+pub fn manifestXml(m: &Manifest, code: int, icon: bool, arena: &Arena): string {
+    let label = xmlEscape(if m.dist.title.len == 0 { m.name } else { m.dist.title }, arena);
+    let t = Text.new(arena);
+    t.add("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n");
+    t.add("    package=\"").add(m.android.package).add("\"\n    android:versionCode=\"").fmt(`{code}`).add("\"\n");
+    t.add("    android:versionName=\"").add(xmlEscape(m.version, arena)).add("\">\n");
+    t.add("    <uses-sdk android:minSdkVersion=\"").add(API_LEVEL).add("\" android:targetSdkVersion=\"").add(TARGET_SDK).add("\" />\n");
+    t.add("    <uses-feature android:glEsVersion=\"0x00030000\" android:required=\"true\" />\n");
+    t.add("    <uses-feature android:name=\"android.hardware.touchscreen\" android:required=\"false\" />\n");
+    t.add("    <uses-feature android:name=\"android.hardware.gamepad\" android:required=\"false\" />\n");
+    t.add("    <uses-permission android:name=\"android.permission.VIBRATE\" />\n");
+    t.add("    <uses-permission android:name=\"android.permission.INTERNET\" />\n");
+    t.add("    <uses-permission android:name=\"android.permission.POST_NOTIFICATIONS\" />");
+    let kind = "";
+    match m.android.foregroundService {
+        Option.Some(k) {
+            kind = k;
+            // connectedDevice needs one of its listed permissions on Android 14+; CHANGE_NETWORK_STATE is a normal one.
+            let perm = if k == "dataSync" { "DATA_SYNC" } else { "CONNECTED_DEVICE" };
+            t.add("\n    <uses-permission android:name=\"android.permission.FOREGROUND_SERVICE\" />\n");
+            t.add("    <uses-permission android:name=\"android.permission.FOREGROUND_SERVICE_").add(perm).add("\" />\n");
+            t.add("    <uses-permission android:name=\"android.permission.WAKE_LOCK\" />");
+            if k != "dataSync" { t.add("\n    <uses-permission android:name=\"android.permission.CHANGE_NETWORK_STATE\" />"); }
+        }
+        Option.None {}
+    }
+    t.add("\n    <application android:label=\"").add(label).add("\"");
+    if icon { t.add("\n        android:icon=\"@mipmap/ic_launcher\""); }
+    t.add("\n        android:allowBackup=\"true\"\n        android:extractNativeLibs=\"true\"\n        android:hasCode=\"true\"\n");
+    t.add("        android:hardwareAccelerated=\"true\"\n        android:theme=\"@android:style/Theme.NoTitleBar.Fullscreen\">\n");
+    t.add("        <activity android:name=\".J3Activity\"\n            android:label=\"").add(label).add("\"\n");
+    t.add("            android:alwaysRetainTaskState=\"true\"\n            android:launchMode=\"singleInstance\"\n");
+    t.add("            android:configChanges=\"layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation\"\n");
+    t.add("            android:preferMinimalPostProcessing=\"true\"\n            android:screenOrientation=\"").add(m.android.orientation).add("\"\n");
+    t.add("            android:exported=\"true\">\n            <intent-filter>\n");
+    t.add("                <action android:name=\"android.intent.action.MAIN\" />\n");
+    t.add("                <category android:name=\"android.intent.category.LAUNCHER\" />\n");
+    t.add("            </intent-filter>\n        </activity>");
+    if kind.len > 0 {
+        t.add("\n        <service android:name=\".J3Service\" android:exported=\"false\" android:foregroundServiceType=\"").add(kind).add("\" />");
+    }
+    t.add("\n    </application>\n</manifest>\n");
+    return t.str();
+}
+
+/// Rust `activity_java`: `J3Activity.java` with the package, the library list and whether a service exists.
+pub fn activityJava(pkg: string, service: bool, arena: &Arena): string {
+    let libs = Text.new(arena);
+    for k in 0..4 { libs.add("\"").add(SDL_LIBS[k]).add("\", "); }
+    libs.add("\"main\"");
+    let t1 = Text.new(arena);
+    let t2 = Text.new(arena);
+    let t3 = Text.new(arena);
+    let a = replace(&t1, ACTIVITY_JAVA, "@PKG@", pkg);
+    let b = replace(&t2, a, "@LIBS@", libs.str());
+    return replace(&t3, b, "@HAS_SERVICE@", if service { "true" } else { "false" });
+}
+
+/// Rust `service_java`: `J3Service.java`; `kind` "" = none (always compiled, declared only when set).
+pub fn serviceJava(pkg: string, kind: string, arena: &Arena): string {
+    // ServiceInfo.FOREGROUND_SERVICE_TYPE_*: dataSync 1, connectedDevice 16.
+    let ty = if kind == "dataSync" { "1" } else { "16" };
+    let t1 = Text.new(arena);
+    let t2 = Text.new(arena);
+    let a = replace(&t1, SERVICE_JAVA, "@PKG@", pkg);
+    return replace(&t2, a, "@FGS_TYPE@", ty);
+}
+
+/// Rust `collect_assets`: files under the `include` entries as (path relative to the project in `triple`,
+/// absolute path in `exe`), sorted, duplicates dropped. A path `j3.apkassets` would reject is skipped
+/// with a warning; a missing entry is an error.
+pub fn collectAssets(root: string, include: []string, arena: &Arena): Result<List<Built>, string> {
+    let found = List<Built>.new(arena);
+    for i in 0..include.len {
+        let src = join(root, include[i], arena);
+        if !fsx.isDir(src) && !fsx.isFile(src) {
+            return Result.Err(Text.new(arena).add("[dist] include: ").add(src).add(" does not exist").str());
+        }
+        let files = List<string>.new(arena);
+        if fsx.isDir(src) { walk(src, &files, arena)?; } else { files.push(src); }
+        let pre = Text.new(arena).add(root).add("/").str();
+        for k in 0..files.len {
+            let f = files.items[k];
+            let rel = if startsWith(f, pre) { f[pre.len..f.len] } else { f };
+            if validRel(rel) {
+                found.push(Built { triple: rel, exe: f });
+            } else {
+                Text.new(arena).add("j3c: dist: ").add(rel).add(" is not a valid APK asset name (no `..`, `\\`, `*.tmp`, j3assets.*); skipped\n").flushTo(2);
+            }
+        }
+    }
+    sortBy(found.items[0..found.len], fn(a: Built, b: Built): bool { return a.triple < b.triple || (a.triple == b.triple && a.exe < b.exe); });
+    let out = List<Built>.new(arena);
+    for i in 0..found.len {
+        if out.len == 0 || out.items[out.len - 1].triple != found.items[i].triple { out.push(found.items[i]); }
+    }
+    return Result.Ok(out);
+}
+
+/// Rust `valid_rel`: the path rules of `j3.apkassets.safePath`, plus no newline (one path per line).
+pub fn validRel(rel: string): bool {
+    if rel.len == 0 || rel.len > 700 { return false; }
+    let seg = 0;
+    for i in 0..rel.len + 1 {
+        if i < rel.len {
+            let c = rel[i];
+            if c == '\\' || c < 32 || c == 127 { return false; }
+            if c != '/' { continue; }
+        }
+        let s = rel[seg..i];
+        if s.len == 0 || s == "." || s == ".." { return false; }
+        seg = i + 1;
+    }
+    return !endsWith(rel, ".tmp") && !startsWith(rel, "j3assets.");
+}
+
+const FNV_START: u64 = 0xcbf29ce484222325;
+
+/// 64-bit FNV-1a over `b`, continuing from `h`.
+fn fnv(h: u64, b: []u8): u64 {
+    let x = h;
+    for i in 0..b.len { x = (x ^ u64(b[i])) * 0x100000001b3; }
+    return x;
+}
+
+/// Rust `uses_tls`: the built library looks up `OPENSSL_init_ssl` (only `j3.net.tls` does).
+pub fn usesTls(so: string, arena: &Arena): Result<bool, string> {
+    let b = fs.read(so, arena)?;
+    let pat = "OPENSSL_init_ssl";
+    // ponytail: naive byte search, fine for one .so per ABI
+    let i = 0;
+    while i + pat.len <= b.len {
+        if b[i] == 'O' && (b[i..i + pat.len] as string) == pat { return Result.Ok(true); }
+        i += 1;
+    }
+    return Result.Ok(false);
+}
+
+/// Rust `j3assets`: `j3assets 1 <stamp>`, then one path per line.
+pub fn j3assets(rels: []string, stamp: string, arena: &Arena): string {
+    let t = Text.new(arena).add("j3assets 1 ").add(stamp).add("\n");
+    for i in 0..rels.len { t.add(rels[i]).add("\n"); }
+    return t.str();
+}

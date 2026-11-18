@@ -4,36 +4,298 @@
 //
 // Part of module j3c.sema.
 // Port of: j3c/src/lsp/query.rs (`file_by_path`, `find_local`, `find_func`, `find_struct`, `find_enum`, `module_path`)
-// J3: Never writes `Checked`. No `typeAt` / `references` (nothing in Rust uses them). `tyText` prints what Rust
-// `dump::ty_string` prints (`int`/`float` aliases included). Names are compared as text (`Names` lookups).
+// J3: Never writes `Checked` (no interning: a generic template's types print with their parameter names, where
+// Rust shows the instances it made; B12.5). No `typeAt` / `references` (nothing in Rust uses them). `tyString`
+// prints what Rust `dump::ty_string` prints (`int`/`float` aliases included). Names are compared as text.
+// J3: Rust's closures are `Func`s of their own; here a closure body is a `TBody` whose `decl` is the enclosing
+// fn. `bodyAt` / `findLocal` look at the fn's own body, then its closure bodies around the offset, outer first
+// (Rust's func order). `fileByPath` compares paths as text: sema does no file I/O (`lsp/query` canonicalizes).
 module j3c.sema;
 
-/// The file of `path` among the loaded sources, as `Source` ids show it (Rust `file_by_path`).
-pub fn fileByPath(c: &Checked, sources: &Pool<Source>, path: string): Option<Id<Source>> { return Option.None; } // STUB LSPQ
+/// The file of `path` among the loaded sources, as `Source` ids show it (Rust `file_by_path`, text equality;
+/// the LSP adds the canonical-path match).
+pub fn fileByPath(c: &Checked, sources: &Pool<Source>, path: string): Option<Id<Source>> {
+    for i in 0..sources.len() {
+        let id = sources.idAt(i);
+        if sources.get(id).path == path { return Option.Some(id); }
+    }
+    return Option.None;
+}
 
-/// The fn (plain or method) whose span in `file` holds `off`.
-pub fn fnAt(c: &Checked, file: Id<Source>, off: u32): Option<Id<FnDecl>> { return Option.None; } // STUB LSPQ
+/// True when `off` is in `sp` (ends included, as Rust's `func_at`) and `sp` is in `file`.
+fn spanHolds(sp: Span, file: Id<Source>, off: u32): bool {
+    return sp.file == file && off >= sp.lo && off <= sp.hi;
+}
 
-/// Rust `find_local`: the last local named `name` of the fn around `off` (params included, temps skipped).
-pub fn findLocal(c: &Checked, file: Id<Source>, off: u32, name: string): Option<Id<TLocal>> { return Option.None; } // STUB LSPQ
+/// The fn (plain or method) whose span in `file` holds `off`: the last such in fn order (Rust `func_at`).
+pub fn fnAt(c: &Checked, file: Id<Source>, off: u32): Option<Id<FnDecl>> {
+    let fns = &c.tables.fns;
+    let i = fns.len() - 1;
+    while i >= 0 {
+        let id = fns.idAt(i);
+        if spanHolds(fns.get(id).span, file, off) { return Option.Some(id); }
+        i -= 1;
+    }
+    return Option.None;
+}
 
-/// Rust `find_func`: the first fn named `name` in `prefer`, else the first anywhere.
-pub fn lookupFn(c: &Checked, name: string, prefer: Id<Source>): Option<Id<FnDecl>> { return Option.None; } // STUB LSPQ
+/// The range a closure body covers: its first param's start (the `fn(..)` header) to its block's end.
+fn closureRange(c: &Checked, b: &TBody): Span {
+    let sp = b.body.span;
+    if b.params.len > 0 {
+        let p = c.typed.locals.get(b.params.items[0]).span;
+        if p.file == sp.file && p.lo < sp.lo { sp.lo = p.lo; }
+    }
+    return sp;
+}
 
-pub fn findStruct(c: &Checked, name: string): Option<Id<StructDecl>> { return Option.None; } // STUB LSPQ
-pub fn findEnum(c: &Checked, name: string): Option<Id<EnumDecl>> { return Option.None; } // STUB LSPQ
-pub fn findGlobal(c: &Checked, name: string): Option<Id<GlobalDecl>> { return Option.None; } // STUB LSPQ
-pub fn findConst(c: &Checked, name: string): Option<Id<ConstDecl>> { return Option.None; } // STUB LSPQ
-pub fn findTrait(c: &Checked, name: string): Option<Id<TraitDecl>> { return Option.None; } // STUB LSPQ
+/// The bodies of `f` around `off` in Rust's func order: `f`'s own (a template's: its instances', as Rust has
+/// a func per instance and none for the template), then the closure bodies that hold `off`, outer first.
+pub fn bodiesAt(c: &Checked, f: Id<FnDecl>, off: u32, out: &List<Id<TBody>>) {
+    let base = out.len;
+    match c.tables.fnAt(f).body {
+        Option.Some(b) { out.push(b); }
+        Option.None {
+            let ins = &c.tables.instances;
+            for i in 0..ins.len() {
+                let inst = ins.get(ins.idAt(i));
+                if inst.key.kind != InstKind.Fn || inst.key.item.kind != DeclKind.Fn || inst.key.item.i != f.i { continue; }
+                match inst.body { Option.Some(b) { out.push(b); } Option.None {} }
+            }
+        }
+    }
+    if out.len == base { return; }
+    let block = c.typed.bodies.get(out.items[base]).body.span;
+    let first = out.len;
+    let bodies = &c.typed.bodies;
+    for i in 0..bodies.len() {
+        let id = bodies.idAt(i);
+        let b = bodies.get(id);
+        if b.decl != f || b.body.span == block { continue; }
+        let r = closureRange(c, b);
+        if off < r.lo || off > r.hi { continue; }
+        // By size, larger (outer) first, pool order among equals: a closure inside another is typed (and
+        // pooled) first; a template's placeholder copy comes before its instances' copies.
+        out.push(id);
+        let k = out.len - 1;
+        while k > first && spanLen(closureRange(c, bodies.get(out.items[k - 1]))) < spanLen(r) {
+            out.items[k] = out.items[k - 1];
+            out.items[k - 1] = id;
+            k -= 1;
+        }
+    }
+}
+
+fn spanLen(sp: Span): u32 { return sp.hi - sp.lo; }
+
+/// The innermost body around `off` in `file` (Rust `func_at`'s body: a closure's own when inside one).
+pub fn bodyAt(c: &Checked, file: Id<Source>, off: u32, scratch: &Arena): Option<Id<TBody>> {
+    let f = fnAt(c, file, off)?;
+    let bs = List<Id<TBody>>.new(scratch);
+    bodiesAt(c, f, off, &bs);
+    if bs.len == 0 { return Option.None; }
+    return Option.Some(bs.items[bs.len - 1]);
+}
+
+/// Rust `find_local`: the last local named `name` of the fn around `off` (params included, temps skipped),
+/// its closures' locals after its own.
+pub fn findLocal(c: &Checked, file: Id<Source>, off: u32, name: string): Option<Id<TLocal>> {
+    let f = fnAt(c, file, off)?;
+    let bs = List<Id<TBody>>.new(c.tables.arena);
+    bodiesAt(c, f, off, &bs);
+    let best: Option<Id<TLocal>> = Option.None;
+    for k in 0..bs.len {
+        let ls = c.typed.bodies.get(bs.items[k]).locals;
+        for j in 0..ls.len {
+            if c.tables.str(c.typed.locals.get(ls.items[j]).name) == name { best = Option.Some(ls.items[j]); }
+        }
+    }
+    return best;
+}
+
+/// A generic free fn: Rust names its instances `name<args>`, so a name lookup never finds one.
+fn isGenericFree(f: &FnDecl): bool {
+    match f.recv { Option.Some(_) { return false; } Option.None {} }
+    match f.gen { Option.Some(_) { return true; } Option.None { return false; } }
+}
+
+/// Rust `find_func`: the first fn named `name` in `prefer`, else the first anywhere (generic free fns
+/// skipped, see `isGenericFree`).
+pub fn lookupFn(c: &Checked, name: string, prefer: Id<Source>): Option<Id<FnDecl>> {
+    let fns = &c.tables.fns;
+    let fallback: Option<Id<FnDecl>> = Option.None;
+    let found = false;
+    for i in 0..fns.len() {
+        let id = fns.idAt(i);
+        let f = fns.get(id);
+        if c.tables.str(f.name) != name || isGenericFree(f) { continue; }
+        if f.span.file == prefer { return Option.Some(id); }
+        if !found { fallback = Option.Some(id); found = true; }
+    }
+    return fallback;
+}
+
+pub fn findStruct(c: &Checked, name: string): Option<Id<StructDecl>> {
+    let p = &c.tables.structs;
+    for i in 0..p.len() { if c.tables.str(p.get(p.idAt(i)).name) == name { return Option.Some(p.idAt(i)); } }
+    return Option.None;
+}
+
+pub fn findEnum(c: &Checked, name: string): Option<Id<EnumDecl>> {
+    let p = &c.tables.enums;
+    for i in 0..p.len() { if c.tables.str(p.get(p.idAt(i)).name) == name { return Option.Some(p.idAt(i)); } }
+    return Option.None;
+}
+
+pub fn findGlobal(c: &Checked, name: string): Option<Id<GlobalDecl>> {
+    let p = &c.tables.globals;
+    for i in 0..p.len() { if c.tables.str(p.get(p.idAt(i)).name) == name { return Option.Some(p.idAt(i)); } }
+    return Option.None;
+}
+
+pub fn findConst(c: &Checked, name: string): Option<Id<ConstDecl>> {
+    let p = &c.tables.consts;
+    for i in 0..p.len() { if c.tables.str(p.get(p.idAt(i)).name) == name { return Option.Some(p.idAt(i)); } }
+    return Option.None;
+}
+
+/// The trait named `name` that comes first in (module key, name) order (Rust `trait_docs` order).
+pub fn findTrait(c: &Checked, name: string): Option<Id<TraitDecl>> {
+    let p = &c.tables.traits;
+    let best: Option<Id<TraitDecl>> = Option.None;
+    let found = false;
+    let bestKey = "";
+    for i in 0..p.len() {
+        let id = p.idAt(i);
+        let t = p.get(id);
+        if c.tables.str(t.name) != name { continue; }
+        let key = c.tables.modAt(t.owner).key;
+        if !found || key < bestKey { best = Option.Some(id); bestKey = key; found = true; }
+    }
+    return best;
+}
+
+/// Rust `find_field`: the first struct with a field named `name` (the caller reads the field by name).
+pub fn findField(c: &Checked, name: string): Option<Id<StructDecl>> {
+    let p = &c.tables.structs;
+    for i in 0..p.len() {
+        let fs = p.get(p.idAt(i)).fields;
+        for k in 0..fs.len { if c.tables.str(fs.items[k].name) == name { return Option.Some(p.idAt(i)); } }
+    }
+    return Option.None;
+}
 
 /// The struct a value of type `ty` has members of (`&` stripped).
-pub fn structOf(c: &Checked, ty: Id<Ty>): Option<Id<StructDecl>> { return Option.None; } // STUB LSPQ
+pub fn structOf(c: &Checked, ty: Id<Ty>): Option<Id<StructDecl>> {
+    let t = ty;
+    while true {
+        match c.tables.ty(t) {
+            Ty.Struct(s) { return Option.Some(s.decl); }
+            Ty.Ref(r) { t = r.inner; }
+            _ { return Option.None; }
+        }
+    }
+    return Option.None;
+}
 
 /// `ty` as Rust `dump::ty_string` prints it.
-pub fn tyString(c: &Checked, ty: Id<Ty>, out: &Text) {} // STUB LSPQ
+pub fn tyString(c: &Checked, ty: Id<Ty>, out: &Text) { tyName(c.tables, ty, out); }
 
-/// `fn name(params): ret` as the hover shows it.
-pub fn sigText(c: &Checked, f: Id<FnDecl>, out: &Text) {} // STUB LSPQ
+/// The type arguments of `ty`'s struct (`&` stripped), the empty list for anything else.
+pub fn structArgs(c: &Checked, ty: Id<Ty>): Id<TyList> {
+    let t = ty;
+    while true {
+        match c.tables.ty(t) {
+            Ty.Struct(s) { return s.args; }
+            Ty.Ref(r) { t = r.inner; }
+            _ { return c.tables.common.none; }
+        }
+    }
+    return c.tables.common.none;
+}
+
+/// The first concrete instance of generic struct `sid` in type order (Rust's first struct of that name;
+/// its fields have the instance's types), the empty list when there is none.
+pub fn firstInstance(c: &Checked, sid: Id<StructDecl>): Id<TyList> {
+    let tys = &c.tables.types.tys;
+    for i in 0..tys.len() {
+        match *tys.get(tys.idAt(i)) {
+            Ty.Struct(s) { if s.decl == sid && c.tables.items(s.args).len > 0 && !mentionsAnyParam(c.tables, s.args) { return s.args; } }
+            _ {}
+        }
+    }
+    return c.tables.common.none;
+}
+
+/// `ty` as `tyString` prints it, a parameter of `gen` printed as its argument in `args` (an instance's view
+/// of a template type, without interning one). Parameters past `args` keep their names.
+pub fn tyStringAt(c: &Checked, ty: Id<Ty>, gen: Option<Id<Generics>>, args: Id<TyList>, out: &Text) {
+    let t = c.tables;
+    let g = match gen { Option.Some(x) { x } Option.None { tyName(t, ty, out); return; } };
+    let xs = t.items(args);
+    if xs.len == 0 { tyName(t, ty, out); return; }
+    match t.ty(ty) {
+        Ty.Param(p) {
+            if p.gen == g && p.index < xs.len { tyName(t, xs[p.index], out); } else { tyName(t, ty, out); }
+        }
+        Ty.Ref(r) { out.add("&"); tyStringAt(c, r.inner, gen, args, out); }
+        Ty.Array(a) {
+            out.add("[");
+            out.pushInt(i64(a.len));
+            out.add("]");
+            tyStringAt(c, a.elem, gen, args, out);
+        }
+        Ty.Slice(sl) { out.add("[]"); tyStringAt(c, sl.elem, gen, args, out); }
+        Ty.Fn(f) {
+            out.add("fn(");
+            tysAt(c, f.params, gen, args, out);
+            out.add(")");
+            if f.ret != t.common.void { out.add(": "); tyStringAt(c, f.ret, gen, args, out); }
+        }
+        Ty.Tuple(tu) { out.add("("); tysAt(c, tu.elems, gen, args, out); out.add(")"); }
+        Ty.Closure(cl) {
+            if cl.boxed { out.add("boxed "); }
+            out.add("closure(");
+            tysAt(c, cl.params, gen, args, out);
+            out.add(")");
+            if cl.ret != t.common.void { out.add(": "); tyStringAt(c, cl.ret, gen, args, out); }
+        }
+        _ { tyName(t, ty, out); }
+    }
+}
+
+fn tysAt(c: &Checked, l: Id<TyList>, gen: Option<Id<Generics>>, args: Id<TyList>, out: &Text) {
+    let xs = c.tables.items(l);
+    for i in 0..xs.len {
+        if i > 0 { out.add(", "); }
+        tyStringAt(c, xs[i], gen, args, out);
+    }
+}
+
+/// Field `k` of struct `sid`'s type; a generic struct's at its first instance (Rust `find_field`'s type).
+pub fn fieldTyString(c: &Checked, sid: Id<StructDecl>, k: int, out: &Text) {
+    let sd = c.tables.structAt(sid);
+    tyStringAt(c, sd.fields.items[k].ty, sd.gen, firstInstance(c, sid), out);
+}
+
+/// `f`'s type as the hover shows it (Rust `dump_ty(func.ty)`): `fn(A, B): R`, `: R` left out for `void`.
+pub fn sigText(c: &Checked, f: Id<FnDecl>, out: &Text) { sigTextAt(c, f, c.tables.common.none, out); }
+
+/// `sigText` of a generic struct's method at the struct's type arguments `args` (its own parameters keep
+/// their names).
+pub fn sigTextAt(c: &Checked, f: Id<FnDecl>, args: Id<TyList>, out: &Text) {
+    let d = c.tables.fnAt(f);
+    out.add("fn(");
+    for i in 0..d.params.len {
+        if i > 0 { out.add(", "); }
+        tyStringAt(c, d.params.items[i].ty, d.gen, args, out);
+    }
+    out.add(")");
+    if d.ret != c.tables.common.void {
+        out.add(": ");
+        tyStringAt(c, d.ret, d.gen, args, out);
+    }
+}
 
 /// Rust `module_path`: the dotted module name of `m`.
-pub fn moduleKey(c: &Checked, m: Id<ModDecl>, out: &Text) {} // STUB LSPQ
+pub fn moduleKey(c: &Checked, m: Id<ModDecl>, out: &Text) { out.add(c.tables.modAt(m).key); }

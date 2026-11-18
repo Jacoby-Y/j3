@@ -1,9 +1,301 @@
 // `j3c i18n extract` and the i18n warnings `check` reports.
 //
 // Port of: j3c/src/i18n.rs
+// J3: Keys are found with the real lexer (`syntax/lex.j3`) over a `.j3` file or the `<script>` and every `{...}` of a
+// `.j3ui` (`ui/markup.parse`); no second parser. `config_module` is the loader's (`load/core_imports.j3`). Folder
+// listings are sorted (Rust sorts its `read_dir`), sets are `j3.data.set.Set` (never printed in hash order), and
+// paths are shown as the walk builds them (Rust `strip_prefix(root)`).
 module j3c.cmd.i18n;
 
-use j3c.base.diag;
+use j3.cmp.sortBy;
+use j3.data.pool.Id;
+use j3.data.set.Set;
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text;
+use j3.text.Text;
+use j3c.base.fsx;
+use j3c.base.span.Source;
+use j3c.base.toml;
+use j3c.syntax.lex.{ lex, trimEnd, trimStart };
+use j3c.syntax.token.TokenKind;
+use j3c.ui.markup;
+use j3c.ui.markup.{ Node, Part, Range, Value };
 
-/// `j3c i18n ...`: the exit code.
-pub fn i18nCmd(rest: []string): int { return diag.notPortedCmd("i18n"); } // STUB LINT
+const CALLS: [5]string = ["t", "tf", "tf2", "tf3", "tfn"];
+const PLURAL: [6]string = ["zero", "one", "two", "few", "many", "other"];
+
+/// A key used in code: file (relative to the project), 1-based line and column (chars) of the string.
+pub struct Use {
+    key: string;
+    file: string;
+    line: int;
+    col: int;
+}
+
+/// One key of a locale file and its 1-based line.
+pub struct LocaleKey {
+    key: string;
+    line: int;
+}
+
+/// `[i18n] dir` and `default` of `root/j3.toml` (`locales`, `en`).
+pub fn config(root: string, a: &Arena): (string, string) {
+    let t = match fsx.readText(path.join(root, "j3.toml", a), a) { Result.Ok(x) { x } Result.Err(_) { "" } };
+    let dir = match toml.str(t, "i18n", "dir", a) { Option.Some(v) { v } Option.None { "locales" } };
+    let def = match toml.str(t, "i18n", "default", a) { Option.Some(v) { v } Option.None { "en" } };
+    return (dir, def);
+}
+
+/// Line and char column of byte `at` in `t` (Rust `pos`).
+fn pos(t: string, at: int): (int, int) {
+    let line = 1;
+    let start = 0;
+    for i in 0..at {
+        if t[i] == '\n' { line += 1; start = i + 1; }
+    }
+    let col = 1;
+    for i in start..at { if (t[i] & 0xC0) != 0x80 { col += 1; } }
+    return (line, col);
+}
+
+fn isCall(name: string): bool {
+    for i in 0..CALLS.len { if CALLS[i] == name { return true; } }
+    return false;
+}
+
+/// Keys in `t[r]` (J3 source), lexed with the compiler's lexer so strings and comments are right.
+fn scanSpan(t: string, r: Range, file: string, out: &List<Use>, a: &Arena) {
+    let toks = match lex(t[r.lo..r.hi], Id<Source> { i: 0 }, a) {
+        Result.Ok(x) { x }
+        Result.Err(_) { return; }
+    };
+    for i in 0..toks.len {
+        if i + 2 >= toks.len { break; }
+        let w0 = toks.items[i];
+        if w0.kind != TokenKind.Ident || !isCall(w0.text) { continue; }
+        if toks.items[i + 1].kind != TokenKind.LParen || toks.items[i + 2].kind != TokenKind.String { continue; }
+        let s = toks.items[i + 2];
+        let (line, col) = pos(t, r.lo + int(s.span.lo));
+        out.push(Use { key: s.text, file: file, line: line, col: col });
+    }
+}
+
+fn scanParts(ps: &List<Part>, t: string, file: string, out: &List<Use>, a: &Arena) {
+    for i in 0..ps.len {
+        match ps.items[i] {
+            Part.Hole(r) { scanSpan(t, r, file, out, a); }
+            Part.Lit(_) {}
+        }
+    }
+}
+
+fn scanNodes(nodes: &List<Node>, t: string, file: string, out: &List<Use>, a: &Arena) {
+    for i in 0..nodes.len {
+        match nodes.items[i] {
+            Node.Let(l) { scanSpan(t, l.expr, file, out, a); }
+            Node.Text(n) { scanParts(&n.parts, t, file, out, a); }
+            Node.Elem(e) {
+                for k in 0..e.attrs.len {
+                    match e.attrs.items[k].value {
+                        Value.Expr(r) { scanSpan(t, r, file, out, a); }
+                        Value.Str(ps) { scanParts(&ps.items, t, file, out, a); }
+                        Value.None {}
+                    }
+                }
+                scanNodes(&e.children, t, file, out, a);
+            }
+            Node.If(n) {
+                match n.scrut { Option.Some(r) { scanSpan(t, r, file, out, a); } Option.None {} }
+                for b in 0..n.branches.len {
+                    let br = n.branches.items[b];
+                    match br.cond { Option.Some(r) { scanSpan(t, r, file, out, a); } Option.None {} }
+                    for v in 0..br.vals.len { scanSpan(t, br.vals.items[v], file, out, a); }
+                    scanNodes(&br.nodes, t, file, out, a);
+                }
+            }
+            Node.Each(n) {
+                scanSpan(t, n.head, file, out, a);
+                scanNodes(&n.body, t, file, out, a);
+            }
+        }
+    }
+}
+
+/// Keys used in one source text: all of a `.j3` file, or the `<script>` and every `{...}` of a `.j3ui`. A file that
+/// does not parse is skipped (`j3c check` reports it). Rust `scan_text`.
+pub fn scanText(t: string, file: string, out: &List<Use>, a: &Arena) {
+    if text.endsWith(file, ".j3ui") {
+        let uid = 0;
+        match markup.parse(t, a, &uid) {
+            Result.Ok(mk) {
+                match mk.script { Option.Some(r) { scanSpan(t, r, file, out, a); } Option.None {} }
+                scanNodes(&mk.nodes, t, file, out, a);
+            }
+            Result.Err(_) {}
+        }
+    } else {
+        scanSpan(t, Range { lo: 0, hi: t.len }, file, out, a);
+    }
+}
+
+/// The entry names of `dir`, sorted (none when it cannot be read).
+fn sortedNames(dir: string, a: &Arena): List<string> {
+    let out = List<string>.new(a);
+    match io.listDir(dir, a) {
+        Result.Ok(es) { for i in 0..es.len { out.push(es[i].name); } }
+        Result.Err(_) {}
+    }
+    sortBy(out.items[0..out.len], fn(x: string, y: string): bool { return x < y; });
+    return out;
+}
+
+/// `.j3`/`.j3ui` files under `dir` (its project-relative path `rel`, "" at the root), skipping hidden entries,
+/// `target` and `skip` (Rust `walk`). Pushes (path, rel) pairs.
+fn walk(dir: string, rel: string, skip: string, paths: &List<string>, rels: &List<string>, a: &Arena) {
+    let names = sortedNames(dir, a);
+    for i in 0..names.len {
+        let n = names.items[i];
+        let p = path.join(dir, n, a);
+        if text.startsWith(n, ".") || n == "target" || p == skip { continue; }
+        let r = if rel.len == 0 { n } else { Text.new(a).add(rel).add("/").add(n).str() };
+        if fsx.isDir(p) {
+            walk(p, r, skip, paths, rels, a);
+        } else if text.endsWith(n, ".j3") || text.endsWith(n, ".j3ui") {
+            paths.push(p);
+            rels.push(r);
+        }
+    }
+}
+
+/// Every key used in the project's `.j3` and `.j3ui` files (not the locales folder). Rust `uses`.
+pub fn uses(root: string, a: &Arena): List<Use> {
+    let (dir, _) = config(root, a);
+    let paths = List<string>.new(a);
+    let rels = List<string>.new(a);
+    walk(root, "", path.join(root, dir, a), &paths, &rels, a);
+    let out = List<Use>.new(a);
+    for i in 0..paths.len {
+        match fsx.readText(paths.items[i], a) {
+            Result.Ok(t) { scanText(t, rels.items[i], &out, a); }
+            Result.Err(_) {}
+        }
+    }
+    return out;
+}
+
+/// The keys of a locale file (Rust `parse_locale`).
+pub fn parseLocale(t: string, a: &Arena): List<LocaleKey> {
+    let out = List<LocaleKey>.new(a);
+    let n = 0;
+    for l in text.lines(t) {
+        n += 1;
+        let s = trimEnd(trimStart(l));
+        if s.len == 0 || text.startsWith(s, "#") { continue; }
+        let eq = text.find(s, "=");
+        if eq < 0 { continue; }
+        let k = trimEnd(trimStart(s[0..eq]));
+        if k.len > 0 { out.push(LocaleKey { key: k, line: n }); }
+    }
+    return out;
+}
+
+/// `key` without a `.zero`/`.one`/... plural suffix (Rust `base`).
+fn base(key: string): string {
+    for i in 0..PLURAL.len {
+        let p = PLURAL[i];
+        if key.len > p.len && text.endsWith(key, p) && key[key.len - p.len - 1] == '.' { return key[0..key.len - p.len - 1]; }
+    }
+    return key;
+}
+
+/// `root`-relative form of `p` (Rust `strip_prefix(root)`), `p` itself outside `root`.
+fn shown(root: string, p: string, a: &Arena): string {
+    let head = if text.endsWith(root, "/") { root } else { Text.new(a).add(root).add("/").str() };
+    if text.startsWith(p, head) { return p[head.len..p.len]; }
+    return p;
+}
+
+/// `warning: file:line:col: message [i18n-missing]` lines for the project at `root`, in `arena`; empty when there is
+/// no locales folder (Rust `lint`).
+pub fn lint(root: string, arena: &Arena): List<string> {
+    let out = List<string>.new(arena);
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    let a = &mem;
+    let (dir, def) = config(root, a);
+    let ldir = path.join(root, dir, a);
+    if !fsx.isDir(ldir) { return out; }
+    let dpath = path.join(ldir, Text.new(a).add(def).add(".txt").str(), a);
+    let dshown = shown(root, dpath, a);
+    let dtext = match fsx.readText(dpath, a) {
+        Result.Ok(x) { x }
+        Result.Err(_) {
+            out.push(Text.new(arena).add("warning: ").add(dshown).add(":1:1: default locale file is missing [i18n-missing]").str());
+            return out;
+        }
+    };
+    let have = Set<string>.new(a, 64);
+    let dkeys = parseLocale(dtext, a);
+    for i in 0..dkeys.len {
+        have.add(dkeys.items[i].key);
+        have.add(base(dkeys.items[i].key));
+    }
+    let seen = Set<string>.new(a, 64);
+    let us = uses(root, a);
+    for i in 0..us.len {
+        let u = us.items[i];
+        if have.has(u.key) { continue; }
+        let at = Text.new(a).add(u.file).add(":");
+        at.pushInt(u.line);
+        at.add(":");
+        at.pushInt(u.col);
+        if !seen.add(at.str()) { continue; }
+        out.push(Text.new(arena).add("warning: ").add(at.str()).add(": key `").add(u.key).add("` is not in ").add(dshown).add(" [i18n-missing]").str());
+    }
+    let names = sortedNames(ldir, a);
+    for i in 0..names.len {
+        let f = path.join(ldir, names.items[i], a);
+        if f == dpath || !text.endsWith(names.items[i], ".txt") || names.items[i] == ".txt" { continue; }
+        let t = match fsx.readText(f, a) { Result.Ok(x) { x } Result.Err(_) { continue; } };
+        let ks = parseLocale(t, a);
+        for k in 0..ks.len {
+            let key = ks.items[k].key;
+            if have.has(key) || have.has(base(key)) { continue; }
+            let w = Text.new(arena).add("warning: ").add(shown(root, f, a)).add(":");
+            w.pushInt(ks.items[k].line);
+            out.push(w.add(":1: key `").add(key).add("` is not in the default locale ").add(dshown).add(" [i18n-missing]").str());
+        }
+    }
+    return out;
+}
+
+/// `j3c i18n extract [project dir]`: the keys used in code, one per line with where (Rust `cmd`).
+pub fn i18nCmd(rest: []string): int {
+    if rest.len == 0 || rest[0] != "extract" {
+        let u = "usage: j3c i18n extract [project dir]\n";
+        sys.write(2, u.ptr as ptr, u.len);
+        return 1;
+    }
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    let root = if rest.len > 1 { rest[1] } else { "." };
+    let seen = Set<string>.new(&mem, 64);
+    let us = uses(root, &mem);
+    let t = Text.new(&mem);
+    for i in 0..us.len {
+        let u = us.items[i];
+        if !seen.add(u.key) { continue; }
+        t.add(u.key).add("\t").add(u.file).add(":");
+        t.pushInt(u.line);
+        t.add(":");
+        t.pushInt(u.col);
+        t.add("\n");
+    }
+    sys.write(1, t.str().ptr as ptr, t.str().len);
+    return 0;
+}

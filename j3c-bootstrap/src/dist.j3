@@ -1,4 +1,340 @@
-// `[dist] build_outputs`: after a release build, write the zip and call the others.
+// `[dist] build_outputs`: after a release build, stage each target's `<name>/` folder (program, `[dist]
+// include`, Windows DLLs), zip it (the `zip` CLI, as Rust), make the `.deb` (`dist/deb`), the `.apk` of the
+// Android targets (`dist/apk`), then run the package outputs (`dist/pkg`).
 //
 // Port of: j3c/src/dist.rs
+// J3: Rust's `(String, i32)` error is `pkg.Fail`; `(triple, exe)` pairs are `pkg.Built`.
 module j3c.dist;
+
+use j3.io;
+use j3.io.path;
+use j3.memory.{ Arena, List };
+use j3.proc;
+use j3.result.Result;
+use j3.sys;
+use j3.text.{ Text, contains, startsWith };
+use j3c.base.fsx;
+use j3c.dist.apk;
+use j3c.dist.deb;
+use j3c.dist.fs;
+use j3c.dist.pkg;
+use j3c.dist.pkg.{ Built, Fail };
+use j3c.project.manifest.{ Manifest, Output, targetSlug };
+use j3c.toolchain;
+use j3c.toolchain.TargetOs;
+
+/// Rust `package`: every built target packaged; the paths written, in order. The stage folders
+/// (`target/.j3c/dist`) are removed whatever happens.
+pub fn package(m: &Manifest, built: []Built, arena: &Arena): Result<List<string>, Fail> {
+    let stages = List<Built>.new(arena);
+    let out = List<string>.new(arena);
+    let failed = false;
+    let f = Fail { msg: "", code: 0 };
+    match builtins(m, built, &stages, &out, arena) {
+        Result.Ok(dist) {
+            match pkg.runAll(m, built, stages.items[0..stages.len], dist, &out, arena) {
+                Result.Ok(_) {}
+                Result.Err(e) {
+                    failed = true;
+                    f = e;
+                }
+            }
+        }
+        Result.Err(e) {
+            failed = true;
+            f = Fail { msg: e, code: 1 };
+        }
+    }
+    fsx.removeTree(path.join(m.root, "target/.j3c/dist", arena), arena);
+    if failed { return Result.Err(f); }
+    return Result.Ok(out);
+}
+
+fn has(m: &Manifest, want: int): bool {
+    for i in 0..m.dist.outputs.len {
+        match m.dist.outputs.items[i] {
+            Output.Zip { if want == 0 { return true; } }
+            Output.Deb { if want == 1 { return true; } }
+            Output.Apk { if want == 2 { return true; } }
+            Output.Pkg(_) { if want == 3 { return true; } }
+        }
+    }
+    return false;
+}
+
+fn isAndroid(t: string): bool { return toolchain.targetOs(t) == TargetOs.Android; }
+
+/// Rust `builtins`: zip / deb / apk; Ok = the absolute `target/dist`. With package outputs named, each
+/// target's staged `<name>/` folder is kept in `stages` for them.
+fn builtins(m: &Manifest, built: []Built, stages: &List<Built>, out: &List<string>, arena: &Arena): Result<string, string> {
+    let keep = has(m, 3);
+    // Absolute: `zip` runs inside the staging folder, so a relative root (`j3c build .`) points nowhere.
+    let dist = pkg.absolute(path.join(m.root, "target/dist", arena), arena);
+    fs.mkdirs(dist, arena)?;
+    let inc = include(m, arena);
+    // One APK holds every Android triple; those triples have no zip/deb of their own.
+    if has(m, 2) {
+        let libs = List<Built>.new(arena);
+        for i in 0..built.len { if isAndroid(built[i].triple) { libs.push(built[i]); } }
+        out.push(apk.build(m, libs.items[0..libs.len], inc.items[0..inc.len], arena)?);
+    }
+    for bi in 0..built.len {
+        let triple = built[bi].triple;
+        if isAndroid(triple) { continue; }
+        let windows = contains(triple, "windows");
+        // The `.exe` first: a Linux build of the same name may sit beside it (`target/<name>`).
+        let exe = built[bi].exe;
+        let dotExe = withExtension(exe, "exe", arena);
+        if windows && fsx.isFile(dotExe) { exe = dotExe; }
+        let stage = path.join(path.join(m.root, "target/.j3c/dist", arena), targetSlug(triple, arena), arena);
+        fsx.removeTree(stage, arena);
+        // The app folder sits where the `.deb` installs it, so both outputs share one copy.
+        let opt = path.join(stage, "root/opt", arena);
+        let dir = path.join(opt, m.name, arena);
+        fs.mkdirs(dir, arena)?;
+        let file = path.basename(exe);
+        if file.len == 0 { return Result.Err("no program name"); }
+        fs.copy(exe, path.join(dir, file, arena), arena)?;
+        for k in 0..inc.len {
+            let src = path.join(m.root, inc.items[k], arena);
+            if !exists(src) { return Result.Err(Text.new(arena).add("[dist] include: ").add(src).add(" does not exist").str()); }
+            fs.copyAll(src, path.join(dir, inc.items[k], arena), arena)?;
+        }
+        if windows {
+            let ds = dlls(m, exe, arena);
+            for k in 0..ds.len {
+                let to = path.join(dir, path.basename(ds.items[k]), arena);
+                fs.copy(ds.items[k], to, arena)?;
+                // SDL2_ttf.dll ships ~68 MB of debug info.
+                let strips: [2]string = ["x86_64-w64-mingw32-strip", "llvm-strip"];
+                for s in 0..2 {
+                    let argv: [3]string = [strips[s], "--strip-debug", to];
+                    let ok = match proc.run(argv[..], "", arena) {
+                        Result.Ok(o) { o.code == 0 }
+                        Result.Err(_) { false }
+                    };
+                    if ok { break; }
+                }
+            }
+        }
+        let plat = platform(triple, arena);
+        for k in 0..m.dist.outputs.len {
+            match m.dist.outputs.items[k] {
+                Output.Zip {
+                    let z = path.join(dist, Text.new(arena).add(m.name).add("-").add(plat).add(".zip").str(), arena);
+                    out.push(zip(m, opt, z, arena)?);
+                }
+                Output.Deb {
+                    if startsWith(plat, "linux-") {
+                        out.push(deb.build(m, triple, stage, path.join(dir, file, arena), dist, arena)?);
+                    } else {
+                        Text.new(arena).add("j3c: dist: no .deb for ").add(plat).add(" (Linux targets only)\n").flushTo(2);
+                    }
+                }
+                Output.Apk {}
+                Output.Pkg(_) {}
+            }
+        }
+        if keep {
+            stages.push(Built { triple: triple, exe: pkg.absolute(dir, arena) });
+        } else {
+            fsx.removeTree(stage, arena);
+        }
+    }
+    return Result.Ok(dist);
+}
+
+fn exists(p: string): bool {
+    match io.stat(p) {
+        Result.Ok(_) { return true; }
+        Result.Err(_) { return false; }
+    }
+}
+
+/// Rust `Path::with_extension`: the file name's extension replaced (or added).
+fn withExtension(p: string, ext: string, arena: &Arena): string {
+    let b = path.basename(p);
+    let cut = p.len;
+    let i = b.len - 1;
+    while i > 0 {
+        if b[i] == '.' {
+            cut = p.len - b.len + i;
+            break;
+        }
+        i -= 1;
+    }
+    return Text.new(arena).add(p[0..cut]).add(".").add(ext).str();
+}
+
+/// Rust `include`: `[dist] include`, else whichever of `assets`, `scripts`, `scenes`, `locales` exist.
+pub fn include(m: &Manifest, arena: &Arena): List<string> {
+    if m.dist.include.len > 0 { return m.dist.include; }
+    let out = List<string>.new(arena);
+    let dirs: [4]string = ["assets", "scripts", "scenes", "locales"];
+    for i in 0..4 { if exists(path.join(m.root, dirs[i], arena)) { out.push(dirs[i]); } }
+    return out;
+}
+
+/// Rust `zip`: `zip -qr ZIP NAME` inside `parent`.
+fn zip(m: &Manifest, parent: string, z: string, arena: &Arena): Result<string, string> {
+    toolchain.discard(z);
+    let argv: [4]string = ["zip", "-qr", z, m.name];
+    match proc.startIn(argv[..], parent, arena) {
+        Result.Ok(c) {
+            let o = c.collect("" as []u8, arena);
+            if o.code != 0 {
+                // zip prints its I/O errors on stdout
+                let t = Text.new(arena).add("zip ").add(z).add(" failed (").add(exitStatus(o.code, arena)).add("):\n");
+                return Result.Err(t.add(o.outStr()).add(o.errStr()).str());
+            }
+        }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("run zip: ").add(fsx.osError(2, arena)).add(" (install `zip`)").str()); }
+    }
+    return Result.Ok(z);
+}
+
+/// Rust's `ExitStatus` display: `exit status: N`, or `signal: N` for 128 + N.
+// ponytail: `j3.proc` folds a signal into 128 + N, so a program exiting 129..159 reads as a signal.
+pub fn exitStatus(code: int, arena: &Arena): string {
+    if code > 128 && code < 160 { return Text.new(arena).fmt(`signal: {code - 128}`).str(); }
+    return Text.new(arena).fmt(`exit status: {code}`).str();
+}
+
+/// Rust `platform`: `linux-x86_64`, `windows-x86_64`, `macos-arm64`; the host when `triple` is empty.
+pub fn platform(triple: string, arena: &Arena): string {
+    if triple.len == 0 { return Text.new(arena).add(osName()).add("-").add(sys.ARCH_NAME).str(); }
+    let t = Text.new(arena);
+    for i in 0..triple.len {
+        let c = triple[i];
+        t.push(if c >= 'A' && c <= 'Z' { c + 32 } else { c });
+    }
+    let low = t.str();
+    let os = "";
+    if contains(low, "windows") {
+        os = "windows";
+    } else if contains(low, "apple") || contains(low, "darwin") {
+        os = "macos";
+    } else if contains(low, "android") {
+        os = "android";
+    } else if contains(low, "linux") {
+        os = "linux";
+    } else {
+        os = part(low, 2);
+        if os.len == 0 && countParts(low) < 3 { os = "unknown"; }
+    }
+    return Text.new(arena).add(os).add("-").add(part(low, 0)).str();
+}
+
+/// `std::env::consts::OS` of this build.
+fn osName(): string {
+    if sys.PLATFORM == sys.PLATFORM_WINDOWS { return "windows"; }
+    if sys.PLATFORM == sys.PLATFORM_MACOS { return "macos"; }
+    if sys.PLATFORM == sys.PLATFORM_ANDROID { return "android"; }
+    return "linux";
+}
+
+/// The `n`-th `-` part of `s`, "" past the end.
+fn part(s: string, n: int): string {
+    let k = 0;
+    let start = 0;
+    for i in 0..s.len + 1 {
+        if i == s.len || s[i] == '-' {
+            if k == n { return s[start..i]; }
+            k += 1;
+            start = i + 1;
+        }
+    }
+    return "";
+}
+
+fn countParts(s: string): int {
+    let n = 1;
+    for i in 0..s.len { if s[i] == '-' { n += 1; } }
+    return n;
+}
+
+/// Rust `dlls`: DLLs `exe` imports that live outside Windows itself, following their own imports too.
+fn dlls(m: &Manifest, exe: string, arena: &Arena): List<string> {
+    let dirs = List<string>.new(arena);
+    for i in 0..m.link.search.len {
+        let s = m.link.search.items[i];
+        let p = if path.isAbs(s) { s } else { path.join(m.root, s, arena) };
+        dirs.push(path.join(p, "../bin", arena));
+        dirs.push(p);
+    }
+    let home = sys.env("HOME");
+    if home.len > 0 { dirs.push(path.join(home, ".cache/j3/sdl2-mingw/dll", arena)); }
+    let found = List<string>.new(arena);
+    // `[link] libs` too.
+    let todo = List<string>.new(arena);
+    for i in 0..m.link.libs.len {
+        let l = m.link.libs.items[i];
+        if l == "c" || l == "dl" { continue; }
+        let w = if l == "GL" { "opengl32" } else { l };
+        todo.push(Text.new(arena).add(w).add(".dll").str());
+    }
+    let imported = fs.objdumpP(exe, "DLL Name:", arena);
+    // `j3.game` opens SDL_image/mixer/ttf at runtime (`addons.j3`), so they are never imports; every
+    // SDL game links all three bindings, so ship all three.
+    let sdl = false;
+    for i in 0..imported.len { if eqNoCase(imported.items[i], "SDL2.dll") { sdl = true; } }
+    if sdl {
+        todo.push("SDL2_image.dll");
+        todo.push("SDL2_mixer.dll");
+        todo.push("SDL2_ttf.dll");
+    }
+    for i in 0..imported.len { todo.push(imported.items[i]); }
+    while todo.len > 0 {
+        let name = todo.items[todo.len - 1];
+        todo.len -= 1;
+        let seen = false;
+        for i in 0..found.len { if eqNoCase(path.basename(found.items[i]), name) { seen = true; } }
+        if seen { continue; }
+        let hit = "";
+        for i in 0..dirs.len {
+            let p = path.join(dirs.items[i], name, arena);
+            if hit.len == 0 && fsx.isFile(p) { hit = p; }
+        }
+        if hit.len > 0 {
+            let more = fs.objdumpP(hit, "DLL Name:", arena);
+            for i in 0..more.len { todo.push(more.items[i]); }
+            found.push(hit);
+        } else if !systemDll(name, arena) {
+            Text.new(arena).add("j3c: dist: ").add(name).add(" not found; ship it beside the .exe yourself\n").flushTo(2);
+        }
+    }
+    return found;
+}
+
+fn eqNoCase(a: string, b: string): bool {
+    if a.len != b.len { return false; }
+    for i in 0..a.len {
+        let x = a[i];
+        let y = b[i];
+        if x >= 'A' && x <= 'Z' { x = x + 32; }
+        if y >= 'A' && y <= 'Z' { y = y + 32; }
+        if x != y { return false; }
+    }
+    return true;
+}
+
+const SYSTEM_DLLS: [26]string = [
+    "kernel32.dll", "user32.dll", "gdi32.dll", "opengl32.dll", "msvcrt.dll", "ucrtbase.dll",
+    "ws2_32.dll", "advapi32.dll", "shell32.dll", "ole32.dll", "oleaut32.dll", "winmm.dll",
+    "imm32.dll", "version.dll", "setupapi.dll", "bcrypt.dll", "cfgmgr32.dll", "dinput8.dll",
+    "dsound.dll", "dxgi.dll", "d3d11.dll", "hid.dll", "comdlg32.dll", "shlwapi.dll", "usp10.dll",
+    "rpcrt4.dll"
+];
+
+/// Rust `system_dll`: part of Windows itself.
+fn systemDll(name: string, arena: &Arena): bool {
+    let t = Text.new(arena);
+    for i in 0..name.len {
+        let c = name[i];
+        t.push(if c >= 'A' && c <= 'Z' { c + 32 } else { c });
+    }
+    let n = t.str();
+    if startsWith(n, "api-ms-win-") { return true; }
+    for i in 0..26 { if SYSTEM_DLLS[i] == n { return true; } }
+    return false;
+}

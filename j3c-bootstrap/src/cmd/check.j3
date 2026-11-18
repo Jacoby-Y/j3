@@ -6,7 +6,8 @@ module j3c.cmd.check;
 // `print_fail` / `json_err` do (rendered diags; a code-0 error with no span or notes is a Rust plain-string
 // error and prints bare, `j3c: msg`). Success prints code warnings, `checked ENTRY` and the autofix hint
 // (`--json`: one line); `--autofix` applies `Checked.fixes` and checks again; `--strict` fails on a code
-// warning. Preflight, CSS and i18n lint are not ported yet. `fmt` is ported whole on top of `syntax.fmt`, one
+// warning, a CSS lint or an i18n warning. Preflight runs first (`toolchain.preflight`), then the CSS lint
+// (`cmd/csslint.j3`, in-process) and i18n (`cmd/i18n.j3`) for a project. `fmt` is ported whole on top of `syntax.fmt`, one
 // scratch arena per file; `collectJ3` lists project sources with `load.scripts_deps.scriptPaths`.
 
 use j3.cmp.sortBy;
@@ -22,6 +23,8 @@ use j3c.base.diag;
 use j3c.base.diag.{ Diag, Severity };
 use j3c.base.fsx;
 use j3c.base.toml.jsonStr;
+use j3c.cmd.csslint.lintProject;
+use j3c.cmd.i18n;
 use j3c.driver;
 use j3c.driver.{ Mode, Session, Stage };
 use j3c.load.scripts_deps.scriptPaths;
@@ -88,7 +91,7 @@ pub fn checkCmd(rest: []string): int {
             Result.Err(e) { return fail(e, json, s.arena); }
         }
     }
-    // Rust's `check` lowers and validates too (`Stage.Passes`). Preflight, CSS and i18n lint come later.
+    // Rust's `check` lowers and validates too (`Stage.Passes`); preflight and the lints run in `report`.
     if !driver.run(s, Stage.Passes) { return fail(failText(s), json, s.arena); }
     if autofix && fixesOf(s).len > 0 {
         // Rust `autofix_run`: apply, check again from disk; a result that no longer checks is put back.
@@ -114,10 +117,41 @@ pub fn checkCmd(rest: []string): int {
     return report(s, path, strict, json);
 }
 
-/// The success report of a checked session (Rust `check_cmd`'s `Ok` arm): code warnings on stderr,
-/// `checked ENTRY` and the autofix hint on stdout, or under `--json` one line on stdout (Rust `check_json`;
-/// the css and i18n arrays wait for those lints); exit code 1 only under `--strict` with warnings.
+/// The success report of a checked session (Rust `check_cmd`'s `Ok` arm): preflight (its failure is the
+/// error), code warnings on stderr, CSS and i18n warnings, `checked ENTRY` and the autofix hint on stdout, or
+/// under `--json` one line on stdout (Rust `check_json`); exit code 1 only under `--strict` with warnings.
 fn report(s: &Session, path: string, strict: bool, json: bool): int {
+    let css = List<string>.new(s.arena);
+    let i18nW = List<string>.new(s.arena);
+    match s.loaded {
+        Option.Some(p) {
+            match s.program {
+                Option.Some(prog) {
+                    match toolchain.preflight(prog, p.project, s.arena) {
+                        Result.Ok(_) {}
+                        Result.Err(x) {
+                            if json { return fail(x, true, s.arena); }
+                            printFail(x, s.arena);
+                            return 1;
+                        }
+                    }
+                }
+                Option.None {}
+            }
+            match p.project {
+                Option.Some(m) {
+                    // CSS lint: warnings only (exit code unchanged unless --strict)
+                    match lintProject(&m, s.arena) {
+                        Result.Ok(w) { css = w; }
+                        Result.Err(e) { err(Text.new(s.arena).add("note: css lint skipped: ").add(e).add("\n").str()); }
+                    }
+                    i18nW = i18n.lint(m.root, s.arena);
+                }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
     let wt = Text.new(s.arena);
     let wj = Text.new(s.arena);
     let nw = 0;
@@ -142,12 +176,18 @@ fn report(s: &Session, path: string, strict: bool, json: bool): int {
     if json {
         let j = Text.new(s.arena).add("{\"ok\":true,\"entry\":");
         jsonStr(j, entry);
+        jsonArr(j, "css", &css);
+        jsonArr(j, "i18n", &i18nW);
         if nw > 0 { j.add(",\"warnings\":[").add(wj.str()).add("]"); }
         out(j.add("}\n").str());
-        if strict && nw > 0 { return 1; }
+        if strict && (nw > 0 || css.len > 0 || i18nW.len > 0) { return 1; }
         return 0;
     }
     err(wt.str());
+    let lw = Text.new(s.arena);
+    for i in 0..css.len { lw.add(css.items[i]).add("\n"); }
+    for i in 0..i18nW.len { lw.add(i18nW.items[i]).add("\n"); }
+    out(lw.str());
     let t = Text.new(s.arena).add("checked ").add(entry);
     if nw == 1 { t.add(" (1 warning)"); } else if nw > 1 { t.fmt(` ({nw} warnings)`); }
     t.add("\n");
@@ -160,8 +200,15 @@ fn report(s: &Session, path: string, strict: bool, json: bool): int {
         t.add("\n");
     }
     out(t.str());
-    if strict && nw > 0 { return 1; }
+    if strict && (nw > 0 || css.len > 0 || i18nW.len > 0) { return 1; }
     return 0;
+}
+
+/// `,"key":[...]` of string warnings, nothing when empty (Rust `check_json`'s `arr`).
+fn jsonArr(j: &Text, key: string, xs: &List<string>) {
+    if xs.len == 0 { return; }
+    j.add(",\"").add(key).add("\":");
+    jsonList(j, xs);
 }
 
 /// The autofix edits of a checked session (Rust `Program.fixes`).
