@@ -18,6 +18,9 @@
 // refuses it): `Node`, `Value`, `Part`, `Mode` helpers are free fns.
 // J3: Strings a `G` keeps (names, `tags`, `rename`, ..) are arena copies or source slices; generated text
 // goes through `Out` (a `Text`), built with `Text.new(g.a)` / `t.fmt(..)`, never plain interpolation.
+// J3: No `Option` / enum field right after a `bool` (`EachHead`, `Virt`, `G` keep their bools last or before
+// an `int`): stage 0 gives a payload enum the LLVM type `{ i32, [N x i8] }` (align 4) but sizes the struct
+// with align 8, so the copy in `List<EachCx>.push` overran its slot and crashed every `{#each}`.
 module j3c.ui.gen;
 
 use j3.cmp.sortBy;
@@ -30,14 +33,14 @@ use j3.result.Result;
 use j3.text;
 use j3.text.{ Text, contains, endsWith, startsWith };
 use j3c.base.intern.own;
-use j3c.base.span.Source;
-use j3c.syntax.lex.lex;
-use j3c.syntax.token.{ ParseError, Token, TokenKind };
+use j3c.base.span.{ NO_FILE, Source };
+use j3c.syntax.lex.{ isWhitespace, lex };
+use j3c.syntax.token.{ Token, TokenKind };
 use j3c.ui.icons;
 use j3c.ui.icons.Icon;
 use j3c.ui.map.{ Out, Seg };
 use j3c.ui.markup;
-use j3c.ui.markup.{ Attr, Branch, EachNode, Elem, EvParam, FnDef, IfNode, Inject, LetDef, LetNode, Markup, Named, Node, Part, Parts, Prop, Range, Script, TextNode, UiError, Value, notYet, uiErr };
+use j3c.ui.markup.{ Attr, Branch, EachNode, Elem, FnDef, IfNode, LetNode, Markup, Named, Node, Part, Prop, Range, Script, UiError, Value, uTrim, uiErr };
 use j3c.ui.pass;
 use j3c.ui.pass.Pass;
 
@@ -335,9 +338,9 @@ pub struct Virt {
     n: string;
     rh: Option<Value>;
     est: Option<Value>;
-    stick: bool;
     keep: Option<Range>;
     atEnd: Option<Range>;
+    stick: bool;
 }
 
 /// A `use:name` on an element: the state it keeps in its container (`ua<k>` handle, `us<k>` mounted,
@@ -380,11 +383,11 @@ pub struct EachHead {
     expr: Range;
     range: Option<RangePair>;
     item: Named;
-    /// `as &x`: the item is a pointer to the element, so the body can change it in place.
-    byRef: bool;
     index: Option<Named>;
     /// `(expr)` after the names: what identifies a row across frames.
     key: Option<Range>;
+    /// `as &x`: the item is a pointer to the element, so the body can change it in place.
+    byRef: bool;
     /// `(expr : int)`: an int key, kept as raw bytes (no formatting).
     keyInt: bool;
 }
@@ -504,10 +507,10 @@ pub struct G {
     /// The `<slot>`s someone fills. `update` ends by telling the owner when one that ran last frame did
     /// not run this frame.
     slotMarks: List<SlotMark>;
-    /// Has slot methods: `emit` in them lands in `sev`, merged into the update's events.
-    ownsSlot: bool;
     /// A `virtual` element's settings for the one `{#each}` it holds.
     virt: Option<Virt>;
+    /// Has slot methods: `emit` in them lands in `sev`, merged into the update's events.
+    ownsSlot: bool;
     /// Inside a `virtual` `{#each}` (slot content can't be re-bound there).
     inVirt: int;
     /// `uid`s of the elements that may carry `animate:flip`: the row elements of keyed, non-`virtual` `{#each}`s.
@@ -532,16 +535,50 @@ pub fn newG(a: &Arena, all: &List<Comp>, files: &List<SrcFile>, themePath: Optio
         flipRows: List<int>.new(a), usesList: false, usesKeyed: false, usesVirt: false, passRoot: -1 };
 }
 
-/// The `<package>.ui` module text for `files` (scan order). `propsText` is the embedded stdlib file
-/// `ui/css/props.j3` (`ui` sits below `load`, so the caller reads it: `load.stdlibFile`); `cssProps` cuts
-/// the names out of it. Everything is allocated in `a`.
-// Steps (Rust `generate`): order by component name (`scope` = position + 1) and check names; per file
-// `markup.parse(text, a, &uid)` + `parseScript`; `lowerChoices` (same `uid` counter); edges + `cycle`;
-// `resolveInject`; `declaredSlots` + `scanSites`; `pass.scan`; `ids` = `a.alloc::<int>(uid)` (zeros);
-// per component `newG(..).run()`; then the header, `head.append(&body)` and the section shift.
-pub fn generate(files: &List<SrcFile>, package: string, theme: Option<Theme>, icons: &List<Icon>, propsText: string, a: &Arena): Result<Built, GenError> {
-    return Result.Err(ge(0, notYet("gen.generate (chunk B)"))); // STUB B
+// ---------------------------------------------------------------------------------------
+// text helpers shared by the parts (Rust `format!`, `Vec::contains`, `join`)
+
+/// `tpl` with `$0`..`$9` replaced by `xs[i]`, as an arena string (Rust `format!`).
+/// `cf` (`gen/slots.j3`) is the short form for arguments used once and in order (`%`); see there.
+pub fn fm(a: &Arena, tpl: string, xs: []string): string {
+    let t = Text.new(a);
+    let i = 0;
+    while i < tpl.len {
+        if tpl[i] == '$' && i + 1 < tpl.len && tpl[i + 1] >= '0' && tpl[i + 1] <= '9' {
+            t.add(xs[int(tpl[i + 1] - '0')]);
+            i += 2;
+            continue;
+        }
+        t.push(tpl[i]);
+        i += 1;
+    }
+    return t.str();
 }
+
+pub fn num(a: &Arena, n: int): string {
+    let t = Text.new(a);
+    t.pushInt(n);
+    return t.str();
+}
+
+pub fn hasStr(xs: &List<string>, s: string): bool {
+    for i in 0..xs.len { if xs.items[i] == s { return true; } }
+    return false;
+}
+
+pub fn joinStr(a: &Arena, xs: &List<string>, sep: string): string {
+    let t = Text.new(a);
+    for i in 0..xs.len {
+        if i > 0 { t.add(sep); }
+        t.add(xs.items[i]);
+    }
+    return t.str();
+}
+
+/// The file id `lex` gets for a fragment (its spans are offsets into the fragment).
+pub fn noFile(): Id<Source> { return Id<Source> { i: NO_FILE }; }
+
+// `generate` (Rust gen/mod.rs) is in `gen/emit_generate.j3`: this file is at the 600-line cap.
 
 /// Attributes and directives an element accepts (for editor completion; Rust `element_attrs`).
 pub fn elementAttrs(tag: string, a: &Arena): List<string> { return accepted(tag, a); }

@@ -1,0 +1,216 @@
+// The per-component run: names, checks, numbering, script fns, then the markup walk and `assemble`.
+//
+// Part of module j3c.ui.gen.
+// Port of: j3c/src/ui/gen/emit.rs
+// J3: C2e chunk B. The `run` / `script_fn` half of emit.rs (the 600-line cap). Rust's `claim` closure is
+// `claimName`. Token lists are lexed straight from the source slice (`rwLex` with `slots` false: Rust
+// lexes these without the `$slots` replacement, so a body with `$slots` gives no tokens here).
+module j3c.ui.gen;
+
+/// Reserve script name `n` (declared at `r` as a `what`) in `seen`.
+fn claimName(seen: &List<string>, n: string, r: Range, what: string, a: &Arena): Result<bool, UiError> {
+    if isReserved(n) { return Result.Err(uiErr(r.lo, r.hi, fm(a, "`$0` is reserved by the generated code ($1)", [n, what]))); }
+    if hasStr(seen, n) { return Result.Err(uiErr(r.lo, r.hi, fm(a, "`$0` is declared twice in this component", [n]))); }
+    seen.push(n);
+    return Result.Ok(true);
+}
+
+/// The tokens of `src[lo..hi]`, none when it does not lex (Rust `unwrap_or_default`).
+fn lexOrNone(src: string, lo: int, hi: int, a: &Arena): List<Token> {
+    match rwLex(src, lo, hi, false, a) {
+        Result.Ok(t) { return t; }
+        Result.Err(_) { return List<Token>.new(a); }
+    }
+    return List<Token>.new(a);
+}
+
+/// `onFrame`'s parameter text is one `name: f32` (Rust `split(':').nth(1).trim() == "f32"`).
+fn frameParam(p: string): bool {
+    let c = text.find(p, ":");
+    if c < 0 { return false; }
+    let rest = p[c + 1..p.len];
+    let e = text.find(rest, ":");
+    if e >= 0 { rest = rest[0..e]; }
+    return markup.uTrim(rest) == "f32";
+}
+
+fn hasFn(sc: &Script, name: string): bool {
+    for i in 0..sc.fns.len { if sc.fns.items[i].name == name { return true; } }
+    return false;
+}
+
+extend G {
+    /// Generate this component: its text with segments (Rust `run`).
+    fn run(this: &G): Result<Out, UiError> {
+        let a = this.a;
+        let c = this.c;
+        let sc = &c.sc;
+        // names
+        let seen = List<string>.new(a);
+        for i in 0..sc.props.len {
+            let p = sc.props.items[i];
+            claimName(&seen, p.name, p.nameR, "prop", a)?;
+            this.names.props.push(p.name);
+        }
+        for i in 0..sc.lets.len {
+            let l = sc.lets.items[i];
+            claimName(&seen, l.name, l.nameR, "let", a)?;
+            this.names.lets.push(l.name);
+        }
+        for i in 0..sc.consts.len {
+            let l = sc.consts.items[i];
+            claimName(&seen, l.name, l.nameR, "const", a)?;
+            this.names.consts.push(ConstName { name: l.name, j3: fm(a, "$0_$1", [c.id, l.name]) });
+        }
+        for i in 0..sc.fns.len {
+            let f = sc.fns.items[i];
+            claimName(&seen, f.name, f.nameR, "fn", a)?;
+            this.names.fns.push(f.name);
+            let ptxt = this.src[f.params.lo..f.params.hi];
+            let noRet = match f.ret { Option.Some(_) { false } Option.None { true } };
+            let ok = true;
+            if f.name == "onMount" || f.name == "onDestroy" { ok = f.params.lo == f.params.hi && noRet; }
+            else if f.name == "onFrame" { ok = f.paramNames.len == 1 && !contains(ptxt, ",") && frameParam(ptxt) && noRet; }
+            if !ok {
+                let sig = if f.name == "onFrame" { "fn onFrame(dt: f32)" } else { "no arguments and no return type" };
+                return Result.Err(uiErr(f.nameR.lo, f.nameR.hi, fm(a, "`$0` has a fixed signature: $1", [f.name, sig])));
+            }
+        }
+        // fns that emit, directly or through another fn (token scan; the rewrite validates each `emit`)
+        let bodies = List<List<Token>>.new(a);
+        for i in 0..sc.fns.len { bodies.push(lexOrNone(this.src, sc.fns.items[i].body.lo, sc.fns.items[i].body.hi, a)); }
+        let grew = true;
+        while grew {
+            grew = false;
+            for fi in 0..sc.fns.len {
+                let toks = &bodies.items[fi];
+                let hit = false;
+                for i in 0..toks.len {
+                    let t = toks.items[i];
+                    let nx = tokKind(toks, i + 1);
+                    let called = t.kind == TokenKind.Ident && hasStr(&this.names.emitting, t.text) && i + 1 < toks.len && nx == TokenKind.LParen && !(i > 0 && isMember(toks, i));
+                    if called || (t.text == "emit" && stmtStart(toks, i) && i + 1 < toks.len && nx == TokenKind.Ident) {
+                        hit = true;
+                        break;
+                    }
+                }
+                let name = sc.fns.items[fi].name;
+                if hit && !hasStr(&this.names.emitting, name) {
+                    this.names.emitting.push(name);
+                    grew = true;
+                }
+            }
+        }
+        // `$slots.x`: the slots this component declares, and which use sites fill each
+        let decl = List<string>.new(a);
+        declaredSlots(&c.mk.nodes, &decl)?;
+        for i in 0..decl.len {
+            let d = decl.items[i];
+            let sites = List<int>.new(a);
+            for k in 0..this.slots.list.len {
+                let s = &this.slots.list.items[k];
+                if s.child == c.name && hasStr(&s.names, d) { sites.push(s.id); }
+            }
+            this.names.slotHas.push(SlotHas { name: d, sites: sites });
+        }
+        // a prop default is a constant: literals and the script's `const`s, not props, lets or fns
+        for i in 0..sc.props.len {
+            let p = sc.props.items[i];
+            match p.default {
+                Option.None {}
+                Option.Some(r) {
+                    let toks = rwLex(this.src, r.lo, r.hi, false, a)?;
+                    for k in 0..toks.len {
+                        let t = toks.items[k];
+                        if t.kind == TokenKind.Ident && !(k > 0 && isMember(&toks, k)) && (hasStr(&this.names.props, t.text) || hasStr(&this.names.lets, t.text) || hasStr(&this.names.fns, t.text)) {
+                            return Result.Err(uiErr(r.lo + int(t.span.lo), r.lo + int(t.span.hi), fm(a, "the default of prop `$0` can't use `$1`", [p.name, t.text]))
+                                .withHelp("a default is a constant: a literal or a `const` of this component"));
+                        }
+                    }
+                }
+            }
+        }
+        for i in 0..sc.events.len {
+            let e = sc.events.items[i];
+            if hasStr(&this.names.events, e.name) { return Result.Err(uiErr(e.r.lo, e.r.hi, fm(a, "event `$0` is declared twice", [e.name]))); }
+            this.names.events.push(e.name);
+        }
+        let fields = List<string>.new(a);
+        for i in 0..sc.events.len { fields.push(sc.events.items[i].name); }
+        for i in 0..sc.evParams.len {
+            let p = sc.evParams.items[i];
+            let ty = markup.uTrim(this.src[p.ty.lo..p.ty.hi]);
+            if !isEvType(ty) {
+                return Result.Err(uiErr(p.ty.lo, p.ty.hi, fm(a, "event payload type `$0` isn't supported", [ty])).withHelp("payload types: int, bool, string, float, f32, f64, i32, u8"));
+            }
+            let f = fm(a, "$0_$1", [p.ev, p.name]);
+            if hasStr(&fields, f) {
+                return Result.Err(uiErr(p.nameR.lo, p.nameR.hi, fm(a, "payload `$0` of `$1` collides with another event field `$2`", [p.name, p.ev, f])));
+            }
+            fields.push(f);
+            this.names.payload.push(Payload { ev: p.ev, name: p.name });
+        }
+        let cn = 0;
+        let ifn = 0;
+        let en = 0;
+        number(&c.mk.nodes, this.ids, &cn, &ifn, &en);
+
+        // script fns first: they may be used from markup but are independent of it
+        let fns = Out.new(a, this.fi);
+        for i in 0..sc.fns.len { this.scriptFn(&sc.fns.items[i], &fns)?; }
+
+        // markup
+        this.upd.ind = 2;
+        this.pnt.ind = 2;
+        if this.slots.pass.has(c.name) {
+            match pass.singleRoot(&c.mk.nodes) {
+                Result.Ok(e) { this.passRoot = e.uid; }
+                Result.Err(_) { this.passRoot = -1; }
+            }
+        }
+        let j = 0;
+        this.seq(&c.mk.nodes, &j, 0, Option.None)?;
+        this.actSweep(0, "this")?;
+        return this.assemble(&fns);
+    }
+
+    /// One script `fn` into `o`.
+    fn scriptFn(this: &G, f: &FnDef, o: &Out): Result<bool, UiError> {
+        let a = this.a;
+        for i in 0..f.paramNames.len { this.checkLocal(f.paramNames.items[i].name, f.paramNames.items[i].r)?; }
+        let saved = this.locals.len;
+        for i in 0..f.paramNames.len { this.locals.push(f.paramNames.items[i].name); }
+        let body = Out.new(a, this.fi);
+        body.set(this.fi, f.nameR.lo, f.nameR.hi);
+        let used = List<string>.new(a);
+        let live = f.name != "onDestroy";
+        let rw = Rw { a: a, src: this.src, fi: this.fi, names: &this.names, locals: &this.locals, rename: &this.rename, emitOk: live, sev: true, callsEmit: live };
+        rewrite(&rw, &body, &used, f.body.lo, f.body.hi, false)?;
+        this.locals.len = saved;
+        o.set(this.fi, f.nameR.lo, f.nameR.hi);
+        o.s(fm(a, "\n    fn $0(this: &$1", [f.name, this.c.id]));
+        if f.params.lo < f.params.hi {
+            o.s(", ");
+            o.copy(this.fi, this.src, f.params.lo, f.params.hi);
+        }
+        o.s(")");
+        match f.ret {
+            Option.Some(r) { o.copy(this.fi, this.src, r.lo, r.hi); }
+            Option.None {}
+        }
+        o.s(" {\n");
+        // `d` in a script fn: the Dom the component was last built with
+        let toks = lexOrNone(this.src, f.body.lo, f.body.hi, a);
+        for i in 0..toks.len {
+            let t = toks.items[i];
+            if t.kind == TokenKind.Ident && t.text == "d" && !(i > 0 && isMember(&toks, i)) {
+                o.s("        let d = (this.dm as ptr) as &Dom;\n");
+                break;
+            }
+        }
+        for i in 0..used.len { o.s(fm(a, "        let $0 = this.p.$0;\n", [used.items[i]])); }
+        o.append(&body);
+        o.s("\n    }\n");
+        return Result.Ok(true);
+    }
+}

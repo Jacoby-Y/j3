@@ -2,20 +2,228 @@
 //
 // Part of module j3c.ui.gen.
 // Port of: j3c/src/ui/gen/inject.rs
-// J3: C2e chunk B. `needs` / `injectPath` (Rust-private helpers of `resolve_inject`) are chunk B's to shape.
+// J3: C2e chunk B. Rust's `memo: Vec<Option<Vec<Need>>>` is `Memo { done, needs }`; the closure `own`
+// (`Option<Option<String>>`) is `ownTy` with `OwnTy { found, typed, ty }`.
 module j3c.ui.gen;
 
-/// Give every component the hidden props its `inject`s (and its children's) need; error when no ancestor provides one. `usedByOther` is a lookup.
+/// What a component must be given: (name, type without whitespace, where to report it).
+struct Need {
+    name: string;
+    ty: string;
+    r: Range;
+}
+
+struct Memo {
+    done: List<bool>;
+    needs: List<List<Need>>;
+}
+
+struct OwnTy {
+    found: bool;
+    typed: bool;
+    ty: string;
+}
+
+/// `t` without whitespace.
+fn normTy(t: string, a: &Arena): string {
+    let o = Text.new(a);
+    let i = 0;
+    while i < t.len {
+        let (cp, w) = text.decodeRune(t, i);
+        if w <= 0 { w = 1; }
+        if !isWhitespace(cp) { o.pushStr(t[i..i + w]); }
+        i += w;
+    }
+    return o.str();
+}
+
+/// The type of a name this component can provide, when it is written down.
+fn ownTy(c: &Comp, src: string, n: string, res: &List<Need>, a: &Arena): OwnTy {
+    for i in 0..res.len { if res.items[i].name == n { return OwnTy { found: true, typed: true, ty: res.items[i].ty }; } }
+    for i in 0..c.sc.props.len {
+        let p = c.sc.props.items[i];
+        if p.name == n { return OwnTy { found: true, typed: true, ty: normTy(src[p.ty.lo..p.ty.hi], a) }; }
+    }
+    for i in 0..c.sc.lets.len {
+        let l = c.sc.lets.items[i];
+        if l.name != n { continue; }
+        match l.ty {
+            Option.Some(t) { return OwnTy { found: true, typed: true, ty: normTy(src[t.lo..t.hi], a) }; }
+            Option.None { return OwnTy { found: true, typed: false, ty: "" }; }
+        }
+    }
+    return OwnTy { found: false, typed: false, ty: "" };
+}
+
+fn compAt(comps: &List<Comp>, name: string): int {
+    for i in 0..comps.len { if comps.items[i].name == name { return i; } }
+    return -1;
+}
+
+fn needAt(res: &List<Need>, n: string): int {
+    for i in 0..res.len { if res.items[i].name == n { return i; } }
+    return -1;
+}
+
+/// What component `i` must be given: its own `inject`s and those of everything it uses that it doesn't `provide`.
+fn needs(i: int, comps: &List<Comp>, edges: &List<List<string>>, files: &List<SrcFile>, memo: &Memo, a: &Arena): Result<List<Need>, GenError> {
+    if memo.done.items[i] { return Result.Ok(memo.needs.items[i]); }
+    let c = &comps.items[i];
+    let src = files.items[c.fi].text;
+    let res = List<Need>.new(a);
+    for k in 0..c.sc.injects.len {
+        let inj = c.sc.injects.items[k];
+        if needAt(&res, inj.name) >= 0 {
+            return Result.Err(ge(c.fi, uiErr(inj.nameR.lo, inj.nameR.hi, fm(a, "`inject $0` is declared twice", [inj.name]))));
+        }
+        res.push(Need { name: inj.name, ty: normTy(src[inj.ty.lo..inj.ty.hi], a), r: inj.nameR });
+    }
+    for k in 0..c.sc.provides.len {
+        let p = c.sc.provides.items[k];
+        if !ownTy(c, src, p.name, &res, a).found {
+            return Result.Err(ge(c.fi, uiErr(p.r.lo, p.r.hi, fm(a, "`provide $0`: `$0` is not a prop, `let`, or `inject` of this component", [p.name]))));
+        }
+    }
+    let seen = List<string>.new(a);
+    let ed = &edges.items[i];
+    for k in 0..ed.len {
+        let ch = ed.items[k];
+        if hasStr(&seen, ch) { continue; }
+        seen.push(ch);
+        let at = match findTag(&c.mk.nodes, ch) { Option.Some(r) { r } Option.None { Range { lo: 0, hi: 0 } } };
+        let ci = compAt(comps, ch);
+        if ci < 0 { continue; }
+        let sub = needs(ci, comps, edges, files, memo, a)?;
+        for q in 0..sub.len {
+            let n = sub.items[q].name;
+            let ty = sub.items[q].ty;
+            let provided = false;
+            for x in 0..c.sc.provides.len { if c.sc.provides.items[x].name == n { provided = true; break; } }
+            let have = "";
+            let bad = false;
+            let o = ownTy(c, src, n, &res, a);
+            let ri = needAt(&res, n);
+            if provided {
+                if o.found && o.typed && o.ty != ty {
+                    bad = true;
+                    have = o.ty;
+                }
+            } else if ri >= 0 {
+                if res.items[ri].ty != ty {
+                    bad = true;
+                    have = res.items[ri].ty;
+                }
+            } else if o.found {
+                return Result.Err(ge(c.fi, uiErr(at.lo, at.hi, fm(a, "`<$0>` injects `$1`, which `$2` already has as its own prop or `let`", [ch, n, c.name]))
+                    .withHelp(fm(a, "add `provide $0;` to the script of `$1` to hand it down", [n, c.name]))));
+            } else {
+                res.push(Need { name: n, ty: ty, r: at });
+            }
+            if bad {
+                return Result.Err(ge(c.fi, uiErr(at.lo, at.hi, fm(a, "`<$0>` injects `$1: $2`, but `$3` has `$1: $4`", [ch, n, ty, c.name, have]))
+                    .withHelp("provide and inject must name the same type")));
+            }
+        }
+    }
+    memo.done.items[i] = true;
+    memo.needs.items[i] = res;
+    return Result.Ok(res);
+}
+
+/// The chain `A -> B -> C` from `i` to a component that declares `inject name`.
+fn injectPath(i: int, name: string, comps: &List<Comp>, edges: &List<List<string>>, memo: &Memo, path: &List<string>) {
+    path.push(comps.items[i].name);
+    let inj = &comps.items[i].sc.injects;
+    for k in 0..inj.len { if inj.items[k].name == name { return; } }
+    let ed = &edges.items[i];
+    for k in 0..ed.len {
+        let ci = compAt(comps, ed.items[k]);
+        if ci < 0 { continue; }
+        if memo.done.items[ci] && needAt(&memo.needs.items[ci], name) >= 0 {
+            injectPath(ci, name, comps, edges, memo, path);
+            break;
+        }
+    }
+}
+
+/// `provide`/`inject`: each component gets a hidden prop for what its descendants inject and it doesn't
+/// provide, and its parent passes it. A root with something left over has no provider. `usedByOther` is a lookup.
 pub fn resolveInject(comps: &List<Comp>, edges: &List<List<string>>, files: &List<SrcFile>, usedByOther: &Set<string>, a: &Arena): Result<bool, GenError> {
-    return Result.Err(ge(0, notYet("gen.resolveInject (chunk B)"))); // STUB B
+    let memo = Memo { done: List<bool>.new(a), needs: List<List<Need>>.new(a) };
+    for i in 0..comps.len {
+        memo.done.push(false);
+        memo.needs.push(List<Need>.new(a));
+    }
+    for i in 0..comps.len { needs(i, comps, edges, files, &memo, a)?; }
+    for i in 0..comps.len {
+        let need = memo.needs.items[i];
+        if !usedByOther.has(comps.items[i].name) && need.len > 0 {
+            let f = need.items[0];
+            let path = List<string>.new(a);
+            injectPath(i, f.name, comps, edges, &memo, &path);
+            return Result.Err(ge(comps.items[i].fi, uiErr(f.r.lo, f.r.hi, fm(a, "nothing provides `$0: $1`", [f.name, f.ty]))
+                .withHelp(fm(a, "$0 (injects `$1`); add `provide $1;` to a component on this path that has `$1` as a prop or `let`", [joinStr(a, &path, " -> "), f.name]))));
+        }
+        for k in 0..need.len {
+            let n = need.items[k];
+            comps.items[i].sc.props.push(Prop { name: n.name, nameR: n.r, ty: Range { lo: 0, hi: 0 }, hidden: Option.Some(n.ty), default: Option.None });
+        }
+    }
+    return Result.Ok(true);
 }
 
 /// The use path from component `at` back to itself (`path` holds the walk so far), if it contains itself.
 pub fn cycle(comps: &List<Comp>, edges: &List<List<string>>, at: int, path: &List<string>): Option<List<string>> {
-    return Option.None; // STUB B
+    let ed = &edges.items[at];
+    for k in 0..ed.len {
+        let n = ed.items[k];
+        if hasStr(path, n) {
+            let p = List<string>.new(path.arena);
+            for i in 0..path.len { p.push(path.items[i]); }
+            p.push(n);
+            return Option.Some(p);
+        }
+        let j = compAt(comps, n);
+        if j >= 0 {
+            path.push(n);
+            match cycle(comps, edges, j, path) {
+                Option.Some(p) { return Option.Some(p); }
+                Option.None {}
+            }
+            path.len -= 1;
+        }
+    }
+    return Option.None;
 }
 
 /// The opening-tag range of the first `<tag>` under `nodes`.
 pub fn findTag(nodes: &List<Node>, tag: string): Option<Range> {
-    return Option.None; // STUB B
+    for i in 0..nodes.len {
+        match nodes.items[i] {
+            Node.Elem(e) {
+                if e.tag == tag { return Option.Some(e.open); }
+                match findTag(&e.children, tag) {
+                    Option.Some(r) { return Option.Some(r); }
+                    Option.None {}
+                }
+            }
+            Node.If(f) {
+                for b in 0..f.branches.len {
+                    match findTag(&f.branches.items[b].nodes, tag) {
+                        Option.Some(r) { return Option.Some(r); }
+                        Option.None {}
+                    }
+                }
+            }
+            Node.Each(e) {
+                match findTag(&e.body, tag) {
+                    Option.Some(r) { return Option.Some(r); }
+                    Option.None {}
+                }
+            }
+            Node.Text(_) {}
+            Node.Let(_) {}
+        }
+    }
+    return Option.None;
 }

@@ -37,6 +37,16 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
 - (a) also applied to sema: `ConstVal` (+ `pad`), `ConstDecl`, `FieldDecl`, `FnDecl`, `TForEach`, `TLetPat`, `traits.Member` (+ `pad`);
   and (C2b wave 7) `ir.UnaryRv` (operand first + `pad`), `ir.AssignOpStmt` (operand before `op` + `pad`),
   `project.manifest.Emit` (`chunks` first). None open from the last layout scan.
+- (a) again in C2e (wave 17, `{#each}` segfault in `List<EachCx>.push`): an `Option` / payload-enum field right after
+  a `bool`, `u8` or `i32` field can make `@sizeof` bigger than LLVM's struct (96 against 88 for the repro), so a
+  by-value copy writes past its slot. Rule: payload enums before the small fields, bools last. Reordered:
+  `ui.gen.EachHead`, `Virt`, `G`. Repro: repo-root `target/w18_layout_repro.j3` (`stage0/j3c run`: SIGSEGV in
+  `List.push`; `7 7 3` with `flag` moved behind the two `Option`s). Gate: `tests/unit/layout_test.j3` compares
+  `@sizeof` with the LLVM stride for 34 `src/` structs (the 31 pub ones a wave 18 scan found with the field pattern, plus `EachHead`, `EachCx`, `G`): none differ.
+- Open (C2e wave 18, Rust side, not looked into): `stage0/j3c run --headless --frames 3 speculative/14_ui_slots` builds a
+  program that dies with SIGSEGV in `Text.pushBytes` (from `Card.update`); the same with `~/.bin/j3c`. `run --fast` with
+  stage 0 and the j3c-boot build both pass, and `dump-llvm` is byte-equal, so it is the split per-module build
+  (compare (c)). `diff.sh run` on it is order-dependent: `run` says `up to date` on the other compiler's binary.
 - Rust bug (not copied): a pattern warning in a part file prints the module main file as its path (`check/lower/pat/check.rs:320` uses `self.path`; `check/mod.rs:251` fixes the path for errors only). stage0 `src/util.j3:4:51`, boot `src/util/more.j3:4:51`: the one known `check` stderr difference.
 - PORT_DEBT: j3c-boot links SDL2/ALSA/pulse/wayland because load uses j3.scene3d's `.j3scene` reader; fix = split the reader
   out of j3.scene3d in the stdlib (Rust tree change + stage0 re-pin), planned for C3/C5.
@@ -58,3 +68,10 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
   corpus file reaches it.
 - Open (C2d gate): `run --fast` in j3c-boot does not print the build-step note `clang -O0 whole program (one
   invocation, links too)` on stderr (Rust `emit/host.rs:195`); stdout and rc are the same.
+- Rust bug not copied (C2e review r1#2, r2 note): a `.j3ui` error whose span ends at a non-ASCII byte makes stage0 die
+  with an internal compiler error (rc 70, `src/diag.rs:58`, "end byte index N is not a char boundary"); j3c-boot
+  prints the proper error, rc 1. Repro, each as the only line of `ui/Main.j3ui` under `dump-ui ui`: `<div é="1">`,
+  `<div a=é>`, `<dév>`, `<div class:é={x}>`, `<div a=&nbsp;"x">`. No `tests/bad-ui` case (it would sit in
+  `known/ui.txt` for good); add them when Rust widens the span to the char.
+- Open (C2e review r1#5): `ui/scan.j3` `scan` takes `extra` (unsaved editor buffers, Rust's overlay paths) and
+  ignores it; the LSP milestone has to merge them in.

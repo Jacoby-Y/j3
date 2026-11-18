@@ -26,7 +26,7 @@ compare the text. Unit checks live beside the code they cover, as `*_test.j3` fi
 | `llvm` | `dump-llvm PATH` | stdout, stderr, exit code |
 | `glsl` | `dump-glsl PATH` (`--es`: `dump-glsl PATH --es`, the OpenGL ES text) | stdout, stderr, exit code |
 | `ui` | `dump-ui PROJECT/ui` (the J3 source generated from a project's `.j3ui` files) | stdout, stderr, exit code |
-| `run` | `run --headless --frames 3 PATH`, offscreen SDL, dummy audio | stdout, exit code |
+| `run` | `run --headless --frames 3 PATH`, offscreen SDL, dummy audio | stdout without the `J3STATS` / `J3UISTATS` timing lines, exit code |
 | `self` | not yet: needs a j3c-boot that builds j3c-bootstrap (stage 2 = stage 1) | |
 
 Exit: 0 when every input is `ok` or listed as known, 1 on a new failure, a `NONDET`, or a known input

@@ -148,6 +148,9 @@ one() {
         echo $? >"$d/$who.rc"
         # ponytail: the entry module is the dump's first `module` section; later sections are imports.
         [ $user = 1 ] && awk '/^module /{n++} n<=1' "$d/$who.out" >"$d/$who.n" && mv "$d/$who.n" "$d/$who.out"
+        # ponytail: a windowed program's `J3STATS` / `J3UISTATS` lines are frame timings; dropped whole (their
+        # counters go too). Keep the counter fields if a paint-count difference ever needs catching here.
+        [ $mode = run ] && sed -i '/^J3STATS \|^J3UISTATS /d' "$d/$who.out"
         [ $norm = 1 ] && awk -f "$here/norm_ir.awk" "$d/$who.out" >"$d/$who.n" && mv "$d/$who.n" "$d/$who.out"
         { cat "$d/$who.out"
           if [ $mode != run ]; then echo "--- stderr"; cat "$d/$who.err"; fi

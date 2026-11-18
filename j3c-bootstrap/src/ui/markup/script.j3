@@ -2,10 +2,273 @@
 //
 // Part of module j3c.ui.markup.
 // Port of: j3c/src/ui/markup/script.rs
-// J3: The `Script` types are in `markup/types.j3` (frozen).
+// J3: The `Script` types are in `markup/types.j3` (frozen). Rust's closures over the token list (`sp`, `close`,
+// `find`) are methods of `Sx`; its one `match` is one method per item kind. Names are token texts (slices of
+// the source or arena copies, see `lex`).
 module j3c.ui.markup;
+
+fn opens(k: TokenKind): bool { return k == TokenKind.LBrace || k == TokenKind.LParen || k == TokenKind.LBracket; }
+
+fn closes(k: TokenKind): bool { return k == TokenKind.RBrace || k == TokenKind.RParen || k == TokenKind.RBracket; }
+
+/// `a` + each of `xs`, as an arena string (Rust `format!`).
+fn cat(a: &Arena, xs: []string): string {
+    let t = Text.new(a);
+    for i in 0..xs.len { t.add(xs[i]); }
+    return t.str();
+}
+
+/// The script's tokens; spans are relative to `base`.
+struct Sx {
+    toks: List<Token>;
+    base: int;
+    n: int;
+    a: &Arena;
+    sc: Script;
+
+    fn lo(this: &Sx, k: int): int { return this.base + int(this.toks.items[k].span.lo); }
+
+    fn hi(this: &Sx, k: int): int { return this.base + int(this.toks.items[k].span.hi); }
+
+    /// Token `k`'s kind; `Eof` past the end (Rust `toks.get(k)` being `None`).
+    fn kind(this: &Sx, k: int): TokenKind {
+        if k >= this.n { return TokenKind.Eof; }
+        return this.toks.items[k].kind;
+    }
+
+    fn txt(this: &Sx, k: int): string { return this.toks.items[k].text; }
+
+    fn errAt(this: &Sx, k: int, msg: string): UiError { return uiErr(this.lo(k), this.hi(k), msg); }
+
+    /// Index of the token closing the bracket opened at `open`.
+    fn close(this: &Sx, open: int): Result<int, UiError> {
+        let depth = 0;
+        for k in open..this.n {
+            let t = this.toks.items[k].kind;
+            if opens(t) {
+                depth += 1;
+            } else if closes(t) {
+                depth -= 1;
+                if depth == 0 { return Result.Ok(k); }
+            }
+        }
+        return Result.Err(this.errAt(open, "this bracket is never closed"));
+    }
+
+    /// First token at bracket depth 0 (from `from`) of kind `k1` or `k2`; -1 for none.
+    fn find(this: &Sx, from: int, k1: TokenKind, k2: TokenKind): int {
+        let depth = 0;
+        for k in from..this.n {
+            let t = this.toks.items[k].kind;
+            if depth == 0 && (t == k1 || t == k2) { return k; }
+            if opens(t) { depth += 1; } else if closes(t) { depth -= 1; }
+        }
+        return -1;
+    }
+
+    /// `props { .. }` / `events { .. }` at `i`; the index after its `}`.
+    fn group(this: &Sx, i: int): Result<int, UiError> {
+        let a = this.a;
+        let word = this.txt(i);
+        let end = this.close(i + 1)?;
+        let k = i + 2;
+        while k < end {
+            if this.kind(k) == TokenKind.Doc {
+                k += 1;
+                continue;
+            }
+            if this.kind(k) != TokenKind.Ident { return Result.Err(this.errAt(k, cat(a, ["expected a name inside `", word, " { }`"]))); }
+            let name = this.txt(k);
+            let nameR = Range { lo: this.lo(k), hi: this.hi(k) };
+            k += 1;
+            if word == "events" {
+                this.sc.events.push(Named { name: name, r: nameR });
+                if k < end && this.kind(k) == TokenKind.LParen {
+                    let rp = this.close(k)?;
+                    let q = k + 1;
+                    while q < rp {
+                        if this.kind(q) != TokenKind.Ident || this.kind(q + 1) != TokenKind.Colon {
+                            return Result.Err(this.errAt(q, cat(a, ["expected `name: Type` in the payload of `", name, "`"])));
+                        }
+                        let tyLo = q + 2;
+                        let stop = this.find(tyLo, TokenKind.Comma, TokenKind.RParen);
+                        if stop <= tyLo || stop > rp { stop = rp; }
+                        if stop <= tyLo { return Result.Err(this.errAt(q, cat(a, ["payload `", this.txt(q), "` needs a type"]))); }
+                        this.sc.evParams.push(EvParam { ev: name, name: this.txt(q), nameR: Range { lo: this.lo(q), hi: this.hi(q) }, ty: Range { lo: this.lo(tyLo), hi: this.hi(stop - 1) } });
+                        q = stop + 1;
+                    }
+                    k = rp + 1;
+                }
+                if k < end && (this.kind(k) == TokenKind.Semi || this.kind(k) == TokenKind.Comma) {
+                    k += 1;
+                } else if k < end {
+                    return Result.Err(this.errAt(k, "expected `;` after the event name"));
+                }
+                continue;
+            }
+            if this.kind(k) != TokenKind.Colon || k >= end {
+                return Result.Err(uiErr(nameR.lo, nameR.hi, cat(a, ["prop `", name, "` needs a type: `", name, ": Type;`"])));
+            }
+            k += 1;
+            let tyLo = k;
+            let angle = 0;
+            while k < end {
+                let t = this.kind(k);
+                if t == TokenKind.Lt {
+                    angle += 1;
+                } else if t == TokenKind.Gt {
+                    angle -= 1;
+                } else if (t == TokenKind.Semi || t == TokenKind.Comma || t == TokenKind.Eq) && angle <= 0 {
+                    break;
+                }
+                k += 1;
+            }
+            if k == tyLo { return Result.Err(uiErr(nameR.lo, nameR.hi, cat(a, ["prop `", name, "` needs a type"]))); }
+            let ty = Range { lo: this.lo(tyLo), hi: this.hi(k - 1) };
+            let dflt: Option<Range> = Option.None;
+            if k < end && this.kind(k) == TokenKind.Eq {
+                let lo = k + 1;
+                let depth = 0;
+                k = lo;
+                while k < end {
+                    let t = this.kind(k);
+                    if opens(t) {
+                        depth += 1;
+                    } else if closes(t) {
+                        depth -= 1;
+                    } else if (t == TokenKind.Semi || t == TokenKind.Comma) && depth <= 0 {
+                        break;
+                    }
+                    k += 1;
+                }
+                if k == lo { return Result.Err(uiErr(nameR.lo, nameR.hi, cat(a, ["prop `", name, "` has `=` but no default value"]))); }
+                dflt = Option.Some(Range { lo: this.lo(lo), hi: this.hi(k - 1) });
+            }
+            this.sc.props.push(Prop { name: name, nameR: nameR, ty: ty, hidden: Option.None, default: dflt });
+            if k < end { k += 1; }
+        }
+        return Result.Ok(end + 1);
+    }
+
+    /// `provide a, b;` / `inject name: Type;` at `i`; the index after its `;`.
+    fn share(this: &Sx, i: int): Result<int, UiError> {
+        let a = this.a;
+        let word = this.txt(i);
+        let semi = this.find(i, TokenKind.Semi, TokenKind.Semi);
+        if semi < 0 { return Result.Err(this.errAt(i, cat(a, ["`", word, "` needs a closing `;`"]))); }
+        if word == "provide" {
+            for k in i + 1..semi {
+                let t = this.kind(k);
+                if t == TokenKind.Ident && (k == i + 1 || this.kind(k - 1) == TokenKind.Comma) {
+                    this.sc.provides.push(Named { name: this.txt(k), r: Range { lo: this.lo(k), hi: this.hi(k) } });
+                } else if t != TokenKind.Comma {
+                    return Result.Err(this.errAt(k, "`provide` takes names: `provide demo, theme;`"));
+                }
+            }
+        } else {
+            if this.kind(i + 2) != TokenKind.Colon || i + 3 >= semi {
+                let nm = this.txt(i + 1);
+                return Result.Err(this.errAt(i + 1, cat(a, ["`inject ", nm, "` needs a type: `inject ", nm, ": Type;`"])));
+            }
+            this.sc.injects.push(Inject { name: this.txt(i + 1), nameR: Range { lo: this.lo(i + 1), hi: this.hi(i + 1) }, ty: Range { lo: this.lo(i + 3), hi: this.hi(semi - 1) } });
+        }
+        return Result.Ok(semi + 1);
+    }
+
+    /// `let` / `const` at `i`; the index after its `;`.
+    fn letDef(this: &Sx, i: int): Result<int, UiError> {
+        let a = this.a;
+        let isConst = this.kind(i) == TokenKind.Const;
+        let kw = if isConst { "const" } else { "let" };
+        let semi = this.find(i, TokenKind.Semi, TokenKind.Semi);
+        if semi < 0 { return Result.Err(this.errAt(i, cat(a, ["`", kw, "` needs a closing `;`"]))); }
+        if this.kind(i + 1) != TokenKind.Ident { return Result.Err(this.errAt(i, cat(a, ["expected a name after `", kw, "`"]))); }
+        let name = this.txt(i + 1);
+        let nameR = Range { lo: this.lo(i + 1), hi: this.hi(i + 1) };
+        let needs = uiErr(nameR.lo, nameR.hi, cat(a, ["`", kw, " ", name, "` needs `= value`"]));
+        let k = i + 2;
+        let ty: Option<Range> = Option.None;
+        if this.kind(k) == TokenKind.Colon {
+            let eq = this.find(k, TokenKind.Eq, TokenKind.Eq);
+            if eq < 0 || eq >= semi { return Result.Err(needs); }
+            if eq == k + 1 { return Result.Err(uiErr(nameR.lo, nameR.hi, cat(a, ["`", kw, " ", name, ":` needs a type"]))); }
+            ty = Option.Some(Range { lo: this.lo(k + 1), hi: this.hi(eq - 1) });
+            k = eq;
+        }
+        if this.kind(k) != TokenKind.Eq || k + 1 >= semi { return Result.Err(needs); }
+        let init = Range { lo: this.lo(k + 1), hi: this.hi(semi - 1) };
+        // a literal, or `-` and a literal
+        let len = semi - (k + 1);
+        let lit = if len == 1 { k + 1 } else if len == 2 && this.kind(k + 1) == TokenKind.Minus { k + 2 } else { -1 };
+        let guess = "";
+        if lit >= 0 {
+            let t = this.kind(lit);
+            if t == TokenKind.Int { guess = "int"; }
+            else if t == TokenKind.Float { guess = "float"; }
+            else if t == TokenKind.String { guess = "string"; }
+            else if t == TokenKind.Ident && (this.txt(lit) == "true" || this.txt(lit) == "false") { guess = "bool"; }
+        }
+        let d = LetDef { name: name, nameR: nameR, ty: ty, init: init, guess: guess };
+        if isConst { this.sc.consts.push(d); } else { this.sc.lets.push(d); }
+        return Result.Ok(semi + 1);
+    }
+
+    /// `fn name(..) .. { .. }` at `i`; the index after its `}`.
+    fn fnDef(this: &Sx, i: int): Result<int, UiError> {
+        let a = this.a;
+        if this.kind(i + 1) != TokenKind.Ident || this.kind(i + 2) != TokenKind.LParen { return Result.Err(this.errAt(i, "expected `fn name(...)`")); }
+        let name = this.txt(i + 1);
+        let nameR = Range { lo: this.lo(i + 1), hi: this.hi(i + 1) };
+        let rp = this.close(i + 2)?;
+        let lb = this.find(rp + 1, TokenKind.LBrace, TokenKind.LBrace);
+        if lb < 0 { return Result.Err(uiErr(nameR.lo, nameR.hi, cat(a, ["`fn ", name, "` has no body"]))); }
+        let rb = this.close(lb)?;
+        let names = List<Named>.new(a);
+        for k in i + 3..rp {
+            if this.kind(k) == TokenKind.Ident && this.kind(k + 1) == TokenKind.Colon && (k == i + 3 || this.kind(k - 1) == TokenKind.Comma) {
+                names.push(Named { name: this.txt(k), r: Range { lo: this.lo(k), hi: this.hi(k) } });
+            }
+        }
+        let params = if rp == i + 3 { Range { lo: this.lo(rp), hi: this.lo(rp) } } else { Range { lo: this.lo(i + 3), hi: this.hi(rp - 1) } };
+        let ret: Option<Range> = if lb > rp + 1 { Option.Some(Range { lo: this.lo(rp + 1), hi: this.hi(lb - 1) }) } else { Option.None };
+        this.sc.fns.push(FnDef { name: name, nameR: nameR, params: params, paramNames: names, ret: ret, body: Range { lo: this.hi(lb), hi: this.lo(rb) } });
+        return Result.Ok(rb + 1);
+    }
+}
 
 /// The items of the `<script>` whose inner range is `r` (Rust `parse_script`); ranges are into `src`.
 pub fn parseScript(src: string, r: Range, a: &Arena): Result<Script, UiError> {
-    return Result.Err(notYet("markup.parseScript (chunk A)")); // STUB A
+    let toks = match lex(src[r.lo..r.hi], Id<Source> { i: 0 }, a) {
+        Result.Ok(t) { t }
+        Result.Err(e) {
+            let lo = int(e.span.lo);
+            let hi = if int(e.span.hi) > lo + 1 { int(e.span.hi) } else { lo + 1 };
+            return Result.Err(uiErr(r.lo + lo, r.lo + hi, e.msg));
+        }
+    };
+    let x = Sx { toks: toks, base: r.lo, n: toks.len, a: a, sc: emptyScript(a) };
+    let i = 0;
+    while i < x.n && x.kind(i) != TokenKind.Eof {
+        let t = x.kind(i);
+        let word = x.txt(i);
+        if t == TokenKind.Doc {
+            i += 1;
+        } else if t == TokenKind.Use {
+            let semi = x.find(i, TokenKind.Semi, TokenKind.Semi);
+            if semi < 0 { return Result.Err(x.errAt(i, "`use` needs a closing `;`")); }
+            x.sc.uses.push(Range { lo: x.lo(i), hi: x.hi(semi) });
+            i = semi + 1;
+        } else if t == TokenKind.Ident && (word == "props" || word == "events") && x.kind(i + 1) == TokenKind.LBrace {
+            i = x.group(i)?;
+        } else if t == TokenKind.Ident && (word == "provide" || word == "inject") && x.kind(i + 1) == TokenKind.Ident {
+            i = x.share(i)?;
+        } else if t == TokenKind.Let || t == TokenKind.Const {
+            i = x.letDef(i)?;
+        } else if t == TokenKind.Fn {
+            i = x.fnDef(i)?;
+        } else {
+            return Result.Err(x.errAt(i, "not allowed in `<script>`").withHelp("a component script holds `use`, `props { }`, `events { }`, `provide`, `inject`, `let`, `const`, and `fn`"));
+        }
+    }
+    return Result.Ok(x.sc);
 }

@@ -1,0 +1,132 @@
+// ui: `remap` / `remapAll` move a diagnostic from the generated text to the `.j3ui` (Rust `Generated::remap`,
+// `ui/tests` `parse_error_lands_in_j3ui`): copy (byte for byte), glue (the whole construct), a span over two
+// copies, a span outside the map, a hint (one more help), other files untouched, a second call a no-op;
+// `show` (a generation error as a Diag) and `attach` + `locate` (runtime abort lines).
+module ui_remap_test;
+
+use j3.data.pool.{ Id, Pool };
+use j3.memory.{ Arena, List };
+use j3.sys.panic;
+use j3.text.Text;
+use j3c.base.diag;
+use j3c.base.diag.{ Diag, Diags, Note, NoteKind, Severity };
+use j3c.base.span.{ NO_FILE, Source, Span, locate, noSpan };
+use j3c.ui;
+use j3c.ui.{ Generated, UiCx };
+use j3c.ui.gen.{ Section, SrcFile };
+use j3c.ui.map.{ Out, SpanMap };
+use j3c.ui.markup.uiErr;
+
+fn at(d: &Diag, file: Id<Source>, lo: int, hi: int, what: string) {
+    if d.span.file.i != file.i || int(d.span.lo) != lo || int(d.span.hi) != hi {
+        panic(`{what}: span {d.span.file.i} {d.span.lo}..{d.span.hi}, want {file.i} {lo}..{hi}`);
+    }
+}
+
+fn main() {
+    let arena = Arena.create(1 << 20);
+    let a = &arena;
+    let sources = Pool<Source>.new(a);
+    let diags = Diags.new(a);
+    let one = "<p>{count.nope()}</p>\n<b>{x}</b>\n";
+    let two = "<i>{a} {b}</i>\n";
+    let files = List<SrcFile>.new(a);
+    files.push(SrcFile { path: "ui/One.j3ui", name: "One", text: one, src: sources.add(Source.of("ui/One.j3ui", one, a)) });
+    files.push(SrcFile { path: "ui/Two.j3ui", name: "Two", text: two, src: sources.add(Source.of("ui/Two.j3ui", two, a)) });
+    let s1 = files.items[0].src;
+    let s2 = files.items[1].src;
+
+    // generated: `    d.text(n1, ` + copy `count.nope()` + `);\n` + hinted `x = ` + copy `x` + `;` + two copies of file 1
+    let o = Out.new(a, 0);
+    o.set(0, 0, 21);
+    o.ind = 1;
+    o.pad();
+    o.s("d.text(n1, ");
+    o.copy(0, one, 4, 16);
+    o.s(");\n");
+    o.set(0, 22, 32);
+    o.hint = "bind hint";
+    o.s("x = ");
+    o.copy(0, one, 26, 27);
+    o.hint = "";
+    o.s(";\n");
+    o.set(1, 0, 14);
+    o.copy(1, two, 4, 5);
+    o.s(" this.");
+    o.copy(1, two, 8, 9);
+    let text = o.text.str();
+    let gsrc = sources.add(Source.of("demo.ui.generated", text, a));
+    let other = sources.add(Source.of("src/main.j3", "fn main() {}\n", a));
+    let g = Generated { label: ui.label("demo", a), key: "demo.ui", text: text, map: SpanMap { segs: o.segs }, files: files, sections: List<Section>.new(a) };
+    if g.label != "demo.ui.generated" { panic("label"); }
+
+    // copy: byte for byte (`nope` is at 15..19 of the generated line, 10..14 of the source)
+    let d = diags.make(0, Severity.Error, Span { file: gsrc, lo: 21, hi: 25 }, "no method");
+    ui.remap(&g, &sources, &d);
+    at(&d, s1, 10, 14, "copy");
+    if d.notes.len != 0 { panic("copy: no hint"); }
+    ui.remap(&g, &sources, &d);
+    at(&d, s1, 10, 14, "second call");
+
+    // glue: the whole construct
+    d = diags.make(0, Severity.Error, Span { file: gsrc, lo: 6, hi: 8 }, "glue");
+    ui.remap(&g, &sources, &d);
+    at(&d, s1, 0, 21, "glue");
+
+    // a hinted segment adds one help, once
+    let hl = 4 + 11 + 12 + 3;
+    d = diags.make(0, Severity.Error, Span { file: gsrc, lo: u32(hl + 4), hi: u32(hl + 5) }, "assign");
+    d.notes.push(Note { kind: NoteKind.Note, span: Span { file: gsrc, lo: 21, hi: 25 }, msg: "a note" });
+    ui.remap(&g, &sources, &d);
+    at(&d, s1, 26, 27, "hinted copy");
+    if d.notes.len != 2 || d.notes.items[1].msg != "bind hint" { panic("hint becomes a help"); }
+    match d.notes.items[1].kind { NoteKind.Help {} NoteKind.Note { panic("hint kind"); } }
+    if d.notes.items[0].span.file.i != s1.i || d.notes.items[0].span.lo != 10 { panic("note span"); }
+    ui.remap(&g, &sources, &d);
+    if d.notes.len != 2 { panic("hint added twice"); }
+
+    // a span over two copies of one file ends in the second
+    let c = hl + 4 + 1 + 2;
+    d = diags.make(0, Severity.Error, Span { file: gsrc, lo: u32(c), hi: u32(c + 8) }, "cross");
+    ui.remap(&g, &sources, &d);
+    at(&d, s2, 4, 9, "cross-segment");
+
+    // outside the map, another file, no span: unchanged
+    d = diags.make(0, Severity.Error, Span { file: gsrc, lo: u32(text.len + 5), hi: u32(text.len + 6) }, "out");
+    ui.remap(&g, &sources, &d);
+    at(&d, gsrc, text.len + 5, text.len + 6, "out of map");
+    d = diags.make(0, Severity.Error, Span { file: other, lo: 3, hi: 7 }, "other");
+    ui.remap(&g, &sources, &d);
+    at(&d, other, 3, 7, "other file");
+    d = diags.make(0, Severity.Error, noSpan(), "none");
+    ui.remap(&g, &sources, &d);
+    if d.span.file.i != NO_FILE { panic("no span"); }
+
+    // remapAll from an index
+    diags.add(diags.make(0, Severity.Error, Span { file: gsrc, lo: 21, hi: 25 }, "first"));
+    diags.add(diags.make(0, Severity.Error, Span { file: gsrc, lo: 21, hi: 25 }, "second"));
+    ui.remapAll(&g, &sources, &diags, 1);
+    at(&diags.items.items[0], gsrc, 21, 25, "remapAll skips before `from`");
+    at(&diags.items.items[1], s1, 10, 14, "remapAll");
+
+    // the rendered error names the `.j3ui` line and column
+    let r = Text.new(a);
+    diag.render(&diags.items.items[1], &sources, &r);
+    let want = "error: second\n  --> ui/One.j3ui:1:11\n   |\n  1 | <p>{count.nope()}</p>\n   |           ^^^^\n";
+    if r.str() != want { panic(r.str()); }
+
+    // show: a generation error with its help
+    let cx = UiCx { arena: a, diags: &diags, sources: &sources };
+    let e = ui.show(cx, &g.files.items[1], uiErr(3, 6, "bad").withHelp("do this"));
+    at(&e, s2, 3, 6, "show");
+    if e.msg != "bad" || e.notes.len != 1 || e.notes.items[0].msg != "do this" { panic("show help"); }
+    let plain = ui.show(cx, &g.files.items[0], uiErr(0, 1, "bad"));
+    if plain.notes.len != 0 { panic("show without help"); }
+
+    // attach: the generated source answers `.j3ui` positions (Rust `locator`)
+    ui.attach(&g, &sources, gsrc);
+    let l = locate(&sources, Span { file: gsrc, lo: 21, hi: 22 });
+    if l.file.i != s1.i || l.lo != 10 { panic("locate copy"); }
+    let k = locate(&sources, Span { file: gsrc, lo: u32(c + 7), hi: u32(c + 8) });
+    if k.file.i != s2.i || k.lo != 8 { panic("locate second file"); }
+}

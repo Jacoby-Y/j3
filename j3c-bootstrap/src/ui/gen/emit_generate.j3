@@ -1,0 +1,208 @@
+// `generate`: every `.j3ui` of a project to the one `<package>.ui` module text.
+//
+// Part of module j3c.ui.gen.
+// Port of: j3c/src/ui/gen/mod.rs
+// J3: C2e chunk B. Here and not in `gen.j3` (which holds the frozen types and is at the 600-line cap).
+// The `uid` counter is project-wide: every `parse` and `lowerChoices` takes it, then `ids` (the node
+// numbers `number` writes) is one zeroed slice of that length.
+module j3c.ui.gen;
+
+fn isAlnum(c: u8): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); }
+
+/// A name segment: `first` kind of start (`upper`: A-Z, else a letter), then letters, digits, `_`.
+fn segOk(s: string, upper: bool): bool {
+    if s.len == 0 { return false; }
+    let c = s[0];
+    if !((c >= 'A' && c <= 'Z') || (!upper && c >= 'a' && c <= 'z')) { return false; }
+    for i in 0..s.len { if !(isAlnum(s[i]) || s[i] == '_') { return false; } }
+    return true;
+}
+
+fn gerr(a: &Arena, fi: int, msg: string, help: string): GenError { return ge(fi, uiErr(0, 0, msg).withHelp(help)); }
+
+/// `name` with `.` as `_`.
+fn dotted(name: string, a: &Arena): string {
+    let t = Text.new(a);
+    for i in 0..name.len { t.push(if name[i] == '.' { '_' } else { name[i] }); }
+    return t.str();
+}
+
+/// Check file `fi`'s component name against the earlier `comps`, parse it, and add it.
+fn addComp(comps: &List<Comp>, files: &List<SrcFile>, fi: int, uid: &int, a: &Arena): Result<bool, GenError> {
+    let f = files.items[fi];
+    let dot = -1;
+    for i in 0..f.name.len { if f.name[i] == '.' { dot = i; } }
+    if !segOk(f.name[dot + 1..f.name.len], true) {
+        return Result.Err(gerr(a, fi, fm(a, "`$0` is not a component name", [f.name]), "component files are named like their component: Capitalised letters, digits, `_`, e.g. UpgradeRow.j3ui"));
+    }
+    let at = 0;
+    while at < dot {
+        let e = at;
+        while f.name[e] != '.' { e += 1; }
+        if !segOk(f.name[at..e], false) {
+            return Result.Err(gerr(a, fi, fm(a, "folder `$0` in `$1` is not a valid name segment", [f.name[at..e], f.path]), "folders under ui/ become part of the component name: start with a letter, then letters, digits, `_`"));
+        }
+        at = e + 1;
+    }
+    let id = dotted(f.name, a);
+    for i in 0..comps.len {
+        let o = comps.items[i].id;
+        let same = o == id;
+        if same || fm(a, "$0Props", [o]) == id || fm(a, "$0Props", [id]) == o || fm(a, "$0Events", [o]) == id || fm(a, "$0Events", [id]) == o {
+            return Result.Err(gerr(a, fi, fm(a, "`$0` and `$1` both generate the J3 name `$2`", [f.path, files.items[comps.items[i].fi].path, if same { id } else { fm(a, "$0` / `$1", [id, o]) }]), "rename one of the files or folders"));
+        }
+    }
+    if isReservedComp(id) || startsWith(id, "SCOPE_") || startsWith(id, "CSS_") || startsWith(id, "Of_") {
+        return Result.Err(gerr(a, fi, fm(a, "`$0` generates the J3 name `$1`, which the generated module already uses", [f.path, id]), "rename the component"));
+    }
+    let mk = match markup.parse(f.text, a, uid) { Result.Ok(m) { m } Result.Err(e) { return Result.Err(ge(fi, e)); } };
+    let sc = markup.emptyScript(a);
+    match mk.script {
+        Option.Some(r) {
+            match markup.parseScript(f.text, r, a) {
+                Result.Ok(s) { sc = s; }
+                Result.Err(e) { return Result.Err(ge(fi, e)); }
+            }
+        }
+        Option.None {}
+    }
+    comps.push(Comp { name: f.name, id: id, fi: fi, mk: mk, sc: sc, scope: comps.len + 1 });
+    return Result.Ok(true);
+}
+
+/// The `<package>.ui` module text for `files` (scan order). `propsText` is the embedded stdlib file
+/// `ui/css/props.j3` (`ui` sits below `load`, so the caller reads it); `cssProps` cuts the names out of it.
+/// Everything is allocated in `a`.
+pub fn generate(files: &List<SrcFile>, package: string, theme: Option<Theme>, icons: &List<Icon>, propsText: string, a: &Arena): Result<Built, GenError> {
+    let comps = List<Comp>.new(a);
+    let order = List<int>.new(a);
+    for i in 0..files.len { order.push(i); }
+    sortBy(order.items[0..order.len], fn(x: int, y: int): bool { return strLess(files.items[x].name, files.items[y].name); });
+    let uid = 0;
+    for i in 0..order.len { addComp(&comps, files, order.items[i], &uid, a)?; }
+    // who uses whom
+    let known = List<string>.new(a);
+    for i in 0..comps.len { known.push(comps.items[i].name); }
+    let choices = List<ChoiceSet>.new(a);
+    for i in 0..comps.len {
+        let c = &comps.items[i];
+        match lowerChoices(&c.mk.nodes, files.items[c.fi].text, &known, &choices, &uid, a) {
+            Result.Ok(_) {}
+            Result.Err(e) { return Result.Err(ge(c.fi, e)); }
+        }
+    }
+    let usedByOther = Set<string>.new(a, 16);
+    let edges = List<List<string>>.new(a);
+    for i in 0..comps.len {
+        let ch = List<string>.new(a);
+        childrenOf(&comps.items[i].mk.nodes, &ch);
+        for k in 0..ch.len { usedByOther.add(ch.items[k]); }
+        edges.push(ch);
+    }
+    for i in 0..comps.len {
+        let c = &comps.items[i];
+        let path = List<string>.new(a);
+        path.push(c.name);
+        match cycle(&comps, &edges, i, &path) {
+            Option.Some(p) {
+                let open = match findTag(&c.mk.nodes, p.items[1]) { Option.Some(r) { r } Option.None { Range { lo: 0, hi: 0 } } };
+                return Result.Err(ge(c.fi, uiErr(open.lo, open.hi, fm(a, "component `$0` contains itself", [c.name])).withHelp(joinStr(a, &p, " -> "))));
+            }
+            Option.None {}
+        }
+    }
+    resolveInject(&comps, &edges, files, &usedByOther, a)?;
+    let slots = emptySlots(a);
+    let decl = List<List<string>>.new(a);
+    for i in 0..comps.len {
+        let d = List<string>.new(a);
+        match declaredSlots(&comps.items[i].mk.nodes, &d) {
+            Result.Ok(_) {}
+            Result.Err(e) { return Result.Err(ge(comps.items[i].fi, e)); }
+        }
+        decl.push(d);
+    }
+    for i in 0..comps.len {
+        match scanSites(&comps.items[i].mk.nodes, &comps, &decl, comps.items[i].id, &slots) {
+            Result.Ok(_) {}
+            Result.Err(e) { return Result.Err(ge(comps.items[i].fi, e)); }
+        }
+    }
+    let roots = Map<string, List<Node>>.new(a, 16);
+    for i in 0..comps.len { roots.put(comps.items[i].name, comps.items[i].mk.nodes); }
+    for i in 0..comps.len {
+        match pass.scan(&comps.items[i].mk.nodes, &roots, &slots.pass) {
+            Result.Ok(_) {}
+            Result.Err(e) { return Result.Err(ge(comps.items[i].fi, e)); }
+        }
+    }
+    let ids = a.alloc::<int>(uid + 1);
+    for i in 0..ids.len { ids[i] = 0; }
+    let css = cssProps(propsText);
+    let themePath: Option<string> = match theme { Option.Some(t) { Option.Some(t.path) } Option.None { Option.None } };
+    let body = Out.new(a, 0);
+    let sections = List<Section>.new(a);
+    let usesList = false;
+    let usesKeyed = false;
+    let usesVirt = false;
+    let anyRoot = false;
+    for i in 0..comps.len {
+        let c = &comps.items[i];
+        let root = !usedByOther.has(c.name);
+        if root { anyRoot = true; }
+        let g = newG(a, &comps, files, themePath, icons, c, root, &slots, ids, css);
+        let o = match g.run() { Result.Ok(o) { o } Result.Err(e) { return Result.Err(ge(c.fi, e)); } };
+        if g.usesList { usesList = true; }
+        if g.usesKeyed { usesKeyed = true; }
+        if g.usesVirt { usesVirt = true; }
+        let lo = body.text.len();
+        body.append(&o);
+        sections.push(Section { name: c.name, lo: lo, hi: body.text.len() });
+    }
+    // module header
+    let head = Out.new(a, 0);
+    head.s(fm(a, "// Generated by j3c from $0 .j3ui file(s). Edit the .j3ui, not this.\n", [num(a, comps.len)]));
+    head.s(fm(a, "module $0.ui;\n\n", [package]));
+    head.s(if usesList { "use j3.memory.{ Arena, List };\n" } else { "use j3.memory.Arena;\n" });
+    if anyRoot { head.s("use j3.math.Vec2;\n"); }
+    if usesKeyed { head.s("use j3.ui.keyed.Keyed;\n"); }
+    if usesVirt { head.s("use j3.ui.vlist;\nuse j3.ui.vstate.VList;\n"); }
+    head.s("use j3.ui.css.Css;\nuse j3.ui.cssparse.{ parse, parseAt };\nuse j3.ui.uastyle;\nuse j3.ui.dom.Dom;\nuse j3.ui.domhot.{ hotDue, hotFile, hotWarns };\nuse j3.ui.inputs;\nuse j3.text.Text;\n");
+    // every component's `use`, split into one `use path.Name;` per name, each once
+    let seen = Set<string>.new(a, 16);
+    seen.add("j3.text.Text");
+    for i in 0..comps.len {
+        let c = &comps.items[i];
+        let src = files.items[c.fi].text;
+        for k in 0..c.sc.uses.len {
+            let r = c.sc.uses.items[k];
+            let names = useNames(src[r.lo..r.hi], a);
+            for q in 0..names.len {
+                if seen.add(names.items[q]) {
+                    head.set(c.fi, r.lo, r.hi);
+                    head.s(fm(a, "use $0;\n", [names.items[q]]));
+                }
+            }
+        }
+    }
+    head.set(0, 0, 0);
+    head.s("\n");
+    if anyRoot {
+        match theme {
+            Option.Some(t) { head.s(fm(a, "const THEME: string = $0;\n\n", [lit(t.text, a)])); }
+            Option.None { head.s("const THEME: string = \"\";\n\n"); }
+        }
+    }
+    for i in 0..choices.len {
+        let variants = List<string>.new(a);
+        for k in 0..choices.items[i].candidates.len { variants.push(dotted(choices.items[i].candidates.items[k], a)); }
+        head.s(fm(a, "pub enum $0 { $1 }\n", [choices.items[i].name, joinStr(a, &variants, ", ")]));
+    }
+    let shift = head.text.len();
+    head.append(&body);
+    for i in 0..sections.len {
+        sections.items[i].lo += shift;
+        sections.items[i].hi += shift;
+    }
+    return Result.Ok(Built { text: head.text.str(), segs: head.segs, sections: sections });
+}

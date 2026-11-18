@@ -3,18 +3,232 @@
 // Part of module j3c.ui.gen.
 // Port of: j3c/src/ui/gen/rewrite.rs
 // J3: C2e chunk B. `Rw` is in `gen.j3`. Lex `rw.src[lo..hi]` with `$slots` turned into `_slots` (one arena copy of the
-// fragment, only when it holds a `$`); copy to `out` straight from `rw.src` by token offsets (`Out.copy` /
-// `copyFlat`), never a string per token. `used` is byte-sorted (`sortedInsert`).
+// fragment, only when it holds a `$slots`); copy to `out` straight from `rw.src` by token offsets (`Out.copy` /
+// `copyFlat`), never a string per token. `used` is byte-sorted (`sortedInsert`). Rust's `prev` / `next`
+// `Option<TokenKind>` are `tokKind(toks, i)`, `TokenKind.Eof` standing for "no token" (the lexer ends
+// every list with `Eof`, and nothing here asks for it).
 module j3c.ui.gen;
 
 extend Rw {
     /// `n` is a prop, `let`, fn, const, local or renamed name of this component.
     fn declared(this: &Rw, n: string): bool {
-        return false; // STUB B
+        if hasStr(&this.names.props, n) || hasStr(&this.names.lets, n) || hasStr(&this.names.fns, n) || hasStr(this.locals, n) { return true; }
+        for i in 0..this.names.consts.len { if this.names.consts.items[i].name == n { return true; } }
+        for i in 0..this.rename.len { if this.rename.items[i].from == n { return true; } }
+        return false;
     }
+
+    fn put(this: &Rw, out: &Out, flat: bool, a: int, b: int) {
+        if flat { out.copyFlat(this.fi, this.src, a, b); } else { out.copy(this.fi, this.src, a, b); }
+    }
+}
+
+/// The kind of `toks[i]`, `Eof` when there is none.
+pub fn tokKind(toks: &List<Token>, i: int): TokenKind {
+    if i < 0 || i >= toks.len { return TokenKind.Eof; }
+    return toks.items[i].kind;
+}
+
+/// `toks[i]` follows a `.` or `::`.
+pub fn isMember(toks: &List<Token>, i: int): bool {
+    let p = tokKind(toks, i - 1);
+    return p == TokenKind.Dot || p == TokenKind.ColonColon;
+}
+
+/// `toks[i]` starts a statement.
+pub fn stmtStart(toks: &List<Token>, i: int): bool {
+    if i == 0 { return true; }
+    let p = toks.items[i - 1].kind;
+    return p == TokenKind.Semi || p == TokenKind.LBrace || p == TokenKind.RBrace;
+}
+
+/// Lex `src[lo..hi]` (`slots`: with `$slots` as `_slots`, same length); an error is reported at its place in `src`.
+pub fn rwLex(src: string, lo: int, hi: int, slots: bool, a: &Arena): Result<List<Token>, UiError> {
+    let frag = src[lo..hi];
+    if slots && contains(frag, "$slots") {
+        let t = Text.new(a);
+        t.pushStr(frag);
+        for i in 0..frag.len { if startsWith(frag[i..frag.len], "$slots") { t.bytes[i] = '_'; } }
+        frag = t.str();
+    }
+    match lex(frag, noFile(), a) {
+        Result.Ok(toks) { return Result.Ok(toks); }
+        Result.Err(e) {
+            let s = int(e.span.lo);
+            let h = int(e.span.hi);
+            if h < s + 1 { h = s + 1; }
+            return Result.Err(uiErr(lo + s, lo + h, e.msg));
+        }
+    }
+    return Result.Err(uiErr(lo, hi, ""));
 }
 
 /// Copy `rw.src[lo..hi]` to `out`, rewritten; each prop it reads goes into `used`.
 pub fn rewrite(rw: &Rw, out: &Out, used: &List<string>, lo: int, hi: int, flat: bool): Result<bool, UiError> {
-    return Result.Err(notYet("gen.rewrite (chunk B)")); // STUB B
+    let m = rw.a;
+    let toks = rwLex(rw.src, lo, hi, true, m)?;
+    let pos = lo;
+    let k = 0;
+    while k < toks.len {
+        let t = toks.items[k];
+        let a = lo + int(t.span.lo);
+        let b = lo + int(t.span.hi);
+        let next = tokKind(&toks, k + 1);
+        if t.kind == TokenKind.Eof { break; }
+        if t.kind == TokenKind.Interpolate {
+            rw.put(out, flat, pos, a + 1);
+            let litpos = a + 1;
+            let i = a + 1;
+            while i < b - 1 {
+                if rw.src[i] == '{' {
+                    let depth = 1;
+                    let j = i + 1;
+                    while j < b - 1 {
+                        if rw.src[j] == '{' { depth += 1; }
+                        else if rw.src[j] == '}' {
+                            depth -= 1;
+                            if depth == 0 { break; }
+                        }
+                        j += 1;
+                    }
+                    rw.put(out, flat, litpos, i + 1);
+                    rewrite(rw, out, used, i + 1, j, true)?;
+                    litpos = j;
+                    i = j;
+                }
+                i += 1;
+            }
+            pos = litpos;
+        } else if t.kind == TokenKind.Ident {
+            if t.text == "_slots" && rw.src[a] == '$' {
+                if !(next == TokenKind.Dot && tokKind(&toks, k + 2) == TokenKind.Ident) {
+                    return Result.Err(uiErr(a, b, "`$slots` needs a slot name: `$slots.footer` (or `$slots.default`)"));
+                }
+                let nm = toks.items[k + 2];
+                let want = if nm.text == "default" { "" } else { nm.text };
+                let ne = lo + int(nm.span.hi);
+                let found = false;
+                let have = List<string>.new(m);
+                for q in 0..rw.names.slotHas.len {
+                    let n = rw.names.slotHas.items[q].name;
+                    if n == want { found = true; }
+                    have.push(if n.len == 0 { "default" } else { n });
+                }
+                if !found {
+                    let help = if have.len == 0 { "this component has no `<slot>`" } else { fm(m, "slots: $0", [joinStr(m, &have, ", ")]) };
+                    return Result.Err(uiErr(a, ne, fm(m, "`$slots.$0`: no `<slot name=\"$0\">` in this component", [nm.text])).withHelp(help));
+                }
+                rw.put(out, flat, pos, a);
+                out.at(rw.fi, a, fm(m, "this.$0()", [slotHasFn(want, m)]));
+                pos = ne;
+                k += 3;
+                continue;
+            }
+            if t.text == "emit" && next == TokenKind.Ident && stmtStart(&toks, k) {
+                let after = 0;
+                emitStmt(rw, out, used, &toks, k, lo, pos, flat, &after)?;
+                pos = lo + int(toks.items[after - 1].span.hi);
+                k = after;
+                continue;
+            }
+            let prev = tokKind(&toks, k - 1);
+            if k > 0 && (prev == TokenKind.Let || prev == TokenKind.For) {
+                if rw.declared(t.text) || isReserved(t.text) {
+                    return Result.Err(uiErr(a, b, fm(m, "`$0` shadows a prop, `let`, `fn`, or name used by the generated code", [t.text])).withHelp("pick another name for this local"));
+                }
+            } else if !isMember(&toks, k) && next != TokenKind.Colon && !hasStr(rw.locals, t.text) {
+                let to = "";
+                let isConst = false;
+                for q in 0..rw.rename.len { if rw.rename.items[q].from == t.text { to = rw.rename.items[q].to; break; } }
+                if to.len == 0 {
+                    for q in 0..rw.names.consts.len { if rw.names.consts.items[q].name == t.text { to = rw.names.consts.items[q].j3; isConst = true; break; } }
+                }
+                if to.len > 0 {
+                    if isConst && next == TokenKind.Eq {
+                        return Result.Err(uiErr(a, b, fm(m, "`$0` is a `const`; it can't be assigned", [t.text])));
+                    }
+                    rw.put(out, flat, pos, a);
+                    out.at(rw.fi, a, to);
+                    pos = b;
+                } else if hasStr(&rw.names.props, t.text) {
+                    sortedInsert(used, rw.src[a..b]);
+                } else if hasStr(&rw.names.lets, t.text) || hasStr(&rw.names.fns, t.text) {
+                    if !rw.callsEmit && hasStr(&rw.names.emitting, t.text) {
+                        return Result.Err(uiErr(a, b, fm(m, "`$0` emits an event, but there is no event scope here", [t.text]))
+                            .withHelp("call it from an event handler or another script `fn`: a markup expression runs on every update, and `on:draw` and `onDestroy` have no event scope"));
+                    }
+                    rw.put(out, flat, pos, a);
+                    out.at(rw.fi, a, "this.");
+                    pos = a;
+                }
+            }
+        }
+        k += 1;
+    }
+    rw.put(out, flat, pos, hi);
+    return Result.Ok(true);
+}
+
+/// `emit name` / `emit name(a, b)` at `toks[k]`: copies `pos..` up to it, writes the event fields, and
+/// sets `*after` to the token index after the statement's last token.
+fn emitStmt(rw: &Rw, out: &Out, used: &List<string>, toks: &List<Token>, k: int, lo: int, pos: int, flat: bool, afterOut: &int): Result<bool, UiError> {
+    let m = rw.a;
+    let a = lo + int(toks.items[k].span.lo);
+    let ev = toks.items[k + 1];
+    let ea = lo + int(ev.span.lo);
+    let eb = lo + int(ev.span.hi);
+    if !rw.emitOk {
+        return Result.Err(uiErr(a, eb, if rw.sev { "`emit` doesn't work in `onDestroy`: the component is going away" } else { "`emit` only works in an event handler or a script `fn`, not in `on:draw`" }));
+    }
+    if !hasStr(&rw.names.events, ev.text) {
+        let help = if rw.names.events.len == 0 { "this component declares no events; add `events { name; }` to its <script>" } else { fm(m, "declared events: $0", [joinStr(m, &rw.names.events, ", ")]) };
+        return Result.Err(uiErr(ea, eb, fm(m, "`emit $0`: `$0` is not in `events { }`", [ev.text])).withHelp(help));
+    }
+    let ps = List<string>.new(m);
+    for q in 0..rw.names.payload.len { if rw.names.payload.items[q].ev == ev.text { ps.push(rw.names.payload.items[q].name); } }
+    // `emit pick(a, b)`: the argument ranges between the parentheses, split at depth 1
+    let args = List<Range>.new(m);
+    let after = k + 2;
+    if tokKind(toks, after) == TokenKind.LParen {
+        let depth = 0;
+        let from = after + 1;
+        let closed = false;
+        for q in after..toks.len {
+            let kd = toks.items[q].kind;
+            if kd == TokenKind.LParen || kd == TokenKind.LBrace || kd == TokenKind.LBracket { depth += 1; }
+            else if kd == TokenKind.RBrace || kd == TokenKind.RBracket { depth -= 1; }
+            else if kd == TokenKind.Comma && depth == 1 {
+                args.push(Range { lo: from, hi: q });
+                from = q + 1;
+            } else if kd == TokenKind.RParen {
+                depth -= 1;
+                if depth == 0 {
+                    args.push(Range { lo: from, hi: q });
+                    after = q + 1;
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        if !closed { return Result.Err(uiErr(ea, eb, "this `emit` call is never closed")); }
+        if args.len == 1 && args.items[0].lo == args.items[0].hi { args.len = 0; }
+    }
+    let empty = false;
+    for q in 0..args.len { if args.items[q].lo == args.items[q].hi { empty = true; } }
+    if args.len != ps.len || empty {
+        let want = if ps.len == 0 { fm(m, "`$0` has no payload: write `emit $0`", [ev.text]) } else { fm(m, "`$0` takes ($1)", [ev.text, joinStr(m, &ps, ", ")]) };
+        return Result.Err(uiErr(ea, lo + int(toks.items[after - 1].span.hi), fm(m, "`emit $0` has $1 argument(s), expected $2", [ev.text, num(m, args.len), num(m, ps.len)])).withHelp(want));
+    }
+    rw.put(out, flat, pos, a);
+    let who = if rw.sev { "this.sev" } else { "ev" };
+    for q in 0..args.len {
+        out.at(rw.fi, a, fm(m, "$0.$1_$2 = ", [who, ev.text, ps.items[q]]));
+        rewrite(rw, out, used, lo + int(toks.items[args.items[q].lo].span.lo), lo + int(toks.items[args.items[q].hi - 1].span.hi), flat)?;
+        out.at(rw.fi, a, "; ");
+    }
+    out.at(rw.fi, a, if rw.sev { "this.sev." } else { "ev." });
+    rw.put(out, flat, ea, eb);
+    out.at(rw.fi, eb, " = true");
+    *afterOut = after;
+    return Result.Ok(true);
 }

@@ -1,0 +1,291 @@
+// ui/markup: the parser's tree shape (a small printer, here and not in `src`), Rust's two unit tests
+// (`braces_skip_strings`, `unclosed_tag_has_position`), the error text and range of malformed inputs (the
+// strings of `j3c/src/ui/markup/*.rs`), `parseScript`, and a parse of real corpus components.
+module ui_markup_test;
+
+use j3.io;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.{ Text, endsWith };
+use j3c.base.fsx;
+use j3c.ui.markup.{ Attr, Markup, Node, Part, Range, Script, UiError, Value, parse, parseScript, trimRange };
+
+fn parts(t: &Text, src: string, ps: &List<Part>) {
+    for i in 0..ps.len {
+        match ps.items[i] {
+            Part.Lit(l) { t.add("'").add(l).add("'"); }
+            Part.Hole(r) { t.add("{").add(src[r.lo..r.hi]).add("}"); }
+        }
+    }
+}
+
+/// One line per node: `tag#uid attr=value ..`, text as `'lit'{hole}`, blocks by keyword.
+fn shape(t: &Text, src: string, nodes: &List<Node>, ind: int) {
+    for i in 0..nodes.len {
+        for k in 0..ind { t.add("  "); }
+        match nodes.items[i] {
+            Node.Text(x) {
+                parts(t, src, &x.parts);
+                t.add("\n");
+            }
+            Node.Let(l) { t.add("let ").add(l.name).add(" = ").add(src[l.expr.lo..l.expr.hi]).add("\n"); }
+            Node.Elem(e) {
+                t.add(if e.comp { "<" } else { "" }).add(e.tag).add("#");
+                t.pushInt(e.uid);
+                for k in 0..e.attrs.len {
+                    let a = e.attrs.items[k];
+                    t.add(" ").add(a.name);
+                    match a.value {
+                        Value.None {}
+                        Value.Expr(r) { t.add("={").add(src[r.lo..r.hi]).add("}"); }
+                        Value.Str(p) {
+                            t.add("=");
+                            parts(t, src, &p.items);
+                        }
+                    }
+                }
+                t.add("\n");
+                shape(t, src, &e.children, ind + 1);
+            }
+            Node.If(n) {
+                match n.scrut {
+                    Option.Some(r) { t.add("match ").add(src[r.lo..r.hi]); }
+                    Option.None { t.add("if"); }
+                }
+                t.add("#");
+                t.pushInt(n.uid);
+                t.add("\n");
+                for b in 0..n.branches.len {
+                    let br = n.branches.items[b];
+                    for k in 0..ind { t.add("  "); }
+                    t.add(" :");
+                    match br.cond {
+                        Option.Some(r) { t.add("cond ").add(src[r.lo..r.hi]); }
+                        Option.None { t.add(if br.vals.len == 0 { "else" } else { "case" }); }
+                    }
+                    for v in 0..br.vals.len { t.add(" ").add(src[br.vals.items[v].lo..br.vals.items[v].hi]); }
+                    t.add("\n");
+                    shape(t, src, &br.nodes, ind + 1);
+                }
+            }
+            Node.Each(e) {
+                t.add("each ").add(src[e.head.lo..e.head.hi]).add("#");
+                t.pushInt(e.uid);
+                t.add("\n");
+                shape(t, src, &e.body, ind + 1);
+            }
+        }
+    }
+}
+
+fn tree(a: &Arena, src: string): string {
+    let uid = 0;
+    match parse(src, a, &uid) {
+        Result.Ok(m) {
+            let t = Text.new(a);
+            shape(&t, src, &m.nodes, 0);
+            return t.str();
+        }
+        Result.Err(e) { panic(`parse failed: {e.msg}`); }
+    }
+    return "";
+}
+
+fn same(what: string, got: string, want: string) {
+    if got == want { return; }
+    io.printLn("--- got");
+    io.printLn(got);
+    io.printLn("--- want");
+    io.printLn(want);
+    panic(what);
+}
+
+/// `src` must fail with `msg` at `lo..hi`.
+fn bad(a: &Arena, src: string, lo: int, hi: int, msg: string, help: string) {
+    let uid = 0;
+    match parse(src, a, &uid) {
+        Result.Ok(_) { panic(`no error for: {src}`); }
+        Result.Err(e) {
+            if e.msg != msg || e.lo != lo || e.hi != hi || e.help != help { panic(`{src}\n  got  {e.lo}..{e.hi} {e.msg} [{e.help}]\n  want {lo}..{hi} {msg} [{help}]`); }
+        }
+    }
+}
+
+fn script(a: &Arena, src: string): Script {
+    match parseScript(src, Range { lo: 0, hi: src.len }, a) {
+        Result.Ok(s) { return s; }
+        Result.Err(e) { panic(`script failed: {e.msg}`); }
+    }
+    return script(a, "");
+}
+
+fn badScript(a: &Arena, src: string, lo: int, hi: int, msg: string) {
+    match parseScript(src, Range { lo: 0, hi: src.len }, a) {
+        Result.Ok(_) { panic(`no error for: {src}`); }
+        Result.Err(e) {
+            if e.msg != msg || e.lo != lo || e.hi != hi { panic(`{src}\n  got  {e.lo}..{e.hi} {e.msg}\n  want {lo}..{hi} {msg}`); }
+        }
+    }
+}
+
+/// Every `.j3ui` in `dir` parses, with its `<script>`.
+fn corpus(a: &Arena, dir: string): int {
+    let n = 0;
+    let es = match io.listDir(dir, a) {
+        Result.Ok(es) { es }
+        Result.Err(_) { panic(`no folder {dir}`); }
+    };
+    for i in 0..es.len {
+        if !endsWith(es[i].name, ".j3ui") { continue; }
+        let p = Text.new(a).add(dir).add("/").add(es[i].name).str();
+        let src = match fsx.readText(p, a) {
+            Result.Ok(s) { s }
+            Result.Err(e) { panic(e); }
+        };
+        let uid = 0;
+        match parse(src, a, &uid) {
+            Result.Ok(m) {
+                let t = Text.new(a);
+                shape(&t, src, &m.nodes, 0);
+                if t.len() == 0 { panic(`{p}: no nodes`); }
+                match m.script {
+                    Option.Some(r) {
+                        match parseScript(src, r, a) {
+                            Result.Ok(_) {}
+                            Result.Err(e) { panic(`{p}: script: {e.msg}`); }
+                        }
+                    }
+                    Option.None {}
+                }
+            }
+            Result.Err(e) { panic(`{p}: {e.msg}`); }
+        }
+        n += 1;
+    }
+    return n;
+}
+
+fn main() {
+    let arena = Arena.create(1 << 20);
+    let a = &arena;
+
+    // Rust `braces_skip_strings`: three parts in one text
+    same("braces", tree(a, "<div>{f(\"}\")} a {b}</div>"), "div#0\n  {f(\"}\")}' a '{b}\n");
+    // Rust `unclosed_tag_has_position`
+    bad(a, "<div>\n<span>x</div>", 13, 19, "expected `</span>`, found `</div>`", "");
+
+    // whitespace: runs collapse, blank texts go, the first/last text of a list loses its outer space;
+    // entities decode after the collapse; comments vanish; `<textarea>` is a void `<input type="textarea">`
+    same("text", tree(a, "<p>\n  a   b &lt;c&gt; &amp;amp; {x}  <b> y </b>\n  <!-- no -->\n</p>\n<Card.Big on:pick={go(1)} class=\"a {k} b\" open />\n<game.hud.Bar/><textarea type=\"x\" rows=\"3\"></textarea><br>"),
+        "p#1\n  'a b <c> &amp; '{x}' '\n  b#0\n    'y'\n<Card.Big#2 on:pick={go(1)} class='a '{k}' b' open\n<game.hud.Bar#3\ninput#4 type='textarea' rows='3'\nbr#5\n");
+    same("blocks", tree(a, "{#if a > 1}<i/>{:else if b}x{:else}{#let n = xs[0]}{n}{/if}{#each xs as x, i (x.id)}<li>{x}</li>{/each}{#match k}\n {:case 1, f(2, 3)}one{:case \"a,b\"}s{:else}<u/>{/match}"),
+        "if#1\n :cond a > 1\n  i#0\n :cond b\n  'x'\n :else\n  let n = xs[0]\n  {n}\neach xs as x, i (x.id)#3\n  li#2\n    {x}\nmatch k#5\n :case 1 f(2, 3)\n  'one'\n :case \"a,b\"\n  's'\n :else\n  u#4\n");
+    // `<script>` / `<style>` are ranges; a `}` in a string, a backtick text or a `//` comment closes nothing
+    let uid = 7;
+    match parse("<script>let a = 1;</script><style>p { }</style>{f(`}`, \"\\\"}\") // }\n}", a, &uid) {
+        Result.Ok(m) {
+            match m.script { Option.Some(r) { if r.lo != 8 || r.hi != 18 { panic("script range"); } } Option.None { panic("no script"); } }
+            match m.style { Option.Some(r) { if r.lo != 34 || r.hi != 39 { panic("style range"); } } Option.None { panic("no style"); } }
+            if m.nodes.len != 1 || uid != 7 { panic("script/style make no nodes"); }
+        }
+        Result.Err(e) { panic(e.msg); }
+    }
+    let r = trimRange(" \t ab \n", 0, 7);
+    if r.lo != 3 || r.hi != 5 { panic("trimRange"); }
+    let e = trimRange("   ", 1, 3);
+    if e.lo != 1 || e.hi != 1 { panic("trimRange of blanks"); }
+
+    // malformed inputs: text, range and help as in the Rust source
+    bad(a, "<div>", 0, 5, "`<div>` is never closed", "");
+    bad(a, "</div>", 0, 6, "`</div>` closes nothing", "");
+    bad(a, "<input>x</input>", 8, 16, "`<input>` is a text box and takes no content: nothing can go inside it", "");
+    bad(a, "<p>{a</p>", 3, 4, "this `{` is never closed", "");
+    bad(a, "<p>{ }</p>", 3, 6, "empty `{}`", "");
+    bad(a, "<p a=></p>", 5, 6, "expected `\"text\"` or `{expr}` after `=`", "");
+    bad(a, "<p a=\"x></p>", 3, 12, "this attribute value is never closed", "");
+    bad(a, "<p", 0, 2, "`<p>` is never closed (the tag ends the file)", "");
+    bad(a, "<p =1>", 3, 4, "expected an attribute name", "");
+    bad(a, "<!-- x", 0, 4, "this comment is never closed", "");
+    bad(a, "{@html x}", 0, 2, "`{@...}` tags are not supported", "");
+    bad(a, "<script a>", 0, 7, "`<script>` takes no attributes", "");
+    bad(a, "<style>p{}", 0, 6, "`<style>` is never closed", "");
+    bad(a, "<script></script><script></script>", 17, 24, "a component has one `<script>`", "");
+    bad(a, "{#if a}<p>{/if}", 7, 10, "`<p>` is never closed before the block ends at 10", "");
+    bad(a, "{#if}x{/if}", 0, 5, "`{#if}` needs a condition", "");
+    bad(a, "{#if a}x", 0, 7, "`{#if}` is never closed with `{/if}`", "");
+    bad(a, "{#if a}x{:else}y{:else}z{/if}", 16, 23, "`{:else}` must be the last branch", "");
+    bad(a, "{#if a}</p>{/if}", 7, 11, "`</p>` found inside `{#if}`; close the block first", "");
+    bad(a, "{#if a}{/each}", 7, 14, "`{/each}` found where `{/if}` was expected", "");
+    bad(a, "{/if}", 0, 5, "`{/if}` without `{#if}`", "");
+    bad(a, "{:else}", 0, 7, "`{:else}` outside `{#if}`", "");
+    bad(a, "{:else if }", 0, 11, "`{:else if}` needs a condition", "");
+    bad(a, "{:other}", 0, 8, "unknown block tag", "blocks: {#if}{:else if}{:else}{/if}, {#match X}{:case 1, 2}{:else}{/match} and {#each X as x, i}{/each}");
+    bad(a, "{#for x}", 0, 8, "unknown block `{#for}`", "blocks: #if, #match, #each and #let");
+    bad(a, "{#let 1x = 2}", 0, 13, "`{#let}` needs `name = expr`", "`{#let f = state.files[id]}`; it has no `{/let}`");
+    bad(a, "{#let x == 2}", 0, 13, "`{#let}` needs `name = expr`", "`{#let f = state.files[id]}`; it has no `{/let}`");
+    bad(a, "{#each}{/each}", 0, 7, "`{#each}` needs `X as x`", "");
+    bad(a, "{#each a as b}{:else}{/each}", 14, 21, "`{#each}` has no `{:else}`", "");
+    bad(a, "{#match k}x{:case 1}{/match}", 0, 10, "`{#match}` holds only `{:case}` and `{:else}`; put content inside a case", "");
+    bad(a, "{#match k}{:case 1}a{:case 2, 1}b{/match}", 30, 31, "duplicate `{:case 1}`: the first one wins, so this branch would never run", "");
+    bad(a, "{#match k}{:else}a{:case 1}b{/match}", 18, 27, "`{:case}` after `{:else}`; `{:else}` must be last", "");
+    bad(a, "{#match k}{:case 1,}b{/match}", 10, 20, "`{:case}` needs a value (`{:case 1, 2}`)", "");
+    bad(a, "{#match k}{/match}", 0, 10, "`{#match}` has no `{:case}`", "");
+    bad(a, "{#match k}{:case 1}{:else if x}{/match}", 19, 31, "`{:else if}` isn't allowed in `{#match}`; use `{:case a, b}` or `{:else}`", "");
+    bad(a, "<textarea> <br /> </textarea>", 11, 17, "`<br>` is not allowed inside `<textarea>`: a text box takes no content", "");
+
+    // `<script>` items
+    let s = "use j3.math;\n/// doc\nprops { title: string; gap: Map<int, int> = mk(1, 2); n: int = -1 }\nevents { pick(slot: int, who: List<int>); close }\nprovide demo, theme;\ninject bus: &Bus;\nlet count = 0;\nlet neg = -1.5;\nlet name: string = \"x\";\nlet on = true;\nlet xs = [1, 2];\nconst MAX: int = 3;\nfn add(a: int, b: &List<int>): int { return a + b.len; }\nfn go() { count += 1; }\n";
+    let sc = script(a, s);
+    let t = Text.new(a);
+    for i in 0..sc.uses.len { t.add("use[").add(s[sc.uses.items[i].lo..sc.uses.items[i].hi]).add("]\n"); }
+    for i in 0..sc.props.len {
+        let p = sc.props.items[i];
+        t.add("prop ").add(p.name).add(":").add(s[p.ty.lo..p.ty.hi]);
+        match p.default { Option.Some(d) { t.add("=").add(s[d.lo..d.hi]); } Option.None {} }
+        t.add("\n");
+    }
+    for i in 0..sc.events.len { t.add("event ").add(sc.events.items[i].name).add("\n"); }
+    for i in 0..sc.evParams.len {
+        let p = sc.evParams.items[i];
+        t.add("payload ").add(p.ev).add(".").add(p.name).add(":").add(s[p.ty.lo..p.ty.hi]).add("\n");
+    }
+    for i in 0..sc.provides.len { t.add("provide ").add(sc.provides.items[i].name).add("\n"); }
+    for i in 0..sc.injects.len { t.add("inject ").add(sc.injects.items[i].name).add(":").add(s[sc.injects.items[i].ty.lo..sc.injects.items[i].ty.hi]).add("\n"); }
+    for i in 0..sc.lets.len {
+        let l = sc.lets.items[i];
+        t.add("let ").add(l.name).add("<").add(l.guess).add(">");
+        match l.ty { Option.Some(d) { t.add(":").add(s[d.lo..d.hi]); } Option.None {} }
+        t.add("=").add(s[l.init.lo..l.init.hi]).add("\n");
+    }
+    for i in 0..sc.consts.len { t.add("const ").add(sc.consts.items[i].name).add("=").add(s[sc.consts.items[i].init.lo..sc.consts.items[i].init.hi]).add("\n"); }
+    for i in 0..sc.fns.len {
+        let f = sc.fns.items[i];
+        t.add("fn ").add(f.name).add("(").add(s[f.params.lo..f.params.hi]).add(")");
+        for k in 0..f.paramNames.len { t.add(" ").add(f.paramNames.items[k].name); }
+        match f.ret { Option.Some(d) { t.add(" ->").add(s[d.lo..d.hi]); } Option.None {} }
+        t.add(" {").add(s[f.body.lo..f.body.hi]).add("}\n");
+    }
+    same("script", t.str(), "use[use j3.math;]\nprop title:string\nprop gap:Map<int, int>=mk(1, 2)\nprop n:int=-1\nevent pick\nevent close\npayload pick.slot:int\npayload pick.who:List<int>\nprovide demo\nprovide theme\ninject bus:&Bus\nlet count<int>=0\nlet neg<float>=-1.5\nlet name<string>:string=\"x\"\nlet on<bool>=true\nlet xs<>=[1, 2]\nconst MAX=3\nfn add(a: int, b: &List<int>) a b ->: int { return a + b.len; }\nfn go() { count += 1; }\n");
+    badScript(a, "struct A {}", 0, 6, "not allowed in `<script>`");
+    badScript(a, "use a.b", 0, 3, "`use` needs a closing `;`");
+    badScript(a, "props { a; }", 8, 9, "prop `a` needs a type: `a: Type;`");
+    badScript(a, "props { a: int = ; }", 8, 9, "prop `a` has `=` but no default value");
+    badScript(a, "events { a b }", 11, 12, "expected `;` after the event name");
+    badScript(a, "events { a(x) }", 11, 12, "expected `name: Type` in the payload of `a`");
+    badScript(a, "let a: = 1;", 4, 5, "`let a:` needs a type");
+    badScript(a, "const A;", 6, 7, "`const A` needs `= value`");
+    badScript(a, "fn f() ;", 3, 4, "`fn f` has no body");
+    badScript(a, "fn f( {", 4, 5, "this bracket is never closed");
+    badScript(a, "inject bus;", 7, 10, "`inject bus` needs a type: `inject bus: Type;`");
+    badScript(a, "provide a b;", 10, 11, "`provide` takes names: `provide demo, theme;`");
+    badScript(a, "let s = \"x", 8, 10, "unterminated string");
+
+    // real components parse (run from j3c-bootstrap/)
+    if corpus(a, "../speculative/31_ui_rtl/ui") < 1 { panic("31_ui_rtl"); }
+    if corpus(a, "../speculative/14_ui_slots/ui") < 2 { panic("14_ui_slots"); }
+    if corpus(a, "../examples/desk-app/ui/kit") < 2 { panic("desk-app kit"); }
+    if corpus(a, "../examples/big_ui_test/ui/pages") < 10 { panic("big_ui_test pages"); }
+    if corpus(a, "../examples/big_ui_test/ui/kit") < 1 { panic("big_ui_test kit"); }
+}

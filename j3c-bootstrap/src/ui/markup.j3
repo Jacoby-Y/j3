@@ -6,8 +6,10 @@
 // stays a byte range into the file; `gen` copies those ranges verbatim and the real parser reads the result.
 // J3: The tree types are in `markup/types.j3` (frozen). This file holds every `use` of the module (part
 // files share them; a part adds a `use` only for a name no other file of the module imports).
-// J3: C2e chunk A fills `parse`, `trimRange`, `isNameChar` here, `P`'s methods in `markup/block.j3` and
-// `markup/element.j3`, and `parseScript` in `markup/script.j3`. `P` and `End` are chunk A's to shape.
+// J3: `P`'s block methods are in `markup/block.j3`, `element` / `attr` in `markup/element.j3`, `parseScript` in
+// `markup/script.j3`. Rust walks chars where it asks for ASCII whitespace; those are single bytes, so a byte
+// walk lands on the same offsets. Where Rust asks `char::is_whitespace` (`trim`, a block keyword's end) the
+// lexer's `isWhitespace` / `trimStart` / `trimEnd` are used. `nodes` returns `NodesEnd` (no tuple in a `Result`).
 module j3c.ui.markup;
 
 use j3.data.pool.Id;
@@ -18,8 +20,8 @@ use j3.text;
 use j3.text.{ Text, contains, endsWith, startsWith };
 use j3c.base.intern.own;
 use j3c.base.span.Source;
-use j3c.syntax.lex.lex;
-use j3c.syntax.token.{ ParseError, Token, TokenKind };
+use j3c.syntax.lex.{ isWhitespace, lex, trimEnd, trimStart };
+use j3c.syntax.token.{ Token, TokenKind };
 
 /// What ended a node list (Rust `End`).
 enum End {
@@ -44,6 +46,12 @@ struct CaseEnd {
     r: Range;
 }
 
+/// A node list and what ended it (Rust's `(Vec<Node>, End)`).
+struct NodesEnd {
+    nodes: List<Node>;
+    end: End;
+}
+
 /// The parser state (Rust `P`). `uid` is the project's identity counter (see `types.j3`).
 struct P {
     s: string;
@@ -51,20 +59,308 @@ struct P {
     out: Markup;
     a: &Arena;
     uid: &int;
+
+    fn at(this: &P, pat: string): bool { return startsWith(this.s[this.i..this.s.len], pat); }
+
+    fn ws(this: &P) {
+        while this.i < this.s.len && isWs(this.s[this.i]) { this.i += 1; }
+    }
+
+    /// The next identity (`Elem`, `IfNode`, `EachNode`).
+    fn nextUid(this: &P): int {
+        let u = *this.uid;
+        *this.uid = u + 1;
+        return u;
+    }
+
+    /// `open` is at `{`; the index of the matching `}`. Skips strings, backtick text and `//` comments.
+    fn braceEnd(this: &P, open: int): Result<int, UiError> {
+        let b = this.s;
+        let i = open + 1;
+        let depth = 1;
+        while i < b.len {
+            let c = b[i];
+            if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 { return Result.Ok(i); }
+            } else if c == '"' {
+                i += 1;
+                while i < b.len && b[i] != '"' {
+                    if b[i] == '\\' { i += 1; }
+                    let at = if i < b.len - 1 { i } else { b.len - 1 };
+                    if b[at] == '\n' { break; }
+                    i += 1;
+                }
+            } else if c == '`' {
+                i += 1;
+                while i < b.len && b[i] != '`' && b[i] != '\n' { i += 1; }
+            } else if c == '/' && i + 1 < b.len && b[i + 1] == '/' {
+                while i < b.len && b[i] != '\n' { i += 1; }
+                continue;
+            }
+            i += 1;
+        }
+        return Result.Err(uiErr(open, open + 1, "this `{` is never closed"));
+    }
+
+    /// Nodes up to the end of input, a closing tag, or a block tag (`{:..}` / `{/..}`).
+    fn nodes(this: &P, top: bool): Result<NodesEnd, UiError> {
+        let s = this.s;
+        let nodes = List<Node>.new(this.a);
+        let parts = List<Part>.new(this.a);
+        let textLo = this.i;
+        while true {
+            if this.i >= s.len {
+                flush(&nodes, &parts, textLo, this.i, this.a);
+                return Result.Ok(NodesEnd { nodes: nodes, end: End.Eof });
+            }
+            let c = s[this.i];
+            if c == '<' {
+                if this.at("<!--") {
+                    flush(&nodes, &parts, textLo, this.i, this.a);
+                    let k = text.find(s[this.i..s.len], "-->");
+                    if k < 0 { return Result.Err(uiErr(this.i, this.i + 4, "this comment is never closed")); }
+                    this.i += k + 3;
+                    textLo = this.i;
+                    continue;
+                }
+                if this.at("</") {
+                    flush(&nodes, &parts, textLo, this.i, this.a);
+                    let lo = this.i;
+                    let j = this.i + 2;
+                    while j < s.len && isTagChar(s[j]) { j += 1; }
+                    let tag = s[this.i + 2..j];
+                    this.i = j;
+                    this.ws();
+                    if !this.at(">") { return Result.Err(uiErr(lo, j, "expected `>` to end the closing tag")); }
+                    this.i += 1;
+                    return Result.Ok(NodesEnd { nodes: nodes, end: End.Close(Named { name: tag, r: Range { lo: lo, hi: this.i } }) });
+                }
+                if this.i + 1 < s.len && isAlpha(s[this.i + 1]) {
+                    flush(&nodes, &parts, textLo, this.i, this.a);
+                    match this.element(top)? {
+                        Option.Some(el) { nodes.push(Node.Elem(el)); }
+                        Option.None {}
+                    }
+                    textLo = this.i;
+                    continue;
+                }
+            }
+            if c == '{' {
+                let next: u8 = if this.i + 1 < s.len { s[this.i + 1] } else { 0 };
+                if next == '#' {
+                    flush(&nodes, &parts, textLo, this.i, this.a);
+                    nodes.push(this.block()?);
+                    textLo = this.i;
+                    continue;
+                }
+                if next == ':' || next == '/' {
+                    flush(&nodes, &parts, textLo, this.i, this.a);
+                    let end = this.blockEnd()?;
+                    return Result.Ok(NodesEnd { nodes: nodes, end: end });
+                }
+                if next == '@' { return Result.Err(uiErr(this.i, this.i + 2, "`{@...}` tags are not supported")); }
+                if parts.len == 0 { textLo = this.i; }
+                let e = this.braceEnd(this.i)?;
+                let r = trimRange(s, this.i + 1, e);
+                if r.lo == r.hi { return Result.Err(uiErr(this.i, e + 1, "empty `{}`")); }
+                parts.push(Part.Hole(r));
+                this.i = e + 1;
+                continue;
+            }
+            // plain text up to the next tag or brace
+            if parts.len == 0 { textLo = this.i; }
+            let start = this.i;
+            while this.i < s.len {
+                let d = s[this.i];
+                if d == '{' { break; }
+                if d == '<' {
+                    let n: u8 = if this.i + 1 < s.len { s[this.i + 1] } else { 0 };
+                    if isAlpha(n) || n == '/' || this.at("<!--") { break; }
+                }
+                this.i += 1;
+            }
+            // collapse first: an `&nbsp;` decoded before collapsing would count as whitespace
+            parts.push(Part.Lit(decode(collapse(s[start..this.i], this.a), this.a)));
+        }
+        return Result.Ok(NodesEnd { nodes: nodes, end: End.Eof });
+    }
 }
 
 /// Parse one `.j3ui` text. Strings of the tree are slices of `src` or copies in `a`; every `Elem`,
 /// `IfNode` and `EachNode` takes its `uid` from `*uid` (then `*uid += 1`).
 pub fn parse(src: string, a: &Arena, uid: &int): Result<Markup, UiError> {
-    return Result.Err(notYet("markup.parse (chunk A)")); // STUB A
+    let p = P { s: src, i: 0, out: Markup { nodes: List<Node>.new(a), script: Option.None, style: Option.None }, a: a, uid: uid };
+    let ne = p.nodes(true)?;
+    match ne.end {
+        End.Eof {}
+        End.Close(c) { return Result.Err(uiErr(c.r.lo, c.r.hi, closeMsg(c.name, a))); }
+        End.Else(e) { return Result.Err(uiErr(e.r.lo, e.r.hi, "`{:else}` outside `{#if}`")); }
+        End.EndIf(r) { return Result.Err(uiErr(r.lo, r.hi, "`{/if}` without `{#if}`")); }
+        End.EndEach(r) { return Result.Err(uiErr(r.lo, r.hi, "`{/each}` without `{#each}`")); }
+        End.Case(c) { return Result.Err(uiErr(c.r.lo, c.r.hi, "`{:case}` outside `{#match}`")); }
+        End.EndMatch(r) { return Result.Err(uiErr(r.lo, r.hi, "`{/match}` without `{#match}`")); }
+    }
+    p.out.nodes = trimNodes(ne.nodes, a);
+    return Result.Ok(p.out);
+}
+
+fn flush(nodes: &List<Node>, parts: &List<Part>, lo: int, hi: int, a: &Arena) {
+    if parts.len == 0 { return; }
+    nodes.push(Node.Text(TextNode { parts: *parts, range: Range { lo: lo, hi: hi } }));
+    *parts = List<Part>.new(a);
+}
+
+/// Whitespace rules: runs collapse to one space (`collapse`), a text that is only whitespace is dropped,
+/// and the first/last text of a child list loses its outer whitespace. Returns the kept nodes (Rust `trim`).
+fn trimNodes(nodes: List<Node>, a: &Arena): List<Node> {
+    let out = List<Node>.new(a);
+    let n = nodes.len;
+    for k in 0..n {
+        match nodes.items[k] {
+            Node.Elem(e) {
+                e.children = trimNodes(e.children, a);
+                out.push(Node.Elem(e));
+            }
+            Node.If(i) {
+                for j in 0..i.branches.len {
+                    let b = i.branches.items[j];
+                    b.nodes = trimNodes(b.nodes, a);
+                    i.branches.items[j] = b;
+                }
+                out.push(Node.If(i));
+            }
+            Node.Each(e) {
+                e.body = trimNodes(e.body, a);
+                out.push(Node.Each(e));
+            }
+            Node.Let(l) { out.push(Node.Let(l)); }
+            Node.Text(t) {
+                let ps = t.parts;
+                if k == 0 && ps.len > 0 {
+                    match ps.items[0] {
+                        Part.Lit(l) { ps.items[0] = Part.Lit(asciiTrimStart(l)); }
+                        Part.Hole(_) {}
+                    }
+                }
+                if k + 1 == n && ps.len > 0 {
+                    match ps.items[ps.len - 1] {
+                        Part.Lit(l) { ps.items[ps.len - 1] = Part.Lit(asciiTrimEnd(l)); }
+                        Part.Hole(_) {}
+                    }
+                }
+                let kept = List<Part>.new(a);
+                for q in 0..ps.len {
+                    match ps.items[q] {
+                        Part.Lit(l) { if l.len > 0 { kept.push(ps.items[q]); } }
+                        Part.Hole(_) { kept.push(ps.items[q]); }
+                    }
+                }
+                if kept.len == 0 { continue; }
+                if kept.len == 1 {
+                    match kept.items[0] {
+                        Part.Lit(l) { if asciiTrimStart(l).len == 0 { continue; } }
+                        Part.Hole(_) {}
+                    }
+                }
+                out.push(Node.Text(TextNode { parts: kept, range: t.range }));
+            }
+        }
+    }
+    return out;
+}
+
+/// The message for a close tag with no open element; a text box is void, so content written "inside" it ends here.
+fn closeMsg(t: string, a: &Arena): string {
+    if t == "input" || t == "textarea" {
+        return Text.new(a).add("`<").add(t).add(">` is a text box and takes no content: nothing can go inside it").str();
+    }
+    return Text.new(a).add("`</").add(t).add(">` closes nothing").str();
+}
+
+/// Rust `u8::is_ascii_whitespace`: space, tab, newline, form feed, carriage return (not vertical tab).
+fn isWs(c: u8): bool { return c == ' ' || c == '\t' || c == '\n' || c == 12 || c == '\r'; }
+
+fn isAlpha(c: u8): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+
+/// A tag name also takes `.`: `<game.Bar>` is the component `ui/game/Bar.j3ui`.
+fn isTagChar(c: u8): bool { return isNameChar(c) || c == '.'; }
+
+/// A byte of a tag or attribute name (Rust `is_name_char`).
+pub fn isNameChar(c: u8): bool { return isAlpha(c) || (c >= '0' && c <= '9') || c == '_' || c == '-'; }
+
+fn asciiTrimStart(s: string): string {
+    let i = 0;
+    while i < s.len && isWs(s[i]) { i += 1; }
+    return s[i..s.len];
+}
+
+fn asciiTrimEnd(s: string): string {
+    let e = s.len;
+    while e > 0 && isWs(s[e - 1]) { e -= 1; }
+    return s[0..e];
+}
+
+/// `s` without whitespace at both ends (Rust `str::trim`, Unicode whitespace); a slice of `s`.
+pub fn uTrim(s: string): string { return trimEnd(trimStart(s)); }
+
+/// The byte length of the whitespace char (Rust `char::is_whitespace`) at `s[i]`, 0 when there is none.
+fn wsLen(s: string, i: int): int {
+    if i >= s.len { return 0; }
+    let (c, n) = text.decodeRune(s, i);
+    return if isWhitespace(c) { n } else { 0 };
 }
 
 /// `lo..hi` of `s` without the whitespace at both ends (Rust `trim_range`).
+// ASCII whitespace only, like HTML: a no-break space (U+00A0) is content
 pub fn trimRange(s: string, lo: int, hi: int): Range {
-    return Range { lo: lo, hi: hi }; // STUB A
+    let a = lo;
+    while a < hi && isWs(s[a]) { a += 1; }
+    let b = hi;
+    while b > a && isWs(s[b - 1]) { b -= 1; }
+    if a == hi { return Range { lo: lo, hi: lo }; }
+    return Range { lo: a, hi: b };
 }
 
-/// A byte of a tag or attribute name (Rust `is_name_char`).
-pub fn isNameChar(c: u8): bool {
-    return false; // STUB A
+/// Whitespace runs as one space; a leading space survives only when the original began with whitespace.
+fn collapse(s: string, a: &Arena): string {
+    let out = Text.new(a);
+    let ws = false;
+    for i in 0..s.len {
+        let c = s[i];
+        if isWs(c) {
+            ws = true;
+        } else {
+            if ws {
+                out.push(' ');
+                ws = false;
+            }
+            out.push(c);
+        }
+    }
+    if ws { out.push(' '); }
+    return out.str();
+}
+
+/// The seven entities, `&amp;` last (Rust `decode`).
+fn decode(s: string, a: &Arena): string {
+    if !contains(s, "&") { return s; }
+    let r = rep(s, "&lt;", "<", a);
+    r = rep(r, "&gt;", ">", a);
+    r = rep(r, "&lbrace;", "{", a);
+    r = rep(r, "&rbrace;", "}", a);
+    // U+00A0 (stage 0 strings have no `\u` escape)
+    let nb = Text.new(a);
+    nb.pushChar(160);
+    r = rep(r, "&nbsp;", nb.str(), a);
+    r = rep(r, "&quot;", "\"", a);
+    r = rep(r, "&amp;", "&", a);
+    return r;
+}
+
+fn rep(s: string, old: string, new: string, a: &Arena): string {
+    let t = Text.new(a);
+    return text.replace(&t, s, old, new);
 }
