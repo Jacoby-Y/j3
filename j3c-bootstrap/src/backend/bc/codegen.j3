@@ -1,10 +1,15 @@
-// Per-module tables and fn codegen: registers, the frame, the const prologue, places and addresses.
+// Per-module tables and fn codegen: registers, the frame, the const prologue, blocks and defers, compare+branch fusion.
 //
 // Part of module j3c.backend.bc.
 // Port of: j3c/src/emit/bc/codegen.rs
 // J3: `emitFn` is the seam `emitScript` calls per `FuncKind.J3` fn (Rust `Codegen::new(..).emit()`). Numbering
 //     is first-use / declaration order, never map order (contracts-c4.md "Ordering rules"); `Map`s here are
-//     lookups only. Split into more parts (`bc/place.j3`, `bc/walk.j3`) to stay under 600 lines.
+//     lookups only. Parts: this file (state, `new`, `emit`, registers, blocks, `jumpFalse`), `bc/place.j3`
+//     (frame temporaries, places, addresses, loads, stores, operands, `aggregateOffset`), `bc/walk.j3` (the
+//     place walkers behind `addressedLocals` / `countBlock`). Statements, rvalues and calls are `bc/stmt.j3`,
+//     `bc/rvalue.j3`, `bc/call.j3`, all `extend Codegen`.
+// J3: Rust `Result<(), String>` methods return `Result<int, string>` (`Ok(0)`); `usize` code indexes are `int`.
+//     Rust's `last_compare: Option<(usize, u32)>` is `Option<LastCompare>`.
 module j3c.backend.bc;
 
 /// Tables every function in a module appends to (Rust `Shared`), in first-use order.
@@ -41,7 +46,7 @@ pub struct LastCompare {
     reg: u32;
 }
 
-/// One fn's codegen state (Rust `Codegen`). B may add fields.
+/// One fn's codegen state (Rust `Codegen`).
 pub struct Codegen {
     cx: &IrCx;
     func: &Func;
@@ -60,12 +65,239 @@ pub struct Codegen {
     calls: List<CallSite>;
     loops: List<LoopFixups>;
     scopes: List<List<Block>>;
+    /// The register the last compare wrote, so a branch on it can fuse.
     lastCompare: Option<LastCompare>;
     frameSize: u32;
     regs: u32;
+
+    /// Rust `Codegen::new`: a register per scalar local that is never addressed, in `body.locals` order, else a
+    /// frame slot (align and size at least 8).
+    fn new(cx: &IrCx, func: &Func, body: &Body, shared: &Shared, arena: &Arena): Codegen {
+        let n = body.locals.len();
+        let w = PlaceWalk.new(n, arena);
+        walkBlock(&w, &body.block);
+        let mem = List<Option<u32>>.new(arena);
+        let value = List<Option<u32>>.new(arena);
+        let frameSize: u32 = 0;
+        let regs: u32 = 1;
+        for i in 0..n {
+            let local = body.locals.items.items[i];
+            if isScalar(cx, local.ty) && !w.marked.items[i] {
+                value.push(Option.Some(regs));
+                regs = regs + 1;
+                mem.push(Option.None);
+            } else {
+                let align = maxU32(u32(abiAlign(cx, local.ty)), 8);
+                frameSize = alignUp(frameSize, align);
+                mem.push(Option.Some(frameSize));
+                frameSize = frameSize + maxU32(u32(abiSize(cx, local.ty)), 8);
+                value.push(Option.None);
+            }
+        }
+        return Codegen { cx: cx, func: func, body: body, shared: shared, arena: arena, mem: mem, value: value, uses: w.uses,
+            prologue: List<Instr>.new(arena), constRegs: Map<u64, u32>.new(arena, 16), code: List<Instr>.new(arena),
+            calls: List<CallSite>.new(arena), loops: List<LoopFixups>.new(arena), scopes: List<List<Block>>.new(arena),
+            lastCompare: Option.None, frameSize: frameSize, regs: regs };
+    }
 }
 
 /// The bytecode of fn `id` (a `FuncKind.J3` fn of the module `shared` belongs to); Err = why it can't be.
 pub fn emitFn(cx: &IrCx, id: Id<Func>, shared: &Shared, arena: &Arena): Result<BcFunction, string> {
-    return Result.Err("bc codegen: not ported yet"); // STUB B
+    let func = cx.funcMut(id);
+    match func.kind {
+        FuncKind.J3(j) {
+            let body = arena.new::<Body>(j.body);
+            let g = arena.new::<Codegen>(Codegen.new(cx, func, body, shared, arena));
+            return g.emit();
+        }
+        FuncKind.Lib(_) { return Result.Err("bc codegen of a fn without a body"); }
+        FuncKind.Decl { return Result.Err("bc codegen of a fn without a body"); }
+    }
+}
+
+pub fn alignUp(value: u32, align: u32): u32 {
+    return (value + align - 1) / align * align;
+}
+
+fn maxU32(a: u32, b: u32): u32 {
+    if a > b { return a; }
+    return b;
+}
+
+extend Codegen {
+    /// Rust `emit`: the body, a final `Ret` unless one ends it, the const prologue in front (jumps shifted by
+    /// its length), params, signature.
+    fn emit(this: &Codegen): Result<BcFunction, string> {
+        for i in 0..this.body.locals.len() {
+            match this.cx.tyKind(this.body.locals.items.items[i].ty) {
+                TyKind.Vec(v) {
+                    let t = Text.new(this.arena);
+                    t.add(vecName(v)).add(" is not supported in scripts yet");
+                    return Result.Err(t.str());
+                }
+                _ {}
+            }
+        }
+        this.block(&this.body.block)?;
+        if !this.endsInRet() { this.push(instr(Op.Ret, NO_REG, NO_REG, NO_REG, 0)); }
+        let shift = u64(this.prologue.len);
+        let code = List<Instr>.new(this.arena);
+        code.reserve(this.prologue.len + this.code.len);
+        code.extend(this.prologue.slice());
+        for i in 0..this.code.len {
+            let ins = this.code.items[i];
+            if isJump(ins.op) { ins.imm = ins.imm + shift; }
+            code.push(ins);
+        }
+        let params = List<BcParam>.new(this.arena);
+        for i in 0..this.body.params.len {
+            let id = this.body.params.items[i];
+            let local = this.body.local(id);
+            let load: u16 = 0;
+            match class(this.cx, local.ty) {
+                Option.Some(c) { if c != Class.Void { load = opCode(loadOp(c)); } }
+                Option.None {}
+            }
+            let reg: u32 = NO_REG;
+            match this.value.items[int(id.i)] { Option.Some(r) { reg = r; } Option.None {} }
+            let offset: u32 = 0;
+            match this.mem.items[int(id.i)] { Option.Some(o) { offset = o; } Option.None {} }
+            params.push(BcParam { reg: reg, offset: offset, size: u32(abiSize(this.cx, local.ty)), load: load });
+        }
+        let ret = this.cx.common.void;
+        match this.cx.fnSig(this.func.ty) {
+            Option.Some(sig) { ret = sig.ret; }
+            Option.None { return Result.Err("function without a signature"); }
+        }
+        let retAggregate = false;
+        if !isScalar(this.cx, ret) {
+            match class(this.cx, ret) {
+                Option.Some(c) { retAggregate = c != Class.Void; }
+                Option.None { retAggregate = true; }
+            }
+        }
+        return Result.Ok(BcFunction { params: params, calls: this.calls, code: code, name: this.cx.nameStr(this.func.name),
+            signature: tyString(this.cx, this.func.ty, this.arena), key: fnKey(this.cx, this.func.id, this.arena),
+            frameSize: alignUp(this.frameSize, 8), regs: this.regs, retSize: u32(abiSize(this.cx, ret)),
+            public: this.func.vis == Vis.Pub, retAggregate: retAggregate });
+    }
+
+    /// The last instruction is a `Ret`, `RetV` or `RetA`.
+    fn endsInRet(this: &Codegen): bool {
+        if this.code.len == 0 { return false; }
+        let op = this.code.items[this.code.len - 1].op;
+        return op == Op.Ret || op == Op.RetV || op == Op.RetA;
+    }
+
+    fn reg(this: &Codegen): u32 {
+        let r = this.regs;
+        this.regs = r + 1;
+        return r;
+    }
+
+    /// Append `ins`; its code index. Clears the compare a branch could fuse with.
+    fn push(this: &Codegen, ins: Instr): int {
+        let at = this.code.len;
+        this.code.push(ins);
+        this.lastCompare = Option.None;
+        return at;
+    }
+
+    fn patch(this: &Codegen, at: int, target: int) {
+        this.code.items[at].imm = u64(target);
+    }
+
+    fn here(this: &Codegen): int { return this.code.len; }
+
+    /// The register holding constant `bits`; the first use adds a `Const` to the prologue.
+    fn constReg(this: &Codegen, bits: u64): u32 {
+        match this.constRegs.get(bits) {
+            Option.Some(r) { return r; }
+            Option.None {}
+        }
+        let dst = this.reg();
+        this.constRegs.put(bits, dst);
+        this.prologue.push(instr(Op.Const, dst, NO_REG, NO_REG, bits));
+        return dst;
+    }
+
+    /// The statements of `b`, then its defers (last first).
+    fn block(this: &Codegen, b: &Block): Result<int, string> {
+        this.scopes.push(List<Block>.new(this.arena));
+        for i in 0..b.stmts.len {
+            this.stmt(&b.stmts.items[i])?;
+        }
+        let defers = this.scopes.pop();
+        let k = defers.len;
+        while k > 0 {
+            k = k - 1;
+            this.block(&defers.items[k])?;
+        }
+        return Result.Ok(0);
+    }
+
+    /// Run the defers of every scope from `depth` up, innermost first (a `break`/`continue`/`return` leaving them).
+    fn unwindTo(this: &Codegen, depth: int): Result<int, string> {
+        let defers = List<Block>.new(this.arena);
+        let s = this.scopes.len;
+        while s > depth {
+            s = s - 1;
+            let ds = this.scopes.items[s];
+            let k = ds.len;
+            while k > 0 {
+                k = k - 1;
+                defers.push(ds.items[k]);
+            }
+        }
+        for i in 0..defers.len {
+            this.block(&defers.items[i])?;
+        }
+        return Result.Ok(0);
+    }
+
+    /// Emit "jump when `cond` is false" (target patched later); its code index. Fuses a compare that just wrote
+    /// `cond` into one `Jn*` when `fuse` and `cond` is a local used at most twice.
+    fn jumpFalse(this: &Codegen, cond: &Operand, fuse: bool): Result<int, string> {
+        let reg = this.operand(cond)?;
+        if fuse {
+            match this.lastCompare {
+                Option.Some(lc) {
+                    let singleUse = false;
+                    match *cond {
+                        Operand.Copy(place) {
+                            match place.root {
+                                PlaceRoot.Local(l) {
+                                    if place.proj.len == 0 { singleUse = this.uses.items[int(l.id.i)] <= 2; }
+                                }
+                                PlaceRoot.Global(_) {}
+                            }
+                        }
+                        Operand.Const(_) {}
+                    }
+                    if lc.reg == reg && singleUse && lc.at + 1 == this.code.len {
+                        let cmp = this.code.pop();
+                        let fused = fusedJump(cmp.op)?;
+                        return Result.Ok(this.push(instr(fused, NO_REG, cmp.a, cmp.b, 0)));
+                    }
+                }
+                Option.None {}
+            }
+        }
+        return Result.Ok(this.push(instr(Op.Jz, NO_REG, reg, NO_REG, 0)));
+    }
+}
+
+/// The `Jn*` op that jumps when compare `op` is false. Only compares set `lastCompare` (Rust `unreachable!`).
+fn fusedJump(op: Op): Result<Op, string> {
+    if op == Op.Lts { return Result.Ok(Op.JnLts); }
+    if op == Op.Les { return Result.Ok(Op.JnLes); }
+    if op == Op.Ltu { return Result.Ok(Op.JnLtu); }
+    if op == Op.Leu { return Result.Ok(Op.JnLeu); }
+    if op == Op.Eq { return Result.Ok(Op.JnEq); }
+    if op == Op.Ne { return Result.Ok(Op.JnNe); }
+    if op == Op.Flt { return Result.Ok(Op.JnFlt); }
+    if op == Op.Fle { return Result.Ok(Op.JnFle); }
+    if op == Op.Dlt { return Result.Ok(Op.JnDlt); }
+    if op == Op.Dle { return Result.Ok(Op.JnDle); }
+    return Result.Err("bc: fused jump of a non-compare op");
 }

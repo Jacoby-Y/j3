@@ -1,0 +1,158 @@
+// cmd/devrun (Rust compile/tests/script_dev.rs, the parts that need no long-running child): on a scratch
+// project, the first prepare builds, an unchanged one does not, a script edit only rewrites the `.j3sb`, a prop
+// changes the layout hash, a script `use` of a module the program never loaded rebuilds; `watch` runs the dev
+// binary to its end and passes its exit code; `bumpReload` counts up.
+module cmd_devrun_test;
+
+use j3.io;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.proc;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text;
+use j3.text.Text;
+use j3c.backend.bc;
+use j3c.base.fsx;
+use j3c.cmd.devrun;
+use j3c.cmd.devrun.{ Built, Prepared, ScriptLayout };
+use j3c.driver;
+use j3c.driver.{ Mode, Session };
+use j3c.project.manifest;
+use j3c.project.manifest.{ Input, Manifest };
+use j3c.toolchain;
+use j3c.toolchain.EmitOpts;
+
+const TOML: string = "[package]\nname = \"ticker\"\nentry = \"main.j3\"\n\n[emit]\nopt = 0\n";
+const MAIN: string = "module ticker;\nuse j3.memory.frameHook;\nconst Tick = @script(\"scripts/tick.j3s\");\nfn main() {\n    let tick = Tick {};\n    for i in 0..3 {\n        frameHook();\n        tick.say(i);\n    }\n}\n";
+const SCRIPT: string = "use j3.io.printLn;\n\nprops {\n    gain: int = 1;\n}\n\npub fn say(i: int) {\n    if i == 0 { printLn(`value {gain}`); }\n}\n";
+
+fn write(p: string, s: string) {
+    match io.writeFile(p, s as []u8) { Result.Ok(_) {} Result.Err(_) { panic(p); } }
+}
+
+fn read(p: string, arena: &Arena): string {
+    match fsx.readText(p, arena) { Result.Ok(t) { return t; } Result.Err(e) { panic(e); } }
+    return "";
+}
+
+/// The file's bytes (a `.j3sb` is not UTF-8) as a string, for comparing.
+fn bytes(p: string, arena: &Arena): string {
+    match io.readFile(p, arena) { Result.Ok(b) { return b as string; } Result.Err(_) { panic(p); } }
+    return "";
+}
+
+/// Replace `from` by `to` in the file at `p`.
+fn edit(p: string, from: string, to: string, arena: &Arena) {
+    let t = Text.new(arena);
+    let old = read(p, arena);
+    if !text.contains(old, from) { panic(from); }
+    write(p, text.replace(&t, old, from, to));
+}
+
+/// One dev prepare of `dir` in a fresh `Mode.Dev` session, as `cmd/run.j3` makes it.
+fn prepare(dir: string, m: &Manifest, e: &EmitOpts, arena: &Arena): Built {
+    let o = driver.defaults();
+    o.entry = dir;
+    o.mode = Mode.Dev;
+    o.run = true;
+    let s = Session.new(o);
+    defer s.free();
+    match devrun.prepare(s, m, e, arena) {
+        Result.Ok(p) {
+            match p {
+                Prepared.Dev(b) { return b; }
+                Prepared.NoScripts { panic("expected scripts"); }
+            }
+        }
+        Result.Err(x) { panic(x); }
+    }
+    panic("unreachable");
+    return Built { layouts: List<ScriptLayout>.new(arena), scripts: List<string>.new(arena), exe: "", rebuilt: false };
+}
+
+fn main() {
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    let dir = Text.new(&mem).add(io.tempRoot()).add("/j3c-boot-devrun-test").str();
+    let rm: [3]string = ["rm", "-rf", dir];
+    proc.run(rm[..], "", &mem);
+    let scripts = Text.new(&mem).add(dir).add("/scripts").str();
+    match io.makeDirs(scripts) { Result.Ok(_) {} Result.Err(_) { panic("make the scratch project"); } }
+    write(Text.new(&mem).add(dir).add("/j3.toml").str(), TOML);
+    write(Text.new(&mem).add(dir).add("/main.j3").str(), MAIN);
+    let script = Text.new(&mem).add(scripts).add("/tick.j3s").str();
+    write(script, SCRIPT);
+    match manifest.resolve(dir, &mem) {
+        Result.Ok(inp) {
+            match inp {
+                Input.Project(m) { steps(dir, script, &m, &mem); }
+                Input.Hello { panic("not a project"); }
+                Input.File(_) { panic("not a project"); }
+            }
+        }
+        Result.Err(x) { panic(x); }
+    }
+    proc.run(rm[..], "", &mem);
+}
+
+fn steps(dir: string, script: string, m: &Manifest, mem: &Arena) {
+    let e = toolchain.defaultEmitOpts(mem);
+    match toolchain.emitOptsFromManifest(m, mem) { Result.Ok(x) { e = x; } Result.Err(x) { panic(x); } }
+
+    // The dev binary has its own folder in target/.j3c, never beside the real output.
+    let exe = devrun.devOut(m, mem);
+    if !text.endsWith(exe, "/target/.j3c/host/ticker-dev/ticker-dev") { panic(exe); }
+
+    let first = prepare(dir, m, &e, mem);
+    if !first.rebuilt { panic("the first dev build compiles the program"); }
+    if first.exe != exe || !fsx.isFile(exe) { panic(first.exe); }
+    if first.layouts.len != 1 || first.scripts.len != 1 { panic("one script, one layout"); }
+    let j3sb = bc.bytecodePath(m.root, first.layouts.items[0].path, mem);
+    if !fsx.isFile(j3sb) { panic(j3sb); }
+    let key = read(Text.new(mem).add(dir).add("/target/.j3c/host/ticker-dev/dev.key").str(), mem);
+    if !text.endsWith(key, "\nj3s_dev") { panic(key); }
+
+    let again = prepare(dir, m, &e, mem);
+    if again.rebuilt { panic("an unchanged project rebuilt"); }
+
+    // A code edit: new bytecode, same layout, no clang.
+    let before = bytes(j3sb, mem);
+    edit(script, "value {gain}", "value {gain} b", mem);
+    let code = prepare(dir, m, &e, mem);
+    if code.rebuilt { panic("a script code edit ran clang"); }
+    if bytes(j3sb, mem) == before { panic("the .j3sb was not rewritten"); }
+    if code.layouts.items[0].layout != first.layouts.items[0].layout { panic("a code edit changed the layout"); }
+
+    // A new prop: the layout hash changes (the watcher relaunches), still no clang.
+    edit(script, "    gain: int = 1;\n", "    gain: int = 1;\n    extra: int = 7;\n", mem);
+    let layout = prepare(dir, m, &e, mem);
+    if layout.rebuilt { panic("a prop edit ran clang"); }
+    if layout.layouts.items[0].layout == first.layouts.items[0].layout { panic("a new prop kept the layout hash"); }
+
+    // `watch` runs the dev binary (it ends by itself) and returns its exit code.
+    let o = driver.defaults();
+    o.entry = dir;
+    o.mode = Mode.Dev;
+    o.run = true;
+    let s = Session.new(o);
+    match devrun.watch(s, m, &e, &layout, layout.scripts.items[0..0], mem) {
+        Result.Ok(rc) { if rc != 0 { panic("the dev binary failed"); } }
+        Result.Err(x) { panic(x); }
+    }
+    s.free();
+
+    // A script that uses a module the program never loaded rebuilds it.
+    edit(script, "use j3.io.printLn;", "use j3.io.printLn;\nuse j3.rand.Rng;", mem);
+    edit(script, "value {gain} b", "value {gain} {roll()}", mem);
+    let t = Text.new(mem);
+    t.add(read(script, mem)).add("\nfn roll(): int {\n    let r = Rng.new(5);\n    return r.next() % 1;\n}\n");
+    write(script, t.str());
+    let native = prepare(dir, m, &e, mem);
+    if !native.rebuilt { panic("a new native module needs a rebuild"); }
+
+    let reload = Text.new(mem).add(dir).add("/target/j3s/reload").str();
+    devrun.bumpReload(dir, mem);
+    devrun.bumpReload(dir, mem);
+    if read(reload, mem) != "2" { panic(read(reload, mem)); }
+}

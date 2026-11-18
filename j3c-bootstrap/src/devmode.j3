@@ -5,46 +5,406 @@
 // J3: An IR-to-IR pass like `ir.fast`, one conditional entry in the driver's pass table (plan 11 B8): the driver's
 //     `devPass` calls `bytecode` on the un-rewritten IR (kept in `Session.bytecode`), then `lower` with it
 //     (Rust order: check, fast, bytecode, dev lower). Building, spawning and watching are `cmd/devrun.j3`.
-// J3: Parts: `devmode/build.j3` (the `Fb` body builder), `devmode/literals.j3` (script literals to `devNew`),
-//     `devmode/thunk.j3` (one `j3s_dev` thunk per callable native fn). Every `use` of the module is here.
+// J3: Parts: `devmode/build.j3` (the `Fb` body builder, `vmArg`, `stub`), `devmode/literals.j3` (script literals
+//     to `devNew`), `devmode/thunk.j3` (one `j3s_dev` thunk per callable native fn). Every `use` of the module is here.
 // J3: Deterministic order everywhere, since the dumped IR is the `dev.key` (contracts-c4.md "Ordering rules"):
-//     the script table in struct-id order, `called` in bytecode order, thunks by module order then fn order.
+//     the script table in struct-id order, `called` in bytecode order (Rust `HashSet`: its "can't link" error
+//     names the first missing key in that order), thunks by module order then fn order. `Map`/`Set` are lookups only.
+// J3: The u64 sets are `Map<u64, bool>`: a `Set<u64>` here as well as in `ir/validate.j3` makes stage 0 report
+//     "no method `new` on `Set`" in validate.
+// J3: Rust `Span::dummy()` (file 0, 0..0) is `devSpan()`. Rust `place.project` copies the place; here
+//     `Place.project` shares the projection list, so every projection of a kept place goes through `fresh`.
 module j3c.devmode;
 
 use j3.data.map.Map;
-use j3.data.pool.Id;
+use j3.data.pool.{ Id, Pool };
 use j3.data.set.Set;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.result.Result;
-use j3.text.Text;
+use j3.sys.panic;
+use j3.text.{ Text, endsWith };
 use j3c.base.intern.Sym;
-use j3c.base.span.Span;
+use j3c.base.span.{ Source, Span };
 use j3c.backend.bc;
 use j3c.backend.bc.BcModule;
-use j3c.ir.{ Block, Body, Func, FuncKind, IrCx, Module, Operand, Place, Program, Rvalue, RvalueKind, Stmt, StmtKind, StructDef, TyKind };
+use j3c.ir.{ BinOp, Block, Body, FieldDef, FieldId, FieldProj, Func, FuncKind, GlobalDef, IndexProj, IrCx, J3Fn, LocalDecl, LocalKind, Module,
+    Operand, Place, PlaceRoot, Program, Proj, Rvalue, RvalueKind, ScriptMeta, Stmt, StmtKind, StructDef, SwitchCase, TyKind, Vis };
+use j3c.ir.{ abiSize, letBinding, opBytes, opFnAddr, opInt, opNull, throughRef };
 use j3c.ir.dump;
+use j3c.syntax.ast.{ Ast, Item };
+use j3c.syntax.parse.parseScript;
 
 /// The module the pass adds (thunks, `register`); last in `prog.modules`.
 pub const DEV_MODULE: string = "j3s_dev";
 
 /// Rust `bytecode`: every script module of `prog` (a `script.*` module with a script struct), in module order.
 pub fn bytecode(prog: &Program, arena: &Arena): Result<List<BcModule>, string> {
-    return Result.Err("devmode: not ported yet"); // STUB C
+    let out = List<BcModule>.new(arena);
+    for i in 0..prog.modules.len {
+        let m = &prog.modules.items[i];
+        if !bc.isScriptModule(&prog.cx, m.name.slice()) { continue; }
+        let any = false;
+        for k in 0..m.structs.len {
+            match prog.cx.structDef(m.structs.items[k]).script { Option.Some(_) { any = true; } Option.None {} }
+        }
+        if !any { continue; }
+        out.push(bc.emitScript(&prog.cx, m, arena)?);
+    }
+    return Result.Ok(out);
 }
 
 /// Rust `has_scripts`: the program has at least one script module.
 pub fn hasScripts(prog: &Program): bool {
-    return false; // STUB C
+    for i in 0..prog.modules.len {
+        if bc.isScriptModule(&prog.cx, prog.modules.items[i].name.slice()) { return true; }
+    }
+    return false;
+}
+
+/// The `j3.script` entry points the rewrite calls (Rust `Runtime`).
+struct Runtime {
+    devNew: Id<Func>;
+    devCall: Id<Func>;
+    devRegister: Id<Func>;
+    prop: Id<StructDef>;
+    arg: Id<StructDef>;
+}
+
+/// One prop of a script struct (Rust `(String, Ty)`); `name` is the interned field name's text.
+struct PropInfo {
+    name: string;
+    ty: Id<TyKind>;
+}
+
+/// Rust `ScriptInfo`.
+struct ScriptInfo {
+    path: string;
+    file: Id<Source>;
+    props: List<PropInfo>;
 }
 
 /// Rust `lower`: rewrite `prog` for a dev build. `bytecode` is the scripts, printed before this runs. Ok = how
 /// many native thunks the program links.
 pub fn lower(prog: &Program, bytecode: []BcModule, arena: &Arena): Result<int, string> {
-    return Result.Err("devmode: not ported yet"); // STUB C
+    let cx = &prog.cx;
+    let rt = runtime(cx)?;
+    let scripts = Map<Id<StructDef>, ScriptInfo>.new(arena, 16);
+    let scriptIds = List<Id<StructDef>>.new(arena);
+    for i in 0..cx.structs.len() {
+        let sid = Id<StructDef> { i: u32(i) };
+        let def = cx.structDef(sid);
+        match def.script {
+            Option.Some(meta) {
+                let props = List<PropInfo>.new(arena);
+                for k in 0..def.fields.len {
+                    if k >= meta.propSpans.len { break; }
+                    let f = def.fields.items[k];
+                    props.push(PropInfo { name: cx.nameStr(f.name), ty: f.ty });
+                }
+                scripts.put(sid, ScriptInfo { path: bc.scriptPath(cx, def.moduleName.slice(), arena), file: def.span.file, props: props });
+                scriptIds.push(sid);
+            }
+            Option.None {}
+        }
+    }
+    let called = List<u64>.new(arena);
+    let calledSet = Map<u64, bool>.new(arena, 64);
+    for i in 0..bytecode.len {
+        let ns = bytecode[i].natives;
+        for k in 0..ns.len { if !calledSet.has(ns.items[k].key) { calledSet.put(ns.items[k].key, true); called.push(ns.items[k].key); } }
+    }
+
+    let devName = List<Sym>.new(arena);
+    devName.push(cx.internName(DEV_MODULE));
+    let dev = Module.new(arena, devName);
+    let stubs = List<Id<Func>>.new(arena);
+    for i in 0..prog.modules.len {
+        let md = &prog.modules.items[i];
+        if !bc.isScriptModule(cx, md.name.slice()) { continue; }
+        let keep = List<Id<Func>>.new(arena);
+        for k in 0..md.funcs.len {
+            let id = md.funcs.items[k];
+            let func = cx.func(id);
+            if !sameName(func.moduleName, md.name) {
+                // A native generic instantiated for this script: still native code.
+                dev.funcs.push(id);
+                continue;
+            }
+            let scriptMethod = false;
+            match func.methodOf { Option.Some(s) { scriptMethod = scripts.has(s); } Option.None {} }
+            if scriptMethod && func.vis == Vis.Pub {
+                keep.push(id);
+                stubs.push(id);
+            }
+        }
+        md.funcs = keep;
+        md.globals = List<Id<GlobalDef>>.new(arena);
+    }
+
+    // Thunks: everything a script calls now, plus every `pub` fn of a module a script `use`s, so most script
+    // edits can call something new without a rebuild.
+    let used = usedModules(prog, arena);
+    let targets = List<Id<Func>>.new(arena);
+    let targetKeys = Map<u64, bool>.new(arena, 64);
+    for i in 0..prog.modules.len + 1 {
+        let md = dev;
+        if i < prog.modules.len { md = prog.modules.items[i]; }
+        if bc.isScriptModule(cx, md.name.slice()) { continue; }
+        let moduleUsed = used.has(moduleKey(cx, md.name, arena));
+        for k in 0..md.funcs.len {
+            let id = md.funcs.items[k];
+            let func = cx.func(id);
+            match func.kind { FuncKind.Decl { continue; } FuncKind.J3(_) {} FuncKind.Lib(_) {} }
+            let key = bc.fnKey(cx, id, arena);
+            let wanted = calledSet.has(key);
+            let open = moduleUsed && func.vis == Vis.Pub && sameName(func.moduleName, md.name);
+            if !open && !wanted { continue; }
+            if mentionsScript(cx, func.ty, &scripts, arena) {
+                if wanted {
+                    let t = Text.new(arena);
+                    t.add("a script calls `").add(bc.fnLabel(cx, id, arena))
+                        .add("`, which takes or returns a script instance; dev builds can't pass those to native code yet");
+                    return Result.Err(t.str());
+                }
+                continue;
+            }
+            targets.push(id);
+            targetKeys.put(key, true);
+        }
+    }
+    for i in 0..called.len {
+        let key = called.items[i];
+        if targetKeys.has(key) { continue; }
+        let name = "";
+        for m in 0..bytecode.len {
+            let ns = bytecode[m].natives;
+            for k in 0..ns.len { if name == "" && ns.items[k].key == key { name = ns.items[k].label; } }
+        }
+        let t = Text.new(arena);
+        t.add("a script calls `").add(name).add("`, which the program can't link");
+        return Result.Err(t.str());
+    }
+
+    for i in 0..stubs.len { stub(cx, &rt, &scripts, stubs.items[i])?; }
+    let native = List<Id<Func>>.new(arena);
+    for i in 0..prog.modules.len {
+        let m = prog.modules.items[i];
+        if !bc.isScriptModule(cx, m.name.slice()) { native.extend(m.funcs.slice()); }
+    }
+    native.extend(dev.funcs.slice());
+    for i in 0..native.len { rewriteLiterals(cx, &rt, &scripts, native.items[i])?; }
+    let ptr = cx.common.ptr;
+    for i in 0..scriptIds.len {
+        let handle = cx.internName("handle");
+        let def = cx.structDefMut(scriptIds.items[i]);
+        let fields = List<FieldDef>.new(arena);
+        fields.push(FieldDef { name: handle, doc: "", ty: ptr, embedded: false, default: Option.None });
+        def.fields = fields;
+        match def.script {
+            Option.Some(meta) { def.script = Option.Some(ScriptMeta { path: meta.path, propSpans: List<Span>.new(arena) }); }
+            Option.None {}
+        }
+    }
+
+    let register = Fb.new(cx);
+    let thunkCount = targets.len;
+    for i in 0..targets.len {
+        let target = targets.items[i];
+        let th = thunk(cx, target)?;
+        dev.funcs.push(th);
+        let key = bc.fnKey(cx, target, arena);
+        let fnTy = cx.func(th).ty;
+        let callee = cx.func(rt.devRegister).ty;
+        let args = List<Operand>.new(arena);
+        args.push(opInt(devSpan(), cx.common.u64, key));
+        args.push(opFnAddr(devSpan(), fnTy, th));
+        register.expr(Rvalue.call(devSpan(), cx.common.void, opFnAddr(devSpan(), callee, rt.devRegister), args));
+    }
+    let registerTy = cx.tyFn(List<Id<TyKind>>.new(arena), cx.common.void);
+    let registerId = addFunc(cx, dev.name, "register", registerTy, register.finish());
+    dev.funcs.push(registerId);
+    let mainId = Id<Func> { i: 0 };
+    match findMain(prog) {
+        Option.Some(id) { mainId = id; }
+        Option.None { return Result.Err("dev build: no `main` to register script thunks from"); }
+    }
+    let mf = cx.funcMut(mainId);
+    match mf.kind {
+        FuncKind.J3(j) {
+            let stmts = List<Stmt>.new(arena);
+            stmts.push(Stmt.expr(devSpan(), cx.common.void,
+                Rvalue.call(devSpan(), cx.common.void, opFnAddr(devSpan(), registerTy, registerId), List<Operand>.new(arena))));
+            stmts.extend(j.body.block.stmts.slice());
+            j.body.block = Block { stmts: stmts };
+            mf.kind = FuncKind.J3(j);
+        }
+        FuncKind.Lib(_) {}
+        FuncKind.Decl {}
+    }
+    prog.modules.push(dev);
+    return Result.Ok(thunkCount);
+}
+
+/// Rust `Span::dummy()`.
+fn devSpan(): Span { return Span { file: Id<Source> { i: 0 }, lo: 0, hi: 0 }; }
+
+/// Two module paths are equal (Rust `Vec<Name> ==`).
+fn sameName(a: List<Sym>, b: List<Sym>): bool {
+    if a.len != b.len { return false; }
+    for i in 0..a.len { if !(a.items[i] == b.items[i]) { return false; } }
+    return true;
+}
+
+/// Rust `module_key`: `a.b.c` (an arena copy).
+fn moduleKey(cx: &IrCx, name: List<Sym>, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..name.len {
+        if i > 0 { t.add("."); }
+        t.add(cx.nameStr(name.items[i]));
+    }
+    return t.str();
+}
+
+/// Rust `used_modules`: modules the scripts name in `use` lines (the last part may be an item, not a module).
+fn usedModules(prog: &Program, arena: &Arena): Set<string> {
+    let cx = &prog.cx;
+    let modules = Set<string>.new(arena, 64);
+    for i in 0..prog.modules.len { modules.add(moduleKey(cx, prog.modules.items[i].name, arena)); }
+    let out = Set<string>.new(arena, 16);
+    let ast = Ast.new(arena, cx.names);
+    let scriptPath: [1]string = ["script"];
+    for i in 0..cx.sources.len() {
+        let src = *cx.sources.get(Id<Source> { i: u32(i) });
+        if !endsWith(src.path, ".j3s") { continue; }
+        match parseScript(src.text, Id<Source> { i: 0 }, scriptPath, &ast) {
+            Result.Ok(file) {
+                for k in 0..file.items.len {
+                    match file.items.items[k] {
+                        Item.Use(u) {
+                            let full = Text.new(arena);
+                            let parent = Text.new(arena);
+                            for p in 0..u.path.len {
+                                if p > 0 { full.add("."); }
+                                full.add(cx.nameStr(u.path.items[p].name));
+                                if p + 1 < u.path.len {
+                                    if p > 0 { parent.add("."); }
+                                    parent.add(cx.nameStr(u.path.items[p].name));
+                                }
+                            }
+                            if modules.has(full.str()) { out.add(full.str()); } else if u.path.len > 1 { out.add(parent.str()); }
+                        }
+                        _ {}
+                    }
+                }
+            }
+            Result.Err(_) {}
+        }
+    }
+    return out;
+}
+
+/// Rust `runtime`: `devNew`, `devCall`, `devRegister`, `Prop`, `Arg` of module `j3.script` (first in id order).
+fn runtime(cx: &IrCx): Result<Runtime, string> {
+    return Result.Ok(Runtime { devNew: runtimeFn(cx, "devNew")?, devCall: runtimeFn(cx, "devCall")?,
+        devRegister: runtimeFn(cx, "devRegister")?, prop: runtimeStruct(cx, "Prop")?, arg: runtimeStruct(cx, "Arg")? });
+}
+
+fn isScriptRuntime(cx: &IrCx, m: List<Sym>): bool {
+    return m.len == 2 && cx.nameStr(m.items[0]) == "j3" && cx.nameStr(m.items[1]) == "script";
+}
+
+fn runtimeMissing(cx: &IrCx, name: string): string {
+    let t = Text.new(cx.arena);
+    t.add("dev build: j3.script has no `").add(name).add("`");
+    return t.str();
+}
+
+fn runtimeFn(cx: &IrCx, name: string): Result<Id<Func>, string> {
+    let fs = cx.allFuncs();
+    for i in 0..fs.len {
+        let f = fs[i];
+        let free = true;
+        match f.methodOf { Option.Some(_) { free = false; } Option.None {} }
+        if free && isScriptRuntime(cx, f.moduleName) && cx.nameStr(f.name) == name { return Result.Ok(f.id); }
+    }
+    return Result.Err(runtimeMissing(cx, name));
+}
+
+fn runtimeStruct(cx: &IrCx, name: string): Result<Id<StructDef>, string> {
+    let ss = cx.allStructs();
+    for i in 0..ss.len {
+        if isScriptRuntime(cx, ss[i].moduleName) && cx.nameStr(ss[i].name) == name { return Result.Ok(Id<StructDef> { i: u32(i) }); }
+    }
+    return Result.Err(runtimeMissing(cx, name));
+}
+
+/// Rust `find_main`: the first `main` of the first module.
+fn findMain(prog: &Program): Option<Id<Func>> {
+    if prog.modules.len == 0 { return Option.None; }
+    let fs = prog.modules.items[0].funcs;
+    for i in 0..fs.len {
+        if prog.cx.nameStr(prog.cx.func(fs.items[i]).name) == "main" { return Option.Some(fs.items[i]); }
+    }
+    return Option.None;
+}
+
+/// Rust `script_of`: the script struct `ty` is.
+fn scriptOf(cx: &IrCx, ty: Id<TyKind>, scripts: &Map<Id<StructDef>, ScriptInfo>): Option<Id<StructDef>> {
+    match cx.tyKind(ty) {
+        TyKind.Struct(s) { if scripts.has(s.id) { return Option.Some(s.id); } }
+        _ {}
+    }
+    return Option.None;
+}
+
+/// Rust `script_ref`: `&Door` for a script struct `Door`.
+fn scriptRef(cx: &IrCx, ty: Id<TyKind>, scripts: &Map<Id<StructDef>, ScriptInfo>): Option<Id<StructDef>> {
+    match cx.refInner(ty) {
+        Option.Some(inner) { return scriptOf(cx, inner, scripts); }
+        Option.None { return Option.None; }
+    }
+}
+
+/// Rust `mentions_script`.
+fn mentionsScript(cx: &IrCx, ty: Id<TyKind>, scripts: &Map<Id<StructDef>, ScriptInfo>, arena: &Arena): bool {
+    let seen = Set<Id<TyKind>>.new(arena, 16);
+    return mentions(cx, ty, scripts, &seen);
+}
+
+fn mentions(cx: &IrCx, ty: Id<TyKind>, scripts: &Map<Id<StructDef>, ScriptInfo>, seen: &Set<Id<TyKind>>): bool {
+    if !seen.add(ty) { return false; }
+    match cx.tyKind(ty) {
+        TyKind.Struct(s) {
+            if scripts.has(s.id) { return true; }
+            let fs = cx.structDef(s.id).fields;
+            for i in 0..fs.len { if mentions(cx, fs.items[i].ty, scripts, seen) { return true; } }
+            return false;
+        }
+        TyKind.Enum(e) {
+            let vs = cx.enumDef(e.id).variants;
+            for i in 0..vs.len {
+                match vs.items[i].payload {
+                    Option.Some(p) { if mentions(cx, p, scripts, seen) { return true; } }
+                    Option.None {}
+                }
+            }
+            return false;
+        }
+        TyKind.Ref(r) { return mentions(cx, r.inner, scripts, seen); }
+        TyKind.Array(a) { return mentions(cx, a.elem, scripts, seen); }
+        TyKind.Slice(s) { return mentions(cx, s.elem, scripts, seen); }
+        TyKind.Fn(f) {
+            for i in 0..f.params.len { if mentions(cx, f.params.items[i], scripts, seen) { return true; } }
+            return mentions(cx, f.ret, scripts, seen);
+        }
+        _ { return false; }
+    }
 }
 
 /// Rust `native_key`: everything the dev binary depends on besides `.j3` sources (the lowered native IR text).
 pub fn nativeKey(prog: &Program, arena: &Arena): string {
-    return ""; // STUB C
+    let t = Text.new(arena);
+    dump.dumpProgram(prog, &t);
+    return t.str();
 }

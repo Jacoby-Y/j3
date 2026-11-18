@@ -1,15 +1,16 @@
 // `j3c run`: projects, single files, `.j3s` tools, `--headless`, `--frames`, `--screenshot`.
 //
-// Port of: j3c/src/cli/runner.rs, devrun.rs, the run flags of cli/mod.rs (`take_run_flags`, run help)
+// Port of: j3c/src/cli/runner.rs, the run flags of cli/mod.rs (`take_run_flags`, run help)
 // J3: Rust `run_user` + `run_loaded` in one function: the stat-only shortcut (`stamp.unchangedProject`), then the
 //     check through `driver.run(s, Stage.Passes)`, warnings, the Android refusal, `toolchain.preflight`, the
 //     source-key shortcut (`stamp.upToDate`), else the build on to `Stage.Link` (Options.run = true: temp
 //     output for a program without a manifest), `toolchain.runExe` on `Session.exe`, `stamp.markBuilt` and
-//     the report (Rust `report_run`). The shared failure printing (`printFail` with its `= help:` hint,
-//     warnings, the library refusal) is here; `cmd/build.j3` uses it.
-// J3: Not ported yet: dev mode for projects with `.j3s` scene scripts (`devrun.rs`, C4: such a project runs
-//     as a plain build and, as in Rust, never writes or uses the `run` stamps), `--hot` (`hot.rs`, C4: refused),
-//     `run samples` (the IR samples are a unit-test fixture now).
+//     the report (Rust `report_run`). Warnings and the library refusal are here (`cmd/build.j3` uses them);
+//     `printFail` (with its `= help:` hint) is in `cmd/check.j3`, so `devrun` and `hot` share it.
+// J3: A project goes through `devrun.prepare` on its session as `Mode.Dev` (`runDev`, Rust `run_user`): with
+//     scripts the dev watcher runs it (no `run` stamps), `--hot` then only prints Rust's "ignored" note;
+//     without scripts the same session builds and runs as before, or `hot.run` takes it with `--hot`. Not
+//     ported: `run samples` (the IR samples are a unit-test fixture now).
 // J3: `--emit c` is an error (B8a), also when the output is up to date: the shortcuts are skipped for it.
 module j3c.cmd.run;
 
@@ -18,20 +19,23 @@ use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.result.Result;
 use j3.sys;
-use j3.text.{ Text, contains, endsWith, parseInt, startsWith };
+use j3.text.{ Text, parseInt, startsWith };
 use j3c.base.diag;
 use j3c.base.diag.Severity;
 use j3c.base.fsx;
-use j3c.cmd.check.{ err, failText, out };
+use j3c.cmd.check.{ err, failText, hint, out, printFail };
+use j3c.cmd.devrun;
+use j3c.cmd.devrun.Prepared;
 use j3c.cmd.gen;
+use j3c.cmd.hot;
 use j3c.cmd.stamp;
 use j3c.cmd.stamp.StampFlags;
 use j3c.driver;
 use j3c.driver.{ ANDROID_RUN, Mode, Session, Stage };
 use j3c.project.manifest;
-use j3c.project.manifest.Input;
+use j3c.project.manifest.{ Input, Manifest };
 use j3c.toolchain;
-use j3c.toolchain.{ TargetOs, discard };
+use j3c.toolchain.{ EmitOpts, TargetOs, discard };
 
 const RUN_HELP: string = "usage: j3c run [path | file.j3 | tool.j3s] [--frames N] [--screenshot F.png] [--headless] [--hot] [--file] [--host] [--splash]\n  --hot       rebuild and restart on .j3/.j3ui/.j3s edits; the old run stays up if the build fails (`j3c doc j3ui`).\n  --headless  offscreen video, silent audio: no window. Agents always pass it (`j3c doc testing`).\n  --host      ignore [emit] target: build and run an Android package for this machine, in place (`j3c doc testing`).\n  --splash    show the startup splash in a dev run (`j3c doc ship`); same as J3_SPLASH=1\n  --frames N  stop an App after N frames; --screenshot saves the last one (relative to your cwd).\n";
 
@@ -197,17 +201,12 @@ pub fn runCmd(rest: []string): int {
     manifest.setFileOnly(f.fileOnly);
     let refused = refuseLib(f.path, "run", &mem);
     if refused != 0 { return refused; }
-    // C4 dispatch point (chunk D, Rust `run_user`): a project goes through `devrun.prepare` on a `Mode.Dev`
-    // session; `NoScripts` continues below (or `hot.run` with `--hot`), `Dev` goes to `devrun.watch`.
-    if f.hot {
-        err("j3c-boot: run --hot: not ported yet\n");
-        return 1;
-    }
     let s = sessionFor(&f, true);
     defer s.free();
     s.phases.begin("parse");
-    // Rust `run_user`: a project whose files have not changed (stat only) runs its output as it is.
-    if f.emit != "c" {
+    // Rust `run_user`: a project whose files have not changed (stat only) runs its output as it is (not with
+    // `--hot`, which watches from the start).
+    if f.emit != "c" && !f.hot {
         let sf = StampFlags { path: f.path, hasPath: f.hasPath, fast: f.fast, release: f.release, opt: f.opt };
         match stamp.unchangedProject(&sf, "run", s.arena) {
             Option.Some(u) { return runBuilt(s, u.e.cc.out, u.e.cwd, &f); }
@@ -220,11 +219,17 @@ pub fn runCmd(rest: []string): int {
             match inp {
                 Input.Project(m) {
                     isProject = true;
+                    let e = toolchain.defaultEmitOpts(s.arena);
                     match toolchain.emitOptsFromManifest(&m, s.arena) {
-                        Result.Ok(_) {}
-                        Result.Err(e) { printFail(e, s.arena); return 1; }
+                        Result.Ok(x) { e = x; }
+                        Result.Err(x) { printFail(x, s.arena); return 1; }
                     }
+                    driver.applyFlags(&s.opts, &e);
                     gen.beforeBuild(m.root);
+                    match runDev(s, &f, &m, &e) {
+                        Option.Some(rc) { return rc; }
+                        Option.None {}
+                    }
                 }
                 Input.Hello {}
                 Input.File(_) {}
@@ -291,6 +296,52 @@ pub fn runCmd(rest: []string): int {
     return code;
 }
 
+/// Rust `run_user` for a project: `devrun.prepare` on the session as `Mode.Dev`. None = no scripts, the caller
+/// builds and runs `s` the plain way (`run_loaded`); else the exit code (dev watcher, `--hot`, or a failure).
+fn runDev(s: &Session, f: &RunFlags, m: &Manifest, e: &EmitOpts): Option<int> {
+    s.opts.mode = Mode.Dev;
+    let args = f.args.items[0..f.args.len];
+    match devrun.prepare(s, m, e, s.arena) {
+        Result.Ok(p) {
+            match p {
+                Prepared.NoScripts {
+                    if f.hot { return Option.Some(hot.run(s, m, e, Option.None, args)); }
+                    return Option.None;
+                }
+                Prepared.Dev(b) {
+                    let built = b;
+                    if f.hot {
+                        err("j3c: --hot ignored: this project has .j3s scripts, and its own watcher handles them (script edits swap live; .j3 and markup edits need a restart)\n");
+                    }
+                    match devrun.watch(s, m, e, &built, args, s.arena) {
+                        Result.Ok(code) {
+                            if code != 0 {
+                                let t = Text.new(s.arena);
+                                t.add("j3c: program exited ");
+                                t.pushInt(code);
+                                exitReason(code, &t);
+                                t.add("\n");
+                                err(t.str());
+                            }
+                            return Option.Some(code);
+                        }
+                        Result.Err(x) {
+                            printFail(x, s.arena);
+                            return Option.Some(1);
+                        }
+                    }
+                }
+            }
+        }
+        Result.Err(x) {
+            if f.hot { return Option.Some(hot.run(s, m, e, Option.Some(x), args)); }
+            printFail(x, s.arena);
+            return Option.Some(1);
+        }
+    }
+    return Option.Some(1);
+}
+
 /// The up-to-date path of Rust `run_user` / `run_loaded`: run `exe` as it is and report.
 fn runBuilt(s: &Session, exe: string, cwd: string, f: &RunFlags): int {
     s.phases.begin("up to date");
@@ -351,28 +402,6 @@ pub fn refuseLib(p: string, cmd: string, arena: &Arena): int {
         Result.Err(_) {}
     }
     return 0;
-}
-
-/// Rust `print_fail`: a diagnostic as it is, anything else as `j3c: E`; then the `= help:` install hint
-/// when the text names a missing library or compiler (and doesn't already carry it).
-pub fn printFail(e: string, arena: &Arena) {
-    let t = Text.new(arena);
-    if contains(e, "error:") || contains(e, "warning:") || contains(e, "-->") {
-        t.add(e);
-        if !endsWith(e, "\n") { t.add("\n"); }
-    } else {
-        t.add("j3c: ").add(e).add("\n");
-    }
-    hint(&t, e, arena);
-    err(t.str());
-}
-
-/// Rust `print_hint`, appended to `t`.
-fn hint(t: &Text, text: string, arena: &Arena) {
-    match toolchain.failureHint(text, arena) {
-        Option.Some(h) { if !contains(text, h) { t.add("  = help: ").add(h).add("\n"); } }
-        Option.None {}
-    }
 }
 
 /// Rust `print_warnings`: code warnings to stderr (the program still builds and runs).

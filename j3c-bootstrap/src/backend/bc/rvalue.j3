@@ -1,0 +1,254 @@
+// Scalar rvalues to bytecode: moves, refs, unary and binary math, casts, and the narrow-int re-extension.
+//
+// Part of module j3c.backend.bc.
+// Port of: j3c/src/emit/bc/stmt.rs (`void_rvalue`, `scalar`, `scalar_into`, `extend`, `binary`, `cast`)
+// J3: Rust `extend` is `extendReg` (`extend` is a keyword). Rust matches on `(op, class)` tuples; here the
+//     match is nested, each arm exhaustive (rule 6). `{op:?}` of a `BinOp` is `binOpDebug` (variant names).
+// J3: Every fn returning `Result<int, string>` stands for Rust `Result<(), String>` (Ok is 0).
+module j3c.backend.bc;
+
+/// Rust `BinOp`'s `Debug` text: the variant name.
+fn binOpDebug(op: BinOp): string {
+    match op {
+        BinOp.Add { return "Add"; }
+        BinOp.Sub { return "Sub"; }
+        BinOp.Mul { return "Mul"; }
+        BinOp.Div { return "Div"; }
+        BinOp.Rem { return "Rem"; }
+        BinOp.Eq { return "Eq"; }
+        BinOp.Ne { return "Ne"; }
+        BinOp.Lt { return "Lt"; }
+        BinOp.Le { return "Le"; }
+        BinOp.Gt { return "Gt"; }
+        BinOp.Ge { return "Ge"; }
+        BinOp.And { return "And"; }
+        BinOp.Or { return "Or"; }
+        BinOp.BitAnd { return "BitAnd"; }
+        BinOp.BitOr { return "BitOr"; }
+        BinOp.BitXor { return "BitXor"; }
+        BinOp.Shl { return "Shl"; }
+        BinOp.Shr { return "Shr"; }
+    }
+}
+
+/// One binary op choice: the op, whether the operands swap, whether it is a compare.
+struct BinPick {
+    op: Op;
+    swap: bool;
+    compare: bool;
+}
+
+fn pick(op: Op, swap: bool, compare: bool): BinPick { return BinPick { op: op, swap: swap, compare: compare }; }
+
+/// Float op `f` for `f32`, `g` for `f64`.
+fn fpick(d: bool, f: Op, g: Op): Op {
+    if d { return g; }
+    return f;
+}
+
+/// Signed op `s`, else unsigned `u`.
+fn spick(signed: bool, s: Op, u: Op): Op {
+    if signed { return s; }
+    return u;
+}
+
+extend Codegen {
+    fn voidRvalue(this: &Codegen, rv: &Rvalue): Result<int, string> {
+        match rv.kind {
+            RvalueKind.Call(c) { return this.call(NO_REG, rv.ty, &c.func, c.args.slice()); }
+            RvalueKind.Use(_) { return Result.Ok(0); }
+            RvalueKind.Syscall(_) { return Result.Err("`@syscall` isn't supported in scripts"); }
+            RvalueKind.Atomic(_) { return Result.Err("`@atomic*` isn't supported in scripts (the VM runs on one thread)"); }
+            RvalueKind.Simd(_) { return Result.Err("vec4f is not supported in scripts yet"); }
+            RvalueKind.Ref(_) | RvalueKind.Binary(_) | RvalueKind.Unary(_) | RvalueKind.Aggregate(_) | RvalueKind.Enum(_)
+                | RvalueKind.Cast(_) | RvalueKind.Interpolate(_) {
+                return Result.Err("unsupported void expression");
+            }
+        }
+    }
+
+    /// Evaluate a scalar rvalue into a fresh or existing register.
+    fn scalar(this: &Codegen, rv: &Rvalue): Result<u32, string> {
+        match rv.kind {
+            RvalueKind.Use(op) { return this.operand(&op); }
+            _ {}
+        }
+        let dst = this.reg();
+        this.scalarInto(rv, dst)?;
+        return Result.Ok(dst);
+    }
+
+    fn scalarInto(this: &Codegen, rv: &Rvalue, dst: u32): Result<int, string> {
+        match rv.kind {
+            RvalueKind.Use(op) {
+                let src = this.operand(&op)?;
+                if src != dst { this.push(instr(Op.Mov, dst, src, NO_REG, 0)); }
+            }
+            RvalueKind.Ref(r) {
+                let at = this.placeAddr(&r.place)?;
+                this.push(instr(Op.Addr, dst, at.base, NO_REG, at.offset));
+            }
+            RvalueKind.Binary(b) {
+                let x = this.operand(&b.lhs)?;
+                let y = this.operand(&b.rhs)?;
+                this.binary(dst, b.op, operandTy(b.lhs), x, y)?;
+            }
+            RvalueKind.Unary(u) {
+                let a = this.operand(&u.arg)?;
+                let c = Class.Void;
+                match class(this.cx, operandTy(u.arg)) {
+                    Option.Some(k) { c = k; }
+                    Option.None { return Result.Err("unary on an aggregate"); }
+                }
+                match u.op {
+                    UnaryOp.Not { this.push(instr(Op.Not, dst, a, NO_REG, 0)); }
+                    UnaryOp.Neg {
+                        if c == Class.F32 {
+                            this.push(instr(Op.Fneg, dst, a, NO_REG, 0));
+                        } else if c == Class.F64 {
+                            this.push(instr(Op.Dneg, dst, a, NO_REG, 0));
+                        } else {
+                            this.push(instr(Op.Neg, dst, a, NO_REG, 0));
+                            this.extendReg(dst, c);
+                        }
+                    }
+                    UnaryOp.BitNot {
+                        this.push(instr(Op.Bnot, dst, a, NO_REG, 0));
+                        this.extendReg(dst, c);
+                    }
+                }
+            }
+            RvalueKind.Cast(c) {
+                let a = this.operand(&c.from)?;
+                this.cast(dst, operandTy(c.from), rv.ty, a)?;
+            }
+            RvalueKind.Call(c) { this.call(dst, rv.ty, &c.func, c.args.slice())?; }
+            RvalueKind.Syscall(_) { return Result.Err("`@syscall` isn't supported in scripts"); }
+            RvalueKind.Atomic(_) { return Result.Err("`@atomic*` isn't supported in scripts (the VM runs on one thread)"); }
+            RvalueKind.Simd(_) { return Result.Err("vec4f is not supported in scripts yet"); }
+            RvalueKind.Enum(e) {
+                // a payloadless enum is its tag
+                let tagOnly = false;
+                match e.payload {
+                    Option.None { tagOnly = this.cx.enumDef(e.variant.enumId).isCLike(); }
+                    Option.Some(_) {}
+                }
+                if !tagOnly { return Result.Err("aggregate value in a scalar slot"); }
+                let tag = this.constReg(u64(e.variant.index));
+                this.push(instr(Op.Mov, dst, tag, NO_REG, 0));
+            }
+            RvalueKind.Aggregate(_) { return Result.Err("aggregate value in a scalar slot"); }
+            RvalueKind.Interpolate(_) { return Result.Err("interpolate must be lowered before bytecode"); }
+        }
+        return Result.Ok(0);
+    }
+
+    /// Re-extend a narrow integer register after math (Rust `extend`).
+    fn extendReg(this: &Codegen, reg: u32, c: Class) {
+        match extOp(c) {
+            Option.Some(op) { this.push(instr(op, reg, reg, NO_REG, 0)); }
+            Option.None {}
+        }
+    }
+
+    fn binary(this: &Codegen, dst: u32, op: BinOp, ty: Id<TyKind>, a: u32, b: u32): Result<int, string> {
+        let c = Class.Void;
+        match class(this.cx, ty) {
+            Option.Some(k) { c = k; }
+            Option.None { return Result.Err("binary op on an aggregate"); }
+        }
+        let p = pick(Op.Add, false, false);
+        if c == Class.F32 || c == Class.F64 {
+            let d = c == Class.F64;
+            match op {
+                BinOp.Add { p = pick(fpick(d, Op.Fadd, Op.Dadd), false, false); }
+                BinOp.Sub { p = pick(fpick(d, Op.Fsub, Op.Dsub), false, false); }
+                BinOp.Mul { p = pick(fpick(d, Op.Fmul, Op.Dmul), false, false); }
+                BinOp.Div { p = pick(fpick(d, Op.Fdiv, Op.Ddiv), false, false); }
+                BinOp.Eq { p = pick(fpick(d, Op.Feq, Op.Deq), false, true); }
+                BinOp.Ne { p = pick(fpick(d, Op.Fne, Op.Dne), false, true); }
+                BinOp.Lt { p = pick(fpick(d, Op.Flt, Op.Dlt), false, true); }
+                BinOp.Le { p = pick(fpick(d, Op.Fle, Op.Dle), false, true); }
+                BinOp.Gt { p = pick(fpick(d, Op.Flt, Op.Dlt), true, true); }
+                BinOp.Ge { p = pick(fpick(d, Op.Fle, Op.Dle), true, true); }
+                BinOp.Rem | BinOp.And | BinOp.Or | BinOp.BitAnd | BinOp.BitOr | BinOp.BitXor | BinOp.Shl | BinOp.Shr {
+                    return Result.Err(Text.new(this.arena).add("`").add(binOpDebug(op)).add("` on a float isn't supported in scripts").str());
+                }
+            }
+        } else {
+            let s = classSigned(c);
+            match op {
+                BinOp.Add { p = pick(Op.Add, false, false); }
+                BinOp.Sub { p = pick(Op.Sub, false, false); }
+                BinOp.Mul { p = pick(Op.Mul, false, false); }
+                BinOp.Div { p = pick(spick(s, Op.Divs, Op.Divu), false, false); }
+                BinOp.Rem { p = pick(spick(s, Op.Rems, Op.Remu), false, false); }
+                BinOp.Eq { p = pick(Op.Eq, false, true); }
+                BinOp.Ne { p = pick(Op.Ne, false, true); }
+                BinOp.Lt { p = pick(spick(s, Op.Lts, Op.Ltu), false, true); }
+                BinOp.Le { p = pick(spick(s, Op.Les, Op.Leu), false, true); }
+                BinOp.Gt { p = pick(spick(s, Op.Lts, Op.Ltu), true, true); }
+                BinOp.Ge { p = pick(spick(s, Op.Les, Op.Leu), true, true); }
+                BinOp.And { p = pick(Op.Land, false, false); }
+                BinOp.Or { p = pick(Op.Lor, false, false); }
+                BinOp.BitAnd { p = pick(Op.Band, false, false); }
+                BinOp.BitOr { p = pick(Op.Bor, false, false); }
+                BinOp.BitXor { p = pick(Op.Bxor, false, false); }
+                BinOp.Shl | BinOp.Shr { return Result.Err("shifts aren't supported in scripts"); }
+            }
+        }
+        let x = a;
+        let y = b;
+        if p.swap {
+            x = b;
+            y = a;
+        }
+        let at = this.push(instr(p.op, dst, x, y, 0));
+        if p.compare {
+            this.lastCompare = Option.Some(LastCompare { at: at, reg: dst });
+        } else {
+            this.extendReg(dst, c);
+        }
+        return Result.Ok(0);
+    }
+
+    fn cast(this: &Codegen, dst: u32, from: Id<TyKind>, to: Id<TyKind>, a: u32): Result<int, string> {
+        let f = Class.Void;
+        let t = Class.Void;
+        match class(this.cx, from) {
+            Option.Some(k) { f = k; }
+            Option.None { return Result.Err("cast from an aggregate"); }
+        }
+        match class(this.cx, to) {
+            Option.Some(k) { t = k; }
+            Option.None { return Result.Err("cast to an aggregate"); }
+        }
+        // Rust `matches!(t, Class::Int { bits: 64, .. })` unsigned: only `u64` takes the unsigned float convert
+        let toU64 = t == Class.U64;
+        let op = Op.Mov;
+        if (f == Class.F32 && t == Class.F32) || (f == Class.F64 && t == Class.F64) {
+            op = Op.Mov;
+        } else if f == Class.F32 && t == Class.F64 {
+            op = Op.F2d;
+        } else if f == Class.F64 && t == Class.F32 {
+            op = Op.D2f;
+        } else if f == Class.F32 {
+            op = Op.F2i;
+            if toU64 { op = Op.F2u; }
+        } else if f == Class.F64 {
+            op = Op.D2i;
+            if toU64 { op = Op.D2u; }
+        } else if t == Class.F32 {
+            op = spick(classSigned(f), Op.I2f, Op.U2f);
+        } else if t == Class.F64 {
+            op = spick(classSigned(f), Op.I2d, Op.U2d);
+        } else if t == Class.Bool {
+            let zero = this.constReg(0);
+            this.push(instr(Op.Ne, dst, a, zero, 0));
+            return Result.Ok(0);
+        }
+        this.push(instr(op, dst, a, NO_REG, 0));
+        this.extendReg(dst, t);
+        return Result.Ok(0);
+    }
+}

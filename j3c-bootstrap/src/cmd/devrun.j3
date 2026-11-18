@@ -3,28 +3,44 @@
 // and watch the scripts: swap code live, relaunch on a layout change, rebuild when the natives change.
 //
 // Port of: j3c/src/devrun.rs
-// J3: `prepare` takes a fresh `Session` with `Mode.Dev` from the caller (`cmd/run.j3`) and runs it to
-//     `Stage.Passes` (the driver's `devmode` pass fills `Session.bytecode`). `Prepared.NoScripts` hands the same
-//     session back for a plain build (Rust passes the checked `Program`). Each re-prepare of `watch` makes a
-//     new Session from `s.opts` (one arena per compile); what `Built` keeps is copied into the caller's arena.
+// J3: `prepare` takes a fresh `Session` with `Mode.Dev` from the caller (`cmd/run.j3`) and runs it: to
+//     `Stage.Lower` (check), then `preflight` (Rust's order: before the bytecode), then `Stage.Passes` (validate,
+//     fast, the driver's `devmode` pass: bytecode into `Session.bytecode`, then the IR rewrite), then
+//     `Stage.Link` when the key changed (the driver points the output at `devOut` and picks per-module, split
+//     or one clang). `Prepared.NoScripts` hands the same session back for a plain build (Rust passes the
+//     checked `Program`). Each re-prepare of `watch` makes a new Session from `s.opts` (one arena per compile)
+//     and frees it; what `Built` keeps is copied into the caller's arena (a few paths per script edit).
 // J3: Keys (`dev.key`, `vm.key`) are `j3.hash` `xxh3_64` (Rust `DefaultHasher`): not comparable with stage 0,
-//     so a j3c-boot dev build never reuses a stage-0 one. The watcher polls script mtimes every 100 ms as Rust
-//     does (no `j3.io.watch`: Linux-only, and the poll is what the oracle does).
-// J3: The dev binary lives in `target/.j3c/<host>/<bin>-dev/<bin>-dev` (`devOut`), never beside the real
-//     output, and this path writes no `run` stamp.
+//     so a j3c-boot dev build never reuses a stage-0 one. `dev.key` line 1 hashes the non-script sources and
+//     the embeds (load order), the lowered native IR (`devmode.nativeKey`), the emit options, `fast` and
+//     `cache.compilerId` (Rust: the binary's size and mtime). The watcher polls script mtimes every 100 ms as
+//     Rust does (no `j3.io.watch`: Linux-only, and the poll is what the oracle does).
+// J3: Rust's `cli::timing` lines are not printed: with the `[n/6]` status on (every `run`) Rust skips them too.
+// J3: The child's stdout and stderr are pipes (`j3.proc` pipes all three), pumped by `pump` while `watch` (or
+//     `cmd/hot.j3`) waits: stdout goes through as it comes, stderr line by line with Rust's crash lines held
+//     back for `reportCrash` (Rust: a reader thread). Its stdin is closed (Rust inherits the terminal's).
+// J3: The dev binary lives in `target/.j3c/<host>/<bin>-dev/<bin>-dev` (`driver.devOut`, which `emitOpts`
+//     uses), never beside the real output, and this path writes no `run` stamp.
 module j3c.cmd.devrun;
 
+use j3.io;
 use j3.io.path;
+use j3.hash.Xxh3;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.proc;
-use j3.proc.Child;
+use j3.proc.{ Child, ProcError };
 use j3.result.Result;
-use j3.text.Text;
+use j3.sys;
+use j3.text.{ Text, endsWith, lines, parseU64, startsWith, trim };
 use j3c.backend.bc;
-use j3c.backend.bc.BcModule;
+use j3c.base.fsx;
+use j3c.cache;
+use j3c.cmd.check.{ err, failText, printFail };
+use j3c.devmode;
 use j3c.driver;
 use j3c.driver.{ Session, Stage };
+use j3c.ir.Program;
 use j3c.project.manifest.Manifest;
 use j3c.toolchain;
 use j3c.toolchain.EmitOpts;
@@ -56,34 +72,462 @@ pub enum Prepared {
 }
 
 /// Where the dev binary lives (Rust `dev_out`): its own folder in `target/.j3c`, not beside the real one.
-pub fn devOut(m: &Manifest, arena: &Arena): string {
-    return ""; // STUB D
-}
+pub fn devOut(m: &Manifest, arena: &Arena): string { return driver.devOut(m, arena); }
 
 /// Rust `prepare`: `s` is a fresh `Mode.Dev` session for `m`; check, bytecode, dev lower, key, build if stale,
 /// then write every `.j3sb` (also when the binary was current). Err = the rendered failure text.
 pub fn prepare(s: &Session, m: &Manifest, e: &EmitOpts, arena: &Arena): Result<Prepared, string> {
-    return Result.Err("dev mode: not ported yet"); // STUB D
+    if !driver.run(s, Stage.Lower) { return Result.Err(failText(s)); }
+    match s.program {
+        Option.Some(p) { return prepareChecked(s, p, m, e, arena); }
+        Option.None { return Result.Err(failText(s)); }
+    }
 }
+
+/// `prepare` once `prog` is checked and lowered.
+fn prepareChecked(s: &Session, prog: &Program, m: &Manifest, e: &EmitOpts, arena: &Arena): Result<Prepared, string> {
+    if !devmode.hasScripts(prog) { return Result.Ok(Prepared.NoScripts); }
+    toolchain.preflight(prog, Option.Some(*m), s.arena)?;
+    if !driver.run(s, Stage.Passes) { return Result.Err(failText(s)); }
+    let scripts = List<string>.new(arena);
+    match s.loaded {
+        Option.Some(p) { for i in 0..p.files.len { if endsWith(p.files.items[i].path, ".j3s") { scripts.push(copy(p.files.items[i].path, arena)); } } }
+        Option.None {}
+    }
+    let key = devKey(s, prog, e);
+    let exe = devOut(m, s.arena);
+    let stamp = path.join(path.dirname(exe), "dev.key", s.arena);
+    let modules = List<string>.new(s.arena);
+    for i in 0..prog.modules.len {
+        let t = Text.new(s.arena);
+        let name = &prog.modules.items[i].name;
+        for j in 0..name.len {
+            if j > 0 { t.push('.'); }
+            t.add(prog.cx.nameStr(name.items[j]));
+        }
+        modules.push(t.str());
+    }
+    let old = "";
+    match fsx.readText(stamp, s.arena) {
+        Result.Ok(t) { old = t; }
+        Result.Err(_) {}
+    }
+    let had = fsx.isFile(exe);
+    let rebuilt = false;
+    if had && firstLine(old) == key {
+        s.phases.begin("up to date");
+    } else {
+        if had { noteAdded(old, &modules, s.arena); }
+        if !driver.run(s, Stage.Link) { return Result.Err(failText(s)); }
+        let record = Text.new(s.arena);
+        record.add(key);
+        for i in 0..modules.len { record.push('\n'); record.add(modules.items[i]); }
+        match io.writeFile(stamp, record.str() as []u8) {
+            Result.Ok(_) {}
+            Result.Err(_) {}
+        }
+        rebuilt = true;
+    }
+    let layouts = List<ScriptLayout>.new(arena);
+    for i in 0..s.bytecode.len {
+        let b = &s.bytecode.items[i];
+        bc.writeTo(b, m.root, s.arena)?;
+        layouts.push(ScriptLayout { path: copy(b.path, arena), layout: b.layoutHash, signature: b.signatureHash });
+    }
+    return Result.Ok(Prepared.Dev(Built { layouts: layouts, scripts: scripts, exe: copy(exe, arena), rebuilt: rebuilt }));
+}
+
+fn copy(v: string, arena: &Arena): string { return Text.new(arena).add(v).str(); }
+
+/// The text up to the first newline.
+fn firstLine(t: string): string {
+    for i in 0..t.len { if t[i] == '\n' { return t[0..i]; } }
+    return t;
+}
+
+/// Rust: on a rebuild of an existing dev binary, name the first newly loaded module that is not a script.
+fn noteAdded(old: string, modules: &List<string>, arena: &Arena) {
+    let before = List<string>.new(arena);
+    let it = lines(old);
+    let first = true;
+    while true {
+        match it.next() {
+            Option.Some(l) { if !first { before.push(l); } first = false; }
+            Option.None { break; }
+        }
+    }
+    for i in 0..modules.len {
+        let md = modules.items[i];
+        let seen = false;
+        for j in 0..before.len { if before.items[j] == md { seen = true; } }
+        if !seen && !startsWith(md, "script.") {
+            err(Text.new(arena).add("j3c: a script uses `").add(md).add("`, which the program didn't load; rebuilding\n").str());
+            return;
+        }
+    }
+}
+
+// Hash feeding as `cmd/stamp.j3`: a string with a 0 byte after it, an int as 8 bytes.
+fn hStr(h: &Xxh3, v: string) {
+    let zero: [1]u8 = [0];
+    h.update(v as []u8);
+    h.update(zero[..]);
+}
+
+fn hInt(h: &Xxh3, v: int) {
+    let b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0];
+    let x = u64(v);
+    for i in 0..8 { b[i] = u8((x >> u64(i * 8)) & 255); }
+    h.update(b[..]);
+}
+
+fn hList(h: &Xxh3, l: &List<string>) {
+    hInt(h, l.len);
+    for i in 0..l.len { hStr(h, l.items[i]); }
+}
+
+/// Rust `native_source_key` + `dev_key`: line 1 of `dev.key`.
+fn devKey(s: &Session, prog: &Program, e: &EmitOpts): string {
+    let h = Xxh3.new();
+    let srcs = s.sources.items.slice();
+    for i in 0..srcs.len {
+        if endsWith(srcs[i].path, ".j3s") { continue; }
+        hStr(&h, srcs[i].path);
+        hInt(&h, srcs[i].text.len);
+        h.update(srcs[i].text as []u8);
+    }
+    match s.loaded {
+        Option.Some(p) {
+            for i in 0..p.files.len {
+                let es = &p.files.items[i].ast.embeds;
+                for j in 0..es.len {
+                    for k in 0..es.items[j].files.len {
+                        let f = es.items[j].files.items[k];
+                        hStr(&h, f.disk);
+                        hInt(&h, f.data.len);
+                        h.update(f.data);
+                    }
+                }
+            }
+        }
+        Option.None {}
+    }
+    hStr(&h, devmode.nativeKey(prog, s.arena));
+    hList(&h, &e.cc.libs);
+    hList(&h, &e.cc.search);
+    hList(&h, &e.cc.files);
+    hList(&h, &e.cc.flags);
+    hStr(&h, e.cc.std);
+    hStr(&h, e.cc.opt);
+    hInt(&h, if e.cc.debug { 1 } else { 0 });
+    hInt(&h, if e.cc.release { 1 } else { 0 });
+    hStr(&h, e.target);
+    hStr(&h, e.cpu);
+    hStr(&h, e.clang);
+    hList(&h, &e.flags);
+    hInt(&h, if e.incremental { 1 } else { 0 });
+    hInt(&h, if e.incrementalAll { 1 } else { 0 });
+    hInt(&h, e.chunks);
+    hStr(&h, s.opts.emit);
+    hInt(&h, if fastOf(s) { 1 } else { 0 });
+    hInt(&h, int(cache.compilerId(s.arena)));
+    return toolchain.hex16(h.finish(), s.arena);
+}
+
+/// `--fast`, or the manifest's `[cc] fast` / `[emit] fast`.
+fn fastOf(s: &Session): bool {
+    if s.opts.fast { return true; }
+    match s.loaded {
+        Option.Some(p) {
+            match p.project {
+                Option.Some(m) { return m.cc.fast || m.emit.fast; }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
+    return false;
+}
+
+/// The running child's held crash lines (Rust's `CRASH` thread-local) and its stderr's unfinished line.
+struct Held {
+    on: bool;
+    outEof: bool;
+    errEof: bool;
+    /// Its own arena, living in its own first cell (as `Session`).
+    mem: &Arena;
+    exe: string;
+    root: string;
+    crash: Text;
+    line: Text;
+    buf: []u8;
+}
+
+#[singleton]
+let HELD: Held;
 
 /// Rust `launch`: start `exe` with cwd `root`, `J3_ROOT`, `J3_INSPECT=1`, then `env` (`NAME=VALUE` items, the
 /// `--hot` handshake of `cmd/hot.j3`) on top; stdio inherited.
 pub fn launch(exe: string, root: string, args: []string, env: []string, arena: &Arena): Result<Child, string> {
-    return Result.Err("dev mode: not ported yet"); // STUB D
+    let r = "";
+    match path.realpath(root, arena) {
+        Option.Some(p) { r = p; }
+        Option.None { return Result.Err(Text.new(arena).add("project root ").add(root).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+    }
+    let x = "";
+    match path.realpath(exe, arena) {
+        Option.Some(p) { x = p; }
+        Option.None { return Result.Err(Text.new(arena).add("run ").add(exe).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+    }
+    sys.setenv("J3_ROOT", r);
+    // a dev run lets F12 open the UI inspector (`j3.ui.inspect`); `J3_INSPECT=0` turns that off
+    let inspect = sys.env("J3_INSPECT");
+    sys.setenv("J3_INSPECT", if inspect.len == 0 { "1" } else { inspect });
+    for i in 0..env.len {
+        let eq = -1;
+        for j in 0..env[i].len { if eq < 0 && env[i][j] == '=' { eq = j; } }
+        if eq > 0 { sys.setenv(env[i][0..eq], env[i][eq + 1..env[i].len]); }
+    }
+    let argv = List<string>.new(arena);
+    argv.push(x);
+    for i in 0..args.len { argv.push(args[i]); }
+    match proc.startIn(argv.items[0..argv.len], r, arena) {
+        Result.Ok(c) {
+            let child = c;
+            child.closeStdin();
+            dropHeld();
+            let a = Arena.create(1 << 12);
+            let cell = a.alloc::<Arena>(1);
+            cell[0] = a;
+            HELD.mem = &cell[0];
+            HELD.on = true;
+            HELD.outEof = false;
+            HELD.errEof = false;
+            HELD.exe = Text.new(HELD.mem).add(x).str();
+            HELD.root = Text.new(HELD.mem).add(r).str();
+            HELD.crash = Text.new(HELD.mem);
+            HELD.line = Text.new(HELD.mem);
+            HELD.buf = HELD.mem.alloc::<u8>(4096);
+            return Result.Ok(child);
+        }
+        Result.Err(e) { return Result.Err(Text.new(arena).add("run ").add(exe).add(": ").add(procErr(e, arena)).str()); }
+    }
 }
 
-/// Rust `report_crash`: the held-back crash report of the child, if any, on stderr.
-pub fn reportCrash() {
-    // STUB D
+/// Rust's `io::Error` text for a program that would not start.
+fn procErr(e: ProcError, arena: &Arena): string {
+    match e {
+        ProcError.NotFound { return fsx.osError(2, arena); }
+        ProcError.ExecFailed { return fsx.osError(13, arena); }
+        ProcError.Fail { return fsx.osError(sys.errno(), arena); }
+    }
+    return "";
+}
+
+/// Forget the held state of the last child (it was killed, or reported).
+fn dropHeld() {
+    if !HELD.on { return; }
+    HELD.on = false;
+    let a = *HELD.mem;
+    a.destroy();
+}
+
+/// Pass the launched child's waiting output through (stdout as it is, stderr by line, crash lines held);
+/// never blocks. `watch` calls it while it waits; so must any other caller of `launch` (`cmd/hot.j3`), or a
+/// chatty child stalls on a full pipe.
+pub fn pump(c: &Child) {
+    if !HELD.on { return; }
+    let buf = HELD.buf;
+    while !HELD.outEof {
+        match c.tryRead(buf) {
+            Option.Some(n) {
+                if n <= 0 { HELD.outEof = true; } else { sys.write(1, &buf[0] as ptr, n); }
+            }
+            Option.None { break; }
+        }
+    }
+    while !HELD.errEof {
+        match c.tryReadErr(buf) {
+            Option.Some(n) {
+                if n <= 0 {
+                    HELD.errEof = true;
+                    if HELD.line.len() > 0 { errLine(HELD.line.str()); }
+                    HELD.line.clear();
+                } else {
+                    for i in 0..n {
+                        if buf[i] == '\n' {
+                            errLine(HELD.line.str());
+                            HELD.line.clear();
+                        } else {
+                            HELD.line.push(buf[i]);
+                        }
+                    }
+                }
+            }
+            Option.None { break; }
+        }
+    }
+}
+
+/// One stderr line of the child: a crash-handler line is held, anything else shown (with its source line
+/// when it is a runtime check's).
+fn errLine(l: string) {
+    if startsWith(l, "j3 crash:") || startsWith(l, "j3 base:") || startsWith(l, "j3 pc:") || startsWith(l, "j3 at:") {
+        HELD.crash.add(l).push('\n');
+        return;
+    }
+    let scratch = Arena.create(1 << 12);
+    defer scratch.destroy();
+    let t = Text.new(&scratch);
+    match toolchain.abortContext(l, HELD.root, &scratch) {
+        Option.Some(x) { t.add(x); }
+        Option.None { t.add(l); }
+    }
+    t.push('\n');
+    err(t.str());
+}
+
+/// Wait up to `ms` for output on the child's open pipes (sleep when both are at their end).
+fn waitOutput(c: &Child, ms: int) {
+    let fds: [4]i32 = [0, 0, 0, 0];
+    let n = 0;
+    if HELD.on && !HELD.outEof { fds[2 * n] = i32(c.stdout); fds[2 * n + 1] = 1; n += 1; }
+    if HELD.on && !HELD.errEof { fds[2 * n] = i32(c.stderr); fds[2 * n + 1] = 1; n += 1; }
+    sys.pollFds(&fds[0] as ptr, n, ms);
+}
+
+/// Rust `report_crash`: the held-back crash report of `c` (just exited), if any, on stderr; its last output
+/// is passed through first.
+pub fn reportCrash(c: &Child) {
+    if !HELD.on { return; }
+    // Rust waits up to about a second for the reader to see the pipe close (a grandchild may keep it open).
+    for _ in 0..100 {
+        if HELD.outEof && HELD.errEof { break; }
+        pump(c);
+        if HELD.outEof && HELD.errEof { break; }
+        waitOutput(c, 10);
+    }
+    let text = HELD.crash.str();
+    if text.len > 0 {
+        match toolchain.symbolize(HELD.exe, text, HELD.mem) {
+            Option.Some(out) { err(out); }
+            Option.None {}
+        }
+    }
+    dropHeld();
+}
+
+/// Each script's mtime in ns (-1 when it cannot be read).
+fn mtimes(paths: &List<string>, arena: &Arena): List<int> {
+    let out = List<int>.new(arena);
+    for i in 0..paths.len {
+        match fsx.statNs(paths.items[i], arena) {
+            Option.Some(st) { out.push(st.1 * 1000000000 + st.2); }
+            Option.None { out.push(-1); }
+        }
+    }
+    return out;
+}
+
+fn same(a: &List<int>, b: &List<int>): bool {
+    if a.len != b.len { return false; }
+    for i in 0..a.len { if a.items[i] != b.items[i] { return false; } }
+    return true;
 }
 
 /// Rust `watch`: launch `built.exe`, poll the scripts until the child exits; Ok = its exit code. A failed
 /// re-check prints and keeps the running scripts.
 pub fn watch(s: &Session, m: &Manifest, e: &EmitOpts, built: &Built, args: []string, arena: &Arena): Result<int, string> {
-    return Result.Err("dev mode: not ported yet"); // STUB D
+    s.phases.begin("running");
+    let child = launch(built.exe, m.root, args, args[0..0], arena)?;
+    let scratch = Arena.create(1 << 12);
+    defer scratch.destroy();
+    let mark = scratch.checkpoint();
+    let seen = mtimes(&built.scripts, arena);
+    let last = sys.monotonicMs();
+    while true {
+        pump(&child);
+        match child.tryWait() {
+            Option.Some(code) {
+                reportCrash(&child);
+                child.wait();
+                return Result.Ok(code);
+            }
+            Option.None {}
+        }
+        let left = 100 - (sys.monotonicMs() - last);
+        if left > 0 {
+            waitOutput(&child, left);
+            continue;
+        }
+        last = sys.monotonicMs();
+        scratch.rewind(mark);
+        let now = mtimes(&built.scripts, &scratch);
+        if same(&now, &seen) { continue; }
+        seen = mtimes(&built.scripts, arena);
+        let ns = Session.new(s.opts);
+        ns.phases.enable();
+        let r = prepare(ns, m, e, arena);
+        // the Err text lives in `ns.arena`: print it before the session is freed
+        match r { Result.Err(x) { printFail(x, &scratch); } Result.Ok(_) {} }
+        ns.free();
+        match r {
+            Result.Err(_) {
+                err("j3c: kept the running scripts\n");
+            }
+            Result.Ok(p) {
+                match p {
+                    Prepared.NoScripts { err("j3c: the program has no scripts now; rerun `j3c run`\n"); }
+                    Prepared.Dev(next) {
+                        if next.rebuilt || !sameLayout(&next, built) {
+                            pump(&child);
+                            sys.kill(child.pid, sys.SIGKILL);
+                            child.wait();
+                            dropHeld();
+                            err(if next.rebuilt { "j3c: relaunching (rebuilt)\n" } else { "j3c: relaunching (script layout changed)\n" });
+                            child = launch(next.exe, m.root, args, args[0..0], arena)?;
+                        } else {
+                            bumpReload(m.root, &scratch);
+                            err("j3c: swapped script code\n");
+                        }
+                        seen = mtimes(&next.scripts, arena);
+                        *built = next;
+                    }
+                }
+            }
+        }
+    }
+    return Result.Ok(0);
+}
+
+/// Every script of `next` has the layout hash it had in `old` (a new script counts as the same).
+fn sameLayout(next: &Built, old: &Built): bool {
+    for i in 0..next.layouts.len {
+        let n = next.layouts.items[i];
+        for j in 0..old.layouts.len {
+            if old.layouts.items[j].path == n.path && old.layouts.items[j].layout != n.layout { return false; }
+        }
+    }
+    return true;
 }
 
 /// Rust `bump_reload`: add one to the integer in `ROOT/target/j3s/reload` (the VM reloads when it changes).
 pub fn bumpReload(root: string, arena: &Arena) {
-    // STUB D
+    let p = path.join(root, "target/j3s/reload", arena);
+    let next: u64 = 1;
+    match fsx.readText(p, arena) {
+        Result.Ok(t) {
+            match parseU64(trim(t), 10) {
+                Option.Some(v) { next = v + 1; }
+                Option.None {}
+            }
+        }
+        Result.Err(_) {}
+    }
+    let t = Text.new(arena);
+    t.pushU64(next);
+    match io.writeFile(p, t.str() as []u8) {
+        Result.Ok(_) {}
+        Result.Err(_) {}
+    }
 }

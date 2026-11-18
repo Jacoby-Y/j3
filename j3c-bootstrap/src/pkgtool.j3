@@ -5,16 +5,33 @@
 // J3: The tool builds through `driver` with its package as the project (`Mode.Tool`, host, opt 0, headless).
 //     Cache: `$J3_PKG_DIR/tools` when set, else `~/.cache/j3/tools`; folder `NAME-KEY` with `KEY` an `xxh3_64`
 //     (Rust `DefaultHasher`). Tests always set `J3_PKG_DIR` to scratch.
+// J3: `run` starts the tool itself (fork + execve, stdio inherited: `j3.proc` always pipes). ponytail: the
+//     tool env is `setenv` on this process before the fork (`proc` takes no env), so it stays set for the rest
+//     of the run; fine while every caller sets the same names.
+// J3: Must not `use j3c.cmd.*` (`cmd/pkg.j3` calls here): a failed build's text is `driver.failText`.
 module j3c.pkgtool;
 
+use j3.hash.Xxh3;
+use j3.io;
+use j3.io.path;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.result.Result;
+use j3.sys;
 use j3.text.Text;
+use j3.cmp.sortBy;
+use j3c.base.fsx;
+use j3c.base.intern.own;
+use j3c.base.toml;
+use j3c.cache.compilerId;
 use j3c.driver;
+use j3c.driver.{ Mode, Session, Stage };
+use j3c.project.config.J3C_VERSION;
+use j3c.project.deps;
 use j3c.project.deps.Dep;
 use j3c.project.deps.Tool;
-use j3c.project.manifest.Manifest;
+use j3c.project.manifest;
+use j3c.project.manifest.{ Android, Dist, DesktopAction, Manifest, Output };
 use j3c.toolchain;
 
 /// The tool API version a tool sees in its env (Rust `TOOL_API`).
@@ -32,16 +49,232 @@ pub struct ToolCmd {
 /// Rust `build`: the cached exe of `tool`, built first (stderr `building PKG:TOOL (first run)`) when its key
 /// changed. Err carries the compiler's diagnostics.
 pub fn build(project: &Manifest, dep: &Dep, tool: &Tool, arena: &Arena): Result<string, string> {
-    return Result.Err("package tools: not ported yet"); // STUB E
+    let m = toolManifest(project, dep, tool, arena);
+    let dir = path.join(cacheDir(arena)?, Text.new(arena).add(dep.name).add("-").add(toolchain.hex16(key(&m, tool, arena), arena)).str(), arena);
+    let exe = path.join(dir, tool.name, arena);
+    if fsx.isFile(exe) { return Result.Ok(exe); }
+    let label = Text.new(arena).add(dep.name).add(":").add(tool.name).str();
+    errOut(Text.new(arena).add("building ").add(label).add(" (first run)\n").str());
+    let head = Text.new(arena).add("building ").add(label).add(" (").add(tool.file).add(") failed:\n").str();
+    // Tools are dev builds whoever asks (`release` false: one cached exe serves `pkg` and packaging).
+    let opts = driver.defaults();
+    opts.entry = m.entry;
+    opts.mode = Mode.Tool;
+    opts.headless = true;
+    opts.host = true;
+    opts.project = Option.Some(m);
+    let s = Session.new(opts);
+    defer s.free();
+    if !driver.run(s, Stage.Backend) { return Result.Err(Text.new(arena).add(head).add(driver.failText(s)).str()); }
+    toolchain.mkdirs(dir, arena)?;
+    // Build beside, then rename: a killed build never leaves an exe the next run trusts.
+    let tmp = path.join(dir, Text.new(arena).add(tool.name).add(".tmp").fmt(`{sys.getpid()}`).str(), arena);
+    s.emit.cc.out = tmp;
+    let ok = driver.run(s, Stage.Link);
+    // Objects are never reused: a changed source is a new `<pkg>-<hash>` dir.
+    fsx.removeTree(path.join(dir, ".j3c", arena), arena);
+    if !ok {
+        toolchain.discard(tmp);
+        return Result.Err(Text.new(arena).add(head).add(driver.failText(s)).str());
+    }
+    let built = own(arena, s.exe);
+    match io.rename(built, exe) {
+        Result.Ok(_) {}
+        Result.Err(_) {
+            return Result.Err(Text.new(arena).add("rename ").add(built).add(" to ").add(exe).add(": ").add(fsx.osError(sys.errno(), arena)).str());
+        }
+    }
+    return Result.Ok(exe);
 }
 
 /// Rust `command`: the tool built, the manifest JSON written, cwd the project root, env set; not started.
 pub fn command(project: &Manifest, dep: &Dep, tool: &Tool, args: []string, env: []string, arena: &Arena): Result<ToolCmd, string> {
-    return Result.Err("package tools: not ported yet"); // STUB E
+    let root = match path.realpath(project.root, arena) {
+        Option.Some(r) { r }
+        Option.None { return Result.Err(Text.new(arena).add(project.root).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+    };
+    let exe = build(project, dep, tool, arena)?;
+    let json = writeManifest(root, arena)?;
+    let j3c = match path.realpath("/proc/self/exe", arena) {
+        Option.Some(p) { p }
+        Option.None { return Result.Err(Text.new(arena).add("path of j3c: ").add(fsx.osError(sys.errno(), arena)).str()); }
+    };
+    let c = ToolCmd { argv: List<string>.new(arena), env: List<string>.new(arena), cwd: root };
+    c.argv.push(exe);
+    for i in 0..args.len { c.argv.push(args[i]); }
+    pair(&c.env, "J3_PROJECT_ROOT", root, arena);
+    pair(&c.env, "J3_PKG_ROOT", dep.pkgRoot, arena);
+    pair(&c.env, "J3_PKG_NAME", dep.name, arena);
+    pair(&c.env, "J3C", j3c, arena);
+    pair(&c.env, "J3_TOOL_API", TOOL_API, arena);
+    pair(&c.env, "J3_MANIFEST", json, arena);
+    for i in 0..env.len { c.env.push(env[i]); }
+    return Result.Ok(c);
 }
 
 /// Rust `run`: build if needed and run to the end, stdio inherited. Ok = the tool's exit code (signal N is
 /// `128 + N`, with a line on stderr).
 pub fn run(project: &Manifest, dep: &Dep, tool: &Tool, args: []string, env: []string, arena: &Arena): Result<int, string> {
-    return Result.Err("package tools: not ported yet"); // STUB E
+    let c = command(project, dep, tool, args, env, arena)?;
+    let fail = Text.new(arena).add("run ").add(dep.name).add(":").add(tool.name).add(": ").str();
+    let status = spawnWait(&c, arena);
+    if status < 0 { return Result.Err(Text.new(arena).add(fail).add(fsx.osError(0 - status, arena)).str()); }
+    let sig = status % 128;
+    if sig == 0 { return Result.Ok((status / 256) % 256); }
+    errOut(Text.new(arena).add("j3c: ").add(dep.name).add(":").add(tool.name).add(" killed by signal ").fmt(`{sig}`).add("\n").str());
+    return Result.Ok(128 + sig);
 }
+
+/// Start `c` (env set here, cwd in the child) and wait: the raw `waitpid` status, or `-errno` when it could
+/// not start (a failed `chdir`/`execve` in the child sends its errno back over a close-on-exec pipe).
+fn spawnWait(c: &ToolCmd, arena: &Arena): int {
+    for i in 0..c.env.len {
+        let kv = c.env.items[i];
+        let eq = 0;
+        while eq < kv.len && kv[eq] != '=' { eq += 1; }
+        sys.setenv(own(arena, kv[0..eq]), kv[eq + 1..kv.len]);
+    }
+    // everything the child touches is built before fork: it must not allocate
+    let cpath = cstr(c.argv.items[0], arena);
+    if !sys.canExec(cpath.ptr as ptr) { return 0 - sys.errno(); }
+    let cargv = arena.alloc::<int>(c.argv.len + 1);
+    for i in 0..c.argv.len { cargv[i] = cstr(c.argv.items[i], arena).ptr as int; }
+    cargv[c.argv.len] = 0;
+    let ccwd = cstr(c.cwd, arena);
+    let envp = sys.environ();
+    let fds: [2]i32 = [0, 0];
+    if sys.pipe(fds[..], sys.O_CLOEXEC) < 0 { return 0 - sys.errno(); }
+    let pid = sys.fork();
+    if pid < 0 {
+        let e = sys.errno();
+        sys.close(int(fds[0]));
+        sys.close(int(fds[1]));
+        return 0 - e;
+    }
+    if pid == 0 {
+        let ce: [1]i32 = [0];
+        if sys.chdir(ccwd.ptr as ptr) < 0 { ce[0] = i32(sys.errno()); } else { ce[0] = i32(0 - sys.execve(cpath.ptr as ptr, cargv.ptr as ptr, envp)); }
+        sys.write(int(fds[1]), &ce[0] as ptr, 4);
+        sys.exit(127);
+    }
+    sys.close(int(fds[1]));
+    let ce: [1]i32 = [0];
+    let got = sys.read(int(fds[0]), &ce[0] as ptr, 4);
+    sys.close(int(fds[0]));
+    let st: i32 = 0;
+    while sys.waitpid(pid, &st, 0) < 0 {
+        if sys.errno() != sys.EINTR { return 0 - sys.errno(); }
+    }
+    if got == 4 { return 0 - int(ce[0]); }
+    return int(st);
+}
+
+/// Rust `write_manifest`: `target/.j3c/manifest.json`, the project's whole `j3.toml` as JSON.
+fn writeManifest(root: string, arena: &Arena): Result<string, string> {
+    let file = path.join(root, "j3.toml", arena);
+    let text = fsx.readText(file, arena)?;
+    let json = "";
+    match toml.json(text, arena) {
+        Result.Ok(j) { json = j; }
+        Result.Err(e) { return Result.Err(deps.renameToml(e, file, arena)); }
+    }
+    let dir = path.join(root, "target/.j3c", arena);
+    toolchain.mkdirs(dir, arena)?;
+    let p = path.join(dir, "manifest.json", arena);
+    match io.writeFile(p, Text.new(arena).add(json).add("\n").str() as []u8) {
+        Result.Ok(_) { return Result.Ok(p); }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("write ").add(p).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+    }
+}
+
+/// Rust `tool_manifest`: the package as a project whose entry is the tool: host, opt 0, nothing else of
+/// the game's. The game's dep list is flat with each name once, so the package's own deps are in it.
+fn toolManifest(project: &Manifest, dep: &Dep, tool: &Tool, arena: &Arena): Manifest {
+    let emit = manifest.defaultEmit(arena);
+    emit.opt = "0";
+    let ds = List<Dep>.new(arena);
+    for i in 0..project.deps.len { if project.deps.items[i].name != dep.name { ds.push(project.deps.items[i]); } }
+    let dist = Dist { outputs: List<Output>.new(arena), include: List<string>.new(arena), icon: Option.None, title: "",
+        categories: "", maintainer: "", depends: List<string>.new(arena), section: "", postinst: Option.None,
+        prerm: Option.None, actions: List<DesktopAction>.new(arena) };
+    let android = Android { package: "", orientation: "", nativeLibs: Option.None, foregroundService: Option.None };
+    return Manifest { root: dep.pkgRoot, name: dep.name, bin: dep.name, version: "0.0.0", description: "", entry: tool.file,
+        cc: manifest.defaultCc(), emit: emit, link: manifest.defaultLink(arena), dist: dist, android: android, ui: Option.None,
+        deps: ds, isLib: false };
+}
+
+// ponytail: hashes every byte each run (no mtime shortcut) and keeps old `<pkg>-<hash>` dirs; add a stamp or a
+// sweep if packages or the cache grow big.
+fn key(m: &Manifest, tool: &Tool, arena: &Arena): u64 {
+    let h = Xxh3.new();
+    let zero: [1]u8 = [0];
+    h.update(toolchain.hex16(compilerId(arena), arena) as []u8);
+    h.update(J3C_VERSION as []u8);
+    h.update(zero[..]);
+    h.update(tool.name as []u8);
+    h.update(zero[..]);
+    h.update(tool.file as []u8);
+    h.update(zero[..]);
+    match io.readFile(tool.file, arena) {
+        Result.Ok(b) { h.update(b); }
+        Result.Err(_) {}
+    }
+    hashDir(&h, path.join(m.root, "src", arena), arena);
+    hashDir(&h, path.join(m.root, "tools", arena), arena);
+    for i in 0..m.deps.len { hashDir(&h, m.deps.items[i].root, arena); }
+    let std = sys.env("J3_STDLIB");
+    if std.len > 0 { hashDir(&h, own(arena, std), arena); }
+    return h.finish();
+}
+
+/// Rust `editor::hash_dir`: every path (sorted per folder) and file's bytes under `dir`; nothing when it
+/// cannot be read.
+fn hashDir(h: &Xxh3, dir: string, arena: &Arena) {
+    match io.listDir(dir, arena) {
+        Result.Ok(ents) {
+            let names = List<string>.new(arena);
+            for i in 0..ents.len { names.push(ents[i].name); }
+            sortBy(names.items[0..names.len], fn(a: string, b: string): bool { return a < b; });
+            let zero: [1]u8 = [0];
+            for i in 0..names.len {
+                let p = path.join(dir, names.items[i], arena);
+                h.update(p as []u8);
+                h.update(zero[..]);
+                if fsx.isDir(p) {
+                    hashDir(h, p, arena);
+                } else {
+                    match io.readFile(p, arena) {
+                        Result.Ok(b) { h.update(b); }
+                        Result.Err(_) {}
+                    }
+                }
+            }
+        }
+        Result.Err(_) {}
+    }
+}
+
+/// Rust `cache_dir`: `$J3_PKG_DIR/tools`, else `<cache root>/tools`.
+fn cacheDir(arena: &Arena): Result<string, string> {
+    let d = sys.env("J3_PKG_DIR");
+    if d.len > 0 { return Result.Ok(path.join(own(arena, d), "tools", arena)); }
+    match deps.cacheRoot(arena) {
+        Option.Some(c) { return Result.Ok(path.join(c, "tools", arena)); }
+        Option.None { return Result.Err("no cache directory for package tools (set HOME or J3_PKG_DIR)"); }
+    }
+}
+
+fn pair(env: &List<string>, k: string, v: string, arena: &Arena) {
+    env.push(Text.new(arena).add(k).add("=").add(v).str());
+}
+
+fn cstr(s: string, arena: &Arena): []u8 {
+    let b = arena.alloc::<u8>(s.len + 1);
+    for i in 0..s.len { b[i] = s[i]; }
+    b[s.len] = 0;
+    return b;
+}
+
+
+
+fn errOut(s: string) { sys.write(2, s.ptr as ptr, s.len); }

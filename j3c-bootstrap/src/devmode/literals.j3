@@ -2,4 +2,176 @@
 //
 // Part of module j3c.devmode.
 // Port of: j3c/src/compile/dev/literals.rs
+// J3: Rust consumes the block; here `rewriteBlock` builds new statement lists (and a new switch case list), so
+//     nothing shared with the old body is written. Rust's `mem::take(&mut fb.stmts)` is a swap of `fb.stmts`.
+// J3: A default the literal did not name is found as Rust does: its span (the default's own) is in the script file.
 module j3c.devmode;
+
+/// In a native fn, turn every script literal into `devNew(path, props)`.
+fn rewriteLiterals(cx: &IrCx, rt: &Runtime, scripts: &Map<Id<StructDef>, ScriptInfo>, id: Id<Func>): Result<int, string> {
+    let func = cx.func(id);
+    match func.kind {
+        FuncKind.J3(j) {
+            if !blockHasLiteral(cx, j.body.block, scripts) { return Result.Ok(0); }
+            let fb = Fb.withLocals(cx, &j.body);
+            fb.params = j.body.params;
+            let block = rewriteBlock(cx, rt, scripts, &fb, j.body.block)?;
+            cx.funcMut(id).kind = FuncKind.J3(J3Fn { body: Body { locals: fb.locals, params: fb.params, block: block } });
+            return Result.Ok(0);
+        }
+        FuncKind.Lib(_) { return Result.Ok(0); }
+        FuncKind.Decl { return Result.Ok(0); }
+    }
+}
+
+/// An aggregate of a script struct type.
+fn isLiteral(cx: &IrCx, rv: Rvalue, scripts: &Map<Id<StructDef>, ScriptInfo>): bool {
+    match rv.kind {
+        RvalueKind.Aggregate(_) {
+            match scriptOf(cx, rv.ty, scripts) { Option.Some(_) { return true; } Option.None { return false; } }
+        }
+        _ { return false; }
+    }
+}
+
+fn blockHasLiteral(cx: &IrCx, block: Block, scripts: &Map<Id<StructDef>, ScriptInfo>): bool {
+    for i in 0..block.stmts.len {
+        match block.stmts.items[i].kind {
+            StmtKind.Assign(a) { if isLiteral(cx, a.rvalue, scripts) { return true; } }
+            StmtKind.Defer(d) { if blockHasLiteral(cx, d.body, scripts) { return true; } }
+            StmtKind.Block(b) { if blockHasLiteral(cx, b, scripts) { return true; } }
+            StmtKind.While(w) { if blockHasLiteral(cx, w.body, scripts) { return true; } }
+            StmtKind.ForRange(r) { if blockHasLiteral(cx, r.body, scripts) { return true; } }
+            StmtKind.Switch(s) {
+                for k in 0..s.cases.len { if blockHasLiteral(cx, s.cases.items[k].block, scripts) { return true; } }
+                if blockHasLiteral(cx, s.default, scripts) { return true; }
+            }
+            StmtKind.If(f) {
+                if blockHasLiteral(cx, f.thenBlock, scripts) { return true; }
+                match f.elseBlock { Option.Some(e) { if blockHasLiteral(cx, e, scripts) { return true; } } Option.None {} }
+            }
+            StmtKind.AssignOp(_) {}
+            StmtKind.Return(_) {}
+            StmtKind.Break(_) {}
+            StmtKind.Continue(_) {}
+            StmtKind.Expr(_) {}
+            StmtKind.Abort(_) {}
+            StmtKind.Div0 {}
+            StmtKind.InterpFill(_) {}
+        }
+    }
+    return false;
+}
+
+fn rewriteBlock(cx: &IrCx, rt: &Runtime, scripts: &Map<Id<StructDef>, ScriptInfo>, fb: &Fb, block: Block): Result<Block, string> {
+    let out = List<Stmt>.new(cx.arena);
+    for i in 0..block.stmts.len {
+        let st = block.stmts.items[i];
+        match st.kind {
+            StmtKind.Assign(a) {
+                let sid = Id<StructDef> { i: 0 };
+                let lit = false;
+                match a.rvalue.kind {
+                    RvalueKind.Aggregate(_) { match scriptOf(cx, a.rvalue.ty, scripts) { Option.Some(s) { sid = s; lit = true; } Option.None {} } }
+                    _ {}
+                }
+                if !lit { out.push(st); continue; }
+                let fields = List<Operand>.new(cx.arena);
+                match a.rvalue.kind { RvalueKind.Aggregate(g) { fields = g.fields; } _ {} }
+                let saved = fb.stmts;
+                fb.stmts = List<Stmt>.new(cx.arena);
+                let handle = newInstance(cx, rt, scripts, fb, sid, fields)?;
+                let made = fb.stmts;
+                fb.stmts = saved;
+                out.extend(made.slice());
+                let one = List<Operand>.new(cx.arena);
+                one.push(handle);
+                out.push(Stmt.assign(st.span, st.ty, a.place, Rvalue.aggregate(a.rvalue.span, a.rvalue.ty, one)));
+            }
+            StmtKind.Defer(d) {
+                d.body = rewriteBlock(cx, rt, scripts, fb, d.body)?;
+                st.kind = StmtKind.Defer(d);
+                out.push(st);
+            }
+            StmtKind.Block(b) {
+                st.kind = StmtKind.Block(rewriteBlock(cx, rt, scripts, fb, b)?);
+                out.push(st);
+            }
+            StmtKind.While(w) {
+                w.body = rewriteBlock(cx, rt, scripts, fb, w.body)?;
+                st.kind = StmtKind.While(w);
+                out.push(st);
+            }
+            StmtKind.ForRange(r) {
+                r.body = rewriteBlock(cx, rt, scripts, fb, r.body)?;
+                st.kind = StmtKind.ForRange(r);
+                out.push(st);
+            }
+            StmtKind.If(f) {
+                f.thenBlock = rewriteBlock(cx, rt, scripts, fb, f.thenBlock)?;
+                match f.elseBlock {
+                    Option.Some(e) { f.elseBlock = Option.Some(rewriteBlock(cx, rt, scripts, fb, e)?); }
+                    Option.None {}
+                }
+                st.kind = StmtKind.If(f);
+                out.push(st);
+            }
+            StmtKind.Switch(s) {
+                let cases = List<SwitchCase>.new(cx.arena);
+                for k in 0..s.cases.len {
+                    let c = s.cases.items[k];
+                    cases.push(SwitchCase { value: c.value, block: rewriteBlock(cx, rt, scripts, fb, c.block)? });
+                }
+                s.default = rewriteBlock(cx, rt, scripts, fb, s.default)?;
+                s.cases = cases;
+                st.kind = StmtKind.Switch(s);
+                out.push(st);
+            }
+            StmtKind.AssignOp(_) { out.push(st); }
+            StmtKind.Return(_) { out.push(st); }
+            StmtKind.Break(_) { out.push(st); }
+            StmtKind.Continue(_) { out.push(st); }
+            StmtKind.Expr(_) { out.push(st); }
+            StmtKind.Abort(_) { out.push(st); }
+            StmtKind.Div0 { out.push(st); }
+            StmtKind.InterpFill(_) { out.push(st); }
+        }
+    }
+    return Result.Ok(Block { stmts: out });
+}
+
+/// Emit `devNew(path, [props the literal named])` and return the handle operand.
+fn newInstance(cx: &IrCx, rt: &Runtime, scripts: &Map<Id<StructDef>, ScriptInfo>, fb: &Fb, sid: Id<StructDef>, fields: List<Operand>): Result<Operand, string> {
+    let info = ScriptInfo { path: "", file: Id<Source> { i: 0 }, props: List<PropInfo>.new(cx.arena) };
+    match scripts.get(sid) { Option.Some(found) { info = found; } Option.None { panic("devmode: literal of an unknown script"); } }
+    let propTy = cx.tyStruct(rt.prop);
+    let int = cx.common.int;
+    let items = List<Operand>.new(cx.arena);
+    for i in 0..info.props.len {
+        if i >= fields.len { continue; }
+        let value = fields.items[i];
+        // The script's own default; the VM fills it from the bytecode.
+        let vs = operandSpan(value);
+        if vs.file == info.file { continue; }
+        let p = info.props.items[i];
+        let a = vmArg(cx, fb, scripts, value, p.ty)?;
+        let parts = List<Operand>.new(cx.arena);
+        parts.push(stringConst(cx, p.name));
+        parts.push(a.value);
+        parts.push(opInt(devSpan(), int, a.size));
+        items.push(fb.value(cx, Rvalue.aggregate(devSpan(), propTy, parts)));
+    }
+    let props = sliceOf(cx, fb, propTy, items);
+    let callee = cx.func(rt.devNew).ty;
+    let args = List<Operand>.new(cx.arena);
+    args.push(stringConst(cx, info.path));
+    args.push(props);
+    return Result.Ok(fb.value(cx, Rvalue.call(devSpan(), cx.common.ptr, opFnAddr(devSpan(), callee, rt.devNew), args)));
+}
+
+fn operandSpan(op: Operand): Span {
+    match op {
+        Operand.Const(c) { return c.span; }
+        Operand.Copy(p) { return p.span; }
+    }
+}

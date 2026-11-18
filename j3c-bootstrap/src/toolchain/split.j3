@@ -3,11 +3,129 @@
 //
 // Part of module j3c.toolchain.
 // Port of: j3c/src/emit/host.rs (compile_llvm_split)
-// J3: Used only when the object cache is off and opt is "", 0 or 1 (`cmd/devrun.j3`); with the cache on the
-//     per-module path builds the dev binary. `vm.key` is `xxh3_64` (Rust `DefaultHasher`).
+// J3: Used only when the object cache is off and opt is "", 0 or 1 (`driver.linkStage` in a dev build with
+//     scripts); with the cache on the per-module path builds the dev binary. `vm.key` is `xxh3_64` over the VM
+//     text and its clang argv (Rust `DefaultHasher` over the text and the `Command`'s Debug form). Rust's
+//     `status("compiling")` has no `Phases` here (frozen signature): the driver's open phase stays.
 module j3c.toolchain;
 
 /// Rust `compile_llvm_split`: `mainLl` at `cc`'s opt, `vmLl` at `-O2`, linked to `cc.out`. Ok = the exe path.
 pub fn compileLlvmSplit(mainLl: string, vmLl: string, cc: &CcOpts, clang: string, target: string, cpu: string, extra: []string, arena: &Arena): Result<string, string> {
-    return Result.Err("split build: not ported yet"); // STUB D
+    let exe = cc.out;
+    if exe.len == 0 { return Result.Err("split build needs an output path"); }
+    mkdirs(path.dirname(exe), arena)?;
+    let cl = clangFor(clang, target, arena);
+    let dir = cacheDir(exe, target, arena);
+    mkdirs(dir, arena)?;
+    let vmSrc = path.join(dir, "vm.ll", arena);
+    let vmObj = path.join(dir, "vm.o", arena);
+    let vmStamp = path.join(dir, "vm.key", arena);
+    let mainSrc = path.join(dir, "main.ll", arena);
+    let mainObj = path.join(dir, "main.o", arena);
+    let started = sys.monotonicMs();
+    let vmArgv = splitCompileArgv(cl, vmSrc, vmObj, "2", false, target, cpu, extra, arena);
+    let h = Xxh3.new();
+    h.update(vmLl as []u8);
+    let zero: [1]u8 = [0];
+    for i in 0..vmArgv.len {
+        h.update(vmArgv.items[i] as []u8);
+        h.update(zero[..]);
+    }
+    let vmKey = hex16(h.finish(), arena);
+    let vmCached = fsx.isFile(vmObj);
+    if vmCached {
+        match fsx.readText(vmStamp, arena) {
+            Result.Ok(k) { vmCached = k == vmKey; }
+            Result.Err(_) { vmCached = false; }
+        }
+    }
+    // The VM compiles while the main object does (Rust spawns it first, then waits after main).
+    let mainArgv = splitCompileArgv(cl, mainSrc, mainObj, clangOpt(cc.opt), cc.debug, target, cpu, extra, arena);
+    if vmCached {
+        compileMain(cl, mainSrc, mainLl, &mainArgv, arena)?;
+    } else {
+        discard(vmStamp);
+        writeOrErr(vmSrc, vmLl, arena)?;
+        match proc.start(vmArgv.items[0..vmArgv.len], arena) {
+            Result.Ok(c) {
+                let child = c;
+                child.closeStdin();
+                compileMain(cl, mainSrc, mainLl, &mainArgv, arena)?;
+                let vo = child.collect("" as []u8, arena);
+                discard(vmSrc);
+                if vo.code != 0 { return Result.Err(Text.new(arena).add(cl).add(" failed on the script VM:\n").add(vo.errStr()).str()); }
+                match io.writeFile(vmStamp, vmKey as []u8) {
+                    Result.Ok(_) {}
+                    Result.Err(_) {}
+                }
+            }
+            Result.Err(e) { return Result.Err(spawnErr(cl, e, arena)); }
+        }
+    }
+    let link = List<string>.new(arena);
+    link.push(cl);
+    link.push(linkGcFlag(target));
+    targetArgs(&link, target, arena);
+    useMold(&link, cc.release, target);
+    for i in 0..extra.len { link.push(extra[i]); }
+    link.push("-o");
+    link.push(exe);
+    link.push(mainObj);
+    link.push(vmObj);
+    appendLinkArgs(&link, cc, mainLl, target, arena)?;
+    let lo = Output { code: 0, out: "" as []u8, err: "" as []u8 };
+    match proc.run(link.items[0..link.len], "", arena) {
+        Result.Ok(o) { lo = o; }
+        Result.Err(e) { return Result.Err(spawnErr(cl, e, arena)); }
+    }
+    discard(mainObj);
+    if sys.env("J3C_TIMINGS").len > 0 {
+        let t = Text.new(arena);
+        t.add("j3c: clang (split").add(if vmCached { ", VM cached" } else { "" }).add("): ");
+        pushSecs(&t, sys.monotonicMs() - started, 3);
+        t.add("s\n");
+        sys.write(2, t.str().ptr as ptr, t.len());
+    }
+    if lo.code != 0 { return Result.Err(Text.new(arena).add(cl).add(" link failed:\n").add(lo.errStr()).str()); }
+    return Result.Ok(exe);
+}
+
+/// Rust's `compile` closure in `compile_llvm_split`: `clang -c` of `src` to `obj` at `-O{opt}`.
+fn splitCompileArgv(cl: string, src: string, obj: string, opt: string, debug: bool, target: string, cpu: string, extra: []string, arena: &Arena): List<string> {
+    let a = List<string>.new(arena);
+    a.push(cl);
+    a.push("-c");
+    a.push("-Wno-override-module");
+    a.push(Text.new(arena).add("-O").add(opt).str());
+    a.push("-ffunction-sections");
+    a.push("-fdata-sections");
+    if debug { a.push("-g"); }
+    targetArgs(&a, target, arena);
+    if cpu.len > 0 { a.push(Text.new(arena).add("-mcpu=").add(cpu).str()); }
+    for i in 0..extra.len { a.push(extra[i]); }
+    a.push("-o");
+    a.push(obj);
+    a.push(src);
+    return a;
+}
+
+/// The main object of a split build: write `mainLl`, `clang -c` it, remove the text.
+fn compileMain(cl: string, src: string, mainLl: string, argv: &List<string>, arena: &Arena): Result<bool, string> {
+    writeOrErr(src, mainLl, arena)?;
+    let mo = Output { code: 0, out: "" as []u8, err: "" as []u8 };
+    match proc.run(argv.items[0..argv.len], "", arena) {
+        Result.Ok(o) { mo = o; }
+        Result.Err(e) { return Result.Err(spawnErr(cl, e, arena)); }
+    }
+    discard(src);
+    if mo.code != 0 { return Result.Err(Text.new(arena).add(cl).add(" failed:\n").add(mo.errStr()).str()); }
+    return Result.Ok(true);
+}
+
+/// Write `text` to `p`, Err as Rust's `write P: E`.
+fn writeOrErr(p: string, text: string, arena: &Arena): Result<bool, string> {
+    match io.writeFile(p, text as []u8) {
+        Result.Ok(_) { return Result.Ok(true); }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("write ").add(p).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
+    }
 }

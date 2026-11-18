@@ -1,0 +1,198 @@
+// Build settings and the two output stages: `emitOpts` (Rust `cli::emit_opts`), the backend text
+// (`backendStage`), the link (`linkStage`, with the split VM link of a dev build) and `dump-llvm`'s text.
+//
+// Part of module j3c.driver.
+// Port of: j3c/src/compile.rs (emit_opts, compile_program), j3c/src/devrun.rs (split_vm, the split branch of prepare)
+module j3c.driver;
+
+/// `dump-llvm`: the `.ll` text of `s.program` from the LLVM backend into `out`, after `Stage.Passes` (Rust
+/// `dump_ll_prog`: always LLVM, the build settings or the defaults when they are bad).
+pub fn emitLlvm(s: &Session, out: &Text): bool {
+    let e = toolchain.defaultEmitOpts(s.arena);
+    match emitOpts(s) {
+        Result.Ok(x) { e = x; }
+        Result.Err(_) {}
+    }
+    return emitWith(s, "llvm", &e, out);
+}
+
+/// Rust `cli::emit_opts`: the manifest's `[emit]`/`[cc]`/`[link]` (or the defaults for a single file), then
+/// `--opt`, `--fast` and `--release`. `build` of a program with no manifest writes `target/a.out`.
+pub fn emitOpts(s: &Session): Result<EmitOpts, string> {
+    let e = toolchain.defaultEmitOpts(s.arena);
+    match s.loaded {
+        Option.Some(p) {
+            match p.project {
+                Option.Some(m) { e = toolchain.emitOptsFromManifest(&m, s.arena)?; }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
+    // One Session per `[emit] targets` entry (`build`, in sequence): `Options.target` replaces the primary
+    // target and the output goes to `target/<triple>/<bin>` (Rust `compile_manifest_target`).
+    if s.opts.target.len > 0 {
+        e.target = s.opts.target;
+        match s.loaded {
+            Option.Some(p) {
+                match p.project {
+                    Option.Some(m) { e.cc.out = m.outPathFor(s.opts.target, s.arena); }
+                    Option.None {}
+                }
+            }
+            Option.None {}
+        }
+    }
+    applyFlags(&s.opts, &e);
+    // Rust `devrun::prepare`: `opts.cc.out = dev_out(m)` for the dev binary.
+    if devScripts(s) {
+        match s.loaded {
+            Option.Some(p) {
+                match p.project {
+                    Option.Some(m) { e.cc.out = devOut(&m, s.arena); }
+                    Option.None {}
+                }
+            }
+            Option.None {}
+        }
+    }
+    return Result.Ok(e);
+}
+
+/// The flag half of `emitOpts`: `--opt`, `--fast`, `--release`, and `build`'s `target/a.out` (Rust `cli::emit_opts`
+/// after `EmitOpts::from_manifest`). `cmd/run.j3` applies it to a manifest's options before any load.
+pub fn applyFlags(o: &Options, e: &EmitOpts) {
+    if o.opt.len > 0 { e.cc.opt = o.opt; }
+    if o.fast { e.cc.debug = false; }
+    if o.release {
+        e.cc.release = true;
+        e.cc.debug = false;
+        e.incremental = false;
+        if o.opt.len == 0 { e.cc.opt = "s"; }
+    }
+    if !o.run && e.cc.out.len == 0 { e.cc.out = "target/a.out"; }
+}
+
+/// Emit `s.program` with the backend `name` into `out`; false with Diags.
+fn emitWith(s: &Session, name: string, e: &EmitOpts, out: &Text): bool {
+    match s.program {
+        Option.Some(p) {
+            match backend.find(name, noSpan(), &s.diags) {
+                Option.Some(b) {
+                    let o = toolchain.backendOpts(e);
+                    return b.emit(p, &o, out, &s.diags);
+                }
+                Option.None { return false; }
+            }
+        }
+        Option.None { return false; }
+    }
+}
+
+/// Rust `emit_opts` + `emit_text`: the build settings into `s.emit`, the backend's text into `s.ll`. The
+/// backend is `--emit`, else `[emit] backend`, else LLVM.
+fn backendStage(s: &Session): bool {
+    match emitOpts(s) {
+        Result.Ok(e) { s.emit = e; }
+        Result.Err(x) { return fail(s, x); }
+    }
+    let name = backendName(s);
+    // The object cache emits each module itself (`cache.compile`), a split dev build its two parts
+    // (`linkStage`): the whole-program text would be unused.
+    if cache.enabled(&s.emit) || cache.thinLto(&s.emit) || splitVm(s, name) {
+        match backend.find(name, noSpan(), &s.diags) {
+            Option.Some(_) { return true; }
+            Option.None { return false; }
+        }
+    }
+    let t = Text.new(s.arena);
+    if !emitWith(s, name, &s.emit, &t) { return false; }
+    s.ll = t.str();
+    return true;
+}
+
+/// Rust `compile_program` (the clang half) and `run_loaded`'s Android refusal: the program's path in `s.exe`.
+/// A cross build's error names its target (Rust `link_built`).
+fn linkStage(s: &Session): bool {
+    if s.opts.run && toolchain.targetOs(s.emit.target) == toolchain.TargetOs.Android {
+        return fail(s, ANDROID_RUN);
+    }
+    // Rust `compile_program`: per-module objects (cached) or ThinLTO objects when the options allow, else
+    // one clang over the whole text.
+    let built: Result<string, string> = Result.Err("");
+    let split = cache.enabled(&s.emit) || cache.thinLto(&s.emit);
+    if split {
+        match s.program {
+            Option.Some(p) { built = cache.compile(p, &s.emit, &s.phases, s.arena); }
+            Option.None { return false; }
+        }
+    } else if splitVm(s, backendName(s)) {
+        match s.program {
+            Option.Some(p) { built = linkSplit(s, p); }
+            Option.None { return false; }
+        }
+    } else {
+        built = toolchain.compileTextWith(s.ll, &s.emit, &s.phases, s.arena);
+    }
+    match built {
+        Result.Ok(p) {
+            s.exe = p;
+            return true;
+        }
+        Result.Err(x) {
+            if s.emit.target.len == 0 { return fail(s, x); }
+            return fail(s, Text.new(s.arena).add("target ").add(s.emit.target).add(":\n").add(x).str());
+        }
+    }
+}
+
+/// `--emit`, else `[emit] backend`, else LLVM.
+fn backendName(s: &Session): string {
+    if s.opts.emit.len > 0 { return s.opts.emit; }
+    match s.loaded {
+        Option.Some(p) {
+            match p.project {
+                Option.Some(m) { return m.emit.backend; }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
+    return "llvm";
+}
+
+/// Rust `devrun::split_vm`: a dev build with scripts below `-O2` (LLVM, no object cache) gives the VM its own
+/// `-O2` object.
+fn splitVm(s: &Session, backendName: string): bool {
+    let o = s.emit.cc.opt;
+    return devScripts(s) && backendName == "llvm" && (o == "" || o == "0" || o == "1");
+}
+
+/// Rust `prepare`'s split branch: the program but the `j3.script` fns (Rust `vm_funcs`) as one text, those
+/// fns as another, then `toolchain.compileLlvmSplit`.
+fn linkSplit(s: &Session, p: &Program): Result<string, string> {
+    let vm = Set<Id<Func>>.new(s.arena, 256);
+    for i in 0..p.modules.len {
+        let m = &p.modules.items[i];
+        if m.name.len == 2 && p.cx.nameStr(m.name.items[0]) == "j3" && p.cx.nameStr(m.name.items[1]) == "script" {
+            for j in 0..m.funcs.len { vm.add(m.funcs.items[j]); }
+        }
+    }
+    let bo = toolchain.backendOpts(&s.emit);
+    let lo = LlOpts { target: bo.target, opt: bo.opt, debug: bo.debug, release: bo.release };
+    let mainText = Text.new(s.arena);
+    let except = Part { kind: PartKind.Except, funcs: &vm };
+    llvm.emitLlvmPart(&p.cx, p.modules.slice(), &lo, &except, &mainText)?;
+    let vmText = Text.new(s.arena);
+    let only = Part { kind: PartKind.Only, funcs: &vm };
+    llvm.emitLlvmPart(&p.cx, p.modules.slice(), &lo, &only, &vmText)?;
+    s.phases.begin("compile");
+    let e = &s.emit;
+    return toolchain.compileLlvmSplit(mainText.str(), vmText.str(), &e.cc, e.clang, e.target, e.cpu, e.flags.items[0..e.flags.len], s.arena);
+}
+
+/// A plain error (code 0, no span: Rust's `Err(String)`); false.
+fn fail(s: &Session, msg: string): bool {
+    s.diags.add(s.diags.make(0, Severity.Error, noSpan(), msg));
+    return false;
+}

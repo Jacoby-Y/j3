@@ -3,55 +3,346 @@
 //
 // Port of: j3c/src/cli/pkg.rs
 // J3: Rust `refuse_lib` is `cmd/run.j3` `refuseLib` (ported in C3; `run` and `build` call it).
-// J3: Stubs print `j3c-boot: CMD: not ported yet` rc 1 (the `cmd/args.j3` fallback text) until filled.
+// J3: Rust `pkg_in(start, rest)` is `pkgIn`; the cwd is `realpath(".")` (Rust `current_dir`, the kernel's
+//     resolved path). Every command runs in one arena dropped at the end (the manifest and its deps live there).
 module j3c.cmd.pkg;
 
+use j3.io;
 use j3.io.path;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.result.Result;
-use j3.text.Text;
+use j3.sys;
+use j3.text.{ Text, endsWith, lines, startsWith, trim, trimStart };
+use j3c.base.fsx;
 use j3c.cmd.check.{ err, out };
 use j3c.pkgtool;
-use j3c.project.deps.Dep;
+use j3c.project.deps;
+use j3c.project.deps.{ Dep, Tool, parentOf };
 use j3c.project.manifest;
 use j3c.project.manifest.Manifest;
 
+const FETCH_USAGE: string = "usage: j3c fetch [path]\n  download the project's git dependencies (and theirs) and write j3.lock; prints each dep's folder\n";
+const UPDATE_USAGE: string = "usage: j3c update [name]\n  move git deps (or just `name`) to the newest commit of their tag/branch and rewrite j3.lock\n";
+const PKG_USAGE: string = "usage: j3c pkg [NAME [CMD [args...]]]\n  no NAME: every dependency's commands and dist outputs; NAME: that one's commands;\n  NAME CMD: build (cached) and run that command of the package, args passed untouched, exit code = its\n";
+const ADD_USAGE: string = "usage: j3c add <name> --path DIR\n       j3c add <name> --git URL [--tag T | --rev R | --branch B]";
+
 /// `j3c fetch [path]`: fetch every git dep, write `j3.lock`, list where each dep lives.
 pub fn fetchCmd(rest: []string): int {
-    return stub("fetch"); // STUB E
+    if wantsHelp(rest) {
+        out(FETCH_USAGE);
+        return 0;
+    }
+    let mem = Arena.create(1 << 14);
+    defer mem.destroy();
+    let start: Option<string> = Option.None;
+    if rest.len > 0 { start = Option.Some(rest[0]); }
+    match projectToml(start, &mem) {
+        Result.Ok(t) {
+            match manifest.load(t, &mem) {
+                Result.Ok(m) {
+                    report(&m, &mem);
+                    return 0;
+                }
+                Result.Err(e) { return fail("fetch", e, &mem); }
+            }
+        }
+        Result.Err(e) { return fail("fetch", e, &mem); }
+    }
 }
 
-/// `j3c update [name]`: unlock (one dep or all), then fetch again.
+/// `j3c update [name]`: unlock (one dep or all), then fetch again; the old `j3.lock` is put back when the
+/// load fails.
 pub fn updateCmd(rest: []string): int {
-    return stub("update"); // STUB E
+    if wantsHelp(rest) {
+        out(UPDATE_USAGE);
+        return 0;
+    }
+    let mem = Arena.create(1 << 14);
+    defer mem.destroy();
+    let t = "";
+    match projectToml(Option.None, &mem) {
+        Result.Ok(x) { t = x; }
+        Result.Err(e) { return fail("update", e, &mem); }
+    }
+    let root = match parentOf(t) { Option.Some(r) { r } Option.None { "." } };
+    let lock = path.join(root, "j3.lock", &mem);
+    let saved: Option<string> = Option.None;
+    match fsx.readText(lock, &mem) {
+        Result.Ok(s) { saved = Option.Some(s); }
+        Result.Err(_) {}
+    }
+    let name: Option<string> = Option.None;
+    if rest.len > 0 { name = Option.Some(rest[0]); }
+    match deps.unlock(root, name, &mem) {
+        Result.Ok(_) {}
+        Result.Err(e) { return fail("update", e, &mem); }
+    }
+    match manifest.load(t, &mem) {
+        Result.Ok(m) {
+            report(&m, &mem);
+            return 0;
+        }
+        Result.Err(e) {
+            match saved {
+                Option.Some(s) { io.writeFile(lock, s as []u8); }
+                Option.None {}
+            }
+            return fail("update", e, &mem);
+        }
+    }
 }
 
 /// `j3c add <name> (--path DIR | --git URL [--tag T | --rev R | --branch B])`; `j3.toml` put back on failure.
 pub fn addCmd(rest: []string): int {
-    return stub("add"); // STUB E
+    let mem = Arena.create(1 << 14);
+    defer mem.destroy();
+    let name = "";
+    let hasName = false;
+    let keys = List<string>.new(&mem);
+    let vals = List<string>.new(&mem);
+    let i = 0;
+    while i < rest.len {
+        let a = rest[i];
+        i += 1;
+        if a == "--help" || a == "-h" {
+            out(Text.new(&mem).add(ADD_USAGE).add("\n  writes the dependency into j3.toml and fetches it; then `use <name>;` in your code\n").str());
+            return 0;
+        }
+        if a == "--path" || a == "--git" || a == "--tag" || a == "--rev" || a == "--branch" {
+            if i >= rest.len {
+                err(Text.new(&mem).add("j3c add: ").add(a).add(" needs a value\n").add(ADD_USAGE).add("\n").str());
+                return 1;
+            }
+            keys.push(a[2..a.len]);
+            vals.push(rest[i]);
+            i += 1;
+        } else if !startsWith(a, "-") && !hasName {
+            name = a;
+            hasName = true;
+        } else {
+            err(Text.new(&mem).add("j3c add: unexpected `").add(a).add("`\n").add(ADD_USAGE).add("\n").str());
+            return 1;
+        }
+    }
+    let src = 0;
+    for k in 0..keys.len { if keys.items[k] == "path" || keys.items[k] == "git" { src += 1; } }
+    if !hasName || src != 1 {
+        err(Text.new(&mem).add(ADD_USAGE).add("\n").str());
+        return 1;
+    }
+    let lt = Text.new(&mem).add(name).add(" = { ");
+    for k in 0..keys.len {
+        if k > 0 { lt.add(", "); }
+        lt.add(keys.items[k]).add(" = \"").add(vals.items[k]).add("\"");
+    }
+    let line = lt.add(" }").str();
+    let toml = "";
+    match projectToml(Option.None, &mem) {
+        Result.Ok(t) { toml = t; }
+        Result.Err(e) { return fail("add", e, &mem); }
+    }
+    let old = "";
+    match fsx.readText(toml, &mem) {
+        Result.Ok(t) { old = t; }
+        Result.Err(e) { return fail("add", e, &mem); }
+    }
+    let new = addDepLine(old, name, line, &mem);
+    match io.writeFile(toml, new as []u8) {
+        Result.Ok(_) {}
+        Result.Err(_) {
+            let e = Text.new(&mem).add("write ").add(toml).add(": ").add(fsx.osError(sys.errno(), &mem)).str();
+            return fail("add", e, &mem);
+        }
+    }
+    match manifest.load(toml, &mem) {
+        Result.Ok(m) {
+            out(Text.new(&mem).add("added ").add(line).add("\n").str());
+            report(&m, &mem);
+            return 0;
+        }
+        Result.Err(e) {
+            io.writeFile(toml, old as []u8);
+            return fail("add", Text.new(&mem).add(e).add("\n  (j3.toml left as it was)").str(), &mem);
+        }
+    }
 }
 
 /// `j3c pkg [NAME [CMD [args...]]]`: list deps' tools, or build (cached) and run one; rc = the tool's.
 pub fn pkgCmd(rest: []string): int {
-    return stub("pkg"); // STUB E
+    if rest.len > 0 && (rest[0] == "--help" || rest[0] == "-h") {
+        out(PKG_USAGE);
+        return 0;
+    }
+    let mem = Arena.create(1 << 12);
+    defer mem.destroy();
+    match path.realpath(".", &mem) {
+        Option.Some(cwd) { return pkgIn(cwd, rest); }
+        Option.None { return fail("pkg", Text.new(&mem).add("cwd: ").add(fsx.osError(sys.errno(), &mem)).str(), &mem); }
+    }
 }
 
-/// Rust `add_dep_line`: `text` with `line` under `[dependencies]` (the section made when missing), every other
-/// line kept.
+/// Rust `pkg_in`: `j3c pkg` for the project around `start`.
+pub fn pkgIn(start: string, rest: []string): int {
+    let mem = Arena.create(1 << 14);
+    defer mem.destroy();
+    let m = match findOrLoad(start, &mem) {
+        Result.Ok(x) { x }
+        Result.Err(e) { return fail("pkg", e, &mem); }
+    };
+    if rest.len == 0 {
+        let any = false;
+        for i in 0..m.deps.len {
+            let d = &m.deps.items[i];
+            if d.commands.len > 0 || d.distOutputs.len > 0 {
+                any = true;
+                out(toolsText(d, &mem));
+            }
+        }
+        if !any { out("no package tools: no dependency has [commands] or [dist_outputs]\n"); }
+        return 0;
+    }
+    let name = rest[0];
+    let di = -1;
+    for i in 0..m.deps.len { if di < 0 && m.deps.items[i].name == name { di = i; } }
+    if di < 0 {
+        let t = Text.new(&mem).add("no dependency `").add(name).add("` in ").add(path.join(m.root, "j3.toml", &mem)).add("\n  = note: ");
+        if m.deps.len == 0 { t.add("the project has no dependencies"); } else {
+            t.add("dependencies: ");
+            for i in 0..m.deps.len {
+                if i > 0 { t.add(", "); }
+                t.add(m.deps.items[i].name);
+            }
+        }
+        return fail("pkg", t.str(), &mem);
+    }
+    let dep = &m.deps.items[di];
+    if rest.len == 1 {
+        out(toolsText(dep, &mem));
+        return 0;
+    }
+    let cmd = rest[1];
+    let ti = -1;
+    for i in 0..dep.commands.len { if ti < 0 && dep.commands.items[i].name == cmd { ti = i; } }
+    if ti < 0 {
+        let t = Text.new(&mem).add("`").add(name).add("` has no command `").add(cmd).add("`\n  = note: ");
+        if dep.commands.len == 0 { t.add("`").add(name).add("` has no [commands]"); } else {
+            t.add("commands of `").add(name).add("`: ");
+            for i in 0..dep.commands.len {
+                if i > 0 { t.add(", "); }
+                t.add(dep.commands.items[i].name);
+            }
+        }
+        return fail("pkg", t.str(), &mem);
+    }
+    match pkgtool.run(&m, dep, &dep.commands.items[ti], rest[2..rest.len], rest[0..0], &mem) {
+        Result.Ok(code) { return code; }
+        Result.Err(e) { return fail("pkg", e, &mem); }
+    }
+}
+
+/// Rust `add_dep_line`: `text` with `line` as the last key of `[dependencies]` (an existing `name = ...` is
+/// replaced), or a new section at the end; every other line kept.
 pub fn addDepLine(text: string, name: string, line: string, arena: &Arena): string {
-    return text; // STUB E
+    let ls = List<string>.new(arena);
+    let it = lines(text);
+    while true {
+        match it.next() {
+            Option.Some(l) { ls.push(l); }
+            Option.None { break; }
+        }
+    }
+    let head = -1;
+    for i in 0..ls.len { if head < 0 && trim(ls.items[i]) == "[dependencies]" { head = i; } }
+    if head < 0 {
+        let sep = "\n\n";
+        if text.len == 0 || endsWith(text, "\n\n") { sep = ""; } else if text[text.len - 1] == '\n' { sep = "\n"; }
+        return Text.new(arena).add(text).add(sep).add("[dependencies]\n").add(line).add("\n").str();
+    }
+    let end = ls.len;
+    for i in head + 1..ls.len { if end == ls.len && startsWith(trimStart(ls.items[i]), "[") { end = i; } }
+    let found = -1;
+    for i in head + 1..end { if found < 0 && keyOf(ls.items[i]) == name { found = i; } }
+    let at = found;
+    if found < 0 {
+        at = end;
+        while at > head + 1 && trim(ls.items[at - 1]).len == 0 { at -= 1; }
+    }
+    let t = Text.new(arena);
+    for i in 0..ls.len {
+        if i == at { t.add(line).add("\n"); }
+        if i != found { t.add(ls.items[i]).add("\n"); }
+    }
+    if at == ls.len { t.add(line).add("\n"); }
+    return t.str();
 }
 
 /// Rust `tools_text`: a dep's tools, one per line under its name.
 pub fn toolsText(d: &Dep, arena: &Arena): string {
-    return ""; // STUB E
+    let t = Text.new(arena).add(d.name).add("\n");
+    if d.commands.len == 0 { t.add("  (no commands)\n"); }
+    for i in 0..d.commands.len { toolLine(t, "", &d.commands.items[i]); }
+    for i in 0..d.distOutputs.len { toolLine(t, "dist: ", &d.distOutputs.items[i]); }
+    return t.str();
 }
 
-// The not-ported text of `cmd/args.j3`; goes when the four commands are real.
-fn stub(cmd: string): int {
-    err("j3c-boot: ");
-    err(cmd);
-    err(": not ported yet\n");
+fn toolLine(t: &Text, kind: string, tool: &Tool) {
+    t.add("  ").add(kind).add(tool.name);
+    if tool.hasHelp { t.add("  ").add(tool.help); }
+    t.add("\n");
+}
+
+/// Rust `project_toml`: the `j3.toml` at or above `p` (else the cwd).
+fn projectToml(p: Option<string>, arena: &Arena): Result<string, string> {
+    let start = "";
+    match p {
+        Option.Some(x) { start = x; }
+        Option.None {
+            match path.realpath(".", arena) {
+                Option.Some(c) { start = c; }
+                Option.None { return Result.Err(Text.new(arena).add("cwd: ").add(fsx.osError(sys.errno(), arena)).str()); }
+            }
+        }
+    }
+    match manifest.findTomlUp(start, arena) {
+        Option.Some(t) { return Result.Ok(t); }
+        Option.None { return Result.Err(noToml(start, arena)); }
+    }
+}
+
+fn findOrLoad(start: string, arena: &Arena): Result<Manifest, string> {
+    match manifest.findTomlUp(start, arena) {
+        Option.Some(t) { return manifest.load(t, arena); }
+        Option.None { return Result.Err(noToml(start, arena)); }
+    }
+}
+
+fn noToml(start: string, arena: &Arena): string {
+    return Text.new(arena).add("no j3.toml in ").add(start).add(" or above it").str();
+}
+
+/// Rust `report`: each dep's folder, or `no dependencies`.
+fn report(m: &Manifest, arena: &Arena) {
+    if m.deps.len == 0 { out("no dependencies\n"); }
+    for i in 0..m.deps.len {
+        out(Text.new(arena).add(m.deps.items[i].name).add("  ").add(m.deps.items[i].root).add("\n").str());
+    }
+}
+
+/// `j3c CMD: E` on stderr; 1.
+fn fail(cmd: string, e: string, arena: &Arena): int {
+    err(Text.new(arena).add("j3c ").add(cmd).add(": ").add(e).add("\n").str());
     return 1;
+}
+
+fn wantsHelp(rest: []string): bool {
+    for i in 0..rest.len { if rest[i] == "--help" || rest[i] == "-h" { return true; } }
+    return false;
+}
+
+/// Rust `l.split('=').next().trim()`.
+fn keyOf(l: string): string {
+    let e = 0;
+    while e < l.len && l[e] != '=' { e += 1; }
+    return trim(l[0..e]);
 }

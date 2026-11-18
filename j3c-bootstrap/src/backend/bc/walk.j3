@@ -1,0 +1,160 @@
+// Place walkers: which locals must live in memory, and how often each local is used.
+//
+// Part of module j3c.backend.bc.
+// Port of: j3c/src/emit/bc/codegen.rs (`addressed_locals`, `count_block`, `walk_block`, `walk_rvalue`,
+//     `walk_operand`, `walk_place`)
+// J3: Rust walks the body twice with a `FnMut(&Place, bool)` closure (once to mark addressed locals, once to
+//     count uses). Both closures only record, so here one walk fills a `PlaceWalk` with both results; the
+//     visiting order is Rust's. Matches are exhaustive over `StmtKind`, `RvalueKind`, `InterpPart`, `Proj`.
+module j3c.backend.bc;
+
+/// What one walk over a body records: `marked[i]` = local `i` must live in memory (its address is taken, or
+/// `InterpFill` writes it; a ref local read through `Deref` keeps its register), `uses[i]` = places rooted at it.
+pub struct PlaceWalk {
+    marked: List<bool>;
+    uses: List<u32>;
+
+    fn new(count: int, arena: &Arena): PlaceWalk {
+        let w = PlaceWalk { marked: List<bool>.new(arena), uses: List<u32>.new(arena) };
+        for i in 0..count {
+            w.marked.push(false);
+            w.uses.push(0);
+        }
+        return w;
+    }
+}
+
+/// Rust's two closures in one: `addressed_locals` marks, `count_block` counts.
+fn visitPlace(w: &PlaceWalk, place: &Place, force: bool) {
+    match place.root {
+        PlaceRoot.Local(l) {
+            let i = int(l.id.i);
+            if force && !derefFirst(place) { w.marked.items[i] = true; }
+            w.uses.items[i] = w.uses.items[i] + 1;
+        }
+        PlaceRoot.Global(_) {}
+    }
+}
+
+fn derefFirst(place: &Place): bool {
+    if place.proj.len == 0 { return false; }
+    match place.proj.items[0] {
+        Proj.Deref { return true; }
+        Proj.Field(_) | Proj.Index(_) | Proj.Ptr | Proj.Len | Proj.EnumTag | Proj.Lane(_) | Proj.EnumPayload(_) { return false; }
+    }
+}
+
+/// Visit every place of `b`; `force` is true where the place's address is taken.
+pub fn walkBlock(w: &PlaceWalk, b: &Block) {
+    for i in 0..b.stmts.len {
+        let st = &b.stmts.items[i];
+        match st.kind {
+            StmtKind.Assign(a) {
+                walkPlace(w, &a.place, false);
+                walkRvalue(w, &a.rvalue);
+            }
+            StmtKind.AssignOp(a) {
+                walkPlace(w, &a.place, false);
+                walkOperand(w, &a.rhs);
+            }
+            StmtKind.Defer(d) { walkBlock(w, &d.body); }
+            StmtKind.Block(body) { walkBlock(w, &body); }
+            StmtKind.If(f) {
+                walkOperand(w, &f.cond);
+                walkBlock(w, &f.thenBlock);
+                match f.elseBlock {
+                    Option.Some(other) { walkBlock(w, &other); }
+                    Option.None {}
+                }
+            }
+            StmtKind.While(l) {
+                walkOperand(w, &l.cond);
+                walkBlock(w, &l.body);
+            }
+            StmtKind.Switch(sw) {
+                walkOperand(w, &sw.scrut);
+                for c in 0..sw.cases.len { walkBlock(w, &sw.cases.items[c].block); }
+                walkBlock(w, &sw.default);
+            }
+            StmtKind.Return(r) {
+                match r.value {
+                    Option.Some(op) { walkOperand(w, &op); }
+                    Option.None {}
+                }
+            }
+            StmtKind.Expr(rv) { walkRvalue(w, &rv); }
+            StmtKind.ForRange(f) {
+                walkPlace(w, &f.index, false);
+                walkOperand(w, &f.end);
+                walkBlock(w, &f.body);
+            }
+            StmtKind.InterpFill(f) {
+                walkPlace(w, &f.buf, true);
+                walkPlace(w, &f.used, true);
+                walkParts(w, f.parts.slice());
+            }
+            StmtKind.Break(_) | StmtKind.Continue(_) | StmtKind.Abort(_) | StmtKind.Div0 {}
+        }
+    }
+}
+
+fn walkParts(w: &PlaceWalk, parts: []InterpPart) {
+    for i in 0..parts.len {
+        match parts[i] {
+            InterpPart.Value(op) { walkOperand(w, &op); }
+            InterpPart.Lit(_) {}
+        }
+    }
+}
+
+fn walkOperands(w: &PlaceWalk, ops: []Operand) {
+    for i in 0..ops.len { walkOperand(w, &ops[i]); }
+}
+
+pub fn walkRvalue(w: &PlaceWalk, rv: &Rvalue) {
+    match rv.kind {
+        RvalueKind.Use(op) { walkOperand(w, &op); }
+        RvalueKind.Unary(u) { walkOperand(w, &u.arg); }
+        RvalueKind.Cast(c) { walkOperand(w, &c.from); }
+        RvalueKind.Ref(r) { walkPlace(w, &r.place, true); }
+        RvalueKind.Binary(b) {
+            walkOperand(w, &b.lhs);
+            walkOperand(w, &b.rhs);
+        }
+        RvalueKind.Call(c) {
+            walkOperand(w, &c.func);
+            walkOperands(w, c.args.slice());
+        }
+        RvalueKind.Syscall(s) {
+            walkOperand(w, &s.nr);
+            walkOperands(w, s.args.slice());
+        }
+        RvalueKind.Atomic(a) { walkOperands(w, a.args.slice()); }
+        RvalueKind.Simd(s) { walkOperands(w, s.args.slice()); }
+        RvalueKind.Aggregate(a) { walkOperands(w, a.fields.slice()); }
+        RvalueKind.Enum(e) {
+            match e.payload {
+                Option.Some(op) { walkOperand(w, &op); }
+                Option.None {}
+            }
+        }
+        RvalueKind.Interpolate(i) { walkParts(w, i.parts.slice()); }
+    }
+}
+
+pub fn walkOperand(w: &PlaceWalk, op: &Operand) {
+    match *op {
+        Operand.Copy(place) { walkPlace(w, &place, false); }
+        Operand.Const(_) {}
+    }
+}
+
+pub fn walkPlace(w: &PlaceWalk, place: &Place, force: bool) {
+    visitPlace(w, place, force);
+    for i in 0..place.proj.len {
+        match place.proj.items[i] {
+            Proj.Index(ix) { walkOperand(w, &ix.index); }
+            Proj.Deref | Proj.Field(_) | Proj.Ptr | Proj.Len | Proj.EnumTag | Proj.Lane(_) | Proj.EnumPayload(_) {}
+        }
+    }
+}

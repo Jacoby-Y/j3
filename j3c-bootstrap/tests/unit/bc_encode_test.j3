@@ -1,0 +1,193 @@
+// `backend/bc/encode.j3` against stage 0: a hand-built `BcModule` (the header of `examples/scripted`'s
+// `fighter.j3s` plus its `strike` fn, values read back from stage 0's `dump-bc` file) encodes to the same bytes
+// and dumps to the same text. Also the FNV key recipe, `bytecodePath`, and `writeTo` skipping an equal file.
+module bc_encode_test;
+
+use j3.io;
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+use j3.hash.fnv1a64;
+use j3c.base.fsx;
+use j3c.backend.bc.{ BcField, BcFunction, BcGlobal, BcModule, BcNative, BcParam, CallSite, Instr, NO_REG, bytecodePath, dump,
+    encode, instr, opAt, writeTo };
+
+/// stage 0 `dump-bc examples/scripted/scripts/fighter.j3s`, bytes 0..0x360 (header and `strike`), with the
+/// function count patched from 4 to 1.
+const WANT_HEX: [16]string = [
+    "4a33534202000000bb73e17a3eecfcf2d12ce3ace5a5d7460e0000007363726970742e666967687465720b000000666967687465722e6a33",
+    "73380000000300000006000000040000006e616d65000000001000000000000000ffffffff02000000687010000000080000000800000014",
+    "00000000000000ffffffff0600000061747461636b1800000008000000080000000400000000000000ffffffff04000000646f776e200000",
+    "00010000000100000000ffffffff050000006465616c742800000008000000080000000000000000000000ffffffff0500000074616b656e",
+    "3000000008000000080000000000000000000000ffffffff0100000041dad32979bc79b3090000006b6e6f636b6f75747308000000000000",
+    "00ffffffff070000000200000020200a00000020697320646f776e20280800000020736f2066617229070000003a20746f6f6b2004000000",
+    "206f6620080000002c206465616c74200b0000002c207374616e64696e672001000000eb57cfb4f15c768f180000006a332e696f2e707269",
+    "6e744c6e3a666e28737472696e67290000000001000000b1968a01fd6433bc06000000737472696b6516000000666e282646696768746572",
+    "2c20696e74293a20696e7401000000000000000c0000000800000000000000020000000100000000000000080000000d0000000200000000",
+    "000000080000000d000000000000000e00000000000000000100000007000000ffffffffffffffff00000000000000000100000008000000",
+    "ffffffffffffffff0400000000000000080000000600000001000000ffffffff200000000000000045000000ffffffff06000000ffffffff",
+    "050000000000000053000000ffffffff07000000ffffffff00000000000000004b000000ffffffff08000000070000000700000000000000",
+    "56000000ffffffffffffffffffffffff00000000000000001700000004000000020000000800000000000000000000000d00000009000000",
+    "01000000ffffffff18000000000000001300000005000000090000000400000000000000000000000d0000000a00000001000000ffffffff",
+    "2800000000000000130000000b0000000a00000005000000000000000000000011000000ffffffff010000000b0000002800000000000000",
+    "53000000ffffffff05000000ffffffff0000000000000000"
+];
+
+/// stage 0 `dump-bc` of the same, one line each.
+const WANT_DUMP: [27]string = [
+    "j3sb 2 script.fighter (fighter.j3s)",
+    "layout f2fcec3e7ae173bb signatures 46d7a5e5ace32cd1",
+    "instance 56 bytes, 3 props",
+    "  field name @0 size 16",
+    "  field hp @16 size 8 default",
+    "  field attack @24 size 8 default",
+    "  field down @32 size 1 default",
+    "  field dealt @40 size 8 default",
+    "  field taken @48 size 8 default",
+    "  shared knockouts size 8",
+    "  native j3.io.printLn:fn(string)",
+    "",
+    "pub fn strike [fn(&Fighter, int): int] frame 0 regs 12",
+    "  0000 const r7, 0x0",
+    "  0001 const r8, 0x4",
+    "  0002 ld8u r6, [r1+32]",
+    "  0003 jz r6, 0005",
+    "  0004 retv r7",
+    "  0005 jn.eq r8, r7, 0007",
+    "  0006 div0",
+    "  0007 rems r4, r2, r8",
+    "  0008 ld64 r9, [r1+24]",
+    "  0009 add r5, r9, r4",
+    "  0010 ld64 r10, [r1+40]",
+    "  0011 add r11, r10, r5",
+    "  0012 st64 [r1+40], r11",
+    "  0013 retv r5"
+];
+fn le(v: u64, n: int, a: &Arena): List<u8> {
+    let out = List<u8>.new(a);
+    for i in 0..n { out.push(u8((v >> u64(8 * i)) & 0xFF)); }
+    return out;
+}
+
+fn field(name: string, offset: u32, size: u32, def: List<u8>): BcField {
+    return BcField { defaultConst: Option.None, default: def, name: name, offset: offset, size: size };
+}
+
+fn str(s: string, a: &Arena): List<u8> {
+    let out = List<u8>.new(a);
+    out.extend(s as []u8);
+    return out;
+}
+
+/// `op` is the file code (`opAt(code - 1)`).
+fn ins(code: int, dst: u32, x: u32, y: u32, imm: u64): Instr { return instr(opAt(code - 1), dst, x, y, imm); }
+
+fn fighter(a: &Arena): BcModule {
+    let m = BcModule { fields: List<BcField>.new(a), globals: List<BcGlobal>.new(a), constants: List<List<u8>>.new(a),
+        natives: List<BcNative>.new(a), scripts: List<string>.new(a), functions: List<BcFunction>.new(a), name: "script.fighter",
+        path: "fighter.j3s", layoutHash: 0xf2fcec3e7ae173bb, signatureHash: 0x46d7a5e5ace32cd1, instanceSize: 56, props: 3 };
+    m.fields.push(field("name", 0, 16, List<u8>.new(a)));
+    m.fields.push(field("hp", 16, 8, le(20, 8, a)));
+    m.fields.push(field("attack", 24, 8, le(4, 8, a)));
+    m.fields.push(field("down", 32, 1, le(0, 1, a)));
+    m.fields.push(field("dealt", 40, 8, le(0, 8, a)));
+    m.fields.push(field("taken", 48, 8, le(0, 8, a)));
+    m.globals.push(BcGlobal { initConst: Option.None, init: List<u8>.new(a), name: "knockouts", key: 0xb379bc7929d3da41, size: 8 });
+    let cs: [7]string = ["  ", " is down (", " so far)", ": took ", " of ", ", dealt ", ", standing "];
+    for i in 0..7 { m.constants.push(str(cs[i], a)); }
+    m.natives.push(BcNative { label: "j3.io.printLn:fn(string)", key: 0x8f765cf1b4cf57eb });
+    let f = BcFunction { params: List<BcParam>.new(a), calls: List<CallSite>.new(a), code: List<Instr>.new(a), name: "strike",
+        signature: "fn(&Fighter, int): int", key: 0xbc3364fd018a96b1, frameSize: 0, regs: 12, retSize: 8, public: true, retAggregate: false };
+    f.params.push(BcParam { reg: 1, offset: 0, size: 8, load: 13 });
+    f.params.push(BcParam { reg: 2, offset: 0, size: 8, load: 13 });
+    let n: u32 = NO_REG;
+    f.code.push(ins(1, 7, n, n, 0));
+    f.code.push(ins(1, 8, n, n, 4));
+    f.code.push(ins(8, 6, 1, n, 32));
+    f.code.push(ins(69, n, 6, n, 5));
+    f.code.push(ins(83, n, 7, n, 0));
+    f.code.push(ins(75, n, 8, 7, 7));
+    f.code.push(ins(86, n, n, n, 0));
+    f.code.push(ins(23, 4, 2, 8, 0));
+    f.code.push(ins(13, 9, 1, n, 24));
+    f.code.push(ins(19, 5, 9, 4, 0));
+    f.code.push(ins(13, 10, 1, n, 40));
+    f.code.push(ins(19, 11, 10, 5, 0));
+    f.code.push(ins(17, n, 1, 11, 40));
+    f.code.push(ins(83, n, 5, n, 0));
+    m.functions.push(f);
+    return m;
+}
+
+fn hexOf(b: []u8, a: &Arena): string {
+    let t = Text.new(a);
+    let d = "0123456789abcdef";
+    for i in 0..b.len { t.push(d[int(b[i] >> 4)]); t.push(d[int(b[i] & 15)]); }
+    return t.str();
+}
+
+fn main() {
+    let arena = Arena.create(1 << 20);
+    let a = &arena;
+    let m = fighter(a);
+    let want = Text.new(a);
+    for i in 0..16 { want.add(WANT_HEX[i]); }
+    let got = hexOf(encode(&m, a).slice(), a);
+    if got != want.str() { panic(`encode differs from stage 0:\n got {got}\nwant {want.str()}`); }
+    let t = Text.new(a);
+    dump(&m, &t);
+    let wantDump = Text.new(a);
+    for i in 0..WANT_DUMP.len { wantDump.add(WANT_DUMP[i]).add("\n"); }
+    if t.str() != wantDump.str() { panic(`dump differs from stage 0:\n{t.str()}`); }
+    // Keys are FNV-1a 64 of the label (the native key in the file).
+    if fnv1a64("j3.io.printLn:fn(string)" as []u8) != 0x8f765cf1b4cf57eb { panic("fnv1a64 key recipe differs"); }
+    if bytecodePath("", "fighter.j3s", a) != "target/j3s/fighter.j3sb" { panic(bytecodePath("", "fighter.j3s", a)); }
+    if bytecodePath("p", "a/door.j3s", a) != "p/target/j3s/a/door.j3sb" { panic(bytecodePath("p", "a/door.j3s", a)); }
+    if bytecodePath("p", "x", a) != "p/target/j3s/x.j3sb" { panic(bytecodePath("p", "x", a)); }
+    // writeTo: writes once, then leaves an equal file alone (same mtime), rewrites a changed one.
+    let dir = "";
+    match io.tempDir("", "bc_encode_test", a) {
+        Result.Ok(d) { dir = d; }
+        Result.Err(_) { panic("tempDir failed"); }
+    }
+    let p = "";
+    match writeTo(&m, dir, a) {
+        Result.Ok(x) { p = x; }
+        Result.Err(e) { panic(e); }
+    }
+    match io.readFile(p, a) {
+        Result.Ok(b) { if hexOf(b, a) != got { panic("writeTo wrote other bytes"); } }
+        Result.Err(_) { panic("writeTo wrote nothing"); }
+    }
+    let before = fsx.statNs(p, a);
+    match writeTo(&m, dir, a) {
+        Result.Ok(_) {}
+        Result.Err(e) { panic(e); }
+    }
+    let after = fsx.statNs(p, a);
+    match before {
+        Option.Some(x) {
+            match after {
+                Option.Some(y) { if x.1 != y.1 || x.2 != y.2 { panic("writeTo rewrote an equal file"); } }
+                Option.None { panic("stat failed"); }
+            }
+        }
+        Option.None {}
+    }
+    m.props = 4;
+    match writeTo(&m, dir, a) {
+        Result.Ok(_) {}
+        Result.Err(e) { panic(e); }
+    }
+    match io.readFile(p, a) {
+        Result.Ok(b) { if b[61] != 4 { panic("writeTo kept a changed file"); } }
+        Result.Err(_) { panic("read failed"); }
+    }
+    io.remove(p);
+    io.removeDir(Text.new(a).add(dir).add("/target/j3s").str());
+    io.removeDir(Text.new(a).add(dir).add("/target").str());
+    io.removeDir(dir);
+    arena.destroy();
+}

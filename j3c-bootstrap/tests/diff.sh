@@ -13,7 +13,8 @@ usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-kno
   --no-coverage   skip tools/coverage.sh (also DIFF_NO_COVERAGE=1); tools/layers.sh always runs
   --update-known  rewrite the known list (tests/known/MODE.txt) to this run's DIFF/CRASH files
   --list          print the expanded inputs, one per line, and exit (nothing runs)
-  -j N            parallel jobs (default: core count, 4 for run)
+  -j N            parallel jobs (default J3_TEST_JOBS, else half the cores; llvm a quarter: each job
+                  holds up to ~1 GB of memory and three dumps of up to ~80 MB on disk)
   files           inputs instead of tests/corpus.txt (paths or project folders)
      glsl runs `dump-glsl PATH`; ui runs `dump-ui PROJECT/ui` (the project's `.j3ui` folder).
      tests/bad-ui/NAME is a UI project with one error: ui compares the `dump-ui` error text, and err takes
@@ -27,7 +28,8 @@ usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-kno
      runs, and a NONDET (or any other outcome) of it does not fail the run.
      bc: every compiler works on its own scratch copy (never the tree: `run` and `dump-bc` write `target/j3s/`
      and `scripts/target/`). A project input runs `run --headless --frames 3 .` (dev mode: scripts on the VM) and
-     compares the exit code and the set of `*.j3sb` files with their sha256 (not stdout: timings); a `.j3s` file
+     compares the exit code, the set of `*.j3sb` files with their sha256 (not stdout: timings) and, when it
+     fails, stderr without the `[n/6]` lines (the refusal text); a `.j3s` file
      input runs `dump-bc` on it in a copy of its project (or of its folder when that project is j3c-bootstrap)
      and compares stdout, stderr, exit code and the written `.j3sb`.
      self: stage 1 (j3c-boot) builds a scratch copy of j3c-bootstrap/{j3.toml,src,text} under <repo>/target/
@@ -68,7 +70,7 @@ done
 case $mode in
     fmt|ast|err) to=30 ;;
     ir|llvm|glsl|ui) to=120 ;;
-    run|bc) to=300; : "${jobs:=4}" ;;
+    run|bc) to=300 ;;
     self) to=0 ;;
     *) usage >&2; exit 2 ;;
 esac
@@ -76,7 +78,9 @@ esac
 [ $user = 0 ] || [ $mode = ir ] || die "--user is for ir only"
 [ $es = 0 ] || [ $mode = glsl ] || die "--es is for glsl only"
 to=${DIFF_TIMEOUT:-$to}
-: "${jobs:=$(nproc)}"
+if [ $mode = llvm ] || [ $mode = self ]; then : "${jobs:=${J3_TEST_JOBS:-$(( $(nproc) / 4 ))}}"; fi
+: "${jobs:=${J3_TEST_JOBS:-$(( $(nproc) / 2 ))}}"
+[ "$jobs" -ge 1 ] 2>/dev/null || jobs=1
 [ -x "$S0" ] || die "no $S0: run tools/stage0.sh --worktree"
 
 # Fail fast on the structural checks (not for --list: it only prints).
@@ -128,12 +132,17 @@ if [ $mode = self ]; then
         sub glsl --es
         sub ir --norm
     fi
-    # llvm: one input per call (a whole-corpus llvm run fills /tmp).
-    li=0
-    while IFS= read -r f; do
-        li=$((li + 1))
-        if [ $li -ge "$la" ] && [ $li -le "$lb" ]; then sub llvm "$f"; fi
-    done < <("$0" llvm --list)
+    # llvm: one input per call (a whole-corpus llvm run fills /tmp), $jobs calls at a time, each writing its
+    # own $scratch/llvm.N; printed in list order as `sub` would.
+    export self=$here/diff.sh scratch
+    llist=$("$0" llvm --list)
+    awk -v a="$la" -v b="$lb" 'NR >= a && NR <= b { print NR; print }' <<<"$llist" |
+        xargs -d '\n' -n2 -P "$jobs" bash -c '"$self" llvm "$2" >"$scratch/llvm.$1" 2>&1; echo $? >"$scratch/llvm.$1.rc"' _
+    for o in $(ls "$scratch" | sed -n 's/^llvm\.\([0-9]*\)$/\1/p' | sort -n); do
+        n=$((n + 1)); f=$scratch/llvm.$o
+        if [ "$(cat "$f.rc")" = 0 ]; then tail -1 "$f"
+        else bad=$((bad + 1)); echo "FAILED: diff.sh llvm $(sed -n "${o}p" <<<"$llist")"; cat "$f"; fi
+    done
     echo "diff.sh self: $((n - bad)) ok, $bad failed (of $n comparisons)"
     [ $bad = 0 ] || exit 1
     exit 0
@@ -196,6 +205,13 @@ if [ $list = 1 ]; then echo "$inputs"; exit 0; fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# projof FILE: the project folder a run input builds in (nearest `j3.toml` at or above it), or nothing.
+projof() {
+    local p=$root/$1; [ -d "$p" ] || p=$(dirname "$p")
+    while [ ! -f "$p/j3.toml" ] && [ "$p" != "$root" ] && [ "$p" != / ]; do p=$(dirname "$p"); done
+    [ ! -f "$p/j3.toml" ] || echo "$p"
+}
+
 # one IDX FILE: run both compilers, write $tmp/IDX/{status,detail}.
 one() {
     set +e
@@ -242,9 +258,7 @@ one() {
     # leaves nothing behind.
     local proj=
     if [ $mode = run ]; then
-        proj=$root/$f; [ -d "$proj" ] || proj=$(dirname "$proj")
-        while [ ! -f "$proj/j3.toml" ] && [ "$proj" != "$root" ] && [ "$proj" != / ]; do proj=$(dirname "$proj"); done
-        [ -f "$proj/j3.toml" ] || proj=
+        proj=$(projof "$f")
         # A lone file runs in a scratch cwd: what it writes by relative path dies with $d/w
         # (j3c/stdlib/tests/win_io_test.j3 makes `C:\j3_win_io_test\...` folders in the cwd on Linux).
         if [ -z "$proj" ]; then mkdir -p "$d/w"; cwd=$d/w; cmd=(run --headless --frames 3 "$root/$f"); fi
@@ -252,7 +266,8 @@ one() {
     for who in a a2 b; do
         local bin=$S0; [ $who = b ] && bin=$BOOT
         # Each compiler builds from nothing: no stamp or object of the other one (or of an earlier run).
-        [ -z "$proj" ] || rm -rf "$proj/target/.j3c"
+        # A dev run (a project with `.j3s` scripts) also writes `target/j3s/` (bytecode, reload counter): gone too.
+        [ -z "$proj" ] || rm -rf "$proj/target/.j3c" "$proj/target/j3s"
         if [ -n "$bsrc" ]; then
             rm -rf "$d/w"; mkdir -p "$d/w"; cwd=$d/w
             (cd "$bsrc" && tar cf - --exclude=./target .) | (cd "$d/w" && tar xf -)
@@ -268,7 +283,10 @@ one() {
         if [ -n "$bsrc" ]; then
             [ -d "$root/$f" ] && : >"$d/$who.out"
             { echo "--- j3sb"; (cd "$d/w" && find . -name '*.j3sb' -type f | LC_ALL=C sort | xargs -r sha256sum); } >>"$d/$who.out"
-            [ -d "$root/$f" ] && : >"$d/$who.err"
+            # a failed project run keeps its error text (the refusal), less the `[n/6]` progress lines
+            if [ -d "$root/$f" ]; then
+                if [ "$(cat "$d/$who.rc")" = 0 ]; then : >"$d/$who.err"; else sed -i '/^j3c: \[/d' "$d/$who.err"; fi
+            fi
             rm -rf "$d/w"
         fi
         [ $mode = run ] && sed -i '/^J3STATS \|^J3UISTATS /d' "$d/$who.out"
@@ -281,6 +299,7 @@ one() {
         { cat "$d/$who.out"
           if [ $mode != run ]; then echo "--- stderr"; cat "$d/$who.err"; fi
           echo "--- exit $(cat "$d/$who.rc")"; } >"$d/$who.txt"
+        rm -f "$d/$who.out"   # disk: only the .txt is compared
     done
     local ra rb; ra=$(cat "$d/a.rc"); rb=$(cat "$d/b.rc")
     if ! cmp -s "$d/a.txt" "$d/a2.txt"; then
@@ -292,16 +311,31 @@ one() {
     else
         echo DIFF >"$d/status"; diff -u --label stage0 --label j3c-boot "$d/a.txt" "$d/b.txt" | head -40 >"$d/detail"
     fi
-    [ -z "$proj" ] || rm -rf "$proj/target/.j3c"
+    [ -z "$proj" ] || rm -rf "$proj/target/.j3c" "$proj/target/j3s"
     # Only status and detail are read after this; dumps of a whole corpus would fill the disk.
     rm -rf "$d/w" "$d"/*.out "$d"/*.err "$d"/*.txt "$d"/*.rc
     true
 }
-export -f one
+# job LINE: the inputs of one job line, one after another.
+job() {
+    local a k; IFS=$'\t' read -ra a <<<"$1"
+    for ((k = 0; k < ${#a[@]}; k += 2)); do one "${a[k]}" "${a[k+1]}"; done
+}
+export -f one projof job
 export tmp root boot mode norm user es here S0 BOOT to
 
 start=$SECONDS
-echo "$inputs" | awk '{print NR; print}' | xargs -d '\n' -n2 -P "$jobs" bash -c 'one "$@"' _
+# One job per input, except run inputs that build in the same project (they share its target/): one job
+# runs those in input order. A job line is IDX<TAB>FILE pairs; each input writes only $tmp/IDX.
+i=0
+while IFS= read -r f; do
+    i=$((i + 1)); k=$i
+    if [ $mode = run ]; then p=$(projof "$f"); [ -z "$p" ] || k=$p; fi
+    printf '%s\t%s\t%s\n' "$k" "$i" "$f"
+done <<<"$inputs" |
+    awk -F '\t' '!($1 in g) { g[$1] = ++n } { job[g[$1]] = job[g[$1]] (job[g[$1]] == "" ? "" : "\t") $2 "\t" $3 }
+        END { for (j = 1; j <= n; j++) print job[j] }' |
+    xargs -d '\n' -n1 -P "$jobs" bash -c 'job "$1"' _
 
 nok=0; ndiff=0; ncrash=0; nnon=0; new=0; fixed=(); failing=(); i=0
 while IFS= read -r f; do

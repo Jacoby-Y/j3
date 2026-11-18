@@ -6,8 +6,9 @@
 //     addressed live in registers, everything else in the frame at an `ir/abi.j3` offset. Ops are typed here,
 //     so the VM never looks at a type. Integer registers hold the value sign- or zero-extended to 64 bits.
 // J3: Parts: `bc/op.j3` (ops, `Instr`, call sites, register classes; frozen), `bc/encode.j3` (binary, `dump-bc`
-//     text, paths), `bc/codegen.j3` + `bc/stmt.j3` + `bc/call.j3` (+ new parts) fn codegen. Every `use` of the
-//     module is here (stage 0 rejects a repeated `use` across part files).
+//     text, paths), fn codegen in `bc/codegen.j3` (state, registers, blocks), `bc/place.j3` (frame, places,
+//     loads, stores), `bc/walk.j3` (place walkers), `bc/stmt.j3`, `bc/rvalue.j3`, `bc/call.j3`. Every `use` of
+//     the module is here (stage 0 rejects a repeated `use` across part files).
 // J3: Rust `Vec<(u64, String)>` natives are `List<BcNative>`; byte vectors are `List<u8>`. Strings in a
 //     `BcModule` are arena copies (rule 1). Structs stored by value in lists keep payload enums / `Option`
 //     first and bools last (stage-0 hazard (a)); they are in `tests/unit/layout_test.j3`.
@@ -18,14 +19,19 @@ module j3c.backend.bc;
 use j3.data.map.Map;
 use j3.data.pool.Id;
 use j3.hash.fnv1a64;
+use j3.io;
 use j3.io.path;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.result.Result;
+use j3.sys;
 use j3.text.Text;
+use j3c.base.fsx;
 use j3c.base.intern.Sym;
-use j3c.ir.{ BinOp, Block, Body, ConstInit, ConstKind, EnumDef, FieldId, FloatTy, Func, FuncKind, GlobalDef, IntTy, IrCx, LocalDecl,
-    Module, Operand, Place, PlaceRoot, Proj, Rvalue, RvalueKind, Stmt, StmtKind, StructDef, TyKind, UnaryOp, Vis };
+use j3c.ir.{ BinOp, Block, Body, ConstInit, ConstKind, FieldId, FieldProj, FloatTy, Func, FuncKind, GlobalDef, IntTy,
+    InterpPart, IrCx, Module, Operand, Place, PlaceRoot, Proj, Rvalue, RvalueKind, Stmt, StmtKind, StructDef, StructTy,
+    TyKind, UnaryOp, Vis };
+use j3c.ir.{ operandTy, vecName };
 use j3c.ir.{ abiAlign, abiSize, fieldOffset };
 use j3c.ir.dump.tyString;
 
@@ -101,25 +107,274 @@ pub struct BcModule {
 
 /// Rust `emit_script`: the bytecode of one script module, or the error text (`PATH: fn NAME: why`).
 pub fn emitScript(cx: &IrCx, m: &Module, arena: &Arena): Result<BcModule, string> {
-    return Result.Err("bc backend: not ported yet"); // STUB A
+    let at = -1;
+    for i in 0..m.structs.len {
+        match cx.structDef(m.structs.items[i]).script {
+            Option.Some(_) { at = i; break; }
+            Option.None {}
+        }
+    }
+    if at < 0 { return Result.Err("module is not a script"); }
+    let sid = m.structs.items[at];
+    let def = cx.structDef(sid);
+    let metaPath = "";
+    let props: u32 = 0;
+    match def.script {
+        Option.Some(meta) { metaPath = meta.path; props = u32(meta.propSpans.len); }
+        Option.None {}
+    }
+    let structTy = Id<TyKind> { i: 0 };
+    match cx.lookupTy(TyKind.Struct(StructTy { id: sid })) {
+        Option.Some(t) { structTy = t; }
+        Option.None { return Result.Err("script type not interned"); }
+    }
+    let constants = List<List<u8>>.new(arena);
+    let fields = List<BcField>.new(arena);
+    let layout = List<u8>.new(arena);
+    for i in 0..def.fields.len {
+        let field = def.fields.items[i];
+        let offset: u32 = 0;
+        match fieldOffset(cx, structTy, i) {
+            Option.Some(o) { offset = u32(o); }
+            Option.None { return Result.Err("script field has no ABI offset"); }
+        }
+        let size = u32(abiSize(cx, field.ty));
+        let bytes = List<u8>.new(arena);
+        let idx: u32 = NO_REG;
+        match field.default {
+            Option.Some(v) {
+                if !constBytes(v, size, &constants, &bytes, &idx, arena) { bytes.clear(); idx = NO_REG; }
+            }
+            Option.None {}
+        }
+        let fname = cx.nameStr(field.name);
+        layout.extend(fname as []u8);
+        layout.push(0);
+        layout.extend(tyString(cx, field.ty, arena) as []u8);
+        u32Out(&layout, offset);
+        fields.push(BcField { defaultConst: optIndex(idx), default: bytes, name: fname, offset: offset, size: size });
+    }
+    let instanceSize = u32(abiSize(cx, structTy));
+    u32Out(&layout, props);
+    u32Out(&layout, instanceSize);
+    let globals = List<BcGlobal>.new(arena);
+    for gi in 0..m.globals.len {
+        let id = m.globals.items[gi];
+        let g = cx.global(id);
+        let size = u32(abiSize(cx, g.ty));
+        let init = List<u8>.new(arena);
+        let idx: u32 = NO_REG;
+        match g.init {
+            Option.Some(ci) {
+                match ci {
+                    ConstInit.Scalar(sc) {
+                        if !constBytes(sc.value, size, &constants, &init, &idx, arena) { init.clear(); idx = NO_REG; }
+                    }
+                    ConstInit.Fields(_) { if !globalImage(cx, g.ty, ci, size, &init, arena) { return Result.Err(tableErr(cx, metaPath, g, arena)); } }
+                    ConstInit.Elems(_) { if !globalImage(cx, g.ty, ci, size, &init, arena) { return Result.Err(tableErr(cx, metaPath, g, arena)); } }
+                }
+            }
+            Option.None {}
+        }
+        let key = globalKey(cx, id, arena);
+        u64Out(&layout, key);
+        u32Out(&layout, size);
+        globals.push(BcGlobal { initConst: optIndex(idx), init: init, name: cx.nameStr(g.name), key: key, size: size });
+    }
+    let layoutHash = fnv1a64(layout.slice());
+    let shared = Shared.new(arena);
+    shared.constants = constants;
+    shared.globals.extend(m.globals.slice());
+    let n: u32 = 0;
+    for fi in 0..m.funcs.len {
+        match cx.func(m.funcs.items[fi]).kind {
+            FuncKind.J3(_) { shared.localIndex.put(m.funcs.items[fi], n); n += 1; }
+            FuncKind.Lib(_) {}
+            FuncKind.Decl {}
+        }
+    }
+    let functions = List<BcFunction>.new(arena);
+    for fi in 0..m.funcs.len {
+        let id = m.funcs.items[fi];
+        let isJ3 = false;
+        match cx.func(id).kind {
+            FuncKind.J3(_) { isJ3 = true; }
+            FuncKind.Lib(_) {}
+            FuncKind.Decl {}
+        }
+        if !isJ3 { continue; }
+        match emitFn(cx, id, &shared, arena) {
+            Result.Ok(f) { functions.push(f); }
+            Result.Err(e) {
+                return Result.Err(Text.new(arena).add(metaPath).add(": fn ").add(cx.nameStr(cx.func(id).name)).add(": ").add(e).str());
+            }
+        }
+    }
+    let sigs = Text.new(arena);
+    let first = true;
+    for i in 0..functions.len {
+        let f = functions.items[i];
+        if !f.public { continue; }
+        if !first { sigs.add("\n"); }
+        first = false;
+        sigs.add(f.name).add(":").add(f.signature);
+    }
+    return Result.Ok(BcModule { fields: fields, globals: globals, constants: shared.constants, natives: shared.natives,
+        scripts: shared.scripts, functions: functions, name: moduleStr(cx, m.name.slice(), arena),
+        path: scriptPath(cx, m.name.slice(), arena), layoutHash: layoutHash, signatureHash: fnv1a64(sigs.str() as []u8),
+        instanceSize: instanceSize, props: props });
+}
+
+/// Rust's message for a global table holding strings.
+fn tableErr(cx: &IrCx, metaPath: string, g: GlobalDef, arena: &Arena): string {
+    return Text.new(arena).add(metaPath).add(": `").add(cx.nameStr(g.name))
+        .add("` is a table holding strings (`@embedDir`, `[N]string`), which a `.j3s` script cannot hold yet; declare it in a `.j3` module and `use` it").str();
+}
+
+/// A table global's bytes (`size` zeroes filled by `tableImage`) into `out`; false when it holds strings.
+fn globalImage(cx: &IrCx, ty: Id<TyKind>, init: ConstInit, size: u32, out: &List<u8>, arena: &Arena): bool {
+    for i in 0..int(size) { out.push(0); }
+    return tableImage(cx, ty, init, out.slice(), arena);
+}
+
+/// `NO_REG` (Rust `None`) or the constant index.
+fn optIndex(idx: u32): Option<u32> {
+    if idx == NO_REG { return Option.None; }
+    return Option.Some(idx);
+}
+
+/// Rust `hash`: FNV-1a 64.
+fn bcHash(bytes: []u8): u64 { return fnv1a64(bytes); }
+
+/// The module path joined with `.`.
+fn moduleStr(cx: &IrCx, name: []Sym, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..name.len {
+        if i > 0 { t.add("."); }
+        t.add(cx.nameStr(name[i]));
+    }
+    return t.str();
 }
 
 /// The project-relative path of a script module (`script.a.b` -> `a/b.j3s`).
 pub fn scriptPath(cx: &IrCx, name: []Sym, arena: &Arena): string {
-    return ""; // STUB A
+    let t = Text.new(arena);
+    for i in 1..name.len {
+        if i > 1 { t.add("/"); }
+        t.add(cx.nameStr(name[i]));
+    }
+    t.add(".j3s");
+    return t.str();
 }
 
 /// The module path starts with `script`.
 pub fn isScriptModule(cx: &IrCx, name: []Sym): bool {
-    return false; // STUB A
+    return name.len > 0 && cx.nameStr(name[0]) == "script";
 }
 
 /// Stable name of a function across rebuilds: `module.name:tyString(type)`.
 pub fn fnLabel(cx: &IrCx, id: Id<Func>, arena: &Arena): string {
-    return ""; // STUB A
+    let f = cx.func(id);
+    return Text.new(arena).add(moduleStr(cx, f.moduleName.slice(), arena)).add(".").add(cx.nameStr(f.name)).add(":")
+        .add(tyString(cx, f.ty, arena)).str();
 }
 
 /// The key the VM and the dev thunk table use for a function: FNV-1a 64 of `fnLabel`.
 pub fn fnKey(cx: &IrCx, id: Id<Func>, arena: &Arena): u64 {
-    return 0; // STUB A
+    return bcHash(fnLabel(cx, id, arena) as []u8);
+}
+
+/// Rust `global_key`: FNV-1a 64 of `module.name:type`.
+fn globalKey(cx: &IrCx, id: Id<GlobalDef>, arena: &Arena): u64 {
+    let g = cx.global(id);
+    let label = Text.new(arena).add(moduleStr(cx, g.moduleName.slice(), arena)).add(".").add(cx.nameStr(g.name)).add(":")
+        .add(tyString(cx, g.ty, arena)).str();
+    return bcHash(label as []u8);
+}
+
+/// Rust `table_image`: a struct or array initializer of plain scalars written into `out` (the global's bytes).
+/// False when it holds byte data (strings), which needs more than one constant pointer.
+fn tableImage(cx: &IrCx, ty: Id<TyKind>, init: ConstInit, out: []u8, arena: &Arena): bool {
+    match init {
+        ConstInit.Scalar(sc) {
+            let scratch = List<List<u8>>.new(arena);
+            let bytes = List<u8>.new(arena);
+            let idx: u32 = NO_REG;
+            if !constBytes(sc.value, u32(out.len), &scratch, &bytes, &idx, arena) || idx != NO_REG { return false; }
+            for i in 0..bytes.len { out[i] = bytes.items[i]; }
+            return true;
+        }
+        ConstInit.Fields(fs) {
+            let sid = Id<StructDef> { i: 0 };
+            match cx.tyKind(ty) {
+                TyKind.Struct(st) { sid = st.id; }
+                _ { return false; }
+            }
+            let def = cx.structDef(sid);
+            for k in 0..fs.fields.len {
+                let cf = fs.fields.items[k];
+                let at = -1;
+                for i in 0..def.fields.len {
+                    if cx.nameStr(def.fields.items[i].name) == cf.name { at = i; break; }
+                }
+                if at < 0 { return false; }
+                let fty = def.fields.items[at].ty;
+                match fieldOffset(cx, ty, at) {
+                    Option.Some(o) {
+                        let lo = int(o);
+                        if !tableImage(cx, fty, cf.init, out[lo..lo + int(abiSize(cx, fty))], arena) { return false; }
+                    }
+                    Option.None { return false; }
+                }
+            }
+            return true;
+        }
+        ConstInit.Elems(es) {
+            let elem = ty;
+            match cx.tyKind(ty) {
+                TyKind.Array(a) { elem = a.elem; }
+                _ { return false; }
+            }
+            let n = int(abiSize(cx, elem));
+            for k in 0..es.elems.len {
+                if !tableImage(cx, elem, es.elems.items[k], out[k * n..(k + 1) * n], arena) { return false; }
+            }
+            return true;
+        }
+    }
+}
+
+/// Rust `const_bytes`: the bytes of constant `op` stored in `size` bytes, into `out`; a string constant is
+/// appended to `constants` and its index set in `idx` (else `idx` stays `NO_REG`). False (Rust `None`) when `op`
+/// is not a plain constant.
+fn constBytes(op: Operand, size: u32, constants: &List<List<u8>>, out: &List<u8>, idx: &u32, arena: &Arena): bool {
+    let raw: u64 = 0;
+    match op {
+        Operand.Const(c) {
+            match c.kind {
+                ConstKind.Bytes(b) {
+                    if size != 16 { return false; }
+                    *idx = u32(constants.len);
+                    let copy = List<u8>.new(arena);
+                    copy.extend(b.bytes);
+                    constants.push(copy);
+                    for i in 0..8 { out.push(0); }
+                    u64Out(out, u64(b.bytes.len));
+                    return true;
+                }
+                ConstKind.Bool(v) { if v { raw = 1; } }
+                ConstKind.Int(v) { raw = v; }
+                ConstKind.F32Bits(v) { raw = u64(v); }
+                ConstKind.F64Bits(v) { raw = v; }
+                ConstKind.Null {}
+                ConstKind.Void { return false; }
+                ConstKind.FnAddr(_) { return false; }
+            }
+        }
+        Operand.Copy(_) { return false; }
+    }
+    let n = int(size);
+    if n > 8 { n = 8; }
+    for i in 0..n { out.push(u8((raw >> u64(8 * i)) & 0xFF)); }
+    return true;
 }

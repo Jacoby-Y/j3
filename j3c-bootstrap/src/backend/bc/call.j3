@@ -1,5 +1,214 @@
-// Calls to bytecode, native calls from scripts.
+// Calls to bytecode (a fn of this module, another script, or a native fn through the thunk table),
+// aggregate rvalues into memory, and the interpolation appends.
 //
 // Part of module j3c.backend.bc.
 // Port of: j3c/src/emit/bc/call.rs
+// J3: The `scripts` and `natives` tables of `Shared` grow in first-call order (contracts-c4.md ordering
+//     rule 4); a `Script`/`Native` call site's `index` stays 0 as in Rust (the VM finds them by key).
+// J3: Strings put in `Shared` are arena copies (rule 1): `scriptPath`/`fnLabel` return them, literal bytes
+//     are copied into `List<u8>`.
 module j3c.backend.bc;
+
+extend Codegen {
+    /// Evaluate an aggregate rvalue into the memory at `dst` (an address register).
+    fn aggregateInto(this: &Codegen, dst: u32, rv: &Rvalue): Result<int, string> {
+        let cx = this.cx;
+        match rv.kind {
+            RvalueKind.Use(op) { this.copyInto(dst, &op, rv.ty)?; }
+            RvalueKind.Cast(c) {
+                // `s as []u8` and back: the same `{ ptr, len }` bytes
+                if isSliceLike(cx, operandTy(c.from)) && isSliceLike(cx, rv.ty) {
+                    this.copyInto(dst, &c.from, rv.ty)?;
+                } else {
+                    return Result.Err("scalar value in an aggregate slot");
+                }
+            }
+            RvalueKind.Call(c) { this.call(dst, rv.ty, &c.func, c.args.slice())?; }
+            RvalueKind.Aggregate(ag) {
+                for i in 0..ag.fields.len {
+                    let offset = aggregateOffset(cx, rv.ty, i)?;
+                    let value = this.operand(&ag.fields.items[i])?;
+                    this.store(Addr { offset: offset, base: dst }, value, operandTy(ag.fields.items[i]));
+                }
+            }
+            RvalueKind.Enum(e) {
+                let tag = this.constReg(u64(e.variant.index));
+                this.push(instr(Op.St32, NO_REG, dst, tag, 0));
+                match e.payload {
+                    Option.Some(payload) {
+                        let offset: u64 = 0;
+                        match fieldOffset(cx, rv.ty, 1) {
+                            Option.Some(o) { offset = o; }
+                            Option.None { return Result.Err("enum payload without an ABI offset"); }
+                        }
+                        let value = this.operand(&payload)?;
+                        this.store(Addr { offset: offset, base: dst }, value, operandTy(payload));
+                    }
+                    Option.None {}
+                }
+            }
+            RvalueKind.Syscall(_) { return Result.Err("`@syscall` isn't supported in scripts"); }
+            RvalueKind.Atomic(_) { return Result.Err("`@atomic*` isn't supported in scripts (the VM runs on one thread)"); }
+            RvalueKind.Interpolate(_) { return Result.Err("interpolate must be lowered before bytecode"); }
+            RvalueKind.Ref(_) | RvalueKind.Binary(_) | RvalueKind.Unary(_) | RvalueKind.Simd(_) {
+                return Result.Err("scalar value in an aggregate slot");
+            }
+        }
+        return Result.Ok(0);
+    }
+
+    /// Copy an aggregate operand's bytes to `dst` (the Rust `Use` / string-cast arm).
+    fn copyInto(this: &Codegen, dst: u32, op: &Operand, ty: Id<TyKind>): Result<int, string> {
+        let src = this.operand(op)?;
+        let size = abiSize(this.cx, ty);
+        if src != dst && size > 0 { this.push(instr(Op.Copy, NO_REG, dst, src, size)); }
+        return Result.Ok(0);
+    }
+
+    fn call(this: &Codegen, dst: u32, ret: Id<TyKind>, func: &Operand, args: []Operand): Result<int, string> {
+        let cx = this.cx;
+        let id = callee(func)?;
+        let target = cx.func(id);
+        let kind = CallKind.Native;
+        let index: u32 = 0;
+        match this.shared.localIndex.get(id) {
+            Option.Some(i) {
+                kind = CallKind.Local;
+                index = i;
+            }
+            Option.None {
+                if isScriptModule(cx, target.moduleName.slice()) {
+                    let path = scriptPath(cx, target.moduleName.slice(), this.arena);
+                    let seen = false;
+                    for i in 0..this.shared.scripts.len {
+                        if this.shared.scripts.items[i] == path { seen = true; }
+                    }
+                    if !seen { this.shared.scripts.push(path); }
+                    kind = CallKind.Script;
+                } else {
+                    let key = fnKey(cx, id, this.arena);
+                    let seen = false;
+                    for i in 0..this.shared.natives.len {
+                        if this.shared.natives.items[i].key == key { seen = true; }
+                    }
+                    if !seen { this.shared.natives.push(BcNative { label: fnLabel(cx, id, this.arena), key: key }); }
+                }
+            }
+        }
+        let lowered = List<CallArg>.new(this.arena);
+        for i in 0..args.len {
+            let ty = operandTy(args[i]);
+            let reg = this.operand(&args[i])?;
+            lowered.push(CallArg { reg: reg, size: u32(abiSize(cx, ty)), aggregate: !isScalar(cx, ty) });
+        }
+        let retLoad: u16 = 0;
+        let retAggregate = true;
+        match class(cx, ret) {
+            Option.Some(c) {
+                retAggregate = false;
+                if c != Class.Void { retLoad = opCode(loadOp(c)); }
+            }
+            Option.None {}
+        }
+        let site = u64(this.calls.len);
+        this.calls.push(CallSite { args: lowered, key: fnKey(cx, id, this.arena), kind: kind, index: index,
+            retSize: u32(abiSize(cx, ret)), retLoad: retLoad, retAggregate: retAggregate });
+        this.push(instr(Op.Call, dst, NO_REG, NO_REG, site));
+        return Result.Ok(0);
+    }
+
+    fn appendLiteral(this: &Codegen, buf: u32, used: u32, bytes: []u8) {
+        let index = u64(this.shared.constants.len);
+        let copy = List<u8>.new(this.arena);
+        for i in 0..bytes.len { copy.push(bytes[i]); }
+        this.shared.constants.push(copy);
+        this.push(instr(Op.AppLit, buf, used, NO_REG, index));
+    }
+
+    fn appendValue(this: &Codegen, buf: u32, used: u32, op: &Operand): Result<int, string> {
+        let cx = this.cx;
+        let ty = operandTy(*op);
+        match cx.tyKind(ty) {
+            TyKind.String {
+                let value = this.operand(op)?;
+                this.push(instr(Op.AppStr, buf, used, value, 0));
+                return Result.Ok(0);
+            }
+            _ {}
+        }
+        match class(cx, ty) {
+            Option.Some(c) {
+                if c == Class.Bool {
+                    let value = this.operand(op)?;
+                    this.push(instr(Op.AppBool, buf, used, value, 0));
+                    return Result.Ok(0);
+                }
+                if c == Class.F32 {
+                    let value = this.operand(op)?;
+                    let wide = this.reg();
+                    this.push(instr(Op.F2d, wide, value, NO_REG, 0));
+                    this.push(instr(Op.AppF64, buf, used, wide, 0));
+                    return Result.Ok(0);
+                }
+                if c == Class.F64 {
+                    let value = this.operand(op)?;
+                    this.push(instr(Op.AppF64, buf, used, value, 0));
+                    return Result.Ok(0);
+                }
+                if c != Class.Void && c != Class.Ptr {
+                    // Rust `Class::Int { .. }`
+                    let value = this.operand(op)?;
+                    this.push(instr(Op.AppInt, buf, used, value, 0));
+                    return Result.Ok(0);
+                }
+            }
+            Option.None {}
+        }
+        match cx.tyKind(ty) {
+            TyKind.Struct(st) {
+                let def = cx.structDef(st.id);
+                if !def.debug { return Result.Err("interpolate of a non-#[Debug] struct"); }
+                match *op {
+                    Operand.Copy(base) { return this.appendStruct(buf, used, &base, st.id); }
+                    Operand.Const(_) { return Result.Err("interpolated struct must be a place"); }
+                }
+            }
+            _ {}
+        }
+        return Result.Err("interpolate of this type isn't supported in scripts");
+    }
+
+    /// A `#[Debug]` struct place: `Name { a: .., b: .. }`, each field appended through its own place.
+    fn appendStruct(this: &Codegen, buf: u32, used: u32, base: &Place, sid: Id<StructDef>): Result<int, string> {
+        let cx = this.cx;
+        let def = cx.structDef(sid);
+        this.appendLiteral(buf, used, Text.new(this.arena).add(cx.nameStr(def.name)).add(" { ").str() as []u8);
+        for i in 0..def.fields.len {
+            if i > 0 { this.appendLiteral(buf, used, ", " as []u8); }
+            let field = def.fields.items[i];
+            this.appendLiteral(buf, used, Text.new(this.arena).add(cx.nameStr(field.name)).add(": ").str() as []u8);
+            // a fresh proj list: `project` pushes onto the copy's list
+            let place = Place { ty: base.ty, access: base.access, span: base.span, root: base.root, proj: List<Proj>.new(this.arena) };
+            for j in 0..base.proj.len { place.proj.push(base.proj.items[j]); }
+            place = place.project(Proj.Field(FieldProj { field: FieldId { structId: sid, index: u32(i) }, ty: field.ty }),
+                field.ty, base.access, base.span);
+            let fieldOp = Operand.Copy(place);
+            this.appendValue(buf, used, &fieldOp)?;
+        }
+        this.appendLiteral(buf, used, " }" as []u8);
+        return Result.Ok(0);
+    }
+}
+
+/// The fn a call names (only a constant fn address; Rust `call`'s first match).
+fn callee(func: &Operand): Result<Id<Func>, string> {
+    match *func {
+        Operand.Const(c) {
+            match c.kind {
+                ConstKind.FnAddr(f) { return Result.Ok(f.func); }
+                _ { return Result.Err("call of a non-function constant"); }
+            }
+        }
+        Operand.Copy(_) { return Result.Err("calling a function value isn't supported in scripts"); }
+    }
+}

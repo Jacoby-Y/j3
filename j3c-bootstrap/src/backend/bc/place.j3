@@ -1,0 +1,226 @@
+// Frame temporaries, places to addresses, loads, stores and operands.
+//
+// Part of module j3c.backend.bc.
+// Port of: j3c/src/emit/bc/codegen.rs (`aggregate_offset`, `temp_mem`, `materialize`, `load`, `store`,
+//     `place_addr`, `local_reg`, `operand`)
+// J3: `Addr` is a value (Rust `Copy`). Error texts are Rust's; the global one is built in a `Text` on the
+//     Codegen arena (rule 1). `ConstKind.Bytes` is copied into a new `List<u8>` for `Shared.constants`.
+module j3c.backend.bc;
+
+/// Byte offset of field / element `index` of an aggregate of type `ty` (Rust `aggregate_offset`).
+pub fn aggregateOffset(cx: &IrCx, ty: Id<TyKind>, index: int): Result<u64, string> {
+    match cx.tyKind(ty) {
+        TyKind.Array(a) { return Result.Ok(abiSize(cx, a.elem) * u64(index)); }
+        TyKind.Struct(_) | TyKind.Slice(_) | TyKind.String {
+            match fieldOffset(cx, ty, index) {
+                Option.Some(o) { return Result.Ok(o); }
+                Option.None { return Result.Err("aggregate field without ABI offset"); }
+            }
+        }
+        TyKind.Void | TyKind.Bool | TyKind.Int(_) | TyKind.Float(_) | TyKind.Ptr | TyKind.CStr | TyKind.Ref(_) | TyKind.Fn(_)
+            | TyKind.Enum(_) | TyKind.Half | TyKind.Vec(_) {
+            return Result.Err("aggregate of a non-aggregate type");
+        }
+    }
+}
+
+extend Codegen {
+    /// A fresh frame slot for a value of type `ty` (align and size at least 8).
+    fn tempMem(this: &Codegen, ty: Id<TyKind>): Addr {
+        let align = maxU32(u32(abiAlign(this.cx, ty)), 8);
+        this.frameSize = alignUp(this.frameSize, align);
+        let offset = this.frameSize;
+        this.frameSize = this.frameSize + maxU32(u32(abiSize(this.cx, ty)), 8);
+        return Addr { offset: u64(offset), base: FP };
+    }
+
+    /// A register holding the address `at`: the base itself when the offset is 0 (and it is not the frame).
+    fn materialize(this: &Codegen, at: Addr): u32 {
+        if at.offset == 0 && at.base != FP { return at.base; }
+        let dst = this.reg();
+        this.push(instr(Op.Addr, dst, at.base, NO_REG, at.offset));
+        return dst;
+    }
+
+    fn load(this: &Codegen, at: Addr, ty: Id<TyKind>): Result<u32, string> {
+        match class(this.cx, ty) {
+            Option.Some(c) {
+                let dst = this.reg();
+                this.push(instr(loadOp(c), dst, at.base, NO_REG, at.offset));
+                return Result.Ok(dst);
+            }
+            Option.None { return Result.Err("load of an aggregate"); }
+        }
+    }
+
+    /// Store register `value` (a scalar, or an aggregate's address) at `at`; nothing for a zero-size type.
+    fn store(this: &Codegen, at: Addr, value: u32, ty: Id<TyKind>) {
+        let size = abiSize(this.cx, ty);
+        if size == 0 { return; }
+        if isScalar(this.cx, ty) {
+            this.push(instr(storeOp(size), NO_REG, at.base, value, at.offset));
+        } else {
+            let dst = this.materialize(at);
+            this.push(instr(Op.Copy, NO_REG, dst, value, size));
+        }
+    }
+
+    /// Where `place`'s bytes are (Rust `place_addr`).
+    fn placeAddr(this: &Codegen, place: &Place): Result<Addr, string> {
+        let start = 0;
+        let at = Addr { offset: 0, base: FP };
+        let ty = place.ty;
+        match place.root {
+            PlaceRoot.Local(l) {
+                let local = this.body.local(l.id);
+                let i = int(l.id.i);
+                match this.mem.items[i] {
+                    Option.Some(offset) {
+                        at = Addr { offset: u64(offset), base: FP };
+                        ty = local.ty;
+                    }
+                    Option.None {
+                        match this.value.items[i] {
+                            Option.Some(reg) {
+                                if !derefFirst(place) { return Result.Err("address of a register local"); }
+                                start = 1;
+                                match this.cx.refInner(local.ty) {
+                                    Option.Some(inner) { ty = inner; }
+                                    Option.None { return Result.Err("deref of a non-ref local"); }
+                                }
+                                at = Addr { offset: 0, base: reg };
+                            }
+                            Option.None { return Result.Err("local without storage"); }
+                        }
+                    }
+                }
+            }
+            PlaceRoot.Global(g) {
+                let index = this.shared.globals.indexOf(g.id);
+                if index < 0 {
+                    let t = Text.new(this.arena);
+                    t.add("`").add(this.cx.nameStr(this.cx.global(g.id).name))
+                        .add("` is another module's value; scripts reach only their own `shared`");
+                    return Result.Err(t.str());
+                }
+                let dst = this.reg();
+                this.push(instr(Op.Global, dst, NO_REG, NO_REG, u64(index)));
+                at = Addr { offset: 0, base: dst };
+                ty = this.cx.global(g.id).ty;
+            }
+        }
+        for k in start..place.proj.len {
+            match place.proj.items[k] {
+                Proj.Lane(_) { return Result.Err("vec4f is not supported in scripts yet"); }
+                Proj.Deref {
+                    let dst = this.reg();
+                    this.push(instr(Op.Ld64, dst, at.base, NO_REG, at.offset));
+                    at = Addr { offset: 0, base: dst };
+                    match this.cx.refInner(ty) {
+                        Option.Some(inner) { ty = inner; }
+                        Option.None { return Result.Err("deref of a non-ref place"); }
+                    }
+                }
+                Proj.Field(f) {
+                    match fieldOffset(this.cx, ty, int(f.field.index)) {
+                        Option.Some(o) { at.offset = at.offset + o; }
+                        Option.None { return Result.Err("field without an ABI offset"); }
+                    }
+                    ty = f.ty;
+                }
+                Proj.Index(ix) {
+                    let data: u32 = 0;
+                    if isSliceLike(this.cx, ty) {
+                        data = this.reg();
+                        this.push(instr(Op.Ld64, data, at.base, NO_REG, at.offset));
+                    } else {
+                        data = this.materialize(at);
+                    }
+                    let idx = this.operand(&ix.index)?;
+                    let dst = this.reg();
+                    this.push(instr(Op.Idx, dst, data, idx, abiSize(this.cx, ix.ty)));
+                    at = Addr { offset: 0, base: dst };
+                    ty = ix.ty;
+                }
+                Proj.Ptr { ty = this.cx.common.ptr; }
+                Proj.Len {
+                    at.offset = at.offset + 8;
+                    ty = this.cx.common.int;
+                }
+                Proj.EnumTag { ty = this.cx.common.i32; }
+                Proj.EnumPayload(p) {
+                    match fieldOffset(this.cx, ty, 1) {
+                        Option.Some(o) { at.offset = at.offset + o; }
+                        Option.None { return Result.Err("enum payload without an ABI offset"); }
+                    }
+                    ty = p.ty;
+                }
+            }
+        }
+        return Result.Ok(at);
+    }
+
+    /// The register of a projection-free register local.
+    fn localReg(this: &Codegen, place: &Place): Option<u32> {
+        if place.proj.len != 0 { return Option.None; }
+        match place.root {
+            PlaceRoot.Local(l) { return this.value.items[int(l.id.i)]; }
+            PlaceRoot.Global(_) { return Option.None; }
+        }
+    }
+
+    /// A scalar operand's register, or an aggregate operand's address register.
+    fn operand(this: &Codegen, op: &Operand): Result<u32, string> {
+        match *op {
+            Operand.Const(c) {
+                let bits: u64 = 0;
+                match c.kind {
+                    ConstKind.Bytes(b) {
+                        let index = u64(this.shared.constants.len);
+                        let bytes = List<u8>.new(this.arena);
+                        bytes.extend(b.bytes);
+                        this.shared.constants.push(bytes);
+                        let at = this.tempMem(this.cx.common.string);
+                        let dst = this.materialize(at);
+                        this.push(instr(Op.Str, NO_REG, dst, NO_REG, index));
+                        return Result.Ok(dst);
+                    }
+                    ConstKind.Void | ConstKind.Null { bits = 0; }
+                    ConstKind.Bool(v) { if v { bits = 1; } }
+                    ConstKind.Int(v) { bits = v; }
+                    ConstKind.F32Bits(v) { bits = u64(v); }
+                    ConstKind.F64Bits(v) { bits = v; }
+                    ConstKind.FnAddr(f) {
+                        let t = Text.new(this.arena);
+                        t.add("taking the address of `").add(this.cx.nameStr(this.cx.func(f.func).name))
+                            .add("` isn't supported in scripts");
+                        return Result.Err(t.str());
+                    }
+                }
+                let cl = Class.Ptr;
+                match class(this.cx, c.ty) { Option.Some(k) { cl = k; } Option.None {} }
+                return Result.Ok(this.constReg(canonical(cl, bits)));
+            }
+            Operand.Copy(place) {
+                if !isScalar(this.cx, place.ty) {
+                    let at = this.placeAddr(&place)?;
+                    return Result.Ok(this.materialize(at));
+                }
+                match this.localReg(&place) {
+                    Option.Some(r) { return Result.Ok(r); }
+                    Option.None {}
+                }
+                let at = this.placeAddr(&place)?;
+                return this.load(at, place.ty);
+            }
+        }
+    }
+}
+
+/// A slice or string (`{ ptr, len }`): the data pointer is loaded from the place, not its address taken.
+fn isSliceLike(cx: &IrCx, ty: Id<TyKind>): bool {
+    match cx.tyKind(ty) {
+        TyKind.Slice(_) | TyKind.String { return true; }
+        _ { return false; }
+    }
+}

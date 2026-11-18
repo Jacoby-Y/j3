@@ -16,7 +16,7 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
 
 - pre-freeze: `[package] bin` key, the program file name, default `name` (`j3c/src/project.rs`,
   `j3c/src/pkgtool.rs`, `j3c/src/devrun.rs`) -> mirrored by the port of `j3c-bootstrap/src/project/manifest.j3`
-  (and `cmd/run.j3` for the `<bin>-dev` name)
+  (and `driver.devOut` / `cmd/devrun.j3` `devOut` for the `<bin>-dev` name, C4) | already mirrored
 - pre-freeze: `j3c dump-ast FILE`, S-expression AST on stdout, lex errors as `j3c fmt` prints them, parse errors as the rendered diagnostic, rc 1
   (`j3c/src/parse/dump.rs`, `j3c/src/cli/dump.rs`) -> mirrored by the port of `j3c-bootstrap/src/syntax/dump.j3`
   and `j3c-bootstrap/src/cmd/dump.j3`
@@ -76,9 +76,10 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
 - Open (C3 contracts, wave 19): `gen::before_build` (Rust `gen.rs:148`, called from `build_inner`, `run_user`, `run_loaded`,
   `unchanged_project`) is the no-op `cmd/gen.j3` `beforeBuild` until C5: j3c-boot does not run a project's stale
   `assets/gen/*.j3` generators before a build (`examples/editor_village` is the one corpus project with any).
-- Open (C3 wave 20, for C4): `cmd/stamp.j3` `StampFlags` has no `--emit` field, so the backend is not in
-  `inputs.<kind>.key` (it is in `src.key` through `Options.emit`). Only LLVM builds today and `build` / `run` skip
-  the stat shortcut for `--emit c`; add the field when the `bc` backend lands.
+- Note (C3 wave 20, checked C4): `cmd/stamp.j3` `StampFlags` has no `--emit` field, so the backend is not in
+  `inputs.<kind>.key` (it is in `src.key` through `Options.emit`). Still only LLVM builds a program: `Bc.emit` is an
+  error by design (Rust has no `--emit bc`; scripts reach `.j3sb` through `run` / `dump-bc`). Add the field if a
+  second program backend ever lands.
 - Not copied (C3, by decision): the compiler id stamp is `~/.cache/j3/compiler-boot.id` (Rust: `compiler.id`). Its
   text is `size sec.nsec` (`fsx.statNs`, x86-64 Linux; seconds elsewhere); sharing Rust's file would make each compiler
   re-hash itself after the other ran. Object and stamp keys are `xxh3_64`, never equal to Rust's.
@@ -93,3 +94,15 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
 - Stage-0 quirk (C3 wave 20; listed here, not a miscompile): a top-level fn named `less` in a file that calls
   `j3.cmp.sortBy` shadows `sortBy`'s `less` parameter when the instance is lowered (the `MergedEnv` rule above):
   a type error inside `cmp.j3`. Workaround: do not name a top-level fn `less` (or any stdlib generic's parameter name).
+- Stage-0 bug (C4 wave 23): a `Set<u64>` in `devmode` as well as in `ir/validate.j3` makes stage 0 report "no method
+  `new` on `Set`" in validate.j3. Workaround: `Map<u64, bool>` in `devmode`.
+- Not copied (C4, internal): `devmode` gives `(*this).handle` `through_ref` access where Rust gives `read_only_view`
+  (Rust never validates dev IR; the port does, `tests/unit/devmode_lower_test.j3`). Not in any compared output.
+- Not copied (C4, `j3.proc` limits): the dev runner (`cmd/devrun.j3`) pipes the child's stdout and stderr and passes
+  them through (`devrun.pump`; Rust inherits stdio), and closes its stdin. The
+  `cli::timing` lines are not printed (Rust skips them too while the `[n/6]` progress is on).
+- Not copied (C4, `j3.sys` has no `signal`): `run --hot` (`cmd/hot.j3`) has no SIGINT/SIGTERM trap, and a rebuild reads
+  the new session's `[emit]` (Rust keeps the first `EmitOpts`: differs only when `j3.toml` changes mid-session).
+  `pkgtool.run` sets the tool's env with `setenv` on this process before the fork (`proc` takes no env).
+- Open (C4): `devmode.lower`'s "a script calls `X`, which the program can't link" has no corpus case (no valid
+  source found that reaches it); the two other devmode refusals are `tests/proj/bc_refuse_dev_*` (`diff.sh bc`).

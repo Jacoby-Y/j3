@@ -11,8 +11,13 @@ compare the text. Unit checks live beside the code they cover, as `*_test.j3` fi
 1. Runs `tools/coverage.sh` (skip with `--no-coverage` or `DIFF_NO_COVERAGE=1`) and `tools/layers.sh`;
    either failing stops the run (exit 2).
 2. Builds `target/j3c-boot` with `stage0/j3c build j3c-bootstrap` when it is missing or older than `src/`.
-3. Runs every input through stage0 twice and j3c-boot once, in parallel, each under `timeout`
-   (`DIFF_TIMEOUT`). Two stage0 runs that disagree print `NONDET` (the oracle is not deterministic there).
+3. Runs every input through stage0 twice and j3c-boot once, each under `timeout` (`DIFF_TIMEOUT`). Two
+   stage0 runs that disagree print `NONDET` (the oracle is not deterministic there). Inputs run in parallel:
+   `-j N`, else `J3_TEST_JOBS`, else half the cores (a quarter for `llvm` and `self`'s llvm calls: a big
+   project's dump holds ~1 GB and writes ~80 MB per side). Each input writes only its own scratch folder;
+   `run` inputs that build in one project run one after another in one job (they share its `target/`);
+   `bc` inputs each copy their project, so every one is its own job.
+   Output is printed in input order after all jobs end, the same as with `J3_TEST_JOBS=1`.
 4. Prints `ok FILE`, `DIFF FILE` (both ran, the text differs) or `CRASH FILE` (j3c-boot failed, timed out
    or died where stage0 did not), the first 40 diff lines of each new failure, and a summary line
    `diff.sh MODE: N ok, N DIFF, N CRASH` to paste into a chunk report.
@@ -27,11 +32,14 @@ compare the text. Unit checks live beside the code they cover, as `*_test.j3` fi
 | `glsl` | `dump-glsl PATH` (`--es`: `dump-glsl PATH --es`, the OpenGL ES text) | stdout, stderr, exit code |
 | `ui` | `dump-ui PROJECT/ui` (the J3 source generated from a project's `.j3ui` files) | stdout, stderr, exit code |
 | `run` | `run --headless --frames 3 PATH`, offscreen SDL, dummy audio | stdout without the `J3STATS` / `J3UISTATS` timing lines and with the number before ` us` / ` ms` / ` ns` / ` s` masked (tests print their timings), exit code |
+| `bc` | every compiler run on its own scratch copy (`mktemp -d`, `tar --exclude=./target`), never the tree. A project: `run --headless --frames 3 .` (dev mode: scripts on the VM). A `.j3s` file: `dump-bc REL` in a copy of its project (of its folder when that project is j3c-bootstrap). Inputs: the `[bc]` section of `corpus.txt` | a project: exit code, the sorted `sha256sum` of every `*.j3sb` it wrote (stdout has timings: `run` covers it) and, when it fails, stderr without the `[n/6]` lines (a refusal text); a file: stdout (the dump), stderr, exit code and the `.j3sb` hashes |
 | `self` | stage 1 (`j3c-boot`) builds stage 2 from a scratch copy of `j3c-bootstrap/{j3.toml,src,text}` under `<repo>/target/self.PID/` (never in place), then `DIFF_STAGE0=stage1 DIFF_BOOT=stage2` over `fmt`, `ast`, `err`, `ui`, `glsl`, `glsl --es`, `ir --norm` and `llvm` (one input per call) | one summary line per comparison, then `diff.sh self: N ok, N failed` |
 
 
-`run` removes a project's `target/.j3c` (stamps and objects) before each of the three runs and after the last, so no
-compiler reuses another's build and the corpus keeps no object folders. A file input inside a project (a `j3.toml`
+`run` removes a project's `target/.j3c` (stamps and objects) and `target/j3s` (a dev run's bytecode) before each of
+the three runs and after the last, so no compiler reuses another's build and the corpus keeps no build output. A
+project with `.j3s` scripts runs in dev mode in both compilers (bytecode VM, `cmd/devrun.j3`); `bc` compares its
+bytecode, `run` its stdout. A file input inside a project (a `j3.toml`
 above it) builds that project, so its folder is cleared the same way; a file outside any project builds to a temp
 file, writes no stamps and runs in a scratch cwd (what it writes by relative path is removed). `self` prints one summary line per clean comparison and the whole output (the DIFF /
 CRASH detail) of a failed one. `--list` prints the expanded inputs and exits.
@@ -64,6 +72,14 @@ harness, or comparing stage 2 later).
   (keeping entries for inputs this run did not cover).
 - `known/ir-user.txt`: the known list for `ir --user` (entry module only), kept apart from the full-file `ir.txt`.
 - `known/glsl-es.txt`: the known list for `glsl --es`, kept apart from `glsl.txt`.
+- `known/bc.txt`: the known list for `bc` (empty since the end of C4).
+
+## `unit.sh`
+
+`tests/unit.sh [NAME...]` builds and runs `tests/unit/NAME_test.j3` (all of them by default) as its own
+package in `target/unit/NAME/`, in parallel (`J3_TEST_JOBS`, default half the cores), and prints `ok NAME` /
+`FAIL NAME` in name order, then `unit.sh: N ok, N FAIL`. A test writes only under its own name (scratch
+folders are `target/unit/NAME`, `target/NAME`, or carry the pid), so tests never share a folder.
 
 ## Other files
 

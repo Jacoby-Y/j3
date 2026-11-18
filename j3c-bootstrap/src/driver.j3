@@ -28,9 +28,16 @@
 //     flags that reach the compiler (`--fast`, `--release`, `--emit`, `--opt`, `--file`, `--host`, `--hot`,
 //     plus the new `--dump-after`, `--time-passes`). `--frames`/`--screenshot`/`--splash` are env for the
 //     program, not compiler options.
+// J3: `Mode.Dev` with a `.j3s` loaded is Rust's `devrun` build (`cmd/devrun.j3` drives it): the `devmode` pass
+//     runs, `emitOpts` points the output at `devOut`, and below `-O2` without the object cache `linkStage`
+//     builds the VM apart (`splitVm`, `toolchain.compileLlvmSplit`). Without scripts it is a plain build.
+// J3: Part `driver/emit.j3`: build settings (`emitOpts`, `applyFlags`), the backend and link stages, `dump-llvm`'s
+//     text. `failText` (the errors of a failed run as Rust's error string) is here so `pkgtool` and `cmd/*` share it.
 module j3c.driver;
 
-use j3.data.pool.Pool;
+use j3.data.pool.{ Id, Pool };
+use j3.data.set.Set;
+use j3.io.path;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.result.Result;
@@ -38,12 +45,15 @@ use j3.text.Text;
 use j3c.backend;
 use j3c.cache;
 use j3c.backend.bc.BcModule;
+use j3c.backend.llvm;
+use j3c.backend.llvm.{ LlOpts, Part, PartKind };
 use j3c.devmode;
+use j3c.base.diag;
 use j3c.base.diag.{ Diags, Severity };
 use j3c.base.intern.{ Names, Sym };
 use j3c.base.phase.Phases;
-use j3c.base.span.{ Source, noSpan };
-use j3c.ir.{ Pass, PassCx, Program, runPasses };
+use j3c.base.span.{ Source, isNone, noSpan };
+use j3c.ir.{ Func, Pass, PassCx, Program, runPasses };
 use j3c.ir.dump;
 use j3c.ir.fast;
 use j3c.ir.validate;
@@ -52,6 +62,7 @@ use j3c.load.{ LoadCx, LoadOpts, Parsed };
 use j3c.lower;
 use j3c.lower.LowerCx;
 use j3c.project.manifest;
+use j3c.project.manifest.Manifest;
 use j3c.sema;
 use j3c.sema.Checked;
 use j3c.toolchain;
@@ -93,6 +104,8 @@ pub struct Options {
     /// The command runs the program after the link (`run`): an Android target is refused, and a program
     /// without a manifest output path goes to a temp file (`build` writes `target/a.out`).
     run: bool;
+    /// A ready manifest to build instead of resolving `entry` (Rust `compile_tool(&manifest)`, `pkgtool`).
+    project: Option<Manifest>;
 }
 
 /// Rust `run_loaded`: why an Android target is not run here (`cmd/run.j3` prints it before `preflight`).
@@ -101,7 +114,7 @@ pub const ANDROID_RUN: string = "this is an Android target, which can't run on t
 /// Defaults: check the project in the cwd, dev settings.
 pub fn defaults(): Options {
     return Options { entry: ".", entryGiven: true, target: "", mode: Mode.Check, headless: false, fast: false, opt: "", debug: true, emit: "", dumpAfter: "", timePasses: false, release: false, fileOnly: false, host: false, hot: false,
-        run: false };
+        run: false, project: Option.None };
 }
 
 /// One compile. Everything it allocates is in `arena`.
@@ -195,10 +208,9 @@ pub fn passCx(s: &Session, dump: fn(&PassCx, &Program)): PassCx {
     // `scripts`: any loaded `.j3s` (Rust `dev::has_scripts`). `fast`: the flag, or the manifest's `[cc] fast` /
     // `[emit] fast` (Rust `load_and_check`).
     let isFast = s.opts.fast;
-    let scripts = false;
+    let scripts = scriptsLoaded(s);
     match s.loaded {
         Option.Some(p) {
-            for i in 0..p.files.len { if p.files.items[i].ast.isScript { scripts = true; } }
             match p.project {
                 Option.Some(m) { if m.cc.fast || m.emit.fast { isFast = true; } }
                 Option.None {}
@@ -209,6 +221,28 @@ pub fn passCx(s: &Session, dump: fn(&PassCx, &Program)): PassCx {
     // Rust validates in every check (`check/mod.rs`), release or not.
     return PassCx { dev: dev, fast: isFast, validate: true, scripts: scripts, dumpAfter: s.opts.dumpAfter,
         timePasses: s.opts.timePasses, arena: s.arena, diags: &s.diags, phases: &s.phases, dump: dump, bytecode: &s.bytecode as ptr };
+}
+
+/// Any loaded `.j3s` (Rust `dev::has_scripts` before lowering): with `Mode.Dev` the `devmode` pass runs and
+/// the program is the dev binary (`devOut`).
+pub fn scriptsLoaded(s: &Session): bool {
+    match s.loaded {
+        Option.Some(p) { for i in 0..p.files.len { if p.files.items[i].ast.isScript { return true; } } }
+        Option.None {}
+    }
+    return false;
+}
+
+/// A dev build of a program with scripts (`Mode.Dev`, a `.j3s` loaded).
+fn devScripts(s: &Session): bool { return s.opts.mode == Mode.Dev && scriptsLoaded(s); }
+
+/// Rust `devrun::dev_out`: the dev binary `<bin>-dev` in its own `target/.j3c/<host>/<bin>-dev/` folder,
+/// never beside the real output.
+pub fn devOut(m: &Manifest, arena: &Arena): string {
+    let out = m.outPath(arena);
+    let name = Text.new(arena).add(m.bin).add("-dev").str();
+    let dev = path.join(path.dirname(out), name, arena);
+    return path.join(toolchain.cacheDir(dev, m.emit.primary(), arena), name, arena);
 }
 
 /// Run the IR passes of `s` on `prog`; false on an error.
@@ -306,7 +340,8 @@ fn loadStage(s: &Session): bool {
         Mode.Tool {}
     }
     let cx = LoadCx { arena: s.arena, names: &s.names, diags: &s.diags, sources: &s.sources };
-    let lo = LoadOpts { entry: s.opts.entry, given: s.opts.entryGiven, target: s.opts.target, headless: s.opts.headless, release: s.opts.release, dev: dev };
+    let lo = LoadOpts { entry: s.opts.entry, given: s.opts.entryGiven, target: s.opts.target, headless: s.opts.headless, release: s.opts.release, dev: dev,
+        analyze: s.opts.mode == Mode.Lib, project: s.opts.project };
     match load.loadProgram(cx, lo) {
         Option.Some(p) {
             s.loaded = Option.Some(p);
@@ -376,137 +411,32 @@ pub fn dumpIr(s: &Session, out: &Text): bool {
     }
 }
 
-/// `dump-llvm`: the `.ll` text of `s.program` from the LLVM backend into `out`, after `Stage.Passes` (Rust
-/// `dump_ll_prog`: always LLVM, the build settings or the defaults when they are bad).
-pub fn emitLlvm(s: &Session, out: &Text): bool {
-    let e = toolchain.defaultEmitOpts(s.arena);
-    match emitOpts(s) {
-        Result.Ok(x) { e = x; }
-        Result.Err(_) {}
-    }
-    return emitWith(s, "llvm", &e, out);
-}
-
-/// Rust `cli::emit_opts`: the manifest's `[emit]`/`[cc]`/`[link]` (or the defaults for a single file), then
-/// `--opt`, `--fast` and `--release`. `build` of a program with no manifest writes `target/a.out`.
-pub fn emitOpts(s: &Session): Result<EmitOpts, string> {
-    let e = toolchain.defaultEmitOpts(s.arena);
-    match s.loaded {
-        Option.Some(p) {
-            match p.project {
-                Option.Some(m) { e = toolchain.emitOptsFromManifest(&m, s.arena)?; }
-                Option.None {}
-            }
-        }
-        Option.None {}
-    }
-    // One Session per `[emit] targets` entry (`build`, in sequence): `Options.target` replaces the primary
-    // target and the output goes to `target/<triple>/<bin>` (Rust `compile_manifest_target`).
-    if s.opts.target.len > 0 {
-        e.target = s.opts.target;
-        match s.loaded {
-            Option.Some(p) {
-                match p.project {
-                    Option.Some(m) { e.cc.out = m.outPathFor(s.opts.target, s.arena); }
-                    Option.None {}
-                }
-            }
-            Option.None {}
-        }
-    }
-    if s.opts.opt.len > 0 { e.cc.opt = s.opts.opt; }
-    if s.opts.fast { e.cc.debug = false; }
-    if s.opts.release {
-        e.cc.release = true;
-        e.cc.debug = false;
-        e.incremental = false;
-        if s.opts.opt.len == 0 { e.cc.opt = "s"; }
-    }
-    if !s.opts.run && e.cc.out.len == 0 { e.cc.out = "target/a.out"; }
-    return Result.Ok(e);
-}
-
-/// Emit `s.program` with the backend `name` into `out`; false with Diags.
-fn emitWith(s: &Session, name: string, e: &EmitOpts, out: &Text): bool {
-    match s.program {
-        Option.Some(p) {
-            match backend.find(name, noSpan(), &s.diags) {
-                Option.Some(b) {
-                    let o = toolchain.backendOpts(e);
-                    return b.emit(p, &o, out, &s.diags);
-                }
-                Option.None { return false; }
-            }
-        }
-        Option.None { return false; }
-    }
-}
-
-/// Rust `emit_opts` + `emit_text`: the build settings into `s.emit`, the backend's text into `s.ll`. The
-/// backend is `--emit`, else `[emit] backend`, else LLVM.
-fn backendStage(s: &Session): bool {
-    match emitOpts(s) {
-        Result.Ok(e) { s.emit = e; }
-        Result.Err(x) { return fail(s, x); }
-    }
-    let name = s.opts.emit;
-    if name.len == 0 {
-        name = "llvm";
-        match s.loaded {
-            Option.Some(p) {
-                match p.project {
-                    Option.Some(m) { name = m.emit.backend; }
-                    Option.None {}
-                }
-            }
-            Option.None {}
-        }
-    }
-    // The object cache emits each module itself (`cache.compile`): the whole-program text would be unused.
-    if cache.enabled(&s.emit) || cache.thinLto(&s.emit) {
-        match backend.find(name, noSpan(), &s.diags) {
-            Option.Some(_) { return true; }
-            Option.None { return false; }
-        }
-    }
+/// The diagnostics of a failed run as Rust's error string: rendered diags, except that a plain message
+/// (code 0, no span, no notes: a Rust `Err(String)` such as a read or manifest error) is the bare text.
+pub fn failText(s: &Session): string {
     let t = Text.new(s.arena);
-    if !emitWith(s, name, &s.emit, &t) { return false; }
-    s.ll = t.str();
-    return true;
+    let shown = 0;
+    let omitted = 0;
+    for i in 0..s.diags.count() {
+        let d = s.diags.at(i);
+        match d.severity {
+            Severity.Error {}
+            Severity.Warning { continue; }
+        }
+        if shown >= MAX_SHOWN { omitted += 1; continue; }
+        if shown > 0 { t.add("\n"); }
+        shown += 1;
+        if d.code == 0 && isNone(d.span) && d.notes.len == 0 {
+            t.add(d.msg);
+        } else {
+            diag.render(d, &s.sources, &t);
+        }
+    }
+    // Rust `CheckError::render`'s footer under several errors.
+    if omitted > 0 { t.add("\n").fmt(`error: {shown} errors (and {omitted} more not shown)`).add("\n"); }
+    else if shown > 1 { t.add("\n").fmt(`error: {shown} errors`).add("\n"); }
+    return t.str();
 }
 
-/// Rust `compile_program` (the clang half) and `run_loaded`'s Android refusal: the program's path in `s.exe`.
-/// A cross build's error names its target (Rust `link_built`).
-fn linkStage(s: &Session): bool {
-    if s.opts.run && toolchain.targetOs(s.emit.target) == toolchain.TargetOs.Android {
-        return fail(s, ANDROID_RUN);
-    }
-    // Rust `compile_program`: per-module objects (cached) or ThinLTO objects when the options allow, else
-    // one clang over the whole text.
-    let built: Result<string, string> = Result.Err("");
-    let split = cache.enabled(&s.emit) || cache.thinLto(&s.emit);
-    if split {
-        match s.program {
-            Option.Some(p) { built = cache.compile(p, &s.emit, &s.phases, s.arena); }
-            Option.None { return false; }
-        }
-    } else {
-        built = toolchain.compileTextWith(s.ll, &s.emit, &s.phases, s.arena);
-    }
-    match built {
-        Result.Ok(p) {
-            s.exe = p;
-            return true;
-        }
-        Result.Err(x) {
-            if s.emit.target.len == 0 { return fail(s, x); }
-            return fail(s, Text.new(s.arena).add("target ").add(s.emit.target).add(":\n").add(x).str());
-        }
-    }
-}
-
-/// A plain error (code 0, no span: Rust's `Err(String)`); false.
-fn fail(s: &Session, msg: string): bool {
-    s.diags.add(s.diags.make(0, Severity.Error, noSpan(), msg));
-    return false;
-}
+/// Errors a failed run prints (Rust `MAX_ERRORS`); the rest are counted in the footer.
+const MAX_SHOWN = 20;

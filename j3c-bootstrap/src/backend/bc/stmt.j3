@@ -1,5 +1,205 @@
-// Statements to bytecode.
+// Statements to bytecode: assignments, branches, the compare-chain switch, loops with break/continue
+// fixups, returns, defers, aborts, and string interpolation fills.
 //
 // Part of module j3c.backend.bc.
-// Port of: j3c/src/emit/bc/stmt.rs
+// Port of: j3c/src/emit/bc/stmt.rs (`stmt`; the rvalue helpers are in `bc/rvalue.j3`)
+// J3: `stmt` is exhaustive over `StmtKind` (rule 6). A switch case constant goes straight to `constReg`
+//     (`canonical` of the scrutinee's class, `Ptr` for none): what Rust's `operand(Operand::int(..))` does.
+// J3: Loop fixups are code indexes; `isJump` targets are shifted by the const prologue in `emitFn`.
 module j3c.backend.bc;
+
+/// The type's class is `Void` (Rust `class(..) == Some(Class::Void)`).
+fn isVoidClass(cx: &IrCx, ty: Id<TyKind>): bool {
+    match class(cx, ty) {
+        Option.Some(c) { return c == Class.Void; }
+        Option.None { return false; }
+    }
+}
+
+extend Codegen {
+    fn stmt(this: &Codegen, s: &Stmt): Result<int, string> {
+        let cx = this.cx;
+        match s.kind {
+            StmtKind.Assign(a) {
+                match this.localReg(&a.place) {
+                    Option.Some(reg) { this.scalarInto(&a.rvalue, reg)?; }
+                    Option.None {
+                        if isScalar(cx, a.place.ty) {
+                            let value = this.scalar(&a.rvalue)?;
+                            let at = this.placeAddr(&a.place)?;
+                            this.store(at, value, a.place.ty);
+                        } else {
+                            let at = this.placeAddr(&a.place)?;
+                            let dst = this.materialize(at);
+                            this.aggregateInto(dst, &a.rvalue)?;
+                        }
+                    }
+                }
+            }
+            StmtKind.AssignOp(a) {
+                let value = this.operand(&a.rhs)?;
+                match this.localReg(&a.place) {
+                    Option.Some(reg) { this.binary(reg, a.op, a.place.ty, reg, value)?; }
+                    Option.None {
+                        let at = this.placeAddr(&a.place)?;
+                        let old = this.load(at, a.place.ty)?;
+                        let new = this.reg();
+                        this.binary(new, a.op, a.place.ty, old, value)?;
+                        this.store(at, new, a.place.ty);
+                    }
+                }
+            }
+            StmtKind.Defer(d) { this.scopes.items[this.scopes.len - 1].push(d.body); }
+            StmtKind.If(f) {
+                let fail = this.jumpFalse(&f.cond, true)?;
+                this.block(&f.thenBlock)?;
+                match f.elseBlock {
+                    Option.Some(eb) {
+                        let end = this.push(instr(Op.Jmp, NO_REG, NO_REG, NO_REG, 0));
+                        this.patch(fail, this.here());
+                        this.block(&eb)?;
+                        this.patch(end, this.here());
+                    }
+                    Option.None { this.patch(fail, this.here()); }
+                }
+            }
+            StmtKind.Switch(sw) {
+                // A compare chain: the VM has no jump table.
+                let v = this.operand(&sw.scrut)?;
+                let kc = Class.Ptr;
+                match class(cx, operandTy(sw.scrut)) {
+                    Option.Some(c) { kc = c; }
+                    Option.None {}
+                }
+                let ends = List<int>.new(this.arena);
+                for i in 0..sw.cases.len {
+                    let k = this.constReg(canonical(kc, sw.cases.items[i].value));
+                    let next = this.push(instr(Op.JnEq, NO_REG, v, k, 0));
+                    this.block(&sw.cases.items[i].block)?;
+                    ends.push(this.push(instr(Op.Jmp, NO_REG, NO_REG, NO_REG, 0)));
+                    this.patch(next, this.here());
+                }
+                this.block(&sw.default)?;
+                let here = this.here();
+                for i in 0..ends.len { this.patch(ends.items[i], here); }
+            }
+            StmtKind.While(w) {
+                let header = this.here();
+                let exit = this.jumpFalse(&w.cond, false)?;
+                this.loops.push(LoopFixups { breaks: List<int>.new(this.arena), continues: List<int>.new(this.arena), scopeDepth: this.scopes.len });
+                this.block(&w.body)?;
+                this.push(instr(Op.Jmp, NO_REG, NO_REG, NO_REG, u64(header)));
+                let end = this.here();
+                this.patch(exit, end);
+                let fixes = this.loops.items[this.loops.len - 1];
+                this.loops.len -= 1;
+                for i in 0..fixes.breaks.len { this.patch(fixes.breaks.items[i], end); }
+                for i in 0..fixes.continues.len { this.patch(fixes.continues.items[i], header); }
+            }
+            StmtKind.ForRange(fr) {
+                let signed = false;
+                match class(cx, fr.index.ty) {
+                    Option.Some(c) { signed = classSigned(c); }
+                    Option.None {}
+                }
+                let header = this.here();
+                let indexReg: u32 = NO_REG;
+                let inMem = false;
+                let memAt = Addr { offset: 0, base: FP };
+                match this.localReg(&fr.index) {
+                    Option.Some(reg) { indexReg = reg; }
+                    Option.None {
+                        memAt = this.placeAddr(&fr.index)?;
+                        indexReg = this.load(memAt, fr.index.ty)?;
+                        inMem = true;
+                    }
+                }
+                let endReg = this.operand(&fr.end)?;
+                let jump = Op.JnLtu;
+                if signed { jump = Op.JnLts; }
+                let exit = this.push(instr(jump, NO_REG, indexReg, endReg, 0));
+                this.loops.push(LoopFixups { breaks: List<int>.new(this.arena), continues: List<int>.new(this.arena), scopeDepth: this.scopes.len });
+                this.block(&fr.body)?;
+                let increment = this.here();
+                let one = this.constReg(1);
+                if inMem {
+                    let old = this.load(memAt, fr.index.ty)?;
+                    let new = this.reg();
+                    this.binary(new, BinOp.Add, fr.index.ty, old, one)?;
+                    this.store(memAt, new, fr.index.ty);
+                } else {
+                    this.binary(indexReg, BinOp.Add, fr.index.ty, indexReg, one)?;
+                }
+                this.push(instr(Op.Jmp, NO_REG, NO_REG, NO_REG, u64(header)));
+                let finish = this.here();
+                this.patch(exit, finish);
+                let fixes = this.loops.items[this.loops.len - 1];
+                this.loops.len -= 1;
+                for i in 0..fixes.breaks.len { this.patch(fixes.breaks.items[i], finish); }
+                for i in 0..fixes.continues.len { this.patch(fixes.continues.items[i], increment); }
+            }
+            StmtKind.Return(r) {
+                this.unwindTo(0)?;
+                match r.value {
+                    Option.None { this.push(instr(Op.Ret, NO_REG, NO_REG, NO_REG, 0)); }
+                    Option.Some(v) {
+                        let ty = operandTy(v);
+                        if isVoidClass(cx, ty) {
+                            this.push(instr(Op.Ret, NO_REG, NO_REG, NO_REG, 0));
+                        } else {
+                            let reg = this.operand(&v)?;
+                            if isScalar(cx, ty) {
+                                this.push(instr(Op.RetV, NO_REG, reg, NO_REG, 0));
+                            } else {
+                                this.push(instr(Op.RetA, NO_REG, reg, NO_REG, abiSize(cx, ty)));
+                            }
+                        }
+                    }
+                }
+            }
+            StmtKind.Break(n) { this.loopJump(n, true)?; }
+            StmtKind.Continue(n) { this.loopJump(n, false)?; }
+            StmtKind.Expr(rv) {
+                if isScalar(cx, rv.ty) {
+                    this.scalar(&rv)?;
+                } else if isVoidClass(cx, rv.ty) {
+                    this.voidRvalue(&rv)?;
+                } else {
+                    let at = this.tempMem(rv.ty);
+                    let dst = this.materialize(at);
+                    this.aggregateInto(dst, &rv)?;
+                }
+            }
+            StmtKind.Abort(_) { this.push(instr(Op.Abort, NO_REG, NO_REG, NO_REG, 0)); }
+            StmtKind.Div0 { this.push(instr(Op.Div0, NO_REG, NO_REG, NO_REG, 0)); }
+            StmtKind.Block(inner) { this.block(&inner)?; }
+            StmtKind.InterpFill(f) {
+                let bufAt = this.placeAddr(&f.buf)?;
+                let buf = this.materialize(bufAt);
+                let usedAt = this.placeAddr(&f.used)?;
+                let used = this.materialize(usedAt);
+                for i in 0..f.parts.len {
+                    match f.parts.items[i] {
+                        InterpPart.Lit(lit) { this.appendLiteral(buf, used, lit.bytes); }
+                        InterpPart.Value(op) { this.appendValue(buf, used, &op)?; }
+                    }
+                }
+            }
+        }
+        return Result.Ok(0);
+    }
+
+    /// `break n` / `continue n`: run the defers down to the loop's scope, then a jump patched when it ends.
+    fn loopJump(this: &Codegen, n: u32, isBreak: bool): Result<int, string> {
+        let target = this.loops.len - 1 - int(n);
+        if target < 0 { return Result.Err("break/continue outside a loop"); }
+        this.unwindTo(this.loops.items[target].scopeDepth)?;
+        let at = this.push(instr(Op.Jmp, NO_REG, NO_REG, NO_REG, 0));
+        if isBreak {
+            this.loops.items[target].breaks.push(at);
+        } else {
+            this.loops.items[target].continues.push(at);
+        }
+        return Result.Ok(0);
+    }
+}

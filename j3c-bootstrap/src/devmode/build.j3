@@ -2,4 +2,233 @@
 //
 // Part of module j3c.devmode.
 // Port of: j3c/src/compile/dev/build.rs
+// J3: `Fb` is Rust's struct (locals, params, stmts, `next` for the `_devN` temp names) in the Session arena;
+//     `withLocals` copies the body's locals into a new pool. `vmArg` returns `VmArg { value, size }` for Rust's
+//     `(Operand, u64)`. `deref`/`handleOf` project a `fresh` copy of the place (see devmode.j3).
 module j3c.devmode;
+
+/// A tiny function-body builder: locals, then statements.
+struct Fb {
+    arena: &Arena;
+    locals: Pool<LocalDecl>;
+    params: List<Id<LocalDecl>>;
+    stmts: List<Stmt>;
+    void: Id<TyKind>;
+    next: u32;
+
+    fn new(cx: &IrCx): Fb {
+        return Fb { arena: cx.arena, locals: Pool<LocalDecl>.new(cx.arena), params: List<Id<LocalDecl>>.new(cx.arena),
+            stmts: List<Stmt>.new(cx.arena), void: cx.common.void, next: 0 };
+    }
+
+    fn withLocals(cx: &IrCx, body: &Body): Fb {
+        let fb = Fb.new(cx);
+        let ls = body.locals.items.slice();
+        for i in 0..ls.len { fb.locals.add(ls[i]); }
+        fb.next = u32(ls.len);
+        return fb;
+    }
+
+    fn local(this: &Fb, name: Sym, ty: Id<TyKind>, kind: LocalKind): Place {
+        let id = Id<LocalDecl> { i: u32(this.locals.len()) };
+        this.locals.add(LocalDecl { id: id, doc: "", name: name, ty: ty, access: letBinding(), kind: kind, span: devSpan() });
+        if kind == LocalKind.Param { this.params.push(id); }
+        this.next += 1;
+        return Place.local(this.arena, id, ty, letBinding(), devSpan());
+    }
+
+    fn tmp(this: &Fb, cx: &IrCx, ty: Id<TyKind>): Place {
+        let t = Text.new(this.arena);
+        t.add("_dev").pushU64(u64(this.next));
+        return this.local(cx.internName(t.str()), ty, LocalKind.Tmp);
+    }
+
+    fn assign(this: &Fb, place: Place, rvalue: Rvalue) { this.stmts.push(Stmt.assign(devSpan(), this.void, place, rvalue)); }
+    fn expr(this: &Fb, rvalue: Rvalue) { this.stmts.push(Stmt.expr(devSpan(), this.void, rvalue)); }
+
+    /// Store `rvalue` in a new temp and return a copy of it.
+    fn value(this: &Fb, cx: &IrCx, rvalue: Rvalue): Operand {
+        let place = this.tmp(cx, rvalue.ty);
+        this.assign(fresh(place, this.arena), rvalue);
+        return Operand.Copy(place);
+    }
+
+    /// `place as ptr`, via `&place`.
+    fn address(this: &Fb, cx: &IrCx, place: Place): Operand {
+        let refTy = cx.tyRef(place.ty);
+        let r = this.value(cx, Rvalue.refPlace(devSpan(), refTy, place));
+        return this.value(cx, Rvalue.cast(devSpan(), cx.common.ptr, r));
+    }
+
+    fn finish(this: &Fb): Body {
+        return Body { locals: this.locals, params: this.params, block: Block { stmts: this.stmts } };
+    }
+}
+
+/// A copy of `p` with its own projection list, so projecting it leaves `p` alone (Rust `Place::clone`).
+fn fresh(p: Place, arena: &Arena): Place {
+    let q = p;
+    q.proj = List<Proj>.new(arena);
+    q.proj.extend(p.proj.slice());
+    return q;
+}
+
+/// The place of an operand that is a copy (Rust `let Operand::Copy(place) = .. else { unreachable!() }`).
+fn placeOf(op: Operand): Place {
+    match op {
+        Operand.Copy(p) { return p; }
+        Operand.Const(_) { panic("devmode: a temp is not a place"); }
+    }
+}
+
+fn deref(cx: &IrCx, place: Place): Place {
+    match cx.refInner(place.ty) {
+        Option.Some(inner) { return fresh(place, cx.arena).project(Proj.Deref, inner, throughRef(), devSpan()); }
+        Option.None { panic("deref of a non-ref"); }
+    }
+}
+
+/// `(*p).handle`. Rust gives it `read_only_view` (field 0 was a prop when the place was made); once `lower` clears
+/// `propSpans` the validator folds `through_ref` for it, so that is the access here: Rust never validates dev IR,
+/// the access is not in the dump or any backend output, and this way the lowered program validates.
+fn handleOf(cx: &IrCx, scriptPlace: Place, sid: Id<StructDef>): Place {
+    let ptr = cx.common.ptr;
+    return fresh(scriptPlace, cx.arena).project(Proj.Field(FieldProj { field: FieldId { structId: sid, index: 0 }, ty: ptr }), ptr,
+        throughRef(), devSpan());
+}
+
+fn stringConst(cx: &IrCx, text: string): Operand { return opBytes(cx.arena, devSpan(), cx.common.string, text as []u8); }
+
+/// A `[]T` slice over `items` (each an operand of type `elem`), built in a stack array.
+fn sliceOf(cx: &IrCx, fb: &Fb, elem: Id<TyKind>, items: List<Operand>): Operand {
+    let sliceTy = cx.tySlice(elem);
+    let refTy = cx.tyRef(elem);
+    let int = cx.common.int;
+    let n = u64(items.len);
+    let data = opNull(devSpan(), refTy);
+    if items.len > 0 {
+        let arrayTy = cx.tyArray(elem, n);
+        let array = fb.tmp(cx, arrayTy);
+        fb.assign(fresh(array, cx.arena), Rvalue.aggregate(devSpan(), arrayTy, items));
+        let first = fresh(array, cx.arena).project(Proj.Index(IndexProj { index: opInt(devSpan(), int, 0), ty: elem }), elem, letBinding(),
+            devSpan());
+        data = fb.value(cx, Rvalue.refPlace(devSpan(), refTy, first));
+    }
+    let fields = List<Operand>.new(cx.arena);
+    fields.push(data);
+    fields.push(opInt(devSpan(), int, n));
+    return fb.value(cx, Rvalue.aggregate(devSpan(), sliceTy, fields));
+}
+
+/// Rust `vm_arg`'s `(Operand, u64)`.
+struct VmArg {
+    value: Operand;
+    size: u64;
+}
+
+/// Pass `value` (of type `ty`) to the VM: its address, or for `&Door`, the address of the VM instance pointer the
+/// handle holds.
+fn vmArg(cx: &IrCx, fb: &Fb, scripts: &Map<Id<StructDef>, ScriptInfo>, value: Operand, ty: Id<TyKind>): Result<VmArg, string> {
+    match scriptRef(cx, ty, scripts) {
+        Option.Some(sid) {
+            match value {
+                Operand.Copy(place) {
+                    let handle = handleOf(cx, deref(cx, place), sid);
+                    let slot = placeOf(fb.value(cx, Rvalue.useOp(devSpan(), Operand.Copy(handle))));
+                    return Result.Ok(VmArg { value: fb.address(cx, slot), size: 8 });
+                }
+                Operand.Const(_) { return Result.Err("dev build: a script reference must be a place"); }
+            }
+        }
+        Option.None {}
+    }
+    if mentionsScript(cx, ty, scripts, cx.arena) {
+        let t = Text.new(cx.arena);
+        t.add("dev builds pass a script instance only as `&Script` (found `").add(dump.tyString(cx, ty, cx.arena)).add("`)");
+        return Result.Err(t.str());
+    }
+    let slot = Place.local(cx.arena, Id<LocalDecl> { i: 0 }, ty, letBinding(), devSpan());
+    let direct = false;
+    match value {
+        Operand.Copy(place) {
+            match place.root {
+                PlaceRoot.Local(_) { if place.proj.len == 0 { slot = place; direct = true; } }
+                PlaceRoot.Global(_) {}
+            }
+        }
+        Operand.Const(_) {}
+    }
+    if !direct { slot = placeOf(fb.value(cx, Rvalue.useOp(devSpan(), value))); }
+    let size = abiSize(cx, ty);
+    return Result.Ok(VmArg { value: fb.address(cx, slot), size: size });
+}
+
+/// Replace a `pub` script fn's body with a call into the VM.
+fn stub(cx: &IrCx, rt: &Runtime, scripts: &Map<Id<StructDef>, ScriptInfo>, id: Id<Func>): Result<int, string> {
+    let func = cx.func(id);
+    match func.kind {
+        FuncKind.J3(j) { return stubJ3(cx, rt, scripts, id, func, &j.body); }
+        FuncKind.Lib(_) { return Result.Ok(0); }
+        FuncKind.Decl { return Result.Ok(0); }
+    }
+}
+
+fn stubJ3(cx: &IrCx, rt: &Runtime, scripts: &Map<Id<StructDef>, ScriptInfo>, id: Id<Func>, func: Func, body: &Body): Result<int, string> {
+    let key = bc.fnKey(cx, id, cx.arena);
+    let ret = cx.common.void;
+    match cx.fnSig(func.ty) {
+        Option.Some(sig) { ret = sig.ret; }
+        Option.None { return Result.Err("stub signature"); }
+    }
+    if mentionsScript(cx, ret, scripts, cx.arena) {
+        let t = Text.new(cx.arena);
+        t.add("`").add(bc.fnLabel(cx, id, cx.arena)).add("` returns a script instance; dev builds can't return those to native code yet");
+        return Result.Err(t.str());
+    }
+    let fb = Fb.new(cx);
+    let params = List<Place>.new(cx.arena);
+    for i in 0..body.params.len {
+        let decl = body.local(body.params.items[i]);
+        params.push(fb.local(decl.name, decl.ty, LocalKind.Param));
+    }
+    let argTy = cx.tyStruct(rt.arg);
+    let int = cx.common.int;
+    let args = List<Operand>.new(cx.arena);
+    for i in 1..params.len {
+        let p = params.items[i];
+        let a = vmArg(cx, &fb, scripts, Operand.Copy(fresh(p, cx.arena)), p.ty)?;
+        let fields = List<Operand>.new(cx.arena);
+        fields.push(a.value);
+        fields.push(opInt(devSpan(), int, a.size));
+        args.push(fb.value(cx, Rvalue.aggregate(devSpan(), argTy, fields)));
+    }
+    let argSlice = sliceOf(cx, &fb, argTy, args);
+    if params.len == 0 { return Result.Err("stub without `this`"); }
+    let thisSid = Id<StructDef> { i: 0 };
+    match scriptRef(cx, params.items[0].ty, scripts) {
+        Option.Some(s) { thisSid = s; }
+        Option.None { return Result.Err("stub without `this`"); }
+    }
+    let handle = handleOf(cx, deref(cx, params.items[0]), thisSid);
+    let handleOp = fb.value(cx, Rvalue.useOp(devSpan(), Operand.Copy(handle)));
+    let void = cx.common.void;
+    let resultPtr = opNull(devSpan(), cx.common.ptr);
+    let result: Option<Operand> = Option.None;
+    if !(ret == void) {
+        let slot = fb.tmp(cx, ret);
+        resultPtr = fb.address(cx, fresh(slot, cx.arena));
+        result = Option.Some(Operand.Copy(slot));
+    }
+    let callee = cx.func(rt.devCall).ty;
+    let callArgs = List<Operand>.new(cx.arena);
+    callArgs.push(opInt(devSpan(), cx.common.u64, key));
+    callArgs.push(handleOp);
+    callArgs.push(argSlice);
+    callArgs.push(resultPtr);
+    fb.expr(Rvalue.call(devSpan(), void, opFnAddr(devSpan(), callee, rt.devCall), callArgs));
+    fb.stmts.push(Stmt.returnValue(devSpan(), void, result));
+    let f = cx.funcMut(id);
+    f.kind = FuncKind.J3(J3Fn { body: fb.finish() });
+    f.span = devSpan();
+    return Result.Ok(0);
+}

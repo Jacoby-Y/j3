@@ -4,34 +4,458 @@
 // Port of: j3c/src/hot.rs
 // J3: Polls every 100 ms as Rust does (no `j3.io.watch`: Linux-only inotify, and the poll is the oracle's
 //     behaviour). Children start through `cmd/devrun.j3` `launch`. Never run in tests (the loop never ends on its
-//     own): unit tests cover `watched` and `withoutStyles` only.
+//     own): unit tests cover `watched` and `withoutStyles` only. `launch` pipes the child's output, so every poll
+//     calls `devrun.pump` (Rust inherits stdio).
 // J3: Must not `use j3c.cmd.run` (`cmd/run.j3` calls `run` here: import cycle).
+// J3: Rust's `Hooks` (test stand-ins for clang and the game) are plain calls: the loop is not unit-tested.
+//     Each scan lives in its own arena (`Scan.mem`), freed once `Debounce` no longer holds it, so an hour of
+//     polling does not grow memory; `Scanner.cache` keeps one entry per file. ponytail: no SIGINT/SIGTERM
+//     trap (`j3.sys` has no `signal`): Ctrl-C reaches the child too (same process group) and ends j3c-boot; a
+//     compiler panic ends the watcher (no `catch_unwind`). Build errors and exe paths are kept in the run's
+//     arena (a few KB per rebuild).
 module j3c.cmd.hot;
 
+use j3.cmp.sortBy;
+use j3.data.map.Map;
+use j3.hash.xxh3_64;
+use j3.io;
+use j3.io.path;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
+use j3.proc.Child;
 use j3.result.Result;
-use j3.text.Text;
-use j3c.cmd.check.err;
+use j3.sys;
+use j3.text.{ Text, find, startsWith };
+use j3c.base.fsx;
+use j3c.base.intern.own;
+use j3c.cmd.check.{ err, failText, printFail };
 use j3c.cmd.devrun;
+use j3c.cmd.gen;
+use j3c.devmode;
 use j3c.driver;
-use j3c.driver.{ Session, Stage };
+use j3c.driver.{ Options, Session, Stage };
 use j3c.project.manifest.Manifest;
+use j3c.toolchain;
 use j3c.toolchain.EmitOpts;
+
+/// Quiet time after the last change before a rebuild starts (Rust `DEBOUNCE`).
+const DEBOUNCE_MS: int = 150;
+/// How long the old program gets to save and exit before it is killed.
+const GRACE_MS: int = 3000;
+const POLL_MS: int = 100;
 
 /// Rust `run`: `s` is the checked `Mode.Dev` session `devrun.prepare` answered `NoScripts` for, or `first` the
 /// prepare error (the loop then waits for a fix). Returns only when the program is closed; the exit code.
 pub fn run(s: &Session, m: &Manifest, e: &EmitOpts, first: Option<string>, args: []string): int {
-    err("j3c-boot: run --hot: not ported yet\n"); // STUB E
-    return 1;
+    let mem = Arena.create(1 << 16);
+    defer mem.destroy();
+    let h = Hot { opts: s.opts, root: m.root, args: args, paths: hotPaths(m.root, &mem), n: 0, mem: &mem };
+    let start: Result<string, string> = Result.Err("");
+    match first {
+        Option.Some(x) { start = Result.Err(x); }
+        Option.None { start = finish(s, &mem); }
+    }
+    s.phases.begin("running");
+    err("j3c: hot mode: rebuilding on .j3 / .j3ui / .j3s edits\n");
+    let roots = List<string>.new(&mem);
+    roots.push(m.root);
+    let std = sys.env("J3_STDLIB");
+    if std.len > 0 { roots.push(own(&mem, std)); }
+    match supervise(&h, roots.items[0..roots.len], start) {
+        Result.Ok(code) {
+            if code != 0 { err(Text.new(&mem).add("j3c: program exited ").fmt(`{code}`).add("\n").str()); }
+            return code;
+        }
+        Result.Err(x) {
+            printFail(x, &mem);
+            return 1;
+        }
+    }
 }
 
 /// Rust `watched`: `.j3`, `.j3ui`, `.j3s` files and `j3.toml`.
 pub fn watched(p: string): bool {
-    return false; // STUB E
+    let ext = path.ext(p);
+    if ext == ".j3" || ext == ".j3ui" || ext == ".j3s" { return true; }
+    return path.basename(p) == "j3.toml";
 }
 
-/// Rust `without_styles`: `src` with top-level `<style>...</style>` blocks removed (a style edit is no restart).
+/// Rust `without_styles`: `src` with top-level `<style>...</style>` blocks removed (a style edit is no
+/// restart). `<script>` bodies are skipped over (a `"<style>"` there is code), and a tag only counts when
+/// `<style` is followed by `>` or whitespace (`<styles>` is a component).
 pub fn withoutStyles(src: string, arena: &Arena): string {
-    return src; // STUB E
+    let out = Text.new(arena);
+    let rest = src;
+    while true {
+        let style = styleTag(rest);
+        let script = find(rest, "<script");
+        if style >= 0 && (script < 0 || style < script) {
+            out.add(rest[0..style]);
+            let b = find(rest[style..rest.len], "</style>");
+            if b < 0 { return out.str(); }
+            rest = rest[style + b + 8..rest.len];
+        } else if script >= 0 {
+            // keep the whole script block
+            let e = find(rest[script..rest.len], "</script>");
+            let end = if e < 0 { rest.len } else { script + e + 9 };
+            out.add(rest[0..end]);
+            rest = rest[end..rest.len];
+        } else {
+            out.add(rest);
+            return out.str();
+        }
+    }
+    return out.str();
 }
+
+/// The first `<style` in `s` followed by `>` or whitespace; -1 when none. ponytail: ASCII whitespace only
+/// (Rust `char::is_whitespace` also takes Unicode spaces).
+fn styleTag(s: string): int {
+    let from = 0;
+    while true {
+        let i = find(s[from..s.len], "<style");
+        if i < 0 { return -1; }
+        let at = from + i;
+        if at + 6 < s.len {
+            let c = s[at + 6];
+            if c == '>' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12 { return at; }
+        }
+        from = at + 1;
+    }
+    return -1;
+}
+
+/// The three files of the restart handshake, under `target/.j3hot` (Rust `HotPaths`).
+struct HotPaths {
+    quit: string;
+    win: string;
+    state: string;
+}
+
+fn hotPaths(root: string, arena: &Arena): HotPaths {
+    let dir = path.join(root, "target/.j3hot", arena);
+    io.makeDirs(dir);
+    return HotPaths { quit: path.join(dir, "quit", arena), win: path.join(dir, "window", arena), state: path.join(dir, "state", arena) };
+}
+
+/// What a program is started with, as `NAME=VALUE`.
+fn envs(p: &HotPaths, arena: &Arena): List<string> {
+    let out = List<string>.new(arena);
+    out.push(Text.new(arena).add("J3_HOT_QUIT=").add(p.quit).str());
+    out.push(Text.new(arena).add("J3_HOT_WIN=").add(p.win).str());
+    out.push(Text.new(arena).add("J3_HOT_STATE=").add(p.state).str());
+    return out;
+}
+
+/// Content hashes of the watched files, sorted by path, in their own arena.
+struct Scan {
+    mem: &Arena;
+    paths: List<string>;
+    hashes: List<u64>;
+}
+
+fn same(a: &Scan, b: &Scan): bool {
+    if a.paths.len != b.paths.len { return false; }
+    for i in 0..a.paths.len {
+        if a.hashes.items[i] != b.hashes.items[i] || a.paths.items[i] != b.paths.items[i] { return false; }
+    }
+    return true;
+}
+
+fn freeScan(x: &Scan) {
+    let a = *x.mem;
+    a.destroy();
+}
+
+/// A file's size and mtime when it was hashed.
+struct Stamp {
+    size: int;
+    sec: int;
+    nsec: int;
+    hash: u64;
+}
+
+/// Rust `Scanner`: a file is re-read only when its size or mtime moved, and compared by content, so a
+/// generated file rewritten with the same text is no change.
+struct Scanner {
+    mem: &Arena;
+    cache: Map<string, Stamp>;
+    rehashed: int;
+
+    fn scan(this: &Scanner, roots: []string): &Scan {
+        let a = Arena.create(1 << 14);
+        // The arena lives inside itself (as `driver.Session.new`), so `freeScan` drops the scan whole.
+        let cell = a.alloc::<Arena>(1);
+        cell[0] = a;
+        let ap = &cell[0];
+        let files = List<string>.new(ap);
+        for i in 0..roots.len { walk(roots[i], &files, ap); }
+        sortBy(files.items[0..files.len], fn(x: string, y: string): bool { return x < y; });
+        let out = ap.new::<Scan>(Scan { mem: ap, paths: List<string>.new(ap), hashes: List<u64>.new(ap) });
+        for i in 0..files.len {
+            let f = files.items[i];
+            let st = Stamp { size: 0, sec: 0, nsec: 0, hash: 0 };
+            match fsx.statNs(f, ap) {
+                Option.Some(t) { st = Stamp { size: t.0, sec: t.1, nsec: t.2, hash: 0 }; }
+                Option.None {
+                    match io.stat(f) {
+                        Result.Ok(x) { st = Stamp { size: x.size, sec: x.mtime, nsec: 0, hash: 0 }; }
+                        Result.Err(_) { continue; }
+                    }
+                }
+            }
+            let hit = false;
+            if this.cache.has(f) {
+                let c = this.cache.getPtr(f);
+                if c.size == st.size && c.sec == st.sec && c.nsec == st.nsec { st.hash = c.hash; hit = true; }
+            }
+            if !hit {
+                this.rehashed += 1;
+                let bytes = "" as []u8;
+                match io.readFile(f, ap) {
+                    Result.Ok(b) { bytes = b; }
+                    Result.Err(_) {}
+                }
+                if path.ext(f) == ".j3ui" { bytes = withoutStyles(bytes as string, ap) as []u8; }
+                st.hash = xxh3_64(bytes);
+                if this.cache.has(f) { *this.cache.getPtr(f) = st; } else { this.cache.put(own(this.mem, f), st); }
+            }
+            out.paths.push(f);
+            out.hashes.push(st.hash);
+        }
+        return out;
+    }
+}
+
+/// The watched files under `dir` (not `target/`, hidden or `node_modules` folders).
+fn walk(dir: string, out: &List<string>, arena: &Arena) {
+    match io.listDir(dir, arena) {
+        Result.Ok(ents) {
+            for i in 0..ents.len {
+                let name = ents[i].name;
+                let p = path.join(dir, name, arena);
+                if fsx.isDir(p) {
+                    if name != "target" && !startsWith(name, ".") && name != "node_modules" { walk(p, out, arena); }
+                } else if watched(p) {
+                    out.push(p);
+                }
+            }
+        }
+        Result.Err(_) {}
+    }
+}
+
+/// Rust `Debounce`: waits until the files have been still for `quiet` ms (a burst of saves is one build),
+/// and compares with the scan the last build started from, so an edit made during a build triggers the next.
+/// `built` and `cur` may be the same scan; a scan is freed once neither holds it.
+struct Debounce {
+    built: &Scan;
+    cur: &Scan;
+    since: int;
+    quiet: int;
+
+    /// Note the latest scan without deciding anything.
+    fn observe(this: &Debounce, scan: &Scan, now: int) {
+        if same(scan, this.cur) {
+            freeScan(scan);
+            return;
+        }
+        let old = this.cur;
+        this.cur = scan;
+        this.since = now;
+        if old != this.built { freeScan(old); }
+    }
+
+    /// No change is waiting: the latest scan is the one the last build started from.
+    fn stable(this: &Debounce): bool { return same(this.cur, this.built); }
+
+    /// True once when a change has settled; the build then starts from this scan.
+    fn poll(this: &Debounce, scan: &Scan, now: int): bool {
+        this.observe(scan, now);
+        if !same(this.cur, this.built) && now - this.since >= this.quiet {
+            let old = this.built;
+            this.built = this.cur;
+            if old != this.cur { freeScan(old); }
+            return true;
+        }
+        return false;
+    }
+}
+
+/// The run's fixed inputs (Rust's closures over `m`, `opts`, `args`).
+struct Hot {
+    opts: Options;
+    root: string;
+    args: []string;
+    paths: HotPaths;
+    /// Spawns so far: copies alternate `run-0` / `run-1`.
+    n: int;
+    mem: &Arena;
+}
+
+/// Rust `supervise`: run until the program exits by itself; its code. `first` is the initial executable,
+/// or the initial build error (then it waits for an edit). A build that finishes while newer edits wait
+/// is not started: those are built first, so a restart always runs the newest sources.
+fn supervise(h: &Hot, roots: []string, first: Result<string, string>): Result<int, string> {
+    clear(&h.paths);
+    let sc = Scanner { mem: h.mem, cache: Map<string, Stamp>.new(h.mem, 64), rehashed: 0 };
+    let one = sc.scan(roots);
+    let deb = Debounce { built: one, cur: one, since: sys.monotonicMs(), quiet: DEBOUNCE_MS };
+    let child = Child { pid: 0, stdin: -1, stdout: -1, stderr: -1, done: false, code: 0 };
+    let running = false;
+    let ready = "";
+    match first {
+        Result.Ok(exe) {
+            child = spawn(h, exe)?;
+            running = true;
+        }
+        Result.Err(e) {
+            printFail(e, h.mem);
+            err("j3c: waiting for a fix\n");
+        }
+    }
+    while true {
+        if running {
+            // `launch` pipes the child's output: pass it through every poll, or a chatty child stalls
+            devrun.pump(&child);
+            match child.tryWait() {
+                Option.Some(code) {
+                    devrun.reportCrash(&child);
+                    child.wait();
+                    return Result.Ok(code);
+                }
+                Option.None {}
+            }
+        }
+        sleepMs(POLL_MS);
+        if deb.poll(sc.scan(roots), sys.monotonicMs()) {
+            err("j3c: change detected, rebuilding\n");
+            match rebuild(h) {
+                Result.Err(e) {
+                    ready = "";
+                    printFail(e, h.mem);
+                    err(if running { "j3c: build failed; kept the running program\n" } else { "j3c: build failed; waiting for a fix\n" });
+                }
+                Result.Ok(exe) { ready = exe; }
+            }
+        }
+        deb.observe(sc.scan(roots), sys.monotonicMs());
+        // restart only when nothing newer than this build is waiting (the poll above has seen any save made
+        // during the build)
+        if deb.stable() && ready.len > 0 {
+            let exe = ready;
+            ready = "";
+            if running { stop(&child, &h.paths); }
+            err("j3c: restarting\n");
+            child = spawn(h, exe)?;
+            running = true;
+        }
+    }
+    return Result.Ok(0);
+}
+
+/// Rust `stop`: ask the child to save and exit; kill it after `GRACE_MS`.
+fn stop(child: &Child, paths: &HotPaths) {
+    toolchain.discard(paths.state);
+    io.writeFile(paths.quit, "" as []u8);
+    let end = sys.monotonicMs() + GRACE_MS;
+    let done = false;
+    while !done && sys.monotonicMs() < end {
+        devrun.pump(child);
+        match child.tryWait() {
+            Option.Some(_) { done = true; }
+            Option.None { sleepMs(20); }
+        }
+    }
+    if !done {
+        match child.tryWait() {
+            Option.Some(_) {}
+            Option.None {
+                err("j3c: the program did not exit in time; killed it (no state kept). A program with its own main loop: add app.hotPoll() to the loop to save state\n");
+                sys.kill(child.pid, sys.SIGKILL);
+            }
+        }
+    }
+    child.wait();
+    toolchain.discard(paths.quit);
+}
+
+/// Forget a previous session (a fresh `j3c run --hot` starts fresh).
+fn clear(p: &HotPaths) {
+    toolchain.discard(p.quit);
+    toolchain.discard(p.win);
+    toolchain.discard(p.state);
+}
+
+/// Rust's `build` closure: a fresh dev check of the project, refused once it has scripts, then `finish`.
+fn rebuild(h: &Hot): Result<string, string> {
+    gen.beforeBuild(h.root);
+    let s = Session.new(h.opts);
+    defer s.free();
+    s.phases.enable();
+    if !driver.run(s, Stage.Lower) { return Result.Err(own(h.mem, failText(s))); }
+    match s.program {
+        Option.Some(prog) {
+            if devmode.hasScripts(prog) {
+                return Result.Err("the program has `.j3s` scripts now; rerun `j3c run` (scripts have their own watcher)");
+            }
+        }
+        Option.None {}
+    }
+    return finish(s, h.mem);
+}
+
+/// Rust `finish`: preflight, then the build on to `Stage.Link`; the exe path (or the error) in `mem`.
+fn finish(s: &Session, mem: &Arena): Result<string, string> {
+    match s.loaded {
+        Option.Some(p) {
+            match s.program {
+                Option.Some(prog) {
+                    match toolchain.preflight(prog, p.project, s.arena) {
+                        Result.Ok(_) {}
+                        Result.Err(x) { return Result.Err(own(mem, x)); }
+                    }
+                }
+                Option.None {}
+            }
+        }
+        Option.None {}
+    }
+    if !driver.run(s, Stage.Link) { return Result.Err(own(mem, failText(s))); }
+    return Result.Ok(own(mem, s.exe));
+}
+
+/// Rust's `spawn` closure: run a private copy of `exe` (`target/.j3hot/run-N`), so the next build can replace
+/// the original. ponytail: the two copies stay in `target/.j3hot`.
+fn spawn(h: &Hot, exe: string): Result<Child, string> {
+    h.n += 1;
+    let t = Text.new(h.mem).fmt(`run-{h.n % 2}`);
+    let ext = path.ext(exe);
+    if ext.len > 0 { t.add(ext); }
+    let copy = path.join(path.dirname(h.paths.quit), t.str(), h.mem);
+    toolchain.discard(copy);
+    makeExecutable(copy, h.mem);
+    match io.copyFile(exe, copy) {
+        Result.Ok(_) {}
+        Result.Err(_) { return Result.Err(Text.new(h.mem).add("copy ").add(exe).add(": ").add(fsx.osError(sys.errno(), h.mem)).str()); }
+    }
+    let env = envs(&h.paths, h.mem);
+    return devrun.launch(copy, h.root, h.args, env.items[0..env.len], h.mem);
+}
+
+/// Create `p` empty with mode 0755 before `io.copyFile` fills it (Rust `fs::copy` keeps the mode;
+/// `io.copyFile` only sets 0644 on a file it creates, and keeps an existing file's mode).
+fn makeExecutable(p: string, arena: &Arena) {
+    let c = Text.new(arena).add(p);
+    c.push(0);
+    let fd = sys.openMode(c.str().ptr as ptr, sys.O_WRONLY + sys.O_CREAT + sys.O_TRUNC, 493);
+    if fd >= 0 { sys.close(fd); }
+}
+
+
+fn sleepMs(ms: int) {
+    let none: [1]i64 = [0];
+    sys.pollFds(&none[0] as ptr, 0, ms);
+}
+
+

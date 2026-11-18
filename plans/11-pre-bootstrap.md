@@ -574,7 +574,7 @@ Gate: whole-corpus `diff.sh run` clean (leftovers in `known/run.txt` with causes
 - [x] Wave 20 (4 agents, shared worktree): object cache; toolchain rest + preflight; `build` stamps, multi-target, log, `size`; `run`, commands, driver, harness.
 - [x] Wave 21 (integration): self LLVM exact, whole-corpus run by tier, `diff.sh self`.
 
-### Milestone C4: bytecode backend, dev mode, dev runner, package commands, `--hot`
+### Milestone C4: bytecode backend, dev mode, dev runner, package commands, `--hot` — DONE (bc 19/19 byte-equal; dev path no-clang rebuild; pkg 11/11; run 229; self 238; review 1 must-fix + 11 should-fix fixed)
 - [x] Wave 22 (contracts): bc op table, Bc* types, devmode/devrun/pkg stubs, `diff.sh bc`, c4 corpus.
-- [ ] Wave 23 (5 chunks): A bc module + encode + dump-bc; B bc codegen; C devmode pass; D dev runner + run wiring; E pkg commands, pkgtool, --hot.
-- [ ] Wave 24 (integration): `.j3sb` byte-equal on the corpus, dev-mode run, self.
+- [x] Wave 23 (5 chunks): A bc module + encode + dump-bc; B bc codegen; C devmode pass; D dev runner + run wiring; E pkg commands, pkgtool, --hot.
+- [x] Wave 24 (integration): `.j3sb` byte-equal on the corpus, dev-mode run, self.
