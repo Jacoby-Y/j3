@@ -17,16 +17,19 @@ die() { echo "package.sh: $*" >&2; exit 1; }
 
 if [ -z "${J3_SKIP_BUILD:-}" ]; then
   [ -x j3c-bootstrap/stage0/j3c ] || j3c-bootstrap/tools/stage0.sh rust-final
-  j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap
+  # The version is git's (see build.sh): written for this build only.
+  vf=j3c-bootstrap/text/version-build.txt
+  d=$(git describe --tags --match 'v[0-9]*' --dirty) || die "git describe: no v* tag (fetch tags)"
+  printf '%s\n%s\n' "${d#v}" "$(git describe --tags --match 'v[0-9]*' --abbrev=0 | sed 's/^v//')" > "$vf"
+  j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap || { rm -f "$vf"; die "build failed"; }
+  rm -f "$vf"
   strip j3c-bootstrap/target/j3c
 fi
 bin=j3c-bootstrap/target/j3c
 [ -x "$bin" ] || die "no $bin (build failed?)"
 
-version=$(sed -n 's/^pub const J3C_VERSION: string = "\(.*\)";/\1/p' j3c-bootstrap/src/project/config.j3)
-[ -n "$version" ] || die "no J3C_VERSION in j3c-bootstrap/src/project/config.j3"
-got=$("$bin" version | awk '{print $2}')
-[ "$got" = "$version" ] || die "binary says $got, config.j3 says $version"
+version=$("$bin" version | awk '{print $2}')
+[ -n "$version" ] || die "$bin version printed nothing"
 
 arch=$(uname -m)
 case "$arch" in

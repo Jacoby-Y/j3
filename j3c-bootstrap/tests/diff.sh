@@ -101,9 +101,10 @@ if [ $mode = ast ] && [[ $("$S0" dump-ast /dev/null 2>&1) == *'unknown command'*
     die "stage0 has no dump-ast yet: rebuild it with tools/stage0.sh rust-final"
 fi
 
-# One build of j3c-boot when it is missing or older than its sources. `--opt 2` (plan 13): the j3.toml stays opt 0
+# One build of j3c-boot when it is missing, older than its sources, or carries a git build version (./build.sh
+# embeds text/version-build.txt, then removes it; stage 0 says 0.1.0). `--opt 2` (plan 13): the j3.toml stays opt 0
 # for the self build (stage 2 and the bench measure that one); only the binary under test is optimized.
-if [ $list = 0 ] && [ -z "${DIFF_BOOT:-}" ] && { [ ! -x "$BOOT" ] || [ -n "$(find "$boot/src" "$boot/j3.toml" -newer "$BOOT" -print -quit)" ] || [ "$S0" -nt "$BOOT" ]; }; then
+if [ $list = 0 ] && [ -z "${DIFF_BOOT:-}" ] && { [ ! -x "$BOOT" ] || [ -n "$(find "$boot/src" "$boot/j3.toml" -newer "$BOOT" -print -quit)" ] || [ "$S0" -nt "$BOOT" ] || [ "$("$BOOT" version 2>/dev/null)" != "$("$S0" version)" ]; }; then
     echo "diff.sh: building j3c-boot" >&2
     log=$(mktemp)
     if ! timeout 900 "$S0" build --opt 2 "$boot" >"$log" 2>&1; then tail -20 "$log" >&2; rm -f "$log"; die "j3c-boot build failed"; fi

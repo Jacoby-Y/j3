@@ -11,9 +11,12 @@ Every channel ships the same `j3c` binary, built by `.github/workflows/release.y
 | AUR `j3c-bin` | `aur/j3c-bin/PKGBUILD` | After publishing: bump `pkgver`, `updpkgsums`, `makepkg --printsrcinfo > .SRCINFO`, push both to `ssh://aur@aur.archlinux.org/j3c-bin.git` |
 | Homebrew, winget/Scoop, npm | | Later, once macOS/Windows builds run |
 
-Release steps: bump `version` in `j3c/Cargo.toml`, move the `CHANGELOG.md` section from
-unreleased to a date, commit, tag `v<ver>`, push the tag. The workflow refuses a tag that
-does not match `Cargo.toml`.
+Release steps: move the `CHANGELOG.md` section from unreleased to a date, commit, tag
+`v<ver>`, push the tag. No version bump: the version is `git describe --tags --match 'v[0-9]*'`
+(`0.1.4` on the tag, `0.1.4-7-gabc1234[-dirty]` after it), which `./build.sh` and
+`tools/release/package.sh` write to the gitignored `j3c-bootstrap/text/version-build.txt` for
+the build (`src/project/config.j3`: `j3cBuild`, `j3cSemver`; without the file it is
+`J3C_VERSION`, 0.1.0). The workflow refuses a binary whose version is not the tag.
 
 ## Compatibility
 

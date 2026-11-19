@@ -23,6 +23,14 @@ else bin=$HOME/.local/bin
 fi
 mkdir -p "$bin"
 
+# The version is git's: `git describe` minus the `v` (`0.1.4-7-gabc1234-dirty`), then the tag (`0.1.4`), into
+# a gitignored file both stages embed (src/project/config.j3). Removed after stage 2, so a later in-place build
+# (tests/diff.sh compares against stage 0's `0.1.0`) falls back to J3C_VERSION.
+vf=j3c-bootstrap/text/version-build.txt
+trap 'rm -f "$root/$vf"' EXIT
+if d=$(git describe --tags --match 'v[0-9]*' --dirty 2>/dev/null) && t=$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null); then
+    printf '%s\n%s\n' "${d#v}" "${t#v}" > "$vf"
+fi
 echo "build.sh: stage 1 (built by stage 0)"
 timeout 1800 "$s0" build --opt 2 j3c-bootstrap
 stage1=$root/j3c-bootstrap/target/j3c
@@ -39,6 +47,7 @@ stage2=$s2/j3c-bootstrap/target/j3c
 v1=$("$stage1" version --verbose | grep -v '^binary ')
 v2=$("$stage2" version --verbose | grep -v '^binary ')
 [ "$v1" = "$v2" ] || { printf 'build.sh: stage 1 and stage 2 disagree:\n%s\n---\n%s\n' "$v1" "$v2"; exit 1; }
+rm -f "$vf"
 strip -o "$s2/j3c.stripped" "$stage2"
 install -m 755 "$s2/j3c.stripped" "$bin/j3c"
 rm -f "$s2/j3c.stripped"

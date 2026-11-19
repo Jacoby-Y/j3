@@ -5,6 +5,11 @@ stage 1 with `stage0/j3c` (the Rust compiler from the git tag `rust-final`), sta
 they agree and installs stage 2. Every file's header says what it does and which Rust files it replaced
 (`Port of:`, paths in `j3c/src/` at `rust-final`). A plain `build` writes `target/j3c`.
 
+The version follows git, never a bump commit: `build.sh` writes `git describe` (minus the `v`) and its tag to
+the gitignored `text/version-build.txt`, both stages embed it, then it is removed. `j3c version`, `doctor`
+and cache keys show the full string (`0.1.0-24-gabc1234`), `[package] j3` bounds and `new` templates the
+tag (`project/config.j3`). A build without the file says `J3C_VERSION` (0.1.0, what stage 0 says).
+
 Agents read `AGENTS.md` first (coding rules, checklists, gates). Rust changes made during the port
 are in `PORT_DEBT.md`; Rust files that are not ported are in `DELETED.md`. The gate is
 `tests/diff.sh MODE` (`tests/README.md`).
