@@ -460,7 +460,7 @@ report), then `./build.sh` (installs only the Rust `j3c`, see A3).
 
 ## Part D: after parity (behaviour changes, now allowed)
 
-0. Speed baseline (after C5, before C6): time j3c-boot vs stage0 on the same inputs (self build cold/warm, the editor, a big game, `check` on the corpus, `doc`/`lsp` startup) and write the numbers down. Measure only; tuning is a separate pass, except fixes that are obvious or already listed here.
+0. Speed baseline (after C5, before C6) — DONE 2026-11-18, numbers in `j3c-bootstrap/SPEED.md`: time j3c-boot vs stage0 on the same inputs (self build cold/warm, the editor, a big game, `check` on the corpus, `doc`/`lsp` startup) and write the numbers down. Measure only; tuning is a separate pass, except fixes that are obvious or already listed here.
 
 1. Several errors per run, with codes shown and `j3c explain` (B3, B10).
 2. The memo table and finer cache keys (B5), parallel `lower`. The LSP switches to per-module rechecks
@@ -578,3 +578,12 @@ Gate: whole-corpus `diff.sh run` clean (leftovers in `known/run.txt` with causes
 - [x] Wave 22 (contracts): bc op table, Bc* types, devmode/devrun/pkg stubs, `diff.sh bc`, c4 corpus.
 - [x] Wave 23 (5 chunks): A bc module + encode + dump-bc; B bc codegen; C devmode pass; D dev runner + run wiring; E pkg commands, pkgtool, --hot.
 - [x] Wave 24 (integration): `.j3sb` byte-equal on the corpus, dev-mode run, self.
+
+### Milestone C5: tools (doc, help, new, lsp, mcp, scene/render, editor runner, dist, assets, gen, golden, imgdiff, textmate), per B12 — DONE (tool 937/0 DIFF, 5 deferred known; run 244; self 253; unit 120; review 2 must-fix + 17 should-fix fixed; LSP/MCP server, editor, android, web, asset import deferred to plan 12)
+- [x] Wave 25 (contracts): routes, cross-chunk stubs, sema queries, `diff.sh tool`, arena-churn probe. Probe passed (RSS flat over 1000 requests): one fresh Session per request.
+- [x] Wave 26 (8 chunks): LSPQ, TM, NEW, DOC, IMG, SCENE, LINT, DIST.
+- [x] Wave 27 (integration; the planned LSPS/LSPU/MCP/EDDEV/ASSETS chunks were dropped by the user).
+- B12 choices (C5): B12.1 scene tools run in-process (`scene/ops` calls `j3_editor.tool.apply`); `-e render` stays an offscreen subprocess of the editor program, built by `editor/frontend` into `~/.cache/j3/editor-boot`. B12.2 (`j3.instance` to the open editor) is deferred: it needs an edit in the frozen `j3c/editor/src`, so the file protocol (`target/j3-editor/events` + `replies`, `lock`) stays. B12.3/B12.4 done in wave 25; B12.5/B12.6/B12.7 land with the deferred LSP/MCP/editor work.
+- Deferred by the user (2026-11-18): LSP server and scanners, MCP server, `j3c editor`, `-e android`, `-e web`, asset import. Stubs stay (`not ported yet`, rc 1); the work is plans/12-deferred-tools.md. Waves 26-27 shipped the rest (wave 27 = integration).
+
+- C6 status (2026-11-18): DONE. Tag `rust-final` (local) = 7d14b08 keeps the Rust compiler; `j3c-bootstrap/j3.toml` `bin = "j3c"`; `build.sh` builds stage 1 with stage0, stage 2 with stage 1 (copy under `target/stage2/`), checks `version`, installs stage 2 stripped (no cargo unless stage0 is missing); `j3c/src`, `Cargo.*`, `.cargo/` deleted, embedded data moved to `j3c-bootstrap/text/` and the diag goldens to `j3c-bootstrap/tests/diag/`; contract moved to `j3c-bootstrap/AGENTS.md`; coverage/keywords read the tag. Report: `.swarm-opus/13-speed/c6/report.md`.
