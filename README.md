@@ -31,8 +31,8 @@ The same todo app built with each HTML/CSS-style UI stack ([code and method](exa
 
 | Stack | Clean build | Rebuild after a 1-line edit | Shipped size | Dev environment to build it |
 |---|---:|---:|---:|---:|
-| **J3 + `.j3ui`** | **1.7 s** | 0.8 s | **1.8 MB** | **251 MB** |
-| Electron | 1.6 s | 1.6 s | 273 MB | 344 MB |
+| **J3 + `.j3ui`** | 1.8 s | **0.5 s** | **1.7 MB** | **249 MB** |
+| Electron | **1.6 s** | 1.6 s | 273 MB | 344 MB |
 | Tauri (Rust) | 51 s | 25 s | 3.4 MB | 2.3 GB |
 | Wails (Go) | 8.7 s | 0.6 s | 8.6 MB | 610 MB |
 | Dioxus native (Rust) | 102 s | 66 s | 16.3 MB | 3.1 GB |
@@ -54,7 +54,7 @@ Heavy UI, 1,200 cards that all change every frame, software-rendered under Xvfb 
 ## Why J3
 
 - **Fast to run, fast to build.** Compiles to native code through clang. Release builds are small (a large game ships in about 1.3 MB).
-- **One binary, no dependencies.** `j3c` is a single Rust crate with no crates. The compiler, standard library, docs, formatter, LSP, and editor all ship inside it.
+- **One binary, no dependencies.** `j3c` is written in J3 and builds itself (only clang needed). The compiler, standard library, docs, and formatter all ship inside it.
 - **UI with HTML/CSS syntax.** `.j3ui` components use Svelte-like markup and a large subset of CSS, compiled to native code. No browser, no webview.
 - **A batteries-included game stdlib.** Windows, input, audio, 2D painting, 3D scenes, physics, ECS, pathfinding, shaders written in J3, threads, saves, JSON, HTTP/TLS.
 - **Made for agents too.** `j3c doc` answers from the binary you run, and `j3c -e mcp` is an MCP server that lets Claude Code (or any MCP client) build, render, and check 3D scenes.

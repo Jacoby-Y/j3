@@ -16,10 +16,10 @@ Electron, Tauri and Wails share one frontend, [`web/`](web) (plain HTML, CSS and
 
 | App | Clean build | Rebuild after a 1-line UI edit | Shipped size | .tar.gz |
 |---|---:|---:|---:|---:|
-| **J3** | **1.7 s** | 0.8 s | **1.8 MB** | **0.8 MB** |
-| Electron | 1.6 s | 1.6 s | 273.2 MB | 118.1 MB |
+| **J3** | 1.8 s | **0.5 s** | **1.7 MB** | **0.8 MB** |
+| Electron | **1.6 s** | 1.6 s | 273.2 MB | 118.1 MB |
 | Tauri | 51.1 s | 25.1 s | 3.4 MB | 1.3 MB |
-| Wails | 8.7 s | **0.6 s** | 8.6 MB | 3.6 MB |
+| Wails | 8.7 s | 0.6 s | 8.6 MB | 3.6 MB |
 | Dioxus native | 102.4 s | 65.7 s | 16.3 MB | 6.8 MB |
 
 Linux x86-64, Intel Core Ultra 7 270K Plus (24 threads), release builds. Run `./bench.sh` to measure on your machine (`./bench.sh j3 wails` for some), then `./stress.py` (needs `xvfb`) and `./envsize.sh`.
@@ -65,7 +65,7 @@ What a developer needs on disk to build each app: the compiler toolchain, downlo
 
 | Stack | Toolchain | Downloaded deps | Build cache | System libs | Total |
 |---|---:|---:|---:|---:|---:|
-| **J3 + `.j3ui`** | 238 MB | 0 MB | 8 MB | 4 MB | **251 MB** |
+| **J3 + `.j3ui`** | 237 MB | 0 MB | 8 MB | 4 MB | **249 MB** |
 | Electron | 198 MB | 146 MB | 0 MB | 0 MB | 344 MB |
 | Tauri (Rust) | 561 MB | 567 MB | 990 MB | 143 MB | 2262 MB |
 | Wails (Go) | 233 MB | 110 MB | 124 MB | 143 MB | 610 MB |
