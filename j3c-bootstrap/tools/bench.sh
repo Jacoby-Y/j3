@@ -6,6 +6,8 @@
 # left out by --only are kept from the last run).
 # Cold = `target/` removed before each run; warm = built once, then timed again; leaf = a comment line
 # appended to one module before each run. `%M` is the largest process in the tree (the compiler, or clang).
+# Short metrics (11, 13, 14, 15: under ~0.2 s) run K times in one timed loop, K picked so a loop takes >= 1 s
+# (BENCH_K overrides), and report wall per run; RSS is the largest single run of the loop.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd); boot=$(dirname "$here"); root=$(dirname "$boot")
 S0=$(realpath "${BENCH_STAGE0:-$boot/stage0/j3c}"); BT=$(realpath "${BENCH_BOOT:-$boot/target/j3c-boot}")
@@ -25,6 +27,9 @@ esac; shift; done
 
 # tm CMD...: run it once under /usr/bin/time; prints "wall rss_kb rc".
 tm() { local rc=0; /usr/bin/time -f '%e %M' -o "$tf" timeout 1800 "$@" >/dev/null 2>&1 || rc=$?; echo "$(tail -1 "$tf") $rc"; }
+# rep BODY: run the bash snippet BODY ("$0" is the compiler) K times in one timed process; prints "wall/K rss rc".
+rep() { local r; r=$(tm bash -c "for _ in \$(seq $K); do $1 || exit 1; done" "$C")
+    awk -v k="$K" '{ printf "%.4f %s %s\n", $1 / k, $2, $3 }' <<<"$r"; }
 need0() { [ "$3" = 0 ] || { echo "bench.sh: $C failed (rc $3) in $PWD" >&2; exit 1; }; echo "$1 $2"; }
 build() { (cd "$W/$1" && rm -rf target && tm "$C" build . >/dev/null); }   # untimed pre-build
 cold() { (cd "$W/$1" && rm -rf target && need0 $(tm "$C" build .)); }
@@ -45,11 +50,11 @@ run1() { case $1 in
        done <"$out/corpus.lst" | awk '{ s += $1; if ($2 > m) m = $2 } END { printf "%.2f %d\n", s, m }' ;;
     9) cd "$W/j3c/stdlib/tests" && need0 $(tm "$C" check grid_test.j3) ;;
     10) cd "$W/j3c-bootstrap" && need0 $(tm "$C" check .) ;;
-    11) cd "$W/j3c/stdlib" && tm "$C" fmt --check j3 | cut -d' ' -f1-2 ;;   # rc 1: the same files need formatting
+    11) cd "$W/j3c/stdlib" && need0 $(rep '{ "$0" fmt --check j3; [ $? -le 1 ]; }') ;;   # rc 1: the same files need formatting
     12) cd "$W/examples/desk-app" && need0 $(tm "$C" dump-ir .) ;;
-    13) cd "$W/examples/scripted" && rm -rf target && need0 $(tm "$C" dump-bc scripts/fighter.j3s) ;;
-    14) cd "$W" && need0 $(tm bash -c '"$0" doc && "$0" doc j3.game --short && "$0" doc search mesh' "$C") ;;
-    15) rm -rf "$W/new" && mkdir "$W/new" && cd "$W/new" && need0 $(tm bash -c '"$0" new demo && cd demo && "$0" check .' "$C") ;;
+    13) cd "$W/examples/scripted" && need0 $(rep '{ rm -rf target && "$0" dump-bc scripts/fighter.j3s; }') ;;
+    14) cd "$W" && need0 $(rep '{ "$0" doc && "$0" doc j3.game --short && "$0" doc search mesh; }') ;;
+    15) cd "$W" && need0 $(rep '( rm -rf new && mkdir new && cd new && "$0" new demo && cd demo && "$0" check . )') ;;
     16) strip -o "$out/stripped" "$C" && echo "$(stat -c %s "$out/stripped") 0" && rm -f "$out/stripped" ;;
 esac; }
 med() { sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }'; }
@@ -70,6 +75,8 @@ for i in $only; do
     for C in "$S0" "$BT"; do
         echo "bench.sh: [$i] ${names[$i]}: $C" >&2
         pre "$i"
+        K=1; case $i in 11|13|14|15)   # calibrate: one run, then enough runs per loop for >= 1 s
+            K=${BENCH_K:-$( (run1 "$i") | awk '{ k = int(1 / ($1 > 0.005 ? $1 : 0.005)) + 1; print (k > 200 ? 200 : k) }')} ;; esac
         : >"$out/runs"; for _ in $(seq 1 "$N"); do (run1 "$i") >>"$out/runs"; done
         row="$row	$(cut -d' ' -f1 "$out/runs" | med)	$(cut -d' ' -f2 "$out/runs" | med)"
     done
@@ -86,7 +93,8 @@ rm -f "$out/runs" "$out/corpus.lst"; sort -n -o "$out/result.tsv" "$out/result.t
     function r(a, b) { return a > 0 ? sprintf("%.2fx", b / a) : (b > 0 ? "inf" : "1.00x") }
     function v(a, b) { return b < a ? "WIN" : (b == a ? "TIE" : "LOSE") }
     $1 == 16 { printf "| 16 | %s | %.2f MB | - | %.2f MB | - | %s | - | %s | - |\n", nm[16], $2 / 1e6, $4 / 1e6, r($2, $4), v($2, $4); next }
-    { printf "| %s | %s | %.2f s | %d MB | %.2f s | %d MB | %s | %s | %s | %s |\n", $1, nm[$1], $2, $3 / 1024, $4, $5 / 1024,
+    function t(x) { return sprintf(x < 1 ? "%.3f s" : "%.2f s", x) }
+    { printf "| %s | %s | %s | %d MB | %s | %d MB | %s | %s | %s | %s |\n", $1, nm[$1], t($2), $3 / 1024, t($4), $5 / 1024,
         r($2, $4), r($3, $5), v($2, $4), v($3, $5) }' "$out/result.tsv"
 } >"$out/result.md"
 cat "$out/result.md"

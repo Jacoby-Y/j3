@@ -27,7 +27,7 @@ use j3.io.path;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.proc;
-use j3.proc.{ Output, ProcError };
+use j3.proc.{ Child, Output, ProcError };
 use j3.result.Result;
 use j3.sys;
 use j3.text.{ Text, contains, endsWith, find, lastIndexOf, lines, parseInt, parseU64, split, startsWith, trim };
@@ -40,6 +40,15 @@ use j3c.base.span.{ Span, noSpan };
 use j3c.base.text_fmt.hasLower;
 use j3c.ir.{ Block, ConstKind, Func, FuncKind, IrCx, LocalDecl, Operand, PlaceRoot, Program, Rvalue, RvalueKind, StmtKind };
 use j3c.project.manifest.{ Manifest, targetSlug };
+
+// `spawnRun`: libc's `posix_spawn` starts a program without copying this process (see there).
+use lib "c" as c {
+    fn posix_spawn(pid: ptr, path: ptr, actions: ptr, attr: ptr, argv: ptr, envp: ptr): i32;
+    fn posix_spawn_file_actions_init(actions: ptr): i32;
+    fn posix_spawn_file_actions_destroy(actions: ptr): i32;
+    fn posix_spawn_file_actions_addopen(actions: ptr, fd: i32, path: ptr, oflag: i32, mode: i32): i32;
+    fn posix_spawn_file_actions_adddup2(actions: ptr, fd: i32, newfd: i32): i32;
+}
 
 /// Compiler and linker settings for one build (Rust `CcOpts`); strings are argv, manifest or arena copies.
 pub struct CcOpts {
@@ -494,4 +503,59 @@ pub fn pushSecs(t: &Text, ms: int, places: int) {
     if r < 100 { t.push('0'); }
     if r < 10 { t.push('0'); }
     t.pushInt(r);
+}
+
+/// `proc.start(argv)` with stdin and stdout on `/dev/null` (only `stderr` is a pipe; end it with
+/// `spawnFinish`): libc `posix_spawn` starts it vfork-style, so the start costs the same however big this
+/// process is. `proc.start` forks, copying the page tables of a multi-GB compiler (tens of ms, and as much
+/// again when the copy exits) for every clang of a build.
+/// ponytail: SIGPIPE stays as this process has it (ignored once `j3.proc` ran); clang never writes to a
+/// closed pipe here. `posix_spawnattr` SETSIGDEF if a tool ever cares.
+pub fn spawnStart(argv: []string, arena: &Arena): Result<Child, ProcError> {
+    if argv.len == 0 { return Result.Err(ProcError.NotFound); }
+    let exe = proc.findProgram(argv[0], arena);
+    if exe.len == 0 { return Result.Err(ProcError.NotFound); }
+    let cpath = proc.cString(exe, arena);
+    let cargv = arena.alloc::<int>(argv.len + 1);
+    for i in 0..argv.len { cargv[i] = proc.cString(argv[i], arena).ptr as int; }
+    cargv[argv.len] = 0;
+    let p: [2]i32 = [-1, -1];
+    if sys.pipe(p[..], sys.O_CLOEXEC) < 0 { return Result.Err(ProcError.Fail); }
+    // glibc's posix_spawn_file_actions_t is 80 bytes on 64-bit; room to spare
+    let fa = arena.alloc::<u8>(256);
+    let devnull = proc.cString("/dev/null", arena);
+    c.posix_spawn_file_actions_init(fa.ptr as ptr);
+    c.posix_spawn_file_actions_addopen(fa.ptr as ptr, 0, devnull.ptr as ptr, 0, 0);
+    c.posix_spawn_file_actions_addopen(fa.ptr as ptr, 1, devnull.ptr as ptr, 1, 0);
+    c.posix_spawn_file_actions_adddup2(fa.ptr as ptr, p[1], 2);
+    let pid: [1]i32 = [0];
+    let rc = c.posix_spawn(pid[..].ptr as ptr, cpath.ptr as ptr, fa.ptr as ptr, 0 as ptr, cargv.ptr as ptr, sys.environ());
+    c.posix_spawn_file_actions_destroy(fa.ptr as ptr);
+    sys.close(int(p[1]));
+    if rc != 0 {
+        sys.close(int(p[0]));
+        // ENOENT 2, ENOTDIR 20
+        return Result.Err(if rc == 2 || rc == 20 { ProcError.NotFound } else { ProcError.ExecFailed });
+    }
+    return Result.Ok(Child { pid: int(pid[0]), stdin: -1, stdout: -1, stderr: int(p[0]) });
+}
+
+/// Read a `spawnStart` child's stderr to the end and wait for it (`out` is empty).
+pub fn spawnFinish(ch: &Child, arena: &Arena): Output {
+    let err = Text.new(arena);
+    let buf = arena.alloc::<u8>(65536);
+    while ch.stderr >= 0 {
+        let n = sys.read(ch.stderr, buf.ptr as ptr, buf.len);
+        if n == -4 { continue; }   // EINTR
+        if n <= 0 { break; }
+        err.pushBytes(buf[0..n]);
+    }
+    let code = ch.wait();
+    return Output { code: code, out: "" as []u8, err: err.bytes };
+}
+
+/// `spawnStart` then `spawnFinish`: `proc.run(argv, "")` without the fork.
+pub fn spawnRun(argv: []string, arena: &Arena): Result<Output, ProcError> {
+    let ch = spawnStart(argv, arena)?;
+    return Result.Ok(spawnFinish(&ch, arena));
 }

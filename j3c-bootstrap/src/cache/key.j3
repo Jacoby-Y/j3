@@ -18,6 +18,10 @@ pub struct Layouts {
     deps: List<List<int>>;
     /// Type name -> its entries (a lookup only; several modules may share a name).
     byNeedle: Map<string, List<int>>;
+    /// `xxh3_64` of each entry's text: the key hashes these, not the joined text (`hashLayouts`).
+    hashes: List<u64>;
+    /// `firsts[b]`: some type name starts with byte `b` (`pushNamed` skips the map for the other tokens).
+    firsts: []bool;
 }
 
 #[singleton]
@@ -96,14 +100,15 @@ fn hashStr(h: &Xxh3, s: string) {
     h.update(zero[..]);
 }
 
-/// Rust `object_key`: 16 hex digits over chunks, the layout digest of the types `text` names, `text`, opt,
+/// Rust `object_key`: 16 hex digits over chunks, the layout digest of the types `text` names (as entry
+/// hashes, see `hashLayouts`), `text`, opt,
 /// debug, release, target, cpu, flags, clang and `compilerId`.
 pub fn objectKey(text: string, e: &EmitOpts, layouts: &Layouts, arena: &Arena): string {
     let h = Xxh3.new();
     let t = Text.new(arena);
     t.fmt(`{e.chunks}`);
     hashStr(&h, t.str());
-    hashStr(&h, layoutsFor(layouts, text, arena));
+    hashLayouts(&h, layouts, text, arena);
     hashStr(&h, text);
     hashStr(&h, e.cc.opt);
     hashStr(&h, if e.cc.debug { "g" } else { "" });
@@ -126,23 +131,31 @@ fn isTokenByte(b: u8): bool {
 }
 
 /// Push the layout entries named by the tokens of `s` onto `stack`.
-fn pushNamed(l: &Layouts, s: string, stack: &List<int>) {
+/// Each entry goes on once: `seen` marks it (a module text names `Id` thousands of times).
+fn pushNamed(l: &Layouts, s: string, stack: &List<int>, seen: &List<bool>) {
     let i = 0;
     while i < s.len {
         if !isTokenByte(s[i]) { i += 1; continue; }
         let start = i;
         while i < s.len && isTokenByte(s[i]) { i += 1; }
+        if !l.firsts[int(s[start])] { continue; }
         let at = l.byNeedle.find(s[start..i]);
         if at < 0 { continue; }
         let hits = l.byNeedle.valAt(at);
-        for k in 0..hits.len { stack.push(hits.items[k]); }
+        for k in 0..hits.len {
+            let e = hits.items[k];
+            if seen.items[e] { continue; }
+            seen.items[e] = true;
+            stack.push(e);
+        }
     }
 }
 
 /// Rust `layout_digest`: one entry per struct and enum, in module order then declaration order.
 pub fn layoutDigest(cx: &IrCx, modules: []Module, arena: &Arena): Layouts {
     let l = Layouts { texts: List<string>.new(arena), needles: List<string>.new(arena), deps: List<List<int>>.new(arena),
-        byNeedle: Map<string, List<int>>.new(arena, 256) };
+        byNeedle: Map<string, List<int>>.new(arena, 256), hashes: List<u64>.new(arena), firsts: arena.alloc::<bool>(256) };
+    for b in 0..256 { l.firsts[b] = false; }
     for mi in 0..modules.len {
         let label = moduleLabel(cx, &modules[mi], arena);
         for i in 0..modules[mi].structs.len {
@@ -176,12 +189,18 @@ pub fn layoutDigest(cx: &IrCx, modules: []Module, arena: &Arena): Layouts {
         }
     }
     for i in 0..l.needles.len {
+        let nd = l.needles.items[i];
+        if nd.len > 0 { l.firsts[int(nd[0])] = true; }
         let hits = l.byNeedle.getOrPut(l.needles.items[i], List<int>.new(arena));
         hits.push(i);
     }
+    let mark = List<bool>.new(arena);
+    for _ in 0..l.texts.len { mark.push(false); }
     for i in 0..l.texts.len {
+        l.hashes.push(xxh3_64(l.texts.items[i] as []u8));
         let d = List<int>.new(arena);
-        pushNamed(&l, l.texts.items[i], &d);
+        pushNamed(&l, l.texts.items[i], &d, &mark);
+        for k in 0..d.len { mark.items[d.items[k]] = false; }
         l.deps.push(d);
     }
     return l;
@@ -190,17 +209,7 @@ pub fn layoutDigest(cx: &IrCx, modules: []Module, arena: &Arena): Layouts {
 /// Rust `Layouts::for_module`: layout text of the types `moduleText` names, closed over embedded types, in
 /// entry order joined by `;`.
 pub fn layoutsFor(l: &Layouts, moduleText: string, arena: &Arena): string {
-    let seen = List<bool>.new(arena);
-    for _ in 0..l.texts.len { seen.push(false); }
-    let stack = List<int>.new(arena);
-    pushNamed(l, moduleText, &stack);
-    while stack.len > 0 {
-        let i = stack.pop();
-        if seen.items[i] { continue; }
-        seen.items[i] = true;
-        let d = l.deps.items[i];
-        for k in 0..d.len { stack.push(d.items[k]); }
-    }
+    let seen = layoutsNamed(l, moduleText, arena);
     let out = Text.new(arena);
     let any = false;
     for i in 0..seen.len {
@@ -210,6 +219,43 @@ pub fn layoutsFor(l: &Layouts, moduleText: string, arena: &Arena): string {
         out.add(l.texts.items[i]);
     }
     return out.str();
+}
+
+/// `layoutsFor` as the key takes it: the hash of each named entry in entry order, then the count. Rust
+/// hashes the joined text; joining and hashing every module's layouts (hundreds of KB for a module that
+/// names the IR types) was half of `emit: hash modules`. Same entries, same order: same digest; an edited
+/// entry changes its hash.
+fn hashLayouts(h: &Xxh3, l: &Layouts, moduleText: string, arena: &Arena) {
+    let seen = layoutsNamed(l, moduleText, arena);
+    let n = 0;
+    for i in 0..seen.len {
+        if !seen.items[i] { continue; }
+        let v: [1]u64 = [l.hashes.items[i]];
+        let bytes: []u8 = @slice(v[..].ptr as ptr, 8);
+        h.update(bytes);
+        n += 1;
+    }
+    let t = Text.new(arena);
+    t.fmt(`{n}`);
+    hashStr(h, t.str());
+}
+
+/// Which entries `moduleText` names, closed over the entries they name.
+fn layoutsNamed(l: &Layouts, moduleText: string, arena: &Arena): List<bool> {
+    let seen = List<bool>.new(arena);
+    for _ in 0..l.texts.len { seen.push(false); }
+    let stack = List<int>.new(arena);
+    pushNamed(l, moduleText, &stack, &seen);
+    while stack.len > 0 {
+        let d = l.deps.items[stack.pop()];
+        for k in 0..d.len {
+            let e = d.items[k];
+            if seen.items[e] { continue; }
+            seen.items[e] = true;
+            stack.push(e);
+        }
+    }
+    return seen;
 }
 
 /// Rust `module_ir`: the stable IR text of one module (no ids that change between compiles) into `out`:

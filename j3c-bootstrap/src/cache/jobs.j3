@@ -1,5 +1,5 @@
-// The misses of one build: a forked worker per module emits its text and runs its clang (one clang per
-// chunk when the module is split).
+// The misses of one build: a pool of forked workers, each emitting a module's text and running its clang (one
+// clang per chunk when the module is split), module after module.
 //
 // Part of module j3c.cache.
 // Port of: j3c/src/emit/incr.rs (the job pool of `compile`, `emit_and_clang`, `clang_obj`,
@@ -7,12 +7,14 @@
 // J3: Rust's pool threads are worker processes: `sys.fork` gives each worker its own copy of the IR and
 //     the arena, so emitting runs side by side without sharing the single-threaded Session arena, and the
 //     megabytes of text a worker makes die with it. The compiler has no other thread when it gets here
-//     (`sys.fork`'s rule). A worker never returns into the driver: it writes `OBJ.job` (`ok EMIT_MS
-//     CLANG_MS`, or `err` and the message) and exits; the parent reaps with `proc.waitAny`.
-// J3: After the first failure no new worker starts; the running ones are waited for (their clang ends by
-//     itself), so no child is left behind. Rust lets its pool run dry.
-// J3: A failed `fork` (no process to spare) reaps one running worker and retries; with none running the
-//     module is built in the compiler itself. Rust's pool threads never fail to start mid-build.
+//     (`sys.fork`'s rule). `jobCap()` workers are forked once (a fork of the multi-GB compiler costs tens
+//     of ms of page-table copy in the parent, so one fork per module was most of the compile wall): the
+//     parent hands out unit indices on pipe `q`, a worker writes `OBJ.job` (`ok EMIT_MS CLANG_MS`, or
+//     `err` and the message) and sends the index back on pipe `r`. A worker never returns into the driver.
+// J3: After the first failure no unit is handed out; the running ones finish (their clang ends by itself)
+//     and every worker is waited for, so no child is left behind. Rust lets its pool run dry.
+// J3: Fewer workers than asked (`fork` failed) share the units; with none, or no pipe, the modules are
+//     built in the compiler itself. Rust's pool threads never fail to start mid-build.
 // J3: Workers draw no status line (each has a copy of `Phases`); the parent counts finished modules.
 module j3c.cache;
 
@@ -23,10 +25,8 @@ struct Jobs {
     e: &EmitOpts;
     units: &List<Unit>;
     phases: &Phases;
-    /// One per started worker, with the unit it builds.
+    /// One per started worker.
     workers: List<Child>;
-    unitOf: List<int>;
-    running: int;
     width: int;
     doneUnits: int;
     total: int;
@@ -46,8 +46,18 @@ fn writeErr(what: string, p: string, a: &Arena): string {
     return Text.new(a).add(what).add(p).add(": ").add(fsx.osError(sys.errno(), a)).str();
 }
 
-/// Rust `clang_obj`: compile the text `ll` to `obj` (the `.ll` beside it is removed again).
-fn clangObj(label: string, obj: string, ll: string, e: &EmitOpts, thin: bool, a: &Arena): Result<bool, string> {
+/// A started clang of `clangStart`.
+struct Clang {
+    child: Child;
+    label: string;
+    obj: string;
+    llPath: string;
+    clang: string;
+    started: int;
+}
+
+/// The first half of Rust `clang_obj`: write `ll` beside `obj` and start its clang.
+fn clangStart(label: string, obj: string, ll: string, e: &EmitOpts, thin: bool, a: &Arena): Result<Clang, string> {
     let llPath = withExt(obj, "ll", a);
     match io.writeFile(llPath, ll as []u8) {
         Result.Ok(_) {}
@@ -57,28 +67,38 @@ fn clangObj(label: string, obj: string, ll: string, e: &EmitOpts, thin: bool, a:
     objArgv(&argv, obj, llPath, e, thin, a);
     let clang = argv.items[0];
     let started = sys.monotonicMs();
-    match proc.run(argv.slice(), "", a) {
-        Result.Ok(o) {
-            toolchain.discard(llPath);
-            if sys.env("J3C_TIME_REPORT").len > 0 {
-                // One file per object next to it: `cat <obj dir>/*.time.txt`.
-                match io.writeFile(withExt(obj, "time.txt", a), o.err) {
-                    Result.Ok(_) {}
-                    Result.Err(_) {}
-                }
-            }
-            pushTiming("clang", label, sys.monotonicMs() - started, a);
-            if o.code != 0 {
-                toolchain.discard(obj);
-                return Result.Err(Text.new(a).add(clang).add(" failed on ").add(label).add(":\n").add(o.errStr()).str());
-            }
-        }
+    match toolchain.spawnStart(argv.slice(), a) {
+        Result.Ok(ch) { return Result.Ok(Clang { child: ch, label: label, obj: obj, llPath: llPath, clang: clang, started: started }); }
         Result.Err(x) {
             toolchain.discard(llPath);
             return Result.Err(toolchain.spawnErr(clang, x, a));
         }
     }
+}
+
+/// The second half of Rust `clang_obj`: wait for the clang; the `.ll` is removed again.
+fn clangEnd(c: &Clang, a: &Arena): Result<bool, string> {
+    let o = toolchain.spawnFinish(&c.child, a);
+    toolchain.discard(c.llPath);
+    if sys.env("J3C_TIME_REPORT").len > 0 {
+        // One file per object next to it: `cat <obj dir>/*.time.txt`.
+        match io.writeFile(withExt(c.obj, "time.txt", a), o.err) {
+            Result.Ok(_) {}
+            Result.Err(_) {}
+        }
+    }
+    pushTiming("clang", c.label, sys.monotonicMs() - c.started, a);
+    if o.code != 0 {
+        toolchain.discard(c.obj);
+        return Result.Err(Text.new(a).add(c.clang).add(" failed on ").add(c.label).add(":\n").add(o.errStr()).str());
+    }
     return Result.Ok(true);
+}
+
+/// Rust `clang_obj`: compile the text `ll` to `obj` (the `.ll` beside it is removed again).
+fn clangObj(label: string, obj: string, ll: string, e: &EmitOpts, thin: bool, a: &Arena): Result<bool, string> {
+    let c = clangStart(label, obj, ll, e, thin, a)?;
+    return clangEnd(&c, a);
 }
 
 fn llOpts(e: &EmitOpts): LlOpts {
@@ -86,15 +106,15 @@ fn llOpts(e: &EmitOpts): LlOpts {
     return LlOpts { target: bo.target, opt: bo.opt, debug: bo.debug, release: bo.release };
 }
 
-/// Chunk `n` of a split module: emit it and compile it to `partPath(obj, n)`.
-fn chunkObj(j: &Jobs, u: &Unit, sets: &List<Set<Id<Func>>>, n: int): Result<bool, string> {
+/// Chunk `n` of a split module: emit it and start its clang to `partPath(obj, n)`.
+fn chunkStart(j: &Jobs, u: &Unit, sets: &List<Set<Id<Func>>>, n: int): Result<Clang, string> {
     let a = j.arena;
     let ll = Text.new(a);
     let lo = llOpts(j.e);
     emitLlvmModule(j.cx, j.modules, u.index, &lo, Option.Some(Chunk { no: n, defined: &sets.items[n] }), &ll)?;
     let label = Text.new(a);
     label.add(u.label).fmt(` [{n + 1}/{sets.len}]`);
-    return clangObj(label.str(), partPath(u.obj, n, a), ll.str(), j.e, j.thin, a);
+    return clangStart(label.str(), partPath(u.obj, n, a), ll.str(), j.e, j.thin, a);
 }
 
 /// Rust `emit_and_clang`, in a worker: emit module `ui`, compile it (split: one clang per share, side by
@@ -114,51 +134,25 @@ fn work(j: &Jobs, ui: int): Result<(int, int), string> {
     if sets.len == 0 {
         clangObj(u.label, u.obj, ll.str(), j.e, j.thin, a)?;
     } else {
-        // The giant fns are the long pole: chunk 0 here, each other chunk in a worker of its own.
-        let pids = List<int>.new(a);
-        for n in 1..sets.len {
-            let pid = sys.fork();
-            if pid == 0 {
-                match chunkObj(j, u, &sets, n) {
-                    Result.Ok(_) { sys.exit(0); }
-                    Result.Err(x) {
-                        match io.writeFile(withExt(partPath(u.obj, n, a), "err", a), x as []u8) {
-                            Result.Ok(_) {}
-                            Result.Err(_) {}
-                        }
-                        sys.exit(1);
-                    }
+        // The giant fns are the long pole: each chunk is emitted here in turn and its clang started at once
+        // (Rust: a thread per chunk), so the clangs run side by side; the first failure in chunk order wins.
+        let runs = List<Clang>.new(a);
+        let first: Result<bool, string> = Result.Ok(true);
+        for n in 0..sets.len {
+            match chunkStart(j, u, &sets, n) {
+                Result.Ok(c) { runs.push(c); }
+                Result.Err(x) {
+                    first = Result.Err(x);
+                    break;
                 }
             }
-            pids.push(pid);
         }
-        let first = chunkObj(j, u, &sets, 0);
-        for k in 0..pids.len {
-            let n = k + 1;
-            let code = 0;
-            if pids.items[k] < 0 {
-                // no process to spare: do it here
-                match first {
-                    Result.Ok(_) { first = chunkObj(j, u, &sets, n); }
-                    Result.Err(_) {}
-                }
-                continue;
+        for k in 0..runs.len {
+            let r = clangEnd(&runs.items[k], a);
+            match first {
+                Result.Ok(_) { first = r; }
+                Result.Err(_) {}
             }
-            let status: i32 = 0;
-            if sys.waitpid(pids.items[k], &status, 0) < 0 { code = 1; } else { code = sys.exitCode(status); }
-            let errPath = withExt(partPath(u.obj, n, a), "err", a);
-            if code != 0 {
-                let msg = Text.new(a);
-                match io.readFile(errPath, a) {
-                    Result.Ok(b) { msg.add(b as string); }
-                    Result.Err(_) { msg.add("chunk worker of ").add(u.label).fmt(` ended with code {code}`); }
-                }
-                match first {
-                    Result.Ok(_) { first = Result.Err(msg.str()); }
-                    Result.Err(_) {}
-                }
-            }
-            toolchain.discard(errPath);
         }
         first?;
         let n = Text.new(a);
@@ -178,74 +172,63 @@ fn work(j: &Jobs, ui: int): Result<(int, int), string> {
 /// The worker's report for the parent, beside the object.
 fn jobFile(obj: string, a: &Arena): string { return withExt(obj, "job", a); }
 
-/// Start the worker of unit `ui`, after waiting for a free slot.
-fn launch(j: &Jobs, ui: int): Result<bool, string> {
-    while j.running >= j.width { reap(j)?; }
-    let a = j.arena;
-    let u = j.units.items[ui];
-    toolchain.discard(jobFile(u.obj, a));
-    let pid = sys.fork();
-    // No process to spare: free a slot and retry, or build it here when no worker is left to wait for.
-    while pid < 0 && j.running > 0 {
-        reap(j)?;
-        pid = sys.fork();
-    }
-    if pid < 0 {
-        let ms = work(j, ui)?;
-        return took(j, &j.units.items[ui], ms.0, ms.1);
-    }
-    if pid == 0 {
-        let t = Text.new(a);
-        let code: i32 = 0;
-        match work(j, ui) {
-            Result.Ok(ms) { t.fmt(`ok {ms.0} {ms.1}`); }
-            Result.Err(x) {
-                t.add("err\n").add(x);
-                code = 1;
-            }
-        }
-        match io.writeFile(jobFile(u.obj, a), t.str() as []u8) {
-            Result.Ok(_) {}
-            Result.Err(_) { code = 1; }
-        }
-        sys.exit(code);
-    }
-    j.workers.push(Child { pid: pid, stdin: -1, stdout: -1, stderr: -1 });
-    j.unitOf.push(ui);
-    j.running += 1;
-    return Result.Ok(true);
+/// One unit index through a pipe: 4 bytes, one `write` (atomic under `PIPE_BUF`). false: the reader is gone.
+fn send(fd: int, v: int): bool {
+    let b: [1]i32 = [i32(v)];
+    let n = sys.write(fd, b[..].ptr as ptr, 4);
+    while n == -4 { n = sys.write(fd, b[..].ptr as ptr, 4); }   // EINTR
+    return n == 4;
 }
 
-/// Wait for one worker and take its result into its unit; Err is its failure (Rust's `CLANG failed on
-/// LABEL:` text).
-fn reap(j: &Jobs): Result<bool, string> {
-    let a = j.arena;
-    let i = -1;
-    match proc.waitAny(j.workers.slice()) {
-        Result.Ok(k) { i = k; }
-        Result.Err(_) {
-            // no `pidfd_open`: wait for the oldest one still running
-            for k in 0..j.workers.len {
-                if !j.workers.items[k].done { i = k; break; }
-            }
-        }
+/// The next unit index from a pipe; -1 once every writer has closed it.
+fn recv(fd: int): int {
+    let b: [1]i32 = [0];
+    let got = 0;
+    while got < 4 {
+        let n = sys.read(fd, (b[..].ptr as int + got) as ptr, 4 - got);
+        if n == -4 { continue; }   // EINTR
+        if n <= 0 { return -1; }
+        got += n;
     }
-    if i < 0 { j.running = 0; return Result.Ok(true); }
-    let code = j.workers.items[i].wait();
-    j.workers.items[i].done = true;
-    j.running -= 1;
-    let u = &j.units.items[j.unitOf.items[i]];
+    return int(b[0]);
+}
+
+/// A worker: build each unit index read from `q` (writing `OBJ.job`) and send the index back on `r`, until
+/// the parent closes `q`. Never returns.
+fn serve(j: &Jobs, q: int, r: int) {
+    let a = j.arena;
+    while true {
+        let ui = recv(q);
+        if ui < 0 { sys.exit(0); }
+        let u = j.units.items[ui];
+        let t = Text.new(a);
+        match work(j, ui) {
+            Result.Ok(ms) { t.fmt(`ok {ms.0} {ms.1}`); }
+            Result.Err(x) { t.add("err\n").add(x); }
+        }
+        // a report that cannot be written is read back as missing (`worker of LABEL ended with code 1`)
+        match io.writeFile(jobFile(u.obj, a), t.str() as []u8) {
+            Result.Ok(_) {}
+            Result.Err(_) {}
+        }
+        if !send(r, ui) { sys.exit(1); }
+    }
+}
+
+/// Take the report a worker wrote for unit `ui` into its unit; Err is its failure (Rust's `CLANG failed on
+/// LABEL:` text).
+fn collect(j: &Jobs, ui: int): Result<bool, string> {
+    let a = j.arena;
+    let u = &j.units.items[ui];
     let report = "";
     match io.readFile(jobFile(u.obj, a), a) {
         Result.Ok(b) { report = b as string; }
         Result.Err(_) {}
     }
     toolchain.discard(jobFile(u.obj, a));
-    if code != 0 || !startsWith(report, "ok ") {
+    if !startsWith(report, "ok ") {
         if startsWith(report, "err\n") { return Result.Err(report[4..report.len]); }
-        let t = Text.new(a);
-        t.add("worker of ").add(u.label).fmt(` ended with code {code}`);
-        return Result.Err(t.str());
+        return Result.Err(Text.new(a).add("worker of ").add(u.label).add(" ended with code 1").str());
     }
     let nums = trim(report[3..report.len]);
     let sp = find(nums, " ");
@@ -280,6 +263,35 @@ struct Cost {
     unit: int;
 }
 
+/// Every unit of `order` built in this process, one after another (no pipe or no process to spare).
+fn runHere(j: &Jobs, order: []Cost): Result<bool, string> {
+    for k in 0..order.len {
+        let ms = work(j, order[k].unit)?;
+        took(j, &j.units.items[order[k].unit], ms.0, ms.1)?;
+    }
+    return Result.Ok(true);
+}
+
+/// Fork up to `j.width` workers that serve `q`/`r`, handing `order[k]` out right after fork `k` (a fork
+/// takes ~20 ms here, so the costliest module starts at once instead of after every fork); how many
+/// started, which is also how many units are out.
+fn startWorkers(j: &Jobs, q: []i32, r: []i32, order: []Cost, held: &List<bool>): int {
+    for k in 0..j.width {
+        let pid = sys.fork();
+        if pid < 0 { break; }
+        if pid == 0 {
+            sys.close(int(q[1]));
+            sys.close(int(r[0]));
+            serve(j, int(q[0]), int(r[1]));
+        }
+        j.workers.push(Child { pid: pid, stdin: -1, stdout: -1, stderr: -1 });
+        // `q[0]` is still open here, so the write cannot fail for want of a reader
+        send(int(q[1]), order[k].unit);
+        held.items[order[k].unit] = true;
+    }
+    return j.workers.len;
+}
+
 /// Build every miss of `units`: costliest module first (ties: module order), results kept by module, the
 /// first failure returned once no worker is left running.
 fn runJobs(cx: &IrCx, modules: []Module, units: &List<Unit>, misses: int, e: &EmitOpts, thin: bool, phases: &Phases, arena: &Arena): Result<bool, string> {
@@ -292,21 +304,69 @@ fn runJobs(cx: &IrCx, modules: []Module, units: &List<Unit>, misses: int, e: &Em
     let width = jobCap();
     if width > misses { width = misses; }
     let j = Jobs { arena: arena, cx: cx, modules: modules, e: e, units: units, phases: phases, workers: List<Child>.new(arena),
-        unitOf: List<int>.new(arena), running: 0, width: width, doneUnits: 0, total: misses, thin: thin };
+        width: width, doneUnits: 0, total: misses, thin: thin };
     let started = sys.monotonicMs();
+    let q: [2]i32 = [-1, -1];
+    let r: [2]i32 = [-1, -1];
     let first: Result<bool, string> = Result.Ok(true);
-    for k in 0..order.len {
-        first = launch(&j, order.items[k].unit);
-        match first {
-            Result.Ok(_) {}
-            Result.Err(_) { break; }
+    if sys.pipe(q[..], sys.O_CLOEXEC) < 0 {
+        first = runHere(&j, order.slice());
+    } else if sys.pipe(r[..], sys.O_CLOEXEC) < 0 {
+        sys.close(int(q[0]));
+        sys.close(int(q[1]));
+        first = runHere(&j, order.slice());
+    } else {
+        let held = List<bool>.new(arena);
+        for _ in 0..units.len { held.push(false); }
+        let n = startWorkers(&j, q[..], r[..], order.slice(), &held);
+        sys.close(int(q[0]));
+        sys.close(int(r[1]));
+        sys.ignoreSigpipe(true);
+        // One unit per worker; a finished one gets the next costliest. After the first failure none is
+        // handed out; the running ones finish (their clang ends by itself) and see `q` close.
+        let next = n;
+        let out = n;
+        while out > 0 {
+            let ui = recv(int(r[0]));
+            if ui < 0 { break; }
+            out -= 1;
+            held.items[ui] = false;
+            let res = collect(&j, ui);
+            match first {
+                Result.Ok(_) { first = res; }
+                Result.Err(_) {}
+            }
+            match first {
+                Result.Ok(_) {
+                    if next < order.len && send(int(q[1]), order.items[next].unit) {
+                        held.items[order.items[next].unit] = true;
+                        next += 1;
+                        out += 1;
+                    }
+                }
+                Result.Err(_) {}
+            }
         }
-    }
-    // Every started worker is waited for, also after a failure (the first one is the one reported).
-    while j.running > 0 {
-        let r = reap(&j);
+        sys.close(int(q[1]));
+        let code = 0;
+        for k in 0..j.workers.len {
+            let c = j.workers.items[k].wait();
+            if c != 0 && code == 0 { code = c; }
+        }
+        sys.close(int(r[0]));
         match first {
-            Result.Ok(_) { first = r; }
+            Result.Ok(_) {
+                if n == 0 {
+                    first = runHere(&j, order.slice());
+                } else if out > 0 || next < order.len {
+                    // a worker died holding a unit, or every worker is gone before the last one was handed out
+                    let lost = order.items[if next < order.len { next } else { order.len - 1 }].unit;
+                    for k in 0..next {
+                        if held.items[order.items[k].unit] { lost = order.items[k].unit; break; }
+                    }
+                    first = Result.Err(Text.new(arena).add("worker of ").add(units.items[lost].label).fmt(` ended with code {code}`).str());
+                }
+            }
             Result.Err(_) {}
         }
     }

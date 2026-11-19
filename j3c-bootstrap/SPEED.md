@@ -1,6 +1,31 @@
 # Speed: j3c-boot vs stage0
 
-## Scoreboard (2026-11-18, plan 13 phase 1)
+## Scoreboard
+
+### 2026-11-18, speed wave 1 (BUILD: posix_spawn clang fan-out, hash step; STARTUP: doc index, bench K-loop; MEM: arenas): wall 15/15 WIN, RSS 7/15 WIN, size WIN
+| # | Metric | stage0 | j3c-boot opt | boot/stage0 wall / RSS | wall / RSS |
+|---|---|---|---|---|---|
+| 1 | self build cold | 4.00 s / 1097 MB | 3.46 s / 951 MB | 0.87x / 0.87x | WIN / WIN |
+| 2 | self build warm | 1.32 s / 508 MB | 0.570 s / 492 MB | 0.43x / 0.97x | WIN / WIN |
+| 3 | self build leaf edit | 1.72 s / 530 MB | 0.880 s / 542 MB | 0.51x / 1.02x | WIN / LOSE |
+| 4 | editor program cold | 1.31 s / 267 MB | 1.20 s / 228 MB | 0.92x / 0.85x | WIN / WIN |
+| 5 | desk-app cold | 1.15 s / 395 MB | 1.05 s / 383 MB | 0.91x / 0.97x | WIN / WIN |
+| 6 | editor_village cold | 1.64 s / 162 MB | 1.55 s / 160 MB | 0.95x / 0.99x | WIN / WIN |
+| 7 | desk-app leaf edit | 0.500 s / 172 MB | 0.310 s / 190 MB | 0.62x / 1.11x | WIN / LOSE |
+| 8 | check corpus (sum, max RSS) | 38.04 s / 218 MB | 23.71 s / 222 MB | 0.62x / 1.02x | WIN / LOSE |
+| 9 | check grid_test | 0.520 s / 150 MB | 0.190 s / 158 MB | 0.37x / 1.05x | WIN / LOSE |
+| 10 | check j3c-bootstrap | 1.26 s / 508 MB | 0.570 s / 492 MB | 0.45x / 0.97x | WIN / WIN |
+| 11 | fmt --check j3c/stdlib/j3 | 0.090 s / 5 MB | 0.065 s / 7 MB | 0.72x / 1.42x | WIN / LOSE |
+| 12 | dump-ir examples/desk-app | 0.370 s / 178 MB | 0.220 s / 186 MB | 0.59x / 1.04x | WIN / LOSE |
+| 13 | dump-bc scripted/fighter.j3s | 0.017 s / 19 MB | 0.014 s / 22 MB | 0.82x / 1.14x | WIN / LOSE |
+| 14 | doc x3 | 0.195 s / 27 MB | 0.057 s / 27 MB | 0.29x / 1.00x | WIN / WIN |
+| 15 | new + first check | 0.019 s / 19 MB | 0.017 s / 22 MB | 0.89x / 1.13x | WIN / LOSE |
+| 16 | binary size, stripped | 13.43 MB | 12.23 MB | 0.91x | WIN |
+
+Left: RSS on 3, 7 (module-hash step allocates), 8, 9, 12 (AST/typed sizes), 11, 13, 15 (libSDL2 + ~40 libs loaded at
+startup via `use lib "SDL2"` in j3.game; needs a frozen-file/stdlib decision). Rows 11/13/14/15 now use a K-loop (3 decimals).
+
+### 2026-11-18, plan 13 phase 1
 
 `tools/bench.sh` (median of 3, wall and peak RSS from `/usr/bin/time -f '%e %M'`, scratch copies under
 `<repo>/target/bench/`; metric definitions in `plans/13-speed.md` and the script). **dev** = j3c-boot as `j3.toml`

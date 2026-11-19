@@ -53,11 +53,37 @@ pub struct ItemFound {
 }
 
 /// `j3/` under the stdlib directory.
-fn j3Dir(a: &Arena): string { return path.join(load.stdlibDir(a), "j3", a); }
+// J3 (speed): the stdlib folders are worked out once per process (`load.stdlibDir` stats up to 8 folders per call,
+// and `isPart` asked three times per file); the two strings live in their own small arena, never freed.
+#[singleton]
+let DIRS_SET: bool;
+#[singleton]
+let OVERRIDE: bool;
+#[singleton]
+let STD_DIR: string;
+#[singleton]
+let J3_DIR: string;
+#[singleton]
+let DIRS_MEM: Arena;
+
+fn dirs() {
+    if DIRS_SET { return; }
+    DIRS_MEM = Arena.create(1024);
+    OVERRIDE = load.usingOverride();
+    STD_DIR = load.stdlibDir(&DIRS_MEM);
+    J3_DIR = path.join(STD_DIR, "j3", &DIRS_MEM);
+    DIRS_SET = true;
+}
+
+/// `overridden()`, cached.
+fn overridden(): bool { dirs(); return OVERRIDE; }
+/// `load.stdlibDir()`, cached.
+fn stdDir(): string { dirs(); return STD_DIR; }
+fn j3Dir(a: &Arena): string { dirs(); return J3_DIR; }
 
 /// Embedded source when `p` is `stdlibDir()/j3/<file>` and `J3_STDLIB` is unset (Rust `stdlib::embedded`).
 fn embeddedSrc(p: string, a: &Arena): Option<string> {
-    if load.usingOverride() { return Option.None; }
+    if overridden() { return Option.None; }
     match load.stripPrefix(p, j3Dir(a), a) {
         Option.Some(name) { return load.stdlibFile(name); }
         Option.None { return Option.None; }
@@ -97,7 +123,7 @@ fn pathBefore(x: string, y: string): bool {
 /// Every `.j3` below `dir` (Rust `read_dir_j3` / `collect_j3`): the embedded names, or the disk with `J3_STDLIB`.
 fn readDirJ3(dir: string, a: &Arena): Result<List<string>, string> {
     let out = List<string>.new(a);
-    if !load.usingOverride() {
+    if !overridden() {
         let names = load.stdlibNames(a);
         for i in 0..names.len { out.push(path.join(dir, names.items[i], a)); }
         return Result.Ok(out);
@@ -177,7 +203,7 @@ fn moduleLine(src: string): string {
 /// `J3_STDLIB` is unset, else on disk; sorted (Rust `stdlib::parts`).
 fn partsOf(dir: string, a: &Arena): List<string> {
     let out = List<string>.new(a);
-    if !load.usingOverride() {
+    if !overridden() {
         let j3 = j3Dir(a);
         match load.stripPrefix(dir, j3, a) {
             Option.Some(rel) {
@@ -212,12 +238,13 @@ fn originOf(p: string, base: string, a: &Arena): string {
 fn withParts(p: string, src: string, base: string, parts: &List<PartAt>, a: &Arena): Result<string, string> {
     let main = moduleLine(src);
     let t = Text.new(a);
-    t.add(src);
+    let copied = false;   // J3 (speed): a module with no parts keeps `src` (the embedded bytes), uncopied
     let files = partsOf(noExt(p), a);
     for f in 0..files.len {
         let part = files.items[f];
         let txt = readSource(part, a)?;
         if moduleLine(txt) != main { continue; }
+        if !copied { t.add(src); copied = true; }
         t.push('\n');
         parts.push(PartAt { origin: originOf(part, base, a), start: t.len() });
         let i = 0;
@@ -233,13 +260,13 @@ fn withParts(p: string, src: string, base: string, parts: &List<PartAt>, a: &Are
             i = e + 1;
         }
     }
-    return Result.Ok(t.str());
+    return Result.Ok(if copied { t.str() } else { src });
 }
 
 /// A stdlib module with its parts (Rust `load_stdlib`).
 fn loadStdlib(px: &Px, p: string): Result<&Module, string> {
     let a = px.arena;
-    let base = load.stdlibDir(a);
+    let base = stdDir();
     let parts = List<PartAt>.new(a);
     let src = withParts(p, readSource(p, a)?, base, &parts, a)?;
     return finish(px, p, src, originOf(p, base, a), parts, isEmbedded(p, a));
@@ -400,4 +427,97 @@ fn parseText(px: &Px, p: string, src: string): Result<File, string> {
         Option.None {}
     }
     return Result.Ok(file);
+}
+
+/// What `index` needs of a module: its `module` path and leading doc comment.
+pub struct Head {
+    ok: bool;
+    key: string;
+    doc: string;
+}
+
+fn byteAt(s: string, i: int): u8 { return if i < s.len { s[i] } else { 0 }; }
+
+fn isIdentByte(c: u8): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+
+/// J3 (speed): the doc comment and module key of embedded stdlib source `src` read off its first lines the way
+/// `lex` + `Parser.file` make them (`///` lines, not `////`, joined by `\n`; `//` lines skipped; `module a.b;`),
+/// so `index` parses no stdlib file. `ok` is false for any other head (a non-ASCII byte, a comment inside the
+/// `module` line), and the caller parses.
+fn headOf(src: string, a: &Arena): Head {
+    let no = Head { ok: false, key: "", doc: "" };
+    let d = Text.new(a);
+    let docs = 0;
+    let i = 0;
+    while i < src.len {
+        let c = src[i];
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' { i += 1; continue; }
+        if c != '/' || byteAt(src, i + 1) != '/' { break; }
+        let e = i;
+        while e < src.len && src[e] != '\n' { e += 1; }
+        if byteAt(src, i + 2) == '/' && byteAt(src, i + 3) != '/' {
+            let s = i + 3;
+            if byteAt(src, s) == ' ' { s += 1; }
+            if docs > 0 { d.add("\n"); }
+            docs += 1;
+            d.add(trimEnd(src[s..e]));
+        }
+        i = e;
+    }
+    if !startsWith(src[i..src.len], "module") || isIdentByte(byteAt(src, i + 6)) { return no; }
+    i += 6;
+    let k = Text.new(a);
+    let need = true;
+    while true {
+        while byteAt(src, i) == ' ' || byteAt(src, i) == '\t' || byteAt(src, i) == '\n' || byteAt(src, i) == '\r' { i += 1; }
+        let c = byteAt(src, i);
+        if need {
+            if !isIdentByte(c) || (c >= '0' && c <= '9') { return no; }
+            let s = i;
+            while isIdentByte(byteAt(src, i)) { i += 1; }
+            k.add(src[s..i]);
+            need = false;
+        } else if c == '.' {
+            k.push('.');
+            need = true;
+            i += 1;
+        } else if c == ';' {
+            break;
+        } else {
+            return no;
+        }
+    }
+    return Head { ok: true, key: k.str(), doc: if docs > 0 { d.str() } else { "" } };
+}
+
+/// J3 (speed): false only when no hit of `search` can come from `src` (a module with its parts): every hit is a
+/// lower-cased slice of it. `w` is lower-case ASCII without a newline; `U+0130` lowers to an ASCII `i`, so a
+/// source holding one is always searched.
+fn mayMention(src: string, w: string): bool {
+    if w.len == 0 || text.find(src, "İ") >= 0 { return true; }
+    let c0 = w[0];
+    let last = src.len - w.len;
+    let i = 0;
+    while i <= last {
+        let c = src[i];
+        if c >= 'A' && c <= 'Z' { c += 32; }
+        if c == c0 {
+            let k = 1;
+            while k < w.len {
+                let x = src[i + k];
+                if x >= 'A' && x <= 'Z' { x += 32; }
+                if x != w[k] { break; }
+                k += 1;
+            }
+            if k == w.len { return true; }
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// `w` can go through `mayMention`.
+fn plainWord(w: string): bool {
+    for i in 0..w.len { if w[i] >= 0x80 || w[i] == '\n' { return false; } }
+    return true;
 }

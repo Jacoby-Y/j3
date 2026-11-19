@@ -12,6 +12,7 @@ module j3c.doc;
 
 use j3.cmp.sortBy;
 use j3.data.pool.{ Id, Pool };
+use j3.hash.Xxh3;
 use j3.io;
 use j3.io.path;
 use j3.memory.{ Arena, List };
@@ -55,6 +56,10 @@ const GUIDES: [16]string = ["lang", "j3ui", "j3ui-immediate @j3ui", "css",
     "i18n locale locales translation l10n", "ship dist deb packaging release",
     "packages package deps dependencies lib lock git pkg commands dist_outputs tools", "android apk",
     "steam steamworks", "j2 mods modding", "shaders shader glsl"];
+
+/// The per-file scratch arena of `index`, `byName` and `search`: big enough that the biggest module never grows it
+/// (a grown arena keeps its first chunk's touched pages); mmap'd, so untouched pages cost no memory.
+const SCRATCH: int = 1 << 27;
 
 /// The generated scripts module (`load/scene_scripts.j3` `SCENE_MODULE`).
 const SCRIPTS_MODULE: string = "j3.scene3d.scripts";
@@ -332,7 +337,7 @@ fn isInternal(key: string): bool {
 
 /// Rust `stdlib::provenance`.
 fn provenance(t: &Text, a: &Arena) {
-    if load.usingOverride() { t.add("stdlib from J3_STDLIB=").add(load.stdlibDir(a)).add(", docs ").add(docsId(a)); }
+    if overridden() { t.add("stdlib from J3_STDLIB=").add(stdDir()).add(", docs ").add(docsId(a)); }
     else { t.add("stdlib embedded, docs ").add(docsId(a)); }
 }
 
@@ -344,19 +349,29 @@ fn index(a: &Arena): Result<string, string> {
     t.add(")\n\n").add(TASKS).add("stdlib modules (`j3c doc <module>`):\n");
     let internal = Text.new(a);
     let files = stdlibFiles(a)?;
-    let scratch = Arena.create(1 << 24);
+    let scratch = Arena.create(SCRATCH);
     let mark = scratch.checkpoint();
     for f in 0..files.len {
         scratch.rewind(mark);
-        let px = newPx(&scratch);
-        let m = loadStdlib(&px, files.items[f])?;
-        if isInternal(m.key) {
-            internal.add(if internal.len() > 0 { " " } else { "" }).add(m.key);
+        let key = "";
+        let d = "";
+        let hd = Head { ok: false, key: "", doc: "" };
+        if !overridden() { hd = headOf(readSource(files.items[f], &scratch)?, &scratch); }
+        if hd.ok {
+            key = hd.key;
+            d = hd.doc;
+        } else {
+            let px = newPx(&scratch);
+            let m = loadStdlib(&px, files.items[f])?;
+            key = m.key;
+            d = m.file.doc;
+        }
+        if isInternal(key) {
+            internal.add(if internal.len() > 0 { " " } else { "" }).add(key);
             continue;
         }
         // First sentence only; `j3c doc <module>` prints the rest, thread rules included.
         let head = Text.new(&scratch);
-        let d = m.file.doc;
         let i = 0;
         while i < d.len {
             let e = i;
@@ -370,7 +385,7 @@ fn index(a: &Arena): Result<string, string> {
         let k = text.find(h, ". ");
         let first = trim(if k < 0 { h } else { h[0..k + 2] });
         t.add("    ");
-        padTo(&t, m.key, 26);
+        padTo(&t, key, 26);
         t.add(" ");
         snippet(&t, first, 90);
         t.add("\n");
@@ -410,10 +425,20 @@ fn byName(name: string, a: &Arena): Option<Result<string, string>> {
     let mods = List<string>.new(a);
     let quals = List<string>.new(a);
     let dot = Text.new(a).add(".").add(name).str();
-    let scratch = Arena.create(1 << 24);
+    let scratch = Arena.create(SCRATCH);
     let mark = scratch.checkpoint();
+    // J3 (speed): a hit's last name component is in its module's text; embedded modules without it are not parsed.
+    let lastDot = name.len - 1;
+    while lastDot >= 0 && name[lastDot] != '.' { lastDot -= 1; }
+    let last = name[lastDot + 1..name.len];
     for f in 0..files.len {
         scratch.rewind(mark);
+        if !overridden() {
+            let ps = List<PartAt>.new(&scratch);
+            let src = match readSource(files.items[f], &scratch) { Result.Ok(s) { s } Result.Err(_) { continue; } };
+            let all = match withParts(files.items[f], src, stdDir(), &ps, &scratch) { Result.Ok(s) { s } Result.Err(_) { continue; } };
+            if text.find(all, last) < 0 { continue; }
+        }
         let px = newPx(&scratch);
         let m = match loadStdlib(&px, files.items[f]) { Result.Ok(m) { m } Result.Err(_) { continue; } };
         let syms = symbols(m, &scratch);
@@ -434,11 +459,11 @@ fn byName(name: string, a: &Arena): Option<Result<string, string>> {
     return Option.Some(Result.Ok(t.str()));
 }
 
-/// Rust `stdlib::docs_id`: 8 lower-case hex digits (FNV-1a 64 `>> 32`) over the embedded stdlib (each name then
+/// Rust `stdlib::docs_id`: 8 lower-case hex digits (XXH3 64 `>> 32`) over the embedded stdlib (each name then
 /// its source) and every page this binary prints. → `cmd/info` (version --verbose)
+/// J3 (speed): XXH3, not Rust's byte-serial FNV-1a (a third of `j3c doc`'s time); the id never matched Rust's
+/// anyway (`tests/diff.sh` masks `docs XXXXXXXX`), only `doc` and `version --verbose` have to agree.
 pub fn docsId(arena: &Arena): string {
-    let h: u64 = 0xcbf29ce484222325;
-    let prime: u64 = 0x100000001b3;
     let texts = List<string>.new(arena);
     let names = load.stdlibNames(arena);
     for i in 0..names.len {
@@ -450,10 +475,9 @@ pub fn docsId(arena: &Arena): string {
     texts.push(guide.recipeIndex(arena));
     let rs = guide.recipes(arena);
     for i in 0..rs.len { texts.push(rs.items[i].text); }
-    for i in 0..texts.len {
-        let s = texts.items[i];
-        for k in 0..s.len { h = (h ^ u64(s[k])) * prime; }
-    }
+    let x = Xxh3.new();
+    for i in 0..texts.len { x.update(texts.items[i] as []u8); }
+    let h = x.finish();
     let hex = Text.new(arena);
     hex.pushHex(h >> 32);
     let t = Text.new(arena);
