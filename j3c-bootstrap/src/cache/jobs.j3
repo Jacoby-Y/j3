@@ -111,7 +111,7 @@ fn chunkStart(j: &Jobs, u: &Unit, sets: &List<Set<Id<Func>>>, n: int, mem: &Aren
     let a = mem;
     let ll = Text.new(a);
     let lo = llOpts(j.e);
-    emitLlvmModule(j.cx, j.modules, u.index, &lo, Option.Some(Chunk { no: n, defined: &sets.items[n] }), &ll)?;
+    emitLlvmModule(j.cx, j.modules, u.index, &lo, Option.Some(Chunk { no: n, defined: &sets.items[n] }), u.cost / sets.len, &ll)?;
     let label = Text.new(a);
     label.add(u.label).fmt(` [{n + 1}/{sets.len}]`);
     return clangStart(label.str(), partPath(u.obj, n, a), ll.str(), j.e, j.thin, a);
@@ -138,7 +138,7 @@ fn workIn(j: &Jobs, ui: int, mem: &Arena): Result<(int, int), string> {
     let started = sys.monotonicMs();
     let ll = Text.new(a);
     let lo = llOpts(j.e);
-    emitLlvmModule(j.cx, j.modules, u.index, &lo, Option.None, &ll)?;
+    emitLlvmModule(j.cx, j.modules, u.index, &lo, Option.None, u.cost, &ll)?;
     let emit = sys.monotonicMs() - started;
     pushTiming("emit", u.label, emit, a);
     let note = libNotes(ll.str(), a);
@@ -305,6 +305,20 @@ fn startWorkers(j: &Jobs, q: []i32, r: []i32, order: []Cost, held: &List<bool>):
     return j.workers.len;
 }
 
+/// `fd` has bytes (or EOF) within `ms`.
+fn readable(fd: int, ms: int): bool {
+    let pfd: [2]i32 = [i32(fd), i32(sys.POLLIN)];
+    return sys.pollFds(&pfd[0] as ptr, 1, ms) > 0;
+}
+
+/// Some worker has exited (reaped; its `wait` later gives the same code).
+fn anyEnded(j: &Jobs): bool {
+    for k in 0..j.workers.len {
+        if let Option.Some(_) = j.workers.items[k].tryWait() { return true; }
+    }
+    return false;
+}
+
 /// Build every miss of `units`: costliest module first (ties: module order), results kept by module, the
 /// first failure returned once no worker is left running.
 fn runJobs(cx: &IrCx, modules: []Module, units: &List<Unit>, misses: int, e: &EmitOpts, thin: bool, phases: &Phases, arena: &Arena): Result<bool, string> {
@@ -340,6 +354,12 @@ fn runJobs(cx: &IrCx, modules: []Module, units: &List<Unit>, misses: int, e: &Em
         let next = n;
         let out = n;
         while out > 0 {
+            // a worker only exits before `q` closes by dying (panic, signal, OOM); its unit never comes
+            // back, so stop waiting and fail the build below instead of hanging
+            if !readable(int(r[0]), 50) {
+                if anyEnded(&j) { break; }
+                continue;
+            }
             let ui = recv(int(r[0]));
             if ui < 0 { break; }
             out -= 1;
@@ -366,6 +386,14 @@ fn runJobs(cx: &IrCx, modules: []Module, units: &List<Unit>, misses: int, e: &Em
             let c = j.workers.items[k].wait();
             if c != 0 && code == 0 { code = c; }
         }
+        // units finished after a death was seen: every writer is gone, so this reads to EOF
+        let ui = recv(int(r[0]));
+        while ui >= 0 {
+            held.items[ui] = false;
+            out -= 1;
+            toolchain.discard(jobFile(units.items[ui].obj, arena));
+            ui = recv(int(r[0]));
+        }
         sys.close(int(r[0]));
         match first {
             Result.Ok(_) {
@@ -375,7 +403,11 @@ fn runJobs(cx: &IrCx, modules: []Module, units: &List<Unit>, misses: int, e: &Em
                     // a worker died holding a unit, or every worker is gone before the last one was handed out
                     let lost = order.items[if next < order.len { next } else { order.len - 1 }].unit;
                     for k in 0..next {
-                        if held.items[order.items[k].unit] { lost = order.items[k].unit; break; }
+                        if held.items[order.items[k].unit] {
+                            lost = order.items[k].unit;
+                            toolchain.discard(jobFile(units.items[lost].obj, arena));
+                            break;
+                        }
                     }
                     first = Result.Err(Text.new(arena).add("worker of ").add(units.items[lost].label).fmt(` ended with code {code}`).str());
                 }

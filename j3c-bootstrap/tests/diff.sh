@@ -40,7 +40,8 @@ usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-kno
      matching file: text, or sha256 when binary, with its mode; `**` recurses), unpack=GLOB (a .zip/.deb/.tar.gz
      compared by its member list and unpacked files), mask=SED (`sed -E` on everything compared), env=K=V (`@ROOT@`
      is the repo), timeout=SECONDS. Built-in masks: the scratch path -> $DIR, `docs  XXXXXXXX` -> `docs  ID`, the MCP
-     `serverInfo` version, timings (`5.2 ms` -> `N ms`).
+     `serverInfo` version, timings (`5.2 ms` -> `N ms`), and dropped ticking progress lines (`      linking: 3s`:
+     piped, one prints every 2 s, so whether it shows depends on machine load).
      self: stage 1 (j3c-boot) builds a scratch copy of j3c-bootstrap/{j3.toml,src,text} under <repo>/target/
      (never in place: that would overwrite the running binary); stage 2 is then compared with stage 1 on
      fmt, ast, err, ui, glsl, ir --norm and llvm (one input per call). SELF_BUILD_TIMEOUT seconds (default 1800).
@@ -296,6 +297,7 @@ one_tool() {
            for g in "${unpacks[@]+"${unpacks[@]}"}"; do for f in $g; do echo "--- unpack $f"; unpacked "$f"; done; done)
         } | sed -E -e "s|$d/w|\$DIR|g" -e 's/(docs +)[0-9a-f]{8}/\1ID/g' \
               -e 's/("serverInfo":\{"name":"j3c","version":)"[^"]*"/\1"V"/g' \
+              -e '/^      (\[[^]]*\] )?[a-z]+: [0-9]+s$/d' \
               -e 's/[0-9]+(\.[0-9]+)? (us|ms|ns|s)\b/N \2/g' ${masks[@]+"${masks[@]}"} >"$d/$who.txt"
         rm -rf "$d/w" "$d/$who.out" "$d/$who.err"
     done
