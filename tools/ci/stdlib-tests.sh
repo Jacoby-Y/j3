@@ -1,13 +1,13 @@
 #!/bin/sh
 # Run every j3c/stdlib/tests/*.j3 headless (offscreen SDL, no audio, no window) and print a
 # pass/fail table. Exit 1 if any test failed. Args: test names to run only those (no .j3).
-# J3C=path/to/j3c (default j3c/target/release/j3c), J3_TEST_TIMEOUT=seconds per test (240),
+# J3C=path/to/j3c (default j3c-bootstrap/target/j3c), J3_TEST_TIMEOUT=seconds per test (240),
 # J3_TEST_LOGS=dir for per-test logs (default a temp dir, kept when something fails).
 set -u
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root" || exit 2
-j3c=${J3C:-$root/j3c/target/release/j3c}
-[ -x "$j3c" ] || { echo "stdlib-tests.sh: no j3c at $j3c (cd j3c && cargo build --release)" >&2; exit 2; }
+j3c=${J3C:-$root/j3c-bootstrap/target/j3c}
+[ -x "$j3c" ] || { echo "stdlib-tests.sh: no j3c at $j3c (./build.sh, or j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap)" >&2; exit 2; }
 limit=${J3_TEST_TIMEOUT:-240}
 logs=${J3_TEST_LOGS:-$(mktemp -d)}
 mkdir -p "$logs"

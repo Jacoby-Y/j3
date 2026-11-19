@@ -1,6 +1,6 @@
 #!/bin/sh
 # Plan 11 A7: every Rust file of j3c has a home in the port, or a reason it's gone.
-# Prints each j3c/src/**/*.rs that no stub names and DELETED.md doesn't list, one per line; exit 1 if any.
+# Prints each j3c/src/**/*.rs (read from the git tag rust-final: plan 11 C6 deleted j3c/src) that no stub names and DELETED.md doesn't list, one per line; exit 1 if any.
 # Also prints `stale: PATH (WHERE)` for a name that matches no Rust file (typo, renamed file); exit 1.
 #
 # Test files are not ported (the port's tests are J3 source) and need no entry: a file named `tests.rs`
@@ -15,11 +15,11 @@
 # crosses `/`); other lines are prose.
 set -eu
 cd "$(dirname "$0")/.."
-rust=../j3c/src
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-(cd "$rust" && find . -name '*.rs' | sed 's|^\./||') | LC_ALL=C sort >"$tmp/every"
+git ls-tree -r --name-only --full-name rust-final -- ../j3c/src | sed -n 's|^j3c/src/\(.*\.rs\)$|\1|p' | LC_ALL=C sort >"$tmp/every"
+[ -s "$tmp/every" ] || { echo "coverage.sh: no j3c/src at tag rust-final" >&2; exit 1; }
 grep -Ev '(^|/)tests?\.rs$|(^|/)tests/' "$tmp/every" >"$tmp/all"
 
 # ponytail: header grep, not a J3 parse; a `Port of:` outside a header comment would count too.

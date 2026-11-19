@@ -3,13 +3,13 @@
 Each case is one `.j3` (or `.j3s`) file under `tests/cases/` (folders by area: `basics/`, `generics/`, ...)
 with its expectations in header comments at the top. One runner runs them all:
 
-    j3c-bootstrap/target/j3c-boot test-compiler [--compiler PATH] [-j N] [DIR|FILE...]
+    j3c-bootstrap/target/j3c test-compiler [--compiler PATH] [-j N] [DIR|FILE...]
 
-Default compiler: `j3c-boot` itself; today pass `--compiler j3c-bootstrap/stage0/j3c`. Default DIR:
+Default compiler: `j3c` itself; today pass `--compiler j3c-bootstrap/stage0/j3c`. Default DIR:
 `tests/cases` (from the cwd, else next to the binary). `-j` (default 4) runs cases in parallel; results
 print in case order (`ok NAME` / `FAIL NAME: reason`), then `test-compiler: N ok, N FAIL`; exit 1 on any
 failure, 2 on bad usage. Each case runs on a copy in its own temp dir (removed after), headless, under
-`timeout 120`. A case with `expect-err` runs `check FILE`; any other runs `run --headless FILE ARGS`. Porting a Rust test from `j3c/src/compile/tests/*.rs` means turning its inline source into a
+`timeout 120`. A case with `expect-err` runs `check FILE`; any other runs `run --headless FILE ARGS`. Porting a Rust test from `j3c/src/compile/tests/*.rs` (tag `rust-final`) means turning its inline source into a
 file here; a new feature's tests are new files. Until the Rust compiler is retired, `tests/diff.sh` is the
 main gate and these are extra; after that, `cases/` is the suite.
 

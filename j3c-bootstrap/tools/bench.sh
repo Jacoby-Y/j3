@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Plan 13 bench: stage0/j3c (Rust) against target/j3c-boot on 16 metrics, wall time and peak RSS.
+# Plan 13 bench: stage0/j3c (Rust) against target/j3c on 16 metrics, wall time and peak RSS.
 # Usage: tools/bench.sh [--only N,M,...] [--list]. Env: BENCH_N (runs per metric, median; default 3),
 # BENCH_STAGE0 / BENCH_BOOT (the two compilers). Every run works on one scratch copy under <repo>/target/bench/w
 # (tar without `target/`), deleted at the end; writes target/bench/result.md and result.tsv (rows of metrics
@@ -10,7 +10,7 @@
 # (BENCH_K overrides), and report wall per run; RSS is the largest single run of the loop.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd); boot=$(dirname "$here"); root=$(dirname "$boot")
-S0=$(realpath "${BENCH_STAGE0:-$boot/stage0/j3c}"); BT=$(realpath "${BENCH_BOOT:-$boot/target/j3c-boot}")
+S0=$(realpath "${BENCH_STAGE0:-$boot/stage0/j3c}"); BT=$(realpath "${BENCH_BOOT:-$boot/target/j3c}")
 N=${BENCH_N:-3}; out=$root/target/bench; W=$out/w; tf=$out/time.txt
 export J3C_NO_INSTALL=1 SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy
 unset J3_STDLIB

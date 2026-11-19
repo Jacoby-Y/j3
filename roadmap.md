@@ -1,6 +1,6 @@
 # J3 roadmap
 
-Non-goals: no GC, borrow checker, drop, heap or refcounted closure environments (escaping closures are arena-boxed, `fn[mem]`), or comptime interpreter in v1. Do not CFG-ify check, start a second parser, grow `j3c/src/stdlib/mod.rs`, or add libLLVM / crates.io.
+Non-goals: no GC, borrow checker, drop, heap or refcounted closure environments (escaping closures are arena-boxed, `fn[mem]`), or comptime interpreter in v1. Do not CFG-ify check, start a second parser, or add libLLVM / compiler dependencies.
 
 `[emit] target` is one triple or an array (`sys.j3` / `sys_windows.j3` / `sys_macos.j3`). `build` writes one binary per triple; `run` uses the host triple.
 

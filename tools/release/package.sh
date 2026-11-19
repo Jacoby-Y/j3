@@ -3,7 +3,8 @@
 #   j3c-<ver>-<arch>-linux.tar.gz   j3c/bin/j3c + licenses + README (what install.sh unpacks)
 #   j3c_<ver>_<debarch>.deb          /usr/bin/j3c (needs dpkg-deb)
 #   SHA256SUMS
-# Native builds only: run it on the arch you ship. J3_SKIP_BUILD=1 reuses j3c/target/release/j3c.
+# Native builds only: run it on the arch you ship. J3_SKIP_BUILD=1 reuses j3c-bootstrap/target/j3c.
+# The build: stage 0 (j3c-bootstrap/stage0/j3c; built from the tag rust-final with cargo when missing) builds j3c.
 # Maintainer of the .deb: J3_DEB_MAINTAINER (default below). j3c-composer is not shipped (separate tool).
 set -eu
 umask 022
@@ -15,15 +16,17 @@ cd "$root"
 die() { echo "package.sh: $*" >&2; exit 1; }
 
 if [ -z "${J3_SKIP_BUILD:-}" ]; then
-  (cd j3c && J3C_NO_INSTALL=1 cargo build --release --locked)
+  [ -x j3c-bootstrap/stage0/j3c ] || j3c-bootstrap/tools/stage0.sh rust-final
+  j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap
+  strip j3c-bootstrap/target/j3c
 fi
-bin=j3c/target/release/j3c
+bin=j3c-bootstrap/target/j3c
 [ -x "$bin" ] || die "no $bin (build failed?)"
 
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' j3c/Cargo.toml | head -n 1)
-[ -n "$version" ] || die "no version in j3c/Cargo.toml"
+version=$(sed -n 's/^pub const J3C_VERSION: string = "\(.*\)";/\1/p' j3c-bootstrap/src/project/config.j3)
+[ -n "$version" ] || die "no J3C_VERSION in j3c-bootstrap/src/project/config.j3"
 got=$("$bin" version | awk '{print $2}')
-[ "$got" = "$version" ] || die "binary says $got, Cargo.toml says $version"
+[ "$got" = "$version" ] || die "binary says $got, config.j3 says $version"
 
 arch=$(uname -m)
 case "$arch" in
@@ -41,7 +44,7 @@ mkdir -p "$dist"
 copy_licenses() {
   cp LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md "$1/"
   cp j3c/editor/LICENSE-DejaVu.txt "$1/LICENSE-DejaVu.txt"
-  cp j3c/src/ui/icons/LICENSE "$1/LICENSE-BootstrapIcons.txt"
+  cp j3c-bootstrap/text/icons/LICENSE "$1/LICENSE-BootstrapIcons.txt"
 }
 
 # --- tarball ---

@@ -1,8 +1,9 @@
 #!/bin/sh
 # Rebuild stage0/j3c, the pinned Rust j3c that builds j3c-bootstrap and serves as the oracle
-# (plan 11 A2). This script is the only way stage0 changes.
-#   stage0.sh COMMIT      release-build j3c at COMMIT in a scratch git worktree
-#   stage0.sh --worktree  release-build the current working tree (VERSION says dirty if j3c/ has edits)
+# (plan 11 A2), and seeds ./build.sh on a clone with no stage0. This script is the only way stage0 changes.
+#   stage0.sh rust-final  release-build the Rust j3c at the tag rust-final in a scratch git worktree
+# Since plan 11 C6 the Rust source (j3c/src, j3c/Cargo.toml) exists only at that tag, so COMMIT is always
+# rust-final (an older commit still works). Needs cargo, only here.
 # Writes stage0/j3c (gitignored) and stage0/VERSION (tracked). Never touches ~/.bin/j3c:
 # J3C_NO_INSTALL=1 turns off the cargo wrapper (j3c/.cargo/copy-j3c.sh).
 # Cargo output goes to $J3_STAGE0_TARGET, default target/stage0-cargo (kept, so rebuilds are incremental).
@@ -17,13 +18,8 @@ cleanup() { [ -z "$tree" ] || git -C "$repo" worktree remove --force "$tree" >/d
 trap cleanup EXIT INT TERM
 
 case "${1:-}" in
-  --worktree)
-    src=$repo
-    commit=$(git -C "$repo" rev-parse HEAD)
-    if [ -n "$(git -C "$repo" status --porcelain -- j3c)" ]; then dirty="yes (uncommitted edits under j3c/)"; else dirty=no; fi
-    ;;
   "" | -*)
-    echo "usage: stage0.sh COMMIT | --worktree" >&2
+    echo "usage: stage0.sh rust-final" >&2
     exit 2
     ;;
   *)

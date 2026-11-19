@@ -1,5 +1,9 @@
 # Port debt: Rust changes the port has to mirror
 
+Since plan 11 C6 the Rust tree exists only at the git tag `rust-final`; `j3c/src/...` paths below are
+there, and `j3c-boot` is the old name of `target/j3c`. The ledger is history plus the open differences
+from stage 0.
+
 The Rust `j3c` is frozen for the port (`AGENTS.md`, plan 11 A8). Every Rust change made anyway gets one
 line here, newest last:
 

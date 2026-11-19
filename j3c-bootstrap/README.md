@@ -1,12 +1,11 @@
 # j3c-bootstrap
 
-`j3c` rewritten in J3. **Stubs only:** every file exists with a header saying what it does and which Rust
-files it replaces (`Port of:`), and nothing else. `stage0/j3c check j3c-bootstrap` passes.
+`j3c`, the J3 compiler, written in J3. Since plan 11 C6 this is the installed `j3c`: `../build.sh` builds
+stage 1 with `stage0/j3c` (the Rust compiler from the git tag `rust-final`), stage 2 with stage 1, checks
+they agree and installs stage 2. Every file's header says what it does and which Rust files it replaced
+(`Port of:`, paths in `j3c/src/` at `rust-final`). A plain `build` writes `target/j3c`.
 
-It builds to `target/j3c-boot` (`[package] bin` in `j3.toml`), never `j3c`, and is never installed:
-`build.sh` refuses anything under `j3c-bootstrap/`. Renaming it to `j3c` is the last step of the port.
-
-Port agents read `AGENTS.md` first (coding rules, checklists, gates). Rust changes made during the port
+Agents read `AGENTS.md` first (coding rules, checklists, gates). Rust changes made during the port
 are in `PORT_DEBT.md`; Rust files that are not ported are in `DELETED.md`. The gate is
 `tests/diff.sh MODE` (`tests/README.md`).
 
@@ -77,13 +76,14 @@ Stages, in order. A stage may use only the stages above it (`tools/layers.txt`, 
 4. Self-host: stage 2 (j3c-bootstrap built by stage 1) gives the same output as stage 1 (`diff.sh self`).
 5. `backend/bc`, `shader`, `devmode`, and the rest of `ui` and `project`. After this it can replace the Rust
    compiler for building games.
-6. The tools (`lsp`, `doc`, `mcp`, `scene`, `editor`, `dist`, `assets`, `textmate`). These
-   can stay in Rust until last.
+6. The tools (`lsp`, `doc`, `mcp`, `scene`, `editor`, `dist`, `assets`, `textmate`). The LSP and MCP
+   servers, `j3c editor`, `-e android`, `-e web` and asset import are still stubs: `plans/12-deferred-tools.md`.
+7. Switch (C6, done): this tree is `j3c`; `j3c/src/` is deleted (tag `rust-final` keeps it).
 
 How to test it: `tests/README.md`.
 
 ## Seed
 
-A fresh clone with no `j3c` builds the Rust compiler at the tag `rust-final` with cargo, uses it to
-build `j3c-boot`, then `j3c-boot` builds itself. There is no C seed (no C backend). If a clang-only seed
-is ever wanted, commit `dump-llvm` output of `j3c-boot` for x86-64 Linux.
+A fresh clone with no `stage0/j3c` builds the Rust compiler at the tag `rust-final` with cargo
+(`tools/stage0.sh rust-final`, run by `../build.sh`), uses it to build stage 1, then stage 1 builds itself. There is no C seed (no C backend). If a clang-only seed
+is ever wanted, commit `dump-llvm` output of `j3c` for x86-64 Linux.

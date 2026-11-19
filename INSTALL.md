@@ -55,9 +55,9 @@ sudo pacman -S clang sdl2 sdl2_ttf sdl2_image sdl2_mixer libglvnd
 
 HTTPS (`j3.net.tls`, `j3.net.http`) also needs OpenSSL 3 (`libssl3` on Debian/Ubuntu). Console programs that don't open a window only need `clang`.
 
-## From source (any platform with Rust)
+## From source
 
-Needs Rust (with Cargo, [rustup.rs](https://rustup.rs)) and `clang`. The crate has no dependencies.
+Needs `clang`, plus Rust (with Cargo, [rustup.rs](https://rustup.rs)) once, to build the seed compiler.
 
 ```sh
 git clone https://github.com/Jacoby-Y/j3
@@ -65,7 +65,7 @@ cd j3
 ./build.sh
 ```
 
-`build.sh` release-builds `j3c` and installs it, with the `j3c-composer` tool, to `$J3_BIN_DIR`, else `~/.bin` if it exists, else `~/.local/bin`. Without the script: `cargo build --release --manifest-path j3c/Cargo.toml`, and the binary is `j3c/target/release/j3c`.
+`j3c` is written in J3 (`j3c-bootstrap/`). `build.sh` builds the seed (`j3c-bootstrap/stage0/j3c`, the last Rust `j3c`, from the git tag `rust-final` with Cargo) when it is missing, builds `j3c` with it, has that build itself, and installs the result, with the `j3c-composer` tool, to `$J3_BIN_DIR`, else `~/.bin` if it exists, else `~/.local/bin`.
 
 ## Windows
 

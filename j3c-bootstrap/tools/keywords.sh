@@ -1,15 +1,14 @@
 #!/bin/sh
-# Fails (rc 1, with a diff) when text/syntax/keywords.txt and the Rust tables differ: `KEYWORDS` in
+# Fails (rc 1, with a diff) when text/syntax/keywords.txt and the Rust tables (at the git tag rust-final) differ: `KEYWORDS` in
 # j3c/src/parse/token.rs as `keyword`, then `BOOL_LITS` as `literal`, then `BUILTIN_TYPES` in
 # j3c/src/parse/syntax.rs as `type`, same order. The keyword SCOPE column is checked by the textmate unit
 # test (the grammar equals the shipped editors/vscode/syntaxes/j3.tmLanguage.json).
 set -eu
 cd "$(dirname "$0")/.."
-tok=../j3c/src/parse/token.rs
-syn=../j3c/src/parse/syntax.rs
-for f in "$tok" "$syn"; do [ -f "$f" ] || { echo "keywords.sh: no $f" >&2; exit 1; }; done
-want=$(mktemp); got=$(mktemp)
-trap 'rm -f "$want" "$got"' EXIT
+want=$(mktemp); got=$(mktemp); tok=$(mktemp); syn=$(mktemp)
+trap 'rm -f "$want" "$got" "$tok" "$syn"' EXIT
+git show rust-final:j3c/src/parse/token.rs >"$tok" || { echo "keywords.sh: no token.rs at tag rust-final" >&2; exit 1; }
+git show rust-final:j3c/src/parse/syntax.rs >"$syn" || { echo "keywords.sh: no syntax.rs at tag rust-final" >&2; exit 1; }
 # ponytail: grep/sed over token.rs / syntax.rs; a reformat of those tables shows up as a diff here, not silence.
 {
     sed -n '/^pub const KEYWORDS/,/^];/p' "$tok" | sed -n 's/^ *("\([a-z_]*\)", TokenKind::[A-Za-z]*),$/\1 keyword/p'

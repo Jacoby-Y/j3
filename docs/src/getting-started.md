@@ -2,16 +2,15 @@
 
 ## Installing
 
-You need Rust (with Cargo) and `clang` on your `PATH`. Games that open a window also need SDL2, and 3D ones need OpenGL 3.3.
+You need `clang` on your `PATH` (and, once, Rust with Cargo: see below). Games that open a window also need SDL2, and 3D ones need OpenGL 3.3.
 
 From the repository root:
 
 ```text
-cd j3c
-cargo build --release
+./build.sh
 ```
 
-The binary is `j3c/target/release/j3c`. Put it on your `PATH` (the repo's `build.sh` builds and installs it to `$J3_BIN_DIR`, else `~/.bin` if that exists, else `~/.local/bin`). Check it with:
+`j3c` is written in J3. `build.sh` builds it with a pinned seed compiler (`j3c-bootstrap/stage0/j3c`; when it is missing, the script builds it once with Cargo from the git tag `rust-final`), then has it build itself, and installs it to `$J3_BIN_DIR`, else `~/.bin` if that exists, else `~/.local/bin`. Check it with:
 
 ```text
 j3c version

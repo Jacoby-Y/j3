@@ -62,18 +62,17 @@
 
 While `j3c editor` has the project open, scene tools and `render` act on the live editor: each change is one undo step, nothing is saved until you save (or the agent passes `save`), and renders include unsaved edits. Scenes the editor doesn't have open are edited as files. The same operations are on the command line: `j3c -e scene --help`, `j3c -e render --help`; `j3c -e mcp --tools` lists every tool's arguments next to its CLI command. Every edit reply says whether it went to the open editor or the file.
 
-How it works: the scene operations are `j3c/editor/src/tool.j3` and `render.j3`, run by the editor binary in headless `cli`/`render` modes (`J3_EDITOR_MODE`), so `scene3d` stays the only reader and writer of scene files. `j3c/src/scene.rs` runs them and turns replies into JSON; `j3c/src/mcp.rs` is the server. Live commands go through the events file as `cmd` lines (`live.j3`), and replies come back on the editor's stdout as `J3EDITOR REPLY` lines, which the host appends to `target/j3-editor/replies`. Renders use SDL's offscreen video driver, so no display is needed.
+How it works: the scene operations are `j3c/editor/src/tool.j3` and `render.j3`, run by the editor binary in headless `cli`/`render` modes (`J3_EDITOR_MODE`), so `scene3d` stays the only reader and writer of scene files. `j3c-bootstrap/src/scene.j3` runs them and turns replies into JSON; `j3c-bootstrap/src/mcp.j3` is the server (a stub until plan 12). Live commands go through the events file as `cmd` lines (`live.j3`), and replies come back on the editor's stdout as `J3EDITOR REPLY` lines, which the host appends to `target/j3-editor/replies`. Renders use SDL's offscreen video driver, so no display is needed.
 
 ## Setup and use
 
-On Linux, install Rust/Cargo, `clang`, SDL2, OpenGL 3.3 (`libGL`), and SDL2_ttf. SDL2_image is needed only for JPEG textures (PNG decodes without it). From the repository root:
+On Linux, install `clang`, SDL2, OpenGL 3.3 (`libGL`), and SDL2_ttf (and Rust/Cargo once, for the seed compiler `./build.sh` builds when it is missing). SDL2_image is needed only for JPEG textures (PNG decodes without it). From the repository root (`j3c editor` is a stub in the J3 `j3c` until plan 12 lands):
 
 ```sh
-cd j3c
-cargo build --release
-./target/release/j3c editor --new ../my-game
+./build.sh
+j3c editor --new ../my-game
 # Reopen it later:
-./target/release/j3c editor ../my-game
+j3c editor ../my-game
 ```
 
 Use the left panel to add objects or choose assets, the right panel to edit them, and **Save** or **Play** when ready. For an existing project, run `j3c editor PATH`, then load and draw `j3.scene3d` from its game code; the new-project template shows the integration.
@@ -84,14 +83,14 @@ Read [`j3c/AGENTS.md`](j3c/AGENTS.md) for compiler and language constraints befo
 
 | Area | Source of truth |
 |------|-----------------|
-| CLI entry and help | `j3c/src/cli.rs` dispatches `editor` to `j3c/src/editor.rs`. |
-| Project setup and desktop host | `j3c/src/editor.rs` creates project files, reads `j3.editor.toml`, generates the script and asset catalogs, builds the editor once per `j3c` version into `~/.cache/j3/scene3d/editor/` (`J3_EDITOR_SRC=path/to/editor/src` builds from disk instead of the embedded copy), launches it, and handles the editor's `J3EDITOR` requests on stdout: PLAY/STOP, IMPORT/PICK, SCRIPT, RESCAN, RENAME/DELETE. Messages back to the editor are lines appended to `target/j3-editor/events`. |
+| CLI entry and help | `j3c-bootstrap/src/cmd/args.j3` dispatches `editor` to `j3c-bootstrap/src/editor.j3` (a stub until plan 12; the Rust host is `j3c/src/editor.rs` at the tag `rust-final`). |
+| Project setup and desktop host | `editor.rs` (tag `rust-final`; plan 12 ports it) creates project files, reads `j3.editor.toml`, generates the script and asset catalogs, builds the editor once per `j3c` version into `~/.cache/j3/scene3d/editor/` (`J3_EDITOR_SRC=path/to/editor/src` builds from disk instead of the embedded copy), launches it, and handles the editor's `J3EDITOR` requests on stdout: PLAY/STOP, IMPORT/PICK, SCRIPT, RESCAN, RENAME/DELETE. Messages back to the editor are lines appended to `target/j3-editor/events`. |
 | Editor window and interactions | `j3c/editor/src/` (one module per file, entry `main.j3`) owns the viewport, panels, selection, transforms, undo (diff-based `Delta` steps), autosave, overrides of placed objects, the material panel, and commands sent to the host. |
-| Scene format and runtime API | `j3c/stdlib/j3/scene3d.j3` loads/stores scenes, expands placed scenes (`INSTANCE`, `expand`, `refresh`, `uses`), applies per-placement overrides (`over.*` lines), manages nodes, per-object fields, lights, scene lighting (`scene.env.*`), and materials, uploads meshes, and draws them (see-through ones last). It is embedded through `j3c/src/stdlib/mod.rs`. |
-| Asset conversion | `j3c/src/gltf.rs` imports static glTF/GLB and `.j3mesh` into project assets and writes each import to its own `target/j3-editor/import-<n>.j3scene`, which the editor pastes into the scene, or moves it to `assets/imported/<name>.j3scene` to be placed as a scene. |
+| Scene format and runtime API | `j3c/stdlib/j3/scene3d.j3` loads/stores scenes, expands placed scenes (`INSTANCE`, `expand`, `refresh`, `uses`), applies per-placement overrides (`over.*` lines), manages nodes, per-object fields, lights, scene lighting (`scene.env.*`), and materials, uploads meshes, and draws them (see-through ones last). It is embedded through `j3c-bootstrap/src/load/stdlib.j3`. |
+| Asset conversion | `j3c-bootstrap/src/assets/gltf.j3` imports static glTF/GLB and `.j3mesh` into project assets and writes each import to its own `target/j3-editor/import-<n>.j3scene`, which the editor pastes into the scene, or moves it to `assets/imported/<name>.j3scene` to be placed as a scene. |
 | Supporting UI/rendering | `j3c/stdlib/j3/ui.j3`, `gfx.j3` (lit shader, `Surface`, `ViewState` for extra views), `noise.j3` (material noise), `bvh.j3` (the triangle BVH URP traces), `mesh.j3`, and `game.j3`. |
 
-Project-owned files are `j3.editor.toml`, `scenes/*.j3scene`, `assets/`, and `scripts/*.j3s`. `j3c` makes `j3.scene3d.scripts` from the scenes in memory (`j3c/src/compile/scene_scripts.rs`); nothing is generated into `src/`. `target/j3-editor/` holds catalogs, the events log, import output, build logs, autosaves, editor prefs, and the asset trash. See [`j3c/editor/README.md`](j3c/editor/README.md) for the user-facing script and prop format.
+Project-owned files are `j3.editor.toml`, `scenes/*.j3scene`, `assets/`, and `scripts/*.j3s`. `j3c` makes `j3.scene3d.scripts` from the scenes in memory (`j3c-bootstrap/src/load/scene_scripts.j3`); nothing is generated into `src/`. `target/j3-editor/` holds catalogs, the events log, import output, build logs, autosaves, editor prefs, and the asset trash. See [`j3c/editor/README.md`](j3c/editor/README.md) for the user-facing script and prop format.
 
 ## MCP Fixes
 

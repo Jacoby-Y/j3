@@ -1,6 +1,6 @@
 # Rust files that are not ported
 
-`tools/coverage.sh` reads the `- PATH: reason` lines: PATH is relative to `j3c/src/` and may be a shell
+`tools/coverage.sh` reads the `- PATH: reason` lines: PATH is relative to `j3c/src/` at the git tag `rust-final` and may be a shell
 glob (`*` also crosses `/`). Every other Rust file is named on a `Port of:` line in `src/`.
 
 - scenefile.rs: scenes are read and written only through `j3.scene3d` (repo rule); only its v2 line helpers

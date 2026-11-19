@@ -2,9 +2,9 @@
 
 Non-code data embedded with `@embed` / `@embedDir` (plan 08 A7). Text that was Rust code (templates, help,
 page prose) lives here with `@NAME@` placeholders (Rust `{{`/`}}` undone); a templated code file ends in `.in`
-so no tool takes it for a source. Verbatim files (`j3c/src/doc/pages/*.md`, `helptext/{guide,manifest}.md`,
-`helptext/recipes/*`, `ui/icons/bootstrap.txt`, the editor font) stay `@embed`ded from `j3c/` until plan 11 C6
-moves them here.
+so no tool takes it for a source. Verbatim files moved here from `j3c/src/` at plan 11 C6:
+`doc/pages/*.md`, `helptext/{guide,manifest}.md`, `helptext/recipes/*`, `icons/` (Bootstrap Icons,
+`bootstrap.txt` + `LICENSE`), `dist/` (`apk/*.java`, `logo.png`). The editor font stays in `j3c/editor/`.
 
 - `new/`: `j3c new` (`cmd/new`): project templates (`*.in`), the AGENTS/SCENES/UI sections, `usage.txt`
   (`new --help`).

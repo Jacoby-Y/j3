@@ -1,5 +1,5 @@
 #!/bin/bash
-# Differential harness (plan 11 A4): run stage0/j3c (the Rust oracle) and target/j3c-boot on the same
+# Differential harness (plan 11 A4): run stage0/j3c (the Rust oracle) and target/j3c on the same
 # inputs and compare. See tests/README.md. Exit 0 all ok or known, 1 new failure, 2 harness/setup error.
 set -euo pipefail
 usage() {
@@ -47,7 +47,7 @@ usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-kno
      fmt, ast, err, ui, glsl, ir --norm and llvm (one input per call). SELF_BUILD_TIMEOUT seconds (default 1800).
      SELF_LLVM=A:B: only llvm inputs A..B of `llvm --list` (the other modes only when A is 1), to run it in pieces.
 Env: DIFF_TIMEOUT seconds per command (default 30; ir/llvm 120; tool 60; run, bc 300).
-     DIFF_STAGE0 / DIFF_BOOT replace the two compilers (default stage0/j3c, target/j3c-boot;
+     DIFF_STAGE0 / DIFF_BOOT replace the two compilers (default stage0/j3c, target/j3c;
      DIFF_BOOT skips the j3c-boot rebuild).
 E
 }
@@ -57,7 +57,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 boot=$(dirname "$here")
 root=$(dirname "$boot")
 S0=${DIFF_STAGE0:-$boot/stage0/j3c}
-BOOT=${DIFF_BOOT:-$boot/target/j3c-boot}
+BOOT=${DIFF_BOOT:-$boot/target/j3c}
 
 [ $# -ge 1 ] || { usage >&2; exit 2; }
 case $1 in -h|--help) usage; exit 0 ;; esac
@@ -92,13 +92,13 @@ to=${DIFF_TIMEOUT:-$to}
 if [ $mode = llvm ] || [ $mode = self ]; then : "${jobs:=${J3_TEST_JOBS:-$(( $(nproc) / 4 ))}}"; fi
 : "${jobs:=${J3_TEST_JOBS:-$(( $(nproc) / 2 ))}}"
 [ "$jobs" -ge 1 ] 2>/dev/null || jobs=1
-[ -x "$S0" ] || die "no $S0: run tools/stage0.sh --worktree"
+[ -x "$S0" ] || die "no $S0: run tools/stage0.sh rust-final"
 
 # Fail fast on the structural checks (not for --list: it only prints).
 if [ $list = 1 ]; then :; elif [ "$cov" = 0 ]; then "$boot/tools/coverage.sh" >&2 || die "tools/coverage.sh failed (--no-coverage skips it)"; fi
 [ $list = 1 ] || "$boot/tools/layers.sh" >&2 || die "tools/layers.sh failed"
 if [ $mode = ast ] && [[ $("$S0" dump-ast /dev/null 2>&1) == *'unknown command'* ]]; then
-    die "stage0 has no dump-ast yet: rebuild it with tools/stage0.sh --worktree"
+    die "stage0 has no dump-ast yet: rebuild it with tools/stage0.sh rust-final"
 fi
 
 # One build of j3c-boot when it is missing or older than its sources. `--opt 2` (plan 13): the j3.toml stays opt 0
@@ -124,9 +124,9 @@ if [ $mode = self ]; then
     if ! (cd "$scratch" && timeout -k 5 "${SELF_BUILD_TIMEOUT:-1800}" "$BOOT" build j3c-bootstrap) >"$log" 2>&1; then
         tail -20 "$log" >&2; die "self: stage 1 could not build stage 2"
     fi
-    stage2=$scratch/j3c-bootstrap/target/j3c-boot
+    stage2=$scratch/j3c-bootstrap/target/j3c
     [ -x "$stage2" ] || die "self: no $stage2 after the build"
-    [ ! "$boot/target/j3c-boot" -nt "$scratch/start" ] || die "self: the build wrote j3c-bootstrap/target/j3c-boot"
+    [ ! "$boot/target/j3c" -nt "$scratch/start" ] || die "self: the build wrote j3c-bootstrap/target/j3c"
     export DIFF_STAGE0=$BOOT DIFF_BOOT=$stage2 DIFF_NO_COVERAGE=1
     bad=0; n=0
     # A clean comparison prints its summary line; a failed one prints everything (the DIFF/CRASH detail).

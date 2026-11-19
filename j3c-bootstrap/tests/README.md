@@ -1,6 +1,6 @@
 # Tests
 
-Differential first: run the Rust `j3c` (`stage0/j3c`, the oracle) and `j3c-boot` on the same input and
+Differential first: run the Rust `j3c` (`stage0/j3c`, the oracle) and `target/j3c` (the J3 compiler) on the same input and
 compare the text. Unit checks live beside the code they cover, as `*_test.j3` files the way
 `j3c/stdlib/tests/` does it.
 
@@ -10,16 +10,16 @@ compare the text. Unit checks live beside the code they cover, as `*_test.j3` fi
 
 1. Runs `tools/coverage.sh` (skip with `--no-coverage` or `DIFF_NO_COVERAGE=1`) and `tools/layers.sh`;
    either failing stops the run (exit 2).
-2. Builds `target/j3c-boot` with `stage0/j3c build --opt 2 j3c-bootstrap` (optimized; plan 13) when it is missing
+2. Builds `target/j3c` with `stage0/j3c build --opt 2 j3c-bootstrap` (optimized; plan 13) when it is missing
    or older than `src/`. `self` still builds stage 2 the way `j3.toml` says (`opt = 0`).
-3. Runs every input through stage0 twice and j3c-boot once, each under `timeout` (`DIFF_TIMEOUT`). Two
+3. Runs every input through stage0 twice and `target/j3c` once, each under `timeout` (`DIFF_TIMEOUT`). Two
    stage0 runs that disagree print `NONDET` (the oracle is not deterministic there). Inputs run in parallel:
    `-j N`, else `J3_TEST_JOBS`, else half the cores (a quarter for `llvm` and `self`'s llvm calls: a big
    project's dump holds ~1 GB and writes ~80 MB per side). Each input writes only its own scratch folder;
    `run` inputs that build in one project run one after another in one job (they share its `target/`);
    `bc` and `tool` inputs each copy their project, so every one is its own job.
    Output is printed in input order after all jobs end, the same as with `J3_TEST_JOBS=1`.
-4. Prints `ok FILE`, `DIFF FILE` (both ran, the text differs) or `CRASH FILE` (j3c-boot failed, timed out
+4. Prints `ok FILE`, `DIFF FILE` (both ran, the text differs) or `CRASH FILE` (`target/j3c` failed, timed out
    or died where stage0 did not), the first 40 diff lines of each new failure, and a summary line
    `diff.sh MODE: N ok, N DIFF, N CRASH` to paste into a chunk report.
 
@@ -35,7 +35,7 @@ compare the text. Unit checks live beside the code they cover, as `*_test.j3` fi
 | `run` | `run --headless --frames 3 PATH`, offscreen SDL, dummy audio | stdout without the `J3STATS` / `J3UISTATS` timing lines and with the number before ` us` / ` ms` / ` ns` / ` s` masked (tests print their timings), exit code |
 | `bc` | every compiler run on its own scratch copy (`mktemp -d`, `tar --exclude=./target`), never the tree. A project: `run --headless --frames 3 .` (dev mode: scripts on the VM). A `.j3s` file: `dump-bc REL` in a copy of its project (of its folder when that project is j3c-bootstrap). Inputs: the `[bc]` section of `corpus.txt` | a project: exit code, the sorted `sha256sum` of every `*.j3sb` it wrote (stdout has timings: `run` covers it) and, when it fails, stderr without the `[n/6]` lines (a refusal text); a file: stdout (the dump), stderr, exit code and the `.j3sb` hashes |
 | `tool` | one case per line of `tool/*.txt` (C5; id `STEM/NAME`): `NAME<TAB>PROJECT\|-<TAB>ARGV[<TAB>OPTION]...`, run in a fresh scratch copy of `PROJECT` (`-`: an empty folder) per compiler run, never the tree. OPTIONs: `stdin=FILE` (under `tool/`), `out=GLOB` (`**` recurses), `unpack=GLOB` (`.zip`, `.deb`, `.tar.gz`), `mask=SED` (`sed -E`), `env=K=V` (`@ROOT@` = the repo), `timeout=N` | stdout, stderr, exit code, each `out=` file (text, or sha256 when binary, with its mode), each `unpack=` archive's members and unpacked files (mode, sha256; times left out); built-in masks: the scratch path (`$DIR`), the `docs` id, the MCP `serverInfo` version, timings |
-| `self` | stage 1 (`j3c-boot`) builds stage 2 from a scratch copy of `j3c-bootstrap/{j3.toml,src,text}` under `<repo>/target/self.PID/` (never in place), then `DIFF_STAGE0=stage1 DIFF_BOOT=stage2` over `fmt`, `ast`, `err`, `ui`, `glsl`, `glsl --es`, `ir --norm` and `llvm` (one input per call) | one summary line per comparison, then `diff.sh self: N ok, N failed` |
+| `self` | stage 1 (`target/j3c`) builds stage 2 from a scratch copy of `j3c-bootstrap/{j3.toml,src,text}` under `<repo>/target/self.PID/` (never in place), then `DIFF_STAGE0=stage1 DIFF_BOOT=stage2` over `fmt`, `ast`, `err`, `ui`, `glsl`, `glsl --es`, `ir --norm` and `llvm` (one input per call) | one summary line per comparison, then `diff.sh self: N ok, N failed` |
 
 
 `run` removes a project's `target/.j3c` (stamps and objects) and `target/j3s` (a dev run's bytecode) before each of
@@ -59,7 +59,7 @@ harness, or comparing stage 2 later).
   folder is a project for `ir`/`llvm`/`run` (a folder without `j3.toml` means every project under it);
   `fmt`/`ast`/`err` take every `.j3` under it, skipping `target/` and `*.d/`.
 - `bad/`: parse, name and type errors for `err`, beside the Rust goldens in
-  `j3c/src/compile/tests/diag/`.
+  `diag/` (moved from `j3c/src/compile/tests/diag/` at C6).
   A case that needs more files (a `.j3s` script) keeps them in `bad/NAME.d/`, copied beside `NAME.j3`
   for the check (`*.d` folders are never inputs themselves). A `NAME.d/` with a `j3.toml` makes the case a
   project: `check .` in the copy, entry `NAME.j3`, modules in `NAME.d/src/`.

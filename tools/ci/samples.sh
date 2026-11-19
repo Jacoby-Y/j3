@@ -1,12 +1,12 @@
 #!/bin/sh
 # Headless: run speculative/01-07 and speculative/lang/*, then `j3c check` every examples/*.
-# Exit 1 if any failed. J3C=path/to/j3c (default j3c/target/release/j3c).
-# speculative/08 needs a game loop with input; cargo test covers it through game_headless.
+# Exit 1 if any failed. J3C=path/to/j3c (default j3c-bootstrap/target/j3c).
+# speculative/08 needs a game loop with input (not run here).
 set -u
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root" || exit 2
-j3c=${J3C:-$root/j3c/target/release/j3c}
-[ -x "$j3c" ] || { echo "samples.sh: no j3c at $j3c (cd j3c && cargo build --release)" >&2; exit 2; }
+j3c=${J3C:-$root/j3c-bootstrap/target/j3c}
+[ -x "$j3c" ] || { echo "samples.sh: no j3c at $j3c (./build.sh, or j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap)" >&2; exit 2; }
 unset DISPLAY WAYLAND_DISPLAY
 export SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy
 log=$(mktemp)
