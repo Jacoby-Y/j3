@@ -18,18 +18,6 @@ fn nameLen(s: string): int {
     return n;
 }
 
-/// `@name` / `%name` tokens of an LLVM text line (`%` also matches locals, which only adds misses).
-pub fn llNames(line: string, sigil: u8, out: &Set<string>) {
-    let i = 0;
-    while i < line.len {
-        if line[i] != sigil { i += 1; continue; }
-        let rest = line[i + 1..line.len];
-        let n = nameLen(rest);
-        if n > 0 { out.add(rest[0..n]); }
-        i += 1 + n;
-    }
-}
-
 /// The name a declaration line introduces: `declare ... @f(`, `@g = external ...`, `%T = type ...`;
 /// sigil 0 for none.
 struct Decl {
@@ -55,47 +43,88 @@ fn declaredName(line: string): Decl {
     return none;
 }
 
+/// Where the line starting at `s` ends (its `\n`, or the end of `text`).
+fn lineEnd(text: string, s: int): int {
+    let e = s;
+    while e < text.len && text[e] != '\n' { e += 1; }
+    return e;
+}
+
+/// The `@name` / `%name` tokens of an LLVM text line that `known` has (the only ones a later lookup asks
+/// about; `%` also matches locals, which `known` drops).
+fn llNamesKnown(line: string, sigil: u8, known: &Map<string, int>, out: &Set<string>) {
+    let i = 0;
+    while i < line.len {
+        if line[i] != sigil { i += 1; continue; }
+        let rest = line[i + 1..line.len];
+        let n = nameLen(rest);
+        if n > 0 && known.has(rest[0..n]) { out.add(rest[0..n]); }
+        i += 1 + n;
+    }
+}
+
 /// Drop the declarations and types a per-module text never uses. Every module declares the whole
 /// program (types, `use lib` bindings, foreign globals and functions), which clang would parse for
 /// every object. A `; use lib` comment goes with the declaration under it (Rust `prune_unused`).
+/// J3: The lines are walked in place (no line or decl lists) and the name sets hold declared names only
+/// (Rust's hold every `%` local too); `out` is sized for the whole text once. Same kept lines: a name no
+/// line declares is never looked up.
 pub fn pruneUnused(text: string, out: &Text) {
     let arena = out.arena;
-    let lines = List<string>.new(arena);
-    let s = 0;
-    for i in 0..text.len {
-        if text[i] == '\n' { lines.push(text[s..i]); s = i + 1; }
+    let need = out.bytes.len + text.len + 1;
+    if out.cap < need {
+        let fresh = arena.alloc::<u8>(need);
+        for k in 0..out.bytes.len { fresh[k] = out.bytes[k]; }
+        out.bytes = []u8 { ptr: fresh.ptr, len: out.bytes.len };
+        out.cap = need;
     }
-    if s < text.len { lines.push(text[s..text.len]); }
-    let decl = List<Decl>.new(arena);
-    for i in 0..lines.len { decl.push(declaredName(lines.items[i])); }
+    // Declared names: `@` ones (value unused) and `%` types with the start of their line (the last wins).
+    let funcs = Map<string, int>.new(arena, 256);
+    let byType = Map<string, int>.new(arena, 64);
+    let s = 0;
+    while s < text.len {
+        let e = lineEnd(text, s);
+        let d = declaredName(text[s..e]);
+        if d.sigil == '@' { funcs.put(d.name, s); }
+        if d.sigil == '%' { byType.put(d.name, s); }
+        s = e + 1;
+    }
     let used = Set<string>.new(arena, 256);
     let types = Set<string>.new(arena, 256);
-    for i in 0..lines.len {
-        let line = lines.items[i];
-        if decl.items[i].sigil == 0 && !isLibNote(line) {
-            llNames(line, '@', &used);
-            llNames(line, '%', &types);
+    s = 0;
+    while s < text.len {
+        let e = lineEnd(text, s);
+        let line = text[s..e];
+        let d = declaredName(line);
+        if d.sigil == 0 && !isLibNote(line) {
+            llNamesKnown(line, '@', &funcs, &used);
+            llNamesKnown(line, '%', &byType, &types);
         }
+        s = e + 1;
     }
     // Kept `@` declarations name types too; then close over the type lines themselves.
-    for i in 0..lines.len {
-        let d = decl.items[i];
-        if d.sigil == '@' && used.has(d.name) { llNames(lines.items[i], '%', &types); }
-    }
-    let byType = Map<string, int>.new(arena, 64);
-    for i in 0..lines.len {
-        if decl.items[i].sigil == '%' { byType.put(decl.items[i].name, i); }
+    s = 0;
+    while s < text.len {
+        let e = lineEnd(text, s);
+        let line = text[s..e];
+        let d = declaredName(line);
+        if d.sigil == '@' && used.has(d.name) { llNamesKnown(line, '%', &byType, &types); }
+        s = e + 1;
     }
     let stack = List<string>.new(arena);
-    for i in 0..lines.len {
+    s = 0;
+    while s < text.len {
+        let e = lineEnd(text, s);
+        let d = declaredName(text[s..e]);
         // the seed set is every name seen so far; walking each type line once covers it
-        if decl.items[i].sigil == '%' && types.has(decl.items[i].name) { stack.push(decl.items[i].name); }
+        if d.sigil == '%' && types.has(d.name) { stack.push(d.name); }
+        s = e + 1;
     }
     while stack.len > 0 {
         let t = stack.pop();
         match byType.get(t) {
-            Option.Some(li) {
-                let line = lines.items[li];
+            Option.Some(at) {
+                let line = text[at..lineEnd(text, at)];
                 let k = 0;
                 while k + 8 <= line.len && line[k..k + 8] != " = type " { k += 1; }
                 if k + 8 <= line.len {
@@ -113,11 +142,17 @@ pub fn pruneUnused(text: string, out: &Text) {
             Option.None {}
         }
     }
-    for i in 0..lines.len {
-        let line = lines.items[i];
+    s = 0;
+    while s < text.len {
+        let e = lineEnd(text, s);
+        let line = text[s..e];
+        s = e + 1;
         if isLibNote(line) {
-            if i + 1 < lines.len && decl.items[i + 1].sigil != 0 && !keepDecl(decl.items[i + 1], &used, &types) { continue; }
-        } else if !keepDecl(decl.items[i], &used, &types) {
+            if s < text.len {
+                let next = declaredName(text[s..lineEnd(text, s)]);
+                if next.sigil != 0 && !keepDecl(next, &used, &types) { continue; }
+            }
+        } else if !keepDecl(declaredName(line), &used, &types) {
             continue;
         }
         out.add(line).push('\n');

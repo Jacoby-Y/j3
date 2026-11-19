@@ -41,6 +41,30 @@ byte-identity rule, not a metric.
 ## Scoreboard (updated after every wave; details and phase splits in `j3c-bootstrap/SPEED.md`)
 Goal: every row WIN in every column (wall, RSS, size). stage0 = Rust j3c; boot = j3c in J3.
 
+### 2026-11-18, speed wave 2 (HASH: streamed cache key, emit buffers; NOSDL: scene tools via the editor `cli` subprocess as Rust, SDL2/GL dropped; FRONT: keyword table, pool hints, check-only stdlib body drop): wall 15/15 WIN, RSS 15/15 WIN, size WIN
+| # | Metric | stage0 | j3c-boot opt | boot/stage0 wall / RSS | wall / RSS |
+|---|---|---|---|---|---|
+| 1 | self build cold | 3.64 s / 998 MB | 2.92 s / 461 MB | 0.80x / 0.46x | WIN / WIN |
+| 2 | self build warm | 1.15 s / 447 MB | 0.450 s / 353 MB | 0.39x / 0.79x | WIN / WIN |
+| 3 | self build leaf edit | 1.53 s / 470 MB | 0.710 s / 361 MB | 0.46x / 0.77x | WIN / WIN |
+| 4 | editor program cold | 1.28 s / 262 MB | 1.15 s / 141 MB | 0.90x / 0.54x | WIN / WIN |
+| 5 | desk-app cold | 1.17 s / 387 MB | 1.00 s / 214 MB | 0.85x / 0.55x | WIN / WIN |
+| 6 | editor_village cold | 1.61 s / 165 MB | 1.52 s / 101 MB | 0.94x / 0.61x | WIN / WIN |
+| 7 | desk-app leaf edit | 0.500 s / 172 MB | 0.300 s / 161 MB | 0.60x / 0.94x | WIN / WIN |
+| 8 | check corpus (sum, max RSS) | 37.95 s / 218 MB | 19.63 s / 155 MB | 0.52x / 0.71x | WIN / WIN |
+| 9 | check grid_test | 0.520 s / 150 MB | 0.170 s / 103 MB | 0.33x / 0.69x | WIN / WIN |
+| 10 | check j3c-bootstrap | 1.11 s / 447 MB | 0.440 s / 328 MB | 0.40x / 0.73x | WIN / WIN |
+| 11 | fmt --check j3c/stdlib/j3 | 0.090 s / 5 MB | 0.045 s / 3 MB | 0.50x / 0.60x | WIN / WIN |
+| 12 | dump-ir examples/desk-app | 0.370 s / 177 MB | 0.200 s / 162 MB | 0.54x / 0.92x | WIN / WIN |
+| 13 | dump-bc scripted/fighter.j3s | 0.016 s / 19 MB | 0.010 s / 17 MB | 0.63x / 0.89x | WIN / WIN |
+| 14 | doc x3 | 0.195 s / 27 MB | 0.044 s / 21 MB | 0.23x / 0.78x | WIN / WIN |
+| 15 | new + first check | 0.018 s / 19 MB | 0.010 s / 14 MB | 0.56x / 0.74x | WIN / WIN |
+| 16 | binary size, stripped | 13.43 MB | 11.87 MB | 0.88x | WIN |
+
+j3c-boot NEEDED: libc, ld-linux, libm only (was libSDL2 + ~40). Rows 1-3 build a smaller j3c-bootstrap than before (the
+`j3_editor` dependency is gone), same program for both compilers. Thinnest margins: 7 RSS (0.94x), 12 RSS (0.92x),
+6 wall (0.94x), 4 wall (0.90x).
+
 ### 2026-11-18, speed wave 1 (BUILD: posix_spawn clang fan-out, hash step; STARTUP: doc index, bench K-loop; MEM: arenas): wall 15/15 WIN, RSS 7/15 WIN, size WIN
 | # | Metric | stage0 | j3c-boot opt | boot/stage0 wall / RSS | wall / RSS |
 |---|---|---|---|---|---|
@@ -97,4 +121,5 @@ startup via `use lib "SDL2"` in j3.game; needs a frozen-file/stdlib decision). R
 ## Status
 - [x] Phase 1 (2026-11-18: `tools/bench.sh`; `diff.sh` builds j3c-boot `--opt 2`; scoreboard in `SPEED.md`: wall 8 WIN 2 TIE 6 LOSE, RSS 0 WIN, size WIN)
 - [x] Phase 2 (profiled by wave 1 chunks; perf works)
-- [ ] Phase 3+ (wave 1 done 2026-11-18: wall 15/15 WIN, RSS 7/15, size WIN)
+- [x] Phase 3 (wave 1: wall 15/15, RSS 7/15; wave 2 2026-11-18: wall 15/15, RSS 15/15, size WIN)
+- [ ] Phase 4: widen thin margins (7/12 RSS, 4/6 wall) if wanted; final review

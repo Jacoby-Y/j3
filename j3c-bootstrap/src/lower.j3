@@ -14,6 +14,10 @@
 //     explicit input and reads no global state, so modules lower in parallel once signatures are done.
 // J3 (plan 13): body builders grow their lists in `Lw.scratch` and copy them out at exact size
 // (`ir/build.j3`); `fresh` reuses one name buffer.
+// J3 (plan 13): under `check` (`ir.dropStdBodies`) each `stdlib/j3/` body is a window: it and every fn made
+// while it lowers are built in `Lw.bodyMem`, validated, cut to their params (`paramsOnly`) and the memory
+// rewound. A window holding a fn outside `stdlib/j3/` (preflight walks it) or one that fails validation
+// (`validatePass` reports it) is kept whole, and `bodyMem` then lives on past `lowerProgram`.
 module j3c.lower;
 // J3: Contract (wave 4, `.swarm-opus/11-port/contracts-c2a-sema.md`): `LowerCx`, `lowerProgram`,
 // `lowerModule`, `FnLower`. Every `use` of the module is here (stage 0 rejects one repeated in a part).
@@ -30,7 +34,7 @@ use j3.data.pool.{ Id, Pool };
 use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.sys.panic;
-use j3.text.{ Text, f32Bits, f64Bits };
+use j3.text.{ Text, contains, f32Bits, f64Bits };
 use j3c.base.diag.Diags;
 use j3c.base.intern.{ Names, Sym, own };
 use j3c.base.span.{ Source, Span, noSpan };
@@ -38,8 +42,9 @@ use j3c.ir.{ AbortKind, AbortStmt, BinOp, Block, BodyBuilder, ConstElems, ConstF
     FieldId, ForRangeStmt, Func, FuncKind, GlobalDef, IfStmt, INTERP_CAP, InterpFillStmt, InterpLit, InterpPart, IrCx, J3Fn, LibFn,
     LocalDecl, Module, Operand, Place, Program, Proj, Rvalue, RvalueKind, ScalarInit, Stmt, StmtKind, StructDef, SwitchCase, SwitchStmt, TryCatch, TyArg,
     TyKind, UnaryOp, UnaryRv, VariantDef, VariantId, Vis, WhileStmt, abiSize, letBinding, opBool, opBytes, opF32Bits, opF64Bits, opFnAddr, opInt,
-    opNull, operandTy, readOnlyView };
+    opNull, operandTy, readOnlyView, dropSources };
 use j3c.ir.dump.tyString;
+use j3c.ir.validate.bodyOk;
 use j3c.ir.names.pushStableTy;
 use j3c.lower.seminit.{ FlatInit, InitKind, flatten };
 use j3c.sema.{ BinKind, Callee, CapturePlace, Checked, ClosureOpKind, ClosureTy, DynCallee, DynLayout, DynTy, LanePlace,
@@ -96,6 +101,16 @@ pub struct Lw {
     nameBuf: Text;
     /// Where body builders grow their lists (`BodyBuilder.newIn`); owned by `lowerProgram` / `lowerModule`.
     scratch: &Arena;
+    /// Where a body being lowered lives: `cx.arena`, or `bodyMem` inside a dropped window (see the header).
+    dest: &Arena;
+    bodyMem: &Arena;
+    /// The Session's sources (`ir.dropSources`), read when `drop`.
+    srcs: &Pool<Source>;
+    drop: bool;
+    /// A window is open (`lowerInto` does not nest one).
+    inWin: bool;
+    /// A window was kept: `bodyMem` holds live bodies.
+    kept: bool;
 
     fn ir(this: &Lw): &IrCx { return this.irp; }
 }
@@ -138,11 +153,23 @@ pub fn lowerProgram(cx: &LowerCx): Option<Program> {
     let scratch = Arena.create(1 << 26); // address space; touched only as far as the biggest fn goes
     defer scratch.destroy();
     let lw = declareAll(cx, p, &scratch);
+    let bodyMem = Arena.create(64);
+    match dropSources() {
+        Option.Some(srcs) {
+            bodyMem.destroy();
+            bodyMem = Arena.create(1 << 28); // address space, rewound after each window
+            lw.srcs = srcs;
+            lw.drop = true;
+        }
+        Option.None {}
+    }
+    lw.bodyMem = &bodyMem;
     for i in 0..cx.checked.mods.len { lowerMod(lw, &cx.checked.mods.items[i]); }
-    if cx.diags.hasErrors() { return Option.None; }
+    if cx.diags.hasErrors() { return Option.None; } // ponytail: bodyMem leaks on this error path (a compiler bug)
     instDropUnused(lw);
     if p.modules.len > 0 { p.modules.items[p.modules.len - 1].structs.extend(lw.tuples.slice()); }
     dynProgramDone(lw);
+    if !lw.kept { bodyMem.destroy(); }
     return Option.Some(*p);
 }
 
@@ -172,7 +199,8 @@ fn declareAll(cx: &LowerCx, p: &Program, scratch: &Arena): &Lw {
         enumIds: List<u32>.new(cx.arena), fnIds: List<u32>.new(cx.arena), globalIds: List<u32>.new(cx.arena),
         tyMemo: List<u32>.new(cx.arena), insts: Map<u64, u32>.new(cx.arena, 64), tuples: List<Id<StructDef>>.new(cx.arena), modIds: List<int>.new(cx.arena), curMod: 0,
         instFuncs: List<u32>.new(cx.arena), pending: List<Id<Instance>>.new(cx.arena),
-        methodFns: Map<u64, u32>.new(cx.arena, 64), lazy: Map<u32, u32>.new(cx.arena, 64), modInsts: List<u32>.new(cx.arena), nameBuf: Text.new(cx.arena), scratch: scratch });
+        methodFns: Map<u64, u32>.new(cx.arena, 64), lazy: Map<u32, u32>.new(cx.arena, 64), modInsts: List<u32>.new(cx.arena), nameBuf: Text.new(cx.arena), scratch: scratch,
+        dest: cx.arena, bodyMem: scratch, srcs: p.cx.sources, drop: false, inWin: false, kept: false });
     p.cx.tyRef(p.cx.common.u8);
     p.cx.tySlice(p.cx.common.u8);
     declareDecls(lw);
@@ -197,8 +225,17 @@ fn lowerInto(lw: &Lw, id: Id<TBody>, func: Id<Func>, inst: Option<Id<Instance>>)
         Option.Some(s) { ret = s.ret; params = s.params; }
         Option.None {}
     }
-    let f = lw.cx.arena.new::<FnLower>(FnLower { inst: inst, cx: lw.cx, lw: lw, body: id, loops: List<int>.new(lw.cx.arena),
-        defers: List<int>.new(lw.cx.arena), b: BodyBuilder.newIn(lw.cx.arena, lw.scratch, ir.common.void), locals: Map<u32, u32>.new(lw.cx.arena, 32),
+    let win = lw.drop && !lw.inWin && isStd(lw, ir.func(func).span);
+    let first = ir.allFuncs().len;
+    let mark = lw.bodyMem.checkpoint();
+    let cap = lw.bodyMem.cap;
+    if win {
+        lw.inWin = true;
+        lw.dest = lw.bodyMem;
+    }
+    let a = lw.dest;
+    let f = a.new::<FnLower>(FnLower { inst: inst, cx: lw.cx, lw: lw, body: id, loops: List<int>.new(a),
+        defers: List<int>.new(a), b: BodyBuilder.newIn(a, lw.scratch, ir.common.void), locals: Map<u32, u32>.new(a, 32),
         ret: ret, tmp: 0, clo: closureFrameNone() });
     for i in 0..tb.params.len {
         let l = lw.typed.local(tb.params.items[i]);
@@ -209,4 +246,56 @@ fn lowerInto(lw: &Lw, id: Id<TBody>, func: Id<Func>, inst: Option<Id<Instance>>)
     let body = f.b.finish();
     instWake(lw, &body.block);
     ir.funcMut(func).kind = FuncKind.J3(J3Fn { body: body });
+    if win {
+        lw.inWin = false;
+        lw.dest = lw.cx.arena;
+        if dropWindow(lw, func, first) {
+            // a grow moved the bump into a chunk that holds only this window
+            lw.bodyMem.rewind(if lw.bodyMem.cap == cap { mark } else { 0 });
+        } else {
+            lw.kept = true;
+        }
+    }
+}
+
+/// Is `sp` in a `stdlib/j3/` file (one `toolchain.preflight` skips)? A span with no file counts as one.
+fn isStd(lw: &Lw, sp: Span): bool {
+    if int(sp.file.i) >= lw.srcs.len() { return true; }
+    return contains(lw.srcs.get(sp.file).path, "stdlib/j3/");
+}
+
+/// A window's fns (`func` and every J3 fn from id `first` on): when all are in `stdlib/j3/` and validate,
+/// each keeps only its params (`paramsOnly`, in `cx.arena`) and true; false leaves them whole.
+fn dropWindow(lw: &Lw, func: Id<Func>, first: int): bool {
+    let ir = lw.ir();
+    let fs = ir.allFuncs();
+    for k in first - 1..fs.len {
+        let id = if k < first { func } else { Id<Func> { i: u32(k) } };
+        let f = ir.funcMut(id);
+        match f.kind {
+            FuncKind.J3(j) { if !isStd(lw, f.span) || !bodyOk(ir, f.ty, &j.body) { return false; } }
+            _ {}
+        }
+    }
+    for k in first - 1..fs.len {
+        let id = if k < first { func } else { Id<Func> { i: u32(k) } };
+        let f = ir.funcMut(id);
+        match f.kind {
+            FuncKind.J3(j) { f.kind = FuncKind.J3(J3Fn { body: paramsOnly(lw.cx.arena, &j.body) }); }
+            _ {}
+        }
+    }
+    return true;
+}
+
+/// `b` with no statements and only the locals up to its last param (what `validate` and `preflight` read
+/// of a dropped body), copied into `a`.
+fn paramsOnly(a: &Arena, b: &Body): Body {
+    let n = 0;
+    for i in 0..b.params.len { if int(b.params.items[i].i) + 1 > n { n = int(b.params.items[i].i) + 1; } }
+    let locals = Pool<LocalDecl>.new(a);
+    for i in 0..n { locals.add(b.local(Id<LocalDecl> { i: u32(i) })); }
+    let params = List<Id<LocalDecl>>.new(a);
+    params.extend(b.params.slice());
+    return Body { locals: locals, params: params, block: Block.empty(a) };
 }

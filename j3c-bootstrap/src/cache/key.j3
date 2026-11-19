@@ -8,6 +8,8 @@
 // J3: `compilerId` keeps its stamp in `<cache>/compiler-boot.id`, not Rust's `compiler.id`: sharing the file would make
 // each compiler re-hash itself after the other ran. The stamp is `size sec.nsec` (`fsx.statNs`; seconds only
 // off x86-64 Linux).
+// J3: `moduleKey` streams `moduleIr` piece by piece into the hash and the layout scan (Rust builds the
+// whole text); the key takes the text's `xxh3_64`, not the text.
 module j3c.cache;
 
 /// Layout text of every struct and enum, with which other entries each one names (Rust `Layouts`).
@@ -18,7 +20,7 @@ pub struct Layouts {
     deps: List<List<int>>;
     /// Type name -> its entries (a lookup only; several modules may share a name).
     byNeedle: Map<string, List<int>>;
-    /// `xxh3_64` of each entry's text: the key hashes these, not the joined text (`hashLayouts`).
+    /// `xxh3_64` of each entry's text: the key hashes these, not the joined text (`hashSeen`).
     hashes: List<u64>;
     /// `firsts[b]`: some type name starts with byte `b` (`pushNamed` skips the map for the other tokens).
     firsts: []bool;
@@ -101,15 +103,53 @@ fn hashStr(h: &Xxh3, s: string) {
 }
 
 /// Rust `object_key`: 16 hex digits over chunks, the layout digest of the types `text` names (as entry
-/// hashes, see `hashLayouts`), `text`, opt,
-/// debug, release, target, cpu, flags, clang and `compilerId`.
+/// hashes, see `hashSeen`), the hash of `text`, opt, debug, release, target, cpu, flags, clang and `compilerId`.
 pub fn objectKey(text: string, e: &EmitOpts, layouts: &Layouts, arena: &Arena): string {
+    let seen = layoutsNamed(layouts, text, arena);
+    return keyOf(e, layouts, &seen, xxh3_64(text as []u8), arena);
+}
+
+/// Buffers `moduleKey` reuses from module to module.
+pub struct KeyBufs {
+    piece: Text;
+    seen: List<bool>;
+    stack: List<int>;
+}
+
+pub fn keyBufs(l: &Layouts, arena: &Arena): KeyBufs {
+    let b = KeyBufs { piece: Text.new(arena), seen: List<bool>.new(arena), stack: List<int>.new(arena) };
+    for _ in 0..l.texts.len { b.seen.push(false); }
+    return b;
+}
+
+/// `objectKey(moduleIr(m))` without ever holding the module's text: each piece of `moduleIr` goes into
+/// `b.piece`, then into the layout scan and the text hash, so only the biggest piece (one fn) is held.
+/// The same key, as no name spans two pieces. Also the text's length (the unit's cost).
+/// J3: Rust builds the whole text (`module_ir`); on a self build that text and its growth were ~60 MB.
+pub fn moduleKey(cx: &IrCx, m: &Module, e: &EmitOpts, l: &Layouts, b: &KeyBufs, arena: &Arena): (string, int) {
+    let h = Xxh3.new();
+    let n = 0;
+    for p in 0..irPieces(m) {
+        b.piece.clear();
+        irPiece(cx, m, p, &b.piece);
+        let s = b.piece.str();
+        pushNamed(l, s, &b.stack, &b.seen);
+        h.update(s as []u8);
+        n += s.len;
+    }
+    closeNamed(l, &b.stack, &b.seen);
+    let key = keyOf(e, l, &b.seen, h.finish(), arena);
+    for i in 0..b.seen.len { b.seen.items[i] = false; }
+    return (key, n);
+}
+
+fn keyOf(e: &EmitOpts, layouts: &Layouts, seen: &List<bool>, textHash: u64, arena: &Arena): string {
     let h = Xxh3.new();
     let t = Text.new(arena);
     t.fmt(`{e.chunks}`);
     hashStr(&h, t.str());
-    hashLayouts(&h, layouts, text, arena);
-    hashStr(&h, text);
+    hashSeen(&h, layouts, seen, arena);
+    hashU64(&h, textHash);
     hashStr(&h, e.cc.opt);
     hashStr(&h, if e.cc.debug { "g" } else { "" });
     hashStr(&h, if e.cc.release { "r" } else { "" });
@@ -122,6 +162,12 @@ pub fn objectKey(text: string, e: &EmitOpts, layouts: &Layouts, arena: &Arena): 
     t.pushHex(compilerId(arena));
     hashStr(&h, t.str());
     return hex16(h.finish(), arena);
+}
+
+fn hashU64(h: &Xxh3, x: u64) {
+    let v: [1]u64 = [x];
+    let bytes: []u8 = @slice(v[..].ptr as ptr, 8);
+    h.update(bytes);
 }
 
 /// A byte of a name token (Rust `tokens`: alphanumeric or `_`; every non-ASCII byte counts, so a name is
@@ -225,14 +271,11 @@ pub fn layoutsFor(l: &Layouts, moduleText: string, arena: &Arena): string {
 /// hashes the joined text; joining and hashing every module's layouts (hundreds of KB for a module that
 /// names the IR types) was half of `emit: hash modules`. Same entries, same order: same digest; an edited
 /// entry changes its hash.
-fn hashLayouts(h: &Xxh3, l: &Layouts, moduleText: string, arena: &Arena) {
-    let seen = layoutsNamed(l, moduleText, arena);
+fn hashSeen(h: &Xxh3, l: &Layouts, seen: &List<bool>, arena: &Arena) {
     let n = 0;
     for i in 0..seen.len {
         if !seen.items[i] { continue; }
-        let v: [1]u64 = [l.hashes.items[i]];
-        let bytes: []u8 = @slice(v[..].ptr as ptr, 8);
-        h.update(bytes);
+        hashU64(h, l.hashes.items[i]);
         n += 1;
     }
     let t = Text.new(arena);
@@ -246,6 +289,12 @@ fn layoutsNamed(l: &Layouts, moduleText: string, arena: &Arena): List<bool> {
     for _ in 0..l.texts.len { seen.push(false); }
     let stack = List<int>.new(arena);
     pushNamed(l, moduleText, &stack, &seen);
+    closeNamed(l, &stack, &seen);
+    return seen;
+}
+
+/// Mark the entries the ones on `stack` name, until it is empty.
+fn closeNamed(l: &Layouts, stack: &List<int>, seen: &List<bool>) {
     while stack.len > 0 {
         let d = l.deps.items[stack.pop()];
         for k in 0..d.len {
@@ -255,14 +304,55 @@ fn layoutsNamed(l: &Layouts, moduleText: string, arena: &Arena): List<bool> {
             stack.push(e);
         }
     }
-    return seen;
 }
 
 /// Rust `module_ir`: the stable IR text of one module (no ids that change between compiles) into `out`:
 /// the IR dump, type arguments and field types, globals with their initializers, each fn's symbol, local
-/// types and constants.
+/// types and constants. It is the pieces of `irPiece` joined.
 pub fn moduleIr(cx: &IrCx, m: &Module, out: &Text) {
-    dumpModule(cx, m, out);
+    for p in 0..irPieces(m) { irPiece(cx, m, p, out); }
+}
+
+/// How many pieces `moduleIr` has: the dump's head and structs, each fn's dump, the type and global text,
+/// each fn's key text.
+fn irPieces(m: &Module): int { return 2 * m.funcs.len + 2; }
+
+/// Piece `p` of `moduleIr`, appended to `out`. Every piece ends in a byte no name holds (`moduleKey`
+/// scans them one by one).
+/// J3: Rust's text has no `\n` after a fn's key text (it is `module_ir`'s only change).
+fn irPiece(cx: &IrCx, m: &Module, p: int, out: &Text) {
+    let nf = m.funcs.len;
+    if p == 0 {
+        let head = *m;
+        head.funcs.len = 0;
+        dumpModule(cx, &head, out);
+    } else if p <= nf {
+        let f = cx.func(m.funcs.items[p - 1]);
+        dumpFunc(cx, &f, out);
+        out.push('\n');
+    } else if p == nf + 1 {
+        typesIr(cx, m, out);
+    } else {
+        let f = cx.func(m.funcs.items[p - nf - 2]);
+        pushFuncName(out, cx, &f);
+        out.push(';');
+        match f.kind {
+            FuncKind.J3(jf) {
+                for k in 0..jf.body.locals.len() {
+                    pushStableTy(out, cx, jf.body.local(Id<LocalDecl> { i: u32(k) }).ty, 0);
+                    out.push(';');
+                }
+                hashBlock(cx, &jf.body.block, out);
+            }
+            FuncKind.Lib(_) {}
+            FuncKind.Decl {}
+        }
+        out.push('\n');
+    }
+}
+
+/// Type arguments and field types, enum payloads, globals with their initializers.
+fn typesIr(cx: &IrCx, m: &Module, out: &Text) {
     for i in 0..m.structs.len {
         let def = cx.structDef(m.structs.items[i]);
         for j in 0..def.tyArgs.len {
@@ -296,21 +386,5 @@ pub fn moduleIr(cx: &IrCx, m: &Module, out: &Text) {
             Option.None {}
         }
         out.push(';');
-    }
-    for i in 0..m.funcs.len {
-        let f = cx.func(m.funcs.items[i]);
-        pushFuncName(out, cx, &f);
-        out.push(';');
-        match f.kind {
-            FuncKind.J3(jf) {
-                for k in 0..jf.body.locals.len() {
-                    pushStableTy(out, cx, jf.body.local(Id<LocalDecl> { i: u32(k) }).ty, 0);
-                    out.push(';');
-                }
-                hashBlock(cx, &jf.body.block, out);
-            }
-            FuncKind.Lib(_) {}
-            FuncKind.Decl {}
-        }
     }
 }

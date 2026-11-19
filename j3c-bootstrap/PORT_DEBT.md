@@ -125,3 +125,16 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
   prints `exit status: 128+N` in `doctor`, `golden`, `dist` (`j3.proc` folds signals; Rust `signal: N`).
 - Rust bug (C5, not copied): stage0's `lsp/json.rs` reads raw UTF-8 inside JSON strings byte by byte, so `'é'` in a
   `didOpen` buffer gives a bogus parse error; j3c-boot uses `j3.data.json`.
+- Not copied (plan 13 speed, `cache/jobs.j3`): clang fan-out is a fixed pool of forked workers fed unit indices on a pipe (costliest first; chunk clangs started from the worker after sequential chunk emits), with a per-unit scratch arena; Rust uses one pool thread per core plus a scoped thread per chunk.
+- Not copied (plan 13 speed, `toolchain.spawnStart`/`spawnRun`): per-module clangs start with libc `posix_spawn`, not `proc.run` (fork); SIGPIPE is left as the process has it.
+- Not copied (plan 13 speed, `cache/key.j3`): the module key is `xxh3_64(moduleIr)` streamed piece by piece (a `\n` after each fn's key text) and the layout digest is the per-entry hashes plus count; Rust hashes the joined text. Keys are j3c-boot's own.
+- Not copied (plan 13 speed, `backend/llvm/names.j3`): `pushFuncName`'s hash input goes in a static 4 KB buffer (Rust: a fresh `DefaultHasher` stream).
+- Not copied (plan 13 speed, `backend/llvm/prune.j3`): in-place line walks, name sets of declared names only, `out` pre-sized (Rust: `lines()` plus a `HashSet` of every token).
+- Not copied (plan 13 speed, `backend/llvm.j3`): the module text is pre-reserved at 64 MB in `out.arena`, `DebugOut` lives there, and `LlvmFn` emit buffers are reused across fns.
+- Not copied (plan 13 speed, `doc/`): `docsId` hashes with XXH3, not FNV-1a (the value never matched Rust); the `doc` index reads the embedded stdlib's heads as text instead of parsing it, and search/byName pre-filter by text; `doc/load.j3` caches the stdlib folders process-wide (Rust recomputes them per call).
+- Not copied (plan 13 speed, memory): frame-string walks use a scratch arena plus `peek`/`derefSelect` instead of clones; token lists, lower scratch and UI generation get their own per-Session arenas; `room` grows pools 8x; `BodyBuilder.newIn` copies lists out at exact size; `Place.project` makes an exact copy; `dumpIrTo` streams its output.
+- Not copied (plan 13 speed, `base/ids.j3`): pool growth releases the old buffer's pages with `madvise`.
+- Not copied (plan 13 speed, `cmd/check`, `ir`): `check` drops validated `stdlib/j3/` IR bodies down to their params (process global `ir.dropStdBodies`/`keepBodies`, set only by `cmd/check`); Rust keeps them all.
+- Not copied (plan 13 speed, `syntax/token.j3`): `keyword` is a hard-coded `kindOf`; `keywords.txt` stays the source for textmate scopes and the type and literal lists, and a unit test ties the two together.
+- Not copied (plan 13 speed, `load/scene_parse.j3`): a hand copy of the stdlib `.j3scene` reader (`j3.scene3d.parse`) so j3c-boot does not link libSDL2; a rule changed in the stdlib reader must change there too (`diff.sh tool` scene/* and `diff.sh run` catch drift).
+- Not copied (plan 13 speed, `scene/ops.j3`): scene tool requests run the editor program in its `cli` mode as a subprocess, as Rust does, reverting B12.1's in-process `j3_editor.tool` (cost: one editor build per new j3c-boot binary, one process per request).
