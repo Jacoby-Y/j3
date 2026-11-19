@@ -32,7 +32,9 @@ if d=$(git describe --tags --match 'v[0-9]*' --dirty 2>/dev/null) && t=$(git des
     printf '%s\n%s\n' "${d#v}" "${t#v}" > "$vf"
 fi
 echo "build.sh: stage 1 (built by stage 0)"
-timeout 1800 "$s0" build --opt 2 j3c-bootstrap
+# Stage 0 embeds the stdlib of its tag; the compiler uses newer stdlib modules (j3.data.toml), so stage 0 reads
+# the tree on disk.
+J3_STDLIB=$root/j3c/stdlib timeout 1800 "$s0" build --opt 2 j3c-bootstrap
 stage1=$root/j3c-bootstrap/target/j3c
 # Stage 2: stage 1 builds a copy under target/stage2/ (kept, so its object cache makes rebuilds fast), never
 # j3c-bootstrap in place under the running binary. A `j3c` link beside the copy keeps `@embed("../../../j3c/...")`.

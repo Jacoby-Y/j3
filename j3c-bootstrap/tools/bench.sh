@@ -13,7 +13,8 @@ here=$(cd "$(dirname "$0")" && pwd); boot=$(dirname "$here"); root=$(dirname "$b
 S0=$(realpath "${BENCH_STAGE0:-$boot/stage0/j3c}"); BT=$(realpath "${BENCH_BOOT:-$boot/target/j3c}")
 N=${BENCH_N:-3}; out=$root/target/bench; W=$out/w; tf=$out/time.txt
 export J3C_NO_INSTALL=1 SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy
-unset J3_STDLIB
+# stage 0 needs the stdlib on disk to build j3c-bootstrap (it uses modules newer than its tag); both sides read it
+export J3_STDLIB=$W/j3c/stdlib
 names=('' 'self build cold' 'self build warm' 'self build leaf edit' 'editor program cold' 'desk-app cold'
     'editor_village cold' 'desk-app leaf edit' 'check corpus (sum, max RSS)' 'check grid_test' 'check j3c-bootstrap'
     'fmt --check j3c/stdlib/j3' 'dump-ir examples/desk-app' 'dump-bc scripted/fighter.j3s'

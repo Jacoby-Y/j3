@@ -21,7 +21,7 @@ if [ -z "${J3_SKIP_BUILD:-}" ]; then
   vf=j3c-bootstrap/text/version-build.txt
   d=$(git describe --tags --match 'v[0-9]*' --dirty) || die "git describe: no v* tag (fetch tags)"
   printf '%s\n%s\n' "${d#v}" "$(git describe --tags --match 'v[0-9]*' --abbrev=0 | sed 's/^v//')" > "$vf"
-  j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap || { rm -f "$vf"; die "build failed"; }
+  J3_STDLIB=$PWD/j3c/stdlib j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap || { rm -f "$vf"; die "build failed"; }
   rm -f "$vf"
   strip j3c-bootstrap/target/j3c
 fi

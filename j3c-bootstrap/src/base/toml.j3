@@ -1,21 +1,25 @@
 // The TOML subset `j3.toml` and the user config use: tables, strings, string arrays, ints, bools, inline
-// tables.
+// tables. The reading is `j3.data.toml.items` (the stdlib's TOML reader, so there is one); this keeps the
+// `Table` view the manifest, deps, golden and config readers want, and the subset's rules.
 //
 // Port of: j3c/src/project/toml.rs
 module j3c.base.toml;
 // J3: Strings in a `Table` are arena copies. The JSON view (`json`, Rust `toml/json.rs`) is the part
 // `base/toml/json.j3`. Rust's `toml_doc` and `TomlVal::as_list` come with their callers (`manifest`,
 // `j3c golden`); `list` inlines `as_list`.
-// J3: Bytes, not chars: every character the reader looks at is ASCII, so a multi-byte UTF-8 sequence passes
-// through whole. ponytail: `trim` is ASCII-only where Rust's `str::trim` also drops Unicode spaces (U+00A0
-// ...); a j3.toml line padded with those reads differently. Add a Unicode trim if one ever shows up.
+// J3: Since the stdlib reader took over, the file reads full TOML lines (multi-line arrays, literal and
+// multi-line strings, dotted keys, `1_000`); where it differs from Rust is in PORT_DEBT.md ("base/toml").
+// Strings in a `Val` are kept as written: the decoded string escaped again (`written`), so `\u00e9` comes
+// back as `é` but `unescape` still gives the same text. ponytail: a number in an inline table keeps its token.
 
+use j3.data.json.{ Json, Kind };
+use j3.data.toml;
+use j3.data.toml.ItemKind;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.result.Result;
-use j3.text.{ Text, decodeRune, lines, trim };
-use j3c.base.intern.own;
-use j3c.base.text_fmt.{ hexVal, isAlpha, isDigit };
+use j3.text.{ Text, decodeRune };
+use j3c.base.text_fmt.{ isAlpha, isDigit };
 
 /// One value (Rust `TomlVal`). Strings are kept as written; `unescape` decodes them.
 pub enum Val {
@@ -100,178 +104,108 @@ fn lineErr(arena: &Arena, line: int, msg: string): string {
     return t.str();
 }
 
-/// `text` parsed; Err is Rust's message (`j3.toml:3: key outside a section`), in `arena`.
+/// `text` parsed; Err reads `j3.toml:3: key outside a section`, in `arena`. The lines are read by
+/// `j3.data.toml.items` (the one TOML reader); this adds the subset's rules: every key under a `[section]`,
+/// keys are `isIdent`, arrays hold strings, inline tables hold strings or bare tokens, no `[[...]]`.
 pub fn parse(text: string, arena: &Arena): Result<Table, string> {
+    let its = match toml.items(text, arena) {
+        Result.Ok(x) { x }
+        Result.Err(e) { return Result.Err(lineErr(arena, e.line, e.msg)); }
+    };
     let section = "";
     let t = Table { vals: List<Entry>.new(arena), heads: List<Head>.new(arena), lines: List<int>.new(arena) };
-    let lineNo = 0;
-    for raw in lines(text) {
-        lineNo += 1;
-        let line = trim(stripComment(raw));
-        if line.len == 0 { continue; }
-        match parseSection(line) {
-            Option.Some(name) {
-                section = own(arena, name);
-                t.heads.push(Head { name: section, line: lineNo });
-                continue;
+    for i in 0..its.len {
+        let it = its.items[i];
+        match it.kind {
+            ItemKind.Table {
+                section = joinKeys(&it.keys, it.keys.len, arena);
+                t.heads.push(Head { name: section, line: it.line });
             }
-            Option.None {}
+            ItemKind.ArrayTable {
+                return Result.Err(lineErr(arena, it.line, "`[[...]]` (an array of tables) is not read in this file"));
+            }
+            ItemKind.Key {
+                if section.len == 0 { return Result.Err(lineErr(arena, it.line, "key outside a section")); }
+                for k in 0..it.keys.len {
+                    if !isIdent(it.keys.items[k]) { return Result.Err(lineErr(arena, it.line, "bad key")); }
+                }
+                let key = it.keys.items[it.keys.len - 1];
+                // `a.b = 1` under `[s]` is `b` in `[s.a]`
+                let sec = section;
+                if it.keys.len > 1 {
+                    sec = Text.new(arena).add(section).add(".").add(joinKeys(&it.keys, it.keys.len - 1, arena)).str();
+                }
+                let val = fromJson(it.val, key, it.line, arena)?;
+                t.vals.push(Entry { section: sec, key: key, val: val });
+                t.lines.push(it.line);
+            }
         }
-        if section.len == 0 { return Result.Err(lineErr(arena, lineNo, "key outside a section")); }
-        let (key, val) = parseKeyVal(line, lineNo, arena)?;
-        t.vals.push(Entry { section: section, key: key, val: val });
-        t.lines.push(lineNo);
     }
     return Result.Ok(t);
 }
 
-/// `line` up to a `#` outside a string.
-fn stripComment(line: string): string {
-    let inStr = false;
-    let i = 0;
-    while i < line.len {
-        let c = line[i];
-        if c == '"' {
-            inStr = !inStr;
-            i += 1;
-        } else if c == '\\' && inStr {
-            i += 2;
-        } else if c == '#' && !inStr {
-            return line[0..i];
-        } else {
-            i += 1;
+fn joinKeys(keys: &List<string>, n: int, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..n {
+        if i > 0 { t.push('.'); }
+        t.add(keys.items[i]);
+    }
+    return t.str();
+}
+
+/// A decoded string back in its written form (`unescape` reverses it), so callers keep reading escapes.
+fn written(s: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    toml.escape(&t, s);
+    return t.str();
+}
+
+/// A scalar as the subset keeps it: a string as written, a number or bool as its token, else None.
+fn scalar(v: &Json, arena: &Arena): Option<Val> {
+    if v.kind == Kind.Str { return Option.Some(Val.Str(written(v.s, arena))); }
+    if v.kind == Kind.Num || v.kind == Kind.Bool { return Option.Some(Val.Bare(v.s)); }
+    return Option.None;
+}
+
+fn fromJson(v: &Json, key: string, line: int, arena: &Arena): Result<Val, string> {
+    if v.kind == Kind.Arr {
+        let out = List<string>.new(arena);
+        for i in 0..v.len() {
+            let e = v.at(i);
+            if e.kind != Kind.Str { return Result.Err(lineErr(arena, line, "expected a \"string\"")); }
+            out.push(written(e.s, arena));
         }
+        return Result.Ok(Val.List(StrList { items: out }));
     }
-    return line;
-}
-
-/// `[name]` (no brackets or spaces inside, not empty), else None. A slice of `line`.
-fn parseSection(line: string): Option<string> {
-    if line.len < 2 || line[0] != '[' || line[line.len - 1] != ']' { return Option.None; }
-    let s = line[1..line.len - 1];
-    if s.len == 0 { return Option.None; }
-    for i in 0..s.len {
-        if s[i] == '[' || s[i] == ']' || s[i] == ' ' { return Option.None; }
-    }
-    return Option.Some(s);
-}
-
-fn parseKeyVal(line: string, lineNo: int, arena: &Arena): Result<(string, Val), string> {
-    let eq = 0;
-    while eq < line.len && line[eq] != '=' { eq += 1; }
-    if eq == line.len { return Result.Err(lineErr(arena, lineNo, "expected `key = value`")); }
-    let key = trim(line[0..eq]);
-    if key.len == 0 || !isIdent(key) { return Result.Err(lineErr(arena, lineNo, "bad key")); }
-    let rhs = trim(line[eq + 1..line.len]);
-    let val = Val.Bare("");
-    if rhs.len > 0 && rhs[0] == '{' {
-        val = Val.Map(StrMap { pairs: parseInlineTable(rhs, lineNo, arena)? });
-    } else if rhs.len > 0 && rhs[0] == '[' {
-        val = Val.List(StrList { items: parseStringArray(rhs, lineNo, arena)? });
-    } else if rhs.len > 0 && rhs[0] == '"' {
-        val = Val.Str(parseString(rhs, lineNo, arena)?);
-    } else if isBare(rhs) {
-        val = Val.Bare(own(arena, rhs));
-    } else {
-        val = Val.Str(parseString(rhs, lineNo, arena)?);
-    }
-    return Result.Ok((own(arena, key), val));
-}
-
-fn isBare(s: string): bool {
-    if s.len == 0 { return false; }
-    for i in 0..s.len {
-        let c = s[i];
-        if !isAlnum(c) && c != '_' && c != '-' && c != '.' { return false; }
-    }
-    return true;
-}
-
-fn isAlnum(c: u8): bool { return isAlpha(c) || isDigit(c); }
-
-/// A bare key: ASCII letters, digits, `_`, `-` (Rust `is_ident`).
-pub fn isIdent(s: string): bool {
-    if s.len == 0 || (!isAlpha(s[0]) && s[0] != '_') { return false; }
-    for i in 1..s.len {
-        let c = s[i];
-        if !isAlnum(c) && c != '_' && c != '-' { return false; }
-    }
-    return true;
-}
-
-/// The body of `"..."`, as written (escapes kept), in `arena`.
-fn parseString(s: string, lineNo: int, arena: &Arena): Result<string, string> {
-    if s.len < 2 || s[0] != '"' || s[s.len - 1] != '"' { return Result.Err(lineErr(arena, lineNo, "expected a \"string\"")); }
-    return Result.Ok(own(arena, s[1..s.len - 1]));
-}
-
-/// `{ a = "x", b = "y" }`: string values only, on one line.
-fn parseInlineTable(s: string, lineNo: int, arena: &Arena): Result<List<Pair>, string> {
-    if s.len < 2 || s[0] != '{' || s[s.len - 1] != '}' {
-        return Result.Err(lineErr(arena, lineNo, "expected `{ key = \"value\", ... }` on one line"));
-    }
-    let inner = s[1..s.len - 1];
-    let out = List<Pair>.new(arena);
-    let start = 0;
-    let inStr = false;
-    let esc = false;
-    // one past the end stands for the `,` Rust chains on
-    for i in 0..inner.len + 1 {
-        let c: u8 = if i < inner.len { inner[i] } else { ',' };
-        // `\"` inside a string is a quote, not its end (as in `stripComment`)
-        if esc {
-            esc = false;
-        } else if inStr && c == '\\' {
-            esc = true;
-        } else if c == '"' {
-            inStr = !inStr;
-        }
-        if c == ',' && !inStr {
-            let part = trim(inner[start..i]);
-            if part.len > 0 {
-                let (k, v) = parseKeyVal(part, lineNo, arena)?;
-                match v {
-                    Val.Str(x) { out.push(Pair { key: k, value: x }); }
-                    Val.Bare(x) { out.push(Pair { key: k, value: x }); }
-                    Val.List(_) { return Result.Err(notString(arena, lineNo, k)); }
-                    Val.Map(_) { return Result.Err(notString(arena, lineNo, k)); }
-                }
+    if v.kind == Kind.Obj {
+        let out = List<Pair>.new(arena);
+        for i in 0..v.len() {
+            match scalar(v.at(i), arena) {
+                Option.Some(Val.Str(x)) { out.push(Pair { key: v.keys.items[i], value: x }); }
+                Option.Some(Val.Bare(x)) { out.push(Pair { key: v.keys.items[i], value: x }); }
+                _ { return Result.Err(notString(arena, line, v.keys.items[i])); }
             }
-            start = i + 1;
         }
+        return Result.Ok(Val.Map(StrMap { pairs: out }));
     }
-    return Result.Ok(out);
+    match scalar(v, arena) {
+        Option.Some(x) { return Result.Ok(x); }
+        Option.None { return Result.Err(lineErr(arena, line, "expected a \"string\"")); }
+    }
 }
 
 fn notString(arena: &Arena, lineNo: int, k: string): string {
     return lineErr(arena, lineNo, Text.new(arena).add("`").add(k).add("` in an inline table must be a string").str());
 }
 
-/// `["a", "b"]`: quoted strings only (escapes kept).
-fn parseStringArray(s: string, lineNo: int, arena: &Arena): Result<List<string>, string> {
-    if s.len < 2 || s[0] != '[' || s[s.len - 1] != ']' { return Result.Err(lineErr(arena, lineNo, "expected an array")); }
-    let inner = trim(s[1..s.len - 1]);
-    let out = List<string>.new(arena);
-    let start = 0;
-    let inStr = false;
-    let esc = false;
-    for i in 0..inner.len {
-        let c = inner[i];
-        if esc {
-            esc = false;
-        } else if inStr && c == '\\' {
-            esc = true;
-        } else if c == '"' {
-            inStr = !inStr;
-        } else if c == ',' && !inStr {
-            let part = trim(inner[start..i]);
-            if part.len > 0 { out.push(parseString(part, lineNo, arena)?); }
-            start = i + 1;
-        }
+/// A bare key: ASCII letters, digits, `_`, `-`, not starting with a digit or `-` (Rust `is_ident`).
+pub fn isIdent(s: string): bool {
+    if s.len == 0 || (!isAlpha(s[0]) && s[0] != '_') { return false; }
+    for i in 1..s.len {
+        let c = s[i];
+        if !isAlpha(c) && !isDigit(c) && c != '_' && c != '-' { return false; }
     }
-    let part = trim(inner[start..inner.len]);
-    if part.len > 0 { out.push(parseString(part, lineNo, arena)?); }
-    return Result.Ok(out);
+    return true;
 }
 
 /// `[section] key` of `text` as a string, as written (escapes kept, as Rust), None when absent or not a
@@ -301,46 +235,7 @@ pub fn list(text: string, section: string, key: string, arena: &Arena): Option<L
     }
 }
 
-/// A quoted string's body with its escapes decoded (Rust `unescape`): `\"`, `\\`, `\n`, `\t`, `\r`, `\b`,
-/// `\f`, `\uXXXX`, `\UXXXXXXXX`. Anything else (a bad `\u`, a surrogate) stays as written.
+/// A quoted string's body with its escapes decoded (Rust `unescape`): `j3.data.toml.unescape`.
 pub fn unescape(s: string, arena: &Arena): string {
-    let out = Text.new(arena);
-    let i = 0;
-    while i < s.len {
-        let c = s[i];
-        if c != '\\' || i + 1 >= s.len {
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        let n = s[i + 1];
-        let simple: int = -1;
-        if n == '"' { simple = 34; } else if n == '\\' { simple = 92; } else if n == 'n' { simple = 10; }
-        else if n == 't' { simple = 9; } else if n == 'r' { simple = 13; } else if n == 'b' { simple = 8; }
-        else if n == 'f' { simple = 12; }
-        if simple >= 0 {
-            out.push(u8(simple));
-            i += 2;
-            continue;
-        }
-        let hex = if n == 'u' { 4 } else if n == 'U' { 8 } else { 0 };
-        let code = -1;
-        if hex > 0 && i + 2 + hex <= s.len {
-            code = 0;
-            for j in 0..hex {
-                let h = hexVal(s[i + 2 + j]);
-                if h < 0 { code = -1; break; }
-                code = code * 16 + h;
-            }
-        }
-        // `char::from_u32`: no surrogates, nothing past U+10FFFF
-        if code < 0 || (code >= 0xD800 && code <= 0xDFFF) || code > 0x10FFFF {
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        out.pushChar(u32(code));
-        i += 2 + hex;
-    }
-    return out.str();
+    return toml.unescape(s, arena);
 }

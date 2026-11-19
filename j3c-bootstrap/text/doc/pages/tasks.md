@@ -11,6 +11,7 @@ Start from the task. `j3c doc recipes <name>` prints a complete, checked program
     mods loaded at runtime (.j2)     recipes j2        then `j3c doc j2`
     meshes built in code             recipes meshgen   then j3.gfx.meshgen
     heavy work off the frame thread  recipes threads   then `j3c doc threads`, j3.thread
+    settings / config files (TOML)   recipes config    then j3.data.toml, j3.data.json
     call a web API (https, JSON)     recipes http      then j3.net.http, j3.data.json, examples/openrouter-chat
     run another program (curl, git)  j3.proc           (`proc.run(argv, stdin, &arena)`: exit code, stdout, stderr)
     materials and shader effects     recipes material  then j3.scene3d.fx, `j3c doc editor`

@@ -1,0 +1,547 @@
+/// TOML: `parse` text into the same `Json` tree `j3.data.json` reads (`get` / `path` / `asStr` / `asNum`),
+/// or walk it line by line with `items`; `stringify` writes a tree back as TOML. The tree and its strings
+/// live on the arena you pass.
+///
+///     let cfg = toml.parse(text, &arena)?;            // Result<&Json, TomlError>
+///     let w = cfg.path("window.width").asInt();       // [window] width = 1280
+///     let name = cfg.path("enemies.0.name").asStr();  // [[enemies]] name = "slime"
+///     let out = toml.stringify(cfg, &arena);
+///
+/// Reads TOML 1.0: tables, `[[arrays of tables]]`, dotted keys, inline tables, arrays over several lines,
+/// basic, literal and multi-line strings, ints (`1_000`, `0xff`, `0o7`, `0b1`), floats (`inf`, `nan`) and
+/// bools. Lenient where that costs nothing: a key or table set twice keeps the last value, and an unquoted
+/// word that is not a number or bool (`backend = llvm`, `1.2.3`, a date) reads as a string, as do datetimes.
+/// A bad escape (`\q`) stays as written. Numbers are `f64`: ints past 2^53 lose precision. For a `Num` or
+/// `Bool` node from `parse`, `s` is the token as written (`1_000`, `0x1F`).
+
+module j3.data.toml;
+
+use j3.data.json;
+use j3.data.json.{ Json, Kind };
+use j3.memory.{ Arena, List };
+use j3.option.Option;
+use j3.result.Result;
+use j3.text.{ Text, parseF64, parseU64 };
+
+/// What one `Item` is.
+pub enum ItemKind {
+    /// `[a.b]`
+    Table,
+    /// `[[a.b]]`
+    ArrayTable,
+    /// `key = value` (or `a.b = value`)
+    Key,
+}
+
+/// One header or `key = value` line, in file order. Nothing is merged: a key written twice is two items.
+pub struct Item {
+    kind: ItemKind;
+    /// 1-based line the item starts on.
+    line: int;
+    /// The header's keys, or the key's parts (`a.b = 1` is `["a", "b"]`, relative to the last header).
+    keys: List<string>;
+    /// The value of a `Key` (null for headers).
+    val: &Json;
+}
+
+/// Why `parse` or `items` failed.
+pub struct TomlError {
+    /// 1-based line of the problem.
+    line: int;
+    /// What was wrong.
+    msg: string;
+}
+
+const MAX_DEPTH: int = 128;
+const INLINE_MSG: string = "expected `{ key = \"value\", ... }` on one line";
+const STR_MSG: string = "expected a \"string\"";
+
+/// The reader: `at` is a byte offset into `s`, `line` the line it is on.
+struct R {
+    s: string;
+    at: int;
+    line: int;
+    arena: &Arena;
+
+    fn peek(this: &R): u8 {
+        if this.at < this.s.len { return this.s[this.at]; }
+        return 0;
+    }
+
+    fn eof(this: &R): bool { return this.at >= this.s.len; }
+
+    fn fail(this: &R, msg: string): TomlError { return TomlError { line: this.line, msg: msg }; }
+
+    fn startsAt(this: &R, w: string): bool {
+        if this.at + w.len > this.s.len { return false; }
+        for i in 0..w.len {
+            if this.s[this.at + i] != w[i] { return false; }
+        }
+        return true;
+    }
+
+    /// Spaces and tabs.
+    fn blank(this: &R) {
+        while this.peek() == ' ' || this.peek() == '\t' { this.at += 1; }
+    }
+
+    /// Blanks, comments and line ends (between items, inside arrays).
+    fn gap(this: &R) {
+        while true {
+            this.blank();
+            let c = this.peek();
+            if c == '#' {
+                while !this.eof() && this.peek() != '\n' { this.at += 1; }
+            } else if c == '\n' {
+                this.at += 1;
+                this.line += 1;
+            } else if c == '\r' && this.at + 1 < this.s.len && this.s[this.at + 1] == '\n' {
+                this.at += 1;
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// After an item: only blanks and a comment may finish the line.
+    fn endLine(this: &R): Result<bool, TomlError> {
+        this.blank();
+        if this.peek() == '#' {
+            while !this.eof() && this.peek() != '\n' { this.at += 1; }
+        }
+        if this.peek() == '\r' { this.at += 1; }
+        if this.eof() { return Result.Ok(true); }
+        if this.peek() != '\n' {
+            let t = Text.new(this.arena);
+            t.add("unexpected `").add(this.s[this.at..this.at + 1]).add("` after the value");
+            return Result.Err(this.fail(t.str()));
+        }
+        return Result.Ok(true);
+    }
+
+    /// Whether the rest of this line has an `=` (picks "bad key" over "expected `key = value`").
+    fn lineHasEq(this: &R): bool {
+        let i = this.at;
+        while i < this.s.len && this.s[i] != '\n' {
+            if this.s[i] == '=' { return true; }
+            i += 1;
+        }
+        return false;
+    }
+
+    /// `a`, `"a b"`, `'a'`, joined by `.`; stops before whatever follows.
+    fn keyPath(this: &R, header: bool): Result<List<string>, TomlError> {
+        let out = List<string>.new(this.arena);
+        while true {
+            this.blank();
+            out.push(this.key(header)?);
+            this.blank();
+            if this.peek() != '.' { break; }
+            this.at += 1;
+        }
+        return Result.Ok(out);
+    }
+
+    fn key(this: &R, header: bool): Result<string, TomlError> {
+        let c = this.peek();
+        if c == '"' { return this.basic(); }
+        if c == '\'' { return this.literal(); }
+        let start = this.at;
+        while !this.eof() && isBareKey(this.peek()) { this.at += 1; }
+        if this.at == start {
+            if header { return Result.Err(this.fail("bad table header")); }
+            return Result.Err(this.fail(if this.lineHasEq() { "bad key" } else { "expected `key = value`" }));
+        }
+        return Result.Ok(own(this.arena, this.s[start..this.at]));
+    }
+
+    /// One value; `inArray` limits unquoted words to ones starting with a digit (see `bare`).
+    fn value(this: &R, depth: int, inArray: bool): Result<&Json, TomlError> {
+        if depth > MAX_DEPTH { return Result.Err(this.fail("nested too deep")); }
+        let c = this.peek();
+        if this.startsAt("\"\"\"") { return Result.Ok(json.str(this.multi('"')?, this.arena)); }
+        if this.startsAt("'''") { return Result.Ok(json.str(this.multi('\'')?, this.arena)); }
+        if c == '"' { return Result.Ok(json.str(this.basic()?, this.arena)); }
+        if c == '\'' { return Result.Ok(json.str(this.literal()?, this.arena)); }
+        if c == '[' { return this.array(depth); }
+        if c == '{' { return this.inline(depth); }
+        return this.bare(inArray);
+    }
+
+    /// `"..."` on one line, escapes decoded.
+    fn basic(this: &R): Result<string, TomlError> {
+        this.at += 1;
+        let start = this.at;
+        while true {
+            let c = this.peek();
+            if this.eof() || c == '\n' { return Result.Err(this.fail(STR_MSG)); }
+            if c == '"' { break; }
+            this.at += if c == '\\' && this.at + 1 < this.s.len && this.s[this.at + 1] != '\n' { 2 } else { 1 };
+        }
+        let body = this.s[start..this.at];
+        this.at += 1;
+        return Result.Ok(unescapeIn(body, false, this.arena));
+    }
+
+    /// `'...'` on one line, as written.
+    fn literal(this: &R): Result<string, TomlError> {
+        this.at += 1;
+        let start = this.at;
+        while this.peek() != '\'' {
+            if this.eof() || this.peek() == '\n' { return Result.Err(this.fail(STR_MSG)); }
+            this.at += 1;
+        }
+        let body = this.s[start..this.at];
+        this.at += 1;
+        return Result.Ok(own(this.arena, body));
+    }
+
+    /// `"""..."""` or `'''...'''` (by `q`): a newline right after the opening quotes is dropped; the
+    /// closing run may carry up to two more quotes, which belong to the string.
+    fn multi(this: &R, q: u8): Result<string, TomlError> {
+        let startLine = this.line;
+        this.at += 3;
+        if this.peek() == '\r' && this.at + 1 < this.s.len && this.s[this.at + 1] == '\n' { this.at += 1; }
+        if this.peek() == '\n' {
+            this.at += 1;
+            this.line += 1;
+        }
+        let start = this.at;
+        while true {
+            if this.eof() { return Result.Err(TomlError { line: startLine, msg: STR_MSG }); }
+            let c = this.peek();
+            if c == q && this.at + 2 < this.s.len && this.s[this.at + 1] == q && this.s[this.at + 2] == q { break; }
+            if c == '\n' { this.line += 1; }
+            this.at += if q == '"' && c == '\\' && this.at + 1 < this.s.len { 2 } else { 1 };
+            if this.at > this.s.len { this.at = this.s.len; }
+            if q == '"' && c == '\\' && this.s[this.at - 1] == '\n' { this.line += 1; }
+        }
+        let end = this.at;
+        this.at += 3;
+        let extra = 0;
+        while extra < 2 && this.peek() == q {
+            this.at += 1;
+            extra += 1;
+        }
+        let body = this.s[start..end + extra];
+        if q == '\'' { return Result.Ok(own(this.arena, body)); }
+        return Result.Ok(unescapeIn(body, true, this.arena));
+    }
+
+    /// `[a, b]`, over any number of lines, comments allowed, trailing comma allowed.
+    fn array(this: &R, depth: int): Result<&Json, TomlError> {
+        let startLine = this.line;
+        this.at += 1;
+        let arr = json.arr(this.arena);
+        while true {
+            this.gap();
+            if this.eof() { return Result.Err(TomlError { line: startLine, msg: "expected an array" }); }
+            if this.peek() == ']' {
+                this.at += 1;
+                return Result.Ok(arr);
+            }
+            arr.push(this.value(depth + 1, true)?);
+            this.gap();
+            let c = this.peek();
+            if c == ',' {
+                this.at += 1;
+            } else if this.eof() {
+                return Result.Err(TomlError { line: startLine, msg: "expected an array" });
+            } else if c != ']' {
+                return Result.Err(this.fail("expected `,` or `]` in an array"));
+            }
+        }
+        return Result.Ok(arr);
+    }
+
+    /// `{ a = 1, b.c = "x" }` on one line (a trailing comma is allowed).
+    fn inline(this: &R, depth: int): Result<&Json, TomlError> {
+        this.at += 1;
+        let obj = json.obj(this.arena);
+        while true {
+            this.blank();
+            let c = this.peek();
+            if c == '}' {
+                this.at += 1;
+                return Result.Ok(obj);
+            }
+            if this.eof() || c == '\n' || c == '\r' || c == '#' { return Result.Err(this.fail(INLINE_MSG)); }
+            let keys = this.keyPath(false)?;
+            if this.peek() != '=' { return Result.Err(this.fail("expected `key = value`")); }
+            this.at += 1;
+            this.blank();
+            let v = this.value(depth + 1, false)?;
+            let at = descend(obj, &keys, keys.len - 1, this.line, this.arena)?;
+            at.set(keys.items[keys.len - 1], v);
+            this.blank();
+            let d = this.peek();
+            if d == ',' {
+                this.at += 1;
+            } else if d != '}' {
+                return Result.Err(this.fail(INLINE_MSG));
+            }
+        }
+        return Result.Ok(obj);
+    }
+
+    /// An unquoted token: bool, number, or (leniently) a word or datetime read as a string. `inArray`:
+    /// words must start with a digit there (dates), as in strict TOML no bare word is a value.
+    fn bare(this: &R, inArray: bool): Result<&Json, TomlError> {
+        let start = this.at;
+        while !this.eof() && !stopsBare(this.peek()) { this.at += 1; }
+        // `1979-05-27 07:32:00`: a date, a space, a time
+        if this.at - start == 10 && this.s[start + 4] == '-' && this.peek() == ' ' && this.at + 1 < this.s.len
+            && isDigit(this.s[this.at + 1]) {
+            this.at += 1;
+            while !this.eof() && !stopsBare(this.peek()) { this.at += 1; }
+        }
+        let tok = own(this.arena, this.s[start..this.at]);
+        if tok.len == 0 { return Result.Err(this.fail(if this.eof() || this.peek() == '\n' { "expected a value" } else { STR_MSG })); }
+        if tok == "true" || tok == "false" {
+            let b = json.boolean(tok == "true", this.arena);
+            b.s = tok;
+            return Result.Ok(b);
+        }
+        match number(tok, this.arena) {
+            Option.Some(n) {
+                let j = json.num(n, this.arena);
+                j.s = tok;
+                return Result.Ok(j);
+            }
+            Option.None {}
+        }
+        if inArray && !isDigit(tok[0]) { return Result.Err(this.fail(STR_MSG)); }
+        return Result.Ok(json.str(tok, this.arena));
+    }
+}
+
+/// Every header and `key = value` of `text`, in file order, with nothing merged.
+pub fn items(text: string, arena: &Arena): Result<List<Item>, TomlError> {
+    let r = R { s: text, at: 0, line: 1, arena: arena };
+    let out = List<Item>.new(arena);
+    let none = json.null(arena);
+    // a UTF-8 byte order mark
+    if text.len >= 3 && text[0] == 0xEF && text[1] == 0xBB && text[2] == 0xBF { r.at = 3; }
+    while true {
+        r.gap();
+        if r.eof() { break; }
+        let line = r.line;
+        if r.peek() == '[' {
+            let twice = r.at + 1 < r.s.len && r.s[r.at + 1] == '[';
+            r.at += if twice { 2 } else { 1 };
+            let keys = r.keyPath(true)?;
+            if !r.startsAt(if twice { "]]" } else { "]" }) { return Result.Err(r.fail("bad table header")); }
+            r.at += if twice { 2 } else { 1 };
+            r.endLine()?;
+            out.push(Item { kind: if twice { ItemKind.ArrayTable } else { ItemKind.Table }, line: line, keys: keys, val: none });
+            continue;
+        }
+        let keys = r.keyPath(false)?;
+        if r.peek() != '=' {
+            return Result.Err(r.fail(if r.lineHasEq() { "bad key" } else { "expected `key = value`" }));
+        }
+        r.at += 1;
+        r.blank();
+        let v = r.value(0, false)?;
+        r.endLine()?;
+        out.push(Item { kind: ItemKind.Key, line: line, keys: keys, val: v });
+    }
+    return Result.Ok(out);
+}
+
+/// `text` as a tree: tables are `Obj`, arrays (and `[[...]]`) `Arr`, keys in file order.
+pub fn parse(text: string, arena: &Arena): Result<&Json, TomlError> {
+    let its = items(text, arena)?;
+    let root = json.obj(arena);
+    let cur = root;
+    for i in 0..its.len {
+        let it = its.items[i];
+        let last = it.keys.items[it.keys.len - 1];
+        match it.kind {
+            ItemKind.Table { cur = descend(root, &it.keys, it.keys.len, it.line, arena)?; }
+            ItemKind.ArrayTable {
+                let parent = descend(root, &it.keys, it.keys.len - 1, it.line, arena)?;
+                if !parent.has(last) { parent.set(last, json.arr(arena)); }
+                let a = parent.get(last);
+                if a.kind != Kind.Arr { return Result.Err(notTable(last, it.line, arena)); }
+                let o = json.obj(arena);
+                a.push(o);
+                cur = o;
+            }
+            ItemKind.Key {
+                let at = descend(cur, &it.keys, it.keys.len - 1, it.line, arena)?;
+                at.set(last, it.val);
+            }
+        }
+    }
+    return Result.Ok(root);
+}
+
+/// The table `keys[0..n]` below `from`, made when missing; through an array of tables, its last one.
+fn descend(from: &Json, keys: &List<string>, n: int, line: int, arena: &Arena): Result<&Json, TomlError> {
+    let cur = from;
+    for i in 0..n {
+        let k = keys.items[i];
+        if !cur.has(k) {
+            let o = json.obj(arena);
+            cur.set(k, o);
+            cur = o;
+            continue;
+        }
+        let v = cur.get(k);
+        if v.kind == Kind.Obj {
+            cur = v;
+        } else if v.kind == Kind.Arr && v.len() > 0 && v.at(v.len() - 1).kind == Kind.Obj {
+            cur = v.at(v.len() - 1);
+        } else {
+            return Result.Err(notTable(k, line, arena));
+        }
+    }
+    return Result.Ok(cur);
+}
+
+fn notTable(k: string, line: int, arena: &Arena): TomlError {
+    return TomlError { line: line, msg: Text.new(arena).add("`").add(k).add("` is already a value, not a table").str() };
+}
+
+fn own(arena: &Arena, s: string): string {
+    return Text.new(arena).add(s).str();
+}
+
+fn isDigit(c: u8): bool { return c >= '0' && c <= '9'; }
+
+fn isBareKey(c: u8): bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || isDigit(c) || c == '_' || c == '-';
+}
+
+fn stopsBare(c: u8): bool {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',' || c == ']' || c == '}' || c == '#'
+        || c == '=' || c == '[' || c == '{' || c == '"' || c == '\'';
+}
+
+fn hexVal(c: u8): int {
+    if c >= '0' && c <= '9' { return int(c) - 48; }
+    if c >= 'a' && c <= 'f' { return int(c) - 87; }
+    if c >= 'A' && c <= 'F' { return int(c) - 55; }
+    return -1;
+}
+
+/// Digits of `base` from `i`, single `_` only between two digits; the index after them (`i` when none).
+fn digits(s: string, i: int, base: int): int {
+    let start = i;
+    while i < s.len {
+        let c = s[i];
+        if c == '_' && i > start && i + 1 < s.len && digitOf(s[i + 1], base) && digitOf(s[i - 1], base) {
+            i += 1;
+        } else if digitOf(c, base) {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    return i;
+}
+
+fn digitOf(c: u8, base: int): bool {
+    let v = hexVal(c);
+    return v >= 0 && v < base;
+}
+
+/// `s` without its `_`s.
+fn plain(s: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    for i in 0..s.len {
+        if s[i] != '_' { t.push(s[i]); }
+    }
+    return t.str();
+}
+
+/// A TOML number token's value, or None (`007`, `1.`, `.5`, `1.2.3` are not numbers).
+fn number(s: string, arena: &Arena): Option<f64> {
+    let i = if s.len > 0 && (s[0] == '-' || s[0] == '+') { 1 } else { 0 };
+    let rest = s[i..s.len];
+    if rest == "inf" || rest == "nan" { return parseF64(s); }
+    if i == 0 && s.len > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'o' || s[1] == 'b') {
+        let base = if s[1] == 'x' { 16 } else if s[1] == 'o' { 8 } else { 2 };
+        if digits(s, 2, base) != s.len { return Option.None; }
+        match parseU64(plain(s[2..s.len], arena), base) {
+            Option.Some(v) { return Option.Some(f64(v)); }
+            Option.None { return Option.None; }
+        }
+    }
+    let start = i;
+    i = digits(s, i, 10);
+    if i == start || (s[start] == '0' && i - start > 1) { return Option.None; }
+    if i < s.len && s[i] == '.' {
+        let f = i + 1;
+        i = digits(s, f, 10);
+        if i == f { return Option.None; }
+    }
+    if i < s.len && (s[i] == 'e' || s[i] == 'E') {
+        i += 1;
+        if i < s.len && (s[i] == '+' || s[i] == '-') { i += 1; }
+        let x = i;
+        i = digits(s, x, 10);
+        if i == x { return Option.None; }
+    }
+    if i != s.len { return Option.None; }
+    return parseF64(plain(s, arena));
+}
+
+/// A basic string's body with its escapes decoded: `\"`, `\\`, `\n`, `\t`, `\r`, `\b`, `\f`, `\e`,
+/// `\uXXXX`, `\UXXXXXXXX`. A bad escape (`\q`, a surrogate) stays as written.
+pub fn unescape(s: string, arena: &Arena): string {
+    return unescapeIn(s, false, arena);
+}
+
+/// `unescape`; `ml` also drops a `\` at a line end with the line break and the blanks after it.
+fn unescapeIn(s: string, ml: bool, arena: &Arena): string {
+    let out = Text.new(arena);
+    let i = 0;
+    while i < s.len {
+        let c = s[i];
+        if c != '\\' || i + 1 >= s.len {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let n = s[i + 1];
+        if ml {
+            // `\`, blanks, then a line break: skip to the next non-blank
+            let j = i + 1;
+            while j < s.len && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r') { j += 1; }
+            if j < s.len && s[j] == '\n' {
+                while j < s.len && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r' || s[j] == '\n') { j += 1; }
+                i = j;
+                continue;
+            }
+        }
+        let simple: int = -1;
+        if n == '"' { simple = 34; } else if n == '\\' { simple = 92; } else if n == 'n' { simple = 10; }
+        else if n == 't' { simple = 9; } else if n == 'r' { simple = 13; } else if n == 'b' { simple = 8; }
+        else if n == 'f' { simple = 12; } else if n == 'e' { simple = 27; }
+        if simple >= 0 {
+            out.push(u8(simple));
+            i += 2;
+            continue;
+        }
+        let hex = if n == 'u' { 4 } else if n == 'U' { 8 } else { 0 };
+        let code = -1;
+        if hex > 0 && i + 2 + hex <= s.len {
+            code = 0;
+            for j in 0..hex {
+                let h = hexVal(s[i + 2 + j]);
+                if h < 0 { code = -1; break; }
+                code = code * 16 + h;
+            }
+        }
+        if code < 0 || (code >= 0xD800 && code <= 0xDFFF) || code > 0x10FFFF {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        out.pushChar(u32(code));
+        i += 2 + hex;
+    }
+    return out.str();
+}

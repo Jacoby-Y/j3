@@ -29,7 +29,15 @@ release builds show it; see it in the dev loop with `j3c run --splash` (works ev
 restart, and J3_NO_SPLASH=1.
 
 App icon: `[dist] icon` is the menu icon in packages and, when it is a PNG, the window icon
-of an App. Unset, both are the J3 logo.
+of an App. Unset, both are the J3 logo. A PNG icon is also embedded in a Windows .exe (what
+Explorer and the taskbar show; keep it 256 or smaller there). That needs `windres`
+(x86_64-w64-mingw32-windres from mingw-w64 binutils, or llvm-windres); without one the build
+warns and the exe keeps the default icon.
+
+Windows console: an .exe opens a console window when double-clicked. `[emit]
+windows_subsystem = "gui"` links it for the GUI subsystem instead (no console; started from
+cmd or PowerShell it also prints nothing there). Default "console", which a program that
+prints, or is both a game and a command-line tool, keeps.
 
 Packages: list them in j3.toml and every release build writes them to target/dist/:
 

@@ -7,7 +7,7 @@ set -u
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root" || exit 2
 j3c=${J3C:-$root/j3c-bootstrap/target/j3c}
-[ -x "$j3c" ] || { echo "stdlib-tests.sh: no j3c at $j3c (./build.sh, or j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap)" >&2; exit 2; }
+[ -x "$j3c" ] || { echo "stdlib-tests.sh: no j3c at $j3c (./build.sh, or J3_STDLIB=$PWD/j3c/stdlib j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap)" >&2; exit 2; }
 limit=${J3_TEST_TIMEOUT:-240}
 logs=${J3_TEST_LOGS:-$(mktemp -d)}
 mkdir -p "$logs"

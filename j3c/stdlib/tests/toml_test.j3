@@ -1,0 +1,162 @@
+// Tests for j3.data.toml: parse, items, errors, stringify round trip. Run from the repo root:
+//   timeout 60 j3c run j3c/stdlib/tests/toml_test.j3
+// Panics on the first failed check.
+
+module toml_test;
+
+use j3.data.json;
+use j3.data.json.{ Json, Kind };
+use j3.data.toml;
+use j3.data.toml.ItemKind;
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.result.Result;
+use j3.sys.panic;
+use j3.text.Text;
+
+#[singleton]
+let CHECKS: int;
+
+fn ok(cond: bool, msg: string) {
+    CHECKS += 1;
+    if !cond {
+        printLn(`FAIL: {msg}`);
+        panic(msg);
+    }
+}
+
+fn doc(text: string, arena: &Arena): &Json {
+    match toml.parse(text, arena) {
+        Result.Ok(d) { return d; }
+        Result.Err(e) {
+            printLn(`parse failed at line {e.line}: {e.msg}`);
+            panic("parse");
+            return json.null(arena);
+        }
+    }
+}
+
+/// `text` must fail on `line` with a message starting with `msg`.
+fn bad(text: string, line: int, msg: string, arena: &Arena) {
+    match toml.parse(text, arena) {
+        Result.Ok(_) { printLn(`should fail: {text}`); panic("no error"); }
+        Result.Err(e) {
+            let head = if e.msg.len >= msg.len { e.msg[0..msg.len] } else { e.msg };
+            if e.line != line || head != msg {
+                printLn(`{text}: got line {e.line}: {e.msg}; want line {line}: {msg}`);
+                panic("wrong error");
+            }
+            CHECKS += 1;
+        }
+    }
+}
+
+fn main() {
+    let arena = Arena.create(1 << 22);
+    let a = &arena;
+
+    // scalars, comments, sub-tables, dotted keys
+    let d = doc("# top\ntitle = \"Game\" # trailing\n[window]\nwidth = 1_280\nheight = 720\nscale = 1.5\nvsync = true\n[window.pos]\nx = -10\n[audio]\nvol.music = 0.8\nvol.sfx = 1e-1\n", a);
+    ok(d.get("title").asStr() == "Game", "title");
+    ok(d.path("window.width").asInt() == 1280, "underscores");
+    ok(d.path("window.width").s == "1_280", "number as written");
+    ok(d.path("window.scale").asNum() == 1.5, "float");
+    ok(d.path("window.vsync").asBool(), "bool");
+    ok(d.path("window.pos.x").asInt() == -10, "sub-table");
+    ok(d.path("audio.vol.music").asNum() == 0.8, "dotted key");
+    ok(d.path("audio.vol.sfx").asNum() == 0.1, "exponent");
+    ok(d.keys.items[0] == "title" && d.keys.items[1] == "window" && d.keys.items[2] == "audio", "key order");
+
+    // number forms
+    let n = doc("a = 0xff\nb = 0o17\nc = 0b101\nd = +3\ne = -inf\nf = nan\ng = 0\nh = 6.02e23\n", a);
+    ok(n.get("a").asInt() == 255 && n.get("b").asInt() == 15 && n.get("c").asInt() == 5, "prefixed ints");
+    ok(n.get("d").asInt() == 3, "plus sign");
+    ok(n.get("e").kind == Kind.Num && n.get("e").asNum() < -1e308, "inf");
+    ok(n.get("f").kind == Kind.Num && !(n.get("f").n == n.get("f").n), "nan");
+    ok(n.get("h").asNum() == 6.02e23, "big float");
+
+    // lenient words: not numbers, read as strings
+    let w = doc("[emit]\nbackend = llvm\nver = 1.2.3\nodd = 007\nwhen = 1979-05-27 07:32:00Z\nday = 1979-05-27\n", a);
+    ok(w.path("emit.backend").kind == Kind.Str && w.path("emit.backend").asStr() == "llvm", "bare word");
+    ok(w.path("emit.ver").asStr() == "1.2.3", "dotted version");
+    ok(w.path("emit.odd").asStr() == "007", "leading zero is a word");
+    ok(w.path("emit.when").asStr() == "1979-05-27 07:32:00Z", "datetime with a space");
+    ok(w.path("emit.day").asStr() == "1979-05-27", "date");
+
+    // strings
+    let s = doc("a = \"tab\\there \\\"q\\\" \\u00e9 \\U0001F600\"\nb = 'C:\\new'\nc = \"\"\"\nline1\nline2\"\"\"\nd = '''\nraw \\n'''\ne = \"\"\"one \\\n    two\"\"\"\nf = \"\"\"x\"\"\"\"\"\ng = \"bad \\q\"\n", a);
+    ok(s.get("a").asStr() == "tab\there \"q\" é 😀", "basic escapes");
+    ok(s.get("b").asStr() == "C:\\new", "literal");
+    ok(s.get("c").asStr() == "line1\nline2", "multi-line basic");
+    ok(s.get("d").asStr() == "raw \\n", "multi-line literal");
+    ok(s.get("e").asStr() == "one two", "line-end backslash");
+    ok(s.get("f").asStr() == "x\"\"", "extra closing quotes");
+    ok(s.get("g").asStr() == "bad \\q", "bad escape kept");
+
+    // arrays and inline tables
+    let r = doc("nums = [\n  1, 2, # two\n  3,\n]\nmixed = [[1, 2], [\"a\"]]\npt = { x = 1, y.z = \"w\" }\nlist = [{ id = 1 }, { id = 2 }]\n", a);
+    ok(r.get("nums").len() == 3 && r.path("nums.2").asInt() == 3, "multi-line array");
+    ok(r.path("mixed.1.0").asStr() == "a", "nested array");
+    ok(r.path("pt.x").asInt() == 1 && r.path("pt.y.z").asStr() == "w", "inline table");
+    ok(r.path("list.1.id").asInt() == 2, "array of inline tables");
+
+    // arrays of tables
+    let t = doc("[[enemy]]\nname = \"slime\"\nhp = 3\n[enemy.drop]\nitem = \"goo\"\n[[enemy]]\nname = \"bat\"\n", a);
+    ok(t.get("enemy").len() == 2, "two tables");
+    ok(t.path("enemy.0.drop.item").asStr() == "goo", "sub-table of the last array element");
+    ok(t.path("enemy.1.name").asStr() == "bat", "second element");
+
+    // lenient: last value wins
+    ok(doc("a = 1\na = 2\n", a).get("a").asInt() == 2, "key twice");
+
+    // items keep everything, in order
+    match toml.items("[a]\nk = 1\nk = 2\n[[b]]\n", a) {
+        Result.Ok(its) {
+            ok(its.len == 4, "items count");
+            ok(its.items[0].kind == ItemKind.Table && its.items[0].line == 1, "header item");
+            ok(its.items[2].kind == ItemKind.Key && its.items[2].val.asInt() == 2 && its.items[2].line == 3, "key item");
+            ok(its.items[3].kind == ItemKind.ArrayTable && its.items[3].keys.items[0] == "b", "array table item");
+        }
+        Result.Err(_) { panic("items"); }
+    }
+
+    // CRLF and a BOM
+    let bom = Text.new(a);
+    bom.push(0xEF);
+    bom.push(0xBB);
+    bom.push(0xBF);
+    bom.add("[a]\r\nb = \"x\"\r\n");
+    let c = doc(bom.str(), a);
+    ok(c.path("a.b").asStr() == "x", "crlf + bom");
+
+    // errors
+    bad("[a]\nnoeq\n", 2, "expected `key = value`", a);
+    bad("[a]\n= 1\n", 2, "bad key", a);
+    bad("[a]\nb = \"x\n", 2, "expected a \"string\"", a);
+    bad("[a]\nb = [\"x\",\n", 2, "expected an array", a);
+    bad("[a]\nb = [\"x\", y]\n", 2, "expected a \"string\"", a);
+    bad("[a]\nb = {x = \"1\"\n", 2, "expected `{ key = \"value\", ... }` on one line", a);
+    bad("a = 1\n[a.b]\n", 2, "`a` is already a value", a);
+    bad("a = 1 2\n", 1, "unexpected `2`", a);
+    bad("[a\nx = 1\n", 1, "bad table header", a);
+    bad("x = \"\"\"never closed\n\n", 1, "expected a \"string\"", a);
+
+    // stringify, then read back the same tree
+    let src = "title = \"G \\\"q\\\"\"\n[win]\nw = 1280\ns = 0.5\non = true\ntags = [\"a\", \"b\"]\npt = { x = 1 }\n[win.pos]\nx = -1\n[[enemy]]\nname = \"slime\"\n[[enemy]]\nname = \"bat\"\n[\"odd key\"]\nk = \"v\"\n";
+    let first = doc(src, a);
+    let out = toml.stringify(first, a);
+    let back = doc(out, a);
+    ok(json.stringify(first, a) == json.stringify(back, a), "round trip");
+    // inline tables come back as sub-tables
+    let want = "title = \"G \\\"q\\\"\"\n\n[win]\nw = 1280\ns = 0.5\non = true\ntags = [\"a\", \"b\"]\n\n[win.pt]\nx = 1\n\n[win.pos]\nx = -1\n\n[[enemy]]\nname = \"slime\"\n\n[[enemy]]\nname = \"bat\"\n\n[\"odd key\"]\nk = \"v\"\n";
+    ok(out == want, "stringify layout");
+    let built = json.obj(a);
+    built.set("n", json.num(2.0, a));
+    let sub = json.obj(a);
+    sub.set("gone", json.null(a));
+    sub.set("f", json.num(0.25, a));
+    built.set("t", sub);
+    ok(toml.stringify(built, a) == "n = 2\n\n[t]\nf = 0.25\n", "stringify a built tree");
+
+    printLn(`toml ok ({CHECKS} checks)`);
+}

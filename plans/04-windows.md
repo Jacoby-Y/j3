@@ -375,7 +375,7 @@ wineserver inherits pipes, see `targets.rs:171`. Run `wineserver -k` after a bat
 - Test: a `targets.rs` wine test that builds a program which writes through a bad pointer and asserts that the function name
   shows up in the output.
 
-### 12. `j3c` on a Windows host (needs plan 05's triple fix)
+### 12. `j3c` on a Windows host (needs plan 05's triple fix): superseded by [plan 14](14-windows-j3c.md)
 
 - Files: `j3c/src/stdlib/mod.rs` (`embedded`, `parts`: turn `\` into `/` before comparing; add a unit test with
   a backslashed path that runs on every OS, built by hand with `Path::new` components), `src/editor/frontend.rs`
@@ -409,7 +409,7 @@ wineserver inherits pipes, see `targets.rs:171`. Run `wineserver -k` after a bat
   attach `j3c-<ver>-x86_64-windows.zip` with checksums.
 - Done when both jobs are green on GitHub, and plan 02 §7/§8 Windows boxes can be ticked.
 
-### 14. Ship: Scoop/winget and docs
+### 14. Ship: Scoop/winget and docs: superseded by [plan 14](14-windows-j3c.md)
 
 - Files: `packaging/scoop/j3c.json` (url, hash, `bin: j3c.exe`, a `depends`/notes line for llvm-mingw), a winget manifest
   once a release exists (`packaging/winget/`), `INSTALL.md` "Windows" (install llvm-mingw, unzip `j3c`, run `j3c doctor`,

@@ -107,7 +107,7 @@ fi
 if [ $list = 0 ] && [ -z "${DIFF_BOOT:-}" ] && { [ ! -x "$BOOT" ] || [ -n "$(find "$boot/src" "$boot/j3.toml" -newer "$BOOT" -print -quit)" ] || [ "$S0" -nt "$BOOT" ] || [ "$("$BOOT" version 2>/dev/null)" != "$("$S0" version)" ]; }; then
     echo "diff.sh: building j3c-boot" >&2
     log=$(mktemp)
-    if ! timeout 900 "$S0" build --opt 2 "$boot" >"$log" 2>&1; then tail -20 "$log" >&2; rm -f "$log"; die "j3c-boot build failed"; fi
+    if ! J3_STDLIB=$root/j3c/stdlib timeout 900 "$S0" build --opt 2 "$boot" >"$log" 2>&1; then tail -20 "$log" >&2; rm -f "$log"; die "j3c-boot build failed"; fi
     rm -f "$log"; touch "$BOOT"  # a cached build may leave the old mtime
 fi
 

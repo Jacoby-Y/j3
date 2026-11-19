@@ -103,4 +103,7 @@ Run from the repo root. Every chunk ends with all of them clean, or with its lef
   `tools/stage0.sh rust-final` rebuilds `stage0/j3c` from it (needs cargo).
 - Stdlib edits go in `j3c/stdlib/`: `target/j3c` embeds the tree on disk, stage 0 the tree at its commit,
   so a stdlib change can show up as a `diff.sh` DIFF; list it in `tests/known/` or `PORT_DEBT.md`.
+- The compiler itself uses stdlib modules newer than the tag (`j3.data.toml` in `base/toml`), so stage 0
+  builds it with `J3_STDLIB=<repo>/j3c/stdlib` (`build.sh`, `tests/diff.sh`, `tests/unit.sh`, `tools/bench.sh`
+  and `tools/release/package.sh` set it). A bare `stage0/j3c build j3c-bootstrap` fails on `use j3.data.toml`.
 - Behaviour changes in the J3 compiler (plan 11 Part D) go in `PORT_DEBT.md` with the `diff.sh` cases they move.
