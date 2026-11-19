@@ -15,10 +15,10 @@ mkdir -p "$logs"
 unset DISPLAY WAYLAND_DISPLAY
 export SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy
 
-# Not run: wine-only (writes C:\ files), needs the network, a benchmark.
+# Not run: wine-only (writes C:\ files; win_os_test runs cross-built under wine), needs the network, a benchmark.
 skip() {
   case $1 in
-    win_io_test) echo "wine only" ;;
+    win_io_test|win_os_test) echo "wine only" ;;
     tls_live_test) echo "network" ;;
     j2_bench) echo "benchmark, not a test" ;;
     *) return 1 ;;
@@ -36,7 +36,7 @@ for n in $names; do
     printf '%-28s %-6s %5s  %s\n' "$n" skip - "$why"; skipped=$((skipped + 1)); continue
   fi
   extra=
-  [ "$n" = idle_key_test ] && extra="J3_IDLE_SKIP=1"
+  case $n in idle_key_test|watch_idle_test) extra="J3_IDLE_SKIP=1" ;; esac
   t0=$(date +%s)
   # shellcheck disable=SC2086 # $extra is one VAR=value word or empty
   env $extra timeout "$limit" "$j3c" run "j3c/stdlib/tests/$n.j3" > "$logs/$n.log" 2>&1 < /dev/null
