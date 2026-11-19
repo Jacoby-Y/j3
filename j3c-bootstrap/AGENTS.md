@@ -66,6 +66,10 @@ Run from the repo root. Every chunk ends with all of them clean, or with its lef
   `err`, `ir`, `llvm`, `run`, `self`. Runs coverage and layers first.
 - `timeout 300 j3c-bootstrap/stage0/j3c check j3c-bootstrap` and `... build j3c-bootstrap` (binary
   `j3c-bootstrap/target/j3c-boot`; never install it, never name it `j3c`).
+  `tests/diff.sh` builds it with `build --opt 2` (plan 13: about 3x faster than the `opt = 0` dev build and
+  smaller stripped); `j3.toml` stays `opt = 0`, which is what `diff.sh self` and `tools/bench.sh` time.
+- `j3c-bootstrap/tools/bench.sh [--only N,M] [--list]`: the plan 13 speed bench, stage0 against j3c-boot on
+  scratch copies; writes `target/bench/result.md`. Scoreboard in `SPEED.md`.
 - `j3c-bootstrap/tools/stage0.sh COMMIT | --worktree`: the only way `stage0/j3c` changes. Scripts call
   `stage0/j3c` by path, never `j3c` from `PATH`.
 

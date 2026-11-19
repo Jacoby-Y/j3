@@ -1,4 +1,57 @@
-# Speed baseline: j3c-boot vs stage0 (plan 11 Part D item 0)
+# Speed: j3c-boot vs stage0
+
+## Scoreboard (2026-11-18, plan 13 phase 1)
+
+`tools/bench.sh` (median of 3, wall and peak RSS from `/usr/bin/time -f '%e %M'`, scratch copies under
+`<repo>/target/bench/`; metric definitions in `plans/13-speed.md` and the script). **dev** = j3c-boot as `j3.toml`
+builds it (`opt = 0`, `debug = true`); **opt** = `stage0/j3c build --opt 2 j3c-bootstrap` (ThinLTO per module, mold),
+which `tests/diff.sh` now builds. The self-build metrics (1-3) build j3c-bootstrap's own `j3.toml` (opt 0) with
+either compiler. The C5 gate stays green with the opt binary (unit 120 ok, test-compiler 25/25, fmt/ast/err/ui/glsl,
+ir --norm 246 + j3c-bootstrap, llvm per file, run 244 ok, bc 19 ok, tool 937 ok + 5 known, self 67 + 186 ok, object cache).
+`--opt 3` measured the same as 2; `--release` (opt s, stripped) is 10.8 MB but ~7% slower. A 0.01 s row is at the
+timer's resolution.
+
+| # | Metric | stage0 | j3c-boot dev | j3c-boot opt | opt/stage0 wall / RSS | opt wall / RSS |
+|---|---|---|---|---|---|---|
+| 1 | self build cold | 4.05 s / 1123 MB | 13.67 s / 1925 MB | 7.73 s / 1921 MB | 1.91x / 1.71x | LOSE / LOSE |
+| 2 | self build warm | 1.32 s / 505 MB | 2.35 s / 913 MB | 0.72 s / 905 MB | 0.55x / 1.79x | WIN / LOSE |
+| 3 | self build leaf edit | 1.72 s / 528 MB | 4.34 s / 1689 MB | 1.48 s / 1680 MB | 0.86x / 3.18x | WIN / LOSE |
+| 4 | editor program cold | 1.34 s / 261 MB | 2.31 s / 331 MB | 1.39 s / 327 MB | 1.04x / 1.25x | LOSE / LOSE |
+| 5 | desk-app cold | 1.16 s / 384 MB | 2.91 s / 511 MB | 1.45 s / 508 MB | 1.25x / 1.32x | LOSE / LOSE |
+| 6 | editor_village cold | 1.63 s / 166 MB | 2.29 s / 226 MB | 1.64 s / 223 MB | 1.01x / 1.34x | LOSE / LOSE |
+| 7 | desk-app leaf edit | 0.50 s / 171 MB | 1.18 s / 404 MB | 0.41 s / 394 MB | 0.82x / 2.29x | WIN / LOSE |
+| 8 | check corpus (244 inputs: sum, max RSS) | 38.16 s / 218 MB | 106.13 s / 1204 MB | 33.14 s / 1196 MB | 0.87x / 5.48x | WIN / LOSE |
+| 9 | check grid_test | 0.51 s / 151 MB | 1.58 s / 1204 MB | 0.61 s / 1196 MB | 1.20x / 7.92x | LOSE / LOSE |
+| 10 | check j3c-bootstrap | 1.27 s / 505 MB | 2.32 s / 914 MB | 0.72 s / 905 MB | 0.57x / 1.79x | WIN / LOSE |
+| 11 | fmt --check j3c/stdlib/j3 | 0.09 s / 4 MB | 0.29 s / 8 MB | 0.07 s / 6 MB | 0.78x / 1.40x | WIN / LOSE |
+| 12 | dump-ir examples/desk-app | 0.37 s / 177 MB | 0.94 s / 400 MB | 0.29 s / 391 MB | 0.78x / 2.20x | WIN / LOSE |
+| 13 | dump-bc scripted/fighter.j3s | 0.01 s / 19 MB | 0.05 s / 36 MB | 0.01 s / 30 MB | 1.00x / 1.59x | TIE / LOSE |
+| 14 | doc + doc j3.game --short + doc search mesh | 0.19 s / 27 MB | 1.16 s / 56 MB | 0.24 s / 52 MB | 1.26x / 1.88x | LOSE / LOSE |
+| 15 | new + first check | 0.01 s / 19 MB | 0.06 s / 36 MB | 0.01 s / 29 MB | 1.00x / 1.51x | TIE / LOSE |
+| 16 | binary size, stripped | 13.43 MB | 24.24 MB | 12.20 MB | 0.91x | WIN |
+
+Wall: 8 WIN, 2 TIE, 6 LOSE. RSS: 0 of 15 WIN (opt changed RSS by under 2%: the memory is data, not code).
+Size: WIN.
+
+Where the losing metrics go (cold phases from `target/compilation.log`, stage0 / opt):
+- **1 self cold, wall:** parse 0.10 / 0.20 s, check 1.16 / 0.46 s, hash modules 0.32 / 0.58 s, compile 2.28 / 6.29 s
+  wall. Emit CPU is now lower (17.3 / 9.4 s) and the slowest single module is the same (~2.3 s), but "clang cpu" is
+  36.9 / 63.6 s: clang fan-out oversubscribes (24 workers x up to 4 clangs per split module; boot's "clang cpu" is the
+  wall time of each clang, so contention shows there). *Guess:* one shared clang pool of 24 closes most of the 4 s.
+- **4, 5, 6 cold game builds, wall:** desk-app parse 0.06 / 0.09 s, check 0.31 / 0.16 s, hash 0.05 / 0.06 s, compile
+  0.65 / 1.04 s ("clang cpu" 11.0 / 14.3 s, emit cpu 3.4 / 2.3 s). Same fan-out cause as 1; editor_village is
+  link-bound in both, so it is a tie.
+- **9 grid_test, wall and RSS:** 1.2 GB against 151 MB. *Guess:* arena growth through lower/check of the big
+  generated UI module, never reset; time follows the page faults (the same cause as the 5.5x RSS of metric 8).
+- **14 doc, wall and RSS:** *guess:* every call parses/indexes the embedded stdlib and doc text before answering
+  (Rust looks up lazily); 52 MB is that index.
+- **RSS everywhere (1-3, 10, 12: 1.8-3.2x):** *guess:* per-session arenas sized for the whole program plus IR text
+  kept for the module-hash step (the hash prints each module's IR and hashes the text); the leaf self build peaks at
+  1.7 GB against 0.5 GB. 13 and 15 (30 MB against 19 MB) are startup: the binary's data and the embedded text.
+- **13, 15 wall:** ties at the 10 ms timer resolution.
+
+# Baseline (before plan 13)
+Plan 11 Part D item 0.
 
 Measured 2026-11-18, after C5 and before C6. This is a baseline only: no code was tuned.
 

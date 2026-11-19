@@ -18,6 +18,7 @@ say "plan 023" and the like point at those old, deleted plans.
 | [10](10-steam-package.md) | The `steam` package at `../j3-packages/j3-steam`: bindings, `check` tool, depot dist output, dev env, tests | DONE (tag `v0.1.0`, local repo, no remote yet) |
 | [11](11-pre-bootstrap.md) | Before porting j3c to J3: anti-footgun setup (pinned stage 0, diff harness, oracles, coverage, freeze), the new compiler's shape (driver, diags, ids, per-module work, pass/backend tables), port gates | TODO |
 | [12](12-deferred-tools.md) | Tools left unported in j3c-boot (LSP server and scanners, MCP server, `j3c editor`, `-e android`, `-e web`, asset import): stubs, Rust to port, gate. Broken after plan 11 C6 until done | TODO |
+| [13](13-speed.md) | Make j3c in J3 faster, smaller and lighter than Rust j3c on every bench metric (`j3c-bootstrap/tools/bench.sh`) | IN PROGRESS |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason). A new plan takes the next
 number. Open direction lives in `roadmap.md` and `EDITOR.md`.

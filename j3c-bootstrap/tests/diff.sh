@@ -100,11 +100,12 @@ if [ $mode = ast ] && [[ $("$S0" dump-ast /dev/null 2>&1) == *'unknown command'*
     die "stage0 has no dump-ast yet: rebuild it with tools/stage0.sh --worktree"
 fi
 
-# One build of j3c-boot when it is missing or older than its sources.
+# One build of j3c-boot when it is missing or older than its sources. `--opt 2` (plan 13): the j3.toml stays opt 0
+# for the self build (stage 2 and the bench measure that one); only the binary under test is optimized.
 if [ $list = 0 ] && [ -z "${DIFF_BOOT:-}" ] && { [ ! -x "$BOOT" ] || [ -n "$(find "$boot/src" "$boot/j3.toml" -newer "$BOOT" -print -quit)" ] || [ "$S0" -nt "$BOOT" ]; }; then
     echo "diff.sh: building j3c-boot" >&2
     log=$(mktemp)
-    if ! timeout 900 "$S0" build "$boot" >"$log" 2>&1; then tail -20 "$log" >&2; rm -f "$log"; die "j3c-boot build failed"; fi
+    if ! timeout 900 "$S0" build --opt 2 "$boot" >"$log" 2>&1; then tail -20 "$log" >&2; rm -f "$log"; die "j3c-boot build failed"; fi
     rm -f "$log"; touch "$BOOT"  # a cached build may leave the old mtime
 fi
 

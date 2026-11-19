@@ -10,7 +10,8 @@ compare the text. Unit checks live beside the code they cover, as `*_test.j3` fi
 
 1. Runs `tools/coverage.sh` (skip with `--no-coverage` or `DIFF_NO_COVERAGE=1`) and `tools/layers.sh`;
    either failing stops the run (exit 2).
-2. Builds `target/j3c-boot` with `stage0/j3c build j3c-bootstrap` when it is missing or older than `src/`.
+2. Builds `target/j3c-boot` with `stage0/j3c build --opt 2 j3c-bootstrap` (optimized; plan 13) when it is missing
+   or older than `src/`. `self` still builds stage 2 the way `j3.toml` says (`opt = 0`).
 3. Runs every input through stage0 twice and j3c-boot once, each under `timeout` (`DIFF_TIMEOUT`). Two
    stage0 runs that disagree print `NONDET` (the oracle is not deterministic there). Inputs run in parallel:
    `-j N`, else `J3_TEST_JOBS`, else half the cores (a quarter for `llvm` and `self`'s llvm calls: a big
