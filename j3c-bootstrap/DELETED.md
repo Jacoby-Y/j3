@@ -3,7 +3,8 @@
 `tools/coverage.sh` reads the `- PATH: reason` lines: PATH is relative to `j3c/src/` and may be a shell
 glob (`*` also crosses `/`). Every other Rust file is named on a `Port of:` line in `src/`.
 
-- scenefile.rs: scenes are read and written only through `j3.scene3d` (repo rule).
+- scenefile.rs: scenes are read and written only through `j3.scene3d` (repo rule); only its v2 line helpers
+  (`rename_v2` and friends, `scene/rename.j3`) and `Object::fields` (`scene/diff.j3`) are ported.
 - lsp/json.rs: replaced by `j3.data.json`.
 - ir/samples.rs: hand-built IR samples; tests are J3 source.
 - ir/samples/*: the sample bodies (same reason).
@@ -13,3 +14,6 @@ glob (`*` also crosses `/`). Every other Rust file is named on a `Port of:` line
 - emit/c_expr/*: the C backend's expressions and statements (B8a).
 
 `csslint_main.j3` (not Rust) goes too: `cmd/csslint` calls `j3.ui.css` in-process.
+
+Not deleted but deferred (stubs that keep their `Port of:` lines): the LSP server and scanners, MCP, `editor`,
+`android_run.rs`, `web/*`, `gltf/*`, `online*`: plans/12-deferred-tools.md.

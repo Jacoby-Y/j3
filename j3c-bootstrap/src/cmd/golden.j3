@@ -15,6 +15,7 @@ use j3.io;
 use j3.io.path;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
+use j3.proc;
 use j3.proc.Child;
 use j3.result.Result;
 use j3.sys;
@@ -41,8 +42,11 @@ pub struct Tbl {
     }
 }
 
-/// A child to start (Rust `Command`): stdin is `/dev/null`; stdout and stderr go to `out` (an open fd), or to
-/// two pipes when `out` is -1. `env` is set over the inherited environment after `unset` is taken out of it.
+/// A child to start (Rust `Command`): stdin is `/dev/null`; stdout and stderr go to `out` (an open fd), to two
+/// pipes when `out` is `PIPED`, or stay this process's when it is `INHERIT`. `env` is set over the inherited environment after `unset` is taken out of it.
+pub const PIPED: int = -1;
+pub const INHERIT: int = -2;
+
 pub struct Spawn {
     argv: List<string>;
     env: List<Pair>;
@@ -206,13 +210,6 @@ pub fn judgeCheck(rc: Option<int>, out: string, arena: &Arena): Result<bool, str
     return Result.Ok(true);
 }
 
-fn cstr(s: string, arena: &Arena): []u8 {
-    let t = Text.new(arena);
-    t.add(s);
-    t.push(0);
-    return t.str() as []u8;
-}
-
 /// True when the C string at `p` is `KEY=...`.
 fn envIs(p: int, key: string): bool {
     for k in 0..key.len {
@@ -243,7 +240,7 @@ fn envp(sp: &Spawn, arena: &Arena): []int {
         let key = sp.env.items[k].key;
         let later = false;
         for j in k + 1..sp.env.len { if sp.env.items[j].key == key { later = true; } }
-        if !later { keep.push(cstr(Text.new(arena).add(key).add("=").add(sp.env.items[k].value).str(), arena).ptr as int); }
+        if !later { keep.push(proc.cString(Text.new(arena).add(key).add("=").add(sp.env.items[k].value).str(), arena).ptr as int); }
     }
     keep.push(0);
     return keep.items[0..keep.len];
@@ -254,33 +251,37 @@ fn envp(sp: &Spawn, arena: &Arena): []int {
 /// pipe).
 pub fn spawn(sp: &Spawn, arena: &Arena): Result<Child, int> {
     // everything the child touches is built before fork: it must not allocate
-    let cpath = cstr(sp.argv.items[0], arena);
+    let cpath = proc.cString(sp.argv.items[0], arena);
     let cargv = arena.alloc::<int>(sp.argv.len + 1);
-    for i in 0..sp.argv.len { cargv[i] = cstr(sp.argv.items[i], arena).ptr as int; }
+    for i in 0..sp.argv.len { cargv[i] = proc.cString(sp.argv.items[i], arena).ptr as int; }
     cargv[sp.argv.len] = 0;
-    let ccwd = cstr(sp.cwd, arena);
+    let ccwd = proc.cString(sp.cwd, arena);
     let env = envp(sp, arena);
-    let devnull = cstr("/dev/null", arena);
+    let devnull = proc.cString("/dev/null", arena);
     let nul = sys.open(devnull.ptr as ptr, sys.O_RDONLY + sys.O_CLOEXEC);
-    if nul < 0 { return Result.Err(0 - nul); }
-    let fe: [2]i32 = [0, 0];
+    if nul < 0 { return Result.Err(sys.errno()); }
+    let fe: [2]i32 = [-1, -1];
     let fo: [2]i32 = [-1, -1];
     let fr: [2]i32 = [-1, -1];
-    if sys.pipe(fe[..], sys.O_CLOEXEC) < 0 || (sp.out < 0 && (sys.pipe(fo[..], sys.O_CLOEXEC) < 0 || sys.pipe(fr[..], sys.O_CLOEXEC) < 0)) {
+    let piped = sp.out == PIPED;
+    if sys.pipe(fe[..], sys.O_CLOEXEC) < 0 || (piped && (sys.pipe(fo[..], sys.O_CLOEXEC) < 0 || sys.pipe(fr[..], sys.O_CLOEXEC) < 0)) {
         let e = sys.errno();
         sys.close(nul);
+        // the pipes made before the one that failed
+        let made: [6]i32 = [fe[0], fe[1], fo[0], fo[1], fr[0], fr[1]];
+        for k in 0..6 { if made[k] >= 0 { sys.close(int(made[k])); } }
         return Result.Err(e);
     }
     let pid = sys.fork();
     if pid == 0 {
         if sp.group { sys.setsid(); }
         sys.dup2(nul, 0);
-        if sp.out >= 0 {
-            sys.dup2(sp.out, 1);
-            sys.dup2(sp.out, 2);
-        } else {
+        if piped {
             sys.dup2(int(fo[1]), 1);
             sys.dup2(int(fr[1]), 2);
+        } else if sp.out >= 0 {
+            sys.dup2(sp.out, 1);
+            sys.dup2(sp.out, 2);
         }
         let ce: [1]i32 = [0];
         if sys.chdir(ccwd.ptr as ptr) < 0 { ce[0] = i32(sys.errno()); } else { ce[0] = i32(0 - sys.execve(cpath.ptr as ptr, cargv.ptr as ptr, env.ptr as ptr)); }
@@ -290,7 +291,7 @@ pub fn spawn(sp: &Spawn, arena: &Arena): Result<Child, int> {
     let forkErr = if pid < 0 { sys.errno() } else { 0 };
     sys.close(nul);
     sys.close(int(fe[1]));
-    if sp.out < 0 {
+    if piped {
         sys.close(int(fo[1]));
         sys.close(int(fr[1]));
     }
@@ -298,7 +299,7 @@ pub fn spawn(sp: &Spawn, arena: &Arena): Result<Child, int> {
     let got = if pid < 0 { 0 } else { sys.read(int(fe[0]), &ce[0] as ptr, 4) };
     sys.close(int(fe[0]));
     if pid < 0 || got == 4 {
-        if sp.out < 0 {
+        if piped {
             sys.close(int(fo[0]));
             sys.close(int(fr[0]));
         }
@@ -357,8 +358,8 @@ fn numOf(t: &Tbl, d: &Tbl, k: string, dflt: int): int {
 /// (None: timed out and killed, or ended by a signal) and the log text.
 fn runOne(dir: string, t: &Tbl, d: &Tbl, name: string, frames: int, capture: string, capFrame: int, arena: &Arena): (Option<int>, string) {
     let log = path.join(dir, Text.new(arena).add("target/golden/").add(name).add(".log").str(), arena);
-    let clog = cstr(log, arena);
-    let fd = sys.openMode(clog.ptr as ptr, sys.O_WRONLY + sys.O_CREAT + sys.O_TRUNC + sys.O_CLOEXEC, 420);
+    let clog = proc.cString(log, arena);
+    let fd = sys.openMode(clog.ptr as ptr, sys.O_WRONLY + sys.O_CREAT + sys.O_TRUNC + sys.O_CLOEXEC, 438);
     let sp = Spawn { argv: List<string>.new(arena), env: List<Pair>.new(arena), unset: List<string>.new(arena), cwd: dir,
         out: fd, group: true };
     sp.argv.push(selfExe(arena));
@@ -382,8 +383,8 @@ fn runOne(dir: string, t: &Tbl, d: &Tbl, name: string, frames: int, capture: str
     let tv = match t.get("timeout") { Option.Some(x) { x } Option.None { match d.get("timeout") { Option.Some(x) { x } Option.None { "" } } } };
     let secs = imgdiff.parseUint(tv, 1 << 40);
     if secs < 0 { secs = 300; }
-    // ponytail: no log file (it could not be created) leaves the child on this process's stdout, as Rust
-    if fd < 0 { sp.out = 1; }
+    // no log file (it could not be created) leaves the child on this process's stdout and stderr, as Rust
+    if fd < 0 { sp.out = INHERIT; }
     match spawn(&sp, arena) {
         Result.Ok(ch) {
             if fd >= 0 { sys.close(fd); }
@@ -507,7 +508,7 @@ fn stateRun(dir: string, t: &Tbl, d: &Tbl, name: string, bless: bool, a: &Arena)
     if bless {
         let ok = false;
         if exists(cap) {
-            ok = imgdiff.copyFile(cap, gold, a);
+            ok = copied(cap, gold, a);
         }
         if ok {
             put(Text.new(a).add("blessed ").add(name).add("\n").str());
@@ -518,7 +519,7 @@ fn stateRun(dir: string, t: &Tbl, d: &Tbl, name: string, bless: bool, a: &Arena)
         match text {
             Option.Some(x) {
                 let to = path.join(dir, Text.new(a).add("golden/").add(name).add(".txt").str(), a);
-                if !imgdiff.copyFile(path.join(dir, x, a), to, a) {
+                if !copied(path.join(dir, x, a), to, a) {
                     put(Text.new(a).add("FAIL ").add(name).add(" (the run wrote no ").add(x).add(" to bless)\n").str());
                     fail = true;
                 }
@@ -575,4 +576,12 @@ fn stateRun(dir: string, t: &Tbl, d: &Tbl, name: string, bless: bool, a: &Arena)
         }
     }
     return fail;
+}
+
+/// Rust `fs::copy` (keeps the mode) succeeded.
+fn copied(from: string, to: string, a: &Arena): bool {
+    match fsx.copyFile(from, to, a) {
+        Result.Ok(_) { return true; }
+        Result.Err(_) { return false; }
+    }
 }

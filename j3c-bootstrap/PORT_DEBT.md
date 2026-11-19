@@ -48,8 +48,9 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
   stage 0 and the j3c-boot build both pass, and `dump-llvm` is byte-equal, so it is the split per-module build
   (compare (c)). `diff.sh run` on it is order-dependent: `run` says `up to date` on the other compiler's binary.
 - Rust bug (not copied): a pattern warning in a part file prints the module main file as its path (`check/lower/pat/check.rs:320` uses `self.path`; `check/mod.rs:251` fixes the path for errors only). stage0 `src/util.j3:4:51`, boot `src/util/more.j3:4:51`: the one known `check` stderr difference.
-- PORT_DEBT: j3c-boot links SDL2/ALSA/pulse/wayland because load uses j3.scene3d's `.j3scene` reader; fix = split the reader
-  out of j3.scene3d in the stdlib (Rust tree change + stage0 re-pin), planned for C3/C5.
+- Kept (C5 decision, closed): j3c-boot links SDL2/ALSA/pulse/wayland because load uses j3.scene3d's `.j3scene` reader and
+  the in-process scene tools (`use j3_editor.tool`) pull `j3.gfx`/`j3.game`. No headless op calls GL or SDL. No stdlib
+  split, no stage0 re-pin; revisit only if j3c-boot must run on a machine without SDL2.
 - Rust quirk (copied): an instance body is lowered with the origin module's names plus those of the module whose queue
   lowers it (`check/lower/setup.rs` `MergedEnv`), and a bare call resolves fns before locals, so `boot(mem)` in
   `App<W>.create` calls the user's `fn boot`, not the `boot` parameter, when the user module has one
@@ -71,11 +72,8 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
   prints the proper error, rc 1. Repro, each as the only line of `ui/Main.j3ui` under `dump-ui ui`: `<div é="1">`,
   `<div a=é>`, `<dév>`, `<div class:é={x}>`, `<div a=&nbsp;"x">`. No `tests/bad-ui` case (it would sit in
   `known/ui.txt` for good); add them when Rust widens the span to the char.
-- Open (C2e review r1#5): `ui/scan.j3` `scan` takes `extra` (unsaved editor buffers, Rust's overlay paths) and
-  ignores it; the LSP milestone has to merge them in.
-- Open (C3 contracts, wave 19): `gen::before_build` (Rust `gen.rs:148`, called from `build_inner`, `run_user`, `run_loaded`,
-  `unchanged_project`) is the no-op `cmd/gen.j3` `beforeBuild` until C5: j3c-boot does not run a project's stale
-  `assets/gen/*.j3` generators before a build (`examples/editor_village` is the one corpus project with any).
+- Closed (C5 wave 25): `ui/scan.j3` `scan` merges `extra` (the overlay paths) as Rust `scan.rs:48-53`.
+- Closed (C5 wave 26): `gen::before_build` is real (`cmd/gen.j3` `beforeBuild`, honours `J3_GEN_RUNNING`).
 - Note (C3 wave 20, checked C4): `cmd/stamp.j3` `StampFlags` has no `--emit` field, so the backend is not in
   `inputs.<kind>.key` (it is in `src.key` through `Options.emit`). Still only LLVM builds a program: `Bc.emit` is an
   error by design (Rust has no `--emit bc`; scripts reach `.j3sb` through `run` / `dump-bc`). Add the field if a
@@ -87,10 +85,12 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
   clang per missed module, reaped with `proc.waitAny`), where Rust has pool threads (`emit/incr.rs`). The Session
   arena is single-threaded; measured 9 s against 62 s serial for the self build. The time note keeps Rust's words
   (`N modules on W threads`). Two j3c-boot runs on one project race like Rust's (no `io.flock` on the cache dir yet).
-- Open (C3 wave 20, for C5): `version --verbose` prints `docs: not in j3c-boot yet` (Rust hashes its doc and help
-  sources, `stdlib::docs_id`) and its own path on the `binary` line; the other lines are equal.
-- Open (C3 wave 20, for C5): no C fallback when clang is missing (`resolve_backend`); `opensslLibDir` and
-  `clangAvailable` have no caller yet (apk, doctor); Android builds are checked by argv only.
+- Closed (C5 wave 26): `version --verbose` prints `docs  <docsId>`. Not copied, by design: the id hashes this binary's
+  embedded stdlib and page text (FNV-1a 64), never Rust's `.rs`-source hash; `diff.sh tool` masks it. The `binary`
+  line is j3c-boot's own path.
+- Open (C3 wave 20): no C fallback when clang is missing (`resolve_backend`; no C backend, B8a). Closed in C5:
+  `opensslLibDir` has its caller (`dist/apk`). Not copied: `doctor` runs `clang --version` itself as Rust does, so
+  `clangAvailable` still has no caller there. Android builds are checked by argv only (`tests/unit/dist_apk_test.j3`).
 - Stage-0 quirk (C3 wave 20; listed here, not a miscompile): a top-level fn named `less` in a file that calls
   `j3.cmp.sortBy` shadows `sortBy`'s `less` parameter when the instance is lowered (the `MergedEnv` rule above):
   a type error inside `cmp.j3`. Workaround: do not name a top-level fn `less` (or any stdlib generic's parameter name).
@@ -106,3 +106,22 @@ Stdlib-only edits (`j3c/stdlib/`) need no line, but still need a bump for the or
   `pkgtool.run` sets the tool's env with `setenv` on this process before the fork (`proc` takes no env).
 - Open (C4): `devmode.lower`'s "a script calls `X`, which the program can't link" has no corpus case (no valid
   source found that reaches it); the two other devmode refusals are `tests/proj/bc_refuse_dev_*` (`diff.sh bc`).
+- Deferred (user, 2026-11-18): the LSP server and its scanners/`.j3ui` LSP, the MCP server, `j3c editor`, `-e android`,
+  `-e web` and asset import (glTF, online, packs) are stubs (`not ported yet`, rc 1): plans/12-deferred-tools.md.
+- Not copied (C5, B12.2 deferred): the open editor is reached through Rust's file protocol (`target/j3-editor/events`
+  + `replies`, `lock` try-lock), not `j3.instance`: that needs an edit in the frozen `j3c/editor/src`.
+- Not copied (C5, by decision): the editor program is cached in `~/.cache/j3/editor-boot/<xxh3>` (Rust
+  `~/.cache/j3/editor`; Rust's `cleanup_frontends` deletes hash dirs it does not know). `editor/frontend` holds its
+  `in-use.lock` only while it publishes and cleans up (`j3.io` has exclusive locks only).
+- Not copied (C5, B12.5): LSP hover/definition of a name defined twice (`new`, `push`, ...) resolves in sema decl
+  order where Rust uses IR func order, and stdlib generic types show the declared, not an instance's, type args.
+  Single-definition names match byte for byte.
+- Not copied (C5, `lsp/proto`): an unknown method gets -32601 and a bad JSON body -32700 (Rust: `null` / skipped).
+- Not copied (C5): `phase::run_ticking` lives in `toolchain.runTicking` (C3), not in `base/phase`.
+- Not copied (C5, x86-64 Linux only): Rust `fs` file modes (`0666 & ~umask` writes, `0777 & ~umask` folders, copies
+  keep the mode) go through raw `newfstatat`/`fchmodat` in `base/fsx` (`writeFile`, `makeDirs`, `copyFile`); other
+  hosts keep `j3.io`'s modes. The `.deb` `ar` member mtime is the `control.tar.gz` mtime (no wall clock in `j3.sys`).
+- Not copied (C5): `golden --bless` with no dir prints usage, rc 2 (Rust panics, rc 101); a tool killed by a signal
+  prints `exit status: 128+N` in `doctor`, `golden`, `dist` (`j3.proc` folds signals; Rust `signal: N`).
+- Rust bug (C5, not copied): stage0's `lsp/json.rs` reads raw UTF-8 inside JSON strings byte by byte, so `'é'` in a
+  `didOpen` buffer gives a bogus parse error; j3c-boot uses `j3.data.json`.

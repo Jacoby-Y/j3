@@ -15,6 +15,7 @@ use lib "m" as libm {
 }
 
 use j3.cmp.sortBy;
+use j3.data.map.Map;
 use j3.io.path;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
@@ -22,12 +23,12 @@ use j3.proc;
 use j3.result.Result;
 use j3.scene3d;
 use j3.scene3d.Node;
-use j3.sys;
 use j3.text.Text;
 use j3c.base.fixed.pushFixed;
 use j3c.base.fsx;
 use j3c.base.intern.own;
 use j3c.scene.ops;
+use j3c.toolchain.procErrText;
 
 /// Rust `scene::Diff`.
 pub struct Diff {
@@ -39,7 +40,7 @@ pub struct Diff {
 }
 
 /// One object of a scene file: its `Parent/Child` path (`#2`, `#3` for repeats), position and fields.
-struct Obj {
+pub struct Obj {
     path: string;
     x: f64;
     y: f64;
@@ -133,29 +134,59 @@ fn fields(o: &Obj, n: &Node, params: &List<string>, arena: &Arena) {
     for i in 0..params.len / 2 { put(o, params.items[2 * i], params.items[2 * i + 1]); }
 }
 
-/// `param.<id>.<field>[ k]=<value>` data lines of object `id`, as `param.<field>`, value pairs.
-fn paramsOf(data: string, id: int, arena: &Arena): List<string> {
-    let out = List<string>.new(arena);
-    let pre = Text.new(arena);
-    pre.add("param.");
-    pre.pushInt(id);
-    pre.push('.');
-    let p = pre.str();
+/// One `param.<id>.<field>[ k]=<value>` data line: `id` the text between the first two dots, `key` the field
+/// (up to a space), `val` the value. Slices of the data section.
+struct ParamLine {
+    id: string;
+    key: string;
+    val: string;
+}
+
+/// Every param line of `data`, grouped by `id` (stable sort, so file order within an id), and the first index
+/// of each id: one pass instead of a scan per object.
+struct Params {
+    lines: List<ParamLine>;
+    first: Map<string, int>;
+}
+
+fn paramIndex(data: string, arena: &Arena): Params {
+    let lines = List<ParamLine>.new(arena);
     let a = 0;
     for i in 0..data.len + 1 {
         if i < data.len && data[i] != '\n' { continue; }
         let l = data[a..i];
         a = i + 1;
-        if l.len <= p.len || l[0..p.len] != p { continue; }
-        let rest = l[p.len..l.len];
+        if l.len < 6 || l[0..6] != "param." { continue; }
+        let d = 6;
+        while d < l.len && l[d] != '.' { d += 1; }
+        if d + 1 >= l.len { continue; }
+        let rest = l[d + 1..l.len];
         let eq = 0;
         while eq < rest.len && rest[eq] != '=' { eq += 1; }
         if eq == rest.len { continue; }
         let key = rest[0..eq];
         let sp = 0;
         while sp < key.len && key[sp] != ' ' { sp += 1; }
-        out.push(Text.new(arena).add("param.").add(key[0..sp]).str());
-        out.push(own(arena, rest[eq + 1..rest.len]));
+        lines.push(ParamLine { id: l[6..d], key: key[0..sp], val: rest[eq + 1..rest.len] });
+    }
+    sortBy(lines.items[0..lines.len], fn(x: ParamLine, y: ParamLine): bool { return x.id < y.id; });
+    let first = Map<string, int>.new(arena, 16);
+    for k in 0..lines.len { if !first.has(lines.items[k].id) { first.put(lines.items[k].id, k); } }
+    return Params { lines: lines, first: first };
+}
+
+/// The param lines of object `id`, as `param.<field>`, value pairs (in `arena`).
+fn paramsOf(ps: &Params, id: int, arena: &Arena): List<string> {
+    let out = List<string>.new(arena);
+    let t = Text.new(arena);
+    t.pushInt(id);
+    let key = t.str();
+    let k = ps.first.getOr(key, -1);
+    if k < 0 { return out; }
+    while k < ps.lines.len && ps.lines.items[k].id == key {
+        out.push(Text.new(arena).add("param.").add(ps.lines.items[k].key).str());
+        out.push(own(arena, ps.lines.items[k].val));
+        k += 1;
     }
     return out;
 }
@@ -166,7 +197,7 @@ fn sceneObjects(text: string, arena: &Arena): List<Obj> {
     let out = List<Obj>.new(arena);
     let mem = Arena.create(64 * 1024 + text.len * 4);
     let s = scene3d.parse(own(&mem, text) as []u8, true, &mem);
-    let data = s.data.bytes as string;
+    let params = paramIndex(s.data.bytes as string, &mem);
     let seen = List<string>.new(arena);
     for k in 0..s.len {
         let n = s.nodes[k];
@@ -208,7 +239,7 @@ fn sceneObjects(text: string, arena: &Arena): List<Obj> {
         node.effects = own(arena, n.effects);
         node.script = own(arena, n.script);
         node.tags = own(arena, n.tags);
-        let ps = paramsOf(data, n.id, arena);
+        let ps = paramsOf(&params, n.id, arena);
         fields(&o, &node, &ps, arena);
         sortFields(&o);
         out.push(o);
@@ -257,21 +288,24 @@ fn find(objs: &List<Obj>, p: string): int {
     return -1;
 }
 
+/// `root/rel` as text; Err `read REL: E` with `fsx.readText`'s own reason (Rust `read_to_string`'s error).
+fn readRel(root: string, rel: string, arena: &Arena): Result<string, string> {
+    let full = path.join(root, rel, arena);
+    match fsx.readText(full, arena) {
+        Result.Ok(t) { return Result.Ok(t); }
+        Result.Err(e) { return Result.Err(Text.new(arena).add("read ").add(rel).add(": ").add(e[5 + full.len + 2..e.len]).str()); }
+    }
+}
+
 /// Rust `scene::diff`: `rel` against `old` (a project-relative scene) or git HEAD. → MCP (`scene_diff`)
 pub fn diff(root: string, rel: string, old: Option<string>, arena: &Arena): Result<Diff, string> {
-    let now = match fsx.readText(path.join(root, rel, arena), arena) {
-        Result.Ok(t) { t }
-        Result.Err(_) { return Result.Err(Text.new(arena).add("read ").add(rel).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
-    };
+    let now = readRel(root, rel, arena)?;
     let before = "";
     let against = "git HEAD";
     match old {
         Option.Some(o) {
             let r = ops.sceneRel(root, Option.Some(o), arena)?;
-            match fsx.readText(path.join(root, r, arena), arena) {
-                Result.Ok(t) { before = t; }
-                Result.Err(_) { return Result.Err(Text.new(arena).add("read ").add(r).add(": ").add(fsx.osError(sys.errno(), arena)).str()); }
-            }
+            before = readRel(root, r, arena)?;
             against = r;
         }
         Option.None {
@@ -282,7 +316,7 @@ pub fn diff(root: string, rel: string, old: Option<string>, arena: &Arena): Resu
                     // Not in HEAD yet: everything is new.
                     if o.code == 0 { before = o.outStr(); }
                 }
-                Result.Err(_) { return Result.Err(Text.new(arena).add("run git: ").add(fsx.osError(sys.errno(), arena)).str()); }
+                Result.Err(e) { return Result.Err(Text.new(arena).add("run git: ").add(procErrText(e, arena)).str()); }
             }
         }
     }
