@@ -72,4 +72,4 @@ The standard library is written in J3 and ships inside `j3c`. This page is a map
 | `j3.net.tcp`, `j3.net.dns` | TCP connections and name lookup |
 | `j3.net.http`, `j3.net.tls` | HTTP/1.1 and HTTPS clients |
 
-Networking and processes work on Linux and Android.
+Networking and processes work on Linux and Android; TCP and DNS (`j3.net.tcp`, `j3.net.dns`) also work on Windows.

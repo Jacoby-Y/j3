@@ -1,5 +1,6 @@
-// Tests for j3.app.pick: scripted results, and the portal path through a fake `gdbus` (pick_fake/). Linux.
-// Run from the repo root:  timeout 60 j3c run j3c/stdlib/tests/pick_test.j3
+// Tests for j3.app.pick: scripted results, the portal path against a fake portal on a private D-Bus
+// (pick_fake/portal.py; skipped without dbus-daemon or python3-gi), and the zenity fallback (pick_fake/zenity).
+// Linux. Run from the repo root:  timeout 60 j3c run j3c/stdlib/tests/pick_test.j3
 
 module pick_test;
 
@@ -8,6 +9,8 @@ use j3.app.pick.{ Pick, PickJob };
 use j3.io;
 use j3.io.printLn;
 use j3.memory.Arena;
+use j3.proc;
+use j3.proc.{ Child, StartOpts };
 use j3.sys;
 use j3.sys.panic;
 use j3.result.Result;
@@ -21,7 +24,7 @@ fn ok(cond: bool, msg: string) {
 }
 
 fn wait(job: &PickJob): Pick {
-    for _ in 0..200 {
+    for _ in 0..400 {
         match job.poll() {
             Pick.Pending { sys.sleepMs(25); }
             _ { return job.poll(); }
@@ -37,31 +40,88 @@ fn picked(p: Pick, want: string): bool {
     }
 }
 
+fn read(path: string, a: &Arena): string {
+    return match io.readFile(path, a) { Result.Ok(b) { b as string } Result.Err(_) { "" } };
+}
+
+/// Waits (up to 5 s) for `path` to contain `want`.
+fn waitFor(path: string, want: string, a: &Arena): bool {
+    for _ in 0..200 {
+        if contains(read(path, a), want) {
+            return true;
+        }
+        sys.sleepMs(25);
+    }
+    return false;
+}
+
+fn start(argv: []string, a: &Arena): Child {
+    return match proc.startWith(argv, argv[0..0], StartOpts { group: true, parentDeathSignal: sys.SIGKILL }, a) {
+        Result.Ok(c) { c }
+        Result.Err(_) { Child { pid: 0, stdin: -1, stdout: -1, stderr: -1 } }
+    };
+}
+
 fn main() {
     let a = Arena.create(1048576);
     sys.setenv("SDL_VIDEODRIVER", "x11");
-
+    // never the real desktop: fakes first on PATH, and a bus of our own
     sys.setenv("PATH", Text.new(&a).add("j3c/stdlib/tests/pick_fake:").add(sys.env("PATH")).str());
     let log = `/tmp/j3pick_test_{sys.getpid()}`;
+    let sock = `/tmp/j3pb{sys.getpid()}`;
     sys.setenv("PICK_FAKE_LOG", log);
-    sys.setenv("PICK_FAKE_URI", "file:///home/u/My%20Project");
+    sys.setenv("DBUS_SESSION_BUS_ADDRESS", `unix:path={sock}`);
     let f: [1]string = ["Images|*.png *.jpg"];
-    let j1 = pick.file("It's", "/home/u", f[:], &a);
-    ok(picked(wait(&j1), "/home/u/My Project"), "portal path decoded");
-    let args = match io.readFile(log, &a) { Result.Ok(b) { b as string } Result.Err(_) { "" } };
-    ok(contains(args, "'It\\'s'"), "title quoted");
-    ok(contains(args, "('Images', [(uint32 0, '*.png'), (uint32 0, '*.jpg')])"), "filters");
-    ok(contains(args, "'current_folder': <b'/home/u'>"), "start dir");
 
-    io.remove(`{log}.tok`);
+    let gi: [3]string = ["python3", "-c", "import gi.repository.Gio"];
+    let busArgv: [4]string = ["dbus-daemon", "--session", "--nofork", `--address=unix:path={sock}`];
+    let portalArgv: [2]string = ["python3", "j3c/stdlib/tests/pick_fake/portal.py"];
+    let haveGi = match proc.run(gi[:], "", &a) {
+        Result.Ok(o) { o.code == 0 }
+        Result.Err(_) { false }
+    };
+    let bus = if haveGi { start(busArgv[:], &a) }
+        else { Child { pid: 0, stdin: -1, stdout: -1, stderr: -1 } };
+    if bus.pid > 0 {
+        for _ in 0..200 {
+            if io.exists(sock) { break; }
+            sys.sleepMs(25);
+        }
+        let portal = start(portalArgv[:], &a);
+        ok(waitFor(log, "ready", &a), "fake portal up");
+
+        let j1 = pick.file("It's", "/home/u", f[:], &a);
+        ok(picked(wait(&j1), "/home/u/My Project"), "portal path decoded");
+        let args = read(log, &a);
+        ok(contains(args, "\"It's\""), "title");
+        ok(contains(args, "('Images', [(uint32 0, '*.png'), (0, '*.jpg')])"), "filters");
+        ok(contains(args, "'current_folder': <b'/home/u'>"), "start dir");
+
+        let j2 = pick.folder("cancel", "", &a);
+        match wait(&j2) { Pick.Cancelled {} _ { ok(false, "portal cancel"); } }
+        ok(contains(read(log, &a), "'directory': <true>"), "folder mode");
+
+        let j6 = pick.folder("hang", "", &a);
+        ok(waitFor(log, "'hang'", &a), "hang job asked the portal");
+        match j6.poll() { Pick.Pending {} _ { ok(false, "hang job pending"); } }
+        j6.cancel();
+        match j6.poll() { Pick.Cancelled {} _ { ok(false, "cancel() is Cancelled"); } }
+        ok(waitFor(log, "closed /org/freedesktop/portal/desktop/request/", &a), "cancel() closes the portal request");
+
+        portal.killTree(sys.SIGKILL);
+        portal.wait();
+        bus.killTree(sys.SIGKILL);
+        bus.wait();
+        io.remove(sock);
+    } else {
+        printLn("pick_test: no dbus-daemon or python3-gi, portal path skipped");
+    }
+
+    // no bus at that address now: the portal half bows out to zenity
     io.remove(log);
-    sys.setenv("PICK_FAKE_CODE", "1");
-    let j2 = pick.folder("Open", "", &a);
-    match wait(&j2) { Pick.Cancelled {} _ { ok(false, "portal cancel"); } }
-    sys.setenv("PICK_FAKE_NOPORTAL", "1");
     let j5 = pick.file("Open", "/home/u", f[:], &a);
     ok(picked(wait(&j5), "/home/u/picked.png"), "zenity path");
-    let zargs = match io.readFile(log, &a) { Result.Ok(b) { b as string } Result.Err(_) { "" } };
+    let zargs = read(log, &a);
     ok(contains(zargs, "--file-filter=Images | *.png *.jpg"), "zenity filter");
     ok(contains(zargs, "--filename=/home/u/"), "zenity start dir");
     // scripted last: J3_PICK_RESULT cannot be unset again
@@ -72,7 +132,6 @@ fn main() {
     let j4 = pick.folder("Open", "", &a);
     match j4.poll() { Pick.Cancelled {} _ { ok(false, "scripted cancel"); } }
 
-    io.remove(`{log}.tok`);
     io.remove(log);
     printLn("pick_test ok");
 }

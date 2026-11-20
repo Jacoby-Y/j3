@@ -1,10 +1,9 @@
 /// Windows j3.netsys. Same pub names as netsys.j3. Winsock 2 (`ws2_32`): `WSAStartup` runs
-/// on the first `udp()`, and a SOCKET is a handle-sized integer.
-/// Untested: no Windows box in the loop when this was written.
+/// once, lazily, on the first socket or lookup, and a SOCKET is a handle-sized integer.
 
 module j3.netsys;
 
-use j3.text.Text;
+use j3.text.{ Text, cstr };
 use lib "ws2_32" as ws {
     fn WSAStartup(version: u32, data: ptr): i32;
     fn WSAGetLastError(): i32;
@@ -15,6 +14,19 @@ use lib "ws2_32" as ws {
     fn recvfrom(s: int, buf: ptr, n: i32, flags: i32, sa: ptr, len: ptr): i32;
     fn getsockname(s: int, sa: ptr, len: ptr): i32;
     fn closesocket(s: int): i32;
+    fn connect(s: int, sa: ptr, len: i32): i32;
+    fn listen(s: int, backlog: i32): i32;
+    fn accept(s: int, sa: ptr, len: ptr): int;
+    fn recv(s: int, buf: ptr, n: i32, flags: i32): i32;
+    fn send(s: int, buf: ptr, n: i32, flags: i32): i32;
+    fn select(nfds: i32, r: ptr, w: ptr, e: ptr, tv: ptr): i32;
+    fn setsockopt(s: int, level: i32, name: i32, val: ptr, len: i32): i32;
+    fn getsockopt(s: int, level: i32, name: i32, val: ptr, len: ptr): i32;
+    fn getaddrinfo(node: cstr, service: ptr, hints: ptr, res: ptr): i32;
+    fn freeaddrinfo(res: ptr);
+}
+use lib "iphlpapi" as iphlp {
+    fn GetAdaptersAddresses(family: u32, flags: u32, reserved: ptr, out: ptr, size: ptr): u32;
 }
 
 /// `WSAEWOULDBLOCK`.
@@ -39,13 +51,22 @@ pub const NONE: int = 0 - 1;
 /// Any call result: the OS refused.
 pub const FAIL: int = 0 - 2;
 
-/// A new non-blocking IPv4 UDP socket, or a negative number.
-pub fn udp(): int {
+/// Start Winsock once. False when it would not start.
+// ponytail: unlocked; two threads racing here both call WSAStartup, which is refcounted and harmless.
+fn up(): bool {
     if !started {
         if ws.WSAStartup(u32(514), &wsaData[0] as ptr) != 0 {
-            return FAIL;
+            return false;
         }
         started = true;
+    }
+    return true;
+}
+
+/// A new non-blocking IPv4 UDP socket, or a negative number.
+pub fn udp(): int {
+    if !up() {
+        return FAIL;
     }
     let s = ws.socket(2, 2, 0);
     if s == INVALID_SOCKET {
@@ -105,8 +126,6 @@ pub fn shut(s: int) {
     ws.closesocket(s);
 }
 
-// TCP and DNS (`j3.net.tcp`, `j3.net.dns`) are Linux only for now: same pub names as netsys.j3, all fail.
-
 /// TCP result: the wait ran past its timeout.
 pub const TIMEOUT: int = 0 - 3;
 /// `connectTimeout` result: nothing listens on that port.
@@ -115,31 +134,245 @@ pub const REFUSED: int = 0 - 4;
 pub const NO_NAME: int = 0 - 5;
 /// `AF_INET`.
 pub const AF_INET: int = 2;
-/// `AF_INET6` (Linux value; unused here).
-pub const AF_INET6: int = 10;
-/// Bytes of the largest socket address `lookup` returns.
+/// `AF_INET6` (Windows value).
+pub const AF_INET6: int = 23;
+/// Bytes of the largest socket address `lookup` returns (`sockaddr_in6`).
 pub const SA_MAX: int = 28;
 
-/// Not on this target yet: `FAIL`.
-pub fn tcp(family: int): int { return FAIL; }
-/// Not on this target yet: `FAIL`.
-pub fn waitFd(fd: int, write: bool, ms: int): int { return FAIL; }
-/// Not on this target yet: `FAIL`.
-pub fn connectTimeout(fd: int, sa: ptr, len: int, ms: int): int { return FAIL; }
-/// Not on this target yet: does nothing.
-pub fn setTimeouts(fd: int, ms: int) {}
-/// Not on this target yet: does nothing.
-pub fn noDelay(fd: int) {}
-/// Not on this target yet: `FAIL`.
-pub fn listenOn(fd: int, sa: ptr, backlog: int): int { return FAIL; }
-/// Not on this target yet: `FAIL`.
-pub fn accept(fd: int): int { return FAIL; }
-/// Not on this target yet: `FAIL`.
-pub fn recv(fd: int, buf: ptr, n: int): int { return FAIL; }
-/// Not on this target yet: `FAIL`.
-pub fn send(fd: int, buf: ptr, n: int): int { return FAIL; }
-/// Not on this target yet: `FAIL`.
-pub fn lookup(host: cstr, port: int, out: []u8, lens: []int, fams: []int, max: int): int { return FAIL; }
+/// `WSAETIMEDOUT`: a socket timeout or a connect that never got an answer.
+const WSAETIMEDOUT: int = 10060;
+/// `WSAECONNREFUSED`.
+const WSAECONNREFUSED: int = 10061;
+/// `WSAEINTR`.
+const WSAEINTR: int = 10004;
+/// `WSAHOST_NOT_FOUND` / `WSANO_DATA`: `getaddrinfo`'s "no such name".
+const WSAHOST_NOT_FOUND: int = 11001;
+const WSANO_DATA: int = 11004;
+/// `SOL_SOCKET`, `SO_SNDTIMEO`, `SO_RCVTIMEO`, `SO_ERROR`.
+const SOL_SOCKET: int = 65535;
+const SO_SNDTIMEO: int = 4101;
+const SO_RCVTIMEO: int = 4102;
+const SO_ERROR: int = 4103;
+/// `IPPROTO_TCP`, `TCP_NODELAY`.
+const IPPROTO_TCP: int = 6;
+const TCP_NODELAY: int = 1;
+
+/// Map a Winsock error code to `TIMEOUT`, `REFUSED`, or `FAIL`.
+fn mapErr(e: int): int {
+    if e == WSAETIMEDOUT || e == WSAEWOULDBLOCK {
+        return TIMEOUT;
+    }
+    if e == WSAECONNREFUSED {
+        return REFUSED;
+    }
+    return FAIL;
+}
+
+/// A new blocking TCP socket of `family` (`AF_INET` or `AF_INET6`), or `FAIL`.
+pub fn tcp(family: int): int {
+    if !up() {
+        return FAIL;
+    }
+    let s = ws.socket(i32(family), 1, 6);
+    if s == INVALID_SOCKET {
+        return FAIL;
+    }
+    return s;
+}
+
+fn setBlocking(s: int, on: bool) {
+    let v: u32 = if on { u32(0) } else { u32(1) };
+    ws.ioctlsocket(s, i32(FIONBIO), &v as ptr);
+}
+
+/// Wait up to `ms` (negative waits forever) until `s` can read (`write` false) or write.
+/// 1 when ready (or failed: the next call reports it), `TIMEOUT`, or `FAIL`.
+pub fn waitFd(s: int, write: bool, ms: int): int {
+    // fd_set on x64: u32 fd_count, padding, SOCKET fd_array[64]; one socket is enough here.
+    // A failed connect shows up in the except set, not the write set.
+    let rw: [2]int = [1, s];
+    let ex: [2]int = [1, s];
+    // struct timeval { long sec; long usec; } (32-bit longs)
+    let tv: [2]i32 = [i32(ms / 1000), i32((ms % 1000) * 1000)];
+    let tvp: ptr = if ms < 0 { 0 as ptr } else { &tv[0] as ptr };
+    let r = if write {
+        int(ws.select(0, 0 as ptr, &rw[0] as ptr, &ex[0] as ptr, tvp))
+    } else {
+        int(ws.select(0, &rw[0] as ptr, 0 as ptr, &ex[0] as ptr, tvp))
+    };
+    if r > 0 {
+        return 1;
+    }
+    if r == 0 {
+        return TIMEOUT;
+    }
+    return FAIL;
+}
+
+/// Connect `s` to the socket address `sa` (`len` bytes), giving up after `ms`.
+/// 0, `TIMEOUT`, `REFUSED`, or `FAIL`. The socket is blocking again afterwards.
+pub fn connectTimeout(s: int, sa: ptr, len: int, ms: int): int {
+    setBlocking(s, false);
+    if ws.connect(s, sa, i32(len)) == 0 {
+        setBlocking(s, true);
+        return 0;
+    }
+    let e = int(ws.WSAGetLastError());
+    if e != WSAEWOULDBLOCK {
+        setBlocking(s, true);
+        return mapErr(e);
+    }
+    let w = waitFd(s, true, if ms <= 0 { 0 - 1 } else { ms });
+    if w < 0 {
+        setBlocking(s, true);
+        return w;
+    }
+    let err: i32 = 0;
+    let elen: i32 = 4;
+    let g = ws.getsockopt(s, i32(SOL_SOCKET), i32(SO_ERROR), &err as ptr, &elen as ptr);
+    setBlocking(s, true);
+    if g != 0 {
+        return FAIL;
+    }
+    if err != 0 {
+        return mapErr(int(err));
+    }
+    return 0;
+}
+
+/// Make blocking reads and writes on `s` fail with `TIMEOUT` after `ms` (0 waits forever).
+pub fn setTimeouts(s: int, ms: int) {
+    // Winsock takes a DWORD of milliseconds, not a timeval.
+    let v: u32 = u32(ms);
+    ws.setsockopt(s, i32(SOL_SOCKET), i32(SO_RCVTIMEO), &v as ptr, 4);
+    ws.setsockopt(s, i32(SOL_SOCKET), i32(SO_SNDTIMEO), &v as ptr, 4);
+}
+
+/// Send small writes at once instead of batching them (`TCP_NODELAY`).
+pub fn noDelay(s: int) {
+    let on: i32 = 1;
+    ws.setsockopt(s, i32(IPPROTO_TCP), i32(TCP_NODELAY), &on as ptr, 4);
+}
+
+/// Bind `s` to the IPv4 address `sa` (16 bytes) and listen. Negative on failure.
+/// No `SO_REUSEADDR`: on Windows it lets a second socket steal a port that is in use.
+pub fn listenOn(s: int, sa: ptr, backlog: int): int {
+    if ws.bind(s, sa, 16) != 0 {
+        return FAIL;
+    }
+    if ws.listen(s, i32(backlog)) != 0 {
+        return FAIL;
+    }
+    return 0;
+}
+
+/// Wait for one connection on the listening `s`. The new socket, or `FAIL`.
+pub fn accept(s: int): int {
+    while true {
+        let r = ws.accept(s, 0 as ptr, 0 as ptr);
+        if r != INVALID_SOCKET {
+            return r;
+        }
+        let e = int(ws.WSAGetLastError());
+        if e != WSAEINTR {
+            return mapErr(e);
+        }
+    }
+    return FAIL;
+}
+
+/// Read up to `n` bytes. Bytes read, 0 at end of stream, `TIMEOUT`, or `FAIL`.
+pub fn recv(s: int, buf: ptr, n: int): int {
+    let r = int(ws.recv(s, buf, i32(n), 0));
+    if r >= 0 {
+        return r;
+    }
+    return mapErr(int(ws.WSAGetLastError()));
+}
+
+/// Write up to `n` bytes (Windows has no `SIGPIPE`). Bytes written, `TIMEOUT`, or `FAIL`.
+pub fn send(s: int, buf: ptr, n: int): int {
+    let r = int(ws.send(s, buf, i32(n), 0));
+    if r >= 0 {
+        return r;
+    }
+    return mapErr(int(ws.WSAGetLastError()));
+}
+
+/// Resolve `host` (a name or a numeric address) for TCP. Copies up to `max` socket addresses into
+/// `out` (`SA_MAX` bytes each), their lengths into `lens` and families into `fams`.
+/// The count found, `NO_NAME`, or `FAIL`. Blocks; call it off the frame thread.
+pub fn lookup(host: cstr, port: int, out: []u8, lens: []int, fams: []int, max: int): int {
+    if !up() {
+        return FAIL;
+    }
+    // Windows x64 struct addrinfo: ai_flags@0 ai_family@4 ai_socktype@8 ai_protocol@12
+    // ai_addrlen(size_t)@16 ai_canonname@24 ai_addr@32 ai_next@40 (canonname and addr swap vs Linux)
+    let hints: [6]int = [0, 0, 0, 0, 0, 0];
+    let st = ((&hints[0] as int) + 8) as ptr as &i32;
+    *st = 1;
+    let res: ptr = 0;
+    let r = int(ws.getaddrinfo(host, 0, &hints[0] as ptr, &res as ptr));
+    if r != 0 {
+        if r == WSAHOST_NOT_FOUND || r == WSANO_DATA {
+            return NO_NAME;
+        }
+        return FAIL;
+    }
+    let n = 0;
+    let ai = res as int;
+    while ai != 0 && n < max {
+        let fam = int(*((ai + 4) as ptr as &i32));
+        let alen = *((ai + 16) as ptr as &int);
+        let addr = *((ai + 32) as ptr as &int);
+        if (fam == AF_INET || fam == AF_INET6) && alen <= SA_MAX && addr != 0 {
+            let src: []u8 = @slice(addr as ptr, alen);
+            for i in 0..SA_MAX {
+                out[n * SA_MAX + i] = if i < alen { src[i] } else { 0 };
+            }
+            // the port is big-endian at bytes 2..3 in both sockaddr_in and sockaddr_in6
+            out[n * SA_MAX + 2] = u8(port / 256);
+            out[n * SA_MAX + 3] = u8(port % 256);
+            lens[n] = alen;
+            fams[n] = fam;
+            n += 1;
+        }
+        ai = *((ai + 40) as ptr as &int);
+    }
+    ws.freeaddrinfo(res);
+    return n;
+}
+
+/// This machine's IPv4 addresses, 4 bytes each into `out`, up to `max`. The count, or `FAIL`.
+pub fn localIPv4s(out: []u8, max: int): int {
+    // ponytail: one fixed 16 KiB buffer (Microsoft's suggested start); ERROR_BUFFER_OVERFLOW gives FAIL.
+    let buf: [2048]int;
+    let size: u32 = 16384;
+    // AF_INET, GAA_FLAG_SKIP_ANYCAST | SKIP_MULTICAST | SKIP_DNS_SERVER
+    if iphlp.GetAdaptersAddresses(2, 14, 0 as ptr, &buf[0] as ptr, &size as ptr) != 0 {
+        return FAIL;
+    }
+    // IP_ADAPTER_ADDRESSES: Next@8 FirstUnicastAddress@24. IP_ADAPTER_UNICAST_ADDRESS: Next@8,
+    // Address.lpSockaddr@16 (a sockaddr_in: the IPv4 address at bytes 4..8).
+    let n = 0;
+    let ad = &buf[0] as int;
+    while ad != 0 && n < max {
+        let ua = *((ad + 24) as ptr as &int);
+        while ua != 0 && n < max {
+            let sa = *((ua + 16) as ptr as &int);
+            if sa != 0 {
+                let src: []u8 = @slice(sa as ptr, 8);
+                for k in 0..4 {
+                    out[n * 4 + k] = src[4 + k];
+                }
+                n += 1;
+            }
+            ua = *((ua + 8) as ptr as &int);
+        }
+        ad = *((ad + 8) as ptr as &int);
+    }
+    return n;
+}
 
 /// Root certificate files to load one by one (Android only): none here, OpenSSL's default paths serve.
 pub fn caFiles(t: &Text): int { return 0; }
