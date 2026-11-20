@@ -84,7 +84,11 @@ Native $j3c @('build')
 # opengl32.dll is looked up beside the exe before System32: `build` writes target\app.exe, `run` target\.j3c\host\.
 foreach ($d in @('target', 'target\.j3c\host')) {
     New-Item -ItemType Directory -Force -Path $d | Out-Null
-    Copy-Item "$work\mesa\x64\*.dll" $d
+    # Only the GL pieces: a d3d10warp.dll beside the exe shadows the system WARP and crashed the run (c0000005).
+    foreach ($dll in @('opengl32.dll', 'libgallium_wgl.dll', 'libglapi.dll')) {
+        $src = Join-Path "$work\mesa\x64" $dll
+        if (Test-Path $src) { Copy-Item $src $d }
+    }
 }
 # mesa-dist-win may pick its d3d12 driver (WARP on a GPU-less VM); pin the software one.
 $env:GALLIUM_DRIVER = 'llvmpipe'
