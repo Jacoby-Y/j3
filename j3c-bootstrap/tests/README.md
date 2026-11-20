@@ -36,7 +36,8 @@ they cover, as `*_test.j3` files the way `j3c/stdlib/tests/` does it.
    holds up the end; the summary names the run's five slowest. `-x` stops starting inputs after the first
    `DIFF`, `CRASH` or `NONDET` (the rest print `notrun`, a failure). `diff.sh affected [REV]` runs only the
    modes the files changed since `REV` (default `HEAD`, plus untracked files) can change, cheapest first, each
-   with `-x`, and stops at the first failing mode; `--list` prints them. A change under `src/syntax`, `src/base`,
+   with `-x`, and stops at the first failing mode; `--list` prints them. It leaves out the whole-program `ir` and
+   `llvm` hashes (any stdlib or lowering change moves them all); `--full` adds them for the final gate. A change under `src/syntax`, `src/base`,
    `tests/proj`, `corpus.txt` or `diff.sh` runs every mode; `self` only runs when asked for.
 
 The compared text is stdout, `--- stderr`, stderr and `--- exit N`, so a changed exit code or diagnostic fails.
@@ -122,7 +123,13 @@ package): `unitkit.expect(got, FILE, WHAT)` panics on a difference and prints th
 `unitkit.mask` swaps a machine-specific path (temp folder, repo) for `$TMP` / `$ROOT` first; `unitkit.digest`
 stores a sha256 for a text too big to keep. Most of these files began as the Rust compiler's output (plan 15).
 After a deliberate output change, `J3_UNIT_BLESS=1 tests/unit.sh NAME` rewrites them (`blessed FILE` lines);
-review `git diff j3c-bootstrap/tests/unit/expect` before committing. `toolchain_run_test` reads `diff.sh run`'s
+review `git diff j3c-bootstrap/tests/unit/expect` before committing.
+
+`tests/unit.sh --affected [--list] [REV]` runs only the tests a change since `REV` (default `HEAD`, plus untracked
+files) can reach: `tests/affected.awk` reads every `module` and `use` line of the compiler, the stdlib and the
+tests, and picks the tests that use a changed module directly or through other modules, plus tests whose own
+file or expected file changed (all of them when `tests/unit/kit` or `j3.toml` changed). A change to a module
+the driver uses still reaches most tests; a leaf (an LSP or command module) reaches a few. `toolchain_run_test` reads `diff.sh run`'s
 `tests/expect/run/` instead.
 
 ## Other files

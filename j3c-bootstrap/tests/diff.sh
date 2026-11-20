@@ -6,10 +6,12 @@ set -euo pipefail
 usage() {
     cat <<'E'
 usage: tests/diff.sh MODE [--bless] [--norm] [--user] [--es] [--list] [-x] [-j N] [files...]
-       tests/diff.sh affected [--list] [REV] [-j N]
+       tests/diff.sh affected [--list] [--full] [REV] [-j N]
   MODE            fmt | ast | err | ir | llvm | glsl | ui | run | bc | tool | self
   affected        the modes the files changed since REV (default HEAD, plus untracked files) can change, cheapest
                   first, each with -x; stops at the first failing mode. --list prints the modes. Never self.
+                  Leaves out the whole-program ir and llvm hashes (any stdlib or lowering change moves all of them;
+                  run checks behavior, ir --user the entry module's text): --full adds them, for the final gate.
   -x              stop starting inputs after the first DIFF, CRASH or NONDET (the rest print `notrun`)
   --bless         write this run's output as the expected files (tests/expect/KIND/INPUT.out, KIND = MODE, ir-user
                   or glsl-es); each input runs twice and one that prints different text is NONDET, not written.
@@ -75,9 +77,9 @@ case $1 in -h|--help) usage; exit 0 ;; esac
 mode=$1; shift
 # affected: map changed paths to modes; then run each mode with -x, cheapest first.
 if [ "$mode" = affected ]; then
-    alist=0; rev=HEAD; pass=()
+    alist=0; full=0; rev=HEAD; pass=()
     while [ $# -gt 0 ]; do
-        case $1 in --list) alist=1 ;; -j) pass+=(-j "$2"); shift ;; -*) die "affected: unknown flag $1" ;; *) rev=$1 ;; esac
+        case $1 in --list) alist=1 ;; --full) full=1 ;; -j) pass+=(-j "$2"); shift ;; -*) die "affected: unknown flag $1" ;; *) rev=$1 ;; esac
         shift
     done
     all="fmt ast err ui glsl glsl-es bc tool ir ir-user llvm run"
@@ -105,6 +107,7 @@ if [ "$mode" = affected ]; then
         esac
     done <<<"$changed"
     modes=; for m in $all; do case $want in *" $m "*) modes="$modes $m" ;; esac; done
+    [ $full = 1 ] || modes=$(sed -E 's/ (ir|llvm)( |$)/\2/g; s/ (ir|llvm)( |$)/\2/g' <<<"$modes ")
     if [ $alist = 1 ]; then echo $modes; exit 0; fi
     [ -n "$modes" ] || { echo "diff.sh affected: no mode covers the changed files"; exit 0; }
     echo "diff.sh affected:$modes" >&2

@@ -17,8 +17,32 @@
 # Half the cores at most: J3_TEST_JOBS tests side by side, each build with J3_JOBS = (nproc/2) / J3_TEST_JOBS
 # clang processes (at least 1); a J3_JOBS you set wins.
 #   tests/unit.sh [NAME...]     NAME = file name without _test.j3 (e.g. smoke)
+#   tests/unit.sh --affected [--list] [REV]   only the tests a change since REV (default HEAD, plus untracked
+#       files) can reach: tests using a changed compiler or stdlib module directly or through other modules
+#       (tests/affected.awk), tests whose own file or expected file changed; all of them when the unit kit or
+#       j3.toml changed. --list prints the names.
 set -eu
 cd "$(dirname "$0")/.."
+if [ "${1:-}" = --affected ]; then
+    shift; alist=0; rev=HEAD
+    for a in "$@"; do case $a in --list) alist=1 ;; *) rev=$a ;; esac; done
+    picked=$( { grep -H -E '^(module |(pub )?use j3)' src/*.j3 src/*/*.j3 src/*/*/*.j3 $(find ../j3c/stdlib/j3 -name '*.j3') tests/unit/*_test.j3 2>/dev/null
+                echo --CHANGED--
+                (cd .. && { git diff --name-only "$rev" --; git ls-files --others --exclude-standard; }) } | awk -f tests/affected.awk | sort -u)
+    if grep -qx ALL <<<"$picked"; then picked=$(for f in tests/unit/*_test.j3; do basename "$f" _test.j3; done)
+    else
+        # an expected file is named after its test, or begins with the test's name (driver_check_dump_chain.sha256)
+        for e in $(sed -n 's/^expect://p' <<<"$picked"); do
+            for f in tests/unit/*_test.j3; do t=$(basename "$f" _test.j3); case $e in "$t"|"$t"_*) picked="$picked
+$t" ;; esac; done
+        done
+        picked=$(grep -v '^expect:' <<<"$picked" | sort -u | while read -r t; do [ ! -f "tests/unit/${t}_test.j3" ] || echo "$t"; done)
+    fi
+    if [ $alist = 1 ]; then echo $picked; exit 0; fi
+    [ -n "$picked" ] || { echo "unit.sh: no unit test reaches the changed files"; exit 0; }
+    set -- $picked
+    echo "unit.sh --affected: $# tests" >&2
+fi
 budget=$(( $(nproc) / 2 )); [ "$budget" -ge 1 ] || budget=1
 jobs=${J3_TEST_JOBS:-2}; [ "$jobs" -ge 1 ] 2>/dev/null || jobs=1
 tests/boot.sh || { echo "unit.sh: cannot build target/j3c" >&2; exit 1; }   # runs alone: boot.sh takes the whole budget

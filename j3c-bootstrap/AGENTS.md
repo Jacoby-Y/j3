@@ -81,6 +81,12 @@ you.
 ## Gates
 
 Run from the repo root. Every chunk ends with all of them clean.
+- **While implementing, test only what the change reaches:** `j3c-bootstrap/tests/unit.sh --affected` (tests
+  using a changed module, directly or through others) and `j3c-bootstrap/tests/diff.sh affected` (the modes the
+  changed files can move, cheapest first, stopping at the first failure; leaves out the whole-program `ir`/`llvm`
+  hashes). Run the full gates (`diff.sh affected --full`, `diff.sh self` for compiler changes) once, at the end.
+  A DIFF that is only a `--- sha256` line in `ir`/`llvm` after a stdlib or lowering change is expected: bless it,
+  don't investigate it.
 - `j3c-bootstrap/tools/layers.sh`: fails on a `use` that points down `tools/layers.txt`.
 - `j3c-bootstrap/tests/diff.sh MODE [--bless] [files...]`: `target/j3c` against the checked-in
   `tests/expect/MODE/` files, one line per file (`ok` / `DIFF` / `CRASH`), then a summary line to paste in your
