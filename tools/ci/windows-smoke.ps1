@@ -86,6 +86,8 @@ foreach ($d in @('target', 'target\.j3c\host')) {
     New-Item -ItemType Directory -Force -Path $d | Out-Null
     Copy-Item "$work\mesa\x64\*.dll" $d
 }
+# mesa-dist-win may pick its d3d12 driver (WARP on a GPU-less VM); pin the software one.
+$env:GALLIUM_DRIVER = 'llvmpipe'
 # Bounded: a hung game (no frames, a modal box) fails in 5 min with its output instead of eating the job timeout.
 $p = Start-Process -FilePath $j3c -ArgumentList 'run', '--headless', '--frames', '5', '--screenshot', 's.png' `
     -NoNewWindow -PassThru -RedirectStandardOutput run.out -RedirectStandardError run.err
