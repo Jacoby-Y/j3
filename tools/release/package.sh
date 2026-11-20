@@ -3,7 +3,7 @@
 #   j3c-<ver>-<arch>-linux.tar.gz   j3c/bin/j3c + licenses + README (what install.sh unpacks)
 #   j3c_<ver>_<debarch>.deb          /usr/bin/j3c (needs dpkg-deb)
 #   SHA256SUMS
-# --windows instead: j3c-<ver>-x86_64-windows.zip (j3c/j3c.exe + licenses + README.md), cross-built by the Linux
+# --windows instead: j3c-<ver>-x86_64-windows.zip (j3c/j3c.exe + licenses + README.md) and a bare j3c.exe, cross-built by the Linux
 # j3c this script just built (needs clang, x86_64-w64-mingw32-windres or llvm-windres), added to SHA256SUMS. What
 # install.ps1 unpacks. Fails when the build warns (no windres = an exe without its UTF-8 manifest).
 # Native builds only: run it on the arch you ship. J3_SKIP_BUILD=1 reuses j3c-bootstrap/target/j3c.
@@ -107,7 +107,11 @@ if [ -n "$windows" ]; then
   rm -f "$dist/$zname"
   (cd "$w" && zip -qrX "$dist/$zname" j3c) || die "zip failed (apt install zip)"
   addSum "$zname"
+  # Versionless bare exe: releases/latest/download/j3c.exe is a stable one-click link.
+  cp "$exe" "$dist/j3c.exe"
+  addSum j3c.exe
   echo "dist/$zname"
+  echo "dist/j3c.exe"
   echo "dist/SHA256SUMS"
   exit 0
 fi

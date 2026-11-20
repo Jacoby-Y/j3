@@ -1,7 +1,7 @@
 # Install j3c, the J3 compiler, on Windows (x64, Windows 10 1903+), from GitHub Releases. No admin rights.
-#   irm https://github.com/Jacoby-Y/j3/releases/latest/download/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/Jacoby-Y/j3/main/install.ps1 | iex
 # With options (a script piped to iex takes none):
-#   & ([scriptblock]::Create((irm https://github.com/Jacoby-Y/j3/releases/latest/download/install.ps1))) -Version 0.1.0
+#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Jacoby-Y/j3/main/install.ps1))) -Version 0.1.0
 # Options (or environment):
 #   -Version 0.1.0     ($env:J3_VERSION)      a release instead of the latest
 #   -InstallDir DIR    ($env:J3_INSTALL_DIR)  default %LOCALAPPDATA%\Programs\j3c

@@ -6,9 +6,9 @@ After installing, run `j3c doctor`. It tells you what's missing.
 
 | Platform | Status |
 |---|---|
-| Linux x86-64, arm64 | Main target. Prebuilt binaries. |
+| Linux x86-64, arm64 | Supported. Prebuilt binaries. |
+| Windows 10 1903+ / 11 x64 | Supported. Prebuilt `j3c.exe`. |
 | Android (arm64, x86_64) | Build target: `j3c` on Linux builds an APK. |
-| Windows 10 1903+ / 11 x64 | Prebuilt `j3c.exe`, cross-built on Linux and tried under wine; not yet run on real hardware. |
 | macOS | In progress. No prebuilt binary; untested. |
 
 ## Linux
@@ -74,7 +74,7 @@ cd j3
 In PowerShell (no admin rights needed):
 
 ```powershell
-irm https://github.com/Jacoby-Y/j3/releases/latest/download/install.ps1 | iex
+irm https://raw.githubusercontent.com/Jacoby-Y/j3/main/install.ps1 | iex
 ```
 
 It downloads the latest `j3c-<version>-x86_64-windows.zip`, checks it against the release's `SHA256SUMS`, unpacks it to `%LOCALAPPDATA%\Programs\j3c`, adds that folder to your user `PATH` if it is not there, and runs `j3c setup`. Then open a new terminal:
@@ -85,7 +85,7 @@ cd hello
 j3c run
 ```
 
-A given release, or another folder: `& ([scriptblock]::Create((irm https://github.com/Jacoby-Y/j3/releases/latest/download/install.ps1))) -Version 0.1.1 -InstallDir D:\tools\j3c` (or set `J3_VERSION` / `J3_INSTALL_DIR` before the one-liner).
+A given release, or another folder: `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Jacoby-Y/j3/main/install.ps1))) -Version 0.1.1 -InstallDir D:\tools\j3c` (or set `J3_VERSION` / `J3_INSTALL_DIR` before the one-liner).
 
 ### Scoop
 
@@ -97,7 +97,7 @@ Scoop runs `j3c setup` after installing.
 
 ### By hand
 
-Download `j3c-<version>-x86_64-windows.zip` from [Releases](https://github.com/Jacoby-Y/j3/releases) (check it: `Get-FileHash j3c-*.zip` against `SHA256SUMS`), unzip it anywhere, put the `j3c` folder on your `PATH`, then run `j3c setup`.
+Download [`j3c.exe`](https://github.com/Jacoby-Y/j3/releases/latest/download/j3c.exe) (latest release; check it: `Get-FileHash j3c.exe` against `SHA256SUMS`), put it in a folder on your `PATH`, then run `j3c setup`. The `j3c-<version>-x86_64-windows.zip` on [Releases](https://github.com/Jacoby-Y/j3/releases) is the same exe plus licenses.
 
 ### SmartScreen
 

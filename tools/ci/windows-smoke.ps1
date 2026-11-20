@@ -32,7 +32,7 @@ New-Item -ItemType Directory -Path $work | Out-Null
 Step 'install.ps1 -ZipPath'
 $zip = Get-ChildItem -Path $ZipDir -Filter 'j3c-*-x86_64-windows.zip' | Select-Object -First 1
 if (-not $zip) { Fail "no j3c-*-x86_64-windows.zip in $ZipDir" }
-& (Join-Path $repo 'tools/release/install.ps1') -ZipPath $zip.FullName
+& (Join-Path $repo 'install.ps1') -ZipPath $zip.FullName
 $j3c = Join-Path $env:LOCALAPPDATA 'Programs\j3c\j3c.exe'
 if (-not (Test-Path $j3c)) { Fail "install.ps1 left no $j3c" }
 Native $j3c @('version', '--verbose')

@@ -23,7 +23,7 @@
 
 <p align="center"><img src="docs/images/village.png" width="720" alt="A 3D village scene made in J3"></p>
 
-> **Status: alpha.** Linux (x86-64, arm64) is the main target. Windows x64 has a prebuilt `j3c.exe` (not yet run on real hardware); macOS and Android are in progress. Anything can break before 1.0. A game made entirely in J3 is coming to Steam soon.
+> **Status: alpha.** Linux (x86-64, arm64) and Windows x64 are supported; macOS and Android are in progress. Anything can break before 1.0. A game made entirely in J3 is coming to Steam soon.
 
 ## How it compares
 
@@ -124,8 +124,10 @@ curl -fsSL https://raw.githubusercontent.com/Jacoby-Y/j3/main/install.sh | sh
 Windows (PowerShell):
 
 ```powershell
-irm https://github.com/Jacoby-Y/j3/releases/latest/download/install.ps1 | iex
+irm https://raw.githubusercontent.com/Jacoby-Y/j3/main/install.ps1 | iex
 ```
+
+Or just grab [`j3c.exe`](https://github.com/Jacoby-Y/j3/releases/latest/download/j3c.exe), put it on your `PATH`, and run `j3c setup`.
 
 Linux, Windows, macOS, Android, packages, dependencies, and building from source: see [INSTALL.md](INSTALL.md).
 
