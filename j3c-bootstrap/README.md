@@ -1,18 +1,17 @@
 # j3c-bootstrap
 
 `j3c`, the J3 compiler, written in J3. Since plan 11 C6 this is the installed `j3c`: `../build.sh` builds
-stage 1 with `stage0/j3c` (the Rust compiler from the git tag `rust-final`), stage 2 with stage 1, checks
-they agree and installs stage 2. Every file's header says what it does and which Rust files it replaced
-(`Port of:`, paths in `j3c/src/` at `rust-final`). A plain `build` writes `target/j3c`.
+stage 1 with a seed j3c (the installed one, or the release pinned in `seed/VERSION`; `tools/seed.sh`), stage 2
+with stage 1, checks they agree and installs stage 2. Every file's header says what it does; ported files also
+name the Rust files they replaced (`Port of:`, paths in `j3c/src/` at the git tag `rust-final`). A plain `build` writes `target/j3c`.
 
 The version follows git, never a bump commit: `build.sh` writes `git describe` (minus the `v`) and its tag to
 the gitignored `text/version-build.txt`, both stages embed it, then it is removed. `j3c version`, `doctor`
 and cache keys show the full string (`0.1.0-24-gabc1234`), `[package] j3` bounds and `new` templates the
-tag (`project/config.j3`). A build without the file says `J3C_VERSION` (0.1.0, what stage 0 says).
+tag (`project/config.j3`). A build without the file says `J3C_VERSION` (0.1.0).
 
-Agents read `AGENTS.md` first (coding rules, checklists, gates). Rust changes made during the port
-are in `PORT_DEBT.md`; Rust files that are not ported are in `DELETED.md`. The gate is
-`tests/diff.sh MODE` (`tests/README.md`).
+Agents read `AGENTS.md` first (coding rules, checklists, gates). Rust files that were not ported are in
+`DELETED.md`. The gates are `tests/diff.sh MODE` and `tests/unit.sh` (`tests/README.md`).
 
 The language features the port needs come first: `plans/boostrap_features.md` (plan 08, done). Setup, rules and gates for the port itself: `plans/11-pre-bootstrap.md`. Lines starting
 `J3:` in a file header say which plan item that file waits on, or what changes from the Rust version.
@@ -89,6 +88,8 @@ How to test it: `tests/README.md`.
 
 ## Seed
 
-A fresh clone with no `stage0/j3c` builds the Rust compiler at the tag `rust-final` with cargo
-(`tools/stage0.sh rust-final`, run by `../build.sh`), uses it to build stage 1, then stage 1 builds itself. There is no C seed (no C backend). If a clang-only seed
+`../build.sh` seeds from `tools/seed.sh list`: `J3_SEED`, the installed `j3c` (and `j3c.prev`); when those all fail, the
+release pinned in `seed/VERSION` (downloaded by `tools/seed.sh`). With none of those (no J3 release is pinned yet), the last resort is
+`tools/stage0.sh rust-final`: it builds the Rust compiler at that tag with cargo into
+`~/.cache/j3/stage0/rust-final/j3c` and prints the path; then `J3_SEED=<path> ../build.sh` (CI does this). There is no C seed (no C backend). If a clang-only seed
 is ever wanted, commit `dump-llvm` output of `j3c` for x86-64 Linux.

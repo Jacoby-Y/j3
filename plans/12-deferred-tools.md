@@ -13,7 +13,7 @@ Every other tool is ported and byte-gated against stage 0 (`doc`, `help`, `guide
 
 ## Today
 
-Each deferred route prints `j3c-boot: CMD: not ported yet` on stderr and exits 1 (`base/diag.notPortedCmd`). Each deferred library fn returns a neutral value (`Err("... not ported yet")`, `""`, `false`, `None`, an empty list) and keeps its final signature, so filling a body is the whole job. Stub bodies end in `// STUB LSPS` / `LSPU` / `MCP` / `EDDEV` / `ASSETS` (`grep -rn "// STUB " j3c-bootstrap/src`). `tests/known/tool.txt` lists the five dispatch cases that reach them (`lsp-eof`, `e-mcp-ping`, `e-android-help`, `e-web-help`, `editor-help`), each with the cause `deferred: plans/12-deferred-tools.md`; delete a line when its case passes.
+Each deferred route prints `j3c-boot: CMD: not ported yet` on stderr and exits 1 (`base/diag.notPortedCmd`). Each deferred library fn returns a neutral value (`Err("... not ported yet")`, `""`, `false`, `None`, an empty list) and keeps its final signature, so filling a body is the whole job. Stub bodies end in `// STUB LSPS` / `LSPU` / `MCP` / `EDDEV` / `ASSETS` (`grep -rn "// STUB " j3c-bootstrap/src`). The five dispatch cases that reach them (`lsp-eof`, `e-mcp-ping`, `e-android-help`, `e-web-help`, `editor-help`) have the stub error as their expected output in `tests/expect/tool/` (plan 15); re-bless each (`diff.sh tool --bless`) when its route lands and review the new text.
 
 Paths below are under `j3c-bootstrap/src/` (port) and `j3c/src/` (Rust).
 
@@ -121,12 +121,12 @@ Get right: output order follows the node walk; shared meshes and `bake` at the c
 ## Gate for this plan
 
 From the repo root, foreground, `J3C_NO_INSTALL=1`, everything under `timeout`:
-- `diff.sh tool --no-coverage j3c-bootstrap/tests/tool/<f>.txt` 0 DIFF/0 CRASH for the case files `lsp`, `lsp_ui`, `mcp`, `eddev`, `assets` (they exist with headers only; write the cases). LSP sessions: Content-Length stdin files, one open buffer each, only names defined once. MCP: line-framed sessions on scratch copies of `examples/3d-editor-scene` and `examples/editor_village`, `check` with `mask=` on `"diags"`, `play` with `frames`. ASSETS: MCP `import` of `tests/proj/gltf_*` with `out=assets/imported/**`.
-- `tests/known/tool.txt` empty (its five lines pass).
+- `diff.sh tool j3c-bootstrap/tests/tool/<f>.txt` 0 DIFF/0 CRASH for the case files `lsp`, `lsp_ui`, `mcp`, `eddev`, `assets` (they exist with headers only; write the cases). LSP sessions: Content-Length stdin files, one open buffer each, only names defined once. MCP: line-framed sessions on scratch copies of `examples/3d-editor-scene` and `examples/editor_village`, `check` with `mask=` on `"diags"`, `play` with `frames`. ASSETS: MCP `import` of `tests/proj/gltf_*` with `out=assets/imported/**`.
+- The five dispatch cases' expected files (`tests/expect/tool/`) re-blessed with the real output, reviewed.
 - `tests/unit.sh` incl. `lsp_*` (with `lsp_complete` no longer skipped), `mcp_*`, `editor_host_*`, `editor_play_*`, `gltf_*`, `online_*`, `pack_*`, `android_*`, `web_*`.
 - Two RSS loops through the real binary: 1000 `didChange` edits of one buffer through `j3c-boot lsp`, and 1000 `tools/call scene_list` through `j3c-boot -e mcp`; RSS levels off.
 - The plan 11 standing gate and `diff.sh self` stay green.
 
 Never run in tests: `j3c editor` without `--help` (also `editor --new`); `-e android run`; `-e web run`; `-e web serve` outside a unit test on port 0; online search/fetch and MCP `asset_online_search`/`asset_fetch`; `j3c lsp` or `-e mcp` without stdin from a file and a `timeout`; MCP `play` without headless SDL env and `frames`; any MCP write outside a scratch copy; writing `~/.cache/j3/editor/` or `~/.cache/j3/tools` from `j3c-boot`.
 
-When done: drop the matching `main.j3` "imported so it compiles" lines, the PORT_DEBT `deferred` line, and this plan.
+When done: drop the matching `main.j3` "imported so it compiles" lines, and this plan.

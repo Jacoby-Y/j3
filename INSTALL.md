@@ -57,15 +57,15 @@ HTTPS (`j3.net.tls`, `j3.net.http`) also needs OpenSSL 3 (`libssl3` on Debian/Ub
 
 ## From source
 
-Needs `clang`, plus Rust (with Cargo, [rustup.rs](https://rustup.rs)) once, to build the seed compiler.
+Needs `clang` and a seed `j3c`: an installed one (see above), else Rust (with Cargo, [rustup.rs](https://rustup.rs)) once, to build the old Rust compiler as the seed.
 
 ```sh
 git clone https://github.com/Jacoby-Y/j3
 cd j3
-./build.sh
+./build.sh   # with no j3c installed: J3_SEED=$(j3c-bootstrap/tools/stage0.sh rust-final) ./build.sh
 ```
 
-`j3c` is written in J3 (`j3c-bootstrap/`). `build.sh` builds the seed (`j3c-bootstrap/stage0/j3c`, the last Rust `j3c`, from the git tag `rust-final` with Cargo) when it is missing, builds `j3c` with it, has that build itself, and installs the result, with the `j3c-composer` tool, to `$J3_BIN_DIR`, else `~/.bin` if it exists, else `~/.local/bin`.
+`j3c` is written in J3 (`j3c-bootstrap/`). `build.sh` builds `j3c` with a seed (the installed `j3c`, a pinned release, or `J3_SEED`; `j3c-bootstrap/tools/stage0.sh rust-final` builds the last Rust `j3c` from the git tag `rust-final` with Cargo into `~/.cache/j3/stage0/` and prints its path), has that build itself, and installs the result, with the `j3c-composer` tool, to `$J3_BIN_DIR`, else `~/.bin` if it exists, else `~/.local/bin`.
 
 ## Windows
 

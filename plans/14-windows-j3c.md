@@ -134,7 +134,7 @@ Checked by reading and grepping `j3c-bootstrap/src` and `j3c/stdlib` on 2026-11-
 Each chunk ships alone. Test under wine on Linux unless the chunk says otherwise: `WINEDEBUG=-all`, `timeout`, stdout to
 a file, `wineserver -k` afterwards (plan 04 "Testing without the hardware"). Copy test projects **outside the repo**
 (scratchpad) so the on-disk stdlib fallback can't hide chunk 3 bugs. Mid-work, rebuild with
-`j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap`. Run `./build.sh` only at the end, after `tests/unit.sh` and the
+`J3_STDLIB=$PWD/j3c/stdlib j3c build --opt 2 j3c-bootstrap` (or let `tests/diff.sh`/`unit.sh` rebuild `target/j3c`). Run `./build.sh` only at the end, after `tests/unit.sh` and the
 diff gate pass.
 
 ### 1. Host triple, datalayout, `--target` (decisions 4)

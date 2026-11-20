@@ -1,31 +1,34 @@
 #!/bin/bash
-# Differential harness (plan 11 A4): run stage0/j3c (the Rust oracle) and target/j3c on the same
-# inputs and compare. See tests/README.md. Exit 0 all ok or known, 1 new failure, 2 harness/setup error.
+# Differential harness (plan 11 A4, frozen in plan 15): run target/j3c on every corpus input and compare its
+# normalized output with the checked-in tests/expect/MODE/INPUT.out (the Rust oracle's output until plan 15, then
+# reviewed). --bless rewrites them. See tests/README.md. Exit 0 all ok, 1 a failure, 2 harness/setup error.
 set -euo pipefail
 usage() {
     cat <<'E'
-usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-known] [--list] [-j N] [files...]
+usage: tests/diff.sh MODE [--bless] [--norm] [--user] [--es] [--list] [-j N] [files...]
   MODE            fmt | ast | err | ir | llvm | glsl | ui | run | bc | tool | self
-  --norm          ir only: renumber temps by first appearance on both sides (tests/norm_ir.awk)
-  --user          ir only: compare only the entry module (the dump's first `module` section);
-                  its known list is tests/known/ir-user.txt
-  --es            glsl only: `dump-glsl --es` (the OpenGL ES text); its known list is tests/known/glsl-es.txt
-  --no-coverage   skip tools/coverage.sh (also DIFF_NO_COVERAGE=1); tools/layers.sh always runs
-  --update-known  rewrite the known list (tests/known/MODE.txt) to this run's DIFF/CRASH files
+  --bless         write this run's output as the expected files (tests/expect/KIND/INPUT.out, KIND = MODE, ir-user
+                  or glsl-es); each input runs twice and one that prints different text is NONDET, not written.
+                  A whole-corpus bless also deletes expected files no input produces. Review the change in git.
+  --norm          ir with DIFF_REF only: renumber temps by first appearance on both sides (tests/norm_ir.awk)
+  --user          ir only: compare only the entry module (the dump's first `module` section); tests/expect/ir-user/
+  --es            glsl only: `dump-glsl --es` (the OpenGL ES text); tests/expect/glsl-es/
   --list          print the expanded inputs, one per line, and exit (nothing runs)
   -j N            parallel jobs (default J3_TEST_JOBS, else half the cores; llvm a quarter: each job
-                  holds up to ~1 GB of memory and three dumps of up to ~80 MB on disk)
+                  holds up to ~1 GB of memory and three dumps of up to ~80 MB on disk). Half the cores at
+                  most: each job's builds get J3_JOBS = (nproc/2) / N clang processes (at least 1), the
+                  j3c-boot and self stage 2 builds (alone) all nproc/2; a J3_JOBS you set wins
   files           inputs instead of tests/corpus.txt (paths or project folders; tool: case files)
      glsl runs `dump-glsl PATH`; ui runs `dump-ui PROJECT/ui` (the project's `.j3ui` folder).
      tests/bad-ui/NAME is a UI project with one error: ui compares the `dump-ui` error text, and err takes
      such a folder (any folder with a `j3.toml`) as one case, `check .` in a scratch copy.
-     ir/llvm/glsl/ui/run export J3_STDLIB=<repo>/j3c/stdlib to both sides, so stage0's build-dir stdlib path
-     stays out of the output.
-     run: a project's `target/.j3c` (stamps, objects) is removed before each compiler and after the last, so
-     neither reuses the other's build and nothing is left in the corpus (a file input inside a project counts
-     as that project; a file outside any project builds to a temp file, writes no stamps and runs in a scratch cwd). An input whose line in
-     tests/known/run.txt has a `# skip: CAUSE` comment is never run (network). A line with `# nondet: CAUSE`
-     runs, and a NONDET (or any other outcome) of it does not fail the run.
+     ir/llvm/glsl/ui/run export J3_STDLIB=<repo>/j3c/stdlib, so the output names one stdlib path.
+     Compared text: stdout, `--- stderr`, stderr, `--- exit N` (run: no stderr); a stdout or stderr over 64 KiB
+     is replaced by one `--- sha256 HASH, N lines, N bytes` line (whole-program ir and llvm dumps are megabytes).
+     run: a project's `target/.j3c` (stamps, objects) is removed before each run and after the last, so no run
+     reuses another's build and nothing is left in the corpus (a file input inside a project counts as that
+     project; a file outside any project builds to a temp file, writes no stamps and runs in a scratch cwd).
+     A corpus line `!PATH  # CAUSE` drops that input from its section's modes (printed as `skip PATH`: network).
      bc: every compiler works on its own scratch copy (never the tree: `run` and `dump-bc` write `target/j3s/`
      and `scripts/target/`). A project input runs `run --headless --frames 3 .` (dev mode: scripts on the VM) and
      compares the exit code, the set of `*.j3sb` files with their sha256 (not stdout: timings) and, when it
@@ -43,12 +46,14 @@ usage: tests/diff.sh MODE [--norm] [--user] [--es] [--no-coverage] [--update-kno
      `serverInfo` version, timings (`5.2 ms` -> `N ms`), and dropped ticking progress lines (`      linking: 3s`:
      piped, one prints every 2 s, so whether it shows depends on machine load).
      self: stage 1 (j3c-boot) builds a scratch copy of j3c-bootstrap/{j3.toml,src,text} under <repo>/target/
-     (never in place: that would overwrite the running binary); stage 2 is then compared with stage 1 on
-     fmt, ast, err, ui, glsl, ir --norm and llvm (one input per call). SELF_BUILD_TIMEOUT seconds (default 1800).
+     (never in place: that would overwrite the running binary); stage 2 is then compared with stage 1 (DIFF_REF)
+     on fmt, ast, err, ui, glsl, ir --norm and llvm (one input per call). SELF_BUILD_TIMEOUT seconds (default 1800).
      SELF_LLVM=A:B: only llvm inputs A..B of `llvm --list` (the other modes only when A is 1), to run it in pieces.
 Env: DIFF_TIMEOUT seconds per command (default 30; ir/llvm 120; tool 60; run, bc 300).
-     DIFF_STAGE0 / DIFF_BOOT replace the two compilers (default stage0/j3c, target/j3c;
-     DIFF_BOOT skips the j3c-boot rebuild).
+     DIFF_BOOT replaces the compiler under test (default target/j3c, rebuilt by the seed when it is missing, older
+     than src/, or not the plain J3C_VERSION build; DIFF_BOOT skips that). J3_SEED names the seed (else
+     tools/seed.sh list's first). DIFF_REF=J3C compares with that compiler's output instead of the expected files
+     (self uses it; `DIFF_REF=~/.bin/j3c.prev diff.sh llvm FILE` shows the text behind a changed hash).
 E
 }
 die() { echo "diff.sh: $*" >&2; exit 2; }
@@ -56,20 +61,19 @@ die() { echo "diff.sh: $*" >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
 boot=$(dirname "$here")
 root=$(dirname "$boot")
-S0=${DIFF_STAGE0:-$boot/stage0/j3c}
+REF=${DIFF_REF:-}
 BOOT=${DIFF_BOOT:-$boot/target/j3c}
 
 [ $# -ge 1 ] || { usage >&2; exit 2; }
 case $1 in -h|--help) usage; exit 0 ;; esac
 mode=$1; shift
-norm=0; user=0; es=0; cov=${DIFF_NO_COVERAGE:-0}; update=0; list=0; jobs=; files=()
+norm=0; user=0; es=0; bless=0; list=0; jobs=; files=()
 while [ $# -gt 0 ]; do
     case $1 in
         --norm) norm=1 ;;
         --user) user=1 ;;
         --es) es=1 ;;
-        --no-coverage) cov=1 ;;
-        --update-known) update=1 ;;
+        --bless) bless=1 ;;
         --list) list=1 ;;
         -j) [ $# -ge 2 ] || die "-j needs a number"; jobs=$2; shift ;;
         -*) die "unknown flag $1" ;;
@@ -88,28 +92,23 @@ esac
 [ $norm = 0 ] || [ $mode = ir ] || die "--norm is for ir only"
 [ $user = 0 ] || [ $mode = ir ] || die "--user is for ir only"
 [ $es = 0 ] || [ $mode = glsl ] || die "--es is for glsl only"
+[ $norm = 0 ] || [ -n "$REF" ] || die "--norm compares two compilers: set DIFF_REF (the expected files hold the raw dump)"
+[ $bless = 0 ] || [ -z "$REF" ] || die "--bless writes the expected files: unset DIFF_REF"
 to=${DIFF_TIMEOUT:-$to}
 if [ $mode = llvm ] || [ $mode = self ]; then : "${jobs:=${J3_TEST_JOBS:-$(( $(nproc) / 4 ))}}"; fi
 : "${jobs:=${J3_TEST_JOBS:-$(( $(nproc) / 2 ))}}"
 [ "$jobs" -ge 1 ] 2>/dev/null || jobs=1
-[ -x "$S0" ] || die "no $S0: run tools/stage0.sh rust-final"
+budget=$(( $(nproc) / 2 )); [ "$budget" -ge 1 ] || budget=1
+solo=${J3_JOBS:-$budget}   # a build that runs alone (boot.sh, the self stage 2)
+per=$(( budget / jobs )); [ "$per" -ge 1 ] || per=1
+export J3_JOBS=${J3_JOBS:-$per}
+[ -z "$REF" ] || [ -x "$REF" ] || die "DIFF_REF: no $REF"
 
-# Fail fast on the structural checks (not for --list: it only prints).
-if [ $list = 1 ]; then :; elif [ "$cov" = 0 ]; then "$boot/tools/coverage.sh" >&2 || die "tools/coverage.sh failed (--no-coverage skips it)"; fi
+# Fail fast on the structural check (not for --list: it only prints).
 [ $list = 1 ] || "$boot/tools/layers.sh" >&2 || die "tools/layers.sh failed"
-if [ $mode = ast ] && [[ $("$S0" dump-ast /dev/null 2>&1) == *'unknown command'* ]]; then
-    die "stage0 has no dump-ast yet: rebuild it with tools/stage0.sh rust-final"
-fi
 
-# One build of j3c-boot when it is missing, older than its sources, or carries a git build version (./build.sh
-# embeds text/version-build.txt, then removes it; stage 0 says 0.1.0). `--opt 2` (plan 13): the j3.toml stays opt 0
-# for the self build (stage 2 and the bench measure that one); only the binary under test is optimized.
-if [ $list = 0 ] && [ -z "${DIFF_BOOT:-}" ] && { [ ! -x "$BOOT" ] || [ -n "$(find "$boot/src" "$boot/j3.toml" -newer "$BOOT" -print -quit)" ] || [ "$S0" -nt "$BOOT" ] || [ "$("$BOOT" version 2>/dev/null)" != "$("$S0" version)" ]; }; then
-    echo "diff.sh: building j3c-boot" >&2
-    log=$(mktemp)
-    if ! J3_STDLIB=$root/j3c/stdlib timeout 900 "$S0" build --opt 2 "$boot" >"$log" 2>&1; then tail -20 "$log" >&2; rm -f "$log"; die "j3c-boot build failed"; fi
-    rm -f "$log"; touch "$BOOT"  # a cached build may leave the old mtime
-fi
+# One build of j3c-boot when it is missing, stale, or a git-versioned ./build.sh binary (tests/boot.sh).
+if [ $list = 0 ] && [ -z "${DIFF_BOOT:-}" ]; then J3_JOBS=$solo "$here/boot.sh" || die "cannot build j3c-boot"; fi
 
 # self (plan 11 A4): stage 1 = $BOOT builds stage 2 from a scratch copy, then stage 2 must print what stage 1
 # prints. The copy sits at <repo>/target/self.PID/j3c-bootstrap with a `j3c` link beside it, so the sources'
@@ -122,13 +121,13 @@ if [ $mode = self ]; then
     ln -s "$root/j3c" "$scratch/j3c"
     echo "diff.sh self: stage 1 builds stage 2 in $scratch" >&2
     log=$scratch/build.log; touch "$scratch/start"
-    if ! (cd "$scratch" && timeout -k 5 "${SELF_BUILD_TIMEOUT:-1800}" "$BOOT" build j3c-bootstrap) >"$log" 2>&1; then
+    if ! (cd "$scratch" && J3_JOBS=$solo timeout -k 5 "${SELF_BUILD_TIMEOUT:-1800}" "$BOOT" build j3c-bootstrap) >"$log" 2>&1; then
         tail -20 "$log" >&2; die "self: stage 1 could not build stage 2"
     fi
     stage2=$scratch/j3c-bootstrap/target/j3c
     [ -x "$stage2" ] || die "self: no $stage2 after the build"
     [ ! "$boot/target/j3c" -nt "$scratch/start" ] || die "self: the build wrote j3c-bootstrap/target/j3c"
-    export DIFF_STAGE0=$BOOT DIFF_BOOT=$stage2 DIFF_NO_COVERAGE=1
+    export DIFF_REF=$BOOT DIFF_BOOT=$stage2
     bad=0; n=0
     # A clean comparison prints its summary line; a failed one prints everything (the DIFF/CRASH detail).
     sub() {
@@ -161,7 +160,7 @@ if [ $mode = self ]; then
     exit 0
 fi
 
-# After the build: stage0 builds j3c-boot with its own embedded stdlib.
+# One stdlib path in every dump, whichever binary embedded which stdlib.
 case $mode in ir|llvm|glsl|ui|run|bc) export J3_STDLIB=$root/j3c/stdlib ;; esac
 
 # Inputs: corpus lines from sections naming this mode, expanded per mode.
@@ -201,30 +200,37 @@ inputs=$(
             [ -n "${line// /}" ] || continue
             case $line in \[*) case " ${line//[\[\]]/} " in *" $mode "*) on=1 ;; *) on=0 ;; esac; continue ;; esac
             [ $on = 1 ] || continue
+            case $line in '!'*|'?'*) continue ;; esac
             for p in $line; do expand "$p"; done   # unquoted: the line is a glob
         done < "$here/corpus.txt"
     fi | awk '!seen[$0]++'
 )
+# Marked corpus lines in a section of this mode (`MARK PATH  # CAUSE`): `!` never runs the input (network), `?`
+# runs it but a DIFF or NONDET of it does not fail the run (a timing assertion that fails under load).
+marked() {
+    local on=0 line
+    while read -r line; do
+        line=${line%%#*}
+        case $line in \[*) case " ${line//[\[\]]/} " in *" $mode "*) on=1 ;; *) on=0 ;; esac; continue ;; esac
+        [ $on = 1 ] || continue
+        case $line in "$1"*) line=${line#"$1"}; echo ${line// /} ;; esac
+    done < "$here/corpus.txt"
+}
+skipset=$(marked '!')
+flakyset=$(marked '?')
+isflaky() { [ -n "$flakyset" ] && grep -qxF -- "$1" <<<"$flakyset"; }
 [ -n "$inputs" ] || die "no inputs for $mode"
 [ $mode != tool ] || [ -z "$(sort <<<"$inputs" | uniq -d)" ] || die "tool: case names repeat: $(sort <<<"$inputs" | uniq -d | tr '\n' ' ')"
 
-kname=$mode; [ $user = 0 ] || kname=$mode-user   # --user compares less, so it has its own list
+kname=$mode; [ $user = 0 ] || kname=$mode-user   # --user compares less, so it has its own expected files
 [ $es = 0 ] || kname=$mode-es
-known=$here/known/$kname.txt
-knownset=$( [ -f "$known" ] && sed 's/#.*//; s/[[:space:]]*$//; /^$/d' "$known" || true )
-isknown() { grep -qxF -- "$1" <<<"$knownset"; }
-# `PATH  # skip: CAUSE` in the known list: the input is never run (network). It stays a known entry.
-skipset=$( [ -f "$known" ] && sed -n 's/[[:space:]]*#[[:space:]]*skip:.*//p' "$known" || true )
+expect=$here/expect/$kname
 if [ -n "$skipset" ]; then
     skipped=$(grep -xF -- "$skipset" <<<"$inputs" || true)
     inputs=$(grep -vxF -- "$skipset" <<<"$inputs" || true)
     [ -z "$skipped" ] || sed "s|^|skip |" <<<"$skipped" >&$((list + 1))
     [ -n "$inputs" ] || die "every input for $mode is skipped"
 fi
-# `PATH  # nondet: CAUSE`: the oracle's own output changes run to run (timings, pids). The input still runs (a
-# j3c-boot crash on it would show as CRASH when stage0's two runs agree), but no outcome of it fails the run.
-nondetset=$( [ -f "$known" ] && sed -n 's/[[:space:]]*#[[:space:]]*nondet:.*//p' "$known" || true )
-isnondet() { [ -n "$nondetset" ] && grep -qxF -- "$1" <<<"$nondetset"; }
 if [ $list = 1 ]; then echo "$inputs"; exit 0; fi
 # run builds in the project's own target/: never j3c-bootstrap itself (the running binary lives there).
 [ $mode != run ] || ! grep -qxF j3c-bootstrap <<<"$inputs" || die "run: j3c-bootstrap is not a run input (use self)"
@@ -279,8 +285,8 @@ one_tool() {
             *) echo CRASH >"$d/status"; echo "harness: unknown option $o in tests/tool/$stem.txt" >"$d/detail"; return ;;
         esac
     done
-    for who in a a2 b; do
-        local bin=$S0; [ $who = b ] && bin=$BOOT
+    for who in $whos; do
+        local bin=$BOOT; [ $who = a ] && bin=$REF
         rm -rf "$d/w"; mkdir -p "$d/w"
         [ "$proj" = - ] || (cd "$root/$proj" && tar cf - --exclude=./target .) | (cd "$d/w" && tar xf -)
         (cd "$d/w" && env "${envs[@]+"${envs[@]}"}" SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
@@ -296,10 +302,11 @@ one_tool() {
                done
            done
            for g in "${unpacks[@]+"${unpacks[@]}"}"; do for f in $g; do echo "--- unpack $f"; unpacked "$f"; done; done)
-        } | sed -E -e "s|$d/w|\$DIR|g" -e 's/(docs +)[0-9a-f]{8}/\1ID/g' \
+        } | sed -E -e "s|$d/w|\$DIR|g" -e "s|$rootre|\$ROOT|g" -e "s|$homere|\$HOME|g" -e 's/(docs +)[0-9a-f]{8}/\1ID/g' \
               -e 's/("serverInfo":\{"name":"j3c","version":)"[^"]*"/\1"V"/g' \
               -e '/^      (\[[^]]*\] )?[a-z]+: [0-9]+s$/d' \
               -e 's/[0-9]+(\.[0-9]+)? (us|ms|ns|s)\b/N \2/g' ${masks[@]+"${masks[@]}"} >"$d/$who.txt"
+        digest "$d/$who.txt"
         rm -rf "$d/w" "$d/$who.out" "$d/$who.err"
     done
 }
@@ -309,7 +316,7 @@ one() {
     set +e
     if [ $mode = tool ]; then
         one_tool "$1" "$2"
-        if [ ! -f "$tmp/$1/status" ]; then verdict "$tmp/$1"; fi
+        if [ ! -f "$tmp/$1/status" ]; then verdict "$tmp/$1" "$2"; fi
         rm -f "$tmp/$1"/*.txt "$tmp/$1"/*.rc
         return
     fi
@@ -361,8 +368,8 @@ one() {
         # (j3c/stdlib/tests/win_io_test.j3 makes `C:\j3_win_io_test\...` folders in the cwd on Linux).
         if [ -z "$proj" ]; then mkdir -p "$d/w"; cwd=$d/w; cmd=(run --headless --frames 3 "$root/$f"); fi
     fi
-    for who in a a2 b; do
-        local bin=$S0; [ $who = b ] && bin=$BOOT
+    for who in $whos; do
+        local bin=$BOOT; [ $who = a ] && bin=$REF
         # Each compiler builds from nothing: no stamp or object of the other one (or of an earlier run).
         # A dev run (a project with `.j3s` scripts) also writes `target/j3s/` (bytecode, reload counter): gone too.
         [ -z "$proj" ] || rm -rf "$proj/target/.j3c" "$proj/target/j3s"
@@ -394,40 +401,57 @@ one() {
         # ponytail: thread-race counters (a11y_inbox_test: `full N times, woke N`); add patterns here, not entries.
         [ $mode = run ] && sed -i -E 's/full [0-9]+ times, woke [0-9]+/full N times, woke N/' "$d/$who.out"
         [ $norm = 1 ] && awk -f "$here/norm_ir.awk" "$d/$who.out" >"$d/$who.n" && mv "$d/$who.n" "$d/$who.out"
+        # fmt: stdout as a diff against the input (empty for a formatted file), so editing a formatted corpus
+        # file keeps its expected file; the input plus the diff is the whole output, so the check is the same.
+        [ $mode = fmt ] && { diff -u --label input --label fmt "$root/$f" "$d/$who.out" >"$d/$who.n"; mv "$d/$who.n" "$d/$who.out"; }
+        # the checkout and home folders (diagnostics, `doc` headers, debug paths in dumps) are machine-specific
+        sed -i -e "s|$rootre|\$ROOT|g" -e "s|$homere|\$HOME|g" "$d/$who.out" "$d/$who.err"
+        digest "$d/$who.out"; digest "$d/$who.err"
         { cat "$d/$who.out"
           if [ $mode != run ]; then echo "--- stderr"; cat "$d/$who.err"; fi
           echo "--- exit $(cat "$d/$who.rc")"; } >"$d/$who.txt"
         rm -f "$d/$who.out"   # disk: only the .txt is compared
     done
-    verdict "$d"
+    verdict "$d" "$f"
     [ -z "$proj" ] || rm -rf "$proj/target/.j3c" "$proj/target/j3s"
     # Only status and detail are read after this; dumps of a whole corpus would fill the disk.
     rm -rf "$d/w" "$d"/*.out "$d"/*.err "$d"/*.txt "$d"/*.rc
     true
 }
-# verdict DIR: status and detail from DIR/{a,a2,b}.{txt,rc} (stage0 twice, then j3c-boot).
+# digest FILE: a text over $big bytes becomes one line naming its sha256 and size (whole-program ir/llvm dumps
+# are megabytes each; the hash keeps the check exact, DIFF_REF shows the text behind a change).
+digest() {
+    local n; n=$(stat -c %s "$1")
+    [ "$n" -le $big ] || echo "--- sha256 $(sha256sum <"$1" | cut -c1-64), $(wc -l <"$1") lines, $n bytes" >"$1"
+}
+# verdict DIR FILE: status and detail from DIR/{a,a2,b}.txt: b (j3c-boot) against a (DIFF_REF) or the expected
+# file of input FILE; with --bless, a2 is a second j3c-boot run and the expected file is written when both agree.
 verdict() {
-    local d=$1 ra rb; ra=$(cat "$d/a.rc"); rb=$(cat "$d/b.rc")
-    if ! cmp -s "$d/a.txt" "$d/a2.txt"; then
-        echo NONDET >"$d/status"; diff -u --label stage0-run1 --label stage0-run2 "$d/a.txt" "$d/a2.txt" | head -40 >"$d/detail"
-    elif { [ "$rb" -ge 124 ] && [ "$rb" != "$ra" ]; } || { [ "$rb" != 0 ] && [ "$ra" = 0 ]; }; then
-        echo CRASH >"$d/status"
-        { echo "j3c-boot exit $rb (stage0 exit $ra)"
-          if [ -f "$d/b.err" ]; then grep -v '^j3c: \[\| modules compiled$' "$d/b.err" | tail -8
-          else sed -n '/^--- stderr$/,/^--- exit/p' "$d/b.txt" | sed '1d;$d' | tail -8; fi; } >"$d/detail"
-    elif cmp -s "$d/a.txt" "$d/b.txt"; then
-        echo ok >"$d/status"
-    else
-        echo DIFF >"$d/status"; diff -u --label stage0 --label j3c-boot "$d/a.txt" "$d/b.txt" | head -40 >"$d/detail"
-    fi
+    local d=$1 e=$expect/$2.out
+    if [ -n "$REF" ]; then
+        if cmp -s "$d/a.txt" "$d/b.txt"; then echo ok >"$d/status"
+        else echo DIFF >"$d/status"; diff -u --label "$REF" --label j3c-boot "$d/a.txt" "$d/b.txt" | head -40 >"$d/detail"; fi
+    elif [ $bless = 1 ]; then
+        if ! cmp -s "$d/a2.txt" "$d/b.txt"; then
+            echo NONDET >"$d/status"; diff -u --label run1 --label run2 "$d/a2.txt" "$d/b.txt" | head -40 >"$d/detail"
+        elif cmp -s "$e" "$d/b.txt"; then echo ok >"$d/status"
+        else mkdir -p "$(dirname "$e")"; cp "$d/b.txt" "$e"; echo blessed >"$d/status"; fi
+    elif [ ! -f "$e" ]; then
+        echo DIFF >"$d/status"; echo "no expected file ${e#"$root"/} (diff.sh $mode --bless writes it)" >"$d/detail"
+    elif cmp -s "$e" "$d/b.txt"; then echo ok >"$d/status"
+    else echo DIFF >"$d/status"; diff -u --label expected --label j3c-boot "$e" "$d/b.txt" | head -40 >"$d/detail"; fi
 }
 # job LINE: the inputs of one job line, one after another.
 job() {
     local a k; IFS=$'\t' read -ra a <<<"$1"
     for ((k = 0; k < ${#a[@]}; k += 2)); do one "${a[k]}" "${a[k+1]}"; done
 }
-export -f one projof job verdict one_tool unpacked
-export tmp root boot mode norm user es here S0 BOOT to
+export -f one projof job verdict one_tool unpacked digest
+whos=b; [ -z "$REF" ] || whos="a b"; [ $bless = 0 ] || whos="a2 b"
+big=65536
+rootre=$(sed 's/[][\.*^$|]/\\&/g' <<<"$root"); homere=$(sed 's/[][\.*^$|]/\\&/g' <<<"$HOME")
+[ ${#HOME} -gt 1 ] || homere=$rootre   # no home folder to mask: an empty pattern would repeat the last one
+export tmp root boot mode norm user es here REF BOOT to whos big bless expect rootre homere
 
 start=$SECONDS
 # One job per input, except run inputs that build in the same project (they share its target/): one job
@@ -442,40 +466,36 @@ done <<<"$inputs" |
         END { for (j = 1; j <= n; j++) print job[j] }' |
     xargs -d '\n' -n1 -P "$jobs" bash -c 'job "$1"' _
 
-nok=0; ndiff=0; ncrash=0; nnon=0; new=0; fixed=(); failing=(); i=0
+nok=0; nbless=0; ndiff=0; ncrash=0; nnon=0; nflaky=0; i=0
 while IFS= read -r f; do
     i=$((i + 1)); st=$(cat "$tmp/$i/status" 2>/dev/null || echo CRASH)
     case $st in
-        ok) nok=$((nok + 1)); echo "ok $f"; if isknown "$f" && ! isnondet "$f"; then fixed+=("$f"); fi; continue ;;
+        ok) nok=$((nok + 1)); echo "ok $f"; continue ;;
+        blessed) nbless=$((nbless + 1)); echo "blessed $f"; continue ;;
+        CRASH) ncrash=$((ncrash + 1)) ;;   # the harness itself failed on the input
+        DIFF|NONDET) if isflaky "$f"; then nflaky=$((nflaky + 1)); echo "$st $f (flaky in corpus.txt: not a failure)"; continue; fi ;;&
         DIFF) ndiff=$((ndiff + 1)) ;;
-        CRASH) ncrash=$((ncrash + 1)) ;;
-        NONDET) nnon=$((nnon + 1))
-                if isnondet "$f"; then echo "NONDET $f (known)"; continue; fi
-                new=$((new + 1)); echo "NONDET $f (stage0 printed different text on two runs)"
-                sed 's/^/    /' "$tmp/$i/detail"; continue ;;
+        NONDET) nnon=$((nnon + 1)) ;;
     esac
-    echo "$st $f"; failing+=("$f")
-    if ! isknown "$f"; then new=$((new + 1)); [ $update = 1 ] || sed 's/^/    /' "$tmp/$i/detail" 2>/dev/null; fi
+    echo "$st $f"; sed 's/^/    /' "$tmp/$i/detail" 2>/dev/null || true
 done <<<"$inputs"
 
-if [ $update = 1 ]; then
-    mkdir -p "$here/known"
-    oldknown=$(cat "$known" 2>/dev/null || true)
-    { echo "# diff.sh $kname: known DIFF/CRASH inputs. Only ever shrinks: remove a line when its input passes."
-      # ponytail: an existing list only shrinks; a new failure is never blessed (delete the file to reseed).
-      { grep -vxF -- "$inputs" <<<"$knownset" || true
-        # a `# nondet:` entry passes or is NONDET, so it is in neither list above: keep it
-        [ -z "$nondetset" ] || echo "$nondetset"
-        if [ -n "$knownset" ]; then printf '%s\n' "${failing[@]+"${failing[@]}"}" | grep -xF -- "$knownset" || true
-        else printf '%s\n' "${failing[@]+"${failing[@]}"}"; fi; } | sed '/^$/d' | sort -u |
-        # a kept entry keeps its `# cause` / `# skip:` comment
-        awk 'NR == FNR { k = $0; sub(/[[:space:]]*#.*/, "", k); if (k != "") old[k] = $0; next } { print (($0 in old) ? old[$0] : $0) }' <(echo "$oldknown") -
-    } >"$known"
-    echo "diff.sh: wrote tests/known/$kname.txt" >&2
-    [ -n "$knownset" ] || new=$nnon; fixed=()
+# A whole-corpus run owns tests/expect/KIND/: a file no input produced is stale (--bless deletes it).
+nstale=0
+if [ -z "$REF" ] && [ ${#files[@]} = 0 ] && [ -d "$expect" ]; then
+    while IFS= read -r e; do
+        [ -n "$e" ] || continue
+        if [ $bless = 1 ]; then rm -f "$expect/$e"; echo "deleted tests/expect/$kname/$e"
+        else nstale=$((nstale + 1)); echo "stale tests/expect/$kname/$e: no input produces it (--bless deletes it)"; fi
+    done < <(cd "$expect" && find . -name '*.out' -type f | sed 's|^\./||; s|\.out$||' | LC_ALL=C sort |
+             LC_ALL=C comm -23 - <(LC_ALL=C sort <<<"$inputs") | sed 's|$|.out|')
+    [ $bless = 0 ] || find "$expect" -mindepth 1 -type d -empty -delete
 fi
-for f in "${fixed[@]+"${fixed[@]}"}"; do echo "fixed $f: remove it from tests/known/$kname.txt"; done
-sum="diff.sh $mode: $nok ok, $ndiff DIFF, $ncrash CRASH"
+sum="diff.sh $mode: $nok ok"
+[ $bless = 0 ] || sum="$sum, $nbless blessed"
+sum="$sum, $ndiff DIFF, $ncrash CRASH"
 [ $nnon = 0 ] || sum="$sum, $nnon NONDET"
+[ $nstale = 0 ] || sum="$sum, $nstale stale"
+[ $nflaky = 0 ] || sum="$sum, $nflaky flaky"
 echo "$sum ($((SECONDS - start)) s)"
-[ $new = 0 ] && [ ${#fixed[@]} = 0 ] || exit 1
+[ $((ndiff + ncrash + nnon + nstale)) = 0 ] || exit 1

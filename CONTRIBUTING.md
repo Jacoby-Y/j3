@@ -4,13 +4,13 @@ Thanks for helping. J3 is a young, alpha project: bug reports with a small repro
 
 ## Build and test
 
-You need `clang`, Rust (stable) once for the seed compiler, and for anything with a window SDL2 and OpenGL.
+You need `clang`, a seed `j3c` (an installed one, e.g. from a release; else Rust (stable) once to build the old
+Rust compiler as the seed), and for anything with a window SDL2 and OpenGL.
 `j3c doctor` lists what is missing.
 
 ```sh
-j3c-bootstrap/tools/stage0.sh rust-final           # once: the seed, j3c-bootstrap/stage0/j3c (cargo)
-j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap   # binary: j3c-bootstrap/target/j3c
-j3c-bootstrap/tests/unit.sh                        # compiler unit tests
+J3_STDLIB=$PWD/j3c/stdlib j3c build --opt 2 j3c-bootstrap   # binary: j3c-bootstrap/target/j3c
+j3c-bootstrap/tests/unit.sh                                # compiler unit tests
 ```
 
 From the repository root, with that binary built:
@@ -24,7 +24,8 @@ CI (`.github/workflows/ci.yml`) runs them. Compiler changes also run `j3c-bootst
 `j3c run --headless --frames N --screenshot out.png`, and `SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy`
 for a built binary. `j3c doc testing` has the details.
 
-`./build.sh` builds `j3c` (stage 0, then stage 1 builds stage 2) and installs it to `$J3_BIN_DIR`, else
+No `j3c` yet: `J3_SEED=$(j3c-bootstrap/tools/stage0.sh rust-final) ./build.sh` (needs cargo; the
+seed is cached in `~/.cache/j3/stage0/`). `./build.sh` builds `j3c` (the seed builds stage 1, stage 1 builds stage 2) and installs it to `$J3_BIN_DIR`, else
 `~/.bin`, else `~/.local/bin`. Nothing else in the repository installs anything.
 
 ## Where code lives

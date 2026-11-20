@@ -66,7 +66,7 @@ for abi in "${todo[@]}"; do
     export ANDROID_NDK_ROOT=$NDK PATH="$BIN:$PATH"
     timeout 600 ./Configure "$target" -D__ANDROID_API__=$API shared no-tests no-docs no-apps no-engine < /dev/null
     # SHLIB_VERSION_NUMBER empty: SONAME libssl.so / libcrypto.so (an APK only carries lib*.so)
-    timeout 1800 make -j"$(nproc)" build_libs SHLIB_VERSION_NUMBER= SHLIB_EXT=.so < /dev/null
+    timeout 1800 make -j"${J3_JOBS:-$(( ($(nproc) + 1) / 2 ))}" build_libs SHLIB_VERSION_NUMBER= SHLIB_EXT=.so < /dev/null
   )
   rm -rf "${CACHE:?}/$abi"; mkdir -p "$CACHE/$abi/lib"
   cp "$src/libssl.so" "$src/libcrypto.so" "$CACHE/$abi/lib/"

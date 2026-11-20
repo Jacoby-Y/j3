@@ -4,10 +4,12 @@
 # J3C=path/to/j3c (default j3c-bootstrap/target/j3c), J3_TEST_TIMEOUT=seconds per test (240),
 # J3_TEST_LOGS=dir for per-test logs (default a temp dir, kept when something fails).
 set -u
+budget=$(( $(nproc) / 2 )); [ "$budget" -ge 1 ] || budget=1
+export J3_JOBS=${J3_JOBS:-$budget}   # half the cores at most: clang processes per build (repo script rule)
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root" || exit 2
 j3c=${J3C:-$root/j3c-bootstrap/target/j3c}
-[ -x "$j3c" ] || { echo "stdlib-tests.sh: no j3c at $j3c (./build.sh, or J3_STDLIB=$PWD/j3c/stdlib j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap)" >&2; exit 2; }
+[ -x "$j3c" ] || { echo "stdlib-tests.sh: no j3c at $j3c (./build.sh, or J3_STDLIB=$PWD/j3c/stdlib j3c build --opt 2 j3c-bootstrap)" >&2; exit 2; }
 limit=${J3_TEST_TIMEOUT:-240}
 logs=${J3_TEST_LOGS:-$(mktemp -d)}
 mkdir -p "$logs"

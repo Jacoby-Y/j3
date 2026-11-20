@@ -1,0 +1,404 @@
+module j3.scene3d
+    Editable, hierarchical 3D scene data. Paths are relative to the project root.
+    Main thread only: scene and GL state is not thread-safe (`j3c doc threads`).
+
+const GROUP: int = 0
+
+const MESH: int = 1
+
+const CAMERA: int = 2
+
+const INSTANCE: int = 3
+    Places another scene file (`Node.scene`) under this node. `load` adds that scene's
+    objects as children with `owner` set; `store` leaves them out.
+
+const LIGHT: int = 4
+    A point light: `color`, and `range` in world units. `lights` feeds the first eight to gfx.
+
+const OPAQUE: int = 0
+    `Node.alpha` values.
+
+const CUTOUT: int = 1
+
+const BLEND: int = 2
+
+const NEST: int = 8
+    Instances nested deeper than this are skipped.
+
+const GRAFT: int = 1099511627776
+    First id given to objects added from placed scenes. They count up from here on every
+    load, so the same files always give the same ids and the saved `nextId` never moves.
+
+struct Node
+    Stable id, local transform, asset paths, and the script attached to it (if any).
+    id: int
+    parent: int
+    kind: int
+    name: string
+    asset: string
+    texture: string
+    script: string
+        Script attached in the editor (`scripts/door.j3s`), or "". `j3.scene3d.scripts`
+        makes its instances.
+    doubleSided: bool
+    position: Vec3
+    rotation: Vec3
+    scale: Vec3
+    fov: f32
+    near: f32
+    far: f32
+    gpu: Mesh
+    image: Tex
+    boundLo: Vec3
+    boundHi: Vec3
+    scene: string
+        Scene file an `INSTANCE` node places.
+    owner: int
+        For objects added from an instanced scene, the id of the instance node in this
+        scene that brought them in. `0` for the scene's own objects.
+    missing: bool
+        An `INSTANCE` whose scene file, or a `MESH` whose mesh or texture file, could not be read.
+    collapsed: bool
+        Children hidden in an editor's hierarchy. Not saved.
+    color: Vec3
+        `LIGHT` color (1 is full brightness) and reach.
+    tint: Vec3
+        `MESH`/`INSTANCE` color multiplier, 1 = unchanged (above 1 brightens); on an
+        instance it multiplies everything it places.
+    range: f32
+    alpha: int
+        `MESH` transparency: `OPAQUE`, `CUTOUT` (texture alpha under 0.5 is a hole), or
+        `BLEND` (see-through by `opacity` times texture alpha).
+    opacity: f32
+    material: string
+        `MESH` material file (`.j3mat`): tint, glow, and a texture or generated noise. It
+        replaces `texture` when set. `mat` is its slot in the loaded materials, plus one.
+    mat: int
+    source: int
+        For a placed object, its id in the file it came from; `0` otherwise.
+    sourcePath: string
+        For a placed object, the ids leading to it from its placed copy (`owner`): its id in
+        that copy's file, or `<id>/<id>/...` through scenes nested deeper. `override` keys on
+        it; "" otherwise.
+    editable: bool
+        An `INSTANCE` whose placed objects an editor lists and lets you edit. Not saved.
+    effects: string
+        `CAMERA` effect files (`kind=camera` `.j3fx`), `|`-separated, run in order over what
+        it sees. Their params are `fx.<file stem>.<name>` in the param table.
+    tags: string
+        Comma-separated tags a game reads instead of name prefixes: `nocollide`, or
+        `launch=30` with a value. See `hasTag` and `tagValue`.
+    note: string
+        A comment kept with the object: the `//` lines above it in the file, joined by newlines.
+
+struct NodeId
+    A handle to one object: its stable id. A script prop of this type is set in the editor
+    by picking an object (`param.<id>.<prop> r=<target id>`); `scene.node(handle)` reads it.
+    id: int
+
+struct Env
+    Scene-wide lighting, stored as `scene.env.*` lines so undo and the file keep it.
+    sunDir: Vec3
+        Direction toward the sun.
+    sunColor: Vec3
+    sky: Vec3
+        Sky, fog, and ambient color.
+    fogStart: f32
+    fogEnd: f32
+    shadows: bool
+    shadowSize: f32
+        Half size of the box around the origin that casts sun shadows.
+    urp: bool
+        URP: mirrors and glass trace real rays through the scene. `bounces` surfaces a ray
+        follows, `samples` rays a pixel on rough or glass surfaces, and traced sun shadows
+        at the surfaces rays hit (else the shadow map).
+    bounces: int
+    samples: int
+    tracedShadows: bool
+    traceNear: f32 = 40
+        Traced sun shadows reach this far from the eye; the shadow map covers the rest (0: no limit).
+
+struct ParamEntry
+    One script prop (or effect param) value in a scene's parameter table (`Scene.params`).
+    id: int
+    field: string
+    kind: int
+        0 is integer/bool, 1 is float, 2 is string.
+    value: []u8
+    cap: int
+    changed: bool
+
+struct Scene
+    A scene owns its nodes and editable key/value data in `arena`.
+    Code outside this module that rewrites `nodes` or `len` directly must call `relink`.
+    nodes: []Node
+    len: int
+    nextId: int
+    data: Save
+    arena: &Arena
+    placedData: Save
+    params: []ParamEntry
+    paramCount: int
+    paramsData: ptr
+    paramsLen: int
+    paramsDirty: bool
+    paramsPlacedData: ptr
+    paramsPlacedLen: int
+    placedDirty: bool
+    placed: &Arena
+        Expanded scene file text and placed-node strings are replaced on refresh.
+    slots: []int
+        Id lookup table: open addressing, each entry a slot + 1 (0 is empty).
+    linked: int
+        `nodes[0..linked]` are in `slots`.
+    grafted: int
+        Next id for an object added from a placed scene.
+    found: bool
+        The file `read` came from existed.
+    tooDeep: bool
+        Placed scenes went more than `NEST` levels deep; the deeper ones were left out.
+    parseError: string
+        The first thing `read` could not make sense of in a v2 file (`line 12: ...`), or "".
+        `store` refuses to overwrite a file whose last read had one.
+    urpChild: string
+        The first placed scene (at any depth) that turns URP on, "" for none, and the
+        strongest URP settings among placed scenes.
+    childUrp: Env
+    flush: []f32
+        Per node slot, how far `drawWith` pulls it toward the camera in depth (0 for none):
+        the smaller of two objects with faces on one plane. See `flushScan`.
+    flushSig: f32
+        Where the objects stood when `flush` was last worked out, how many frames they have
+        stood still, and whether they moved since.
+    flushStill: int
+    flushStale: bool
+    fn Scene.node(this: &Scene, handle: NodeId): &Node
+        The object `handle` names. Panics when it isn't in the scene.
+    fn Scene.find(this: &Scene, path: string): NodeId
+        The object at `path`: a name (`"Door"`, the first object with it) or a
+        `Parent/Child` path from the top. `NodeId { id: 0 }` when nothing matches.
+
+fn upload(scene: &Scene)
+    Upload mesh assets after the GL context exists.
+fn refreshMaterial(path: string)
+    Read material `path` again after its file changed; every object using it follows.
+fn previewMaterial(path: string, file: &Save)
+    Show material `path` as `file` describes it on every object using it, without writing
+    the file (an editor's unsaved edits). `refreshMaterial` goes back to the file.
+fn materialImage(path: string): Tex
+    Material `path`'s texture or baked noise (id 0 when it has neither).
+fn noiseOf(file: &Save, mem: &Arena): Noise
+    The noise a material file describes (`noise.kind`, `.fractal`, `.octaves`, `.lacunarity`,
+    `.gain`, `.scale`, `.seed`, `.warp`, `.cell`, `.contrast`, `.brightness`, `.invert`,
+    `.steps`, `.threshold`).
+fn rampOf(file: &Save): Ramp
+    The color ramp of a material file: `ramp.count` stops of `ramp.<i>.pos` and
+    `ramp.<i>.r/.g/.b`. Files from before ramps use `noise.a` and `noise.b`.
+const BUILTIN: string = "builtin:"
+    Built-in shapes and images, named `builtin:<name>`: they need no file and work the
+    same in an editor and a game.
+
+const SKY_CLOUDS: string = "builtin:sky-clouds"
+    Meshes: `builtin:cube` (unit), `builtin:sphere` (radius 0.5), `builtin:quad` (1x1 on XY
+    facing +Z), `builtin:plane` (1x1 on XZ facing up), and `builtin:sky` (an inside-out
+    sphere drawn behind everything).
+    A cloudy sky image made for `builtin:sky`.
+
+fn isBuiltin(path: string): bool
+    Whether `path` names a built-in shape or image.
+fn isSky(n: Node): bool
+    Whether mesh node `n` is a sky.
+fn assetVerts(asset: string, arena: &Arena): []f32
+    The vertices (12 floats each) of mesh asset `asset`, built-in or a file, without the
+    GPU: for bounds and ray tests in tools. Empty when it can't be read.
+fn environment(scene: &Scene): Env
+    The scene's lighting; defaults for anything never set.
+fn setEnvironment(scene: &Scene, env: Env)
+    Store `env` in the scene's data (saved with it).
+fn lights(scene: &Scene): int
+    Point the first four `LIGHT` objects at gfx's point lights and turn the rest off. Returns
+    how many lights the scene has (it may be more than four).
+fn shadows(scene: &Scene, env: Env)
+    Set gfx fog and run the sun shadow pass for this scene's `env`, drawing it into the
+    shadow map unless shadows are off. Call before the camera pass.
+fn drawFrame(scene: &Scene, look: Look, env: Env, fov: f32)
+    One frame of `scene` seen from `look`: fog, a sun shadow box of half size
+    `env.shadowSize` around the eye (so a smaller box is sharper nearby), lights, sky, and the
+    scene, then the scene's first camera's effects (see `beginEffects`).
+    The camera pass reuses the shadow pass's world matrices (see `draw`).
+fn draw(scene: &Scene)
+    Draw the scene's meshes in the current gfx pass.
+fn urpSettings(scene: &Scene): Env
+    The URP settings a scene draws with: its own when it turns URP on, else the strongest of
+    the scenes placed in it (see `Scene.urpChild`). `urp` false means plain drawing.
+fn drawSky(scene: &Scene)
+    Draw the scene's sky boxes now, behind anything drawn later, such as an editor grid.
+    The next `draw` or `drawWith` then leaves them out.
+fn drawWith(scene: &Scene, transforms: []Mat4)
+    Draw with matrices produced by `worlds` for this scene. See-through meshes go last,
+    farthest from the camera first.
+fn refreshEffect(path: string)
+    Rebuild effect file `path` if it changed, then reload every material using it.
+fn takeEffectErrors(mem: &Arena): string
+    Effect errors printed since the last call, one per line, copied into `mem`; then cleared.
+fn effectParams(path: string, arena: &Arena): []FxParam
+    Effect file `path`'s params (copied into `arena`), loading it if needed. Empty when it
+    can't be read or parsed.
+fn beginEffects(scene: &Scene, id: int): bool
+    Get ready for camera `id`'s effects: true (and the next camera pass goes offscreen) when
+    it has any that work; then call `endEffects` after drawing. False does nothing.
+fn endEffects(scene: &Scene, id: int)
+    Run camera `id`'s effects in order over the frame drawn since `beginEffects`, with its
+    `fx.<stem>.<name>` params, and show the result where the camera pass would have gone.
+fn cameraFxParams(scene: &Scene, id: int, keys: &[]string, arena: &Arena): []FxParam
+    Every param camera `id`'s effect files declare, as `fx.<stem>.<name>` keys (in `arena`)
+    with their params. Broken or missing files are skipped.
+fn effectIsCamera(path: string): bool
+    Whether effect file `path` is a camera effect (`kind=camera`).
+fn effectError(path: string): string
+    Effect file `path`'s last error, or empty.
+fn hasTag(n: Node, name: string): bool
+    `n` has tag `name`, bare or with a value (`launch=30` has `launch`).
+fn tagValue(n: Node, name: string, fallback: string): string
+    The value of tag `name=value` on `n`; `fallback` when it has no such tag or no value.
+fn fieldIs(bytes: []u8, at: int, end: int, name: string): bool
+    True when `bytes[at..end]` is exactly `name`.
+fn load(path: string, arena: &Arena): Scene
+    Read a scene written by `store`, with every instanced scene added under its
+    instance node. Missing files yield an empty scene.
+fn read(path: string, arena: &Arena): Scene
+    Read a scene file as stored, without adding instanced scenes. One pass: `node.*` lines
+    become nodes, every other line (`param.*`, `scene.*`) stays in `scene.data`.
+fn parse(bytes: []u8, found: bool, arena: &Arena): Scene
+    A scene from file text already in memory (`read` without the file). Node strings point
+    into `bytes`, so they must outlive the scene.
+fn store(scene: &Scene, path: string): bool
+    Persist all node edits in one pass. Parameter lines stay in `data`.
+    Returns false on a write error. Allocates nothing that outlives the call.
+fn startsWith(bytes: []u8, at: int, end: int, prefix: string): bool
+    Whether `bytes[at..end]` starts with `prefix`.
+fn nodeText(scene: &Scene, at: int, depth: int, out: &Text, mem: &Arena)
+    The v2 text of object `at` (its slot in `scene.nodes`): its note lines, then its line, at
+    `depth` levels of indent, newline-ended. Reads the scene's param and override lines.
+fn treeOrder(scene: &Scene, mem: &Arena, slots: []int, depths: []int): int
+    The scene's own objects (not placed ones) depth first, parents before children, siblings in
+    array order: `slots[k]` is a slot in `scene.nodes` and `depths[k]` its depth. Both need room
+    for `scene.len`. An object whose parent loops back to itself is listed at depth 0. Returns how many.
+fn index(scene: &Scene, id: int): int
+    Index of `id`, or -1 when absent. Zero is the root sentinel.
+fn nextSlot(h: int, size: int): int
+    Next probe after `h` in a table of `size`.
+fn bucket(id: int, size: int): int
+    Fibonacci hash of `id` into `0..size`.
+fn relink(scene: &Scene)
+    Rebuild the id table. Call after rewriting `nodes` or `len` outside this module.
+fn add(scene: &Scene, kind: int, name: string, parent: int): int
+    Add a node under `parent`, falling back to the root if missing.
+fn moveTo(scene: &Scene, id: int, slot: int)
+    Reparent while preserving the node's local transform. Returns false for cycles.
+    Move node `id` to array slot `slot`, shifting the nodes between. Siblings are listed in
+    array order, so this reorders them; nothing else depends on the order.
+fn reparent(scene: &Scene, id: int, parent: int): bool
+fn remove(scene: &Scene, id: int)
+    Delete a node and all descendants, keeping the order of everything else.
+    Objects whose parent no longer exists go too.
+fn local(n: Node): Mat4
+    Local transform uses XYZ Euler angles in radians.
+fn world(scene: &Scene, id: int): Mat4
+    World transform; malformed parent chains stop after `len` links.
+fn worlds(scene: &Scene, out: []Mat4)
+    Fill one world matrix per node. Parents are resolved on demand and each node is computed once.
+fn paramSlot(table: []ParamEntry, id: int, field: string): int
+    The slot of `id`'s `field` in `table`: its entry, or the empty slot it would take.
+fn rebuildParams(scene: &Scene)
+    Rebuild the parameter table after rewriting `param.` lines in the scene data.
+fn ensureParams(scene: &Scene)
+    Build the parameter table if the scene data changed since it was last built.
+fn flushParams(scene: &Scene)
+    Materialize edited fields only at save or snapshot boundaries. Old blobs stay immutable for undo.
+fn number(scene: &Scene, id: int, field: string, fallback: f32): f32
+    A float parameter scoped to one object instance.
+fn setNumber(scene: &Scene, id: int, field: string, value: f32)
+fn flag(scene: &Scene, id: int, field: string, fallback: bool): bool
+fn setFlag(scene: &Scene, id: int, field: string, value: bool)
+fn integer(scene: &Scene, id: int, field: string, fallback: int): int
+fn setInteger(scene: &Scene, id: int, field: string, value: int)
+fn vector(scene: &Scene, id: int, field: string, fallback: Vec3): Vec3
+    A `vec3` or `color` field, stored as numbers `<field>.x`, `.y`, and `.z`.
+fn setVector(scene: &Scene, id: int, field: string, value: Vec3)
+fn object(scene: &Scene, id: int, field: string): int
+    An `object` field: the id of another object in this scene, or 0. Copies and placed
+    scenes point it at the matching copy when that object came along.
+fn setObject(scene: &Scene, id: int, field: string, target: int)
+fn label(scene: &Scene, id: int, field: string, fallback: string): string
+fn setLabel(scene: &Scene, id: int, field: string, value: string)
+fn keyId(bytes: []u8, at: int, end: int, prefix: string): int
+    The id in a `<prefix><id>.<rest>` line, or 0 for any other line.
+fn appendParams(src: &Save, from: []int, to: []int, extra: &Text, mem: &Arena)
+    Append `src`'s `param.<from[k]>.*` lines to `extra` as `param.<to[k]>.*`. An object field that
+    names one of `from` is pointed at its `to`.
+fn clearParams(scene: &Scene, id: int)
+    Drop every parameter line of object `id`.
+fn retainParams(scene: &Scene, ctx: ptr, keep: fn(ptr, int, string): bool)
+    Keep only the parameter lines where `keep(ctx, id, field)` is true. `ctx` is passed through.
+fn hit(scene: &Scene, id: int, ray: Ray, reach: f32): RayHit
+    World-space AABB hit for a mesh's loaded vertex bounds.
+fn hitWith(scene: &Scene, transforms: []Mat4, at: int, ray: Ray, reach: f32): RayHit
+    Hit test with an already computed transform at node slot `at`. Meshes are tested
+    against their triangles (both sides); a mesh with no loaded vertices and a sky never
+    hit. Other nodes use their bounds box.
+fn hitTriangles(verts: []f32, model: Mat4, ray: Ray, reach: f32): RayHit
+    Nearest crossing of `ray` with the triangles of `verts` (12 floats a vertex) placed by
+    `model`, within `reach`. Meshes past `PICK_BVH` triangles are searched through a BVH
+    built on first use and kept.
+struct Part
+    A scene file loaded into another at `at`: see `loadParts`.
+    file: string
+    at: Vec3
+        Added to the position of the part's top-level objects.
+
+fn loadParts(path: string, parts: []Part, arena: &Arena): Scene
+    Read `path` and bring each of `parts` into it: the part's objects get ids past everything so far,
+    those at the top of the part move by its `at`, and their params and per-copy values come along.
+    Placed scenes are expanded after. A part that isn't there is skipped. This is how a game
+    builds one world from a scene per region; `-e scene split` makes such files.
+fn expand(scene: &Scene, path: string)
+fn copyKey(copy: int, name: string): string
+    The data key of prop `name` set on placed copy `copy`: `over.<copy>.prop.<name>`.
+fn copyOf(scene: &Scene, id: int): int
+    The placed copy (an `INSTANCE` node) that `id` belongs to: itself when it is one, else
+    the nearest one above it; 0 for none. Behaviors inside a reusable scene call
+    `prop(scene, copyOf(scene, self), ...)`.
+fn prop(scene: &Scene, copy: int, name: string, fallback: string): string
+    Prop `name` of placed copy `copy`: the value set on this copy (in this scene, or by the
+    scene that placed it), else its scene's default, else `fallback`.
+fn propNumber(scene: &Scene, copy: int, name: string, fallback: f32): f32
+fn propInt(scene: &Scene, copy: int, name: string, fallback: int): int
+fn propFlag(scene: &Scene, copy: int, name: string, fallback: bool): bool
+fn propSet(scene: &Scene, copy: int, name: string): bool
+    Whether copy `copy` sets `name` itself (in this scene), rather than using the default.
+fn refresh(scene: &Scene, path: string)
+    Rebuild instanced objects after scene files changed on disk, and upload the new ones.
+    Meshes still in use stay on the GPU.
+fn sharedRefs(asset: string, texture: string): int
+    Uses of the cache entry holding `asset` + `texture`, or 0 when it isn't cached.
+fn unload(n: &Node)
+    Give up a node's GPU mesh and texture, freeing them when no other node uses them.
+fn reload(scene: &Scene, id: int)
+    Refresh one node's GPU resources after its asset path changes.
+fn rebuild(asset: string, texture: string, scenes: []Scene): bool
+    Re-read one mesh/texture pair and update every supplied live scene together. The caller
+    supplies all scenes that can hold this cache entry; GPU ids stay stable for shared users.
+fn release(scene: &Scene)
+const TRACE_MAX: int = 262144
+    Most mesh triangles URP traces, counting each mesh once however many objects use it.
+    Meshes past it are left out of reflections and shadows.
+
+fn flushScan(scene: &Scene, transforms: []Mat4, meshes: [][]f32, a: []int, b: []int, at: []Vec3, gaveUp: &bool): int
+    Find pairs of nodes with overlapping faces on one plane: they flicker where they share a
+    view. `meshes[i]` is node slot `i`'s vertices (12 floats each), empty to leave it out;
+    `transforms[i]` its world matrix. Slots of the first `a.len` pairs go to `a[k]`/`b[k]`
+    and a corner of the overlap to `at[k]`. Returns every pair found, and sets `gaveUp` when
+    the scene was too large to compare them all.
+--- stderr
+--- exit 0

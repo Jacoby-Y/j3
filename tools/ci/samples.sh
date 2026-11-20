@@ -3,10 +3,12 @@
 # Exit 1 if any failed. J3C=path/to/j3c (default j3c-bootstrap/target/j3c).
 # speculative/08 needs a game loop with input (not run here).
 set -u
+budget=$(( $(nproc) / 2 )); [ "$budget" -ge 1 ] || budget=1
+export J3_JOBS=${J3_JOBS:-$budget}   # half the cores at most: clang processes per build (repo script rule)
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root" || exit 2
 j3c=${J3C:-$root/j3c-bootstrap/target/j3c}
-[ -x "$j3c" ] || { echo "samples.sh: no j3c at $j3c (./build.sh, or J3_STDLIB=$PWD/j3c/stdlib j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap)" >&2; exit 2; }
+[ -x "$j3c" ] || { echo "samples.sh: no j3c at $j3c (./build.sh, or J3_STDLIB=$PWD/j3c/stdlib j3c build --opt 2 j3c-bootstrap)" >&2; exit 2; }
 unset DISPLAY WAYLAND_DISPLAY
 export SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy
 log=$(mktemp)

@@ -1,14 +1,14 @@
 # Scale (plan 11 A11)
 
 Build cost of the Rust oracle, so the port can be held to it. Measured with
-`/usr/bin/time -v stage0/j3c build DIR` on a fresh copy of each project in a scratch folder ("cold": no
+`/usr/bin/time -v j3c build DIR` (stage 0, the Rust j3c) on a fresh copy of each project in a scratch folder ("cold": no
 `target/` yet) and then again ("warm": the build's own cache in `target/.j3c`). Peak RSS is
 "Maximum resident set size".
 
 ## Now (stubs, before C1)
 
 - Date: 2026-11-16. Machine: 24 cores (`nproc`), Linux x86-64.
-- stage0: `commit b7fd5978c1fe6d7268334291b238a28eab89c25c`, `dirty yes (uncommitted edits under j3c/)`, j3c 0.1.0, docs 970ea767.
+- stage 0: `commit b7fd5978c1fe6d7268334291b238a28eab89c25c`, `dirty yes (uncommitted edits under j3c/)`, j3c 0.1.0, docs 970ea767.
 
 | Build | Source lines (own) | Wall cold | RSS cold | Wall warm | RSS warm |
 |---|---|---|---|---|---|
@@ -18,7 +18,7 @@ Build cost of the Rust oracle, so the port can be held to it. Measured with
 The stub build is near zero because `main.j3` reaches almost none of the stub modules. The editor is the
 real yardstick: the biggest J3 program built today (about 160k lines with the stdlib).
 
-`tests/diff.sh fmt` over the corpus (496 files, 3 stage0 runs + 1 j3c-boot run each, 24 jobs): about 2 s.
+`tests/diff.sh fmt` over the corpus (496 files, 3 stage 0 runs + 1 j3c-boot run each, 24 jobs): about 2 s.
 `ir`: 219 inputs, 11 s. `llvm`: 219 inputs, 60 s.
 
 ## After C1 (front end ported)
@@ -33,7 +33,7 @@ Rust time or RSS above 4x the Rust RSS.
 | `check` of the editor project (load + parse: 179 files, 1.6 MB with the stdlib) | 0.030 s | 60 MB | 0.07 s | 97 MB | 2.3x | 1.6x |
 | `check` of `j3c-bootstrap` (load + parse: 100 files, 0.75 MB) | 0.020 s | 39 MB | 0.03 s | 45 MB | 1.5x | 1.2x |
 
-- Date: 2026-11-16, same machine. stage0 as above (docs 51255b76). j3c-boot built with `j3c build --release`
+- Date: 2026-11-16, same machine. stage 0 as above (docs 51255b76). j3c-boot built with `j3c build --release`
   (a dev build, `opt = 0`, is about 3.5x slower on `dump-ast`: 1.25 s). Median of 2-3 runs, `/usr/bin/time -v`.
 - Rust "load + parse" is its own `J3C_TIMINGS=1` line (no process start), with RSS read from `/proc` when that
   line is printed (Rust `check` goes on to sema; its whole-run peak is 120 MB for the editor, 94 MB for
@@ -49,15 +49,15 @@ Rust time or RSS above 4x the Rust RSS.
 
 ## After C3 (self build through the object cache)
 
-Stage 1 (`target/j3c-boot`, built by stage0, dev: opt 0) builds stage 2 from a scratch copy of `j3c-bootstrap`
+Stage 1 (`target/j3c-boot`, built by stage 0, dev: opt 0) builds stage 2 from a scratch copy of `j3c-bootstrap`
 (`{j3.toml,src,text}` under `<repo>/target/`, what `diff.sh self` does): 97 modules, 271 clang jobs.
 
 | Build of the scratch copy | Wall | Peak RSS | Notes |
 |---|---|---|---|
 | j3c-boot (stage 1), cache cold | 9.0 s | 1292 MB | every module emitted and compiled in forked workers, 24 cores |
 | j3c-boot (stage 1), cache warm (nothing changed) | 1.6 s | 691 MB | parse + check, then `up to date`; no clang, no link |
-| stage0 (Rust), cache cold | 2.8 s | 868 MB | same copy |
-| stage0 (Rust), cache warm | 0.8 s | 365 MB | same copy |
+| stage 0 (Rust), cache cold | 2.8 s | 868 MB | same copy |
+| stage 0 (Rust), cache warm | 0.8 s | 365 MB | same copy |
 
 - Date: 2026-11-18, same machine, `/usr/bin/time -f "%e %M"` (the RSS is the largest single process: the parent,
   whose workers are forks of it). One run each. Ratio to Rust: 3.2x wall and 1.5x RSS cold, 2.0x and 1.9x warm.

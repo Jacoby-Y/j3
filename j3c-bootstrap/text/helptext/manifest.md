@@ -139,6 +139,9 @@ Environment
                 that directory too
     J3C_COLOR   set to color rustc-shaped diagnostics
     J3C_TIMINGS set to print how long each build phase took, to stderr
+    J3_JOBS     N >= 1: at most N clang processes side by side (a cold build may
+                be slower: giant modules split less). Unset: one worker per core,
+                and a split module adds more; anything else warns, uses every core
     J3_FRAMES, J3_SCREENSHOT  set by `run --frames` / `--screenshot`; an App
                 stops after that many frames and saves the last one
     J3_CAPTURE  out.png:N saves frame N (1-based), then quits (goldens)

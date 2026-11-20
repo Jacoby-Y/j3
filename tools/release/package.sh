@@ -4,10 +4,16 @@
 #   j3c_<ver>_<debarch>.deb          /usr/bin/j3c (needs dpkg-deb)
 #   SHA256SUMS
 # Native builds only: run it on the arch you ship. J3_SKIP_BUILD=1 reuses j3c-bootstrap/target/j3c.
-# The build: stage 0 (j3c-bootstrap/stage0/j3c; built from the tag rust-final with cargo when missing) builds j3c.
+# The build: a seed j3c builds j3c, chosen like build.sh does (j3c-bootstrap/tools/seed.sh list: $J3_SEED, the
+# installed j3c, its j3c.prev, then the release pinned in j3c-bootstrap/seed/VERSION, downloaded only when the
+# others failed); one that fails hands over to the next. J3_JOBS defaults to half the cores (see build.sh). No seed at all: J3_SEED=$(j3c-bootstrap/tools/stage0.sh rust-final) (cargo; release.yml does this).
 # Maintainer of the .deb: J3_DEB_MAINTAINER (default below). j3c-composer is not shipped (separate tool).
 set -eu
 umask 022
+budget=$(( $(nproc) / 2 )); [ "$budget" -ge 1 ] || budget=1
+export J3_JOBS=${J3_JOBS:-$budget}
+pin=
+if [ "$J3_JOBS" -lt "$(nproc)" ] 2>/dev/null && taskset -c "0-$((J3_JOBS - 1))" true 2>/dev/null; then pin="taskset -c 0-$((J3_JOBS - 1))"; fi
 REPO_URL=https://github.com/Jacoby-Y/j3
 MAINTAINER=${J3_DEB_MAINTAINER:-"Jacoby-Y <Jacoby-Y@users.noreply.github.com>"}
 
@@ -16,13 +22,28 @@ cd "$root"
 die() { echo "package.sh: $*" >&2; exit 1; }
 
 if [ -z "${J3_SKIP_BUILD:-}" ]; then
-  [ -x j3c-bootstrap/stage0/j3c ] || j3c-bootstrap/tools/stage0.sh rust-final
+  seeds=$(j3c-bootstrap/tools/seed.sh list)
+  last=pinned; [ -z "${J3_SEED:-}" ] || last=
   # The version is git's (see build.sh): written for this build only.
   vf=j3c-bootstrap/text/version-build.txt
   d=$(git describe --tags --match 'v[0-9]*' --dirty) || die "git describe: no v* tag (fetch tags)"
   printf '%s\n%s\n' "${d#v}" "$(git describe --tags --match 'v[0-9]*' --abbrev=0 | sed 's/^v//')" > "$vf"
-  J3_STDLIB=$PWD/j3c/stdlib j3c-bootstrap/stage0/j3c build --opt 2 j3c-bootstrap || { rm -f "$vf"; die "build failed"; }
+  # The seed embeds its own stdlib; the compiler may need newer modules, so it reads the tree's.
+  seed=
+  nl='
+'
+  ifs=$IFS
+  IFS=$nl
+  for c in $seeds $last; do
+    IFS=$ifs
+    if [ "$c" = pinned ]; then c=$(j3c-bootstrap/tools/seed.sh) || break; fi
+    echo "package.sh: building with seed $c ($("$c" version))"
+    if J3_STDLIB=$PWD/j3c/stdlib $pin "$c" build --opt 2 j3c-bootstrap; then seed=$c; break; fi
+    echo "package.sh: seed $c failed; trying the next seed"
+  done
+  IFS=$ifs
   rm -f "$vf"
+  [ -n "$seed" ] || die "no seed j3c built it (see above): install one, set J3_SEED, or pin j3c-bootstrap/seed/VERSION"
   strip j3c-bootstrap/target/j3c
 fi
 bin=j3c-bootstrap/target/j3c

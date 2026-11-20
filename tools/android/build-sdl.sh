@@ -86,7 +86,7 @@ cm() {
     -DCMAKE_INSTALL_PREFIX="$CACHE/$abi" -DCMAKE_PREFIX_PATH="$CACHE/$abi" \
     -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
     "$@" < /dev/null
-  timeout 1800 cmake --build "$bd" -j"$(nproc)" < /dev/null
+  timeout 1800 cmake --build "$bd" -j"${J3_JOBS:-$(( ($(nproc) + 1) / 2 ))}" < /dev/null
   timeout 300 cmake --install "$bd" < /dev/null
 }
 

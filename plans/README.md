@@ -20,10 +20,9 @@ say "plan 023" and the like point at those old, deleted plans.
 | [12](12-deferred-tools.md) | Tools left unported in j3c-boot (LSP server and scanners, MCP server, `j3c editor`, `-e android`, `-e web`, asset import): stubs, Rust to port, gate. Broken after plan 11 C6 until done | TODO |
 | [13](13-speed.md) | Make j3c in J3 faster, smaller and lighter than Rust j3c on every bench metric (`j3c-bootstrap/tools/bench.sh`) | IN PROGRESS |
 | [14](14-windows-j3c.md) | Ship `j3c.exe`: host triple, `.exe`/cache paths, `j3c setup` (llvm-mingw + SDL kit), cross-built release zip, `install.ps1`, Scoop, Windows CI | TODO |
-| [15](15-retire-stage0.md) | Retire stage 0: seed from the installed `j3c` / a pinned release, freeze the Rust oracle into expected files, unit tests built by `target/j3c` (fast, no `J3_STDLIB`) | TODO (seed choice is the user's) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason). A new plan takes the next
 number. Open direction lives in `roadmap.md` and `EDITOR.md`.
 
-Since plan 11 C6 the compiler is J3 (`j3c-bootstrap/`) and nothing is built with cargo except the seed
-(`j3c-bootstrap/tools/stage0.sh rust-final`). `./build.sh` installs `j3c`.
+Since plan 11 C6 the compiler is J3 (`j3c-bootstrap/`) and nothing is built with cargo except, as a last-resort seed,
+the old Rust compiler (`j3c-bootstrap/tools/stage0.sh rust-final`). `./build.sh` installs `j3c`.

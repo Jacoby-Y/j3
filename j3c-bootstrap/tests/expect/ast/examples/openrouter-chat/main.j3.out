@@ -1,0 +1,188 @@
+(file (module main)
+  (use j3.data.json)
+  (use j3.io.printLn)
+  (use j3.memory.Arena)
+  (use j3.net.http)
+  (use j3.net.http (names HttpError Request))
+  (use j3.net.tls)
+  (use j3.proc)
+  (use j3.proc.ProcError)
+  (use j3.result.Result)
+  (use j3.sys)
+  (use j3.text.Text)
+  (const DEFAULT_URL string "https://openrouter.ai/api/v1/chat/completions")
+  (fn fail (params (msg string)) _ (block
+    (let line _ (interp "error: " msg))
+    (expr (call (. sys write) 2 (as (. line ptr) ptr) (. line len)))
+    (expr (call (. sys write) 2 (as (. "\n" ptr) ptr) 1))
+    (expr (call (. sys exit) 1))))
+  (fn (doc "Write `s` to stdout with no newline (stream tokens as they come).") out (params (s string)) _ (block
+    (expr (call (. sys write) 1 (as (. s ptr) ptr) (. s len)))))
+  (fn (doc "`{\"model\": ..., \"messages\": [{\"role\": \"user\", \"content\": ...}], \"stream\": ...}`") requestBody (params (model string) (prompt string) (stream bool) (a (ref Arena))) string (block
+    (let msg _ (call (. json obj) a))
+    (expr (call (. msg set) "role" (call (. json str) "user" a)))
+    (expr (call (. msg set) "content" (call (. json str) prompt a)))
+    (let msgs _ (call (. json arr) a))
+    (expr (call (. msgs push) msg))
+    (let body _ (call (. json obj) a))
+    (expr (call (. body set) "model" (call (. json str) model a)))
+    (expr (call (. body set) "messages" msgs))
+    (if stream (block
+      (expr (call (. body set) "stream" (call (. json boolean) (bool true) a)))))
+    (return (call (. json stringify) body a))))
+  (fn (doc "The reply text, or the API's error message as a failure.") answer (params (status int) (body (slice u8)) (a (ref Arena))) string (block
+    (let doc _ (call (. json null) a))
+    (match (call (. json parse) body a)
+      (arm (pats (variant Result.Ok (bind d))) (block
+        (= doc d)))
+      (arm (pats (variant Result.Err (bind e))) (block
+        (expr (call fail (interp "HTTP " status ", reply is not JSON (" (. e msg) " at byte " (. e at) ")"))))))
+    (let err _ (call (. doc get) "error"))
+    (if (! (call (. err isNull))) (block
+      (expr (call fail (interp "HTTP " status ": " (call (. (call (. err get) "message") asStr)))))))
+    (if (!= status 200) (block
+      (expr (call fail (interp "HTTP " status)))))
+    (return (call (. (call (. doc path) "choices.0.message.content") asStr)))))
+  (fn httpFailure (params (e HttpError) (a (ref Arena))) _ (block
+    (let t _ (call (. Text new) a))
+    (expr (call (. t pushStr) (call (. http errorName) e)))
+    (match e
+      (arm (pats (variant HttpError.Tls)) (block
+        (expr (call (. t pushStr) ": "))
+        (expr (call (. tls lastError) (& t)))))
+      (arm (pats (variant HttpError.BadUrl)) (block))
+      (arm (pats (variant HttpError.BadRequest)) (block))
+      (arm (pats (variant HttpError.Resolve)) (block))
+      (arm (pats (variant HttpError.Connect)) (block))
+      (arm (pats (variant HttpError.Timeout)) (block))
+      (arm (pats (variant HttpError.Protocol)) (block))
+      (arm (pats (variant HttpError.TooManyRedirects)) (block)))
+    (expr (call fail (call (. t str))))))
+  (fn newRequest (params (url string) (key string) (body string) (a (ref Arena))) Request (block
+    (let req _ (call (. http post) url body a))
+    (let auth _ (call (. Text new) a))
+    (expr (call (. auth pushStr) "Bearer "))
+    (expr (call (. auth pushStr) key))
+    (expr (call (. req header) "Authorization" (call (. auth str))))
+    (expr (call (. req header) "Content-Type" "application/json"))
+    (= (. req timeoutMs) 120000)
+    (return req)))
+  (fn plain (params (url string) (key string) (model string) (prompt string) (a (ref Arena))) _ (block
+    (let req _ (call newRequest url key (call requestBody model prompt (bool false) a) a))
+    (match (call (. http request) (& req) a)
+      (arm (pats (variant Result.Ok (bind res))) (block
+        (expr (call printLn (call answer (. res status) (. res body) a)))))
+      (arm (pats (variant Result.Err (bind e))) (block
+        (expr (call httpFailure e a)))))))
+  (fn streamed (params (url string) (key string) (model string) (prompt string) (a (ref Arena))) _ (block
+    (let req _ (call newRequest url key (call requestBody model prompt (bool true) a) a))
+    (let s _ (call (. http open) (& req) a))
+    (match s
+      (arm (pats (variant Result.Ok (bind st))) (block
+        (if (!= (. st status) 200) (block
+          (match (call (. st readAll) a)
+            (arm (pats (variant Result.Ok (bind b))) (block
+              (expr (call answer (. st status) b a))))
+            (arm (pats (variant Result.Err (bind e))) (block
+              (expr (call httpFailure e a)))))
+          (expr (call fail (interp "HTTP " (. st status))))))
+        (let line _ (call (. Text new) a))
+        (let ev _ (call (. Arena create) 65536))
+        (while (call (. st readLine) (& line)) (block
+          (let l _ (call (. line str)))
+          (if (|| (< (. l len) 6) (! (call same (slice-expr l 0 6) "data: "))) (block
+            (continue)))
+          (let data _ (slice-expr l 6 (. l len)))
+          (if (call same data "[DONE]") (block
+            (break)))
+          (expr (call (. ev rewind) 0))
+          (match (call (. json parseStr) data (& ev))
+            (arm (pats (variant Result.Ok (bind chunk))) (block
+              (let err _ (call (. chunk get) "error"))
+              (if (! (call (. err isNull))) (block
+                (expr (call fail (call (. (call (. err get) "message") asStr))))))
+              (expr (call out (call (. (call (. chunk path) "choices.0.delta.content") asStr))))))
+            (arm (pats (variant Result.Err (wild))) (block)))))
+        (if (. st broken) (block
+          (expr (call httpFailure (. st failed) a))))
+        (expr (call (. st close)))
+        (expr (call out "\n"))))
+      (arm (pats (variant Result.Err (bind e))) (block
+        (expr (call httpFailure e a)))))))
+  (fn (doc "`s` as a quoted value for a curl config file.") curlQuote (params (s string) (t (ref Text))) _ (block
+    (expr (call (. t push) 34))
+    (for i (.. 0 (. s len)) (block
+      (if (|| (== (index s i) 34) (== (index s i) 92)) (block
+        (expr (call (. t push) 92))))
+      (expr (call (. t push) (index s i)))))
+    (expr (call (. t push) 34))))
+  (fn viaCurl (params (url string) (key string) (model string) (prompt string) (a (ref Arena))) _ (block
+    (let cfg _ (call (. Text new) a))
+    (expr (call (. cfg pushStr) "url = "))
+    (expr (call curlQuote url (& cfg)))
+    (expr (call (. cfg pushStr) "\nheader = "))
+    (expr (call curlQuote (interp "Authorization: Bearer " key) (& cfg)))
+    (expr (call (. cfg pushStr) "\nheader = \"Content-Type: application/json\"\ndata-binary = "))
+    (expr (call curlQuote (call requestBody model prompt (bool false) a) (& cfg)))
+    (expr (call (. cfg pushStr) "\nwrite-out = \"\\n%{http_code}\"\n"))
+    (let argv (array 4 string) (array-lit "curl" "--silent" "--show-error" "-K-"))
+    (match (call (. proc run) (slice-expr argv _ _) (call (. cfg str)) a)
+      (arm (pats (variant Result.Ok (bind o))) (block
+        (if (!= (. o code) 0) (block
+          (expr (call fail (interp "curl exited " (. o code) ": " (call (. o errStr)))))))
+        (let body _ (call (. o outStr)))
+        (let cut _ (. body len))
+        (while (&& (> cut 0) (!= (index body (- cut 1)) 10)) (block
+          (-= cut 1)))
+        (let status _ 0)
+        (for i (.. cut (. body len)) (block
+          (= status (- (+ (* status 10) (call int (index body i))) 48))))
+        (let reply _ (if-expr (> cut 0) (slice-expr body 0 (- cut 1)) body))
+        (expr (call printLn (call answer status (as reply (slice u8)) a)))))
+      (arm (pats (variant Result.Err (bind e))) (block) (tail (match e
+        (arm (pats (variant ProcError.NotFound)) (block
+          (expr (call fail "curl is not installed"))))
+        (arm (pats (variant ProcError.ExecFailed)) (block
+          (expr (call fail "curl could not start"))))
+        (arm (pats (variant ProcError.Fail)) (block
+          (expr (call fail "could not start a process"))))))))))
+  (fn same (params (a string) (b string)) bool (block
+    (if (!= (. a len) (. b len)) (block
+      (return (bool false))))
+    (for i (.. 0 (. a len)) (block
+      (if (!= (index a i) (index b i)) (block
+        (return (bool false))))))
+    (return (bool true))))
+  (fn main (params) _ (block
+    (let a _ (call (. Arena create) 1048576))
+    (let mode _ "plain")
+    (let model _ "openrouter/auto")
+    (let words _ (call (. Text new) (& a)))
+    (let i _ 1)
+    (while (< i (call (. sys argCount))) (block
+      (let arg _ (call (. sys arg) i))
+      (if (call same arg "--") (block) (block
+        (if (|| (call same arg "--stream") (call same arg "--curl")) (block
+          (= mode (slice-expr arg 2 (. arg len)))) (block
+          (if (&& (call same arg "--model") (< (+ i 1) (call (. sys argCount)))) (block
+            (+= i 1)
+            (= model (call (. sys arg) i))) (block
+            (if (> (call (. words len)) 0) (block
+              (expr (call (. words push) 32))))
+            (expr (call (. words pushStr) arg))))))))
+      (+= i 1)))
+    (if (== (call (. words len)) 0) (block
+      (expr (call fail "usage: openrouter-chat [--stream | --curl] [--model NAME] prompt..."))))
+    (let key _ (call (. sys env) "OPENROUTER_API_KEY"))
+    (if (== (. key len) 0) (block
+      (expr (call fail "set OPENROUTER_API_KEY (https://openrouter.ai/keys)"))))
+    (let url _ (call (. sys env) "OPENROUTER_URL"))
+    (if (== (. url len) 0) (block
+      (= url DEFAULT_URL)))
+    (if (call same mode "stream") (block
+      (expr (call streamed url key model (call (. words str)) (& a)))) (block
+      (if (call same mode "curl") (block
+        (expr (call viaCurl url key model (call (. words str)) (& a)))) (block
+        (expr (call plain url key model (call (. words str)) (& a))))))))))
+--- stderr
+--- exit 0

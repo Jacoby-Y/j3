@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Plan 13 bench: stage0/j3c (Rust) against target/j3c on 16 metrics, wall time and peak RSS.
+# Plan 13 bench: stage 0 (the Rust j3c, built by tools/stage0.sh rust-final) against target/j3c on 16 metrics, wall time and peak RSS.
 # Usage: tools/bench.sh [--only N,M,...] [--list]. Env: BENCH_N (runs per metric, median; default 3),
 # BENCH_STAGE0 / BENCH_BOOT (the two compilers). Every run works on one scratch copy under <repo>/target/bench/w
 # (tar without `target/`), deleted at the end; writes target/bench/result.md and result.tsv (rows of metrics
@@ -9,8 +9,10 @@
 # Short metrics (11, 13, 14, 15: under ~0.2 s) run K times in one timed loop, K picked so a loop takes >= 1 s
 # (BENCH_K overrides), and report wall per run; RSS is the largest single run of the loop.
 set -eu
+budget=$(( $(nproc) / 2 )); [ "$budget" -ge 1 ] || budget=1
+export J3_JOBS=${J3_JOBS:-$budget}   # half the cores at most: clang processes per build (repo script rule)
 here=$(cd "$(dirname "$0")" && pwd); boot=$(dirname "$here"); root=$(dirname "$boot")
-S0=$(realpath "${BENCH_STAGE0:-$boot/stage0/j3c}"); BT=$(realpath "${BENCH_BOOT:-$boot/target/j3c}")
+S0=$(realpath "${BENCH_STAGE0:-${XDG_CACHE_HOME:-$HOME/.cache}/j3/stage0/rust-final/j3c}"); BT=$(realpath "${BENCH_BOOT:-$boot/target/j3c}")
 N=${BENCH_N:-3}; out=$root/target/bench; W=$out/w; tf=$out/time.txt
 export J3C_NO_INSTALL=1 SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy
 # stage 0 needs the stdlib on disk to build j3c-bootstrap (it uses modules newer than its tag); both sides read it
@@ -63,10 +65,10 @@ med() { sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }'; }
 trap 'rm -rf "$W" "$tf"' EXIT
 rm -rf "$W"; mkdir -p "$W"
 echo "bench.sh: scratch copy in $W" >&2
-tar -C "$root" --exclude=target --exclude=j3c-bootstrap/stage0 -cf - j3c j3c-bootstrap speculative examples | tar -C "$W" -xf -
+tar -C "$root" --exclude=target -cf - j3c j3c-bootstrap speculative examples | tar -C "$W" -xf -
 mkdir -p "$W/editor"; cp -r "$W/j3c/editor/src" "$W/editor/src"; cp "$W/j3c/editor/font.ttf" "$W/editor/"
 printf '[package]\nname = "j3_editor"\nentry = "src/main.j3"\n\n[link]\nlibs = ["SDL2", "GL"]\n' >"$W/editor/j3.toml"
-"$boot/tests/diff.sh" run --list --no-coverage >"$out/corpus.lst"
+"$boot/tests/diff.sh" run --list >"$out/corpus.lst"
 
 # Rows of metrics this run skips are kept from the last result.tsv, so --only runs add up.
 touch "$out/result.tsv"; grep -vE "^($(echo $only | tr ' ' '|'))	" "$out/result.tsv" >"$out/keep" || true

@@ -1,0 +1,175 @@
+module j3.term.view
+    The terminal emulator's front: paints a `j3.term.grid.Grid` with `j3.gfx.paint` and turns `j3.game` keys, text,
+    paste and the mouse into the bytes a program on a pty expects. GL and main thread only (like all of `paint`). The
+    caller owns the grid, the pty and the loop, so a terminal pane can sit in any app:
+    let v = View.new(&arena, font);              // cell size from the font's advance and line height
+    // each frame:
+    v.input(&grid, &out);                        // keys, text, paste, wheel -> bytes; then pty.write(out.bytes)
+    v.draw(&grid, 0.0, 0.0);                     // all rows, bottom of scrollback unless scrolled
+    // on window resize: cols = v.colsFor(width), rows = v.rowsFor(height)
+    Drawing: every glyph sits at `col * cellW`, whatever the font. ASCII goes out as one text run per same-style stretch
+    only when the font's advance is exactly `cellW` for every printable character (checked once per font and cached;
+    a ligature run is measured each time); otherwise, as for other characters, each glyph is placed in its own cell,
+    wide ones across two. Bold cells use `bold` / `boldItalic` when set, else faux bold: the glyph drawn twice, 1px
+    apart, with the advance unchanged (so a bold run never grows past its cells). Backgrounds merge into one rect
+    per same-color run, bold also brightens palette colors 0 to 7, `dim` blends toward the background, underline and
+    strike are lines. Block elements (U+2580-259F, shades as fg at 25/50/75% alpha), box drawing (U+2500-257F: light,
+    heavy, double, dashed, diagonals; rounded corners come out square) and sextants (U+1FB00-1FB3B) are painted as
+    rects that fill the whole cell, not taken from the font, so they join across rows at any `setLineHeight`;
+    `builtinBoxes = false` draws them from the font instead. Italic uses `italic` (a font you load, such as the family's Italic file; without one italic looks
+    upright), combining marks (`Cell.marks`) are drawn with their base character, and `ligatures` lets runs with
+    symbol pairs shape (`->` in Fira Code). The cursor is a block, underline or bar (DECSCUSR) and shows only at
+    the bottom of scrollback. It blinks when the app sets `blinkMs` (the View owns the timer: it hides the cursor
+    every other `blinkMs` for the blinking DECSCUSR shapes 0, 1, 3, 5, restarts the phase visible on each key or text
+    `input` sends, and asks `game.wakeAt` for the next edge so an idle-sleeping app wakes for it); 0, the default, is
+    steady. The `blink` text attribute is not drawn. `input` repeats held keys itself (SDL sends no repeats here) and sends
+    each printable character once, from `textTyped`; Ctrl and Alt combos come through the key path. Shift+PageUp/PageDown
+    scroll, Ctrl+Shift+V pastes. There is no selection or copy. Kitty graphics placements (`j3.term.grid` keeps them) are
+    drawn with the text, z < 0 under it; `draw` also tells the grid the cell size in pixels (`Grid.cellPxW`/`cellPxH`).
+    Tell the program the pixel size too, or image tools refuse: `pty.resizePx(cols, rows, v.cellW, v.cellH)`.
+
+struct View
+    font: Font
+    italic: Font
+        Font for `ATTR_ITALIC` cells (same size as `font`); empty (`raw` 0) draws them with `font`.
+    bold: Font
+        Fonts for `ATTR_BOLD` cells, and bold italic ones (same size as `font`). Bold italic falls back to `bold`, then
+        `italic` (faux bold), then `font`; bold falls back to faux bold on `font`. Empty (`raw` 0) means not loaded.
+    boldItalic: Font
+    ligatures: bool
+        Draw runs that hold two symbols in a row (`->`, `!=`, `===`) as one shaped string, so a font's ligatures form
+        (needs `game.textShaping()`; costs a cached raster per distinct run). Glyph positions stay on the cell grid
+        only for a monospace font whose ligatures keep the cell width, which coding fonts do.
+    builtinBoxes: bool
+        Paint block elements (U+2580-259F), box drawing (U+2500-257F) and sextants (U+1FB00-1FB3B) as shapes that fill
+        the whole cell, so neighbors join at any line height; false takes them from the font like other characters.
+    cellW: int
+        Cell size in pixels.
+    cellH: int
+    fontH: int
+        The font's line height, and how far glyphs sit below a cell's top (`setLineHeight` centers them).
+    textDy: int
+    scrollOff: int
+        Lines the view is scrolled back from the live screen (0 is the bottom).
+    ox: f32
+        Where `draw` last put the top-left cell, for mouse coordinates.
+    oy: f32
+    started: bool
+    pal: []int
+    defaultFg: int
+        Default foreground, default background and cursor color, 0xRRGGBB. Set any time; the next `draw` uses them.
+    defaultBg: int
+    cursorColor: int
+    run: Text
+    texSerial: []int
+        Kitty graphics textures, keyed by image serial (`Grid.kittyImage`); made on first draw, freed when the grid
+        drops the image.
+    texs: []Texture
+    ntex: int
+    keys: []Key
+        Key table (parallel arrays): the `j3.game` key and what it sends (`KEY_*`, or minus a code point for Ctrl/Alt chars).
+    codes: []int
+    nkeys: int
+    repIdx: int
+    repAt: int
+    mouseDown: int
+    arena: &Arena
+        The last frame drawn outside a synchronized update (`?2026`), shown again while `Grid.syncHeld`: `held`
+        holds `heldRows` rows of `heldCols` cells, plus the cursor as it was.
+    held: []Cell
+    heldCols: int
+    heldRows: int
+    heldCx: int
+    heldCy: int
+    heldCursor: bool
+    heldShape: int
+    blinkMs: int
+        Cursor blink half period in ms (on for `blinkMs`, off for `blinkMs`; 530 is xterm's); 0 never blinks.
+    blinkT0: int
+        `game.ticks()` when the blink phase last restarted (on): set by `input` when it sends something, and `blinkReset`.
+    fitRaw: []int
+        Fonts already checked for an advance of exactly `cellW` on every ASCII character (`fitRaw`), 1 yes 2 no (`fitVal`).
+    fitVal: []int
+    fitNext: int
+    fn View.new(arena: &Arena, font: Font): View
+        A view for `font`: the cell is one `M` wide and `fontLine` tall. Call after the window exists (the glyph sheet is
+        measured) and with the font loaded.
+    fn View.setFont(this: &View, font: Font)
+        Switch to `font` in place: re-measure the cell like `new` (one `M` wide, `fontLine` tall, so a line height set
+        with `setLineHeight` resets to 100) and forget the per-font grid-fit checks. Palette, cursor color, the
+        `italic`/`bold`/`boldItalic` faces, `ligatures`, `builtinBoxes`, scroll, key and mouse state stay. Allocates
+        nothing, so a long-lived pane can call it on every zoom. Same rules as `new`: after the window exists, with
+        `font` loaded. Recompute `colsFor`/`rowsFor` and resize the grid and pty after.
+    fn View.blinkReset(this: &View)
+        Show the cursor now and restart its blink phase (`input` does this for every key or text it sends).
+    fn View.blinkOn(this: &View, shape: int, now: int): bool
+        Whether a cursor of DECSCUSR `shape` is in its visible phase at `now` (ms). Steady shapes (2, 4, 6) and
+        `blinkMs` 0 are always on; otherwise the next edge is passed to `game.wakeAt`.
+    fn View.setLineHeight(this: &View, percent: int)
+        Cell height as `percent` of the font's line (100 is the default; below 100 is clamped to 100). Glyphs, the
+        cursor, underline and strike are centered in the taller cell, the extra space split evenly above and below.
+        Recompute `rowsFor` and resize the grid and pty after calling it.
+    fn View.colsFor(this: &View, width: f32): int
+        Columns that fit `width` pixels (at least 1).
+    fn View.rowsFor(this: &View, height: f32): int
+        Rows that fit `height` pixels (at least 1).
+    fn View.scroll(this: &View, g: &Grid, lines: int)
+        Scroll back by `lines` (negative goes forward), clamped to the scrollback held.
+    fn View.snap(this: &View)
+        Jump to the live screen (the example calls it when new output arrives).
+    fn View.off(this: &View, g: &Grid): int
+    fn View.draw(this: &View, g: &Grid, x: f32, y: f32)
+        Paint the whole grid with its top-left corner at (`x`, `y`). While the program holds a synchronized update
+        (`Grid.syncHeld`) it paints the last complete frame instead (text and cursor; kitty images are left out).
+    fn View.bgColor(this: &View): Color
+        The default background with `game.backgroundAlpha()` (a transparent window shows the desktop through it).
+    fn View.drawImages(this: &View, g: &Grid, pics: []KPlace, x: f32, y: f32, off: int, below: bool)
+        Kitty placements of the showing screen, `below` the text (z < 0) or over it, clipped to the grid.
+    fn View.texFor(this: &View, g: &Grid, serial: int): Texture
+        The texture of image `serial`, uploaded on first use (empty when the grid no longer has it or the cache is full).
+    fn View.dropTextures(this: &View, g: &Grid)
+        Free textures of images the grid dropped.
+    fn View.drawBg(this: &View, cells: []Cell, x: f32, y: f32)
+    fn View.drawText(this: &View, cells: []Cell, x: f32, y: f32)
+    fn View.lines(this: &View, st: Style, fg: int, x: f32, y: f32, span: int)
+        Underline and strike across `span` cells starting at `x`.
+    fn View.textAt(this: &View, p: Vec2, msg: string, color: int, bold: bool, ital: bool, cells: int)
+        `msg` at `p` in the font for `bold` and `ital`. `cells` > 1 means `msg` is that many ASCII cells: drawn as one
+        run when the font's advance is exactly `cellW`, else one glyph per cell.
+    fn View.fontOf(this: &View, bold: bool, ital: bool): Font
+    fn View.faux(this: &View, f: Font, bold: bool): bool
+        Whether `bold` text in `f` needs faux bold (`f` is not a loaded bold font).
+    fn View.put(this: &View, f: Font, p: Vec2, msg: string, c: Color, fauxBold: bool)
+        `msg` at `p`; faux bold draws it again 1px right, so the advance stays the font's.
+    fn View.fitsGrid(this: &View, f: Font): bool
+        True when every printable ASCII character of `f` advances exactly `cellW` (and a run of them `n * cellW`), so
+        a run can go out as one string. Checked once per font.
+    fn View.boxCell(this: &View, cp: int, x: f32, y: f32, color: int): bool
+        Paint `cp` as a shape over the whole cell at (`x`, `y`) when it is a block, box-drawing or sextant character;
+        false for anything else (the caller draws the glyph).
+    fn View.glyphCell(this: &View, c: Cell, x: f32, y: f32, color: int)
+        Cell `c`'s character and its combining marks, drawn as one string with its top-left at (`x`, `y`).
+    fn View.drawHeld(this: &View, x: f32, y: f32)
+        The frame kept by the last `draw` outside a synchronized update.
+    fn View.drawCursor(this: &View, cx: int, cy: int, c: Cell, shape: int, x: f32, y: f32)
+        The cursor at cell (`cx`, `cy`) over cell `c`, DECSCUSR `shape`.
+    fn View.bgOf(this: &View, st: Style): int
+        Effective background (inverse swaps it with the foreground), as 0xRRGGBB.
+    fn View.fgOf(this: &View, st: Style): int
+        Effective foreground: inverse, bold-bright and dim applied.
+    fn View.rgbOf(this: &View, st: Style, fgSide: bool, def: int, boldBright: bool): int
+    fn View.input(this: &View, g: &Grid, out: &Text)
+        Read this frame's keys, text, paste and mouse, and append what the program should receive to `out`
+        (the caller writes it to the pty and clears it). Resets the scroll to the bottom when something is sent.
+    fn View.keyScan(this: &View, g: &Grid, mods: int, ctrl: bool, alt: bool, out: &Text)
+        Fire the key table for this frame: new presses, and the held key's repeats.
+    fn View.sendKey(this: &View, code: int, mods: int, ev: int, g: &Grid, out: &Text)
+        One key-table entry's event (`code` as in `codes`).
+    fn View.wheelAndMouse(this: &View, g: &Grid, mods: int, out: &Text)
+    fn View.addKeys(this: &View)
+        Fill the key table: named keys first (positive `KEY_*`), then a-z and a few punctuation keys as minus the code
+        point (only read with Ctrl or Alt).
+    fn View.addKey(this: &View, k: Key, code: int)
+
+--- stderr
+--- exit 0

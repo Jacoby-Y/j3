@@ -1,0 +1,140 @@
+recipe http: call a web API on a worker thread: JSON body, https, reply read on the frame loop
+
+A headless program that POSTs JSON over https from a worker thread while a loop that stands in
+for the frame thread keeps running and picks the reply up with `tryPop`. Point it at a URL that
+echoes JSON (`j3c run -- https://postman-echo.com/post`), or change it into your API call.
+`examples/openrouter-chat` is a full one: an LLM chat request, token streaming, and curl.
+
+The pieces:
+- `j3.net.http`: `http.get(url, &arena)` / `http.post(url, body, &arena)` make a `Request`;
+  `req.header(name, value)` adds headers; `http.request(&req, &arena)` returns a `Response`
+  (`status`, `bodyStr()`, `header(name)`), any status counts as `Ok`. `http.open` returns a
+  `Stream` instead, read with `read(buf)` or `readLine(&text)` as the body arrives (server-sent
+  events, `data: {...}` lines). Errors are `HttpError`; `http.errorName(e)` names one.
+- `https://` goes through `j3.net.tls` on the system OpenSSL (`libssl.so.3`, loaded on first use).
+  The certificate and host name are always checked. On `HttpError.Tls`, `tls.lastError(&text)`
+  says why (`certificate has expired`, `hostname mismatch`). Android: the APK carries its own
+  OpenSSL (run `tools/android/build-openssl.sh` once) and trusts the phone's CA store.
+- `j3.data.json`: `json.parse(bytes, &arena)` gives a `&Json`; `get`, `at`, `path("a.0.b")`
+  never fail (a missing value is null, `asStr()` is ""). Build with `json.obj` / `arr` / `str` /
+  `num` / `boolean` plus `set` / `push`, then `json.stringify`.
+- Every call blocks (connect, TLS, the reply), up to `req.timeoutMs` per step. Never call it on the
+  frame thread. Give the worker its own `Arena` and everything it needs in one struct, as in
+  `j3c doc recipes threads`, and take the result back through a `Queue` with `tryPop`.
+- A string a request keeps (a header value, the body) must outlive the call. A backtick string
+  (`Bearer {key}`) lives in the stack frame of the function that made it, so build kept strings
+  with `Text` on an arena.
+- Lower level: `j3.net.tcp` (`dial`, `listen`), `j3.net.dns` (`resolve`). Another program instead
+  of a library: `j3.proc.run(["curl", ...], stdin, &arena)` returns its exit code, stdout, and stderr.
+- Linux for now; on Windows and macOS these calls compile and return errors.
+
+==> j3.toml <==
+[package]
+name = "webcall"
+entry = "src/main.j3"
+
+==> src/main.j3 <==
+module webcall;
+
+use j3.data.json;
+use j3.io.printLn;
+use j3.memory.Arena;
+use j3.net.http;
+use j3.net.http.HttpError;
+use j3.net.tls;
+use j3.option.Option;
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use j3.thread.{ Queue, Thread, join, spawn };
+
+/// What main hands the worker. Main does not touch it again until `done` says so.
+struct Call {
+    url: string;
+    body: string;
+    mem: &Arena;
+    status: int;
+    reply: string;
+    done: &Queue<int>;
+}
+
+/// Runs on the worker: one blocking request, then report.
+fn work(arg: ptr) {
+    let c = arg as &Call;
+    let req = http.post(c.url, c.body, c.mem);
+    req.header("Content-Type", "application/json");
+    req.timeoutMs = 15000;
+    match http.request(&req, c.mem) {
+        Result.Ok(res) {
+            c.status = res.status;
+            c.reply = res.bodyStr();
+        }
+        Result.Err(e) {
+            let t = Text.new(c.mem);
+            t.pushStr(http.errorName(e));
+            match e {
+                HttpError.Tls {
+                    t.pushStr(": ");
+                    tls.lastError(&t);
+                }
+                HttpError.BadUrl {}
+                HttpError.BadRequest {}
+                HttpError.Resolve {}
+                HttpError.Connect {}
+                HttpError.Timeout {}
+                HttpError.Protocol {}
+                HttpError.TooManyRedirects {}
+            }
+            c.status = -1;
+            c.reply = t.str();
+        }
+    }
+    c.done.push(1);
+}
+
+fn main() {
+    let arena = Arena.create(1048576);
+    let url = sys.arg(1);
+    if url.len == 0 {
+        url = "https://postman-echo.com/post";
+    }
+
+    let msg = json.obj(&arena);
+    msg.set("player", json.str("ada", &arena));
+    msg.set("score", json.num(1250.0, &arena));
+
+    // the worker allocates only from its own arena
+    let workMem = Arena.create(1048576);
+    let done = Queue<int>.create(&arena, 1);
+    let call = Call { url: url, body: json.stringify(msg, &arena), mem: &workMem, status: 0, reply: "", done: &done };
+    let th = Thread { f: work };
+    spawn(&th, "http", work, &call as ptr);
+
+    // the frame loop: never blocks, checks for the reply once per pass
+    let frames = 0;
+    let waiting = true;
+    while waiting {
+        frames += 1;
+        match done.tryPop() {
+            Option.Some(_) { waiting = false; }
+            Option.None {}
+        }
+    }
+    join(&th);
+
+    if call.status < 0 {
+        printLn(`failed: {call.reply}`);
+        return;
+    }
+    printLn(`HTTP {call.status} after {frames} loop passes`);
+    match json.parseStr(call.reply, &workMem) {
+        Result.Ok(doc) {
+            // postman-echo puts the parsed body under `json`
+            let back = doc.get("json");
+            printLn(`echoed player={back.get("player").asStr()} score={back.get("score").asInt()}`);
+        }
+        Result.Err(e) { printLn(`not JSON: {e.msg}`); }
+    }
+}
+--- stderr
+--- exit 0

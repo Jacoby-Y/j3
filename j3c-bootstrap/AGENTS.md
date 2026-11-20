@@ -1,10 +1,10 @@
 # j3c-bootstrap: the J3 compiler (`j3c`)
 
 `j3c` is written in J3 here (`src/`); since plan 11 C6 it is the installed compiler (`./build.sh`). Layout
-and stage order: `README.md`. The Rust compiler it was ported from is at the git tag `rust-final` and runs
-as `stage0/j3c`: the seed `./build.sh` builds stage 1 with, and the `tests/diff.sh` oracle (same output,
-byte for byte, unless a plan item or `PORT_DEBT.md` says otherwise). `stage0/` and `tests/diff.sh` are
-for the compiler only; stdlib and editor work lives in `../j3c/` (`../j3c/AGENTS.md`).
+and stage order: `README.md`. The Rust compiler it was ported from is at the git tag `rust-final` (history;
+plan 15 retired it as seed and oracle). The seed that builds stage 1 is an installed J3 `j3c` or the release
+pinned in `seed/VERSION` (`tools/seed.sh`); `tests/diff.sh` compares with the checked-in `tests/expect/`
+files. `tests/` is for the compiler only; stdlib and editor work lives in `../j3c/` (`../j3c/AGENTS.md`).
 
 ## Language contract
 
@@ -42,9 +42,9 @@ Unknown `#[foo]` / `@foo()` are parse errors: `@ident(...)` is only compiler cal
    grows: the LSP and MCP servers live for hours.
 6. **Exhaustive matches without `_`** in `syntax/walk`, `syntax/fmt`, the IR validator and every backend
    dispatch. A new variant must fail to compile everywhere that has to handle it.
-7. **Files under 600 lines**, split at real seams. Every file keeps its header: what it does,
-   `Port of:` (Rust paths relative to `j3c/src/` at the tag `rust-final`), `J3:` notes. A Rust file you drop goes in
-   `DELETED.md` with its reason.
+7. **Files under 600 lines**, split at real seams. Every file keeps its header: what it does and
+   `J3:` notes. (Older files also carry a `Port of:` line naming their Rust source at `rust-final`; new files
+   need none.)
 8. **Headless only.** Never open a window or play audio: `j3c run --headless`, built binaries with
    `SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy`, everything long in `timeout`.
 
@@ -72,7 +72,7 @@ you.
 - `lsp/query.j3` (hover), `doc.j3` (signatures), `text/doc/`, a `tests/cases/` file
 
 **Adding an IR op**
-- `ir.j3`, `ir/dump.j3` (byte-compatible with `j3c/src/ir/dump.rs` at `rust-final` while stage 0 is the oracle),
+- `ir.j3`, `ir/dump.j3` (the `diff.sh ir` expected files capture it; re-bless on purpose),
   `ir/validate.j3`
 - `lower.j3` (makes it), `ir/passes.j3` (each pass that must see it), `devmode.j3`
 - `backend/llvm.j3`, `backend/bc.j3` (or a clear VM rejection), `shader.j3` (or rejection)
@@ -80,30 +80,34 @@ you.
 
 ## Gates
 
-Run from the repo root. Every chunk ends with all of them clean, or with its leftovers listed in
-`tests/known/<mode>.txt`.
-- `j3c-bootstrap/tools/coverage.sh`: prints every Rust file with no `Port of:` home and no `DELETED.md`
-  line; must print nothing.
+Run from the repo root. Every chunk ends with all of them clean.
 - `j3c-bootstrap/tools/layers.sh`: fails on a `use` that points down `tools/layers.txt`.
-- `j3c-bootstrap/tests/diff.sh MODE [--norm] [files...]`: stage 0 against `target/j3c`, one line per file
-  (`ok` / `DIFF` / `CRASH`), then a summary line to paste in your report. Modes in port order: `fmt`,
-  `err`, `ir`, `llvm`, `run`, `self`. Runs coverage and layers first.
-- `timeout 300 j3c-bootstrap/stage0/j3c check j3c-bootstrap` and `... build j3c-bootstrap` (binary
+- `j3c-bootstrap/tests/diff.sh MODE [--bless] [files...]`: `target/j3c` against the checked-in
+  `tests/expect/MODE/` files, one line per file (`ok` / `DIFF` / `CRASH`), then a summary line to paste in your
+  report. A deliberate output change (or an edited corpus file or stdlib) is re-blessed with `--bless` and
+  reviewed in git. Modes: `fmt`, `ast`, `err`, `ir`, `llvm`, `glsl`, `ui`, `run`, `bc`, `tool`, `self`. Runs
+  layers first.
+- `j3c-bootstrap/tests/unit.sh [NAME...]` (unit tests; `J3_TEST_JOBS=2`) and
+  `j3c-bootstrap/target/j3c test-compiler` (`tests/cases/`).
+- `J3_STDLIB=$PWD/j3c/stdlib timeout 300 j3c build --opt 2 j3c-bootstrap` with any seed j3c (binary
   `j3c-bootstrap/target/j3c`; `./build.sh` installs a stage-2 build of it, never this file).
   `tests/diff.sh` builds it with `build --opt 2` (plan 13: about 3x faster than the `opt = 0` dev build and
   smaller stripped); `j3.toml` stays `opt = 0`, which is what `diff.sh self` and `tools/bench.sh` time.
-- `j3c-bootstrap/tools/bench.sh [--only N,M] [--list]`: the plan 13 speed bench, stage0 against `target/j3c` on
+- `j3c-bootstrap/tools/bench.sh [--only N,M] [--list]`: the plan 13 speed bench, stage 0 (`BENCH_STAGE0`) against `target/j3c` on
   scratch copies; writes `target/bench/result.md`. Scoreboard in `SPEED.md`.
-- `j3c-bootstrap/tools/stage0.sh rust-final`: the only way `stage0/j3c` changes. Scripts call
-  `stage0/j3c` by path, never `j3c` from `PATH`.
 
-## Stage 0 is frozen
+## Seed and stdlib
 
-- The Rust compiler is at the tag `rust-final` only (`j3c/src/` is gone from the branch); it never changes.
-  `tools/stage0.sh rust-final` rebuilds `stage0/j3c` from it (needs cargo).
-- Stdlib edits go in `j3c/stdlib/`: `target/j3c` embeds the tree on disk, stage 0 the tree at its commit,
-  so a stdlib change can show up as a `diff.sh` DIFF; list it in `tests/known/` or `PORT_DEBT.md`.
-- The compiler itself uses stdlib modules newer than the tag (`j3.data.toml` in `base/toml`), so stage 0
-  builds it with `J3_STDLIB=<repo>/j3c/stdlib` (`build.sh`, `tests/diff.sh`, `tests/unit.sh`, `tools/bench.sh`
-  and `tools/release/package.sh` set it). A bare `stage0/j3c build j3c-bootstrap` fails on `use j3.data.toml`.
-- Behaviour changes in the J3 compiler (plan 11 Part D) go in `PORT_DEBT.md` with the `diff.sh` cases they move.
+- The seed is chosen by `tools/seed.sh list` (`J3_SEED`, the installed `j3c` and its `j3c.prev`), then the release
+  pinned in `seed/VERSION` (`tools/seed.sh`, downloaded only when those fail); `build.sh`, `tests/boot.sh` (`diff.sh`, `unit.sh`) and `tools/release/package.sh`
+  use it. With none (a fresh machine, CI until a J3 release is pinned), the last resort is
+  `tools/stage0.sh rust-final`: it builds the Rust compiler at that tag with cargo into
+  `~/.cache/j3/stage0/rust-final/j3c` and prints the path to pass as `J3_SEED`.
+  While stage 0 can still seed, keep its layout workarounds (comments saying `stage-0 ABI hazard (a)`):
+  stage 0 must still build `src/`. Comments citing `PORT_DEBT.md` mean the file in git history (plan 15 deleted
+  it: `git log -- j3c-bootstrap/PORT_DEBT.md`).
+- Every j3c embeds its own stdlib and the compiler may use modules newer than the seed's (`j3.data.toml` in
+  `base/toml`), so the seed builds it with `J3_STDLIB=<repo>/j3c/stdlib` (`build.sh`, `tests/boot.sh`,
+  `tools/bench.sh` and `tools/release/package.sh` set it). Stage 1 embeds the tree's stdlib.
+- Stdlib edits go in `j3c/stdlib/`; a stdlib change can move `diff.sh` output (the ir/llvm hashes); re-bless
+  the modes it moves (`diff.sh MODE --bless`) and review the diff.

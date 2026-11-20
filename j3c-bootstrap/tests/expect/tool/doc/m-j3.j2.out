@@ -1,0 +1,709 @@
+module j3.j2
+    j2: a small dynamic script language the game reads from plain text at runtime, for modders
+    and designers without the source. It looks like J3 (`let`, `fn`, `{ }`, backtick strings,
+    `match`, `use`, `pub`) and behaves like Lua (values carry their types, tables, closures, GC).
+    Pure J3, no window: lexer, parser, compiler, VM and heap. Guide: `j3c doc j2` (host),
+    `j3c doc j2 lang` (the language, for script writers), `j3c doc recipes j2`.
+    Host API: `Vm.new(mem, Limits)`, `openLibs(LIB_*)`, `bind(name, native)`, `vm.host`,
+    `vm.resolver`/`resolverCtx` (how `use name;` finds a script), `loadString`/`loadFile` (give the
+    exports table), `call`/`callWithThis` (re-entrant from natives), `keep`/`value`/`get`/`release`,
+    `getNum`/`setNum`, `newTable`/`newArray`/`intern`/`raise`, `protect`, `seed`, `stats`/`collect`,
+    `Args` getters, `Table`/`Array` views, `nil()` `none()` `num()` `int()` `str()` `noArgs()`.
+    Every entry returns `Result<_, Error>`; nothing panics on script input, and the `Vm` keeps
+    working after any error. One `Vm` per thread.
+    Inside (the other public names): values (`value.j3`), the heap (`heap.j3`, `str.j3`,
+    `table.j3`, `array.j3`), `fmt.j3`, the front end in `j3.j2.lex` / `j3.j2.parse`, the compiler
+    (`compile*.j3`, `code.j3`), the VM (`vm*.j3`), the GC (`gc.j3`), the built-ins (`lib*.j3`),
+    `dumpProto`. Example: `examples/j2_script`.
+
+fn nil(): Value
+    `nil`.
+fn int(n: int): Value
+    An int value.
+fn num(x: f64): Value
+    A float value.
+fn boolean(b: bool): Value
+    A bool value.
+fn noArgs(): []Value
+    No arguments, for `vm.call(f, j2.noArgs())` (J3 has no empty array literal).
+fn none(): Ref
+    The `Ref` that holds nothing; `value` of it is nil and releasing it does nothing.
+struct Arr
+    h: GcHeader
+    items: ptr
+        `cap` values, the first `len` in use.
+    len: int
+    cap: int
+    fn Arr.values(this: &Arr): []Value
+        The values in use (a view; invalid after the array grows).
+    fn Arr.get(this: &Arr, i: int): Value
+        `a[i]`, nil when out of range.
+    fn Arr.set(this: &Arr, h: &Heap, i: int, v: Value): bool
+        `a[i] = v`: replaces, or appends when `i == len`. False when `i` is negative or past `len`.
+    fn Arr.push(this: &Arr, h: &Heap, v: Value)
+    fn Arr.pop(this: &Arr): Value
+        Remove and return the last value, nil when empty.
+    fn Arr.insert(this: &Arr, h: &Heap, i: int, v: Value): bool
+        Insert `v` before index `i` (0..len). False when `i` is out of that range.
+    fn Arr.remove(this: &Arr, i: int): Value
+        Remove and return `a[i]`, keeping order; nil when out of range.
+    fn Arr.reserve(this: &Arr, h: &Heap, n: int)
+        Make room for at least `n` values.
+    fn Arr.freeParts(this: &Arr, h: &Heap)
+        Give back the item buffer (the sweep calls this before `freeObject`).
+
+fn arrOf(v: Value): &Arr
+    The `Arr` of a `T_ARRAY` value.
+struct Proto
+    A compiled function: code, constants, child protos, upvalue descriptors, and a `line << 32 |
+    col` per instruction. Made at load time; every buffer is in the j2 heap.
+    h: GcHeader
+    code: ptr
+    ncode: int
+    lines: ptr
+    consts: ptr
+    nconsts: int
+    protos: ptr
+        Child proto addresses.
+    nprotos: int
+    ups: ptr
+        Per upvalue: `idx << 1 | 1` for the enclosing frame's register `idx`, `idx << 1` for its upvalue `idx`.
+    nups: int
+    nparams: int
+    maxStack: int
+    flags: int
+        `parse.F_THIS` when the first parameter is `this`.
+    name: Value
+        The function's name (a string, or nil for a literal), its chunk's name, and the file
+        errors name (the path for `loadFile`, else the chunk name). Both are fixed strings.
+    chunk: Value
+    file: Value
+    fn Proto.codeOf(this: &Proto): []u32
+    fn Proto.constsOf(this: &Proto): []Value
+    fn Proto.protosOf(this: &Proto): []int
+    fn Proto.upsOf(this: &Proto): []int
+    fn Proto.linesOf(this: &Proto): []int
+    fn Proto.freeParts(this: &Proto, h: &Heap)
+        Give back the owned buffers (the sweep calls this before `freeObject`).
+
+struct Closure
+    A script function value (`T_FN`): a proto, the module env it reads top-level names from (an
+    array), and `nups` upvalue addresses right after this header.
+    h: GcHeader
+    proto: ptr
+    env: Value
+    nups: int
+    fn Closure.protoOf(this: &Closure): &Proto
+    fn Closure.upsOf(this: &Closure): []int
+
+struct Upval
+    A captured variable. Open (`idx >= 0`): it is stack slot `idx` (an index, so the stack can
+    move). Closed (`idx == -1`): the value is in `v`. Open ones are linked on `Vm.open`, highest
+    `idx` first.
+    h: GcHeader
+    idx: int
+    v: Value
+    next: ptr
+
+fn closureOf(v: Value): &Closure
+    The `Closure` of a `T_FN` value.
+struct Buf
+    A growable byte buffer in the j2 heap: what the VM builds strings, `print` output and error
+    text in, so running a script never allocates in a J3 arena. Same methods as `Text`, so
+    `fmtAt` writes into either.
+    heap: &Heap
+    p: ptr
+    len: int
+    cap: int
+    full: bool
+        Growing would pass the heap cap (or the OS refused): later pushes are dropped. Whoever
+        builds a script value from the bytes checks it (`Vm.bufStr`).
+    fn Buf.push(this: &Buf, b: u8)
+    fn Buf.pushStr(this: &Buf, s: string)
+    fn Buf.pushInt(this: &Buf, n: int)
+    fn Buf.str(this: &Buf): string
+        The bytes so far (a view; valid until the next push or clear).
+    fn Buf.clear(this: &Buf)
+        Empty it; a block over 64 KB goes back to the heap so one big string doesn't stay counted.
+
+fn newBuf(h: &Heap): Buf
+fn compileChunk(vm: &Vm, name: string, src: string): Result<Value, Error>
+    Compile `src` (chunk `name`, also the file name in errors) to a function that runs its top
+    level over a new module env. `vm.loadString` is compile + run; this is for tests and tools.
+fn dumpProto(t: &Text, p: &Proto)
+    Append a listing of `p` and its child functions to `t`: one line per instruction,
+    `pc line:col OP operands`, with the constant shown after `;` where one is used.
+fn fmtValue(t: &Text, v: Value)
+    Append the `str()` text of `v` to `t`.
+fn fmtBuf(b: &Buf, v: Value)
+    `fmtValue` into a heap `Buf` (what the VM uses while a script runs). Shared containers can
+    make the text far bigger than the heap (`[b, b, ..]` of `[a, a, ..]`): past `heap.limit / 2`
+    values (each adds at least 2 bytes) it stops and marks `b` full, instead of walking them all.
+struct Stats
+    Heap numbers for tests and tools (`vm.stats()`).
+    liveObjects: int
+        GC objects alive (or not yet swept).
+    bytes: int
+        Bytes in use (what `Limits.heapBytes` caps).
+    collections: int
+        Collections so far.
+
+const OBJ_STR: u8 = 1
+    Object kinds in `GcHeader.kind`. The compiler chunk adds functions, protos and upvalues.
+
+const OBJ_TABLE: u8 = 2
+
+const OBJ_ARRAY: u8 = 3
+
+struct GcHeader
+    In front of every GC object, 16 bytes.
+    next: ptr
+        The next object on `Heap.objects`.
+    kind: u8
+    mark: u8
+    cls: u8
+        Size class of this object's block.
+    fixed: u8
+        1: never collected (chunk names, strings handed to the host by `vm.intern`). The GC treats it as marked.
+
+struct Ref
+    A host's handle on a value (`vm.keep`). `id` 0 is none; otherwise slot + 1 in the low 32
+    bits and the slot's generation above.
+    id: int
+
+struct Heap
+    chunks: ptr
+        Newest mmap'd page chunk (each starts with [next chunk, byte size]); blocks are cut from
+        `cur` at `curUsed` up to `curCap`.
+    cur: ptr
+    curUsed: int
+    curCap: int
+    free: []int
+        Free-list head address per size class (0 when empty); a free block's first word links the
+        next. Addresses are ints: the C backend can't index a `[]ptr`.
+    objects: ptr
+        Every live GC object, newest first.
+    bytes: int
+        Bytes in blocks currently handed out (class sizes, so slack included).
+    liveObjects: int
+        GC objects currently on `objects`.
+    strs: []int
+        Intern table: open addressing over `&Str` addresses (0 empty).
+    strCount: int
+    keeps: []KeepSlot
+    keepFree: int
+    limit: int
+        The script's byte cap (`Limits.heapBytes`); a `Buf` never grows past it.
+    fn Heap.newArray(this: &Heap, n: int): Value
+        A new empty array with room for `n` values.
+    fn Heap.newClosure(this: &Heap, p: &Proto, env: Value): Value
+        A closure of `p` over `env` with room for `p.nups` upvalues (all 0 until filled).
+    fn Heap.destroy(this: &Heap)
+        Give back every page. The heap and all its values are gone after this.
+    fn Heap.carve(this: &Heap, n: int): ptr
+        `n` fresh (zero) bytes, 16-aligned, from the current chunk or a new one.
+    fn Heap.newChunk(this: &Heap, size: int): ptr
+    fn Heap.mapChunk(this: &Heap, size: int): ptr
+        A new chunk of `size` bytes linked on `chunks`, or null when the OS refuses.
+    fn Heap.allocRaw(this: &Heap, n: int): ptr
+        A zeroed block of at least `n` bytes. Free it with `freeRaw(p, n)` (the same `n`).
+    fn Heap.tryAllocRaw(this: &Heap, n: int): ptr
+        `allocRaw(n)`, or null when `n` needs a chunk of its own and the OS refuses it (the
+        script-sized buffers use this, so a huge request is an error, not a panic).
+    fn Heap.freeRaw(this: &Heap, p: ptr, n: int)
+        Return a block from `allocRaw(n)`.
+    fn Heap.freeClass(this: &Heap, p: ptr, k: int)
+    fn Heap.newObject(this: &Heap, kind: u8, n: int): ptr
+        A zeroed GC object of `n` bytes (header included), linked on `objects`.
+    fn Heap.freeObject(this: &Heap, p: ptr)
+        Free the block of a GC object the sweep already unlinked from `objects`. Its owned buffers
+        must be freed first (`Table.freeParts`, `Arr.freeParts`).
+    fn Heap.keep(this: &Heap, v: Value): Ref
+        Hold `v` for the host: it stays alive (a GC root) until `releaseRef`.
+    fn Heap.keepSlot(this: &Heap, r: Ref): int
+        The slot of `r`, or -1 when `r` is none, released, or from another heap's reuse.
+    fn Heap.refValue(this: &Heap, r: Ref): Value
+        The kept value, or nil for a none or released `Ref`.
+    fn Heap.releaseRef(this: &Heap, r: Ref)
+        Let go of `r`. Releasing none or an already released `Ref` does nothing.
+    fn Heap.intern(this: &Heap, s: string): Value
+        The interned string with these bytes, made if new.
+    fn Heap.lookupStr(this: &Heap, s: string): Value
+        The interned string with these bytes, or nil when no such string exists (then no table
+        can have it as a key, so a host lookup by name can stop there without allocating).
+    fn Heap.findStr(this: &Heap, s: string, hash: int): int
+        The slot of `s` in `strs`, or -1.
+    fn Heap.growStrs(this: &Heap)
+    fn Heap.newTable(this: &Heap): Value
+        A new empty table.
+
+fn newHeap(): Heap
+    A new, empty heap.
+struct Limits
+    What one VM may use. A field left out (or 0) takes the default shown.
+    heapBytes: int = 33554432
+        Script heap cap; past it the running script stops with `out of script memory`.
+    stepsPerCall: int = 10000000
+        Backward jumps and calls one host call (`call`, `loadString`, ...) may make, natives'
+        callbacks included; past it: `took too long (over N steps)`.
+    maxDepth: int = 200
+        Script call depth; past it: `stack overflow`.
+
+const LIB_BASE: int = 1
+    `vm.openLibs` bits; `|` them together.
+
+const LIB_MATH: int = 2
+
+const LIB_STRING: int = 4
+
+const LIB_ARRAY: int = 8
+
+const LIB_ALL: int = 15
+
+fn str(vm: &Vm, s: string): Value
+    A string value (interned in `vm`'s heap; protected like `vm.newTable`).
+struct Args
+    A native's arguments (`fn spawn(vm: &Vm, args: Args): Value`). Index 0 is the first.
+    A getter given the wrong type raises `chunk:line:col: spawn: argument 2 must be a number, got
+    string` at the script's call and returns a zero value; the native's result is then dropped,
+    so natives don't check types themselves (do the checks before side effects that matter).
+    vm: &Vm
+    base: int
+    n: int
+    id: int
+        Index of the running native in `Vm.natives`, for its name.
+    fn Args.count(this: Args): int
+    fn Args.get(this: Args, i: int): Value
+        Argument `i` as it is; nil past the end.
+    fn Args.wrong(this: Args, i: int, what: string)
+        `<name>: argument <i+1> must be <what>, got <type>` (the first one in a native counts).
+    fn Args.num(this: Args, i: int): f64
+        An int or float argument as a float.
+    fn Args.int(this: Args, i: int): int
+        An int argument; a float is truncated toward zero.
+    fn Args.str(this: Args, i: int): string
+        A string argument (a view into the heap, valid while the string is alive).
+    fn Args.table(this: Args, i: int): Table
+    fn Args.array(this: Args, i: int): Value
+        An array argument (as a value; `arrOf` reaches its items).
+    fn Args.func(this: Args, i: int): Value
+        A script fn or native (`fn` is a J3 keyword, hence the name).
+    fn Args.numOr(this: Args, i: int, d: f64): f64
+        `num(i)`, or `d` when the argument is missing or nil.
+    fn Args.intOr(this: Args, i: int, d: int): int
+    fn Args.joined(this: Args, sep: string): string
+        Every argument as `str()` writes it, `sep` between (what `print` shows). Valid until the
+        next `joined`.
+
+struct Table
+    The host's view of a script table. Made from any value: when it isn't a table, reads give
+    nil and writes do nothing.
+    v: Value
+    fn Table.value(this: Table): Value
+    fn Table.isTable(this: Table): bool
+    fn Table.count(this: Table): int
+    fn Table.get(this: Table, k: string): Value
+        Field `k`, nil when missing.
+    fn Table.set(this: Table, k: string, v: Value)
+        `t.k = v` (nil removes it).
+    fn Table.setDefault(this: Table, k: string, v: Value)
+        `set(k, v)` unless the field already has a value.
+    fn Table.merge(this: Table, o: Table)
+        Copy every field of `o` into this table (o's values win).
+    fn Table.copyFields(this: Table, o: Table, keys: []string)
+        Copy the fields `keys` of `o` that are set.
+    fn Table.getNum(this: Table, k: string, d: f64): f64
+        Field `k` as a float, `d` when missing or not a number.
+    fn Table.getStr(this: Table, k: string, d: string): string
+        Field `k` as a string, `d` when missing or not a string.
+
+struct Array
+    The host's view of a new script array (`vm.newArray`).
+    heap: &Heap
+    v: Value
+    fn Array.value(this: Array): Value
+    fn Array.count(this: Array): int
+    fn Array.get(this: Array, i: int): Value
+    fn Array.push(this: Array, x: Value)
+
+struct Str
+    h: GcHeader
+    hash: int
+    len: int
+
+fn strBytes(s: &Str): string
+    The bytes of `s` (a view into the heap; valid while the string is alive).
+fn strOf(v: Value): &Str
+    The `Str` of a `T_STR` value.
+fn textOf(v: Value): string
+    The text of a `T_STR` value, "" for anything else.
+struct Entry
+    key: Value
+    val: Value
+
+struct Tbl
+    h: GcHeader
+    ents: ptr
+        `cap` entries; the first `used` were handed out, `live` of them not dead.
+    idx: ptr
+        `2 * cap` i32 slots: 0 empty, else entry number + 1.
+    cap: int
+    used: int
+    live: int
+    heap: &Heap
+        The heap it lives in, so the host's `Table` wrapper (made from a bare `Value`) can intern keys.
+    fn Tbl.count(this: &Tbl): int
+        Number of fields.
+    fn Tbl.entries(this: &Tbl): []Entry
+    fn Tbl.index(this: &Tbl): []i32
+    fn Tbl.find(this: &Tbl, k: Value): int
+        Entry number holding normalized key `k`, or -1.
+    fn Tbl.findStr(this: &Tbl, k: Value): int
+        Entry number of string key `k` (a `T_STR`, so no `keyOf`), or -1: the field access fast path.
+    fn Tbl.get(this: &Tbl, k: Value): Value
+        `t[k]`, nil when missing.
+    fn Tbl.set(this: &Tbl, h: &Heap, k: Value, v: Value): bool
+        `t[k] = v`; a nil `v` removes the field. False when `k` can't be a key (nil or NaN).
+    fn Tbl.place(this: &Tbl, key: Value, n: int)
+        Point the index at entry `n` for `key` (not already present).
+    fn Tbl.rebuild(this: &Tbl, h: &Heap)
+        Make room for one more entry: pack live entries in order, and double the capacity unless
+        at least half were dead. The index is rebuilt, which drops every tombstone.
+    fn Tbl.next(this: &Tbl, i: int): int
+        The first live entry at or after entry number `i`, or -1. Walk a table with
+        `let i = t.next(0); while i >= 0 { ..t.entries()[i].. ; i = t.next(i + 1); }`.
+        Setting existing fields (nil included) while walking is fine; adding new ones may pack the
+        entries and is not.
+    fn Tbl.freeParts(this: &Tbl, h: &Heap)
+        Give back the entry and index buffers (the sweep calls this before `freeObject`).
+
+fn tableOf(v: Value): &Tbl
+    The `Tbl` of a `T_TABLE` value.
+const T_NIL: int = 0
+
+const T_BOOL: int = 1
+
+const T_INT: int = 2
+
+const T_FLOAT: int = 3
+
+const T_STR: int = 4
+
+const T_ARRAY: int = 5
+
+const T_TABLE: int = 6
+
+const T_FN: int = 7
+    A script function (closure). Its object kind is added by the compiler chunk.
+
+const T_NATIVE: int = 8
+    A host function bound with `vm.bind`; `bits` is its index in the VM's native table.
+
+struct Value
+    A j2 value, 16 bytes. Compare with `equals` (script `==`) or `same` (identity, table keys).
+    tag: int
+    bits: int
+    fn Value.isNil(this: Value): bool
+    fn Value.truthy(this: Value): bool
+        Only `nil` and `false` are false.
+    fn Value.isNum(this: Value): bool
+    fn Value.asNum(this: Value): f64
+        The number as a float (ints convert); 0 for anything else.
+    fn Value.f(this: Value): f64
+        The float of a `T_FLOAT` value.
+    fn Value.obj(this: Value): ptr
+        The address of a heap value.
+    fn Value.asTable(this: Value): Table
+        This value as a table view (empty when it isn't a table).
+    fn Value.asStr(this: Value): string
+        A string's text, "" for anything else.
+
+fn nilv(): Value
+fn boolv(b: bool): Value
+fn intv(n: int): Value
+fn floatv(x: f64): Value
+fn objv(tag: int, p: ptr): Value
+    A heap value of `tag` at address `p`.
+fn bitsOf(x: f64): int
+    The IEEE bit pattern of `x`.
+fn floatOf(b: int): f64
+    The float with bit pattern `b`.
+fn equals(a: Value, b: Value): bool
+    Script `==`: numbers compare by value across int and float (`2 == 2.0`), everything else by
+    tag and bits (strings are interned, so that is content equality; tables and arrays are identity).
+fn same(a: Value, b: Value): bool
+    Identity: same tag and bits. Table keys compare this way after `keyOf`.
+fn keyOf(v: Value): Value
+    The key `v` is stored under. Floats holding an exact integer become that int (`t[2.0]` is
+    `t[2]`, and `-0.0` is `0`), as in Lua 5.4, so a key never depends on how the number was made.
+    `nil` and NaN can't be keys: the result is `nil`, which `Table.set` rejects and `get` misses.
+fn typeName(v: Value): string
+    The name `type(x)` gives.
+struct Error
+    A script error. `chunk` is the name the script was loaded under (a fixed string: it stays
+    valid). `message` is the whole text, `file:line:col: what` when the error has a position, and
+    `trace` is up to 8 lines `at fn name (chunk:line)`, innermost first. Those two are views into
+    the VM, valid until its next error: copy them (into a `j3.text.Text`) to keep them longer.
+    chunk: string
+    line: int
+    col: int
+    message: string
+    trace: string
+
+struct Frame
+    One active script call. `ret` is the stack slot its result goes to.
+    cl: ptr
+    pc: int
+    base: int
+    ret: int
+
+struct Native
+    A function the host bound with `vm.bind`; a `T_NATIVE` value's `bits` is its index in `Vm.natives`.
+    f: fn(&Vm, Args): Value
+    name: Value
+        The bound name (a fixed string), for argument errors.
+
+struct Vm
+    heap: &Heap
+        Stable address (allocated once from the host's arena), so `Buf`s can point at it.
+    stack: []Value
+        Registers of every frame; `stack.len` is the capacity. Frames and open upvalues hold
+        indices, so growing it moves nothing that matters.
+    top: int
+        First free slot above the running frame's registers.
+    frames: []Frame
+    nframes: int
+    open: ptr
+        Open upvalues, highest stack index first.
+    globals: Value
+        Host names (natives and values) a script reads with `OP_GETGLOBAL` and the dot fallback.
+    natives: []Native
+    nnatives: int
+    host: ptr
+        The host's own pointer; natives read it back (`vm.host as &World`).
+    resolver: fn(ptr, &Vm, string): Value
+        How `use name;` finds a script: returns its exports table, or `vm.raise`s.
+    resolverCtx: ptr
+    loading: []Value
+        Chunk names being loaded, outermost first (for `use` cycles).
+    nloading: int
+    libs: int
+        `LIB_*` bits already opened.
+    maxDepth: int
+        Limits (`Limits`, defaults filled in).
+    stepsPerCall: int
+    memLimit: int
+    budget: int
+        Steps left in the current host call (backward jumps and calls count).
+    callDepth: int
+        Host calls (`call`, `loadString`, ...) in progress, nested through natives.
+    raised: bool
+        A native (or the resolver) called `vm.raise`; the error text is pending.
+    sb: Buf
+        Scratch for strings built at runtime (`+`, templates) and `args.joined`.
+    joinBuf: Buf
+    errBuf: Buf
+        The pending error: what went wrong, then the full message and trace built from it.
+    msgBuf: Buf
+    traceBuf: Buf
+    errFile: string
+    err: Error
+    located: bool
+        `err` already has its position (set by the innermost frame that failed).
+    temps: []Value
+        GC (`gc.j3`): natives' temporaries (`protect`), the mark work list, compiles running
+        (no collection then), collect at every safe point, the size that triggers the next one.
+    ntemps: int
+    gray: []int
+    ngray: int
+    gcPause: int
+    gcStress: bool
+    nextGc: int
+    collections: int
+    rng: int
+        `pick` / `rand` state (`vm.seed`).
+    fn Vm.syntaxError(this: &Vm, e: SyntaxError, chunk: Value, file: Value): Error
+        A lex, parse or compile error of chunk `chunk` as an `Error` (its text copied into the VM).
+    fn Vm.stats(this: &Vm): Stats
+        Heap counters for a debug HUD: live objects, bytes in use, collections so far.
+    fn Vm.protect(this: &Vm, v: Value): Value
+        Keep `v` alive until the running native returns (or, outside any native, until the
+        current top-level `call`/`loadString` ends). `newTable`, `newArray` and `j2.str` do this
+        for you; use it for a value a native holds in a J3 local across `vm.call` that nothing in
+        script reaches, e.g. a call's result. Returns `v`.
+    fn Vm.collect(this: &Vm)
+        Run a full collection now.
+    fn Vm.markRoots(this: &Vm)
+    fn Vm.markValue(this: &Vm, v: Value)
+    fn Vm.markObj(this: &Vm, p: ptr)
+        Mark `p` and queue it for its children (strings have none).
+    fn Vm.drainGray(this: &Vm)
+        Mark the children of every queued object (a work list, so deep nesting can't overflow the J3 stack).
+    fn Vm.dropDeadStrings(this: &Vm)
+        The weak intern table: forget unmarked strings (the sweep frees them). Linear probing
+        without tombstones, so after clearing the dead slots every live entry is placed again,
+        scanning from an empty slot so no cluster wraps past the start of the scan.
+    fn Vm.sweep(this: &Vm)
+        Free every unmarked, unfixed object; clear the marks of the rest.
+    fn Vm.new(mem: &Arena, limits: Limits): Vm
+        A VM with an empty heap and no names bound (`openLibs` adds the built-ins). `mem` holds
+        only the heap header; everything else lives in the VM's own heap.
+    fn Vm.bind(this: &Vm, name: string, f: fn(&Vm, Args): Value)
+        Make `f` the global `name` for every script loaded after this. Binding a name again
+        replaces it (built-ins too, `print` included), also for scripts already loaded.
+    fn Vm.newNative(this: &Vm, name: Value, f: fn(&Vm, Args): Value): Value
+        A native fn value that is not a global (e.g. a field of the `math` table); `name` (a
+        fixed string) is what its argument errors say.
+    fn Vm.bindLib(this: &Vm, name: string, f: fn(&Vm, Args): Value)
+        Like `bind`, but keeps a name the host already bound (how `openLibs` adds built-ins).
+    fn Vm.call(this: &Vm, f: Value, args: []Value): Result<Value, Error>
+        `f(args)`: a script fn or a native. Re-entrant: a native may call back into script.
+    fn Vm.callWithThis(this: &Vm, f: Value, self: Value, args: []Value): Result<Value, Error>
+        `f(self, args)` when `f` is a script fn whose first parameter is `this`, else `f(args)`.
+    fn Vm.raise(this: &Vm, msg: string): Value
+        Stop the running native with a script error at its caller's line, and return a value to
+        return from it: `return vm.raise("no such enemy");`. The first raise in a native counts;
+        after it `vm.call` gives that error back instead of running more script.
+    fn Vm.keep(this: &Vm, v: Value): Ref
+        Hold `v` across frames: it stays alive (a GC root) until `release`.
+    fn Vm.value(this: &Vm, r: Ref): Value
+        The kept value; nil for `none()` or a released `Ref`.
+    fn Vm.get(this: &Vm, r: Ref): Table
+        The kept value as a table (an empty view when it isn't one).
+    fn Vm.release(this: &Vm, r: Ref)
+        Let go of `r`. Releasing `none()` or a `Ref` twice does nothing.
+    fn Vm.getNum(this: &Vm, r: Ref, k: string): f32
+        Field `k` of the kept table as an `f32` (0 when missing or not a number).
+    fn Vm.setNum(this: &Vm, r: Ref, k: string, x: f32)
+        Set field `k` of the kept table to the float `x`.
+    fn Vm.newTable(this: &Vm): Table
+        A new empty table. It stays alive until the running native returns (outside a native:
+        until the next top-level call ends); store it or `keep` it to hold it longer.
+    fn Vm.newArray(this: &Vm, n: int): Array
+        A new empty array with room for `n` values (`n` is only a hint). Protected like `newTable`.
+    fn Vm.intern(this: &Vm, s: string): string
+        `s` as a string that lives as long as the VM (so the host may keep it, e.g. as a name).
+    fn Vm.openLibs(this: &Vm, libs: int)
+        Bind the built-ins of the `LIB_*` bits in `libs`. Open them before loading scripts: a
+        script's names are checked when it loads.
+    fn Vm.seed(this: &Vm, n: int)
+        Restart the `pick` / `rand` sequence: the same seed gives the same values (replays).
+    fn Vm.nextRand(this: &Vm): u64
+        The next 64 random bits (splitmix64; the VM's own state, apart from `j3.rand`).
+    fn Vm.randUnit(this: &Vm): f64
+        A random float in [0, 1).
+    fn Vm.setLibGlobal(this: &Vm, name: string, v: Value)
+        The global `name` = `v` unless the host set it already (how `math` is added).
+    fn Vm.passOn(this: &Vm): Value
+        Fail the running native with the error a `vm.call` it made just returned (message,
+        position and trace stay the callback's). Returns nil to return.
+    fn Vm.openArrayLib(this: &Vm)
+    fn Vm.call1(this: &Vm, f: Value, x: Value, out: &Value): bool
+        `f(x)`; false (error pending, `passOn` it) when it failed.
+    fn Vm.openMathLib(this: &Vm)
+    fn Vm.mathFn(this: &Vm, m: Value, name: string, f: fn(&Vm, Args): Value)
+        `math.<name>` = native `f` (errors name it `math.<name>`).
+    fn Vm.openTextLib(this: &Vm)
+    fn Vm.loadString(this: &Vm, name: string, text: string): Result<Value, Error>
+        Compile `text` as chunk `name` and run its top level. Ok holds its exports table.
+    fn Vm.loadFile(this: &Vm, name: string, path: string): Result<Value, Error>
+        `loadString` of the file at `path` (errors name the path). The only place j2 reads files.
+    fn Vm.load(this: &Vm, name: string, file: string, text: string): Result<Value, Error>
+    fn Vm.compileAndRun(this: &Vm, name: string, file: string, text: string): Result<Value, Error>
+    fn Vm.useModule(this: &Vm, name: string, out: &Value): bool
+        The exports table `use name;` binds, from `resolver`. False with the error text pending
+        (`use cycle: a -> b -> a` when `name` is still loading).
+    fn Vm.destroy(this: &Vm)
+        Give back all script memory. The VM is unusable after this.
+    fn Vm.errText(this: &Vm): &Buf
+        Start a new error message; append to the returned buffer, then return false.
+    fn Vm.fail(this: &Vm, msg: string): bool
+        An error with message `msg`; always false.
+    fn Vm.failAt(this: &Vm, fi: int, pc: int): bool
+        Give the pending error the position of frame `fi`'s instruction before `pc`, and the trace
+        from there down (once: an error from a nested call keeps its own). Always false.
+    fn Vm.error(this: &Vm): Error
+        The pending error as a value (its strings are views; see `Error`).
+    fn Vm.charge(this: &Vm, n: int): bool
+        Charge `n` units of native work (bytes read or built, values moved) to the step budget,
+        256 per step, so `stepsPerCall` bounds what natives do too. False with `took too long`
+        pending; a native then sets `raised` (`chargeNative`).
+    fn Vm.chargeNative(this: &Vm, n: int): bool
+        `charge` from inside a native: false with the native failed.
+    fn Vm.tooLong(this: &Vm): bool
+        Out of steps: `took too long (over N steps)`. Always false.
+    fn Vm.memFull(this: &Vm): bool
+        True (with `out of script memory` pending) when the heap is past `Limits.heapBytes`. Called
+        right after an op that allocated stored its result (an op that allocated nothing never
+        fails here, so code that doesn't allocate keeps running at the cap), so every live value is reachable: the
+        place where a collection (chunk D) runs before giving up.
+    fn Vm.ensureStack(this: &Vm, n: int)
+        Room for slots below `n`.
+    fn Vm.pushFrame(this: &Vm, f: Value, argBase: int, nargs: int, ret: int): bool
+        Push a frame for closure `f` whose arguments are `nargs` slots at `argBase`; its result
+        goes to `ret`. False past `maxDepth` (`stack overflow`), the step budget, or the heap cap.
+    fn Vm.callAt(this: &Vm, f: Value, argBase: int, nargs: int, ret: int): bool
+        Call `f` with `nargs` arguments at `argBase`, result to `ret`. A closure gets a frame (the
+        caller then runs it); a native runs now. False with the error pending.
+    fn Vm.callNative(this: &Vm, id: int, argBase: int, nargs: int, ret: int): bool
+        Run native `id` on `stack[argBase..argBase+nargs]`. It fails when it called `vm.raise`
+        (an argument getter does that on a wrong type); its return value is dropped then.
+    fn Vm.invoke(this: &Vm, f: Value, self: Value, withThis: bool, args: []Value): Result<Value, Error>
+        Call `f(args)` from J3 (or from a native) and run it to the end. With `withThis`, a script
+        fn whose first parameter is `this` gets `self` before `args`. Re-entrant. On an error the
+        frames, open upvalues and `top` go back to how they were.
+    fn Vm.callValue(this: &Vm, f: Value, args: []Value): Result<Value, Error>
+        `f(args)`; see `invoke`.
+    fn Vm.findUp(this: &Vm, idx: int): ptr
+        The open upvalue for stack slot `idx`, made if there is none yet.
+    fn Vm.closeUps(this: &Vm, level: int)
+        Close every open upvalue at stack slot `level` or above: it keeps the current value.
+    fn Vm.step(this: &Vm): bool
+        One step of the budget (a backward jump); false with `took too long` pending when spent.
+    fn Vm.testJump(this: &Vm, code: []u32, pc: int, take: bool): int
+        After a compare-and-jump at `pc - 1`: take the `OP_JMP` at `pc` when `take`, else skip
+        it. The next pc, or `-(pc + 1)` with the error pending when a backward jump spent the
+        budget (so the error is positioned at that `OP_JMP`, which has the loop's position).
+    fn Vm.badOperands(this: &Vm, op: int, x: Value, y: Value): bool
+        `can't use <op> on <type> and <type>`.
+    fn Vm.arith(this: &Vm, op: int, x: Value, y: Value, out: &Value): bool
+        `x op y` for `+ - * / %` into `out`. Ints wrap; int `/ 0` and `% 0` are errors; a float
+        operand makes the result a float; `+` with a string joins the `str()` texts.
+    fn Vm.less(this: &Vm, op: int, x: Value, y: Value, out: &bool): bool
+        `x < y` (`le`: `<=`) for two numbers or two strings (byte order).
+    fn Vm.negate(this: &Vm, x: Value, out: &Value): bool
+        `-x`.
+    fn Vm.concat(this: &Vm, xs: []Value): Value
+        `str(xs[0]) + .. + str(xs[n-1])` as an interned string; nil with the error pending.
+    fn Vm.makeStr(this: &Vm, s: string): Value
+        `s` as a script string: the one way ops and natives make one from script input. Its bytes
+        are charged to the step budget, and a new copy must fit under `Limits.heapBytes` (after a
+        collection), so one op can't overshoot the cap. Nil with `took too long` or `out of script
+        memory` pending (a native then sets `raised`, see `strOut`). It may collect: call it only
+        where every live value is reachable (registers, arguments, `protect`ed).
+    fn Vm.bufStr(this: &Vm, b: &Buf): Value
+        `makeStr` of what `b` holds, then `b` cleared (a big block goes back). A `b` that hit
+        the cap is `out of script memory`.
+    fn Vm.strOut(this: &Vm, s: string): Value
+        `makeStr` from a native: nil with the native failed.
+    fn Vm.bufOut(this: &Vm, b: &Buf): Value
+        `bufStr` from a native.
+    fn Vm.getField(this: &Vm, o: Value, name: Value, out: &Value): bool
+        `o.name`: a table's field (nil when missing).
+    fn Vm.setField(this: &Vm, o: Value, name: Value, v: Value): bool
+        `o.name = v`; nil removes the field.
+    fn Vm.arrayIndex(this: &Vm, k: Value, out: &int): bool
+        An array index from `k` (an int, or a float holding one) into `out`.
+    fn Vm.getIndex(this: &Vm, o: Value, k: Value, out: &Value): bool
+        `o[k]`: an array element (nil out of range) or a table field.
+    fn Vm.setIndex(this: &Vm, o: Value, k: Value, v: Value): bool
+        `o[k] = v`. An array takes indices up to its length (that one appends).
+    fn Vm.global(this: &Vm, name: Value): Value
+        A host global by name, nil when missing.
+    fn Vm.unknownName(this: &Vm, name: Value): bool
+        `unknown name "x"`.
+    fn Vm.noMethod(this: &Vm, name: Value): bool
+        `no field "f" and no function f` (a method call with nothing to call).
+
+--- stderr
+--- exit 0

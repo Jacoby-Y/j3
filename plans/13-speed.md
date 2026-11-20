@@ -1,11 +1,11 @@
 # Plan 13: j3c in J3 beats Rust j3c on every metric
 
 Goal (user, 2026-11-18): `j3c-boot` (j3c in J3, `j3c-bootstrap/`) is **faster, smaller and uses less memory** than the
-Rust `j3c` (`j3c-bootstrap/stage0/j3c`) on **every** metric of a fixed 10-20 metric bench. Baseline: `j3c-bootstrap/SPEED.md`
+Rust `j3c` (stage 0: `j3c-bootstrap/tools/stage0.sh rust-final` prints its path; `tools/bench.sh` finds it) on **every** metric of a fixed 10-20 metric bench. Baseline: `j3c-bootstrap/SPEED.md`
 (2026-11-18: 1.4-7x slower, up to 8x the memory, binary 30 MB vs 13.4 MB).
 
 ## Rules
-- Output stays byte-identical to stage0: every gate in `.swarm-opus/11-port/context.md` (C5) stays green after each change.
+- Output stays byte-identical: `tests/diff.sh` (the `tests/expect/` files, frozen from stage 0 by plan 15) stays green after each change.
   Speed never buys a diff.
 - Measure before and after every change with the bench; keep a change only if its metric moves and none regresses.
 - No crates.io, no libLLVM, never edit `j3c/` (Rust), headless, `timeout`, no network.

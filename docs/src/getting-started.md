@@ -10,7 +10,7 @@ From the repository root:
 ./build.sh
 ```
 
-`j3c` is written in J3. `build.sh` builds it with a pinned seed compiler (`j3c-bootstrap/stage0/j3c`; when it is missing, the script builds it once with Cargo from the git tag `rust-final`), then has it build itself, and installs it to `$J3_BIN_DIR`, else `~/.bin` if that exists, else `~/.local/bin`. Check it with:
+`j3c` is written in J3. `build.sh` builds it with a seed compiler (the installed `j3c`, or a pinned release; on a machine with neither, `J3_SEED=$(j3c-bootstrap/tools/stage0.sh rust-final) ./build.sh` builds the old Rust compiler once with Cargo from the git tag `rust-final`), then has it build itself, and installs it to `$J3_BIN_DIR`, else `~/.bin` if that exists, else `~/.local/bin`. Check it with:
 
 ```text
 j3c version
