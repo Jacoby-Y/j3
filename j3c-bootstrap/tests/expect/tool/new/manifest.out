@@ -127,7 +127,7 @@ lives in target/.j3c/. Deleting it only costs a full rebuild.
     opt      optimization. [emit] opt inherits this when [emit] is omitted
     fast     strip bounds-check aborts
 
-CLI flags override the file: --emit llvm|c, --opt N, --fast, --release (opt s, no -g, stripped; `j3c size` shows what is in the binary; also writes [dist] build_outputs, `j3c doc ship`).
+CLI flags override the file: --emit llvm|bc, --opt N, --fast, --release (opt s, no -g, stripped; `j3c size` shows what is in the binary; also writes [dist] build_outputs, `j3c doc ship`).
 No [emit] section inherits [cc] opt.
 
 Environment
