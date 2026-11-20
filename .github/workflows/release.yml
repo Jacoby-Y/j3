@@ -2,13 +2,41 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]  # every push to main cuts the next patch release
+    tags: ["v*"]      # or push a tag by hand for a minor/major bump
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # A tag push releases that tag. A main push tags HEAD with the next patch (unless HEAD is already tagged).
+      # Tags pushed with GITHUB_TOKEN don't trigger workflows, so this run doesn't fire twice.
+      - id: t
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then t=$GITHUB_REF_NAME
+          elif t=$(git describe --tags --exact-match --match 'v[0-9]*' HEAD 2>/dev/null); then :
+          else
+            last=$(git describe --tags --abbrev=0 --match 'v[0-9]*')
+            IFS=. read -r ma mi pa <<<"${last#v}"
+            t="v$ma.$mi.$((pa + 1))"
+            git tag "$t" && git push origin "$t"
+          fi
+          echo "tag=$t" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: tag
     strategy:
       matrix:
         # 22.04 keeps the glibc floor at 2.35 (see packaging/README.md).
@@ -18,6 +46,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # git describe (version), and stage 0 is built from the tag rust-final
+          ref: ${{ needs.tag.outputs.tag }}
 
       # No J3 release is pinned yet (j3c-bootstrap/seed/VERSION says `unset`) and the runner has no j3c, so the
       # seed is stage 0: the Rust j3c at the tag rust-final, built with cargo by tools/stage0.sh (prints its
@@ -41,10 +70,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang mingw-w64 binutils-mingw-w64-x86-64 zip
 
       - name: Package
+        env:
+          TAG: ${{ needs.tag.outputs.tag }}
         run: |
           tools/release/package.sh
           v=$(j3c-bootstrap/target/j3c version | awk '{print $2}')
-          [ "$GITHUB_REF_NAME" = "v$v" ] || { echo "::error::binary says $v, tag is $GITHUB_REF_NAME"; exit 1; }
+          [ "$TAG" = "v$v" ] || { echo "::error::binary says $v, tag is $TAG"; exit 1; }
           if [ "$(uname -m)" = x86_64 ]; then
             J3_SKIP_BUILD=1 tools/release/package.sh --windows
             cp install.ps1 dist/
@@ -57,7 +88,7 @@ jobs:
           path: dist/
 
   release:
-    needs: build
+    needs: [tag, build]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -70,14 +101,14 @@ jobs:
       - name: Upload to the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.tag.outputs.tag }}
         run: |
           cat dist/SHA256SUMS.* > dist/SHA256SUMS
           rm dist/SHA256SUMS.*
-          v=${GITHUB_REF_NAME#v}
-          # This release's CHANGELOG section as the notes.
+          v=${TAG#v}
+          # This release's CHANGELOG section as the notes, else GitHub's generated commit list.
           awk -v h="## [$v]" 'index($0, h) == 1 { p = 1; next } /^## \[/ { p = 0 } p' CHANGELOG.md > notes.md
-          # Drafts: publish by hand after a look (install.sh only sees published releases).
-          # `gh release view <tag>` misses drafts, so look the tag up in the list (drafts included).
-          gh release list --json tagName --jq '.[].tagName' | grep -qx "$GITHUB_REF_NAME" ||
-            gh release create "$GITHUB_REF_NAME" --draft --title "j3c $v" --notes-file notes.md
-          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          if [ -s notes.md ]; then notes=(--notes-file notes.md); else notes=(--generate-notes); fi
+          gh release list --json tagName --jq '.[].tagName' | grep -qx "$TAG" ||
+            gh release create "$TAG" --title "j3c $v" "${notes[@]}"
+          gh release upload "$TAG" dist/* --clobber

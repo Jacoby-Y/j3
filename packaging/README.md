@@ -6,7 +6,7 @@ Every channel ships the same `j3c` binary, built by `.github/workflows/release.y
 
 | Channel | Files | Per release |
 |---|---|---|
-| Tarball + `install.sh` | `j3c-<ver>-<arch>-linux.tar.gz`, `SHA256SUMS` | Automatic: the workflow uploads them; publish the draft release. `install.sh` picks up the latest published one |
+| Tarball + `install.sh` | `j3c-<ver>-<arch>-linux.tar.gz`, `SHA256SUMS` | Automatic: every push to `main` tags the next patch (`v0.1.1`, ...) and publishes a release; push a `v*` tag by hand for a minor/major bump. `install.sh` picks up the latest one |
 | `.deb` | `j3c_<ver>_<amd64\|arm64>.deb` | Automatic, same release. `sudo apt install ./j3c_<ver>_amd64.deb`. A PPA or apt repo is later |
 | AUR `j3c-bin` | `aur/j3c-bin/PKGBUILD` | After publishing: bump `pkgver`, `updpkgsums`, `makepkg --printsrcinfo > .SRCINFO`, push both to `ssh://aur@aur.archlinux.org/j3c-bin.git` |
 | Windows zip + `install.ps1` | `j3c-<ver>-x86_64-windows.zip` and `j3c.exe` (in `SHA256SUMS`), `install.ps1` | Automatic: the x86_64 job cross-builds `j3c.exe` (`package.sh --windows`) and uploads both. `install.ps1` takes the latest published release |
