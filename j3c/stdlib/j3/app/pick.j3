@@ -1,0 +1,185 @@
+/// Native "choose folder" / "choose file" dialogs that do not block the frame loop. Start one, then
+/// `poll` it each frame until it is no longer `Pending`:
+///
+///     use j3.app.pick;
+///     use j3.app.pick.{ Pick, PickJob };
+///
+///     let job = pick.folder("Open workspace", sys.env("HOME"), app.mem);   // keep it in your world
+///     // every frame:
+///     match job.poll() {
+///         Pick.Picked(dir) { openWorkspace(dir); }
+///         Pick.Cancelled {}
+///         Pick.Unavailable { showError("no file dialog on this system"); }
+///         Pick.Pending {}
+///     }
+///
+/// `pick.file(title, startDir, filters, mem)` picks one file; each filter is `"Name|*.png *.jpg"`
+/// (empty slice: any file). `cancel()` closes a dialog still open.
+///
+/// - Linux: the XDG Desktop Portal (`org.freedesktop.portal.FileChooser`, through `gdbus`), so the user
+///   gets their desktop's own GTK/KDE dialog; without a portal `zenity`, then `kdialog`; none of them is `Unavailable`.
+///   The dialog runs in a child process (`j3.proc`), so the window keeps drawing.
+/// - Other platforms: `Unavailable` for now.
+/// - Tests: with `J3_PICK_RESULT` set the job is done at once with that path (`""` is `Cancelled`); with
+///   `J3_CAPTURE` set, or `SDL_VIDEODRIVER=offscreen`/`dummy` (`--headless`), and no `J3_PICK_RESULT`,
+///   it is `Cancelled`, so goldens never open a window.
+/// - A portal path comes back as a `file://` URI and is decoded; other URIs (a remote location) come back as they are.
+
+module j3.app.pick;
+
+use j3.memory.Arena;
+use j3.option.Option;
+use j3.proc;
+use j3.proc.{ Child, StartOpts };
+use j3.result.Result;
+use j3.sys;
+use j3.text.Text;
+use j3.text.same;
+
+/// Where a pick job stands.
+pub enum Pick {
+    /// The dialog is still open.
+    Pending,
+    /// The chosen path.
+    Picked(string),
+    /// The user closed the dialog without choosing.
+    Cancelled,
+    /// No dialog could be shown (no portal, zenity or kdialog; not Linux).
+    Unavailable,
+}
+
+/// A dialog started by `folder` or `file`.
+pub struct PickJob {
+    child: Child;
+    /// Where it stands; set by `poll`.
+    now: Pick;
+    mem: &Arena;
+
+    /// `Pending` while the dialog is open, then the result (the same every later call).
+    fn poll(this: &PickJob): Pick {
+        match this.now {
+            Pick.Pending {}
+            _ { return this.now; }
+        }
+        match this.child.tryWait() {
+            Option.None { return Pick.Pending; }
+            Option.Some(code) {
+                let out = Text.new(this.mem);
+                let buf = this.mem.alloc::<u8>(4096);
+                while true {
+                    let n = this.child.read(buf);
+                    if n <= 0 {
+                        break;
+                    }
+                    out.pushBytes(buf[0..n]);
+                }
+                this.child.wait();
+                let s = out.str();
+                while s.len > 0 && (s[s.len - 1] == '\n' || s[s.len - 1] == '\r') {
+                    s = s[0..s.len - 1];
+                }
+                this.now = if code == 0 && s.len > 0 { Pick.Picked(fileUri(s, this.mem)) }
+                    else if code == 1 || code == 0 { Pick.Cancelled } else { Pick.Unavailable };
+            }
+        }
+        return this.now;
+    }
+
+    /// Close the dialog if it is still open; the job is then `Cancelled`.
+    fn cancel(this: &PickJob) {
+        match this.now {
+            Pick.Pending {
+                this.child.killTree(sys.SIGTERM);
+                this.child.wait();
+                this.now = Pick.Cancelled;
+            }
+            _ {}
+        }
+    }
+}
+
+/// Start a "choose folder" dialog titled `title`, opening in `startDir` ("" for the default).
+pub fn folder(title: string, startDir: string, mem: &Arena): PickJob {
+    return start("dir", title, startDir, mem.alloc::<string>(0), mem);
+}
+
+/// Start a "choose file" dialog; `filters` are `"Name|*.png *.jpg"` entries (none: any file).
+pub fn file(title: string, startDir: string, filters: []string, mem: &Arena): PickJob {
+    return start("file", title, startDir, filters, mem);
+}
+
+// Arguments: mode (dir|file), title, start dir, then filters. Prints the path (portal: a file:// URI);
+// exit 1 on cancel, 3 when nothing can show a dialog.
+// ponytail: GVariant text through gdbus instead of a D-Bus client; a raw-socket client when gdbus is missing matters.
+const SCRIPT: string = "set -f; m=$1; t=$2; d=$3; shift 3\nq() { printf %s \"$1\" | sed \"s/[\\\\\\\\']/\\\\\\\\&/g\"; }\nportal() {\n  gdbus introspect --session --dest org.freedesktop.portal.Desktop --object-path /org/freedesktop/portal/desktop 2>/dev/null | grep -q FileChooser || return 2\n  o=\"'handle_token': <'j3pick$$'>\"\n  [ \"$m\" = dir ] && o=\"$o, 'directory': <true>\"\n  [ -n \"$d\" ] && o=\"$o, 'current_folder': <b'$(q \"$d\")'>\"\n  if [ $# -gt 0 ]; then\n    fs=\"\"\n    for f; do ps=\"\"; for g in ${f#*|}; do ps=\"$ps${ps:+, }(uint32 0, '$(q \"$g\")')\"; done; fs=\"$fs${fs:+, }('$(q \"${f%%|*}\")', [$ps])\"; done\n    o=\"$o, 'filters': <[$fs]>\"\n  fi\n  log=$(mktemp) || return 2\n  gdbus monitor --session --dest org.freedesktop.portal.Desktop >\"$log\" 2>/dev/null & w=$!\n  trap 'rm -f \"$log\"; kill $w 2>/dev/null' EXIT\n  sleep 0.2\n  h=$(gdbus call --session --dest org.freedesktop.portal.Desktop --object-path /org/freedesktop/portal/desktop --method org.freedesktop.portal.FileChooser.OpenFile \"\" \"'$(q \"$t\")'\" \"{$o}\" 2>/dev/null) || return 2\n  h=$(printf %s \"$h\" | sed \"s/^[^']*'\\([^']*\\)'.*/\\1/\")\n  l=\"\"\n  while kill -0 $w 2>/dev/null; do\n    l=$(grep -F \"$h: org.freedesktop.portal.Request.Response\" \"$log\") && break\n    sleep 0.2\n  done\n  case \"$l\" in *\"(uint32 0,\"*) ;; *) exit 1;; esac\n  printf %s \"$l\" | sed -n \"s/.*'uris': <\\['\\([^']*\\)'.*/\\1/p\"\n  exit 0\n}\nportal \"$@\"\nif command -v zenity >/dev/null 2>&1; then\n  n=$#; for f; do set -- \"$@\" \"--file-filter=${f%%|*} | ${f#*|}\"; done; shift $n\n  [ \"$m\" = dir ] && set -- --directory \"$@\"\n  exec zenity --file-selection --title=\"$t\" ${d:+\"--filename=$d/\"} \"$@\"\nfi\nif command -v kdialog >/dev/null 2>&1; then\n  [ \"$m\" = dir ] && exec kdialog --title \"$t\" --getexistingdirectory \"${d:-.}\"\n  k=\"\"; for f; do k=\"${k:+$k\n}${f#*|}|${f%%|*}\"; done\n  exec kdialog --title \"$t\" --getopenfilename \"${d:-.}\" \"$k\"\nfi\nexit 3\n";
+
+fn start(mode: string, title: string, startDir: string, filters: []string, mem: &Arena): PickJob {
+    let none = Child { pid: 0, stdin: -1, stdout: -1, stderr: -1 };
+    let scripted = sys.env("J3_PICK_RESULT");
+    if scripted.len > 0 {
+        return PickJob { child: none, now: Pick.Picked(scripted), mem: mem };
+    }
+    let vd = sys.env("SDL_VIDEODRIVER");
+    if hasEnv("J3_PICK_RESULT") || hasEnv("J3_CAPTURE") || same(vd, "offscreen") || same(vd, "dummy") {
+        return PickJob { child: none, now: Pick.Cancelled, mem: mem };
+    }
+    if sys.PLATFORM != sys.PLATFORM_LINUX {
+        return PickJob { child: none, now: Pick.Unavailable, mem: mem };
+    }
+    let argv = mem.alloc::<string>(7 + filters.len);
+    argv[0] = "sh";
+    argv[1] = "-c";
+    argv[2] = SCRIPT;
+    argv[3] = "j3pick";
+    argv[4] = mode;
+    argv[5] = title;
+    argv[6] = startDir;
+    for i in 0..filters.len {
+        argv[7 + i] = filters[i];
+    }
+    match proc.startWith(argv, argv[0..0], StartOpts { group: true }, mem) {
+        Result.Ok(c) {
+            c.closeStdin();
+            return PickJob { child: c, now: Pick.Pending, mem: mem };
+        }
+        Result.Err(_) { return PickJob { child: none, now: Pick.Unavailable, mem: mem }; }
+    }
+}
+
+/// True when `name` is in the environment, even set to "".
+fn hasEnv(name: string): bool {
+    let a = Arena.create(65536);
+    defer a.destroy();
+    for kv in proc.environ(&a) {
+        if kv.len > name.len && kv[name.len] == '=' && same(kv[0..name.len], name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// `file:///a%20b` as `/a b`; anything else as it is.
+fn fileUri(s: string, mem: &Arena): string {
+    if s.len < 8 || !same(s[0..7], "file://") {
+        return s;
+    }
+    let t = Text.new(mem);
+    let i = 7;
+    while i < s.len {
+        if s[i] == '%' && i + 2 < s.len && hex(s[i + 1]) >= 0 && hex(s[i + 2]) >= 0 {
+            t.push(u8(hex(s[i + 1]) * 16 + hex(s[i + 2])));
+            i += 3;
+        } else {
+            t.push(s[i]);
+            i += 1;
+        }
+    }
+    return t.str();
+}
+
+fn hex(c: u8): int {
+    if c >= '0' && c <= '9' { return int(c - '0'); }
+    if c >= 'a' && c <= 'f' { return int(c - 'a') + 10; }
+    if c >= 'A' && c <= 'F' { return int(c - 'A') + 10; }
+    return -1;
+}
