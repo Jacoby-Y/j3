@@ -23,8 +23,9 @@ API=26
 STAMP="sdl2=$SDL2_VER image=$IMG_VER mixer=$MIX_VER ttf=$TTF_VER api=$API cfg=2"
 
 ABIS=${J3_ANDROID_ABIS:-"arm64-v8a x86_64"}
-CACHE=${J3_SDL_CACHE:-$HOME/.cache/j3/android/sdl}
-BUILD=$HOME/.cache/j3/android/build
+J3ROOT=${J3_CACHE:-${XDG_CACHE_HOME:+$XDG_CACHE_HOME/j3}}; J3ROOT=${J3ROOT:-$HOME/.cache/j3}  # j3c `cacheRoot`
+CACHE=${J3_SDL_CACHE:-$J3ROOT/android/sdl}
+BUILD=$J3ROOT/android/build
 export GIT_TERMINAL_PROMPT=0
 
 # --- NDK

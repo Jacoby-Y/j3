@@ -17,6 +17,8 @@ Run the real program with no display, save a frame, and read the PNG.
 handshake; tests print from the `App.hot` load hook to see state survive (`j3c doc j3ui`, Dev loop).
 
 Without `--headless` or those variables a run opens a real window. Any game run needs one of them.
+On Windows, whose SDL offscreen driver has no GL, `--headless` sets `J3_HIDDEN=1` (a window that never shows)
+and `SDL_AUDIODRIVER=dummy` instead; set those two for a built `.exe` (also under `xvfb-run wine`).
 
 An Android package (`[emit] target` has an Android triple) runs on the host with `--host`: `j3c check --host`,
 `j3c run --host --headless --frames 60 --screenshot shot.png`. It ignores `[emit] target` only and builds in place
@@ -54,7 +56,7 @@ look at the new PNG first.
 
 `j3c golden <dir> [name...] [--bless]` does the whole loop for a project from `<dir>/golden.toml`: per
 `[[state]]` it runs `j3c run . --headless --frames N` (offscreen SDL, dummy audio, `J3_FIXED_DT=0.016`,
-`J3_CAPTURE=target/golden/<name>.png:<frame>`), compares with `golden/<name>.png`, and prints `PASS name` or
+`J3_CAPTURE=target/golden/<name>.png:<frame>`; a hidden window on Windows), compares with `golden/<name>.png`, and prints `PASS name` or
 `FAIL name (why)`; exit 1 on any FAIL. A missing golden is a FAIL; `--bless` copies the captures over the goldens
 (named states only, else all). Names run just those states. Diff images and run logs land in `target/golden/`.
 

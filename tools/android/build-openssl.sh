@@ -17,8 +17,9 @@ API=26
 STAMP="openssl=$VER api=$API cfg=1"
 
 ABIS=${J3_ANDROID_ABIS:-"arm64-v8a x86_64"}
-CACHE=${J3_OPENSSL_CACHE:-$HOME/.cache/j3/android/openssl}
-BUILD=$HOME/.cache/j3/android/build
+J3ROOT=${J3_CACHE:-${XDG_CACHE_HOME:+$XDG_CACHE_HOME/j3}}; J3ROOT=${J3ROOT:-$HOME/.cache/j3}  # j3c `cacheRoot`
+CACHE=${J3_OPENSSL_CACHE:-$J3ROOT/android/openssl}
+BUILD=$J3ROOT/android/build
 
 NDK=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}
 if [ -z "$NDK" ]; then

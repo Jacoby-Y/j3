@@ -1,35 +1,149 @@
-// The `[dist] icon` PNG as a Windows exe icon: wrapped in a one-image `.ico` (PNG inside, Vista and later),
-// compiled to a COFF resource object by `windres`, and linked like any object file.
+// The resources of every Windows exe: one `.rc` with the manifest (UTF-8 code page, PerMonitorV2 DPI,
+// longPathAware), the `[dist] icon` PNG as icon 1 and a VERSIONINFO from `[package]`, compiled to a COFF object by
+// `windres` and linked like any object file (plan 08 decision 11).
 //
 // Part of module j3c.toolchain.
+// J3: The object sits in `<cache>/winres/<hash>.o`, the hash over everything that goes into it, so a build reuses
+//     it until the manifest, icon bytes, name, version or description change (a temp `run` has no `out` to sit
+//     beside either). Plan 02 decision 4 (j3c writes the `.rsrc` itself, no windres) is the follow-up.
 module j3c.toolchain;
 
-/// `<out>.icon.o`, the resource object with `png` as icon 1 (Explorer and the taskbar show the first icon).
-/// Err when the PNG cannot be read or no `windres` runs.
-fn iconObject(png: string, out: string, target: string, arena: &Arena): Result<string, string> {
-    let data: []u8 = "" as []u8;
-    match io.readFile(png, arena) {
-        Result.Ok(d) { data = d; }
-        Result.Err(_) { return Result.Err(Text.new(arena).add("[dist] icon: cannot read ").add(png).str()); }
+/// The manifest every Windows exe gets (plan 02 decision 3): `*A` calls take UTF-8 (Windows 10 1903+), per-monitor
+/// DPI, paths past `MAX_PATH` where the registry allows, and `asInvoker` so a name like `setup.exe` never asks for
+/// admin rights.
+const WIN_MANIFEST: string = @embed("winres.manifest");
+
+/// The resource object for `cc` (manifest, `cc.winIcon`, VERSIONINFO when `cc.winName` is set), built once per
+/// content. Err (the caller warns and links without it) when no cache folder or no `windres` works; an unreadable
+/// icon only warns and drops the icon.
+fn resourceObject(cc: &CcOpts, target: string, arena: &Arena): Result<string, string> {
+    let icon: []u8 = "" as []u8;
+    if cc.winIcon.len > 0 {
+        match io.readFile(cc.winIcon, arena) {
+            Result.Ok(d) {
+                if d.len < 24 || d[1] != 'P' || d[2] != 'N' || d[3] != 'G' {
+                    warn(Text.new(arena).add("[dist] icon: not a PNG: ").add(cc.winIcon).str());
+                } else {
+                    icon = d;
+                }
+            }
+            Result.Err(_) { warn(Text.new(arena).add("[dist] icon: cannot read ").add(cc.winIcon).str()); }
+        }
     }
-    if data.len < 24 || data[1] != 'P' || data[2] != 'N' || data[3] != 'G' {
-        return Result.Err(Text.new(arena).add("[dist] icon: not a PNG: ").add(png).str());
+    let info = versionInfo(cc, arena);
+    let h = Xxh3.new();
+    let zero: [1]u8 = [0];
+    let parts: [4][]u8 = [WIN_MANIFEST as []u8, info as []u8, icon, target as []u8];
+    for i in 0..4 { h.update(parts[i]); h.update(zero[..]); }
+    let dir = "";
+    match config.cacheRoot(arena) {
+        Option.Some(r) { dir = path.join(r, "winres", arena); }
+        Option.None {
+            if cc.out.len == 0 { return Result.Err("Windows resources not embedded in the .exe: no cache folder (set J3_CACHE)"); }
+            dir = path.dirname(cc.out);
+        }
     }
-    let ico = Text.new(arena).add(out).add(".icon.ico").str();
-    let rc = Text.new(arena).add(out).add(".icon.rc").str();
-    let obj = Text.new(arena).add(out).add(".icon.o").str();
-    fsx.writeFile(ico, icoOf(data, arena), arena)?;
-    fsx.writeFile(rc, Text.new(arena).add("1 ICON \"").add(ico).add("\"\n").str() as []u8, arena)?;
+    let base = path.join(dir, hex16(h.finish(), arena), arena);
+    let obj = Text.new(arena).add(base).add(".res.o").str();
+    if fsx.isFile(obj) { return Result.Ok(obj); }
+    mkdirs(dir, arena)?;
+    let man = Text.new(arena).add(base).add(".manifest").str();
+    let ico = Text.new(arena).add(base).add(".ico").str();
+    let rcFile = Text.new(arena).add(base).add(".rc").str();
+    fsx.writeFile(man, WIN_MANIFEST as []u8, arena)?;
+    let rc = Text.new(arena);
+    rc.add("1 24 ").add(rcString(man, arena)).add("\n");
+    if icon.len > 0 {
+        fsx.writeFile(ico, icoOf(icon, arena), arena)?;
+        rc.add("1 ICON ").add(rcString(ico, arena)).add("\n");
+    }
+    rc.add(info);
+    fsx.writeFile(rcFile, rc.str() as []u8, arena)?;
+    // Written aside and renamed, so a parallel build never links half an object.
+    let tmp = Text.new(arena).add(obj).add(".tmp-").fmt(`{sys.getpid()}`).str();
     let triple = if startsWith(target, "aarch64") { "aarch64-w64-mingw32" } else { "x86_64-w64-mingw32" };
-    let tools: [3]string = [Text.new(arena).add(triple).add("-windres").str(), "llvm-windres", "windres"];
+    let rest: [3]string = [Text.new(arena).add(triple).add("-windres").str(), "llvm-windres", "windres"];
+    let tools = besideClang("windres", rest[:], arena);
+    let why = "";
     for i in 0..tools.len {
-        let argv: [6]string = [tools[i], "-O", "coff", "-i", rc, Text.new(arena).add("-o").add(obj).str()];
+        let argv: [7]string = [tools.items[i], "--codepage=65001", "-O", "coff", "-i", rcFile, Text.new(arena).add("-o").add(tmp).str()];
         match spawnRun(argv[:], arena) {
-            Result.Ok(o) { if o.code == 0 { return Result.Ok(obj); } }
+            Result.Ok(o) {
+                if o.code == 0 && renamed(tmp, obj) { return Result.Ok(obj); }
+                if why.len == 0 { why = Text.new(arena).add(tools.items[i]).add(": ").add(trim(o.err as string)).str(); }
+            }
             Result.Err(_) {}
         }
     }
-    return Result.Err("[dist] icon not embedded in the .exe: no windres (install mingw-w64 binutils or llvm)");
+    match io.remove(tmp) { Result.Ok(_) {} Result.Err(_) {} }
+    if why.len > 0 { return Result.Err(Text.new(arena).add("Windows resources not embedded in the .exe: ").add(why).str()); }
+    return Result.Err("Windows resources (UTF-8 manifest, icon) not embedded in the .exe: no windres (install mingw-w64 binutils or llvm, or run `j3c setup`)");
+}
+
+fn renamed(from: string, to: string): bool {
+    match io.rename(from, to) {
+        Result.Ok(_) { return true; }
+        Result.Err(_) { return false; }
+    }
+}
+
+/// The VERSIONINFO block for `cc.winName` / `winVersion` / `winDescription`; "" without a name.
+fn versionInfo(cc: &CcOpts, arena: &Arena): string {
+    if cc.winName.len == 0 { return ""; }
+    let n = versionNums(cc.winVersion);
+    let nums = Text.new(arena);
+    nums.fmt(`{n.0},{n.1},{n.2},0`);
+    let t = Text.new(arena);
+    t.add("1 VERSIONINFO\nFILEVERSION ").add(nums.str()).add("\nPRODUCTVERSION ").add(nums.str());
+    // VOS_NT_WINDOWS32, VFT_APP
+    t.add("\nFILEFLAGSMASK 0x3f\nFILEFLAGS 0x0\nFILEOS 0x40004\nFILETYPE 0x1\nFILESUBTYPE 0x0\nBEGIN\n");
+    t.add("  BLOCK \"StringFileInfo\"\n  BEGIN\n    BLOCK \"040904b0\"\n    BEGIN\n");
+    let exe = Text.new(arena).add(cc.winName).add(".exe").str();
+    if cc.out.len > 0 { exe = path.basename(cc.out); }
+    let keys: [6]string = ["FileDescription", "FileVersion", "InternalName", "OriginalFilename", "ProductName", "ProductVersion"];
+    let vals: [6]string = [if cc.winDescription.len > 0 { cc.winDescription } else { cc.winName }, cc.winVersion, cc.winName, exe, cc.winName, cc.winVersion];
+    for i in 0..6 {
+        t.add("      VALUE \"").add(keys[i]).add("\", ").add(rcString(vals[i], arena)).add("\n");
+    }
+    t.add("    END\n  END\n  BLOCK \"VarFileInfo\"\n  BEGIN\n    VALUE \"Translation\", 0x409, 1200\n  END\nEND\n");
+    return t.str();
+}
+
+/// `major.minor.patch` of a semver (pre-release and build metadata dropped; missing or bad parts are 0, each
+/// clamped to 65535, the size of a VERSIONINFO field).
+pub fn versionNums(v: string): (int, int, int) {
+    let n: [3]int = [0, 0, 0];
+    let k = 0;
+    for i in 0..v.len {
+        let ch = v[i];
+        if ch == '-' || ch == '+' { break; }
+        if ch == '.' {
+            k += 1;
+            if k >= 3 { break; }
+            continue;
+        }
+        if ch < '0' || ch > '9' { break; }
+        if n[k] < 65535 { n[k] = n[k] * 10 + int(ch - '0'); }
+        if n[k] > 65535 { n[k] = 65535; }
+    }
+    return (n[0], n[1], n[2]);
+}
+
+/// `s` as a quoted `.rc` string: `"` doubled, `\` doubled, newlines as `\n`; other bytes (UTF-8, read with
+/// `--codepage=65001`) as they are.
+pub fn rcString(s: string, arena: &Arena): string {
+    let t = Text.new(arena);
+    t.push('"');
+    for i in 0..s.len {
+        let ch = s[i];
+        if ch == '"' { t.add("\"\""); }
+        else if ch == '\\' { t.add("\\\\"); }
+        else if ch == '\n' { t.add("\\n"); }
+        else if ch == '\r' || ch == '\t' { t.push(' '); }
+        else { t.push(ch); }
+    }
+    t.push('"');
+    return t.str();
 }
 
 /// A one-image `.ico` holding `png` as is; width and height come from its IHDR (0 means 256 or more).

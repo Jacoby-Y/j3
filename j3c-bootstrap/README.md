@@ -29,7 +29,7 @@ Stages, in order. A stage may use only the stages above it (`tools/layers.txt`, 
 
 | Stage | Files | What |
 |---|---|---|
-| base | `base/*` | span, diag, intern, `Id<T>`, toml, zip, deflate, hash, fs helpers, phase timings |
+| base | `base/*` | span, diag, intern, `Id<T>`, toml, zip, deflate, hash, fs helpers, phase timings, host triple (`triple`) |
 | project | `project/*` | `j3.toml`, deps, user config, appconfig |
 | syntax | `syntax/*` | tokens, lexer, AST, parser (`syntax/parse` parts), extend folding, flow, walk, fmt |
 | ui | `ui.j3`, `ui/markup` + parts, `ui/gen` + parts | the `.j3ui` compiler |

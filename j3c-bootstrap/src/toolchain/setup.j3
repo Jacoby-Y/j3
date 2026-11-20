@@ -1,0 +1,285 @@
+// `j3c setup`: download the pinned Windows toolchain (llvm-mingw) and the SDL2 mingw kits into the cache
+// (plan 08 decisions 1-2). `clang.j3` finds the clang a build runs.
+//
+// Part of module j3c.toolchain.
+module j3c.toolchain;
+// J3: Downloads go through `curl` and unpacking through `tar` (`unzip` for a zip off Windows: GNU tar has no
+//     zip), spawned by argv. On Windows both are the in-box `%SystemRoot%\System32` copies (bsdtar unpacks zips),
+//     so Git's GNU tar on PATH cannot misread `C:\...`. No `j3.net.http`: TLS on Windows would need OpenSSL DLLs.
+//     The archive's sha256 is checked before anything is unpacked; unpacking goes into `<dest>.partial`, which is
+//     renamed into place only when complete.
+
+/// Where a pin lands under the cache root.
+pub enum PinKind {
+    /// `<cacheRoot>/toolchain/<folder>`; fetched only for a Windows host.
+    Toolchain,
+    /// `<cacheRoot>/sdl2-mingw/<folder>`; fetched on every host.
+    Sdl,
+}
+
+/// One pinned download. The archive holds one top folder, `top`, which lands at `<kind dir>/<folder>`.
+pub struct Pin {
+    name: string;
+    url: string;
+    /// Lowercase hex sha256 of the archive.
+    sha256: string;
+    top: string;
+    folder: string;
+    kind: PinKind;
+    /// When the pin and hash were taken.
+    date: string;
+}
+
+pub const PIN_COUNT: int = 5;
+
+/// The pin table. A bump changes `url`, `sha256`, `top`, `folder` and `date` together; `findClang` takes the
+/// highest `llvm-mingw-<n>`, so an old toolchain folder left beside a new one is harmless.
+pub fn pins(): [5]Pin {
+    return [
+        // GitHub's release asset digest; also checked by downloading once
+        Pin { name: "llvm-mingw 20261117 (ucrt, x86_64 host)",
+            url: "https://github.com/mstorsjo/llvm-mingw/releases/download/20261117/llvm-mingw-20261117-ucrt-x86_64.zip",
+            sha256: "4d002e330a0f703625aa5ccbc37e96f8f824413e163bfc7336774aabd2c3a412",
+            top: "llvm-mingw-20261117-ucrt-x86_64", folder: "llvm-mingw-20261117", kind: PinKind.Toolchain, date: "2026-11-20" },
+        // libsdl-org publishes no checksums: hashed from one download
+        Pin { name: "SDL2 2.30.9 (mingw)",
+            url: "https://github.com/libsdl-org/SDL/releases/download/release-2.30.9/SDL2-devel-2.30.9-mingw.tar.gz",
+            sha256: "b188d165dc4a0372042bff3d0c18e9bb90772581e92a7b8b47b521b47714f75c",
+            top: "SDL2-2.30.9", folder: "SDL2-2.30.9", kind: PinKind.Sdl, date: "2026-11-20" },
+        Pin { name: "SDL2_image 2.8.2 (mingw)",
+            url: "https://github.com/libsdl-org/SDL_image/releases/download/release-2.8.2/SDL2_image-devel-2.8.2-mingw.tar.gz",
+            sha256: "9dc1348c36d94cbbd4702dd2f2e6ba151b9c835eb13d55ec6c03a9c2cb9b7748",
+            top: "SDL2_image-2.8.2", folder: "SDL2_image-2.8.2", kind: PinKind.Sdl, date: "2026-11-20" },
+        Pin { name: "SDL2_ttf 2.22.0 (mingw)",
+            url: "https://github.com/libsdl-org/SDL_ttf/releases/download/release-2.22.0/SDL2_ttf-devel-2.22.0-mingw.tar.gz",
+            sha256: "7e3edf46630bbfb1cb8bffd69a5456b037469ed7a20a75232caee0b1752dc65b",
+            top: "SDL2_ttf-2.22.0", folder: "SDL2_ttf-2.22.0", kind: PinKind.Sdl, date: "2026-11-20" },
+        Pin { name: "SDL2_mixer 2.8.0 (mingw)",
+            url: "https://github.com/libsdl-org/SDL_mixer/releases/download/release-2.8.0/SDL2_mixer-devel-2.8.0-mingw.tar.gz",
+            sha256: "4f426c9f0863707a1315333c7e41e0b56099fa412d26a27756ad8fa4ef0240ae",
+            top: "SDL2_mixer-2.8.0", folder: "SDL2_mixer-2.8.0", kind: PinKind.Sdl, date: "2026-11-20" }
+    ];
+}
+
+/// llvm-mingw sysroots `setup` deletes after unpacking (`<arch>-w64-mingw32`): j3c targets x86_64 only, and
+/// this halves the tree. `generic-w64-mingw32` (shared headers) stays.
+const PRUNE_ARCHES: [4]string = ["i686", "armv7", "aarch64", "arm64ec"];
+
+/// Setup acts for a Windows host. `J3_SETUP_HOST=windows` forces it elsewhere so the toolchain path can be
+/// tried on Linux (it then unpacks with `unzip`, and the `clang.exe` it leaves does not run there).
+fn setupForWindows(): bool { return sys.PLATFORM == sys.PLATFORM_WINDOWS || sys.env("J3_SETUP_HOST") == "windows"; }
+
+/// The in-box Windows tool (`curl.exe`, `tar.exe`) by full path, else the bare name off Windows.
+pub fn hostTool(name: string, arena: &Arena): string {
+    if sys.PLATFORM != sys.PLATFORM_WINDOWS { return name; }
+    let root = sys.env("SystemRoot");
+    if root.len == 0 { return Text.new(arena).add(name).add(".exe").str(); }
+    return Text.new(arena).add(root).add("\\System32\\").add(name).add(".exe").str();
+}
+
+/// `<cacheRoot>/<toolchain|sdl2-mingw>/<folder>` for `p`.
+pub fn pinDest(root: string, p: &Pin, arena: &Arena): string {
+    let sub = match p.kind { PinKind.Toolchain { "toolchain" } PinKind.Sdl { "sdl2-mingw" } };
+    return path.join(path.join(root, sub, arena), p.folder, arena);
+}
+
+/// The archive's file name: the last part of its URL.
+pub fn pinFile(p: &Pin): string {
+    let i = lastIndexOf(p.url, "/");
+    return p.url[i + 1..p.url.len];
+}
+
+/// Lowercase hex sha256 of the file at `p`, read in 64 KiB pieces (llvm-mingw is ~190 MB). None if unreadable.
+pub fn fileSha256(p: string, arena: &Arena): Option<string> {
+    let fd = io.openPath(p, sys.O_RDONLY, 0);
+    if fd < 0 { return Option.None; }
+    let h = Sha256.new();
+    let buf = arena.alloc::<u8>(1 << 16);
+    while true {
+        let got = sys.read(fd, buf.ptr as ptr, buf.len);
+        if got < 0 {
+            sys.close(fd);
+            return Option.None;
+        }
+        if got == 0 { break; }
+        h.update(buf[0..got]);
+    }
+    sys.close(fd);
+    let t = Text.new(arena);
+    h.finish().hex(&t);
+    return Option.Some(t.str());
+}
+
+/// The file at `p` exists and hashes to `want`.
+pub fn shaMatches(p: string, want: string, arena: &Arena): bool {
+    match fileSha256(p, arena) {
+        Option.Some(got) { return got == want; }
+        Option.None { return false; }
+    }
+}
+
+fn say(s: string) { sys.write(1, s.ptr as ptr, s.len); }
+
+/// Run `argv`; Err is one line naming the tool and what it printed.
+fn runTool(argv: []string, arena: &Arena): Result<bool, string> {
+    match proc.run(argv, "", arena) {
+        Result.Ok(o) {
+            if o.code == 0 { return Result.Ok(true); }
+            let t = Text.new(arena).add(argv[0]).add(" exited with ");
+            t.pushInt(o.code);
+            let e = trim(o.errStr());
+            if e.len > 0 { t.add(": ").add(e); }
+            return Result.Err(t.str());
+        }
+        Result.Err(e) { return Result.Err(Text.new(arena).add(argv[0]).add(": ").add(procErrText(e, arena)).str()); }
+    }
+}
+
+/// `archive` holds `p` with the pinned hash: a cached copy is used when it matches; a mismatching one (cached or
+/// just downloaded) is deleted and downloaded again once, then it is an error.
+fn fetchVerified(p: &Pin, archive: string, arena: &Arena): Result<bool, string> {
+    let retried = false;
+    while true {
+        if !fsx.isFile(archive) {
+            say(Text.new(arena).add("  downloading ").add(p.url).add("\n").str());
+            let argv: [6]string = [hostTool("curl", arena), "-fsSL", "-o", archive, "--", p.url];
+            match runTool(argv[..], arena) {
+                Result.Ok(_) {}
+                Result.Err(e) {
+                    io.remove(archive);
+                    return Result.Err(e);
+                }
+            }
+        }
+        let got = "";
+        match fileSha256(archive, arena) {
+            Option.Some(s) { got = s; }
+            Option.None { got = "(unreadable)"; }
+        }
+        if got == p.sha256 { return Result.Ok(true); }
+        io.remove(archive);
+        if retried {
+            return Result.Err(Text.new(arena).add("sha256 mismatch for ").add(pinFile(p)).add(": got ").add(got).add(", want ").add(p.sha256)
+                .add(" (deleted; the download is corrupt or the release changed)").str());
+        }
+        say(Text.new(arena).add("  ").add(pinFile(p)).add(": sha256 mismatch, downloading again\n").str());
+        retried = true;
+    }
+    return Result.Ok(true);
+}
+
+/// Unpack `archive` into the existing folder `into`.
+fn unpack(archive: string, into: string, arena: &Arena): Result<bool, string> {
+    if sys.PLATFORM != sys.PLATFORM_WINDOWS && endsWith(archive, ".zip") {
+        let argv: [5]string = ["unzip", "-q", archive, "-d", into];
+        return runTool(argv[..], arena);
+    }
+    let argv: [5]string = [hostTool("tar", arena), "-xf", archive, "-C", into];
+    return runTool(argv[..], arena);
+}
+
+/// Download, check, unpack and move `p` to `dest`. A stale `<dest>.partial` from a cut-off run is removed first.
+fn install(p: &Pin, root: string, dest: string, arena: &Arena): Result<bool, string> {
+    let partial = Text.new(arena).add(dest).add(".partial").str();
+    fsx.removeTree(partial, arena);
+    let downloads = path.join(root, "downloads", arena);
+    fsx.makeDirs(downloads, arena)?;
+    let archive = path.join(downloads, pinFile(p), arena);
+    fetchVerified(p, archive, arena)?;
+    fsx.makeDirs(partial, arena)?;
+    say(Text.new(arena).add("  unpacking ").add(pinFile(p)).add("\n").str());
+    unpack(archive, partial, arena)?;
+    let top = path.join(partial, p.top, arena);
+    if !fsx.isDir(top) {
+        fsx.removeTree(partial, arena);
+        return Result.Err(Text.new(arena).add(pinFile(p)).add(" has no top folder ").add(p.top).str());
+    }
+    if p.kind == PinKind.Toolchain {
+        for i in 0..PRUNE_ARCHES.len {
+            fsx.removeTree(path.join(top, Text.new(arena).add(PRUNE_ARCHES[i]).add("-w64-mingw32").str(), arena), arena);
+        }
+    }
+    match io.rename(top, dest) {
+        Result.Ok(_) {}
+        Result.Err(_) {
+            fsx.removeTree(partial, arena);
+            return Result.Err(Text.new(arena).add("cannot move ").add(top).add(" to ").add(dest).str());
+        }
+    }
+    fsx.removeTree(partial, arena);
+    io.remove(archive);
+    return Result.Ok(true);
+}
+
+/// `<sdl2-mingw>/dll`: every kit's `x86_64-w64-mingw32/bin/*.dll`, which `dist` copies beside a Windows game.
+/// Rebuilt in `dll.partial` and renamed, like a pin.
+fn refreshDlls(kit: string, arena: &Arena): Result<bool, string> {
+    let dll = path.join(kit, "dll", arena);
+    let partial = Text.new(arena).add(dll).add(".partial").str();
+    fsx.removeTree(partial, arena);
+    fsx.makeDirs(partial, arena)?;
+    let ps = pins();
+    for i in 0..PIN_COUNT {
+        if ps[i].kind != PinKind.Sdl { continue; }
+        let bin = path.join(path.join(path.join(kit, ps[i].folder, arena), "x86_64-w64-mingw32", arena), "bin", arena);
+        match io.listDir(bin, arena) {
+            Result.Ok(ents) {
+                for j in 0..ents.len {
+                    if !endsWith(ents[j].name, ".dll") { continue; }
+                    fsx.copyFile(path.join(bin, ents[j].name, arena), path.join(partial, ents[j].name, arena), arena)?;
+                }
+            }
+            Result.Err(_) { return Result.Err(Text.new(arena).add("no ").add(bin).str()); }
+        }
+    }
+    fsx.removeTree(dll, arena);
+    match io.rename(partial, dll) {
+        Result.Ok(_) {}
+        Result.Err(_) { return Result.Err(Text.new(arena).add("cannot move ").add(partial).add(" to ").add(dll).str()); }
+    }
+    return Result.Ok(true);
+}
+
+/// `j3c setup [--sdl-only]`: fetch what is missing; the exit code. Off Windows only the SDL kit is fetched.
+pub fn setupRun(sdlOnly: bool, arena: &Arena): int {
+    let root = "";
+    match config.cacheRoot(arena) {
+        Option.Some(r) { root = r; }
+        Option.None {
+            let m = "error: no cache folder: set J3_CACHE (or HOME / LOCALAPPDATA)\n";
+            sys.write(2, m.ptr as ptr, m.len);
+            return 1;
+        }
+    }
+    let withToolchain = !sdlOnly && setupForWindows();
+    let changed = false;
+    let ps = pins();
+    for i in 0..PIN_COUNT {
+        let p = ps[i];
+        if p.kind == PinKind.Toolchain && !withToolchain { continue; }
+        let dest = pinDest(root, &p, arena);
+        if fsx.isDir(dest) { continue; }
+        say(Text.new(arena).add(p.name).add(" -> ").add(dest).add("\n").str());
+        match install(&p, root, dest, arena) {
+            Result.Ok(_) { changed = true; }
+            Result.Err(e) {
+                let m = Text.new(arena).add("error: ").add(p.name).add(": ").add(e).add("\n").str();
+                sys.write(2, m.ptr as ptr, m.len);
+                return 1;
+            }
+        }
+    }
+    let kit = mingwSdlRoot(arena);
+    if changed || !fsx.isDir(path.join(kit, "dll", arena)) {
+        match refreshDlls(kit, arena) {
+            Result.Ok(_) { changed = true; }
+            Result.Err(e) {
+                let m = Text.new(arena).add("error: SDL dlls: ").add(e).add("\n").str();
+                sys.write(2, m.ptr as ptr, m.len);
+                return 1;
+            }
+        }
+    }
+    say(Text.new(arena).add(if changed { "done: " } else { "up to date: " }).add(root).add("\n").str());
+    return 0;
+}

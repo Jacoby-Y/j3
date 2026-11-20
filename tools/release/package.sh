@@ -3,6 +3,9 @@
 #   j3c-<ver>-<arch>-linux.tar.gz   j3c/bin/j3c + licenses + README (what install.sh unpacks)
 #   j3c_<ver>_<debarch>.deb          /usr/bin/j3c (needs dpkg-deb)
 #   SHA256SUMS
+# --windows instead: j3c-<ver>-x86_64-windows.zip (j3c/j3c.exe + licenses + README.md), cross-built by the Linux
+# j3c this script just built (needs clang, x86_64-w64-mingw32-windres or llvm-windres), added to SHA256SUMS. What
+# install.ps1 unpacks. Fails when the build warns (no windres = an exe without its UTF-8 manifest).
 # Native builds only: run it on the arch you ship. J3_SKIP_BUILD=1 reuses j3c-bootstrap/target/j3c.
 # The build: a seed j3c builds j3c, chosen like build.sh does (j3c-bootstrap/tools/seed.sh list: $J3_SEED, the
 # installed j3c, its j3c.prev, then the release pinned in j3c-bootstrap/seed/VERSION, downloaded only when the
@@ -20,14 +23,24 @@ MAINTAINER=${J3_DEB_MAINTAINER:-"Jacoby-Y <Jacoby-Y@users.noreply.github.com>"}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 die() { echo "package.sh: $*" >&2; exit 1; }
+windows=
+case "${1:-}" in
+  --windows) windows=1 ;;
+  '') ;;
+  *) die "unknown argument $1 (only --windows)" ;;
+esac
+
+# The version is git's (see build.sh): written for this build only, line 1 the build, line 2 its tag.
+vf=j3c-bootstrap/text/version-build.txt
+writeVersion() {
+  d=$(git describe --tags --match 'v[0-9]*' --dirty) || die "git describe: no v* tag (fetch tags)"
+  printf '%s\n%s\n' "${d#v}" "$(git describe --tags --match 'v[0-9]*' --abbrev=0 | sed 's/^v//')" > "$vf"
+}
 
 if [ -z "${J3_SKIP_BUILD:-}" ]; then
   seeds=$(j3c-bootstrap/tools/seed.sh list)
   last=pinned; [ -z "${J3_SEED:-}" ] || last=
-  # The version is git's (see build.sh): written for this build only.
-  vf=j3c-bootstrap/text/version-build.txt
-  d=$(git describe --tags --match 'v[0-9]*' --dirty) || die "git describe: no v* tag (fetch tags)"
-  printf '%s\n%s\n' "${d#v}" "$(git describe --tags --match 'v[0-9]*' --abbrev=0 | sed 's/^v//')" > "$vf"
+  writeVersion
   # The seed embeds its own stdlib; the compiler may need newer modules, so it reads the tree's.
   seed=
   nl='
@@ -52,6 +65,53 @@ bin=j3c-bootstrap/target/j3c
 version=$("$bin" version | awk '{print $2}')
 [ -n "$version" ] || die "$bin version printed nothing"
 
+dist=$root/dist
+mkdir -p "$dist"
+
+# Replace (or add) this file's line in dist/SHA256SUMS, keeping the others (the Linux run's).
+addSum() {
+  (cd "$dist" && {
+    [ ! -f SHA256SUMS ] || while read -r h f; do [ "$f" = "$1" ] || echo "$h  $f"; done < SHA256SUMS
+    sha256sum "$1"
+  } > SHA256SUMS.new && mv SHA256SUMS.new SHA256SUMS)
+}
+
+if [ -n "$windows" ]; then
+  # j3c.exe embeds the same version-build.txt as $bin; J3_PACKAGE_VERSION puts it in the VERSIONINFO too.
+  w=$(mktemp -d)
+  trap 'rm -rf "$w" "$vf"' EXIT INT TERM
+  writeVersion
+  # j3c.exe takes $bin's version, so the two always agree. Git may say -dirty by now (CI's samples and stdlib
+  # steps run before this and can touch tracked files): that only warns, a stale $bin shows in the message.
+  gv=$(head -n 1 "$vf")
+  tag=$(sed -n 2p "$vf")
+  [ "$version" = "$gv" ] || echo "package.sh: warning: $bin is $version, git says $gv; j3c.exe gets $version" >&2
+  want=$version
+  printf '%s\n%s\n' "$want" "$tag" > "$vf"
+  exe=j3c-bootstrap/target/j3c.exe
+  rm -f "$exe"
+  # sh has no pipefail: a failed build shows as no $exe.
+  J3_PACKAGE_VERSION=$want J3_STDLIB=$PWD/j3c/stdlib $pin "$bin" build --release --target x86_64-pc-windows-gnu j3c-bootstrap 2>&1 | tee "$w/build.log"
+  rm -f "$vf"
+  [ -f "$exe" ] || die "no $exe (build failed, see above)"
+  # --release already strips (-Wl,-s). No windres (or a broken one) = an exe without its UTF-8 manifest and icon:
+  # toolchain/winres.j3 warns `Windows resources ... not embedded`, a broken release here.
+  ! grep -q '^warning: .*\(Windows resources\|\[dist\] icon\)' "$w/build.log" ||
+    die "the Windows resources did not build (see the warning above); install binutils-mingw-w64-x86-64"
+  zname=j3c-$version-x86_64-windows.zip
+  mkdir -p "$w/j3c"
+  cp "$exe" "$w/j3c/j3c.exe"
+  cp LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md README.md "$w/j3c/"
+  cp j3c/editor/LICENSE-DejaVu.txt "$w/j3c/LICENSE-DejaVu.txt"
+  cp j3c-bootstrap/text/icons/LICENSE "$w/j3c/LICENSE-BootstrapIcons.txt"
+  rm -f "$dist/$zname"
+  (cd "$w" && zip -qrX "$dist/$zname" j3c) || die "zip failed (apt install zip)"
+  addSum "$zname"
+  echo "dist/$zname"
+  echo "dist/SHA256SUMS"
+  exit 0
+fi
+
 arch=$(uname -m)
 case "$arch" in
   x86_64) debarch=amd64 ;;
@@ -59,10 +119,8 @@ case "$arch" in
   *) die "unsupported arch $arch" ;;
 esac
 
-dist=$root/dist
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT INT TERM
-mkdir -p "$dist"
 
 # Licenses for j3c and what it embeds (DejaVu font, Bootstrap Icons).
 copy_licenses() {

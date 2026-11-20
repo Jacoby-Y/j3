@@ -8,7 +8,7 @@ After installing, run `j3c doctor`. It tells you what's missing.
 |---|---|
 | Linux x86-64, arm64 | Main target. Prebuilt binaries. |
 | Android (arm64, x86_64) | Build target: `j3c` on Linux builds an APK. |
-| Windows | In progress. Cross-builds from Linux; the exe has not been run on Windows yet. |
+| Windows 10 1903+ / 11 x64 | Prebuilt `j3c.exe`, cross-built on Linux and tried under wine; not yet run on real hardware. |
 | macOS | In progress. No prebuilt binary; untested. |
 
 ## Linux
@@ -69,13 +69,67 @@ cd j3
 
 ## Windows
 
-There is no Windows build of `j3c` yet. From Linux you can build a Windows exe of your game:
+### Install script
 
-```sh
-j3c build --target x86_64-pc-windows-gnu --release
+In PowerShell (no admin rights needed):
+
+```powershell
+irm https://github.com/Jacoby-Y/j3/releases/latest/download/install.ps1 | iex
 ```
 
-This needs a mingw `clang` and SDL2 import libraries; a missing one shows up as a link error. The exe links but has never been run on Windows, so expect bugs. Networking (`j3.net.*`) and `j3.proc` compile there and return errors. Progress: [`plans/02-windows.md`](plans/02-windows.md).
+It downloads the latest `j3c-<version>-x86_64-windows.zip`, checks it against the release's `SHA256SUMS`, unpacks it to `%LOCALAPPDATA%\Programs\j3c`, adds that folder to your user `PATH` if it is not there, and runs `j3c setup`. Then open a new terminal:
+
+```powershell
+j3c new hello --app
+cd hello
+j3c run
+```
+
+A given release, or another folder: `& ([scriptblock]::Create((irm https://github.com/Jacoby-Y/j3/releases/latest/download/install.ps1))) -Version 0.1.1 -InstallDir D:\tools\j3c` (or set `J3_VERSION` / `J3_INSTALL_DIR` before the one-liner).
+
+### Scoop
+
+```powershell
+scoop install https://raw.githubusercontent.com/Jacoby-Y/j3/main/packaging/scoop/j3c.json
+```
+
+Scoop runs `j3c setup` after installing.
+
+### By hand
+
+Download `j3c-<version>-x86_64-windows.zip` from [Releases](https://github.com/Jacoby-Y/j3/releases) (check it: `Get-FileHash j3c-*.zip` against `SHA256SUMS`), unzip it anywhere, put the `j3c` folder on your `PATH`, then run `j3c setup`.
+
+### SmartScreen
+
+`j3c.exe` is not signed yet, so the first run may show "Windows protected your PC". Click **More info**, then **Run anyway**. Defender can also make the first builds with a freshly downloaded `clang.exe` slow.
+
+### What `j3c setup` downloads
+
+Into `%LOCALAPPDATA%\j3` (or `J3_CACHE`), each archive checked against a sha256 pinned in `j3c` before it is unpacked. Run it again any time: with everything present it prints `up to date`.
+
+| Folder | What | Size on disk |
+|---|---|---|
+| `toolchain\llvm-mingw-<ver>\` | llvm-mingw: `clang`, `lld`, `llvm-windres` and the x86_64 mingw sysroot (other architectures are deleted after unpacking) | about 530 MB |
+| `sdl2-mingw\` | SDL2, SDL2_image, SDL2_ttf, SDL2_mixer mingw kits, plus `dll\` (what runs and `dist` copy beside your game) | about 80 MB |
+
+`j3c` finds them with no `PATH` changes. `j3c doctor` shows which clang it picked (`J3_CLANG`, then the llvm-mingw from `setup`, then `clang` on `PATH`) and what is missing. `j3c add` of a git dependency needs [Git for Windows](https://git-scm.com/download/win).
+
+Not on a Windows host yet: parallel builds and their cache, package tools (`j3c pkg`, `[dist_outputs]` from packages), and the LSP, MCP server and editor (stubs on every host for now).
+
+### Uninstall
+
+Delete `%LOCALAPPDATA%\Programs\j3c` (the exe) and `%LOCALAPPDATA%\j3` (toolchain, SDL kit, caches), and remove the `PATH` entry (Settings, "Edit environment variables for your account"). Scoop: `scoop uninstall j3c`, then delete `%LOCALAPPDATA%\j3`.
+
+### Windows games from Linux
+
+From Linux you can build a Windows exe of your game:
+
+```sh
+j3c setup   # once: the SDL2 mingw kit
+j3c build --target x86_64-pc-windows-gnu --release   # writes target/<name>.exe; no [emit] target needed
+```
+
+This needs a mingw `clang` (and `x86_64-w64-mingw32-windres` for the icon and manifest). Networking (`j3.net.*`) compiles there and returns errors. Progress: [`plans/02-windows.md`](plans/02-windows.md), [`plans/08-windows-j3c.md`](plans/08-windows-j3c.md).
 
 ## macOS
 

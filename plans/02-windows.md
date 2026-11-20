@@ -391,7 +391,7 @@ wineserver inherits pipes, see `targets.rs:171`. Run `wineserver -k` after a bat
 - Test: under wine you can only check `check`, `doc`, `fmt`, `lsp` on stdin and `-e scene` read ops, because there is no Windows clang in
   the prefix. Building and running on a Windows host goes in chunk 13's CI job and the hardware list.
 
-### 13. CI
+### 13. CI: the Windows-host job and the release zip are in [plan 08](08-windows-j3c.md) (chunks 7, 8); the `windows-cross` wine job for games stays here
 
 - Files: `.github/workflows/ci.yml`, `tools/ci/samples.sh`, `tools/ci/stdlib-tests.sh`, `tools/release/package.sh`,
   `.github/workflows/release.yml`.

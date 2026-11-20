@@ -32,7 +32,7 @@ j3.toml   (`j3c manifest --json [path]` prints the parsed file as JSON, every ta
 [link]
     libs     library names without -l (SDL2 links as -lSDL2)
     search   library search directories (-L); Windows targets add
-             ~/.cache/j3/sdl2-mingw's SDL lib dirs themselves
+             <cache>/sdl2-mingw's SDL lib dirs themselves (`j3c setup --sdl-only`)
     files    extra object files or archives
     flags    extra linker flags, such as an rpath
 
@@ -41,7 +41,7 @@ j3.toml   (`j3c manifest --json [path]` prints the parsed file as JSON, every ta
              zip    <name>-<os>-<arch>.zip, a <name>/ folder with the
                     program, the include list, and (Windows) the DLLs the
                     .exe imports or [link] libs names, found via [link] search
-                    or ~/.cache/j3/sdl2-mingw/dll
+                    or <cache>/sdl2-mingw/dll
              deb    <pkg>_<version>_<arch>.deb (Linux targets): the folder
                     in /opt/<name>, a /usr/bin/<name> launcher that runs it
                     from ~/.local/share/<name> (so relative saves work), a

@@ -13,7 +13,7 @@ may point at an old, deleted plan; check `git log -- plans/` for the name.
 | [05](05-android.md) | Android: GL context loss, real device runs, touch/back, ship to Play | TODO |
 | [06](06-deferred-tools.md) | Tools left unported in j3c (LSP server and scanners, MCP server, `j3c editor`, `-e android`, `-e web`, asset import): stubs, Rust to port, gate | TODO |
 | [07](07-speed.md) | j3c in J3 faster, smaller and lighter than Rust j3c on every bench metric (`j3c-bootstrap/tools/bench.sh`) | IN PROGRESS (phase 4: widen thin margins, final review) |
-| [08](08-windows-j3c.md) | Ship `j3c.exe`: host triple, `.exe`/cache paths, `j3c setup` (llvm-mingw + SDL kit), cross-built release zip, `install.ps1`, Scoop, Windows CI | TODO |
+| [08](08-windows-j3c.md) | Ship `j3c.exe`: host triple, `.exe`/cache paths, `j3c setup` (llvm-mingw + SDL kit), cross-built release zip, `install.ps1`, Scoop, Windows CI | Chunks 1–9 landed; CI run and real hardware (chunk 10) left |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason). A new plan takes the next
 number. Open direction lives in `roadmap.md` and `EDITOR.md`; follow-ups from deleted plans are in `roadmap.md` **Left**.

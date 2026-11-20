@@ -161,6 +161,11 @@ Scratch projects in `/tmp/claude-1000/.../scratchpad/mac/`.
 Each chunk ends with `cargo test` green in `j3c/` (with `J3C_NO_INSTALL=1`) and no change to Linux x86-64 output except where stated.
 
 1. **Host triple** (cross-cutting; plan 02 and plan 01's aarch64 build depend on it).
+   **Done in the J3 j3c by plan 08 chunk 1** (2026-11-20): `j3c-bootstrap/src/base/triple.j3` (`tripleFor(platform, arch)`,
+   `hostTriple`, `resolveTriple`, `isHost`; macOS spells `arm64-apple-macosx11.0.0` / `x86_64-apple-macosx11.0.0`), an empty
+   `[emit] target` resolved at manifest parse, no `target datalayout` line, `--target T` on build/check/run. Left for this plan:
+   the macOS-specific tests below (sys_macos selection, `-dead_strip`, no crash handler) once a macOS host j3c exists. The Rust
+   file names in this chunk predate the port.
    Files: `j3c/src/emit/host/target.rs` (`host_triple()`, `resolve()`, `foreign_target`/`link_gc_flag`/`keep_flag`/`windows_target` and
    `target_os("")` go through `resolve`), `j3c/src/compile.rs:36-60` (`os_kind`/`arch_kind` use `resolve`), `j3c/src/emit/llvm.rs:62,264`
    (triple = `resolve`, drop the datalayout lines `:70`, `:272`), `j3c/src/emit/host/link.rs` (the `.so` probe and `-rpath-link` only when

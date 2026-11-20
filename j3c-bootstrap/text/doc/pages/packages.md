@@ -48,6 +48,8 @@ Git deps and j3.lock:
     j3.toml: the exact commit of every git dep, transitive ones too. Commit j3.lock. With the
     lock and the cache present no git runs, so builds work offline and everyone gets the same
     code. A branch or default-branch dep stays at its locked commit until you update it.
+    ~/.cache/j3 here and below is the cache root: J3_CACHE, else $XDG_CACHE_HOME/j3, else
+    ~/.cache/j3, else %LOCALAPPDATA%\j3 on Windows.
 
     j3c fetch                 download every git dep now, write j3.lock, print where each one lives
     j3c update [name]         move git deps (or one) to the newest commit of their tag/branch
@@ -140,7 +142,7 @@ Two deps providing the same name is an error. After the built-ins, each package 
 in build_outputs order, with:
 
     --dist <abs target/dist>
-    --built <triple>=<abs exe>        once per built target; an empty triple is the host
+    --built <triple>=<abs exe>        once per built target (no [emit] target: the host triple)
     --stage <triple>=<abs folder>     once per non-Android target: the <name>/ folder the zip packs
                                       (exe, [dist] include, Windows DLLs), made even with zip off.
                                       Removed after the last tool runs: copy out of it.

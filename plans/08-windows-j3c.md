@@ -1,8 +1,12 @@
 # Plan 08: Ship `j3c.exe`: the compiler on a Windows host, easy to install
 
-**Status (2026-11-19): TODO.** Windows *games* cross-build from Linux and run under wine ([plan 02](02-windows.md)).
-`j3c` itself has never run on a Windows host. The bootstrap (J3) compiler still assumes a Linux host in a handful of
-places. This plan takes over plan 02 chunks 12–14 (they cite Rust files that no longer exist) and adds the install story.
+**Status (2026-11-20): chunks 1–9 landed, unverified on GitHub and on hardware.** `j3c.exe` cross-builds
+(`tools/release/package.sh --windows` → `dist/j3c-<ver>-x86_64-windows.zip` + `SHA256SUMS`) and, under wine, runs
+`version` (same string as the Linux build), `doc`, `new`, `check`, `fmt`. `j3c setup`, `install.ps1`, Scoop, the
+release and CI workflows are written. Not yet seen: a release run (tag push), the `windows` CI job green, winget
+(skeleton only, submit after the second Windows release), and chunk 10 (real hardware). Still off on a Windows host:
+the fork-based paths (`cache/jobs` parallel builds, `pkgtool`, dist package tools). This plan took over plan 02
+chunks 12–14.
 
 ## Goal
 
@@ -131,13 +135,13 @@ Checked by reading and grepping `j3c-bootstrap/src` and `j3c/stdlib` on 2026-11-
 
 ## Chunks
 
-Run list (orchestrated 2026-11-19; chunk 3 folded into 2):
-- [ ] 1. Host triple, datalayout, `--target`
-- [ ] 2. Exe path, `cacheRoot`, embedded names with backslashes (was 2 + 3)
-- [ ] 4. `j3c setup`, clang lookup, doctor
-- [ ] 5. Host tools and headless
-- [ ] 6. Build `j3c.exe` and its resources
-- [ ] 7. Release artifacts
+Run list (orchestrated 2026-11-20 with /orchestrate-opus on branch `plan08-windows-j3c`; plan chunks merged into run chunks):
+- [x] R1. Host triple, datalayout, `--target`, exe path, `cacheRoot`, embedded names with backslashes (plan 1, 2, 3)
+- [x] R2. `j3c setup`, clang lookup, doctor (plan 4)
+- [x] R3. Host tools and headless (plan 5)
+- [x] R4. Build `j3c.exe` and its resources (plan 6)
+- [x] R5. Release artifacts, Windows CI job, Scoop + docs (plan 7, 8, 9; CI green and winget submission need GitHub)
+- Plan 10 stays with the developer.
 
 Each chunk ships alone. Test under wine on Linux unless the chunk says otherwise: `WINEDEBUG=-all`, `timeout`, stdout to
 a file, `wineserver -k` afterwards (plan 02 "Testing without the hardware"). Copy test projects **outside the repo**
@@ -222,6 +226,10 @@ diff gate pass.
   `& j3c.exe setup`, then print `open a new terminal, then: j3c new hello --app`. No admin rights.
 - Done when a tag push on a fork (or `act`) produces the zip, the checksum line, and `install.ps1` as release assets,
   and `unzip -l` shows the expected files.
+- Landed (R5): `package.sh --windows` (cross-build with the version file; `J3_PACKAGE_VERSION` puts the same version
+  in the VERSIONINFO; fails when the resources warning appears), `install.ps1` (`-Version`, `-InstallDir`, `-ZipPath`;
+  registry user PATH kept as `REG_EXPAND_SZ`), `release.yml` x86_64 job. Ran locally end to end; not run on GitHub;
+  `install.ps1` never parsed by PowerShell here (no `pwsh`).
 
 ### 8. Windows CI job
 
@@ -234,6 +242,11 @@ diff gate pass.
   `%LOCALAPPDATA%\j3\toolchain`.
 - Then add the self-build: the Windows `j3c.exe` builds `j3c-bootstrap` and the result's `version` matches (decision 10).
 - Done when the job is green on GitHub. Tick plan 01 §7 Windows and plan 02 chunk 13 (the j3c part).
+- Landed (R5): the Linux job uploads `j3c-windows` (zip + `SHA256SUMS`); the `windows` job (LF checkout, cache of
+  `toolchain` + `sdl2-mingw` keyed on `setup.j3`) runs `tools/ci/windows-smoke.ps1`. Mesa pinned to mesa-dist-win
+  26.2.7 release-mingw (GitHub's asset digest). `j3c run` on Windows now puts `<sdl2-mingw>\dll` first on the child's
+  PATH (`toolchain.runExe`). Never run: the first push decides; likely first fixes are in the mesa DLL step and the
+  self-build.
 
 ### 9. Scoop, docs, winget
 
@@ -248,6 +261,9 @@ diff gate pass.
   second Windows release.
 - Done when a fresh Windows VM gets from zero to the Goal's four commands by following `INSTALL.md` only. Who runs the VM:
   the developer (see chunk 10).
+- Landed (R5): `packaging/scoop/j3c.json` (version/url/hash filled by `checkver -u` after the first Windows release),
+  `packaging/winget/` skeleton, `packaging/README.md`, `INSTALL.md` Windows, README, `roadmap.md`, plan 01 §6, plan 02
+  chunk 13. No `j3c doc` page called j3c itself Linux only; `j3c doc ship` gained `J3_PACKAGE_VERSION`.
 
 ### 10. First real-hardware run (developer)
 

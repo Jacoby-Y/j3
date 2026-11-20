@@ -1,9 +1,11 @@
 Shipping a game: release builds, zips, .deb
 
 `j3c build --release` makes the small binary (opt s, no -g, stripped; checks stay on) in
-target/<name> (target/<triple>/<name> per [emit] target). `--target TRIPLE` (repeatable) builds
-only those [emit] target entries, and [dist] outputs only for them: `j3c build --release --target
-x86_64-unknown-linux-gnu` makes the .deb without the Windows SDL libs. Dev builds are for the loop, not
+target/<name> (target/<triple>/<name> per [emit] target; `.exe` for Windows). No [emit] target is this
+machine's triple. `--target TRIPLE` (repeatable) builds only those [emit] target entries, and [dist]
+outputs only for them: `j3c build --release --target x86_64-unknown-linux-gnu` makes the .deb without
+the Windows SDL libs. A triple not in [emit] target replaces it for that run: `j3c build --target
+x86_64-pc-windows-gnu` writes target/<name>.exe from a Linux-only project. Dev builds are for the loop, not
 for sending. `j3c size` shows what is in a dev build.
 
 Dev-only code (cheats, debug keys, extra logging): `use j3.build;` then `if build.DEV { ... }`
@@ -11,6 +13,8 @@ Dev-only code (cheats, debug keys, extra logging): `use j3.build;` then `if buil
 RELEASE = true, DEV = false; `j3c run` and plain `j3c build` give the opposite.
 `build.VERSION` and `build.NAME` are `[package] version` and `name` from `j3.toml`, so an
 about box or title shows the version you ship without a second copy of it.
+`J3_PACKAGE_VERSION=1.2.3` in the environment replaces `[package] version` for that run (a CI build
+stamped from its git tag); it also sets the Windows exe's version info.
 
 Startup splash: `[splash] enabled = true` in j3.toml (or `app.splash()`) shows the J3 voxel
 logo as soon as the window opens, then your cards, while the `startup` systems run:
@@ -32,9 +36,14 @@ restart, and J3_NO_SPLASH=1.
 
 App icon: `[dist] icon` is the menu icon in packages and, when it is a PNG, the window icon
 of an App. Unset, both are the J3 logo. A PNG icon is also embedded in a Windows .exe (what
-Explorer and the taskbar show; keep it 256 or smaller there). That needs `windres`
-(x86_64-w64-mingw32-windres from mingw-w64 binutils, or llvm-windres); without one the build
-warns and the exe keeps the default icon.
+Explorer and the taskbar show; keep it 256 or smaller there).
+
+Windows resources: every Windows .exe, dev and release, gets a manifest (UTF-8 code page, so
+paths like `Café\` work; per-monitor DPI; long paths), the icon, and version info from
+`[package]` name, version (`1.2.3-beta` shows as 1.2.3.0) and description. They are
+compiled by `windres` (llvm-windres beside the clang `j3c setup` installed, else
+x86_64-w64-mingw32-windres from mingw-w64 binutils, else llvm-windres or windres on PATH)
+and cached in `<cache>/winres/`; without one the build warns and the exe has none of them.
 
 Windows console: an .exe opens a console window when double-clicked. `[emit]
 windows_subsystem = "gui"` links it for the GUI subsystem instead (no console; started from
@@ -56,10 +65,10 @@ Packages: list them in j3.toml and every release build writes them to target/dis
   program, the include list, and for Windows targets the DLLs the .exe imports plus those
   [link] libs names, and SDL2_image/mixer/ttf for any SDL game (j3.game loads them at runtime,
   so they are not imports), found via [link] search, its
-  ../bin, or ~/.cache/j3/sdl2-mingw/dll. A Windows target links against the SDL libs in
-  ~/.cache/j3/sdl2-mingw on its own: unpack the SDL2, SDL2_image, SDL2_mixer and SDL2_ttf
-  `*-devel-*-mingw.tar.gz` releases (github.com/libsdl-org) there (each gives
-  <pkg>/x86_64-w64-mingw32/lib) and copy their bin/*.dll to ~/.cache/j3/sdl2-mingw/dll;
+  ../bin, or <cache>/sdl2-mingw/dll. A Windows target links against the SDL libs in
+  <cache>/sdl2-mingw (<cache> is J3_CACHE, else ~/.cache/j3, %LOCALAPPDATA%\j3) on its own:
+  `j3c setup --sdl-only` downloads the pinned SDL2, SDL2_image, SDL2_mixer and SDL2_ttf mingw
+  kits there, sha256-checked (on a Windows host `j3c setup` also fetches the llvm-mingw clang);
   `j3c doctor` in the project says if they are found. Needs `zip`.
   Smoke test a Windows build without a window: a program that loads assets and prints runs
   under `wine <name>.exe`. Windowed frames cannot be captured there: the Windows SDL

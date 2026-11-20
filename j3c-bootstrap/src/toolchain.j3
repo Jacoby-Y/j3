@@ -21,7 +21,7 @@ module j3c.toolchain;
 
 use j3.cmp.sortBy;
 use j3.data.pool.Id;
-use j3.hash.Xxh3;
+use j3.hash.{ Sha256, Xxh3 };
 use j3.io;
 use j3.io.path;
 use j3.memory.{ Arena, List };
@@ -35,10 +35,13 @@ use j3c.backend.Opts;
 use j3c.base.diag;
 use j3c.base.diag.{ Diag, Note, NoteKind, Severity };
 use j3c.base.fsx;
+use j3c.base.intern.own;
 use j3c.base.phase.Phases;
 use j3c.base.span.{ Span, noSpan };
 use j3c.base.text_fmt.hasLower;
 use j3c.ir.{ Block, ConstKind, Func, FuncKind, IrCx, LocalDecl, Operand, PlaceRoot, Program, Rvalue, RvalueKind, StmtKind };
+use j3c.base.triple.{ hostTriple, isHost, resolveTriple };
+use j3c.project.config;
 use j3c.project.manifest.{ Manifest, targetSlug };
 
 // `spawnRun`: libc's `posix_spawn` starts a program without copying this process (see there).
@@ -67,6 +70,10 @@ pub struct CcOpts {
     winGui: bool = false;
     /// Windows targets: absolute path of the `[dist] icon` PNG to embed in the exe, "" for none.
     winIcon: string = "";
+    /// Windows targets: `[package]` name, version and description for the exe's VERSIONINFO; "" name for none.
+    winName: string = "";
+    winVersion: string = "";
+    winDescription: string = "";
 }
 
 /// Rust `CcOpts::default()` (opt "", debug off; `defaultEmitOpts` sets the dev values).
@@ -90,6 +97,9 @@ pub fn ccFromManifest(m: &Manifest, arena: &Arena): CcOpts {
     c.debug = !m.cc.fast;
     c.out = m.outPath(arena);
     c.winGui = m.emit.windowsGui;
+    c.winName = m.name;
+    c.winVersion = m.version;
+    c.winDescription = m.description;
     match m.dist.icon {
         Option.Some(rel) { if endsWith(rel, ".png") { c.winIcon = if path.isAbs(rel) { rel } else { path.join(m.root, rel, arena) }; } }
         Option.None {}
@@ -101,7 +111,7 @@ pub fn ccFromManifest(m: &Manifest, arena: &Arena): CcOpts {
 /// `[emit] backend`, looked up with `backend.find`).
 pub struct EmitOpts {
     cc: CcOpts;
-    /// Target triple, "" for the host.
+    /// Target triple, resolved (`hostTriple` when nothing names one).
     target: string;
     cpu: string;
     clang: string;
@@ -119,7 +129,7 @@ pub fn defaultEmitOpts(arena: &Arena): EmitOpts {
     let cc = defaultCc(arena);
     cc.debug = true;
     cc.opt = "0";
-    return EmitOpts { cc: cc, target: "", cpu: "", clang: "clang", flags: List<string>.new(arena), incremental: true,
+    return EmitOpts { cc: cc, target: hostTriple(), cpu: "", clang: "clang", flags: List<string>.new(arena), incremental: true,
         incrementalAll: false, chunks: -1, cwd: "" };
 }
 
@@ -392,16 +402,33 @@ pub fn cacheDir(out: string, target: string, arena: &Arena): string {
     }
     let slug = targetSlug(target, arena);
     let base = parent;
-    if target.len > 0 && path.basename(parent) == slug { base = path.dirname(parent); }
+    if slug.len > 0 && path.basename(parent) == slug { base = path.dirname(parent); }
     let name = path.basename(out);
     if name.len == 0 { name = "a.out"; }
-    let sub = if target.len == 0 { "host" } else { slug };
+    let sub = if isHost(target) { "host" } else { slug };
     return path.join(path.join(path.join(base, ".j3c", arena), sub, arena), name, arena);
+}
+
+/// A Windows program loads `SDL2.dll` and friends from beside it or from `PATH`, and a run (unlike `dist`) copies
+/// none beside it: `j3c setup`'s `<sdl2-mingw>/dll` goes first on `PATH`, once per process, for the child to inherit.
+fn sdlDllsOnPath(arena: &Arena) {
+    let kit = mingwSdlRoot(arena);
+    if kit.len == 0 { return; }
+    let dll = Text.new(arena).add(kit).add("\\dll").str() as []u8;
+    for i in 0..dll.len { if dll[i] == '/' { dll[i] = '\\'; } }
+    let d = dll as string;
+    if !fsx.isDir(d) { return; }
+    let cur = sys.env("PATH");
+    if startsWith(cur, d) { return; }
+    sys.setenv("PATH", Text.new(arena).add(d).add(";").add(cur).str());
 }
 
 /// Rust `run_exe_in`: run `exe` with `args` (in `cwd` with `J3_ROOT` and `J3_INSPECT` set; "" = here) and
 /// capture its output. A failed runtime check's line gets its source context, crash addresses are symbolized.
 pub fn runExe(exe: string, cwd: string, args: []string, arena: &Arena): Result<RunResult, string> {
+    if sys.PLATFORM != sys.PLATFORM_WINDOWS && endsWith(exe, ".exe") {
+        return Result.Err(Text.new(arena).add(exe).add(" is a Windows program: run it on Windows, or with `wine ").add(exe).add("`").str());
+    }
     let absolute = "";
     match path.realpath(exe, arena) {
         Option.Some(p) { absolute = p; }
@@ -418,6 +445,7 @@ pub fn runExe(exe: string, cwd: string, args: []string, arena: &Arena): Result<R
         let inspect = sys.env("J3_INSPECT");
         sys.setenv("J3_INSPECT", if inspect.len == 0 { "1" } else { inspect });
     }
+    if sys.PLATFORM == sys.PLATFORM_WINDOWS { sdlDllsOnPath(arena); }
     let argv = List<string>.new(arena);
     argv.push(absolute);
     for i in 0..args.len { argv.push(args[i]); }
@@ -522,6 +550,8 @@ pub fn pushSecs(t: &Text, ms: int, places: int) {
 /// closed pipe here. `posix_spawnattr` SETSIGDEF if a tool ever cares.
 pub fn spawnStart(argv: []string, arena: &Arena): Result<Child, ProcError> {
     if argv.len == 0 { return Result.Err(ProcError.NotFound); }
+    // Windows has no posix_spawn: `CreateProcess` copies nothing, so `j3.proc` costs the same.
+    if sys.PLATFORM == sys.PLATFORM_WINDOWS { return proc.start(argv, arena); }
     let exe = proc.findProgram(argv[0], arena);
     if exe.len == 0 { return Result.Err(ProcError.NotFound); }
     let cpath = proc.cString(exe, arena);
@@ -551,6 +581,7 @@ pub fn spawnStart(argv: []string, arena: &Arena): Result<Child, ProcError> {
 
 /// Read a `spawnStart` child's stderr to the end and wait for it (`out` is empty).
 pub fn spawnFinish(ch: &Child, arena: &Arena): Output {
+    if sys.PLATFORM == sys.PLATFORM_WINDOWS { return ch.collect("" as []u8, arena); }
     let err = Text.new(arena);
     let buf = arena.alloc::<u8>(65536);
     while ch.stderr >= 0 {

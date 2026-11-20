@@ -7,15 +7,15 @@ module j3c.toolchain;
 // calls here (or move into `base` if `project`/`load`, which sit below toolchain, still need them):
 // `project/manifest.j3` `isForeignTarget`/`isAndroid`, `load/core_imports.j3` `osKind`/`archKind`.
 // J3: Rust's `OnceLock` lookups (`lld_present`, `mold_on_path`) are `#[singleton]` tri-states (0 unknown,
-//     1 yes, 2 no). j3c-boot is built for Linux only, so the host is `TargetOs.Linux`.
+//     1 yes, 2 no). `""` is the host: `base/triple` `resolveTriple` says which OS that is.
 
 /// What a target needs to know about its platform (Rust `TargetOs`). A new one is an arm here and a row in
 /// `releaseFlags`.
 pub enum TargetOs { Linux, Windows, Macos, Android, Web, Other }
 
-/// `""` is the host.
-pub fn targetOs(triple: string): TargetOs {
-    if triple.len == 0 { return TargetOs.Linux; }
+/// `""` is the host (`resolveTriple`).
+pub fn targetOs(t: string): TargetOs {
+    let triple = resolveTriple(t);
     if hasLower(triple, "windows") { return TargetOs.Windows; }
     if hasLower(triple, "apple") || hasLower(triple, "darwin") { return TargetOs.Macos; }
     if hasLower(triple, "emscripten") { return TargetOs.Web; }
@@ -27,9 +27,17 @@ pub fn targetOs(triple: string): TargetOs {
     return TargetOs.Other;
 }
 
-/// Rust `is_host_target`: `triple` is "" or a Linux triple for this machine's CPU.
+/// Rust `is_host_target`: `triple` is "" or the host triple, or a Linux triple for this machine's CPU on a Linux host.
 pub fn isHostTarget(triple: string): bool {
-    return triple.len == 0 || (targetOs(triple) == TargetOs.Linux && startsWith(triple, sys.ARCH_NAME));
+    return isHost(triple) || (sys.PLATFORM == sys.PLATFORM_LINUX && targetOs(triple) == TargetOs.Linux && startsWith(triple, sys.ARCH_NAME));
+}
+
+/// What `--headless` puts in the environment of a program built for `t` (`""` = host), as `NAME=value`. SDL's
+/// offscreen driver has no GL on Windows, so a Windows program gets a hidden real window instead (`J3_HIDDEN`,
+/// read by `j3.game` `initGl`; plan 02 decision 10).
+pub fn headlessEnv(t: string): [2]string {
+    if targetOs(t) == TargetOs.Windows { return ["J3_HIDDEN=1", "SDL_AUDIODRIVER=dummy"]; }
+    return ["SDL_VIDEODRIVER=offscreen", "SDL_AUDIODRIVER=dummy"];
 }
 
 /// Clang compile flags and flags appended after the inputs and libraries (Rust `ReleaseFlags`).
@@ -113,25 +121,28 @@ pub fn moldOnPath(): bool {
 
 /// Dev links on the host use mold when it is installed (a manifest `-fuse-ld=` flag comes later and wins).
 pub fn useMold(out: &List<string>, release: bool, target: string) {
-    if !release && target.len == 0 && moldOnPath() { out.push("-fuse-ld=mold"); }
+    if !release && isHost(target) && sys.PLATFORM == sys.PLATFORM_LINUX && moldOnPath() { out.push("-fuse-ld=mold"); }
 }
 
 /// Unwind tables are dropped in release builds only where `releaseFlags` drops them.
 pub fn releaseNounwind(release: bool, triple: string): bool { return release && targetOs(triple) == TargetOs.Linux; }
 
-/// `--target=` for `target`, appended to `out`. An Android triple needs the NDK flags (`android.j3`).
+/// `--target=` for `target`, appended to `out`; none for a Linux or macOS host (clang's default). A Windows
+/// host always passes it: a clang from PATH may default to MSVC, and j3c links for mingw. An Android triple
+/// needs the NDK flags (`android.j3`).
 pub fn targetArgs(out: &List<string>, target: string, arena: &Arena) {
     if targetOs(target) == TargetOs.Android {
         androidTargetFlags(out, target, arena);
-    } else if target.len > 0 {
-        out.push(Text.new(arena).add("--target=").add(target).str());
+    } else if !isHost(target) || sys.PLATFORM == sys.PLATFORM_WINDOWS {
+        out.push(Text.new(arena).add("--target=").add(resolveTriple(target)).str());
     }
 }
 
-/// The clang for `target`: `[emit] clang`, else the NDK's on Android, else `clang`.
+/// The clang for `target`: the NDK's on Android, else `[emit] clang` when it names another program, else
+/// `defaultClang` (`J3_CLANG`, the `j3c setup` llvm-mingw, `clang` on PATH).
 pub fn clangFor(clang: string, target: string, arena: &Arena): string {
     if targetOs(target) == TargetOs.Android { return androidCompiler(clang, arena); }
-    if clang.len == 0 { return "clang"; }
+    if clang.len == 0 || clang == "clang" { return defaultClang(); }
     return clang;
 }
 
@@ -141,25 +152,39 @@ pub fn linkGcFlag(target: string): string {
 }
 
 fn foreignTarget(target: string): bool {
-    return hasLower(target, "windows") || hasLower(target, "apple") || hasLower(target, "darwin");
+    let os = targetOs(target);
+    return os == TargetOs.Windows || os == TargetOs.Macos;
 }
 
-pub fn windowsTarget(target: string): bool { return hasLower(target, "windows"); }
+pub fn windowsTarget(target: string): bool { return targetOs(target) == TargetOs.Windows; }
+
+/// `build` of a program with no manifest: `target/a.out`, `target/a.exe` for Windows.
+pub fn fileOut(target: string): string { return if windowsTarget(target) { "target/a.exe" } else { "target/a.out" }; }
+
+/// `<cacheRoot>/<rel>` (`project/config` `cacheRoot`), "" when there is no cache root.
+pub fn cachePath(rel: string, arena: &Arena): string {
+    match config.cacheRoot(arena) {
+        Option.Some(c) { return path.join(c, rel, arena); }
+        Option.None { return ""; }
+    }
+}
+
+/// The mingw SDL kit, `<cacheRoot>/sdl2-mingw` (`j3c setup`); "" without a cache root.
+pub fn mingwSdlRoot(arena: &Arena): string { return cachePath("sdl2-mingw", arena); }
 
 fn keepFlag(flag: string, target: string): bool {
     if !windowsTarget(target) { return true; }
     return !hasLower(flag, "rpath") && !hasLower(flag, "--disable-new-dtags");
 }
 
-/// `~/.cache/j3/sdl2-mingw/<pkg>/<arch>-w64-mingw32/lib` for every SDL package there, sorted.
+/// `<mingwSdlRoot>/<pkg>/<arch>-w64-mingw32/lib` for every SDL package there, sorted.
 pub fn mingwSdlLibs(target: string, arena: &Arena): List<string> {
     let dirs = List<string>.new(arena);
-    let home = sys.env("HOME");
-    if home.len == 0 { return dirs; }
+    let root = mingwSdlRoot(arena);
+    if root.len == 0 { return dirs; }
     let e = 0;
     while e < target.len && target[e] != '-' { e += 1; }
     let arch = target[0..e];
-    let root = path.join(home, ".cache/j3/sdl2-mingw", arena);
     match io.listDir(root, arena) {
         Result.Ok(ents) {
             let sub = Text.new(arena).add(arch).add("-w64-mingw32/lib").str();

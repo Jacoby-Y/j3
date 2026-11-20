@@ -11,9 +11,9 @@ use j3.io.path;
 use j3.memory.{ Arena, List };
 use j3.proc;
 use j3.result.Result;
-use j3.sys;
 use j3.text.{ Text, contains, startsWith };
 use j3c.base.fsx;
+use j3c.base.triple.resolveTriple;
 use j3c.dist.apk;
 use j3c.dist.deb;
 use j3c.dist.fs;
@@ -82,10 +82,7 @@ fn builtins(m: &Manifest, built: []Built, stages: &List<Built>, out: &List<strin
         let triple = built[bi].triple;
         if isAndroid(triple) { continue; }
         let windows = contains(triple, "windows");
-        // The `.exe` first: a Linux build of the same name may sit beside it (`target/<name>`).
-        let exe = built[bi].exe;
-        let dotExe = withExtension(exe, "exe", arena);
-        if windows && fsx.isFile(dotExe) { exe = dotExe; }
+        let exe = built[bi].exe; // `outPathFor`: already `<bin>.exe` for a Windows triple
         let stage = path.join(path.join(m.root, "target/.j3c/dist", arena), targetSlug(triple, arena), arena);
         fsx.removeTree(stage, arena);
         // The app folder sits where the `.deb` installs it, so both outputs share one copy.
@@ -106,9 +103,10 @@ fn builtins(m: &Manifest, built: []Built, stages: &List<Built>, out: &List<strin
                 let to = path.join(dir, path.basename(ds.items[k]), arena);
                 fs.copy(ds.items[k], to, arena)?;
                 // SDL2_ttf.dll ships ~68 MB of debug info.
-                let strips: [2]string = ["x86_64-w64-mingw32-strip", "llvm-strip"];
-                for s in 0..2 {
-                    let argv: [3]string = [strips[s], "--strip-debug", to];
+                let rest: [2]string = ["x86_64-w64-mingw32-strip", "llvm-strip"];
+                let strips = toolchain.besideClang("strip", rest[..], arena);
+                for s in 0..strips.len {
+                    let argv: [3]string = [strips.items[s], "--strip-debug", to];
                     let ok = match proc.run(argv[..], "", arena) {
                         Result.Ok(o) { o.code == 0 }
                         Result.Err(_) { false }
@@ -122,7 +120,7 @@ fn builtins(m: &Manifest, built: []Built, stages: &List<Built>, out: &List<strin
             match m.dist.outputs.items[k] {
                 Output.Zip {
                     let z = path.join(dist, Text.new(arena).add(m.name).add("-").add(plat).add(".zip").str(), arena);
-                    out.push(zip(m, opt, z, arena)?);
+                    out.push(zipDir(opt, m.name, z, arena)?);
                 }
                 Output.Deb {
                     if startsWith(plat, "linux-") {
@@ -151,21 +149,6 @@ fn exists(p: string): bool {
     }
 }
 
-/// Rust `Path::with_extension`: the file name's extension replaced (or added).
-fn withExtension(p: string, ext: string, arena: &Arena): string {
-    let b = path.basename(p);
-    let cut = p.len;
-    let i = b.len - 1;
-    while i > 0 {
-        if b[i] == '.' {
-            cut = p.len - b.len + i;
-            break;
-        }
-        i -= 1;
-    }
-    return Text.new(arena).add(p[0..cut]).add(".").add(ext).str();
-}
-
 /// Rust `include`: `[dist] include`, else whichever of `assets`, `scripts`, `scenes`, `locales` exist.
 pub fn include(m: &Manifest, arena: &Arena): List<string> {
     if m.dist.include.len > 0 { return m.dist.include; }
@@ -175,22 +158,44 @@ pub fn include(m: &Manifest, arena: &Arena): List<string> {
     return out;
 }
 
-/// Rust `zip`: `zip -qr ZIP NAME` inside `parent`.
-fn zip(m: &Manifest, parent: string, z: string, arena: &Arena): Result<string, string> {
+/// `zip -qr ZIP NAME` inside `parent` (Rust `zip`), else bsdtar's `tar -a -cf ZIP NAME` (in-box on Windows 10 1803+;
+/// both store `NAME/...` entries). GNU tar has no zip writer (`-a` falls back to a plain tar named `.zip`), so a
+/// `tar` is used only when `--version` says bsdtar.
+pub fn zipDir(parent: string, name: string, z: string, arena: &Arena): Result<string, string> {
     toolchain.discard(z);
-    let argv: [4]string = ["zip", "-qr", z, m.name];
-    match proc.startIn(argv[..], parent, arena) {
+    let tar = "";
+    if proc.findProgram("zip", arena).len == 0 {
+        tar = bsdtar(arena);
+        if tar.len == 0 { return Result.Err("no zip tool: install `zip` (or bsdtar, `libarchive-tools`)"); }
+    }
+    let zipArgv: [4]string = ["zip", "-qr", z, name];
+    let tarArgv: [5]string = [tar, "-a", "-cf", z, name];
+    let tool = if tar.len == 0 { "zip" } else { "tar" };
+    match proc.startIn(if tar.len == 0 { zipArgv[..] } else { tarArgv[..] }, parent, arena) {
         Result.Ok(c) {
             let o = c.collect("" as []u8, arena);
             if o.code != 0 {
                 // zip prints its I/O errors on stdout
-                let t = Text.new(arena).add("zip ").add(z).add(" failed (").add(exitStatus(o.code, arena)).add("):\n");
+                let t = Text.new(arena).add(tool).add(" ").add(z).add(" failed (").add(exitStatus(o.code, arena)).add("):\n");
                 return Result.Err(t.add(o.outStr()).add(o.errStr()).str());
             }
         }
-        Result.Err(_) { return Result.Err(Text.new(arena).add("run zip: ").add(fsx.osError(2, arena)).add(" (install `zip`)").str()); }
+        Result.Err(_) { return Result.Err(Text.new(arena).add("run ").add(tool).add(": ").add(fsx.osError(2, arena)).str()); }
     }
     return Result.Ok(z);
+}
+
+/// A tar that writes zips: `bsdtar` on PATH, else `tar` (Windows' own by full path) when it is bsdtar; "" for none.
+fn bsdtar(arena: &Arena): string {
+    let b = proc.findProgram("bsdtar", arena);
+    if b.len > 0 { return b; }
+    let t = toolchain.hostTool("tar", arena);
+    let argv: [2]string = [t, "--version"];
+    match proc.run(argv[..], "", arena) {
+        Result.Ok(o) { if o.code == 0 && contains(o.outStr(), "bsdtar") { return t; } }
+        Result.Err(_) {}
+    }
+    return "";
 }
 
 /// Rust's `ExitStatus` display: `exit status: N`, or `signal: N` for 128 + N.
@@ -201,8 +206,8 @@ pub fn exitStatus(code: int, arena: &Arena): string {
 }
 
 /// Rust `platform`: `linux-x86_64`, `windows-x86_64`, `macos-arm64`; the host when `triple` is empty.
-pub fn platform(triple: string, arena: &Arena): string {
-    if triple.len == 0 { return Text.new(arena).add(osName()).add("-").add(sys.ARCH_NAME).str(); }
+pub fn platform(given: string, arena: &Arena): string {
+    let triple = resolveTriple(given);
     let t = Text.new(arena);
     for i in 0..triple.len {
         let c = triple[i];
@@ -223,14 +228,6 @@ pub fn platform(triple: string, arena: &Arena): string {
         if os.len == 0 && countParts(low) < 3 { os = "unknown"; }
     }
     return Text.new(arena).add(os).add("-").add(part(low, 0)).str();
-}
-
-/// `std::env::consts::OS` of this build.
-fn osName(): string {
-    if sys.PLATFORM == sys.PLATFORM_WINDOWS { return "windows"; }
-    if sys.PLATFORM == sys.PLATFORM_MACOS { return "macos"; }
-    if sys.PLATFORM == sys.PLATFORM_ANDROID { return "android"; }
-    return "linux";
 }
 
 /// The `n`-th `-` part of `s`, "" past the end.
@@ -262,8 +259,8 @@ fn dlls(m: &Manifest, exe: string, arena: &Arena): List<string> {
         dirs.push(path.join(p, "../bin", arena));
         dirs.push(p);
     }
-    let home = sys.env("HOME");
-    if home.len > 0 { dirs.push(path.join(home, ".cache/j3/sdl2-mingw/dll", arena)); }
+    let kit = toolchain.mingwSdlRoot(arena);
+    if kit.len > 0 { dirs.push(path.join(kit, "dll", arena)); }
     let found = List<string>.new(arena);
     // `[link] libs` too.
     let todo = List<string>.new(arena);

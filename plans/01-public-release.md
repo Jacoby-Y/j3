@@ -65,7 +65,7 @@ the first Steam game ships.
 - [x] **apt / `.deb`**: J3 already makes `.deb`s for games; build one for `j3c` itself. Start with a downloadable `.deb`, later a PPA or own apt repo.
 - [x] **AUR**: `j3c-bin` PKGBUILD, cheapest Linux distro channel to maintain.
 - [ ] **Homebrew** (once macOS runs): tap with a formula.
-- [ ] **Windows** (once it runs): zip + `winget`/Scoop manifest.
+- [x] **Windows**: zip + `install.ps1` in the release workflow, Scoop manifest (`packaging/scoop/j3c.json`), winget skeleton (submit after the second Windows release). Plan 08; not yet run on GitHub or real hardware.
 - [ ] **npm** (optional): `npx j3c` wrapper that downloads the release binary (esbuild-style). Low value unless targeting web devs; skip at first.
 - [ ] **Nix/Flatpak** (later): only if people ask.
 - [x] **Runtime deps declared**: each package depends on clang (+ SDL2/GL dev libs as recommends).

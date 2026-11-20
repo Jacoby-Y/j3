@@ -16,7 +16,7 @@ use j3.io.path;
 use j3.memory.{ Arena, List };
 use j3.option.Option;
 use j3.proc;
-use j3.proc.Child;
+use j3.proc.{ Child, StartOpts };
 use j3.result.Result;
 use j3.sys;
 use j3.text.{ Text, find, lines, startsWith };
@@ -342,7 +342,7 @@ pub fn waitOrKill(pid: int, limitMs: int): Option<int> {
 
 /// This binary (Rust `current_exe`, "j3c" when unknown).
 fn selfExe(arena: &Arena): string {
-    match path.realpath("/proc/self/exe", arena) {
+    match path.exePath(arena) {
         Option.Some(p) { return p; }
         Option.None { return "j3c"; }
     }
@@ -370,8 +370,7 @@ fn runOne(dir: string, t: &Tbl, d: &Tbl, name: string, frames: int, capture: str
         sp.argv.push("--frames");
         sp.argv.push(Text.new(arena).fmt(`{frames}`).str());
     }
-    sp.env.push(Pair { key: "SDL_VIDEODRIVER", value: "offscreen" });
-    sp.env.push(Pair { key: "SDL_AUDIODRIVER", value: "dummy" });
+    // the child's `--headless` sets the video and audio drivers (`toolchain.headlessEnv`)
     sp.env.push(Pair { key: "__GL_SHADER_DISK_CACHE", value: "0" });
     sp.env.push(Pair { key: "J3_FIXED_DT", value: "0.016" });
     // an inherited one must not leak in; the toml may set them
@@ -383,6 +382,10 @@ fn runOne(dir: string, t: &Tbl, d: &Tbl, name: string, frames: int, capture: str
     let tv = match t.get("timeout") { Option.Some(x) { x } Option.None { match d.get("timeout") { Option.Some(x) { x } Option.None { "" } } } };
     let secs = imgdiff.parseUint(tv, 1 << 40);
     if secs < 0 { secs = 300; }
+    if sys.PLATFORM == sys.PLATFORM_WINDOWS {
+        if fd >= 0 { sys.close(fd); }
+        return runProc(&sp, log, secs * 1000, arena);
+    }
     // no log file (it could not be created) leaves the child on this process's stdout and stderr, as Rust
     if fd < 0 { sp.out = INHERIT; }
     match spawn(&sp, arena) {
@@ -397,6 +400,53 @@ fn runOne(dir: string, t: &Tbl, d: &Tbl, name: string, frames: int, capture: str
             return (Option.Some(127), "could not start j3c");
         }
     }
+}
+
+/// One non-blocking read of the child's stdout and stderr into `text`; true if either gave bytes.
+fn pump(c: &Child, buf: []u8, text: &Text): bool {
+    let got = false;
+    match c.tryRead(buf) { Option.Some(n) { if n > 0 { text.pushBytes(buf[0..n]); got = true; } } Option.None {} }
+    match c.tryReadErr(buf) { Option.Some(n) { if n > 0 { text.pushBytes(buf[0..n]); got = true; } } Option.None {} }
+    return got;
+}
+
+/// `runOne` through `j3.proc` (Windows: no `fork`): the child in its own job object, its output collected and
+/// written to `log`, the whole tree ended past `limitMs` (None, as `waitOrKill`).
+fn runProc(sp: &Spawn, log: string, limitMs: int, arena: &Arena): (Option<int>, string) {
+    let env = List<string>.new(arena);
+    // `NAME=` stands for unset: Windows env blocks have no bare-name removal
+    for i in 0..sp.unset.len { env.push(Text.new(arena).add(sp.unset.items[i]).add("=").str()); }
+    for i in 0..sp.env.len { env.push(Text.new(arena).add(sp.env.items[i].key).add("=").add(sp.env.items[i].value).str()); }
+    let c = match proc.startWith(sp.argv.slice(), env.slice(), StartOpts { cwd: sp.cwd, group: true }, arena) {
+        Result.Ok(c) { c }
+        Result.Err(_) { return (Option.Some(127), "could not start j3c"); }
+    };
+    c.closeStdin();
+    let text = Text.new(arena);
+    let buf = arena.alloc::<u8>(65536);
+    let start = sys.monotonicMs();
+    let rc: Option<int> = Option.None;
+    while true {
+        // The deadline first: a hung child that keeps printing must still time out.
+        if sys.monotonicMs() - start > limitMs {
+            c.killTree(sys.SIGKILL);
+            break;
+        }
+        if pump(&c, buf, &text) { continue; }
+        match c.tryWait() {
+            Option.Some(code) {
+                rc = Option.Some(code);
+                // What it wrote between the last read and exit (bounded by the same deadline).
+                while (pump(&c, buf, &text) && sys.monotonicMs() - start <= limitMs) {}
+                break;
+            }
+            Option.None {}
+        }
+        sleepMs(50);
+    }
+    c.wait();
+    fsx.writeFile(log, text.bytes, arena);
+    return (rc, text.str());
 }
 
 fn exists(p: string): bool { return io.exists(p); }
