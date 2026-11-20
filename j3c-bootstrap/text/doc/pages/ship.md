@@ -1,7 +1,9 @@
 Shipping a game: release builds, zips, .deb
 
 `j3c build --release` makes the small binary (opt s, no -g, stripped; checks stay on) in
-target/<name> (target/<triple>/<name> per [emit] target). Dev builds are for the loop, not
+target/<name> (target/<triple>/<name> per [emit] target). `--target TRIPLE` (repeatable) builds
+only those [emit] target entries, and [dist] outputs only for them: `j3c build --release --target
+x86_64-unknown-linux-gnu` makes the .deb without the Windows SDL libs. Dev builds are for the loop, not
 for sending. `j3c size` shows what is in a dev build.
 
 Dev-only code (cheats, debug keys, extra logging): `use j3.build;` then `if build.DEV { ... }`
@@ -55,7 +57,10 @@ Packages: list them in j3.toml and every release build writes them to target/dis
   [link] libs names, and SDL2_image/mixer/ttf for any SDL game (j3.game loads them at runtime,
   so they are not imports), found via [link] search, its
   ../bin, or ~/.cache/j3/sdl2-mingw/dll. A Windows target links against the SDL libs in
-  ~/.cache/j3/sdl2-mingw on its own. Needs `zip`.
+  ~/.cache/j3/sdl2-mingw on its own: unpack the SDL2, SDL2_image, SDL2_mixer and SDL2_ttf
+  `*-devel-*-mingw.tar.gz` releases (github.com/libsdl-org) there (each gives
+  <pkg>/x86_64-w64-mingw32/lib) and copy their bin/*.dll to ~/.cache/j3/sdl2-mingw/dll;
+  `j3c doctor` in the project says if they are found. Needs `zip`.
   Smoke test a Windows build without a window: a program that loads assets and prints runs
   under `wine <name>.exe`. Windowed frames cannot be captured there: the Windows SDL
   offscreen driver has no renderer or GL, so SDL_VIDEODRIVER=offscreen exits (or hangs).
