@@ -49,10 +49,10 @@ j3c-boot NEEDED: libc, ld-linux, libm only (was libSDL2 + ~40). Rows 1-3 build a
 Left: RSS on 3, 7 (module-hash step allocates), 8, 9, 12 (AST/typed sizes), 11, 13, 15 (libSDL2 + ~40 libs loaded at
 startup via `use lib "SDL2"` in j3.game; needs a frozen-file/stdlib decision). Rows 11/13/14/15 now use a K-loop (3 decimals).
 
-### 2026-11-18, plan 13 phase 1
+### 2026-11-18, plan 07 phase 1
 
 `tools/bench.sh` (median of 3, wall and peak RSS from `/usr/bin/time -f '%e %M'`, scratch copies under
-`<repo>/target/bench/`; metric definitions in `plans/13-speed.md` and the script). **dev** = j3c-boot as `j3.toml`
+`<repo>/target/bench/`; metric definitions in `plans/07-speed.md` and the script). **dev** = j3c-boot as `j3.toml`
 builds it (`opt = 0`, `debug = true`); **opt** = `stage0/j3c build --opt 2 j3c-bootstrap` (ThinLTO per module, mold),
 which `tests/diff.sh` now builds. The self-build metrics (1-3) build j3c-bootstrap's own `j3.toml` (opt 0) with
 either compiler. The C5 gate stays green with the opt binary (unit 120 ok, test-compiler 25/25, fmt/ast/err/ui/glsl,
@@ -99,7 +99,7 @@ Where the losing metrics go (cold phases from `target/compilation.log`, stage0 /
   1.7 GB against 0.5 GB. 13 and 15 (30 MB against 19 MB) are startup: the binary's data and the embedded text.
 - **13, 15 wall:** ties at the 10 ms timer resolution.
 
-# Baseline (before plan 13)
+# Baseline (before plan 07)
 Plan 11 Part D item 0.
 
 Measured 2026-11-18, after C5 and before C6. This is a baseline only: no code was tuned.

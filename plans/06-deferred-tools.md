@@ -1,4 +1,4 @@
-# Plan 12: Deferred tools in j3c-boot (LSP, MCP, editor, android, web, asset import)
+# Plan 06: Deferred tools in j3c-boot (LSP, MCP, editor, android, web, asset import)
 
 **Status (2026-11-18): TODO.** Not ported during plan 11 milestone C5, by the user's choice: these tools have hardly been used since they were first written.
 

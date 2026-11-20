@@ -1,5 +1,7 @@
 // j3.io OS pieces (plan B6): j3.io.path, atomic replace (also killed halfway), temp files,
-// flock contention between two processes, copyFile, walk with a glob, proc.waitAny. Linux.
+// flock contention between two processes, copyFile, walk with a glob, proc.waitAny, readFile of /proc
+// (stat size 0), diskSpace, sys.unixMs and text.fmtTimeUtc, sys.sleepMs, proc.startWith (group + killTree,
+// stdout/stderr onto a file, rlimits). Linux.
 //   timeout 60 j3c run j3c/stdlib/tests/io_os_test.j3
 // Run by cargo (`compile/tests/stdlib_cmp.rs`) on both backends. Panics on the first failed check.
 
@@ -11,11 +13,11 @@ use j3.io.path;
 use j3.memory.Arena;
 use j3.option.Option;
 use j3.proc;
-use j3.proc.Child;
+use j3.proc.{ Child, StartOpts };
 use j3.result.Result;
 use j3.sys;
 use j3.sys.panic;
-use j3.text.same;
+use j3.text.{ fmtTimeUtc, parseInt, same, startsWith, Text };
 
 fn ok(cond: bool, msg: string) {
     if !cond {
@@ -302,6 +304,116 @@ fn testWaitAny(a: &Arena) {
     ok(sys.waitpid(other, &st, 0) == other && sys.exitCode(st) == 9, "unrelated child not reaped");
 }
 
+/// `readFile` of 0-size /proc files and of a file past the 4096 first chunk; `diskSpace`; the wall clock.
+fn testProcDiskClock(base: string, a: &Arena) {
+    match io.readFile("/proc/meminfo", a) {
+        Result.Ok(b) { ok(startsWith(b as string, "MemTotal:"), "/proc/meminfo content"); }
+        Result.Err(_) { panic("readFile /proc/meminfo"); }
+    }
+    match io.readFile("/proc/cpuinfo", a) {
+        Result.Ok(b) { ok(b.len > 4096, "/proc/cpuinfo read past the first chunk"); }
+        Result.Err(_) { panic("readFile /proc/cpuinfo"); }
+    }
+    let big = a.alloc::<u8>(10000);
+    for i in 0..big.len { big[i] = u8(i % 251); }
+    let p = path.join(base, "big.bin", a);
+    match io.writeFile(p, big) {
+        Result.Ok(_) {}
+        Result.Err(_) { panic("write big.bin"); }
+    }
+    match io.readFile(p, a) {
+        Result.Ok(b) { ok(b.len == 10000 && b[9999] == u8(9999 % 251), "readFile sized file"); }
+        Result.Err(_) { panic("readFile big.bin"); }
+    }
+    match io.diskSpace(base) {
+        Result.Ok(d) { ok(d.total > 0 && d.free <= d.total && d.available <= d.free, "diskSpace sizes"); }
+        Result.Err(_) { panic("diskSpace"); }
+    }
+    match io.diskSpace(path.join(base, "nope/nope", a)) {
+        Result.Ok(_) { panic("diskSpace of a missing path"); }
+        Result.Err(IoError.NotFound) {}
+        Result.Err(_) { panic("diskSpace missing should be NotFound"); }
+    }
+    // 2026-01-01 .. 2100-01-01
+    let now = sys.unixMs();
+    ok(now > 1767225600000 && now < 4102444800000, "unixMs is a plausible date");
+    let ns = sys.unixNs();
+    ok(ns / 1000000 >= now && ns / 1000000 - now < 5000, "unixNs agrees with unixMs");
+    let t = Text.new(a);
+    is(fmtTimeUtc(&t, 0), "1970-01-01T00:00:00.000Z", "fmtTimeUtc epoch");
+    t.clear();
+    is(fmtTimeUtc(&t, 1795640645123), "2026-11-25T21:04:05.123Z", "fmtTimeUtc 2026");
+    t.clear();
+    is(fmtTimeUtc(&t, 951782400000), "2000-02-29T00:00:00.000Z", "fmtTimeUtc leap day");
+    t.clear();
+    is(fmtTimeUtc(&t, -1), "1969-12-31T23:59:59.999Z", "fmtTimeUtc before epoch");
+    t.clear();
+    t.pushStr("log ");
+    is(fmtTimeUtc(&t, 253402300799999), "9999-12-31T23:59:59.999Z", "fmtTimeUtc returns only the appended part");
+}
+
+/// `sleepMs`; `startWith`: `killTree` reaches a grandchild, both streams appended to one file, an rlimit.
+fn testProcExtras(base: string, a: &Arena) {
+    let t0 = sys.monotonicMs();
+    sys.sleepMs(50);
+    ok(sys.monotonicMs() - t0 >= 50, "sleepMs sleeps the whole time");
+
+    let pidFile = path.join(base, "grandchild.pid", a);
+    let script: [3]string = ["sh", "-c", `sleep 30 & echo $! > {pidFile}; wait`];
+    let c = match proc.startWith(script[:], script[0..0], StartOpts { group: true }, a) {
+        Result.Ok(c) { c }
+        Result.Err(_) { panic("startWith group"); return; }
+    };
+    let gpid = 0;
+    for i in 0..200 {
+        match io.readFile(pidFile, a) {
+            Result.Ok(b) {
+                if b.len > 1 && b[b.len - 1] == u8(10) {
+                    match parseInt(b[0..b.len - 1] as string, 10) { Option.Some(v) { gpid = v; } Option.None {} }
+                }
+            }
+            Result.Err(_) {}
+        }
+        if gpid > 0 { break; }
+        sys.sleepMs(10);
+    }
+    ok(gpid > 0, "grandchild pid written");
+    c.killTree(sys.SIGKILL);
+    ok(c.wait() == 128 + sys.SIGKILL, "group leader killed");
+    let gone = false;
+    for i in 0..200 {
+        // the grandchild was reparented to init, which reaps it
+        if sys.kill(gpid, 0) < 0 { gone = true; break; }
+        sys.sleepMs(10);
+    }
+    ok(gone, "killTree reached the grandchild");
+
+    let logPath = path.join(base, "both.log", a);
+    let both: [3]string = ["sh", "-c", "echo out; echo err >&2"];
+    for i in 0..2 {
+        let fd = io.openPath(logPath, sys.O_WRONLY + sys.O_CREAT + sys.O_APPEND, 420);
+        ok(fd >= 0, "open log");
+        match proc.startWith(both[:], both[0..0], StartOpts { stdoutFd: fd, stderrFd: fd }, a) {
+            Result.Ok(k) {
+                sys.close(fd);
+                let o = k.collect(both[0..0] as []u8, a);
+                ok(o.code == 0 && o.out.len == 0 && o.err.len == 0, "redirected streams leave the pipes empty");
+            }
+            Result.Err(_) { panic("startWith redirect"); }
+        }
+    }
+    match io.readFile(logPath, a) {
+        Result.Ok(b) { is(b as string, "out\nerr\nout\nerr\n", "both streams appended"); }
+        Result.Err(_) { panic("read log"); }
+    }
+
+    let lim: [3]string = ["sh", "-c", "ulimit -t"];
+    match proc.startWith(lim[:], lim[0..0], StartOpts { cpuSecs: 7 }, a) {
+        Result.Ok(k) { is(k.collect(lim[0..0] as []u8, a).outStr(), "7\n", "cpuSecs rlimit"); }
+        Result.Err(_) { panic("startWith rlimit"); }
+    }
+}
+
 fn main() {
     let a = Arena.create(1 << 20);
     testPath(&a);
@@ -314,6 +426,8 @@ fn main() {
     testCopyWalkTemp(base, &a);
     testLock(base, &a);
     testWaitAny(&a);
+    testProcDiskClock(base, &a);
+    testProcExtras(base, &a);
     let rm: [3]string = ["rm", "-rf", base];
     proc.run(rm[:], "", &a);
     ok(!io.exists(base), "cleaned up");

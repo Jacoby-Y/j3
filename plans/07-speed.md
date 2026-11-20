@@ -1,4 +1,4 @@
-# Plan 13: j3c in J3 beats Rust j3c on every metric
+# Plan 07: j3c in J3 beats Rust j3c on every metric
 
 Goal (user, 2026-11-18): `j3c-boot` (j3c in J3, `j3c-bootstrap/`) is **faster, smaller and uses less memory** than the
 Rust `j3c` (stage 0: `j3c-bootstrap/tools/stage0.sh rust-final` prints its path; `tools/bench.sh` finds it) on **every** metric of a fixed 10-20 metric bench. Baseline: `j3c-bootstrap/SPEED.md`

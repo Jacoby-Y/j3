@@ -91,9 +91,9 @@ Run from the repo root. Every chunk ends with all of them clean.
   `j3c-bootstrap/target/j3c test-compiler` (`tests/cases/`).
 - `J3_STDLIB=$PWD/j3c/stdlib timeout 300 j3c build --opt 2 j3c-bootstrap` with any seed j3c (binary
   `j3c-bootstrap/target/j3c`; `./build.sh` installs a stage-2 build of it, never this file).
-  `tests/diff.sh` builds it with `build --opt 2` (plan 13: about 3x faster than the `opt = 0` dev build and
+  `tests/diff.sh` builds it with `build --opt 2` (plan 07: about 3x faster than the `opt = 0` dev build and
   smaller stripped); `j3.toml` stays `opt = 0`, which is what `diff.sh self` and `tools/bench.sh` time.
-- `j3c-bootstrap/tools/bench.sh [--only N,M] [--list]`: the plan 13 speed bench, stage 0 (`BENCH_STAGE0`) against `target/j3c` on
+- `j3c-bootstrap/tools/bench.sh [--only N,M] [--list]`: the plan 07 speed bench, stage 0 (`BENCH_STAGE0`) against `target/j3c` on
   scratch copies; writes `target/bench/result.md`. Scoreboard in `SPEED.md`.
 
 ## Seed and stdlib

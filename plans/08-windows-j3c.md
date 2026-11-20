@@ -1,8 +1,8 @@
-# Plan 14: Ship `j3c.exe`: the compiler on a Windows host, easy to install
+# Plan 08: Ship `j3c.exe`: the compiler on a Windows host, easy to install
 
-**Status (2026-11-19): TODO.** Windows *games* cross-build from Linux and run under wine ([plan 04](04-windows.md)).
+**Status (2026-11-19): TODO.** Windows *games* cross-build from Linux and run under wine ([plan 02](02-windows.md)).
 `j3c` itself has never run on a Windows host. The bootstrap (J3) compiler still assumes a Linux host in a handful of
-places. This plan takes over plan 04 chunks 12–14 (they cite Rust files that no longer exist) and adds the install story.
+places. This plan takes over plan 02 chunks 12–14 (they cite Rust files that no longer exist) and adds the install story.
 
 ## Goal
 
@@ -27,7 +27,7 @@ works. That means:
    would and builds and runs a console program and an SDL app.
 
 Out of scope: the LSP server, MCP server and `j3c editor`, which are stubs on every host until
-[plan 12](12-deferred-tools.md). Once ported they pick up this plan's path fixes. Also out: `j3c-composer` (`package.sh`
+[plan 06](06-deferred-tools.md). Once ported they pick up this plan's path fixes. Also out: `j3c-composer` (`package.sh`
 doesn't ship it on Linux either), Windows on arm64, an MSI/Inno installer, and Authenticode signing (see Later).
 
 ## Current state
@@ -40,7 +40,7 @@ Checked by reading and grepping `j3c-bootstrap/src` and `j3c/stdlib` on 2026-11-
 - **Cross builds of games**: `[emit] target = "x86_64-pc-windows-gnu"` → clang `--target`, mingw link flags
   (`toolchain/link.j3`: `--disable-dynamicbase`, the new `[emit] windows_subsystem = "gui"` → `--subsystem,windows`, and
   `[dist] icon` PNG → `.ico` → `windres` → linked `.icon.o` via `toolchain/winres.j3`). `windowsLib` maps `-lGL` to
-  `opengl32` (`toolchain/target.j3:187`). Plan 04 "Current state" covers the wine runs. Those were done with the Rust j3c,
+  `opengl32` (`toolchain/target.j3:187`). Plan 02 "Current state" covers the wine runs. Those were done with the Rust j3c,
   and the J3 port copies its logic.
 - **Stdlib on Windows** (uncommitted diff): `j3.proc` on `CreateProcessW` with `waitAny` (`proc_windows.j3:194`, built on
   `winsys.waitAnyOf`), `j3.io` fs plus `path` absolute via `GetFullPathNameA` (`io/path.j3:194`), Windows `dir`/`fs`
@@ -55,7 +55,7 @@ Checked by reading and grepping `j3c-bootstrap/src` and `j3c/stdlib` on 2026-11-
    is empty. `:447` always writes the x86-64 ELF datalayout. A j3c.exe has to pick `sys_windows.j3` for an empty
    target on its own host while the IR says Linux. Check what `target.j3:19` (`TargetOs` from the triple) does with `""`
    today. This is the same bug
-   [plan 05](05-macos.md) describes, still unfixed in the port.
+   [plan 03](03-macos.md) describes, still unfixed in the port.
 2. **No `--target` flag.** Nothing in `j3c-bootstrap/src/driver` or `cmd/build.j3` reads one, so cross-building j3c itself
    means editing `j3c-bootstrap/j3.toml`.
 3. **`.exe` paths.** `Manifest.outPathFor` (`project/manifest.j3:53`) returns `target/<bin>`. mingw writes
@@ -67,9 +67,9 @@ Checked by reading and grepping `j3c-bootstrap/src` and `j3c/stdlib` on 2026-11-
 5. **Embedded stdlib keys.** `Loader.embedded` (`load/stdlib.j3`) strips `<stdlib>/j3/` from a loader path and looks the
    rest up in `stdIndex`, whose keys are the `@embedDir` names with `/`. If `path.join` on Windows writes `\`, every nested
    module (`gfx/canvas.j3`) misses and falls back to disk, and on a user's machine there is no disk copy. This was confirmed
-   in the Rust j3c under wine (plan 04). Unknown for the port: check what `j3.io.path.join` emits on Windows.
+   in the Rust j3c under wine (plan 02). Unknown for the port: check what `j3.io.path.join` emits on Windows.
 6. **`--headless`** sets `SDL_VIDEODRIVER=offscreen` (`cmd/run.j3:103`, `cmd/golden.j3:373`, `scene/ops.j3:424`). The
-   Windows SDL2 offscreen driver has no GL, so headless frames and screenshots can't work. Plan 04 decision 10 has the fix.
+   Windows SDL2 offscreen driver has no GL, so headless frames and screenshots can't work. Plan 02 decision 10 has the fix.
 7. **Host tools Windows lacks.** `zip` (8 spawn sites: `dist.j3`, `dist/apk.j3`), `sh` (2: `cmd/testcompiler.j3:280`,
    which also uses `timeout`, plus one more), `strip` in `package.sh` (Linux side, fine). `tar` and `curl.exe` ship with
    Windows 10 1803+. `git` is the user's problem (`j3c doctor` row).
@@ -77,7 +77,7 @@ Checked by reading and grepping `j3c-bootstrap/src` and `j3c/stdlib` on 2026-11-
    targets mingw by default and brings its own sysroot, lld and `llvm-windres`. Nothing tells j3c where llvm-mingw is.
 9. **The exe's own resources.** `j3c.exe` will call `*A` Windows APIs (`GetFullPathNameA` and others in
    `sys_windows`). Without a manifest carrying `<activeCodePage>UTF-8</activeCodePage>`, a user named José or a project
-   under `Documents\Café` breaks (plan 04 bug 3, fix verified there under wine). `winres.j3` only does icons today.
+   under `Documents\Café` breaks (plan 02 bug 3, fix verified there under wine). `winres.j3` only does icons today.
 
 ## Design decisions
 
@@ -87,7 +87,7 @@ Checked by reading and grepping `j3c-bootstrap/src` and `j3c/stdlib` on 2026-11-
 2. **`j3c setup` pins exact versions and hashes inside j3c** (a small table in `toolchain/setup.j3`: URL, sha256, folder
    name). It downloads with `curl.exe -fL` and unpacks with `tar.exe -xf` (zip support comes from bsdtar), both in-box on
    Windows 10 1803+, and checks the sha256 with `j3.hash.sha256` before unpacking. It doesn't use `j3.net.http` in process:
-   TLS on Windows would need OpenSSL DLLs (plan 04 decision 9). Writes go to `<cacheRoot>\toolchain\llvm-mingw-<ver>\` and
+   TLS on Windows would need OpenSSL DLLs (plan 02 decision 9). Writes go to `<cacheRoot>\toolchain\llvm-mingw-<ver>\` and
    `<cacheRoot>\sdl2-mingw\`. Unpacking goes into a `.partial` folder that gets renamed at the end, so a cut-off download is
    never half-used. It is idempotent: a second run with everything present prints "up to date". After unpacking it deletes
    the i686/armv7/aarch64 sysroots. The x86_64-only tree is about half the size.
@@ -97,8 +97,8 @@ Checked by reading and grepping `j3c-bootstrap/src` and `j3c/stdlib` on 2026-11-
    error line: `no clang: run \`j3c setup\``.
 4. **Host triple**: an empty `[emit] target` resolves once, at manifest load, to the host triple from `sys.PLATFORM` and
    `sys.ARCH`, which are compile-time in the j3c binary itself: `x86_64-pc-windows-gnu`, `x86_64-pc-linux-gnu`,
-   `aarch64-unknown-linux-gnu`, and macOS per plan 05. Everything downstream sees a real triple. Drop the `target datalayout`
-   line, since clang fills the right one (plan 05 verified this). Do it in this plan, because Windows needs it first. Plan 05
+   `aarch64-unknown-linux-gnu`, and macOS per plan 03. Everything downstream sees a real triple. Drop the `target datalayout`
+   line, since clang fills the right one (plan 03 verified this). Do it in this plan, because Windows needs it first. Plan 03
    reuses it.
 5. **One `cacheRoot()`** in `project/config.j3` (or wherever `config` already decides): `J3_CACHE`, then
    `XDG_CACHE_HOME/j3`, then `HOME/.cache/j3`, then `LOCALAPPDATA\j3`, then `USERPROFILE\AppData\Local\j3`. Every `HOME`
@@ -108,7 +108,7 @@ Checked by reading and grepping `j3c-bootstrap/src` and `j3c/stdlib` on 2026-11-
    become calls.
 7. **Paths compare with `/`.** Before any lookup keyed on embedded names (`Loader.embedded`, `stdIndex`, editor
    `@embedDir`), normalise `\` to `/`. One helper, a unit test with a backslashed path that runs on every host.
-8. **Headless on Windows = hidden real window** (plan 04 decision 10): `--headless` sets `J3_HIDDEN=1` and
+8. **Headless on Windows = hidden real window** (plan 02 decision 10): `--headless` sets `J3_HIDDEN=1` and
    `SDL_AUDIODRIVER=dummy` instead of `SDL_VIDEODRIVER=offscreen`, and `game/window.j3` `initGl` adds
    `SDL_WINDOW_HIDDEN` under `J3_HIDDEN`. If hardware gives blank reads from a hidden default framebuffer, render into an
    FBO when hidden (its own chunk, only if needed).
@@ -118,10 +118,10 @@ Checked by reading and grepping `j3c-bootstrap/src` and `j3c/stdlib` on 2026-11-
     `j3c build --release --target x86_64-pc-windows-gnu j3c-bootstrap`. Stage 0 (Rust) is not involved. The Windows exe
     can't build itself in CI until the `windows-latest` job exists. Once it does, that job also rebuilds j3c with the
     Windows j3c.exe and compares `version` (the same agreement check `build.sh` does).
-11. **Resources for every Windows exe**, j3c.exe included: one `.rc` with the UTF-8/DPI/longPath manifest (plan 04
+11. **Resources for every Windows exe**, j3c.exe included: one `.rc` with the UTF-8/DPI/longPath manifest (plan 02
     decision 3), the icon (j3c.exe gets `logo.svg` rendered to PNG at 256, committed as `j3c-bootstrap/assets/j3c.png`),
     and VERSIONINFO from `[package]`. Keep `windres` (`llvm-windres` comes with llvm-mingw, `x86_64-w64-mingw32-windres` with
-    the Linux mingw-w64 binutils) for now. Plan 04 decision 4 (j3c writes the `.rsrc` COFF itself) is the follow-up, not a
+    the Linux mingw-w64 binutils) for now. Plan 02 decision 4 (j3c writes the `.rsrc` COFF itself) is the follow-up, not a
     blocker. With no windres the build warns, like it does for icons today.
 12. **Install channels, in order**: `install.ps1` (attached to each release, mirrors `install.sh`: download the zip, check
     sha256 against `SHA256SUMS`, unpack to `%LOCALAPPDATA%\Programs\j3c\`, add it to the user `PATH` through
@@ -131,8 +131,16 @@ Checked by reading and grepping `j3c-bootstrap/src` and `j3c/stdlib` on 2026-11-
 
 ## Chunks
 
+Run list (orchestrated 2026-11-19; chunk 3 folded into 2):
+- [ ] 1. Host triple, datalayout, `--target`
+- [ ] 2. Exe path, `cacheRoot`, embedded names with backslashes (was 2 + 3)
+- [ ] 4. `j3c setup`, clang lookup, doctor
+- [ ] 5. Host tools and headless
+- [ ] 6. Build `j3c.exe` and its resources
+- [ ] 7. Release artifacts
+
 Each chunk ships alone. Test under wine on Linux unless the chunk says otherwise: `WINEDEBUG=-all`, `timeout`, stdout to
-a file, `wineserver -k` afterwards (plan 04 "Testing without the hardware"). Copy test projects **outside the repo**
+a file, `wineserver -k` afterwards (plan 02 "Testing without the hardware"). Copy test projects **outside the repo**
 (scratchpad) so the on-disk stdlib fallback can't hide chunk 3 bugs. Mid-work, rebuild with
 `J3_STDLIB=$PWD/j3c/stdlib j3c build --opt 2 j3c-bootstrap` (or let `tests/diff.sh`/`unit.sh` rebuild `target/j3c`). Run `./build.sh` only at the end, after `tests/unit.sh` and the
 diff gate pass.
@@ -145,14 +153,14 @@ diff gate pass.
   meaning), `text/` help strings, `INSTALL.md:75` (it already documents `--target`).
 - Done when `j3c dump-llvm` of hello on Linux prints the host triple and no datalayout line, the Linux build output is
   unchanged (`tests/diff.sh`), and `j3c build --target x86_64-pc-windows-gnu .` writes a PE32+ (`file`).
-- Coordinate with plan 05 chunk 1: mark it done there, or point it here.
+- Coordinate with plan 03 chunk 1: mark it done there, or point it here.
 
 ### 2. Exe path and `cacheRoot` (decisions 5, 6)
 
 - Files: `project/manifest.j3` (`outPathFor` + `.exe`), every `outPath` caller that patches the name by hand
   (`cmd/size.j3:103`, `grep -rn '\.exe' j3c-bootstrap/src`), `project/config.j3` (`cacheRoot`, `homeDir`), each `HOME`
   site from "breaks" item 4.
-- Done when a Windows-target project on Linux: `j3c run` with the target set runs it under wine (plan 04 decision 11, if
+- Done when a Windows-target project on Linux: `j3c run` with the target set runs it under wine (plan 02 decision 11, if
   not already done there) or at least prints the right `target/x.exe` path. A unit test feeds `cacheRoot` an env with only
   `LOCALAPPDATA` set and gets `...\j3`. `grep -rn 'env("HOME")' j3c-bootstrap/src` hits only `homeDir`.
 
@@ -193,7 +201,7 @@ diff gate pass.
 - Files: `toolchain/winres.j3` (grows from icon-only to `.rc` with manifest + icon + VERSIONINFO), `toolchain/link.j3`
   (always link the resource object for Windows targets, dev and release), `j3c-bootstrap/assets/j3c.png`,
   `j3c-bootstrap/j3.toml` (`[dist] icon`), `j3c/stdlib/j3/sys_windows.j3` (`SetConsoleOutputCP(65001)` /
-  `SetConsoleCP(65001)` in start, if plan 04 chunk 4 hasn't already).
+  `SetConsoleCP(65001)` in start, if plan 02 chunk 4 hasn't already).
 - `j3c-bootstrap/target/j3c build --release --target x86_64-pc-windows-gnu j3c-bootstrap` gives `j3c.exe`. Fix what
   breaks at link time: Linux-only stdlib reached from j3c. `grep` for `sys.fork`, `/proc/`, `/dev/` in `j3c-bootstrap/src`.
 - Done when, under wine from a scratchpad copy: `j3c.exe version --verbose`, `doc search window`, `new hello`, `check`
@@ -225,7 +233,7 @@ diff gate pass.
   1.1, so put mesa-dist-win's `opengl32.dll` beside the exe for the GL step (pin + hash, like `setup`). Cache
   `%LOCALAPPDATA%\j3\toolchain`.
 - Then add the self-build: the Windows `j3c.exe` builds `j3c-bootstrap` and the result's `version` matches (decision 10).
-- Done when the job is green on GitHub. Tick plan 02 §7 Windows and plan 04 chunk 13 (the j3c part).
+- Done when the job is green on GitHub. Tick plan 01 §7 Windows and plan 02 chunk 13 (the j3c part).
 
 ### 9. Scoop, docs, winget
 
@@ -233,8 +241,8 @@ diff gate pass.
   `INSTALL.md` "Windows" (install.ps1 one-liner, Scoop, manual zip + `j3c setup`, SmartScreen note: unsigned exes
   show "Windows protected your PC" → More info → Run anyway; what `j3c setup` downloads and where; uninstall = delete
   `%LOCALAPPDATA%\Programs\j3c` and `%LOCALAPPDATA%\j3`), `README.md` support line, `j3c doc` pages that say "Linux only"
-  about j3c itself (`text/doc/pages/`, `grep -rn -i 'linux only\|linux-only'`), `roadmap.md` status, `plans/02` §6
-  Windows box, `plans/04` chunks 12–14 → "see plan 14". Add the Windows host to the untested-features list in the README
+  about j3c itself (`text/doc/pages/`, `grep -rn -i 'linux only\|linux-only'`), `roadmap.md` status, `plans/01` §6
+  Windows box, `plans/02` chunks 12–14 → "see plan 08". Add the Windows host to the untested-features list in the README
   until chunk 10 is done.
 - winget: `packaging/winget/` manifest (portable installer type pointing at the zip, `Commands: j3c`), submitted after the
   second Windows release.
@@ -252,15 +260,15 @@ Not something an agent can do. A checklist for the person with a Windows box:
 - `j3c run --headless --screenshot` on a real driver: if the frame is blank, open the FBO follow-up (decision 8).
 - A username or project path with non-ASCII letters, and a project path over 260 characters.
 - `j3c add` of a git dependency (needs Git for Windows).
-- Write what happened into this plan's Status, with dates. Fixes become chunks here or in plan 04.
+- Write what happened into this plan's Status, with dates. Fixes become chunks here or in plan 02.
 
 ## Later (not chunks yet)
 
 - **Signing**: Authenticode (an OV cert or Azure Trusted Signing) removes the SmartScreen prompt. It costs money and the
   key needs a home in CI. Decide after people ask.
-- **`.rsrc` written by j3c** (plan 04 decision 4): drops the `windres` need for game developers on Linux without mingw
+- **`.rsrc` written by j3c** (plan 02 decision 4): drops the `windres` need for game developers on Linux without mingw
   binutils.
 - **arm64 Windows**: llvm-mingw has it, but the SDL mingw kits ship no arm64 libs.
-- **ASLR** on with lld (plan 04 chunk 15). It applies to j3c.exe too.
-- **VS Code extension**: spawn `j3c.exe` and use the Windows path for `j3c lsp`, after plan 12 ports the LSP.
+- **ASLR** on with lld (plan 02 chunk 15). It applies to j3c.exe too.
+- **VS Code extension**: spawn `j3c.exe` and use the Windows path for `j3c lsp`, after plan 06 ports the LSP.
 - **`j3c self-update`**, once there's more than one release a month.

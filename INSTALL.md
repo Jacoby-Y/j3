@@ -75,11 +75,11 @@ There is no Windows build of `j3c` yet. From Linux you can build a Windows exe o
 j3c build --target x86_64-pc-windows-gnu --release
 ```
 
-This needs a mingw `clang` and SDL2 import libraries; a missing one shows up as a link error. The exe links but has never been run on Windows, so expect bugs. Networking (`j3.net.*`) and `j3.proc` compile there and return errors. Progress: [`plans/04-windows.md`](plans/04-windows.md).
+This needs a mingw `clang` and SDL2 import libraries; a missing one shows up as a link error. The exe links but has never been run on Windows, so expect bugs. Networking (`j3.net.*`) and `j3.proc` compile there and return errors. Progress: [`plans/02-windows.md`](plans/02-windows.md).
 
 ## macOS
 
-No prebuilt binary. Building from source should work but has not been tried on a real Mac, and the macOS stdlib layer (`sys_macos.j3`) is partial: networking and `j3.proc` return errors. You'd need Xcode's command line tools (`clang`) and SDL2 from Homebrew (`brew install sdl2 sdl2_ttf sdl2_image sdl2_mixer`). Progress: [`plans/05-macos.md`](plans/05-macos.md).
+No prebuilt binary. Building from source should work but has not been tried on a real Mac, and the macOS stdlib layer (`sys_macos.j3`) is partial: networking and `j3.proc` return errors. You'd need Xcode's command line tools (`clang`) and SDL2 from Homebrew (`brew install sdl2 sdl2_ttf sdl2_image sdl2_mixer`). Progress: [`plans/03-macos.md`](plans/03-macos.md).
 
 ## Android
 

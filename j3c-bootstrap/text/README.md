@@ -1,6 +1,6 @@
 # text/
 
-Non-code data embedded with `@embed` / `@embedDir` (plan 08 A7). Text that was Rust code (templates, help,
+Non-code data embedded with `@embed` / `@embedDir` (plan 08 (bootstrap features) A7). Text that was Rust code (templates, help,
 page prose) lives here with `@NAME@` placeholders (Rust `{{`/`}}` undone); a templated code file ends in `.in`
 so no tool takes it for a source. Verbatim files moved here from `j3c/src/` at plan 11 C6:
 `doc/pages/*.md`, `helptext/{guide,manifest}.md`, `helptext/recipes/*`, `icons/` (Bootstrap Icons,

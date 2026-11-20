@@ -1,7 +1,7 @@
 #!/bin/bash
 # Make target/j3c current: build it with the seed (J3_SEED, else the first of tools/seed.sh list, else the pinned release) when it is
 # missing, older than src/, or carries a git build version (./build.sh embeds text/version-build.txt, then
-# removes it; expected files hold the plain J3C_VERSION). `--opt 2` (plan 13): the j3.toml stays opt 0 for the
+# removes it; expected files hold the plain J3C_VERSION). `--opt 2` (plan 07): the j3.toml stays opt 0 for the
 # self build; only the binary under test is optimized. The seed reads this tree's stdlib (it may predate
 # modules the compiler uses). Used by diff.sh and unit.sh; prints only when it builds. Exit 1 on failure.
 # J3_JOBS defaults to half the cores; the seed may predate it, so it is also pinned to that many CPUs (taskset).

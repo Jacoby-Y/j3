@@ -1,4 +1,4 @@
-# Plan 05: macOS: host triple, run, bundle, ship
+# Plan 03: macOS: host triple, run, bundle, ship
 
 **Status (2026-11-11): TODO.** Host builds on a Mac cannot link today (Linux `sys.j3`, `.so` probes, GNU ld flags), and threads would silently not lock; chunks 1-6 get `j3c run` working, 7-9 ship `.app` bundles and `j3c` itself.
 
@@ -37,8 +37,8 @@ Scratch projects in `/tmp/claude-1000/.../scratchpad/mac/`.
     `emit/host/link.rs` probes `lib*.so` in Linux dirs (`cannot find library SDL2` on a Mac) and adds `-Wl,-rpath-link` (ld64 rejects it).
   - `compile.rs:36` `arch_kind("")` uses `std::env::consts::ARCH`: correct (the `j3c` binary's arch).
   - The C printer has no triple; clang/cc pick the host. It is hit by `os_kind` the same way.
-- Same bug on a Windows host (`os_kind("")` = Linux): plan 04 depends on chunk 1.
-- **aarch64 Linux** (plan 02 ships an `ubuntu-22.04-arm` prebuilt, `INSTALL.md` says "Linux (x86-64, arm64)"): chunk 1 fixes the
+- Same bug on a Windows host (`os_kind("")` = Linux): plan 02 depends on chunk 1.
+- **aarch64 Linux** (plan 01 ships an `ubuntu-22.04-arm` prebuilt, `INSTALL.md` says "Linux (x86-64, arm64)"): chunk 1 fixes the
   triple and drops the x86 crash handler there, but `sys.j3`, `netsys.j3`, `instance.j3`, `threadsys.j3` hardcode **amd64 syscall
   numbers** (`sys.j3:14-40`; aarch64 has no `open`/`fork`/`access`/`dup2`/`pipe`/`poll` syscalls at all) and the amd64 `struct stat`
   layout. Programs built on aarch64 Linux are broken. Not owned here: see Out of scope.
@@ -69,7 +69,7 @@ Scratch projects in `/tmp/claude-1000/.../scratchpad/mac/`.
   `use lib` has no `...`; only the emitter prelude knows variadics (`emit/llvm.rs:470-500`, `PRELUDE_DECLS`, `variadic_call_ty`).
 - C `int` returns bound as J3 `int` (i64): `open`, `close`, `munmap` in `sys_macos.j3` (and `sys_android.j3`). On arm64 and x86-64
   a 32-bit `-1` arrives as 0x00000000FFFFFFFF, so a failed `open` reads as fd 4294967295. `sys_android.j3` already binds its
-  newer calls as `i32` ("so -1 reads as -1"); its `open`/`close` have the same bug (plan 07).
+  newer calls as `i32` ("so -1 reads as -1"); its `open`/`close` have the same bug (plan 05).
 - x86-64 macOS: `stat`/`fstatat`/`readdir`/`fdopendir` with 64-bit inodes are the `$INODE64` symbols; the plain names are the
   old layout. arm64 has only the plain names. A J3 name cannot contain `$`; there is no `link_name`. From memory, unverified.
 
@@ -124,7 +124,7 @@ Scratch projects in `/tmp/claude-1000/.../scratchpad/mac/`.
 
 - **One resolved host triple.** `host_triple()` in `emit/host/target.rs` from `cfg!(target_os)` + `std::env::consts::ARCH`
   (same source as `arch_kind`, no process spawn): `arm64-apple-macosx11.0.0`, `x86_64-apple-macosx11.0.0`, `aarch64-unknown-linux-gnu`,
-  `x86_64-pc-linux-gnu`, `x86_64-pc-windows-gnu` (match plan 04's host toolchain). Every OS/arch question about `""` goes through
+  `x86_64-pc-linux-gnu`, `x86_64-pc-windows-gnu` (match plan 02's host toolchain). Every OS/arch question about `""` goes through
   `resolve(target)`. `""` keeps meaning "native build" where that is the question (output dir `host`, `cc`, lib probing, ThinLTO, mold, `run`).
   Not `clang -print-target-triple`: under Rosetta it would disagree with `arch_kind`, and it costs a spawn per build.
 - **Drop the `target datalayout` line.** clang fills the target's own (verified); one wrong constant gone, zero behaviour change.
@@ -160,7 +160,7 @@ Scratch projects in `/tmp/claude-1000/.../scratchpad/mac/`.
 
 Each chunk ends with `cargo test` green in `j3c/` (with `J3C_NO_INSTALL=1`) and no change to Linux x86-64 output except where stated.
 
-1. **Host triple** (cross-cutting; plan 04 and plan 02's aarch64 build depend on it).
+1. **Host triple** (cross-cutting; plan 02 and plan 01's aarch64 build depend on it).
    Files: `j3c/src/emit/host/target.rs` (`host_triple()`, `resolve()`, `foreign_target`/`link_gc_flag`/`keep_flag`/`windows_target` and
    `target_os("")` go through `resolve`), `j3c/src/compile.rs:36-60` (`os_kind`/`arch_kind` use `resolve`), `j3c/src/emit/llvm.rs:62,264`
    (triple = `resolve`, drop the datalayout lines `:70`, `:272`), `j3c/src/emit/host/link.rs` (the `.so` probe and `-rpath-link` only when
@@ -243,7 +243,7 @@ Each chunk ends with `cargo test` green in `j3c/` (with `J3C_NO_INSTALL=1`) and 
    `cargo test --release` (expect a first round of Linux-assuming tests to mark `#[cfg(target_os = "linux")]`), `j3c run` hello, a headless
    screenshot of the `--app` template), `.github/workflows/release.yml` (macOS job: both darwin targets, `lipo`), `tools/release/package.sh`
    (Darwin: `j3c-<ver>-universal-macos.tar.gz`, no `.deb`), `install.sh:15` (Darwin branch), `INSTALL.md` macOS section, `packaging/homebrew/j3c.rb`
-   (formula template for a tap: the release tarball + sha256, `depends_on "sdl2"` etc. as recommended; Homebrew item in plan 02 points here).
+   (formula template for a tap: the release tarball + sha256, `depends_on "sdl2"` etc. as recommended; Homebrew item in plan 01 points here).
    Done when: the workflows parse (`actionlint` if installed), `package.sh` logic for Darwin is a no-op on Linux, and the CI job is green on
    the first GitHub run (developer).
 
@@ -284,10 +284,10 @@ Each chunk ends with `cargo test` green in `j3c/` (with `J3C_NO_INSTALL=1`) and 
 ## Out of scope
 
 - **aarch64 Linux `sys` layer**: found here (amd64 syscall numbers and `struct stat` in `sys.j3`, `netsys.j3`, `instance.j3`, `threadsys.j3`),
-  but it is a Linux fix, and plan 02's arm64 prebuilt is already shipped by the release workflow. It needs its own plan (or a plan 02 item):
+  but it is a Linux fix, and plan 01's arm64 prebuilt is already shipped by the release workflow. It needs its own plan (or a plan 01 item):
   `if ARCH == ARCH_AARCH64` syscall tables (`openat`, `clone`, `faccessat`, `dup3`, `ppoll`, `renameat`, `unlinkat`, `mkdirat`, the generic
   `struct stat`) or a libc layer shared with this plan's Darwin port. Until then INSTALL.md overstates arm64 Linux.
-- The `open`/`close` i64-return bug in `sys_android.j3` (same as chunk 3's): plan 07.
+- The `open`/`close` i64-return bug in `sys_android.j3` (same as chunk 3's): plan 05.
 - Metal, MoltenVK, SDL3 (see Design decisions: ANGLE first if GL goes away).
 - Steam on macOS (depots, overlay in a bundle): the `steam` package's README lists macOS depots out of scope; chunk 7 only keeps the entitlement hook.
 - iOS, the Mac App Store (sandbox entitlements), automated notarization, a `.dmg` output, Sparkle-style updates.

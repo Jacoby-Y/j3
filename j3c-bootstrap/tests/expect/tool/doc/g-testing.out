@@ -84,12 +84,15 @@ Steady frame (an idle UI should cost nothing). `J3_STEADY=a:b` (1-based frames, 
 `j3.app`: at the end of frame a it notes the layouts, restyles and `App.mem` use, and at the end of
 frame b it prints one line and exits (rc 1 when any is non-zero, else 0):
 
-    steady layouts=0 restyles=0 arena_growth=0
+    steady layouts=0 restyles=0 arena_growth=0 rss_growth_kb=40
 
-    J3_STEADY=60:120 j3c run --headless --frames 200       (a built binary: offscreen SDL, same variable)
+    J3_STEADY=60:600 j3c run --headless       (a built binary: offscreen SDL, same variable)
 
 Layouts and restyles count boxes laid out and styles recomputed in every `.j3ui` root, so an idle
-frame leaves both unchanged; `arena_growth` growing means something allocates per frame. Warm up
+frame leaves both unchanged; `arena_growth` growing means something allocates per frame. `rss_growth_kb`
+(Linux) fails the run above 4096: GL objects or driver queues growing per frame show only there. Leave
+out `--frames` for it, since `--frames` waits for the GPU every frame (`glFinish`) and hides such a leak;
+`speculative/29_ui_steady/golden.toml` is that check over a screen of `<icon>`s. Warm up
 first (the first frames lay everything out and a few frames after a state change still settle), and
 set a fixed state before measuring. A malformed value prints a warning and is ignored. `examples/desk-app/golden.toml`
 uses it as a `[[check]]`; `speculative/29_ui_steady` shows both outcomes (`STEADY_CHURN=1` changes a value every frame: rc 1).

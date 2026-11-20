@@ -5,8 +5,12 @@
 set -euo pipefail
 usage() {
     cat <<'E'
-usage: tests/diff.sh MODE [--bless] [--norm] [--user] [--es] [--list] [-j N] [files...]
+usage: tests/diff.sh MODE [--bless] [--norm] [--user] [--es] [--list] [-x] [-j N] [files...]
+       tests/diff.sh affected [--list] [REV] [-j N]
   MODE            fmt | ast | err | ir | llvm | glsl | ui | run | bc | tool | self
+  affected        the modes the files changed since REV (default HEAD, plus untracked files) can change, cheapest
+                  first, each with -x; stops at the first failing mode. --list prints the modes. Never self.
+  -x              stop starting inputs after the first DIFF, CRASH or NONDET (the rest print `notrun`)
   --bless         write this run's output as the expected files (tests/expect/KIND/INPUT.out, KIND = MODE, ir-user
                   or glsl-es); each input runs twice and one that prints different text is NONDET, not written.
                   A whole-corpus bless also deletes expected files no input produces. Review the change in git.
@@ -18,6 +22,8 @@ usage: tests/diff.sh MODE [--bless] [--norm] [--user] [--es] [--list] [-j N] [fi
                   holds up to ~1 GB of memory and three dumps of up to ~80 MB on disk). Half the cores at
                   most: each job's builds get J3_JOBS = (nproc/2) / N clang processes (at least 1), the
                   j3c-boot and self stage 2 builds (alone) all nproc/2; a J3_JOBS you set wins
+  Inputs start slowest first (seconds of the last run, target/diff-times/KIND; new inputs first); the
+  summary names the slowest of this run.
   files           inputs instead of tests/corpus.txt (paths or project folders; tool: case files)
      glsl runs `dump-glsl PATH`; ui runs `dump-ui PROJECT/ui` (the project's `.j3ui` folder).
      tests/bad-ui/NAME is a UI project with one error: ui compares the `dump-ui` error text, and err takes
@@ -67,7 +73,49 @@ BOOT=${DIFF_BOOT:-$boot/target/j3c}
 [ $# -ge 1 ] || { usage >&2; exit 2; }
 case $1 in -h|--help) usage; exit 0 ;; esac
 mode=$1; shift
-norm=0; user=0; es=0; bless=0; list=0; jobs=; files=()
+# affected: map changed paths to modes; then run each mode with -x, cheapest first.
+if [ "$mode" = affected ]; then
+    alist=0; rev=HEAD; pass=()
+    while [ $# -gt 0 ]; do
+        case $1 in --list) alist=1 ;; -j) pass+=(-j "$2"); shift ;; -*) die "affected: unknown flag $1" ;; *) rev=$1 ;; esac
+        shift
+    done
+    all="fmt ast err ui glsl glsl-es bc tool ir ir-user llvm run"
+    changed=$(cd "$root" && { git diff --name-only "$rev" --; git ls-files --others --exclude-standard; } | sort -u)
+    want=" "
+    add() { want="$want$* "; }
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        case $f in
+            j3c-bootstrap/src/syntax/*|j3c-bootstrap/src/base/*|j3c-bootstrap/j3.toml) add $all ;;
+            j3c-bootstrap/src/load*|j3c-bootstrap/src/sema*|j3c-bootstrap/src/project*|j3c-bootstrap/src/driver*)
+                add err ui glsl glsl-es bc tool ir ir-user llvm run ;;
+            j3c-bootstrap/src/lower*|j3c-bootstrap/src/ir*) add glsl glsl-es bc ir ir-user llvm run ;;
+            j3c-bootstrap/src/backend*|j3c-bootstrap/src/cache*|j3c-bootstrap/src/toolchain*) add tool llvm run ;;
+            j3c-bootstrap/src/shader*) add glsl glsl-es ;;
+            j3c-bootstrap/src/ui*) add err ui tool run ;;
+            j3c-bootstrap/src/devmode*) add bc ;;
+            j3c-bootstrap/src/*|j3c-bootstrap/text/*|j3c/editor/*) add tool ;;
+            j3c/stdlib/*) add ui glsl glsl-es bc tool ir ir-user llvm run ;;
+            speculative/*|examples/*) add fmt ast ui glsl glsl-es bc ir ir-user llvm run ;;
+            j3c-bootstrap/tests/expect/*) k=${f#j3c-bootstrap/tests/expect/}; add "${k%%/*}" ;;
+            j3c-bootstrap/tests/tool/*) add tool ;;
+            j3c-bootstrap/tests/bad*|j3c-bootstrap/tests/diag/*) add err ui ;;
+            j3c-bootstrap/tests/proj/*|j3c-bootstrap/tests/corpus.txt|j3c-bootstrap/tests/diff.sh) add $all ;;
+        esac
+    done <<<"$changed"
+    modes=; for m in $all; do case $want in *" $m "*) modes="$modes $m" ;; esac; done
+    if [ $alist = 1 ]; then echo $modes; exit 0; fi
+    [ -n "$modes" ] || { echo "diff.sh affected: no mode covers the changed files"; exit 0; }
+    echo "diff.sh affected:$modes" >&2
+    for m in $modes; do
+        case $m in ir-user) a=(ir --user) ;; glsl-es) a=(glsl --es) ;; *) a=("$m") ;; esac
+        "$0" "${a[@]}" -x ${pass[@]+"${pass[@]}"} || { echo "diff.sh affected: stopped at ${a[*]}"; exit 1; }
+    done
+    echo "diff.sh affected: all ok ($modes )"
+    exit 0
+fi
+norm=0; user=0; es=0; bless=0; list=0; failfast=0; jobs=; files=()
 while [ $# -gt 0 ]; do
     case $1 in
         --norm) norm=1 ;;
@@ -75,6 +123,7 @@ while [ $# -gt 0 ]; do
         --es) es=1 ;;
         --bless) bless=1 ;;
         --list) list=1 ;;
+        -x) failfast=1 ;;
         -j) [ $# -ge 2 ] || die "-j needs a number"; jobs=$2; shift ;;
         -*) die "unknown flag $1" ;;
         *) files+=("$(realpath -m --relative-to="$root" "$1")") ;;
@@ -105,7 +154,8 @@ export J3_JOBS=${J3_JOBS:-$per}
 [ -z "$REF" ] || [ -x "$REF" ] || die "DIFF_REF: no $REF"
 
 # Fail fast on the structural check (not for --list: it only prints).
-[ $list = 1 ] || "$boot/tools/layers.sh" >&2 || die "tools/layers.sh failed"
+# A `self` sub-call (DIFF_SUB) skips it: the parent ran it once.
+[ $list = 1 ] || [ -n "${DIFF_SUB:-}" ] || "$boot/tools/layers.sh" >&2 || die "tools/layers.sh failed"
 
 # One build of j3c-boot when it is missing, stale, or a git-versioned ./build.sh binary (tests/boot.sh).
 if [ $list = 0 ] && [ -z "${DIFF_BOOT:-}" ]; then J3_JOBS=$solo "$here/boot.sh" || die "cannot build j3c-boot"; fi
@@ -146,10 +196,11 @@ if [ $mode = self ]; then
     fi
     # llvm: one input per call (a whole-corpus llvm run fills /tmp), $jobs calls at a time, each writing its
     # own $scratch/llvm.N; printed in list order as `sub` would.
-    export self=$here/diff.sh scratch
+    # the list is repo-relative: each call gets an absolute path (a relative one resolves against the cwd)
+    export self=$here/diff.sh scratch root DIFF_SUB=1
     llist=$("$0" llvm --list)
     awk -v a="$la" -v b="$lb" 'NR >= a && NR <= b { print NR; print }' <<<"$llist" |
-        xargs -d '\n' -n2 -P "$jobs" bash -c '"$self" llvm "$2" >"$scratch/llvm.$1" 2>&1; echo $? >"$scratch/llvm.$1.rc"' _
+        xargs -d '\n' -n2 -P "$jobs" bash -c '"$self" llvm "$root/$2" >"$scratch/llvm.$1" 2>&1; echo $? >"$scratch/llvm.$1.rc"' _
     for o in $(ls "$scratch" | sed -n 's/^llvm\.\([0-9]*\)$/\1/p' | sort -n); do
         n=$((n + 1)); f=$scratch/llvm.$o
         if [ "$(cat "$f.rc")" = 0 ]; then tail -1 "$f"
@@ -442,18 +493,29 @@ verdict() {
     else echo DIFF >"$d/status"; diff -u --label expected --label j3c-boot "$e" "$d/b.txt" | head -40 >"$d/detail"; fi
 }
 # job LINE: the inputs of one job line, one after another.
+# Each input's wall time goes to $tmp/IDX/ms; with -x a failure makes $tmp/stop and later inputs never start.
 job() {
-    local a k; IFS=$'\t' read -ra a <<<"$1"
-    for ((k = 0; k < ${#a[@]}; k += 2)); do one "${a[k]}" "${a[k+1]}"; done
+    local a k t st; IFS=$'\t' read -ra a <<<"$1"
+    for ((k = 0; k < ${#a[@]}; k += 2)); do
+        [ ! -e "$tmp/stop" ] || return 0
+        t=${EPOCHREALTIME//[.,]/}
+        one "${a[k]}" "${a[k+1]}"
+        mkdir -p "$tmp/${a[k]}"; echo $(( (${EPOCHREALTIME//[.,]/} - t) / 1000 )) >"$tmp/${a[k]}/ms"
+        if [ $failfast = 1 ]; then
+            st=$(cat "$tmp/${a[k]}/status" 2>/dev/null || echo CRASH)
+            case $st in ok|blessed) ;; *) isflaky "${a[k+1]}" || touch "$tmp/stop" ;; esac
+        fi
+    done
 }
-export -f one projof job verdict one_tool unpacked digest
+export -f one projof job verdict one_tool unpacked digest isflaky
 whos=b; [ -z "$REF" ] || whos="a b"; [ $bless = 0 ] || whos="a2 b"
 big=65536
 rootre=$(sed 's/[][\.*^$|]/\\&/g' <<<"$root"); homere=$(sed 's/[][\.*^$|]/\\&/g' <<<"$HOME")
 [ ${#HOME} -gt 1 ] || homere=$rootre   # no home folder to mask: an empty pattern would repeat the last one
-export tmp root boot mode norm user es here REF BOOT to whos big bless expect rootre homere
+export tmp root boot mode norm user es here REF BOOT to whos big bless expect rootre homere failfast flakyset
 
 start=$SECONDS
+times=$boot/target/diff-times/$kname; [ $norm = 0 ] && [ -z "$REF" ] || times=$times.ref
 # One job per input, except run inputs that build in the same project (they share its target/): one job
 # runs those in input order. A job line is IDX<TAB>FILE pairs; each input writes only $tmp/IDX.
 i=0
@@ -464,11 +526,17 @@ while IFS= read -r f; do
 done <<<"$inputs" |
     awk -F '\t' '!($1 in g) { g[$1] = ++n } { job[g[$1]] = job[g[$1]] (job[g[$1]] == "" ? "" : "\t") $2 "\t" $3 }
         END { for (j = 1; j <= n; j++) print job[j] }' |
+    # slowest first by the last run's times (a job's inputs summed; an input with no time first): the long
+    # inputs no longer start last and hold up the end of the run.
+    awk -F '\t' -v t="$times" 'BEGIN { while ((getline l < t) > 0) { split(l, x, "\t"); ms[x[2]] = x[1] } }
+        { c = 0; for (i = 2; i <= NF; i += 2) c += ($i in ms) ? ms[$i] : 1e12; printf "%d\t%s\n", c, $0 }' |
+    sort -t $'\t' -k1,1nr -s | cut -f2- |
     xargs -d '\n' -n1 -P "$jobs" bash -c 'job "$1"' _
 
-nok=0; nbless=0; ndiff=0; ncrash=0; nnon=0; nflaky=0; i=0
+nok=0; nbless=0; ndiff=0; ncrash=0; nnon=0; nflaky=0; nnot=0; i=0
 while IFS= read -r f; do
     i=$((i + 1)); st=$(cat "$tmp/$i/status" 2>/dev/null || echo CRASH)
+    if [ ! -f "$tmp/$i/status" ] && [ -e "$tmp/stop" ] && [ ! -f "$tmp/$i/ms" ]; then nnot=$((nnot + 1)); echo "notrun $f"; continue; fi
     case $st in
         ok) nok=$((nok + 1)); echo "ok $f"; continue ;;
         blessed) nbless=$((nbless + 1)); echo "blessed $f"; continue ;;
@@ -491,11 +559,19 @@ if [ -z "$REF" ] && [ ${#files[@]} = 0 ] && [ -d "$expect" ]; then
              LC_ALL=C comm -23 - <(LC_ALL=C sort <<<"$inputs") | sed 's|$|.out|')
     [ $bless = 0 ] || find "$expect" -mindepth 1 -type d -empty -delete
 fi
+# Input times: merged into target/diff-times/KIND (the next run's order); the slowest of this run are named.
+i=0; now=$(while IFS= read -r f; do i=$((i + 1)); [ ! -f "$tmp/$i/ms" ] || printf '%s\t%s\n' "$(cat "$tmp/$i/ms")" "$f"; done <<<"$inputs")
+if [ -n "$now" ]; then
+    mkdir -p "$(dirname "$times")"
+    { printf '%s\n' "$now"; [ ! -f "$times" ] || cat "$times"; } | awk -F '\t' '!seen[$2]++' >"$times.$$" && mv "$times.$$" "$times"
+    echo "slowest: $(sort -t $'\t' -k1,1nr <<<"$now" | head -5 | awk -F '\t' '{ printf "%s%s %.1f s", (NR > 1 ? ", " : ""), $2, $1 / 1000 }')"
+fi
 sum="diff.sh $mode: $nok ok"
 [ $bless = 0 ] || sum="$sum, $nbless blessed"
 sum="$sum, $ndiff DIFF, $ncrash CRASH"
 [ $nnon = 0 ] || sum="$sum, $nnon NONDET"
 [ $nstale = 0 ] || sum="$sum, $nstale stale"
 [ $nflaky = 0 ] || sum="$sum, $nflaky flaky"
+[ $nnot = 0 ] || sum="$sum, $nnot notrun"
 echo "$sum ($((SECONDS - start)) s)"
-[ $((ndiff + ncrash + nnon + nstale)) = 0 ] || exit 1
+[ $((ndiff + ncrash + nnon + nstale + nnot)) = 0 ] || exit 1

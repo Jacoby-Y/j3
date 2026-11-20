@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Plan 13 bench: stage 0 (the Rust j3c, built by tools/stage0.sh rust-final) against target/j3c on 16 metrics, wall time and peak RSS.
+# Plan 07 bench: stage 0 (the Rust j3c, built by tools/stage0.sh rust-final) against target/j3c on 16 metrics, wall time and peak RSS.
 # Usage: tools/bench.sh [--only N,M,...] [--list]. Env: BENCH_N (runs per metric, median; default 3),
 # BENCH_STAGE0 / BENCH_BOOT (the two compilers). Every run works on one scratch copy under <repo>/target/bench/w
 # (tar without `target/`), deleted at the end; writes target/bench/result.md and result.tsv (rows of metrics

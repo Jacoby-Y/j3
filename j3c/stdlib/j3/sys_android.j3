@@ -17,6 +17,10 @@ use lib "c" as c {
     fn mmap(addr: ptr, len: int, prot: int, flags: int, fd: int, offset: int): ptr;
     fn munmap(addr: ptr, len: int): int;
     fn exit(code: i32);
+    fn clock_gettime(clock: i32, ts: ptr): i32;
+    fn nanosleep(req: ptr, rem: ptr): i32;
+    fn setrlimit(res: i32, lim: ptr): i32;
+    fn setsid(): i32;
     fn __errno(): ptr;
     fn dlopen(name: cstr, flags: i32): ptr;
     fn dlsym(handle: ptr, name: cstr): ptr;
@@ -34,6 +38,10 @@ use lib "c" as c {
     fn waitpid(pid: i32, status: ptr, flags: i32): i32;
     fn kill(pid: i32, sig: i32): i32;
     fn getpid(): i32;
+    fn getppid(): i32;
+    fn prctl(option: i32, a: int, b: int, c: int, d: int): i32;
+    fn sigprocmask(how: i32, set: ptr, old: ptr): i32;
+    fn signalfd(fd: i32, mask: ptr, flags: i32): i32;
     fn poll(fds: ptr, n: int, ms: i32): i32;
     fn setenv(name: ptr, value: ptr, overwrite: i32): i32;
 }
@@ -88,6 +96,16 @@ pub const O_WRONLY: int = 1;
 pub const O_CREAT: int = 64;
 /// Truncate to empty when opening (bionic, same on arm64 and x86_64).
 pub const O_TRUNC: int = 512;
+/// Every write goes to the end of the file.
+pub const O_APPEND: int = 1024;
+/// `setrlimit`: CPU seconds (SIGXCPU at the soft limit, SIGKILL at the hard one).
+pub const RLIMIT_CPU: int = 0;
+/// `setrlimit`: largest file the process may write, in bytes (SIGXFSZ past it).
+pub const RLIMIT_FSIZE: int = 1;
+/// `setrlimit`: processes the user may have, counted over all of the user's processes.
+pub const RLIMIT_NPROC: int = 6;
+/// `setrlimit`: address space in bytes (allocations past it fail).
+pub const RLIMIT_AS: int = 9;
 /// Seek from the start of the file.
 pub const SEEK_SET: int = 0;
 /// Seek from the end of the file.
@@ -106,6 +124,8 @@ pub const O_RDWR: int = 2;
 pub const O_NOCTTY: int = 256;
 /// `kill` signal: the controlling terminal went away.
 pub const SIGHUP: int = 1;
+/// Signal: Ctrl+C in the terminal.
+pub const SIGINT: int = 2;
 /// `pollFds` events: readable, writable; results add hang-up and error.
 pub const POLLIN: int = 1;
 pub const POLLOUT: int = 4;
@@ -186,6 +206,35 @@ fn runExitHook() {
 
 /// Not available here: 0.
 pub fn monotonicMs(): int { return 0; }
+
+/// Wall clock: nanoseconds since the Unix epoch (1970-01-01 UTC); 0 where there is none. It jumps when the
+/// clock is set, so time intervals with `monotonicMs`. `j3.text.fmtTimeUtc` prints `unixMs` as RFC 3339.
+pub fn unixNs(): int {
+    let ts: [2]int = [0, 0];
+    if c.clock_gettime(0, &ts[0] as ptr) != 0 {
+        return 0;
+    }
+    return ts[0] * 1000000000 + ts[1];
+}
+/// Wall clock in milliseconds since the Unix epoch (`unixNs` / 1e6); 0 where there is none. Wait with `sleepMs`.
+pub fn unixMs(): int { return unixNs() / 1000000; }
+
+/// Block this thread for `ms` milliseconds (none when `ms <= 0`). A signal does not cut it short: the rest is
+/// slept. A poll loop: `while !ready() && sys.monotonicMs() < deadline { sys.sleepMs(20); }`.
+pub fn sleepMs(ms: int) {
+    if ms <= 0 {
+        return;
+    }
+    // struct timespec req, rem; EINTR (4) leaves what is left in rem
+    let ts: [4]int = [ms / 1000, (ms % 1000) * 1000000, 0, 0];
+    while c.nanosleep(&ts[0] as ptr, &ts[2] as ptr) != 0 {
+        if errno() != 4 {
+            return;
+        }
+        ts[0] = ts[2];
+        ts[1] = ts[3];
+    }
+}
 
 /// Terminate the process with exit code `code`.
 pub fn exit(code: i32) {
@@ -315,7 +364,7 @@ pub fn chdir(path: ptr): int { return int(c.chdir(path)); }
 /// Not on this target: -1.
 pub fn ioctl(fd: int, req: int, arg: ptr): int { return -1; }
 /// Not on this target: -1.
-pub fn setsid(): int { return -1; }
+pub fn setsid(): int { return int(c.setsid()); }
 /// True when the file at `path` (NUL-terminated) exists and may be executed.
 pub fn canExec(path: ptr): bool { return c.access(path, 1) == 0; }
 
@@ -327,6 +376,8 @@ pub const AT_FDCWD: int = -100;
 /// Not on Android yet: -1.
 pub fn statAt(dir: int, path: ptr, out: []int): int { return -1; }
 pub fn lstatAt(dir: int, path: ptr, out: []int): int { return -1; }
+/// Not on this target yet: -1.
+pub fn statfs(path: ptr, out: []int): int { return -1; }
 /// Not on Android yet: -1.
 pub fn dirents(fd: int, buf: []u8): int { return -1; }
 /// Rename `from` to `to` (both NUL-terminated), replacing `to`. `-errno` on failure.
@@ -361,7 +412,16 @@ pub fn exitCode(status: i32): int {
     }
     return 128 + sig;
 }
-/// Send `sig` to process `pid`. Negative on failure.
+/// Set resource limit `res` (`RLIMIT_*`) to `soft` / `hard` for this process and what it starts. 0 or `-errno`.
+/// `j3.proc.StartOpts` sets them on a child.
+pub fn setrlimit(res: int, soft: int, hard: int): int {
+    let r: [2]int = [soft, hard];
+    if c.setrlimit(i32(res), &r[0] as ptr) != 0 {
+        return 0 - errno();
+    }
+    return 0;
+}
+/// Send `sig` to process `pid` (`-pgid`: every process in that group). Negative on failure.
 pub fn kill(pid: int, sig: int): int { return int(c.kill(i32(pid), i32(sig))); }
 /// This process's id.
 pub fn getpid(): int { return int(c.getpid()); }
@@ -380,6 +440,57 @@ pub fn pollFds(fds: ptr, n: int, ms: int): int {
 pub fn ignoreSigpipe(on: bool) {
     // SIG_IGN 1, SIG_DFL 0; SIGPIPE 13
     c.signal(13, if on { 1 } else { 0 });
+}
+
+/// The parent process's id. As `j3.sys` on Linux.
+pub fn getppid(): int { return int(c.getppid()); }
+
+/// Send this process `sig` when its parent thread dies (`PR_SET_PDEATHSIG`). As `j3.sys` on Linux.
+pub fn setParentDeathSignal(sig: int): int { return failed(int(c.prctl(1, sig, 0, 0, 0))); }
+
+#[singleton]
+let SIG_MASK: int = 0;
+#[singleton]
+let SIG_FD: int = -1;
+
+/// Queue `sigs` for `pendingSignal` instead of dying of them. As `j3.sys` on Linux.
+pub fn watchSignals(sigs: []int): bool {
+    let mask = SIG_MASK;
+    for s in sigs {
+        if s >= 1 && s <= 64 {
+            mask = mask | (1 << (s - 1));
+        }
+    }
+    // SIG_BLOCK 0; arm64 sigset_t is 8 bytes
+    if c.sigprocmask(0, &mask as ptr, 0 as ptr) < 0 {
+        return false;
+    }
+    // SFD_NONBLOCK 0x800 | SFD_CLOEXEC 0x80000
+    let fd = int(c.signalfd(i32(SIG_FD), &mask as ptr, 2048 + 524288));
+    if fd < 0 {
+        return false;
+    }
+    SIG_FD = fd;
+    SIG_MASK = mask;
+    return true;
+}
+
+/// The next queued signal, 0 when none. As `j3.sys` on Linux.
+pub fn pendingSignal(): int {
+    if SIG_FD < 0 {
+        return 0;
+    }
+    let info: [16]int;
+    if c.read(SIG_FD, &info[0] as ptr, 128) != 128 {
+        return 0;
+    }
+    return info[0] & 4294967295;
+}
+
+/// Unblock every signal on this thread (a child before `execve`).
+pub fn unblockSignals() {
+    let none: int = 0;
+    c.sigprocmask(2, &none as ptr, 0 as ptr);
 }
 
 /// NUL-terminated copy of a short name (`dlopen`, `dlsym`), per thread.

@@ -8,7 +8,7 @@ use j3.io;
 use j3.io.printLn;
 use j3.memory.Arena;
 use j3.proc;
-use j3.proc.{ Output, ProcError };
+use j3.proc.{ Output, ProcError, StartOpts };
 use j3.option.Option;
 use j3.result.Result;
 use j3.sys;
@@ -149,9 +149,93 @@ fn main() {
         Result.Err(_) { ok(false, "runEnv"); }
     }
     ok(run(envsh2[:], "", &a).outStr().len == home.len + 1, "run without env");
+    // a bare name removes it; proc.environ sees setenv
+    sys.setenv("JZ_SECRET", "s");
+    let seen = false;
+    let envs = proc.environ(&a);
+    for i in 0..envs.len { if eq(envs[i], "JZ_SECRET=s") { seen = true; } }
+    ok(seen, "proc.environ shows setenv");
+    let envsh3: [3]string = ["sh", "-c", "echo [$JZ_SECRET]"];
+    let gone: [1]string = ["JZ_SECRET"];
+    match proc.runEnv(envsh3[:], "", gone[:], &a) {
+        Result.Ok(go) { ok(eq(go.outStr(), "[]\n"), "bare name unsets"); }
+        Result.Err(_) { ok(false, "bare name unsets"); }
+    }
     ok(io.cwd(&a).len > 0 && io.cwd(&a)[0] == 47, "io.cwd");
     let t0 = sys.monotonicMs();
     ok(t0 > 0, "monotonicMs");
 
+    pdeathsigTest(&a);
+    signalTest(&a);
+
     printLn(`proc_test: {CHECKS} checks ok`);
 }
+
+/// Gone or a zombie, from /proc/PID/stat ("pid (comm) S ...").
+fn procDead(pid: int, a: &Arena): bool {
+    match io.readFile(`/proc/{pid}/stat`, a) {
+        Result.Ok(b) {
+            for i in 0..b.len {
+                if b[i] == 41 && i + 2 < b.len {
+                    return b[i + 2] == 90;   // ')' then " Z"
+                }
+            }
+            return false;
+        }
+        Result.Err(_) { return true; }
+    }
+    return true;
+}
+
+/// A middle process starts `sleep 30` with parentDeathSignal and exits: the sleep must die with it.
+fn pdeathsigTest(a: &Arena) {
+    let fds: [2]i32 = [0, 0];
+    ok(sys.pipe(fds[:], 0) == 0, "pipe");
+    let mid = sys.fork();
+    if mid == 0 {
+        let argv: [2]string = ["sleep", "30"];
+        let opts = StartOpts { group: true, parentDeathSignal: sys.SIGKILL };
+        let pid = 0;
+        match proc.startWith(argv[:], argv[0..0], opts, a) {
+            Result.Ok(c) { pid = c.pid; }
+            Result.Err(_) {}
+        }
+        sys.write(int(fds[1]), &pid as ptr, 8);
+        sys.exit(0);
+    }
+    sys.close(int(fds[1]));
+    let pid = 0;
+    ok(sys.read(int(fds[0]), &pid as ptr, 8) == 8 && pid > 0, "parentDeathSignal: child started");
+    sys.close(int(fds[0]));
+    let st: i32 = 0;
+    sys.waitpid(mid, &st, 0);
+    let dead = false;
+    for _ in 0..100 {
+        if procDead(pid, a) { dead = true; break; }
+        sys.sleepMs(10);
+    }
+    if !dead { sys.kill(pid, sys.SIGKILL); }
+    ok(dead, "parentDeathSignal kills the child when its parent dies");
+}
+
+fn signalTest(a: &Arena) {
+    ok(sys.pendingSignal() == 0, "no signal before watchSignals");
+    let sigs: [2]int = [sys.SIGTERM, sys.SIGINT];
+    ok(sys.watchSignals(sigs[:]), "watchSignals");
+    ok(sys.pendingSignal() == 0, "nothing pending yet");
+    sys.kill(sys.getpid(), sys.SIGTERM);
+    sys.kill(sys.getpid(), sys.SIGINT);
+    let got = sys.pendingSignal() + sys.pendingSignal() * 100;
+    ok(got == 15 + 200 || got == 2 + 1500, "SIGTERM and SIGINT queued");
+    ok(sys.pendingSignal() == 0, "drained");
+    // a child starts with signals unblocked, so SIGTERM still ends it
+    let sh: [3]string = ["sh", "-c", "kill -TERM $$; sleep 5"];
+    match proc.startWith(sh[:], sh[0..0], StartOpts {}, a) {
+        Result.Ok(c) {
+            let cc = c;
+            ok(cc.wait() == 143, "child of a watching process dies of SIGTERM");
+        }
+        Result.Err(_) { ok(false, "start sh"); }
+    }
+}
+

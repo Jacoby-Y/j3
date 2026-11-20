@@ -17,4 +17,4 @@ lines in `src/`.
 `csslint_main.j3` (not Rust) goes too: `cmd/csslint` calls `j3.ui.css` in-process.
 
 Not deleted but deferred (stubs that keep their `Port of:` lines): the LSP server and scanners, MCP, `editor`,
-`android_run.rs`, `web/*`, `gltf/*`, `online*`: plans/12-deferred-tools.md.
+`android_run.rs`, `web/*`, `gltf/*`, `online*`: plans/06-deferred-tools.md.

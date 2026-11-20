@@ -1,4 +1,4 @@
-# Plan 06: Web target as a platform package (no Emscripten)
+# Plan 04: Web target as a platform package (no Emscripten)
 
 **Status (2026-11-11): TODO** (rewritten). Decided: no emsdk. `j3c` keeps writing LLVM text and the
 system clang makes wasm objects (verified); everything web-specific lives in a **platform package**
@@ -99,7 +99,7 @@ platform.
    target. The link and run scripts are the only package code `j3c` executes; they run only when that
    target is built or run, never on fetch (say so in `packages.md`).
 4. **Link script contract.** `j3c build` compiles the per-module objects as for any cross target, then
-   runs the link script through plan 09's shared runner, `pkgtool::run(project: &Manifest, dep: &Dep,
+   runs the link script through the shared package-tool runner (`j3c-bootstrap/src/pkgtool.j3`), `pkgtool::run(project: &Manifest, dep: &Dep,
    tool: &Tool, args: &[String], env: &[(String, String)]) -> Result<i32, String>` (or
    `pkgtool::command(..same..) -> Result<Command, String>` when it needs the stdout), with a `Tool`
    (`project/deps/tools.rs`: name, absolute file, help) built from `[platform] link` / `run`. So it gets

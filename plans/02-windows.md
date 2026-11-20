@@ -1,4 +1,4 @@
-# Plan 04: Windows: run, fill the stubs, ship
+# Plan 02: Windows: run, fill the stubs, ship
 
 **Status (2026-11-11): TODO.** Windows exes already build and run under wine (console, SDL/GL apps, the editor's
 renderer). What's left: a short list of real bugs found under wine, the `proc`/`net`/`instance`/`term` stubs, the
@@ -109,13 +109,13 @@ session scratchpad. "V:" says how a claim was checked. "Read" means only from re
 - GL entry points come from `SDL_GL_GetProcAddress` (`game/window.j3:318`, `gfx/glcalls.j3:5`). SDL falls back to
   `opengl32.dll` exports for GL 1.1 names that `wglGetProcAddress` refuses. Unverified on a real driver.
 
-### Cross-cutting compiler bug (owned by plan 05)
+### Cross-cutting compiler bug (owned by plan 03)
 
 `src/emit/llvm.rs:63` and `:265` hard-code `target triple = "x86_64-pc-linux-gnu"` when `opts.target` is empty. Both
 sites also always write the ELF datalayout `e-m:e-...`, and Windows should get `e-m:w-...`. Cross builds still link
 because clang takes the explicit `--target` (V: every build above). On a **Windows host** with no `[emit] target`,
 though, `target_os("")` picks Windows (`target.rs:21`), so the loader takes `sys_windows.j3` while the IR claims Linux. That
-build cannot work. [Plan 05](05-macos.md) fixes it (host triple plus a per-triple datalayout). Chunk 12 here depends on it.
+build cannot work. [Plan 03](03-macos.md) fixes it (host triple plus a per-triple datalayout). Chunk 12 here depends on it.
 
 ### `j3c` on a Windows host
 
@@ -149,8 +149,8 @@ build cannot work. [Plan 05](05-macos.md) fixes it (host triple plus a per-tripl
 
 - `.github/workflows/ci.yml` and `release.yml` run only on `ubuntu-24.04`, `ubuntu-22.04` and `ubuntu-22.04-arm` (Read). No job
   builds a Windows target.
-- [Plan 02](02-public-release.md) has open boxes for "Windows: zip + winget/Scoop" (§6) and "Windows: run the built exe,
-  test in CI" (§7). The `steam` package's `VERIFY.md` (was plan 01) item 7 covers the Windows Steam checks (`steam_api64.dll`, cloud,
+- [Plan 01](01-public-release.md) has open boxes for "Windows: zip + winget/Scoop" (§6) and "Windows: run the built exe,
+  test in CI" (§7). The `steam` package's `VERIFY.md` (was the old Steam verify plan) item 7 covers the Windows Steam checks (`steam_api64.dll`, cloud,
   `J3_STEAM_FAKE`). Its status line says its Windows primitives were tested under wine.
 
 ## Gaps and blockers
@@ -164,7 +164,7 @@ In priority order. Bold ones block "a game runs and ships":
 4. **`j3.net` tcp/dns/tls and `j3.proc` are stubs.** These block `j3.net.http` and `examples/openrouter-chat`.
 5. `j3.instance` stub, hotkey, non-text clipboard, `j3.term` tty/pty.
 6. A crash gives only raw offsets in `crash.log`, and the TLS relocation workaround turns ASLR off.
-7. `j3c` on a Windows host: embedded stdlib path keys, the triple bug (plan 05), `HOME` caches, LSP URIs, headless GL.
+7. `j3c` on a Windows host: embedded stdlib path keys, the triple bug (plan 03), `HOME` caches, LSP URIs, headless GL.
 8. No CI for Windows at all, and no Windows release of `j3c`.
 9. Nothing has ever run on real Windows hardware: GPU drivers, DPI, audio (WASAPI), XInput pads, Defender/SmartScreen,
    Steam overlay.
@@ -375,7 +375,7 @@ wineserver inherits pipes, see `targets.rs:171`. Run `wineserver -k` after a bat
 - Test: a `targets.rs` wine test that builds a program which writes through a bad pointer and asserts that the function name
   shows up in the output.
 
-### 12. `j3c` on a Windows host (needs plan 05's triple fix): superseded by [plan 14](14-windows-j3c.md)
+### 12. `j3c` on a Windows host (needs plan 03's triple fix): superseded by [plan 08](08-windows-j3c.md)
 
 - Files: `j3c/src/stdlib/mod.rs` (`embedded`, `parts`: turn `\` into `/` before comparing; add a unit test with
   a backslashed path that runs on every OS, built by hand with `Path::new` components), `src/editor/frontend.rs`
@@ -407,15 +407,15 @@ wineserver inherits pipes, see `targets.rs:171`. Run `wineserver -k` after a bat
   exe). Add that once the console path is green.
 - Release: build `j3c.exe` (cross `--target x86_64-pc-windows-gnu` from the Linux job is fine, verified above) and
   attach `j3c-<ver>-x86_64-windows.zip` with checksums.
-- Done when both jobs are green on GitHub, and plan 02 §7/§8 Windows boxes can be ticked.
+- Done when both jobs are green on GitHub, and plan 01 §7/§8 Windows boxes can be ticked.
 
-### 14. Ship: Scoop/winget and docs: superseded by [plan 14](14-windows-j3c.md)
+### 14. Ship: Scoop/winget and docs: superseded by [plan 08](08-windows-j3c.md)
 
 - Files: `packaging/scoop/j3c.json` (url, hash, `bin: j3c.exe`, a `depends`/notes line for llvm-mingw), a winget manifest
   once a release exists (`packaging/winget/`), `INSTALL.md` "Windows" (install llvm-mingw, unzip `j3c`, run `j3c doctor`,
   then `j3c -e fetch-mingw-libs`), `README.md` support line, `j3c doc ship` (Windows zip, GUI subsystem, icon,
   `crash.log`, SmartScreen note: unsigned exes warn; Authenticode signing is the developer's call), `roadmap.md`
-  status lines. Tick plan 02 §6 Windows.
+  status lines. Tick plan 01 §6 Windows.
 - Done when a fresh Windows VM gets from zero to `j3c new hello --app && j3c run --headless --frames 30 --screenshot s.png` by
   following `INSTALL.md` only (developer, see below).
 

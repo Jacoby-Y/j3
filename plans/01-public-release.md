@@ -1,7 +1,7 @@
 # Public release checklist
 
 Goal: anyone on any supported system can clone, build or install, and run J3 in five minutes, before
-the first Steam game ships. Scored audit with more detail: [version1](version1.md).
+the first Steam game ships.
 
 ## 1. Clone-and-build blockers (a fresh clone fails today)
 
@@ -77,7 +77,7 @@ the first Steam game ships. Scored audit with more detail: [version1](version1.m
 - [ ] **Windows**: run the built exe for real, fix what breaks, test in CI.
 - [ ] **macOS**: build + run once, decide if it's in scope for v0.1.
 - [ ] **Wayland vs X11, NVIDIA vs Mesa**: smoke-test both; note the ones you can't test.
-- [ ] **Steam Deck / sniper runtime**: covered by the `steam` package's `VERIFY.md` (was plan 01), but needed before your game ships anyway.
+- [ ] **Steam Deck / sniper runtime**: covered by the `steam` package's `VERIFY.md` (was the old Steam verify plan), but needed before your game ships anyway.
 
 ## 8. CI and release process
 

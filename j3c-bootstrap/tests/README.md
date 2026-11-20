@@ -11,7 +11,7 @@ they cover, as `*_test.j3` files the way `j3c/stdlib/tests/` does it.
 
 1. Runs `tools/layers.sh`; a failure stops the run (exit 2).
 2. Builds `target/j3c` with the seed (`tests/boot.sh`, shared with `unit.sh`; `J3_SEED`, else the first of
-   `tools/seed.sh list`, reading this tree's stdlib) as `build --opt 2 j3c-bootstrap` (optimized; plan 13) when
+   `tools/seed.sh list`, reading this tree's stdlib) as `build --opt 2 j3c-bootstrap` (optimized; plan 07) when
    it is missing, older than `src/`, or a `./build.sh` binary with a git version (the expected files hold the
    plain `J3C_VERSION`). `self` still builds stage 2 the way `j3.toml` says (`opt = 0`).
 3. Runs every input through `target/j3c` once, under `timeout` (`DIFF_TIMEOUT`), and compares the normalized
@@ -31,6 +31,13 @@ they cover, as `*_test.j3` files the way `j3c/stdlib/tests/` does it.
 4. Prints `ok FILE`, `blessed FILE` (written), `DIFF FILE` (the text differs from the expected file, or there is
    none) or `CRASH FILE` (the harness failed on the input), the first 40 diff lines of each failure, and a summary
    line `diff.sh MODE: N ok, N DIFF, N CRASH` to paste into a chunk report.
+5. Speed: inputs start slowest first, by each input's time in the last run (`target/diff-times/KIND`; an
+   input with no time starts first), so a big one (`j3c-bootstrap` in `ir`/`llvm`) no longer starts last and
+   holds up the end; the summary names the run's five slowest. `-x` stops starting inputs after the first
+   `DIFF`, `CRASH` or `NONDET` (the rest print `notrun`, a failure). `diff.sh affected [REV]` runs only the
+   modes the files changed since `REV` (default `HEAD`, plus untracked files) can change, cheapest first, each
+   with `-x`, and stops at the first failing mode; `--list` prints them. A change under `src/syntax`, `src/base`,
+   `tests/proj`, `corpus.txt` or `diff.sh` runs every mode; `self` only runs when asked for.
 
 The compared text is stdout, `--- stderr`, stderr and `--- exit N`, so a changed exit code or diagnostic fails.
 Masked everywhere: the repo folder (`$ROOT`) and the home folder (`$HOME`). A stdout or stderr over 64 KiB
@@ -97,14 +104,17 @@ error. `DIFF_BOOT` swaps the compiler under test, `DIFF_REF` the reference (see 
 ## `unit.sh`
 
 `tests/unit.sh [NAME...]` builds and runs `tests/unit/NAME_test.j3` (all of them by default; one test:
-`tests/unit.sh lower_plain`) as its own package in `target/unit/NAME/`, with `target/j3c` (`tests/boot.sh`
-rebuilds it with the seed when it is missing or stale, as `diff.sh` does), in parallel (`J3_TEST_JOBS`,
+`tests/unit.sh lower_plain`) as its own package in `target/unit/NAME/`, built at opt 0 by the seed (`tools/seed.sh list`'s first,
+reading this tree's stdlib; `J3_UNIT_CC=target` uses `target/j3c`, for a codegen change, `J3_UNIT_CC=PATH` any
+compiler). The object cache key holds the building compiler's id, so with the seed an edit to `src/` rebuilds
+only the modules it changed; `target/j3c` is rebuilt on every edit and would rebuild them all. `target/j3c` is
+still made current first (`tests/boot.sh`, as `diff.sh` does): some tests run it. Tests run in parallel (`J3_TEST_JOBS`,
 default 2; each build gets `J3_JOBS` = (nproc/2) / `J3_TEST_JOBS`, so the suite stays within half the cores;
 a `J3_JOBS` you set wins), and prints `ok NAME` / `FAIL NAME` (with the tail of its log) in name order, then
 `unit.sh: N ok, N FAIL`. A test writes only under its own name (scratch folders are `target/unit/NAME`,
-`target/NAME`, or carry the pid), so tests never share a folder. Cost: one test build is about 3.5 s and
-400 MB; the whole suite runs in a few minutes (each package compiles the `j3c` modules it imports again; the
-object cache is per package).
+`target/NAME`, or carry the pid), so tests never share a folder. Cost: a cold test build is about 2.5 s and
+400 MB (each package compiles the `j3c` modules it imports; the object cache is per package); a warm one, after
+an edit, rebuilds only the changed modules.
 
 Expected output: a test that compares a text it made (an IR or AST dump, diagnostics, a tool table) reads
 `tests/unit/expect/NAME...` through the `unitkit` package (`tests/unit/kit`, a dependency of every test
