@@ -86,7 +86,16 @@ foreach ($d in @('target', 'target\.j3c\host')) {
     New-Item -ItemType Directory -Force -Path $d | Out-Null
     Copy-Item "$work\mesa\x64\*.dll" $d
 }
-Native $j3c @('run', '--headless', '--frames', '5', '--screenshot', 's.png')
+# Bounded: a hung game (no frames, a modal box) fails in 5 min with its output instead of eating the job timeout.
+$p = Start-Process -FilePath $j3c -ArgumentList 'run', '--headless', '--frames', '5', '--screenshot', 's.png' `
+    -NoNewWindow -PassThru -RedirectStandardOutput run.out -RedirectStandardError run.err
+$null = $p.Handle  # keeps ExitCode readable after the wait
+$hung = -not $p.WaitForExit(300000)
+if ($hung) { Stop-Process -Id $p.Id -Force; Get-Process app -ErrorAction SilentlyContinue | Stop-Process -Force }
+Get-Content run.out, run.err -ErrorAction SilentlyContinue | Write-Host
+if (Test-Path crash.log) { Write-Host '--- crash.log'; Get-Content crash.log | Write-Host }
+if ($hung) { Fail 'app: j3c run --headless hung for 5 min' }
+if ($p.ExitCode -ne 0) { Fail "app: j3c run exit $($p.ExitCode)" }
 if (-not (Test-Path 's.png')) { Fail 'app: no s.png' }
 Pop-Location; Pop-Location
 EndStep
